@@ -22,6 +22,7 @@ import concurrent.futures as cf
 import json
 import logging
 import os
+import re
 import subprocess
 import sys
 import time
@@ -44,12 +45,114 @@ _POLL_INTERVAL_SECS = 0.1
 # After terminate(), wait this long before escalating to kill().
 _TERMINATE_GRACE_SECS = 1.0
 
+_KNOWN_TEXT_BACKENDS = frozenset({
+    "bing",
+    "brave",
+    "duckduckgo",
+    "google",
+    "grokipedia",
+    "mojeek",
+    "startpage",
+    "wikipedia",
+    "yahoo",
+    "yandex",
+})
+_BACKEND_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
+
+
+def _load_web_config() -> dict[str, Any]:
+    """Load the YAML-backed ``web`` configuration without importing web_tools."""
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        config = load_config_readonly()
+        web = config.get("web") if isinstance(config, dict) else None
+        return web if isinstance(web, dict) else {}
+    except Exception:  # noqa: BLE001 — config absence falls back to DDGS defaults
+        return {}
+
+
+def _resolve_backends() -> Optional[str]:
+    """Return normalized ``web.ddgs_backends`` or use DDGS's default.
+
+    ``backend="auto"`` rotates through every text engine ddgs supports. When
+    one of them is unreachable from a given host — e.g. an engine whose cert
+    chain fails local TLS validation — each rotation onto it burns the full
+    per-request timeout and returns nothing, which degrades unattended
+    searches (cron research jobs) into empty results. Naming an explicit
+    ordered list lets an operator route around a broken engine without
+    patching this file. YAML accepts either a list or a comma-delimited string;
+    values are normalized to the string contract exposed by ``DDGS.text``.
+    """
+    raw = _load_web_config().get("ddgs_backends")
+    if raw is None:
+        return None
+    if isinstance(raw, str):
+        candidates = raw.split(",")
+    elif isinstance(raw, (list, tuple)) and all(
+        isinstance(item, str) for item in raw
+    ):
+        candidates = list(raw)
+    else:
+        raise ValueError(
+            "web.ddgs_backends must be a YAML list or comma-delimited string"
+        )
+
+    normalized: list[str] = []
+    for candidate in candidates:
+        name = candidate.strip().lower()
+        if not name or name in normalized:
+            continue
+        if not _BACKEND_NAME_RE.fullmatch(name):
+            raise ValueError(
+                f"Invalid DDGS backend name {candidate!r} in web.ddgs_backends"
+            )
+        normalized.append(name)
+
+    if not normalized:
+        return None
+    if len(normalized) > 1 and ({"auto", "all"} & set(normalized)):
+        raise ValueError(
+            "web.ddgs_backends values 'auto' and 'all' must be used alone"
+        )
+    return ",".join(normalized)
+
+
+def _validate_backends(backends: Optional[str]) -> Optional[str]:
+    """Validate configured names against the installed DDGS text engines."""
+    if not backends or backends in {"auto", "all"}:
+        return backends
+
+    available = set(_KNOWN_TEXT_BACKENDS)
+    try:
+        from ddgs.engines import ENGINES  # type: ignore
+
+        engines = ENGINES.get("text")
+        if isinstance(engines, dict):
+            available.update(str(name).lower() for name in engines)
+    except Exception:  # noqa: BLE001 — public documented names remain available
+        pass
+
+    requested = backends.split(",")
+    unknown = sorted(set(requested) - available)
+    if unknown:
+        raise ValueError(
+            "Unknown DDGS text backend(s) in web.ddgs_backends: "
+            f"{', '.join(unknown)}. Available: {', '.join(sorted(available))}"
+        )
+    return backends
+
 
 class _SearchInterrupted(Exception):
     """Raised when tools.interrupt.is_interrupted() trips during a search wait."""
 
 
-def _run_ddgs_search(query: str, safe_limit: int) -> list[dict[str, Any]]:
+def _run_ddgs_search(
+    query: str,
+    safe_limit: int,
+    *,
+    backends: Optional[str] = None,
+) -> list[dict[str, Any]]:
     """Run the blocking ddgs query and return normalized hits.
 
     Module-level (not a closure) so the child worker can import it and so
@@ -59,9 +162,16 @@ def _run_ddgs_search(query: str, safe_limit: int) -> list[dict[str, Any]]:
     """
     from ddgs import DDGS  # type: ignore
 
+    text_kwargs: Dict[str, Any] = {}
+    backends = _validate_backends(backends)
+    if backends:
+        text_kwargs["backend"] = backends
+
     results: list[dict[str, Any]] = []
     with DDGS(timeout=10) as client:
-        for i, hit in enumerate(client.text(query, max_results=safe_limit)):
+        for i, hit in enumerate(
+            client.text(query, max_results=safe_limit, **text_kwargs)
+        ):
             if i >= safe_limit:
                 break
             url = str(hit.get("href") or hit.get("url") or "")
@@ -153,6 +263,9 @@ def _run_ddgs_search_bounded(query: str, safe_limit: int) -> list[dict[str, Any]
     global _last_worker_proc
 
     request: dict[str, Any] = {"query": query, "safe_limit": safe_limit}
+    backends = _resolve_backends()
+    if backends:
+        request["backends"] = backends
     if _test_hook:
         request["test_hook"] = _test_hook
 

@@ -110,6 +110,38 @@ hermes tools
 
 ---
 
+### DDGS (DuckDuckGo)
+
+DDGS is a free, search-only backend. Select it in `hermes tools`, or configure
+it directly:
+
+```yaml
+# ~/.hermes/config.yaml
+web:
+  search_backend: "ddgs"
+```
+
+By default, DDGS rotates through its available text engines. If one engine is
+slow or unreachable on your network, pin an ordered subset with
+`web.ddgs_backends`:
+
+```yaml
+# ~/.hermes/config.yaml
+web:
+  search_backend: "ddgs"
+  ddgs_backends:
+    - duckduckgo
+    - brave
+    - google
+```
+
+The value may also be a comma-delimited string. Supported text engines include
+`bing`, `brave`, `duckduckgo`, `google`, `grokipedia`, `mojeek`, `startpage`,
+`wikipedia`, `yahoo`, and `yandex`; `auto` or `all` may be used alone. Invalid
+names produce an actionable search error instead of silently falling back.
+
+---
+
 ### Firecrawl (default)
 
 Full-featured search and extract. Recommended for most users.

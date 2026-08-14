@@ -41,7 +41,10 @@ def _install_fake_ddgs(monkeypatch, *, text_results=None, text_raises=None, text
             return self
         def __exit__(self, *_a):
             return False
-        def text(self, query, max_results=5):
+        def text(self, query, max_results=5, **kwargs):
+            # kwargs are recorded so tests can assert which optional
+            # parameters (e.g. backend=) the provider forwarded.
+            fake.text_kwargs.append(kwargs)
             if text_sleep is not None:
                 _time.sleep(text_sleep)
             if text_raises is not None:
@@ -50,6 +53,7 @@ def _install_fake_ddgs(monkeypatch, *, text_results=None, text_raises=None, text
                 yield hit
 
     fake.DDGS = _FakeDDGS
+    fake.text_kwargs = []
     monkeypatch.setitem(sys.modules, "ddgs", fake)
     return fake
 
@@ -64,7 +68,11 @@ def _force_inprocess_search(monkeypatch, prov):
     monkeypatch.setattr(
         prov,
         "_run_ddgs_search_bounded",
-        lambda query, safe_limit: prov._run_ddgs_search(query, safe_limit),
+        lambda query, safe_limit: prov._run_ddgs_search(
+            query,
+            safe_limit,
+            backends=prov._resolve_backends(),
+        ),
         raising=True,
     )
 
@@ -291,3 +299,101 @@ class TestDDGSSearchOnlyErrors:
         assert result["success"] is False
         assert "search-only" in result["error"].lower()
         assert "duckduckgo" in result["error"].lower() or "ddgs" in result["error"].lower()
+
+
+# ---------------------------------------------------------------------------
+# Configurable DDGS text engines (web.ddgs_backends)
+# ---------------------------------------------------------------------------
+
+
+class TestDDGSBackendSelection:
+    """``backend=`` is forwarded only when an engine list is configured.
+
+    An unset key must leave DDGS on its own default so existing behavior is
+    unchanged; a configured list must reach ``DDGS.text`` in order so an
+    operator can route around an engine that is unreachable from their host.
+    """
+
+    def test_real_config_yaml_reaches_resolver(self, monkeypatch, tmp_path):
+        home = tmp_path / "hermes-home"
+        home.mkdir()
+        (home / "config.yaml").write_text(
+            "web:\n"
+            "  search_backend: ddgs\n"
+            "  ddgs_backends:\n"
+            "    - duckduckgo\n"
+            "    - brave\n"
+        )
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        import plugins.web.ddgs.provider as prov
+
+        assert prov._resolve_backends() == "duckduckgo,brave"
+
+    def test_no_backend_kwarg_by_default(self, monkeypatch):
+        fake = _install_fake_ddgs(monkeypatch, text_results=[])
+        import plugins.web.ddgs.provider as prov
+        monkeypatch.setattr(prov, "_load_web_config", lambda: {})
+        _force_inprocess_search(monkeypatch, prov)
+
+        prov.DDGSWebSearchProvider().search("q", limit=5)
+
+        assert fake.text_kwargs == [{}]
+
+    def test_configured_backends_are_forwarded(self, monkeypatch):
+        fake = _install_fake_ddgs(monkeypatch, text_results=[])
+        import plugins.web.ddgs.provider as prov
+        monkeypatch.setattr(
+            prov,
+            "_load_web_config",
+            lambda: {"ddgs_backends": ["DuckDuckGo", "brave", "google"]},
+        )
+        _force_inprocess_search(monkeypatch, prov)
+
+        prov.DDGSWebSearchProvider().search("q", limit=5)
+
+        assert fake.text_kwargs == [{"backend": "duckduckgo,brave,google"}]
+
+    def test_blank_config_is_ignored(self, monkeypatch):
+        fake = _install_fake_ddgs(monkeypatch, text_results=[])
+        import plugins.web.ddgs.provider as prov
+        monkeypatch.setattr(prov, "_load_web_config", lambda: {"ddgs_backends": "   "})
+        _force_inprocess_search(monkeypatch, prov)
+
+        prov.DDGSWebSearchProvider().search("q", limit=5)
+
+        assert fake.text_kwargs == [{}]
+
+    def test_invalid_backend_is_actionable(self, monkeypatch):
+        _install_fake_ddgs(monkeypatch, text_results=[])
+        import plugins.web.ddgs.provider as prov
+        monkeypatch.setattr(
+            prov,
+            "_load_web_config",
+            lambda: {"ddgs_backends": ["duckduckgo", "typo-engine"]},
+        )
+        _force_inprocess_search(monkeypatch, prov)
+
+        result = prov.DDGSWebSearchProvider().search("q", limit=5)
+
+        assert result["success"] is False
+        assert "unknown ddgs text backend" in result["error"].lower()
+        assert "web.ddgs_backends" in result["error"]
+
+    @pytest.mark.live_system_guard_bypass
+    def test_config_reaches_bounded_worker(self, monkeypatch):
+        _install_fake_ddgs(monkeypatch)
+        import plugins.web.ddgs.provider as prov
+
+        monkeypatch.setattr(
+            prov,
+            "_load_web_config",
+            lambda: {"ddgs_backends": ["duckduckgo", "brave"]},
+        )
+        monkeypatch.setattr(prov, "_test_hook", "backends", raising=True)
+        monkeypatch.setattr("tools.interrupt.is_interrupted", lambda: False)
+
+        result = prov.DDGSWebSearchProvider().search("q", limit=5)
+
+        assert result["success"] is True, result
+        assert result["data"]["web"][0]["description"] == "duckduckgo,brave"
+        _assert_worker_reaped(prov)
