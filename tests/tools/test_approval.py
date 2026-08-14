@@ -168,7 +168,7 @@ class TestApprovalRiskAnalysis:
             if isinstance(aux_result, Exception)
             else {"return_value": aux_result}
         )
-        config = {"approvals": {"mode": "manual"}, "security": {"tirith_enabled": False}}
+        config = {"approvals": {"mode": "smart"}, "security": {"tirith_enabled": False}}
         with mock_patch("hermes_cli.config.load_config_readonly", return_value=config), \
              mock_patch("agent.auxiliary_client.call_llm", **call_effect):
             result = approval_module.check_all_command_guards(
@@ -185,6 +185,35 @@ class TestApprovalRiskAnalysis:
             assert result["user_consent"] is False
         else:
             assert result["user_approved"] is True
+
+    def test_manual_mode_does_not_send_command_to_auxiliary_model(self, monkeypatch):
+        command = "rm -rf /var/data && printf done"
+        captured = {}
+
+        def approval_callback(display_command, display_description, **_kwargs):
+            captured["command"] = display_command
+            captured["description"] = display_description
+            return "deny"
+
+        monkeypatch.setenv("HERMES_INTERACTIVE", "1")
+        monkeypatch.delenv("HERMES_EXEC_ASK", raising=False)
+        monkeypatch.setattr(approval_module, "_YOLO_MODE_FROZEN", False)
+        approval_module._session_approved.clear()
+        approval_module._permanent_approved.clear()
+        config = {"approvals": {"mode": "manual"}, "security": {"tirith_enabled": False}}
+
+        with mock_patch("hermes_cli.config.load_config_readonly", return_value=config), \
+             mock_patch("agent.auxiliary_client.call_llm") as call:
+            result = approval_module.check_all_command_guards(
+                command,
+                "local",
+                approval_callback=approval_callback,
+            )
+
+        call.assert_not_called()
+        assert result["approved"] is False
+        assert captured["command"] == command
+        assert "AI-generated analysis" not in captured["description"]
 
 
 class TestDetectDangerousRm:
@@ -1561,10 +1590,10 @@ class TestApprovalPromptRedaction:
             f'api_key = "{fake_secret}"\n'
             "print(api_key)"
         )
-        cfg = {"approvals": {"mode": "manual"}}
+        cfg = {"approvals": {"mode": "smart"}}
         with _patch("hermes_cli.config.load_config_readonly", return_value=cfg), \
              _patch("tools.approval._is_gateway_approval_context", return_value=True), \
-             _patch("tools.approval._get_approval_mode", return_value="manual"), \
+             _patch("tools.approval._get_approval_mode", return_value="smart"), \
              _patch("agent.auxiliary_client.call_llm",
                     side_effect=TimeoutError("summary timeout")):
             # No gateway notify callback registered -> pending fallback.

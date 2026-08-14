@@ -3692,7 +3692,7 @@ def check_dangerous_command(command: str, env_type: str,
         autoapprove_log_prefix=(
             "AUTO-APPROVED dangerous command in non-interactive non-gateway context"
         ),
-        include_ai_risk_analysis=True,
+        include_ai_risk_analysis=_get_approval_mode() == "smart",
     )
 
 
@@ -4357,10 +4357,12 @@ def check_all_command_guards(command: str, env_type: str,
 
     # Combine descriptions for a single approval prompt
     combined_desc = "; ".join(desc for _, desc, _ in warnings)
-    approval_display_desc = _approval_description_with_ai_risk_analysis(
-        command,
-        combined_desc,
-    )
+    approval_display_desc = combined_desc
+    if approval_mode == "smart":
+        approval_display_desc = _approval_description_with_ai_risk_analysis(
+            command,
+            combined_desc,
+        )
     primary_key = warnings[0][0]
     all_keys = [key for key, _, _ in warnings]
     # "Always" is offered when at least one warning is a dangerous-pattern
@@ -4809,10 +4811,12 @@ def check_execute_code_guard(code: str, env_type: str,
     # smart approval and executed; redaction is display-only. Approval
     # persistence keys off pattern_key, so the allowlist is unaffected.
     from agent.redact import redact_sensitive_text
-    approval_display_description = _approval_description_with_ai_risk_analysis(
-        command,
-        description,
-    )
+    approval_display_description = description
+    if approval_mode == "smart":
+        approval_display_description = _approval_description_with_ai_risk_analysis(
+            command,
+            description,
+        )
     display_command = redact_sensitive_text(command)
     display_code = redact_sensitive_text(code)
     display_description = redact_sensitive_text(approval_display_description)
