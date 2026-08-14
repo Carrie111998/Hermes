@@ -50,11 +50,15 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import signal
+import subprocess
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Set
 from urllib.parse import quote, unquote
+
+import psutil
 
 from hermes_cli._subprocess_compat import windows_hide_flags
 
@@ -205,6 +209,10 @@ class LSPClient:
 
         # Process + streams
         self._proc: Optional[asyncio.subprocess.Process] = None
+        # ``start_new_session`` gives POSIX servers an owned process group.
+        # Keep the group id as soon as the child is returned so cancellation
+        # during initialize can still reap descendants.
+        self._pgid: Optional[int] = None
         self._stderr_task: Optional[asyncio.Task] = None
         self._reader_task: Optional[asyncio.Task] = None
 
@@ -275,7 +283,7 @@ class LSPClient:
             await self._spawn()
             await self._initialize()
             self._state = "running"
-        except Exception:
+        except BaseException:
             self._state = "error"
             await self._cleanup_process()
             raise
@@ -302,16 +310,15 @@ class LSPClient:
         # a VS Code/Zed extension running the ACP adapter.
         # windows_hide_flags() is CREATE_NO_WINDOW on Windows, 0 on POSIX.
         creationflags = windows_hide_flags()
+        if sys.platform == "win32":
+            creationflags |= getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
 
-        try:
-            # start_new_session=True detaches the LSP server into its own
-            # process group / session. Without this, the LSP server inherits
-            # the gateway's pgid (= TUI parent PID). When mcp_tool's
-            # _kill_orphaned_mcp_children races with LSP spawn and sweeps the
-            # gateway's child set, it captures the LSP PID, records the
-            # inherited pgid, and killpg() then kills the TUI parent itself.
-            # See tui_gateway_crash.log "killpg → SIGTERM received" stacks.
-            self._proc = await asyncio.create_subprocess_exec(
+        # Shield process creation from cancellation.  ``create_subprocess_exec``
+        # can finish spawning after the caller is cancelled; awaiting the
+        # shielded task lets us record the PID and group before propagating the
+        # cancellation into ``start``'s cleanup path.
+        spawn_task = asyncio.create_task(
+            asyncio.create_subprocess_exec(
                 cmd[0],
                 *cmd[1:],
                 stdin=asyncio.subprocess.PIPE,
@@ -322,16 +329,49 @@ class LSPClient:
                 start_new_session=True,
                 creationflags=creationflags,
             )
+        )
+        try:
+            proc = await asyncio.shield(spawn_task)
+        except asyncio.CancelledError:
+            proc = await spawn_task
+            self._proc = proc
+            self._record_process_group()
+            raise
         except FileNotFoundError as e:
             raise LSPProtocolError(
                 f"LSP server binary not found: {cmd[0]} ({e})"
             ) from e
+        self._proc = proc
+        self._record_process_group()
 
         # Drain stderr at debug level — if we don't, the pipe buffer
         # fills and the server hangs.
         self._stderr_task = asyncio.create_task(self._drain_stderr())
         # Start the reader loop.
         self._reader_task = asyncio.create_task(self._reader_loop())
+
+    def _record_process_group(self) -> None:
+        """Record the process group owned by the just-spawned server."""
+        proc = self._proc
+        if proc is None or os.name == "nt":
+            return
+        try:
+            pgid = os.getpgid(proc.pid)
+        except ProcessLookupError:
+            # ``start_new_session`` makes the child PID its group ID.  If
+            # the parent exited before getpgid(), retaining that ID still
+            # lets cleanup reap a descendant that outlived its parent.
+            pgid = proc.pid
+        except OSError:
+            return
+        try:
+            # ``start_new_session`` owns the group whose id is the child PID.
+            # Refuse to signal a group the child joined later because it may
+            # contain unrelated processes.
+            if pgid == proc.pid and pgid != os.getpgrp():
+                self._pgid = pgid
+        except OSError:
+            return
 
     async def _drain_stderr(self) -> None:
         if self._proc is None or self._proc.stderr is None:
@@ -487,21 +527,68 @@ class LSPClient:
             except (asyncio.CancelledError, Exception):  # noqa: BLE001
                 pass
         proc = self._proc
+        pgid = self._pgid
         self._proc = None
+        self._pgid = None
         if proc is None:
             return
+
+        # Capture descendants before signaling the root.  Process groups are
+        # the primary POSIX cleanup mechanism, while the snapshot also covers
+        # a child that deliberately creates a new session and is required for
+        # Windows where process-group signals are unavailable.
+        descendants = []
+        try:
+            descendants = psutil.Process(proc.pid).children(recursive=True)
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
+
+        if pgid is not None:
+            try:
+                os.killpg(pgid, signal.SIGTERM)
+            except (ProcessLookupError, OSError):
+                pass
+        else:
+            self._terminate_processes([*descendants, proc], force=False)
+
+        deadline = asyncio.get_running_loop().time() + SHUTDOWN_GRACE
         if proc.returncode is None:
             try:
-                proc.terminate()
-                try:
-                    await asyncio.wait_for(proc.wait(), timeout=SHUTDOWN_GRACE)
-                except asyncio.TimeoutError:
-                    try:
-                        proc.kill()
-                        await proc.wait()
-                    except ProcessLookupError:
-                        pass
+                remaining = max(0.0, deadline - asyncio.get_running_loop().time())
+                await asyncio.wait_for(proc.wait(), timeout=remaining)
+            except (asyncio.TimeoutError, ProcessLookupError):
+                pass
+        remaining = max(0.0, deadline - asyncio.get_running_loop().time())
+        if remaining:
+            await asyncio.sleep(remaining)
+
+        if pgid is not None:
+            try:
+                os.killpg(pgid, signal.SIGKILL)
+            except (ProcessLookupError, OSError):
+                pass
+        self._terminate_processes([*descendants, proc], force=True)
+        if proc.returncode is None:
+            try:
+                await proc.wait()
             except ProcessLookupError:
+                pass
+
+    @staticmethod
+    def _terminate_processes(processes: list, *, force: bool) -> None:
+        """Best-effort fallback for descendants outside the process group."""
+        for process in processes:
+            try:
+                if isinstance(process, psutil.Process):
+                    if not process.is_running():
+                        continue
+                elif process.returncode is not None:
+                    continue
+                if force:
+                    process.kill()
+                else:
+                    process.terminate()
+            except (ProcessLookupError, psutil.NoSuchProcess, OSError, AttributeError):
                 pass
 
     # ------------------------------------------------------------------

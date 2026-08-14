@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
 import time
 
@@ -64,6 +65,7 @@ def write_message(obj):
 
 def main():
     script = os.environ.get("MOCK_LSP_SCRIPT", "clean")
+    child = None
 
     while True:
         msg = read_message()
@@ -88,6 +90,16 @@ def main():
             )
             if script == "crash":
                 return 0
+            child_pid_file = os.environ.get("MOCK_LSP_CHILD_PID_FILE")
+            if child_pid_file and child is None:
+                child = subprocess.Popen(
+                    [sys.executable, "-c", "import time; time.sleep(60)"],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                with open(child_pid_file, "w", encoding="ascii") as f:
+                    f.write(str(child.pid))
             continue
 
         if msg.get("method") == "initialized":

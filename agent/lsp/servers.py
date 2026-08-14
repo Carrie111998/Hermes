@@ -167,6 +167,7 @@ class ServerContext:
     binary_overrides: Dict[str, List[str]] = field(default_factory=dict)
     env_overrides: Dict[str, Dict[str, str]] = field(default_factory=dict)
     init_overrides: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    hermes_home: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -206,7 +207,7 @@ def _root_or_workspace(file_path: str, workspace: str, markers: Sequence[str], e
         file_path,
         markers,
         excludes=excludes,
-        ceiling=os.path.dirname(workspace) if workspace else None,
+        ceiling=workspace or None,
     )
     if found is None and excludes:
         # Distinguish "no marker found" from "exclude hit": when
@@ -216,7 +217,7 @@ def _root_or_workspace(file_path: str, workspace: str, markers: Sequence[str], e
         recheck = nearest_root(
             file_path,
             markers,
-            ceiling=os.path.dirname(workspace) if workspace else None,
+            ceiling=workspace or None,
         )
         if recheck is not None:
             return None  # exclude triggered
@@ -235,7 +236,7 @@ def _spawn_pyright(root: str, ctx: ServerContext) -> Optional[SpawnSpec]:
     )
     if bin_path is None:
         from agent.lsp.install import try_install
-        bin_path = try_install("pyright", ctx.install_strategy)
+        bin_path = try_install("pyright", ctx.install_strategy, hermes_home=ctx.hermes_home)
         if bin_path is None:
             return None
     # If we got the cli ``pyright``, the langserver is its sibling.
@@ -278,7 +279,7 @@ def _spawn_typescript(root: str, ctx: ServerContext) -> Optional[SpawnSpec]:
     bin_path = _resolve_override(ctx, "typescript") or _which("typescript-language-server")
     if bin_path is None:
         from agent.lsp.install import try_install
-        bin_path = try_install("typescript-language-server", ctx.install_strategy)
+        bin_path = try_install("typescript-language-server", ctx.install_strategy, hermes_home=ctx.hermes_home)
         if bin_path is None:
             return None
     return SpawnSpec(
@@ -295,7 +296,7 @@ def _spawn_gopls(root: str, ctx: ServerContext) -> Optional[SpawnSpec]:
     bin_path = _resolve_override(ctx, "gopls") or _which("gopls")
     if bin_path is None:
         from agent.lsp.install import try_install
-        bin_path = try_install("gopls", ctx.install_strategy)
+        bin_path = try_install("gopls", ctx.install_strategy, hermes_home=ctx.hermes_home)
         if bin_path is None:
             return None
     return SpawnSpec(
@@ -311,7 +312,7 @@ def _spawn_rust_analyzer(root: str, ctx: ServerContext) -> Optional[SpawnSpec]:
     bin_path = _resolve_override(ctx, "rust-analyzer") or _which("rust-analyzer")
     if bin_path is None:
         from agent.lsp.install import try_install
-        bin_path = try_install("rust-analyzer", ctx.install_strategy)
+        bin_path = try_install("rust-analyzer", ctx.install_strategy, hermes_home=ctx.hermes_home)
         if bin_path is None:
             return None
     return SpawnSpec(
@@ -327,7 +328,7 @@ def _spawn_clangd(root: str, ctx: ServerContext) -> Optional[SpawnSpec]:
     bin_path = _resolve_override(ctx, "clangd") or _which("clangd")
     if bin_path is None:
         from agent.lsp.install import try_install
-        bin_path = try_install("clangd", ctx.install_strategy)
+        bin_path = try_install("clangd", ctx.install_strategy, hermes_home=ctx.hermes_home)
         if bin_path is None:
             return None
     return SpawnSpec(
@@ -346,7 +347,7 @@ def _spawn_bash_ls(root: str, ctx: ServerContext) -> Optional[SpawnSpec]:
     bin_path = _resolve_override(ctx, "bash-language-server") or _which("bash-language-server")
     if bin_path is None:
         from agent.lsp.install import try_install
-        bin_path = try_install("bash-language-server", ctx.install_strategy)
+        bin_path = try_install("bash-language-server", ctx.install_strategy, hermes_home=ctx.hermes_home)
         if bin_path is None:
             return None
     # bash-language-server delegates diagnostics to ``shellcheck``.  Without
@@ -374,7 +375,7 @@ def _spawn_yaml_ls(root: str, ctx: ServerContext) -> Optional[SpawnSpec]:
     bin_path = _resolve_override(ctx, "yaml-language-server") or _which("yaml-language-server")
     if bin_path is None:
         from agent.lsp.install import try_install
-        bin_path = try_install("yaml-language-server", ctx.install_strategy)
+        bin_path = try_install("yaml-language-server", ctx.install_strategy, hermes_home=ctx.hermes_home)
         if bin_path is None:
             return None
     return SpawnSpec(
@@ -390,7 +391,7 @@ def _spawn_lua_ls(root: str, ctx: ServerContext) -> Optional[SpawnSpec]:
     bin_path = _resolve_override(ctx, "lua-language-server") or _which("lua-language-server")
     if bin_path is None:
         from agent.lsp.install import try_install
-        bin_path = try_install("lua-language-server", ctx.install_strategy)
+        bin_path = try_install("lua-language-server", ctx.install_strategy, hermes_home=ctx.hermes_home)
         if bin_path is None:
             return None
     return SpawnSpec(
@@ -406,7 +407,7 @@ def _spawn_intelephense(root: str, ctx: ServerContext) -> Optional[SpawnSpec]:
     bin_path = _resolve_override(ctx, "intelephense") or _which("intelephense")
     if bin_path is None:
         from agent.lsp.install import try_install
-        bin_path = try_install("intelephense", ctx.install_strategy)
+        bin_path = try_install("intelephense", ctx.install_strategy, hermes_home=ctx.hermes_home)
         if bin_path is None:
             return None
     init = {"telemetry": {"enabled": False}}
@@ -437,7 +438,7 @@ def _spawn_dockerfile_ls(root: str, ctx: ServerContext) -> Optional[SpawnSpec]:
     bin_path = _resolve_override(ctx, "dockerfile-ls") or _which("docker-langserver")
     if bin_path is None:
         from agent.lsp.install import try_install
-        bin_path = try_install("dockerfile-language-server-nodejs", ctx.install_strategy)
+        bin_path = try_install("dockerfile-language-server-nodejs", ctx.install_strategy, hermes_home=ctx.hermes_home)
         if bin_path is None:
             return None
     return SpawnSpec(
@@ -631,7 +632,7 @@ def _spawn_vue(root: str, ctx: ServerContext) -> Optional[SpawnSpec]:
     )
     if bin_path is None:
         from agent.lsp.install import try_install
-        bin_path = try_install("@vue/language-server", ctx.install_strategy)
+        bin_path = try_install("@vue/language-server", ctx.install_strategy, hermes_home=ctx.hermes_home)
         if bin_path is None:
             return None
     return SpawnSpec(
@@ -649,7 +650,7 @@ def _spawn_svelte(root: str, ctx: ServerContext) -> Optional[SpawnSpec]:
     )
     if bin_path is None:
         from agent.lsp.install import try_install
-        bin_path = try_install("svelte-language-server", ctx.install_strategy)
+        bin_path = try_install("svelte-language-server", ctx.install_strategy, hermes_home=ctx.hermes_home)
         if bin_path is None:
             return None
     return SpawnSpec(
@@ -667,7 +668,7 @@ def _spawn_astro(root: str, ctx: ServerContext) -> Optional[SpawnSpec]:
     )
     if bin_path is None:
         from agent.lsp.install import try_install
-        bin_path = try_install("@astrojs/language-server", ctx.install_strategy)
+        bin_path = try_install("@astrojs/language-server", ctx.install_strategy, hermes_home=ctx.hermes_home)
         if bin_path is None:
             return None
     return SpawnSpec(
@@ -710,9 +711,12 @@ def _find_pses_bundle(ctx: ServerContext) -> Optional[str]:
     env_path = os.environ.get("PSES_BUNDLE_PATH")
     if env_path:
         candidates.append(env_path)
-    from hermes_constants import get_hermes_home
+    if ctx.hermes_home is not None:
+        home = ctx.hermes_home
+    else:
+        from hermes_constants import get_hermes_home
 
-    home = str(get_hermes_home())
+        home = str(get_hermes_home())
     candidates.append(os.path.join(home, "lsp", "PowerShellEditorServices"))
 
     for cand in candidates:
@@ -759,10 +763,11 @@ def _spawn_powershell_es(root: str, ctx: ServerContext) -> Optional[SpawnSpec]:
         bundle, "PowerShellEditorServices", "Start-EditorServices.ps1"
     )
     # Session details file: PSES writes connection info here on startup.
+    session_dir = hermes_lsp_session_dir(ctx.hermes_home)
     session_path = os.path.join(
-        hermes_lsp_session_dir(), f"pses-session-{os.getpid()}.json"
+        session_dir, f"pses-session-{os.getpid()}.json"
     )
-    log_path = os.path.join(hermes_lsp_session_dir(), "pses.log")
+    log_path = os.path.join(session_dir, "pses.log")
     inner = (
         f"& '{start_script}' "
         f"-BundledModulesPath '{bundle}' "
@@ -794,12 +799,13 @@ def _spawn_powershell_es(root: str, ctx: ServerContext) -> Optional[SpawnSpec]:
     )
 
 
-def hermes_lsp_session_dir() -> str:
+def hermes_lsp_session_dir(hermes_home: Optional[str] = None) -> str:
     """Return (and create) the dir for PSES session/log scratch files."""
-    from hermes_constants import get_hermes_home
+    if hermes_home is None:
+        from hermes_constants import get_hermes_home
 
-    home = str(get_hermes_home())
-    d = os.path.join(home, "lsp", "pses")
+        hermes_home = str(get_hermes_home())
+    d = os.path.join(hermes_home, "lsp", "pses")
     os.makedirs(d, exist_ok=True)
     return d
 
@@ -917,7 +923,7 @@ def _root_clojure(file_path: str, workspace: str) -> Optional[str]:
 
 
 def _root_nix(file_path: str, workspace: str) -> str:
-    found = nearest_root(file_path, ["flake.nix"])
+    found = nearest_root(file_path, ["flake.nix"], ceiling=workspace)
     return found or workspace
 
 

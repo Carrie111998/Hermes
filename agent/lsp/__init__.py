@@ -34,33 +34,45 @@ import threading
 from typing import Optional
 
 from agent.lsp.manager import LSPService
+from hermes_constants import hermes_home_key
 
 logger = logging.getLogger("agent.lsp")
 
 _service: Optional[LSPService] = None
+_service_scope: Optional[str] = None
+_services: dict[str, LSPService] = {}
 _atexit_registered = False
 _service_lock = threading.Lock()
 
 
+def _current_scope() -> str:
+    """Return the active profile/home key for service isolation."""
+    return hermes_home_key()
+
+
 def get_service() -> Optional[LSPService]:
-    """Return the process-wide LSP service singleton, or None when disabled.
+    """Return the active profile/home-scoped LSP service, or None when disabled.
 
     The service is created lazily on first call.  ``None`` is returned
     when LSP is disabled in config, when no workspace can be detected,
     or when the platform doesn't support subprocess-based LSP servers.
+    Services are shared within one Hermes home and isolated across homes,
+    so a multiplexed process cannot reuse another profile's clients.
 
     On first creation, registers an :mod:`atexit` handler that tears
     down spawned language servers on Python exit so a long-running
     CLI or gateway session doesn't leak pyright/gopls/etc. processes
     when it terminates.
     """
-    global _service, _atexit_registered
-    if _service is not None:
-        return _service if _service.is_active() else None
+    global _service, _service_scope, _atexit_registered
+    scope = _current_scope()
     with _service_lock:
-        if _service is not None:
-            return _service if _service.is_active() else None
-        _service = LSPService.create_from_config()
+        _service = _services.get(scope)
+        _service_scope = scope
+        if _service is None:
+            _service = LSPService.create_from_config()
+            if _service is not None:
+                _services[scope] = _service
         if not _atexit_registered:
             # ``atexit`` handlers run in LIFO order on normal Python
             # exit and on SystemExit, but NOT on os._exit() or
@@ -82,11 +94,15 @@ def shutdown_service() -> None:
 
     Safe to call multiple times; safe to call when no service was created.
     """
-    global _service
+    global _service, _service_scope
     with _service_lock:
-        svc = _service
+        services = list(_services.values())
+        if _service is not None and _service not in services:
+            services.append(_service)
+        _services.clear()
         _service = None
-    if svc is not None:
+        _service_scope = None
+    for svc in services:
         try:
             svc.shutdown()
         except Exception as e:  # noqa: BLE001

@@ -55,6 +55,7 @@ from agent.lsp.workspace import (
     clear_cache,
     resolve_workspace_for_file,
 )
+from hermes_constants import get_hermes_home
 
 logger = logging.getLogger("agent.lsp.manager")
 
@@ -156,6 +157,7 @@ class LSPService:
         init_overrides: Optional[Dict[str, Dict[str, Any]]] = None,
         disabled_servers: Optional[List[str]] = None,
         idle_timeout: float = DEFAULT_IDLE_TIMEOUT,
+        hermes_home: Optional[str] = None,
     ) -> None:
         self._enabled = enabled
         self._wait_mode = wait_mode if wait_mode in {"document", "full"} else "document"
@@ -166,6 +168,7 @@ class LSPService:
         self._init_overrides = init_overrides or {}
         self._disabled_servers = set(disabled_servers or [])
         self._idle_timeout = idle_timeout
+        self._hermes_home = hermes_home or str(get_hermes_home())
 
         self._loop = _BackgroundLoop()
         if self._enabled:
@@ -175,6 +178,7 @@ class LSPService:
         self._clients: Dict[Tuple[str, str], LSPClient] = {}
         self._broken: set = set()
         self._spawning: Dict[Tuple[str, str], asyncio.Future] = {}
+        self._spawn_tasks: Dict[Tuple[str, str], asyncio.Task] = {}
         self._last_used: Dict[Tuple[str, str], float] = {}
         self._state_lock = threading.Lock()
         self._idle_reaper_task: Optional[asyncio.Task] = None
@@ -196,6 +200,7 @@ class LSPService:
         itself returns ``is_active()`` False when LSP is disabled.
         """
         try:
+            hermes_home = str(get_hermes_home())
             from hermes_cli.config import load_config_readonly
             cfg = load_config_readonly()
         except Exception as e:  # noqa: BLE001
@@ -251,6 +256,7 @@ class LSPService:
             init_overrides=init_overrides,
             disabled_servers=disabled,
             idle_timeout=idle_timeout,
+            hermes_home=hermes_home,
         )
 
     # ------------------------------------------------------------------
@@ -526,8 +532,12 @@ class LSPService:
         srv = find_server_for_file(file_path)
         if not (ws and gated and srv):
             return []
+        try:
+            per_server_root = srv.resolve_root(file_path, ws) or ws
+        except Exception:  # noqa: BLE001
+            per_server_root = ws
         with self._state_lock:
-            client = self._clients.get((srv.server_id, ws))
+            client = self._clients.get((srv.server_id, per_server_root))
         if client is None:
             return []
         return list(client.diagnostics_for(file_path, fresh_only=True))
@@ -562,15 +572,35 @@ class LSPService:
             spawning = self._spawning.get(key)
         if spawning is not None:
             try:
-                return await spawning
+                # A cancelled waiter must not cancel the shared spawn future.
+                return await asyncio.shield(spawning)
+            except asyncio.CancelledError:
+                raise
             except Exception:  # noqa: BLE001
                 return None
 
-        # Begin spawn
+        # Begin one shared spawn.  The second check under the lock closes the
+        # race where two callers both observe no existing client/future.
         loop = asyncio.get_running_loop()
         spawn_future: asyncio.Future = loop.create_future()
         with self._state_lock:
-            self._spawning[key] = spawn_future
+            spawning = self._spawning.get(key)
+            if spawning is None:
+                self._spawning[key] = spawn_future
+                owner_task = asyncio.current_task()
+                if owner_task is not None:
+                    self._spawn_tasks[key] = owner_task
+            else:
+                spawn_future = spawning
+        if spawning is not None:
+            try:
+                return await asyncio.shield(spawning)
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001
+                return None
+
+        client: Optional[LSPClient] = None
         try:
             ctx = ServerContext(
                 workspace_root=per_server_root,
@@ -578,6 +608,7 @@ class LSPService:
                 binary_overrides=self._binary_overrides,
                 env_overrides=self._env_overrides,
                 init_overrides=self._init_overrides,
+                hermes_home=self._hermes_home,
             )
             spec = srv.build_spawn(per_server_root, ctx)
             if spec is None:
@@ -587,33 +618,50 @@ class LSPService:
                 # the structured logger so the user can act on it.
                 eventlog.log_server_unavailable(srv.server_id, srv.server_id)
                 self._broken.add(key)
-                spawn_future.set_result(None)
+                self._resolve_spawn_future(spawn_future, None)
                 return None
+            client_env = dict(spec.env)
+            # LSP subprocesses must use the service's profile home even when
+            # the service was created from a context-local profile override.
+            client_env["HERMES_HOME"] = self._hermes_home
             client = LSPClient(
                 server_id=srv.server_id,
                 workspace_root=spec.workspace_root,
                 command=spec.command,
-                env=spec.env,
+                env=client_env,
                 cwd=spec.cwd,
                 initialization_options=spec.initialization_options,
                 seed_diagnostics_on_first_push=spec.seed_diagnostics_on_first_push or srv.seed_first_push,
             )
-            try:
-                await client.start()
-            except Exception as e:  # noqa: BLE001
-                eventlog.log_spawn_failed(srv.server_id, per_server_root, e)
-                self._broken.add(key)
-                spawn_future.set_result(None)
-                return None
+            await client.start()
             with self._state_lock:
                 self._clients[key] = client
                 self._last_used[key] = time.time()
             eventlog.log_active(srv.server_id, per_server_root)
-            spawn_future.set_result(client)
+            self._resolve_spawn_future(spawn_future, client)
             return client
+        except asyncio.CancelledError:
+            # ``LSPClient.start`` owns cancellation cleanup.  Resolve the
+            # shared future before propagating so concurrent waiters cannot
+            # remain pending after the owner times out.
+            self._resolve_spawn_future(spawn_future, None)
+            raise
+        except Exception as e:  # noqa: BLE001
+            eventlog.log_spawn_failed(srv.server_id, per_server_root, e)
+            self._broken.add(key)
+            self._resolve_spawn_future(spawn_future, None)
+            return None
         finally:
             with self._state_lock:
-                self._spawning.pop(key, None)
+                if self._spawning.get(key) is spawn_future:
+                    self._spawning.pop(key, None)
+                self._spawn_tasks.pop(key, None)
+
+    @staticmethod
+    def _resolve_spawn_future(future: asyncio.Future, value: Optional[LSPClient]) -> None:
+        """Complete a shared spawn future exactly once."""
+        if not future.done():
+            future.set_result(value)
 
     async def _start_idle_reaper(self) -> None:
         self._idle_reaper_task = asyncio.create_task(self._idle_reaper_loop())
@@ -673,10 +721,23 @@ class LSPService:
             reaper.cancel()
             await asyncio.gather(reaper, return_exceptions=True)
         with self._state_lock:
+            spawn_tasks = list(self._spawn_tasks.values())
+            spawn_futures = list(self._spawning.values())
+        for task in spawn_tasks:
+            if not task.done():
+                task.cancel()
+        for future in spawn_futures:
+            if not future.done():
+                future.cancel()
+        if spawn_tasks:
+            await asyncio.gather(*spawn_tasks, return_exceptions=True)
+        with self._state_lock:
             clients = list(self._clients.values())
             self._clients.clear()
             self._broken.clear()
             self._last_used.clear()
+            self._spawn_tasks.clear()
+            self._spawning.clear()
         await asyncio.gather(
             *(c.shutdown() for c in clients),
             return_exceptions=True,

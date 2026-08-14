@@ -112,8 +112,8 @@ INSTALL_RECIPES: Dict[str, Dict[str, Any]] = {
 }
 
 
-_install_locks: Dict[str, threading.Lock] = {}
-_install_results: Dict[str, Optional[str]] = {}
+_install_locks: Dict[tuple[str, str], threading.Lock] = {}
+_install_results: Dict[tuple[str, str], Optional[str]] = {}
 _install_lock_meta = threading.Lock()
 _WINDOWS_WRAPPER_SUFFIXES = (".cmd", ".exe", ".bat")
 
@@ -122,11 +122,17 @@ def _is_windows() -> bool:
     return os.name == "nt"
 
 
-def hermes_lsp_bin_dir() -> Path:
-    """Return the Hermes-owned bin staging dir for LSP servers."""
+def _home_key(hermes_home: Optional[str] = None) -> str:
+    if hermes_home is not None:
+        return os.path.abspath(os.path.expanduser(hermes_home))
     from hermes_constants import get_hermes_home
 
-    p = get_hermes_home() / "lsp" / "bin"
+    return str(get_hermes_home())
+
+
+def hermes_lsp_bin_dir(hermes_home: Optional[str] = None) -> Path:
+    """Return the Hermes-owned bin staging dir for LSP servers."""
+    p = Path(_home_key(hermes_home)) / "lsp" / "bin"
     p.mkdir(parents=True, exist_ok=True)
     return p
 
@@ -145,9 +151,9 @@ def _native_binary_candidates(base: Path) -> list[Path]:
     return candidates
 
 
-def _existing_binary(name: str) -> Optional[str]:
+def _existing_binary(name: str, hermes_home: Optional[str] = None) -> Optional[str]:
     """Probe the staging dir + PATH for a binary named ``name``."""
-    for staged in _native_binary_candidates(hermes_lsp_bin_dir() / name):
+    for staged in _native_binary_candidates(hermes_lsp_bin_dir(hermes_home) / name):
         if staged.exists() and os.access(staged, os.X_OK):
             return str(staged)
     on_path = shutil.which(name)
@@ -161,47 +167,55 @@ def _existing_binary(name: str) -> Optional[str]:
     return None
 
 
-def _get_lock(pkg: str) -> threading.Lock:
+def _get_lock(pkg: str, hermes_home: str) -> threading.Lock:
+    key = (hermes_home, pkg)
     with _install_lock_meta:
-        lock = _install_locks.get(pkg)
+        lock = _install_locks.get(key)
         if lock is None:
             lock = threading.Lock()
-            _install_locks[pkg] = lock
+            _install_locks[key] = lock
         return lock
 
 
-def try_install(pkg: str, strategy: str = "auto") -> Optional[str]:
+def try_install(
+    pkg: str,
+    strategy: str = "auto",
+    *,
+    hermes_home: Optional[str] = None,
+) -> Optional[str]:
     """Try to install ``pkg`` and return the binary path if successful.
 
     ``strategy`` is ``"auto"``, ``"manual"``, or ``"off"``.  In
     ``manual``/``off`` mode, this function only probes for an
     existing binary and returns ``None`` if not found.
 
-    The install is cached per-package — a second call returns the
-    same path (or ``None``) without reinstalling.  Concurrent calls
-    are serialized.
+    The install is cached per-package and per-Hermes home — a second
+    call returns the same path (or ``None``) without reinstalling.
+    Concurrent calls for one profile/package are serialized.
     """
+    home = _home_key(hermes_home)
+    cache_key = (home, pkg)
     if strategy not in {"auto",}:
         # Only ``auto`` triggers an actual install.  In manual/off,
         # we still check whether the binary already exists.
         recipe = INSTALL_RECIPES.get(pkg, {})
         bin_name = recipe.get("bin", pkg)
-        return _existing_binary(bin_name)
+        return _existing_binary(bin_name, home)
 
-    if pkg in _install_results:
-        return _install_results[pkg]
+    if cache_key in _install_results:
+        return _install_results[cache_key]
 
-    lock = _get_lock(pkg)
+    lock = _get_lock(pkg, home)
     with lock:
         # Double-check after acquiring lock.
-        if pkg in _install_results:
-            return _install_results[pkg]
-        result = _do_install(pkg)
-        _install_results[pkg] = result
+        if cache_key in _install_results:
+            return _install_results[cache_key]
+        result = _do_install(pkg, home)
+        _install_results[cache_key] = result
         return result
 
 
-def _do_install(pkg: str) -> Optional[str]:
+def _do_install(pkg: str, hermes_home: str) -> Optional[str]:
     recipe = INSTALL_RECIPES.get(pkg)
     if recipe is None:
         # Not in our registry — best-effort: just probe PATH.
@@ -211,7 +225,7 @@ def _do_install(pkg: str) -> Optional[str]:
     bin_name = recipe.get("bin", pkg)
 
     # Check if already present (shutil.which or staging dir)
-    existing = _existing_binary(bin_name)
+    existing = _existing_binary(bin_name, hermes_home)
     if existing:
         return existing
 
@@ -224,11 +238,12 @@ def _do_install(pkg: str) -> Optional[str]:
             recipe.get("pkg", pkg),
             bin_name,
             extra_pkgs=recipe.get("extra_pkgs") or [],
+            hermes_home=hermes_home,
         )
     if strategy == "go":
-        return _install_go(recipe.get("pkg", pkg), bin_name)
+        return _install_go(recipe.get("pkg", pkg), bin_name, hermes_home)
     if strategy == "pip":
-        return _install_pip(recipe.get("pkg", pkg), bin_name)
+        return _install_pip(recipe.get("pkg", pkg), bin_name, hermes_home)
 
     logger.warning("[install] unknown strategy %r for %s", strategy, pkg)
     return None
@@ -238,6 +253,8 @@ def _install_npm(
     pkg: str,
     bin_name: str,
     extra_pkgs: Optional[list] = None,
+    *,
+    hermes_home: Optional[str] = None,
 ) -> Optional[str]:
     """Install an npm package into our staging dir.
 
@@ -257,7 +274,7 @@ def _install_npm(
     if npm is None:
         logger.info("[install] cannot install %s: no usable npm found", pkg)
         return None
-    staging = hermes_lsp_bin_dir().parent  # <HERMES_HOME>/lsp/
+    staging = hermes_lsp_bin_dir(hermes_home).parent  # <HERMES_HOME>/lsp/
     install_targets = [pkg] + list(extra_pkgs or [])
     try:
         logger.info(
@@ -288,7 +305,7 @@ def _install_npm(
     for c in _native_binary_candidates(nm_bin):
         if c.exists():
             # Symlink into our `lsp/bin/` for stable PATH access.
-            link = hermes_lsp_bin_dir() / c.name
+            link = hermes_lsp_bin_dir(hermes_home) / c.name
             if not link.exists():
                 try:
                     link.symlink_to(c)
@@ -303,13 +320,15 @@ def _install_npm(
     return None
 
 
-def _install_go(pkg: str, bin_name: str) -> Optional[str]:
+def _install_go(
+    pkg: str, bin_name: str, hermes_home: Optional[str] = None
+) -> Optional[str]:
     """Install a Go module to GOBIN=<staging>."""
     go = shutil.which("go")
     if go is None:
         logger.info("[install] cannot install %s: go not on PATH", pkg)
         return None
-    staging = hermes_lsp_bin_dir()
+    staging = hermes_lsp_bin_dir(hermes_home)
     env = dict(os.environ)
     env["GOBIN"] = str(staging)
     try:
@@ -341,7 +360,9 @@ def _install_go(pkg: str, bin_name: str) -> Optional[str]:
     return None
 
 
-def _install_pip(pkg: str, bin_name: str) -> Optional[str]:
+def _install_pip(
+    pkg: str, bin_name: str, hermes_home: Optional[str] = None
+) -> Optional[str]:
     """Install a Python package into a hermes-owned target dir.
 
     We avoid polluting the user's site-packages by using
@@ -350,7 +371,7 @@ def _install_pip(pkg: str, bin_name: str) -> Optional[str]:
     ``<staging>/bin``.  Note: this only works for packages that ship a
     console script.
     """
-    pip_target = hermes_lsp_bin_dir().parent / "python-packages"
+    pip_target = hermes_lsp_bin_dir(hermes_home).parent / "python-packages"
     pip_target.mkdir(parents=True, exist_ok=True)
     try:
         logger.info("[install] pip install --target %s %s", pip_target, pkg)
@@ -376,7 +397,7 @@ def _install_pip(pkg: str, bin_name: str) -> Optional[str]:
     for script_dir in script_dirs:
         for bin_path in _native_binary_candidates(script_dir / bin_name):
             if bin_path.exists():
-                link = hermes_lsp_bin_dir() / bin_path.name
+                link = hermes_lsp_bin_dir(hermes_home) / bin_path.name
                 if not link.exists():
                     try:
                         link.symlink_to(bin_path)

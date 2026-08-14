@@ -14,6 +14,7 @@ from agent.lsp.workspace import (
     normalize_path,
     resolve_workspace_for_file,
 )
+from agent.lsp.servers import _root_python
 
 
 @pytest.fixture(autouse=True)
@@ -63,6 +64,33 @@ def test_resolve_workspace_for_file_uses_cwd_first(tmp_path: Path, monkeypatch):
     root, gated = resolve_workspace_for_file(str(file_path))
     assert root == str(repo)
     assert gated is True
+
+
+def test_resolve_workspace_does_not_escape_current_worktree(
+    tmp_path: Path, monkeypatch
+):
+    current = tmp_path / "current"
+    other = tmp_path / "other"
+    (current / ".git").mkdir(parents=True)
+    (other / ".git").mkdir(parents=True)
+    file_path = other / "outside.py"
+    file_path.write_text("")
+
+    monkeypatch.chdir(str(current))
+
+    assert resolve_workspace_for_file(str(file_path)) == (None, False)
+
+
+def test_python_root_does_not_escape_worktree_ceiling(tmp_path: Path):
+    parent = tmp_path / "parent"
+    workspace = parent / "workspace"
+    source = workspace / "src" / "module.py"
+    source.parent.mkdir(parents=True)
+    (parent / "pyproject.toml").write_text("")
+    (workspace / ".git").mkdir()
+    source.write_text("")
+
+    assert _root_python(str(source), str(workspace)) == str(workspace)
 
 
 

@@ -59,6 +59,28 @@ def test_install_npm_works_without_extras(tmp_path, monkeypatch):
     assert install_targets == ["pyright"]
 
 
+def test_install_cache_is_scoped_to_hermes_home(tmp_path, monkeypatch):
+    """A cached staged binary from one profile must not serve another."""
+    from agent.lsp import install as install_mod
+
+    calls = []
+
+    def fake_install(pkg, home):
+        calls.append((pkg, home))
+        return str(tmp_path / home / pkg)
+
+    monkeypatch.setattr(install_mod, "_do_install", fake_install)
+    home_a = str(tmp_path / "profile-a")
+    home_b = str(tmp_path / "profile-b")
+    pkg = "profile-cache-regression"
+
+    assert install_mod.try_install(pkg, hermes_home=home_a) != install_mod.try_install(
+        pkg, hermes_home=home_b
+    )
+    assert len(calls) == 2
+    assert install_mod.try_install(pkg, hermes_home=home_a) == calls[0][1] + "/" + pkg
+
+
 
 
 @pytest.mark.windows_only

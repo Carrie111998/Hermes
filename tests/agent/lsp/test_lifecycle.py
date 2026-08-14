@@ -23,9 +23,13 @@ def _reset_singleton():
     after every test so order doesn't matter.
     """
     lsp_module._service = None
+    lsp_module._service_scope = None
+    lsp_module._services.clear()
     lsp_module._atexit_registered = False
     yield
     lsp_module._service = None
+    lsp_module._service_scope = None
+    lsp_module._services.clear()
     lsp_module._atexit_registered = False
 
 
@@ -86,6 +90,33 @@ def test_shutdown_service_idempotent(monkeypatch):
     lsp_module.shutdown_service()  # must not raise
 
     assert fake_svc.shutdown.call_count == 1
+
+
+def test_get_service_isolated_by_hermes_home(monkeypatch, tmp_path):
+    """Profile-scoped service accessors must not share client state."""
+    services = []
+
+    def make_service(cls):
+        fake = MagicMock()
+        fake.is_active.return_value = True
+        services.append(fake)
+        return fake
+
+    monkeypatch.setattr(
+        lsp_module.LSPService, "create_from_config", classmethod(make_service)
+    )
+    monkeypatch.setattr(atexit, "register", lambda fn: None)
+    home_a = tmp_path / "profile-a"
+    home_b = tmp_path / "profile-b"
+    monkeypatch.setenv("HERMES_HOME", str(home_a))
+    service_a = lsp_module.get_service()
+    monkeypatch.setenv("HERMES_HOME", str(home_b))
+    service_b = lsp_module.get_service()
+
+    assert service_a is not service_b
+    monkeypatch.setenv("HERMES_HOME", str(home_a))
+    assert lsp_module.get_service() is service_a
+    assert len(services) == 2
 
 
 

@@ -136,6 +136,10 @@ def nearest_root(
     except (OSError, RuntimeError, ValueError):
         return None
     ceiling_path = Path(normalize_path(ceiling)) if ceiling else None
+    if ceiling_path is not None and not is_inside_workspace(
+        str(start_path), str(ceiling_path)
+    ):
+        return None
 
     markers_list = list(markers)
     excludes_list = list(excludes) if excludes else []
@@ -178,9 +182,9 @@ def resolve_workspace_for_file(
     """Resolve the workspace root for a file.
 
     Returns ``(workspace_root, gated_in)`` where ``gated_in`` is True
-    iff LSP should run for this file at all.  Currently the gate is
-    "file is inside a git worktree found by walking up from cwd OR
-    from the file itself".
+    iff LSP should run for this file at all.  The active cwd worktree
+    is the boundary; when cwd is outside a worktree, the file's own
+    location is used as a fallback anchor.
 
     The cwd path takes precedence — if the agent was launched in a
     git project, that worktree is the workspace, and any edit inside
@@ -195,9 +199,9 @@ def resolve_workspace_for_file(
     if cwd_root is not None:
         if is_inside_workspace(file_path, cwd_root):
             return cwd_root, True
-        # File is outside the cwd's worktree — try the file's own
-        # location as a secondary anchor.  Useful for monorepos where
-        # the user opens an unrelated checkout.
+        # The active cwd worktree is the task/profile boundary.  Do not
+        # let a file in another checkout select a different project root.
+        return None, False
     file_root = find_git_worktree(file_path)
     if file_root is not None:
         return file_root, True

@@ -15,6 +15,7 @@ The handlers are kept here (rather than in
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 
 
@@ -55,6 +56,41 @@ def register_subparser(subparsers: argparse._SubParsersAction) -> None:
         help="Even attempt servers marked manual-install (best effort)",
     )
 
+    sub_validate = sub.add_parser(
+        "validate",
+        help="Run an explicit bounded full-project Pyright check",
+    )
+    sub_validate.add_argument(
+        "--project",
+        dest="project_config",
+        help="Repository pyrightconfig.json or pyproject.toml",
+    )
+    sub_validate.add_argument(
+        "--include",
+        action="append",
+        default=[],
+        help="Include path relative to the repository (repeatable; default: repository root)",
+    )
+    sub_validate.add_argument(
+        "--exclude",
+        action="append",
+        dest="exclude",
+        default=None,
+        help="Exclude path relative to the repository (repeatable)",
+    )
+    sub_validate.add_argument(
+        "--timeout",
+        type=float,
+        default=300.0,
+        help="Maximum Pyright runtime in seconds",
+    )
+    sub_validate.add_argument(
+        "--term-grace",
+        type=float,
+        default=2.0,
+        help="Grace after TERM before KILL, in seconds",
+    )
+
     sub.add_parser(
         "restart",
         help="Tear down running LSP clients (next edit re-spawns)",
@@ -78,6 +114,14 @@ def run_lsp_command(args: argparse.Namespace) -> int:
             return _cmd_install(args.server)
         if sub == "install-all":
             return _cmd_install_all(getattr(args, "include_manual", False))
+        if sub == "validate":
+            return _cmd_validate(
+                getattr(args, "project_config", None),
+                getattr(args, "include", []),
+                getattr(args, "exclude", None),
+                getattr(args, "timeout", 300.0),
+                getattr(args, "term_grace", 2.0),
+            )
         if sub == "restart":
             return _cmd_restart()
         if sub == "which":
@@ -122,7 +166,9 @@ def _cmd_status(emit_json: bool) -> int:
         out.append(f"  wait_mode:       {info.get('wait_mode')}")
         out.append(f"  wait_timeout:    {info.get('wait_timeout')}s")
         out.append(f"  install_strategy:{info.get('install_strategy')}")
-        clients = info.get("clients") or []
+        clients = info.get("clients")
+        if not isinstance(clients, list):
+            clients = []
         if clients:
             out.append(f"  active clients:  {len(clients)}")
             for c in clients:
@@ -131,12 +177,16 @@ def _cmd_status(emit_json: bool) -> int:
                 )
         else:
             out.append("  active clients:  none")
-        broken = info.get("broken") or []
+        broken = info.get("broken")
+        if not isinstance(broken, list):
+            broken = []
         if broken:
             out.append(f"  broken pairs:    {len(broken)}")
             for b in broken:
                 out.append(f"    - {b}")
-        disabled = info.get("disabled_servers") or []
+        disabled = info.get("disabled_servers")
+        if not isinstance(disabled, list):
+            disabled = []
         if disabled:
             out.append(f"  disabled in cfg: {', '.join(disabled)}")
 
@@ -244,6 +294,42 @@ def _cmd_restart() -> int:
     shutdown_service()
     sys.stdout.write("LSP service shut down. Next edit will respawn clients.\n")
     return 0
+
+
+def _cmd_validate(
+    project_config: str | None,
+    include: list[str],
+    exclude: list[str] | None,
+    timeout: float,
+    term_grace: float,
+) -> int:
+    from agent.lsp.validation import DEFAULT_EXCLUDES, run_full_project_check
+    from agent.lsp.workspace import find_git_worktree
+
+    workspace = find_git_worktree(os.getcwd())
+    if workspace is None:
+        sys.stderr.write("lsp validate requires a git workspace\n")
+        return 2
+    try:
+        result = run_full_project_check(
+            workspace,
+            project_config=project_config,
+            include=include,
+            exclude=exclude if exclude is not None else DEFAULT_EXCLUDES,
+            timeout=timeout,
+            term_grace=term_grace,
+        )
+    except (FileNotFoundError, NotADirectoryError, ValueError) as exc:
+        sys.stderr.write(f"lsp validate: {exc}\n")
+        return 2
+    if result.stdout:
+        sys.stdout.write(result.stdout)
+    if result.stderr:
+        sys.stderr.write(result.stderr)
+    if result.timed_out:
+        sys.stderr.write("lsp validate: timed out; process group terminated\n")
+        return 124
+    return result.returncode
 
 
 def _cmd_which(server_id: str) -> int:
