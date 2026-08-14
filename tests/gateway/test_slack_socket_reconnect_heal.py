@@ -284,7 +284,7 @@ class TestSocketModeRestart:
 
         reasons: list[str] = []
 
-        async def _fake_restart(reason: str) -> None:
+        async def _fake_restart(reason: str, **_expected_state) -> None:
             reasons.append(reason)
             adapter._running = False
 

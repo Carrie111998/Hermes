@@ -802,6 +802,74 @@ class TestSlackSocketWatchdog:
             finally:
                 await adapter.disconnect()
 
+    @pytest.mark.asyncio
+    async def test_concurrent_restart_requests_coalesce_to_single_reconnect(self):
+        adapter = SlackAdapter(PlatformConfig(enabled=True, token="xoxb-fake"))
+        adapter._socket_watchdog_interval_s = 9999
+        factory, instances = self._make_fake_handler_factory()
+
+        with contextlib.ExitStack() as stack:
+            for p in self._patch_stack(factory):
+                stack.enter_context(p)
+
+            try:
+                assert await adapter.connect() is True
+                baseline = len(instances)
+                original_task = adapter._socket_mode_task
+                original_generation = adapter._socket_mode_generation
+
+                await asyncio.gather(
+                    adapter._restart_socket_mode(
+                        "watchdog",
+                        expected_task=original_task,
+                        expected_generation=original_generation,
+                    ),
+                    adapter._restart_socket_mode(
+                        "done-callback",
+                        expected_task=original_task,
+                        expected_generation=original_generation,
+                    ),
+                )
+
+                new_handlers = len(instances) - baseline
+                assert new_handlers == 1
+            finally:
+                await adapter.disconnect()
+
+    @pytest.mark.asyncio
+    async def test_stale_reconnect_requests_are_dropped_after_fresh_handler_starts(self):
+        adapter = SlackAdapter(PlatformConfig(enabled=True, token="xoxb-fake"))
+        adapter._socket_watchdog_interval_s = 9999
+        factory, instances = self._make_fake_handler_factory()
+
+        with contextlib.ExitStack() as stack:
+            for p in self._patch_stack(factory):
+                stack.enter_context(p)
+
+            try:
+                assert await adapter.connect() is True
+                baseline = len(instances)
+                original_task = adapter._socket_mode_task
+                original_generation = adapter._socket_mode_generation
+
+                await adapter._restart_socket_mode(
+                    "watchdog",
+                    expected_task=original_task,
+                    expected_generation=original_generation,
+                )
+
+                await adapter._restart_socket_mode(
+                    "stale queued retry",
+                    expected_task=original_task,
+                    expected_generation=original_generation,
+                )
+
+                assert len(instances) - baseline == 1
+                assert adapter._socket_mode_generation == original_generation + 1
+                assert adapter._handler is instances[-1]
+            finally:
+                await adapter.disconnect()
+
 
     # -- ping/pong staleness: heals the wedged transport that is_connected() misses --
 
