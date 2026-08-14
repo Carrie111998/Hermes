@@ -81,7 +81,19 @@ _GB = 1024 ** 3
 
 # Default thresholds — tuned to the 2026-06-11 incident shape.
 DEFAULT_COMMIT_PCT_THRESHOLD = 85.0      # commit charge > this % of the limit
-DEFAULT_DISK_FREE_GB_THRESHOLD = 15.0    # C: free below this many GB
+# Raised 15.0 -> 60.0 on 2026-08-14. 15 GB sat BELOW the amplitude of normal daily
+# churn on this box: the Docker data VHDX routinely allocates 40-50 GB of transient
+# blocks between nightly fstrim runs (audit history: 46 -> 95 GB in one night on
+# 08-13/14). A 15 GB trigger therefore fired only once the disk was already hours
+# from zero -- it tripped on 11 separate days since 07-17, five of them reaching
+# 0.0 GB free. 60 GB gives roughly a full churn cycle of warning instead.
+DEFAULT_DISK_FREE_GB_THRESHOLD = 60.0    # C: free below this many GB
+# Second, lower disk axis added 2026-08-14. ``disk_low`` at 60 GB is an EARLY
+# WARNING and must stay cheap to receive (routing keeps it a WARN in the alerts
+# topic), or it pages every cooldown for a whole day while the disk sits at
+# 55 GB and everyone learns to ignore it. ``disk_critical`` is the one that
+# pages: below it the box is close enough to wedging that a human must act now.
+DEFAULT_DISK_FREE_GB_CRITICAL = 25.0     # C: free below this many GB -> ACT/page
 DEFAULT_PAGEFILE_GROWTH_GB_THRESHOLD = 2.0   # pagefile grew more than this...
 DEFAULT_GROWTH_WINDOW_SECONDS = 600.0    # ...within this trailing window (10 min)
 DEFAULT_RE_ALERT_COOLDOWN_SECONDS = 900.0    # re-ping a sustained episode every 15 min
@@ -94,7 +106,14 @@ DEFAULT_PHYS_PCT_THRESHOLD = 92.0        # physical RAM used > this %
 # clear of its trigger. Re-arming at the trigger itself let threshold hover
 # storm (2026-06-11 22:52-23:21Z: six alerts in 29 min at commit 84.x<->85.x).
 DEFAULT_COMMIT_PCT_DISARM = 80.0             # commit back below this % clears
-DEFAULT_DISK_FREE_GB_DISARM = 20.0           # C: free back above this clears
+DEFAULT_DISK_FREE_GB_DISARM = 75.0           # C: free back above this clears
+# Every latching axis MUST have a disarm level. Without one it enters
+# ``_latched`` via ``reasons`` but can never leave through ``comfortably_clear``,
+# so a single breach latches the episode FOREVER -- ``was_in_episode`` stays
+# True, no later rising edge ever fires, and the monitor silently degrades to
+# cooldown-only re-pings. That is the phys-axis bug documented above; do not
+# repeat it. Gap mirrors the low axis (60 -> 75).
+DEFAULT_DISK_FREE_GB_CRITICAL_DISARM = 40.0  # C: free back above this clears
 DEFAULT_PAGEFILE_GROWTH_GB_DISARM = 1.0      # in-window growth below this clears
 # The phys axis (2026-07-16) postdates the original disarm set (2026-06-12), so
 # it had no disarm level until these two landed together. Without one it can
@@ -214,12 +233,14 @@ class ResourcePressureMonitor:
         clock: Optional[Callable[[], float]] = None,
         commit_pct_threshold: float = DEFAULT_COMMIT_PCT_THRESHOLD,
         disk_free_gb_threshold: float = DEFAULT_DISK_FREE_GB_THRESHOLD,
+        disk_free_gb_critical: float = DEFAULT_DISK_FREE_GB_CRITICAL,
         pagefile_growth_gb_threshold: float = DEFAULT_PAGEFILE_GROWTH_GB_THRESHOLD,
         growth_window_seconds: float = DEFAULT_GROWTH_WINDOW_SECONDS,
         re_alert_cooldown_seconds: float = DEFAULT_RE_ALERT_COOLDOWN_SECONDS,
         phys_pct_threshold: float = DEFAULT_PHYS_PCT_THRESHOLD,
         commit_pct_disarm: float = DEFAULT_COMMIT_PCT_DISARM,
         disk_free_gb_disarm: float = DEFAULT_DISK_FREE_GB_DISARM,
+        disk_free_gb_critical_disarm: float = DEFAULT_DISK_FREE_GB_CRITICAL_DISARM,
         pagefile_growth_gb_disarm: float = DEFAULT_PAGEFILE_GROWTH_GB_DISARM,
         phys_pct_disarm: float = DEFAULT_PHYS_PCT_DISARM,
     ):
@@ -228,12 +249,14 @@ class ResourcePressureMonitor:
         self._clock = clock or time.monotonic
         self.commit_pct_threshold = commit_pct_threshold
         self.disk_free_gb_threshold = disk_free_gb_threshold
+        self.disk_free_gb_critical = disk_free_gb_critical
         self.pagefile_growth_gb_threshold = pagefile_growth_gb_threshold
         self.growth_window_seconds = growth_window_seconds
         self.re_alert_cooldown_seconds = re_alert_cooldown_seconds
         self.phys_pct_threshold = phys_pct_threshold
         self.commit_pct_disarm = commit_pct_disarm
         self.disk_free_gb_disarm = disk_free_gb_disarm
+        self.disk_free_gb_critical_disarm = disk_free_gb_critical_disarm
         self.pagefile_growth_gb_disarm = pagefile_growth_gb_disarm
         self.phys_pct_disarm = phys_pct_disarm
 
@@ -284,6 +307,8 @@ class ResourcePressureMonitor:
             reasons.append("phys_high")
         if sample.disk_free_bytes < self.disk_free_gb_threshold * _GB:
             reasons.append("disk_low")
+        if sample.disk_free_bytes < self.disk_free_gb_critical * _GB:
+            reasons.append("disk_critical")
         if growth_bytes > self.pagefile_growth_gb_threshold * _GB:
             reasons.append("pagefile_growth")
 
@@ -298,6 +323,8 @@ class ResourcePressureMonitor:
             comfortably_clear.add("phys_high")
         if sample.disk_free_bytes > self.disk_free_gb_disarm * _GB:
             comfortably_clear.add("disk_low")
+        if sample.disk_free_bytes > self.disk_free_gb_critical_disarm * _GB:
+            comfortably_clear.add("disk_critical")
         if growth_bytes < self.pagefile_growth_gb_disarm * _GB:
             comfortably_clear.add("pagefile_growth")
 
@@ -340,6 +367,7 @@ class ResourcePressureMonitor:
                 "commit_pct": self.commit_pct_threshold,
                 "phys_pct": self.phys_pct_threshold,
                 "disk_free_gb": self.disk_free_gb_threshold,
+                "disk_free_gb_critical": self.disk_free_gb_critical,
                 "pagefile_growth_gb": self.pagefile_growth_gb_threshold,
                 "growth_window_min": round(self.growth_window_seconds / 60.0, 1),
             },

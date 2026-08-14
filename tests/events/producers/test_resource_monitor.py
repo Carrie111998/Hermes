@@ -32,7 +32,7 @@ def bus(tmp_path):
 def make_sample(
     commit_pct=50.0,
     pagefile_gb=20.0,
-    disk_free_gb=100.0,
+    disk_free_gb=300.0,
     commit_limit_gb=47.0,
     phys_pct=50.0,
     phys_total_gb=64.0,
@@ -86,16 +86,50 @@ class TestCommitThreshold:
 
 
 class TestDiskThreshold:
-    def test_disk_below_15gb_emits(self, bus):
-        monitor = ResourcePressureMonitor(bus)
+    def test_disk_below_threshold_emits(self, bus):
+        # disk_free_gb_critical=0.0 isolates the low axis under test.
+        monitor = ResourcePressureMonitor(
+            bus, disk_free_gb_threshold=15.0, disk_free_gb_critical=0.0)
         event_id = monitor.evaluate(make_sample(disk_free_gb=12.3), now=0.0)
         assert event_id
         assert "disk_low" in _pressure_events(bus)[0].payload["reasons"]
 
     def test_disk_at_threshold_does_not_emit(self, bus):
-        monitor = ResourcePressureMonitor(bus)
+        monitor = ResourcePressureMonitor(
+            bus, disk_free_gb_threshold=15.0, disk_free_gb_critical=0.0)
         assert monitor.evaluate(make_sample(disk_free_gb=15.0), now=0.0) is None
         assert _pressure_events(bus) == []
+
+    def test_disk_critical_is_a_separate_axis_from_disk_low(self, bus):
+        # 50 GB: below the 60 GB early-warning axis, above the 25 GB paging one.
+        monitor = ResourcePressureMonitor(bus)
+        monitor.evaluate(make_sample(disk_free_gb=50.0), now=0.0)
+        reasons = _pressure_events(bus)[0].payload["reasons"]
+        assert "disk_low" in reasons
+        assert "disk_critical" not in reasons
+
+    def test_disk_critical_emits_below_25gb(self, bus):
+        monitor = ResourcePressureMonitor(bus)
+        monitor.evaluate(make_sample(disk_free_gb=12.0), now=0.0)
+        reasons = _pressure_events(bus)[0].payload["reasons"]
+        assert "disk_low" in reasons
+        assert "disk_critical" in reasons
+
+    def test_disk_critical_axis_can_unlatch(self, bus):
+        # An axis with no disarm level latches forever (the phys-axis bug).
+        # Breach, recover comfortably clear, then breach again -> second event.
+        monitor = ResourcePressureMonitor(bus)
+        assert monitor.evaluate(make_sample(disk_free_gb=12.0), now=0.0)
+        assert monitor.evaluate(make_sample(disk_free_gb=300.0), now=60.0) is None
+        assert monitor.evaluate(make_sample(disk_free_gb=12.0), now=120.0)
+        assert len(_pressure_events(bus)) == 2
+
+    def test_default_threshold_warns_with_a_full_churn_cycle_of_headroom(self, bus):
+        # Regression 2026-08-14: the old 15 GB default fired only once the disk was
+        # hours from zero, because Docker's VHDX can allocate 40-50 GB overnight.
+        monitor = ResourcePressureMonitor(bus)
+        assert monitor.evaluate(make_sample(disk_free_gb=50.0), now=0.0)
+        assert "disk_low" in _pressure_events(bus)[0].payload["reasons"]
 
 
 class TestPagefileGrowthTrigger:
@@ -189,7 +223,7 @@ class TestPhysMemoryThreshold:
             commit_used_bytes=int(23 * GB),
             commit_limit_bytes=int(47 * GB),
             pagefile_allocated_bytes=int(20 * GB),
-            disk_free_bytes=int(100 * GB),
+            disk_free_bytes=int(300 * GB),
         )
         assert sample.phys_pct == 0.0
         monitor = ResourcePressureMonitor(bus)
@@ -269,10 +303,10 @@ class TestHysteresis:
         monitor = ResourcePressureMonitor(bus, re_alert_cooldown_seconds=900.0)
         assert monitor.evaluate(make_sample(disk_free_gb=12.0), now=0.0)
         # 17 GB free is between the 15 GB trigger and the 20 GB disarm: holds.
-        assert monitor.evaluate(make_sample(disk_free_gb=17.0), now=60.0) is None
+        assert monitor.evaluate(make_sample(disk_free_gb=65.0), now=60.0) is None
         assert monitor.evaluate(make_sample(disk_free_gb=12.0), now=120.0) is None
         # Recovery above the disarm clears; the next breach fires immediately.
-        assert monitor.evaluate(make_sample(disk_free_gb=25.0), now=180.0) is None
+        assert monitor.evaluate(make_sample(disk_free_gb=80.0), now=180.0) is None
         assert monitor.evaluate(make_sample(disk_free_gb=12.0), now=240.0)
         assert len(_pressure_events(bus)) == 2
 
@@ -317,11 +351,11 @@ class TestHysteresis:
         # episode — disk must not suppress the next fresh commit emergency.
         monitor = ResourcePressureMonitor(bus, re_alert_cooldown_seconds=900.0)
         assert monitor.evaluate(
-            make_sample(commit_pct=88.0, disk_free_gb=17.0), now=0.0)
+            make_sample(commit_pct=88.0, disk_free_gb=170.0), now=0.0)
         assert monitor.evaluate(
-            make_sample(commit_pct=70.0, disk_free_gb=17.0), now=60.0) is None
+            make_sample(commit_pct=70.0, disk_free_gb=170.0), now=60.0) is None
         assert monitor.evaluate(
-            make_sample(commit_pct=88.0, disk_free_gb=17.0), now=120.0)
+            make_sample(commit_pct=88.0, disk_free_gb=170.0), now=120.0)
         assert len(_pressure_events(bus)) == 2
 
     def test_custom_disarm_levels_are_honored(self, bus):

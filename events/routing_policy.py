@@ -459,6 +459,24 @@ def classify(
             attention = Attention.TRACE
             wa = "none"
 
+    elif et == EventType.RESOURCE_PRESSURE:
+        # Disk is the one resource axis that does NOT self-resolve. Commit,
+        # phys and pagefile spikes drain on their own; a filling disk keeps
+        # filling until a human frees space, and at zero the box stops working.
+        # Verified 2026-08-14: disk_low fired on 11 days since 07-17 -- five of
+        # them reaching 0.0 GB free -- and was DELIVERED every time, into the
+        # alerts topic alongside ~2,200 watchdog events. Detection was never the
+        # problem; the signal was indistinguishable from the noise.
+        # Two stages on purpose: disk_low (60 GB) stays a WARN early warning so
+        # it is cheap to receive, and only disk_critical (25 GB) becomes ACT ->
+        # action_required + WhatsApp. Paging on the 60 GB axis would fire every
+        # cooldown for a whole day of ordinary Docker churn and teach exactly
+        # the alert-blindness that caused this.
+        reasons = payload.get("reasons")
+        if isinstance(reasons, (list, tuple)) and "disk_critical" in reasons:
+            attention = Attention.ACT
+            topic_key = ACTION_REQUIRED
+
     elif et == EventType.WATCHDOG_SELF_DEGRADED:
         if payload.get("reason", "") in STATUS_BLACKOUT_SELF_DEGRADED_REASONS:
             topic_key = SECURITY

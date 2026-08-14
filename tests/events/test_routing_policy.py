@@ -703,3 +703,44 @@ def test_boot_summary_at_critical_pages_urgent():
         EventType.BOOT_SUMMARY, {"state": "failed"},
         priority=Priority.CRITICAL, source="laptop-start"))
     assert route.wa_tier == WA_URGENT
+
+
+# ------------------------------------------------- disk pressure (2026-08-14)
+
+def test_disk_critical_pages_and_lands_in_action_required():
+    """A disk about to hit zero needs a human, not an alerts-thread line.
+
+    Regression: disk_low fired on 11 days between 07-17 and 08-14 -- five of
+    them at 0.0 GB free -- and was delivered every time into `watchdog_alerts`
+    alongside ~2,200 watchdog events. It was never seen in time.
+    """
+    route = classify(make_event(
+        EventType.RESOURCE_PRESSURE,
+        payload={"reasons": ["disk_low", "disk_critical"], "disk_c_free_gb": 8.6},
+    ))
+    assert route.attention is Attention.ACT
+    assert route.topic_key == ACTION_REQUIRED
+    assert route.wa_tier in (WA_URGENT, WA_IMMEDIATE)
+
+
+def test_disk_low_alone_warns_without_paging():
+    """The 60 GB early-warning axis must stay cheap to receive.
+
+    Paging on it would fire every cooldown through a whole day of ordinary
+    Docker churn and train exactly the alert-blindness this is meant to fix.
+    """
+    route = classify(make_event(
+        EventType.RESOURCE_PRESSURE,
+        payload={"reasons": ["disk_low"], "disk_c_free_gb": 55.0},
+    ))
+    assert route.attention is Attention.WARN
+    assert route.topic_key != ACTION_REQUIRED
+    assert route.wa_tier is None
+
+
+def test_non_disk_pressure_is_unchanged():
+    route = classify(make_event(
+        EventType.RESOURCE_PRESSURE,
+        payload={"reasons": ["commit_high"], "commit_pct": 98.4},
+    ))
+    assert route.attention is Attention.WARN
