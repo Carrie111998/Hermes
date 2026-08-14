@@ -11,6 +11,7 @@ Run with:  python -m pytest tests/test_delegate.py -v
 
 import json
 import os
+import tempfile
 import threading
 import time
 import types
@@ -27,6 +28,7 @@ from tools.delegate_tool import (
     _build_child_agent,
     _build_child_progress_callback,
     _build_child_system_prompt,
+    _resolve_workspace_hint,
     _strip_blocked_tools,
     _resolve_child_credential_pool,
     _resolve_delegation_credentials,
@@ -54,6 +56,90 @@ def _make_mock_parent(depth=0):
     parent.tool_progress_callback = None
     parent.thinking_callback = None
     return parent
+
+
+class TestDelegatedWorkspaceContext(unittest.TestCase):
+    def test_workspace_hint_prefers_parent_session_cwd_over_process_env(self):
+        """A child inherits the parent session's live workspace, not gateway cwd."""
+        from tools.terminal_tool import clear_session_cwd, record_session_cwd
+
+        parent = _make_mock_parent()
+        parent._current_task_id = "parent-workspace-context"
+        with tempfile.TemporaryDirectory() as session_dir, tempfile.TemporaryDirectory() as gateway_dir:
+            record_session_cwd(parent._current_task_id, session_dir)
+            try:
+                with patch.dict(os.environ, {"TERMINAL_CWD": gateway_dir}):
+                    assert _resolve_workspace_hint(parent) == session_dir
+            finally:
+                clear_session_cwd(parent._current_task_id)
+
+    def test_child_construction_scopes_session_workspace_and_loads_context_files(self):
+        """Prompt construction sees the inherited workspace before AIAgent init."""
+        from agent.runtime_cwd import resolve_context_cwd
+        from tools.terminal_tool import clear_session_cwd, record_session_cwd
+
+        parent = _make_mock_parent()
+        parent._current_task_id = "parent-child-construction-workspace"
+        with tempfile.TemporaryDirectory() as session_dir, tempfile.TemporaryDirectory() as gateway_dir:
+            record_session_cwd(parent._current_task_id, session_dir)
+            captured = {}
+
+            def make_child(**kwargs):
+                captured["context_cwd"] = resolve_context_cwd()
+                captured.update(kwargs)
+                child = MagicMock()
+                child.session_id = "child-session"
+                return child
+
+            try:
+                with (
+                    patch.dict(os.environ, {"TERMINAL_CWD": gateway_dir}),
+                    patch("run_agent.AIAgent", side_effect=make_child),
+                ):
+                    child = _build_child_agent(
+                        task_index=0,
+                        goal="Inspect the inherited workspace",
+                        context=None,
+                        toolsets=None,
+                        model=None,
+                        max_iterations=10,
+                        parent_agent=parent,
+                        task_count=1,
+                    )
+            finally:
+                clear_session_cwd(parent._current_task_id)
+
+        self.assertEqual(str(captured["context_cwd"]), os.path.abspath(session_dir))
+        self.assertFalse(captured["skip_context_files"])
+        self.assertEqual(getattr(child, "_delegated_workspace_cwd"), os.path.abspath(session_dir))
+
+    def test_worker_thread_scopes_child_workspace_during_run(self):
+        """The daemon worker preserves the construction workspace for tool execution."""
+        from agent.runtime_cwd import resolve_context_cwd
+        from tools.delegate_tool import _run_single_child
+
+        parent = _make_mock_parent()
+        child = MagicMock()
+        child.session_id = "child-session"
+        child._delegated_workspace_cwd = None
+        captured = {}
+
+        with tempfile.TemporaryDirectory() as workspace:
+            child._delegated_workspace_cwd = workspace
+
+            def run(**_kwargs):
+                captured["context_cwd"] = resolve_context_cwd()
+                return {"final_response": "done", "completed": True, "api_calls": 1}
+
+            child.run_conversation.side_effect = run
+            _run_single_child(
+                task_index=0,
+                goal="Inspect workspace in worker",
+                child=child,
+                parent_agent=parent,
+            )
+
+        self.assertEqual(str(captured["context_cwd"]), workspace)
 
 
 class TestDelegateRequirements(unittest.TestCase):

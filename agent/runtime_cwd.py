@@ -12,9 +12,10 @@ contextvar; CLI/cron fall through to `TERMINAL_CWD`/launch cwd.
 
 import logging
 import os
+from contextlib import contextmanager
 from contextvars import ContextVar, Token
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +49,21 @@ def set_session_cwd(cwd: str | None) -> Token:
 
 def clear_session_cwd() -> None:
     _SESSION_CWD.set("")
+
+
+@contextmanager
+def scoped_session_cwd(cwd: str | None) -> Iterator[None]:
+    """Temporarily pin the logical cwd for an isolated agent execution.
+
+    Delegated children execute in worker threads that share the host process's
+    ``os.getcwd()``.  Scope their inherited workspace through this ContextVar
+    instead of changing process-wide cwd or relying on ``TERMINAL_CWD``.
+    """
+    token = set_session_cwd(cwd)
+    try:
+        yield
+    finally:
+        _SESSION_CWD.reset(token)
 
 
 def _session_cwd_override() -> str:

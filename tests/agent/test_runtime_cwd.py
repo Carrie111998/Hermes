@@ -10,6 +10,7 @@ from agent.runtime_cwd import (
     clear_session_cwd,
     resolve_agent_cwd,
     resolve_context_cwd,
+    scoped_session_cwd,
     set_session_cwd,
 )
 
@@ -76,6 +77,19 @@ class TestSessionCwdOverride:
         try:
             clear_session_cwd()
             assert resolve_agent_cwd() == tmp_path
+        finally:
+            rt._SESSION_CWD.reset(token)
+
+    def test_scoped_session_cwd_restores_prior_context(self, tmp_path):
+        original = tmp_path / "original"
+        delegated = tmp_path / "delegated"
+        original.mkdir()
+        delegated.mkdir()
+        token = set_session_cwd(str(original))
+        try:
+            with scoped_session_cwd(str(delegated)):
+                assert resolve_context_cwd() == delegated
+            assert resolve_context_cwd() == original
         finally:
             rt._SESSION_CWD.reset(token)
 

@@ -1143,7 +1143,21 @@ def _resolve_workspace_hint(parent_agent) -> Optional[str]:
     teaching subagents a fake container path while still helping them avoid
     guessing `/workspace/...` for local repo tasks.
     """
+    # The terminal session record is the canonical live workspace: it tracks
+    # explicit workspace registration and subsequent `cd` commands per task.
+    # Consult it before process-wide env/agent hints, which can point at the
+    # gateway's launch directory rather than the conversation's repository.
+    session_cwd = None
+    try:
+        from tools.terminal_tool import get_session_cwd
+
+        session_cwd = get_session_cwd(
+            getattr(parent_agent, "_current_task_id", None)
+        )
+    except Exception:
+        logger.debug("Could not read parent session cwd for delegated child", exc_info=True)
     candidates = [
+        session_cwd,
         os.getenv("TERMINAL_CWD"),
         getattr(
             getattr(parent_agent, "_subdirectory_hints", None), "working_dir", None
@@ -1773,8 +1787,12 @@ def _build_child_agent(
         child_optional_kwargs["max_tokens"] = child_max_tokens
 
     from agent.delegation_context import delegated_child_context
+    from agent.runtime_cwd import scoped_session_cwd
 
-    with delegated_child_context():
+    # Construction builds the system prompt and discovers project instructions.
+    # Scope the child's inherited workspace now; the host process cwd may be an
+    # unrelated gateway/service directory shared by every concurrent child.
+    with delegated_child_context(), scoped_session_cwd(workspace_hint):
         child = AIAgent(
             base_url=effective_base_url,
             api_key=effective_api_key,
@@ -1794,7 +1812,10 @@ def _build_child_agent(
             ephemeral_system_prompt=child_prompt,
             log_prefix=f"[subagent-{task_index}]",
             platform="subagent",
-            skip_context_files=True,
+            # Only load project instructions when we resolved an inherited
+            # workspace. Without one, falling back to process cwd could inject
+            # unrelated gateway/service context.
+            skip_context_files=not bool(workspace_hint),
             skip_memory=True,
             clarify_callback=None,
             thinking_callback=child_thinking_cb,
@@ -1830,6 +1851,9 @@ def _build_child_agent(
     child._subagent_id = subagent_id
     child._parent_subagent_id = parent_subagent_id
     child._subagent_goal = goal
+    # Keep the construction-time workspace for the child's worker-thread run.
+    # ContextVars do not survive the hand-off to DaemonThreadPoolExecutor.
+    setattr(child, "_delegated_workspace_cwd", workspace_hint)
     child._parent_turn_id = getattr(parent_agent, "_current_turn_id", "") or ""
     # Ownership chain for the model-facing control plane (action=list/steer/
     # stop): a parent may only control agents whose weakref chain reaches it.
@@ -2519,6 +2543,10 @@ def _run_single_child(
                     from tools.terminal_tool import record_session_cwd as _rsc
 
                     _rsc(child_task_id, _worktree_info["path"])
+                    # Match the terminal record: subsequent child turns run in
+                    # this isolated worktree, not the parent workspace used to
+                    # construct the child prompt.
+                    setattr(child, "_delegated_workspace_cwd", _worktree_info["path"])
                 except Exception as e:
                     logger.debug("worktree cwd seed failed: %s", e)
                 # The child's context is already built; carry the isolation
@@ -2568,8 +2596,12 @@ def _run_single_child(
         def _run_with_thread_capture():
             _worker_thread_holder["t"] = threading.current_thread()
             from agent.delegation_context import delegated_child_context
+            from agent.runtime_cwd import scoped_session_cwd
 
-            with delegated_child_context(str(getattr(child, "session_id", "") or "")):
+            with (
+                delegated_child_context(str(getattr(child, "session_id", "") or "")),
+                scoped_session_cwd(getattr(child, "_delegated_workspace_cwd", None)),
+            ):
                 return child.run_conversation(
                     user_message=goal,
                     task_id=child_task_id,
