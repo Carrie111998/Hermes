@@ -50,7 +50,7 @@ from agent.prompt_builder import (
     drain_truncation_warnings,
 )
 from agent.runtime_cwd import resolve_context_cwd
-from hermes_constants import get_hermes_home
+from hermes_constants import get_default_hermes_root, get_hermes_home
 from pathlib import Path
 from utils import is_truthy_value
 
@@ -352,7 +352,10 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # cwd project instructions disabled.
     _soul_loaded = False
     if agent.load_soul_identity or not agent.skip_context_files:
-        _soul_content = _r.load_soul_md(_ctx_len)
+        # Scope the SOUL.md read to the agent's OWN home (see _agent_home) —
+        # ambient resolution on a thread that lost the HERMES_HOME ContextVar
+        # reads the launch profile's SOUL.md instead (#50233).
+        _soul_content = _r.load_soul_md(_ctx_len, home_override=_agent_home(agent))
         if _soul_content:
             stable_parts.append(_soul_content)
             _soul_loaded = True
@@ -586,10 +589,8 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # paths. Without an agent home, keep the ambient resolution byte-identical
     # to the legacy behavior (and patchable via this module's get_hermes_home).
     if _agent_home_path is not None:
-        from hermes_constants import get_default_hermes_root as _root_fn
-
         _home_str = str(_agent_home_path)
-        _root_str = str(_root_fn())
+        _root_str = str(get_default_hermes_root())
     else:
         _home_str = _root_str = str(get_hermes_home())
     if active_profile == "default":
@@ -602,11 +603,20 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
             "you to."
         )
     else:
+        # A non-default name is only ever returned when the resolved home is
+        # ALREADY <root>/profiles/<name> — that is exactly how both
+        # _profile_name_for_home() and _resolve_active_profile_name() derive
+        # it. So the profile home is the session home itself; appending
+        # /profiles/<name> again doubled it (#72894). The default profile's
+        # data sits at the ROOT (get_default_hermes_root()), which in ambient
+        # profile mode is NOT get_hermes_home().
+        profile_home = _home_str
+        default_root = get_default_hermes_root()
         post_workspace_parts.append(
             f"Active Hermes profile: {active_profile}. This session reads "
-            f"and writes {_home_str}/. The default "
-            f"profile's data lives at {_root_str}/skills/, {_root_str}/plugins/, "
-            f"{_root_str}/cron/, {_root_str}/memories/ — those belong to a "
+            f"and writes {profile_home}/. The default "
+            f"profile's data lives at {default_root}/skills/, {default_root}/plugins/, "
+            f"{default_root}/cron/, {default_root}/memories/ — those belong to a "
             f"different session run from a different shell. Do NOT modify "
             f"another profile's skills/plugins/cron/memories unless the user "
             f"explicitly directs you to. The cross-profile write guard will "
@@ -685,7 +695,8 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         context_files_prompt = _r.build_context_files_prompt(
             cwd=resolve_context_cwd(), skip_soul=_soul_loaded,
             context_length=_ctx_len,
-            allow_install_tree_fallback=agent.platform in ("cli", "tui"))
+            allow_install_tree_fallback=agent.platform in ("cli", "tui"),
+            home_override=_agent_home(agent))
         if context_files_prompt:
             context_parts.append(context_files_prompt)
 
