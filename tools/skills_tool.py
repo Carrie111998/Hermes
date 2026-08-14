@@ -832,16 +832,30 @@ def skills_list(category: str = None, task_id: str = None) -> str:
                 ensure_ascii=False,
             )
 
-        # Filter by category if specified
+        # Filter by category if specified. Root-level skills historically carry
+        # category=None; expose them through the synthetic "general" category
+        # used by the compact system-prompt index. Nested categories are routed
+        # by their top-level discovery category (for example mlops/models via
+        # skills_list(category="mlops")).
         if category:
-            all_skills = [s for s in all_skills if s.get("category") == category]
+            if category == "general":
+                all_skills = [
+                    s for s in all_skills if s.get("category") in (None, "general")
+                ]
+            else:
+                all_skills = [
+                    s
+                    for s in all_skills
+                    if s.get("category") == category
+                    or str(s.get("category") or "").startswith(f"{category}/")
+                ]
 
         # Sort by category then name
         all_skills = _sort_skills(all_skills)
 
         # Extract unique categories
         categories = sorted(
-            {s.get("category") for s in all_skills if s.get("category")}
+            {str(s["category"]) for s in all_skills if s.get("category")}
         )
 
         return json.dumps(
