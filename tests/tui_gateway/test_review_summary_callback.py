@@ -10,6 +10,7 @@ transcript line.
 """
 
 from __future__ import annotations
+from pathlib import Path
 
 from unittest.mock import MagicMock, patch
 
@@ -24,7 +25,7 @@ def server():
         "sys.modules",
         {
             "hermes_constants": MagicMock(
-                get_hermes_home=MagicMock(return_value="/tmp/hermes_test_review_summary")
+                get_hermes_home=MagicMock(return_value=Path("/tmp/hermes_test_review_summary"))
             ),
             "hermes_cli.env_loader": MagicMock(),
             "hermes_cli.banner": MagicMock(),

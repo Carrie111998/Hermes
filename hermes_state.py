@@ -41,6 +41,7 @@ from agent.skill_commands import (
     SKILL_SCAFFOLD_SQL_LIKE,
     describe_skill_invocation,
 )
+from agent.conversation_loop import STALE_TOOL_CALL_MARKER_RE
 from hermes_constants import get_hermes_home
 from hermes_cli.sqlite_runtime import (
     is_sqlite_wal_reset_vulnerable as _is_sqlite_wal_reset_vulnerable,
@@ -663,10 +664,6 @@ def _strip_background_review_harness(
     return out
 
 
-# Matches a bare protocol/tool-name marker such as "[memory]" or "[skill_manage]".
-_STALE_TOOL_CALL_MARKER_RE = re.compile(r"^\[[A-Za-z_][A-Za-z0-9_.-]*\]$")
-
-
 def _is_stale_tool_call_marker_message(msg: Dict[str, Any]) -> bool:
     """True when ``msg`` is a persisted assistant turn whose content is a bare
     bracketed marker (e.g. ``[memory]``) left over from a tool-call turn.
@@ -686,7 +683,7 @@ def _is_stale_tool_call_marker_message(msg: Dict[str, Any]) -> bool:
     content = msg.get("content")
     if not isinstance(content, str):
         return False
-    return bool(_STALE_TOOL_CALL_MARKER_RE.fullmatch(content.strip()))
+    return bool(STALE_TOOL_CALL_MARKER_RE.fullmatch(content.strip()))
 
 
 def _strip_stale_tool_call_markers(
@@ -10651,7 +10648,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             affected: List[int] = []
             for row in cursor.fetchall():
                 content = row["content"]
-                if isinstance(content, str) and _STALE_TOOL_CALL_MARKER_RE.fullmatch(content.strip()):
+                if isinstance(content, str) and STALE_TOOL_CALL_MARKER_RE.fullmatch(content.strip()):
                     affected.append(row["id"])
             return affected
 
