@@ -282,6 +282,11 @@ DEFAULT_CONFIG = {
         "image_input_mode": "auto",
         "disabled_toolsets": [],
 
+        # Global reasoning effort: none|minimal|low|medium|high|xhigh|max|ultra
+        # (empty = provider default). Read by the CLI/gateway at session start
+        # (cli.py _parse_reasoning_config). Sits alongside reasoning_overrides,
+        # which takes precedence when the current model matches a key in it.
+        "reasoning_effort": "",
         # Per-model reasoning effort overrides (spelling-tolerant).
         # Dict mapping model names (any reasonable spelling) to effort levels.
         # Takes precedence over agent.reasoning_effort when the current model
