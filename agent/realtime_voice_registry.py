@@ -19,25 +19,34 @@ from agent.realtime_voice_provider import (
     REALTIME_VOICE_PROVIDER_API_VERSION,
     RealtimeVoiceProvider,
 )
+from hermes_constants import hermes_home_key
 
 logger = logging.getLogger(__name__)
 
 _providers: Dict[str, RealtimeVoiceProvider] = {}
+_scoped_providers: Dict[str, Dict[str, RealtimeVoiceProvider]] = {}
 _built_in_names: Set[str] = set()
 _lock = threading.Lock()
 
 
-def register_provider(provider: RealtimeVoiceProvider) -> bool:
+def register_provider(
+    provider: RealtimeVoiceProvider, *, scope: Optional[str] = None
+) -> bool:
     """Register a plugin provider without replacing a reserved built-in."""
-    return _register_provider(provider, built_in=False)
+    return _register_provider(provider, built_in=False, scope=scope)
 
 
 def _register_builtin_provider(provider: RealtimeVoiceProvider) -> bool:
     """Register a core built-in; the first built-in for a name wins."""
-    return _register_provider(provider, built_in=True)
+    return _register_provider(provider, built_in=True, scope=None)
 
 
-def _register_provider(provider: RealtimeVoiceProvider, *, built_in: bool) -> bool:
+def _register_provider(
+    provider: RealtimeVoiceProvider,
+    *,
+    built_in: bool,
+    scope: Optional[str],
+) -> bool:
     if not isinstance(provider, RealtimeVoiceProvider):
         raise TypeError(
             "register_provider() expects a RealtimeVoiceProvider instance, "
@@ -77,10 +86,11 @@ def _register_provider(provider: RealtimeVoiceProvider, *, built_in: bool) -> bo
             )
             return False
 
-        existing = _providers.get(key)
+        target = _providers if scope is None else _scoped_providers.setdefault(scope, {})
+        existing = target.get(key)
         if built_in:
             _built_in_names.add(key)
-        _providers[key] = provider
+        target[key] = provider
 
     if existing is not None:
         logger.debug(
@@ -97,19 +107,72 @@ def _register_provider(provider: RealtimeVoiceProvider, *, built_in: bool) -> bo
     return True
 
 
-def list_providers() -> List[RealtimeVoiceProvider]:
+def list_providers(*, scope: Optional[str] = None) -> List[RealtimeVoiceProvider]:
     """Return registered providers sorted by normalized name."""
     with _lock:
-        items = list(_providers.items())
+        merged = dict(_providers)
+        merged.update(_scoped_providers.get(scope or hermes_home_key(), {}))
+        for name in _built_in_names:
+            merged[name] = _providers[name]
+        items = list(merged.items())
     return [provider for _, provider in sorted(items)]
 
 
-def get_provider(name: str) -> Optional[RealtimeVoiceProvider]:
+def get_provider(
+    name: str, *, scope: Optional[str] = None
+) -> Optional[RealtimeVoiceProvider]:
     """Return a provider by case-insensitive, whitespace-tolerant name."""
     if not isinstance(name, str):
         return None
+    key = name.strip().lower()
     with _lock:
-        return _providers.get(name.strip().lower())
+        if key in _built_in_names:
+            return _providers.get(key)
+        scoped_provider = _scoped_providers.get(
+            scope or hermes_home_key(), {}
+        ).get(key)
+        if scoped_provider is not None:
+            return scoped_provider
+        return _providers.get(key)
+
+
+def snapshot_registration(
+    name: str, *, scope: Optional[str] = None
+) -> Optional[RealtimeVoiceProvider]:
+    """Return the exact provider installed in one registry scope."""
+    key = name.strip().lower()
+    with _lock:
+        target = _providers if scope is None else _scoped_providers.get(scope, {})
+        return target.get(key)
+
+
+def restore_registration(
+    name: str,
+    current: RealtimeVoiceProvider,
+    previous: Optional[RealtimeVoiceProvider],
+    *,
+    scope: Optional[str] = None,
+) -> bool:
+    """Restore a registration only while *current* still owns its slot."""
+    key = name.strip().lower()
+    with _lock:
+        if scope is None:
+            if key in _built_in_names:
+                return False
+            target = _providers
+        else:
+            target = _scoped_providers.get(scope)
+            if target is None:
+                return False
+        if target.get(key) is not current:
+            return False
+        if previous is None:
+            target.pop(key, None)
+        else:
+            target[key] = previous
+        if scope is not None and not target:
+            _scoped_providers.pop(scope, None)
+    return True
 
 
 def is_builtin_provider(name: str) -> bool:
@@ -124,4 +187,5 @@ def _reset_for_tests() -> None:
     """Clear all providers and built-in reservations. Test-only."""
     with _lock:
         _providers.clear()
+        _scoped_providers.clear()
         _built_in_names.clear()

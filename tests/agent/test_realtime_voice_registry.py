@@ -100,6 +100,79 @@ class TestRegistration:
         assert realtime_voice_registry.register_provider(second) is True
         assert realtime_voice_registry.get_provider("custom") is second
 
+    def test_scoped_plugins_are_isolated_and_fall_back_to_global(self):
+        global_provider = _FakeProvider(name="custom")
+        first = _FakeProvider(name="custom")
+        second = _FakeProvider(name="custom")
+
+        assert realtime_voice_registry.register_provider(global_provider) is True
+        assert realtime_voice_registry.register_provider(first, scope="profile-a") is True
+        assert realtime_voice_registry.register_provider(second, scope="profile-b") is True
+
+        assert realtime_voice_registry.get_provider("custom", scope="profile-a") is first
+        assert realtime_voice_registry.get_provider("custom", scope="profile-b") is second
+        assert realtime_voice_registry.get_provider("custom", scope="profile-c") is global_provider
+
+    def test_restore_registration_is_exact_and_scope_local(self):
+        previous = _FakeProvider(name="custom")
+        current = _FakeProvider(name="custom")
+        replacement = _FakeProvider(name="custom")
+
+        assert realtime_voice_registry.register_provider(previous, scope="profile") is True
+        assert realtime_voice_registry.snapshot_registration("custom", scope="profile") is previous
+        assert realtime_voice_registry.register_provider(current, scope="profile") is True
+        assert (
+            realtime_voice_registry.restore_registration(
+                "custom", current, previous, scope="profile"
+            )
+            is True
+        )
+        assert realtime_voice_registry.get_provider("custom", scope="profile") is previous
+
+        assert realtime_voice_registry.register_provider(replacement, scope="profile") is True
+        assert (
+            realtime_voice_registry.restore_registration(
+                "custom", current, previous, scope="profile"
+            )
+            is False
+        )
+        assert realtime_voice_registry.get_provider("custom", scope="profile") is replacement
+
+    def test_restore_cannot_remove_reserved_builtin(self):
+        built_in = _FakeProvider(name="openai")
+
+        assert realtime_voice_registry._register_builtin_provider(built_in) is True
+        assert realtime_voice_registry.restore_registration(
+            "openai", built_in, None
+        ) is False
+        assert realtime_voice_registry.get_provider("openai") is built_in
+        assert realtime_voice_registry.list_providers() == [built_in]
+
+    def test_failed_scoped_restore_does_not_create_empty_scope(self):
+        stale = _FakeProvider(name="custom")
+
+        assert realtime_voice_registry.restore_registration(
+            "custom", stale, None, scope="missing-profile"
+        ) is False
+        assert "missing-profile" not in realtime_voice_registry._scoped_providers
+
+    def test_scoped_lookup_preserves_falsey_provider(self):
+        class _FalseyProvider(_FakeProvider):
+            def __bool__(self):
+                return False
+
+        global_provider = _FakeProvider(name="custom")
+        scoped_provider = _FalseyProvider(name="custom")
+        assert realtime_voice_registry.register_provider(global_provider) is True
+        assert realtime_voice_registry.register_provider(
+            scoped_provider, scope="profile"
+        ) is True
+
+        assert (
+            realtime_voice_registry.get_provider("custom", scope="profile")
+            is scoped_provider
+        )
+
     def test_builtin_replaces_plugin_and_cannot_be_shadowed(self, caplog):
         plugin = _FakeProvider(name="openai")
         built_in = _FakeProvider(name="openai")
@@ -109,6 +182,11 @@ class TestRegistration:
         assert realtime_voice_registry._register_builtin_provider(built_in) is True
         assert realtime_voice_registry.get_provider("openai") is built_in
         assert realtime_voice_registry.is_builtin_provider(" OpenAI ") is True
+
+        assert realtime_voice_registry.register_provider(
+            _FakeProvider(name="openai"), scope="profile"
+        ) is False
+        assert realtime_voice_registry.get_provider("openai", scope="profile") is built_in
 
         with caplog.at_level(logging.WARNING, logger="agent.realtime_voice_registry"):
             accepted = realtime_voice_registry.register_provider(shadow)

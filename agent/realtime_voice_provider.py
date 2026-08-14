@@ -451,9 +451,11 @@ class RealtimeVoiceSession(abc.ABC):
         self._close_lock = asyncio.Lock()
         self._close_task: asyncio.Task[None] | None = None
         self._pending_continuation_batch_ids: OrderedDict[str, None] = OrderedDict()
-        self._continuation_responses: dict[str, str] = {}
-        self._completed_continuation_responses: OrderedDict[str, str] = OrderedDict()
-        self._ordinary_response_ids: OrderedDict[str, None] = OrderedDict()
+        self._continuation_responses: dict[str, tuple[str, str]] = {}
+        self._completed_continuation_responses: OrderedDict[
+            str, tuple[str, str]
+        ] = OrderedDict()
+        self._ordinary_response_ids: OrderedDict[str, str] = OrderedDict()
 
     @property
     def capabilities(self) -> frozenset[RealtimeCapability]:
@@ -497,10 +499,22 @@ class RealtimeVoiceSession(abc.ABC):
         return self._validated_events()
 
     async def _validated_events(self) -> AsyncIterator[RealtimeVoiceEvent]:
+        events = self._events()
         try:
-            async for event in self._events():
-                self._validate_continuation_event(event)
-                yield event
+            try:
+                async for event in events:
+                    if not isinstance(event, RealtimeVoiceEvent):
+                        raise TypeError(
+                            "provider event stream must yield RealtimeVoiceEvent instances"
+                        )
+                    self._validate_continuation_event(event)
+                    yield event
+                    if isinstance(event, (SessionFailure, SessionClosed)):
+                        return
+            finally:
+                close_events = getattr(events, "aclose", None)
+                if close_events is not None:
+                    await close_events()
         except BaseException:
             self._pending_continuation_batch_ids.clear()
             self._continuation_responses.clear()
@@ -529,67 +543,81 @@ class RealtimeVoiceSession(abc.ABC):
             return
 
         if isinstance(event, ResponseStarted):
-            known_batch = self._continuation_responses.get(event.response_id)
-            if known_batch is None:
-                known_batch = self._completed_continuation_responses.get(
+            known_identity = self._continuation_responses.get(event.response_id)
+            if known_identity is None:
+                known_identity = self._completed_continuation_responses.get(
                     event.response_id
                 )
-            if known_batch is not None:
-                if linked_batch != known_batch:
-                    raise ValueError("continuation response linkage changed")
+            if known_identity is not None:
+                known_batch, known_turn = known_identity
+                if linked_batch != known_batch or event.turn_id != known_turn:
+                    raise ValueError("continuation response identity changed")
                 return
             if event.response_id in self._ordinary_response_ids:
-                if linked_batch is not None:
-                    raise ValueError("ordinary response linkage changed")
-                self._remember_ordinary_response(event.response_id)
+                self._validate_ordinary_response(event, linked_batch)
                 return
             if linked_batch is None:
-                self._remember_ordinary_response(event.response_id)
+                self._remember_ordinary_response(event.response_id, event.turn_id)
                 return
             if linked_batch not in self._pending_continuation_batch_ids:
                 raise ValueError("unsolicited continuation response linkage")
             self._pending_continuation_batch_ids.pop(linked_batch)
-            self._continuation_responses[event.response_id] = linked_batch
+            self._continuation_responses[event.response_id] = (
+                linked_batch,
+                event.turn_id,
+            )
             return
 
         if event.response_id in self._ordinary_response_ids:
-            if linked_batch is not None:
-                raise ValueError("ordinary response completion linkage changed")
-            self._remember_ordinary_response(event.response_id)
+            self._validate_ordinary_response(event, linked_batch)
             return
 
-        expected_batch = self._continuation_responses.get(event.response_id)
-        if expected_batch is None:
-            completed_batch = self._completed_continuation_responses.get(
+        expected_identity = self._continuation_responses.get(event.response_id)
+        if expected_identity is None:
+            completed_identity = self._completed_continuation_responses.get(
                 event.response_id
             )
-            if completed_batch is not None:
-                if linked_batch != completed_batch:
-                    raise ValueError("continuation completion linkage changed")
+            if completed_identity is not None:
+                completed_batch, completed_turn = completed_identity
+                if linked_batch != completed_batch or event.turn_id != completed_turn:
+                    raise ValueError("continuation completion identity changed")
             elif linked_batch is not None:
                 raise ValueError("unsolicited continuation completion linkage")
             else:
-                self._remember_ordinary_response(event.response_id)
+                self._remember_ordinary_response(event.response_id, event.turn_id)
             return
-        if linked_batch != expected_batch:
+        expected_batch, expected_turn = expected_identity
+        if linked_batch != expected_batch or event.turn_id != expected_turn:
             raise ValueError(
-                "continuation completion must link requested batch "
-                f"{expected_batch}"
+                "continuation completion identity changed from requested batch "
+                f"{expected_batch} and turn {expected_turn}"
             )
-        del self._continuation_responses[event.response_id]
-        self._completed_continuation_responses[event.response_id] = expected_batch
-        self._completed_continuation_responses.move_to_end(event.response_id)
         if (
-            len(self._completed_continuation_responses)
-            > MAX_TRACKED_CONTINUATION_RESPONSES
+            event.response_id not in self._completed_continuation_responses
+            and len(self._completed_continuation_responses)
+            >= MAX_TRACKED_CONTINUATION_RESPONSES
         ):
-            self._completed_continuation_responses.popitem(last=False)
+            raise ValueError("continuation response identity history limit reached")
+        del self._continuation_responses[event.response_id]
+        self._completed_continuation_responses[event.response_id] = expected_identity
 
-    def _remember_ordinary_response(self, response_id: str) -> None:
-        self._ordinary_response_ids[response_id] = None
-        self._ordinary_response_ids.move_to_end(response_id)
-        if len(self._ordinary_response_ids) > MAX_TRACKED_ORDINARY_RESPONSES:
-            self._ordinary_response_ids.popitem(last=False)
+    def _validate_ordinary_response(
+        self, event: ResponseStarted | ResponseCompleted, linked_batch: str | None
+    ) -> None:
+        if linked_batch is not None:
+            raise ValueError("ordinary response linkage changed")
+        if self._ordinary_response_ids[event.response_id] != event.turn_id:
+            raise ValueError("ordinary response identity changed")
+
+    def _remember_ordinary_response(self, response_id: str, turn_id: str) -> None:
+        known_turn = self._ordinary_response_ids.get(response_id)
+        if known_turn is not None:
+            if known_turn != turn_id:
+                raise ValueError("ordinary response identity changed")
+            return
+        if len(self._ordinary_response_ids) >= MAX_TRACKED_ORDINARY_RESPONSES:
+            raise ValueError("ordinary response identity history limit reached")
+        self._ordinary_response_ids[response_id] = turn_id
 
     @abc.abstractmethod
     def _events(self) -> AsyncIterator[RealtimeVoiceEvent]:
@@ -649,9 +677,18 @@ class RealtimeVoiceSession(abc.ABC):
     async def continue_response(self, batch_id: str) -> None:
         _validate_identifier(batch_id, "batch_id")
         self._require(RealtimeCapability.CONTINUATION)
-        if batch_id in self._pending_continuation_batch_ids or batch_id in (
-            self._continuation_responses.values()
-        ) or batch_id in self._completed_continuation_responses.values():
+        active_batch_ids = {
+            identity[0] for identity in self._continuation_responses.values()
+        }
+        completed_batch_ids = {
+            identity[0]
+            for identity in self._completed_continuation_responses.values()
+        }
+        if (
+            batch_id in self._pending_continuation_batch_ids
+            or batch_id in active_batch_ids
+            or batch_id in completed_batch_ids
+        ):
             raise ValueError(f"continuation batch is already pending: {batch_id}")
         if (
             len(self._pending_continuation_batch_ids)
@@ -666,8 +703,8 @@ class RealtimeVoiceSession(abc.ABC):
             self._pending_continuation_batch_ids.pop(batch_id, None)
             failed_response_ids = [
                 response_id
-                for response_id, active_batch_id in self._continuation_responses.items()
-                if active_batch_id == batch_id
+                for response_id, identity in self._continuation_responses.items()
+                if identity[0] == batch_id
             ]
             for response_id in failed_response_ids:
                 del self._continuation_responses[response_id]

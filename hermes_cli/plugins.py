@@ -2770,7 +2770,8 @@ class PluginContext:
 
     # -- realtime voice provider registration -------------------------------
 
-    def register_realtime_voice_provider(self, provider) -> None:
+    @_serialized_replacement
+    def register_realtime_voice_provider(self, provider) -> bool:
         """Register a bidirectional realtime voice backend.
 
         ``provider`` must inherit from
@@ -2784,7 +2785,11 @@ class PluginContext:
         Gemini Live and other engines to use the same extension surface.
         """
         from agent.realtime_voice_provider import RealtimeVoiceProvider
-        from agent.realtime_voice_registry import register_provider
+        from agent.realtime_voice_registry import (
+            register_provider,
+            restore_registration,
+            snapshot_registration,
+        )
 
         if not isinstance(provider, RealtimeVoiceProvider):
             logger.warning(
@@ -2792,13 +2797,31 @@ class PluginContext:
                 "does not inherit from RealtimeVoiceProvider. Ignoring.",
                 self.manifest.name,
             )
-            return
-        if register_provider(provider):
-            logger.info(
-                "Plugin '%s' registered realtime voice provider: %s",
-                self.manifest.name,
-                provider.name,
-            )
+            return False
+        registry_name = provider.name.strip().lower()
+        scope = self._manager.scope_key
+        previous = snapshot_registration(registry_name, scope=scope)
+        if not register_provider(provider, scope=scope):
+            return False
+        current = snapshot_registration(registry_name, scope=scope)
+        if current is not provider:
+            return False
+        self._track_replacement(
+            "realtime_voice_provider",
+            registry_name,
+            slot=("realtime_voice_provider", scope, registry_name),
+            current=provider,
+            previous=previous,
+            restore=lambda replacement: restore_registration(
+                registry_name, provider, replacement, scope=scope
+            ),
+        )
+        logger.info(
+            "Plugin '%s' registered realtime voice provider: %s",
+            self.manifest.name,
+            provider.name,
+        )
+        return True
 
     # -- platform adapter registration ---------------------------------------
 

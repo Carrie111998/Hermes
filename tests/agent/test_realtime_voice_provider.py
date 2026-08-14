@@ -411,6 +411,22 @@ class _ControlledCloseSession(_Session):
         self.completed_close_count += 1
 
 
+class _FinalizingEventSession(_Session):
+    def __init__(self) -> None:
+        super().__init__()
+        self.stream_finalized = asyncio.Event()
+
+    def _events(self):
+        async def stream():
+            try:
+                yield SessionClosed(reason="normal")
+                yield SessionReady(session_id="late")
+            finally:
+                self.stream_finalized.set()
+
+        return stream()
+
+
 class _FailingContinuationSession(_Session):
     def __init__(self) -> None:
         super().__init__({RealtimeCapability.CONTINUATION})
@@ -509,6 +525,47 @@ async def test_requested_continuation_links_response_start_and_completion() -> N
     await session.continue_response("batch")
 
     assert [event async for event in session.events()] == [started, completed]
+
+
+@pytest.mark.asyncio
+async def test_continuation_batch_cannot_be_reused_while_active_or_completed() -> None:
+    session = _Session({RealtimeCapability.CONTINUATION})
+    await session.continue_response("batch")
+    session._validate_continuation_event(
+        ResponseStarted("response", "turn", "batch")
+    )
+
+    with pytest.raises(ValueError, match="already pending"):
+        await session.continue_response("batch")
+
+    session._validate_continuation_event(
+        ResponseCompleted("response", "turn", "batch")
+    )
+    with pytest.raises(ValueError, match="already pending"):
+        await session.continue_response("batch")
+
+
+@pytest.mark.asyncio
+async def test_continuation_completion_rejects_turn_identity_drift() -> None:
+    session = _Session({RealtimeCapability.CONTINUATION})
+    session.event_values = [
+        ResponseStarted(
+            response_id="next-response",
+            turn_id="turn-a",
+            continuation_of_batch_id="batch",
+        ),
+        ResponseCompleted(
+            response_id="next-response",
+            turn_id="turn-b",
+            continuation_of_batch_id="batch",
+        ),
+    ]
+    await session.continue_response("batch")
+
+    events = session.events()
+    assert await anext(events) == session.event_values[0]
+    with pytest.raises(ValueError, match="identity changed"):
+        await anext(events)
 
 
 @pytest.mark.asyncio
@@ -626,8 +683,70 @@ async def test_ordinary_response_identity_history_is_bounded(monkeypatch) -> Non
         for index in range(3)
     ]
 
-    assert [event async for event in session.events()] == session.event_values
-    assert list(session._ordinary_response_ids) == ["response-1", "response-2"]
+    events = session.events()
+    assert await anext(events) == session.event_values[0]
+    assert await anext(events) == session.event_values[1]
+    with pytest.raises(ValueError, match="identity history limit"):
+        await anext(events)
+    assert list(session._ordinary_response_ids) == ["response-0", "response-1"]
+
+
+@pytest.mark.asyncio
+async def test_saturated_ordinary_history_cannot_upgrade_retained_identity(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(realtime_voice_provider, "MAX_TRACKED_ORDINARY_RESPONSES", 2)
+    session = _Session({RealtimeCapability.CONTINUATION})
+    ordinary = [
+        ResponseStarted(response_id=f"response-{index}", turn_id="turn")
+        for index in range(2)
+    ]
+    for event in ordinary:
+        session._validate_continuation_event(event)
+    with pytest.raises(ValueError, match="identity history limit"):
+        session._validate_continuation_event(
+            ResponseStarted(response_id="response-2", turn_id="turn")
+        )
+
+    await session.continue_response("batch")
+    with pytest.raises(ValueError, match="linkage changed"):
+        session._validate_continuation_event(
+            ResponseStarted(
+                response_id="response-0",
+                turn_id="turn",
+                continuation_of_batch_id="batch",
+            )
+        )
+
+
+@pytest.mark.asyncio
+async def test_completed_continuation_history_fails_closed_at_capacity(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        realtime_voice_provider, "MAX_TRACKED_CONTINUATION_RESPONSES", 1
+    )
+    session = _Session({RealtimeCapability.CONTINUATION})
+    await session.continue_response("batch-a")
+    session._validate_continuation_event(
+        ResponseStarted("response-a", "turn-a", "batch-a")
+    )
+    session._validate_continuation_event(
+        ResponseCompleted("response-a", "turn-a", "batch-a")
+    )
+    await session.continue_response("batch-b")
+    session._validate_continuation_event(
+        ResponseStarted("response-b", "turn-b", "batch-b")
+    )
+
+    with pytest.raises(ValueError, match="identity history limit"):
+        session._validate_continuation_event(
+            ResponseCompleted("response-b", "turn-b", "batch-b")
+        )
+    assert session._continuation_responses["response-b"] == (
+        "batch-b",
+        "turn-b",
+    )
 
 
 @pytest.mark.asyncio
@@ -648,6 +767,25 @@ async def test_event_stream_eof_rejects_unresolved_continuations() -> None:
     await active.continue_response("active-batch")
     with pytest.raises(ValueError, match="unresolved continuation"):
         assert [event async for event in active.events()] == active.event_values
+
+
+@pytest.mark.asyncio
+async def test_event_stream_rejects_non_contract_values() -> None:
+    session = _Session()
+    session.event_values = [{"type": "response.started"}]
+
+    with pytest.raises(TypeError, match="RealtimeVoiceEvent"):
+        await anext(session.events())
+
+
+@pytest.mark.asyncio
+async def test_event_stream_stops_after_first_terminal_session_event() -> None:
+    session = _FinalizingEventSession()
+
+    assert [event async for event in session.events()] == [
+        SessionClosed(reason="normal")
+    ]
+    assert session.stream_finalized.is_set()
 
 
 @pytest.mark.asyncio
@@ -779,7 +917,10 @@ async def test_linked_start_does_not_mask_concurrent_continuation_write_failure(
     with pytest.raises(RuntimeError, match="continuation write failed"):
         await continuing
     assert "batch" not in session._pending_continuation_batch_ids
-    assert "batch" not in session._continuation_responses.values()
+    assert all(
+        identity[0] != "batch"
+        for identity in session._continuation_responses.values()
+    )
 
 
 def test_provider_api_version_reflects_events_implementation_migration() -> None:

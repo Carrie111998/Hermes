@@ -85,6 +85,73 @@ class TestRegisterRealtimeVoiceProvider:
         )
         assert realtime_voice_registry.get_provider("fake-realtime") is not None
 
+        assert manager.unload("my-realtime-plugin") is True
+        assert realtime_voice_registry.get_provider("fake-realtime") is None
+
+        realtime_voice_registry._reset_for_tests()
+
+    def test_unload_restores_previous_exact_registration(self):
+        from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
+        from tests.agent.test_realtime_voice_registry import _FakeProvider
+
+        from agent import realtime_voice_registry
+
+        realtime_voice_registry._reset_for_tests()
+        manager = PluginManager()
+        first = _FakeProvider("shared-realtime")
+        second = _FakeProvider("shared-realtime")
+        first_context = PluginContext(PluginManifest(name="first-plugin"), manager)
+        second_context = PluginContext(PluginManifest(name="second-plugin"), manager)
+
+        try:
+            assert first_context.register_realtime_voice_provider(first) is True
+            assert second_context.register_realtime_voice_provider(second) is True
+            assert realtime_voice_registry.get_provider("shared-realtime") is second
+
+            assert manager.unload("second-plugin") is True
+            assert realtime_voice_registry.get_provider("shared-realtime") is first
+
+            assert manager.unload("first-plugin") is True
+            assert realtime_voice_registry.get_provider("shared-realtime") is None
+        finally:
+            realtime_voice_registry._reset_for_tests()
+
+    def test_register_then_raise_rolls_back_provider(self):
+        from hermes_cli.plugins import PluginManager
+
+        from agent import realtime_voice_registry
+
+        realtime_voice_registry._reset_for_tests()
+        hermes_home = Path(os.environ["HERMES_HOME"])
+        _write_plugin(
+            hermes_home / "plugins",
+            "failing-realtime-plugin",
+            register_body=(
+                "from agent.realtime_voice_provider import RealtimeVoiceProvider, RealtimeVoiceSession\n"
+                "    class S(RealtimeVoiceSession):\n"
+                "        async def send_audio(self, audio, **kw): pass\n"
+                "        async def _submit_tool_results(self, batch_id, results): pass\n"
+                "        def _events(self):\n"
+                "            async def stream():\n"
+                "                if False: yield {}\n"
+                "            return stream()\n"
+                "        async def _close(self): pass\n"
+                "    class P(RealtimeVoiceProvider):\n"
+                "        @property\n"
+                "        def name(self): return 'failed-realtime'\n"
+                "        async def open_session(self, setup): return S()\n"
+                "    assert ctx.register_realtime_voice_provider(P()) is True\n"
+                "    raise RuntimeError('registration failed')"
+            ),
+        )
+        _enable(hermes_home, "failing-realtime-plugin")
+
+        manager = PluginManager()
+        manager.discover_and_load()
+
+        assert manager._plugins["failing-realtime-plugin"].enabled is False
+        assert realtime_voice_registry.get_provider("failed-realtime") is None
+
         realtime_voice_registry._reset_for_tests()
 
     def test_rejects_non_provider(self, caplog):
