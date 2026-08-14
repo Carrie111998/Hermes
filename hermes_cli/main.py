@@ -698,12 +698,14 @@ from hermes_cli.config import get_hermes_home
 from hermes_cli.env_loader import load_hermes_dotenv
 
 load_hermes_dotenv(project_env=PROJECT_ROOT / ".env")
+os.environ["HERMES_REDACT_PHONE_NUMBERS"] = "true"
 
-# Bridge security.redact_secrets from config.yaml → HERMES_REDACT_SECRETS env
-# var BEFORE hermes_logging imports agent.redact (which snapshots the flag at
-# module-import time). Without this, config.yaml's toggle is ignored because
-# the setup_logging() call below imports agent.redact, which reads the env var
-# exactly once. Env var in .env still wins — this is config.yaml fallback only.
+# Bridge redaction settings from config.yaml → internal env carriers BEFORE
+# hermes_logging imports agent.redact (which snapshots the flags at
+# module-import time). Without this, config.yaml toggles are ignored because
+# the setup_logging() call below imports agent.redact, which reads the env vars
+# exactly once. HERMES_REDACT_SECRETS preserves legacy .env precedence; phone
+# number redaction has no user-facing env var, so config.yaml is authoritative.
 #
 # We also read network.force_ipv4 from the same yaml load to avoid two
 # separate config.yaml reads (saves ~17ms on every CLI startup — the second
@@ -735,6 +737,13 @@ try:
                 _early_redact = _early_sec_cfg.get("redact_secrets")
                 if _early_redact is not None:
                     os.environ["HERMES_REDACT_SECRETS"] = str(_early_redact).lower()
+        _early_privacy_cfg = _early_cfg_raw.get("privacy", {})
+        if isinstance(_early_privacy_cfg, dict):
+            _early_phone_redact = _early_privacy_cfg.get("redact_phone_numbers")
+            if _early_phone_redact is not None:
+                os.environ["HERMES_REDACT_PHONE_NUMBERS"] = str(
+                    _early_phone_redact
+                ).lower()
         _early_net_cfg = _early_cfg_raw.get("network", {})
         if isinstance(_early_net_cfg, dict) and _early_net_cfg.get("force_ipv4"):
             _FORCE_IPV4_EARLY = True

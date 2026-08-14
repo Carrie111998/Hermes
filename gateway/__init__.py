@@ -9,6 +9,10 @@ to various messaging platforms (Telegram, Discord, WhatsApp, Weixin, and more) w
 - Platform-specific toolsets (different capabilities per platform)
 """
 
+from .redaction_bootstrap import bridge_gateway_redaction_env
+
+bridge_gateway_redaction_env()
+
 from .config import GatewayConfig, PlatformConfig, HomeChannel, load_gateway_config
 from .session import (
     SessionContext,

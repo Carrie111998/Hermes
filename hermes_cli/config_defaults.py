@@ -1494,6 +1494,7 @@ DEFAULT_CONFIG = {
     # Privacy settings
     "privacy": {
         "redact_pii": False,  # When True, hash user IDs and strip phone numbers from LLM context
+        "redact_phone_numbers": True,  # When True, mask E.164 phone numbers in logs/tool output
     },
 
     # Text-to-speech configuration

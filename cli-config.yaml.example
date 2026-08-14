@@ -1590,6 +1590,10 @@ display:
 #   # Names and usernames are NOT affected (user-chosen, publicly visible).
 #   # Routing/delivery still uses the original values internally.
 #   redact_pii: false
+#   # Mask E.164 phone numbers in general redacted output/log surfaces.
+#   # Independent from security.redact_secrets; ordinary phone numbers can be
+#   # allowed while API keys and other credentials remain protected.
+#   redact_phone_numbers: true
 
 # =============================================================================
 # Shell-script hooks

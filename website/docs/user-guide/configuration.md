@@ -1907,6 +1907,7 @@ Signal is listed as a valid platform key because the setting can be saved per pl
 ```yaml
 privacy:
   redact_pii: false  # Strip PII from LLM context (gateway only)
+  redact_phone_numbers: true  # Mask E.164 phone numbers in logs/tool output
 ```
 
 When `redact_pii` is `true`, the gateway redacts personally identifiable information from the system prompt before sending it to the LLM on supported platforms:
@@ -1922,6 +1923,8 @@ When `redact_pii` is `true`, the gateway redacts personally identifiable informa
 **Platform support:** Redaction applies to WhatsApp, Signal, and Telegram. Discord and Slack are excluded because their mention systems (`<@user_id>`) require the real ID in the LLM context.
 
 Hashes are deterministic — the same user always maps to the same hash, so the model can still distinguish between users in group chats. Routing and delivery use the original values internally.
+
+`redact_phone_numbers` controls the general redactor's E.164 phone-number masking in tool output, logs, and displayed responses. It is independent from `security.redact_secrets`, so you can set `privacy.redact_phone_numbers: false` while keeping API key and token redaction enabled.
 
 ## Speech-to-Text (STT)
 
@@ -2286,7 +2289,7 @@ security:
     shared_files: []
 ```
 
-- `redact_secrets` — when `true`, automatically detects and redacts patterns that look like API keys, tokens, and passwords in tool output before it enters the conversation context and logs. **On by default**. Set to `false` explicitly only when you need raw credential-like strings for debugging or redactor development.
+- `redact_secrets` — when `true`, automatically detects and redacts patterns that look like API keys, tokens, and passwords in tool output before it enters the conversation context and logs. **On by default**. Set to `false` explicitly only when you need raw credential-like strings for debugging or redactor development. E.164 phone-number masking is controlled separately by `privacy.redact_phone_numbers`.
 - `tirith_enabled` — when `true`, terminal commands are scanned by [Tirith](https://github.com/sheeki03/tirith) before execution to detect potentially dangerous operations.
 - `tirith_path` — path to the tirith binary. Set this if tirith is installed in a non-standard location.
 - `tirith_timeout` — maximum seconds to wait for a tirith scan. Commands proceed if the scan times out.

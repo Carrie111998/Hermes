@@ -46,6 +46,28 @@ from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from typing import Awaitable, Callable, Dict, Optional, Any, List, Tuple, Union, cast
 
+# Mark this process as a gateway so cli.py's module-level load_cli_config()
+# knows not to clobber TERMINAL_CWD if lazily imported.
+os.environ["_HERMES_GATEWAY"] = "1"
+
+# Add parent directory to path
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from gateway.redaction_bootstrap import bridge_gateway_redaction_env
+
+_hermes_home, _config_path = bridge_gateway_redaction_env()
+
+# Resolve Hermes home directory (respects HERMES_HOME override)
+from hermes_constants import get_hermes_home_override
+from utils import atomic_json_write, is_truthy_value
+
+# Backward-compat for tests that monkeypatch this symbol.
+from dotenv import load_dotenv  # noqa: F401
+from hermes_cli.config_defaults import DEFAULT_CONFIG as _DEFAULT_CONFIG
+from hermes_cli.env_loader import load_hermes_dotenv
+
+_env_path = _hermes_home / '.env'
+
 from agent.async_utils import consume_detached_task_result, safe_schedule_threadsafe
 from agent.conversation_compression import (
     COMPACTION_STATUS,
@@ -1863,26 +1885,7 @@ def _clear_planned_restart_notification() -> None:
     _planned_restart_notification_path().unlink(missing_ok=True)
 
 
-# Mark this process as a gateway so cli.py's module-level load_cli_config()
-# knows not to clobber TERMINAL_CWD if lazily imported.
-os.environ["_HERMES_GATEWAY"] = "1"
-
 _ensure_ssl_certs()
-
-# Add parent directory to path
-sys.path.insert(0, str(Path(__file__).parent.parent))
-
-# Resolve Hermes home directory (respects HERMES_HOME override)
-from hermes_constants import get_hermes_home, get_hermes_home_override
-from utils import atomic_json_write, is_truthy_value
-_hermes_home = get_hermes_home()
-
-# Load environment variables from ~/.hermes/.env first.
-# User-managed env files should override stale shell exports on restart.
-from dotenv import load_dotenv  # noqa: F401  # backward-compat for tests that monkeypatch this symbol
-from hermes_cli.env_loader import load_hermes_dotenv
-_env_path = _hermes_home / '.env'
-load_hermes_dotenv(hermes_home=_hermes_home, project_env=Path(__file__).resolve().parents[1] / '.env')
 
 
 def _reload_runtime_env_preserving_config_authority() -> None:
@@ -2097,18 +2100,12 @@ def _platform_has_bot_credential(platform: "Platform", platform_config: "Platfor
 _DOCKER_VOLUME_SPEC_RE = re.compile(r"^(?P<host>.+):(?P<container>/[^:]+?)(?::(?P<options>[^:]+))?$")
 _DOCKER_MEDIA_OUTPUT_CONTAINER_PATHS = {"/output", "/outputs"}
 
-# This env var is internal bridge plumbing, not a user-facing configuration
-# source. Initialize it from the canonical config default after dotenv loading
-# so an ambient process/.env value can never control lease safety on its own.
-from hermes_cli.config_defaults import DEFAULT_CONFIG as _DEFAULT_CONFIG
-
 os.environ["HERMES_TURN_LEASE_TIMEOUT"] = str(
     _DEFAULT_CONFIG["agent"]["gateway_turn_lease_timeout"]
 )
 
 # Bridge config.yaml values into the environment so os.getenv() picks them up.
 # config.yaml is authoritative for terminal settings — overrides .env.
-_config_path = _hermes_home / 'config.yaml'
 if _config_path.exists():
     try:
         # Presence-sensitive env bridge: raw read is deliberate — only keys the
@@ -2316,6 +2313,13 @@ if _config_path.exists():
             _redact = _security_cfg.get("redact_secrets")
             if _redact is not None:
                 os.environ["HERMES_REDACT_SECRETS"] = str(_redact).lower()
+        _privacy_cfg = _cfg.get("privacy", {})
+        if isinstance(_privacy_cfg, dict):
+            _redact_phone_numbers = _privacy_cfg.get("redact_phone_numbers")
+            if _redact_phone_numbers is not None:
+                os.environ["HERMES_REDACT_PHONE_NUMBERS"] = str(
+                    _redact_phone_numbers
+                ).lower()
         # Gateway settings (media delivery allowlist + recency trust + strict mode)
         _gateway_cfg = _cfg.get("gateway", {})
         if isinstance(_gateway_cfg, dict):

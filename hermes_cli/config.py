@@ -3557,8 +3557,9 @@ _SECURITY_COMMENT = """
 # ── Security ──────────────────────────────────────────────────────────
 # Secret redaction is ON by default — strings that look like API keys,
 # tokens, and passwords are masked in tool output, logs, and chat
-# responses before the model or user ever sees them. Set redact_secrets
-# to false to disable (e.g. when developing the redactor itself).
+# responses before the model or user ever sees them. E.164 phone-number
+# masking is controlled separately by privacy.redact_phone_numbers.
+# Set redact_secrets to false only when developing the redactor itself.
 # tirith pre-exec scanning is enabled by default when the tirith binary
 # is available. Configure via security.tirith_* keys or env vars
 # (TIRITH_ENABLED, TIRITH_BIN, TIRITH_TIMEOUT, TIRITH_FAIL_OPEN).
@@ -3598,8 +3599,9 @@ _FALLBACK_COMMENT = """
 
 _COMMENTED_SECTIONS = """
 # ── Security ──────────────────────────────────────────────────────────
-# Secret redaction is ON by default. Set to false to pass tool output,
-# logs, and chat responses through unmodified (e.g. for redactor dev).
+# Secret redaction is ON by default. Set to false only when you need raw
+# credential-like strings (e.g. for redactor dev). E.164 phone-number
+# masking is controlled separately by privacy.redact_phone_numbers.
 #
 # security:
 #   redact_secrets: true

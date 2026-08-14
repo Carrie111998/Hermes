@@ -765,6 +765,14 @@ def load_cli_config() -> Dict[str, Any]:
         if redact is not None:
             os.environ["HERMES_REDACT_SECRETS"] = str(redact).lower()
 
+    privacy_config = defaults.get("privacy", {})
+    if isinstance(privacy_config, dict):
+        redact_phone_numbers = privacy_config.get("redact_phone_numbers")
+        if redact_phone_numbers is not None:
+            os.environ["HERMES_REDACT_PHONE_NUMBERS"] = str(
+                redact_phone_numbers
+            ).lower()
+
     # Session-search index knobs (hermes_state reads the env carriers).
     sessions_config = defaults.get("sessions", {})
     if isinstance(sessions_config, dict):

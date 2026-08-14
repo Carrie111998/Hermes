@@ -65,6 +65,10 @@ _SENSITIVE_BODY_KEYS = frozenset({
     "key",
 })
 
+def _env_truthy(name: str, default: str = "true") -> bool:
+    return os.getenv(name, default).lower() in {"1", "true", "yes", "on"}
+
+
 # Snapshot at import time so runtime env mutations (e.g. LLM-generated
 # `export HERMES_REDACT_SECRETS=false`) cannot disable redaction
 # mid-session.  ON by default — secure default per issue #17691. Users who
@@ -74,7 +78,13 @@ _SENSITIVE_BODY_KEYS = frozenset({
 # cli.py) or `HERMES_REDACT_SECRETS=false` in ~/.hermes/.env. An opt-out
 # warning is logged at gateway and CLI startup so operators see the
 # downgrade — see `_log_redaction_status()` in gateway/run.py and cli.py.
-_REDACT_ENABLED = os.getenv("HERMES_REDACT_SECRETS", "true").lower() in {"1", "true", "yes", "on"}
+_REDACT_ENABLED = _env_truthy("HERMES_REDACT_SECRETS")
+
+# E.164 phone numbers are ordinary PII, not credentials. Keep their import-time
+# snapshot separate so users can allow phone numbers while secret redaction
+# remains enabled. The internal env carrier is populated from
+# privacy.redact_phone_numbers in config.yaml by the startup config bridges.
+_PHONE_REDACT_ENABLED = _env_truthy("HERMES_REDACT_PHONE_NUMBERS")
 
 # Known API key prefixes -- match the prefix + contiguous token chars
 _PREFIX_PATTERNS = [
@@ -998,7 +1008,7 @@ def redact_sensitive_text(
         text = _redact_form_body(text)
 
     # E.164 phone numbers (Signal, WhatsApp)
-    if "+" in text:
+    if _PHONE_REDACT_ENABLED and "+" in text:
         def _redact_phone(m):
             phone = m.group(1)
             if len(phone) <= 8:

@@ -13,6 +13,7 @@ def _ensure_redaction_enabled(monkeypatch):
     monkeypatch.delenv("HERMES_REDACT_SECRETS", raising=False)
     # Also patch the module-level snapshot so it reflects the cleared env var
     monkeypatch.setattr("agent.redact._REDACT_ENABLED", True)
+    monkeypatch.setattr("agent.redact._PHONE_REDACT_ENABLED", True)
 
 
 class TestKnownPrefixes:
@@ -318,6 +319,18 @@ class TestPassthrough:
         result = redact_sensitive_text({"token": "sk-proj-abc123def456ghi789jkl012"})
         assert "abc123def456" not in result
 
+
+class TestPhoneRedaction:
+    def test_phone_redaction_can_be_disabled_without_disabling_secrets(self, monkeypatch):
+        monkeypatch.setattr("agent.redact._REDACT_ENABLED", True)
+        monkeypatch.setattr("agent.redact._PHONE_REDACT_ENABLED", False)
+
+        text = "Call +15551234567 with OPENAI_API_KEY=sk-proj-abc123def456ghi789jkl012"
+        result = redact_sensitive_text(text)
+
+        assert "+15551234567" in result
+        assert "abc123def456" not in result
+        assert "OPENAI_API_KEY=" in result
 
 
 
