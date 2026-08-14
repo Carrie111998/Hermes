@@ -436,9 +436,16 @@ class HermesTokenStorage:
         HERMES_HOME/mcp-tokens/<server_name>.meta.json     -- oauth server metadata
     """
 
-    def __init__(self, server_name: str, *, hermes_home: str | Path | None = None):
+    def __init__(
+        self,
+        server_name: str,
+        *,
+        hermes_home: str | Path | None = None,
+        require_refresh_token: bool = False,
+    ):
         self._server_name = _safe_filename(server_name)
         self._hermes_home = Path(hermes_home) if hermes_home is not None else None
+        self._require_refresh_token = require_refresh_token
 
     def _tokens_path(self) -> Path:
         return _get_token_dir(self._hermes_home) / f"{self._server_name}.json"
@@ -511,6 +518,21 @@ class HermesTokenStorage:
                 pass
         _write_json(self._tokens_path(), payload)
         logger.debug("OAuth tokens saved for %s", self._server_name)
+        # oauth.require_refresh_token: surface a refresh-less grant loudly at
+        # the moment it is issued, instead of as an opaque parked-server
+        # failure hours later when the access token expires. Warn-only — the
+        # access token is still usable and failing here would strand the flow.
+        if self._require_refresh_token and not payload.get("refresh_token"):
+            logger.error(
+                "OAuth grant for '%s' returned no refresh_token although "
+                "oauth.require_refresh_token is set — the connection will die "
+                "when this access token expires (expires_in=%s). Check that "
+                "oauth.authorization_params (e.g. token_access_type=offline) "
+                "reached the provider, then re-run `hermes mcp login %s`.",
+                self._server_name,
+                payload.get("expires_in"),
+                self._server_name,
+            )
 
     # -- client info -------------------------------------------------------
 
@@ -694,7 +716,11 @@ def _make_callback_handler() -> tuple[type, dict]:
 # ---------------------------------------------------------------------------
 
 
-def _make_redirect_handler(port: int, redirect_uri: str | None = None):
+def _make_redirect_handler(
+    port: int,
+    redirect_uri: str | None = None,
+    extra_authorize_params: dict | None = None,
+):
     """Return a redirect handler closure that closes over the given port.
 
     Using a closure instead of reading the module-level ``_oauth_port`` avoids
@@ -705,6 +731,14 @@ def _make_redirect_handler(port: int, redirect_uri: str | None = None):
     URL), or ``None`` for the loopback default. It tailors the remote-session
     hint: a proxied callback reaches this machine on its own, so the loopback
     SSH-tunnel guidance would be misleading.
+
+    ``extra_authorize_params`` come from ``oauth.authorization_params`` in the
+    server's config block. The SDK's ``OAuthClientProvider`` offers no hook
+    for provider-specific authorize-URL params, but it hands the fully built
+    URL to this handler — so this is the one place they can be appended.
+    Needed e.g. for Dropbox's ``token_access_type: offline``, without which
+    no refresh_token is ever issued and the grant dies with the first access
+    token (~4h).
     """
     async def _redirect_handler(authorization_url: str) -> None:
         """Show the authorization URL to the user.
@@ -713,6 +747,22 @@ def _make_redirect_handler(port: int, redirect_uri: str | None = None):
         as a fallback for headless/SSH/gateway environments.
         """
         from tools.mcp_dashboard_oauth import get_dashboard_oauth_flow
+
+        if extra_authorize_params:
+            from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+
+            parts = urlsplit(authorization_url)
+            present = {k for k, _ in parse_qsl(parts.query, keep_blank_values=True)}
+            extra = {
+                str(k): str(v)
+                for k, v in extra_authorize_params.items()
+                if str(k) not in present
+            }
+            if extra:
+                query = parts.query + ("&" if parts.query else "") + urlencode(extra)
+                authorization_url = urlunsplit(
+                    (parts.scheme, parts.netloc, parts.path, query, parts.fragment)
+                )
 
         dashboard_flow = get_dashboard_oauth_flow()
         if dashboard_flow is not None:
@@ -1395,7 +1445,10 @@ def build_oauth_auth(
     apply_oauth_provider_defaults(
         cfg, server_name=server_name, server_url=server_url
     )
-    storage = HermesTokenStorage(server_name)
+    storage = HermesTokenStorage(
+        server_name,
+        require_refresh_token=bool(cfg.get("require_refresh_token")),
+    )
 
     if not _is_interactive() and not storage.has_cached_tokens():
         raise OAuthNonInteractiveError(
@@ -1413,7 +1466,9 @@ def build_oauth_auth(
     # Use closure factories to avoid global state pollution (#44588, #34260).
     resolved_port = cfg.get("_resolved_port", _oauth_port)
     redirect_handler = _make_redirect_handler(
-        resolved_port, redirect_uri=cfg.get("redirect_uri") or None
+        resolved_port,
+        redirect_uri=cfg.get("redirect_uri") or None,
+        extra_authorize_params=cfg.get("authorization_params") or None,
     )
     callback_handler = _make_callback_waiter(resolved_port)
 
