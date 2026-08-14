@@ -1291,6 +1291,62 @@ class TestChatCompletionsEndpoint:
             assert '"status": "running"' not in body
             assert '"status": "completed"' not in body
 
+    @pytest.mark.asyncio
+    async def test_history_allowlist_preserves_tool_chain(self, adapter):
+        messages = [
+            {
+                "role": "user",
+                "name": "caller",
+                "content": [{"type": "input_text", "text": "Read this"}],
+                "tool_calls": [{"id": "drop-user-call"}],
+                "metadata": {"drop": True},
+            },
+            {
+                "role": "assistant",
+                "name": "assistant-main",
+                "content": "",
+                "tool_calls": [{"id": "call-read", "type": "function"}],
+                "reasoning_content": "thinking",
+                "codex_reasoning_items": [{"id": "rs-1"}],
+                "codex_message_items": [{"id": "msg-1"}],
+                "tool_call_id": "drop-assistant-id",
+                "metadata": {"drop": True},
+            },
+            {
+                "role": "tool",
+                "name": "tool-runner",
+                "content": "ok",
+                "tool_call_id": "call-read",
+                "reasoning_content": "drop-tool-reasoning",
+                "codex_reasoning_items": [{"id": "drop-tool-rs"}],
+                "codex_message_items": [{"id": "drop-tool-msg"}],
+                "metadata": {"drop": True},
+            },
+            {"role": "user", "content": "Summarize"},
+        ]
+        result = {"final_response": "Done", "messages": [], "api_calls": 1}
+
+        async with TestClient(TestServer(_create_app(adapter))) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (result, {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0})
+                resp = await cli.post("/v1/chat/completions", json={"messages": messages})
+
+        assert resp.status == 200
+        assert mock_run.call_args.kwargs["user_message"] == "Summarize"
+        assert mock_run.call_args.kwargs["conversation_history"] == [
+            {"role": "user", "name": "caller", "content": "Read this"},
+            {
+                "role": "assistant",
+                "name": "assistant-main",
+                "content": "",
+                "tool_calls": [{"id": "call-read", "type": "function"}],
+                "reasoning_content": "thinking",
+                "codex_reasoning_items": [{"id": "rs-1"}],
+                "codex_message_items": [{"id": "msg-1"}],
+            },
+            {"role": "tool", "name": "tool-runner", "content": "ok", "tool_call_id": "call-read"},
+        ]
+
 
 # ---------------------------------------------------------------------------
 # _derive_chat_session_id unit tests
@@ -1349,6 +1405,72 @@ class TestResponsesEndpoint:
             assert data["output"][0]["type"] == "message"
             assert data["output"][0]["content"][0]["type"] == "output_text"
             assert data["output"][0]["content"][0]["text"] == "Paris is the capital of France."
+
+    @pytest.mark.parametrize("input_mode", ("array", "explicit"))
+    @pytest.mark.asyncio
+    async def test_history_allowlist_preserves_tool_chain(self, adapter, input_mode):
+        history = [
+            {
+                "role": "user",
+                "name": "caller",
+                "content": [{"type": "input_text", "text": "Read this"}],
+                "tool_calls": [{"id": "drop-user-call"}],
+                "metadata": {"drop": True},
+            },
+            {
+                "role": "assistant",
+                "name": "assistant-main",
+                "content": "",
+                "tool_calls": [{"id": "call-read", "type": "function"}],
+                "reasoning_content": "thinking",
+                "codex_reasoning_items": [{"id": "rs-1"}],
+                "codex_message_items": [{"id": "msg-1"}],
+                "tool_call_id": "drop-assistant-id",
+                "metadata": {"drop": True},
+            },
+            {
+                "role": "tool",
+                "name": "tool-runner",
+                "content": "ok",
+                "tool_call_id": "call-read",
+                "reasoning_content": "drop-tool-reasoning",
+                "codex_reasoning_items": [{"id": "drop-tool-rs"}],
+                "codex_message_items": [{"id": "drop-tool-msg"}],
+                "metadata": {"drop": True},
+            },
+        ]
+        payload = {
+            "model": "hermes-agent",
+            "input": [*history, {"role": "user", "content": "Summarize"}]
+            if input_mode == "array"
+            else "Summarize",
+        }
+        if input_mode == "explicit":
+            payload["conversation_history"] = history
+
+        async with TestClient(TestServer(_create_app(adapter))) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (
+                    {"final_response": "Done", "messages": [], "api_calls": 1},
+                    {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+                )
+                resp = await cli.post("/v1/responses", json=payload)
+
+        assert resp.status == 200
+        assert mock_run.call_args.kwargs["user_message"] == "Summarize"
+        assert mock_run.call_args.kwargs["conversation_history"] == [
+            {"role": "user", "name": "caller", "content": "Read this"},
+            {
+                "role": "assistant",
+                "name": "assistant-main",
+                "content": "",
+                "tool_calls": [{"id": "call-read", "type": "function"}],
+                "reasoning_content": "thinking",
+                "codex_reasoning_items": [{"id": "rs-1"}],
+                "codex_message_items": [{"id": "msg-1"}],
+            },
+            {"role": "tool", "name": "tool-runner", "content": "ok", "tool_call_id": "call-read"},
+        ]
 
 
     @pytest.mark.asyncio
@@ -2865,4 +2987,3 @@ class TestCreateAgentModelRecovery:
         )
         adapter._create_agent(session_id="another-session", gateway_session_key="stable-chan-1")
         assert captured[1]["model"] == "minimax/minimax-m3"
-

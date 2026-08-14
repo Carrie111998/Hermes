@@ -260,6 +260,83 @@ class TestStartRun:
         assert kwargs["requested_provider"] == "minimax"
         assert kwargs["model_options"] == model_options
 
+    @pytest.mark.parametrize("input_mode", ("array", "explicit"))
+    @pytest.mark.asyncio
+    async def test_start_history_allowlist_preserves_tool_chain(self, adapter, input_mode):
+        history = [
+            {
+                "role": "user",
+                "name": "caller",
+                "content": [{"type": "input_text", "text": "Read this"}],
+                "tool_calls": [{"id": "drop-user-call"}],
+                "metadata": {"drop": True},
+            },
+            {
+                "role": "assistant",
+                "name": "assistant-main",
+                "content": "",
+                "tool_calls": [{"id": "call-read", "type": "function"}],
+                "reasoning_content": "thinking",
+                "codex_reasoning_items": [{"id": "rs-1"}],
+                "codex_message_items": [{"id": "msg-1"}],
+                "tool_call_id": "drop-assistant-id",
+                "metadata": {"drop": True},
+            },
+            {
+                "role": "tool",
+                "name": "tool-runner",
+                "content": "ok",
+                "tool_call_id": "call-read",
+                "reasoning_content": "drop-tool-reasoning",
+                "codex_reasoning_items": [{"id": "drop-tool-rs"}],
+                "codex_message_items": [{"id": "drop-tool-msg"}],
+                "metadata": {"drop": True},
+            },
+        ]
+        payload = {
+            "input": [*history, {"role": "user", "content": "Summarize"}]
+            if input_mode == "array"
+            else "Summarize",
+        }
+        if input_mode == "explicit":
+            payload["conversation_history"] = history
+
+        async with TestClient(TestServer(_create_runs_app(adapter))) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                mock_agent = MagicMock()
+                mock_agent.run_conversation.return_value = {"final_response": "done"}
+                mock_agent.session_prompt_tokens = 0
+                mock_agent.session_completion_tokens = 0
+                mock_agent.session_total_tokens = 0
+                mock_create.return_value = mock_agent
+
+                start_resp = await cli.post("/v1/runs", json=payload)
+                assert start_resp.status == 202
+                run_id = (await start_resp.json())["run_id"]
+
+                for _ in range(20):
+                    status = await (await cli.get(f"/v1/runs/{run_id}")).json()
+                    if status["status"] == "completed":
+                        break
+                    await asyncio.sleep(0.05)
+
+                assert mock_agent.run_conversation.call_count == 1
+
+        assert mock_agent.run_conversation.call_args.kwargs["user_message"] == "Summarize"
+        assert mock_agent.run_conversation.call_args.kwargs["conversation_history"] == [
+            {"role": "user", "name": "caller", "content": "Read this"},
+            {
+                "role": "assistant",
+                "name": "assistant-main",
+                "content": "",
+                "tool_calls": [{"id": "call-read", "type": "function"}],
+                "reasoning_content": "thinking",
+                "codex_reasoning_items": [{"id": "rs-1"}],
+                "codex_message_items": [{"id": "msg-1"}],
+            },
+            {"role": "tool", "name": "tool-runner", "content": "ok", "tool_call_id": "call-read"},
+        ]
+
 
 # ---------------------------------------------------------------------------
 # GET /v1/runs/{run_id} — poll run status
