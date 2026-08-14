@@ -128,6 +128,31 @@ class TestLoadState:
 class TestSaveState:
     """Additional save-state edge cases beyond the brief's four."""
 
+    def test_save_state_returns_false_when_write_fails(self, tmp_path, monkeypatch):
+        """_save_state() returns False and does not raise when write fails."""
+        from events import rate_limit_signal
+        state_file = tmp_path / "state.json"
+        state = {
+            "provider/model": {
+                "opened_at": "2026-08-14T10:00:00Z",
+                "diverted_calls": 1,
+            }
+        }
+
+        with patch("events.paths.rate_limit_state_path", return_value=state_file):
+            rate_limit_signal.reset_state_cache()
+
+            # Mock os.fdopen to raise an exception (Windows-compatible)
+            def _boom(fd, *a, **k):
+                raise OSError("disk write failed")
+
+            monkeypatch.setattr("os.fdopen", _boom)
+
+            # The function should return False, not raise
+            result = rate_limit_signal._save_state(state)
+
+        assert result is False
+
     def test_save_creates_file_with_valid_json(self, tmp_path):
         """Saving state creates a valid, independently-parseable JSON file."""
         from events import rate_limit_signal
