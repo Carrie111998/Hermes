@@ -104,6 +104,24 @@ platforms:
 
 Telegram allows up to 100 BotCommands, but large command payloads can fail. Hermes defaults to 60 for reliability and clamps configured values to `1..100`; use `/commands` for the full command list.
 
+### Concurrent inbound updates (Optional)
+
+Telegram forum topics and chats have separate Hermes sessions. By default, Hermes
+therefore processes up to **4** inbound Telegram updates at once: one slow agent
+turn in a topic cannot prevent another topic from reaching its own session.
+Messages in the *same* topic remain serialized by the gateway's session guard.
+
+To choose a different bound, set `concurrent_updates` under Telegram's `extra`
+configuration. Hermes clamps it to `1..16`; use `1` only when you specifically
+need all inbound Telegram updates to be globally ordered.
+
+```yaml
+platforms:
+  telegram:
+    extra:
+      concurrent_updates: 4
+```
+
 ## Step 3: Privacy Mode (Critical for Groups)
 
 Telegram bots have a **privacy mode** that is **enabled by default**. This is the single most common source of confusion when using bots in groups.

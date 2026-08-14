@@ -685,6 +685,35 @@ class TelegramAdapter(BasePlatformAdapter):
     _TEXT_BATCH_SHORT_LEN = 1024
     _TEXT_BATCH_SHORT_DELAY_S = 0.24
 
+    # PTB processes one inbound update at a time unless configured otherwise.
+    # Hermes has per-session busy guards, so independent chats/forum topics can
+    # safely progress in parallel while messages in the same session remain
+    # serialized. Keep the default deliberately small: every slot can begin a
+    # tool-using agent turn.
+    _UPDATE_CONCURRENCY_DEFAULT = 4
+    _UPDATE_CONCURRENCY_MIN = 1
+    _UPDATE_CONCURRENCY_MAX = 16
+
+    def _update_concurrency(self) -> int:
+        """Return the bounded PTB inbound-update concurrency for this adapter."""
+        extra = getattr(self.config, "extra", {}) or {}
+        raw = extra.get("concurrent_updates", self._UPDATE_CONCURRENCY_DEFAULT)
+        try:
+            if isinstance(raw, bool):
+                raise ValueError("boolean is not a concurrency value")
+            value = int(raw)
+        except (TypeError, ValueError):
+            logger.warning(
+                "[%s] Invalid telegram.extra.concurrent_updates=%r; using %d",
+                self.name,
+                raw,
+                self._UPDATE_CONCURRENCY_DEFAULT,
+            )
+            return self._UPDATE_CONCURRENCY_DEFAULT
+        return max(
+            self._UPDATE_CONCURRENCY_MIN, min(value, self._UPDATE_CONCURRENCY_MAX)
+        )
+
     @staticmethod
     def _env_float_clamped(
         name: str,
@@ -4018,6 +4047,7 @@ class TelegramAdapter(BasePlatformAdapter):
 
             # Build the application
             builder = Application.builder().token(self.config.token)
+            builder = builder.concurrent_updates(self._update_concurrency())
             custom_base_url = self.config.extra.get("base_url")
             if custom_base_url:
                 builder = builder.base_url(custom_base_url)
