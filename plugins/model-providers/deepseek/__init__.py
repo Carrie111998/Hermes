@@ -7,11 +7,19 @@ replays history this lands on the notorious HTTP 400
 ``reasoning_content must be passed back`` error after the first tool call
 (#15700, #17212, #17825).
 
-This profile overrides :meth:`build_api_kwargs_extras` to mirror the Kimi /
-Moonshot wire shape that DeepSeek's OpenAI-compat endpoint expects:
+This profile overrides :meth:`build_api_kwargs_extras` to produce the exact
+wire shape DeepSeek's OpenAI-compat endpoint expects:
 
-    {"reasoning_effort": "<low|medium|high|max>",
+    {"reasoning_effort": "<high|max>",
      "extra_body": {"thinking": {"type": "enabled" | "disabled"}}}
+
+Effort vocabulary is the official DeepSeek one — ``off|high|max`` on the
+wire.  ``off`` (and the user-facing alias ``none``) disable thinking mode
+entirely, so no ``reasoning_effort`` is sent.  ``low`` / ``medium`` /
+``minimal`` normalize to ``high`` (DeepSeek maps them server-side to high
+anyway) and ``xhigh`` / ``ultra`` normalize to ``max``.  Any other value
+raises ``ValueError`` *before* any I/O so a bad config fails loudly instead
+of silently degrading to the server default.
 
 Non-thinking models (``deepseek-v3-*`` variants) are left as no-ops so we
 don't perturb the V3 wire format.
@@ -46,6 +54,26 @@ def _model_supports_thinking(model: str | None) -> bool:
     return False
 
 
+# Effort values that disable thinking mode entirely (official "off" plus the
+# user-facing "none" alias).  No reasoning_effort goes on the wire.
+_DEEPSEEK_DISABLE_EFFORTS = frozenset({"none", "off"})
+
+# User-facing effort → official DeepSeek wire vocabulary (off|high|max).
+# DeepSeek's server maps medium/xhigh to high (api-docs.deepseek.com, thinking
+# mode guide); low is normalized to high here too so the wire only ever
+# carries the official off|high|max set.  xhigh/ultra have historically
+# resolved to max in Hermes and keep doing so.
+_DEEPSEEK_EFFORT_ALIASES = {
+    "minimal": "high",
+    "low": "high",
+    "medium": "high",
+    "high": "high",
+    "xhigh": "max",
+    "max": "max",
+    "ultra": "max",
+}
+
+
 class DeepSeekProfile(ProviderProfile):
     """DeepSeek — extra_body.thinking + top-level reasoning_effort."""
 
@@ -66,21 +94,45 @@ class DeepSeekProfile(ProviderProfile):
         if isinstance(reasoning_config, dict) and reasoning_config.get("enabled") is False:
             enabled = False
 
-        extra_body["thinking"] = {"type": "enabled" if enabled else "disabled"}
-
         if not enabled:
+            # Thinking off → explicit disabled marker (DeepSeek defaults to ON
+            # when the field is absent) and NO reasoning_effort on the wire —
+            # DeepSeek rejects effort alongside disabled thinking.
+            extra_body["thinking"] = {"type": "disabled"}
             return extra_body, top_level
 
-        # Effort mapping. Pass low/medium/high through; stronger levels → max.
-        # When no effort is set we omit reasoning_effort so DeepSeek applies
-        # its server default (currently high).
-        if isinstance(reasoning_config, dict):
-            effort = (reasoning_config.get("effort") or "").strip().lower()
-            if effort in {"xhigh", "max", "ultra"}:
-                top_level["reasoning_effort"] = "max"
-            elif effort in {"low", "medium", "high"}:
-                top_level["reasoning_effort"] = effort
+        effort = reasoning_config.get("effort") if isinstance(reasoning_config, dict) else None
+        if effort is None:
+            effort = ""
+        if not isinstance(effort, str):
+            effort = str(effort)
+        effort = effort.strip().lower()
 
+        if not effort:
+            # Unset → omit reasoning_effort so DeepSeek applies its server
+            # default (currently high).
+            extra_body["thinking"] = {"type": "enabled"}
+            return extra_body, top_level
+
+        if effort in _DEEPSEEK_DISABLE_EFFORTS:
+            # "off" / "none" → thinking disabled, no effort on the wire.
+            # Matches the official vocabulary: off is not a wire effort, it
+            # is the disabled switch.
+            extra_body["thinking"] = {"type": "disabled"}
+            return extra_body, top_level
+
+        mapped = _DEEPSEEK_EFFORT_ALIASES.get(effort)
+        if mapped is None:
+            # Invalid effort must fail BEFORE any I/O with a clear error —
+            # never silently degrade to the server default.
+            raise ValueError(
+                f"DeepSeek does not support reasoning effort {effort!r}; expected one of "
+                "off, none, minimal, low, medium, high, xhigh, max, ultra "
+                "(wire vocabulary: off|high|max)"
+            )
+
+        extra_body["thinking"] = {"type": "enabled"}
+        top_level["reasoning_effort"] = mapped
         return extra_body, top_level
 
 

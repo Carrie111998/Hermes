@@ -45,21 +45,41 @@ class TestDeepSeekThinkingWireShape:
         assert top_level == {}
 
 
-    @pytest.mark.parametrize("effort", ["low", "medium", "high"])
-    def test_standard_efforts_pass_through(self, deepseek_profile, effort):
+    @pytest.mark.parametrize(
+        "effort,expected",
+        [
+            ("low", "high"),      # low/medium are not official wire values — normalize to high
+            ("medium", "high"),
+            ("high", "high"),
+            ("minimal", "high"),  # user-facing alias; nearest official level is low → high
+        ],
+    )
+    def test_efforts_normalize_to_high(self, deepseek_profile, effort, expected):
         _, top_level = deepseek_profile.build_api_kwargs_extras(
             reasoning_config={"enabled": True, "effort": effort},
             model="deepseek-v4-pro",
         )
-        assert top_level == {"reasoning_effort": effort}
+        assert top_level == {"reasoning_effort": expected}
 
-    @pytest.mark.parametrize("effort", ["xhigh", "max", "MAX", "  Max  "])
+    @pytest.mark.parametrize("effort", ["xhigh", "max", "ultra", "MAX", "  Max  "])
     def test_xhigh_and_max_normalize_to_max(self, deepseek_profile, effort):
         _, top_level = deepseek_profile.build_api_kwargs_extras(
             reasoning_config={"enabled": True, "effort": effort},
             model="deepseek-v4-pro",
         )
         assert top_level == {"reasoning_effort": "max"}
+
+    @pytest.mark.parametrize("effort", ["off", "none", "OFF", "  off  "])
+    def test_off_and_none_disable_thinking(self, deepseek_profile, effort):
+        """The official vocabulary's ``off`` (and the ``none`` alias) is the
+        disabled switch — thinking.type=disabled and NO reasoning_effort on
+        the wire (DeepSeek rejects effort alongside disabled thinking)."""
+        extra_body, top_level = deepseek_profile.build_api_kwargs_extras(
+            reasoning_config={"enabled": True, "effort": effort},
+            model="deepseek-v4-pro",
+        )
+        assert extra_body == {"thinking": {"type": "disabled"}}
+        assert top_level == {}
 
     def test_explicitly_disabled_sends_disabled_marker(self, deepseek_profile):
         """``reasoning_config.enabled=False`` → ``thinking.type=disabled``.
@@ -75,20 +95,36 @@ class TestDeepSeekThinkingWireShape:
         assert top_level == {}
 
     def test_disabled_ignores_effort_field(self, deepseek_profile):
-        """Effort silently dropped when thinking is off."""
+        """Effort silently dropped when thinking is off (user choice wins)."""
         _, top_level = deepseek_profile.build_api_kwargs_extras(
             reasoning_config={"enabled": False, "effort": "high"},
             model="deepseek-v4-pro",
         )
         assert top_level == {}
 
-    def test_unknown_effort_omits_top_level(self, deepseek_profile):
-        """Garbage effort → omit reasoning_effort so DeepSeek applies its default."""
-        _, top_level = deepseek_profile.build_api_kwargs_extras(
-            reasoning_config={"enabled": True, "effort": "garbage"},
-            model="deepseek-v4-pro",
-        )
-        assert top_level == {}
+    @pytest.mark.parametrize("effort", ["garbage", "turbo", "5", "ultra-fast"])
+    def test_unknown_effort_raises_before_io(self, deepseek_profile, effort):
+        """Invalid effort must fail with a clear error BEFORE any I/O — never
+        silently degrade to the server default."""
+        with pytest.raises(ValueError) as exc:
+            deepseek_profile.build_api_kwargs_extras(
+                reasoning_config={"enabled": True, "effort": effort},
+                model="deepseek-v4-pro",
+            )
+        message = str(exc.value)
+        assert "DeepSeek" in message
+        assert "off|high|max" in message
+        assert effort in message
+
+    def test_non_string_effort_raises_clear_error(self, deepseek_profile):
+        """Numeric/bool effort values must not crash with AttributeError —
+        they are invalid and raise the same pre-I/O ValueError."""
+        with pytest.raises(ValueError) as exc:
+            deepseek_profile.build_api_kwargs_extras(
+                reasoning_config={"enabled": True, "effort": 5},
+                model="deepseek-v4-pro",
+            )
+        assert "does not support reasoning effort" in str(exc.value)
 
     def test_empty_effort_omits_top_level(self, deepseek_profile):
         _, top_level = deepseek_profile.build_api_kwargs_extras(

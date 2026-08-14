@@ -3449,6 +3449,37 @@ def sanitize_api_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]
             dropped_empty_tool_calls,
         )
 
+    # --- Assistant content: "" never null on the wire ---
+    # Reasoning-only turns (the model answers entirely in the reasoning
+    # channel, e.g. a DeepSeek v4-flash greeting) and host-fed histories can
+    # persist assistant messages with explicit content=None.  OpenAI-compatible
+    # endpoints reject a null-content assistant turn that also lacks
+    # tool_calls ("content or tool_calls must be set" — DeepSeek 400), and
+    # strict gateways reject null outright.  The official DeepSeek samples
+    # replay text-less turns as content:"" — normalize an EXPLICIT None to ""
+    # here, on the per-call copy, so stored history (and prompt caching) stays
+    # byte-stable.  An ABSENT content key is left untouched: it serializes as
+    # an absent field (not null) and clean histories pass through by identity.
+    content_fixed = 0
+    normalized = []
+    for msg in messages:
+        if (
+            isinstance(msg, dict)
+            and msg.get("role") == "assistant"
+            and "content" in msg
+            and msg["content"] is None
+        ):
+            msg = {**msg, "content": ""}
+            content_fixed += 1
+        normalized.append(msg)
+    if content_fixed:
+        messages = normalized
+        _ra().logger.debug(
+            "Pre-call sanitizer: normalized content=None to '' on %d "
+            "assistant message(s)",
+            content_fixed,
+        )
+
     # --- Repair tool_calls whose function.name is empty/missing ---
     # Some providers (and partially-streamed responses) emit a tool_call with
     # id="call_xxx" but function.name="". Downstream Responses-API adapters
@@ -3742,12 +3773,18 @@ def copy_reasoning_content_for_api(agent, source_msg: dict, api_msg: dict) -> No
 
     Forwarder — the strip-vs-repad POLICY is owned by
     ``agent.message_sanitization.apply_reasoning_content_policy`` (audit F4);
-    this only supplies the agent's cached provider-direction flag.
+    this only supplies the agent's cached provider-direction flag.  The
+    ``native_deepseek`` flag narrows the policy to the conditional passback
+    (reasoning_content dropped on plain, non-tool-call turns) for the native
+    DeepSeek API only.
     """
     from agent.message_sanitization import apply_reasoning_content_policy
 
     apply_reasoning_content_policy(
-        source_msg, api_msg, agent._needs_thinking_reasoning_pad()
+        source_msg,
+        api_msg,
+        agent._needs_thinking_reasoning_pad(),
+        native_deepseek=agent._is_native_deepseek_endpoint(),
     )
 
 
@@ -3773,6 +3810,12 @@ def reapply_reasoning_echo_for_provider(agent, api_messages: list) -> int:
       fallback bug from #45655 — a DeepSeek primary pads history with ``" "``,
       the request falls back to Mistral, and Mistral 422s on the stale pad.
 
+    On the NATIVE DeepSeek endpoint the reconciliation additionally applies
+    the conditional passback: plain (non-tool-call) assistant turns never
+    carry ``reasoning_content`` on the wire (the API ignores it there), so
+    pads baked in under a prior provider are stripped even though the
+    endpoint is a require-side one.
+
     Calling this immediately before building the request kwargs reconciles the
     fields against the *current* provider.  It is idempotent and safe to call
     every iteration; it covers every fallback path.
@@ -3783,7 +3826,9 @@ def reapply_reasoning_echo_for_provider(agent, api_messages: list) -> int:
     from agent.message_sanitization import reapply_reasoning_echo
 
     return reapply_reasoning_echo(
-        api_messages, agent._needs_thinking_reasoning_pad()
+        api_messages,
+        agent._needs_thinking_reasoning_pad(),
+        native_deepseek=agent._is_native_deepseek_endpoint(),
     )
 
 

@@ -249,6 +249,13 @@ class ChatCompletionsTransport(ProviderTransport):
           gateways (e.g. opencode-go, codex.nekos.me) reject with
           ``Extra inputs are not permitted, field: 'messages[N]._empty_recovery_synthetic'``,
           which then poisons every subsequent request in the session.
+        - Assistant ``content: null`` → normalized to ``""``. Reasoning-only
+          turns (model answered entirely in the reasoning channel) and
+          host-fed histories can persist an explicit ``content=None``;
+          OpenAI-compatible endpoints reject a null-content assistant turn
+          that also lacks ``tool_calls`` ("content or tool_calls must be set"
+          — DeepSeek 400) and strict gateways reject null outright.  An
+          absent content key is left untouched.
         """
         strip_extra_content = not _model_consumes_thought_signature(
             kwargs.get("model")
@@ -268,6 +275,21 @@ class ChatCompletionsTransport(ProviderTransport):
                 needs_sanitize = True
                 break
             if any(isinstance(k, str) and k.startswith("_") for k in msg):
+                needs_sanitize = True
+                break
+            # Assistant turns must never carry content:null on the wire.
+            # Reasoning-only turns and host-fed histories can persist an
+            # explicit content=None; OpenAI-compat endpoints reject a
+            # null-content assistant turn that also lacks tool_calls
+            # ("content or tool_calls must be set" — DeepSeek 400), and
+            # strict gateways reject null outright.  An ABSENT content key is
+            # left untouched (serializes as absent, not null — clean histories
+            # pass through by identity).
+            if (
+                msg.get("role") == "assistant"
+                and "content" in msg
+                and msg["content"] is None
+            ):
                 needs_sanitize = True
                 break
             tool_calls = msg.get("tool_calls")
@@ -325,6 +347,17 @@ class ChatCompletionsTransport(ProviderTransport):
                 out_msg = mutable_msg()
                 for key in internal_keys:
                     out_msg.pop(key, None)
+
+            # Assistant turns must never carry content:null on the wire.
+            # Normalize an explicit None → "" (the official DeepSeek samples
+            # replay text-less turns as ""); the stored history stays
+            # untouched.  Absent content keys are left alone.
+            if (
+                msg.get("role") == "assistant"
+                and "content" in msg
+                and msg["content"] is None
+            ):
+                mutable_msg()["content"] = ""
 
             tool_calls = msg.get("tool_calls")
             if isinstance(tool_calls, list):
