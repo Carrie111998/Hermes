@@ -7132,16 +7132,17 @@ def _parse_model_ids(resp: "Any") -> List[str]:
 
 
 _ENDPOINT_PROBE_BLOCKED_MSG = "That URL targets a blocked internal address."
+_ENDPOINT_PROBE_DNS_TIMEOUT_SECONDS = 2.0
 
 
-def _endpoint_probe_blocked_reason(url: str) -> Optional[str]:
+async def _endpoint_probe_blocked_reason(url: str) -> Optional[str]:
     """Return a user-facing reason when *url* must not be fetched server-side.
 
     Custom-endpoint / ``OPENAI_BASE_URL`` validation intentionally allows
     loopback and private LAN targets (local Ollama, vLLM, llama.cpp). The
     security floor is http(s) only plus the shared always-blocked cloud
-    metadata policy from ``tools.url_safety`` (CWE-918). Preflight alone is
-    not enough — callers must also probe via
+    metadata policy from ``tools.url_safety`` (CWE-918). DNS preflight runs
+    off the event loop with a bounded timeout; callers must also probe via
     ``create_ssrf_safe_async_client(allow_private_urls=True)`` so DNS rebinding
     cannot flip a hostname to metadata at connect time.
     """
@@ -7153,7 +7154,14 @@ def _endpoint_probe_blocked_reason(url: str) -> Optional[str]:
         return "Only http:// and https:// endpoint URLs are allowed."
     if not (parsed.hostname or "").strip():
         return "Enter a valid endpoint URL with a hostname."
-    if is_always_blocked_url(url):
+    try:
+        blocked = await asyncio.wait_for(
+            asyncio.to_thread(is_always_blocked_url, url),
+            timeout=_ENDPOINT_PROBE_DNS_TIMEOUT_SECONDS,
+        )
+    except Exception:
+        return "Could not safely resolve that endpoint URL."
+    if blocked:
         return _ENDPOINT_PROBE_BLOCKED_MSG
     return None
 
@@ -7491,7 +7499,7 @@ async def validate_custom_endpoint(body: CustomEndpointUpdate):
         return {"ok": False, "reachable": True, "message": "Enter an endpoint URL first.", "models": []}
 
     url = base_url + "/models"
-    blocked = _endpoint_probe_blocked_reason(url)
+    blocked = await _endpoint_probe_blocked_reason(url)
     if blocked:
         return {"ok": False, "reachable": False, "message": blocked, "models": []}
 
@@ -7549,7 +7557,7 @@ async def validate_provider_credential(body: EnvVarUpdate, request: Request):
         from tools.url_safety import SSRFConnectionBlocked
 
         url = value.rstrip("/") + "/models"
-        blocked = _endpoint_probe_blocked_reason(url)
+        blocked = await _endpoint_probe_blocked_reason(url)
         if blocked:
             return {"ok": False, "reachable": False, "message": blocked, "models": []}
         # Send the optional API key so endpoints that require auth on

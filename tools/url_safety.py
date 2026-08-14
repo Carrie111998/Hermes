@@ -192,6 +192,7 @@ _ALWAYS_BLOCKED_IPS = frozenset({
 _ALWAYS_BLOCKED_NETWORKS = (
     ipaddress.ip_network("169.254.0.0/16"),    # Entire link-local range (no legit agent target)
     ipaddress.ip_network("::ffff:169.254.0.0/112"), # IPv4-mapped link-local range
+    ipaddress.ip_network("fe80::/10"),         # IPv6 link-local range
 )
 
 # Exact HTTPS hostnames allowed to resolve to private/benchmark-space IPs.
@@ -351,9 +352,12 @@ def is_always_blocked_url(url: str) -> bool:
             )
             return True
 
-        # Literal IP → check directly against the always-blocked set
+        # Literal IP → check directly against the always-blocked set. Strip a
+        # URI zone identifier first so scoped IPv6 link-local forms cannot be
+        # mistaken for hostnames and fall through to DNS-failure handling.
+        literal_hostname = hostname.split("%", 1)[0]
         try:
-            ip = ipaddress.ip_address(hostname)
+            ip = ipaddress.ip_address(literal_hostname)
         except ValueError:
             ip = None
 

@@ -4041,6 +4041,34 @@ class TestValidateProviderCredential:
         assert data["reachable"] is False
         assert "blocked" in data["message"].lower()
 
+    def test_openai_base_url_blocks_scoped_ipv6_link_local(self, monkeypatch):
+        called = []
+
+        class _Client:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+            async def get(self, *args, **kwargs):
+                called.append(True)
+                raise AssertionError("IPv6 link-local target must not be fetched")
+
+        monkeypatch.setattr(
+            "tools.url_safety.create_ssrf_safe_async_client",
+            lambda **kwargs: _Client(**kwargs),
+        )
+        data = self._post(
+            "OPENAI_BASE_URL", "http://[fe80::1%25eth0]/v1"
+        ).json()
+        assert data["ok"] is False
+        assert data["reachable"] is False
+        assert called == []
+
 
 class TestValidateCustomEndpointSsrf:
     """SSRF floor for POST /api/providers/custom-endpoints/validate."""
@@ -4062,6 +4090,54 @@ class TestValidateCustomEndpointSsrf:
             "/api/providers/custom-endpoints/validate",
             json={"name": "probe", "base_url": base_url, "model": "m"},
         )
+
+    @pytest.mark.asyncio
+    async def test_dns_preflight_runs_off_event_loop(self, monkeypatch):
+        import threading
+
+        from hermes_cli import web_server
+
+        event_loop_thread = threading.get_ident()
+        resolver_threads = []
+
+        def _check(_url):
+            resolver_threads.append(threading.get_ident())
+            return True
+
+        monkeypatch.setattr("tools.url_safety.is_always_blocked_url", _check)
+        result = await web_server.validate_custom_endpoint(
+            web_server.CustomEndpointUpdate(
+                name="probe", base_url="https://example.com/v1", model="m"
+            )
+        )
+
+        assert result["ok"] is False
+        assert resolver_threads
+        assert resolver_threads[0] != event_loop_thread
+
+    @pytest.mark.asyncio
+    async def test_dns_preflight_timeout_fails_closed(self, monkeypatch):
+        from hermes_cli import web_server
+
+        original_wait_for = asyncio.wait_for
+
+        async def _timeout(awaitable, *, timeout):
+            awaitable.close()
+            raise TimeoutError
+
+        monkeypatch.setattr(web_server.asyncio, "wait_for", _timeout)
+        try:
+            result = await web_server.validate_custom_endpoint(
+                web_server.CustomEndpointUpdate(
+                    name="probe", base_url="https://example.com/v1", model="m"
+                )
+            )
+        finally:
+            monkeypatch.setattr(web_server.asyncio, "wait_for", original_wait_for)
+
+        assert result["ok"] is False
+        assert result["reachable"] is False
+        assert "safely resolve" in result["message"].lower()
 
     @pytest.mark.parametrize(
         "base_url",
