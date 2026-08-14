@@ -274,6 +274,57 @@ def test_heartbeat_blocks_independent_consumer_theft_during_long_injection(
     assert row["delivery_attempts"] == 1  # failed thief claims burned nothing
 
 
+def test_slow_preflight_holds_no_lease_so_independent_runner_delivers_once(
+    monkeypatch, isolated_state,
+):
+    """The target pre-flight can await past the claim TTL. A lease acquired
+    BEFORE the pre-flight sat un-heartbeated through that await, letting an
+    independent runner steal the row — both adapters accepted (two turns).
+    Pre-flight now runs claim-free: the slow caller's later claim simply
+    fails; exactly one acceptance, one attempt, row delivered."""
+    monkeypatch.setattr(ad, "_DELIVERY_CLAIM_TTL_S", 0.15)
+    evt = _persist_completion_without_wake("deleg_preflight")
+    evt["parent_session_id"] = "parent-x"
+
+    entered_preflight = asyncio.Event()
+    unblock_preflight = asyncio.Event()
+
+    adapter_a = SimpleNamespace(handle_message=AsyncMock())
+    adapter_b = SimpleNamespace(handle_message=AsyncMock())
+    runner_a = _runner(adapter_a)
+    runner_b = _runner(adapter_b)
+
+    async def _slow_classify(_parent):
+        entered_preflight.set()
+        await unblock_preflight.wait()
+        return "deliver"
+
+    async def _fast_classify(_parent):
+        return "deliver"
+
+    runner_a._classify_completion_target = _slow_classify
+    runner_b._classify_completion_target = _fast_classify
+
+    async def _exercise():
+        first = asyncio.create_task(
+            runner_a._deliver_completion_notification("t", dict(evt))
+        )
+        await asyncio.wait_for(entered_preflight.wait(), 5)
+        await asyncio.sleep(0.25)  # pre-flight outlasts the compressed TTL
+        second = await runner_b._deliver_completion_notification("t", dict(evt))
+        unblock_preflight.set()
+        return await first, second
+
+    first, second = asyncio.run(_exercise())
+    assert second is True  # the independent runner delivered
+    assert first is None  # slow caller's post-preflight claim failed cleanly
+    adapter_b.handle_message.assert_awaited_once()
+    adapter_a.handle_message.assert_not_awaited()  # exactly ONE accepted turn
+    row = ad.get_durable_delegation("deleg_preflight")
+    assert row["delivery_state"] == "delivered"
+    assert row["delivery_attempts"] == 1  # the loser burned no attempt
+
+
 def test_accepted_delivery_reconciles_when_claim_scoped_ack_fails(
     monkeypatch, isolated_state,
 ):

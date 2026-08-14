@@ -274,9 +274,35 @@ def _connect() -> sqlite3.Connection:
 
 
 def _initialize_schema(conn: sqlite3.Connection) -> None:
+    """Create/upgrade the schema inside ONE cross-process critical section.
+
+    ``_DB_LOCK`` is process-local, so two processes making their FIRST
+    connection concurrently used to race the PRAGMA-inspect → ALTER sequence:
+    both saw a column missing, both issued the ALTER, and the loser died with
+    ``OperationalError: duplicate column name`` before ever reaching the
+    unique-index arbitration. ``BEGIN IMMEDIATE`` takes SQLite's database
+    write lock up front (honoring the connection's busy timeout), making the
+    whole inspect→ALTER→index section atomic across processes: the loser
+    blocks, then re-inspects a schema the winner already migrated and no-ops.
+    Individual duplicate-column catches would NOT be equivalent — the column
+    checks, the unique index, and any future migration must observe one
+    consistent schema snapshot. Rolled back wholesale on any error; the loud
+    duplicate-slot RuntimeError below is preserved verbatim.
+    """
     from hermes_state import apply_wal_with_fallback
 
     apply_wal_with_fallback(conn, db_label="state.db (async_delegation)")
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        _apply_schema_locked(conn)
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+
+
+def _apply_schema_locked(conn: sqlite3.Connection) -> None:
+    """Schema DDL body; caller holds the BEGIN IMMEDIATE write transaction."""
     conn.execute(
         """CREATE TABLE IF NOT EXISTS async_delegations (
             delegation_id TEXT PRIMARY KEY,

@@ -23761,13 +23761,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
            post-TTL duplicate steal the durable claim and then early-return on
            the inflight check WITHOUT releasing it, stranding the first
            caller's accepted delivery unable to ack (row pending forever).
-        2. Every exit after the reservation runs through ONE ``finally`` that
-           removes the reservation and releases the claim on non-acceptance.
-        3. While the adapter injection is in flight, the durable claim is
-           HEARTBEAT-renewed at well under the claim TTL, so a genuinely long
+        2. The target/session pre-flight runs BEFORE the durable claim, while
+           this caller holds NO lease. The pre-flight awaits the session DB
+           and can outlast the claim TTL; a lease acquired ahead of it sat
+           un-heartbeated through that await, an independent runner stole the
+           row, and BOTH adapters accepted (duplicate turns). With no claim
+           held, a slow pre-flight costs nothing: if another process delivers
+           meanwhile, this caller's later claim simply fails — no duplicate,
+           no wasted attempt.
+        3. The claim-lease heartbeat starts immediately after the claim, with
+           no awaits in between, and renews at well under the claim TTL for
+           as long as the adapter injection is in flight — a genuinely long
            injection cannot lose its lease to an independent consumer
            mid-delivery.
-        4. Adapter acceptance is positive delivery truth. If the claim-scoped
+        4. Every exit after the reservation runs through ONE ``finally`` that
+           removes the reservation and releases the claim on non-acceptance.
+        5. Adapter acceptance is positive delivery truth. If the claim-scoped
            ack then reports no matching pending+claim row (lease raced away
            despite the heartbeat), the row is reconciled to 'delivered' via
            the unconditional acceptance-finalize primitive — accepted truth is
@@ -23789,6 +23798,50 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         try:
             if evt.get("type") == "async_delegation":
                 durable_delegation_id = str(evt.get("delegation_id") or "")
+                parent_session_id = str(evt.get("parent_session_id") or "").strip()
+                if parent_session_id:
+                    # Pre-flight (#65838-class): adapter acceptance is NOT
+                    # proof of delivery — the inner #55578 resolver can still
+                    # fail closed inside the message pipeline AFTER the
+                    # adapter accepted, which would falsely acknowledge the
+                    # durable row as delivered. Verify the target here, before
+                    # acceptance, and give drops an honest durable disposition.
+                    # Runs BEFORE the durable claim (protocol step 2): this
+                    # await can outlast the claim TTL, and no lease may sit
+                    # un-heartbeated through it.
+                    verdict = await self._classify_completion_target(parent_session_id)
+                    if verdict == "terminal":
+                        logger.warning(
+                            "Async delegation %s targets permanently-gone session %s; "
+                            "terminally dropping delivery (result remains in the "
+                            "delegation records).",
+                            durable_delegation_id or "<legacy>", parent_session_id,
+                        )
+                        if durable_delegation_id:
+                            # Take custody only to record the honest terminal
+                            # disposition; a failed claim means another
+                            # consumer owns the row and decides for itself.
+                            try:
+                                from tools.async_delegation import (
+                                    claim_completion_delivery,
+                                    drop_completion_delivery,
+                                )
+
+                                _drop_claim = f"gateway:{id(self)}:{__import__('uuid').uuid4().hex}"
+                                if claim_completion_delivery(
+                                    durable_delegation_id, _drop_claim,
+                                ):
+                                    drop_completion_delivery(
+                                        durable_delegation_id, _drop_claim,
+                                    )
+                            except Exception:
+                                logger.debug(
+                                    "Could not drop durable completion claim",
+                                    exc_info=True,
+                                )
+                        return None
+                    if verdict == "retry":
+                        return False  # nothing claimed yet — plain retry
                 if durable_delegation_id:
                     try:
                         from tools.async_delegation import claim_completion_delivery
@@ -23806,39 +23859,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         )
                         durable_claim_id = ""
                         return False
-                parent_session_id = str(evt.get("parent_session_id") or "").strip()
-                if parent_session_id:
-                    # Pre-flight (#65838-class): adapter acceptance is NOT
-                    # proof of delivery — the inner #55578 resolver can still
-                    # fail closed inside the message pipeline AFTER the
-                    # adapter accepted, which would falsely acknowledge the
-                    # durable row as delivered. Verify the target here, before
-                    # acceptance, and give drops an honest durable disposition.
-                    verdict = await self._classify_completion_target(parent_session_id)
-                    if verdict == "terminal":
-                        logger.warning(
-                            "Async delegation %s targets permanently-gone session %s; "
-                            "terminally dropping delivery (result remains in the "
-                            "delegation records).",
-                            durable_delegation_id or "<legacy>", parent_session_id,
-                        )
-                        if durable_claim_id:
-                            try:
-                                from tools.async_delegation import drop_completion_delivery
 
-                                drop_completion_delivery(
-                                    durable_delegation_id, durable_claim_id,
-                                )
-                                durable_claim_id = ""
-                            except Exception:
-                                logger.debug(
-                                    "Could not drop durable completion claim",
-                                    exc_info=True,
-                                )
-                        return None
-                    if verdict == "retry":
-                        return False  # finally releases the claim for retry
-
+            # Protocol step 3: the lease heartbeat starts immediately after
+            # the claim — no awaits in between.
             heartbeat_task = None
             if durable_claim_id:
                 heartbeat_task = asyncio.create_task(

@@ -49,6 +49,27 @@ def _slot_race_worker(hermes_home, notification_id, barrier, results):
         results.put((notification_id, f"error:{type(exc).__name__}:{exc}"))
 
 
+def _schema_init_worker(hermes_home, worker_id, barrier, results):
+    """Spawn-context worker: perform the FIRST schema initialization.
+
+    Both workers hit a pristine state.db simultaneously — the regression this
+    guards is the PRAGMA-inspect → ALTER race under only the process-local
+    lock (`OperationalError: duplicate column name: supersedes_before`),
+    which the BEGIN IMMEDIATE schema critical section must serialize.
+    """
+    os.environ["HERMES_HOME"] = hermes_home
+    try:
+        from tools import async_delegation as child_ad
+
+        child_ad._reset_for_tests()
+        barrier.wait(timeout=15)
+        conn = child_ad._connect()
+        conn.close()
+        results.put((worker_id, "ok"))
+    except Exception as exc:  # noqa: BLE001 — surfaced to the parent assert
+        results.put((worker_id, f"error:{type(exc).__name__}:{exc}"))
+
+
 @pytest.fixture(autouse=True)
 def _isolated(tmp_path, monkeypatch):
     """Fresh HERMES_HOME state.db and an isolated wake queue per test."""
@@ -846,6 +867,44 @@ def test_cross_process_slot_race_yields_one_row_one_conflict(tmp_path, _isolated
         ).fetchall()
     assert len(slot_rows) == 1  # the DB index is the cross-process arbiter
     assert slot_rows[0][0] == winner
+
+
+def test_simultaneous_first_schema_initialization_is_serialized(tmp_path, _isolated):
+    """Two fresh processes racing the FIRST connect against a pristine
+    HERMES_HOME must both succeed — the whole inspect→ALTER→index section is
+    one BEGIN IMMEDIATE critical section, so the loser re-inspects the
+    winner's migrated schema instead of dying on a duplicate-column ALTER."""
+    try:
+        ctx = multiprocessing.get_context("spawn")
+        barrier = ctx.Barrier(2)
+        results = ctx.Queue()
+    except (ValueError, OSError, ImportError) as exc:
+        pytest.skip(f"multiprocessing spawn primitives unavailable: {exc}")
+
+    pristine_home = tmp_path / "pristine-first-init"
+    pristine_home.mkdir()
+    procs = [
+        ctx.Process(
+            target=_schema_init_worker,
+            args=(str(pristine_home), f"init-{i}", barrier, results),
+        )
+        for i in range(2)
+    ]
+    for p in procs:
+        p.start()
+    outcomes = {}
+    try:
+        for _ in procs:
+            worker_id, status = results.get(timeout=60)
+            outcomes[worker_id] = status
+    finally:
+        for p in procs:
+            p.join(timeout=30)
+            if p.is_alive():
+                p.terminate()
+                p.join(timeout=10)
+    assert [p.exitcode for p in procs] == [0, 0]
+    assert outcomes == {"init-0": "ok", "init-1": "ok"}
 
 
 def test_schema_init_fails_loudly_on_preexisting_duplicate_slots(_isolated):
