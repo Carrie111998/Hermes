@@ -4,9 +4,12 @@ import { test } from 'vitest'
 
 import { profileSshOverride } from './connection-config'
 import {
+  buildMachineServeCommand,
   buildSpawnCommand,
+  classifyPrintTokenError,
   cleanupStale,
   connect,
+  DEFAULT_MACHINE_SERVE_PORT,
   expandRemotePath,
   fingerprintToken,
   isForwardBindCollision,
@@ -186,6 +189,16 @@ test('locateHermes uses a login shell for the command -v probe', async () => {
     'must probe in a login shell (PATH pitfall)'
   )
 })
+
+test('locateHermes prefers ~/.hermes/bin/hermes over ~/.local/bin', async () => {
+  const ssh = fakeSsh([
+    [/command -v hermes/, ''],
+    [/\[ -x .*\/\.hermes\/bin\/hermes/, 'OK']
+  ])
+
+  assert.equal(await locateHermes(ssh, ''), '~/.hermes/bin/hermes')
+})
+
 
 test('probeRemotePlatform accepts Linux and macOS', async () => {
   assert.deepEqual(await probeRemotePlatform(fakeSsh([[/uname/, 'Linux\nx86_64']])), {
@@ -444,6 +457,96 @@ test('connect() spawns fresh when there is no lockfile, adopts the served token'
   assert.equal(result.baseUrl, 'http://127.0.0.1:50001')
   assert.equal(result.tokenFingerprint, fingerprintToken('the-served-token'))
 })
+
+test('connect() attaches to an existing machine serve via print-session-token', async () => {
+  const ssh = fakeSsh([
+    [/uname/, 'Linux\nx86_64'],
+    [/\[ -x/, 'OK'],
+    [/grep -q print-session-token/, 'YES\n'],
+    [/--print-session-token/, 'loopback-token\n']
+  ])
+
+  const result = await connect(connectDeps(ssh))
+
+  assert.equal(result.reused, true)
+  assert.equal(result.remotePort, DEFAULT_MACHINE_SERVE_PORT)
+  assert.equal(result.localPort, 50001)
+  assert.equal(result.token, 'loopback-token')
+  assert.equal(result.baseUrl, 'http://127.0.0.1:50001')
+  assert.ok(!ssh.calls.some(command => /--isolated/.test(command)))
+})
+
+test('connect() starts a machine serve when 9119 is empty', async () => {
+  let prints = 0
+  const ssh = fakeSsh([
+    [/uname/, 'Linux\nx86_64'],
+    [/\[ -x/, 'OK'],
+    [/grep -q print-session-token/, 'YES\n'],
+    [
+      /--print-session-token/,
+      () => {
+        prints += 1
+
+        if (prints === 1) {
+          throw new Error('No hermes serve/dashboard is listening on 127.0.0.1:9119.')
+        }
+
+        return 'fresh-token\n'
+      }
+    ],
+    [/setsid|nohup/, '4242\n']
+  ])
+
+  const result = await connect(connectDeps(ssh))
+
+  assert.equal(result.reused, false)
+  assert.equal(result.pid, 4242)
+  assert.equal(result.remotePort, DEFAULT_MACHINE_SERVE_PORT)
+  assert.equal(result.token, 'fresh-token')
+  const start = ssh.calls.find(command => /setsid|nohup/.test(command)) || ''
+  assert.match(start, /serve --host/)
+  assert.doesNotMatch(start, /--isolated/)
+  assert.doesNotMatch(start, /--ssh-session-token-file/)
+})
+
+test('connect() refuses gated serves instead of spawning an isolated backend', async () => {
+  const ssh = fakeSsh([
+    [/uname/, 'Linux\nx86_64'],
+    [/\[ -x/, 'OK'],
+    [/grep -q print-session-token/, 'YES\n'],
+    [
+      /--print-session-token/,
+      () => {
+        throw new Error('This serve requires sign-in; loopback token attach is not available.')
+      }
+    ]
+  ])
+
+  await assert.rejects(
+    () => connect(connectDeps(ssh)),
+    (err: unknown) => {
+      assert.match(String((err as Error).message), /sign-in/)
+      return true
+    }
+  )
+  assert.ok(!ssh.calls.some(command => /--isolated/.test(command)))
+})
+
+test('buildMachineServeCommand is a shared loopback serve, not an isolated desktop spawn', () => {
+  const cmd = buildMachineServeCommand('/x/hermes')
+  assert.match(cmd, /serve --host/)
+  assert.match(cmd, /--port 9119/)
+  assert.doesNotMatch(cmd, /--isolated/)
+  assert.doesNotMatch(cmd, /--ssh-session-token-file/)
+  assert.doesNotMatch(cmd, /HERMES_DESKTOP=1/)
+})
+
+test('classifyPrintTokenError distinguishes missing, gated, and old serves', () => {
+  assert.equal(classifyPrintTokenError(new Error('No hermes serve/dashboard is listening on 127.0.0.1:9119.')), 'missing')
+  assert.equal(classifyPrintTokenError(new Error('This serve requires sign-in')), 'gated')
+  assert.equal(classifyPrintTokenError(new Error('did not publish a loopback session token')), 'old')
+})
+
 
 test('managed SSH maps a local scope to a different non-default remote profile', async () => {
   const localScope = 'work'
