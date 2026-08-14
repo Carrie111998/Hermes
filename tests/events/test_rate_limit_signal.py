@@ -665,3 +665,94 @@ def test_long_lived_process_observes_episodes_written_by_other_processes(
                   detector="nous_guard", bus=bus) is False, \
         "the cron's episode was re-alerted as if it had never happened"
     assert len(bus.emitted) == 1
+
+
+# --- Gap 2 (final re-review): a transient read failure must not wedge the ---
+# --- cache and clobber other processes' episodes, while a genuinely       ---
+# --- persistent read failure must still degrade to one alert per process. ---
+
+
+def test_transient_read_failure_does_not_clobber_foreign_episodes(
+        state_file, monkeypatch):
+    """The naive fix -- anchoring the marker on ANY failed read, including a
+    transient one -- reproduces exactly the harm I4 exists to prevent: on
+    Windows, an AV/indexer sharing violation or a read racing another
+    process's atomic_replace produces ONE failed open() on a perfectly intact
+    file. If that single failure were treated the same as a legitimately
+    empty state, the very next record() would _save_state({} + our own
+    episode) over the file, permanently deleting every episode another
+    process had persisted -- unbounded in duration, because the wedged
+    process's own marker never again matches the file it never read.
+
+    This test injects exactly ONE failed open() on an otherwise-intact file
+    that already holds a foreign episode, then performs a single successful
+    record() call, and asserts the foreign episode survives on disk.
+    """
+    from events import rate_limit_signal
+    from events.rate_limit_signal import record, _now_iso
+
+    foreign_episode = {
+        "provider": "nous", "model": "nous-portal",
+        "opened_at": _now_iso(), "resets_at": "",
+        "worst_outcome": "diverted", "alerted_level": "diverted",
+        "diverted_calls": 4, "fallbacks_seen": [],
+    }
+    state_file.write_text(
+        json.dumps({"nous/nous-portal": foreign_episode}), encoding="utf-8")
+    rate_limit_signal.reset_state_cache()
+
+    real_open = open
+    calls = {"n": 0}
+
+    def _flaky_open(path, *a, **kw):
+        if calls["n"] == 0 and str(path) == str(state_file):
+            calls["n"] += 1
+            raise PermissionError(13, "Access is denied")
+        return real_open(path, *a, **kw)
+
+    monkeypatch.setattr("builtins.open", _flaky_open)
+
+    bus = _FakeBus()
+    # Must not raise -- record() is best-effort on the agent's hot path.
+    record(provider="deepseek", model="deepseek-v4-pro", reason="rate_limit",
+           detector="runtime", bus=bus)
+
+    assert calls["n"] == 1, "the injected failure never fired -- test is not exercising the read path"
+
+    on_disk = json.loads(state_file.read_text(encoding="utf-8"))
+    assert "nous/nous-portal" in on_disk, (
+        "one transient read failure let the next write overwrite the file "
+        "with only this process's own episode, deleting the foreign one"
+    )
+
+
+def test_persistently_unreadable_state_degrades_to_one_alert_not_one_per_hit(
+        state_file, monkeypatch):
+    """The other half of the same rule: a file that is genuinely, permanently
+    unreadable (not just transiently racing another writer) must still
+    degrade to one alert per process, not one per hit -- this was the
+    original reason _load_state() anchored the marker on every failed read.
+    Verified together with the test above: distinguishing missing-vs-failed
+    reads and bounding the retry rate must not reopen the I1 flood on the
+    read side while closing the I4 hole on it.
+    """
+    from events.rate_limit_signal import record
+
+    state_file.write_text(json.dumps({}), encoding="utf-8")
+
+    def _boom(*a, **k):
+        raise PermissionError(13, "Access is denied")
+
+    monkeypatch.setattr("builtins.open", _boom)
+
+    bus = _FakeBus()
+    kw = dict(provider="deepseek", model="deepseek-v4-pro",
+              reason="rate_limit", detector="runtime", bus=bus)
+    for _ in range(200):
+        record(**kw)
+
+    assert len(bus.emitted) == 1, (
+        f"200 hits against a permanently unreadable file produced "
+        f"{len(bus.emitted)} alerts -- a read failure must degrade to one "
+        "alert per process, the same as a write failure"
+    )

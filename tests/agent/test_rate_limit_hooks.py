@@ -108,6 +108,28 @@ def test_reason_is_threaded_at_known_sites():
         "that site must attribute via telemetry_reason=, never reason= — " \
         "reason= arms the 60s fallback-pinning cooldown"
 
+    # The non-retryable branch (site 2). This needs its own explicit check,
+    # not just the bare==6 count below: reverting this site from
+    # telemetry_reason=classified.reason back to reason=classified.reason
+    # does not touch a single bare "_try_activate_fallback()" call, so
+    # bare==6 stays green through exactly this regression. The literal
+    # string "_try_activate_fallback(reason=classified.reason)" also already
+    # appears twice elsewhere in this file, at two pre-existing, untouched,
+    # genuinely-behavioral sites (rate-limit/billing failover, auth
+    # failover) — so a blanket "must be absent" would false-fail on correct
+    # code. Pin the count instead: it must stay at exactly those 2. A revert
+    # of site 2 raises it to 3.
+    assert "_try_activate_fallback(telemetry_reason=classified.reason)" in src, \
+        "the non-retryable branch must attribute itself via telemetry_reason="
+    site2_reason_count = src.count("_try_activate_fallback(reason=classified.reason)")
+    assert site2_reason_count == 2, (
+        f"expected exactly 2 legitimate reason=classified.reason sites "
+        f"(rate-limit/billing and auth failover), found {site2_reason_count} — "
+        "the non-retryable branch (site 2) appears to have reverted from "
+        "telemetry_reason= to reason=, which re-arms the 60s fallback-pinning "
+        "cooldown; bare==6 alone would not have caught this"
+    )
+
     # Verified counts before this task: 8 bare, 2 carrying a reason.
     # This task converts exactly 2, leaving 6 deliberately bare (the sites
     # that genuinely do not know why they are failing over). An exact match

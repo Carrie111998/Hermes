@@ -49,9 +49,38 @@ process was in sync with the file.
 
 A FAILED write therefore publishes its mutated state into the cache but
 deliberately does NOT advance the marker. A SUCCESSFUL write publishes and
-re-anchors. A failed READ also anchors, so a permanently corrupt or unreadable
-file degrades to a cached ``{}`` rather than re-reading (and re-alerting) on
-every hit.
+re-anchors.
+
+A FAILED read is handled differently depending on WHY it failed:
+
+  * A missing file (``FileNotFoundError``) is legitimate empty state — it is
+    anchored exactly like a successful read of ``{}``.
+  * Any OTHER read failure — permission error, a sharing violation racing
+    another process's ``atomic_replace``, a decode error, malformed JSON —
+    means this process never actually saw the file's true contents. The
+    marker is therefore deliberately left UNANCHORED (mismatched), not pinned
+    to a file we failed to read. Two things follow:
+
+    1. The cache still serves a fail-open ``{}`` for this call, but that
+       ``{}`` is marked UNRELIABLE (``_state_reliable()``). ``record()`` and
+       ``clear()`` refuse to run the destructive whole-file ``_save_state()``
+       over unreliable state — they fall back to ``_publish_unsaved()``
+       instead, exactly as they do for a failed write. Without this, one
+       transient read failure (an AV scan, an indexer, a momentary sharing
+       violation on a file another process is mid-``atomic_replace`` on)
+       would let the very next write silently delete every episode another
+       process had persisted — I4's harm, through a different door, caused
+       by a read rather than a write.
+    2. Because the marker stays unanchored, the NEXT ``_load_state()`` call
+       retries the read instead of trusting the fail-open ``{}`` forever —
+       but retries are bounded to at most once per
+       ``_READ_FAILURE_RETRY_SECONDS``. Without that bound, a genuinely
+       persistent failure (a permanently corrupt file) would re-attempt, and
+       re-alert from a fresh ``{}``, once per hit — the same flood I1 exists
+       to prevent, by a different door. Inside the backoff window the process
+       keeps reusing its own in-memory mutations (published via
+       ``_publish_unsaved``), so ``_should_alert`` still coalesces repeat
+       hits even though the file itself was never re-read.
 
 Known imperfections, stated rather than hidden:
 
@@ -66,6 +95,10 @@ Known imperfections, stated rather than hidden:
 3. The marker is not a lock. Two processes writing concurrently still last-write-
    wins; this rule narrows the window from "the whole process lifetime" to "one
    read-modify-write", it does not close it.
+4. The same discard as #1 applies when a failed READ is followed, after the
+   backoff window, by a successful read: the fresh disk contents replace our
+   in-memory-only mutation. Bounded by the retry interval, not by hit rate,
+   for the same reason #1 cannot flood.
 """
 
 from __future__ import annotations
@@ -75,6 +108,7 @@ import json
 import logging
 import os
 import tempfile
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
@@ -106,18 +140,38 @@ _SEVERITY = {"recovered": 0, "diverted": 1, "chain_exhausted": 2, "no_fallback":
 # module exists to prevent.
 _EPISODE_MAX_AGE_SECONDS = 6 * 60 * 60
 
+# Bound on how often a FAILED read is retried once the marker has been left
+# deliberately unanchored (see the module docstring's "Cache coherence rule").
+# Low enough that a transient failure (AV scan, indexer, a sharing violation
+# racing another process's atomic_replace) recovers within one alerting
+# cycle; high enough that a genuinely persistent failure (permanently corrupt
+# file) is retried at a low rate instead of once per hit, which is exactly
+# the flood I1 exists to prevent, through the read side instead of the write
+# side.
+_READ_FAILURE_RETRY_SECONDS = 30
+
 _state_cache: Optional[Dict[str, Any]] = None
 # (st_mtime_ns, st_size) of the state file as of the last time this process was
 # in sync with it -- see the "Cache coherence rule" section of the module
 # docstring. None means "the file did not exist / could not be stat'd".
 _state_stat: Optional[Tuple[int, int]] = None
+# Whether _state_cache reflects a confirmed read (or a legitimately-missing
+# file), as opposed to a fail-open {} from a read we could not complete.
+# record()/clear() must not run a destructive _save_state() while this is
+# False -- see _state_reliable().
+_state_read_ok: bool = True
+# monotonic() deadline before which a failed, still-unanchored read will not
+# be retried. None when there is nothing to back off from.
+_state_read_retry_at: Optional[float] = None
 
 
 def reset_state_cache() -> None:
     """Test hook: drop the in-process state cache and its file anchor."""
-    global _state_cache, _state_stat
+    global _state_cache, _state_stat, _state_read_ok, _state_read_retry_at
     _state_cache = None
     _state_stat = None
+    _state_read_ok = True
+    _state_read_retry_at = None
 
 
 def _state_path() -> Path:
@@ -183,27 +237,73 @@ def _reap_expired(state: Dict[str, Any]) -> Dict[str, Any]:
     return state if len(live) == len(state) else live
 
 
+def _state_reliable() -> bool:
+    """Whether the current cache reflects a confirmed read (or a
+    legitimately-missing file), rather than a fail-open placeholder from a
+    read this process could not complete. See the module docstring's "Cache
+    coherence rule" and _load_state().
+    """
+    return _state_read_ok
+
+
 def _load_state() -> Dict[str, Any]:
     """Return the (reaped) episode map. Fails open to {} on any error.
 
     Refreshes from disk whenever the file's identity marker no longer matches
-    the one we anchored on, and only then.
+    the one we anchored on, and only then -- except while backed off from a
+    prior failed read (see _READ_FAILURE_RETRY_SECONDS), where the mismatched
+    marker is deliberately not re-probed yet.
     """
-    global _state_cache, _state_stat
+    global _state_cache, _state_stat, _state_read_ok, _state_read_retry_at
     marker = _stat_marker()
-    if _state_cache is None or marker != _state_stat:
+
+    if _state_cache is None:
+        attempt_read = True
+    elif marker == _state_stat:
+        attempt_read = False
+    elif not _state_read_ok and _state_read_retry_at is not None \
+            and time.monotonic() < _state_read_retry_at:
+        # Still backed off from a previous failed read of this (unanchored)
+        # marker. Re-probing on every hit would re-read -- and re-alert
+        # from -- a permanently-bad file once per call.
+        attempt_read = False
+    else:
+        attempt_read = True
+
+    if attempt_read:
         try:
             with open(str(_state_path()), "r", encoding="utf-8") as f:
                 data = json.load(f)
             if not isinstance(data, dict):
                 data = {}
+            _state_cache = data
+            _state_stat = marker
+            _state_read_ok = True
+            _state_read_retry_at = None
+        except FileNotFoundError:
+            # Legitimately absent file: normal empty state, anchor it like a
+            # successful read.
+            _state_cache = {}
+            _state_stat = marker
+            _state_read_ok = True
+            _state_read_retry_at = None
         except Exception:
-            data = {}
-        _state_cache = data
-        # Anchor even on a failed read: a corrupt or unreadable file must
-        # degrade to a cached {} rather than being re-read (and re-alerted on)
-        # once per hit.
-        _state_stat = marker
+            # The file exists but could not be read (permission error, a
+            # sharing violation racing another process's atomic_replace, a
+            # decode error, malformed JSON). We never confirmed the file's
+            # true contents, so the marker must NOT be anchored to it --
+            # doing so would let record()/clear() run a destructive
+            # whole-file _save_state() over data we never actually saw. Fail
+            # open to {} for this call, but leave the marker mismatched so
+            # the NEXT call retries, bounded by the backoff above.
+            logger.debug(
+                "rate_limit_signal: state read failed (swallowed)",
+                exc_info=True,
+            )
+            _state_cache = {}
+            _state_read_ok = False
+            _state_read_retry_at = time.monotonic() + _READ_FAILURE_RETRY_SECONDS
+
     reaped = _reap_expired(_state_cache)
     if reaped is not _state_cache:
         # The file still carries the expired entries; the next successful write
@@ -389,7 +489,13 @@ def record(
             )
 
         state[key] = episode
-        saved = _save_state(state)
+        # _state_reliable() is False when this call's state came from a read
+        # we could not complete (as opposed to a legitimately-missing file).
+        # Persisting it would be a destructive whole-file write built from
+        # data we never actually saw -- silently deleting every episode
+        # another process had persisted. Treat it exactly like a failed
+        # write: skip the save, let _publish_unsaved carry the mutation.
+        saved = _save_state(state) if _state_reliable() else False
 
         if not alert:
             if not saved:
@@ -439,7 +545,9 @@ def clear(*, provider: str, model: str, bus: Any = None) -> bool:
         episode = state.pop(key, None)
         if episode is None:
             return False
-        saved = _save_state(state)
+        # See record(): never run a destructive whole-file write over state
+        # we could not confirm by reading the file.
+        saved = _save_state(state) if _state_reliable() else False
         payload = {
             "provider": provider, "model": model,
             "reason": "recovered", "detector": "runtime",
