@@ -15,6 +15,7 @@ import type {
   BoardMeta,
   BoardsResponse,
   KanbanBoard,
+  KanbanHomeChannelsResponse,
   KanbanProfile,
   KanbanProject,
   KanbanTask,
@@ -42,6 +43,9 @@ export const $lanesByProfile = atom<boolean>(false)
 /** Per-lane collapse OVERRIDES (true=collapsed, false=expanded). Absence means
  *  auto: empty lanes collapse to a rail, occupied lanes expand. Persisted. */
 export const $collapsedLanes = atom<Record<string, boolean>>({})
+
+/** null until probed, false only when this backend session lacks the route. */
+export const $homeChannelsSupported = atom<null | boolean>(null)
 
 const BOARD_SLUG_KEY = 'boardSlug'
 const INTRO_KEY = 'introDismissed'
@@ -81,6 +85,7 @@ interface Persisted<T> {
  *  handshake, so a board switch closes + reopens it. */
 export function bindApi(r: Rest, storage: PluginStorage, socket: Socket): () => void {
   rest = r
+  $homeChannelsSupported.set(null)
   const unsubs: Array<() => void> = []
 
   // Hydrate an atom from storage and keep storage in sync with it.
@@ -116,9 +121,8 @@ function call<T>(path: string, opts?: PluginRestOptions): Promise<T> {
 }
 
 /** Append the selected board (and other params) to a path. */
-function withBoard(path: string, params: Record<string, string> = {}): string {
+function withBoard(path: string, params: Record<string, string> = {}, slug = $boardSlug.get()): string {
   const search = new URLSearchParams(params)
-  const slug = $boardSlug.get()
 
   if (slug) {
     search.set('board', slug)
@@ -134,6 +138,7 @@ function withBoard(path: string, params: Record<string, string> = {}): string {
 export const boardKey = (slug: string, archived: boolean) => ['kanban', 'board', slug, archived] as const
 export const taskKey = (slug: string, id: string) => ['kanban', 'task', slug, id] as const
 export const logKey = (slug: string, id: string) => ['kanban', 'log', slug, id] as const
+export const homeChannelsKey = (slug: string, id: string) => ['kanban', 'home-channels', slug, id] as const
 export const BOARDS_KEY = ['kanban', 'boards'] as const
 export const PROFILES_KEY = ['kanban', 'profiles'] as const
 export const PROJECTS_KEY = ['kanban', 'projects'] as const
@@ -145,6 +150,49 @@ export const fetchBoard = (archived: boolean) =>
   call<KanbanBoard>(withBoard('/board', archived ? { include_archived: 'true' } : {}))
 
 export const fetchTask = (id: string) => call<KanbanTaskDetail>(withBoard(`/tasks/${id}`))
+
+export function isMissingHomeChannelsEndpoint(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error)
+
+  return /(?:no such api endpoint|endpoint is likely missing)/i.test(message)
+}
+
+function isGenericNotFound(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error)
+  const statusCode = (error as { statusCode?: unknown } | null)?.statusCode
+
+  return (
+    (statusCode === 404 || /(?:^|\D)404(?:\D|$)/.test(message)) &&
+    /(?:detail["']?\s*:\s*["']?not found|404:\s*not found\s*$)/i.test(message)
+  )
+}
+
+export const fetchHomeChannels = async (id: string, board = $boardSlug.get()) => {
+  try {
+    const response = await call<KanbanHomeChannelsResponse>(withBoard('/home-channels', { task_id: id }, board))
+    $homeChannelsSupported.set(true)
+
+    return response
+  } catch (error) {
+    if ($homeChannelsSupported.get() !== true) {
+      let missing = isMissingHomeChannelsEndpoint(error)
+
+      if (!missing && isGenericNotFound(error)) {
+        try {
+          await call<KanbanHomeChannelsResponse>('/home-channels')
+        } catch (probeError) {
+          missing = isMissingHomeChannelsEndpoint(probeError) || isGenericNotFound(probeError)
+        }
+      }
+
+      if (missing) {
+        $homeChannelsSupported.set(false)
+      }
+    }
+
+    throw error
+  }
+}
 
 /** Worker stdout/stderr tail (last 16 KiB — plenty for the drawer). */
 export const fetchLog = (id: string) => call<WorkerLog>(withBoard(`/tasks/${id}/log`, { tail: '16384' }))
@@ -217,6 +265,12 @@ export const reclaimTask = (id: string) => nudged(call(withBoard(`/tasks/${id}/r
 
 export const uploadAttachment = (id: string, upload: { filename: string; contentType?: string; bytes: ArrayBuffer }) =>
   call(withBoard(`/tasks/${id}/attachments`), { method: 'POST', upload })
+
+export const subscribeHome = (id: string, platform: string, board = $boardSlug.get()) =>
+  call(withBoard(`/tasks/${id}/home-subscribe/${encodeURIComponent(platform)}`, {}, board), { method: 'POST' })
+
+export const unsubscribeHome = (id: string, platform: string, board = $boardSlug.get()) =>
+  call(withBoard(`/tasks/${id}/home-subscribe/${encodeURIComponent(platform)}`, {}, board), { method: 'DELETE' })
 
 export const createBoard = (slug: string, name: string, projectId?: string) =>
   call<{ board: { slug: string } }>('/boards', {

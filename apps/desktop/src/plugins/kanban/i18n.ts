@@ -123,6 +123,23 @@ type KanbanMessages = {
   metaCreatedBy: string
   metaCreated: string
   metaWorkerPid: string
+  homeChannels: string
+  homeChannelsHelp: string
+  homeChannelAria: (home: string, platform: string) => string
+  homeChannelsEmpty: string
+  homeChannelsUnavailable: string
+  homeChannelsUnavailableBody: string
+  homeChannelsRetry: string
+  homeChannelsOffline: string
+  homeChannelsOrigin: string
+  homeChannelsSaving: string
+  homeChannelsUpdateError: (platform: string, message: string) => string
+  homeChanged: (platform: string) => string
+  homeChangedMove: (oldName: string, currentName: string) => string
+  homeChangedStop: (oldName: string) => string
+  homePrevious: string
+  homeMove: (name: string) => string
+  homeStop: string
   readyUnassignedTitle: string
   readyUnassignedBody: string
   diagnosticsN: (n: number) => string
@@ -312,6 +329,24 @@ const en: KanbanMessages = {
   metaCreatedBy: 'Created by',
   metaCreated: 'Created',
   metaWorkerPid: 'Worker pid',
+  homeChannels: 'Home channel notifications',
+  homeChannelsHelp: 'Send this task’s updates to the selected homes.',
+  homeChannelAria: (home, platform) => `Notify ${home} on ${platform}`,
+  homeChannelsEmpty: 'No home channels for this profile. In a messaging chat, send /sethome.',
+  homeChannelsUnavailable: 'Home channels unavailable',
+  homeChannelsUnavailableBody: 'Couldn’t load this task’s messaging destinations.',
+  homeChannelsRetry: 'Retry',
+  homeChannelsOffline: 'Gateway offline — reconnect to change notifications.',
+  homeChannelsOrigin: 'already notified by task origin',
+  homeChannelsSaving: 'Saving…',
+  homeChannelsUpdateError: (platform, message) => `Couldn’t update ${platform} notifications: ${message}`,
+  homeChanged: platform => `${platform} home changed`,
+  homeChangedMove: (oldName, currentName) =>
+    `Updates still go to ${oldName}. Move them to ${currentName}, or stop home notifications.`,
+  homeChangedStop: oldName => `Updates still go to ${oldName}, which is no longer your home.`,
+  homePrevious: 'your previous home',
+  homeMove: name => `Move to ${name}`,
+  homeStop: 'Stop',
   readyUnassignedTitle: 'Ready, but unassigned — this card will never run.',
   readyUnassignedBody:
     'The dispatcher only claims Ready cards that have an assignee. Pick a profile in the Assignee field above (or set a default assignee in the orchestration settings) and it runs within a minute.',
@@ -503,6 +538,25 @@ const ja: KanbanMessages = {
   metaCreatedBy: '作成者',
   metaCreated: '作成',
   metaWorkerPid: 'ワーカー PID',
+  homeChannels: 'ホームチャンネル通知',
+  homeChannelsHelp: 'このタスクの更新を選択したホームに送信します。',
+  homeChannelAria: (home, platform) => `${platform} の ${home} に通知`,
+  homeChannelsEmpty:
+    'このプロフィールにはホームチャンネルがありません。メッセージチャットで /sethome を送信してください。',
+  homeChannelsUnavailable: 'ホームチャンネルを利用できません',
+  homeChannelsUnavailableBody: 'このタスクのメッセージ送信先を読み込めませんでした。',
+  homeChannelsRetry: '再試行',
+  homeChannelsOffline: 'ゲートウェイはオフラインです — 再接続して通知を変更してください。',
+  homeChannelsOrigin: 'タスクの送信元からも通知されます',
+  homeChannelsSaving: '保存中…',
+  homeChannelsUpdateError: (platform, message) => `${platform} の通知を更新できませんでした: ${message}`,
+  homeChanged: platform => `${platform} のホームが変更されました`,
+  homeChangedMove: (oldName, currentName) =>
+    `更新は引き続き ${oldName} に送られます。${currentName} に移動するか、ホーム通知を停止してください。`,
+  homeChangedStop: oldName => `更新は引き続き ${oldName} に送られますが、現在のホームではありません。`,
+  homePrevious: '以前のホーム',
+  homeMove: name => `${name} に移動`,
+  homeStop: '停止',
   readyUnassignedTitle: 'Ready ですが未割り当て — このカードは実行されません。',
   readyUnassignedBody:
     'ディスパッチャは担当のある Ready カードのみ取得します。上の担当フィールドでプロフィールを選ぶ（またはオーケストレーション設定でデフォルトの担当を設定する）と、1分以内に実行されます。',
@@ -693,6 +747,23 @@ const zh: KanbanMessages = {
   metaCreatedBy: '创建者',
   metaCreated: '创建于',
   metaWorkerPid: '工作单元 PID',
+  homeChannels: '主频道通知',
+  homeChannelsHelp: '将此任务的更新发送到所选主频道。',
+  homeChannelAria: (home, platform) => `在 ${platform} 的 ${home} 中通知`,
+  homeChannelsEmpty: '此配置文件没有主频道。请在消息聊天中发送 /sethome。',
+  homeChannelsUnavailable: '主频道不可用',
+  homeChannelsUnavailableBody: '无法加载此任务的消息目标。',
+  homeChannelsRetry: '重试',
+  homeChannelsOffline: '网关离线 — 重新连接后才能更改通知。',
+  homeChannelsOrigin: '任务来源也会发送通知',
+  homeChannelsSaving: '正在保存…',
+  homeChannelsUpdateError: (platform, message) => `无法更新 ${platform} 通知：${message}`,
+  homeChanged: platform => `${platform} 主频道已更改`,
+  homeChangedMove: (oldName, currentName) => `更新仍发送到 ${oldName}。请将其移至 ${currentName}，或停止主频道通知。`,
+  homeChangedStop: oldName => `更新仍发送到 ${oldName}，但它已不是你的主频道。`,
+  homePrevious: '你之前的主频道',
+  homeMove: name => `移至 ${name}`,
+  homeStop: '停止',
   readyUnassignedTitle: '就绪但未分配 — 这张卡片永远不会运行。',
   readyUnassignedBody:
     '调度器只领取有负责人的就绪卡片。在上面的负责人字段选择一个配置档（或在编排设置中设置默认负责人），它会在一分钟内运行。',
@@ -881,6 +952,23 @@ const zhHant: KanbanMessages = {
   metaCreatedBy: '建立者',
   metaCreated: '建立於',
   metaWorkerPid: '工作單元 PID',
+  homeChannels: '主頻道通知',
+  homeChannelsHelp: '將此任務的更新傳送到所選主頻道。',
+  homeChannelAria: (home, platform) => `在 ${platform} 的 ${home} 中通知`,
+  homeChannelsEmpty: '此設定檔沒有主頻道。請在訊息聊天中傳送 /sethome。',
+  homeChannelsUnavailable: '主頻道無法使用',
+  homeChannelsUnavailableBody: '無法載入此任務的訊息目的地。',
+  homeChannelsRetry: '重試',
+  homeChannelsOffline: '閘道離線 — 重新連線後才能變更通知。',
+  homeChannelsOrigin: '任務來源也會傳送通知',
+  homeChannelsSaving: '正在儲存…',
+  homeChannelsUpdateError: (platform, message) => `無法更新 ${platform} 通知：${message}`,
+  homeChanged: platform => `${platform} 主頻道已變更`,
+  homeChangedMove: (oldName, currentName) => `更新仍傳送到 ${oldName}。請將其移至 ${currentName}，或停止主頻道通知。`,
+  homeChangedStop: oldName => `更新仍傳送到 ${oldName}，但它已不是你的主頻道。`,
+  homePrevious: '你先前的主頻道',
+  homeMove: name => `移至 ${name}`,
+  homeStop: '停止',
   readyUnassignedTitle: '就緒但未指派 — 這張卡片永遠不會執行。',
   readyUnassignedBody:
     '排程器只領取有負責人的就緒卡片。在上方的負責人欄位選擇一個設定檔（或在編排設定中設定預設負責人），它會在一分鐘內執行。',
