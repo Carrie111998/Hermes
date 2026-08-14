@@ -100,6 +100,7 @@ class ProcessSession:
     cwd: Optional[str] = None                   # Working directory
     started_at: float = 0.0                     # time.time() of spawn (wall clock)
     host_start_time: Optional[int] = None       # kernel start ticks (/proc/<pid>/stat f22) — PID-reuse guard
+    host_boot_id: Optional[str] = None          # kernel boot UUID — reboot/PID-reuse guard
     exited: bool = False                        # Whether the process has finished
     exit_code: Optional[int] = None             # Exit code (None if still running)
     completion_reason: str = "exited"           # exited|killed|lost|failed_start|already_exited
@@ -108,6 +109,7 @@ class ProcessSession:
     max_output_chars: int = MAX_OUTPUT_CHARS
     detached: bool = False                      # True if recovered from crash (no pipe)
     pid_scope: str = "host"                     # "host" for local/PTY PIDs, "sandbox" for env-local PIDs
+    backend_process_id: Optional[str] = None      # backend-scoped token + process start identity
     # Watcher/notification metadata (persisted for crash recovery)
     watcher_platform: str = ""
     watcher_chat_id: str = ""
@@ -136,6 +138,9 @@ class ProcessSession:
     _completion_event: threading.Event = field(default_factory=threading.Event, repr=False)
     _lock: threading.Lock = field(default_factory=threading.Lock)
     _reader_thread: Optional[threading.Thread] = field(default=None, repr=False)
+    _lifecycle_thread: Optional[threading.Thread] = field(default=None, repr=False)
+    _lifecycle_last_heartbeat_at: float = field(default=0.0, repr=False)
+    _lifecycle_last_probe_unavailable_at: float = field(default=0.0, repr=False)
     _pty: Any = field(default=None, repr=False)  # ptyprocess handle (when use_pty=True)
 
 
@@ -212,6 +217,90 @@ class ProcessRegistry:
         # terminal tab. Distinct from kill — the process keeps running; only the
         # UI view is dropped (the user can reopen it from the status stack).
         self.on_close = None
+
+    @staticmethod
+    def _emit_process_lifecycle(
+        session: ProcessSession, event: str, **extra: Any
+    ) -> None:
+        from agent.lifecycle_hooks import (
+            emit_managed_process_lifecycle,
+            managed_process_backend,
+            managed_process_backend_id,
+        )
+
+        backend = managed_process_backend(session.env_ref)
+        backend_id = managed_process_backend_id(session.env_ref)
+        # Remote lifecycle is authoritative only with a stable backend identity.
+        # Missing identity degrades telemetry without affecting the process.
+        if session.pid_scope == "sandbox" and backend_id is None:
+            return
+        if session.pid_scope == "host" and (
+            not session.pid
+            or session.host_start_time is None
+            or not session.host_boot_id
+        ):
+            return
+        if event == "heartbeat":
+            now = time.monotonic()
+            if now - session._lifecycle_last_heartbeat_at < 15:
+                return
+            session._lifecycle_last_heartbeat_at = now
+        elif event == "probe_unavailable":
+            now = time.monotonic()
+            if now - session._lifecycle_last_probe_unavailable_at < 15:
+                return
+            session._lifecycle_last_probe_unavailable_at = now
+        emit_managed_process_lifecycle(
+            event,
+            process_id=session.id,
+            task_id=session.task_id,
+            session_key=session.session_key,
+            # Sandbox PIDs are namespace-local observations, not canonical
+            # host identities. Keep them private to the process registry.
+            pid=session.pid if session.pid_scope == "host" else None,
+            host_start_time=(
+                session.host_start_time if session.pid_scope == "host" else None
+            ),
+            host_boot_id=(
+                session.host_boot_id if session.pid_scope == "host" else None
+            ),
+            pid_scope=session.pid_scope,
+            backend=backend,
+            backend_id=backend_id,
+            backend_process_id=session.backend_process_id,
+            exit_code=session.exit_code,
+            **extra,
+        )
+
+    def _local_lifecycle_monitor(self, session: ProcessSession) -> None:
+        """Heartbeat only while the exact local PID identity remains ours."""
+        while not session._completion_event.wait(15):
+            try:
+                if session.exited:
+                    return
+                if session.process is not None and session.process.poll() is not None:
+                    return
+                identity = self._host_pid_identity_status(
+                    session.pid, session.host_start_time, session.host_boot_id
+                )
+                if identity != "ours":
+                    self._emit_process_lifecycle(session, "probe_unavailable")
+                    return
+                self._emit_process_lifecycle(session, "heartbeat")
+            except Exception:
+                logger.debug(
+                    "managed_process_lifecycle_failed event=heartbeat reason=callback_error"
+                )
+
+    def _start_local_lifecycle_monitor(self, session: ProcessSession) -> None:
+        monitor = threading.Thread(
+            target=self._local_lifecycle_monitor,
+            args=(session,),
+            daemon=True,
+            name=f"proc-lifecycle-{session.id}",
+        )
+        session._lifecycle_thread = monitor
+        monitor.start()
 
     @staticmethod
     def _clean_shell_noise(text: str) -> str:
@@ -468,36 +557,69 @@ class ProcessRegistry:
         except Exception:
             return None
 
+    @staticmethod
+    def _safe_host_boot_id() -> Optional[str]:
+        """Authoritative kernel boot UUID, or None when unavailable."""
+        try:
+            with open("/proc/sys/kernel/random/boot_id", encoding="utf-8") as handle:
+                value = handle.read().strip()
+        except Exception:
+            return None
+        return value or None
+
     @classmethod
-    def _host_pid_is_ours(cls, pid: Optional[int], expected_start: Optional[int]) -> bool:
-        """True only if ``pid`` is alive AND still the process we spawned.
-
-        The kernel recycles PID/PGID numbers once a process exits and is reaped,
-        so a stored PID can later name an *unrelated* process — observed in the
-        wild as a recycled number landing on a desktop browser's session leader,
-        which our tree-kill then SIGTERMs (Firefox dying at irregular intervals).
-        We compare the kernel start time captured at spawn against the live one;
-        a mismatch means the number was recycled and must never be signalled.
-
-        When no baseline was captured (legacy checkpoints, or platforms without
-        ``/proc``) we degrade to a bare liveness check rather than refusing to
-        act, preserving prior best-effort behaviour.
-        """
+    def _host_pid_identity_status(
+        cls,
+        pid: Optional[int],
+        expected_start: Optional[int],
+        expected_boot: Optional[str],
+    ) -> str:
+        """Return ours, dead, mismatch, or unavailable for a full host tuple."""
+        if not pid or expected_start is None or not expected_boot:
+            return "unavailable"
+        live_boot = cls._safe_host_boot_id()
+        if live_boot is None:
+            return "unavailable"
+        if live_boot != expected_boot:
+            return "mismatch"
         if not cls._is_host_pid_alive(pid):
-            return False
-        if expected_start is None:
-            return True
-        return cls._safe_host_start_time(pid) == expected_start
+            return "dead"
+        live_start = cls._safe_host_start_time(pid)
+        if live_start is None:
+            return "unavailable"
+        return "ours" if live_start == expected_start else "mismatch"
+
+    @classmethod
+    def _host_pid_is_ours(
+        cls,
+        pid: Optional[int],
+        expected_start: Optional[int],
+        expected_boot: Optional[str],
+    ) -> bool:
+        """True only for a complete, currently matching PID/start/boot tuple.
+
+        Missing tuple members fail closed. A bare PID is never sufficient for
+        liveness, adoption, or signalling because PID values are recycled.
+        """
+        return cls._host_pid_identity_status(
+            pid, expected_start, expected_boot
+        ) == "ours"
 
     def _refresh_detached_session(self, session: Optional[ProcessSession]) -> Optional[ProcessSession]:
         """Update recovered host-PID sessions when the underlying process has exited."""
         if session is None or session.exited or not session.detached or session.pid_scope != "host":
             return session
 
-        # Identity-aware liveness: a recycled PID (alive but a different process
-        # than we spawned) must be treated as "our process exited", so it is
-        # moved to finished and can never be tree-killed by a later kill().
-        if self._host_pid_is_ours(session.pid, session.host_start_time):
+        identity = self._host_pid_identity_status(
+            session.pid, session.host_start_time, session.host_boot_id
+        )
+        if identity == "ours":
+            return session
+
+        # Mismatch/unavailable is uncertainty, not terminal evidence. Keep the
+        # record running for Sentinel reconciliation and never touch that PID.
+        if identity != "dead":
+            self._emit_process_lifecycle(session, "probe_unavailable")
             return session
 
         with session._lock:
@@ -544,7 +666,12 @@ class ProcessRegistry:
             return 2.0
 
     @classmethod
-    def _terminate_host_pid(cls, pid: int, expected_start: Optional[int] = None) -> None:
+    def _terminate_host_pid(
+        cls,
+        pid: Optional[int],
+        expected_start: Optional[int] = None,
+        expected_boot: Optional[str] = None,
+    ) -> None:
         """Terminate a host-visible PID and its descendants.
 
         ``expected_start`` is the kernel start time captured when we spawned the
@@ -586,13 +713,13 @@ class ProcessRegistry:
         POSIX and a missing ``taskkill.exe`` on Windows (effectively
         unreachable on real Windows installs, but cheap insurance).
         """
-        if expected_start is not None and not cls._host_pid_is_ours(pid, expected_start):
+        if not pid or not cls._host_pid_is_ours(pid, expected_start, expected_boot):
             # PID was recycled (start time changed) or is gone — never signal a
             # stranger. A leaked orphan is strictly preferable to killing e.g.
             # a browser whose session leader reused this dead session's PID.
             logger.warning(
-                "Refusing to terminate host pid %d: start-time mismatch — "
-                "PID was recycled onto an unrelated process.", pid,
+                "Refusing to terminate host pid %s: identity tuple unavailable or mismatched.",
+                pid,
             )
             return
         if _IS_WINDOWS:
@@ -732,6 +859,7 @@ class ProcessRegistry:
                 )
                 session.pid = pty_proc.pid
                 session.host_start_time = self._safe_host_start_time(session.pid)
+                session.host_boot_id = self._safe_host_boot_id()
                 # Store the pty handle on the session for read/write
                 session._pty = pty_proc
 
@@ -743,18 +871,34 @@ class ProcessRegistry:
                     name=f"proc-pty-reader-{session.id}",
                 )
                 session._reader_thread = reader
-                reader.start()
 
                 with self._lock:
                     self._prune_if_needed()
                     self._running[session.id] = session
 
+                self._emit_process_lifecycle(session, "started")
+                reader.start()
+                self._start_local_lifecycle_monitor(session)
                 self._write_checkpoint()
                 return session
 
             except ImportError:
                 logger.warning("ptyprocess not installed, falling back to pipe mode")
             except Exception as e:
+                with self._lock:
+                    was_registered = session.id in self._running
+                if was_registered:
+                    try:
+                        if session._pty is not None:
+                            session._pty.terminate(force=True)
+                    except Exception:
+                        pass
+                    session.exited = True
+                    session.exit_code = -1
+                    session.completion_reason = "failed_start"
+                    session.termination_source = "failed_start"
+                    self._move_to_finished(session)
+                    raise
                 logger.warning("PTY spawn failed (%s), falling back to pipe mode", e)
 
         # Standard Popen path (non-PTY or PTY fallback)
@@ -785,6 +929,7 @@ class ProcessRegistry:
         session.process = proc
         session.pid = proc.pid
         session.host_start_time = self._safe_host_start_time(session.pid)
+        session.host_boot_id = self._safe_host_boot_id()
 
         try:
             # Start output reader thread
@@ -795,32 +940,32 @@ class ProcessRegistry:
                 name=f"proc-reader-{session.id}",
             )
             session._reader_thread = reader
-            reader.start()
 
             with self._lock:
                 self._prune_if_needed()
                 self._running[session.id] = session
 
+            self._emit_process_lifecycle(session, "started")
+            reader.start()
+            self._start_local_lifecycle_monitor(session)
             self._write_checkpoint()
         except Exception:
             # Post-Popen setup failed — kill the orphaned subprocess (and any
             # descendants spawned via setsid) before re-raising so they do not
             # leak as untracked background processes.
-            try:
-                if not _IS_WINDOWS:
-                    try:
-                        kill_signal = getattr(signal, "SIGKILL", signal.SIGTERM)
-                        os.killpg(os.getpgid(proc.pid), kill_signal)  # windows-footgun: ok - guarded by _IS_WINDOWS above
-                    except (ProcessLookupError, PermissionError, OSError):
-                        proc.kill()
-                else:
-                    proc.kill()
-            except Exception:
-                pass
+            self._terminate_host_pid(
+                proc.pid, session.host_start_time, session.host_boot_id
+            )
             try:
                 proc.wait(timeout=5)
             except Exception:
                 pass
+            with session._lock:
+                session.exited = True
+                session.exit_code = getattr(proc, "returncode", None)
+                session.completion_reason = "failed_start"
+                session.termination_source = "failed_start"
+            self._move_to_finished(session)
             raise
 
         return session
@@ -861,16 +1006,22 @@ class ProcessRegistry:
         log_path = f"{temp_dir}/hermes_bg_{session.id}.log"
         pid_path = f"{temp_dir}/hermes_bg_{session.id}.pid"
         exit_path = f"{temp_dir}/hermes_bg_{session.id}.exit"
+        identity_path = f"{temp_dir}/hermes_bg_{session.id}.identity"
+        process_token = uuid.uuid4().hex
         quoted_command = shlex.quote(command)
         quoted_temp_dir = shlex.quote(temp_dir)
         quoted_log_path = shlex.quote(log_path)
         quoted_pid_path = shlex.quote(pid_path)
         quoted_exit_path = shlex.quote(exit_path)
+        quoted_identity_path = shlex.quote(identity_path)
         bg_command = (
             f"mkdir -p {quoted_temp_dir} && "
             f"( nohup bash -lc {quoted_command} > {quoted_log_path} 2>&1; "
             f"rc=$?; printf '%s\\n' \"$rc\" > {quoted_exit_path} ) & "
-            f"echo $! > {quoted_pid_path} && cat {quoted_pid_path}"
+            f"pid=$!; echo $pid > {quoted_pid_path}; "
+            f"start=$(awk '{{print $22}}' /proc/$pid/stat 2>/dev/null) || exit 1; "
+            f"printf '%s %s %s\\n' \"$pid\" \"$start\" {shlex.quote(process_token)} > {quoted_identity_path}; "
+            f"cat {quoted_pid_path}"
         )
 
         try:
@@ -886,6 +1037,18 @@ class ProcessRegistry:
                 if line.isdigit():
                     session.pid = int(line)
                     break
+            if session.pid is not None:
+                identity_result = env.execute(f"cat {quoted_identity_path}", timeout=timeout)
+                identity_parts = identity_result.get("output", "").strip().split()
+                if (
+                    len(identity_parts) == 3
+                    and identity_parts[0] == str(session.pid)
+                    and identity_parts[1].isdigit()
+                    and identity_parts[2] == process_token
+                ):
+                    session.backend_process_id = f"{process_token}:{identity_parts[1]}"
+                else:
+                    session.pid = None
             # If the wrapper couldn't produce a PID (for example, syntax
             # error or broken redirect), treat it as a failed launch instead
             # of exposing a fake running session.
@@ -904,24 +1067,37 @@ class ProcessRegistry:
             session.termination_source = "failed_start"
             session.output_buffer = f"Failed to start: {e}"
 
+        reader: Optional[threading.Thread] = None
         if not session.exited:
-            # Start a poller thread that periodically reads the log file
+            # Build the identity-aware poller before registry insertion, but do
+            # not start it until the stable remote PID and registry row exist.
             reader = threading.Thread(
                 target=self._env_poller_loop,
-                args=(session, env, log_path, pid_path, exit_path),
+                args=(session, env, log_path, pid_path, exit_path, identity_path),
                 daemon=True,
                 name=f"proc-poller-{session.id}",
             )
             session._reader_thread = reader
-            reader.start()
+
+        from agent.lifecycle_hooks import managed_process_backend_id
 
         with self._lock:
             self._prune_if_needed()
             if not session.exited:
                 self._running[session.id] = session
+            elif managed_process_backend_id(env) is not None:
+                # The backend identity plus provider process id is stable even
+                # when launch produced no sandbox PID. Register only long enough
+                # for the terminal authority to publish failed_start.
+                self._running[session.id] = session
 
         if not session.exited:
+            assert reader is not None
+            self._emit_process_lifecycle(session, "started")
+            reader.start()
             self._write_checkpoint()
+        elif session.id in self._running:
+            self._move_to_finished(session)
 
         return session
 
@@ -979,12 +1155,14 @@ class ProcessRegistry:
             self._move_to_finished(session)
 
     def _env_poller_loop(
-        self, session: ProcessSession, env: Any, log_path: str, pid_path: str, exit_path: str
+        self, session: ProcessSession, env: Any, log_path: str, pid_path: str,
+        exit_path: str, identity_path: Optional[str] = None,
     ):
         """Background thread: poll a sandbox log file for non-local backends."""
         quoted_log_path = shlex.quote(log_path)
         quoted_pid_path = shlex.quote(pid_path)
         quoted_exit_path = shlex.quote(exit_path)
+        quoted_identity_path = shlex.quote(identity_path or "")
         prev_output_len = 0  # track delta for watch pattern scanning
         while not session.exited:
             time.sleep(2)  # Poll every 2 seconds
@@ -1004,37 +1182,60 @@ class ProcessRegistry:
                         self._check_watch_patterns(session, delta)
                         self._emit_output(session, delta)
 
-                # Check if process is still running
+                # Check the exact backend process identity, not a namespace-local PID.
+                if not session.backend_process_id or not identity_path:
+                    self._emit_process_lifecycle(session, "probe_unavailable")
+                    continue
+                expected_token, expected_start = session.backend_process_id.split(":", 1)
                 check = env.execute(
-                    f"kill -0 \"$(cat {quoted_pid_path} 2>/dev/null)\" 2>/dev/null; echo $?",
+                    f"set -- $(cat {quoted_identity_path} 2>/dev/null); "
+                    f"if [ \"$1\" != {shlex.quote(str(session.pid))} ] || "
+                    f"[ \"$2\" != {shlex.quote(expected_start)} ] || "
+                    f"[ \"$3\" != {shlex.quote(expected_token)} ]; then echo mismatch; "
+                    f"else current=$(awk '{{print $22}}' /proc/$1/stat 2>/dev/null); "
+                    f"if [ -z \"$current\" ]; then echo exited; "
+                    f"elif [ \"$current\" = \"$2\" ]; then echo alive; "
+                    f"else echo mismatch; fi; fi",
                     timeout=5,
                 )
                 check_output = check.get("output", "").strip()
-                if check_output and check_output.splitlines()[-1].strip() != "0":
-                    # Process has exited -- get exit code captured by the wrapper shell.
-                    exit_result = env.execute(
-                        f"cat {quoted_exit_path} 2>/dev/null",
-                        timeout=5,
-                    )
-                    exit_str = exit_result.get("output", "").strip()
-                    try:
-                        session.exit_code = int(exit_str.splitlines()[-1].strip())
-                    except (ValueError, IndexError):
-                        session.exit_code = -1
-                    session.exited = True
-                    if session.completion_reason != "killed":
-                        session.completion_reason = "exited"
-                    self._move_to_finished(session)
-                    return
 
-            except Exception:
-                # Environment might be gone (sandbox reaped, etc.)
+                if check_output.endswith("alive"):
+                    self._emit_process_lifecycle(session, "heartbeat")
+                    continue
+                if not check_output.endswith("exited"):
+                    # A changed token/start identity is PID reuse or an
+                    # unverifiable probe, never evidence about our process.
+                    self._emit_process_lifecycle(session, "probe_unavailable")
+                    continue
+
+                # The exact identity disappeared. Only the wrapper's exit marker
+                # can now provide terminal evidence.
+                exit_result = env.execute(
+                    f"cat {quoted_exit_path} 2>/dev/null",
+                    timeout=5,
+                )
+                exit_str = exit_result.get("output", "").strip()
+                try:
+                    session.exit_code = int(exit_str.splitlines()[-1].strip())
+                except (ValueError, IndexError):
+                    self._emit_process_lifecycle(session, "probe_unavailable")
+                    continue
                 session.exited = True
-                session.exit_code = -1
-                session.completion_reason = "lost"
-                session.termination_source = "backend_lost"
+                if session.completion_reason != "killed":
+                    session.completion_reason = "exited"
                 self._move_to_finished(session)
                 return
+
+            except Exception:
+                # A backend outage says only that the probe is unavailable. It
+                # must never be promoted to false "lost"/terminal evidence.
+                self._emit_process_lifecycle(session, "probe_unavailable")
+                logger.debug(
+                    "managed_process_probe_unavailable process=%s reason=backend_error",
+                    session.id,
+                )
+                continue
 
     def _pty_reader_loop(self, session: ProcessSession):
         """Background thread: read output from a PTY process."""
@@ -1082,6 +1283,23 @@ class ProcessRegistry:
             self._finished[session.id] = session
         session._completion_event.set()
         self._write_checkpoint()
+
+        # This was_running guard is the single terminal authority. Reader,
+        # waiter, kill, and reconciliation races may all call this method, but
+        # only the first removal from _running publishes terminal.
+        if was_running:
+            terminal_status = (
+                session.completion_reason
+                if session.completion_reason
+                in {"exited", "killed", "lost", "failed_start", "already_exited"}
+                else "exited"
+            )
+            self._emit_process_lifecycle(
+                session,
+                "terminal",
+                terminal_status=terminal_status,
+                termination_source=session.termination_source or "unknown",
+            )
 
         # Only enqueue completion notification on the FIRST move.  Without
         # this guard, kill_process() and the reader thread can both call
@@ -1537,37 +1755,62 @@ class ProcessRegistry:
         try:
             if session._pty:
                 # PTY process -- terminate via ptyprocess
+                identity = self._host_pid_identity_status(
+                    session.pid, session.host_start_time, session.host_boot_id
+                )
+                if identity != "ours":
+                    self._emit_process_lifecycle(session, "probe_unavailable")
+                    return {
+                        "status": "error",
+                        "error": "Process identity is unavailable or no longer matches; refusing to signal PID",
+                    }
                 try:
                     session._pty.terminate(force=True)
                 except Exception:
-                    if session.pid:
-                        os.kill(session.pid, signal.SIGTERM)
+                    self._terminate_host_pid(
+                        session.pid, session.host_start_time, session.host_boot_id
+                    )
             elif session.process:
                 # Local process -- kill the process tree. On Windows this
                 # must be taskkill /T /F; Popen.terminate() only kills the
                 # shell wrapper and leaves Git Bash descendants behind.
-                self._terminate_host_pid(session.process.pid, session.host_start_time)
+                identity = self._host_pid_identity_status(
+                    session.process.pid, session.host_start_time, session.host_boot_id
+                )
+                if identity != "ours":
+                    self._emit_process_lifecycle(session, "probe_unavailable")
+                    return {
+                        "status": "error",
+                        "error": "Process identity is unavailable or no longer matches; refusing to signal PID",
+                    }
+                self._terminate_host_pid(
+                    session.process.pid, session.host_start_time, session.host_boot_id
+                )
             elif session.env_ref and session.pid:
-                # Non-local -- kill inside sandbox
-                session.env_ref.execute(f"kill {session.pid} 2>/dev/null", timeout=5)
+                # A namespace-local PID alone is not an authoritative process
+                # identity and may have been recycled. Refuse bare-PID signalling
+                # until the backend provides an identity-aware kill primitive.
+                self._emit_process_lifecycle(session, "probe_unavailable")
+                return {
+                    "status": "error",
+                    "error": "Sandbox process identity cannot be verified; refusing to signal PID",
+                }
             elif session.detached and session.pid_scope == "host" and session.pid:
                 # Identity check, not bare liveness: if the PID is gone OR was
                 # recycled onto an unrelated process, treat our process as
                 # exited and never tree-kill the stranger.
-                if not self._host_pid_is_ours(session.pid, session.host_start_time):
-                    with session._lock:
-                        session.exited = True
-                        session.exit_code = None
-                        output = strip_ansi(session.output_buffer[-2000:])
-                    if consume_output:
-                        self._completion_consumed.add(session_id)
-                    self._move_to_finished(session)
+                identity = self._host_pid_identity_status(
+                    session.pid, session.host_start_time, session.host_boot_id
+                )
+                if identity != "ours":
+                    self._emit_process_lifecycle(session, "probe_unavailable")
                     return {
-                        "status": "already_exited",
-                        "exit_code": session.exit_code,
-                        "output": output,
+                        "status": "error",
+                        "error": "Recovered process identity is unavailable or no longer matches; refusing to signal PID",
                     }
-                self._terminate_host_pid(session.pid, session.host_start_time)
+                self._terminate_host_pid(
+                    session.pid, session.host_start_time, session.host_boot_id
+                )
             else:
                 return {
                     "status": "error",
@@ -1889,12 +2132,15 @@ class ProcessRegistry:
                         # for sessions spawned before this field existed.
                         if s.host_start_time is None and s.pid_scope == "host" and s.pid:
                             s.host_start_time = self._safe_host_start_time(s.pid)
+                        if s.host_boot_id is None and s.pid_scope == "host" and s.pid:
+                            s.host_boot_id = self._safe_host_boot_id()
                         entries.append({
                             "session_id": s.id,
                             "command": s.command,
                             "pid": s.pid,
                             "pid_scope": s.pid_scope,
                             "host_start_time": s.host_start_time,
+                            "host_boot_id": s.host_boot_id,
                             "cwd": s.cwd,
                             "started_at": s.started_at,
                             "task_id": s.task_id,
@@ -1956,7 +2202,8 @@ class ProcessRegistry:
             # watcher tree-kill a stranger (e.g. a browser). Re-validate the
             # kernel start time recorded in the checkpoint.
             recorded_start = entry.get("host_start_time")
-            if not self._host_pid_is_ours(pid, recorded_start):
+            recorded_boot = entry.get("host_boot_id")
+            if not self._host_pid_is_ours(pid, recorded_start, recorded_boot):
                 if self._is_host_pid_alive(pid):
                     logger.info(
                         "Not recovering session %s: pid %d is alive but its "
@@ -1973,6 +2220,7 @@ class ProcessRegistry:
                 session_key=entry.get("session_key", ""),
                 pid=pid,
                 host_start_time=recorded_start,
+                host_boot_id=recorded_boot,
                 pid_scope=pid_scope,
                 cwd=entry.get("cwd"),
                 started_at=entry.get("started_at", time.time()),
@@ -1989,6 +2237,8 @@ class ProcessRegistry:
             )
             with self._lock:
                 self._running[session.id] = session
+            self._emit_process_lifecycle(session, "adopted")
+            self._start_local_lifecycle_monitor(session)
             recovered += 1
             logger.info("Recovered detached process: %s (pid=%d)", session.command[:60], pid)
 

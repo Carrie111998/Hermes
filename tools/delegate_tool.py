@@ -1116,6 +1116,7 @@ def _build_child_agent(
     # one key.  parent_id is non-None when THIS parent is itself a subagent
     # (nested orchestrator -> worker chain).
     subagent_id = f"sa-{task_index}-{_uuid.uuid4().hex[:8]}"
+    wrapper_id = f"dw-{task_index}-{_uuid.uuid4().hex[:12]}"
     parent_subagent_id = getattr(parent_agent, "_subagent_id", None)
     tui_depth = max(0, child_depth - 1)  # 0 = first-level child for the UI
 
@@ -1417,9 +1418,15 @@ def _build_child_agent(
     # Stash subagent identity for nested-delegation event propagation and
     # for _run_single_child / interrupt_subagent to look up by id.
     child._subagent_id = subagent_id
+    setattr(child, "_delegation_wrapper_id", wrapper_id)
     child._parent_subagent_id = parent_subagent_id
     child._subagent_goal = goal
     child._parent_turn_id = getattr(parent_agent, "_current_turn_id", "") or ""
+    # A built child is provider-registered before it is submitted for
+    # execution.  Keep an object-local guard so batch construction/dispatch
+    # failures can close that pre-start lifecycle exactly once.
+    child._delegation_prestart_cleanup_lock = threading.Lock()
+    child._delegation_prestart_cleanup_done = False
     # Stable sidebar marker: delegate subagent sessions must stay out of
     # session pickers even when a parent delete orphans them (parent_session_id
     # → NULL). Mirrors /branch's ``_branched_from`` pattern — see
@@ -1455,6 +1462,33 @@ def _build_child_agent(
             logger.debug("spawn_requested relay failed: %s", exc)
 
     try:
+        from agent.lifecycle_hooks import emit_subagent_lifecycle
+
+        emit_subagent_lifecycle(
+            "registered",
+            parent_session_id=getattr(parent_agent, "session_id", None),
+            parent_turn_id=getattr(parent_agent, "_current_turn_id", "") or "",
+            parent_subagent_id=parent_subagent_id,
+            delegation_wrapper_id=wrapper_id,
+            child_session_id=getattr(child, "session_id", None),
+            child_subagent_id=subagent_id,
+            child_role=effective_role,
+        )
+        from agent.lifecycle_hooks import emit_delegation_wrapper_lifecycle
+        emit_delegation_wrapper_lifecycle(
+            "registered",
+            wrapper_id=wrapper_id,
+            child_subagent_id=subagent_id,
+            parent_session_id=getattr(parent_agent, "session_id", None),
+            parent_turn_id=getattr(parent_agent, "_current_turn_id", "") or "",
+            parent_subagent_id=parent_subagent_id,
+        )
+    except Exception:
+        logger.debug(
+            "subagent_lifecycle_failed event=registered reason=callback_error"
+        )
+
+    try:
         from hermes_cli.plugins import invoke_hook as _invoke_hook
         _invoke_hook(
             "subagent_start",
@@ -1470,6 +1504,75 @@ def _build_child_agent(
         logger.debug("subagent_start hook invocation failed", exc_info=True)
 
     return child
+
+
+def _fail_registered_unstarted_child(child: Any, parent_agent: Any) -> None:
+    """Terminalize and release a provider-registered child that never started.
+
+    Batch construction and executor submission are both fallible after
+    ``_build_child_agent`` has emitted the child and wrapper ``registered``
+    events.  Such children never enter ``_run_single_child``, so its normal
+    terminal and cleanup authority cannot run.  This function is the narrow
+    pre-start owner for those failure paths.
+    """
+    lock = getattr(child, "_delegation_prestart_cleanup_lock", None)
+    if lock is None:
+        lock = threading.Lock()
+        setattr(child, "_delegation_prestart_cleanup_lock", lock)
+    with lock:
+        if getattr(child, "_delegation_prestart_cleanup_done", False) is True:
+            return
+        child._delegation_prestart_cleanup_done = True
+
+    lifecycle_args = {
+        "parent_session_id": getattr(parent_agent, "session_id", None),
+        "parent_turn_id": getattr(child, "_parent_turn_id", "") or "",
+        "parent_subagent_id": getattr(child, "_parent_subagent_id", None),
+    }
+    try:
+        from agent.lifecycle_hooks import emit_subagent_lifecycle
+
+        emit_subagent_lifecycle(
+            "terminal",
+            delegation_wrapper_id=getattr(child, "_delegation_wrapper_id", None),
+            child_session_id=getattr(child, "session_id", None),
+            child_subagent_id=getattr(child, "_subagent_id", None),
+            child_role=getattr(child, "_delegate_role", None),
+            terminal_status="failed",
+            **lifecycle_args,
+        )
+    except Exception:
+        logger.debug("subagent_lifecycle_failed event=terminal reason=prestart_cleanup")
+    try:
+        from agent.lifecycle_hooks import emit_delegation_wrapper_lifecycle
+
+        emit_delegation_wrapper_lifecycle(
+            "terminal",
+            wrapper_id=getattr(child, "_delegation_wrapper_id", None),
+            child_subagent_id=getattr(child, "_subagent_id", None),
+            terminal_status="failed",
+            **lifecycle_args,
+        )
+    except Exception:
+        logger.debug(
+            "delegation_wrapper_lifecycle_failed event=terminal reason=prestart_cleanup"
+        )
+
+    if parent_agent is not None and hasattr(parent_agent, "_active_children"):
+        try:
+            active_lock = getattr(parent_agent, "_active_children_lock", None)
+            if active_lock:
+                with active_lock:
+                    parent_agent._active_children.remove(child)
+            else:
+                parent_agent._active_children.remove(child)
+        except (ValueError, AttributeError):
+            pass
+    try:
+        if child is not None and hasattr(child, "close"):
+            child.close()
+    except Exception:
+        logger.debug("Failed to close unstarted delegated child", exc_info=True)
 
 
 def _dump_subagent_timeout_diagnostic(
@@ -1804,28 +1907,13 @@ def _run_single_child(
     """
     child_start = time.monotonic()
 
-    # Get the progress callback from the child agent
     child_progress_cb = getattr(child, "tool_progress_callback", None)
-
-    # Restore parent tool names using the value saved before child construction
-    # mutated the global. This is the correct parent toolset, not the child's.
-    import model_tools
-
-    _saved_tool_names = getattr(
-        child, "_delegate_saved_tool_names", list(model_tools._last_resolved_tool_names)
-    )
-
     child_pool = getattr(child, "_credential_pool", None)
     leased_cred_id = None
-    if child_pool is not None:
-        leased_cred_id = child_pool.acquire_lease()
-        if leased_cred_id is not None:
-            try:
-                leased_entry = child_pool.current()
-                if leased_entry is not None and hasattr(child, "_swap_credential"):
-                    child._swap_credential(leased_entry)
-            except Exception as exc:
-                logger.debug("Failed to bind child to leased credential: %s", exc)
+    _saved_tool_names = []
+    _raw_sid = getattr(child, "_subagent_id", None)
+    _subagent_id = _raw_sid if isinstance(_raw_sid, str) else None
+    _live_registered = False
 
     # Heartbeat: periodically propagate child activity to the parent so the
     # gateway inactivity timeout doesn't fire while the subagent is working.
@@ -1838,10 +1926,67 @@ def _run_single_child(
     _last_seen_iter = [0]
     _last_seen_tool = [None]  # type: list
     _stale_count = [0]
+    _legacy_touch_suppressed = [False]
+
+    def _emit_child_lifecycle(event: str, **extra: Any) -> None:
+        try:
+            from agent.lifecycle_hooks import emit_subagent_lifecycle
+
+            emit_subagent_lifecycle(
+                event,
+                parent_session_id=getattr(parent_agent, "session_id", None),
+                parent_turn_id=getattr(child, "_parent_turn_id", "") or "",
+                parent_subagent_id=getattr(child, "_parent_subagent_id", None),
+                delegation_wrapper_id=getattr(child, "_delegation_wrapper_id", None),
+                child_session_id=getattr(child, "session_id", None),
+                child_subagent_id=_subagent_id,
+                child_role=getattr(child, "_delegate_role", None),
+                **extra,
+            )
+        except Exception:
+            logger.debug(
+                "subagent_lifecycle_failed event=%s reason=invalid_or_callback_error",
+                event,
+            )
+
+    def _emit_wrapper_lifecycle(event: str, **extra: Any) -> None:
+        try:
+            from agent.lifecycle_hooks import emit_delegation_wrapper_lifecycle
+            emit_delegation_wrapper_lifecycle(
+                event,
+                wrapper_id=getattr(child, "_delegation_wrapper_id", None),
+                child_subagent_id=getattr(child, "_subagent_id", None),
+                parent_session_id=getattr(parent_agent, "session_id", None),
+                parent_turn_id=getattr(child, "_parent_turn_id", "") or "",
+                parent_subagent_id=getattr(child, "_parent_subagent_id", None),
+                **extra,
+            )
+        except Exception:
+            logger.debug("delegation_wrapper_lifecycle_failed event=%s", event)
+
+    _child_terminal_lock = threading.Lock()
+    _child_terminal_done = [False]
+
+    def _emit_child_terminal_once(status: str) -> None:
+        with _child_terminal_lock:
+            if _child_terminal_done[0]:
+                return
+            _child_terminal_done[0] = True
+        _emit_child_lifecycle("terminal", terminal_status=status)
 
     def _heartbeat_loop():
         while not _heartbeat_stop.wait(_HEARTBEAT_INTERVAL):
+            # Contract heartbeat is independent of the waiting wrapper and is
+            # owned by the live child execution context.
+            try:
+                _emit_child_lifecycle("heartbeat")
+            except Exception:
+                logger.debug(
+                    "subagent_lifecycle_failed event=heartbeat reason=callback_error"
+                )
             if parent_agent is None:
+                continue
+            if _legacy_touch_suppressed[0]:
                 continue
             touch = getattr(parent_agent, "_touch_activity", None)
             if not touch:
@@ -1887,7 +2032,10 @@ def _run_single_child(
                         _stale_count[0],
                         child_tool or "<none>",
                     )
-                    break  # stop touching parent, let gateway timeout fire
+                    # Suppress only the legacy parent-activity touch. The v1
+                    # lifecycle heartbeat remains owned by the live child.
+                    _legacy_touch_suppressed[0] = True
+                    continue
 
                 if child_tool:
                     desc = (
@@ -1910,42 +2058,113 @@ def _run_single_child(
 
     _heartbeat_thread = threading.Thread(target=_heartbeat_loop, daemon=True)
 
-    # Register the live agent in the module-level registry so the TUI can
-    # target it by subagent_id (kill, pause, status queries).  Unregistered
-    # in the finally block, even when the child raises.  Test doubles that
-    # hand us a MagicMock don't carry stable ids; skip registration then.
-    _raw_sid = getattr(child, "_subagent_id", None)
-    _subagent_id = _raw_sid if isinstance(_raw_sid, str) else None
-    if _subagent_id:
-        _raw_depth = getattr(child, "_delegate_depth", 1)
-        _tui_depth = max(0, _raw_depth - 1) if isinstance(_raw_depth, int) else 0
-        _parent_sid = getattr(child, "_parent_subagent_id", None)
-        _register_subagent(
-            {
-                "subagent_id": _subagent_id,
-                "parent_id": _parent_sid if isinstance(_parent_sid, str) else None,
-                "depth": _tui_depth,
-                "goal": goal,
-                "model": (
-                    getattr(child, "model", None)
-                    if isinstance(getattr(child, "model", None), str)
-                    else None
-                ),
-                "started_at": time.time(),
-                "status": "running",
-                "tool_count": 0,
-                "agent": child,
-            }
+    # Every operation after provider registration is under terminal authority.
+    # A setup failure happens before actual child start, so close both records
+    # from their registered state and release any partially acquired resource.
+    try:
+        import model_tools
+
+        _saved_tool_names = getattr(
+            child,
+            "_delegate_saved_tool_names",
+            list(model_tools._last_resolved_tool_names),
         )
+        if child_pool is not None:
+            leased_cred_id = child_pool.acquire_lease()
+            if leased_cred_id is not None:
+                try:
+                    leased_entry = child_pool.current()
+                    if leased_entry is not None and hasattr(child, "_swap_credential"):
+                        child._swap_credential(leased_entry)
+                except Exception as exc:
+                    logger.debug("Failed to bind child to leased credential: %s", exc)
+
+        if _subagent_id:
+            _raw_depth = getattr(child, "_delegate_depth", 1)
+            _tui_depth = max(0, _raw_depth - 1) if isinstance(_raw_depth, int) else 0
+            _parent_sid = getattr(child, "_parent_subagent_id", None)
+            _register_subagent(
+                {
+                    "subagent_id": _subagent_id,
+                    "parent_id": _parent_sid if isinstance(_parent_sid, str) else None,
+                    "depth": _tui_depth,
+                    "goal": goal,
+                    "model": (
+                        getattr(child, "model", None)
+                        if isinstance(getattr(child, "model", None), str)
+                        else None
+                    ),
+                    "started_at": time.time(),
+                    "status": "running",
+                    "tool_count": 0,
+                    "agent": child,
+                }
+            )
+            _live_registered = True
+    except BaseException:
+        _emit_child_terminal_once("failed")
+        _emit_wrapper_lifecycle("terminal", terminal_status="failed")
+        if _live_registered and _subagent_id:
+            _unregister_subagent(_subagent_id)
+        if child_pool is not None and leased_cred_id is not None:
+            try:
+                child_pool.release_lease(leased_cred_id)
+            except Exception:
+                pass
+        if parent_agent is not None and hasattr(parent_agent, "_active_children"):
+            try:
+                parent_agent._active_children.remove(child)
+            except (ValueError, AttributeError):
+                pass
+        try:
+            if child is not None and hasattr(child, "close"):
+                child.close()
+        except Exception:
+            pass
+        raise
+
+    _owner_cleanup_lock = threading.Lock()
+    _owner_cleanup_done = [False]
+    _child_future = None
+
+    def _cleanup_after_actual_child() -> None:
+        """Release child-owned resources exactly once after real completion."""
+        with _owner_cleanup_lock:
+            if _owner_cleanup_done[0]:
+                return
+            _owner_cleanup_done[0] = True
+
+        _heartbeat_stop.set()
+        if (
+            _heartbeat_thread.ident is not None
+            and _heartbeat_thread is not threading.current_thread()
+        ):
+            _heartbeat_thread.join(timeout=5)
+        if _subagent_id:
+            _unregister_subagent(_subagent_id)
+        if child_pool is not None and leased_cred_id is not None:
+            try:
+                child_pool.release_lease(leased_cred_id)
+            except Exception as exc:
+                logger.debug("Failed to release credential lease: %s", exc)
+        if parent_agent is not None and hasattr(parent_agent, "_active_children"):
+            try:
+                lock = getattr(parent_agent, "_active_children_lock", None)
+                if lock:
+                    with lock:
+                        parent_agent._active_children.remove(child)
+                else:
+                    parent_agent._active_children.remove(child)
+            except (ValueError, UnboundLocalError) as exc:
+                logger.debug("Could not remove child from active_children: %s", exc)
+        try:
+            if child is not None and hasattr(child, "close"):
+                child.close()
+        except Exception:
+            logger.debug("Failed to close child agent after delegation")
 
     try:
-        _heartbeat_thread.start()
-        if child_progress_cb:
-            try:
-                child_progress_cb("subagent.start", preview=goal)
-            except Exception as e:
-                logger.debug("Progress callback start failed: %s", e)
-
+        _emit_wrapper_lifecycle("started")
         # File-state coordination: reuse the stable subagent_id as the child's
         # task_id so file_state writes, active-subagents registry, and TUI
         # events all share one key.  Falls back to a fresh uuid only if the
@@ -2003,22 +2222,89 @@ def _run_single_child(
             except Exception as e:
                 logger.debug("Child text relay failed: %s", e)
 
+        _queue_announced = threading.Event()
+
+        def _terminal_status(run_result: Any) -> str:
+            """Classify only explicit conversation outcomes; ambiguity fails closed."""
+            if not isinstance(run_result, dict):
+                return "failed"
+            if run_result.get("interrupted") is True:
+                return "cancelled"
+            if run_result.get("failed") is True:
+                return "failed"
+            summary_value = run_result.get("final_response")
+            if (
+                run_result.get("completed") is True
+                and isinstance(summary_value, str)
+                and summary_value.strip()
+                and summary_value.strip() != "(empty)"
+            ):
+                return "succeeded"
+            # Partial, max-iteration, provider-exhaustion, and legacy/unknown
+            # result shapes are not authoritative success signals even when they
+            # carry non-empty user-facing text.
+            return "failed"
+
         def _run_with_thread_capture():
             _worker_thread_holder["t"] = threading.current_thread()
+            # A successful submit does not itself prove execution. The gate lets
+            # the submitter publish queued before this owner publishes started.
+            _queue_announced.wait()
             from agent.delegation_context import delegated_child_context
 
             with delegated_child_context():
-                return child.run_conversation(
-                    user_message=goal,
-                    task_id=child_task_id,
-                    stream_callback=_relay_child_text,
-                )
+                try:
+                    _heartbeat_thread.start()
+                    if child_progress_cb:
+                        try:
+                            child_progress_cb("subagent.start", preview=goal)
+                        except Exception as exc:
+                            logger.debug("Progress callback start failed: %s", exc)
+                    _emit_child_lifecycle("started")
+                    run_result = child.run_conversation(
+                        user_message=goal,
+                        task_id=child_task_id,
+                        stream_callback=_relay_child_text,
+                    )
+                    _emit_child_terminal_once(_terminal_status(run_result))
+                    return run_result
+                except BaseException:
+                    _emit_child_terminal_once("failed")
+                    raise
+                finally:
+                    _cleanup_after_actual_child()
 
-        _child_future = _timeout_executor.submit(_run_with_thread_capture)
+        try:
+            _child_future = _timeout_executor.submit(_run_with_thread_capture)
+            _emit_child_lifecycle("queued")
+        except Exception:
+            # Registration already happened during child construction. Close the
+            # pre-start attempt authoritatively so observers cannot strand it.
+            _emit_child_terminal_once("failed")
+            _emit_wrapper_lifecycle("terminal", terminal_status="failed")
+            _cleanup_after_actual_child()
+            raise
+        finally:
+            _queue_announced.set()
         try:
             result = _child_future.result(timeout=child_timeout)
         except Exception as _timeout_exc:
-            # Signal the child to stop so its thread can exit cleanly.
+            is_timeout = isinstance(_timeout_exc, (FuturesTimeoutError, TimeoutError))
+            if is_timeout:
+                _emit_wrapper_lifecycle("timed_out")
+                # The waiter is complete even though the child future remains
+                # authoritative for its own lifecycle and cleanup.
+                _emit_wrapper_lifecycle("terminal", terminal_status="cancelled")
+                try:
+                    _emit_child_lifecycle(
+                        "cancel_requested", cancel_reason="waiter_timeout"
+                    )
+                except Exception:
+                    logger.debug(
+                        "subagent_lifecycle_failed event=cancel_requested reason=callback_error"
+                    )
+            # Signal the child to stop so its thread can exit cleanly. This is a
+            # request only; terminal and cleanup remain owned by the live future.
             try:
                 if hasattr(child, "interrupt"):
                     child.interrupt()
@@ -2027,7 +2313,6 @@ def _run_single_child(
             except Exception:
                 pass
 
-            is_timeout = isinstance(_timeout_exc, (FuturesTimeoutError, TimeoutError))
             duration = round(time.monotonic() - child_start, 2)
             logger.warning(
                 "Subagent %d %s after %.1fs",
@@ -2097,6 +2382,7 @@ def _run_single_child(
                         f"stuck on a slow API call or unresponsive network request."
                     )
             else:
+                _emit_wrapper_lifecycle("terminal", terminal_status="failed")
                 _err = str(_timeout_exc)
 
             return {
@@ -2126,22 +2412,20 @@ def _run_single_child(
 
         summary = result.get("final_response") or ""
         completed = result.get("completed", False)
+        failed = result.get("failed", False)
         interrupted = result.get("interrupted", False)
         api_calls = result.get("api_calls", 0)
 
-        # The child emits the literal "(empty)" sentinel (see run_agent.py) when
-        # it gives up after repeated empty-LLM-response retries — typically a
-        # transport bug (misrouted provider, adapter returning empty
-        # ChatCompletion, etc.). Treat it as a failure so the parent surfaces
-        # it instead of silently accepting zero-content "success".
-        _empty_sentinel = summary.strip() == "(empty)"
-
+        # Parent-visible status is derived from the same authoritative classifier
+        # used by the lifecycle terminal event, including the literal ``(empty)``
+        # transport-failure sentinel.
+        authoritative_terminal = _terminal_status(result)
+        _emit_wrapper_lifecycle("terminal", terminal_status=authoritative_terminal)
         if interrupted:
             status = "interrupted"
-        elif summary and not _empty_sentinel:
-            # A summary means the subagent produced usable output.
-            # exit_reason ("completed" vs "max_iterations") already
-            # tells the parent *how* the task ended.
+        elif authoritative_terminal == "succeeded":
+            # Parent-facing status must agree with authoritative lifecycle truth:
+            # usable text alone cannot turn an explicit/partial failure into success.
             status = "completed"
         else:
             status = "failed"
@@ -2185,8 +2469,10 @@ def _run_single_child(
         # Determine exit reason
         if interrupted:
             exit_reason = "interrupted"
-        elif completed:
+        elif authoritative_terminal == "succeeded":
             exit_reason = "completed"
+        elif failed or completed:
+            exit_reason = "error"
         else:
             exit_reason = "max_iterations"
 
@@ -2354,56 +2640,18 @@ def _run_single_child(
         }
 
     finally:
-        # Stop the heartbeat thread so it doesn't keep touching parent activity
-        # after the child has finished (or failed).  Guard the join: .start()
-        # now lives inside the try block, so if it raised (OS thread
-        # exhaustion) the thread was never started and Thread.join() would
-        # raise RuntimeError.  ident is None until start() succeeds.
-        _heartbeat_stop.set()
-        if _heartbeat_thread.ident is not None:
-            _heartbeat_thread.join(timeout=5)
-
-        # Drop the TUI-facing registry entry.  Safe to call even if the
-        # child was never registered (e.g. ID missing on test doubles).
-        if _subagent_id:
-            _unregister_subagent(_subagent_id)
-
-        if child_pool is not None and leased_cred_id is not None:
-            try:
-                child_pool.release_lease(leased_cred_id)
-            except Exception as exc:
-                logger.debug("Failed to release credential lease: %s", exc)
-
-        # Restore the parent's tool names so the process-global is correct
-        # for any subsequent execute_code calls or other consumers.
+        # Before a future exists (or after it is done), this wrapper owns
+        # cleanup. A timed-out live future remains the sole cleanup owner.
+        if _child_future is None or _child_future.done():
+            _cleanup_after_actual_child()
+        # Process-global tool-name restoration is wrapper-owned and safe on a
+        # waiter timeout. Child liveness resources are released only by
+        # _cleanup_after_actual_child inside the actual future.
         import model_tools
 
         saved_tool_names = getattr(child, "_delegate_saved_tool_names", None)
         if isinstance(saved_tool_names, list):
             model_tools._last_resolved_tool_names = list(saved_tool_names)
-
-        # Remove child from active tracking
-
-        # Unregister child from interrupt propagation
-        if hasattr(parent_agent, "_active_children"):
-            try:
-                lock = getattr(parent_agent, "_active_children_lock", None)
-                if lock:
-                    with lock:
-                        parent_agent._active_children.remove(child)
-                else:
-                    parent_agent._active_children.remove(child)
-            except (ValueError, UnboundLocalError) as e:
-                logger.debug("Could not remove child from active_children: %s", e)
-
-        # Close tool resources (terminal sandboxes, browser daemons,
-        # background processes, httpx clients) so subagent subprocesses
-        # don't outlive the delegation.
-        try:
-            if hasattr(child, "close"):
-                child.close()
-        except Exception:
-            logger.debug("Failed to close child agent after delegation")
 
 
 def _recover_tasks_from_json_string(
@@ -2600,48 +2848,58 @@ def delegate_task(
     # child build raises (otherwise _last_resolved_tool_names stays corrupted).
     children = []
     try:
-        for i, t in enumerate(task_list):
-            # Per-task role beats top-level; normalise again so unknown
-            # per-task values warn and degrade to leaf uniformly.
-            effective_role = _normalize_role(t.get("role") or top_role)
-            child = _build_child_agent(
-                task_index=i,
-                goal=t["goal"],
-                context=t.get("context"),
-                # Subagents always inherit the parent's toolsets; the model
-                # cannot choose or narrow them (no model-facing toolsets arg).
-                toolsets=None,
-                model=creds["model"],
-                max_iterations=effective_max_iter,
-                task_count=n_tasks,
-                parent_agent=parent_agent,
-                override_provider=creds["provider"],
-                override_base_url=creds["base_url"],
-                override_api_key=creds["api_key"],
-                override_api_mode=creds["api_mode"],
-                override_request_overrides=creds.get("request_overrides"),
-                override_max_tokens=creds.get("max_output_tokens"),
-                override_acp_command=creds.get("command"),
-                override_acp_args=creds.get("args"),
-                role=effective_role,
-            )
-            # Override with correct parent tool names (before child construction mutated global)
-            child._delegate_saved_tool_names = _parent_tool_names
-            # Tee the child's progress events into its live transcript log.
-            # wrap_progress_callback preserves the inner callback contract
-            # (including the _flush attribute) and never lets writer failures
-            # reach the agent loop. When no parent display exists the inner
-            # callback is None and the wrapper still records events.
-            _writer = live_writers[i] if i < len(live_writers) else None
-            if _writer is not None:
-                child.tool_progress_callback = wrap_progress_callback(
-                    getattr(child, "tool_progress_callback", None), _writer
+        try:
+            for i, t in enumerate(task_list):
+                # Per-task role beats top-level; normalise again so unknown
+                # per-task values warn and degrade to leaf uniformly.
+                effective_role = _normalize_role(t.get("role") or top_role)
+                child = _build_child_agent(
+                    task_index=i,
+                    goal=t["goal"],
+                    context=t.get("context"),
+                    # Subagents always inherit the parent's toolsets; the model
+                    # cannot choose or narrow them (no model-facing toolsets arg).
+                    toolsets=None,
+                    model=creds["model"],
+                    max_iterations=effective_max_iter,
+                    task_count=n_tasks,
+                    parent_agent=parent_agent,
+                    override_provider=creds["provider"],
+                    override_base_url=creds["base_url"],
+                    override_api_key=creds["api_key"],
+                    override_api_mode=creds["api_mode"],
+                    override_request_overrides=creds.get("request_overrides"),
+                    override_max_tokens=creds.get("max_output_tokens"),
+                    override_acp_command=creds.get("command"),
+                    override_acp_args=creds.get("args"),
+                    role=effective_role,
                 )
-                child._live_transcript_path = str(_writer.path)
-            children.append((i, t, child))
-    finally:
-        # Authoritative restore: reset global to parent's tool names after all children built
-        _model_tools._last_resolved_tool_names = _parent_tool_names
+                # From this point the provider lifecycle is registered; bind
+                # it to the batch cleanup owner before any further setup.
+                children.append((i, t, child))
+                # Override with correct parent tool names (before child construction mutated global)
+                child._delegate_saved_tool_names = _parent_tool_names
+                # Tee the child's progress events into its live transcript log.
+                # wrap_progress_callback preserves the inner callback contract
+                # (including the _flush attribute) and never lets writer failures
+                # reach the agent loop. When no parent display exists the inner
+                # callback is None and the wrapper still records events.
+                _writer = live_writers[i] if i < len(live_writers) else None
+                if _writer is not None:
+                    child.tool_progress_callback = wrap_progress_callback(
+                        getattr(child, "tool_progress_callback", None), _writer
+                    )
+                    child._live_transcript_path = str(_writer.path)
+        finally:
+            # Authoritative restore: reset global to parent's tool names after all children built
+            _model_tools._last_resolved_tool_names = _parent_tool_names
+    except BaseException:
+        # A later build failed after earlier children were provider-registered.
+        # They will never reach _run_single_child, so close their lifecycle and
+        # resources here before preserving the original build failure.
+        for _i, _t, built_child in children:
+            _fail_registered_unstarted_child(built_child, parent_agent)
+        raise
 
     def _execute_and_aggregate() -> dict:
         """Run all built children (1 or N), join on them, aggregate results,
@@ -2669,15 +2927,28 @@ def delegate_task(
             from tools.daemon_pool import DaemonThreadPoolExecutor
             with DaemonThreadPoolExecutor(max_workers=max_children) as executor:
                 futures = {}
-                for i, t, child in children:
-                    future = executor.submit(
-                        _run_single_child,
-                        task_index=i,
-                        goal=t["goal"],
-                        child=child,
-                        parent_agent=parent_agent,
-                    )
-                    futures[future] = i
+                submitted_count = 0
+                try:
+                    for i, t, child in children:
+                        future = executor.submit(
+                            _run_single_child,
+                            task_index=i,
+                            goal=t["goal"],
+                            child=child,
+                            parent_agent=parent_agent,
+                        )
+                        futures[future] = i
+                        submitted_count += 1
+                except BaseException:
+                    # The failing submit and every later child remain in their
+                    # provider-registered state and have no execution owner.
+                    # Already-submitted children retain _run_single_child as
+                    # their sole terminal/cleanup authority.
+                    for _i, _t, unstarted_child in children[submitted_count:]:
+                        _fail_registered_unstarted_child(
+                            unstarted_child, parent_agent
+                        )
+                    raise
 
                 # Poll futures with interrupt checking.  as_completed() blocks
                 # until ALL futures finish — if a child agent gets stuck,
