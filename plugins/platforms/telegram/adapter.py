@@ -2243,7 +2243,7 @@ class TelegramAdapter(BasePlatformAdapter):
             self._polling_conflict_count = 0
         self._send_path_degraded = False
         if recovered_network_errors > 0:
-            logger.info(
+            logger.warning(
                 "[%s] Telegram polling recovered after successful getUpdates progress",
                 self.name,
             )

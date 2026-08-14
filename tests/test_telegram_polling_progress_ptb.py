@@ -213,7 +213,7 @@ async def test_real_base_request_unsuccessful_200_envelope_cannot_record_progres
 
 @pytest.mark.asyncio
 async def test_real_base_request_valid_success_envelope_records_progress(caplog):
-    caplog.set_level(logging.INFO, logger=tg_adapter.__name__)
+    caplog.set_level(logging.WARNING, logger=tg_adapter.__name__)
     adapter = TelegramAdapter(PlatformConfig(enabled=True, token="123456:test-token"))
     generation, progress = adapter._begin_polling_generation()
     adapter._polling_network_error_count = 4
@@ -239,7 +239,7 @@ async def test_real_base_request_valid_success_envelope_records_progress(caplog)
 
 
 def test_initial_polling_progress_does_not_claim_recovery(caplog):
-    caplog.set_level(logging.INFO, logger=tg_adapter.__name__)
+    caplog.set_level(logging.WARNING, logger=tg_adapter.__name__)
     adapter = TelegramAdapter(PlatformConfig(enabled=True, token="123456:test-token"))
     generation, progress = adapter._begin_polling_generation()
 
