@@ -1210,9 +1210,10 @@ def handle_function_call(
         function_args: Arguments for the function.
         task_id: Unique identifier for terminal/browser session isolation.
         user_task: The user's original task (for browser_snapshot context).
-        enabled_tools: Tool names enabled for this session.  When provided,
-                       execute_code uses this list to determine which sandbox
-                       tools to generate.  Falls back to the process-global
+        enabled_tools: Tool names enabled for this session. When provided,
+                       this is also the runtime authority for Kanban calls;
+                       execute_code uses it to determine which sandbox tools
+                       to generate. Falls back to the process-global
                        ``_last_resolved_tool_names`` for backward compat.
         enabled_toolsets: The session's enabled toolsets.  Used to scope the
                        Tool Search bridge catalog so ``tool_search`` /
@@ -1333,13 +1334,38 @@ def handle_function_call(
                 turn_id=turn_id,
                 api_request_id=api_request_id,
                 user_task=user_task,
-                enabled_tools=enabled_tools,
+                enabled_tools=(
+                    list(dict.fromkeys([*(enabled_tools or []), underlying_name]))
+                    if enabled_tools is not None
+                    else None
+                ),
                 skip_pre_tool_call_hook=skip_pre_tool_call_hook,
                 skip_tool_request_middleware=skip_tool_request_middleware,
                 skip_tool_execution_middleware=skip_tool_execution_middleware,
                 tool_request_middleware_trace=list(_tool_middleware_trace),
                 enabled_toolsets=enabled_toolsets,
                 disabled_toolsets=disabled_toolsets,
+            )
+
+    # Runtime parity for Kanban authority. Tool schema assembly is the primary
+    # UX gate, but model-emitted or replayed calls can arrive out of schema.
+    # Fail closed against the exact session grant and disabled-toolset
+    # subtraction before any hook, middleware, or registry side effect.
+    if function_name.startswith("kanban_"):
+        toolset = get_toolset_for_tool(function_name)
+        disabled = {str(name).strip() for name in (disabled_toolsets or [])}
+        if toolset and toolset in disabled:
+            return _return_bridge_result(
+                tool_error(
+                    f"Tool '{function_name}' is unavailable because disabled "
+                    f"toolset '{toolset}' applies to this session."
+                )
+            )
+        if enabled_tools is not None and function_name not in set(enabled_tools):
+            return _return_bridge_result(
+                tool_error(
+                    f"Tool '{function_name}' is not available in this session."
+                )
             )
 
     _tool_original_args = dict(function_args)

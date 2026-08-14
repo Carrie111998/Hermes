@@ -9332,8 +9332,8 @@ def _collect_kanban_notifications(session: dict) -> list:
     can't deliver those — there is no "tui" messaging adapter — so this
     poller is the delivery path for them (issue #59890). Uses the same
     atomic cursor-claim (``claim_unseen_events_for_sub``) as the gateway
-    notifier, so a subscription is delivered exactly once even if a gateway
-    and a TUI poll the same board DB.
+    notifier. Its SQLite lease serializes a subscription even if multiple TUI
+    pollers overlap; settlement advances the cursor only after formatting.
 
     Returns the list of formatted notification texts (may be empty).
     """
@@ -9397,7 +9397,7 @@ def _collect_kanban_notifications(session: dict) -> list:
                     continue
                 if sub.get("chat_id") != session_key:
                     continue
-                _old, _new, events = _kb.claim_unseen_events_for_sub(
+                claim_token, _old, claim_cursor, events = _kb.claim_unseen_events_for_sub(
                     conn,
                     task_id=sub["task_id"],
                     platform=sub["platform"],
@@ -9412,6 +9412,15 @@ def _collect_kanban_notifications(session: dict) -> list:
                     text = _format_kanban_event_text(sub, task, ev, slug)
                     if text:
                         texts.append(text)
+                _kb.finish_notify_claim(
+                    conn,
+                    task_id=sub["task_id"],
+                    platform=sub["platform"],
+                    chat_id=sub["chat_id"],
+                    thread_id=sub.get("thread_id") or "",
+                    claim_token=claim_token,
+                    delivered_cursor=claim_cursor,
+                )
                 # Unsubscribe only on archive. ``done`` is reversible in
                 # review/controller flows, so retaining the subscription lets
                 # a later reopen notify the same originating TUI/Desktop

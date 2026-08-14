@@ -218,7 +218,7 @@ class GatewayKanbanWatchersMixin:
         # but is not a block (see kanban_db.request_review); the task is not
         # archived, so the subscription stays alive and later review
         # cycles keep notifying.
-        TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "block_loop_detected", "review_requested", "changes_requested")
+        TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "block_loop_detected", "review_requested", "changes_requested", "review_reopened")
         # Subscriptions are removed only when the task reaches the irreversible
         # archived status. ``done`` is reversible in review/controller flows,
         # so removing its subscription would silence a later reopen. We used
@@ -433,7 +433,7 @@ class GatewayKanbanWatchersMixin:
                                             sub.get("task_id"), platform or "<missing>",
                                         )
                                         continue
-                                    old_cursor, cursor, events = _kb.claim_unseen_events_for_sub(
+                                    claim_token, old_cursor, cursor, events = _kb.claim_unseen_events_for_sub(
                                         conn,
                                         task_id=sub["task_id"],
                                         platform=sub["platform"],
@@ -450,6 +450,7 @@ class GatewayKanbanWatchersMixin:
                                     )
                                     deliveries.append({
                                         "sub": sub,
+                                        "claim_token": claim_token,
                                         "old_cursor": old_cursor,
                                         "cursor": cursor,
                                         "events": events,
@@ -480,7 +481,11 @@ class GatewayKanbanWatchersMixin:
                         # Unknown platform string; skip and advance cursor so
                         # we don't replay forever.
                         await asyncio.to_thread(
-                            self._kanban_advance, sub, d["cursor"], board_slug,
+                            self._kanban_advance,
+                            sub,
+                            d["claim_token"],
+                            d["cursor"],
+                            board_slug,
                         )
                         continue
                     sub_profile = sub.get("notifier_profile") or ""
@@ -502,7 +507,7 @@ class GatewayKanbanWatchersMixin:
                         await asyncio.to_thread(
                             self._kanban_rewind,
                             sub,
-                            d["cursor"],
+                            d["claim_token"],
                             d.get("old_cursor", 0),
                             board_slug,
                         )
@@ -525,6 +530,11 @@ class GatewayKanbanWatchersMixin:
                     # "Task X completed" and re-decomposes work that already
                     # exists on the board.
                     wake_handoff = ""
+                    # The claim lease serializes this subscription without
+                    # advancing its durable cursor before I/O. Track the last
+                    # event actually delivered so settlement exposes only the
+                    # unsent suffix after a partial failure.
+                    delivered_cursor = int(d.get("old_cursor", 0))
                     for ev in d["events"]:
                         kind = ev.kind
                         # Identity prefix: attribute terminal pings to the
@@ -610,6 +620,14 @@ class GatewayKanbanWatchersMixin:
                                 f"✏️ {board_tag}{rework_tag}Kanban {sub['task_id']} "
                                 f"changes requested{reason}"
                             )
+                        elif kind == "review_reopened":
+                            reason = ""
+                            if ev.payload and ev.payload.get("reason"):
+                                reason = f": {str(ev.payload['reason'])[:200]}"
+                            msg = (
+                                f"↩️ {board_tag}{tag}Kanban {sub['task_id']} "
+                                f"review reopened{reason}"
+                            )
                         elif kind == "block_loop_detected":
                             # A task re-blocked for the same cause past the
                             # recurrence limit and was routed to `triage` for a
@@ -637,6 +655,7 @@ class GatewayKanbanWatchersMixin:
                             # archive needs no user ping, and unblocked is an
                             # internal transition. They are also excluded from
                             # _WAKE_KINDS below, so they never wake the creator.
+                            delivered_cursor = max(delivered_cursor, int(ev.id))
                             continue
                         delivery_metadata = sub.get("delivery_metadata")
                         metadata: dict[str, Any] = (
@@ -726,6 +745,7 @@ class GatewayKanbanWatchersMixin:
                                     )
                             # Reset the failure counter on success.
                             sub_fail_counts.pop(sub_key, None)
+                            delivered_cursor = max(delivered_cursor, int(ev.id))
                         except Exception as exc:
                             fails = sub_fail_counts.get(sub_key, 0) + 1
                             sub_fail_counts[sub_key] = fails
@@ -747,8 +767,8 @@ class GatewayKanbanWatchersMixin:
                                 await asyncio.to_thread(
                                     self._kanban_rewind,
                                     sub,
-                                    d["cursor"],
-                                    d.get("old_cursor", 0),
+                                    d["claim_token"],
+                                    delivered_cursor,
                                     board_slug,
                                 )
                             # Rewind the pre-send claim on transient failure so
@@ -773,7 +793,7 @@ class GatewayKanbanWatchersMixin:
                         #   claim exactly like a failed send() above, so the
                         #   next tick retries.
                         task_terminal = task and task.status == "archived"
-                        _WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked")
+                        _WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked", "review_requested", "changes_requested", "review_reopened")
                         _wake_kinds = (
                             {ev.kind for ev in d["events"] if ev.kind in _WAKE_KINDS}
                             if wake_agent
@@ -810,6 +830,9 @@ class GatewayKanbanWatchersMixin:
                             if "crashed" in _wake_kinds: _parts.append(t("gateway.kanban.wake.crashed"))
                             if "timed_out" in _wake_kinds: _parts.append(t("gateway.kanban.wake.timed_out"))
                             if "blocked" in _wake_kinds: _parts.append(t("gateway.kanban.wake.blocked"))
+                            if "review_requested" in _wake_kinds: _parts.append(t("gateway.kanban.wake.review_requested"))
+                            if "changes_requested" in _wake_kinds: _parts.append(t("gateway.kanban.wake.changes_requested"))
+                            if "review_reopened" in _wake_kinds: _parts.append(t("gateway.kanban.wake.review_reopened"))
                             _status = t("gateway.kanban.wake.status_joiner").join(_parts) or t("gateway.kanban.wake.status_default")
                             _synth = t(
                                 "gateway.kanban.wake.message",
@@ -873,7 +896,7 @@ class GatewayKanbanWatchersMixin:
                                     await asyncio.to_thread(
                                         self._kanban_rewind,
                                         sub,
-                                        d["cursor"],
+                                        d["claim_token"],
                                         d.get("old_cursor", 0),
                                         board_slug,
                                     )
@@ -973,7 +996,7 @@ class GatewayKanbanWatchersMixin:
                                     await asyncio.to_thread(
                                         self._kanban_rewind,
                                         sub,
-                                        d["cursor"],
+                                        d["claim_token"],
                                         d.get("old_cursor", 0),
                                         board_slug,
                                     )
@@ -985,7 +1008,11 @@ class GatewayKanbanWatchersMixin:
                         # mechanism — it prevents re-delivery of the same
                         # event on subsequent ticks.
                         await asyncio.to_thread(
-                            self._kanban_advance, sub, d["cursor"], board_slug,
+                            self._kanban_advance,
+                            sub,
+                            d["claim_token"],
+                            d["cursor"],
+                            board_slug,
                         )
                         if not _is_push_adapter:
                             # Nothing left to deliver on this path (the wake,
@@ -1026,23 +1053,24 @@ class GatewayKanbanWatchersMixin:
                 await asyncio.sleep(1)
 
     def _kanban_advance(
-        self, sub: dict, cursor: int, board: Optional[str] = None,
+        self,
+        sub: dict,
+        claim_token: str,
+        cursor: int,
+        board: Optional[str] = None,
     ) -> None:
-        """Sync helper: advance a subscription's cursor. Runs in to_thread.
-
-        ``board`` scopes the DB connection to the board that owns this
-        subscription. Unsub cursors in one board can't touch another's.
-        """
+        """Sync helper: settle a successful leased delivery range."""
         from hermes_cli import kanban_db as _kb
         conn = _kb.connect(board=board)
         try:
-            _kb.advance_notify_cursor(
+            _kb.finish_notify_claim(
                 conn,
                 task_id=sub["task_id"],
                 platform=sub["platform"],
                 chat_id=sub["chat_id"],
                 thread_id=sub.get("thread_id") or "",
-                new_cursor=cursor,
+                claim_token=claim_token,
+                delivered_cursor=cursor,
             )
         finally:
             conn.close()
@@ -1064,22 +1092,22 @@ class GatewayKanbanWatchersMixin:
     def _kanban_rewind(
         self,
         sub: dict,
-        claimed_cursor: int,
-        old_cursor: int,
+        claim_token: str,
+        delivered_cursor: int,
         board: Optional[str] = None,
     ) -> None:
-        """Sync helper: undo a claimed notification cursor after send failure."""
+        """Sync helper: release a claim at its last delivered event."""
         from hermes_cli import kanban_db as _kb
         conn = _kb.connect(board=board)
         try:
-            _kb.rewind_notify_cursor(
+            _kb.finish_notify_claim(
                 conn,
                 task_id=sub["task_id"],
                 platform=sub["platform"],
                 chat_id=sub["chat_id"],
                 thread_id=sub.get("thread_id") or "",
-                claimed_cursor=claimed_cursor,
-                old_cursor=old_cursor,
+                claim_token=claim_token,
+                delivered_cursor=delivered_cursor,
             )
         finally:
             conn.close()

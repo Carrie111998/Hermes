@@ -352,7 +352,7 @@ def test_review_requested_event_is_claimable_for_wake(kanban_home: Path) -> None
             "completed", "blocked", "gave_up", "crashed", "timed_out",
             "review_requested",
         )
-        _old, _new, events = kb.claim_unseen_events_for_sub(
+        claim_token, _old, claim_cursor, events = kb.claim_unseen_events_for_sub(
             conn,
             task_id=tid,
             platform="slack",
@@ -362,6 +362,15 @@ def test_review_requested_event_is_claimable_for_wake(kanban_home: Path) -> None
         )
         kinds_seen = [e.kind for e in events]
         assert "review_requested" in kinds_seen
+        assert kb.finish_notify_claim(
+            conn,
+            task_id=tid,
+            platform="slack",
+            chat_id="C123",
+            thread_id="T1",
+            claim_token=claim_token,
+            delivered_cursor=claim_cursor,
+        ) is True
         # Task is parked in review — the subscription must survive (only
         # done/archived tears it down), so subsequent cycles still wake.
         assert kb.get_task(conn, tid).status == "review"

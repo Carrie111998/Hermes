@@ -2544,6 +2544,13 @@ def _get_platform_tools(
     else:
         enabled_toolsets.update(explicit_mcp_servers)
 
+    # Preserve the legacy profile-wide toolset contract. Per-platform config is
+    # preferred, but existing orchestrator profiles may still declare top-level
+    # ``toolsets: [kanban]`` and the runtime gate continues to honour it.
+    legacy_toolsets = config.get("toolsets")
+    if isinstance(legacy_toolsets, (list, tuple)) and "kanban" in legacy_toolsets:
+        enabled_toolsets.add("kanban")
+
     # Honor agent.disabled_toolsets from config.yaml — allows users to
     # globally suppress specific toolsets (e.g. "memory") across all
     # platforms without per-platform toolset configuration.  This runs

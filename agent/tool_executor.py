@@ -2211,7 +2211,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                             or "",
                             enabled_tools=(
                                 list(agent.valid_tool_names)
-                                if agent.valid_tool_names
+                                if getattr(agent, "valid_tool_names", None) is not None
                                 else None
                             ),
                             skip_pre_tool_call_hook=True,
@@ -2293,7 +2293,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                             or "",
                             enabled_tools=(
                                 list(agent.valid_tool_names)
-                                if agent.valid_tool_names
+                                if getattr(agent, "valid_tool_names", None) is not None
                                 else None
                             ),
                             skip_pre_tool_call_hook=True,

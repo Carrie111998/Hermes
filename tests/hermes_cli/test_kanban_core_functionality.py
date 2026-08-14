@@ -151,46 +151,46 @@ def test_notify_sub_crud(kanban_home):
         conn.close()
 
 
-def test_notify_claim_is_single_owner_and_rewindable(kanban_home):
+def test_notify_claim_is_single_owner_and_releasable(kanban_home):
     conn1 = kb.connect()
     conn2 = kb.connect()
     try:
         tid = kb.create_task(conn1, title="x", assignee="w")
         kb.add_notify_sub(conn1, task_id=tid, platform="telegram", chat_id="123")
-        # New subs start caught up at the task's current MAX(task_events.id)
-        # (the `created` event) — issue #29905.
         initial_cursor = int(kb.list_notify_subs(conn1, tid)[0]["last_event_id"])
         kb.complete_task(conn1, tid, result="ok")
 
-        old_cursor, claimed_cursor, events = kb.claim_unseen_events_for_sub(
-            conn1,
-            task_id=tid,
-            platform="telegram",
-            chat_id="123",
-            kinds=["completed", "blocked"],
+        claim_token, old_cursor, claimed_cursor, events = (
+            kb.claim_unseen_events_for_sub(
+                conn1,
+                task_id=tid,
+                platform="telegram",
+                chat_id="123",
+                kinds=["completed", "blocked"],
+            )
         )
+        assert claim_token
         assert old_cursor == initial_cursor
         assert claimed_cursor > old_cursor
         assert [ev.kind for ev in events] == ["completed"]
 
-        # A concurrent notifier instance sees the advanced cursor and cannot
-        # claim/send the same event range.
-        _, _, duplicate_events = kb.claim_unseen_events_for_sub(
+        duplicate_token, _, _, duplicate_events = kb.claim_unseen_events_for_sub(
             conn2,
             task_id=tid,
             platform="telegram",
             chat_id="123",
             kinds=["completed", "blocked"],
         )
+        assert duplicate_token is None
         assert duplicate_events == []
 
-        assert kb.rewind_notify_cursor(
+        assert kb.finish_notify_claim(
             conn1,
             task_id=tid,
             platform="telegram",
             chat_id="123",
-            claimed_cursor=claimed_cursor,
-            old_cursor=old_cursor,
+            claim_token=claim_token,
+            delivered_cursor=old_cursor,
         ) is True
         _, retried_events = kb.unseen_events_for_sub(
             conn2,
@@ -200,6 +200,145 @@ def test_notify_claim_is_single_owner_and_rewindable(kanban_home):
             kinds=["completed", "blocked"],
         )
         assert [ev.kind for ev in retried_events] == ["completed"]
+    finally:
+        conn1.close()
+        conn2.close()
+
+
+def test_expired_notify_claim_rejects_stale_settlement(kanban_home):
+    conn1 = kb.connect()
+    conn2 = kb.connect()
+    try:
+        tid = kb.create_task(conn1, title="ordered cursor", assignee="w")
+        kb.add_notify_sub(conn1, task_id=tid, platform="telegram", chat_id="123")
+
+        kb._append_event(conn1, tid, "review_requested", {"summary": "first"})
+        conn1.commit()
+        token_a, old_cursor, cursor_a, events_a = kb.claim_unseen_events_for_sub(
+            conn1,
+            task_id=tid,
+            platform="telegram",
+            chat_id="123",
+            kinds=["review_requested", "changes_requested"],
+            now=100,
+            lease_seconds=10,
+        )
+        assert token_a
+        assert [event.kind for event in events_a] == ["review_requested"]
+
+        kb._append_event(conn1, tid, "changes_requested", {"reason": "second"})
+        conn1.commit()
+        token_b, old_b, cursor_b, events_b = kb.claim_unseen_events_for_sub(
+            conn2,
+            task_id=tid,
+            platform="telegram",
+            chat_id="123",
+            kinds=["review_requested", "changes_requested"],
+            now=110,
+            lease_seconds=10,
+        )
+        assert token_b
+        assert old_b == old_cursor
+        assert cursor_b > cursor_a
+        assert [event.kind for event in events_b] == [
+            "review_requested",
+            "changes_requested",
+        ]
+
+        assert kb.finish_notify_claim(
+            conn1,
+            task_id=tid,
+            platform="telegram",
+            chat_id="123",
+            claim_token=token_a,
+            delivered_cursor=cursor_a,
+        ) is False
+        assert kb.finish_notify_claim(
+            conn2,
+            task_id=tid,
+            platform="telegram",
+            chat_id="123",
+            claim_token=token_b,
+            delivered_cursor=cursor_b,
+        ) is True
+        sub = kb.list_notify_subs(conn1, tid)[0]
+        assert int(sub["last_event_id"]) == cursor_b
+    finally:
+        conn1.close()
+        conn2.close()
+
+
+def test_notify_claim_lease_prevents_later_success_from_losing_earlier_failure(
+    kanban_home,
+):
+    """A later notifier cannot overtake an in-flight earlier delivery."""
+    conn1 = kb.connect()
+    conn2 = kb.connect()
+    try:
+        tid = kb.create_task(conn1, title="lossless delivery", assignee="w")
+        kb.add_notify_sub(conn1, task_id=tid, platform="telegram", chat_id="123")
+        initial_cursor = int(kb.list_notify_subs(conn1, tid)[0]["last_event_id"])
+
+        kb._append_event(
+            conn1, tid, "review_requested", {"summary": "first"}
+        )
+        conn1.commit()
+        token_a, old_a, cursor_a, events_a = kb.claim_unseen_events_for_sub(
+            conn1,
+            task_id=tid,
+            platform="telegram",
+            chat_id="123",
+            kinds=["review_requested", "changes_requested"],
+            now=100,
+            lease_seconds=30,
+        )
+        assert token_a
+        assert old_a == initial_cursor
+        assert cursor_a > initial_cursor
+        assert [event.kind for event in events_a] == ["review_requested"]
+
+        kb._append_event(
+            conn1, tid, "changes_requested", {"reason": "second"}
+        )
+        conn1.commit()
+        token_b, old_b, cursor_b, events_b = kb.claim_unseen_events_for_sub(
+            conn2,
+            task_id=tid,
+            platform="telegram",
+            chat_id="123",
+            kinds=["review_requested", "changes_requested"],
+            now=101,
+            lease_seconds=30,
+        )
+        assert token_b is None
+        assert (old_b, cursor_b, events_b) == (initial_cursor, initial_cursor, [])
+
+        # A's delivery fails. Releasing its claim at the old cursor must expose
+        # both the earlier event and the event that arrived while A was active.
+        assert kb.finish_notify_claim(
+            conn1,
+            task_id=tid,
+            platform="telegram",
+            chat_id="123",
+            claim_token=token_a,
+            delivered_cursor=old_a,
+        ) is True
+        token_b, old_b, cursor_b, events_b = kb.claim_unseen_events_for_sub(
+            conn2,
+            task_id=tid,
+            platform="telegram",
+            chat_id="123",
+            kinds=["review_requested", "changes_requested"],
+            now=102,
+            lease_seconds=30,
+        )
+        assert token_b
+        assert old_b == initial_cursor
+        assert cursor_b > cursor_a
+        assert [event.kind for event in events_b] == [
+            "review_requested",
+            "changes_requested",
+        ]
     finally:
         conn1.close()
         conn2.close()
@@ -1297,11 +1436,19 @@ def _drive_worker_exit(conn, tid, fake_pid, raw_status):
     _kb._set_worker_pid(conn, tid, fake_pid)
     _kb._record_worker_exit(fake_pid, raw_status)
     original_alive = _kb._pid_alive
+    original_classify = _kb._classify_worker_exit
     _kb._pid_alive = lambda p: False
+    # ``raw_status`` is a POSIX wait status, but this integration is also
+    # qualified on Windows where os.WIFEXITED/WEXITSTATUS are unavailable.
+    # Keep the test focused on failure-budget semantics rather than host APIs.
+    _kb._classify_worker_exit = lambda p: (
+        ("clean_exit", 0) if raw_status == 0 else ("nonzero_exit", 1)
+    )
     try:
         return _kb.detect_crashed_workers(conn)
     finally:
         _kb._pid_alive = original_alive
+        _kb._classify_worker_exit = original_classify
 
 
 def _drive_protocol_violation(conn, tid, fake_pid):

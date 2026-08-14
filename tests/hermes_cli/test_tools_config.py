@@ -827,6 +827,14 @@ def test_explicit_discord_kanban_opt_in_survives_resolution():
     assert "kanban" in current
 
 
+def test_legacy_top_level_kanban_opt_in_survives_cli_resolution():
+    config = {"toolsets": ["web", "terminal", "kanban"]}
+    current = _get_platform_tools(
+        config, "cli", include_default_mcp_servers=False
+    )
+    assert "kanban" in current
+
+
 
 def test_vision_picker_custom_endpoint(tmp_path, monkeypatch):
     """Custom endpoint writes base_url+model to config and the key to env."""

@@ -24,6 +24,19 @@ class RecordingAdapter:
         self.handled.append(event)
 
 
+class FailOnceAdapter(RecordingAdapter):
+    def __init__(self, fail_on_attempt):
+        super().__init__()
+        self.attempts = 0
+        self.fail_on_attempt = fail_on_attempt
+
+    async def send(self, chat_id, text, metadata=None):
+        self.attempts += 1
+        if self.attempts == self.fail_on_attempt:
+            raise RuntimeError("synthetic partial-delivery failure")
+        await super().send(chat_id, text, metadata=metadata)
+
+
 class DisconnectedAdapters(dict):
     """Expose a platform during collection, then simulate disconnect on get()."""
 
@@ -635,13 +648,19 @@ def test_discord_origin_same_card_review_cycle_notifies_changes(
     import json
 
     from gateway.config import Platform
-    from gateway.session_context import clear_session_vars, set_session_vars
+    import gateway.session_context as session_context
+    from gateway.session_context import (
+        clear_session_vars,
+        reset_session_vars,
+        set_session_vars,
+    )
     from tools import kanban_tools
 
     db_path = tmp_path / "discord-same-card.db"
     monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
     kb.init_db()
 
+    engaged_before = session_context._session_context_engaged
     tokens = set_session_vars(
         platform="discord",
         chat_id="thread-42",
@@ -660,6 +679,11 @@ def test_discord_origin_same_card_review_cycle_notifies_changes(
         )
     finally:
         clear_session_vars(tokens)
+        # clear_session_vars intentionally leaves an explicitly-empty gateway
+        # context. Tests share this execution context, so restore the fresh-task
+        # sentinel and preserve environment fallback for subsequent cases.
+        reset_session_vars()
+        session_context._session_context_engaged = engaged_before
     assert created["ok"] is True
     task_id = created["task_id"]
 
@@ -749,3 +773,114 @@ def test_discord_origin_same_card_review_cycle_notifies_changes(
         assert event_kinds.count("completed") == 1
     finally:
         conn.close()
+
+
+def test_partial_milestone_retry_does_not_duplicate_prior_successes(
+    tmp_path, monkeypatch
+):
+    db_path = tmp_path / "partial-delivery.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(conn, title="three milestones", assignee="worker")
+        kb.add_notify_sub(
+            conn, task_id=task_id, platform="telegram", chat_id="chat-1"
+        )
+        kb._append_event(
+            conn,
+            task_id,
+            "review_requested",
+            {"summary": "ready", "implementer": "worker", "reviewer": "reviewer"},
+        )
+        kb._append_event(
+            conn,
+            task_id,
+            "changes_requested",
+            {"reason": "fix it", "implementer": "worker", "reviewer": "reviewer"},
+        )
+        assert kb.complete_task(conn, task_id, summary="done")
+    finally:
+        conn.close()
+
+    adapter = FailOnceAdapter(fail_on_attempt=2)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+    assert len(adapter.sent) == 1
+
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+    messages = [item["text"] for item in adapter.sent]
+    assert len(messages) == 3
+    assert sum("ready for review" in message for message in messages) == 1
+    assert sum("changes requested" in message for message in messages) == 1
+    assert sum(" done" in message for message in messages) == 1
+
+
+def test_changes_requested_notifies_and_wakes_origin_session(tmp_path, monkeypatch):
+    db_path = tmp_path / "changes-wake.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(
+            conn,
+            title="wake on changes",
+            assignee="implementer",
+            session_id="origin-session",
+        )
+        kb.add_notify_sub(
+            conn,
+            task_id=task_id,
+            platform="telegram",
+            chat_id="origin-chat",
+            thread_id="origin-thread",
+            delivery_mode="notify+wake",
+        )
+        kb._append_event(
+            conn,
+            task_id,
+            "changes_requested",
+            {"reason": "revise", "implementer": "implementer", "reviewer": "reviewer"},
+        )
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+    assert len(adapter.sent) == 1
+    assert len(adapter.handled) == 1
+    assert adapter.handled[0].source.thread_id == "origin-thread"
+    assert "changes requested" in adapter.handled[0].text
+    assert "status changed" not in adapter.handled[0].text
+
+
+def test_review_reopened_notifies_origin_thread(tmp_path, monkeypatch):
+    db_path = tmp_path / "review-reopened.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(conn, title="human reopen", assignee="worker")
+        kb.add_notify_sub(
+            conn,
+            task_id=task_id,
+            platform="telegram",
+            chat_id="origin-chat",
+            thread_id="origin-thread",
+        )
+        kb._append_event(
+            conn,
+            task_id,
+            "review_reopened",
+            {"reason": "operator requested another pass", "status": "ready"},
+        )
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+    assert len(adapter.sent) == 1
+    assert "review reopened" in adapter.sent[0]["text"]
+    assert adapter.sent[0]["metadata"]["thread_id"] == "origin-thread"

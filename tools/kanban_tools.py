@@ -63,17 +63,17 @@ def _profile_has_kanban_toolset() -> bool:
         if isinstance(toolsets, (list, tuple)) and "kanban" in toolsets:
             return True
 
-        # Gateway sessions resolve schemas from platform_toolsets.<platform>.
-        # Honour that same per-platform opt-in here; otherwise the resolver can
-        # select kanban_* and this runtime gate immediately hides them again.
-        from gateway.session_context import get_session_env
-
-        platform = get_session_env("HERMES_SESSION_PLATFORM", "")
+        # Toolset resolution already filters schemas by the active platform.
+        # Keep this check_fn profile-scoped: the registry caches check results
+        # by profile, not by session platform, so a context-dependent result can
+        # poison another platform's turn for the cache TTL.
         platform_toolsets = cfg.get("platform_toolsets")
-        if not isinstance(platform_toolsets, dict) or not platform:
+        if not isinstance(platform_toolsets, dict):
             return False
-        enabled = platform_toolsets.get(platform)
-        return isinstance(enabled, (list, tuple)) and "kanban" in enabled
+        return any(
+            isinstance(enabled, (list, tuple)) and "kanban" in enabled
+            for enabled in platform_toolsets.values()
+        )
     except Exception:
         return False
 

@@ -1511,6 +1511,9 @@ CREATE TABLE IF NOT EXISTS kanban_notify_subs (
     delivery_metadata TEXT,
     created_at    INTEGER NOT NULL,
     last_event_id INTEGER NOT NULL DEFAULT 0,
+    claim_token   TEXT,
+    claim_cursor  INTEGER,
+    claim_expires_at INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (task_id, platform, chat_id, thread_id)
 );
 
@@ -2726,6 +2729,21 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             _add_column_if_missing(
                 conn, "kanban_notify_subs", "delivery_metadata", "delivery_metadata TEXT"
             )
+        if "claim_token" not in notify_cols:
+            _add_column_if_missing(
+                conn, "kanban_notify_subs", "claim_token", "claim_token TEXT"
+            )
+        if "claim_cursor" not in notify_cols:
+            _add_column_if_missing(
+                conn, "kanban_notify_subs", "claim_cursor", "claim_cursor INTEGER"
+            )
+        if "claim_expires_at" not in notify_cols:
+            _add_column_if_missing(
+                conn,
+                "kanban_notify_subs",
+                "claim_expires_at",
+                "claim_expires_at INTEGER NOT NULL DEFAULT 0",
+            )
 
     # One-shot backfill: any task that is 'running' before runs existed
     # had its claim_lock / claim_expires / worker_pid on the task row.
@@ -2853,6 +2871,8 @@ _REBUILD_SPECS = {
         " notifier_profile TEXT, delivery_mode TEXT NOT NULL DEFAULT 'notify',"
         " delivery_metadata TEXT, created_at INTEGER NOT NULL,"
         " last_event_id INTEGER NOT NULL DEFAULT 0,"
+        " claim_token TEXT, claim_cursor INTEGER,"
+        " claim_expires_at INTEGER NOT NULL DEFAULT 0,"
         " PRIMARY KEY (task_id, platform, chat_id, thread_id))",
         ("CREATE INDEX idx_notify_task ON kanban_notify_subs(task_id)",),
     ),
@@ -11346,6 +11366,9 @@ def unseen_events_for_sub(
     return max_id, out
 
 
+_NOTIFY_CLAIM_LEASE_SECONDS = 600
+
+
 def claim_unseen_events_for_sub(
     conn: sqlite3.Connection,
     *,
@@ -11354,30 +11377,41 @@ def claim_unseen_events_for_sub(
     chat_id: str,
     thread_id: Optional[str] = None,
     kinds: Optional[Iterable[str]] = None,
-) -> tuple[int, int, list[Event]]:
-    """Atomically claim unseen notification events for one subscription.
+    now: Optional[int] = None,
+    lease_seconds: int = _NOTIFY_CLAIM_LEASE_SECONDS,
+) -> tuple[Optional[str], int, int, list[Event]]:
+    """Lease unseen notification events without advancing the delivery cursor.
 
-    Returns ``(old_cursor, new_cursor, events)``. When events are returned,
-    ``kanban_notify_subs.last_event_id`` has already been advanced to
-    ``new_cursor`` inside a ``BEGIN IMMEDIATE`` transaction. That makes the
-    notifier's read/claim step single-owner across multiple gateway watcher
-    processes pointed at the same board DB: concurrent watchers serialize on
-    SQLite's writer lock, and only the first process sees and claims a given
-    event range.
+    Returns ``(claim_token, old_cursor, claim_cursor, events)``. A short,
+    SQLite-backed lease serializes notifier processes for this subscription.
+    The caller must finish or release the range with
+    :func:`finish_notify_claim` after delivery.
 
-    Callers should send the claimed events, then either leave the cursor at
-    ``new_cursor`` on success or call :func:`rewind_notify_cursor` if delivery
-    failed before any terminal unsubscribe removed the row.
+    Expired leases may be replaced, giving restart recovery with at-least-once
+    delivery. A stale holder cannot settle a replacement claim because
+    settlement compares the unguessable token.
     """
+    claim_now = int(time.time()) if now is None else int(now)
+    lease_seconds = int(lease_seconds)
+    if lease_seconds <= 0:
+        raise ValueError("lease_seconds must be greater than zero")
+
     with write_txn(conn):
         row = conn.execute(
-            "SELECT last_event_id FROM kanban_notify_subs "
+            "SELECT last_event_id, claim_token, claim_expires_at "
+            "FROM kanban_notify_subs "
             "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?",
             (task_id, platform, chat_id, thread_id or ""),
         ).fetchone()
         if row is None:
-            return 0, 0, []
-        old_cursor = int(row["last_event_id"])
+            return None, 0, 0, []
+
+        old_cursor = int(row["last_event_id"] or 0)
+        active_token = str(row["claim_token"] or "")
+        claim_expires_at = int(row["claim_expires_at"] or 0)
+        if active_token and claim_expires_at > claim_now:
+            return None, old_cursor, old_cursor, []
+
         new_cursor, events = unseen_events_for_sub(
             conn,
             task_id=task_id,
@@ -11387,14 +11421,103 @@ def claim_unseen_events_for_sub(
             kinds=kinds,
         )
         if not events:
-            return old_cursor, old_cursor, []
-        conn.execute(
-            "UPDATE kanban_notify_subs SET last_event_id = ? "
+            if active_token:
+                conn.execute(
+                    "UPDATE kanban_notify_subs "
+                    "SET claim_token = NULL, claim_cursor = NULL, claim_expires_at = 0 "
+                    "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ? "
+                    "AND claim_token = ? AND claim_expires_at <= ?",
+                    (
+                        task_id,
+                        platform,
+                        chat_id,
+                        thread_id or "",
+                        active_token,
+                        claim_now,
+                    ),
+                )
+            return None, old_cursor, old_cursor, []
+
+        claim_token = secrets.token_hex(16)
+        cur = conn.execute(
+            "UPDATE kanban_notify_subs "
+            "SET claim_token = ?, claim_cursor = ?, claim_expires_at = ? "
             "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ? "
-            "AND last_event_id = ?",
-            (int(new_cursor), task_id, platform, chat_id, thread_id or "", int(old_cursor)),
+            "AND last_event_id = ? "
+            "AND (claim_token IS NULL OR claim_token = '' OR claim_expires_at <= ?)",
+            (
+                claim_token,
+                int(new_cursor),
+                claim_now + lease_seconds,
+                task_id,
+                platform,
+                chat_id,
+                thread_id or "",
+                old_cursor,
+                claim_now,
+            ),
         )
-        return old_cursor, new_cursor, events
+        if cur.rowcount != 1:
+            return None, old_cursor, old_cursor, []
+        return claim_token, old_cursor, int(new_cursor), events
+
+
+def finish_notify_claim(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    platform: str,
+    chat_id: str,
+    claim_token: str,
+    delivered_cursor: int,
+    thread_id: Optional[str] = None,
+) -> bool:
+    """Settle one leased range and release its ownership.
+
+    ``delivered_cursor`` may remain at the old cursor after total failure or
+    stop within the claimed range after partial delivery. The undelivered
+    suffix is then visible to the next claimant.
+    """
+    if not claim_token:
+        return False
+    delivered_cursor = int(delivered_cursor)
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT last_event_id, claim_cursor FROM kanban_notify_subs "
+            "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ? "
+            "AND claim_token = ?",
+            (
+                task_id,
+                platform,
+                chat_id,
+                thread_id or "",
+                claim_token,
+            ),
+        ).fetchone()
+        if row is None:
+            return False
+        old_cursor = int(row["last_event_id"] or 0)
+        claim_cursor = int(row["claim_cursor"] or old_cursor)
+        if not old_cursor <= delivered_cursor <= claim_cursor:
+            raise ValueError(
+                "delivered_cursor must remain within the leased event range"
+            )
+        cur = conn.execute(
+            "UPDATE kanban_notify_subs "
+            "SET last_event_id = ?, claim_token = NULL, claim_cursor = NULL, "
+            "claim_expires_at = 0 "
+            "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ? "
+            "AND claim_token = ?",
+            (
+                delivered_cursor,
+                task_id,
+                platform,
+                chat_id,
+                thread_id or "",
+                claim_token,
+            ),
+        )
+        return cur.rowcount == 1
 
 
 def advance_notify_cursor(
@@ -11406,11 +11529,21 @@ def advance_notify_cursor(
     thread_id: Optional[str] = None,
     new_cursor: int,
 ) -> None:
+    """Advance a notification cursor monotonically.
+
+    A slower watcher may finish after another watcher has already claimed a
+    newer event range. The stale success path must never overwrite that newer
+    cursor and make already-delivered events visible again.
+    """
     with write_txn(conn):
         conn.execute(
             "UPDATE kanban_notify_subs SET last_event_id = ? "
-            "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?",
-            (int(new_cursor), task_id, platform, chat_id, thread_id or ""),
+            "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ? "
+            "AND last_event_id < ?",
+            (
+                int(new_cursor), task_id, platform, chat_id, thread_id or "",
+                int(new_cursor),
+            ),
         )
 
 

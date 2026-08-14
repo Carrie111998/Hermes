@@ -1151,19 +1151,17 @@ def test_kanban_profile_gate_accepts_matching_platform_opt_in(monkeypatch):
     assert kt._profile_has_kanban_toolset() is True
 
 
-def test_kanban_profile_gate_rejects_other_platform_opt_in(monkeypatch):
+def test_kanban_profile_gate_is_context_independent_for_registry_cache(monkeypatch):
     from tools import kanban_tools as kt
 
     monkeypatch.setattr(
         "hermes_cli.config.load_config",
         lambda: {"platform_toolsets": {"telegram": ["kanban"]}},
     )
-    monkeypatch.setattr(
-        "gateway.session_context.get_session_env",
-        lambda name, default="": "discord" if name == "HERMES_SESSION_PLATFORM" else default,
-    )
-
-    assert kt._profile_has_kanban_toolset() is False
+    # Toolset resolution already excludes kanban from platforms that did not
+    # opt in. The check_fn must not vary by the current session platform because
+    # the registry caches it by profile rather than by platform.
+    assert kt._profile_has_kanban_toolset() is True
 
 
 def test_kanban_profile_gate_preserves_global_opt_in(monkeypatch):

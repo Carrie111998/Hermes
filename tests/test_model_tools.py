@@ -30,6 +30,33 @@ class TestHandleFunctionCall:
         assert "error" in result
         assert "totally_fake_tool_xyz" in result["error"]
 
+    def test_kanban_dispatch_requires_session_tool_grant(self):
+        with patch("model_tools.registry.dispatch") as dispatch:
+            result = json.loads(
+                handle_function_call(
+                    "kanban_list",
+                    {},
+                    enabled_tools=["read_file"],
+                )
+            )
+
+        assert "not available in this session" in result["error"]
+        dispatch.assert_not_called()
+
+    def test_kanban_dispatch_honors_disabled_toolset_at_runtime(self):
+        with patch("model_tools.registry.dispatch") as dispatch:
+            result = json.loads(
+                handle_function_call(
+                    "kanban_list",
+                    {},
+                    enabled_tools=["kanban_list"],
+                    disabled_toolsets=["kanban"],
+                )
+            )
+
+        assert "disabled toolset" in result["error"]
+        dispatch.assert_not_called()
+
 
 
     def test_post_tool_call_receives_non_negative_integer_duration_ms(self):
