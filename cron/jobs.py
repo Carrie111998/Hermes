@@ -2617,6 +2617,14 @@ def _sweep_completed_oneshots(
     return removed
 
 
+#: Transient provenance marker stamped on scheduler snapshots returned by
+#: ``get_due_jobs()``. ``run_one_job`` uses it to tell store-originated
+#: snapshots apart from direct/manual handed-in job dictionaries: only the
+#: former fail closed when the authoritative row was deleted or paused after
+#: enumeration (#82650). Never persisted — the snapshots are deep copies.
+SNAPSHOT_ORIGIN_MARKER = "_cron_scheduler_snapshot"
+
+
 def get_due_jobs() -> List[Dict[str, Any]]:
     """Get all jobs that are due to run now.
 
@@ -2632,7 +2640,14 @@ def get_due_jobs() -> List[Dict[str, Any]]:
     a ``repeat.times`` limit consumes one of its runs on that catch-up fire.
     """
     with _jobs_lock():
-        return _get_due_jobs_locked()
+        due = _get_due_jobs_locked()
+    # Stamp provenance on each returned snapshot. The dicts are deep copies, so
+    # this marker never round-trips back into jobs.json; it exists solely so
+    # ``run_one_job`` can fail closed at dispatch admission when the persisted
+    # row was deleted/paused after this snapshot was taken (#82650).
+    for job in due:
+        job[SNAPSHOT_ORIGIN_MARKER] = True
+    return due
 
 
 def _get_due_jobs_locked() -> List[Dict[str, Any]]:

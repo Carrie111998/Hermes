@@ -110,7 +110,7 @@ class CronScheduler(ABC):
         Returns True if THIS caller claimed and ran the job, False if the claim
         was lost (another machine/retry won it) or the job no longer exists.
         """
-        from cron.jobs import claim_job_for_fire, get_job
+        from cron.jobs import claim_job_for_fire, get_job, SNAPSHOT_ORIGIN_MARKER
         from cron.executions import create_execution
         from cron.scheduler import run_one_job
 
@@ -120,6 +120,10 @@ class CronScheduler(ABC):
         if job is None:
             return False  # job removed (e.g. repeat-N exhausted) between arm and fire
         job["execution_id"] = create_execution(job_id, source=self.name)["id"]
+        # Mark the dict as store-originated so run_one_job's dispatch-admission
+        # revalidation (#82650) fails closed if the row is deleted/paused
+        # between this load and the run.
+        job[SNAPSHOT_ORIGIN_MARKER] = True
         return run_one_job(job, adapters=adapters, loop=loop)
 
     def reconcile(self) -> None:

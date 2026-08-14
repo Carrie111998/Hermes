@@ -427,7 +427,7 @@ _LEGACY_HOME_TARGET_ENV_VARS = {
     "QQBOT_HOME_CHANNEL": "QQ_HOME_CHANNEL",
 }
 
-from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_runs, claim_dispatch, heartbeat_run_claim
+from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_runs, claim_dispatch, heartbeat_run_claim, get_job, SNAPSHOT_ORIGIN_MARKER
 from cron.executions import create_execution, finish_execution, mark_execution_running
 
 # Sentinel: when a cron agent has nothing new to report, it can start its
@@ -4835,6 +4835,31 @@ def run_one_job(
     Returns True if the job was processed (even if the job itself failed —
     failure is recorded via ``mark_job_run``), False only if processing raised.
     """
+    # Dispatch-admission revalidation (#82650): ``job`` may be a stale
+    # scheduler snapshot taken before the persisted row was deleted or paused.
+    # Re-read the authoritative row and fail closed — a job that no longer
+    # exists or is no longer runnable must never reach the executor, the
+    # execution-running transition, completion accounting, or delivery.
+    # Handed-in job dictionaries (no snapshot marker) keep their historical
+    # missing-row compatibility: a missing row is only fatal when the dict
+    # provably came from the store (``get_due_jobs`` / provider ``fire_due``).
+    persisted = get_job(job["id"])
+    if persisted is not None:
+        if not persisted.get("enabled", True) or persisted.get("state") == "paused":
+            logger.info(
+                "Job '%s': skipping at dispatch admission — no longer runnable "
+                "(paused/disabled) since the snapshot was taken",
+                job.get("name", job["id"]),
+            )
+            return True
+    elif job.get(SNAPSHOT_ORIGIN_MARKER):
+        logger.info(
+            "Job '%s': skipping at dispatch admission — persisted record no "
+            "longer exists",
+            job.get("name", job["id"]),
+        )
+        return True
+
     execution_id = job.get("execution_id")
     if not execution_id:
         execution_id = create_execution(job["id"], source="direct")["id"]
