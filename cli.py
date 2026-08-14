@@ -30,6 +30,7 @@ import shutil
 import sys
 import json
 import re
+import subprocess
 import concurrent.futures
 import base64
 import atexit
@@ -1600,6 +1601,91 @@ def _resolve_worktree_base(
     return "HEAD", "HEAD (local — could not reach remote)"
 
 
+def _worktree_test_environment_ready(wt_path: Path) -> bool:
+    """Return whether a conventional local environment can run pytest."""
+    for environment in (wt_path / ".venv", wt_path / "venv"):
+        candidates = (
+            environment / "bin" / "python",
+            environment / "bin" / "python3",
+            environment / "Scripts" / "python.exe",
+        )
+        for python in candidates:
+            if not python.is_file():
+                continue
+            try:
+                probe = subprocess.run(
+                    [str(python), "-c", "import pytest"],
+                    cwd=wt_path,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=10,
+                )
+            except (OSError, subprocess.TimeoutExpired):
+                continue
+            if probe.returncode == 0:
+                return True
+    return False
+
+
+def _provision_uv_worktree(wt_path: Path) -> bool:
+    """Best-effort provision a worktree-local uv environment.
+
+    The project remains the dependency authority: Hermes only selects an
+    existing ``dev``/``test`` extras and groups and never guesses package names.
+    """
+    pyproject_path = wt_path / "pyproject.toml"
+    if (
+        not pyproject_path.is_file()
+        or not (wt_path / "uv.lock").is_file()
+        or _worktree_test_environment_ready(wt_path)
+    ):
+        return False
+
+    uv = shutil.which("uv")
+    if not uv:
+        logger.warning("uv worktree detected, but uv is unavailable; environment not provisioned")
+        return False
+
+    try:
+        import tomllib
+
+        project = tomllib.loads(pyproject_path.read_text(encoding="utf-8"))
+        command = [uv, "sync", "--locked", "--no-default-groups"]
+        optional = project.get("project", {}).get("optional-dependencies", {})
+        groups = project.get("dependency-groups", {})
+        if isinstance(optional, dict):
+            for name in ("dev", "test"):
+                if name in optional:
+                    command.extend(["--extra", name])
+        if isinstance(groups, dict):
+            for name in ("dev", "test"):
+                if name in groups:
+                    command.extend(["--group", name])
+
+        result = subprocess.run(
+            command,
+            cwd=wt_path,
+            env={**os.environ, "UV_PROJECT_ENVIRONMENT": str(wt_path / ".venv")},
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=300,
+        )
+        if result.returncode == 0:
+            if _worktree_test_environment_ready(wt_path):
+                return True
+            logger.warning(
+                "uv worktree provisioning completed, but the local environment cannot import pytest"
+            )
+            return False
+        detail = (result.stderr or result.stdout).strip()
+        logger.warning("uv worktree provisioning failed: %s", detail or result.returncode)
+    except (AttributeError, OSError, ValueError, TimeoutError, subprocess.TimeoutExpired) as exc:
+        logger.warning("uv worktree provisioning failed: %s", exc)
+    return False
+
+
 def _setup_worktree(repo_root: str = None, sync_base: bool = True) -> Optional[Dict[str, str]]:
     """Create an isolated git worktree for this CLI session.
 
@@ -1765,6 +1851,13 @@ def _setup_worktree(repo_root: str = None, sync_base: bool = True) -> Optional[D
                                 raise
         except Exception as e:
             logger.debug("Error copying .worktreeinclude entries: %s", e)
+
+    # Provision declared uv development dependencies unless an explicit
+    # .worktreeinclude entry (or tracked path) already populated an environment.
+    try:
+        _provision_uv_worktree(wt_path)
+    except Exception as exc:
+        logger.warning("Unexpected uv worktree provisioning failure: %s", exc)
 
     # Lock the worktree so other processes (and `git worktree remove`) can see
     # it is actively in use.  Fail-soft: a lock failure never blocks the session.
