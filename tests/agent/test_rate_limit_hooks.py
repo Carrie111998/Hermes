@@ -112,6 +112,23 @@ def test_reason_is_threaded_at_known_sites():
     )
 
 
+def test_nous_rate_limit_records_signal(captured, tmp_path, monkeypatch):
+    """A3: the Nous guard is the only detector that sees a Nous 429."""
+    from agent import nous_rate_guard
+    monkeypatch.setattr(nous_rate_guard, "_state_path",
+                        lambda: str(tmp_path / "nous.json"))
+
+    nous_rate_guard.record_nous_rate_limit(
+        headers={"x-ratelimit-reset-requests-1h": "1800"}
+    )
+
+    assert len(captured) == 1, "hook did not fire — A3 is unwired"
+    assert captured[0]["detector"] == "nous_guard"
+    assert captured[0]["provider"] == "nous"
+    assert captured[0]["reason"] == "rate_limit"
+    assert captured[0]["resets_at"], "reset time must be propagated"
+
+
 def _fake_client():
     client = MagicMock()
     client.base_url = "https://api.openai.com/v1"

@@ -132,6 +132,25 @@ def record_nous_rate_limit(
             "Nous rate limit recorded: resets in %.0fs (at %.0f)",
             reset_at - now, reset_at,
         )
+
+        # A3 — Nous 429s reach _try_activate_fallback() bare (no reason), so
+        # the runtime detector cannot see them. This is the honest detection
+        # point, and it has a real reset time from the response headers.
+        try:
+            from datetime import datetime, timezone
+            from events.rate_limit_signal import record
+            record(
+                provider="nous",
+                model=os.environ.get("HERMES_NOUS_MODEL", "") or "nous-portal",
+                reason="rate_limit",
+                detector="nous_guard",
+                outcome="diverted",
+                resets_at=datetime.fromtimestamp(
+                    reset_at, tz=timezone.utc
+                ).isoformat(timespec="seconds"),
+            )
+        except Exception:
+            pass
     except Exception as exc:
         logger.debug("Failed to write Nous rate limit state: %s", exc)
 
