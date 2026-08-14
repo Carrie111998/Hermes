@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   firstImageFromClipboard,
-  imageAttachPtyInput,
+  imageAttachPtyFrames,
   imageFilesFromTransfer,
   transferMayContainImage,
 } from "./chatImagePaste";
@@ -99,10 +99,11 @@ describe("transferMayContainImage", () => {
   });
 });
 
-describe("imageAttachPtyInput", () => {
-  it("keeps the image command and Return in one PTY frame", () => {
-    expect(imageAttachPtyInput("/tmp/dashboard image.png")).toBe(
-      "/image /tmp/dashboard image.png\r",
-    );
+describe("imageAttachPtyFrames", () => {
+  it("keeps the image command and Return in distinct PTY frames", () => {
+    expect(imageAttachPtyFrames("/tmp/dashboard image.png")).toEqual([
+      "/image /tmp/dashboard image.png",
+      "\r",
+    ]);
   });
 });
