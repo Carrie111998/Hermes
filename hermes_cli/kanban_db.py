@@ -71,12 +71,15 @@ new locking.
 from __future__ import annotations
 
 import contextlib
+import base64
 import hashlib
+import hmac
 import json
 import os
 import re
 import random
 import secrets
+import stat
 import shutil
 import sqlite3
 import subprocess
@@ -1050,6 +1053,17 @@ def remove_board(slug: str, *, archive: bool = True) -> dict:
 # Data classes
 # ---------------------------------------------------------------------------
 
+def _parse_json_list(value: Optional[str]) -> Optional[list]:
+    """Parse persisted list fields without treating corrupt metadata as valid."""
+    if not value:
+        return None
+    try:
+        parsed = json.loads(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if isinstance(parsed, list) else None
+
+
 @dataclass
 class Task:
     """In-memory view of a row from the ``tasks`` table."""
@@ -1142,6 +1156,12 @@ class Task:
     # Unblock-loop counter. See the column comment in SCHEMA_SQL and
     # ``BLOCK_RECURRENCE_LIMIT``. Reset only on successful completion.
     block_recurrences: int = 0
+    # Declarative, machine-readable inputs for fail-closed dispatch. These
+    # fields intentionally remain empty for legacy tasks; prose is never used
+    # as an implicit authority grant.
+    required_capabilities: Optional[list] = None
+    source_manifest: Optional[list] = None
+    required_repo_sha: Optional[str] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -1235,6 +1255,15 @@ class Task:
                 int(row["block_recurrences"])
                 if "block_recurrences" in keys and row["block_recurrences"] is not None
                 else 0
+            ),
+            required_capabilities=_parse_json_list(
+                row["required_capabilities"] if "required_capabilities" in keys else None
+            ),
+            source_manifest=_parse_json_list(
+                row["source_manifest"] if "source_manifest" in keys else None
+            ),
+            required_repo_sha=(
+                row["required_repo_sha"] if "required_repo_sha" in keys else None
             ),
         )
 
@@ -1423,7 +1452,11 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- ``blocked`` so a cron can't spin it forever. Reset to 0 only on a
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
-    block_recurrences    INTEGER NOT NULL DEFAULT 0
+    block_recurrences    INTEGER NOT NULL DEFAULT 0,
+    -- Explicit requirements; NULL means legacy/no pre-claim requirements.
+    required_capabilities TEXT,
+    source_manifest       TEXT,
+    required_repo_sha     TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -1475,7 +1508,11 @@ CREATE TABLE IF NOT EXISTS task_runs (
     --          gave_up | reclaimed | (null while still running)
     summary             TEXT,
     metadata            TEXT,
-    error               TEXT
+    error               TEXT,
+    -- Immutable source/capability receipt captured before this run starts.
+    -- Runtime source reads MUST use this snapshot, never mutable task fields.
+    preclaim_receipt    TEXT,
+    source_snapshot     TEXT
 );
 
 -- Files attached to a task (PDFs, images, source documents). The blob
@@ -2643,6 +2680,24 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "block_recurrences",
             "block_recurrences INTEGER NOT NULL DEFAULT 0",
         )
+    if "required_capabilities" not in cols:
+        _add_column_if_missing(conn, "tasks", "required_capabilities", "required_capabilities TEXT")
+    if "source_manifest" not in cols:
+        _add_column_if_missing(conn, "tasks", "source_manifest", "source_manifest TEXT")
+    if "required_repo_sha" not in cols:
+        _add_column_if_missing(conn, "tasks", "required_repo_sha", "required_repo_sha TEXT")
+
+    # Per-run receipts are added separately because fresh databases receive
+    # them from SCHEMA_SQL while legacy boards require additive migration.
+    run_table_exists = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='task_runs'"
+    ).fetchone() is not None
+    if run_table_exists:
+        run_cols = {row["name"] for row in conn.execute("PRAGMA table_info(task_runs)")}
+        if "preclaim_receipt" not in run_cols:
+            _add_column_if_missing(conn, "task_runs", "preclaim_receipt", "preclaim_receipt TEXT")
+        if "source_snapshot" not in run_cols:
+            _add_column_if_missing(conn, "task_runs", "source_snapshot", "source_snapshot TEXT")
 
     # Indexes over additive ``tasks`` columns must be created after the
     # columns exist. Keeping them in SCHEMA_SQL breaks legacy boards: SQLite
@@ -3136,6 +3191,44 @@ def _require_current_profiles(*assignees: Optional[str]) -> None:
             "assignee profile disappeared before graph commit: "
             + ", ".join(missing)
         )
+def _normalize_required_capabilities(values: Optional[Iterable[str]]) -> Optional[list[str]]:
+    if values is None:
+        return None
+    result = list(dict.fromkeys(str(v).strip() for v in values if str(v).strip()))
+    if any(not re.fullmatch(r"[a-z][a-z0-9_-]{0,63}", v) for v in result):
+        raise ValueError("required_capabilities must contain lowercase capability names")
+    return result
+
+
+def _normalize_source_manifest(values: Optional[Iterable[Mapping[str, Any]]]) -> Optional[list[dict[str, Any]]]:
+    if values is None:
+        return None
+    result: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for raw in values:
+        if not isinstance(raw, Mapping):
+            raise ValueError("source_manifest entries must be objects")
+        source_id = str(raw.get("source_id") or "").strip()
+        attachment_id = raw.get("attachment_id")
+        digest = str(raw.get("sha256") or "").strip().lower()
+        if not re.fullmatch(r"src_[A-Za-z0-9_-]{8,128}", source_id) or source_id in seen:
+            raise ValueError("source_manifest source_id must be unique opaque src_<id>")
+        if not isinstance(attachment_id, int) or attachment_id < 1:
+            raise ValueError("source_manifest attachment_id must be a positive integer")
+        if not re.fullmatch(r"[0-9a-f]{64}", digest):
+            raise ValueError("source_manifest sha256 must be a 64-character lowercase digest")
+        size = raw.get("size")
+        if not isinstance(size, int) or size < 0:
+            raise ValueError("source_manifest size must be a non-negative integer")
+        media_type = str(raw.get("media_type") or "").strip().lower()
+        if media_type not in {"text/plain", "text/markdown", "application/json", "application/yaml"}:
+            raise ValueError("source_manifest media_type is not allowed")
+        seen.add(source_id)
+        result.append({"source_id": source_id, "attachment_id": attachment_id,
+                       "sha256": digest, "size": size, "media_type": media_type,
+                       "provenance": str(raw.get("provenance") or "task_attachment")})
+    return result
+
 
 
 def create_task(
@@ -3163,6 +3256,9 @@ def create_task(
     goal_max_turns: Optional[int] = None,
     initial_status: str = "running",
     session_id: Optional[str] = None,
+    required_capabilities: Optional[Iterable[str]] = None,
+    source_manifest: Optional[Iterable[Mapping[str, Any]]] = None,
+    required_repo_sha: Optional[str] = None,
     board: Optional[str] = None,
     project_id: Optional[str] = None,
     project_source_task_id: Optional[str] = None,
@@ -3211,6 +3307,11 @@ def create_task(
     reasoning_effort = normalize_reasoning_effort(reasoning_effort)
     if provider_override and not model_override:
         raise ValueError("provider_override requires a model_override")
+    required_capabilities_list = _normalize_required_capabilities(required_capabilities)
+    source_manifest_list = _normalize_source_manifest(source_manifest)
+    required_repo_sha = (required_repo_sha or "").strip() or None
+    if required_repo_sha and not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", required_repo_sha):
+        raise ValueError("required_repo_sha must be a full 40- or 64-character git object SHA")
     assignee = _canonical_assignee(assignee)
     if not title or not title.strip():
         raise ValueError("title is required")
@@ -3480,8 +3581,9 @@ def create_task(
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort,
-                        goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        goal_mode, goal_max_turns, session_id,
+                        required_capabilities, source_manifest, required_repo_sha
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -3507,6 +3609,9 @@ def create_task(
                         1 if goal_mode else 0,
                         int(goal_max_turns) if goal_max_turns is not None else None,
                         session_id,
+                        json.dumps(required_capabilities_list) if required_capabilities_list is not None else None,
+                        json.dumps(source_manifest_list, sort_keys=True, separators=(",", ":")) if source_manifest_list is not None else None,
+                        required_repo_sha,
                     ),
                 )
                 for pid in parents:
@@ -4604,6 +4709,136 @@ def _parents_satisfied(conn: sqlite3.Connection, task_id: str) -> bool:
     ).fetchone() is None
 
 
+def _read_pinned_attachment(conn: sqlite3.Connection, task_id: str, entry: Mapping[str, Any]) -> tuple[bytes, dict[str, Any]]:
+    """Return sealed attachment bytes plus filesystem identity, fail closed.
+
+    ``stored_path`` is database data, not authority. The record must remain a
+    regular, non-symlink file below this task's attachment directory. Opening
+    with O_NOFOLLOW closes the check/open race on platforms that support it.
+    """
+    row = conn.execute("SELECT * FROM task_attachments WHERE id = ? AND task_id = ?", (entry["attachment_id"], task_id)).fetchone()
+    if row is None:
+        raise ValueError("source manifest attachment is unavailable")
+    root = (attachments_root() / task_id).resolve(strict=True)
+    path = Path(row["stored_path"])
+    try:
+        resolved = path.resolve(strict=True)
+        resolved.relative_to(root)
+        lst = os.lstat(path)
+        if stat.S_ISLNK(lst.st_mode) or not stat.S_ISREG(lst.st_mode) or lst.st_nlink != 1:
+            raise ValueError("source manifest attachment is unavailable")
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(path, flags)
+        try:
+            fst = os.fstat(fd)
+            if not stat.S_ISREG(fst.st_mode) or fst.st_nlink != 1:
+                raise ValueError("source manifest attachment is unavailable")
+            with os.fdopen(fd, "rb", closefd=False) as fh:
+                data = fh.read()
+        finally:
+            os.close(fd)
+    except (OSError, ValueError):
+        raise ValueError("source manifest attachment is unavailable")
+    digest = hashlib.sha256(data).hexdigest()
+    if len(data) != entry["size"] or not hmac.compare_digest(digest, str(entry["sha256"])):
+        raise ValueError("source manifest integrity check failed")
+    return data, {"device": fst.st_dev, "inode": fst.st_ino, "mtime_ns": fst.st_mtime_ns, "mode": stat.S_IMODE(fst.st_mode)}
+
+
+def _run_source_snapshot(conn: sqlite3.Connection, task_id: str, run_id: int) -> Optional[dict[str, Any]]:
+    row = conn.execute("SELECT source_snapshot FROM task_runs WHERE id = ? AND task_id = ? AND ended_at IS NULL", (run_id, task_id)).fetchone()
+    if not row or not row["source_snapshot"]:
+        return None
+    try:
+        snapshot = json.loads(row["source_snapshot"])
+    except (TypeError, ValueError):
+        return None
+    return snapshot if isinstance(snapshot, dict) else None
+
+
+def _cursor_for(snapshot: Mapping[str, Any], source_id: str, offset: int) -> str:
+    payload = json.dumps({"s": source_id, "o": offset}, sort_keys=True, separators=(",", ":")).encode()
+    mac = hmac.new(str(snapshot["nonce"]).encode(), payload, hashlib.sha256).digest()
+    return base64.urlsafe_b64encode(payload + mac).decode().rstrip("=")
+
+
+def _verify_cursor(snapshot: Mapping[str, Any], cursor: Optional[str], source_id: str, offset: int) -> None:
+    if offset == 0 and cursor is None:
+        return
+    if not cursor:
+        raise ValueError("source cursor is required for a non-initial page")
+    expected = _cursor_for(snapshot, source_id, offset)
+    if not hmac.compare_digest(cursor, expected):
+        raise ValueError("source cursor is invalid")
+
+
+def read_task_source(conn: sqlite3.Connection, task_id: str, source_id: str, *, offset: int = 0, limit: int = 65536, run_id: Optional[int] = None, cursor: Optional[str] = None) -> dict[str, Any]:
+    """Read one bounded page from a task/run-bound opaque source handle."""
+    if offset < 0 or limit < 1 or limit > 65536:
+        raise ValueError("offset must be non-negative and limit must be 1..65536")
+    task = get_task(conn, task_id)
+    if task is None:
+        raise ValueError("source is not available for this task")
+    snapshot = _run_source_snapshot(conn, task_id, run_id) if run_id is not None else None
+    if run_id is not None and (task.current_run_id != run_id or snapshot is None):
+        raise ValueError("source is not available for this run")
+    entries = snapshot.get("sources", []) if snapshot else (task.source_manifest or [])
+    entry = next((e for e in entries if isinstance(e, dict) and e.get("source_id") == source_id), None)
+    if not entry:
+        raise ValueError("source is not available for this task")
+    if snapshot:
+        _verify_cursor(snapshot, cursor, source_id, offset)
+    data, identity = _read_pinned_attachment(conn, task_id, entry)
+    if snapshot and identity != entry.get("identity"):
+        raise ValueError("source manifest integrity check failed")
+    page = data[offset:offset + limit]
+    next_offset = offset + len(page)
+    return {"source_id": source_id, "media_type": entry["media_type"], "size": len(data), "sha256": entry["sha256"], "provenance": entry["provenance"], "offset": offset, "next_offset": next_offset, "eof": next_offset >= len(data), "next_cursor": (_cursor_for(snapshot, source_id, next_offset) if snapshot and next_offset < len(data) else None), "bytes": page}
+
+
+def _preclaim_source_diagnostics(conn: sqlite3.Connection, task_id: str) -> tuple[list[dict[str, str]], list[dict[str, Any]]]:
+    task = get_task(conn, task_id)
+    if task is None:
+        return [{"code": "task_missing"}], []
+    diagnostics: list[dict[str, str]] = []
+    snapshot: list[dict[str, Any]] = []
+    for entry in task.source_manifest or []:
+        try:
+            _data, identity = _read_pinned_attachment(conn, task_id, entry)
+            snapshot.append({**entry, "identity": identity})
+        except (KeyError, TypeError, ValueError) as exc:
+            diagnostics.append({"code": "source_unreachable", "source_id": str(entry.get("source_id", "")) if isinstance(entry, dict) else "", "detail": str(exc)})
+    if task.required_repo_sha:
+        workspace = task.workspace_path
+        if not workspace or not os.path.isdir(workspace):
+            diagnostics.append({"code": "repository_unavailable"})
+        else:
+            try:
+                actual_sha = subprocess.check_output(
+                    ["git", "-C", workspace, "rev-parse", "HEAD"], text=True, stderr=subprocess.DEVNULL
+                ).strip()
+                if not hmac.compare_digest(actual_sha, task.required_repo_sha):
+                    diagnostics.append({"code": "repository_sha_mismatch"})
+            except (OSError, subprocess.CalledProcessError):
+                diagnostics.append({"code": "repository_unavailable"})
+    if task.required_capabilities:
+        try:
+            from hermes_cli.profiles import resolve_profile_env
+            enabled = set(_resolve_worker_cli_toolsets(resolve_profile_env(task.assignee)) or []) if task.assignee else set()
+        except Exception as exc:
+            diagnostics.append({"code": "capability_unproven", "detail": f"profile_resolution:{exc}"})
+            enabled = set()
+        # kanban_read_source is registered in the kanban toolset; callers may
+        # declare either the concrete tool or an enabled toolset capability.
+        for capability in task.required_capabilities:
+            if capability == "kanban_source_reader":
+                if "kanban" not in enabled:
+                    diagnostics.append({"code": "capability_unproven", "detail": capability})
+            elif capability not in enabled:
+                diagnostics.append({"code": "capability_unproven", "detail": capability})
+    return diagnostics, snapshot
+
+
 def claim_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -4644,6 +4879,10 @@ def claim_task(
                 conn, task_id, "claim_rejected",
                 {"reason": "parents_not_done"},
             )
+            return None
+        diagnostics, sealed_sources = _preclaim_source_diagnostics(conn, task_id)
+        if diagnostics:
+            _append_event(conn, task_id, "preclaim_denied", {"diagnostics": diagnostics})
             return None
         # Defensive: if a prior run somehow leaked (invariant violation from
         # an unknown code path), close it as 'reclaimed' so we don't strand
@@ -4692,8 +4931,8 @@ def claim_task(
             INSERT INTO task_runs (
                 task_id, profile, step_key, status,
                 claim_lock, claim_expires, max_runtime_seconds,
-                started_at
-            ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?)
+                started_at, preclaim_receipt, source_snapshot
+            ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?, ?, ?)
             """,
             (
                 task_id,
@@ -4703,6 +4942,8 @@ def claim_task(
                 expires,
                 trow["max_runtime_seconds"] if trow else None,
                 now,
+                json.dumps({"version": 1, "capabilities": (get_task(conn, task_id).required_capabilities if get_task(conn, task_id) else []), "sources_checked": [s["source_id"] for s in sealed_sources], "checked_at": now}, sort_keys=True, separators=(",", ":")),
+                json.dumps({"version": 1, "task_id": task_id, "nonce": secrets.token_urlsafe(32), "sources": sealed_sources}, sort_keys=True, separators=(",", ":")),
             ),
         )
         run_id = run_cur.lastrowid
@@ -10533,6 +10774,8 @@ def _default_spawn(
     if task.tenant:
         env["HERMES_TENANT"] = task.tenant
     env["HERMES_KANBAN_TASK"] = task.id
+    if task.current_run_id is not None:
+        env["HERMES_KANBAN_RUN_ID"] = str(task.current_run_id)
     env["HERMES_KANBAN_WORKSPACE"] = workspace
     # Tag the worker's session so it lands in state.db as `kanban`, not as an
     # untitled `cli` row. A worker is a dispatcher-owned run whose transcript is

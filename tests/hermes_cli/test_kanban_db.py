@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import concurrent.futures
+import hashlib
+import json
 import os
 import sqlite3
 import subprocess
@@ -1078,6 +1080,75 @@ def test_add_column_if_missing_is_idempotent_on_race(kanban_home):
     assert added_again is False
 
     conn.close()
+
+
+def test_source_manifest_reader_is_task_scoped_and_digest_pinned(kanban_home):
+    payload = b"sealed source\n"
+    digest = hashlib.sha256(payload).hexdigest()
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="sealed")
+        other_id = kb.create_task(conn, title="other")
+        attachment_id = kb.store_attachment_bytes(
+            conn, task_id, "source.md", payload, content_type="text/markdown", uploaded_by="test"
+        )
+        conn.execute(
+            "UPDATE tasks SET source_manifest = ? WHERE id = ?",
+            (json.dumps([{"source_id": "src_abcdefgh", "attachment_id": attachment_id,
+                          "sha256": digest, "size": len(payload),
+                          "media_type": "text/markdown", "provenance": "task_attachment"}]), task_id),
+        )
+        page = kb.read_task_source(conn, task_id, "src_abcdefgh", limit=6)
+        assert page["bytes"] == b"sealed"
+        assert page["sha256"] == digest
+        with pytest.raises(ValueError):
+            kb.read_task_source(conn, other_id, "src_abcdefgh")
+        conn.execute("UPDATE task_attachments SET task_id = ? WHERE id = ?", (other_id, attachment_id))
+        with pytest.raises(ValueError):
+            kb.read_task_source(conn, task_id, "src_abcdefgh")
+
+
+def test_claim_seals_sources_and_rejects_cursor_tampering(kanban_home):
+    payload = b"sealed source that needs paging"
+    digest = hashlib.sha256(payload).hexdigest()
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="sealed run")
+        attachment_id = kb.store_attachment_bytes(conn, task_id, "source.md", payload, content_type="text/markdown", uploaded_by="test")
+        manifest = [{"source_id": "src_abcdefgh", "attachment_id": attachment_id, "sha256": digest, "size": len(payload), "media_type": "text/markdown", "provenance": "task_attachment"}]
+        conn.execute("UPDATE tasks SET source_manifest = ? WHERE id = ?", (json.dumps(manifest), task_id))
+        claimed = kb.claim_task(conn, task_id)
+        assert claimed is not None and claimed.current_run_id is not None
+        first = kb.read_task_source(conn, task_id, "src_abcdefgh", run_id=claimed.current_run_id, limit=6)
+        assert first["bytes"] == payload[:6]
+        assert first["next_cursor"]
+        second = kb.read_task_source(conn, task_id, "src_abcdefgh", run_id=claimed.current_run_id, offset=6, limit=6, cursor=first["next_cursor"])
+        assert second["bytes"] == payload[6:12]
+        with pytest.raises(ValueError, match="cursor"):
+            kb.read_task_source(conn, task_id, "src_abcdefgh", run_id=claimed.current_run_id, offset=6, limit=6, cursor="forged")
+        # A post-claim task-manifest mutation cannot redirect this run.
+        conn.execute("UPDATE tasks SET source_manifest = '[]' WHERE id = ?", (task_id,))
+        assert kb.read_task_source(conn, task_id, "src_abcdefgh", run_id=claimed.current_run_id, limit=1)["bytes"] == payload[:1]
+
+
+def test_source_reader_rejects_symlink_escape(kanban_home, tmp_path):
+    payload = b"sealed source\n"
+    digest = hashlib.sha256(payload).hexdigest()
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="sealed")
+        attachment_id = kb.store_attachment_bytes(conn, task_id, "source.md", payload, content_type="text/markdown", uploaded_by="test")
+        conn.execute("UPDATE tasks SET source_manifest = ? WHERE id = ?", (json.dumps([{"source_id": "src_abcdefgh", "attachment_id": attachment_id, "sha256": digest, "size": len(payload), "media_type": "text/markdown", "provenance": "task_attachment"}]), task_id))
+        attachment = kb.get_attachment(conn, attachment_id)
+        Path(attachment.stored_path).unlink()
+        Path(attachment.stored_path).symlink_to(tmp_path / "outside")
+        with pytest.raises(ValueError):
+            kb.read_task_source(conn, task_id, "src_abcdefgh")
+
+def test_claim_fails_closed_for_unproven_capability(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="requires authority", required_capabilities=["terminal"])
+        assert kb.claim_task(conn, task_id) is None
+        assert kb.get_task(conn, task_id).status == "ready"
+        event = conn.execute("SELECT kind FROM task_events WHERE task_id = ? ORDER BY id DESC LIMIT 1", (task_id,)).fetchone()
+        assert event["kind"] == "preclaim_denied"
 
 
 def test_migrate_add_optional_columns_tolerates_concurrent_migration(kanban_home):
