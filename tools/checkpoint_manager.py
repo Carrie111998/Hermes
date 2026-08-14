@@ -55,11 +55,13 @@ import os
 import re
 import shutil
 import subprocess
+import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from hermes_constants import get_hermes_home
 from hermes_cli._subprocess_compat import windows_hide_flags
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, Iterator, List, Optional, Set, Tuple
 
 from utils import env_int
 
@@ -146,6 +148,92 @@ _GIT_TIMEOUT: int = max(10, min(60, env_int("HERMES_CHECKPOINT_TIMEOUT", 30)))
 
 # Max files to snapshot — skip huge directories to avoid slowdowns.
 _MAX_FILES = 50_000
+
+# The v2 checkpoint repository is shared by every session and process.  Git
+# protects each individual command, but a snapshot is a multi-command
+# transaction (index update -> write-tree -> commit-tree -> update-ref), while
+# maintenance runs global ``gc --prune=now``.  Without a lock, GC can delete an
+# as-yet-unreferenced tree/commit between those commands and a later update-ref
+# can publish a commit whose tree is already missing.
+_STORE_THREAD_LOCK = threading.RLock()
+_STORE_LOCK_STATE = threading.local()
+
+
+def _store_lock_path(base: Path) -> Path:
+    """Return a lock path that survives ``clear_all(base)``."""
+    base = Path(base).expanduser().resolve()
+    return base.parent / f".{base.name}.store.lock"
+
+
+def _lock_file(file_obj) -> None:
+    """Acquire an exclusive advisory lock on ``file_obj``."""
+    if os.name == "nt":  # pragma: no cover - exercised on Windows CI
+        import errno
+        import msvcrt
+        file_obj.seek(0)
+        if file_obj.read(1) == b"":
+            file_obj.write(b"\0")
+            file_obj.flush()
+        file_obj.seek(0)
+        while True:
+            try:
+                msvcrt.locking(file_obj.fileno(), msvcrt.LK_NBLCK, 1)
+                break
+            except OSError as exc:
+                if exc.errno not in {errno.EACCES, errno.EAGAIN, errno.EDEADLK}:
+                    raise
+                time.sleep(0.1)
+    else:
+        import fcntl
+        fcntl.flock(file_obj.fileno(), fcntl.LOCK_EX)
+
+
+def _unlock_file(file_obj) -> None:
+    """Release the advisory lock held by ``file_obj``."""
+    if os.name == "nt":  # pragma: no cover - exercised on Windows CI
+        import msvcrt
+        file_obj.seek(0)
+        msvcrt.locking(file_obj.fileno(), msvcrt.LK_UNLCK, 1)
+    else:
+        import fcntl
+        fcntl.flock(file_obj.fileno(), fcntl.LOCK_UN)
+
+
+@contextmanager
+def _checkpoint_store_lock(base: Optional[Path] = None) -> Iterator[None]:
+    """Serialize shared-store transactions across threads and processes.
+
+    The process-local ``RLock`` covers threads because platform file-lock
+    semantics are not uniformly thread-scoped.  The thread-local depth makes
+    nested checkpoint operations re-entrant without trying to acquire the
+    same OS lock twice.
+    """
+    checkpoint_base = Path(base or CHECKPOINT_BASE).expanduser().resolve()
+    lock_path = _store_lock_path(checkpoint_base)
+    with _STORE_THREAD_LOCK:
+        depth = getattr(_STORE_LOCK_STATE, "depth", 0)
+        held_path = getattr(_STORE_LOCK_STATE, "lock_path", None)
+        if depth and held_path == lock_path:
+            _STORE_LOCK_STATE.depth = depth + 1
+            try:
+                yield
+            finally:
+                _STORE_LOCK_STATE.depth -= 1
+            return
+
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        with lock_path.open("a+b") as lock_file:
+            _lock_file(lock_file)
+            previous_depth = depth
+            previous_path = held_path
+            _STORE_LOCK_STATE.depth = 1
+            _STORE_LOCK_STATE.lock_path = lock_path
+            try:
+                yield
+            finally:
+                _STORE_LOCK_STATE.depth = previous_depth
+                _STORE_LOCK_STATE.lock_path = previous_path
+                _unlock_file(lock_file)
 
 # Valid git commit hash pattern: 4–40 hex chars (short or full SHA-1/SHA-256).
 _COMMIT_HASH_RE = re.compile(r'^[0-9a-fA-F]{4,64}$')
@@ -740,7 +828,8 @@ class CheckpointManager:
 
     def new_turn(self) -> None:
         """Reset per-turn dedup.  Call at the start of each agent iteration."""
-        self._checkpointed_dirs.clear()
+        with _STORE_THREAD_LOCK:
+            self._checkpointed_dirs.clear()
 
     # ------------------------------------------------------------------
     # Public API
@@ -769,13 +858,12 @@ class CheckpointManager:
             logger.debug("Checkpoint skipped: directory too broad (%s)", abs_dir)
             return False
 
-        if abs_dir in self._checkpointed_dirs:
-            return False
-
-        self._checkpointed_dirs.add(abs_dir)
-
         try:
-            return self._take(abs_dir, reason)
+            with _checkpoint_store_lock(CHECKPOINT_BASE):
+                if abs_dir in self._checkpointed_dirs:
+                    return False
+                self._checkpointed_dirs.add(abs_dir)
+                return self._take(abs_dir, reason)
         except Exception as e:
             logger.debug("Checkpoint failed (non-fatal): %s", e)
             return False
@@ -835,6 +923,10 @@ class CheckpointManager:
             entry["deletions"] = int(m.group(1))
 
     def diff(self, working_dir: str, commit_hash: str) -> Dict:
+        with _checkpoint_store_lock(CHECKPOINT_BASE):
+            return self._diff_locked(working_dir, commit_hash)
+
+    def _diff_locked(self, working_dir: str, commit_hash: str) -> Dict:
         """Show diff between a checkpoint and the current working tree."""
         hash_err = _validate_commit_hash(commit_hash)
         if hash_err:
@@ -916,7 +1008,15 @@ class CheckpointManager:
                 result["empty"] = True
         return result
 
-    def restore(self, working_dir: str, commit_hash: str, file_path: str = None) -> Dict:
+    def restore(
+        self, working_dir: str, commit_hash: str, file_path: Optional[str] = None,
+    ) -> Dict:
+        with _checkpoint_store_lock(CHECKPOINT_BASE):
+            return self._restore_locked(working_dir, commit_hash, file_path)
+
+    def _restore_locked(
+        self, working_dir: str, commit_hash: str, file_path: Optional[str] = None,
+    ) -> Dict:
         """Restore files to a checkpoint state."""
         hash_err = _validate_commit_hash(commit_hash)
         if hash_err:
@@ -1487,6 +1587,25 @@ def prune_checkpoints(
     max_total_size_mb: int = 0,
     orphan_allowlist: Optional[set] = None,
 ) -> Dict[str, int]:
+    """Run checkpoint maintenance as one shared-store transaction."""
+    base = checkpoint_base or CHECKPOINT_BASE
+    with _checkpoint_store_lock(base):
+        return _prune_checkpoints_locked(
+            retention_days=retention_days,
+            delete_orphans=delete_orphans,
+            checkpoint_base=checkpoint_base,
+            max_total_size_mb=max_total_size_mb,
+            orphan_allowlist=orphan_allowlist,
+        )
+
+
+def _prune_checkpoints_locked(
+    retention_days: int = 7,
+    delete_orphans: bool = True,
+    checkpoint_base: Optional[Path] = None,
+    max_total_size_mb: int = 0,
+    orphan_allowlist: Optional[set] = None,
+) -> Dict[str, int]:
     """Delete stale/orphan checkpoints and reclaim store space.
 
     A project entry is deleted when either:
@@ -1764,6 +1883,25 @@ def maybe_auto_prune_checkpoints(
     checkpoint_base: Optional[Path] = None,
     max_total_size_mb: int = 0,
 ) -> Dict[str, object]:
+    """Run at most one auto-maintenance transaction per interval."""
+    base = checkpoint_base or CHECKPOINT_BASE
+    with _checkpoint_store_lock(base):
+        return _maybe_auto_prune_checkpoints_locked(
+            retention_days=retention_days,
+            min_interval_hours=min_interval_hours,
+            delete_orphans=delete_orphans,
+            checkpoint_base=checkpoint_base,
+            max_total_size_mb=max_total_size_mb,
+        )
+
+
+def _maybe_auto_prune_checkpoints_locked(
+    retention_days: int = 7,
+    min_interval_hours: int = 24,
+    delete_orphans: bool = True,
+    checkpoint_base: Optional[Path] = None,
+    max_total_size_mb: int = 0,
+) -> Dict[str, object]:
     """Idempotent wrapper around ``prune_checkpoints`` for startup hooks.
 
     Writes ``CHECKPOINT_BASE/.last_prune`` on completion so subsequent
@@ -1913,6 +2051,13 @@ def store_status(checkpoint_base: Optional[Path] = None) -> Dict:
 
 
 def clear_all(checkpoint_base: Optional[Path] = None) -> Dict[str, int]:
+    """Delete the checkpoint base while excluding concurrent store users."""
+    base = checkpoint_base or CHECKPOINT_BASE
+    with _checkpoint_store_lock(base):
+        return _clear_all_locked(checkpoint_base)
+
+
+def _clear_all_locked(checkpoint_base: Optional[Path] = None) -> Dict[str, int]:
     """Nuke the entire checkpoint base (store + legacy).  Irreversible.
 
     Returns ``{"bytes_freed": N, "deleted": bool}``.
@@ -1932,6 +2077,13 @@ def clear_all(checkpoint_base: Optional[Path] = None) -> Dict[str, int]:
 
 
 def clear_legacy(checkpoint_base: Optional[Path] = None) -> Dict[str, int]:
+    """Delete legacy archives while excluding concurrent store users."""
+    base = checkpoint_base or CHECKPOINT_BASE
+    with _checkpoint_store_lock(base):
+        return _clear_legacy_locked(checkpoint_base)
+
+
+def _clear_legacy_locked(checkpoint_base: Optional[Path] = None) -> Dict[str, int]:
     """Delete all ``legacy-*`` archive directories.
 
     Returns ``{"bytes_freed": N, "deleted": count}``.
