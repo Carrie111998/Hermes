@@ -7,7 +7,7 @@
 
 import { strict as assert } from 'node:assert';
 import { createHash } from 'node:crypto';
-import { mkdtempSync } from 'node:fs';
+import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { getAggregateVotesInPollMessage } from '@whiskeysockets/baileys';
@@ -17,6 +17,12 @@ import {
   buildTextSendPayload,
   acknowledgeDeliveryReceipts,
   createDeliveryReceiptQueue,
+  createOwnerMessageQueue,
+  ownerMessageTokenMatches,
+  ownerMessageDeliveryMode,
+  ownerSendFenceStatus,
+  providerSendErrorResponse,
+  providerSendIntentStatus,
   createBoundedMessageStore,
   deliveryReceiptFromMessageUpdate,
   deliveryReceiptFromUserReceiptUpdate,
@@ -27,6 +33,254 @@ import {
   pollCreationMessageFromPayload,
   pollUpdateForAggregation,
 } from './bridge_helpers.js';
+
+// -- provider-send intent policy ------------------------------------------
+{
+  const base = { expectedSecret: 'secret-value', authorizationHeader: undefined };
+  assert.equal(providerSendIntentStatus({ ...base, externalConsumer: false }), 'standard');
+  assert.equal(providerSendIntentStatus({
+    ...base, externalConsumer: true, sendIntent: 'automatic', expectedOwnerFenceSequence: 0,
+  }), 'automatic');
+  assert.equal(providerSendIntentStatus({
+    ...base, externalConsumer: true, sendIntent: 'automatic', expectedOwnerFenceSequence: undefined,
+  }), 'invalid');
+  assert.equal(providerSendIntentStatus({
+    ...base, externalConsumer: true, sendIntent: 'human', authorizationHeader: 'Bearer secret-value',
+  }), 'human');
+  assert.equal(providerSendIntentStatus({
+    ...base, externalConsumer: true, sendIntent: 'human', authorizationHeader: 'Bearer wrong',
+  }), 'unauthorized');
+  assert.equal(providerSendIntentStatus({ ...base, externalConsumer: true }), 'invalid');
+  assert.deepEqual(providerSendErrorResponse(
+    Object.assign(new Error('Owner intervention fenced this send'), { code: 'OWNER_FENCED' }),
+    ['sent-1'],
+  ), {
+    statusCode: 409,
+    body: {
+      error: 'Owner intervention fenced this send',
+      code: 'OWNER_FENCED',
+      retryable: false,
+      partial: true,
+      messageId: 'sent-1',
+      messageIds: ['sent-1'],
+    },
+  });
+  assert.deepEqual(providerSendErrorResponse(
+    Object.assign(new Error('queue expired'), { code: 'SEND_QUEUE_EXPIRED' }),
+  ), {
+    statusCode: 503,
+    body: {
+      error: 'queue expired',
+      code: 'SEND_QUEUE_EXPIRED',
+      retryable: true,
+      partial: false,
+      messageId: undefined,
+      messageIds: [],
+    },
+  });
+  console.log('  ✓ expired bridge queue waits return a retryable provider-safe response');
+  console.log('  ✓ partial owner fences are terminal conflicts with sent IDs');
+  console.log('  ✓ send intent fails closed only for external consumers and authenticates humans');
+}
+
+// -- owner-device messages -------------------------------------------------
+{
+  assert.equal(ownerMessageDeliveryMode(true, false), 'inbound');
+  assert.equal(ownerMessageDeliveryMode(true, true), 'external');
+  assert.equal(ownerMessageDeliveryMode(false, true), 'inbound');
+  console.log('  ✓ generic owner forwarding and external durable consumption stay distinct');
+}
+
+{
+  assert.equal(ownerMessageTokenMatches('secret-value', 'Bearer secret-value'), true);
+  assert.equal(ownerMessageTokenMatches('secret-value', 'Bearer secret-valuE'), false);
+  assert.equal(ownerMessageTokenMatches('secret-value', ''), false);
+  assert.equal(ownerMessageTokenMatches('', 'Bearer secret-value'), false);
+  console.log('  ✓ owner-device API bearer tokens use exact authenticated matching');
+}
+
+{
+  const queueDir = mkdtempSync(path.join(tmpdir(), 'hermes-owner-queue-'));
+  const queue = createOwnerMessageQueue({ directory: queueDir, pageSize: 1 });
+  const first = {
+    messageId: 'owner-1',
+    chatId: '15551234567@s.whatsapp.net',
+    senderId: '15551234567@s.whatsapp.net',
+    fromOwner: true,
+    type: 'text',
+    body: 'Assumi o atendimento.',
+    timestamp: 1_723_636_800,
+  };
+  assert.equal(queue.add(first), true);
+  assert.equal(queue.add({ ...first }), false);
+  const firstQueued = { ...first, ownerFenceSequence: 1 };
+  assert.deepEqual(queue.snapshot(), [firstQueued]);
+  const reopened = createOwnerMessageQueue({ directory: queueDir, pageSize: 1 });
+  assert.deepEqual(reopened.snapshot(), [firstQueued]);
+  assert.equal(reopened.lastSequence(first.chatId), 1);
+  assert.match(readFileSync(path.join(queueDir, 'owner-messages.json'), 'utf8'), /owner-1/);
+  assert.equal(reopened.acknowledge([{ messageId: 'owner-1' }]), 1);
+  const afterAck = createOwnerMessageQueue({ directory: queueDir });
+  assert.deepEqual(afterAck.snapshot(), []);
+  assert.equal(afterAck.lastSequence(first.chatId), 1);
+  console.log('  ✓ owner-device messages persist across restart until exact acknowledgement');
+}
+
+{
+  const queueDir = mkdtempSync(path.join(tmpdir(), 'hermes-owner-tombstone-'));
+  let currentTime = 1_723_636_800_000;
+  const retentionMs = 30 * 24 * 60 * 60 * 1000;
+  const options = { directory: queueDir, now: () => currentTime, tombstoneRetentionMs: retentionMs };
+  const event = {
+    messageId: 'owner-replayed-after-ack',
+    chatId: '15551234567@s.whatsapp.net',
+    senderId: '15551234567@s.whatsapp.net',
+    fromOwner: true,
+    type: 'text',
+    body: 'Handled already.',
+    timestamp: 1_723_636_800,
+  };
+  const queue = createOwnerMessageQueue(options);
+  assert.equal(queue.add(event), true);
+  assert.equal(queue.acknowledge([{ messageId: event.messageId }]), 1);
+  const persisted = JSON.parse(readFileSync(path.join(queueDir, 'owner-messages.json'), 'utf8'));
+  assert.equal(persisted.tombstones[event.messageId].sequence, 1);
+
+  const reopened = createOwnerMessageQueue(options);
+  assert.equal(reopened.add(event), false);
+  assert.equal(reopened.lastSequence(event.chatId), 1);
+  assert.deepEqual(reopened.snapshot(), []);
+
+  currentTime += retentionMs + 1;
+  const afterReplayWindow = createOwnerMessageQueue(options);
+  assert.equal(afterReplayWindow.add(event), true);
+  assert.equal(afterReplayWindow.snapshot()[0].ownerFenceSequence, 2);
+  console.log('  ✓ ACK tombstones survive restart, preserve sequence, and expire only by replay age');
+}
+
+{
+  const queue = createOwnerMessageQueue({
+    directory: mkdtempSync(path.join(tmpdir(), 'hermes-owner-fence-')),
+  });
+  const chatId = '15551234567@s.whatsapp.net';
+  assert.equal(ownerSendFenceStatus(queue, chatId, 0), 'allowed');
+  assert.equal(queue.add({
+    messageId: 'owner-fence-1', chatId, senderId: chatId, fromOwner: true,
+    type: 'text', body: 'Assumi.', timestamp: 1_723_636_800,
+  }), true);
+  assert.equal(ownerSendFenceStatus(queue, chatId, 0), 'fenced');
+  assert.equal(ownerSendFenceStatus(queue, chatId, 1), 'allowed');
+  assert.equal(ownerSendFenceStatus(queue, chatId, 2), 'fenced');
+  assert.equal(ownerSendFenceStatus(queue, chatId, undefined), 'invalid');
+  console.log('  ✓ owner sequence fences stale automatic sends before provider dispatch');
+}
+
+{
+  const queueDir = mkdtempSync(path.join(tmpdir(), 'hermes-owner-alias-fence-'));
+  const queue = createOwnerMessageQueue({ directory: queueDir });
+  const lidChatId = '267383306489914@lid';
+  const canonicalChatId = '19175395595@s.whatsapp.net';
+  const base = {
+    senderId: lidChatId, fromOwner: true, type: 'text', timestamp: 1_723_636_800,
+  };
+
+  assert.equal(queue.add({
+    ...base, messageId: 'owner-alias-lid', chatId: lidChatId, body: 'LID first',
+  }), true);
+  assert.equal(ownerSendFenceStatus(queue, canonicalChatId, 0), 'fenced');
+  assert.equal(ownerSendFenceStatus(queue, '15550001111@s.whatsapp.net', 0), 'fenced');
+  assert.equal(ownerSendFenceStatus(
+    createOwnerMessageQueue({ directory: queueDir }), canonicalChatId, 0,
+  ), 'fenced');
+  assert.equal(queue.acknowledge([{ messageId: 'owner-alias-lid' }]), 1);
+  assert.equal(ownerSendFenceStatus(
+    createOwnerMessageQueue({ directory: queueDir }), '15550001111@s.whatsapp.net', 0,
+  ), 'fenced');
+
+  // Baileys can persist this exact mapping only after the owner event arrives.
+  writeFileSync(
+    path.join(queueDir, 'lid-mapping-19175395595.json'),
+    JSON.stringify('267383306489914'),
+  );
+  writeFileSync(
+    path.join(queueDir, 'lid-mapping-267383306489914_reverse.json'),
+    JSON.stringify('19175395595'),
+  );
+
+  assert.equal(ownerSendFenceStatus(queue, canonicalChatId, 0), 'fenced');
+  assert.equal(ownerSendFenceStatus(queue, canonicalChatId, 1), 'allowed');
+  assert.equal(ownerSendFenceStatus(queue, canonicalChatId, 2), 'fenced');
+  assert.equal(ownerSendFenceStatus(queue, '15550001111@s.whatsapp.net', 0), 'allowed');
+  assert.equal(queue.add({
+    ...base,
+    messageId: 'owner-alias-canonical',
+    chatId: canonicalChatId,
+    senderId: canonicalChatId,
+    body: 'canonical second',
+  }), true);
+  assert.equal(ownerSendFenceStatus(queue, lidChatId, 1), 'fenced');
+  assert.equal(ownerSendFenceStatus(queue, lidChatId, 2), 'allowed');
+  assert.equal(ownerSendFenceStatus(queue, lidChatId, 3), 'fenced');
+
+  assert.equal(queue.acknowledge([
+    { messageId: 'owner-alias-lid' },
+    { messageId: 'owner-alias-canonical' },
+  ]), 1);
+  const reopened = createOwnerMessageQueue({ directory: queueDir });
+  assert.equal(ownerSendFenceStatus(reopened, canonicalChatId, 2), 'allowed');
+  assert.equal(ownerSendFenceStatus(reopened, lidChatId, 2), 'allowed');
+  console.log('  ✓ owner fences use exact persisted LID/canonical aliases across mapping, ACK, and restart');
+}
+
+{
+  const queue = createOwnerMessageQueue({
+    directory: mkdtempSync(path.join(tmpdir(), 'hermes-owner-invalid-')),
+    pageSize: 2,
+  });
+  assert.equal(queue.add({ messageId: 'bad', fromOwner: false }), false);
+  assert.equal(queue.add({
+    messageId: 'owner-group', chatId: '123@g.us', senderId: '123@g.us', fromOwner: true,
+    type: 'text', body: 'no', timestamp: 1,
+  }), false);
+  assert.equal(queue.add({
+    messageId: 'owner-image', chatId: '15551234567@s.whatsapp.net',
+    senderId: '15551234567@s.whatsapp.net', fromOwner: true,
+    hasMedia: true, mediaType: 'image', body: '', timestamp: 1,
+  }), true);
+  assert.deepEqual(queue.snapshot(), [{
+    messageId: 'owner-image', chatId: '15551234567@s.whatsapp.net',
+    senderId: '15551234567@s.whatsapp.net', fromOwner: true,
+    type: 'image', body: '', timestamp: 1,
+    ownerFenceSequence: 1,
+    disposition: 'unsupported_media', requiresIntervention: true,
+  }]);
+  assert.equal(queue.size(), 1);
+  console.log('  ✓ owner-device queue rejects non-owner/non-personal and quarantines media');
+}
+
+{
+  const queue = createOwnerMessageQueue({
+    directory: mkdtempSync(path.join(tmpdir(), 'hermes-owner-pages-')),
+    pageSize: 1,
+  });
+  const base = {
+    chatId: '15551234567@s.whatsapp.net', senderId: '15551234567@s.whatsapp.net',
+    fromOwner: true, type: 'text', timestamp: 1,
+  };
+  assert.equal(queue.add({ ...base, messageId: 'page-1', body: 'first' }), true);
+  assert.equal(queue.add({ ...base, messageId: 'page-2', body: 'second' }), true);
+  assert.equal(queue.add({ ...base, messageId: 'page-3', body: 'x'.repeat(25_000) }), true);
+  const firstPage = queue.page();
+  assert.equal(firstPage.messages[0].messageId, 'page-1');
+  assert.equal(firstPage.hasMore, true);
+  const secondPage = queue.page({ cursor: firstPage.nextCursor });
+  assert.equal(secondPage.messages[0].messageId, 'page-2');
+  const thirdPage = queue.page({ cursor: secondPage.nextCursor });
+  assert.equal(thirdPage.messages[0].messageId, 'page-3');
+  assert.equal(thirdPage.messages[0].body.length, 25_000);
+  assert.equal(thirdPage.hasMore, false);
+  console.log('  ✓ owner-device cursor reaches later and oversized text without ACKing earlier pages');
+}
 
 // -- outbound delivery/read receipts --------------------------------------
 {
