@@ -85,10 +85,21 @@ def _find_git_root(start: Path) -> Optional[Path]:
     Returns the directory containing ``.git``, or ``None`` if we hit the
     filesystem root without finding one.
     """
-    current = start.resolve()
+    try:
+        current = start.resolve()
+    except OSError:
+        # A configured cwd may be inaccessible to the gateway user.  Context
+        # discovery is best-effort and must not prevent prompt construction.
+        return None
+
     for parent in [current, *current.parents]:
-        if (parent / ".git").exists():
-            return parent
+        try:
+            if (parent / ".git").exists():
+                return parent
+        except OSError:
+            # PermissionError (and other filesystem errors) mean this
+            # directory cannot be inspected; continue checking its parents.
+            continue
     return None
 
 

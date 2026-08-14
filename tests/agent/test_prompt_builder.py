@@ -637,6 +637,12 @@ class TestFindGitRoot:
         sub.mkdir(parents=True)
         assert _find_git_root(sub) == tmp_path
 
+    def test_ignores_inaccessible_git_markers(self, tmp_path):
+        from unittest.mock import patch
+
+        with patch("pathlib.Path.exists", side_effect=PermissionError):
+            assert _find_git_root(tmp_path) is None
+
     def test_returns_none_without_git(self, tmp_path):
         # Create an isolated dir tree with no .git anywhere in it.
         # tmp_path itself might be under a git repo, so we test with
