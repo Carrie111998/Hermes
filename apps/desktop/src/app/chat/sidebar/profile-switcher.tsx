@@ -61,6 +61,7 @@ import {
   sortByProfileOrder
 } from '@/store/profile'
 import { runExportProfileFlow, runImportProfileFlow } from '@/store/profile-share'
+import { openNewWindow } from '@/store/windows'
 import type { ProfileInfo } from '@/types/hermes'
 
 import { CreateProfileDialog } from '../../profiles/create-profile-dialog'
@@ -695,6 +696,10 @@ function ProfileSquare({
           // Suppress the refocus and the picker survives.
           onCloseAutoFocus={event => event.preventDefault()}
         >
+          <ContextMenuItem onSelect={() => void openNewWindow(label)}>
+            <Codicon name="multiple-windows" size="0.875rem" />
+            <span>{p.newWindow}</span>
+          </ContextMenuItem>
           <ContextMenuItem onSelect={() => setPickerOpen(true)}>
             <Codicon name="symbol-color" size="0.875rem" />
             <span>{p.color}</span>

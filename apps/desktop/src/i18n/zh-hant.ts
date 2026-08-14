@@ -1356,6 +1356,7 @@ export const zhHant = defineLocale({
     search: '搜尋設定檔…',
     loading: '正在載入設定檔…',
     newProfile: '新增設定檔',
+    newWindow: '新視窗',
     importProfile: '匯入設定檔…',
     exportProfile: '匯出設定檔…',
     imported: '設定檔已匯入',

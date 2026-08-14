@@ -37,8 +37,8 @@ declare global {
       openSessionWindow: (sessionId: string, opts?: { watch?: boolean }) => Promise<{ ok: boolean; error?: string }>
       // Open a new full-chrome app window — a peer instance of the primary that
       // renders the complete app against the shared backend, so the user can run
-      // multiple GUI windows at once.
-      openWindow: () => Promise<{ ok: boolean; error?: string }>
+      // multiple GUI windows at once. A profile pins the new peer at boot.
+      openWindow: (profile?: string) => Promise<{ ok: boolean; error?: string }>
       // Claim a one-shot cross-window ambient cue (turn-end sound / spoken
       // reply). Resolves true for the first window to claim a key, false for
       // peers — so N open windows don't all fire the same cue.

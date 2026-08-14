@@ -1407,6 +1407,7 @@ export const ja = defineLocale({
     search: 'プロファイルを検索...',
     loading: 'プロファイルを読み込み中...',
     newProfile: '新しいプロファイル',
+    newWindow: '新しいウィンドウ',
     importProfile: 'プロファイルをインポート…',
     exportProfile: 'プロファイルをエクスポート…',
     imported: 'プロファイルをインポートしました',

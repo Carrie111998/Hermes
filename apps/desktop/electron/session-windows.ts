@@ -70,6 +70,44 @@ function buildSessionWindowUrl(sessionId: string, { devServer, rendererIndexPath
   return `${pathToFileURL(rendererIndexPath).toString()}${query}${route}`
 }
 
+// Build the renderer URL for a full peer app window. With no profile this
+// preserves the existing plain renderer URL; a profile override rides before
+// the HashRouter root so the renderer boots directly against that backend.
+function buildInstanceWindowUrl({ devServer, profile, rendererIndexPath }: any = {}) {
+  const base = devServer || pathToFileURL(rendererIndexPath).toString()
+
+  if (!profile) {
+    return base
+  }
+
+  const separator = devServer ? `${base.endsWith('/') ? base.slice(0, -1) : base}/` : base
+
+  return `${separator}?profile=${encodeURIComponent(profile)}#/`
+}
+
+// Normalize the optional renderer-supplied profile at the IPC boundary. A
+// missing/blank value preserves the generic New Window behavior; every named
+// profile must pass the main process's canonical Hermes profile validator.
+function normalizeInstanceWindowProfile(value: unknown, isValidProfileName: (profile: string) => boolean) {
+  if (value == null) {
+    return { ok: true, profile: null }
+  }
+
+  if (typeof value !== 'string') {
+    return { ok: false, profile: null }
+  }
+
+  const profile = value.trim()
+
+  if (!profile) {
+    return { ok: true, profile: null }
+  }
+
+  return profile === 'default' || isValidProfileName(profile)
+    ? { ok: true, profile }
+    : { ok: false, profile: null }
+}
+
 // Full "instance" windows (⌘⇧N / the "New Window" command) open a complete app
 // peer, not a compact chat. Cascade each one off its source window's bounds so a
 // new window doesn't land exactly on top of the one it was spawned from. Pure so
@@ -153,10 +191,12 @@ function createSessionWindowRegistry() {
 }
 
 export {
+  buildInstanceWindowUrl,
   buildSessionWindowUrl,
   chatWindowWebPreferences,
   createSessionWindowRegistry,
   instanceWindowBounds,
+  normalizeInstanceWindowProfile,
   SESSION_WINDOW_MIN_HEIGHT,
   SESSION_WINDOW_MIN_WIDTH
 }

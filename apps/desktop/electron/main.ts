@@ -187,10 +187,12 @@ import {
 import { missingRendererAssets } from './renderer-bundle'
 import { attachRendererConsoleCapture, formatRendererBoundaryReport } from './renderer-log'
 import {
+  buildInstanceWindowUrl,
   buildSessionWindowUrl,
   chatWindowWebPreferences,
   createSessionWindowRegistry,
   instanceWindowBounds,
+  normalizeInstanceWindowProfile,
   SESSION_WINDOW_MIN_HEIGHT,
   SESSION_WINDOW_MIN_WIDTH
 } from './session-windows'
@@ -8874,9 +8876,9 @@ function nextInstanceBounds() {
 // options (shared chatWindowWebPreferences + streamThrottle registration so a
 // streamed answer never stalls in the background) but is a peer, not the
 // primary: it never overwrites the mainWindow global, doesn't start the backend
-// (the renderer's getConnection() joins the already-running one), and loads the
-// plain renderer URL so the full app renders.
-function createInstanceWindow() {
+// (the renderer's getConnection() joins the already-running one), and loads a
+// full-app renderer URL, optionally pinned to a profile at boot.
+function createInstanceWindow(profile = null) {
   const icon = getAppIconPath()
 
   const win = new BrowserWindow({
@@ -8932,7 +8934,15 @@ function createInstanceWindow() {
   })
 
   attachRendererConsoleCapture(win, 'instance', rememberLog)
-  loadWindowUrl(win, DEV_SERVER || pathToFileURL(resolveRendererIndex()).toString(), 'Instance window')
+  loadWindowUrl(
+    win,
+    buildInstanceWindowUrl({
+      devServer: DEV_SERVER,
+      profile,
+      rendererIndexPath: DEV_SERVER ? undefined : resolveRendererIndex()
+    }),
+    'Instance window'
+  )
 
   return win
 }
@@ -10010,8 +10020,14 @@ ipcMain.handle('hermes:window:openSession', async (_event, sessionId, opts) => {
 
   return { ok: true }
 })
-ipcMain.handle('hermes:window:openInstance', async () => {
-  createInstanceWindow()
+ipcMain.handle('hermes:window:openInstance', async (_event, requestedProfile) => {
+  const result = normalizeInstanceWindowProfile(requestedProfile, profile => PROFILE_NAME_RE.test(profile))
+
+  if (!result.ok) {
+    return { ok: false, error: 'invalid-profile' }
+  }
+
+  createInstanceWindow(result.profile)
 
   return { ok: true }
 })

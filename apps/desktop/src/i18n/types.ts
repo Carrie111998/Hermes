@@ -1323,6 +1323,7 @@ export interface Translations {
     search: string
     loading: string
     newProfile: string
+    newWindow: string
     importProfile: string
     exportProfile: string
     imported: string

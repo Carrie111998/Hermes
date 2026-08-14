@@ -150,6 +150,16 @@ describe('openNewWindow', () => {
     expect(notifyError).not.toHaveBeenCalled()
   })
 
+  it('forwards the selected profile to the bridge', async () => {
+    const openWindow = vi.fn().mockResolvedValue({ ok: true })
+    installBridge(undefined, openWindow)
+
+    await openNewWindow('work')
+
+    expect(openWindow).toHaveBeenCalledWith('work')
+    expect(notifyError).not.toHaveBeenCalled()
+  })
+
   it('notifies on an ok:false result', async () => {
     installBridge(undefined, vi.fn().mockResolvedValue({ ok: false, error: 'nope' }))
 

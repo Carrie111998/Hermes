@@ -1778,6 +1778,7 @@ export const zh: Translations = {
     search: '搜索配置档案…',
     loading: '正在加载配置档案…',
     newProfile: '新建配置档案',
+    newWindow: '新建窗口',
     importProfile: '导入配置档案…',
     exportProfile: '导出配置档案…',
     imported: '配置档案已导入',

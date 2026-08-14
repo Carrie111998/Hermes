@@ -83,12 +83,12 @@ export function isWatchWindow(): boolean {
 // keystroke into N prompts, and a HUD is the last place to paint onboarding.
 export const isAuxiliaryWindow = (): boolean => isSecondaryWindow() || isHudWindow()
 
-// The profile a helper window (the HUD) was asked to boot against, carried in
-// the query string by the main process (see hudUrl). The HUD is a full app
-// renderer that otherwise adopts the PRIMARY backend's profile — wrong the
-// moment the conversation it was opened on belongs to another profile
-// (#82285). Empty/absent means "no override": boot adopts the primary as
-// before, so ordinary windows and single-profile users are untouched.
+// The profile a pinned window (a profile-targeted full peer or the HUD) was
+// asked to boot against, carried in the query string by the main process. Such
+// windows otherwise adopt the PRIMARY backend's profile — wrong for both a HUD
+// opened on another profile's conversation (#82285) and a peer explicitly
+// opened from a profile menu. Empty/absent means "no override": boot adopts the
+// primary as before, so ordinary windows and single-profile users are untouched.
 // Not cached: it is read a handful of times per boot and staying cache-free
 // keeps it honest under test.
 export function windowProfileOverride(): null | string {
@@ -141,11 +141,12 @@ export async function openSessionInNewWindow(sessionId: string, opts?: { watch?:
 }
 
 // Open a new full-chrome app window — a peer instance of the primary that
-// renders the complete app against the shared backend. No-ops outside Electron.
-export async function openNewWindow(): Promise<void> {
+// renders the complete app against the shared backend. An optional profile
+// pins that peer to the selected profile at boot. No-ops outside Electron.
+export async function openNewWindow(profile?: string): Promise<void> {
   if (!canOpenNewWindow()) {
     return
   }
 
-  await runWindowOpen(() => window.hermesDesktop.openWindow(), 'Could not open a new window')
+  await runWindowOpen(() => window.hermesDesktop.openWindow(profile), 'Could not open a new window')
 }
