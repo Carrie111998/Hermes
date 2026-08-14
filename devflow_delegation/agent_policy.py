@@ -102,10 +102,6 @@ class Budget:
         self._max_tokens = max_tokens
         self._timeout_seconds = timeout_seconds
         self._now = now
-        # Recorded at construction time (distinct from `_started_at`, set by
-        # `start()`) so callers can later observe the delay between building a
-        # Budget and actually starting the clock on it.
-        self._created_at = self._now()
         self._started_at = 0.0
         self.iterations = 0
         self.tokens = 0

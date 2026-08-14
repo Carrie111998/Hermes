@@ -74,7 +74,8 @@ def test_budget_trips_on_tokens():
 
 
 def test_budget_trips_on_wall_clock():
-    clock = iter([0.0, 0.0, 999.0])
+    # Budget reads the clock exactly twice on this path: once in start(), once in tick().
+    clock = iter([0.0, 999.0])
     b = Budget(max_iterations=100, max_tokens=1000, timeout_seconds=10, now=lambda: next(clock))
     b.start()
     with pytest.raises(CeilingExceeded, match="wall-clock"):
