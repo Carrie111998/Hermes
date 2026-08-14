@@ -133,6 +133,10 @@ def _is_memory_provider_dir(path: Path) -> bool:
         if not isinstance(meta, dict):
             return False
 
+        name = meta.get("name", path.name)
+        if not isinstance(name, str):
+            return False
+
         kind = meta.get("kind")
         if kind is None:
             kind = ""

@@ -624,7 +624,7 @@ Common reasons a plugin doesn't appear:
 - **Not enabled in config** — plugins are opt-in. Run `hermes plugins enable <name>` (the name comes from the `plugins list` output, which can be `<category>/<plugin>` for nested layouts).
 - **Wrong directory layout:** Native packages use `~/.hermes/plugins/<plugin-name>/plugin.yaml` (flat) or one category level. Portable packages use root `plugin.json` in the same locations. Anything deeper is ignored.
 - **Missing `__init__.py`:** Native packages need both `plugin.yaml` and `__init__.py` with a `register(ctx)` function. Portable packages do not import Python and do not require `__init__.py`.
-- **Wrong `kind`** — gateway adapters need `kind: platform` in their manifest. Memory providers must declare `kind: exclusive` and are routed through the `memory.provider` config instead of `plugins.enabled`.
+- **Wrong `kind`** — gateway adapters need `kind: platform` in their manifest. Memory providers should declare `kind: exclusive` and are routed through the `memory.provider` config instead of `plugins.enabled`. Providers that omit `kind` still work through the legacy source-text fallback, but `kind: exclusive` is the recommended explicit form.
 
 ## Your plugin's final structure
 

@@ -424,6 +424,36 @@ class TestUserInstalledProviderDiscovery:
     @pytest.mark.parametrize(
         ("manifest", "expected"),
         [
+            pytest.param("name: nameprovider\nkind: exclusive\n", True, id="string-name-exclusive"),
+            pytest.param(
+                "name: [nope]\nkind: exclusive\n",
+                False,
+                id="list-name-exclusive",
+            ),
+            pytest.param(
+                "name: 42\nkind: exclusive\n",
+                False,
+                id="numeric-name-exclusive",
+            ),
+            pytest.param(
+                "name: {a: b}\nkind: exclusive\n",
+                False,
+                id="mapping-name-exclusive",
+            ),
+        ],
+    )
+    def test_manifest_name_must_be_string(self, manifest, expected, tmp_path):
+        """Non-string manifest names reject the provider before kind is read."""
+        from plugins.memory import _is_memory_provider_dir
+
+        plugin_dir = self._make_user_memory_plugin(tmp_path, "nameprovider")
+        (plugin_dir / "plugin.yaml").write_text(manifest, encoding="utf-8")
+
+        assert _is_memory_provider_dir(plugin_dir) is expected
+
+    @pytest.mark.parametrize(
+        ("manifest", "expected"),
+        [
             pytest.param("name: documentprovider\n", True, id="valid-unspecified-mapping"),
             pytest.param(
                 "name: documentprovider\nkind: null\n",
