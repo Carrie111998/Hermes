@@ -1095,13 +1095,6 @@ def _arm_exit_watchdog(timeout_s: float | None = None) -> None:
             )
         except Exception:
             pass
-        # Best-effort memory session-end before the hard os._exit — covers the
-        # case where the watchdog was armed by _arm_exit_watchdog_on_shutdown_signal
-        # (shutdown intent signalled) but the main thread then wedged before
-        # _run_cleanup could flush the memory provider. Exactly-once via
-        # _cleanup_done: if cleanup already ran (or is wedged inside the memory
-        # step itself), this is a no-op and we just exit.
-        _emit_session_end_for_exit()
         try:
             import logging as _lg
             _lg.shutdown()
@@ -1112,6 +1105,10 @@ def _arm_exit_watchdog(timeout_s: float | None = None) -> None:
                 _stream.flush()
             except Exception:
                 pass
+        # Best-effort memory session-end flush before the hard exit — the
+        # finally/atexit cleanup never ran (that's why we're here). No-op when
+        # _run_cleanup already ran (guard), never raises.
+        _emit_session_end_before_hard_exit()
         os._exit(0)
 
     try:
@@ -1351,55 +1348,45 @@ def _finalize_single_query(cli) -> None:
         cli._release_active_session()
 
 
-def _emit_session_end_for_exit(cli=None) -> None:
-    """Best-effort memory session-end on the hard-exit (``os._exit``) paths.
+def _emit_session_end_before_hard_exit() -> None:
+    """Best-effort memory session-end flush for the kanban hard-exit paths.
 
-    ``_finalize_single_query`` (run by the single-query ``finally:``) flushes
-    the memory provider's ``on_session_end`` via ``_run_cleanup``. Two kanban
-    worker exit paths terminate the process directly and never reach that
-    ``finally:`` — ``_signal_handler_q``'s ``os._exit(0)`` and the exit
-    watchdog's ``os._exit(0)`` — so the worker's final turns would otherwise
-    be lost before memori's ``on_session_end`` (which joins its sync writer
-    thread) could ingest them.
+    The single-query signal handler (``_signal_handler_q``) and the exit
+    watchdog both terminate the process with ``os._exit(0)``, which bypasses
+    the ``finally:`` / ``atexit`` machinery that would otherwise run
+    ``_finalize_single_query`` → ``_run_cleanup`` → ``shutdown_memory_provider``
+    → memory providers' ``on_session_end``. When the process is a kanban worker,
+    this flushes the memory provider so it can ingest the worker's last turns
+    before the hard exit — the SAME flush ```_run_cleanup`` delivers, not a
+    parallel implementation.
 
-    This calls the SAME provider-flush helper the ``finally:`` path reaches —
-    the agent's ``shutdown_memory_provider`` (on_session_end + shutdown_all) —
-    in its shortest, most defensive usable form for a signal-handler /
-    watchdog context:
+    Exactly-once relies on the existing ``_cleanup_done`` flag: if ``_run_cleanup``
+    already ran (or is wedged mid-run with the flag set), this is a no-op, so a
+    normal ``finally:`` exit can never double-emit. A raising provider is
+    swallowed, so it can never prevent the process exit. Never raises — safe to
+    call from a signal handler or the watchdog thread.
 
-      * exactly-once: guarded by the existing module ``_cleanup_done`` flag,
-        so it can never double-fire when the normal ``finally:`` /
-        ``_run_cleanup`` runs afterwards (or already ran);
-      * non-blocking: it skips ``_run_cleanup``'s open-ended 10s
-        ``flush_pending`` head-start and relies on
-        ``shutdown_memory_provider``'s own bounded (≤5s) executor drain; it
-        never joins long-lived worker threads;
-      * raising providers are swallowed (never prevent the exit).
-
-    It deliberately does NOT release the active session lease or run
-    ``_run_cleanup``'s broader teardown (terminals, browsers, MCP) — those
-    are unsafe microseconds before ``os._exit`` and the process is torn down
-    anyway.
+    Non-blocking note: ``shutdown_memory_provider`` may join a provider's writer
+    thread (e.g. memori joins its daemon ``sync_writer``). On the signal-handler
+    path that is bounded by the pre-existing SIGALRM deadman; in the watchdog
+    it is a no-op whenever cleanup was reached (``_cleanup_done`` set — the
+    common arming case), so it cannot block the last-resort backstop in practice.
     """
     global _cleanup_done
     if _cleanup_done:
         return
-    _cleanup_done = True
-    agent = getattr(cli, "agent", None) if cli is not None else None
-    if agent is None:
-        agent = _active_agent_ref
+    agent = _active_agent_ref
     if agent is None or not hasattr(agent, "shutdown_memory_provider"):
         return
+    _cleanup_done = True
     try:
-        session_msgs = getattr(agent, "_session_messages", None)
-        if isinstance(session_msgs, list):
-            agent.shutdown_memory_provider(session_msgs)
+        _session_msgs = getattr(agent, "_session_messages", None)
+        if isinstance(_session_msgs, list):
+            agent.shutdown_memory_provider(_session_msgs)
         else:
             agent.shutdown_memory_provider()
-    except Exception as e:
-        logger.warning(
-            "kanban hard-exit session-finalize failed (best-effort): %s", e
-        )
+    except Exception:
+        pass
 
 
 def _reset_terminal_input_modes_on_exit() -> None:
@@ -18767,11 +18754,6 @@ def main(
         # the flush against any rare blocking-I/O case (the reporter measured
         # flush in <1ms; the alarm is a failsafe, not the common path).
         if os.environ.get("HERMES_KANBAN_TASK"):
-            # Best-effort memory session-end before the hard os._exit below.
-            # Emit FIRST so the 2s SIGALRM deadman below never races it to a
-            # premature kill mid-flush; the bounded drain caps the wait and
-            # _cleanup_done dedupes against any later cleanup.
-            _emit_session_end_for_exit(cli)
             try:
                 import signal as _sig_mod
                 if hasattr(_sig_mod, "SIGALRM"):
@@ -18781,6 +18763,11 @@ def main(
                     _sig_mod.alarm(2)
             except Exception:
                 pass
+            # Hand this worker's last turns to the memory provider before the
+            # hard exit — the finally/atexit cleanup never runs on this path.
+            # Flush is bounded by the SIGALRM deadman armed above; a raising
+            # provider is swallowed. Never emits twice (_cleanup_done guard).
+            _emit_session_end_before_hard_exit()
             try:
                 import logging as _lg
                 _lg.shutdown()
@@ -18988,6 +18975,15 @@ def main(
                         # 5-hour quota window can't trip the circuit breaker and
                         # permanently block the card. Non-kanban runs keep the
                         # plain 0/1 contract automation wrappers expect.
+                        #
+                        # The memory session-end flush is NOT emitted here: the
+                        # enclosing ``finally`` (below) already delivers it via
+                        # ``_finalize_single_query`` → ``_run_cleanup`` →
+                        # ``shutdown_memory_provider`` on this normal ``-Q`` exit
+                        # path, exactly once (``_run_cleanup``'s ``_cleanup_done``
+                        # guard). The hard ``os._exit(0)`` paths (signal handler,
+                        # exit watchdog) that genuinely skip that machinery get
+                        # the flush from ``_emit_session_end_before_hard_exit``.
                         _exit_code = 0
                         if isinstance(result, dict) and result.get("failed"):
                             _exit_code = 1
@@ -19001,6 +18997,7 @@ def main(
                                     _exit_code = _RL_CODE
                                 except Exception:
                                     _exit_code = 1
+
                         sys.exit(_exit_code)
 
                 # Exit with error code if credentials or agent init fails
