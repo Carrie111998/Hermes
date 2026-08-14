@@ -483,6 +483,11 @@ class SignalAdapter(BasePlatformAdapter):
            check ``GET /v1/receive/{number}``. If it returns 200 (even
            with ``[]`` body), it's ``native`` mode. 404 means the receive
            endpoint is gated by json-rpc — fall through to json-rpc.
+           The receive probe is a DESTRUCTIVE read on native-mode daemons
+           (it dequeues whatever is queued), so any envelopes returned by
+           the probe are dispatched through ``_handle_envelope`` rather
+           than discarded — a message that arrived while the daemon was
+           starting up must not be eaten by the probe (#71884).
         3. ``OPTIONS /v1/receive/{number}`` — 200 / 405 with an Allow header
            that *lacks* ``GET`` indicates json-rpc-only mode.
         4. Fallback: ``native`` (most common docker-compose default), with
@@ -509,6 +514,20 @@ class SignalAdapter(BasePlatformAdapter):
                 rcv_url = f"{self.http_url}/v1/receive/{quote(self.account, safe='')}"
                 rcv = await self.client.get(rcv_url, timeout=5.0)
                 if rcv.status_code == 200:
+                    # The probe is a destructive read on native-mode daemons:
+                    # any envelope queued during startup is returned (and
+                    # dequeued) right here. Dispatch it instead of dropping it
+                    # so the message still reaches the agent (#71884).
+                    try:
+                        probe_data = rcv.json()
+                    except Exception:
+                        probe_data = None
+                    if isinstance(probe_data, list):
+                        for envelope in probe_data:
+                            if envelope:
+                                await self._handle_envelope(envelope)
+                    elif probe_data:
+                        await self._handle_envelope(probe_data)
                     logger.info(
                         "Signal transport detected: native "
                         "(REST /v1/about + /v1/receive both 200); "
