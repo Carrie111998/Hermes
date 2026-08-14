@@ -724,13 +724,24 @@ def _discover(
     raw_results = _order_for_recall(raw_results)
 
     if not raw_results and not title_result:
+        _empty_message = "No matching sessions found."
+        # Multi-term queries are implicit AND in FTS5: every term must appear
+        # in a single message. An empty result for "Laurel Borrowman unboxing
+        # video" says nothing about sessions that mention only "Laurel" —
+        # without this hint models have treated that as proof of absence.
+        if len(query.split()) > 1:
+            _empty_message += (
+                " Note: multi-word queries require ALL terms to appear in one"
+                " message (AND semantics). Retry with fewer or broader terms"
+                " before concluding the topic is absent from past sessions."
+            )
         _empty_payload = {
             "success": True,
             "mode": "discover",
             "query": query,
             "results": [],
             "count": 0,
-            "message": "No matching sessions found.",
+            "message": _empty_message,
         }
         _annotate_rebuild_status(db, _empty_payload)
         return json.dumps(_empty_payload, ensure_ascii=False)
@@ -740,6 +751,7 @@ def _discover(
     # window. parent_session_id is exposed separately when different.
     seen_sessions = {}
     results = []
+    skipped_current = 0
 
     if title_result:
         title_lineage = title_result.pop("_lineage_root", None)
@@ -771,12 +783,14 @@ def _discover(
         is_ended_session = _is_compression_ended(db, raw_sid)
         if current_lineage_root and resolved_sid == current_lineage_root:
             if not (is_ended_session or is_compacted_hit):
+                skipped_current += 1
                 continue
         if current_session_id and raw_sid == current_session_id:
             # Same-session hit: only skip if the matched message is still live
             # (active=1). Archived/compacted rows are pre-compaction content
             # that's been summarised away — let them through.
             if not is_compacted_hit:
+                skipped_current += 1
                 continue
         if resolved_sid not in seen_sessions:
             row = dict(r)
@@ -841,6 +855,19 @@ def _discover(
         "count": len(results),
         "sessions_searched": len(seen_sessions),
     }
+    # Degenerate case behind false "no memory of X" claims: FTS matched, but
+    # every hit lived in the current conversation and was (correctly)
+    # excluded. Without an explanation this payload is indistinguishable from
+    # "the topic appears nowhere", which is the opposite of what it means.
+    if not results and skipped_current:
+        _final_payload["excluded_current_session_matches"] = skipped_current
+        _final_payload["message"] = (
+            f"{skipped_current} match(es) found, but all are part of the"
+            " current conversation and were excluded. This is NOT evidence"
+            " the topic is absent from past sessions. Multi-word queries"
+            " require ALL terms in one message (AND semantics); retry with"
+            " fewer or broader terms to reach older sessions."
+        )
     _annotate_rebuild_status(db, _final_payload)
     return json.dumps(_final_payload, ensure_ascii=False)
 
