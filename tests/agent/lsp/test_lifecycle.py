@@ -69,7 +69,7 @@ def test_atexit_shutdown_swallows_exceptions(monkeypatch):
     def boom():
         raise RuntimeError("server already dead")
 
-    monkeypatch.setattr(lsp_module, "shutdown_service", boom)
+    monkeypatch.setattr(lsp_module, "_shutdown_all_services", boom)
     # Must not raise.
     lsp_module._atexit_shutdown()
 
@@ -90,6 +90,42 @@ def test_shutdown_service_idempotent(monkeypatch):
     lsp_module.shutdown_service()  # must not raise
 
     assert fake_svc.shutdown.call_count == 1
+
+
+def test_shutdown_service_only_stops_active_profile(monkeypatch, tmp_path):
+    """An explicit profile restart must not stop another profile's service."""
+    services: list[MagicMock] = []
+
+    def make_service(cls):
+        fake = MagicMock()
+        fake.is_active.return_value = True
+        services.append(fake)
+        return fake
+
+    monkeypatch.setattr(
+        lsp_module.LSPService, "create_from_config", classmethod(make_service)
+    )
+    monkeypatch.setattr(atexit, "register", lambda fn: None)
+    home_a = tmp_path / "profile-a"
+    home_b = tmp_path / "profile-b"
+
+    monkeypatch.setenv("HERMES_HOME", str(home_a))
+    service_a = lsp_module.get_service()
+    scope_a = lsp_module._current_scope()
+    monkeypatch.setenv("HERMES_HOME", str(home_b))
+    service_b = lsp_module.get_service()
+    scope_b = lsp_module._current_scope()
+
+    monkeypatch.setenv("HERMES_HOME", str(home_a))
+    lsp_module.shutdown_service()
+
+    services[0].shutdown.assert_called_once()
+    services[1].shutdown.assert_not_called()
+    assert service_a is not None
+    assert service_b is not None
+    assert scope_a not in lsp_module._services
+    assert lsp_module._services[scope_b] is service_b
+    assert len(services) == 2
 
 
 def test_get_service_isolated_by_hermes_home(monkeypatch, tmp_path):

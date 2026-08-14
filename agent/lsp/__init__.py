@@ -90,10 +90,28 @@ def get_service() -> Optional[LSPService]:
 
 
 def shutdown_service() -> None:
-    """Tear down the LSP service if one was started.
+    """Tear down the active profile's LSP service if one was started.
 
+    Explicit restart/shutdown commands run in one active Hermes profile and
+    must not terminate language servers owned by another multiplexed profile.
     Safe to call multiple times; safe to call when no service was created.
     """
+    global _service, _service_scope
+    scope = _current_scope()
+    with _service_lock:
+        service = _services.pop(scope, None)
+        if _service_scope == scope:
+            _service = None
+            _service_scope = None
+    if service is not None:
+        try:
+            service.shutdown()
+        except Exception as e:  # noqa: BLE001
+            logger.debug("LSP shutdown error: %s", e)
+
+
+def _shutdown_all_services() -> None:
+    """Tear down every profile service during process exit."""
     global _service, _service_scope
     with _service_lock:
         services = list(_services.values())
@@ -102,9 +120,9 @@ def shutdown_service() -> None:
         _services.clear()
         _service = None
         _service_scope = None
-    for svc in services:
+    for service in services:
         try:
-            svc.shutdown()
+            service.shutdown()
         except Exception as e:  # noqa: BLE001
             logger.debug("LSP shutdown error: %s", e)
 
@@ -114,7 +132,7 @@ def _atexit_shutdown() -> None:
     atexit fires the user has already seen the agent's final output —
     a noisy shutdown line on top of that is just clutter."""
     try:
-        shutdown_service()
+        _shutdown_all_services()
     except Exception as e:  # noqa: BLE001
         logger.debug("atexit LSP shutdown failed: %s", e)
 
