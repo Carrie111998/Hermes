@@ -3197,7 +3197,27 @@ def estimate_messages_tokens_rough(messages: List[Dict[str, Any]]) -> int:
     """
     _IMAGE_TOKEN_COST = 1500
     total = 0
-    for msg in messages:
+    # Only the NEWEST assistant turn's thinking fields are replayed on the
+    # wire; every older turn's reasoning/reasoning_content is stripped or
+    # padded at send time (#73624). Charging stale thinking inflated rough
+    # preflight estimates by ~69% on reasoning-heavy sessions (deepseek:
+    # 376KB of thinking across 755 old assistant rows) and re-triggered
+    # compression every couple of turns while the real prompt sat far below
+    # the threshold. Mirror _estimate_msg_budget_tokens'
+    # charge_stale_thinking semantics so preflight and the tail-budget walk
+    # agree on the same transcript.
+    newest_asst_idx = -1
+    for i in range(len(messages) - 1, -1, -1):
+        _m = messages[i]
+        if isinstance(_m, dict) and _m.get("role") == "assistant":
+            newest_asst_idx = i
+            break
+    for idx, msg in enumerate(messages):
+        if idx != newest_asst_idx and isinstance(msg, dict):
+            msg = {
+                k: v for k, v in msg.items()
+                if k not in ("reasoning", "reasoning_content")
+            }
         total += _estimate_message_tokens_cached(msg, _IMAGE_TOKEN_COST)
     return total
 
