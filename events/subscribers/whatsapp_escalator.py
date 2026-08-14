@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any, Callable, Deque, Dict, List, Optional
 
 from events.bus import EventBus
-from events.noise_guards import RepeatGuard
+from events.noise_guards import RepeatGuard, is_sustained_resource_repeat
 from events.routing_policy import (
     HIGH_SCORE_WA_THRESHOLD,
     WA_IMMEDIATE,
@@ -285,6 +285,9 @@ class WhatsAppEscalator(BaseSubscriber):
         elif route.wa_tier is None:
             return
 
+        if is_sustained_resource_repeat(event):
+            return
+
         # Reset daily counter at midnight
         today = datetime.now().strftime("%Y-%m-%d")
         if self._daily_reset_date != today:
@@ -357,6 +360,7 @@ class WhatsAppEscalator(BaseSubscriber):
             format_whatsapp_message,
             humanize_health_detail,
             probe_transition_body,
+            resource_pressure_body,
             silence_alert_body,
             watchdog_burst_body,
         )
@@ -412,6 +416,11 @@ class WhatsAppEscalator(BaseSubscriber):
             text = failure_cluster_body(p)
         elif et == EventType.CONTAINER_CRASH_LOOP:
             text = container_crash_loop_body(p)
+        elif et == EventType.RESOURCE_PRESSURE:
+            # Without this branch the scalar fallback takes scalars[:6] in
+            # payload order and stops BEFORE disk_c_free_gb — a disk-full page
+            # that never mentions the disk (2026-08-14).
+            text = resource_pressure_body(p)
         elif et == EventType.BOOT_SUMMARY:
             # Only reachable via an explicit --priority critical emit (WARN
             # pages at CRITICAL); the scalar fallback would silently DROP

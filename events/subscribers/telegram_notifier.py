@@ -26,6 +26,7 @@ from events.bus import EventBus
 from events.noise_guards import (
     FlapGuard,
     RepeatGuard,
+    is_sustained_resource_repeat,
     is_noop_cron_output,
     normalize_for_fingerprint,
     strip_agent_iteration_json,
@@ -329,6 +330,8 @@ class TelegramNotifier(BaseSubscriber):
         # run must deliver).
         if event.event_type in _CRON_BUS_ONLY:
             return
+        if is_sustained_resource_repeat(event):
+            return
         if event.event_type == EventType.CRON_COMPLETED:
             output = (event.payload or {}).get("output_summary", "")
             if (route.attention not in (Attention.WARN, Attention.ACT)
@@ -534,18 +537,11 @@ class TelegramNotifier(BaseSubscriber):
             return failure_cluster_body(p)
 
         if et == EventType.RESOURCE_PRESSURE:
-            # 2026-06-11 pagefile-burst remediation. Render a tight operator
-            # line; the generic fallback would splat the nested ``thresholds``
-            # dict and the raw ``reasons`` list verbatim.
-            reasons = ", ".join(p.get("reasons", [])) or "?"
-            return (
-                f"⚠ Resource pressure: {reasons}\n"
-                f"Commit: {p.get('commit_pct', '?')}% "
-                f"({p.get('commit_used_gb', '?')}/{p.get('commit_limit_gb', '?')} GB)\n"
-                f"Pagefile: {p.get('pagefile_allocated_gb', '?')} GB "
-                f"(+{p.get('pagefile_growth_gb_10min', '?')} GB/10m)\n"
-                f"C: free: {p.get('disk_c_free_gb', '?')} GB"
-            )
+            # 2026-06-11 pagefile-burst remediation; shared with the WhatsApp
+            # escalator since 2026-08-14 so both lanes render the severity band
+            # identically (the band is the only part the repeat guard can see).
+            from events.formatting import resource_pressure_body
+            return resource_pressure_body(p)
 
         if et == EventType.TRACKER_PARTIAL_BACKLOG:
             # 2026-07-18 operator feedback: the generic fallback splatted

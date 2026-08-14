@@ -68,6 +68,26 @@ def is_noop_cron_output(output_summary: str) -> bool:
     return text.lower() in _NOOP_PHRASES
 
 
+def is_sustained_resource_repeat(event) -> bool:
+    """True iff this RESOURCE_PRESSURE event is an unchanged re-ping.
+
+    The producer re-samples a live episode every 900s so it stays
+    reconstructable on the bus after the fact — that sampling is what made the
+    2026-08-14 delivery audit possible and is deliberately kept. But an
+    unchanged sample is not a message: only ``rising_edge`` / ``band_change`` /
+    ``reasons_change`` reach chat. Bus-only, exactly like the cron lifecycle
+    types in ``_CRON_BUS_ONLY``.
+
+    Deliberately duck-typed (no ``events.schema`` import) so this module stays
+    dependency-free, and defaulting to FALSE for events with no ``change`` key
+    keeps pre-band producers delivering.
+    """
+    payload = getattr(event, "payload", None) or {}
+    type_string = getattr(getattr(event, "event_type", None), "type_string", "")
+    return (type_string == "resource_pressure"
+            and payload.get("change") == "sustained_repeat")
+
+
 class RepeatGuard:
     """Suppress verbatim repeats of (key, text) within ``window_seconds``.
 

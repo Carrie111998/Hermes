@@ -143,6 +143,48 @@ DEFAULT_PAGEFILE_GROWTH_GB_DISARM = 1.0      # in-window growth below this clear
 # 5 points (92 -> 87).
 DEFAULT_PHYS_PCT_DISARM = 87.0               # phys back below this % clears
 
+# Disk severity bands (2026-08-14). ``normalize_for_fingerprint`` collapses digit
+# runs to "N", so "C: free: 0.0 GB" and "C: free: 56.63 GB" fingerprint
+# IDENTICALLY and the repeat guard suppressed a dying disk exactly as it
+# suppressed a healthy one -- measured over 479 disk_low events, ONE fingerprint
+# covered the whole range including 101 below 5 GiB and 13 at exactly 0.0 GiB.
+# A band label is LETTERS, which the fingerprint can see, so crossing an edge
+# mints a genuinely new message without touching the guard at all.
+# Geometric on purpose: coarse where the slide is slow and undramatic, tight
+# near zero where minutes matter. Descending -- the DEEPEST edge crossed wins,
+# so a 45 -> 2 GiB drop is one "imminent" message, not five.
+DISK_BANDS: Tuple[Tuple[float, str], ...] = (
+    (45.0, "low"),
+    (25.0, "critical"),
+    (12.0, "severe"),
+    (6.0, "emergency"),
+    (3.0, "imminent"),
+    (1.0, "full"),
+)
+# An announced edge re-arms only once free space recovers to this multiple of it
+# (45->54, 25->30, 12->14.4, 6->7.2, 3->3.6, 1->1.2). Hovering at a boundary
+# therefore cannot flap, while a genuine 11 -> 30 -> 11 GiB round trip does
+# re-announce. Same shape as the per-axis ``comfortably_clear`` disarm levels
+# above. The 45 edge's 54 GiB re-arm is unreachable in practice because
+# disk_low disarms at 52 GiB, which ends the episode and resets every edge --
+# that is the intended outcome, not a gap.
+DISK_BAND_REARM_FACTOR = 1.2
+
+
+def disk_band_for(free_bytes: int) -> Tuple[Optional[str], Optional[float]]:
+    """Deepest band whose edge ``free_bytes`` has fallen below.
+
+    Returns ``(label, edge_gb)``, or ``(None, None)`` when free space is above
+    every edge. Pure -- the ratchet that decides whether an edge may ANNOUNCE
+    lives in the monitor, because only it knows the episode.
+    """
+    label: Optional[str] = None
+    edge: Optional[float] = None
+    for band_edge, band_label in DISK_BANDS:
+        if free_bytes < band_edge * _GB:
+            label, edge = band_label, band_edge
+    return label, edge
+
 
 @dataclass(frozen=True)
 class ResourceSample:
@@ -286,6 +328,13 @@ class ResourcePressureMonitor:
         # comfortably clear (its disarm level); episode = any axis latched.
         self._latched: Set[str] = set()
         self._last_emit: Optional[float] = None
+        # Disk band edges already ANNOUNCED this episode. Ratchets down; an
+        # edge re-arms only once free space recovers past
+        # ``edge * DISK_BAND_REARM_FACTOR``, and the whole set clears when the
+        # episode ends.
+        self._announced_disk_edges: Set[float] = set()
+        # ``reasons`` of the last EMITTED event, for reasons_change detection.
+        self._last_reasons: Optional[Set[str]] = None
 
     def check(self) -> Optional[str]:
         """Sample, evaluate, emit if a pressure edge fired. Returns event_id or None.
@@ -354,7 +403,42 @@ class ResourcePressureMonitor:
             # Nothing breaching right now. If every latched axis also cleared
             # comfortably, the episode is over and the next rising edge fires
             # immediately rather than waiting a cooldown.
+            if not self._latched:
+                # Episode over: every band re-arms, so the NEXT episode
+                # announces its severity from scratch.
+                self._announced_disk_edges.clear()
             return None
+
+        # Severity band for the disk axis. Gated on ``reasons`` rather than on
+        # free space alone, so a lowered ``disk_free_gb_threshold`` cannot make
+        # a band appear on an episode the disk axis is not part of.
+        disk_axis = "disk_low" in reasons or "disk_critical" in reasons
+        band, band_edge = (
+            disk_band_for(sample.disk_free_bytes) if disk_axis else (None, None)
+        )
+
+        # Re-arm first: an edge the disk has climbed comfortably back above may
+        # announce again. Unconditional -- an episode kept alive by another axis
+        # must still re-arm its disk edges.
+        self._announced_disk_edges = {
+            edge for edge in self._announced_disk_edges
+            if sample.disk_free_bytes <= edge * DISK_BAND_REARM_FACTOR * _GB
+        }
+        band_changed = (
+            band_edge is not None
+            and band_edge not in self._announced_disk_edges
+        )
+        if band_changed:
+            # Mark EVERY crossed edge announced, not just the deepest, so a
+            # single steep drop is one message instead of one per edge on the
+            # way down.
+            self._announced_disk_edges.update(
+                edge for edge, _label in DISK_BANDS
+                if sample.disk_free_bytes < edge * _GB
+            )
+        reasons_changed = (
+            self._last_reasons is not None and set(reasons) != self._last_reasons
+        )
 
         # Pressure is active. Decide whether to emit: rising edge always; a
         # sustained episode re-pings only after the cooldown elapses.
@@ -381,14 +465,29 @@ class ResourcePressureMonitor:
             self._last_emit is None
             or (now - self._last_emit) >= self.re_alert_cooldown_seconds
         )
-        if not (rising_edge or cooldown_elapsed):
+        if not (rising_edge or band_changed or reasons_changed or cooldown_elapsed):
             return None
 
+        # Why this emission exists. Subscribers deliver everything EXCEPT
+        # ``sustained_repeat``; the bus keeps them all, so the 900s sampling
+        # that makes an episode reconstructable after the fact is preserved.
+        if rising_edge:
+            change = "rising_edge"
+        elif band_changed:
+            change = "band_change"
+        elif reasons_changed:
+            change = "reasons_change"
+        else:
+            change = "sustained_repeat"
+
         self._last_emit = now
-        return self._emit(sample, reasons, growth_bytes)
+        self._last_reasons = set(reasons)
+        return self._emit(sample, reasons, growth_bytes, band, band_edge, change)
 
     def _emit(
         self, sample: ResourceSample, reasons: List[str], growth_bytes: int,
+        band: Optional[str] = None, band_edge: Optional[float] = None,
+        change: str = "rising_edge",
     ) -> str:
         payload = {
             "reasons": reasons,
@@ -400,6 +499,9 @@ class ResourcePressureMonitor:
             "pagefile_allocated_gb": round(sample.pagefile_allocated_bytes / _GB, 2),
             "pagefile_growth_gb_10min": round(growth_bytes / _GB, 2),
             "disk_c_free_gb": round(sample.disk_free_bytes / _GB, 2),
+            "disk_band": band,
+            "disk_band_edge_gb": band_edge,
+            "change": change,
             "thresholds": {
                 "commit_pct": self.commit_pct_threshold,
                 "phys_pct": self.phys_pct_threshold,

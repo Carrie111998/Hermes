@@ -448,6 +448,44 @@ def probe_transition_body(payload: dict) -> str:
     return text
 
 
+def resource_pressure_body(payload: dict) -> str:
+    """Host resource pressure — shared by Telegram and the WhatsApp escalator.
+
+    Leads with the DISK line because that is where the severity band lives, and
+    the band is the only part of this message the repeat guard can see:
+    ``normalize_for_fingerprint`` collapses digit runs to "N", so before the
+    band existed (2026-08-14) a single fingerprint covered every disk_low event
+    from 56.63 GB free down to 0.0 GB — 101 of them below 5 GiB, 13 at exactly
+    zero — and a dying disk was suppressed exactly like a healthy one. The band
+    label is LETTERS, so crossing an edge mints a new message; two readings
+    inside one band still collapse, which is what keeps a filling disk from
+    paging every tick.
+
+    Also the WhatsApp lane's only readable rendering of this type. Without it
+    the escalator falls to its scalar fallback, which takes ``scalars[:6]`` in
+    payload order and stops BEFORE ``disk_c_free_gb`` — a disk-full page that
+    never mentions the disk. Never observed only because disk_critical had
+    fired zero times when this landed.
+    """
+    p = payload or {}
+    reasons = ", ".join(p.get("reasons") or []) or "?"
+    disk = f"C: free: {p.get('disk_c_free_gb', '?')} GB"
+    band = p.get("disk_band")
+    if band:
+        disk += f" — {str(band).upper()}"
+        edge = p.get("disk_band_edge_gb")
+        if edge is not None:
+            disk += f" (under {edge:g} GiB)"
+    return (
+        f"⚠ Resource pressure: {reasons}\n"
+        f"{disk}\n"
+        f"Commit: {p.get('commit_pct', '?')}% "
+        f"({p.get('commit_used_gb', '?')}/{p.get('commit_limit_gb', '?')} GB)\n"
+        f"Pagefile: {p.get('pagefile_allocated_gb', '?')} GB "
+        f"(+{p.get('pagefile_growth_gb_10min', '?')} GB/10m)"
+    )
+
+
 def container_crash_loop_body(payload: dict) -> str:
     """A container burned its 24h restart budget — say how many, and that it may read green.
 

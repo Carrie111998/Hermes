@@ -1186,3 +1186,59 @@ class TestHumanReadableMessages:
         assert "job_name: nightly-consolidate" in msg
         assert "minutes_stale: 95" in msg
         assert "{" not in msg and "'deep'" not in msg
+
+
+class TestResourcePressurePaging:
+    """disk_critical routes ACT -> the phone. Until 2026-08-14 this type had no
+    branch here, so it fell to the scalar fallback, which takes scalars[:6] in
+    payload order and stops BEFORE disk_c_free_gb — a disk-full page that never
+    mentions the disk. Never caught because disk_critical had fired 0 times."""
+
+    def _event(self, free_gb=2.4, band="imminent", edge=3, change="band_change"):
+        return Event.create(
+            EventType.RESOURCE_PRESSURE, "system",
+            {
+                "reasons": ["disk_low", "disk_critical"],
+                "commit_used_gb": 83.32, "commit_limit_gb": 127.2,
+                "commit_pct": 65.5, "phys_used_pct": 75.8,
+                "phys_available_gb": 15.3, "pagefile_allocated_gb": 64.0,
+                "pagefile_growth_gb_10min": 0.0,
+                "disk_c_free_gb": free_gb, "disk_band": band,
+                "disk_band_edge_gb": edge, "change": change,
+                "thresholds": {"disk_free_gb": 45.0},
+            },
+        )
+
+    def test_the_page_names_the_disk_and_its_severity(
+        self, bus, quiet_config, queue_path,
+    ):
+        escalator = WhatsAppEscalator(
+            bus, quiet_config_path=quiet_config, queue_path=queue_path,
+        )
+        msg = escalator.format_message(self._event())
+        assert "IMMINENT" in msg.upper()
+        assert "2.4" in msg
+        assert "disk_c_free_gb" not in msg   # not the raw scalar fallback
+
+    def test_a_sustained_repeat_never_reaches_the_phone(
+        self, bus, quiet_config, queue_path,
+    ):
+        escalator = WhatsAppEscalator(
+            bus, quiet_config_path=quiet_config, queue_path=queue_path,
+        )
+        # URGENT is throttle-buffered rather than delivered synchronously, so
+        # the buffer — not _deliver — is what "reached the phone lane" means.
+        with patch.object(escalator, "_is_quiet_hours", return_value=False):
+            escalator.handle(self._event(change="sustained_repeat"))
+        assert escalator._throttle_buffer == []
+
+    def test_a_band_change_does_reach_the_phone(
+        self, bus, quiet_config, queue_path,
+    ):
+        escalator = WhatsAppEscalator(
+            bus, quiet_config_path=quiet_config, queue_path=queue_path,
+        )
+        with patch.object(escalator, "_is_quiet_hours", return_value=False):
+            escalator.handle(self._event(change="band_change"))
+        assert len(escalator._throttle_buffer) == 1
+        assert "IMMINENT" in escalator._throttle_buffer[0].upper()

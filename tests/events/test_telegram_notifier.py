@@ -2546,3 +2546,57 @@ class TestBootSummaryBody:
             EventType.BOOT_SUMMARY, "laptop-start", {"state": "failed"},
         )
         assert notifier.resolve_target(event)[2] == "100"
+
+
+class TestResourcePressureSeverityBands:
+    """2026-08-14: the producer keeps sampling a live episode every 900s for the
+    bus, but only a CHANGE is a message."""
+
+    def _event(self, free_gb=2.4, band="imminent", edge=3, change="band_change"):
+        return Event.create(
+            EventType.RESOURCE_PRESSURE, "system",
+            {
+                "reasons": ["disk_low"],
+                "commit_used_gb": 83.32, "commit_limit_gb": 127.2,
+                "commit_pct": 65.5, "phys_used_pct": 75.8,
+                "phys_available_gb": 15.3, "pagefile_allocated_gb": 64.0,
+                "pagefile_growth_gb_10min": 0.0,
+                "disk_c_free_gb": free_gb, "disk_band": band,
+                "disk_band_edge_gb": edge, "change": change,
+                "thresholds": {"disk_free_gb": 45.0},
+            },
+        )
+
+    def _notifier(self, bus, topics_config, verbosity_config, sent):
+        return TelegramNotifier(
+            bus, topics_path=topics_config, verbosity_path=verbosity_config,
+            send_fn=lambda chat_id, thread_id, msg: sent.append(msg),
+        )
+
+    def test_a_band_change_is_delivered(self, bus, topics_config, verbosity_config):
+        sent = []
+        self._notifier(bus, topics_config, verbosity_config, sent).handle(
+            self._event(change="band_change"))
+        assert len(sent) == 1
+        assert "IMMINENT" in sent[0].upper()
+
+    def test_a_sustained_repeat_is_bus_only(self, bus, topics_config, verbosity_config):
+        sent = []
+        self._notifier(bus, topics_config, verbosity_config, sent).handle(
+            self._event(change="sustained_repeat"))
+        assert sent == []
+
+    def test_a_deepening_band_defeats_the_repeat_guard(
+        self, bus, topics_config, verbosity_config,
+    ):
+        """The end-to-end point: consecutive events inside the 30-min window
+        used to collapse into one message no matter how bad the disk got."""
+        sent = []
+        notifier = self._notifier(bus, topics_config, verbosity_config, sent)
+        notifier.handle(self._event(free_gb=10.0, band="severe", edge=12))
+        notifier.handle(self._event(free_gb=8.0, band="severe", edge=12,
+                                    change="sustained_repeat"))
+        notifier.handle(self._event(free_gb=2.4, band="imminent", edge=3))
+        assert len(sent) == 2
+        assert "SEVERE" in sent[0].upper()
+        assert "IMMINENT" in sent[1].upper()

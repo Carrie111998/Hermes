@@ -919,3 +919,54 @@ class TestBootSummaryBody:
         header = format_whatsapp_header(e)
         assert "BOOT_SUMMARY" not in header
         assert "BOOT PROBLEMS" in header
+
+
+# --- resource_pressure severity bands (2026-08-14) --------------------------
+
+def _pressure_payload(free_gb, band, edge, change="band_change"):
+    return {
+        "reasons": ["disk_low", "disk_critical"],
+        "commit_used_gb": 83.32, "commit_limit_gb": 127.2, "commit_pct": 65.5,
+        "phys_used_pct": 75.8, "phys_available_gb": 15.3,
+        "pagefile_allocated_gb": 64.0, "pagefile_growth_gb_10min": 0.0,
+        "disk_c_free_gb": free_gb, "disk_band": band,
+        "disk_band_edge_gb": edge, "change": change,
+        "thresholds": {"disk_free_gb": 45.0, "disk_free_gb_critical": 25.0},
+    }
+
+
+def test_resource_pressure_body_leads_with_the_band_and_names_the_disk():
+    from events.formatting import resource_pressure_body
+    body = resource_pressure_body(_pressure_payload(2.4, "imminent", 3))
+    assert "IMMINENT" in body.upper()
+    assert "2.4" in body
+
+
+def test_band_changes_the_fingerprint_but_digits_alone_still_do_not():
+    """The whole point of the 2026-08-14 band work.
+
+    Measured before it: ONE fingerprint covered every disk_low event from
+    56.63 GB free down to 0.0 GB, because normalize_for_fingerprint collapses
+    digit runs. Severity has to live in LETTERS to be visible to the guard --
+    while two readings inside the SAME band must still collapse, or a filling
+    disk goes back to one message per tick.
+    """
+    from events.formatting import resource_pressure_body
+    from events.noise_guards import normalize_for_fingerprint
+
+    severe = resource_pressure_body(_pressure_payload(10.0, "severe", 12))
+    severe_later = resource_pressure_body(_pressure_payload(7.5, "severe", 12))
+    imminent = resource_pressure_body(_pressure_payload(2.4, "imminent", 3))
+
+    assert normalize_for_fingerprint(severe) == normalize_for_fingerprint(severe_later)
+    assert normalize_for_fingerprint(severe) != normalize_for_fingerprint(imminent)
+
+
+def test_resource_pressure_body_without_a_band_still_renders():
+    """Non-disk episodes (commit/phys/pagefile) carry disk_band=None."""
+    from events.formatting import resource_pressure_body
+    payload = _pressure_payload(300.0, None, None)
+    payload["reasons"] = ["phys_high"]
+    body = resource_pressure_body(payload)
+    assert "phys_high" in body
+    assert "None" not in body

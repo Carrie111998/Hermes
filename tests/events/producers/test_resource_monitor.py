@@ -561,3 +561,96 @@ class TestRealSampler:
     @pytest.mark.skipif(sys.platform == "win32", reason="non-Windows path")
     def test_real_sampler_is_none_off_windows(self):
         assert sample_resources() is None
+
+
+class TestSeverityBands:
+    """Severity bands (2026-08-14).
+
+    ``normalize_for_fingerprint`` collapses digit runs, so ``C: free: 0.0 GB``
+    and ``C: free: 56.63 GB`` were the SAME message and a dying disk was
+    suppressed by the same sliding window as a healthy one (measured: one
+    fingerprint covered 101 events below 5 GiB and 13 at exactly 0.0 GiB).
+    A band label is LETTERS, which the fingerprint can see.
+    """
+
+    def test_first_disk_breach_carries_the_low_band(self, bus):
+        monitor = ResourcePressureMonitor(bus)
+        monitor.evaluate(make_sample(disk_free_gb=30.0), now=0.0)
+        p = _pressure_events(bus)[0].payload
+        assert p["disk_band"] == "low"
+        assert p["disk_band_edge_gb"] == 45
+
+    def test_a_drop_past_several_edges_announces_only_the_deepest(self, bus):
+        monitor = ResourcePressureMonitor(bus)
+        monitor.evaluate(make_sample(disk_free_gb=2.0), now=0.0)
+        events = _pressure_events(bus)
+        assert len(events) == 1
+        assert events[0].payload["disk_band"] == "imminent"
+        assert events[0].payload["disk_band_edge_gb"] == 3
+
+    def test_a_non_disk_episode_has_no_band(self, bus):
+        monitor = ResourcePressureMonitor(bus)
+        monitor.evaluate(make_sample(phys_pct=95.0), now=0.0)
+        p = _pressure_events(bus)[0].payload
+        assert p["reasons"] == ["phys_high"]
+        assert p["disk_band"] is None
+
+
+class TestBandRatchetAndChangeStamp:
+    """The ratchet decides when a band may ANNOUNCE, and ``change`` records why
+    each emission exists so the subscribers can drop pure repeats without the
+    bus losing its sampling."""
+
+    def _changes(self, bus):
+        return [e.payload["change"] for e in _pressure_events(bus)]
+
+    def test_a_deeper_edge_announces_without_waiting_for_the_cooldown(self, bus):
+        # Both samples are already below disk_critical (25), so no axis NEWLY
+        # breaches and the deepening band is the only thing that changed --
+        # isolating band_change from the rising edge that outranks it.
+        monitor = ResourcePressureMonitor(bus)
+        monitor.evaluate(make_sample(disk_free_gb=20.0), now=0.0)
+        monitor.evaluate(make_sample(disk_free_gb=10.0), now=60.0)
+        events = _pressure_events(bus)
+        assert [e.payload["disk_band"] for e in events] == ["critical", "severe"]
+        assert self._changes(bus) == ["rising_edge", "band_change"]
+
+    def test_hovering_inside_a_band_never_re_announces_it(self, bus):
+        monitor = ResourcePressureMonitor(bus)
+        monitor.evaluate(make_sample(disk_free_gb=10.0), now=0.0)
+        monitor.evaluate(make_sample(disk_free_gb=9.0), now=1000.0)
+        monitor.evaluate(make_sample(disk_free_gb=11.0), now=2000.0)
+        assert self._changes(bus) == [
+            "rising_edge", "sustained_repeat", "sustained_repeat"]
+
+    def test_an_edge_re_arms_once_free_space_recovers_past_the_factor(self, bus):
+        monitor = ResourcePressureMonitor(bus)
+        monitor.evaluate(make_sample(disk_free_gb=10.0), now=0.0)
+        monitor.evaluate(make_sample(disk_free_gb=20.0), now=1000.0)
+        monitor.evaluate(make_sample(disk_free_gb=10.0), now=2000.0)
+        last = _pressure_events(bus)[-1].payload
+        assert last["disk_band"] == "severe"
+        assert last["change"] == "band_change"
+
+    def test_a_dip_short_of_the_rearm_factor_does_not_re_announce(self, bus):
+        monitor = ResourcePressureMonitor(bus)
+        monitor.evaluate(make_sample(disk_free_gb=10.0), now=0.0)
+        monitor.evaluate(make_sample(disk_free_gb=13.0), now=1000.0)
+        monitor.evaluate(make_sample(disk_free_gb=10.0), now=2000.0)
+        assert "band_change" not in self._changes(bus)[1:]
+
+    def test_an_axis_dropping_out_is_a_reasons_change(self, bus):
+        monitor = ResourcePressureMonitor(bus)
+        monitor.evaluate(make_sample(disk_free_gb=30.0, phys_pct=95.0), now=0.0)
+        monitor.evaluate(make_sample(disk_free_gb=30.0, phys_pct=50.0), now=60.0)
+        last = _pressure_events(bus)[-1].payload
+        assert last["reasons"] == ["disk_low"]
+        assert last["change"] == "reasons_change"
+
+    def test_a_new_episode_announces_its_band_again(self, bus):
+        monitor = ResourcePressureMonitor(bus)
+        monitor.evaluate(make_sample(disk_free_gb=10.0), now=0.0)
+        monitor.evaluate(make_sample(disk_free_gb=60.0), now=1000.0)
+        monitor.evaluate(make_sample(disk_free_gb=10.0), now=2000.0)
+        assert self._changes(bus) == ["rising_edge", "rising_edge"]
+        assert _pressure_events(bus)[-1].payload["disk_band"] == "severe"
