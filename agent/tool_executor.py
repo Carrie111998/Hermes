@@ -281,6 +281,9 @@ def _emit_terminal_post_tool_call(
             tool_call_id=tool_call_id or "",
             turn_id=getattr(agent, "_current_turn_id", "") or "",
             api_request_id=getattr(agent, "_current_api_request_id", "") or "",
+            provider_attempt=getattr(
+                agent, "_tool_call_provider_attempt", None
+            ),
             duration_ms=duration_ms,
             status=status,
             error_type=error_type,

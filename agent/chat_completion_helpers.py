@@ -1920,6 +1920,15 @@ def _fallback_entry_unavailable_without_network(agent, fb: dict) -> Optional[str
 
 
 
+def _record_fallback_activation(agent, reason: "FailoverReason | None" = None) -> None:
+    """Record producer-owned fallback state at the activation boundary."""
+    agent._fallback_activated = True
+    agent._fallback_generation = (
+        int(getattr(agent, "_fallback_generation", 0) or 0) + 1
+    )
+    agent._fallback_reason = getattr(reason, "value", None) or "fallback_activation"
+
+
 def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool:
     """Switch to the next fallback model/provider in the chain.
 
@@ -2150,7 +2159,7 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         agent.api_mode = fb_api_mode
         if hasattr(agent, "_transport_cache"):
             agent._transport_cache.clear()
-        agent._fallback_activated = True
+        _record_fallback_activation(agent, reason)
 
         # Rebind the credential pool to the fallback provider when the provider
         # changes.  Keeping the primary pool attached would make downstream

@@ -47,6 +47,8 @@ import threading
 import uuid
 import warnings
 from typing import List, Dict, Any, Optional, Callable
+
+from agent.provider_attempt import ProviderAttemptProvenance
 # NOTE: `from openai import OpenAI` is deliberately NOT at module top — the
 # SDK pulls ~240 ms of imports. We expose `OpenAI` as a thin proxy object
 # that imports the SDK on first call/isinstance check. This preserves:
@@ -7845,7 +7847,15 @@ class AIAgent:
         self._set_tool_guardrail_halt(decision)
         return toolguard_synthetic_result(decision)
 
-    def _execute_tool_calls(self, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0) -> None:
+    def _execute_tool_calls(
+        self,
+        assistant_message,
+        messages: list,
+        effective_task_id: str,
+        api_call_count: int = 0,
+        *,
+        provider_attempt: Optional[ProviderAttemptProvenance] = None,
+    ) -> None:
         """Execute tool calls from the assistant message and append results to messages.
 
         The segment planner splits the batch into maximal contiguous runs of
@@ -7860,6 +7870,10 @@ class AIAgent:
 
         # Allow _vprint during tool execution even with stream consumers
         self._executing_tools = True
+        _previous_provider_attempt = getattr(
+            self, "_tool_call_provider_attempt", None
+        )
+        self._tool_call_provider_attempt = provider_attempt
         try:
             if len(tool_calls) <= 1:
                 return self._execute_tool_calls_sequential(
@@ -7888,6 +7902,7 @@ class AIAgent:
             )
         finally:
             self._executing_tools = False
+            self._tool_call_provider_attempt = _previous_provider_attempt
 
     def _dispatch_delegate_task(self, function_args: dict) -> str:
         """Single call site for delegate_task dispatch.

@@ -1718,6 +1718,7 @@ def restore_primary_runtime(agent) -> bool:
 
         # ── Reset fallback chain for the new turn ──
         agent._fallback_activated = False
+        agent._fallback_reason = None
         agent._fallback_index = 0
         agent._rate_limit_backoff_count = 0  # reset exponential backoff counter
 
@@ -2863,6 +2864,7 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
 
     # ── Reset fallback state ──
     agent._fallback_activated = False
+    agent._fallback_reason = None
     agent._fallback_index = 0
 
     # When the user deliberately swaps primary providers (e.g. openrouter
