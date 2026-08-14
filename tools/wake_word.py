@@ -335,7 +335,9 @@ def wake_surface_enabled(surface: str, cfg: Optional[Dict[str, Any]] = None) -> 
     process/machine ownership lock still permits only the first claimant.
     """
     cfg = cfg if cfg is not None else load_wake_word_config()
-    if not cfg.get("enabled"):
+    from utils import is_truthy_value
+
+    if not is_truthy_value(cfg.get("enabled"), default=False):
         return False
     want = str(_get(cfg, "surface")).strip().lower() or "auto"
     return want == "auto" or want == surface.strip().lower()
@@ -650,6 +652,7 @@ class _SherpaKwsEngine(_Engine):
 
     def __init__(self, cfg: Dict[str, Any]):
         from tools import lazy_deps
+        from utils import is_truthy_value
 
         lazy_deps.ensure("wake.sherpa", prompt=False)
 
@@ -669,7 +672,7 @@ class _SherpaKwsEngine(_Engine):
         phrase = str(_get(cfg, "phrase") or "hey hermes").strip()
         own_profile = _active_profile_name()
         phrase_map: Dict[str, str] = {phrase: own_profile}
-        if bool(cfg.get("profile_routing", True)):
+        if is_truthy_value(cfg.get("profile_routing"), default=True):
             for prof, p in enrolled_profile_phrases().items():
                 phrase_map.setdefault(p.strip(), prof)
 
