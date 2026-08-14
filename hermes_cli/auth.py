@@ -1964,11 +1964,18 @@ def is_provider_explicitly_configured(provider_id: str) -> bool:
     # ever "explicitly configured" while it is the *current* provider, and it
     # silently vanishes from explicit-only pickers (desktop chat model menu)
     # otherwise. Treat the presence of that deliberate config as explicit.
+    #
+    # NOTE: this uses has_explicit_vertex_config(), NOT has_vertex_credentials()
+    # — the latter also counts an ambient GOOGLE_APPLICATION_CREDENTIALS path
+    # (commonly set globally for unrelated GCP work), which would mark Vertex
+    # explicit for users who never set Hermes up for it. Only Hermes-scoped
+    # signals (VERTEX_PROJECT_ID / vertex.project_id / VERTEX_CREDENTIALS_PATH)
+    # count here.
     try:
         if normalized in ("vertex", "google-vertex", "vertex-ai", "gcp-vertex", "vertexai"):
-            from agent.vertex_adapter import has_vertex_credentials
+            from agent.vertex_adapter import has_explicit_vertex_config
 
-            if has_vertex_credentials():
+            if has_explicit_vertex_config():
                 return True
         elif normalized == "bedrock":
             from hermes_cli.config import load_config as _load_cfg

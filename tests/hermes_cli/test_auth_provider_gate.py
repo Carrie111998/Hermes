@@ -2,7 +2,6 @@
 
 import json
 import pytest
-from unittest.mock import patch
 
 
 def _write_config(tmp_path, config: dict) -> None:
@@ -54,22 +53,46 @@ def test_ambient_pool_source_does_not_count_as_explicit(tmp_path, monkeypatch):
 
 
 def test_vertex_adc_counts_as_explicit_when_config_present(tmp_path, monkeypatch):
-    """A keyless Vertex provider (ADC / service account) is explicitly
-    configured when its non-secret routing settings live in config.yaml, even
-    when it is NOT the current provider — otherwise it silently vanishes from
-    explicit-only pickers (desktop chat model menu) unless already selected."""
+    """A keyless Vertex provider is explicitly configured when the user pointed
+    Hermes at it (VERTEX_PROJECT_ID / vertex.project_id / VERTEX_CREDENTIALS_PATH),
+    even when it is NOT the current provider — otherwise it silently vanishes
+    from explicit-only pickers (desktop chat model menu) unless already selected."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
-    _write_config(tmp_path, {"model": {"provider": "anthropic", "default": "claude-opus-4-8"}})
+    for var in ("VERTEX_PROJECT_ID", "VERTEX_CREDENTIALS_PATH", "GOOGLE_APPLICATION_CREDENTIALS"):
+        monkeypatch.delenv(var, raising=False)
     _write_auth_store(tmp_path, {"version": 1, "providers": {}, "active_provider": None})
 
     from hermes_cli.auth import is_provider_explicitly_configured
 
-    # has_vertex_credentials() is the single source of truth for "the user set
-    # up Vertex" (resolvable ADC / service-account path / project override).
-    with patch("agent.vertex_adapter.has_vertex_credentials", return_value=True):
-        assert is_provider_explicitly_configured("vertex") is True
-    with patch("agent.vertex_adapter.has_vertex_credentials", return_value=False):
-        assert is_provider_explicitly_configured("vertex") is False
+    # vertex.project_id in config.yaml is a deliberate, Hermes-scoped signal.
+    _write_config(tmp_path, {
+        "model": {"provider": "anthropic", "default": "claude-opus-4-8"},
+        "vertex": {"project_id": "my-gcp-project"},
+    })
+    assert is_provider_explicitly_configured("vertex") is True
+
+    # No Hermes-scoped Vertex config at all → stays hidden.
+    _write_config(tmp_path, {"model": {"provider": "anthropic", "default": "claude-opus-4-8"}})
+    assert is_provider_explicitly_configured("vertex") is False
+
+
+def test_vertex_ambient_google_creds_env_does_not_count_as_explicit(tmp_path, monkeypatch):
+    """An ambient GOOGLE_APPLICATION_CREDENTIALS path (commonly set globally for
+    unrelated GCP work) must NOT mark Vertex explicit — only Hermes-scoped
+    signals do. Regression guard for the picker gate (PR review feedback)."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    monkeypatch.delenv("VERTEX_PROJECT_ID", raising=False)
+    monkeypatch.delenv("VERTEX_CREDENTIALS_PATH", raising=False)
+    _write_config(tmp_path, {"model": {"provider": "anthropic", "default": "claude-opus-4-8"}})
+    _write_auth_store(tmp_path, {"version": 1, "providers": {}, "active_provider": None})
+
+    # A real, existing SA file pointed to ONLY by the ambient Google var.
+    sa = tmp_path / "adc.json"
+    sa.write_text("{}")
+    monkeypatch.setenv("GOOGLE_APPLICATION_CREDENTIALS", str(sa))
+
+    from hermes_cli.auth import is_provider_explicitly_configured
+    assert is_provider_explicitly_configured("vertex") is False
 
 
 def test_bedrock_region_counts_as_explicit(tmp_path, monkeypatch):
