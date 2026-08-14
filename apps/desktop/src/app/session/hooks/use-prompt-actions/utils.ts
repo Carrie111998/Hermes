@@ -80,6 +80,7 @@ export interface SessionRecoveryDeps {
    * store and the REST layer: the default implementation reaches through
    * `resolveStoredSession` → `getSession()`, a real fetch that makes any unit
    * test of this helper depend on leftover `$sessions` / `$profiles` state.
+   * The returned value is backend RPC scope, not necessarily the Desktop alias.
    */
   resolveProfile?: (storedSessionId: string) => Promise<string | undefined>
   /**
@@ -100,8 +101,9 @@ export interface SessionRecoveryDeps {
 async function defaultResolveProfile(storedSessionId: string): Promise<string | undefined> {
   // Lazy so utils.ts has no init-time cycle with use-session-actions.
   const { resolveSessionProfile } = await import('../use-session-actions/utils')
+  const { gatewayRpcProfile } = await import('@/store/gateway')
 
-  return resolveSessionProfile(storedSessionId)
+  return gatewayRpcProfile(await resolveSessionProfile(storedSessionId))
 }
 
 /**

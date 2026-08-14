@@ -1,3 +1,5 @@
+import { gatewayRpcProfile } from '@/store/gateway'
+
 import { resolveSessionProfile } from '../use-session-actions/utils'
 
 import type { GatewayRequest } from './utils'
@@ -90,11 +92,12 @@ export async function resolveTargetSessionId(deps: ResolveTargetSessionDeps): Pr
   if (storedTarget) {
     try {
       const profile = await resolveSessionProfile(storedTarget)
+      const resumeProfile = await gatewayRpcProfile(profile)
 
       const resumed = await requestGateway<{ session_id?: string }>('session.resume', {
         session_id: storedTarget,
         source: 'desktop',
-        ...(profile ? { profile } : {})
+        ...(resumeProfile ? { profile: resumeProfile } : {})
       })
 
       return resumed?.session_id || null

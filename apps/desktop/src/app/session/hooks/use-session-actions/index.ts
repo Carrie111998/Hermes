@@ -11,6 +11,7 @@ import { recoverInFlightTurnJournal } from '@/lib/inflight-turn-journal'
 import { setSessionYolo } from '@/lib/yolo-session'
 import { migrateSessionDraft } from '@/store/composer'
 import { clearQueuedPrompts, migrateQueuedPrompts } from '@/store/composer-queue'
+import { gatewayRpcProfile } from '@/store/gateway'
 import { $pinnedSessionIds } from '@/store/layout'
 import { clearNotifications, notify, notifyError } from '@/store/notifications'
 import { $activeGatewayProfile, $newChatProfile, ensureGatewayProfile, normalizeProfileKey } from '@/store/profile'
@@ -655,6 +656,7 @@ export function useSessionActions({
       // id loads as fast as a sidebar click instead of hanging on a list scan.
       const storedForProfile = await resolveStoredSession(storedSessionId)
       const sessionProfile = storedForProfile?.profile
+      const resumeProfile = await gatewayRpcProfile(sessionProfile)
 
       if (resumeRequestRef.current !== requestId) {
         return
@@ -922,7 +924,7 @@ export function useSessionActions({
           // (MCP discovery / prompt build), and the agent pre-warms in the
           // background while the prefetch above paints the transcript.
           ...(watchWindow ? { lazy: true } : { omit_messages: true }),
-          ...(sessionProfile ? { profile: sessionProfile } : {})
+          ...(resumeProfile ? { profile: resumeProfile } : {})
         })
 
         // The rejection is consumed by the `await` below; this guard only

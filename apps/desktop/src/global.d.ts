@@ -534,6 +534,9 @@ export interface HermesConnection {
   // Set for pool (non-primary) backends so the renderer knows which profile a
   // connection belongs to.
   profile?: string
+  // True only when a profile is scoped inside the window's shared primary
+  // backend. Profile-owned pool descriptors remain unmarked.
+  sharedPrimary?: boolean
   windowButtonPosition: { x: number; y: number } | null
 }
 

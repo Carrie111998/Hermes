@@ -21,7 +21,8 @@ vi.mock('@/hermes', () => ({
 vi.mock('@/store/session', () => ({ setGatewayState: vi.fn() }))
 vi.mock('@/store/notify-baseline', () => ({ markNativeNotifyBaseline: vi.fn() }))
 
-const { $gateway, configureGatewayRegistry, ensureGatewayForProfile, setPrimaryGateway } = await import('./gateway')
+const { $gateway, configureGatewayRegistry, ensureGatewayForProfile, gatewayRpcProfile, setPrimaryGateway } =
+  await import('./gateway')
 
 type DesktopStub = { getConnection: ReturnType<typeof vi.fn> }
 
@@ -51,8 +52,8 @@ describe('ensureGatewayForProfile under a shared global remote', () => {
     const primary = makePrimary()
     setPrimaryGateway(primary as never, 'default')
     installDesktop({
-      // Shared descriptor: primary connection tagged with the profile.
-      getConnection: vi.fn(async () => ({ port: 4242, profile: 'venture', token: 't' }))
+      // Shared descriptor: primary connection explicitly tagged as shared.
+      getConnection: vi.fn(async () => ({ port: 4242, profile: 'venture', sharedPrimary: true, token: 't' }))
     })
 
     await ensureGatewayForProfile('venture')
@@ -60,12 +61,12 @@ describe('ensureGatewayForProfile under a shared global remote', () => {
     expect($gateway.get()).toBe(primary)
   })
 
-  it('still pools a socket for profiles with their own descriptor (untagged)', async () => {
+  it('still pools a socket for profile-owned descriptors that carry a profile', async () => {
     const primary = makePrimary()
     setPrimaryGateway(primary as never, 'default')
     installDesktop({
-      // Own descriptor: no profile tag → normal pooled path (dial attempted).
-      getConnection: vi.fn(async () => ({ port: 5151, token: 't2' }))
+      // Pool descriptors identify their Desktop owner but are not shared-primary.
+      getConnection: vi.fn(async () => ({ port: 5151, profile: 'worker', token: 't2' }))
     })
 
     await ensureGatewayForProfile('worker')
@@ -74,5 +75,26 @@ describe('ensureGatewayForProfile under a shared global remote', () => {
     // reconnect is scheduled) — the important part is it did NOT silently
     // reuse the primary.
     expect($gateway.get()).not.toBe(primary)
+  })
+})
+
+describe('gatewayRpcProfile', () => {
+  it('keeps the profile tag for a shared global-remote descriptor', async () => {
+    installDesktop({
+      getConnection: vi.fn(async () => ({ port: 4242, profile: 'venture', sharedPrimary: true, token: 't' }))
+    })
+
+    await expect(gatewayRpcProfile('venture')).resolves.toBe('venture')
+  })
+
+  it('omits a Desktop alias when its backend descriptor is already dedicated', async () => {
+    installDesktop({
+      // Per-profile URL override or local pooled backend: the descriptor itself
+      // is already scoped, so forwarding `profile: worker` would address a
+      // nonexistent profile inside that backend.
+      getConnection: vi.fn(async () => ({ port: 5151, profile: 'worker', token: 't2' }))
+    })
+
+    await expect(gatewayRpcProfile('worker')).resolves.toBeUndefined()
   })
 })

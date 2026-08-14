@@ -18,6 +18,7 @@ import {
   type ComposerAttachment,
   terminalContextBlocksFromDraft
 } from '@/store/composer'
+import { gatewayRpcProfile } from '@/store/gateway'
 import { $hudMode } from '@/store/hud'
 import { clearNotifications, notify, notifyError } from '@/store/notifications'
 import { requestDesktopOnboarding } from '@/store/onboarding'
@@ -479,15 +480,17 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
         // background queue drain only has the durable id). Continue that target
         // conversation; only a genuine new-chat draft may create a new session.
         try {
-          // Re-register on the session's OWNING profile — resuming on whichever
-          // profile is live would fork the conversation into the wrong DB (#67603).
+          // Resolve the session's Desktop owner first; the gateway helper keeps
+          // that scope only for a shared backend and omits aliases for dedicated
+          // per-profile backends (#67603).
           const resumeProfile = await resolveSessionProfile(targetStoredSessionId)
+          const gatewayProfile = await gatewayRpcProfile(resumeProfile)
 
           const resumed = await requestGateway<{ session_id: string }>('session.resume', {
             session_id: targetStoredSessionId,
             source: 'desktop',
             omit_messages: true,
-            ...(resumeProfile ? { profile: resumeProfile } : {})
+            ...(gatewayProfile ? { profile: gatewayProfile } : {})
           })
 
           const resumeDrift = sessionDriftReason()

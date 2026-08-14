@@ -2,6 +2,7 @@ import { useEffect } from 'react'
 
 import { getLatestSessionMessages, PROMPT_SUBMIT_REQUEST_TIMEOUT_MS } from '@/hermes'
 import { toChatMessages } from '@/lib/chat-messages'
+import { gatewayRpcProfile } from '@/store/gateway'
 import { publishSessionState, setSessionTileDelegate } from '@/store/session-states'
 import type { SessionResumeResponse } from '@/types/hermes'
 
@@ -106,8 +107,11 @@ export function useSessionTileDelegate({
         // session from any profile, not just the active one; resuming (or
         // reading messages) without a profile lets the gateway fall back to the
         // launch-profile DB and fork the conversation into the wrong profile —
-        // the same cross-profile bleed the recovery resumes had (#67603).
+        // the same cross-profile bleed the recovery resumes had (#67603). REST
+        // keeps the Desktop owner; the gateway helper translates that owner into
+        // backend-internal scope for the WebSocket RPC.
         const profile = await resolveSessionProfile(storedSessionId)
+        const resumeProfile = await gatewayRpcProfile(profile)
 
         const [prefetch, resumed] = await Promise.all([
           getLatestSessionMessages(storedSessionId, profile).catch(() => null),
@@ -115,7 +119,7 @@ export function useSessionTileDelegate({
             session_id: storedSessionId,
             cols: 96,
             omit_messages: true,
-            ...(profile ? { profile } : {})
+            ...(resumeProfile ? { profile: resumeProfile } : {})
           })
         ])
 
