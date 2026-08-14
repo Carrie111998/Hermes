@@ -82,6 +82,94 @@ def schema_read_probe_statements() -> tuple:
     return _READ_PROBE_STATEMENTS
 
 
+def run_openspec_migration(conn: sqlite3.Connection) -> None:
+    """Implement Task 1.1: Create OpenSpec migration schema script.
+    
+    Creates SQLite DDL for openspec_enforcement_meta, openspec_registry,
+    and task_run_identity_events with immutability triggers.
+    """
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS openspec_enforcement_meta (
+            key TEXT PRIMARY KEY,
+            value TEXT,
+            updated_at REAL NOT NULL DEFAULT (julianday('now'))
+        )
+    """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS openspec_registry (
+            id TEXT PRIMARY KEY,
+            openspec_contract TEXT NOT NULL,
+            status TEXT NOT NULL,
+            created_at REAL NOT NULL DEFAULT (julianday('now'))
+        )
+    """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS task_run_identity_events (
+            id TEXT PRIMARY KEY,
+            run_id TEXT NOT NULL REFERENCES task_runs(id),
+            task_id TEXT NOT NULL REFERENCES tasks(id),
+            identity_snapshot TEXT NOT NULL,
+            event_type TEXT NOT NULL,
+            created_at REAL NOT NULL DEFAULT (julianday('now'))
+        )
+    """)
+    cursor.execute("""
+        CREATE TRIGGER IF NOT EXISTS prevent_openspec_registry_update
+        BEFORE UPDATE ON openspec_registry
+        BEGIN
+            SELECT RAISE(ABORT, 'SQLITE_CONSTRAINT_TRIGGER');
+        END;
+    """)
+    cursor.execute("""
+        CREATE TRIGGER IF NOT EXISTS prevent_openspec_registry_delete
+        BEFORE DELETE ON openspec_registry
+        BEGIN
+            SELECT RAISE(ABORT, 'SQLITE_CONSTRAINT_TRIGGER');
+        END;
+    """)
+    cursor.execute("""
+        CREATE TRIGGER IF NOT EXISTS prevent_identity_events_update
+        BEFORE UPDATE ON task_run_identity_events
+        BEGIN
+            SELECT RAISE(ABORT, 'SQLITE_CONSTRAINT_TRIGGER');
+        END;
+    """)
+    cursor.execute("""
+        CREATE TRIGGER IF NOT EXISTS prevent_identity_events_delete
+        BEFORE DELETE ON task_run_identity_events
+        BEGIN
+            SELECT RAISE(ABORT, 'SQLITE_CONSTRAINT_TRIGGER');
+        END;
+    """)
+    
+    # Task 1.2 additions
+    for col, col_def in [
+        ('openspec_contract', 'TEXT'),
+        ('openspec_contract_hash', 'TEXT'),
+        ('openspec_signature', 'TEXT'),
+        ('review_cycles', 'INTEGER DEFAULT 0')
+    ]:
+        try:
+            cursor.execute(f"ALTER TABLE tasks ADD COLUMN {col} {col_def}")
+        except sqlite3.OperationalError as e:
+            if "duplicate column name" not in str(e).lower():
+                raise
+                
+    try:
+        cursor.execute("ALTER TABLE task_events ADD COLUMN correlation_id TEXT")
+    except sqlite3.OperationalError as e:
+        if "duplicate column name" not in str(e).lower():
+            raise
+            
+    cursor.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_events_correlation 
+        ON task_events(correlation_id) 
+        WHERE correlation_id IS NOT NULL
+    """)
+    conn.commit()
+
+
 class SessionSchemaMixin:
     """See module docstring — mixin for SessionDB (Schema cluster)."""
 

@@ -11147,6 +11147,46 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             )
         self._execute_write(_do)
 
+    def enforce_openspec_transaction(self, task_id: str, new_status: str, expected_contract_hash: str) -> bool:
+        """
+        Task 4.1 Implement Central Validator Hook
+        Enforces pre-transaction validation for state transitions against openspec_contract properties.
+        Uses fail-closed wrapper designs to reject concurrent or incompatible updates natively in SQLite.
+        """
+        def _do(conn):
+            # Check enforcement status
+            cursor = conn.execute("SELECT value FROM openspec_enforcement_meta WHERE key = 'enforcement_status'")
+            row = cursor.fetchone()
+            if not row or row[0] != 'active':
+                return True # If not active, let it pass
+                
+            # Check contract hash
+            cursor = conn.execute(
+                "SELECT openspec_contract_hash, status FROM tasks WHERE id = ?",
+                (task_id,)
+            )
+            row = cursor.fetchone()
+            if not row:
+                raise ValueError(f"Task {task_id} not found")
+                
+            contract_hash = row[0]
+            current_status = row[1]
+            
+            if contract_hash != expected_contract_hash:
+                raise ValueError(f"OpenSpec contract hash mismatch. Expected {expected_contract_hash}, got {contract_hash}")
+                
+            # Execute status update with concurrency check (fail-closed)
+            cursor = conn.execute(
+                "UPDATE tasks SET status = ? WHERE id = ? AND status = ? AND openspec_contract_hash = ?",
+                (new_status, task_id, current_status, expected_contract_hash)
+            )
+            
+            if cursor.rowcount != 1:
+                raise ValueError(f"Concurrency conflict or invariant violation during status update for task {task_id}")
+                
+            return True
+            
+        return self._execute_write(_do)
 
 class AsyncSessionDB:
     """Async door onto SessionDB: offloads each call via asyncio.to_thread so a blocking SQLite call never freezes the event loop. Generic forwarder — the audit confirms no method returns a live cursor/generator."""
