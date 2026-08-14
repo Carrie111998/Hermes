@@ -95,6 +95,148 @@ class TestRequestToolApproval:
         assert calls["session"] == ["plugin_rule:ssh-writes"]
         assert calls["permanent"] == []  # session != always
 
+    def test_once_only_rejects_forged_always_without_persistence(self, monkeypatch):
+        monkeypatch.setattr(approval, "_is_interactive_cli", lambda: True)
+        monkeypatch.setattr(approval, "_is_gateway_approval_context", lambda: False)
+        seen = {}
+
+        def _prompt(*args, **kwargs):
+            seen.update(kwargs)
+            return "always"
+
+        monkeypatch.setattr(approval, "prompt_dangerous_approval", _prompt)
+        session = []
+        permanent = []
+        monkeypatch.setattr(approval, "approve_session", lambda *args: session.append(args))
+        monkeypatch.setattr(approval, "approve_permanent", lambda *args: permanent.append(args))
+        monkeypatch.setattr(
+            approval,
+            "save_permanent_allowlist",
+            lambda *args: pytest.fail("forged always must not be saved"),
+        )
+
+        result = request_tool_approval(
+            "write_file", "reason", allowed_scopes=["once"]
+        )
+
+        assert result["approved"] is False
+        assert result["outcome"] == "invalid_scope"
+        assert seen["allow_permanent"] is False
+        assert seen["allowed_scopes"] == ("once",)
+        assert session == []
+        assert permanent == []
+
+    @pytest.mark.parametrize(
+        "value",
+        [[], ["always"], ["once", "always"], ["once", "future"], "once", None,
+         [["once"]]],
+    )
+    def test_invalid_allowed_scopes_fail_closed_to_once(self, monkeypatch, value):
+        monkeypatch.setattr(approval, "_is_interactive_cli", lambda: True)
+        monkeypatch.setattr(approval, "_is_gateway_approval_context", lambda: False)
+        seen = {}
+
+        def _prompt(*args, **kwargs):
+            seen.update(kwargs)
+            return "once"
+
+        monkeypatch.setattr(approval, "prompt_dangerous_approval", _prompt)
+        result = request_tool_approval("write_file", "reason", allowed_scopes=value)
+
+        assert result["approved"] is True
+        assert seen["allowed_scopes"] == ("once",)
+        assert seen["allow_permanent"] is False
+
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [
+            (["once"], ("once",)),
+            (["session", "once"], ("once", "session")),
+            (["always", "once", "session"], None),
+        ],
+    )
+    def test_supported_exact_scope_sets_are_ordered_and_enforced(
+        self, monkeypatch, value, expected
+    ):
+        monkeypatch.setattr(approval, "_is_interactive_cli", lambda: True)
+        monkeypatch.setattr(approval, "_is_gateway_approval_context", lambda: False)
+        seen = {}
+
+        def _prompt(*args, **kwargs):
+            seen.update(kwargs)
+            return "once"
+
+        monkeypatch.setattr(approval, "prompt_dangerous_approval", _prompt)
+        result = request_tool_approval("write_file", "reason", allowed_scopes=value)
+
+        assert result["approved"] is True
+        if expected is None:
+            assert "allowed_scopes" not in seen
+            assert "allow_permanent" not in seen
+        else:
+            assert seen["allowed_scopes"] == expected
+
+    def test_absent_allowed_scopes_preserves_legacy_callback_shape(self, monkeypatch):
+        monkeypatch.setattr(approval, "_is_interactive_cli", lambda: True)
+        monkeypatch.setattr(approval, "_is_gateway_approval_context", lambda: False)
+        calls = []
+
+        def _legacy_callback(command, description, *, allow_permanent=True):
+            calls.append((command, description, allow_permanent))
+            return "once"
+
+        result = request_tool_approval(
+            "write_file", "reason", approval_callback=_legacy_callback
+        )
+
+        assert result["approved"] is True
+        assert calls and calls[0][2] is True
+
+    def test_gateway_once_only_payload_and_forged_always_fail_closed(self, monkeypatch):
+        monkeypatch.setattr(approval, "_is_interactive_cli", lambda: False)
+        monkeypatch.setattr(approval, "_is_gateway_approval_context", lambda: True)
+        captured = {}
+        monkeypatch.setitem(approval._gateway_notify_cbs, "test-session", lambda data: None)
+
+        def _decision(session_key, notify_cb, approval_data, *, surface):
+            captured.update(approval_data)
+            return {"resolved": True, "choice": "always"}
+
+        monkeypatch.setattr(approval, "_await_gateway_decision", _decision)
+        monkeypatch.setattr(
+            approval,
+            "approve_permanent",
+            lambda *args: pytest.fail("forged always must not persist"),
+        )
+
+        result = request_tool_approval(
+            "write_file", "reason", allowed_scopes=["once"]
+        )
+
+        assert result["approved"] is False
+        assert result["outcome"] == "invalid_scope"
+        assert captured["allowed_scopes"] == ["once"]
+        assert captured["allow_session"] is False
+        assert captured["allow_permanent"] is False
+
+    def test_once_only_does_not_reuse_cached_broad_approval(self, monkeypatch):
+        monkeypatch.setattr(approval, "_is_interactive_cli", lambda: True)
+        monkeypatch.setattr(approval, "_is_gateway_approval_context", lambda: False)
+        monkeypatch.setattr(approval, "is_approved", lambda *args: True)
+        prompted = []
+
+        def _prompt(*args, **kwargs):
+            prompted.append(kwargs)
+            return "once"
+
+        monkeypatch.setattr(approval, "prompt_dangerous_approval", _prompt)
+        result = request_tool_approval(
+            "write_file", "reason", allowed_scopes=["once"]
+        )
+
+        assert result["approved"] is True
+        assert len(prompted) == 1
+
 
     def test_cron_deny_mode_blocks(self, monkeypatch):
         monkeypatch.setattr(approval, "_is_interactive_cli", lambda: False)

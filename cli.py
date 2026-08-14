@@ -14321,7 +14321,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
     def _approval_callback(self, command: str, description: str,
                            *, allow_permanent: bool = True,
-                           smart_denied: bool = False) -> str:
+                           smart_denied: bool = False,
+                           allowed_scopes=None) -> str:
         """
         Prompt for dangerous command approval through the prompt_toolkit UI.
 
@@ -14349,6 +14350,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     command,
                     allow_permanent=allow_permanent,
                     smart_denied=smart_denied,
+                    allowed_scopes=allowed_scopes,
                 ),
                 "selected": 0,
                 "response_queue": response_queue,
@@ -14399,10 +14401,20 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             return "timeout"
 
     def _approval_choices(self, command: str, *, allow_permanent: bool = True,
-                          smart_denied: bool = False) -> list[str]:
+                          smart_denied: bool = False,
+                          allowed_scopes=None) -> list[str]:
         """Return approval choices for a dangerous command prompt."""
         if smart_denied:
             choices = ["once", "deny"]
+        elif allowed_scopes is not None:
+            from tools.approval import _normalize_allowed_scopes
+
+            scopes = _normalize_allowed_scopes(allowed_scopes)
+            choices = [
+                scope for scope in ("once", "session", "always")
+                if scope in scopes and (scope != "always" or allow_permanent)
+            ]
+            choices.append("deny")
         else:
             choices = ["once", "session", "always", "deny"] if allow_permanent else ["once", "session", "deny"]
         if len(command) > 70:

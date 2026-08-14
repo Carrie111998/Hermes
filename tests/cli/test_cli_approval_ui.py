@@ -67,6 +67,14 @@ def _make_background_cli_stub():
 
 
 class TestCliApprovalUi:
+    def test_once_only_callback_offers_only_once_and_deny(self):
+        cli = _make_cli_stub()
+
+        assert cli._approval_choices(
+            "write file",
+            allowed_scopes=("once",),
+        ) == ["once", "deny"]
+
     def test_smart_denied_callback_offers_only_once_and_deny(self):
         cli = _make_cli_stub()
         result = {}

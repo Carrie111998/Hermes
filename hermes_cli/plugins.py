@@ -5782,6 +5782,7 @@ def fire_pre_command_hook(
 
 
 _thread_tool_whitelist = threading.local()
+_DIRECTIVE_SCOPES_UNSET = object()
 
 
 @dataclass(frozen=True)
@@ -5789,6 +5790,7 @@ class _PreToolCallDirective:
     action: Optional[str] = None
     message: Optional[str] = None
     rule_key: Optional[str] = None
+    allowed_scopes: Any = _DIRECTIVE_SCOPES_UNSET
 
 
 def set_thread_tool_whitelist(
@@ -5821,6 +5823,7 @@ def _get_pre_tool_call_directive_details(
         {"action": "block",   "message": "Reason the tool was blocked"}
         {"action": "approve", "message": "Why this needs human confirmation"}
         {"action": "approve", "message": "...", "rule_key": "write_file:ssh"}
+        {"action": "approve", "message": "...", "allowed_scopes": ["once"]}
 
     from their ``pre_tool_call`` callback.
 
@@ -5835,6 +5838,10 @@ def _get_pre_tool_call_directive_details(
       :func:`tools.approval.request_tool_approval`).
     - ``rule_key`` is optional and only honored for ``approve`` directives. It
       lets plugins choose the allowlist grain for `[a]lways` approvals.
+    - ``allowed_scopes`` is optional and only honored for ``approve``
+      directives. Supported values are ``once``, ``once + session``, or the
+      full current set. Absence preserves current behavior; malformed or
+      widening values fail closed at the approval backend.
 
     The first valid directive wins. Invalid or irrelevant hook return values
     are silently ignored so existing observer-only hooks are unaffected.
@@ -5877,7 +5884,15 @@ def _get_pre_tool_call_directive_details(
         rule_key = rule_key.strip() if isinstance(rule_key, str) else None
         if not rule_key:
             rule_key = None
-        return _PreToolCallDirective(action=action, message=message, rule_key=rule_key)
+        allowed_scopes = _DIRECTIVE_SCOPES_UNSET
+        if action == "approve" and "allowed_scopes" in result:
+            allowed_scopes = result.get("allowed_scopes")
+        return _PreToolCallDirective(
+            action=action,
+            message=message,
+            rule_key=rule_key,
+            allowed_scopes=allowed_scopes,
+        )
 
     return _PreToolCallDirective()
 
@@ -5981,10 +5996,15 @@ def resolve_pre_tool_block(
             except Exception:
                 pass
             try:
+                approval_kwargs: Dict[str, Any] = {
+                    "rule_key": details.rule_key or tool_name,
+                }
+                if details.allowed_scopes is not _DIRECTIVE_SCOPES_UNSET:
+                    approval_kwargs["allowed_scopes"] = details.allowed_scopes
                 result = request_tool_approval(
                     tool_name,
                     details.message or "",
-                    rule_key=details.rule_key or tool_name,
+                    **approval_kwargs,
                 )
             finally:
                 if approval_tokens is not None:

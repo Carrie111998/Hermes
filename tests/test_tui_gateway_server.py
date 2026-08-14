@@ -16610,6 +16610,23 @@ def test_clarify_callback_uses_configured_timeout(monkeypatch):
     assert captured["payload"] == {"question": "Pick one", "choices": ["a", "b"]}
 
 
+def test_approval_request_once_only_choices(monkeypatch):
+    events = []
+    monkeypatch.setattr(
+        server,
+        "_emit",
+        lambda event_type, sid, payload: events.append((event_type, sid, payload)),
+    )
+
+    server._emit_approval_request("sid", {
+        "command": "synthetic",
+        "allow_permanent": False,
+        "allow_session": False,
+    })
+
+    assert events[0][2]["choices"] == ["once", "deny"]
+
+
 def test_clarify_callback_multi_select_hint(monkeypatch):
     """multi_select=True adds the hint to the payload; the single-select
     payload shape stays byte-identical to the pre-multi-select protocol

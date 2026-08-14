@@ -30,6 +30,35 @@ from utils import env_var_enabled, is_truthy_value
 
 logger = logging.getLogger(__name__)
 
+_APPROVAL_SCOPE_ORDER = ("once", "session", "always")
+_ALL_APPROVAL_SCOPES = frozenset(_APPROVAL_SCOPE_ORDER)
+_VALID_APPROVAL_SCOPE_SETS = {
+    frozenset({"once"}),
+    frozenset({"once", "session"}),
+    _ALL_APPROVAL_SCOPES,
+}
+_ALLOWED_SCOPES_UNSET = object()
+
+
+def _normalize_allowed_scopes(value: object = _ALLOWED_SCOPES_UNSET) -> frozenset[str]:
+    """Normalize a narrowing-only scope set; malformed values become once-only."""
+    if value is _ALLOWED_SCOPES_UNSET:
+        return _ALL_APPROVAL_SCOPES
+    if not isinstance(value, (list, tuple, set, frozenset)):
+        return frozenset({"once"})
+    try:
+        requested = frozenset(value)
+    except TypeError:
+        return frozenset({"once"})
+    if requested not in _VALID_APPROVAL_SCOPE_SETS:
+        return frozenset({"once"})
+    return requested
+
+
+def _ordered_allowed_scopes(scopes: frozenset[str]) -> tuple[str, ...]:
+    return tuple(scope for scope in _APPROVAL_SCOPE_ORDER if scope in scopes)
+
+
 # Freeze YOLO mode at module import time. Reading os.environ on every call
 # would allow any skill running inside the process to set this variable and
 # instantly bypass all approval checks — a prompt-injection escalation path.
@@ -2739,6 +2768,50 @@ def is_approved(session_key: str, pattern_key: str) -> bool:
         return any(alias in session_approvals for alias in aliases)
 
 
+def _is_approved_within_scopes(
+    session_key: str,
+    pattern_key: str,
+    allowed_scopes: frozenset[str],
+) -> bool:
+    """Reuse only approvals whose stored lifetime remains permitted."""
+    if allowed_scopes == _ALL_APPROVAL_SCOPES:
+        return is_approved(session_key, pattern_key)
+    aliases = _approval_key_aliases(pattern_key)
+    with _lock:
+        if "always" in allowed_scopes and any(
+            alias in _permanent_approved for alias in aliases
+        ):
+            return True
+        if "session" in allowed_scopes:
+            session_approvals = _session_approved.get(session_key, set())
+            return any(alias in session_approvals for alias in aliases)
+    return False
+
+
+def _disallowed_scope_result(
+    pattern_key: str,
+    description: str,
+    choice: object,
+) -> dict:
+    """Deny a forged or stale approval choice outside the current scope set."""
+    logger.warning(
+        "Rejected approval choice outside allowed scopes: %r (pattern: %s)",
+        choice,
+        pattern_key,
+    )
+    return {
+        "approved": False,
+        "message": (
+            "BLOCKED: The approval response selected a scope that was not "
+            "offered for this action. The action was not executed."
+        ),
+        "pattern_key": pattern_key,
+        "description": description,
+        "outcome": "invalid_scope",
+        "user_consent": False,
+    }
+
+
 def approve_permanent(pattern_key: str):
     """Add a pattern to the permanent allowlist."""
     with _lock:
@@ -2830,7 +2903,8 @@ def prompt_dangerous_approval(command: str, description: str,
                               timeout_seconds: int | None = None,
                               allow_permanent: bool = True,
                               approval_callback=None,
-                              *, smart_denied: bool = False) -> str:
+                              *, smart_denied: bool = False,
+                              allowed_scopes: object = _ALLOWED_SCOPES_UNSET) -> str:
     """Prompt the user to approve a dangerous command (CLI only).
 
     Args:
@@ -2839,6 +2913,8 @@ def prompt_dangerous_approval(command: str, description: str,
             is inappropriate for content-level security findings).
         smart_denied: When True, this is an owner override of a Smart DENY.
             Offer only one-operation approval or denial.
+        allowed_scopes: Optional narrowing-only set supplied by a plugin
+            approval directive. Invalid sets offer once-only.
         approval_callback: Optional callback registered by the CLI for
             prompt_toolkit integration. Signature:
             (command, description, *, allow_permanent=True,
@@ -2865,6 +2941,7 @@ def prompt_dangerous_approval(command: str, description: str,
             allow_permanent,
             approval_callback,
             smart_denied=smart_denied,
+            allowed_scopes=allowed_scopes,
         )
 
 
@@ -2872,7 +2949,8 @@ def _prompt_dangerous_approval_inner(command: str, description: str,
                                      timeout_seconds: int,
                                      allow_permanent: bool = True,
                                      approval_callback=None,
-                                     *, smart_denied: bool = False) -> str:
+                                     *, smart_denied: bool = False,
+                                     allowed_scopes: object = _ALLOWED_SCOPES_UNSET) -> str:
     # Redact secrets before any user-visible rendering. The original
     # `command` is still what executes after approval; only the displayed
     # copy is scrubbed. Reuses the same redaction module used for memory
@@ -2880,12 +2958,22 @@ def _prompt_dangerous_approval_inner(command: str, description: str,
     from agent.redact import redact_sensitive_text
     display_command = redact_sensitive_text(command)
     display_description = redact_sensitive_text(description)
+    scopes = _normalize_allowed_scopes(allowed_scopes)
+    if smart_denied:
+        scopes = frozenset({"once"})
+    elif not allow_permanent:
+        scopes = scopes & frozenset({"once", "session"})
+    once_only = scopes == frozenset({"once"})
 
     if approval_callback is not None:
         try:
-            callback_kwargs = {"allow_permanent": allow_permanent}
+            callback_kwargs: dict[str, object] = {
+                "allow_permanent": "always" in scopes
+            }
             if smart_denied:
                 callback_kwargs["smart_denied"] = True
+            if allowed_scopes is not _ALLOWED_SCOPES_UNSET:
+                callback_kwargs["allowed_scopes"] = _ordered_allowed_scopes(scopes)
             return approval_callback(
                 display_command, display_description, **callback_kwargs
             )
@@ -2930,9 +3018,9 @@ def _prompt_dangerous_approval_inner(command: str, description: str,
             print(f"  {t('approval.dangerous_header', description=display_description)}")
             print(f"      {display_command}")
             print()
-            if smart_denied:
+            if once_only:
                 print(t("approval.choose_smart_deny"))
-            elif allow_permanent:
+            elif "always" in scopes:
                 print(t("approval.choose_long"))
             else:
                 print(t("approval.choose_short"))
@@ -2943,10 +3031,10 @@ def _prompt_dangerous_approval_inner(command: str, description: str,
 
             def get_input():
                 try:
-                    if smart_denied:
+                    if once_only:
                         prompt = t("approval.prompt_smart_deny")
                     else:
-                        prompt = t("approval.prompt_long") if allow_permanent else t("approval.prompt_short")
+                        prompt = t("approval.prompt_long") if "always" in scopes else t("approval.prompt_short")
                     result["choice"] = input(prompt).strip().lower()
                 except (EOFError, OSError):
                     result["choice"] = ""
@@ -2963,7 +3051,7 @@ def _prompt_dangerous_approval_inner(command: str, description: str,
                 return "timeout"
 
             choice = result["choice"]
-            if smart_denied:
+            if once_only:
                 choice_map = {
                     **{
                         value: "once"
@@ -2982,12 +3070,15 @@ def _prompt_dangerous_approval_inner(command: str, description: str,
                 print(t("approval.allowed_once"))
                 return "once"
             elif choice in {'s', 'session'}:
+                if "session" not in scopes:
+                    print(t("approval.denied"))
+                    return "deny"
                 print(t("approval.allowed_session"))
                 return "session"
             elif choice in {'a', 'always'}:
-                if not allow_permanent:
-                    print(t("approval.allowed_session"))
-                    return "session"
+                if "always" not in scopes:
+                    print(t("approval.denied"))
+                    return "deny"
                 print(t("approval.allowed_always"))
                 return "always"
             else:
@@ -3274,6 +3365,7 @@ def _run_approval_gate(
     autoapprove_log_prefix: str,
     fail_closed_when_no_human: bool = False,
     no_human_block_message: str = "",
+    allowed_scopes: object = _ALLOWED_SCOPES_UNSET,
 ) -> dict:
     """Shared human-approval gate for a flagged action (command or tool).
 
@@ -3310,11 +3402,16 @@ def _run_approval_gate(
             plugin-flagged action never runs ungated without a human.
         no_human_block_message: Message returned when
             ``fail_closed_when_no_human`` blocks.
+        allowed_scopes: Narrowing-only approval scopes. Absence preserves the
+            historical once/session/always behavior; invalid values are
+            once-only.
 
     Returns:
         ``{"approved": bool, "message": str|None, ...}`` — shape shared with
         ``check_dangerous_command`` so all callers handle it uniformly.
     """
+    scopes = _normalize_allowed_scopes(allowed_scopes)
+
     # --yolo bypasses all approval prompts (session- or process-scoped).
     # Hardline blocks are handled by the caller BEFORE this gate, so yolo
     # here only skips the recoverable approval layer.
@@ -3322,7 +3419,7 @@ def _run_approval_gate(
         return {"approved": True, "message": None}
 
     session_key = get_current_session_key()
-    if is_approved(session_key, pattern_key):
+    if _is_approved_within_scopes(session_key, pattern_key, scopes):
         return {"approved": True, "message": None}
 
     approval_callback = _resolve_cli_approval_callback(approval_callback)
@@ -3386,8 +3483,9 @@ def _run_approval_gate(
                 "pattern_key": pattern_key,
                 "pattern_keys": [pattern_key],
                 "description": redact_sensitive_text(description),
-                "allow_permanent": True,
-                "allow_session": True,
+                "allow_permanent": "always" in scopes,
+                "allow_session": "session" in scopes,
+                "allowed_scopes": list(_ordered_allowed_scopes(scopes)),
             }
             decision = _await_gateway_decision(
                 session_key, notify_cb, approval_data, surface="gateway"
@@ -3426,6 +3524,8 @@ def _run_approval_gate(
                     "user_consent": False,
                 }
 
+            if choice not in scopes:
+                return _disallowed_scope_result(pattern_key, description, choice)
             if choice == "session":
                 approve_session(session_key, pattern_key)
             elif choice == "always":
@@ -3448,6 +3548,9 @@ def _run_approval_gate(
                 "command": display_target,
                 "pattern_key": pattern_key,
                 "description": description,
+                "allow_permanent": "always" in scopes,
+                "allow_session": "session" in scopes,
+                "allowed_scopes": list(_ordered_allowed_scopes(scopes)),
             })
             return {
                 "approved": False,
@@ -3470,8 +3573,20 @@ def _run_approval_gate(
         session_key=session_key,
         surface="cli",
     )
-    choice = prompt_dangerous_approval(display_target, description,
-                                       approval_callback=approval_callback)
+    if scopes != _ALL_APPROVAL_SCOPES:
+        choice = prompt_dangerous_approval(
+            display_target,
+            description,
+            allow_permanent="always" in scopes,
+            approval_callback=approval_callback,
+            allowed_scopes=_ordered_allowed_scopes(scopes),
+        )
+    else:
+        choice = prompt_dangerous_approval(
+            display_target,
+            description,
+            approval_callback=approval_callback,
+        )
     _fire_approval_hook(
         "post_approval_response",
         command=display_target,
@@ -3511,6 +3626,9 @@ def _run_approval_gate(
             "outcome": "denied",
             "user_consent": False,
         }
+
+    if choice not in scopes:
+        return _disallowed_scope_result(pattern_key, description, choice)
 
     if choice == "session":
         approve_session(session_key, pattern_key)
@@ -3612,6 +3730,7 @@ def request_tool_approval(
     *,
     rule_key: str = "",
     approval_callback=None,
+    allowed_scopes: object = _ALLOWED_SCOPES_UNSET,
 ) -> dict:
     """Escalate an arbitrary tool call to the human-approval gate.
 
@@ -3639,6 +3758,10 @@ def request_tool_approval(
             on the same tool).
         approval_callback: Optional CLI callback for interactive prompts
             (same contract as ``check_dangerous_command``).
+        allowed_scopes: Optional narrowing-only scope set from the plugin.
+            Supported sets are once, once+session, and the full current set.
+            Malformed, empty, widening, or always-without-session values fail
+            closed to once-only.
 
     Returns:
         ``{"approved": True, "message": None}`` when allowed, or
@@ -3690,6 +3813,7 @@ def request_tool_approval(
             "but no interactive user or gateway is present to approve it. "
             "A plugin flagged this action for human confirmation."
         ),
+        allowed_scopes=allowed_scopes,
     )
 
 
