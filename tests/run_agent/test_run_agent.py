@@ -3996,7 +3996,7 @@ class TestRunConversation:
         assert "/thinkon" in result["final_response"]
 
 
-    def test_length_with_tool_calls_returns_partial_without_executing_tools(self, agent):
+    def test_length_with_tool_calls_exhaustion_returns_actionable_retry_message(self, agent):
         self._setup_agent(agent)
         bad_tc = _mock_tool_call(
             name="write_file",
@@ -4016,7 +4016,38 @@ class TestRunConversation:
 
         assert result["completed"] is False
         assert result["partial"] is True
-        assert "truncated due to output length limit" in result["error"]
+        assert result["error"] == "tool_call_output_truncated"
+        assert "Response truncated due to output length limit" not in result["final_response"]
+        assert "output was too large" in result["final_response"]
+        assert "smaller steps" in result["final_response"]
+        mock_handle_function_call.assert_not_called()
+
+    def test_finish_reason_tool_calls_with_cutoff_json_uses_same_actionable_message(self, agent):
+        """Routers may hide output truncation behind finish_reason=tool_calls."""
+        self._setup_agent(agent)
+        agent.valid_tool_names.add("write_file")
+        bad_tc = _mock_tool_call(
+            name="write_file",
+            arguments='{"path":"report.md","content":"partial',
+            call_id="c1",
+        )
+        resp = _mock_response(content="", finish_reason="tool_calls", tool_calls=[bad_tc])
+        agent.client.chat.completions.create.return_value = resp
+
+        with (
+            patch("run_agent.handle_function_call") as mock_handle_function_call,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("write the report")
+
+        assert result["completed"] is False
+        assert result["partial"] is True
+        assert result["error"] == "tool_call_output_truncated"
+        assert "Response truncated due to output length limit" not in result["final_response"]
+        assert "output was too large" in result["final_response"]
+        assert "smaller steps" in result["final_response"]
         mock_handle_function_call.assert_not_called()
 
     def test_truncated_tool_call_retries_once_before_refusing(self, agent):
@@ -4174,9 +4205,10 @@ class TestRunConversation:
             result = agent.run_conversation("write then truncate")
 
         assert result.get("partial") is True
+        assert result.get("error") == "tool_call_output_truncated"
         msgs = result.get("messages") or []
         assert msgs[-1].get("role") == "assistant"
-        assert "truncated" in (msgs[-1].get("content") or "").lower()
+        assert "output was too large" in (msgs[-1].get("content") or "").lower()
         assert any(isinstance(m, dict) and m.get("role") == "tool" for m in msgs)
 
 

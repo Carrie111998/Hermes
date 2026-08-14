@@ -1647,6 +1647,12 @@ def run_conversation(
     codex_ack_continuations = 0
     length_continue_retries = 0
     truncated_tool_call_retries = 0
+    truncated_tool_call_message = (
+        "⚠️ **Tool Call Was Not Executed**\n\n"
+        "The model's tool-call output was too large and was cut off before its "
+        "arguments were complete. Hermes did not execute the incomplete action.\n\n"
+        "Please retry the operation in smaller steps or with a shorter payload."
+    )
     truncated_response_parts: List[str] = []
     compression_attempts = 0
     # One resolved per-turn compression attempt cap, shared by every site that
@@ -3602,7 +3608,12 @@ def run_conversation(
                                 "Stream repeatedly dropped mid tool-call (network); "
                                 "the tool was not executed"
                                 if _is_stub_stall
-                                else "Response truncated due to output length limit"
+                                else truncated_tool_call_message
+                            )
+                            _error = (
+                                _final_response
+                                if _is_stub_stall
+                                else "tool_call_output_truncated"
                             )
                             # Prior successful tool batches (or injected tool
                             # errors) can leave a tool-result tail; this path
@@ -3615,7 +3626,7 @@ def run_conversation(
                                 "api_calls": api_call_count,
                                 "completed": False,
                                 "partial": True,
-                                "error": _final_response,
+                                "error": _error,
                             }
 
                     # If we have prior messages, roll back to last complete state
@@ -6651,7 +6662,7 @@ def run_conversation(
                         )
                         agent._invalid_json_retries = 0
                         agent._cleanup_task_resources(effective_task_id)
-                        _final_response = "Response truncated due to output length limit"
+                        _final_response = truncated_tool_call_message
                         # Same tool-tail close as interrupt / invalid-tool
                         # exhaustion — this path never reaches finalize_turn.
                         close_interrupted_tool_sequence(messages, _final_response)
@@ -6662,7 +6673,7 @@ def run_conversation(
                             "api_calls": api_call_count,
                             "completed": False,
                             "partial": True,
-                            "error": _final_response,
+                            "error": "tool_call_output_truncated",
                         }
 
                     # Track retries for invalid JSON arguments
