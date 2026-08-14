@@ -28,6 +28,11 @@ def _now() -> datetime:
     return datetime.now()
 
 
+def _activity_time(entry: "SessionEntry") -> datetime:
+    """User-activity clock for restart resume. Falls back to updated_at."""
+    return entry.last_activity_at or entry.updated_at
+
+
 # Default auto-continue freshness window in seconds (1 hour).  A session
 # interrupted by a restart is only auto-resumed — and only returned by
 # ``get_or_create_session`` — while it stays within this window of when
@@ -784,6 +789,9 @@ class SessionEntry:
     session_id: str
     created_at: datetime
     updated_at: datetime
+    # Last user-facing activity. Distinct from updated_at, which recover,
+    # repoint, and heal also stamp. Restart resume uses this (#85709).
+    last_activity_at: Optional[datetime] = None
     
     # Origin metadata for delivery routing
     origin: Optional[SessionSource] = None
@@ -877,6 +885,11 @@ class SessionEntry:
             "session_id": self.session_id,
             "created_at": self.created_at.isoformat(),
             "updated_at": self.updated_at.isoformat(),
+            "last_activity_at": (
+                self.last_activity_at.isoformat()
+                if self.last_activity_at
+                else None
+            ),
             "display_name": self.display_name,
             "platform": self.platform.value if self.platform else None,
             "chat_type": self.chat_type,
@@ -931,6 +944,14 @@ class SessionEntry:
             except ValueError as e:
                 logger.debug("Unknown platform value %r: %s", data["platform"], e)
 
+        last_activity_at = None
+        _laa = data.get("last_activity_at")
+        if _laa:
+            try:
+                last_activity_at = datetime.fromisoformat(_laa)
+            except (TypeError, ValueError):
+                last_activity_at = None
+
         last_resume_marked_at = None
         _lrma = data.get("last_resume_marked_at")
         if _lrma:
@@ -977,6 +998,7 @@ class SessionEntry:
             session_id=session_id,
             created_at=datetime.fromisoformat(data["created_at"]),
             updated_at=datetime.fromisoformat(data["updated_at"]),
+            last_activity_at=last_activity_at,
             origin=origin,
             display_name=data.get("display_name"),
             platform=platform,
@@ -1932,6 +1954,7 @@ class SessionStore:
             session_id=str(row["id"]),
             created_at=created_at,
             updated_at=updated_at,
+            last_activity_at=updated_at,
             origin=source,
             display_name=source.chat_name,
             platform=source.platform,
@@ -2662,6 +2685,7 @@ class SessionStore:
                     # the prior user-activity clock used by reset policy.
                     if touch_activity:
                         entry.updated_at = now
+                        entry.last_activity_at = now
                     _needs_save = touch_activity or _healed
                     _metadata_only_save = touch_activity and not _healed
                 else:
@@ -2678,6 +2702,7 @@ class SessionStore:
                     else:
                         if touch_activity:
                             entry.updated_at = now
+                            entry.last_activity_at = now
                         _needs_save = touch_activity or _healed
                         _metadata_only_save = touch_activity and not _healed
             else:
@@ -2727,6 +2752,7 @@ class SessionStore:
                 session_id=session_id,
                 created_at=now,
                 updated_at=now,
+                last_activity_at=now,
                 origin=source,
                 display_name=source.chat_name,
                 platform=source.platform,
@@ -2850,7 +2876,9 @@ class SessionStore:
             if entry is None:
                 return
             if touch_activity:
-                entry.updated_at = _now()
+                now = _now()
+                entry.updated_at = now
+                entry.last_activity_at = now
             if last_prompt_tokens is not None:
                 entry.last_prompt_tokens = last_prompt_tokens
             # Snapshot peer fields while still holding _lock: a concurrent
@@ -3192,10 +3220,11 @@ class SessionStore:
 
         Called on gateway startup after a crash or fast restart to preserve
         in-flight sessions instead of destroying their conversation history
-        (#7536).  Only marks sessions updated within *max_age_seconds* to
-        avoid touching long-idle sessions.  Sets ``resume_pending=True`` so
-        the next incoming message on the same session_key auto-resumes from
-        the existing transcript.
+        (#7536).  Only marks sessions whose last user activity is within
+        *max_age_seconds* so recover/repoint bookkeeping cannot make a
+        long-idle session look fresh (#85709).  Sets ``resume_pending=True``
+        so the next incoming message on the same session_key auto-resumes
+        from the existing transcript.
 
         Entries already flagged ``resume_pending=True`` are skipped.  Entries
         explicitly ``suspended=True`` (from /stop or stuck-loop escalation)
@@ -3214,7 +3243,11 @@ class SessionStore:
             for entry in self._entries.values():
                 if entry.resume_pending:
                     continue
-                if not entry.suspended and entry.updated_at >= cutoff:
+                if entry.suspended:
+                    continue
+                # An in-flight turn is the actual crash-recovery case, even
+                # when last_activity_at is older than the 120s window.
+                if entry.active_turn_token or _activity_time(entry) >= cutoff:
                     entry.resume_pending = True
                     entry.resume_reason = "restart_interrupted"
                     entry.last_resume_marked_at = _now()
@@ -3246,6 +3279,7 @@ class SessionStore:
                 session_id=session_id,
                 created_at=now,
                 updated_at=now,
+                last_activity_at=now,
                 origin=old_entry.origin,
                 display_name=display_name if display_name is not None else old_entry.display_name,
                 platform=old_entry.platform,
@@ -3385,6 +3419,7 @@ class SessionStore:
                 session_id=target_session_id,
                 created_at=now,
                 updated_at=now,
+                last_activity_at=now,
                 origin=old_entry.origin,
                 display_name=old_entry.display_name,
                 platform=old_entry.platform,

@@ -51,6 +51,68 @@ class TestSuspendRecentlyActive:
         assert refreshed.resume_pending
         assert refreshed.session_id == entry.session_id  # same session preserved
 
+    def test_store_touch_does_not_mark_idle_session(self, tmp_path):
+        """Recover/repoint may stamp updated_at=now without user activity."""
+        store = _make_store(tmp_path)
+        source = _make_source()
+        entry = store.get_or_create_session(source)
+        idle = datetime.now() - timedelta(days=21)
+        with store._lock:
+            entry.last_activity_at = idle
+            entry.updated_at = datetime.now()
+            store._save()
+
+        count = store.suspend_recently_active(max_age_seconds=120)
+        assert count == 0
+        assert not store.get_or_create_session(source).resume_pending
+
+    def test_missing_last_activity_falls_back_to_updated_at(self, tmp_path):
+        store = _make_store(tmp_path)
+        source = _make_source()
+        entry = store.get_or_create_session(source)
+        with store._lock:
+            entry.last_activity_at = None
+            entry.updated_at = datetime.now()
+            store._save()
+
+        count = store.suspend_recently_active(max_age_seconds=120)
+        assert count == 1
+
+    def test_recovered_row_copies_durable_activity_time(self, tmp_path):
+        store = _make_store(tmp_path)
+        source = _make_source()
+        started = datetime.now() - timedelta(days=21)
+        last_active_ts = (started + timedelta(hours=1)).timestamp()
+        entry = store._create_entry_from_recovered_row(
+            row={
+                "id": "20260724_094354_caf1ed0c",
+                "started_at": started.timestamp(),
+                "last_activity_at": last_active_ts,
+                "message_count": 4,
+            },
+            session_key="telegram:123",
+            source=source,
+            now=datetime.now(),
+        )
+        assert abs(entry.last_activity_at.timestamp() - last_active_ts) < 1
+        store._entries[entry.session_key] = entry
+        store._loaded = True
+        count = store.suspend_recently_active(max_age_seconds=120)
+        assert count == 0
+
+    def test_active_turn_is_marked_even_if_activity_is_old(self, tmp_path):
+        store = _make_store(tmp_path)
+        source = _make_source()
+        entry = store.get_or_create_session(source)
+        with store._lock:
+            entry.last_activity_at = datetime.now() - timedelta(minutes=10)
+            entry.updated_at = datetime.now()
+            entry.active_turn_token = "in-flight"
+            store._save()
+
+        count = store.suspend_recently_active(max_age_seconds=120)
+        assert count == 1
+
 
 # ---------------------------------------------------------------------------
 # Clean shutdown marker integration
