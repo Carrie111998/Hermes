@@ -12566,6 +12566,36 @@ def main():
         ),
     )
 
+    sessions_recover_compression = sessions_subparsers.add_parser(
+        "recover-compression",
+        help="Inspect or clear stale compression blockers for one session",
+        description=(
+            "Inspect a session that reports stuck context compression. With "
+            "--apply, safely clears stale/expired compression locks and "
+            "cooldowns, resets stale gateway routing prompt-token counters, "
+            "and makes a SQLite backup first unless --no-backup is passed."
+        ),
+    )
+    sessions_recover_compression.add_argument(
+        "session_id",
+        help="Session ID whose compression state should be inspected/recovered",
+    )
+    sessions_recover_compression.add_argument(
+        "--apply",
+        action="store_true",
+        help="Apply the safe recovery changes (default: inspect only)",
+    )
+    sessions_recover_compression.add_argument(
+        "--no-backup",
+        action="store_true",
+        help="Do not create a SQLite backup before applying recovery",
+    )
+    sessions_recover_compression.add_argument(
+        "--backup-path",
+        type=Path,
+        help="Optional explicit backup path used with --apply",
+    )
+
     sessions_recover = sessions_subparsers.add_parser(
         "recover",
         help="Rebuild canonical session data into a separate clean database",
