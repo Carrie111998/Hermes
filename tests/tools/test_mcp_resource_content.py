@@ -41,6 +41,32 @@ def doc_cache(tmp_path, monkeypatch):
 
 
 class TestRenderResourceBlock:
+    def test_empty_embedded_text_surfaces_resource_uri(self):
+        from tools.mcp_tool import _render_mcp_resource_block
+
+        resource = SimpleNamespace(
+            uri="paperless://documents/105/download",
+            mimeType="application/octet-stream",
+            text="",
+            blob=None,
+        )
+
+        out = _render_mcp_resource_block(_embedded(resource), "paperless")
+
+        assert "paperless://documents/105/download" in out
+        assert "mcp__paperless__read_resource" in out
+
+    def test_empty_embedded_text_does_not_hide_blob(self, doc_cache):
+        from tools.mcp_tool import _render_mcp_resource_block
+
+        resource = _blob_resource(PDF_BYTES)
+        resource.text = ""
+
+        out = _render_mcp_resource_block(_embedded(resource), "slack")
+
+        assert "saved to" in out
+        assert "application/pdf" in out
+
     def test_embedded_pdf_blob_is_materialized(self, doc_cache):
         from tools.mcp_tool import _render_mcp_resource_block
 

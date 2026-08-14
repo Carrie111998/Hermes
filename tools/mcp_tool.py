@@ -1027,10 +1027,12 @@ def _cache_mcp_audio_block(block) -> str:
 def _render_mcp_resource_block(block, server_name: str = "") -> str:
     """Render an MCP ``ResourceLink`` or ``EmbeddedResource`` block as text.
 
-    - ``EmbeddedResource`` with text contents → the text itself.
+    - ``EmbeddedResource`` with non-empty text contents → the text itself.
     - ``EmbeddedResource`` with blob contents → bytes are decoded (size-capped)
       and materialized into the Hermes document cache; returns a marker with
       the local path so file/terminal tools can consume it.
+    - ``EmbeddedResource`` with neither text nor blob → its URI plus a pointer
+      at the server's read_resource tool.
     - ``ResourceLink`` → the URI plus a pointer at the server's read_resource
       tool. No network fetch happens here; the link is only readable through
       the originating MCP session.
@@ -1065,17 +1067,28 @@ def _render_mcp_resource_block(block, server_name: str = "") -> str:
         return ""
 
     text = getattr(resource, "text", None)
-    if text is not None:
-        return str(text)
+    text_value = str(text) if text is not None else ""
+    if text_value:
+        return text_value
 
     blob = getattr(resource, "blob", None)
+    uri = str(getattr(resource, "uri", "") or "")
+    mime = str(getattr(resource, "mimeType", "") or "")
     if blob is None:
-        return ""
+        if not uri:
+            return ""
+        details = f"uri={uri}"
+        if mime:
+            details += f", mimeType={mime}"
+        reader = (
+            mcp_prefixed_tool_name(server_name, "read_resource")
+            if server_name
+            else "the MCP server's read_resource tool"
+        )
+        return f"[MCP embedded resource: {details} — fetch it with {reader}]"
 
     import base64
 
-    uri = str(getattr(resource, "uri", "") or "")
-    mime = str(getattr(resource, "mimeType", "") or "")
     if len(blob) > _MCP_RESOURCE_MAX_B64_CHARS:
         return f"[MCP embedded resource too large to cache: ~{len(blob) * 3 // 4} bytes, uri={uri}]"
     try:
