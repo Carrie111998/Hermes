@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock, patch, MagicMock
 
 import pytest
 
-from cron.scheduler import _resolve_origin, _resolve_delivery_target, _deliver_result, _send_media_via_adapter, run_job, SILENT_MARKER, _build_job_prompt, _resolve_cron_enabled_toolsets, _merge_mcp_into_per_job_toolsets
+from cron.scheduler import _resolve_origin, _resolve_delivery_target, _deliver_result, _send_media_via_adapter, run_job, SILENT_MARKER, _build_job_prompt, _resolve_cron_enabled_toolsets, _merge_mcp_into_per_job_toolsets, _delivery_intentionally_targets_home_root
 from tools.env_passthrough import clear_env_passthrough
 from tools.credential_files import clear_credential_files
 
@@ -142,6 +142,28 @@ class TestResolveDeliveryTarget:
             "chat_id": "home-parent",
             "thread_id": None,
         }
+
+    def test_home_platform_delivery_is_not_thread_loss(self):
+        job = {
+            "deliver": "telegram",
+            "origin": {
+                "platform": "telegram",
+                "chat_id": "7054850204",
+                "thread_id": "2451",
+            },
+        }
+        assert _delivery_intentionally_targets_home_root(job, "telegram") is True
+
+    def test_origin_delivery_still_requires_origin_thread(self):
+        job = {
+            "deliver": "origin",
+            "origin": {
+                "platform": "telegram",
+                "chat_id": "7054850204",
+                "thread_id": "2451",
+            },
+        }
+        assert _delivery_intentionally_targets_home_root(job, "telegram") is False
 
     def test_telegram_cron_thread_id_overrides_home_thread_id(self, monkeypatch):
         """TELEGRAM_CRON_THREAD_ID wins over TELEGRAM_HOME_CHANNEL_THREAD_ID for cron (#24409)."""
@@ -442,6 +464,42 @@ class TestDeliverResultErrorReturns:
 
 
 class TestRunJobSessionPersistence:
+    def test_run_job_reuses_cached_external_secrets(self, tmp_path):
+        """Every cron fire must not force-refresh slow external secret sources."""
+        job = {"id": "cached-secrets-job", "name": "cached secrets", "prompt": "hello"}
+        fake_db = MagicMock()
+        reset_cache = MagicMock()
+        load_dotenv = MagicMock()
+
+        with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("cron.scheduler._resolve_origin", return_value=None), \
+             patch("hermes_cli.env_loader.load_hermes_dotenv", load_dotenv), \
+             patch("hermes_cli.env_loader.reset_secret_source_cache", reset_cache), \
+             patch("hermes_state.SessionDB", return_value=fake_db), \
+             patch(
+                 "hermes_cli.runtime_provider.resolve_runtime_provider",
+                 return_value={
+                     "api_key": "test-key",
+                     "base_url": "https://example.invalid/v1",
+                     "provider": "openrouter",
+                     "api_mode": "chat_completions",
+                 },
+             ), \
+             patch("tools.mcp_tool.discover_mcp_tools", return_value=[]), \
+             patch("run_agent.AIAgent") as mock_agent_cls:
+            mock_agent = MagicMock()
+            mock_agent.run_conversation.return_value = {"final_response": "ok"}
+            mock_agent_cls.return_value = mock_agent
+            success, _, _, error = run_job(job)
+
+        assert success is True
+        assert error is None
+        assert any(
+            call.kwargs.get("hermes_home") == tmp_path
+            for call in load_dotenv.call_args_list
+        )
+        reset_cache.assert_not_called()
+
     def test_run_job_passes_session_db_and_cron_platform(self, tmp_path):
         job = {
             "id": "test-job",

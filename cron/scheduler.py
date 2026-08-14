@@ -1647,6 +1647,19 @@ def _is_channel_dm_topic(
     return is_channel
 
 
+def _delivery_intentionally_targets_home_root(job: dict, platform_name: str) -> bool:
+    """True when a threadless target is an explicit home/root routing choice.
+
+    Bare platform tokens (``telegram``, ``discord``...) and ``all`` resolve to
+    configured home channels by contract; they must not inherit an unrelated
+    origin topic. ``origin`` and explicit ``platform:chat[:thread]`` targets do
+    not use this exemption.
+    """
+    deliver = _normalize_deliver_value(job.get("deliver", "local"))
+    parts = {part.strip().lower() for part in deliver.split(",") if part.strip()}
+    return "all" in parts or str(platform_name).lower() in parts
+
+
 def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Optional[str]:
     """
     Deliver job output to the configured target(s) (origin chat, specific platform, etc.).
@@ -1742,9 +1755,13 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         # Diagnostic: log thread_id for topic-aware delivery debugging
         origin = _resolve_origin(job) or {}
         origin_thread = origin.get("thread_id")
-        if origin_thread and not thread_id:
+        if (
+            origin_thread
+            and not thread_id
+            and not _delivery_intentionally_targets_home_root(job, platform_name)
+        ):
             logger.warning(
-                "Job '%s': origin has thread_id=%s but delivery target lost it "
+                "Job '%s': origin has thread_id=%s but origin-targeted delivery lost it "
                 "(deliver=%s, target=%s)",
                 job["id"], origin_thread, job.get("deliver", "local"), target,
             )
@@ -3712,23 +3729,17 @@ def run_job(
             os.environ["TERMINAL_CWD"] = _job_workdir
             logger.info("Job '%s': using workdir %s", job_id, _job_workdir)
 
-        # Re-read .env and config.yaml fresh every run so provider/key
-        # changes take effect without a gateway restart. Route through
-        # load_hermes_dotenv (not a bare load_dotenv) and reset the secret-
-        # source cache first: startup already applied external secrets and
-        # recorded this HERMES_HOME in _APPLIED_HOMES, so a naive reload would
-        # re-apply only the .env placeholder and never re-resolve a Bitwarden/
-        # BSM-backed secret — leaving cron jobs 401'ing on the placeholder
-        # (#33465). Clearing the cache forces the re-pull; the resolved secret
-        # overrides the placeholder only when secrets.bitwarden.override_existing
-        # is set (mirrors startup), and the Bitwarden value-cache keeps the
-        # forced re-pull off the network. load_hermes_dotenv also handles the
-        # utf-8/latin-1 encoding fallback internally.
-        from hermes_cli.env_loader import (
-            load_hermes_dotenv,
-            reset_secret_source_cache,
-        )
-        reset_secret_source_cache()
+        # Re-read local .env and config.yaml every run so provider/key changes
+        # take effect without a gateway restart. Do NOT clear the external
+        # secret-source cache here: doing so forces every cron fire to refetch
+        # all configured backends (1Password/Bitwarden), and a slow source can
+        # delay unrelated jobs by its full timeout. ``load_hermes_dotenv`` still
+        # reloads local files; its once-per-HERMES_HOME guard reuses the external
+        # source snapshot already established at gateway startup. Explicit
+        # secret/config reload paths may call reset_secret_source_cache when a
+        # user actually requests a Vault refresh.
+        from hermes_cli.env_loader import load_hermes_dotenv
+
         load_hermes_dotenv(hermes_home=_get_hermes_home())
 
         delivery_target = _resolve_delivery_target(job)
