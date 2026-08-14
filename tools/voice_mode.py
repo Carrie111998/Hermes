@@ -13,6 +13,7 @@ import difflib
 import logging
 import math
 import os
+import signal
 import platform
 import re
 import shlex
@@ -1560,6 +1561,89 @@ def _split_wav_for_transcription(wav_path: str, *, max_file_size: int) -> List[s
 _active_playback: Optional[subprocess.Popen] = None
 _playback_lock = threading.Lock()
 
+# ---------------------------------------------------------------------------
+# Cross-process playback arbitration (serve vs gateway vs CLI)
+#
+# Each Hermes process records the PID of the player it spawned in a shared
+# file under HERMES_HOME. A new playback request terminates a *live system
+# player* recorded there before starting, so two independent Hermes processes
+# can never layer afplay streams on top of each other — latest request wins,
+# same semantics as the in-process _playback_lock arbitration above.
+# ---------------------------------------------------------------------------
+_PLAYBACK_PID_RELPATH = "tts/.audio-playback.pid"
+_PLAYER_COMMS = ("afplay", "ffplay", "aplay")
+
+
+def _playback_pid_path() -> str:
+    try:
+        from hermes_constants import get_hermes_home
+
+        return str(get_hermes_home() / _PLAYBACK_PID_RELPATH)
+    except Exception:
+        return os.path.join(os.path.expanduser("~"), ".hermes", _PLAYBACK_PID_RELPATH)
+
+
+def _interrupt_other_process_playback() -> None:
+    """Terminate a playback player recorded by another Hermes process.
+
+    Reads the shared PID file, verifies the PID still names a system audio
+    player (guards against PID reuse killing an unrelated process), then
+    terminates it. Best-effort: any failure is swallowed — cross-process
+    arbitration is a nicety, never a blocker for local playback.
+    """
+    try:
+        with open(_playback_pid_path(), "r", encoding="utf-8") as fh:
+            pid = int(fh.read().strip() or "0")
+    except (OSError, ValueError):
+        return
+    if pid <= 0:
+        return
+    try:
+        comm = subprocess.check_output(
+            ["ps", "-p", str(pid), "-o", "comm="],
+            timeout=2,
+            stderr=subprocess.DEVNULL,
+        ).decode(errors="replace").strip()
+    except (subprocess.CalledProcessError, OSError, subprocess.TimeoutExpired):
+        return  # stale pidfile (process already gone) or ps unavailable
+    if comm in _PLAYER_COMMS:
+        try:
+            os.kill(pid, signal.SIGTERM)
+            # SIGTERM delivery is async: wait for the player to actually
+            # exit (bounded) so the NEW playback never overlaps it even
+            # briefly — otherwise two afplay streams can coexist for the
+            # tens-of-ms window while the old one drains.
+            _deadline = time.monotonic() + 0.5
+            while time.monotonic() < _deadline:
+                try:
+                    os.kill(pid, 0)  # signal 0 = existence probe
+                except ProcessLookupError:
+                    break
+                time.sleep(0.01)
+        except (ProcessLookupError, PermissionError):
+            pass
+
+
+def _record_playback_pid(pid: int) -> None:
+    try:
+        path = _playback_pid_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(str(pid))
+    except OSError:
+        pass
+
+
+def _clear_playback_pid(pid: int) -> None:
+    """Remove the pidfile only if it still names *pid* (we own the slot)."""
+    try:
+        path = _playback_pid_path()
+        with open(path, "r", encoding="utf-8") as fh:
+            if fh.read().strip() == str(pid):
+                os.unlink(path)
+    except OSError:
+        pass
+
 
 def stop_playback() -> None:
     """Interrupt the currently playing audio (if any)."""
@@ -1573,6 +1657,7 @@ def stop_playback() -> None:
             logger.info("Audio playback interrupted")
         except Exception:
             pass
+        _clear_playback_pid(proc.pid)
     # Also stop sounddevice playback if active
     try:
         sd, _ = _import_audio()
@@ -1767,19 +1852,64 @@ def _play_audio_file_impl(file_path: str) -> bool:
                 # audio players must not inherit gateway tokens / API keys.
                 from tools.environments.local import hermes_subprocess_env
 
-                proc = subprocess.Popen(
-                    cmd,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    stdin=subprocess.DEVNULL,
-                    env=hermes_subprocess_env(inherit_credentials=False),
-                )
+                # Global playback arbitration: a NEW playback request always
+                # interrupts the previous one BEFORE starting. Concurrent
+                # sessions/windows/profile backends hitting the same process
+                # can otherwise layer multiple afplay streams on top of each
+                # other (多会话同时说话叠音). Latest request wins — barge-in
+                # semantics, same as stop_playback() but atomic with the spawn
+                # so there is no window where two players coexist. wait() stays
+                # OUTSIDE the lock so stop_playback() can still kill us
+                # mid-play.
                 with _playback_lock:
+                    prev = _active_playback
+                    _active_playback = None
+                    if prev is not None and prev.poll() is None:
+                        try:
+                            prev.terminate()
+                            # Bounded wait for the old player to actually
+                            # exit so the new one never overlaps it even
+                            # briefly (SIGTERM delivery is async).
+                            try:
+                                prev.wait(timeout=0.5)
+                            except Exception:
+                                pass
+                        except Exception:
+                            pass
+                    # Cross-process: kill a live player owned by another
+                    # Hermes process (serve vs gateway vs CLI) before we
+                    # start, then record ours so the next process can do the
+                    # same to us.
+                    _interrupt_other_process_playback()
+                    proc = subprocess.Popen(
+                        cmd,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        stdin=subprocess.DEVNULL,
+                        env=hermes_subprocess_env(inherit_credentials=False),
+                    )
                     _active_playback = proc
+                    _record_playback_pid(proc.pid)
                 proc.wait(timeout=300)
                 rc = proc.returncode
                 with _playback_lock:
-                    _active_playback = None
+                    was_current = _active_playback is proc
+                    if was_current:
+                        _active_playback = None
+                        _clear_playback_pid(proc.pid)
+                if not was_current:
+                    # We were superseded (a newer playback request barge-in'd
+                    # us, or stop_playback() ran). Do NOT fall through to the
+                    # next player — that would re-spawn a second stream for
+                    # the file we were interrupted on and re-layer audio.
+                    return False
+                if rc < 0:
+                    # The player was terminated by a signal (SIGTERM from
+                    # stop_playback() or cross-process arbitration, or a
+                    # crash). Never fall through to the next player: the
+                    # interrupt was deliberate and re-spawning would layer a
+                    # second stream over whoever superseded us.
+                    return False
                 if rc == 0:
                     return True
                 # Non-zero exit: player failed (e.g. WSL ffplay/aplay with no
