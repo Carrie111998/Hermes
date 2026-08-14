@@ -7990,7 +7990,9 @@ async function ensureBackend(profile) {
 
     // A shared backend still owes the caller its profile scope, so renderer-side
     // WebSocket, filesystem, and cache routing target the selected profile.
-    return route.descriptorProfile ? { ...connection, profile: route.descriptorProfile } : connection
+    return route.descriptorProfile
+      ? { ...connection, profile: route.descriptorProfile, sharedPrimary: true }
+      : connection
   }
 
   const existing = backendPool.get(key)
