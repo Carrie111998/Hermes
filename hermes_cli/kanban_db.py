@@ -6692,6 +6692,7 @@ def reopen_review_task(conn: sqlite3.Connection, task_id: str) -> bool:
         pass
 
     with write_txn(conn):
+        now = int(time.time())
         _reclaim_dangling_run(
             conn, task_id, statuses=("review",), now=now,
             note="invariant recovery on review reopen",
