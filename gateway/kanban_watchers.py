@@ -860,9 +860,7 @@ class GatewayKanbanWatchersMixin:
                                     or getattr(task, "session_id", None)
                                     or ""
                                 )
-                        _can_wake = _wake_now and bool(
-                            _session_key or (_is_push_adapter and _comment_wake)
-                        )
+                        _can_wake = _wake_now and bool(_is_push_adapter or _session_key)
                         if _can_wake:
                             _title = (task.title if task else sub["task_id"])[:120]
                             _assignee = task.assignee if task else ""
