@@ -2550,39 +2550,54 @@ async function checkUpdates() {
 
   branch = await resolveHealedBranch(updateRoot, branch)
   const originUrl = await getOriginUrl(updateRoot)
+  const git = args => runGit(args, { cwd: updateRoot }).then(r => r.stdout.trim())
 
-  if (isOfficialSshRemote(originUrl)) {
-    const git = args => runGit(args, { cwd: updateRoot }).then(r => r.stdout.trim())
+  // A passive check answers one question: "is this checkout behind the
+  // official repo's <branch>?" Only the official repo can answer that. A
+  // local origin pointing at a fork or a stale mirror (common on contributor
+  // machines) must not be treated as the source of truth — a stale fork main
+  // made an 8-day-old checkout report "you're on the latest version" while
+  // official main was thousands of commits ahead. The anonymous HTTPS
+  // ls-remote needs no auth and cannot trigger an SSH/FIDO2 hardware-touch
+  // prompt (see update-remote.ts), so probing the official repo is safe on
+  // every install regardless of the configured origin.
+  const officialProbe = await runGit(
+    ['ls-remote', OFFICIAL_REPO_HTTPS_URL, `refs/heads/${branch}`],
+    { cwd: updateRoot }
+  )
+  const officialTargetSha = firstLine(officialProbe.stdout).split(/\s+/)[0] || ''
 
-    const [currentSha, target, dirtyStr, currentBranch] = await Promise.all([
+  if (officialProbe.code === 0 && officialTargetSha) {
+    const [currentSha, dirtyStr, currentBranch] = await Promise.all([
       git(['rev-parse', 'HEAD']),
-      runGit(['ls-remote', OFFICIAL_REPO_HTTPS_URL, `refs/heads/${branch}`], { cwd: updateRoot }),
       git(['status', '--porcelain']),
       git(['rev-parse', '--abbrev-ref', 'HEAD'])
     ])
-
-    const targetSha = firstLine(target.stdout).split(/\s+/)[0] || ''
-
-    if (target.code !== 0 || !targetSha) {
-      return {
-        supported: true,
-        branch,
-        error: 'fetch-failed',
-        message: firstLine(target.stderr) || 'git ls-remote failed.',
-        hermesRoot: updateRoot,
-        fetchedAt: Date.now()
-      }
-    }
 
     return {
       supported: true,
       branch,
       currentBranch,
-      behind: currentSha && currentSha === targetSha ? 0 : 1,
+      behind: currentSha && currentSha === officialTargetSha ? 0 : 1,
       currentSha,
-      targetSha,
+      targetSha: officialTargetSha,
       commits: [],
       dirty: dirtyStr.length > 0,
+      hermesRoot: updateRoot,
+      fetchedAt: Date.now()
+    }
+  }
+
+  // The official probe failed (offline, GitHub unreachable). Keep the old
+  // behaviour per origin kind: official SSH remotes report the failure rather
+  // than fetch (that would prompt for an SSH/FIDO2 key); any other origin
+  // falls back to its own fetch path below.
+  if (isOfficialSshRemote(originUrl)) {
+    return {
+      supported: true,
+      branch,
+      error: 'fetch-failed',
+      message: firstLine(officialProbe.stderr) || 'git ls-remote failed.',
       hermesRoot: updateRoot,
       fetchedAt: Date.now()
     }
@@ -2600,8 +2615,6 @@ async function checkUpdates() {
       fetchedAt: Date.now()
     }
   }
-
-  const git = args => runGit(args, { cwd: updateRoot }).then(r => r.stdout.trim())
 
   const [currentSha, targetSha, dirtyStr, currentBranch, shallowStr, mergeBaseStr] = await Promise.all([
     git(['rev-parse', 'HEAD']),
