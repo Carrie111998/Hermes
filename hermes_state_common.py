@@ -557,6 +557,66 @@ FTS_CJK_STALE_KEY = "fts_cjk_stale"
 FTS_STALE_KEY = "fts_stale"
 
 
+AUTHORIZED_ACTIVATORS = ["commander", "hermes"]
+
+def activate_openspec_enforcement(conn, operator: str) -> None:
+    """Activate the OpenSpec enforcement routine.
+    
+    Checks if the operator is authorized. If so, sets the enforcement_status
+    key to 'active' in the openspec_enforcement_meta table.
+    Raises PermissionError if unauthorized.
+    """
+    if operator not in AUTHORIZED_ACTIVATORS:
+        raise PermissionError(f"Operator '{operator}' is not authorized to activate OpenSpec enforcement.")
+    
+    cursor = conn.cursor()
+    cursor.execute(
+        "INSERT INTO openspec_enforcement_meta (key, value) VALUES ('enforcement_status', 'active') "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value;"
+    )
+    conn.commit()
+
+def rollback_openspec_enforcement(conn, operator: str) -> None:
+    """Rollback the OpenSpec enforcement setup.
+    
+    Checks if the operator is authorized. Ensures that there are no remaining
+    rows in openspec_registry and task_run_identity_events before allowing the
+    DROP TABLE IF EXISTS for the three tables.
+    Fails closed: if any constraints are violated, the transaction is rolled back.
+    """
+    if operator not in AUTHORIZED_ACTIVATORS:
+        raise PermissionError(f"Operator '{operator}' is not authorized to rollback OpenSpec enforcement.")
+    
+    try:
+        cursor = conn.cursor()
+        
+        # Check if tables exist before counting (they might not exist yet)
+        cursor.execute("SELECT count(name) FROM sqlite_master WHERE type='table' AND name='openspec_registry'")
+        if cursor.fetchone()[0] == 1:
+            cursor.execute("SELECT COUNT(*) FROM openspec_registry")
+            registry_count = cursor.fetchone()[0]
+            if registry_count > 0:
+                raise RuntimeError(f"Cannot rollback: openspec_registry contains {registry_count} rows. State must be empty.")
+        
+        cursor.execute("SELECT count(name) FROM sqlite_master WHERE type='table' AND name='task_run_identity_events'")
+        if cursor.fetchone()[0] == 1:
+            cursor.execute("SELECT COUNT(*) FROM task_run_identity_events")
+            identity_count = cursor.fetchone()[0]
+            if identity_count > 0:
+                raise RuntimeError(f"Cannot rollback: task_run_identity_events contains {identity_count} rows. State must be empty.")
+                
+        # Safe to drop
+        cursor.execute("DROP TABLE IF EXISTS task_run_identity_events")
+        cursor.execute("DROP TABLE IF EXISTS openspec_registry")
+        cursor.execute("DROP TABLE IF EXISTS openspec_enforcement_meta")
+        
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
+
+
 # ── Legacy (v22 / inline-content) FTS DDL ──────────────────────────────
 # Used ONLY to keep an existing pre-v23 install's search working and its
 # triggers repairable UNTIL the user opts into `hermes db optimize`. This is
