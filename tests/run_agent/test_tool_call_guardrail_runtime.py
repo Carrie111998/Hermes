@@ -5,6 +5,11 @@ import uuid
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+from agent.tool_guardrails import (
+    LoopCapConfig,
+    ToolCallGuardrailConfig,
+    ToolCallGuardrailController,
+)
 from run_agent import AIAgent
 
 
@@ -84,6 +89,25 @@ def _hard_stop_config(**overrides) -> dict:
     }
     cfg["tool_loop_guardrails"].update(overrides)
     return cfg
+
+
+def test_web_search_cap_halt_response_reports_per_turn_limit_for_distinct_queries():
+    agent = _make_agent("web_search")
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(loop_caps=LoopCapConfig(max_web_searches=3))
+    )
+    for i in range(3):
+        decision = controller.before_call("web_search", {"query": f"distinct {i}"})
+        assert decision.action == "allow"
+
+    decision = controller.before_call("web_search", {"query": "distinct 3"})
+
+    assert decision.code == "loop_web_search_cap"
+    assert agent._toolguard_controlled_halt_response(decision) == (
+        "I stopped web_search after 3 web searches in this turn because it reached "
+        "the per-turn search limit (loop_web_search_cap). Continue with the results "
+        "already collected or change strategy."
+    )
 
 
 def test_default_sequential_path_warns_repeated_exact_failure_without_blocking_execution():
