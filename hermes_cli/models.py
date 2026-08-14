@@ -4616,7 +4616,8 @@ def probe_api_models(
     headers: dict[str, str] = {"User-Agent": _HERMES_USER_AGENT}
     if urllib.parse.urlparse(normalized).hostname == "generativelanguage.googleapis.com":
         headers["X-Goog-Api-Client"] = f"hermes-agent/{_HERMES_VERSION}"
-    if api_key and api_mode == "anthropic_messages":
+    anthropic_mode = bool(api_key) and api_mode == "anthropic_messages"
+    if anthropic_mode:
         headers["x-api-key"] = api_key
         headers["anthropic-version"] = "2023-06-01"
     elif api_key:
@@ -4630,10 +4631,10 @@ def probe_api_models(
 
         headers.update(normalize_extra_headers(request_headers))
 
-    for candidate_base, is_fallback in candidates:
+    def _probe(candidate_base: str, hdrs: dict[str, str]) -> Optional[dict[str, Any]]:
         url = candidate_base.rstrip("/") + "/models"
         tried.append(url)
-        req = urllib.request.Request(url, headers=headers)
+        req = urllib.request.Request(url, headers=hdrs)
         try:
             with _urlopen_model_catalog_request(req, timeout=timeout) as resp:
                 data = json.loads(resp.read().decode())
@@ -4641,11 +4642,43 @@ def probe_api_models(
                     "models": [m.get("id", "") for m in data.get("data", [])],
                     "probed_url": url,
                     "resolved_base_url": candidate_base.rstrip("/"),
-                    "suggested_base_url": alternate_base if alternate_base != candidate_base else normalized,
-                    "used_fallback": is_fallback,
+                    "suggested_base_url": (
+                        alternate_base if alternate_base != candidate_base else normalized
+                    ),
+                    "used_fallback": candidate_base != normalized,
                 }
+        except urllib.error.HTTPError as exc:
+            # Remember the status so a 401/403 can trigger a Bearer retry
+            # below; any other error is a per-candidate miss.
+            if exc.code in (401, 403):
+                return {"_auth_rejected": True, "url": url}
+            return None
         except Exception:
+            return None
+
+    for candidate_base, _is_fallback in candidates:
+        result = _probe(candidate_base, headers)
+        if result is None:
             continue
+        if result.get("_auth_rejected"):
+            continue
+        return result
+
+    # Some Anthropic-compatible endpoints only accept Authorization: Bearer
+    # on their /models route (e.g. openmodel.ai) while accepting x-api-key on
+    # /v1/messages. The x-api-key probe above got 401/403 — retry with Bearer.
+    if anthropic_mode:
+        bearer_headers = dict(headers)
+        bearer_headers.pop("x-api-key", None)
+        bearer_headers.pop("anthropic-version", None)
+        bearer_headers["Authorization"] = f"Bearer {api_key}"
+        for candidate_base, _is_fallback in candidates:
+            result = _probe(candidate_base, bearer_headers)
+            if result is None:
+                continue
+            if result.get("_auth_rejected"):
+                continue
+            return result
 
     return {
         "models": None,
