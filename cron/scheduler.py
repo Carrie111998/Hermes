@@ -730,6 +730,31 @@ def _cron_inactivity_seconds() -> float:
         return 600.0
 
 
+def _cron_idle_seconds(agent, dispatched_at: float) -> float:
+    """Seconds the agent has been inactive, falling back to time since dispatch.
+
+    The watchdog previously seeded this at 0.0 and swallowed every failure, so any agent that
+    could not report activity — most importantly one still inside its own construction, before
+    `get_activity_summary` exists or its activity clock is set — was measured as fully active and
+    the inactivity limit was never evaluated. The reaper then only fired once the agent became
+    answerable, which can be far past the configured limit.
+
+    An agent that has never reported activity has not been active since it was dispatched, so
+    that is the floor. When the agent can answer, the reported value is used unchanged.
+    """
+    try:
+        summary = agent.get_activity_summary()
+    except Exception:
+        logger.debug("get_activity_summary() failed; ageing from dispatch", exc_info=True)
+        return max(0.0, time.time() - dispatched_at)
+    if not isinstance(summary, dict):
+        return max(0.0, time.time() - dispatched_at)
+    reported = summary.get("seconds_since_activity")
+    if not isinstance(reported, (int, float)):
+        return max(0.0, time.time() - dispatched_at)
+    return float(reported)
+
+
 def _cwd_lock_timeout_seconds() -> float:
     """Bound for the TERMINAL_CWD lock wait: inactivity limit + margin."""
     inactivity = _cron_inactivity_seconds()
@@ -4445,6 +4470,7 @@ def run_job(
         # Tag this fire and time the run_conversation call for the usage_audit.jsonl entry.
         _audit_fire_id = uuid.uuid4().hex
         _audit_t_start = time.monotonic()
+        _cron_dispatched_at = time.time()  # wall clock: the inactivity floor for an agent that cannot report
         _cron_future = _cron_pool.submit(_cron_context.run, agent.run_conversation, prompt)
         _inactivity_timeout = False
         try:
@@ -4474,13 +4500,7 @@ def run_job(
                         break
                     _heartbeat_run_claim_if_due()
                     # Agent still running — check inactivity.
-                    _idle_secs = 0.0
-                    if hasattr(agent, "get_activity_summary"):
-                        try:
-                            _act = agent.get_activity_summary()
-                            _idle_secs = _act.get("seconds_since_activity", 0.0)
-                        except Exception:
-                            pass
+                    _idle_secs = _cron_idle_seconds(agent, _cron_dispatched_at)
                     if _idle_secs >= _cron_inactivity_limit:
                         _inactivity_timeout = True
                         break
