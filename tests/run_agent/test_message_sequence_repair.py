@@ -356,6 +356,45 @@ def test_sanitize_drops_empty_tool_calls_array():
     assert assistant["content"] == "answer"
 
 
+def test_sanitize_drops_empty_tool_calls_created_by_dedup():
+    """Dedup must not leave ``tool_calls: []`` behind when it empties a
+    duplicate call.
+
+    Regression from production: a webui transcript carried the same
+    tool_call id twice — once answered, once as an orphaned replay after an
+    aborted turn. The dedup pass collapsed the later message's call to
+    ``[]``, and because that pass runs AFTER the empty-array drop (see
+    ``test_sanitize_drops_empty_tool_calls_array``), the empty list survived
+    to the wire. Strict OpenAI-compatible providers (DeepSeek, opencode.ai)
+    reject it with HTTP 400 "Invalid 'messages[N].tool_calls': empty array",
+    and since every retry re-sends the same shape the session stalls
+    permanently. The replayed message must lose the ``tool_calls`` KEY
+    entirely, matching the empty==absent semantics.
+    """
+    from agent.agent_runtime_helpers import sanitize_api_messages
+
+    messages = [
+        {"role": "user", "content": "first"},
+        {"role": "assistant", "content": "answered", "tool_calls": [
+            {"id": "call_dup", "type": "function",
+             "function": {"name": "foo", "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": "call_dup", "content": "result"},
+        {"role": "user", "content": "again"},
+        # orphaned replay of the same call id (aborted turn persisted twice)
+        {"role": "assistant", "content": "orphaned replay", "tool_calls": [
+            {"id": "call_dup", "type": "function",
+             "function": {"name": "foo", "arguments": "{}"}}]},
+    ]
+    out = sanitize_api_messages(list(messages))
+    assistants = [m for m in out if m.get("role") == "assistant"]
+    # the first (answered) assistant keeps its call; the replay drops the key
+    assert assistants[0]["tool_calls"][0]["id"] == "call_dup"
+    assert "tool_calls" not in assistants[1]
+    assert assistants[1]["content"] == "orphaned replay"
+    # and no empty tool_calls array survives anywhere on the wire payload
+    assert all(m.get("tool_calls") != [] for m in out)
+
+
 
 
 

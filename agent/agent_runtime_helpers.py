@@ -3458,7 +3458,19 @@ def sanitize_api_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]
                     seen_assistant_call_ids.add(cid)
                 kept_tcs.append(tc)
             if len(kept_tcs) != len(msg.get("tool_calls") or []):
-                msg = {**msg, "tool_calls": kept_tcs}
+                if kept_tcs:
+                    msg = {**msg, "tool_calls": kept_tcs}
+                else:
+                    # Dedup emptied the call list entirely — DROP the key
+                    # rather than leave ``tool_calls: []``, which strict
+                    # OpenAI-compatible providers (DeepSeek, opencode.ai,
+                    # Moonshot) reject with HTTP 400 "Invalid
+                    # 'messages[N].tool_calls': empty array". This mirrors
+                    # the empty-array drop earlier in this function
+                    # (#58755/#59110), but that pass runs BEFORE this dedup
+                    # step, so an empty list produced HERE used to survive
+                    # to the wire and permanently stuck the session.
+                    msg = {k: v for k, v in msg.items() if k != "tool_calls"}
             deduped.append(msg)
         elif role == "tool":
             cid = (msg.get("tool_call_id") or "").strip()
@@ -3475,6 +3487,27 @@ def sanitize_api_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]
         _ra().logger.debug(
             "Pre-call sanitizer: removed %d duplicate tool_call_id reference(s)",
             removed_dupes,
+        )
+
+    # Final sweep: no assistant message may carry an empty ``tool_calls``
+    # array onto the wire. The dedicated empty-drop pass above runs before
+    # the dedup pass, so any empty list created by dedup (or by any other
+    # late mutation) must be caught here. Empty == absent (#58755/#59110).
+    swept = 0
+    for idx, msg in enumerate(messages):
+        if (
+            isinstance(msg, dict)
+            and msg.get("role") == "assistant"
+            and "tool_calls" in msg
+            and not (isinstance(msg["tool_calls"], list) and msg["tool_calls"])
+        ):
+            messages[idx] = {k: v for k, v in msg.items() if k != "tool_calls"}
+            swept += 1
+    if swept:
+        _ra().logger.debug(
+            "Pre-call sanitizer: final sweep dropped %d empty tool_calls "
+            "array(s) created by earlier sanitizer passes",
+            swept,
         )
     return messages
 
