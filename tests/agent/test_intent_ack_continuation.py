@@ -94,6 +94,24 @@ def test_explicit_off_overrides_copilot_acp_default():
     assert intent_ack_continuation_mode(agent) == "off"
 
 
+def test_intent_ack_retry_pair_is_ephemeral_scaffolding():
+    from run_agent import _is_ephemeral_scaffolding
+
+    assistant = {
+        "role": "assistant",
+        "content": "Let me inspect that now.",
+        "_intent_ack_continuation_nudge": True,
+    }
+    user = {
+        "role": "user",
+        "content": "continue with the real tool call",
+        "_intent_ack_continuation_nudge": True,
+    }
+
+    assert _is_ephemeral_scaffolding(assistant)
+    assert _is_ephemeral_scaffolding(user)
+
+
 # ── detector: workspace requirement ─────────────────────────────────────────
 
 
@@ -132,7 +150,6 @@ def test_all_path_drops_workspace_requirement():
 
 
 # ── detector: guardrails that hold regardless of workspace ───────────────────
-
 
 
 
