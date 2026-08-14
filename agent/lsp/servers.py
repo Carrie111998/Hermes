@@ -198,6 +198,34 @@ def _which(*names: str) -> Optional[str]:
     return None
 
 
+def _pyright_langserver_candidates(path: str) -> list[str]:
+    """Return a configured Pyright path only when it names an LSP server."""
+    name = os.path.basename(path).lower()
+    if name in {
+        "pyright-langserver",
+        "pyright-langserver.cmd",
+        "pyright-langserver.exe",
+        "pyright-langserver.bat",
+    }:
+        return [path]
+    if name not in {"pyright", "pyright.cmd", "pyright.exe", "pyright.bat"}:
+        return []
+    directory = os.path.dirname(path)
+    return [
+        os.path.join(directory, f"pyright-langserver{suffix}")
+        for suffix in ("", ".cmd", ".exe", ".bat")
+    ]
+
+
+def _existing_pyright_langserver(path: Optional[str]) -> Optional[str]:
+    if path is None:
+        return None
+    for candidate in _pyright_langserver_candidates(path):
+        if os.path.isfile(candidate):
+            return candidate
+    return None
+
+
 def _root_or_workspace(file_path: str, workspace: str, markers: Sequence[str], excludes: Sequence[str] = ()) -> Optional[str]:
     """Common pattern: try ``nearest_root``, fall back to workspace root.
 
@@ -231,20 +259,34 @@ def _root_or_workspace(file_path: str, workspace: str, markers: Sequence[str], e
 
 
 def _spawn_pyright(root: str, ctx: ServerContext) -> Optional[SpawnSpec]:
-    bin_path = _resolve_override(ctx, "pyright") or _which(
-        "pyright-langserver", "pyright"
+    bin_path = _existing_pyright_langserver(
+        _resolve_override(ctx, "pyright-langserver")
     )
     if bin_path is None:
+        bin_path = _existing_pyright_langserver(
+            _which(
+                "pyright-langserver",
+                "pyright-langserver.cmd",
+                "pyright-langserver.exe",
+                "pyright-langserver.bat",
+            )
+        )
+    if bin_path is None:
+        bin_path = _existing_pyright_langserver(
+            _resolve_override(ctx, "pyright")
+            or _which("pyright", "pyright.cmd", "pyright.exe", "pyright.bat")
+        )
+    if bin_path is None:
         from agent.lsp.install import try_install
-        bin_path = try_install("pyright", ctx.install_strategy, hermes_home=ctx.hermes_home)
-        if bin_path is None:
-            return None
-    # If we got the cli ``pyright``, the langserver is its sibling.
-    base = os.path.basename(bin_path)
-    if base in {"pyright", "pyright.exe"}:
-        sibling = os.path.join(os.path.dirname(bin_path), "pyright-langserver")
-        if os.path.exists(sibling):
-            bin_path = sibling
+
+        installed = try_install("pyright", ctx.install_strategy, hermes_home=ctx.hermes_home)
+        bin_path = _existing_pyright_langserver(installed)
+    if bin_path is None:
+        logger.warning(
+            "pyright LSP unavailable: pyright-langserver --stdio was not found; "
+            "the official pyright CLI is not a language-server substitute"
+        )
+        return None
     init: Dict[str, Any] = {}
     # Pick the project's venv interpreter if there is one — otherwise
     # pyright defaults to "python on PATH" which is rarely the venv.

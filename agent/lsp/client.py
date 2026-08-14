@@ -55,7 +55,7 @@ import subprocess
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Set
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence, Set
 from urllib.parse import quote, unquote
 
 import psutil
@@ -89,6 +89,45 @@ SHUTDOWN_GRACE = 1.0  # seconds between SIGTERM and SIGKILL
 # Retry policy for transient ContentModified errors.
 MAX_CONTENT_MODIFIED_RETRIES = 3
 RETRY_BASE_DELAY = 0.5  # 0.5, 1.0, 2.0 — exponential
+
+
+def _refresh_owned_descendants(
+    owner: Optional[psutil.Process],
+    known: Sequence[psutil.Process],
+) -> list[psutil.Process]:
+    """Re-collect the owned tree, including descendants of known children."""
+    if owner is None:
+        return list(known)
+    seeds = [owner, *known]
+    refreshed: list[psutil.Process] = []
+    seen: set[int] = set()
+    for seed in seeds:
+        try:
+            children = seed.children(recursive=True)
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+        for child in children:
+            child_pid = getattr(child, "pid", id(child))
+            if child_pid in seen:
+                continue
+            seen.add(child_pid)
+            refreshed.append(child)
+    for child in known:
+        child_pid = getattr(child, "pid", id(child))
+        if child_pid not in seen:
+            seen.add(child_pid)
+            refreshed.append(child)
+    return refreshed
+
+
+def _any_process_alive(processes: Sequence[psutil.Process]) -> bool:
+    for process in processes:
+        try:
+            if process.is_running() and process.status() != psutil.STATUS_ZOMBIE:
+                return True
+        except (psutil.NoSuchProcess, psutil.AccessDenied, OSError, AttributeError):
+            continue
+    return False
 
 
 def file_uri(path: str) -> str:
@@ -536,41 +575,49 @@ class LSPClient:
         if proc is None:
             return
 
-        # Capture descendants before signaling the root.  Process groups are
-        # the primary POSIX cleanup mechanism, while the snapshot also covers
-        # a child that deliberately creates a new session and is required for
-        # Windows where process-group signals are unavailable.
-        descendants = []
-        try:
-            descendants = psutil.Process(proc.pid).children(recursive=True)
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
-            pass
-
+        pid = getattr(proc, "pid", None)
+        owner = None
+        if pid is not None:
+            try:
+                owner = psutil.Process(pid)
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+        current = _refresh_owned_descendants(owner, ())
+        # Detached descendants are outside the process group, so signal the
+        # exact tree before terminating the owned group.  Re-collect during
+        # the grace window to catch a child that creates a grandchild after
+        # the first snapshot.
+        self._terminate_processes(current, force=False)
         if pgid is not None:
             try:
                 os.killpg(pgid, signal.SIGTERM)
             except (ProcessLookupError, OSError):
                 pass
         else:
-            self._terminate_processes([*descendants, proc], force=False)
+            self._terminate_processes([proc], force=False)
 
         deadline = asyncio.get_running_loop().time() + SHUTDOWN_GRACE
-        if proc.returncode is None:
-            try:
-                remaining = max(0.0, deadline - asyncio.get_running_loop().time())
-                await asyncio.wait_for(proc.wait(), timeout=remaining)
-            except (asyncio.TimeoutError, ProcessLookupError):
-                pass
-        remaining = max(0.0, deadline - asyncio.get_running_loop().time())
-        if remaining:
-            await asyncio.sleep(remaining)
+        while asyncio.get_running_loop().time() < deadline:
+            current = _refresh_owned_descendants(owner, current)
+            self._terminate_processes(current, force=False)
+            if proc.returncode is not None and not _any_process_alive(current):
+                break
+            await asyncio.sleep(
+                min(
+                    0.05,
+                    max(0.0, deadline - asyncio.get_running_loop().time()),
+                )
+            )
 
+        # Always take a latest snapshot immediately before KILL.  A detached
+        # child may have created a new session and a grandchild during TERM.
+        current = _refresh_owned_descendants(owner, current)
         if pgid is not None:
             try:
                 os.killpg(pgid, signal.SIGKILL)
             except (ProcessLookupError, OSError):
                 pass
-        self._terminate_processes([*descendants, proc], force=True)
+        self._terminate_processes(current, force=True)
         if proc.returncode is None:
             try:
                 await proc.wait()

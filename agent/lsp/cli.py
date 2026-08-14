@@ -315,7 +315,7 @@ def _cmd_validate(
             workspace,
             project_config=project_config,
             include=include,
-            exclude=exclude if exclude is not None else DEFAULT_EXCLUDES,
+            exclude=tuple(dict.fromkeys((*DEFAULT_EXCLUDES, *(exclude or ())))),
             timeout=timeout,
             term_grace=term_grace,
         )
