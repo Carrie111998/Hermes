@@ -228,3 +228,23 @@ def test_ws_transport_preserves_cross_batch_order():
     asyncio.run(scenario())
 
 
+def test_ws_transport_repairs_surrogates_but_preserves_valid_unicode():
+    async def scenario():
+        sent = []
+
+        class FakeWS:
+            async def send_text(self, line):
+                line.encode("utf-8")
+                sent.append(line)
+
+        transport = ws_mod.WSTransport(
+            FakeWS(), asyncio.get_running_loop(), peer="unicode-test"
+        )
+        assert await transport.write_async({"text": "Hermes \ud83d 中文"}) is True
+
+        assert "中文" in sent[0]
+        assert json.loads(sent[0]) == {"text": "Hermes � 中文"}
+        assert transport._closed is False
+
+    asyncio.run(scenario())
+

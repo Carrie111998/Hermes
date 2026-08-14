@@ -137,6 +137,21 @@ except ImportError:
 WEB_DIST = Path(os.environ["HERMES_WEB_DIST"]) if "HERMES_WEB_DIST" in os.environ else Path(__file__).parent / "web_dist"
 _log = logging.getLogger(__name__)
 
+
+class UTF8SafeJSONResponse(JSONResponse):
+    """JSON response that repairs lone surrogates without escaping valid text."""
+
+    def render(self, content: Any) -> bytes:
+        from hermes_cli.json_safety import dumps_utf8_safe
+
+        return dumps_utf8_safe(
+            content,
+            ensure_ascii=False,
+            allow_nan=False,
+            indent=None,
+            separators=(",", ":"),
+        ).encode("utf-8")
+
 # ---------------------------------------------------------------------------
 # Per-channel subscriber registry used by /api/pub (PTY-side gateway → dashboard)
 # and /api/events (dashboard → browser sidebar).  Keyed by an opaque channel id
@@ -327,7 +342,12 @@ def _get_pty_active_session_files(app: "FastAPI") -> dict[str, Path]:
         return app.state.pty_active_session_files
 
 
-app = FastAPI(title="Hermes Agent", version=__version__, lifespan=_lifespan)
+app = FastAPI(
+    title="Hermes Agent",
+    version=__version__,
+    lifespan=_lifespan,
+    default_response_class=UTF8SafeJSONResponse,
+)
 
 # Memory-provider OAuth connect routes live in the memory layer, not here.
 from hermes_cli.memory_oauth import router as _memory_oauth_router  # noqa: E402
