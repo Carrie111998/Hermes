@@ -946,7 +946,10 @@ def _credential_pool_provider_key(provider: str, base_url: str = "") -> str:
             return find_custom_provider_identity(base_url) or provider_norm
         if has_named_custom_provider(provider_norm):
             expected_identity = custom_provider_slug(provider_norm, provider_norm)
-            endpoint_identity = find_custom_provider_identity(base_url)
+            endpoint_identity = find_custom_provider_identity(
+                base_url,
+                provider_norm,
+            )
             if endpoint_identity == expected_identity:
                 return expected_identity
     except Exception:
