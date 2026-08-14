@@ -733,10 +733,13 @@ class BaseEnvironment(ABC):
         # and is genuinely unique per writer, which closes the race.  The
         # static path is shlex-quoted (Windows/Git-Bash drive letters, spaces)
         # with ``$BASHPID`` left outside the quotes so it still expands.
-        _snap_tmp = f"{self._snapshot_path}.tmp.{os.getpid()}"
+        _snap_tmp_template = self._quote_shell_path(self._snapshot_path + ".tmp.XXXXXXXXXX")
+        _snap_tmp = '"$__hermes_snap_tmp"'
+        snapshot_excluded = self._snapshot_excluded_passthrough_names()
         bootstrap = (
-            f"export -p > {_snap_tmp}\n"
-            f"set +u\n"
+            f"umask 077\n"
+            f"__hermes_snap_tmp=$(mktemp {_snap_tmp_template}) || exit 1\n"
+            f"{_export_dump_excluding_session_vars(_snap_tmp, snapshot_excluded)}\n"
             f"__hermes_fns=$(declare -F | awk '{{print $3}}' | grep -vE '^_[^_]') || true\n"
             # helpers — mainly bash-completion internals (``_git``, ``_make``…)
             # by NAME, not by line.  A naive ``declare -f | grep -vE '^_[^_]'``
@@ -848,7 +851,8 @@ class BaseEnvironment(ABC):
         # subshell PID — unique per concurrent ``&``-launched writer — so two
         # writers never share a temp name and clobber each other before the mv.
         # Static path shlex-quoted (Windows/spaces); ``$BASHPID`` left to expand.
-        _snap_tmp = f"{self._snapshot_path}.tmp.{os.getpid()}"
+        _snap_tmp_template = self._quote_shell_path(self._snapshot_path + ".tmp.XXXXXXXXXX")
+        _snap_tmp = '"$__hermes_snap_tmp"'
 
         parts = []
         passthrough_names = self._snapshot_excluded_passthrough_names()
