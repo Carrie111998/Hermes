@@ -476,6 +476,12 @@ def _normalize_job_record(job: Dict[str, Any]) -> Dict[str, Any]:
     # "paused" while the fleet is still live. See effective_job_state().
     normalized["state"] = effective_job_state(normalized)
 
+    # Reactive-chaining defaults so legacy records (written before the feature
+    # landed) expose the same shape as new ones instead of a KeyError/.get()
+    # gap for UI/API/tool/scheduler consumers.
+    normalized.setdefault("trigger_on_complete", False)
+    normalized.setdefault("trigger_status", "ok")
+
     return normalized
 
 
@@ -1586,6 +1592,8 @@ def create_job(
     attach_to_session: Optional[bool] = None,
     monitor_script: Optional[str] = None,
     monitor_url: Optional[str] = None,
+    trigger_on_complete: bool = False,
+    trigger_status: str = "ok",
 ) -> Dict[str, Any]:
     """
     Create a new cron job.
@@ -1643,6 +1651,16 @@ def create_job(
         monitor_url: Optional http(s) URL used as the monitor source instead
                 of a script — fetched with a bounded GET each tick. Same
                 hash-suppression semantics as ``monitor_script``.
+    trigger_on_complete: When True, this job is fired immediately on the
+                completion of any job listed in ``context_from`` (in addition
+                to its own schedule). The upstream output already flows in via
+                ``context_from``; this flag adds the reactive kick so a chain
+                runs without waiting for the next tick. Requires
+                ``context_from`` to be set; cycles are rejected at create time.
+    trigger_status: Which parent outcomes fire this child when
+                ``trigger_on_complete=True``: ``"ok"`` (default, only
+                successful parents), ``"error"`` (only failed parents — useful
+                for alert fan-out), or ``"any"`` (fire regardless).
 
     Returns:
         The created job dict
@@ -1701,6 +1719,19 @@ def create_job(
     else:
         context_from = None
 
+    # Normalize reactive-chaining fields and validate their invariants.
+    # trigger_on_complete requires context_from (something to react to);
+    # cycles across the context_from+trigger graph are rejected so a chain
+    # can't loop back to its own root and fire forever.
+    normalized_toc, normalized_tstatus = _normalize_trigger_fields(
+        trigger_on_complete, trigger_status
+    )
+    if normalized_toc and not context_from:
+        raise ValueError(
+            "trigger_on_complete=True requires context_from to be set "
+            "(there must be at least one upstream job to react to)."
+        )
+
     prompt_text = _coerce_job_text(prompt)
 
     # Reject cron jobs that schedule gateway-lifecycle commands. Prevents
@@ -1756,6 +1787,8 @@ def create_job(
         # "last_changed_at": ...}. None until the first monitor tick.
         "monitor_state": None,
         "context_from": context_from,
+        "trigger_on_complete": normalized_toc,
+        "trigger_status": normalized_tstatus,
         "schedule": parsed_schedule,
         "schedule_display": parsed_schedule.get("display", schedule),
         "repeat": {
@@ -1785,6 +1818,16 @@ def create_job(
         job["attach_to_session"] = normalized_attach
 
     with _jobs_lock():
+        # Validate against the same locked snapshot we append to. Otherwise a
+        # concurrent update could close a reactive cycle after validation but
+        # before this job is persisted.
+        if normalized_toc and context_from:
+            cycle = _detect_trigger_cycle(job_id, context_from, normalized_toc)
+            if cycle:
+                raise ValueError(
+                    "Refusing to create cron job: trigger_on_complete would form a "
+                    f"cycle: {' -> '.join(cycle)}"
+                )
         jobs = load_jobs()
         jobs.append(job)
         save_jobs(jobs)
@@ -1855,6 +1898,132 @@ def list_jobs(include_disabled: bool = False) -> List[Dict[str, Any]]:
     return jobs
 
 
+# ---------------------------------------------------------------------------
+# Reactive chaining: trigger_on_complete
+# ---------------------------------------------------------------------------
+# A job with ``trigger_on_complete=True`` is fired automatically when any job
+# listed in its ``context_from`` completes — instead of (or in addition to)
+# waiting for its own schedule. The upstream's output already flows in through
+# ``context_from``; this flag just adds the reactive kick so the chain runs
+# immediately on the parent's completion rather than on the next tick.
+#
+# ``trigger_status`` gates which parent outcomes fire the child:
+#   "ok"    — only successful parents (default)
+#   "error" — only failed parents (alert/fan-out on failure)
+#   "any"   — fire regardless of outcome
+#
+# Cycles are rejected at create/update time: A.context_from=[B] with both
+# trigger_on_complete would have A fire B fire A forever. DFS over the
+# context_from+trigger graph catches that before it persists.
+
+_VALID_TRIGGER_STATUSES = frozenset({"ok", "error", "any"})
+
+
+def _normalize_trigger_fields(
+    trigger_on_complete: Any, trigger_status: Any
+) -> Tuple[bool, str]:
+    """Coerce the two reactive-chaining fields to their canonical forms.
+
+    Returns ``(trigger_on_complete, trigger_status)``. ``trigger_status`` is
+    only meaningful when ``trigger_on_complete`` is True, but we keep its
+    value normalized either way so stored records are always valid.
+    """
+    if not isinstance(trigger_on_complete, bool):
+        raise ValueError(
+            "trigger_on_complete must be a boolean "
+            f"(got {trigger_on_complete!r})"
+        )
+    toc = trigger_on_complete
+    ts = _coerce_job_text(trigger_status).strip().lower() or "ok"
+    if ts not in _VALID_TRIGGER_STATUSES:
+        raise ValueError(
+            f"trigger_status must be one of {sorted(_VALID_TRIGGER_STATUSES)} "
+            f"(got {trigger_status!r})"
+        )
+    return toc, ts
+
+
+def _reactive_parents(job: Dict[str, Any]) -> List[str]:
+    """Job IDs this job reacts to (its ``context_from`` when trigger_on_complete)."""
+    if not job.get("trigger_on_complete"):
+        return []
+    cf = job.get("context_from") or []
+    if isinstance(cf, str):
+        cf = [cf]
+    return [str(j).strip() for j in cf if str(j).strip()]
+
+
+def _detect_trigger_cycle(
+    job_id: str, context_from: List[str], trigger_on_complete: bool
+) -> Optional[List[str]]:
+    """Return a cycle path if setting these fields would create one, else None.
+
+    The prospective job fires when any of its ``context_from`` parents
+    completes, which adds edges ``parent -> job_id`` to the reactive graph
+    (an edge P -> C means "P's completion fires C"). Those new edges close a
+    loop iff there is already a path ``job_id -> ... -> parent`` through the
+    *persisted* graph: job_id's completion would then (transitively) fire the
+    parent, which fires job_id again — forever.
+
+    So we DFS from ``job_id`` along existing reactive edges only (edges among
+    already-persisted jobs; the prospective ``parent -> job_id`` edges are NOT
+    added to the map — including them would make every legitimate chain look
+    like a 2-node cycle) and treat reaching any prospective parent as a cycle.
+    A ``context_from`` containing ``job_id`` itself is the trivial self-loop
+    and is caught by the same walk (the start node is a prospective parent).
+    """
+    if not trigger_on_complete or not context_from:
+        return None
+
+    prospective_parents = {str(p).strip() for p in context_from if str(p).strip()}
+    if not prospective_parents:
+        return None
+
+    # Existing reactive edges among persisted jobs: parent_id -> [children that
+    # react to it]. job_id's own record is included normally — its context_from
+    # only contributes edges pointing INTO it, which this outward DFS ignores.
+    edges: Dict[str, List[str]] = {}
+    for j in load_jobs():
+        for parent in _reactive_parents(j):
+            edges.setdefault(parent, []).append(j["id"])
+
+    # DFS from job_id; reaching a prospective parent means the new
+    # parent->job_id edge closes a loop: job_id ~> ... ~> parent -> job_id.
+    visited: Set[str] = set()
+    stack: List[Tuple[str, List[str]]] = [(job_id, [job_id])]
+    while stack:
+        node, path = stack.pop()
+        if node in prospective_parents:
+            return path + [job_id]
+        if node in visited:
+            continue
+        visited.add(node)
+        for child in edges.get(node, []):
+            stack.append((child, path + [child]))
+    return None
+
+
+def get_dependent_jobs(parent_id: str) -> List[Dict[str, Any]]:
+    """Jobs that reactively chain off ``parent_id``'s completion.
+
+    Returns enabled jobs with ``trigger_on_complete=True`` whose
+    ``context_from`` contains ``parent_id``. Used by the scheduler after a
+    job finishes to kick its reactive children.
+    """
+    out: List[Dict[str, Any]] = []
+    for job in load_jobs():
+        if not job.get("trigger_on_complete"):
+            continue
+        if not is_job_runnable(job):
+            continue
+        cf = job.get("context_from") or []
+        if isinstance(cf, str):
+            cf = [cf]
+        if parent_id in [str(j).strip() for j in cf if str(j).strip()]:
+            out.append(_normalize_job_record(job))
+    return out
+
+
 def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """Update a job by ID, refreshing derived schedule fields when needed."""
     # Block mutation of immutable fields. ``id`` in particular is a filesystem
@@ -1888,6 +2057,75 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                     _mv = updates[_mon_field]
                     _mv = str(_mv).strip() if isinstance(_mv, str) else None
                     updates[_mon_field] = _mv or None
+
+            # Normalize context_from the same way create_job does: accept a
+            # single ID string or a list of IDs, store as a list (or None when
+            # empty/cleared). Without this, the stored shape depends on which
+            # caller updated the job, and _reactive_parents()/get_dependent_jobs()
+            # have to special-case both shapes on every read.
+            if "context_from" in updates:
+                _cf = updates["context_from"]
+                if isinstance(_cf, str):
+                    _cf = [_cf.strip()] if _cf.strip() else None
+                elif isinstance(_cf, list):
+                    _cf = [str(j).strip() for j in _cf if str(j).strip()] or None
+                else:
+                    _cf = None
+                updates["context_from"] = _cf
+
+            # Normalize reactive-chaining fields when present in the update.
+            # Merges against the existing record so e.g. setting
+            # trigger_on_complete=True on a job that already has context_from
+            # works, and clearing context_from while leaving trigger_on_complete
+            # is rejected (no upstream to react to). Cycle detection runs on the
+            # merged context_from + trigger_on_complete so an update can't
+            # introduce a loop either — including a context_from-only change on
+            # an already-reactive job (context_from is half of every reactive
+            # edge, so touching it without touching trigger fields can still
+            # close a cycle).
+            if (
+                "trigger_on_complete" in updates
+                or "trigger_status" in updates
+                or "context_from" in updates
+            ):
+                _toc = updates.get(
+                    "trigger_on_complete", job.get("trigger_on_complete", False)
+                )
+                _tstatus = updates.get(
+                    "trigger_status", job.get("trigger_status", "ok")
+                )
+                _norm_toc, _norm_tstatus = _normalize_trigger_fields(_toc, _tstatus)
+                updates["trigger_on_complete"] = _norm_toc
+                updates["trigger_status"] = _norm_tstatus
+
+                # Recompute merged context_from for invariant checks below.
+                _merged_cf = job.get("context_from")
+                if "context_from" in updates:
+                    _cf_upd = updates["context_from"]
+                    if isinstance(_cf_upd, str):
+                        _merged_cf = [_cf_upd] if _cf_upd.strip() else []
+                    elif isinstance(_cf_upd, list):
+                        _merged_cf = [str(j).strip() for j in _cf_upd if str(j).strip()]
+                    else:
+                        _merged_cf = []
+                if isinstance(_merged_cf, str):
+                    _merged_cf = (
+                        [_merged_cf.strip()] if _merged_cf.strip() else []
+                    )
+                _merged_cf = _merged_cf or []
+
+                if _norm_toc and not _merged_cf:
+                    raise ValueError(
+                        "trigger_on_complete=True requires context_from to be set "
+                        "(there must be at least one upstream job to react to)."
+                    )
+                if _norm_toc and _merged_cf:
+                    cycle = _detect_trigger_cycle(job_id, _merged_cf, _norm_toc)
+                    if cycle:
+                        raise ValueError(
+                            "Refusing to update cron job: trigger_on_complete "
+                            f"would form a cycle: {' -> '.join(cycle)}"
+                        )
 
             previous_inference_axes = _normalized_inference_axes(job)
             updated = _apply_skill_fields({**job, **updates})
@@ -2037,6 +2275,32 @@ def trigger_job(job_id: str) -> Optional[Dict[str, Any]]:
             "next_run_at": _hermes_now().isoformat(),
         },
     )
+
+
+def trigger_job_if_runnable(job_id: str) -> Optional[Dict[str, Any]]:
+    """Atomically schedule an enabled, unpaused job without resurrecting it.
+
+    Reactive fan-out first discovers children and then fires them. A user may
+    pause/remove a child between those two operations; the regular
+    :func:`trigger_job` intentionally re-enables jobs for manual ``run`` calls,
+    which would undo that concurrent operator action. This variant performs the
+    runnable check and ``next_run_at`` update under the same jobs lock and never
+    changes ``enabled`` or pause markers.
+    """
+    with _jobs_lock():
+        jobs = load_jobs()
+        for i, job in enumerate(jobs):
+            if job.get("id") != job_id:
+                continue
+            if not is_job_runnable(job):
+                return None
+            updated = dict(job)
+            updated["state"] = "scheduled"
+            updated["next_run_at"] = _hermes_now().isoformat()
+            jobs[i] = updated
+            save_jobs(jobs)
+            return _normalize_job_record(updated)
+    return None
 
 
 def remove_job(job_id: str) -> bool:

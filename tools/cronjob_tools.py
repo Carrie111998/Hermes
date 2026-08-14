@@ -1116,6 +1116,8 @@ def cronjob(
     attach_to_session: Optional[bool] = None,
     monitor_script: Optional[str] = None,
     monitor_url: Optional[str] = None,
+    trigger_on_complete: Optional[bool] = None,
+    trigger_status: Optional[str] = None,
     task_id: str = None,
     session_id: Optional[str] = None,
 ) -> str:
@@ -1206,6 +1208,8 @@ def cronjob(
                     attach_to_session=attach_to_session,
                     monitor_script=_normalize_optional_job_value(monitor_script),
                     monitor_url=_normalize_optional_job_value(monitor_url),
+                    trigger_on_complete=trigger_on_complete if trigger_on_complete is not None else False,
+                    trigger_status=trigger_status or "ok",
                 )
             except CronSchedulerRegistrationError as exc:
                 _partial = exc.to_dict()
@@ -1481,6 +1485,15 @@ def cronjob(
                             success=False,
                         )
                 updates["no_agent"] = target_no_agent
+            if trigger_on_complete is not None or trigger_status is not None:
+                # Pass through raw values; update_job() normalizes both and
+                # runs cycle detection against the merged context_from. A
+                # trigger_on_complete=True with no context_from (on the job or
+                # in this same update) is rejected there.
+                if trigger_on_complete is not None:
+                    updates["trigger_on_complete"] = trigger_on_complete
+                if trigger_status is not None:
+                    updates["trigger_status"] = trigger_status
             if repeat is not None:
                 # Normalize: treat 0 or negative as None (infinite)
                 normalized_repeat = None if repeat <= 0 else repeat
@@ -1607,6 +1620,30 @@ Scheduling from cron-run sessions is disabled by default and enabled via cron.al
                     "On update, pass an empty array to clear."
                 ),
             },
+            "trigger_on_complete": {
+                "type": "boolean",
+                "default": False,
+                "description": (
+                    "When True, this job is fired immediately when any job listed in "
+                    "context_from completes — instead of (or in addition to) waiting for "
+                    "its own schedule. The upstream output already flows in via context_from; "
+                    "this flag adds the reactive kick so a pipeline runs without waiting for "
+                    "the next tick. Requires context_from to be set. Cycles are rejected "
+                    "(A→B→A). Combine with trigger_status to gate on success/failure/any. "
+                    "On update, set False to disable reactive chaining while keeping context_from."
+                ),
+            },
+            "trigger_status": {
+                "type": "string",
+                "enum": ["ok", "error", "any"],
+                "default": "ok",
+                "description": (
+                    "Which parent outcome fires this child when trigger_on_complete=True: "
+                    "'ok' (default, only successful parents), 'error' (only failed parents — "
+                    "useful for alert fan-out on upstream failure), or 'any' (fire regardless). "
+                    "Only meaningful when trigger_on_complete is True."
+                ),
+            },
             "enabled_toolsets": {
                 "type": "array",
                 "items": {"type": "string"},
@@ -1679,6 +1716,8 @@ registry.register(
         no_agent=args.get("no_agent"),
         monitor_script=args.get("monitor_script"),
         monitor_url=args.get("monitor_url"),
+        trigger_on_complete=args.get("trigger_on_complete"),
+        trigger_status=args.get("trigger_status"),
         task_id=kw.get("task_id"),
         session_id=kw.get("session_id"),
     ),

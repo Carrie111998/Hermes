@@ -11859,6 +11859,8 @@ def _normalize_dashboard_cron_updates(
         normalized["context_from"] = _cron_string_list(normalized["context_from"])
     if "enabled_toolsets" in normalized:
         normalized["enabled_toolsets"] = _cron_string_list(normalized["enabled_toolsets"])
+    if "trigger_status" in normalized and normalized["trigger_status"] is not None:
+        normalized["trigger_status"] = str(normalized["trigger_status"]).strip().lower() or "ok"
     return normalized
 
 
@@ -12126,6 +12128,8 @@ def _create_cron_job_sync(body: CronJobCreate, profile: Optional[str] = None):
             enabled_toolsets=_cron_string_list(body.enabled_toolsets),
             workdir=_cron_optional_text(body.workdir),
             no_agent=no_agent,
+            trigger_on_complete=bool(body.trigger_on_complete),
+            trigger_status=body.trigger_status or "ok",
         )
     except HTTPException:
         raise

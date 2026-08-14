@@ -427,7 +427,16 @@ _LEGACY_HOME_TARGET_ENV_VARS = {
     "QQBOT_HOME_CHANNEL": "QQ_HOME_CHANNEL",
 }
 
-from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_runs, claim_dispatch, heartbeat_run_claim
+from cron.jobs import (
+    advance_next_runs,
+    claim_dispatch,
+    get_dependent_jobs,
+    get_due_jobs,
+    heartbeat_run_claim,
+    mark_job_run,
+    save_job_output,
+    trigger_job_if_runnable,
+)
 from cron.executions import create_execution, finish_execution, mark_execution_running
 
 # Sentinel: when a cron agent has nothing new to report, it can start its
@@ -4817,6 +4826,68 @@ def _teardown_cron_agent(agent, job_id: str) -> None:
         logger.debug("Job '%s': failed to reap stale auxiliary clients: %s", job_id, e)
 
 
+def _fire_dependent_jobs(parent_id: str, parent_success: bool) -> None:
+    """Kick reactive children of a just-completed job.
+
+    After ``run_one_job`` records a job's terminal status, any enabled job
+    with ``trigger_on_complete=True`` whose ``context_from`` names this parent
+    is scheduled to run on the next tick via ``trigger_job``. The child's
+    ``trigger_status`` gate decides whether a successful/failed/any parent
+    outcome fires it.
+
+    Best-effort and isolated: a failure to fire one child never prevents the
+    parent's own completion from being recorded (this runs after
+    ``mark_job_run``) and never prevents siblings from firing. Each child's
+    current ``trigger_status`` is read fresh from disk so an update between
+    the parent starting and finishing is honoured.
+    """
+    try:
+        dependents = get_dependent_jobs(parent_id)
+    except Exception:
+        logger.debug("Failed to load dependents for %s", parent_id, exc_info=True)
+        return
+    notified = False
+    for child in dependents:
+        gate = (child.get("trigger_status") or "ok").strip().lower()
+        if gate not in {"ok", "error", "any"}:
+            logger.warning(
+                "Reactive chain: child %s has invalid trigger_status %r; skipping",
+                child.get("id"), gate,
+            )
+            continue
+        if gate == "ok" and not parent_success:
+            continue
+        if gate == "error" and parent_success:
+            continue
+        # "any" fires unconditionally.
+        child_id = child.get("id")
+        if not child_id:
+            continue
+        try:
+            updated = trigger_job_if_runnable(child_id)
+            if updated is None:
+                # The child may have been removed after get_dependent_jobs()
+                # loaded it. Do not notify providers for a no-op mutation.
+                continue
+            notified = True
+            logger.info(
+                "Reactive chain: parent %s (%s) fired child %s",
+                parent_id, "ok" if parent_success else "error", child_id,
+            )
+        except Exception:
+            logger.debug(
+                "Failed to trigger reactive child %s for parent %s",
+                child_id, parent_id, exc_info=True,
+            )
+
+    if notified:
+        # trigger_job() mutates the built-in jobs store. External scheduler
+        # providers (for example Chronos) also need a provisioning refresh;
+        # without this callback the child is due in jobs.json but may never be
+        # scheduled by the active provider. Notify once per fan-out batch.
+        _notify_provider_jobs_changed()
+
+
 def run_one_job(
     job: dict, *, adapters=None, loop=None, verbose: bool = False,
     extra_prompt: Optional[str] = None,
@@ -5047,6 +5118,22 @@ def run_one_job(
             error=error,
             delivery_outcome=delivery_outcome,
         )
+        # Reactive chaining (#15831): now that the parent's terminal status
+        # and output are durably recorded, kick any children waiting on this
+        # job's completion. Runs after finish_execution so a child fire never
+        # races the parent's own bookkeeping; best-effort, never raises into
+        # the caller after the parent outcome has already been recorded.
+        # Blocked-config alerts are already deduplicated with a silent marker.
+        # Preserve the same once-only behavior for reactive error fan-out: the
+        # first blocked run may fire an alert child, later silent retries must
+        # not create an alert storm.
+        if not blocked_config_silent:
+            try:
+                _fire_dependent_jobs(job["id"], success)
+            except Exception:
+                logger.debug(
+                    "Reactive chain fan-out failed for parent %s", job["id"], exc_info=True
+                )
         return True
 
     except BaseException as e:  # noqa: BLE001 — deliberate: see below
@@ -5079,6 +5166,16 @@ def run_one_job(
             )
         if not isinstance(e, Exception):
             raise
+        # Reactive chaining (#15831): a hard failure still fires children gated
+        # on trigger_status="error"/"any" (alert fan-out on upstream failure).
+        # Runs after finish_execution like the success path; best-effort, never
+        # raises into the caller (the parent's failure is already recorded).
+        try:
+            _fire_dependent_jobs(job["id"], False)
+        except Exception:
+            logger.debug(
+                "Reactive chain fan-out failed for parent %s", job["id"], exc_info=True
+            )
         return False
 
 

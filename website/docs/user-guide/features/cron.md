@@ -613,6 +613,84 @@ Outputs are concatenated in the order listed.
 - Dependent tasks where step N's work depends on step N−1's output
 - Fan-out/fan-in patterns where one job aggregates results from several others
 
+### Reactive chaining: `trigger_on_complete`
+
+Plain `context_from` chains still wait for each job's own schedule — Job 2 runs
+at 07:30 whether or not Job 1 finished at 07:01. **Reactive chaining** flips
+that: a job with `trigger_on_complete=True` is marked due as soon as any job
+listed in its `context_from` completes and runs on the next scheduler tick,
+rather than waiting for its own scheduled time.
+
+```python
+# Job 1: Collect raw data (runs on its schedule)
+cronjob(
+    action="create",
+    prompt="Fetch the top 10 AI/ML stories from Hacker News and rank them.",
+    schedule="0 7 * * *",
+    name="AI News Collector",
+)
+
+# Job 2: Triage — becomes due when Job 1 finishes
+cronjob(
+    action="create",
+    prompt="Turn the ranked stories into 3 tweet drafts and deliver them.",
+    schedule="0 8 * * *",                # fallback schedule still applies
+    context_from="<job1_id>",
+    trigger_on_complete=True,            # also fires on Job 1 completion
+    name="AI News Brief",
+)
+```
+
+**How it works:**
+
+- When an upstream job finishes, every enabled job whose `context_from` names
+  it and that has `trigger_on_complete=True` is scheduled to run on the next
+  tick. The upstream's output still flows in via `context_from` as usual.
+- `trigger_on_complete` is *in addition to* the job's own schedule: the fallback
+  schedule guarantees the job still runs even if its upstream never completes
+  (e.g. a paused parent).
+- Fan-out works naturally: many children can react to one parent, and children
+  can react to several parents — a child fires when *any* listed parent
+  completes.
+- Reactive fires are coalesced for backpressure: several parents completing
+  before the next scheduler tick produce one child run, not one run per event.
+  If that child is already running, Hermes does not overlap a second copy; the
+  reactive fire is absorbed by the existing in-flight dedupe policy. At run
+  time, `context_from` still injects the latest completed output from every
+  listed parent.
+
+**Gating on success or failure with `trigger_status`:**
+
+`trigger_status` decides which parent outcome fires the child (default `"ok"`):
+
+| Value | Fires when a parent... |
+|-------|------------------------|
+| `"ok"` | completes successfully |
+| `"error"` | finishes with a recorded failure |
+| `"any"` | completes, regardless of outcome |
+
+```python
+# Alert fan-out: fire a notification job only when the collector FAILS
+cronjob(
+    action="create",
+    prompt="The AI News Collector failed. Investigate and report what went wrong.",
+    schedule="every 1h",
+    context_from="<job1_id>",
+    trigger_on_complete=True,
+    trigger_status="error",
+    name="Collector Failure Alert",
+)
+```
+
+**Cycle protection:** because reactive chains fire on completion, a loop
+(A fires B, B fires A) would run forever. Hermes rejects any create or update
+that would form a cycle — either directly (`context_from` naming the job
+itself) or transitively (a longer path that loops back). The rejection is
+enforced at create and update time against the merged `context_from` +
+`trigger_on_complete`, including updates that only change `context_from` on an
+already-reactive job. `trigger_on_complete=True` also requires at least one
+`context_from` entry — there must be something to react to.
+
 ## Provider recovery
 
 Cron jobs inherit your configured fallback providers and credential pool rotation. If the primary API key is rate-limited or the provider returns an error, the cron agent can:
@@ -854,6 +932,19 @@ cronjob(action="create", name="daily-digest",
 ```
 
 The referenced jobs' most recent completed outputs are injected above the prompt as context for this run. Each upstream entry must be a valid job ID or name (see `cronjob action="list"`). Note: chaining reads the *most recent completed* output — it does not wait for upstream jobs that are running in the same tick.
+
+To fire a child *immediately* when an upstream job completes (instead of waiting for its own schedule), set `trigger_on_complete=True` on the child and gate the outcome with `trigger_status` (`"ok"` default, `"error"`, or `"any"`):
+
+```text
+cronjob(action="create", name="digest-alert",
+        schedule="every day 7am",
+        context_from=["daily-digest"],
+        trigger_on_complete=True,
+        trigger_status="error",
+        prompt="The daily digest failed. Summarize what happened and what to check.")
+```
+
+Reactive edges are validated at create/update time: `trigger_on_complete=True` requires a non-empty `context_from`, and any create or update that would form a reactive cycle (A → B → A, transitively included) is rejected.
 
 ## Job storage
 
