@@ -441,6 +441,7 @@ export interface Translations {
     fallbackMoveDown?: string;
     fallbackSelect?: string;
     fallbackNone?: string;
+    fallbackLoadFailed?: string;
     fallbackSaved?: string;
     fallbackCustomEndpoint?: string;
     actions?: string;

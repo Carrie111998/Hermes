@@ -325,6 +325,9 @@ export default function ProfilesPage() {
       fallbackMoveDown: p.fallbackMoveDown ?? "Move fallback down",
       fallbackSelect: p.fallbackSelect ?? "Select a fallback model",
       fallbackNone: p.fallbackNone ?? "No fallback models configured",
+      fallbackLoadFailed:
+        p.fallbackLoadFailed ??
+        "Fallback chain could not be loaded; model and reasoning can still be saved.",
       fallbackSaved: p.fallbackSaved ?? "Fallback chain updated",
       fallbackCustomEndpoint:
         p.fallbackCustomEndpoint ?? "Custom endpoint retained",
@@ -399,6 +402,7 @@ export default function ProfilesPage() {
   const [fallbackEdits, setFallbackEdits] = useState<FallbackDraft[]>([]);
   const [fallbacksLoading, setFallbacksLoading] = useState(false);
   const [fallbacksLoaded, setFallbacksLoaded] = useState(false);
+  const [fallbacksLoadFailed, setFallbacksLoadFailed] = useState(false);
   const [modelSaving, setModelSaving] = useState(false);
   // Tracks the latest fallback-chain request so out-of-order responses don't
   // overwrite state when the user switches profiles or closes the editor.
@@ -736,6 +740,7 @@ export default function ProfilesPage() {
       setReasoningEditChoice(p.reasoning_effort ?? "");
       setFallbackEdits([]);
       setFallbacksLoaded(false);
+      setFallbacksLoadFailed(false);
       setFallbacksLoading(true);
       activeFallbackRequest.current = p.name;
       loadModelChoices(p.name);
@@ -757,10 +762,12 @@ export default function ProfilesPage() {
               api_mode: entry.api_mode,
             })),
           );
+          setFallbacksLoadFailed(false);
           setFallbacksLoaded(true);
         })
         .catch((error) => {
           if (activeFallbackRequest.current === p.name) {
+            setFallbacksLoadFailed(true);
             showToast(`${t.status.error}: ${error}`, "error");
           }
         })
@@ -876,7 +883,7 @@ export default function ProfilesPage() {
       return;
     }
     if (
-      !fallbacksLoaded ||
+      fallbacksLoaded &&
       fallbackEdits.some((entry) => !entry.provider.trim() || !entry.model.trim())
     ) {
       return;
@@ -893,36 +900,6 @@ export default function ProfilesPage() {
         reasoningEditChoice,
       );
       if (activeModelRequest.current !== requestId) return;
-      const fallbackResponse = await api.updateProfileFallbacks(
-        name,
-        fallbackEdits.map(
-          ({
-            source_index,
-            source_provider,
-            source_model,
-            source_base_url,
-            source_api_mode,
-            provider,
-            model,
-            reasoning_effort,
-            base_url,
-            api_mode,
-          }) => ({
-            source_index,
-            source_provider,
-            source_model,
-            source_base_url,
-            source_api_mode,
-            provider,
-            model,
-            reasoning_effort,
-            base_url,
-            api_mode,
-          }),
-        ),
-      );
-      if (activeModelRequest.current !== requestId) return;
-      setFallbackEdits(fallbackResponse.fallbacks);
       setProfiles((prev) =>
         prev.map((p) =>
           p.name === name
@@ -943,7 +920,39 @@ export default function ProfilesPage() {
         `${L.reasoningSaved}: ${settings.reasoning_effort || L.reasoningUnset}`,
         "success",
       );
-      showToast(L.fallbackSaved, "success");
+      if (fallbacksLoaded) {
+        const fallbackResponse = await api.updateProfileFallbacks(
+          name,
+          fallbackEdits.map(
+            ({
+              source_index,
+              source_provider,
+              source_model,
+              source_base_url,
+              source_api_mode,
+              provider,
+              model,
+              reasoning_effort,
+              base_url,
+              api_mode,
+            }) => ({
+              source_index,
+              source_provider,
+              source_model,
+              source_base_url,
+              source_api_mode,
+              provider,
+              model,
+              reasoning_effort,
+              base_url,
+              api_mode,
+            }),
+          ),
+        );
+        if (activeModelRequest.current !== requestId) return;
+        setFallbackEdits(fallbackResponse.fallbacks);
+        showToast(L.fallbackSaved, "success");
+      }
       setEditingModelFor(null);
     } catch (e) {
       if (activeModelRequest.current === requestId) {
@@ -1621,6 +1630,7 @@ export default function ProfilesPage() {
                         disabled={
                           modelSaving ||
                           fallbacksLoading ||
+                          !fallbacksLoaded ||
                           modelChoices === null ||
                           modelChoices.length === 0
                         }
@@ -1634,7 +1644,13 @@ export default function ProfilesPage() {
                       <p className="text-xs text-muted-foreground">{L.modelLoading}</p>
                     )}
 
-                    {!fallbacksLoading && fallbackEdits.length === 0 && (
+                    {!fallbacksLoading && fallbacksLoadFailed && (
+                      <p className="text-xs text-destructive">
+                        {L.fallbackLoadFailed}
+                      </p>
+                    )}
+
+                    {!fallbacksLoading && fallbacksLoaded && fallbackEdits.length === 0 && (
                       <p className="text-xs text-muted-foreground">{L.fallbackNone}</p>
                     )}
 
@@ -1656,7 +1672,7 @@ export default function ProfilesPage() {
                                 size="icon"
                                 title={L.fallbackMoveUp}
                                 aria-label={L.fallbackMoveUp}
-                                disabled={index === 0 || modelSaving}
+                                disabled={index === 0 || modelSaving || !fallbacksLoaded}
                                 onClick={() => moveFallback(index, -1)}
                               >
                                 <ChevronUp className="h-3.5 w-3.5" />
@@ -1667,7 +1683,9 @@ export default function ProfilesPage() {
                                 title={L.fallbackMoveDown}
                                 aria-label={L.fallbackMoveDown}
                                 disabled={
-                                  index === fallbackEdits.length - 1 || modelSaving
+                                  index === fallbackEdits.length - 1 ||
+                                  modelSaving ||
+                                  !fallbacksLoaded
                                 }
                                 onClick={() => moveFallback(index, 1)}
                               >
@@ -1678,7 +1696,7 @@ export default function ProfilesPage() {
                                 size="icon"
                                 title={L.fallbackRemove}
                                 aria-label={L.fallbackRemove}
-                                disabled={modelSaving}
+                                disabled={modelSaving || !fallbacksLoaded}
                                 onClick={() => removeFallback(index)}
                               >
                                 <Trash2 className="h-3.5 w-3.5" />
@@ -1688,7 +1706,9 @@ export default function ProfilesPage() {
 
                           <Select
                             value={current}
-                            disabled={modelChoices === null || modelSaving}
+                            disabled={
+                              modelChoices === null || modelSaving || !fallbacksLoaded
+                            }
                             placeholder={L.fallbackSelect}
                             onValueChange={(value) => {
                               const separator = value.indexOf("\u0000");
@@ -1711,7 +1731,7 @@ export default function ProfilesPage() {
 
                           <Select
                             value={entry.reasoning_effort}
-                            disabled={modelSaving}
+                            disabled={modelSaving || !fallbacksLoaded}
                             onValueChange={(value) =>
                               updateFallback(index, { reasoning_effort: value })
                             }
@@ -1745,10 +1765,10 @@ export default function ProfilesPage() {
                       onClick={() => handleSaveModel(editorName)}
                       disabled={
                         modelSaving ||
-                        !fallbacksLoaded ||
-                        fallbackEdits.some(
-                          (entry) => !entry.provider.trim() || !entry.model.trim(),
-                        ) ||
+                        (fallbacksLoaded &&
+                          fallbackEdits.some(
+                            (entry) => !entry.provider.trim() || !entry.model.trim(),
+                          )) ||
                         (modelEditChoice !== "" &&
                           (modelChoices === null ||
                             (modelChoices.length > 0 &&

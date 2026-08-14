@@ -63,7 +63,7 @@ vi.mock("@nous-research/ui/hooks/use-confirm-delete", () => ({
     isDeleting: false,
   }),
 }));
-vi.mock("react-router-dom", () => ({
+vi.mock("react-router", () => ({
   useNavigate: () => vi.fn(),
 }));
 
@@ -567,6 +567,88 @@ describe("ProfilesPage reasoning effort selector", () => {
       "model-b",
       "high",
     );
+  });
+
+  it("saves model and reasoning while the fallback chain is still loading", async () => {
+    mockedApi.getModelOptions.mockResolvedValue({
+      providers: [
+        { slug: "provider-a", name: "Provider A", models: ["model-a", "model-b"] },
+      ],
+    });
+    mockedApi.setProfileSettings.mockResolvedValue({
+      ok: true,
+      provider: "provider-a",
+      model: "model-b",
+      reasoning_effort: "high",
+    });
+    mockedApi.getProfileFallbacks.mockImplementationOnce(
+      () => new Promise<Awaited<ReturnType<typeof api.getProfileFallbacks>>>(() => {}),
+    );
+
+    await renderPage(<ProfilesPage />);
+    const actions = container.querySelector<HTMLButtonElement>("button[aria-label='Actions']");
+    await act(async () => actions!.click());
+    const changeModel = [...container.querySelectorAll<HTMLButtonElement>("[role=menuitem]")].find(
+      (button) => button.textContent?.includes("Change model"),
+    );
+    await act(async () => changeModel!.click());
+    await settle();
+
+    const selects = [...container.querySelectorAll<HTMLButtonElement>("button[role=combobox]")];
+    await chooseOption(selects[0], "Provider A · model-b");
+    await chooseOption(selects[1], "High");
+    const save = [...container.querySelectorAll<HTMLButtonElement>("button")].find(
+      (button) => button.textContent?.trim() === "Save",
+    );
+    expect(save?.disabled).toBe(false);
+    await act(async () => {
+      save!.click();
+      await Promise.resolve();
+    });
+    await settle();
+
+    expect(mockedApi.setProfileSettings).toHaveBeenCalledWith(
+      "default",
+      "provider-a",
+      "model-b",
+      "high",
+    );
+    expect(mockedApi.updateProfileFallbacks).not.toHaveBeenCalled();
+  });
+
+  it("saves model and reasoning when the fallback chain fails to load", async () => {
+    mockedApi.getProfileFallbacks.mockRejectedValueOnce(new Error("fallback endpoint unavailable"));
+    mockedApi.setProfileSettings.mockResolvedValue({
+      ok: true,
+      provider: null,
+      model: null,
+      reasoning_effort: "high",
+    });
+
+    await renderPage(<ProfilesPage />);
+    const actions = container.querySelector<HTMLButtonElement>("button[aria-label='Actions']");
+    await act(async () => actions!.click());
+    const changeModel = [...container.querySelectorAll<HTMLButtonElement>("[role=menuitem]")].find(
+      (button) => button.textContent?.includes("Change model"),
+    );
+    await act(async () => changeModel!.click());
+    await settle();
+
+    expect(container.textContent).toContain("Fallback chain could not be loaded");
+    const selects = [...container.querySelectorAll<HTMLButtonElement>("button[role=combobox]")];
+    await chooseOption(selects[1], "High");
+    const save = [...container.querySelectorAll<HTMLButtonElement>("button")].find(
+      (button) => button.textContent?.trim() === "Save",
+    );
+    expect(save?.disabled).toBe(false);
+    await act(async () => {
+      save!.click();
+      await Promise.resolve();
+    });
+    await settle();
+
+    expect(mockedApi.setProfileSettings).toHaveBeenCalledWith("default", null, null, "high");
+    expect(mockedApi.updateProfileFallbacks).not.toHaveBeenCalled();
   });
 
   it("ignores a late model save after switching to another profile editor", async () => {

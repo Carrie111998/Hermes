@@ -387,6 +387,8 @@ export const en: Translations = {
     fallbackMoveDown: "Move fallback down",
     fallbackSelect: "Select a fallback model",
     fallbackNone: "No fallback models configured",
+    fallbackLoadFailed:
+      "Fallback chain could not be loaded; model and reasoning can still be saved.",
     fallbackSaved: "Fallback chain updated",
     fallbackCustomEndpoint: "Custom endpoint retained",
     actions: "Actions",
