@@ -23,6 +23,7 @@ from typing import Any, Dict, List
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))  # .../plugins/memory
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(HERE))))  # hermes-agent root (for agent.* imports)
 
 from spine.index import MemoryIndex  # noqa: E402
 from spine import embedder  # noqa: E402
