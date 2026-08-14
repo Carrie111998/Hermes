@@ -2981,12 +2981,24 @@ def _cmd_notify_list(args: argparse.Namespace) -> int:
 
 def _cmd_notify_unsubscribe(args: argparse.Namespace) -> int:
     with kb.connect_closing() as conn:
+        notifier_profile = (
+            _profile_author()
+            if args.notifier_profile is None
+            else args.notifier_profile
+        )
         ok = kb.remove_notify_sub(
             conn, task_id=args.task_id,
-            notifier_profile=args.notifier_profile or _profile_author(),
+            notifier_profile=notifier_profile,
             platform=args.platform, chat_id=args.chat_id,
             thread_id=args.thread_id,
         )
+        if not ok and args.notifier_profile is None:
+            ok = kb.remove_notify_sub(
+                conn, task_id=args.task_id,
+                notifier_profile="",
+                platform=args.platform, chat_id=args.chat_id,
+                thread_id=args.thread_id,
+            )
     if not ok:
         print("(no such subscription)", file=sys.stderr)
         return 1

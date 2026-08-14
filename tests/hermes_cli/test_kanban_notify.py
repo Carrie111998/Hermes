@@ -1,8 +1,10 @@
+import argparse
 import asyncio
 import pytest
 
 from pathlib import Path
 from types import SimpleNamespace
+from hermes_cli import kanban as kanban_cli
 from hermes_cli import kanban_db as kb
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -128,6 +130,70 @@ def test_notify_routes_are_profile_scoped_and_cursor_updates_are_isolated(kanban
         assert refreshed["writer"]["last_event_id"] == baseline["writer"]
     finally:
         conn.close()
+
+
+def test_cli_unsubscribe_without_profile_removes_migrated_unowned_route(kanban_home, monkeypatch):
+    monkeypatch.setenv("HERMES_PROFILE_NAME", "default")
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(conn, title="legacy route")
+        kb.add_notify_sub(
+            conn,
+            task_id=task_id,
+            platform="telegram",
+            chat_id="legacy-chat",
+            notifier_profile="",
+            source_kind="legacy",
+            source_key="legacy",
+        )
+    finally:
+        conn.close()
+
+    result = kanban_cli._cmd_notify_unsubscribe(
+        argparse.Namespace(
+            task_id=task_id,
+            platform="telegram",
+            chat_id="legacy-chat",
+            thread_id=None,
+            notifier_profile=None,
+        )
+    )
+
+    assert result == 0
+    with kb.connect_closing() as conn:
+        assert kb.list_notify_subs(conn, task_id) == []
+
+
+def test_cli_unsubscribe_with_explicit_empty_profile_targets_unowned_route(kanban_home, monkeypatch):
+    monkeypatch.setenv("HERMES_PROFILE_NAME", "default")
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(conn, title="explicit legacy route")
+        kb.add_notify_sub(
+            conn,
+            task_id=task_id,
+            platform="telegram",
+            chat_id="legacy-chat",
+            notifier_profile="",
+            source_kind="legacy",
+            source_key="legacy",
+        )
+    finally:
+        conn.close()
+
+    result = kanban_cli._cmd_notify_unsubscribe(
+        argparse.Namespace(
+            task_id=task_id,
+            platform="telegram",
+            chat_id="legacy-chat",
+            thread_id=None,
+            notifier_profile="",
+        )
+    )
+
+    assert result == 0
+    with kb.connect_closing() as conn:
+        assert kb.list_notify_subs(conn, task_id) == []
 
 
 def test_home_source_coexists_with_origin_without_downgrading_or_deleting(kanban_home):

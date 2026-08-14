@@ -1,8 +1,9 @@
-import type { PluginRestOptions, PluginStorage } from '@hermes/plugin-sdk'
+import { host, type PluginRestOptions, type PluginStorage } from '@hermes/plugin-sdk'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import {
   $boardSlug,
+  $homeChannelsSupported,
   bindApi,
   fetchHomeChannels,
   homeChannelsKey,
@@ -22,6 +23,7 @@ beforeEach(() => {
     set: (key: string, value: unknown) => void values.set(key, value)
   } as PluginStorage
 
+  ;(host.state.gateway as unknown as { set(value: string): void }).set('open')
   dispose = bindApi(rest as never, storage, () => () => undefined)
   $boardSlug.set('fleet alpha')
 })
@@ -78,5 +80,14 @@ describe('home-channel API', () => {
       ['/home-channels?task_id=t_123&board=fleet+alpha', undefined],
       ['/home-channels', undefined]
     ])
+  })
+
+  it('clears cached unsupported state after reconnect even with no drawer mounted', () => {
+    $homeChannelsSupported.set(false)
+
+    ;(host.state.gateway as unknown as { set(value: string): void }).set('closed')
+    ;(host.state.gateway as unknown as { set(value: string): void }).set('open')
+
+    expect($homeChannelsSupported.get()).toBeNull()
   })
 })

@@ -9,7 +9,7 @@
  * desktop's selection never flips the server-wide current-board pointer.
  */
 
-import { atom, type PluginRestOptions, type PluginStorage, queryClient } from '@hermes/plugin-sdk'
+import { atom, host, type PluginRestOptions, type PluginStorage, queryClient } from '@hermes/plugin-sdk'
 
 import type {
   BoardMeta,
@@ -87,6 +87,18 @@ export function bindApi(r: Rest, storage: PluginStorage, socket: Socket): () => 
   rest = r
   $homeChannelsSupported.set(null)
   const unsubs: Array<() => void> = []
+  let gatewayWasOffline = host.state.gateway.get() !== 'open'
+
+  unsubs.push(
+    host.state.gateway.listen(state => {
+      if (state !== 'open') {
+        gatewayWasOffline = true
+      } else if (gatewayWasOffline) {
+        gatewayWasOffline = false
+        $homeChannelsSupported.set(null)
+      }
+    })
+  )
 
   // Hydrate an atom from storage and keep storage in sync with it.
   const persist = <T>(atom: Persisted<T>, key: string, fallback: T) => {
