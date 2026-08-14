@@ -2112,22 +2112,23 @@ def build_execute_code_schema(enabled_sandbox_tools: set = None,
         )
 
     description = (
-        "Run a Python script that calls Hermes tools programmatically. "
-        "Use when you need 3+ tool calls with logic between them: "
-        "filtering/reducing large outputs before they enter context, "
-        "conditional branching, or loops (N pages/files, retry on failure). "
-        "Use normal tool calls for single calls, results you must reason "
-        "over in full, or anything needing user interaction.\n\n"
+        "Run a Python script that calls Hermes tools programmatically. Use when you "
+        "need 3+ tool calls with processing between them, need to filter/reduce large "
+        "outputs before they enter your context, need conditional branching, or need "
+        "to loop (fetch N pages, process N files, retry on failure).\n\n"
+        "Use normal tool calls instead for: single calls with no processing, tasks "
+        "needing complex reasoning on full results, or interactive user input.\n\n"
         f"Available via `from hermes_tools import ...`:\n\n"
         f"{tool_lines}\n\n"
-        "Limits: 5-minute timeout, 50KB stdout cap, max 50 tool calls per script. "
-        "terminal() is foreground-only (no background or pty).\n\n"
+        "Limits: 5-min timeout, 50KB stdout cap, max 50 tool calls. terminal() is "
+        f"foreground-only.\n\n"
         f"{cwd_note}\n\n"
-        "Print your final result to stdout; stdlib (json, re, csv, datetime, ...) "
-        "is available for processing.\n\n"
-        "Built-in helpers (no import): json_parse(text) — tolerant json.loads for "
-        "terminal() output; shell_quote(s) — shlex.quote for dynamic shell args; "
-        "retry(fn, max_attempts=3, delay=2) — exponential backoff for transient failures."
+        "Print your final result to stdout. Use Python stdlib (json, re, math, csv, "
+        "datetime, collections) for processing.\n\n"
+        "Built into hermes_tools (no import):\n"
+        "  json_parse(text) — json.loads(strict=False); for terminal output with control chars\n"
+        "  shell_quote(s) — shlex.quote(); for interpolating dynamic strings into shell commands\n"
+        "  retry(fn, max_attempts=3, delay=2) — exponential backoff for transient failures"
     )
 
     return {

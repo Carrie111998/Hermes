@@ -1084,6 +1084,11 @@ Foreground (default): returns INSTANTLY when the command finishes, even with a h
 Background: set background=true (returns a session_id). Pair with notify_on_complete=true for bounded tasks; leave silent only for servers/daemons that never exit. Never use nohup/setsid/trailing '&' — use background=true so Hermes tracks the process. After starting a server, verify readiness with a health check, then act in a separate call; no blind sleep loops. Manage with process(action="poll"/"wait").
 Working directory: use 'workdir' for per-command cwd. When a command changes the session cwd (cd, pushd), the result includes a "cwd" field — trust it instead of prefixing every command with 'cd'.
 PTY: set pty=true for interactive CLIs (they hang without it). Pipe git output to cat if it might page.
+Do NOT use cat/head/tail (read_file), grep/rg/find (search_files), ls (search_files target='files'), sed/awk (patch), or echo/heredoc (write_file) — dedicated tools exist for all file operations. Reserve terminal for: builds, installs, git, processes, scripts, network, package managers, and anything that needs a shell. Activate virtualenvs/export setup vars once per session; don't re-source unless the shell state was reset.
+
+Foreground (default): returns INSTANTLY when done, even with high timeout. Set timeout=300 for long builds — you'll still get results in seconds if it's fast.
+Background: set background=true to get a session_id. Almost always pair with notify_on_complete=true — bg without notify runs SILENTLY. Two legitimate uses: (1) long-lived processes that never exit (servers/daemons) — silent is correct; (2) bounded long tasks (tests/builds/deploys) — MUST set notify_on_complete=true. Don't use nohup/disown/setsid/trailing '&' in foreground; use background=true so Hermes tracks lifecycle.
+After starting a server, verify readiness with a health check, then run tests in a separate call. Use process(action='poll') for progress, process(action='wait') to block until done. Use 'workdir' for per-command cwd. Set pty=true for interactive CLI tools (Codex, Claude Code, REPL). Don't use vim/nano without pty=true — they hang. Pipe git output to cat if it might page.
 """
 
 # Global state for environment lifecycle management
@@ -3782,7 +3787,7 @@ TERMINAL_SCHEMA = {
             },
             "background": {
                 "type": "boolean",
-                "description": "Run in the background, returning a session_id. Pair with notify_on_complete=true for anything with a defined end (tests, builds, deploys) — without it the process runs silently. Only servers/watchers/daemons that never exit should stay silent. Short commands: prefer foreground with a generous timeout.",
+                "description": "Run in background. Almost always pair with notify_on_complete=true — without it, the process runs silently. Legitimate uses: (1) long-lived processes that never exit (servers/daemons); (2) bounded long tasks (tests/builds/deploys) — MUST set notify_on_complete=true. For short commands, prefer foreground.",
                 "default": False
             },
             "timeout": {
@@ -3801,13 +3806,13 @@ TERMINAL_SCHEMA = {
             },
             "notify_on_complete": {
                 "type": "boolean",
-                "description": "With background=true: get exactly one notification when the process exits. The right choice for nearly every bounded long task — set it and keep working. MUTUALLY EXCLUSIVE with watch_patterns (watch_patterns is dropped when both are set).",
+                "description": "When true (and background=true), notified exactly once when the process finishes. Right choice for almost every long-running task (tests, builds, deploys, batch jobs). Keep working; the system notifies you on exit. MUTUALLY EXCLUSIVE with watch_patterns.",
                 "default": False
             },
             "watch_patterns": {
                 "type": "array",
                 "items": {"type": "string"},
-                "description": "Strings to watch for in background output. ONLY for rare one-shot mid-process signals on processes that never exit (e.g. ['Application startup complete'] on a server). NOT for end-of-run markers (use notify_on_complete) and NOT for per-iteration patterns like 'ERROR' in loops — rate-limited to 1 notification/15s; repeated over-firing auto-disables it and falls back to notify-on-exit. When in doubt, use notify_on_complete. MUTUALLY EXCLUSIVE with notify_on_complete."
+                "description": "Strings to watch for in background output. Rate limit: 1 notification per 15s per process; after 3 consecutive windows with dropped matches, auto-disabled and promoted to notify_on_complete. USE ONLY for rare one-shot signals on long-lived processes that never exit (e.g. ['Application startup complete']). DO NOT use for end-of-run markers (use notify_on_complete) or error patterns in loops (they fire every iteration). MUTUALLY EXCLUSIVE with notify_on_complete."
             }
         },
         "required": ["command"]
