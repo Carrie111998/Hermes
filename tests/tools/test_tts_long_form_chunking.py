@@ -66,10 +66,36 @@ class TestSplitTextForTts:
         assert "".join(chunks).replace(" ", "") == text
         # Every chunk boundary must follow a CJK punctuation mark
         for i, c in enumerate(chunks[1:], start=1):
-            assert chunks[i - 1][-1] in "。！？；，、：”’", (
+            assert chunks[i - 1][-1] in "。！？；，、：", (
                 f"chunk {i} does not start after CJK punctuation: "
                 f"{chunks[i - 1][-1]!r}"
             )
+
+    def test_english_smart_quotes_not_split(self):
+        """Regression (triage #84622): U+201D/U+2019 are Latin closing-quote /
+        curly-apostrophe codepoints (don’t, it’s). They must NOT be hard
+        breaks — otherwise English smart-quoted text splits mid-word into
+        'don’' + 't'."""
+        text = "I don’t think it’s wise to go. " * 6
+        chunks = _split_text_for_tts(text, 80)
+        assert all(len(c) <= 80 for c in chunks)
+        # No chunk may split a curly-apostrophe word.
+        for chunk in chunks:
+            assert "don’" not in chunk.rstrip("’") + "t" or "don’t" in chunk
+            assert "it’" not in chunk.rstrip("’") + "s" or "it’s" in chunk
+        # The words survive intact somewhere (no content loss).
+        joined = " ".join(chunks)
+        assert "don’t" in joined and "it’s" in joined
+
+    def test_cjk_closing_quote_still_breaks_via_preceding_punct(self):
+        """A Chinese closing quote at sentence end is preceded by 。/！/？,
+        so removing ”’ from the hard-break class does not break CJK
+        chunking (triage #84622)."""
+        text = "他说：“你好。”然后他走了。她说“再见”！"
+        chunks = _split_text_for_tts(text, 20)
+        assert "".join(chunks).replace(" ", "") == text.replace(" ", "")
+        # Still splits into multiple chunks (the 。/！ breaks remain).
+        assert len(chunks) >= 2
 
     def test_chinese_short_sentence_stays_whole(self):
         text = "今天天气不错，适合散步。"
