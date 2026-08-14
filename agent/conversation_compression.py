@@ -64,7 +64,7 @@ import uuid
 import threading
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple, cast
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from agent.auxiliary_client import AuxiliaryExplicitCancellation
 from agent.context_engine import (
@@ -75,17 +75,6 @@ from agent.model_metadata import estimate_request_tokens_rough
 from agent.session_activity import ActivityProvenance, normalize_activity_provenance
 
 logger = logging.getLogger(__name__)
-
-# Keep this value aligned with run_agent._DB_PERSISTED_MARKER without importing
-# run_agent here (which would create a compression/runtime import cycle).
-_DB_PERSISTED_MARKER = "_db_persisted"
-
-
-def _mark_durable_messages(messages: List[Dict[str, Any]]) -> None:
-    """Mark DB-loaded recovery rows intrinsically; never retain raw id()s."""
-    for message in messages:
-        if isinstance(message, dict):
-            message[_DB_PERSISTED_MARKER] = True
 
 # Terminal compression outcomes published by host/hygiene timeout or cooldown
 # writers. Detached heartbeat workers must not clobber these back to
@@ -1215,16 +1204,17 @@ def compression_skipped_due_to_lock(agent: Any) -> bool:
     return _sig is True or isinstance(_sig, str)
 
 
-CompressionSessionRecovery = Tuple[
-    str, Dict[str, Any], List[Dict[str, Any]]
-]
-
-
-def _resolve_live_compression_child(
+def _adopt_live_compression_child(
+    agent: Any,
     session_db: Any,
     parent_session_id: str,
-) -> Optional[Tuple[Dict[str, Any], List[Dict[str, Any]]]]:
-    """Resolve and load a unique durable child without mutating the agent."""
+) -> Optional[List[Dict[str, Any]]]:
+    """Move a stale compression contender onto the unique durable child.
+
+    Resolve and load first, then mutate the live agent. This ordering keeps the
+    stale contender fail-closed when lineage is ambiguous or the compacted
+    handoff cannot be read.
+    """
     finder = getattr(type(session_db), "find_live_compression_child", None)
     loader = getattr(type(session_db), "get_messages_as_conversation", None)
     if not callable(finder) or not callable(loader):
@@ -1241,23 +1231,7 @@ def _resolve_live_compression_child(
     confirmed = finder(session_db, parent_session_id)
     if not confirmed or str(confirmed.get("id") or "") != child_session_id:
         return None
-    return cast(Dict[str, Any], child), cast(List[Dict[str, Any]], recovered)
 
-
-def _commit_live_compression_child_adoption(
-    agent: Any,
-    session_db: Any,
-    parent_session_id: str,
-    child: Dict[str, Any],
-    recovered: List[Dict[str, Any]],
-    *,
-    guard_first_write: bool = False,
-) -> List[Dict[str, Any]]:
-    """Bind an existing tip, optionally guarding its first durable write."""
-    child_session_id = str(child["id"])
-    lineage_parent_session_id = str(
-        child.get("parent_session_id") or parent_session_id
-    )
     agent.session_id = child_session_id
     try:
         from gateway.session_context import set_current_session_id
@@ -1277,28 +1251,17 @@ def _commit_live_compression_child_adoption(
         agent._cached_system_prompt = child["system_prompt"]
     agent._last_flushed_db_idx = len(recovered)
     agent._flushed_db_message_session_id = child_session_id
-    _mark_durable_messages(recovered)
-    agent._flushed_db_message_ids = set()
-    # Turn-start and compression-race adoption happen before this process has
-    # durably written on the existing tip. Keep the stale root paired with the
-    # adopted tip until that first append revalidates the whole lineage inside
-    # its write transaction. A final-flush adoption reaches this helper only
-    # after its guarded retry committed, so it clears any older pending guard.
-    agent._pending_compression_lineage_guards = (
-        {child_session_id: parent_session_id} if guard_first_write else {}
-    )
+    agent._flushed_db_message_ids = {
+        id(message) for message in recovered if isinstance(message, dict)
+    }
 
     on_session_start = getattr(agent.context_compressor, "on_session_start", None)
     if callable(on_session_start):
         try:
             on_session_start(
                 child_session_id,
-                # The tip already existed and may have accumulated newer
-                # counters/cooldowns. Bind it like a resume; replaying the
-                # fresh-child compression lifecycle would copy parent state
-                # over authoritative tip state.
-                boundary_reason="resume",
-                old_session_id=lineage_parent_session_id,
+                boundary_reason="compression",
+                old_session_id=parent_session_id,
                 session_db=session_db,
                 platform=getattr(agent, "platform", None) or "cli",
                 conversation_id=getattr(agent, "_gateway_session_key", None),
@@ -1316,7 +1279,7 @@ def _commit_live_compression_child_adoption(
         if agent._memory_manager:
             agent._memory_manager.on_session_switch(
                 child_session_id,
-                parent_session_id=lineage_parent_session_id,
+                parent_session_id=parent_session_id,
                 reset=False,
                 reason="compression",
             )
@@ -1326,53 +1289,13 @@ def _commit_live_compression_child_adoption(
     return recovered
 
 
-def _adopt_live_compression_child(
+def recover_rotated_compression_session(
     agent: Any,
-    session_db: Any,
-    parent_session_id: str,
 ) -> Optional[List[Dict[str, Any]]]:
-    """Move a stale compression contender onto the unique durable child.
-
-    Resolve and load first, then mutate the live agent. This ordering keeps the
-    stale contender fail-closed when lineage is ambiguous or the compacted
-    handoff cannot be read.
-    """
-    pending_guards = getattr(agent, "_pending_compression_lineage_guards", {})
-    lineage_root = (
-        str(pending_guards.get(parent_session_id) or parent_session_id)
-        if isinstance(pending_guards, dict)
-        else parent_session_id
-    )
-    resolved = _resolve_live_compression_child(session_db, lineage_root)
-    if resolved is None:
-        return None
-    child, recovered = resolved
-    return _commit_live_compression_child_adoption(
-        agent,
-        session_db,
-        lineage_root,
-        child,
-        recovered,
-        guard_first_write=True,
-    )
-
-
-def prepare_rotated_compression_session(
-    agent: Any,
-    *,
-    lineage_root: Optional[str] = None,
-) -> Optional[CompressionSessionRecovery]:
-    """Resolve a stale agent's continuation without mutating live agent state."""
+    """Recover a stale live agent before a new turn writes to its old parent."""
     session_db = getattr(agent, "_session_db", None)
-    current_session_id = getattr(agent, "session_id", None) or ""
-    pending_guards = getattr(agent, "_pending_compression_lineage_guards", {})
-    pending_root = (
-        pending_guards.get(current_session_id)
-        if isinstance(pending_guards, dict)
-        else None
-    )
-    session_id = str(lineage_root or pending_root or current_session_id)
-    if session_db is None or not current_session_id or not session_id:
+    session_id = getattr(agent, "session_id", None) or ""
+    if session_db is None or not session_id:
         return None
     try:
         if not _session_was_rotated_by_compression(session_db, session_id):
@@ -1382,10 +1305,9 @@ def prepare_rotated_compression_session(
         # observing the intentional parent-ended/child-empty intermediate state.
         holder_getter = getattr(session_db, "get_compression_lock_holder", None)
         for attempt in range(21):
-            resolved = _resolve_live_compression_child(session_db, session_id)
-            if resolved is not None:
-                child, recovered = resolved
-                return session_id, child, recovered
+            recovered = _adopt_live_compression_child(agent, session_db, session_id)
+            if recovered is not None:
+                return recovered
             holder = holder_getter(session_id) if callable(holder_getter) else None
             if not holder or attempt == 20:
                 if not holder:
@@ -1414,63 +1336,8 @@ def prepare_rotated_compression_session(
         return None
     except Exception as exc:
         logger.warning(
-            "compression session recovery preparation failed for session=%s "
-            "(%s: %s)",
-            session_id,
-            type(exc).__name__,
-            exc,
-        )
-        return None
-
-
-def commit_rotated_compression_session(
-    agent: Any,
-    recovery: CompressionSessionRecovery,
-    *,
-    expected_current_session_id: Optional[str] = None,
-    guard_first_write: bool = False,
-) -> List[Dict[str, Any]]:
-    """Commit adoption, optionally guarding the adopted tip's first write."""
-    session_db = getattr(agent, "_session_db", None)
-    parent_session_id, child, recovered = recovery
-    current_session_id = getattr(agent, "session_id", None) or ""
-    expected_session_id = expected_current_session_id or parent_session_id
-    if session_db is None or current_session_id != expected_session_id:
-        raise RuntimeError(
-            "compression recovery target changed before in-memory adoption"
-        )
-    if not child.get("id"):
-        raise RuntimeError("compression recovery child has no session id")
-    return _commit_live_compression_child_adoption(
-        agent,
-        session_db,
-        parent_session_id,
-        child,
-        recovered,
-        guard_first_write=guard_first_write,
-    )
-
-
-def recover_rotated_compression_session(
-    agent: Any,
-) -> Optional[List[Dict[str, Any]]]:
-    """Recover a stale live agent before a new turn writes to its old parent."""
-    current_session_id = getattr(agent, "session_id", None) or ""
-    recovery = prepare_rotated_compression_session(agent)
-    if recovery is None:
-        return None
-    parent_session_id = recovery[0]
-    try:
-        return commit_rotated_compression_session(
-            agent,
-            recovery,
-            expected_current_session_id=current_session_id,
-            guard_first_write=True,
-        )
-    except Exception as exc:
-        logger.warning(
             "compression session recovery failed for session=%s (%s: %s)",
-            parent_session_id,
+            session_id,
             type(exc).__name__,
             exc,
         )
@@ -3424,38 +3291,13 @@ def compress_context(
                         PROACTIVE_PRUNE_REARM_MODEL_CONFIG_KEY,
                     )
 
-                    _pending_lineage_guards = getattr(
-                        agent,
-                        "_pending_compression_lineage_guards",
-                        {},
-                    )
-                    _pending_lineage_root = (
-                        str(
-                            _pending_lineage_guards.get(agent.session_id)
-                            or ""
-                        )
-                        if isinstance(_pending_lineage_guards, dict)
-                        else ""
-                    )
-                    _lineage_kwargs: Dict[str, Any] = (
-                        {"compression_lineage_root": _pending_lineage_root}
-                        if _pending_lineage_root
-                        else {}
-                    )
                     agent._session_db.archive_and_compact(
                         agent.session_id,
                         compressed,
                         model_config_patch={
                             PROACTIVE_PRUNE_REARM_MODEL_CONFIG_KEY: None,
                         },
-                        **_lineage_kwargs,
                     )
-                    if (
-                        _pending_lineage_root
-                        and _pending_lineage_guards.get(agent.session_id)
-                        == _pending_lineage_root
-                    ):
-                        _pending_lineage_guards.pop(agent.session_id, None)
                     split_status = "in_place_committed"
                     # Reset the flush identity set so the next turn's appends are
                     # diffed against the COMPACTED transcript: the compacted dicts
@@ -3518,21 +3360,6 @@ def compress_context(
                         f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_"
                         f"{uuid.uuid4().hex[:6]}"
                     )
-                    _pending_lineage_guards = getattr(
-                        agent,
-                        "_pending_compression_lineage_guards",
-                        {},
-                    )
-                    _pending_lineage_root = (
-                        str(_pending_lineage_guards.get(old_session_id) or "")
-                        if isinstance(_pending_lineage_guards, dict)
-                        else ""
-                    )
-                    _lineage_kwargs: Dict[str, Any] = (
-                        {"compression_lineage_root": _pending_lineage_root}
-                        if _pending_lineage_root
-                        else {}
-                    )
                     agent._session_db.publish_compression_child(
                         parent_session_id=old_session_id,
                         child_session_id=new_session_id,
@@ -3546,14 +3373,7 @@ def compress_context(
                         profile_name=_profile_for_child,
                         compression_lock_holder=_lock_holder,
                         require_compression_lease=_lock_holder is not None,
-                        **_lineage_kwargs,
                     )
-                    if (
-                        _pending_lineage_root
-                        and _pending_lineage_guards.get(old_session_id)
-                        == _pending_lineage_root
-                    ):
-                        _pending_lineage_guards.pop(old_session_id, None)
                     agent.session_id = new_session_id
                     try:
                         from gateway.session_context import set_current_session_id

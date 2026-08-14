@@ -2284,87 +2284,13 @@ class AIAgent:
             # re-writes the whole tail (same recovery contract as before,
             # minus the partial-prefix case that could double-pay counters).
             if _batch_rows:
-                _pending_lineage_guards = getattr(
-                    self,
-                    "_pending_compression_lineage_guards",
-                    {},
+                self._session_db.append_messages_batch(
+                    session_id=self.session_id,
+                    messages=_batch_rows,
+                    compression_lock_holder=getattr(
+                        self, "_active_compression_lock_holder", None
+                    ),
                 )
-                _pending_lineage_root = (
-                    str(_pending_lineage_guards.get(self.session_id) or "")
-                    if isinstance(_pending_lineage_guards, dict)
-                    else ""
-                )
-                _lineage_kwargs: Dict[str, Any] = (
-                    {"compression_lineage_root": _pending_lineage_root}
-                    if _pending_lineage_root
-                    else {}
-                )
-                try:
-                    self._session_db.append_messages_batch(
-                        session_id=self.session_id,
-                        messages=_batch_rows,
-                        compression_lock_holder=getattr(
-                            self, "_active_compression_lock_holder", None
-                        ),
-                        **_lineage_kwargs,
-                    )
-                    if (
-                        _pending_lineage_root
-                        and _pending_lineage_guards.get(self.session_id)
-                        == _pending_lineage_root
-                    ):
-                        _pending_lineage_guards.pop(self.session_id, None)
-                except Exception as append_exc:
-                    # A long-running turn can publish its compression child and
-                    # still reach this final flush through a stale Agent path.
-                    # The batch writer rejects the ended parent before inserting
-                    # any rows. Adopt only the unique durable continuation, then
-                    # retry the same all-or-nothing batch exactly once.
-                    from hermes_state import CompressionSessionClosedError
-
-                    if not isinstance(append_exc, CompressionSessionClosedError):
-                        raise
-                    stale_session_id = self.session_id
-                    lineage_root = _pending_lineage_root or stale_session_id
-                    from agent.conversation_compression import (
-                        commit_rotated_compression_session,
-                        prepare_rotated_compression_session,
-                    )
-
-                    recovery = prepare_rotated_compression_session(
-                        self,
-                        lineage_root=lineage_root,
-                    )
-                    if recovery is None:
-                        raise
-                    recovery_parent, recovery_child, _ = recovery
-                    candidate_session_id = str(recovery_child.get("id") or "")
-                    if (
-                        recovery_parent != lineage_root
-                        or not candidate_session_id
-                        or candidate_session_id == stale_session_id
-                    ):
-                        raise
-                    self._session_db.append_messages_batch(
-                        session_id=candidate_session_id,
-                        messages=_batch_rows,
-                        compression_lock_holder=getattr(
-                            self, "_active_compression_lock_holder", None
-                        ),
-                        compression_lineage_root=lineage_root,
-                    )
-                    commit_rotated_compression_session(
-                        self,
-                        recovery,
-                        expected_current_session_id=stale_session_id,
-                    )
-                    logger.info(
-                        "Final session flush adopted compression continuation "
-                        "%s -> %s",
-                        stale_session_id,
-                        self.session_id,
-                    )
-                self._flushed_db_message_session_id = self.session_id
                 for _written in _batch_msgs:
                     _written[_DB_PERSISTED_MARKER] = True
             # The intrinsic markers are now the sole source of truth. Reset the

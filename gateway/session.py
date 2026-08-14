@@ -10,6 +10,7 @@ Handles:
 
 import asyncio
 import hashlib
+import inspect
 import logging
 import os
 import json
@@ -3624,10 +3625,10 @@ class SessionStore:
                     child_id = str(child["id"]) if child and child.get("id") else ""
                     if child_id:
                         try:
-                            self._append_transcript_message(
+                            self._append_rerouted_transcript_message(
                                 child_id,
                                 msg,
-                                compression_lineage_root=session_id,
+                                source_session_id=session_id,
                             )
                         except Exception as reroute_exc:
                             exc = reroute_exc
@@ -3737,6 +3738,40 @@ class SessionStore:
             seen.add(session_id)
             session_id = reroutes[session_id]
         return session_id
+
+    def _append_rerouted_transcript_message(
+        self,
+        target_session_id: str,
+        message: Dict[str, Any],
+        *,
+        source_session_id: str,
+    ) -> None:
+        """Append a stale-source retry with legacy-test compatibility."""
+        append = self._append_transcript_message
+        try:
+            parameters = inspect.signature(append).parameters
+        except (TypeError, ValueError):
+            parameters = {}
+        supports_lineage = "compression_lineage_root" in parameters or any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters.values()
+        )
+        if supports_lineage:
+            append(
+                target_session_id,
+                message,
+                compression_lineage_root=source_session_id,
+            )
+            return
+
+        # Production SessionDB exposes durable readers, so a stale-source
+        # append must retain its transactional lineage guard. Only legacy
+        # non-durable test/store substitutes may use the pre-guard signature.
+        if callable(getattr(self._db, "get_session", None)):
+            raise RuntimeError(
+                "Transcript append override lacks compression_lineage_root"
+            )
+        append(target_session_id, message)
 
     def _drain_spooled_drops_for_target(self, target_session_id: str) -> bool:
         """Globally merge all older source spools before queued target rows."""

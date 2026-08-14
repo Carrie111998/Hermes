@@ -139,6 +139,46 @@ class TestSpoolOnDrop:
             {"session_id": "live", "role": "assistant", "content": "ordinary"}
         ]
 
+    def test_rerouted_append_preserves_nondurable_strict_override(self):
+        store = _make_store(SimpleNamespace())
+        rows = []
+
+        def append(session_id, message):
+            rows.append((session_id, message["content"]))
+
+        store.__dict__["_append_transcript_message"] = append
+        store._append_rerouted_transcript_message(
+            "child",
+            {"role": "assistant", "content": "routed"},
+            source_session_id="root",
+        )
+
+        assert rows == [("child", "routed")]
+
+    def test_rerouted_append_requires_lineage_support_for_durable_db(self):
+        class DurableDb:
+            def get_session(self, session_id):
+                return {"id": session_id}
+
+        store = _make_store(DurableDb())
+        rows = []
+
+        def append(session_id, message):
+            rows.append((session_id, message["content"]))
+
+        store.__dict__["_append_transcript_message"] = append
+        with pytest.raises(
+            RuntimeError,
+            match="override lacks compression_lineage_root",
+        ):
+            store._append_rerouted_transcript_message(
+                "child",
+                {"role": "assistant", "content": "blocked"},
+                source_session_id="root",
+            )
+
+        assert rows == []
+
     def test_drop_spool_drain_roundtrip(self, spool_home, caplog, monkeypatch):
         # Small cap so the test stays fast.
         monkeypatch.setattr(SessionStore, "_MAX_PENDING_PER_SESSION", 5)
