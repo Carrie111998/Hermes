@@ -45,6 +45,10 @@ from agent.turn_context import (
     reanchor_current_turn_user_idx,
 )
 from agent.turn_retry_state import TurnRetryState
+from agent.provider_attempt import (
+    ProviderAttemptProvenance,
+    _begin_provider_attempt,
+)
 from agent.runtime_cwd import resolve_agent_cwd
 from agent.message_sanitization import (
     close_interrupted_tool_sequence,
@@ -97,6 +101,37 @@ from tools.skill_provenance import set_current_write_origin
 from utils import base_url_host_matches, env_var_enabled
 
 logger = logging.getLogger(__name__)
+
+
+def _issue_provider_attempt_from_agent(
+    agent,
+    *,
+    effective_task_id: str,
+    turn_id: str,
+    api_request_id: str,
+    attempt_index: int,
+    retry_count: int,
+) -> ProviderAttemptProvenance:
+    """Issue provenance from Hermes-owned loop/agent state only."""
+    fallback_used = getattr(agent, "_fallback_activated", None)
+    fallback_generation = getattr(agent, "_fallback_generation", None)
+    if not isinstance(fallback_used, bool):
+        raise RuntimeError("Hermes fallback state is unavailable")
+    if not isinstance(fallback_generation, int):
+        raise RuntimeError("Hermes fallback generation is unavailable")
+    return _begin_provider_attempt(
+        session_id=str(agent.session_id or ""),
+        task_id=str(effective_task_id or ""),
+        turn_id=str(turn_id or ""),
+        api_request_id=api_request_id,
+        attempt_index=attempt_index,
+        retry_count=retry_count,
+        provider=str(agent.provider or ""),
+        request_model=str(agent.model or ""),
+        fallback_used=fallback_used,
+        fallback_generation=fallback_generation,
+        fallback_reason=getattr(agent, "_fallback_reason", None),
+    )
 
 
 # Scaffold marker used by _apply_active_turn_redirect and the ghost-row filter
@@ -2504,6 +2539,9 @@ def run_conversation(
         api_kwargs = None  # Guard against UnboundLocalError in except handler
         api_request_id = f"{turn_id}:api:{api_call_count}"
         agent._current_api_request_id = api_request_id
+        provider_attempt_index = 0
+        provider_attempt: ProviderAttemptProvenance | None = None
+        successful_provider_attempt: ProviderAttemptProvenance | None = None
 
         while retry_count < max_retries:
             # ── Nous Portal rate limit guard ──────────────────────
@@ -2559,6 +2597,19 @@ def run_conversation(
 
             try:
                 agent._reset_stream_delivery_tracking()
+                # Issue the attempt identity from the Hermes provider loop,
+                # before lifecycle observers run.  The logical api_request_id
+                # is shared by retries; provider_attempt_id is not.
+                provider_attempt = _issue_provider_attempt_from_agent(
+                    agent,
+                    effective_task_id=effective_task_id,
+                    turn_id=turn_id,
+                    api_request_id=api_request_id,
+                    attempt_index=provider_attempt_index,
+                    retry_count=retry_count,
+                )
+                provider_attempt_index += 1
+                agent._current_provider_attempt = provider_attempt
                 # api_messages is built once, before this retry loop, while the
                 # primary provider is active.  A mid-conversation fallback can
                 # switch to a require-side provider (DeepSeek / Kimi / MiMo) that
@@ -2699,9 +2750,104 @@ def run_conversation(
                             started_at=api_start_time,
                             middleware_trace=list(_llm_middleware_trace),
                             request=_request_payload,
+                            runtime_instance_id=(
+                                provider_attempt.runtime_instance_id
+                                if provider_attempt is not None
+                                else ""
+                            ),
+                            provider_attempt_observer=(
+                                provider_attempt.as_dict()
+                                if provider_attempt is not None
+                                else None
+                            ),
+                            provider_attempt_id=(
+                                provider_attempt.provider_attempt_id
+                                if provider_attempt is not None
+                                else ""
+                            ),
+                            attempt_index=(
+                                provider_attempt.attempt_index
+                                if provider_attempt is not None
+                                else None
+                            ),
+                            fallback_used=(
+                                provider_attempt.fallback_used
+                                if provider_attempt is not None
+                                else None
+                            ),
+                            fallback_generation=(
+                                provider_attempt.fallback_generation
+                                if provider_attempt is not None
+                                else None
+                            ),
+                            fallback_reason=(
+                                provider_attempt.fallback_reason
+                                if provider_attempt is not None
+                                else None
+                            ),
+                            request_model=(
+                                provider_attempt.request_model
+                                if provider_attempt is not None
+                                else ""
+                            ),
                         )
                 except Exception:
                     pass
+
+                def _emit_stream_retry_pre_hook(attempt):
+                    """Register a lower-layer stream retry before its wire call."""
+                    try:
+                        from hermes_cli.lifecycle import (
+                            has_hook,
+                            invoke_hook as _invoke_hook,
+                        )
+
+                        if not has_hook("pre_api_request"):
+                            return
+                        request_messages = api_kwargs.get("messages")
+                        if not isinstance(request_messages, list):
+                            request_messages = api_kwargs.get("input")
+                        if not isinstance(request_messages, list):
+                            request_messages = api_messages
+                        _invoke_hook(
+                            "pre_api_request",
+                            task_id=effective_task_id,
+                            turn_id=turn_id,
+                            api_request_id=api_request_id,
+                            session_id=agent.session_id or "",
+                            user_message=original_user_message,
+                            conversation_history=list(messages),
+                            platform=agent.platform or "",
+                            model=agent.model,
+                            provider=agent.provider,
+                            base_url=agent.base_url,
+                            api_mode=agent.api_mode,
+                            api_call_count=api_call_count,
+                            retry_count=retry_count,
+                            request_messages=list(request_messages)
+                            if isinstance(request_messages, list)
+                            else [],
+                            message_count=len(api_messages),
+                            tool_count=len(agent.tools or []),
+                            approx_input_tokens=approx_tokens,
+                            request_char_count=total_chars,
+                            max_tokens=agent.max_tokens,
+                            started_at=api_start_time,
+                            middleware_trace=list(_llm_middleware_trace),
+                            request=agent._api_request_payload_for_hook(api_kwargs),
+                            runtime_instance_id=attempt.runtime_instance_id,
+                            provider_attempt_observer=attempt.as_dict(),
+                            provider_attempt_id=attempt.provider_attempt_id,
+                            attempt_index=attempt.attempt_index,
+                            fallback_used=attempt.fallback_used,
+                            fallback_generation=attempt.fallback_generation,
+                            fallback_reason=attempt.fallback_reason,
+                            request_model=attempt.request_model,
+                        )
+                    except Exception:
+                        # Lifecycle observers are non-authoritative and must
+                        # never change provider-call behavior.
+                        pass
 
                 if env_var_enabled("HERMES_DUMP_REQUESTS"):
                     agent._dump_api_request_debug(api_kwargs, reason="preflight")
@@ -2766,6 +2912,22 @@ def run_conversation(
                     if isinstance(getattr(agent, "client", None), Mock):
                         _use_streaming = False
 
+                def _issue_stream_retry_attempt():
+                    """Issue and register the next physical stream execution."""
+                    nonlocal provider_attempt, provider_attempt_index
+                    provider_attempt = _issue_provider_attempt_from_agent(
+                        agent,
+                        effective_task_id=effective_task_id,
+                        turn_id=turn_id,
+                        api_request_id=api_request_id,
+                        attempt_index=provider_attempt_index,
+                        retry_count=retry_count,
+                    )
+                    provider_attempt_index += 1
+                    agent._current_provider_attempt = provider_attempt
+                    _emit_stream_retry_pre_hook(provider_attempt)
+                    return provider_attempt
+
                 def _perform_api_call(next_api_kwargs):
                     if agent.api_mode == "codex_responses":
                         next_api_kwargs = agent._get_transport().preflight_kwargs(
@@ -2776,19 +2938,32 @@ def run_conversation(
                         )
                     if _use_streaming:
                         return agent._interruptible_streaming_api_call(
-                            next_api_kwargs, on_first_delta=_stop_spinner
+                            next_api_kwargs,
+                            on_first_delta=_stop_spinner,
+                            issue_provider_attempt=_issue_stream_retry_attempt,
                         )
                     from agent import relay_llm
 
+                    def _execute_provider_call(request):
+                        return agent._interruptible_api_call(
+                            request,
+                            issue_provider_attempt=_issue_stream_retry_attempt,
+                        )
+
                     return relay_llm.execute(
                         next_api_kwargs,
-                        agent._interruptible_api_call,
+                        _execute_provider_call,
                         session_id=str(agent.session_id or ""),
                         name=str(agent.provider or "provider"),
                         model_name=str(agent.model or ""),
                         metadata={
                             "api_mode": agent.api_mode,
                             "api_request_id": api_request_id,
+                            "provider_attempt_id": provider_attempt.provider_attempt_id,
+                            "attempt_index": provider_attempt.attempt_index,
+                            "fallback_used": provider_attempt.fallback_used,
+                            "fallback_generation": provider_attempt.fallback_generation,
+                            "fallback_reason": provider_attempt.fallback_reason,
                             "call_role": (
                                 "delegated"
                                 if getattr(agent, "is_subagent", False)
@@ -2820,6 +2995,11 @@ def run_conversation(
                         task_id=effective_task_id,
                         turn_id=turn_id,
                         api_request_id=api_request_id,
+                        provider_attempt_id=provider_attempt.provider_attempt_id,
+                        attempt_index=provider_attempt.attempt_index,
+                        fallback_used=provider_attempt.fallback_used,
+                        fallback_generation=provider_attempt.fallback_generation,
+                        fallback_reason=provider_attempt.fallback_reason,
                         session_id=agent.session_id or "",
                         platform=agent.platform or "",
                         model=agent.model,
@@ -5849,6 +6029,7 @@ def run_conversation(
                         _retry.has_retried_429 = False
                         agent._fallback_index = 0
                         agent._fallback_activated = False
+                        agent._fallback_reason = None
                         continue
                     # Try fallback before giving up entirely
                     if agent._has_pending_fallback():
@@ -6259,6 +6440,18 @@ def run_conversation(
                     )
                     _assistant_text = assistant_message.content or ""
                     _api_ended_at = api_start_time + api_duration
+                    if provider_attempt is not None:
+                        provider_attempt = provider_attempt.complete(
+                            response_model=getattr(response, "model", None),
+                            outcome="success",
+                            ended_at=_api_ended_at,
+                        )
+                        successful_provider_attempt = provider_attempt
+                        agent._current_provider_attempt = provider_attempt
+                        # Keep provenance attached to this exact response
+                        # object.  Tool dispatch below receives this object,
+                        # never a later mutable agent snapshot.
+                        assistant_message._hermes_provider_attempt = provider_attempt
                     _invoke_hook(
                         "post_api_request",
                         task_id=effective_task_id,
@@ -6287,6 +6480,56 @@ def run_conversation(
                         assistant_content_chars=len(_assistant_text),
                         assistant_tool_call_count=len(_assistant_tool_calls),
                         moa_references=_moa_reference_metrics_for_hook(agent),
+                        runtime_instance_id=(
+                            provider_attempt.runtime_instance_id
+                            if provider_attempt is not None
+                            else ""
+                        ),
+                        provider_attempt_observer=(
+                            provider_attempt.as_dict()
+                            if provider_attempt is not None
+                            else None
+                        ),
+                        provider_attempt_id=(
+                            provider_attempt.provider_attempt_id
+                            if provider_attempt is not None
+                            else ""
+                        ),
+                        attempt_index=(
+                            provider_attempt.attempt_index
+                            if provider_attempt is not None
+                            else None
+                        ),
+                        retry_count_snapshot=(
+                            provider_attempt.retry_count
+                            if provider_attempt is not None
+                            else None
+                        ),
+                        fallback_used=(
+                            provider_attempt.fallback_used
+                            if provider_attempt is not None
+                            else None
+                        ),
+                        fallback_generation=(
+                            provider_attempt.fallback_generation
+                            if provider_attempt is not None
+                            else None
+                        ),
+                        fallback_reason=(
+                            provider_attempt.fallback_reason
+                            if provider_attempt is not None
+                            else None
+                        ),
+                        request_model=(
+                            provider_attempt.request_model
+                            if provider_attempt is not None
+                            else ""
+                        ),
+                        outcome=(
+                            provider_attempt.outcome
+                            if provider_attempt is not None
+                            else "unknown"
+                        ),
                     )
             except Exception:
                 pass
@@ -6912,7 +7155,13 @@ def run_conversation(
                     except Exception:
                         pass
 
-                agent._execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count)
+                agent._execute_tool_calls(
+                    assistant_message,
+                    messages,
+                    effective_task_id,
+                    api_call_count,
+                    provider_attempt=successful_provider_attempt,
+                )
 
                 if getattr(agent, "_incremental_persistence_failed", False):
                     # A tool result could not be made canonical. Do not send

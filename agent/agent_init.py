@@ -1333,6 +1333,11 @@ def init_agent(
                             agent.provider = _fb["provider"]
                             agent.model = _fb_model or _fb["model"]
                             agent._fallback_activated = True
+                            agent._fallback_generation = (
+                                int(getattr(agent, "_fallback_generation", 0) or 0)
+                                + 1
+                            )
+                            agent._fallback_reason = "initial_primary_unavailable"
                             client_kwargs = {
                                 "api_key": _fb_client.api_key,
                                 "base_url": str(_fb_client.base_url),
@@ -1467,6 +1472,10 @@ def init_agent(
         agent._fallback_chain = []
     agent._fallback_index = 0
     agent._fallback_activated = getattr(agent, "_fallback_activated", False)
+    agent._fallback_generation = int(
+        getattr(agent, "_fallback_generation", 0) or 0
+    )
+    agent._fallback_reason = getattr(agent, "_fallback_reason", None)
     # Legacy attribute kept for backward compat (tests, external callers)
     agent._fallback_model = agent._fallback_chain[0] if agent._fallback_chain else None
     if agent._fallback_chain and not agent.quiet_mode:

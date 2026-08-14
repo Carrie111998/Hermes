@@ -47,6 +47,8 @@ import threading
 import uuid
 import warnings
 from typing import List, Dict, Any, Optional, Callable
+
+from agent.provider_attempt import ProviderAttemptProvenance
 # NOTE: `from openai import OpenAI` is deliberately NOT at module top — the
 # SDK pulls ~240 ms of imports. We expose `OpenAI` as a thin proxy object
 # that imports the SDK on first call/isinstance check. This preserves:
@@ -5374,10 +5376,23 @@ class AIAgent:
                 exc,
             )
 
-    def _run_codex_stream(self, api_kwargs: dict, client: Any = None, on_first_delta: callable = None):
+    def _run_codex_stream(
+        self,
+        api_kwargs: dict,
+        client: Any = None,
+        on_first_delta=None,
+        issue_provider_attempt=None,
+    ):
         """Forwarder — see ``agent.codex_runtime.run_codex_stream``."""
         from agent.codex_runtime import run_codex_stream
-        return run_codex_stream(self, api_kwargs, client, on_first_delta)
+
+        return run_codex_stream(
+            self,
+            api_kwargs,
+            client,
+            on_first_delta,
+            issue_provider_attempt=issue_provider_attempt,
+        )
 
     def _run_codex_create_stream_fallback(self, api_kwargs: dict, client: Any = None):
         """Forwarder — see ``agent.codex_runtime.run_codex_create_stream_fallback``."""
@@ -6166,10 +6181,20 @@ class AIAgent:
                 drop_context_1m_beta=_drop_1m,
             )
 
-    def _interruptible_api_call(self, api_kwargs: dict):
+    def _interruptible_api_call(
+        self,
+        api_kwargs: dict,
+        *,
+        issue_provider_attempt=None,
+    ):
         """Forwarder — see ``agent.chat_completion_helpers.interruptible_api_call``."""
         from agent.chat_completion_helpers import interruptible_api_call
-        return interruptible_api_call(self, api_kwargs)
+
+        return interruptible_api_call(
+            self,
+            api_kwargs,
+            issue_provider_attempt=issue_provider_attempt,
+        )
 
     # ── Unified streaming API call ─────────────────────────────────────────
 
@@ -6657,11 +6682,21 @@ class AIAgent:
         )
 
     def _interruptible_streaming_api_call(
-        self, api_kwargs: dict, *, on_first_delta: callable = None
+        self,
+        api_kwargs: dict,
+        *,
+        on_first_delta: callable = None,
+        issue_provider_attempt=None,
     ):
         """Forwarder — see ``agent.chat_completion_helpers.interruptible_streaming_api_call``."""
         from agent.chat_completion_helpers import interruptible_streaming_api_call
-        return interruptible_streaming_api_call(self, api_kwargs, on_first_delta=on_first_delta)
+
+        return interruptible_streaming_api_call(
+            self,
+            api_kwargs,
+            on_first_delta=on_first_delta,
+            issue_provider_attempt=issue_provider_attempt,
+        )
 
     def _try_activate_fallback(self, reason: "FailoverReason | None" = None) -> bool:
         """Forwarder — see ``agent.chat_completion_helpers.try_activate_fallback``."""
@@ -7845,7 +7880,15 @@ class AIAgent:
         self._set_tool_guardrail_halt(decision)
         return toolguard_synthetic_result(decision)
 
-    def _execute_tool_calls(self, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0) -> None:
+    def _execute_tool_calls(
+        self,
+        assistant_message,
+        messages: list,
+        effective_task_id: str,
+        api_call_count: int = 0,
+        *,
+        provider_attempt: Optional[ProviderAttemptProvenance] = None,
+    ) -> None:
         """Execute tool calls from the assistant message and append results to messages.
 
         The segment planner splits the batch into maximal contiguous runs of
@@ -7860,6 +7903,10 @@ class AIAgent:
 
         # Allow _vprint during tool execution even with stream consumers
         self._executing_tools = True
+        _previous_provider_attempt = getattr(
+            self, "_tool_call_provider_attempt", None
+        )
+        self._tool_call_provider_attempt = provider_attempt
         try:
             if len(tool_calls) <= 1:
                 return self._execute_tool_calls_sequential(
@@ -7888,6 +7935,7 @@ class AIAgent:
             )
         finally:
             self._executing_tools = False
+            self._tool_call_provider_attempt = _previous_provider_attempt
 
     def _dispatch_delegate_task(self, function_args: dict) -> str:
         """Single call site for delegate_task dispatch.

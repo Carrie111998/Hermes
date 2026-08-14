@@ -29,6 +29,8 @@ import threading
 import time
 from typing import Dict, Any, List, Optional, Tuple
 
+from agent.provider_attempt import ProviderAttemptProvenance
+
 from tools.registry import (
     CHECK_FN_CACHE_BYPASS,
     check_fn_cache_scope,
@@ -1128,6 +1130,7 @@ def _emit_post_tool_call_hook(
     error_type: Optional[str] = None,
     error_message: Optional[str] = None,
     middleware_trace: Optional[List[Dict[str, Any]]] = None,
+    provider_attempt: Optional[ProviderAttemptProvenance] = None,
 ) -> None:
     """Emit the ``post_tool_call`` observer hook.
 
@@ -1147,6 +1150,15 @@ def _emit_post_tool_call_hook(
                 function_name,
                 result,
             )
+        tool_call_provenance = None
+        if provider_attempt is not None and tool_call_id:
+            try:
+                tool_call_provenance = provider_attempt.bind_tool_call(tool_call_id)
+            except (TypeError, ValueError):
+                logger.debug("invalid core provider-attempt/tool binding", exc_info=True)
+        _attempt = (
+            provider_attempt.as_dict() if provider_attempt is not None else {}
+        )
         invoke_hook(
             "post_tool_call",
             tool_name=function_name,
@@ -1162,6 +1174,22 @@ def _emit_post_tool_call_hook(
             error_type=error_type,
             error_message=error_message,
             middleware_trace=list(middleware_trace or []),
+            runtime_instance_id=_attempt.get("runtime_instance_id", ""),
+            provider_attempt_observer=_attempt,
+            provider_attempt_id=_attempt.get("provider_attempt_id", ""),
+            tool_call_provenance=(
+                tool_call_provenance.as_dict()
+                if tool_call_provenance is not None
+                else None
+            ),
+            attempt_index=_attempt.get("attempt_index"),
+            retry_count_snapshot=_attempt.get("retry_count"),
+            fallback_used=_attempt.get("fallback_used"),
+            fallback_generation=_attempt.get("fallback_generation"),
+            fallback_reason=_attempt.get("fallback_reason"),
+            request_model=_attempt.get("request_model", ""),
+            response_model=_attempt.get("response_model"),
+            outcome=_attempt.get("outcome", "unknown"),
         )
     except Exception as _hook_err:
         logger.debug("post_tool_call hook error: %s", _hook_err)
