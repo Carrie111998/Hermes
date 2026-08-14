@@ -28,13 +28,33 @@ def _stub_update_side_effects(monkeypatch):
       Unguarded this would kill a real dashboard — the guard caught it doing
       exactly that (``os.kill(<host pid>, 15)``).
 
-    No test in this file asserts on either seam, so stubbing them costs no
-    coverage and confines the flow to the git mock the tests already install.
+    A third seam of the same class: ``_refresh_active_lazy_features`` reaches
+    ``tools/lazy_deps.py::_venv_pip_install``, which runs a REAL ``pip
+    install``. It escapes the ``subprocess.run`` patch for the same reason
+    ``_build_web_ui`` does — the installer goes through ``run_text_capture``,
+    which spawns via ``Popen``. The live-system guard does not stop it either,
+    and correctly so: the command carries ``--target``, and a redirected
+    install cannot mutate the live venv, so the guard lets it through by
+    design. Nothing was left to catch it. Observed pulling ~100 MB over the
+    network and sitting in ``proc.wait`` until pytest-timeout killed the whole
+    session — on Windows a hang takes the entire run down, not one test.
+
+    Only ``_venv_pip_install`` is stubbed, not ``refresh_active_features``, so
+    the refresh still runs and stays observable for the test that asserts on
+    it; what disappears is solely the ability to install for real.
+
+    No test in this file asserts on any of these seams, so stubbing them costs
+    no coverage and confines the flow to the git mock the tests already install.
     """
     import hermes_cli.main as _m
+    import tools.lazy_deps as _lazy
 
     monkeypatch.setattr(_m, "_build_web_ui", lambda *a, **k: True)
     monkeypatch.setattr(_m, "_kill_stale_dashboard_processes", lambda *a, **k: None)
+    monkeypatch.setattr(
+        _lazy, "_venv_pip_install",
+        lambda *a, **k: _lazy._InstallResult(True, "", ""),
+    )
 
 
 def _make_run_side_effect(branch="main", verify_ok=True, commit_count="0"):

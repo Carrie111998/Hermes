@@ -976,16 +976,37 @@ def test_is_rate_limited_auth_error_distinguishes_credential_errors():
 def test_login_openai_codex_force_new_login_skips_existing_reuse_prompt(monkeypatch):
     called = {"device_login": 0}
 
-    monkeypatch.setattr(
-        "hermes_cli.auth.resolve_codex_runtime_credentials",
+    # Patch the namespace ``_login_openai_codex`` actually resolves from, not
+    # ``sys.modules["hermes_cli.auth"]``.
+    #
+    # This test binds ``_login_openai_codex`` at module import time. A
+    # string-target ``monkeypatch.setattr("hermes_cli.auth.X", ...)`` writes to
+    # whatever object is in ``sys.modules`` when the test RUNS. If anything in
+    # the session re-imported ``hermes_cli.auth`` in between — a fixture that
+    # purges ``sys.modules`` is the usual culprit — those are two different
+    # module objects: the stub lands on the new one and the function keeps
+    # reading its own, original globals.
+    #
+    # The consequence here is not a wrong assertion, it is a live network call.
+    # The real ``_codex_device_code_login`` starts an OAuth device-code flow
+    # and polls with ``max_wait = 15 * 60``, so the miss cost 900 seconds and,
+    # because pytest-timeout kills the session rather than the test on Windows,
+    # took the entire suite run down with it.
+    #
+    # ``__globals__`` is the dict the function body resolves names in, so a
+    # write here cannot miss no matter how many copies of the module exist.
+    _g = _login_openai_codex.__globals__
+
+    monkeypatch.setitem(
+        _g, "resolve_codex_runtime_credentials",
         lambda: {"base_url": DEFAULT_CODEX_BASE_URL},
     )
-    monkeypatch.setattr(
-        "hermes_cli.auth._import_codex_cli_tokens",
+    monkeypatch.setitem(
+        _g, "_import_codex_cli_tokens",
         lambda: {"access_token": "cli-at", "refresh_token": "cli-rt"},
     )
-    monkeypatch.setattr(
-        "hermes_cli.auth._codex_device_code_login",
+    monkeypatch.setitem(
+        _g, "_codex_device_code_login",
         lambda: {
             "tokens": {"access_token": "fresh-at", "refresh_token": "fresh-rt"},
             "last_refresh": "2026-04-01T00:00:00Z",
@@ -998,8 +1019,11 @@ def test_login_openai_codex_force_new_login_skips_existing_reuse_prompt(monkeypa
         called["tokens"] = dict(tokens)
         called["last_refresh"] = last_refresh
 
-    monkeypatch.setattr("hermes_cli.auth._save_codex_tokens", _fake_save)
-    monkeypatch.setattr("hermes_cli.auth._update_config_for_provider", lambda *args, **kwargs: "/tmp/config.yaml")
+    monkeypatch.setitem(_g, "_save_codex_tokens", _fake_save)
+    monkeypatch.setitem(
+        _g, "_update_config_for_provider",
+        lambda *args, **kwargs: "/tmp/config.yaml",
+    )
     monkeypatch.setattr(
         "builtins.input",
         lambda prompt="": (_ for _ in ()).throw(AssertionError("force_new_login should not prompt for reuse/import")),
