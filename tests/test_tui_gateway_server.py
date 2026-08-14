@@ -56,6 +56,37 @@ def _neuter_agent_prewarm_timer(request, monkeypatch):
     yield
 
 
+@pytest.fixture(autouse=True)
+def _neuter_notification_poller(request, monkeypatch):
+    """Stub the session notification poller for every test in this module.
+
+    Any path that reaches ``_init_session`` (eager ``session.resume``,
+    ``_start_agent_build``'s build thread, direct calls) starts a
+    ``_notification_poller_loop`` daemon thread. Nothing here ever sets the
+    session's ``_notif_stop`` event or ``_finalized`` flag, so that thread
+    OUTLIVES its test and keeps reading the process-global
+    ``process_registry.completion_queue`` *attribute* — which resolves to
+    whatever "isolated" Queue a later test has monkeypatched in. Its
+    belongs-elsewhere branch then steal-requeues that test's events (a queue
+    rotation), and its dispatch branch can consume them outright — the
+    intermittent set() == {batch_2, batch_3} failure in
+    test_run_prompt_submit_requeues_all_unstarted_notifications_with_real_threading.
+
+    Tests that exercise the poller itself call
+    ``_notification_poller_loop`` directly and are unaffected. A test that
+    genuinely needs the real thread can opt back in with
+    ``@pytest.mark.real_notification_poller`` — it then owns stopping it
+    (set the returned Event AND join) before returning.
+    """
+    if request.node.get_closest_marker("real_notification_poller"):
+        yield
+        return
+    monkeypatch.setattr(
+        server, "_start_notification_poller", lambda *_a, **_k: threading.Event()
+    )
+    yield
+
+
 def test_session_slot_is_claimed_on_first_turn_not_on_create(monkeypatch, tmp_path):
     home = tmp_path / ".hermes"
     home.mkdir()
@@ -5533,14 +5564,17 @@ def test_run_prompt_submit_requeues_all_unstarted_notifications_with_real_thread
         assert nested_started.wait(timeout=5)
         threads[0].join(timeout=5)
         assert not threads[0].is_alive()
-        # Membership, not order: the completion_queue is process-global, and
-        # notification pollers leaked by earlier session.init tests in this
-        # file legitimately steal-and-requeue foreign-session events (see
-        # _notification_poller_loop's belongs-elsewhere branch), rotating the
-        # queue. The requeue contract is that batch_2 and batch_3 both remain
-        # queued (never consumed) while batch_1's turn is in flight — so drain
-        # with a deadline (an event may be transiently held by a poller
-        # mid-cycle) and assert exactly {batch_2, batch_3} come back.
+        # Membership, not order: this test's requeue contract is that batch_2
+        # and batch_3 both remain queued (never consumed as turns) while
+        # batch_1's turn is in flight. That contract depends on batch_1 being
+        # drained FIRST — drain_notifications preserves queue order, so any
+        # rotation of the isolated queue before the post-turn drain breaks it:
+        # batch_2/batch_3 then dispatch as instant turns instead of being
+        # requeued, and this drain loop comes up empty. Notification pollers
+        # leaked by earlier tests did exactly that (see the
+        # _neuter_notification_poller autouse fixture at the top of this
+        # file). Drain with a deadline as defense-in-depth and assert exactly
+        # {batch_2, batch_3} come back.
         queued: dict = {}
         deadline = time.time() + 5.0
         while time.time() < deadline and set(queued) != {
