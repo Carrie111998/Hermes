@@ -7677,7 +7677,15 @@ class DiscordAdapter(BasePlatformAdapter):
                 "❓ **Hermes needs your input**", str(question or "").strip(),
                 tail=clarify_tail,
             )
-            msg = await channel.send(content=content, embed=embed, view=view) if view else await channel.send(content=content, embed=embed)
+            # Reply-reference the triggering message so the user actually gets
+            # a Discord notification — a bare channel message with no reply
+            # anchor does not ping the author (mirrors send()'s reply_to
+            # handling; honors reply_to_mode "off").
+            reference = None
+            reply_anchor = (metadata or {}).get("reply_to_message_id") if metadata else None
+            if reply_anchor:
+                reference = self._reply_reference_for_send(reply_anchor, channel)
+            msg = await channel.send(content=content, embed=embed, view=view, reference=reference) if view else await channel.send(content=content, embed=embed, reference=reference)
             if view:
                 view._message = msg  # store for on_timeout expiration editing
             return SendResult(success=True, message_id=str(msg.id))

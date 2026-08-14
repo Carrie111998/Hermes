@@ -5654,6 +5654,19 @@ class TurnRunner:
                 )
 
             send_ok = False
+            # Deliver the clarify prompt as a reply to the triggering message
+            # with notify semantics — final replies get this via
+            # _reply_anchor_for_event + _mark_notify_metadata; clarify must
+            # too, or the question lands as a bare channel message and the
+            # user gets no notification (Discord only pings the author of a
+            # message it replies to).
+            _clarify_metadata = (
+                dict(ctx._status_thread_metadata) if ctx._status_thread_metadata else {}
+            )
+            _anchor = getattr(ctx.source, "message_id", None)
+            if _anchor is not None:
+                _clarify_metadata["reply_to_message_id"] = str(_anchor)
+            _clarify_metadata["notify"] = True
             fut = safe_schedule_threadsafe(
                 ctx._status_adapter.send_clarify(
                     chat_id=ctx._status_chat_id,
@@ -5661,7 +5674,7 @@ class TurnRunner:
                     choices=list(choices) if choices else None,
                     clarify_id=clarify_id,
                     session_key=ctx.session_key or "",
-                    metadata=ctx._status_thread_metadata,
+                    metadata=_clarify_metadata,
                 ),
                 ctx._loop_for_step,
                 logger=logger,

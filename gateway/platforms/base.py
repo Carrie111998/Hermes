@@ -4244,9 +4244,15 @@ class BasePlatformAdapter(ABC):
             mark_awaiting_text(clarify_id)
         else:
             text = f"❓ {question}"
+        # Reply-anchor the prompt to the triggering message when the gateway
+        # supplied one — without it platforms that notify on replies (e.g.
+        # Slack, Discord's text path) deliver a bare message the user never
+        # gets pinged for. Mirrors WhatsApp's send_clarify override.
+        reply_to = (metadata or {}).get("reply_to_message_id") if metadata else None
         return await self.send(
             chat_id=chat_id,
             content=text,
+            reply_to=reply_to,
             metadata=metadata,
         )
 
