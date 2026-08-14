@@ -256,7 +256,7 @@ agent:
     - cronjob          # not a scheduler
 ```
 
-The `research` agent keeps `vision` (to read charts in papers) and `session_search` (to recall prior findings) but drops `image_gen`, `tts`, and `cronjob` that the `support` agent had. Its domain facts go in `memories/USER.md` (the analyst's preferred databases, the standing search queries, the embargo policy), and its procedure lives in a skill like `research-assistant`.
+The `research` agent keeps `vision` (to read charts in papers) and `session_search` (to recall prior findings) but drops `image_gen`, `tts`, and `cronjob` that the `support` agent had. These lists are illustrative, not a prescription — a research agent that runs scheduled literature scans or recurring searches should keep `cronjob`. Its domain facts go in `memories/USER.md` (the analyst's preferred databases, the standing search queries, the embargo policy), and its procedure lives in a skill like `research-assistant`.
 
 For a complete worked tutorial of a vertical Hermes agent — built profile, skill, and all — see [GitHub PR Review Agent](/guides/github-pr-review-agent). The only thing that changes between domains is the *what goes where* mapping this guide teaches: swap SOUL voice, swap USER.md domain facts, swap the skill, swap the toolsets. The structure is identical.
 
