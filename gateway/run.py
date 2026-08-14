@@ -29143,6 +29143,7 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         remove_pid_file,
         terminate_pid,
     )
+    replaced_pid: int | None = None
     existing_pid = get_running_pid()
     if existing_pid is not None and existing_pid != os.getpid():
         if replace:
@@ -29277,6 +29278,7 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
                     logger.info("Released %d stale scoped lock(s) from old gateway.", _released)
             except Exception:
                 pass
+            replaced_pid = existing_pid
         else:
             hermes_home = str(get_hermes_home())
             logger.error(
@@ -29618,6 +29620,24 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
             return True
         finally:
             _shutdown_gateway_health_export(runner)
+
+    # The gateway owns its PID/lock and its adapters completed startup: this is
+    # the lifecycle boundary where a start or takeover became real. Best-effort
+    # recording must never make the gateway unavailable, but a configured write
+    # failure is loud in gateway logs so deployment drift is not a silent skip.
+    if os.environ.get("HERMES_GATEWAY_CHURN_PATH", "").strip():
+        try:
+            from gateway.churn import append_gateway_churn_event
+
+            recorded = append_gateway_churn_event(
+                "replace" if replaced_pid is not None else "start",
+                pid_old=replaced_pid,
+                pid_new=os.getpid(),
+            )
+            if not recorded:
+                logger.warning("Configured gateway churn event could not be recorded")
+        except Exception as e:
+            logger.warning("Configured gateway churn hook failed: %s", e)
 
     # Start the background cron scheduler via the resolved provider so
     # scheduled jobs fire automatically. The built-in provider is the
