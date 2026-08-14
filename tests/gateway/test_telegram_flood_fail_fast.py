@@ -65,6 +65,9 @@ async def test_send_long_flood_wait_fails_fast_without_sleep(monkeypatch):
 
     assert isinstance(result, SendResult)
     assert result.success is False
+    assert result.retryable is False
+    assert result.retry_after == 117.0
+    assert result.error_kind == "rate_limited"
     # The long wait must NOT be slept through — fail fast instead.
     assert sleeps == [], f"send() slept on a long flood wait: {sleeps}"
 

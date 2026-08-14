@@ -4796,7 +4796,13 @@ class TelegramAdapter(BasePlatformAdapter):
                                     wait,
                                     safe_send_error,
                                 )
-                                raise
+                                return SendResult(
+                                    success=False,
+                                    error=safe_send_error,
+                                    retryable=False,
+                                    retry_after=wait,
+                                    error_kind="rate_limited",
+                                )
                             if _send_attempt < 2:
                                 safe_send_error = _redact_telegram_error_text(send_err)
                                 logger.warning(
