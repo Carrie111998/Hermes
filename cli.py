@@ -11332,7 +11332,18 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         from tools.async_delegation import (
             claim_event_delivery,
             complete_event_delivery,
+            sweep_undelivered_completions,
         )
+
+        # Durable-truth sweep: a persisted completion whose in-memory wake
+        # was missed/lost (or whose claim was DEFERRED by stream ordering)
+        # must be rediscovered live, not on the next restart. Throttled
+        # process-globally inside the module (~2s), so this per-drain call
+        # costs nothing between scans.
+        try:
+            sweep_undelivered_completions(process_registry.completion_queue)
+        except Exception:
+            logging.debug("Durable completion sweep failed", exc_info=True)
 
         session_key = getattr(self, "session_id", "") or ""
         for event, synthetic_message in process_registry.drain_notifications(

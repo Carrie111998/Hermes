@@ -9302,11 +9302,23 @@ def _notification_poller_loop(
     same way (status.update + agent turn) — the delivery path
     tools/kanban_tools.py documents for platform="tui" rows (issue #59890).
     """
+    from tools.async_delegation import sweep_undelivered_completions
     from tools.process_registry import process_registry, format_process_notification
 
     _emitted = set()  # dedup re-queued events so same completion isn't emitted 50 times while session is busy
     _last_kanban_poll = 0.0
     while not stop_event.is_set() and not session.get("_finalized"):
+        # Durable-truth sweep: persisted completions whose queue wake was
+        # missed/lost (or deferred by stream ordering) re-enter the shared
+        # queue here instead of waiting for a process restart. Desktop runs
+        # ONE poller per session — the module's process-global ~2s scan
+        # throttle collapses all of them to a single SQLite scan per
+        # interval, and the ownership gates below still filter what this
+        # session may actually consume.
+        try:
+            sweep_undelivered_completions(process_registry.completion_queue)
+        except Exception as _sweep_exc:
+            logger.debug("Durable completion sweep failed: %s", _sweep_exc)
         _now = time.monotonic()
         if _now - _last_kanban_poll >= _KANBAN_POLL_SECONDS:
             _last_kanban_poll = _now
@@ -9420,6 +9432,14 @@ def _notification_poller_loop(
         )
         _claim = claim_event_delivery(evt, "tui-poller")
         if _claim is None:
+            # No turn will run for this event (another consumer owns it, it
+            # reached a terminal state, or the claim was deferred by stream
+            # ordering). ``running`` was optimistically set above and no
+            # dispatch will reset it — release it here or the poller wedges
+            # busy forever, requeueing every later event (deferred claims
+            # made this path reachable in normal operation).
+            with session["history_lock"]:
+                session["running"] = False
             continue
         try:
             _emit("message.start", sid)
@@ -9498,6 +9518,10 @@ def _notification_poller_loop(
         )
         _claim = claim_event_delivery(evt, "tui-poller")
         if _claim is None:
+            # Same running-flag release as the live loop: no dispatch will
+            # reset the optimistic busy flag for an unclaimed event.
+            with session["history_lock"]:
+                session["running"] = False
             continue
         try:
             _emit("message.start", sid)
@@ -10583,6 +10607,11 @@ def _run_prompt_submit(
                 )
                 _claim = claim_event_delivery(_evt, "tui-post-turn")
                 if _claim is None:
+                    # Release the optimistic busy flag — no dispatch will
+                    # reset it for an unclaimed/deferred event, and a wedged
+                    # 'running' would requeue every later drained event.
+                    with session["history_lock"]:
+                        session["running"] = False
                     continue
                 try:
                     _emit("message.start", sid)

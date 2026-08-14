@@ -139,6 +139,20 @@ _SWEEP_REWAKE_INTERVAL_S = 5.0  # min spacing between re-wakes of the SAME row
 _SWEEP_ABANDONED_RECOVERY_INTERVAL_S = 30.0
 _last_abandoned_recovery_at = 0.0
 
+# Process-global SQLite scan throttle (monotonic clock), separate from the
+# per-ID re-wake tracker above. Sweep entry points are per-consumer and can be
+# hot — the gateway watcher ticks every ~2s, the CLI drains per idle loop, and
+# a multi-session Desktop runs ONE TUI poller per session at 0.5s each — so an
+# unthrottled sweep would multiply identical DB scans by consumer count.
+# Every periodic entry point shares this one gate: N pollers inside one
+# interval trigger exactly one scan. Explicit callers (tests, one-shot
+# recovery) can bypass with ``force_scan=True``. The interval matches the
+# gateway tick so throttling never worsens the single-digit-seconds recovery
+# bound.
+_SWEEP_SCAN_INTERVAL_S = 2.0
+_sweep_scan_lock = threading.Lock()
+_last_sweep_scan_monotonic = float("-inf")
+
 # delegation_id -> last wake/claim activity timestamp (monotonic wall clock).
 # Precise queued-ID tracking: an entry means "a queue copy for this row was
 # enqueued, or a consumer claimed it, within the last re-arm window", so the
@@ -179,6 +193,36 @@ def _prune_wake_tracker(now: float) -> None:
         ]
         for key in stale:
             _recent_wake_activity.pop(key, None)
+
+
+def _owner_permits_adoption(owner_pid, owner_started_at) -> bool:
+    """Whether THIS process may adopt a durable row's delivery.
+
+    One ownership predicate shared by boot restore and the live sweep, so the
+    two recovery paths cannot drift: adoptable when the row has no recorded
+    owner, is owned by this process, or is owned by a provably dead process /
+    incarnation (recycled PID detected via the persisted start time). NOT
+    adoptable when the recorded owner is a live foreign process — e.g. a TUI
+    or sibling gateway sharing this state.db — whose own drain/restore owns
+    the row; adopting it here would steal routing and burn its delivery
+    attempts (#64484-class). Unverifiable liveness fails closed.
+    """
+    if not owner_pid:
+        return True
+    owner_pid = int(owner_pid)
+    if owner_pid == __import__("os").getpid():
+        return True
+    try:
+        from gateway.status import _pid_exists, get_process_start_time
+    except Exception:
+        return False  # cannot prove the owner is dead — leave the row alone
+    if not _pid_exists(owner_pid):
+        return True
+    if owner_started_at is not None and (
+        get_process_start_time(owner_pid) != int(owner_started_at)
+    ):
+        return True  # recycled PID: the owning incarnation is gone
+    return False
 
 # ---------------------------------------------------------------------------
 # Stale-delegation detection (progress-based, on by default)
@@ -373,7 +417,18 @@ def _delete_durable_delegation(delegation_id: str) -> None:
 
 
 def _prune_durable_records() -> None:
-    """Bound terminal history, preferring delivered records for deletion."""
+    """Bound delivery-terminal history; NEVER delete pending durable truth.
+
+    The retention caps apply only to rows whose delivery already reached a
+    terminal disposition (delivered / dropped / superseded) — history, not
+    obligations. A completed-but-undelivered row is the authoritative record
+    of a delivery the user is still owed; deleting it (the pre-fix behavior:
+    the 50-row history cap counted every non-running row, so publishing 51
+    undelivered notifications silently deleted the oldest) is data loss.
+    When the pending backlog exceeds ``_MAX_DURABLE_PENDING``, overflow rows
+    are explicitly TRANSITIONED to 'dropped' (payload still queryable, loss
+    logged) rather than deleted.
+    """
     now = time.time()
     cutoff = now - _DURABLE_RETENTION_SECONDS
     with _DB_LOCK, _transaction() as conn:
@@ -382,14 +437,15 @@ def _prune_durable_records() -> None:
             (cutoff,),
         )
         terminal_count = conn.execute(
-            "SELECT COUNT(*) FROM async_delegations WHERE state NOT IN ('running','finalizing')"
+            """SELECT COUNT(*) FROM async_delegations
+               WHERE delivery_state IN ('delivered','dropped','superseded')"""
         ).fetchone()[0]
         excess = max(0, terminal_count - _MAX_RETAINED_COMPLETED)
         if excess:
             conn.execute(
                 """DELETE FROM async_delegations WHERE delegation_id IN (
                      SELECT delegation_id FROM async_delegations
-                     WHERE state NOT IN ('running','finalizing')
+                     WHERE delivery_state IN ('delivered','dropped','superseded')
                      ORDER BY CASE delivery_state WHEN 'delivered' THEN 0 ELSE 1 END,
                               updated_at ASC LIMIT ?
                    )""",
@@ -401,13 +457,27 @@ def _prune_durable_records() -> None:
         ).fetchone()[0]
         overflow = max(0, pending_count - _MAX_DURABLE_PENDING)
         if overflow:
+            overflow_ids = [
+                r[0] for r in conn.execute(
+                    """SELECT delegation_id FROM async_delegations
+                       WHERE state NOT IN ('running','finalizing') AND delivery_state='pending'
+                       ORDER BY updated_at ASC LIMIT ?""",
+                    (overflow,),
+                ).fetchall()
+            ]
             conn.execute(
-                """DELETE FROM async_delegations WHERE delegation_id IN (
-                     SELECT delegation_id FROM async_delegations
-                     WHERE state NOT IN ('running','finalizing') AND delivery_state='pending'
-                     ORDER BY updated_at ASC LIMIT ?
-                   )""",
-                (overflow,),
+                f"""UPDATE async_delegations SET delivery_state='dropped',
+                           delivery_claim=NULL, delivery_claimed_at=NULL,
+                           updated_at=?
+                    WHERE delegation_id IN ({','.join('?' * len(overflow_ids))})""",
+                (now, *overflow_ids),
+            )
+            logger.warning(
+                "Async delegation pending backlog exceeded %d rows; %d oldest "
+                "undelivered completion(s) transitioned to terminal 'dropped' "
+                "(payloads remain queryable): %s",
+                _MAX_DURABLE_PENDING, len(overflow_ids),
+                ", ".join(overflow_ids[:10]),
             )
 
 
@@ -506,18 +576,27 @@ def restore_undelivered_completions(target_queue) -> int:
     a full-context turn (a July session replayed in August burned a
     102K-token context on the staging fleet) for a result nobody is waiting
     on anymore; the payload stays queryable on the dropped row.
+
+    Ownership: rows recorded as owned by a provably LIVE foreign process
+    (``_owner_permits_adoption``, shared with the live sweep) are left alone
+    — a gateway booting next to a live TUI must not steal the TUI's pending
+    completions or burn their delivery attempts.
     """
     recover_abandoned_delegations()
     now = time.time()
     restored = 0
     with _DB_LOCK, _transaction() as conn:
         rows = conn.execute(
-            """SELECT delegation_id, event_json, completed_at, dispatched_at
+            """SELECT delegation_id, event_json, completed_at, dispatched_at,
+                      owner_pid, owner_started_at
                FROM async_delegations
                WHERE state != 'running' AND delivery_state='pending' AND event_json IS NOT NULL
                ORDER BY completed_at, delegation_id"""
         ).fetchall()
-        for delegation_id, payload, completed_at, dispatched_at in rows:
+        for (delegation_id, payload, completed_at, dispatched_at,
+             owner_pid, owner_started_at) in rows:
+            if not _owner_permits_adoption(owner_pid, owner_started_at):
+                continue
             age_basis = completed_at or dispatched_at
             if age_basis and (now - age_basis) > _MAX_COMPLETION_REPLAY_AGE_S:
                 conn.execute(
@@ -544,15 +623,25 @@ def restore_undelivered_completions(target_queue) -> int:
     return restored
 
 
-def sweep_undelivered_completions(target_queue, *, now: Optional[float] = None) -> int:
+def sweep_undelivered_completions(
+    target_queue, *, now: Optional[float] = None, force_scan: bool = False
+) -> int:
     """Re-wake due pending durable completions during LIVE operation.
 
-    Called periodically by the live consumer (the gateway async-delegation
-    watcher, every ~2s). Makes the durable store authoritative while the
-    process runs: a completion whose in-memory queue wake was missed or lost
-    is rediscovered here within single-digit seconds and re-enters the exact
-    same delivery rail (enqueue → claim → inject → ack/release) instead of
-    waiting for a process restart.
+    Called periodically by every live consumer — the gateway
+    async-delegation watcher tick, the CLI idle drain, and each Desktop/TUI
+    session's notification poller. Makes the durable store authoritative
+    while the process runs: a completion whose in-memory queue wake was
+    missed or lost is rediscovered here within single-digit seconds and
+    re-enters the exact same delivery rail (enqueue → claim → inject →
+    ack/release) instead of waiting for a process restart.
+
+    Scan cost: the periodic entry points share ONE process-global monotonic
+    throttle (``_SWEEP_SCAN_INTERVAL_S``) — N concurrent pollers inside an
+    interval trigger exactly one SQLite scan; throttled calls return 0
+    without touching the DB. ``force_scan=True`` bypasses the throttle for
+    explicit one-shot callers (tests, manual recovery). The per-ID re-wake
+    tracker below is separate and governs how often one ROW may be re-woken.
 
     Due = ``delivery_state='pending'`` with a persisted event, no active
     delivery claim (an in-flight consumer owns claimed rows), quiet for at
@@ -579,7 +668,14 @@ def sweep_undelivered_completions(target_queue, *, now: Optional[float] = None) 
     owners are classified (throttled) so live operation gets the same crash
     recovery a restart would perform.
     """
-    global _last_abandoned_recovery_at
+    global _last_abandoned_recovery_at, _last_sweep_scan_monotonic
+    mono = time.monotonic()
+    with _sweep_scan_lock:
+        if not force_scan and (
+            mono - _last_sweep_scan_monotonic < _SWEEP_SCAN_INTERVAL_S
+        ):
+            return 0
+        _last_sweep_scan_monotonic = mono
     now = time.time() if now is None else now
     if now - _last_abandoned_recovery_at >= _SWEEP_ABANDONED_RECOVERY_INTERVAL_S:
         _last_abandoned_recovery_at = now
@@ -588,12 +684,6 @@ def sweep_undelivered_completions(target_queue, *, now: Optional[float] = None) 
         except Exception:  # noqa: BLE001 — recovery is additive, never fatal
             logger.debug("Sweep abandoned-delegation recovery failed", exc_info=True)
     _prune_wake_tracker(now)
-    my_pid = __import__("os").getpid()
-    try:
-        from gateway.status import _pid_exists, get_process_start_time
-    except Exception:
-        _pid_exists = None
-        get_process_start_time = None
     enqueued = 0
     with _DB_LOCK, _transaction() as conn:
         rows = conn.execute(
@@ -608,16 +698,8 @@ def sweep_undelivered_completions(target_queue, *, now: Optional[float] = None) 
         ).fetchall()
         for (delegation_id, payload, completed_at, dispatched_at,
              owner_pid, owner_started_at) in rows:
-            if owner_pid and int(owner_pid) != my_pid:
-                if _pid_exists is None:
-                    continue  # cannot prove the owner is dead — leave it alone
-                owner_live = _pid_exists(int(owner_pid))
-                if owner_live and owner_started_at is not None:
-                    owner_live = (
-                        get_process_start_time(int(owner_pid)) == int(owner_started_at)
-                    )
-                if owner_live:
-                    continue  # a live sibling process owns this row
+            if not _owner_permits_adoption(owner_pid, owner_started_at):
+                continue  # a live sibling process owns this row
             age_basis = completed_at or dispatched_at
             if age_basis and (now - age_basis) > _MAX_COMPLETION_REPLAY_AGE_S:
                 conn.execute(
@@ -695,6 +777,7 @@ def _stream_order_blocked_locked(
     stream_id: str,
     stream_seq: int,
     supersedes_before: Optional[int],
+    now: float,
 ) -> bool:
     """Whether an undelivered lower-sequence stream sibling blocks this row.
 
@@ -702,18 +785,54 @@ def _stream_order_blocked_locked(
     can race and present a higher sequence first — deterministic sweep
     ordering alone cannot guarantee order). A sequenced row may not deliver
     while any nonterminal (still-pending, including claimed/running) row with
-    a lower sequence remains in the stream — UNLESS this event's own
-    ``supersedes_before`` watermark covers that lower row, in which case the
-    lower row is scheduled for supersession rather than delivery and must not
-    gate the superseding event.
+    a lower sequence remains in the stream, with ONE carve-out: a lower row
+    covered by this event's own ``supersedes_before`` watermark is scheduled
+    for supersession rather than delivery and does not gate the superseding
+    event — UNLESS that covered row holds a live (unexpired) delivery claim.
+    A live claim means another consumer may already be injecting the older
+    event's user turn; the superseding event must defer until that claim
+    completes (old→terminal order stays honest) or releases (the terminal
+    then retires it), never race past it.
     """
     return conn.execute(
         """SELECT 1 FROM async_delegations
            WHERE stream_id=? AND delegation_id!=? AND stream_seq IS NOT NULL
              AND stream_seq < ? AND delivery_state='pending'
-             AND (? IS NULL OR stream_seq >= ?)
+             AND (
+                   (? IS NULL OR stream_seq >= ?)
+                   OR (delivery_claim IS NOT NULL AND delivery_claimed_at >= ?)
+                 )
            LIMIT 1""",
-        (stream_id, delegation_id, stream_seq, supersedes_before, supersedes_before),
+        (stream_id, delegation_id, stream_seq, supersedes_before,
+         supersedes_before, now - _DELIVERY_CLAIM_TTL_S),
+    ).fetchone() is not None
+
+
+def _covered_by_live_superseding_claim_locked(
+    conn: sqlite3.Connection,
+    delegation_id: str,
+    stream_id: str,
+    stream_seq: int,
+    now: float,
+) -> bool:
+    """Whether a live-claimed superseding sibling covers this row.
+
+    The symmetric half of the claimed-old-vs-terminal protocol: while a
+    pending stream sibling whose ``supersedes_before`` watermark covers this
+    row holds a live (unexpired) delivery claim, this row must defer — if it
+    claimed and delivered now, the in-flight superseding event's acceptance
+    would immediately obsolete a turn the user just received (or the ack-time
+    retirement would have to rewrite a live claim, which is forbidden).
+    After the superseding claim completes, this row is retired as superseded;
+    after it releases, this row claims normally.
+    """
+    return conn.execute(
+        """SELECT 1 FROM async_delegations
+           WHERE stream_id=? AND delegation_id!=? AND delivery_state='pending'
+             AND delivery_claim IS NOT NULL AND delivery_claimed_at >= ?
+             AND supersedes_before IS NOT NULL AND supersedes_before > ?
+           LIMIT 1""",
+        (stream_id, delegation_id, now - _DELIVERY_CLAIM_TTL_S, stream_seq),
     ).fetchone() is not None
 
 
@@ -728,6 +847,15 @@ def _apply_supersession_watermark_locked(
     rows the producer explicitly declared obsolete (stream_seq strictly below
     the delivered event's ``supersedes_before`` watermark) are touched;
     plain sequenced rows without a watermark never retire siblings.
+
+    A covered row holding a LIVE (unexpired) delivery claim is never
+    rewritten — its consumer may be mid-injection, and yanking the row out
+    from under an in-flight claim would fake a 'superseded' disposition for
+    a turn the user actually received. (The claim gates normally prevent a
+    live covered claim from coexisting with a granted superseding claim;
+    this filter is the transactional backstop for claim-TTL expiry races.)
+    Such a row is retired later, by the delivered-watermark check on its
+    next claim attempt.
     """
     meta = conn.execute(
         """SELECT stream_id, supersedes_before FROM async_delegations
@@ -741,8 +869,9 @@ def _apply_supersession_watermark_locked(
         r[0] for r in conn.execute(
             """SELECT delegation_id FROM async_delegations
                WHERE stream_id=? AND delegation_id!=? AND stream_seq IS NOT NULL
-                 AND stream_seq < ? AND delivery_state='pending'""",
-            (stream_id, delegation_id, watermark),
+                 AND stream_seq < ? AND delivery_state='pending'
+                 AND (delivery_claim IS NULL OR delivery_claimed_at < ?)""",
+            (stream_id, delegation_id, watermark, now - _DELIVERY_CLAIM_TTL_S),
         ).fetchall()
     ]
     if superseded:
@@ -801,11 +930,14 @@ def claim_completion_delivery(delegation_id: str, claim_id: str) -> bool:
                 )
                 _clear_wake_activity(delegation_id)
                 return False
-            if _stream_order_blocked_locked(
-                conn, delegation_id, stream_id, stream_seq, supersedes_before
+            if _covered_by_live_superseding_claim_locked(
+                conn, delegation_id, stream_id, stream_seq, now
+            ) or _stream_order_blocked_locked(
+                conn, delegation_id, stream_id, stream_seq, supersedes_before, now
             ):
-                # Refused, not failed: no attempt burned, row stays pending.
-                # The sweep re-wakes it once the lower sibling resolves.
+                # DEFERRED, not failed: no attempt burned, row stays pending.
+                # The durable sweep re-wakes it once the blocking sibling's
+                # claim resolves (completes, releases, or expires).
                 _note_wake_activity(delegation_id, now)
                 return False
         cur = conn.execute(
@@ -955,6 +1087,91 @@ def get_durable_delegation(delegation_id: str) -> Optional[Dict[str, Any]]:
     }
 
 
+# The fields an idempotent notification_id binds immutably. Timestamps are
+# excluded on purpose: a producer retry regenerates "now" defaults, and the
+# durable row's first-publish times remain the truth.
+_IMMUTABLE_NOTIFICATION_FIELDS = (
+    "summary", "goal", "context", "status",
+    "session_key", "origin_ui_session_id", "origin_session_id",
+    "parent_session_id",
+    "stream_id", "sequence", "supersedes_before_sequence",
+)
+
+
+def _notification_payload_conflicts(
+    persisted_evt: Dict[str, Any], new_evt: Dict[str, Any]
+) -> List[str]:
+    """Names of immutable notification fields that differ, empty when none."""
+    return [
+        field
+        for field in _IMMUTABLE_NOTIFICATION_FIELDS
+        if persisted_evt.get(field) != new_evt.get(field)
+    ]
+
+
+def _stream_position_verdict_locked(
+    conn: sqlite3.Connection,
+    notification_id: str,
+    stream_id: str,
+    sequence: int,
+) -> tuple:
+    """Publish-time stream contract checks for a NEW sequenced row.
+
+    Returns ``(verdict, detail)``:
+
+    - ``("conflict", msg)`` — the (stream_id, sequence) slot is already
+      taken by a different notification_id. A sequence is a stable position;
+      two producers (or a buggy retry with a new id) claiming the same slot
+      is a contract violation, refused before any durable write.
+    - ``("superseded", None)`` — an already-DELIVERED watermark covers this
+      late-published sequence; the caller persists it born-terminal.
+    - ``("rejected", msg)`` — a strictly higher sequence in the stream was
+      already delivered without a covering watermark. Delivering this row
+      now would violate the low→high order the stream declared, and claim
+      ordering can no longer repair it (the higher turn already reached the
+      user). Refused with no durable write. Late lower sequences remain
+      legal while every higher sibling is still pending — claim ordering
+      then delivers low→high.
+    - ``(None, None)`` — position is valid; proceed.
+    """
+    duplicate = conn.execute(
+        """SELECT delegation_id FROM async_delegations
+           WHERE stream_id=? AND stream_seq=? AND delegation_id!=?
+           LIMIT 1""",
+        (stream_id, sequence, notification_id),
+    ).fetchone()
+    if duplicate:
+        return (
+            "conflict",
+            f"sequence {sequence} in stream '{stream_id}' is already bound "
+            f"to notification '{duplicate[0]}'",
+        )
+    if conn.execute(
+        """SELECT 1 FROM async_delegations
+           WHERE stream_id=? AND delivery_state='delivered'
+             AND supersedes_before IS NOT NULL AND supersedes_before > ?
+           LIMIT 1""",
+        (stream_id, sequence),
+    ).fetchone():
+        return ("superseded", None)
+    delivered_higher = conn.execute(
+        """SELECT delegation_id, stream_seq FROM async_delegations
+           WHERE stream_id=? AND stream_seq IS NOT NULL AND stream_seq > ?
+             AND delivery_state='delivered'
+           LIMIT 1""",
+        (stream_id, sequence),
+    ).fetchone()
+    if delivered_higher:
+        return (
+            "rejected",
+            f"out-of-order publication: sequence {delivered_higher[1]} "
+            f"('{delivered_higher[0]}') in stream '{stream_id}' was already "
+            f"delivered; a late lower sequence {sequence} can no longer be "
+            "delivered in order",
+        )
+    return (None, None)
+
+
 def publish_background_notification(
     *,
     summary: str,
@@ -999,10 +1216,13 @@ def publish_background_notification(
         state (e.g. ``"completed"``, ``"driver_assigned"``).
     notification_id
         Stable producer identity (e.g. ``"chauffeur/<ride>/13"``). Publishing
-        is idempotent per id: re-publishing a still-pending id only refreshes
-        its wake; re-publishing an id that already reached a terminal
-        delivery state is a no-op returning ``{"status": "duplicate"}``.
-        Auto-generated when omitted.
+        is idempotent per id, and the id binds IMMUTABLE content: 
+        re-publishing a still-pending id with identical payload/routing/
+        stream fields only re-wakes the persisted event (the durable truth is
+        the only payload ever enqueued); divergent immutable fields return
+        ``{"status": "conflict"}`` without touching the row; an id that
+        already reached a terminal delivery state is a no-op returning
+        ``{"status": "duplicate"}``. Auto-generated when omitted.
     occurred_at
         Event occurrence time (defaults to now). Drives deterministic
         recovery ordering, the staleness cap, and honest delivery-age
@@ -1019,13 +1239,22 @@ def publish_background_notification(
         - ``supersedes_before_sequence`` additionally declares that THIS
           event makes every pending stream event with
           ``sequence < supersedes_before_sequence`` obsolete. Once this
-          event is delivered, those older events are retired as
+          event is delivered, those           older events are retired as
           ``superseded`` and can never surface afterwards. A terminal event
           may pass its own sequence (supersede everything before it); a
-          latest-wins stream may do so on every event.
+          latest-wins stream may do so on every event. The watermark may not
+          exceed the event's own sequence (no obsoleting future events).
 
-    Returns ``{"status": "published"|"republished"|"duplicate",
-    "notification_id": ...}``.
+        A sequence is a stable stream position: publishing a second
+        notification_id onto an occupied ``(stream_id, sequence)`` slot is a
+        ``conflict``; publishing a lower sequence after a higher one was
+        already DELIVERED is ``rejected`` as out-of-order (or persisted
+        born-``superseded`` when a delivered watermark covers it). Lower
+        sequences published while higher siblings are still pending are
+        fine — claim ordering delivers low→high.
+
+    Returns ``{"status": "published"|"republished"|"duplicate"|"conflict"|
+    "rejected"|"superseded", "notification_id": ..., ["error": ...]}``.
     """
     if not isinstance(summary, str) or not summary.strip():
         raise ValueError("summary must be a non-empty string")
@@ -1039,6 +1268,13 @@ def publish_background_notification(
         sequence = int(sequence)
     if supersedes_before_sequence is not None:
         supersedes_before_sequence = int(supersedes_before_sequence)
+        if supersedes_before_sequence > sequence:
+            # A watermark above the event's own sequence would obsolete FUTURE
+            # events the producer hasn't emitted yet.
+            raise ValueError(
+                "supersedes_before_sequence must be <= sequence "
+                f"({supersedes_before_sequence} > {sequence})"
+            )
     notification_id = notification_id or f"notif_{uuid.uuid4().hex[:12]}"
     now = time.time()
     occurred_at = float(occurred_at) if occurred_at is not None else now
@@ -1079,9 +1315,11 @@ def publish_background_notification(
     }
 
     outcome = "published"
+    wake_evt = evt
     with _DB_LOCK, _transaction() as conn:
         existing = conn.execute(
-            "SELECT delivery_state FROM async_delegations WHERE delegation_id=?",
+            """SELECT delivery_state, event_json FROM async_delegations
+               WHERE delegation_id=?""",
             (notification_id,),
         ).fetchone()
         if existing is not None:
@@ -1089,8 +1327,55 @@ def publish_background_notification(
                 # Terminal (delivered/dropped/superseded): idempotent no-op —
                 # a producer retry must never resurrect a finished delivery.
                 return {"status": "duplicate", "notification_id": notification_id}
+            # An idempotency key binds IMMUTABLE content. Re-publishing a
+            # still-pending id may only refresh its wake — and the wake must
+            # carry the PERSISTED payload, never the retry's: enqueueing new
+            # content against old durable truth splits the brain (immediate
+            # delivery shows the new summary/routing, a sweep re-wake of the
+            # same row delivers the old one). Divergent immutable fields are
+            # an explicit conflict, not a silent overwrite.
+            try:
+                persisted_evt = json.loads(existing[1] or "{}")
+            except Exception:
+                persisted_evt = {}
+            conflicts = _notification_payload_conflicts(persisted_evt, evt)
+            if conflicts:
+                logger.warning(
+                    "Background notification %s republished with divergent "
+                    "immutable content (%s); refusing the conflicting payload.",
+                    notification_id, ", ".join(conflicts),
+                )
+                return {
+                    "status": "conflict",
+                    "notification_id": notification_id,
+                    "error": (
+                        "notification_id already bound to different content: "
+                        + ", ".join(conflicts)
+                    ),
+                }
+            wake_evt = persisted_evt
             outcome = "republished"
         else:
+            initial_delivery_state = "pending"
+            if stream_id:
+                verdict, detail = _stream_position_verdict_locked(
+                    conn, notification_id, stream_id, sequence
+                )
+                if verdict == "conflict" or verdict == "rejected":
+                    logger.warning(
+                        "Background notification %s refused (%s): %s",
+                        notification_id, verdict, detail,
+                    )
+                    return {
+                        "status": verdict,
+                        "notification_id": notification_id,
+                        "error": detail,
+                    }
+                if verdict == "superseded":
+                    # Late publication of an event an already-DELIVERED
+                    # watermark covers: persist the durable record for
+                    # queryability, but born-terminal — no wake, no delivery.
+                    initial_delivery_state = "superseded"
             conn.execute(
                 """INSERT INTO async_delegations
                    (delegation_id, origin_session, origin_ui_session_id,
@@ -1098,19 +1383,30 @@ def publish_background_notification(
                     updated_at, event_json, result_json, delivery_state,
                     delivery_attempts, owner_pid, owner_started_at, task_json,
                     origin_session_id, stream_id, stream_seq, supersedes_before)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?)""",
                 (notification_id, session_key or "", origin_ui_session_id or "",
                  parent_session_id, status, occurred_at, occurred_at, now,
-                 json.dumps(evt), json.dumps(result),
+                 json.dumps(evt), json.dumps(result), initial_delivery_state,
                  __import__("os").getpid(), owner_started_at,
                  json.dumps(task_payload), origin_session_id or "",
                  stream_id or None, sequence, supersedes_before_sequence),
             )
+            if initial_delivery_state == "superseded":
+                logger.info(
+                    "Background notification %s (stream %s seq %s) published "
+                    "after a delivered watermark already covers it; persisted "
+                    "as superseded without delivery.",
+                    notification_id, stream_id, sequence,
+                )
+                return {
+                    "status": "superseded",
+                    "notification_id": notification_id,
+                }
     _prune_durable_records()
 
     try:
         from tools.process_registry import process_registry
-        process_registry.completion_queue.put(dict(evt))
+        process_registry.completion_queue.put(dict(wake_evt))
         _note_wake_activity(notification_id, now)
     except Exception as exc:  # noqa: BLE001 — durable row survives a lost wake
         logger.warning(
@@ -2144,3 +2440,6 @@ def _reset_for_tests() -> None:
     with _wake_tracker_lock:
         _recent_wake_activity.clear()
     _last_abandoned_recovery_at = 0.0
+    global _last_sweep_scan_monotonic
+    with _sweep_scan_lock:
+        _last_sweep_scan_monotonic = float("-inf")

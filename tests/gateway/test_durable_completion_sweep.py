@@ -37,6 +37,7 @@ def isolated_state(tmp_path, monkeypatch):
     # Tests exercise the recovery machinery, not the production grace bounds.
     monkeypatch.setattr(ad, "_SWEEP_MIN_PENDING_AGE_S", 0.0)
     monkeypatch.setattr(ad, "_SWEEP_REWAKE_INTERVAL_S", 0.0)
+    monkeypatch.setattr(ad, "_SWEEP_SCAN_INTERVAL_S", 0.0)
     yield registry
     ad._reset_for_tests()
 
