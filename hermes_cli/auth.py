@@ -395,6 +395,16 @@ PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
         name="Anthropic",
         auth_type="api_key",
         inference_base_url="https://api.anthropic.com",
+        # NOTE (#82154): CLAUDE_CODE_OAUTH_TOKEN is listed here for source
+        # discovery/status display only. Its value (an sk-ant-oat*/cc-*
+        # OAuth token from `claude setup-token`) is NOT a plain x-api-key
+        # credential — sending it as x-api-key 401s, and as a bare Bearer
+        # token it 429s. Callers that build actual Anthropic requests must
+        # resolve auth via agent.anthropic_adapter.resolve_anthropic_token()
+        # / build_anthropic_client(), which detect the OAuth token format
+        # and pick Bearer + beta header instead of x-api-key. Do not read
+        # this tuple's first-match value and hand it to a provider client
+        # as a raw API key.
         api_key_env_vars=("ANTHROPIC_API_KEY", "ANTHROPIC_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"),
         base_url_env_var="ANTHROPIC_BASE_URL",
     ),
