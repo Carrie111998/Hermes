@@ -86,19 +86,71 @@ class _ScriptedCli:
     def __init__(self):
         self.responses = {}  # (group, cmd) -> list of (code, stdout, stderr)
         self.calls = []
+        self.timeouts = []
 
     def script(self, group, cmd, payload, code=0, stderr=""):
         stdout = payload if isinstance(payload, str) else json.dumps(payload)
         self.responses.setdefault((group, cmd), []).append((code, stdout, stderr))
 
-    async def __call__(self, args, *, input_text=None):
+    async def __call__(self, args, *, input_text=None, timeout=None):
         self.calls.append((list(args), input_text))
+        self.timeouts.append(timeout)
         queue = self.responses.get((args[0], args[1]), [])
         if len(queue) > 1:
             return queue.pop(0)
         if queue:
             return queue[0]
         return 0, "[]", ""
+
+
+class TestExecBuzzCancellation:
+
+    @pytest.mark.asyncio
+    async def test_cancellation_kills_and_reaps_subprocess(self, monkeypatch):
+        communicate_started = asyncio.Event()
+
+        class FakeProcess:
+            returncode = None
+
+            def __init__(self):
+                self.killed = False
+                self.waited = False
+
+            async def communicate(self, _input=None):
+                communicate_started.set()
+                await asyncio.Event().wait()
+
+            def kill(self):
+                self.killed = True
+
+            async def wait(self):
+                self.waited = True
+                self.returncode = -9
+                return self.returncode
+
+        process = FakeProcess()
+        monkeypatch.setattr(
+            _buzz_mod.asyncio,
+            "create_subprocess_exec",
+            AsyncMock(return_value=process),
+        )
+        task = asyncio.create_task(
+            _buzz_mod._exec_buzz(
+                "/fake/buzz",
+                ["reactions", "add"],
+                relay_url="https://test.relay",
+                private_key="test",
+                timeout=30.0,
+            )
+        )
+        await asyncio.wait_for(communicate_started.wait(), timeout=1)
+
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert process.killed is True
+        assert process.waited is True
 
 
 # ── bech32 / identity helpers ─────────────────────────────────────────────
@@ -381,6 +433,85 @@ class TestDmClassification:
         assert a._may_reclassify_as_dm(CHANNEL) is False
 
 
+# ── Thread routing ────────────────────────────────────────────────────────
+
+
+class TestBuzzThreadRouting:
+
+    @pytest.fixture
+    def adapter(self):
+        a = _make_adapter()
+        a._dispatched = []
+
+        async def capture(**kwargs):
+            a._dispatched.append(kwargs)
+
+        a._dispatch_message = capture
+        a._message_handler = AsyncMock()
+        a._channel_state[CHANNEL] = {"chat_type": "group", "last_ts": 0, "seen": {}}
+        return a
+
+    @pytest.mark.asyncio
+    async def test_root_group_mention_starts_dedicated_thread(self, adapter):
+        await adapter._handle_event(
+            CHANNEL,
+            adapter._channel_state[CHANNEL],
+            _event("root-event", content="@Chip review this"),
+        )
+
+        assert adapter._dispatched[0]["thread_id"] == "root-event"
+        assert adapter._dispatched[0]["reply_to_message_id"] is None
+
+    @pytest.mark.asyncio
+    async def test_reply_uses_parent_as_existing_thread(self, adapter):
+        event = _tagged_event(
+            "thread-reply",
+            CHANNEL,
+            content="@Chip continue",
+            reply_to="root-event",
+        )
+
+        await adapter._handle_event(CHANNEL, adapter._channel_state[CHANNEL], event)
+
+        assert adapter._dispatched[0]["thread_id"] == "root-event"
+        assert adapter._dispatched[0]["reply_to_message_id"] == "root-event"
+
+
+    @pytest.mark.asyncio
+    async def test_root_marker_wins_over_direct_reply_parent(self, adapter):
+        event = _tagged_event(
+            "nested-reply",
+            CHANNEL,
+            content="@Chip continue",
+            reply_to="direct-parent",
+        )
+        event["tags"].insert(1, ["e", "root-event", "", "root"])
+
+        await adapter._handle_event(CHANNEL, adapter._channel_state[CHANNEL], event)
+
+        assert adapter._dispatched[0]["thread_id"] == "root-event"
+        assert adapter._dispatched[0]["reply_to_message_id"] == "direct-parent"
+
+    @pytest.mark.asyncio
+    async def test_reply_tagged_dm_remains_unthreaded(self, adapter):
+        adapter._channel_state[DM_CHANNEL] = {
+            "chat_type": "dm",
+            "last_ts": 0,
+            "seen": {},
+        }
+        event = _tagged_event(
+            "dm-reply",
+            DM_CHANNEL,
+            content="continue",
+            reply_to="dm-parent",
+        )
+
+        await adapter._handle_event(DM_CHANNEL, adapter._channel_state[DM_CHANNEL], event)
+
+        assert adapter._dispatched[0]["thread_id"] is None
+        assert adapter._dispatched[0]["reply_to_message_id"] == "dm-parent"
+
+
 # ── Sending ───────────────────────────────────────────────────────────────
 
 
@@ -420,6 +551,272 @@ class TestBuzzAdapterSend:
         assert result.success is True
         args, _stdin = cli.calls[0]
         assert args[args.index("--file") + 1] == str(img)
+
+
+# ── Processing reactions ──────────────────────────────────────────────────
+
+
+class TestBuzzProcessingReactions:
+
+    def test_does_not_advertise_incompatible_generic_unreact_contract(self):
+        adapter = _make_adapter()
+
+        assert not callable(getattr(adapter, "remove_reaction", None))
+
+    @staticmethod
+    def _event(adapter):
+        source = adapter.build_source(
+            chat_id=CHANNEL,
+            chat_type="group",
+            user_id=OTHER_PUBKEY,
+            thread_id="root-event",
+        )
+        return _buzz_mod.MessageEvent(
+            text="review this",
+            message_type=_buzz_mod.MessageType.TEXT,
+            source=source,
+            message_id="source-event",
+        )
+
+    @pytest.mark.asyncio
+    async def test_processing_start_adds_seen_and_working_reactions(self):
+        adapter = _make_adapter()
+        adapter.cli_path = "/fake/buzz"
+        cli = _ScriptedCli()
+        cli.script("reactions", "add", {})
+        adapter._run_cli = cli
+
+        await adapter.on_processing_start(self._event(adapter))
+
+        assert [call[0] for call in cli.calls] == [
+            ["reactions", "add", "--event", "source-event", "--emoji", "👀"],
+            ["reactions", "add", "--event", "source-event", "--emoji", "💬"],
+        ]
+
+    @pytest.mark.asyncio
+    async def test_processing_complete_removes_working_and_seen_reactions(self):
+        adapter = _make_adapter()
+        adapter.cli_path = "/fake/buzz"
+        cli = _ScriptedCli()
+        cli.script("reactions", "remove", {})
+        adapter._run_cli = cli
+
+        await adapter.on_processing_complete(self._event(adapter), MagicMock())
+
+        assert [call[0] for call in cli.calls] == [
+            ["reactions", "remove", "--event", "source-event", "--emoji", "💬"],
+            ["reactions", "remove", "--event", "source-event", "--emoji", "👀"],
+        ]
+
+    @pytest.mark.asyncio
+    async def test_processing_start_runs_reaction_adds_concurrently(self):
+        adapter = _make_adapter()
+        adapter.cli_path = "/fake/buzz"
+        both_started = asyncio.Event()
+        started = []
+
+        async def require_overlap(args, *, input_text=None, timeout=None):
+            started.append(args[-1])
+            if len(started) == 2:
+                both_started.set()
+            await asyncio.wait_for(both_started.wait(), timeout=0.2)
+            return 0, "{}", ""
+
+        adapter._run_cli = require_overlap
+
+        await adapter.on_processing_start(self._event(adapter))
+
+        assert set(started) == {"👀", "💬"}
+
+    @pytest.mark.asyncio
+    async def test_reaction_lifecycle_uses_short_per_operation_timeout(self):
+        adapter = _make_adapter()
+        adapter.cli_path = "/fake/buzz"
+        cli = _ScriptedCli()
+        cli.script("reactions", "add", {})
+        cli.script("reactions", "remove", {})
+        adapter._run_cli = cli
+        event = self._event(adapter)
+
+        await adapter.on_processing_start(event)
+        await adapter.on_processing_complete(event, MagicMock())
+
+        assert cli.timeouts == [2.0, 2.0, 2.0, 2.0]
+
+
+    @pytest.mark.asyncio
+    async def test_completion_attempts_both_cleanups_when_one_raises(self):
+        adapter = _make_adapter()
+        adapter.cli_path = "/fake/buzz"
+        calls = []
+
+        async def flaky_remove(args, *, input_text=None, timeout=None):
+            calls.append(list(args))
+            if args[-1] == "💬":
+                raise OSError("reaction endpoint unavailable")
+            return 0, "{}", ""
+
+        adapter._run_cli = flaky_remove
+
+        await adapter.on_processing_complete(self._event(adapter), MagicMock())
+
+        assert [call[-1] for call in calls] == ["💬", "👀"]
+
+    @pytest.mark.asyncio
+    async def test_real_background_lifecycle_threads_final_and_cleans_reactions(self):
+        adapter = _make_adapter()
+        adapter.cli_path = "/fake/buzz"
+        cli = _ScriptedCli()
+        cli.script("reactions", "add", {})
+        cli.script("reactions", "remove", {})
+        cli.script(
+            "messages",
+            "send",
+            {"accepted": True, "event_id": "final-event"},
+        )
+        adapter._run_cli = cli
+        started = asyncio.Event()
+        release = asyncio.Event()
+        delivered_events = []
+
+        async def handler(event):
+            delivered_events.append(event)
+            started.set()
+            await release.wait()
+            return "final response"
+
+        adapter._message_handler = handler
+
+        await adapter._dispatch_message(
+            text="review this",
+            chat_id=CHANNEL,
+            chat_type="group",
+            user_id=OTHER_PUBKEY,
+            user_name="Basar",
+            message_id="source-event",
+            created_at=1000,
+            thread_id="root-event",
+            raw_message=_event("source-event", content="@Chip review this"),
+        )
+        await asyncio.wait_for(started.wait(), timeout=1)
+        tasks = list(adapter._session_tasks.values())
+        release.set()
+        await asyncio.gather(*tasks)
+
+        assert delivered_events[0].source.thread_id == "root-event"
+        reaction_calls = [
+            (args[1], args[-1])
+            for args, _input_text in cli.calls
+            if args[0] == "reactions"
+        ]
+        assert reaction_calls == [
+            ("add", "👀"),
+            ("add", "💬"),
+            ("remove", "💬"),
+            ("remove", "👀"),
+        ]
+        message_calls = [call for call in cli.calls if call[0][0] == "messages"]
+        assert message_calls == [
+            (
+                [
+                    "messages",
+                    "send",
+                    "--channel",
+                    CHANNEL,
+                    "--content",
+                    "-",
+                    "--reply-to",
+                    "source-event",
+                ],
+                "final response",
+            )
+        ]
+
+
+    @pytest.mark.asyncio
+    async def test_background_cancellation_reaps_add_processes_before_cleanup(
+        self, monkeypatch
+    ):
+        adapter = _make_adapter()
+        adapter.cli_path = "/fake/buzz"
+        add_processes = []
+        add_started = asyncio.Event()
+        cli_operations = []
+        cleanup_started_after_reap = []
+
+        class HangingAddProcess:
+            returncode = None
+
+            def __init__(self):
+                self.killed = False
+                self.waited = False
+
+            async def communicate(self, _input=None):
+                add_processes.append(self)
+                if len(add_processes) == 2:
+                    add_started.set()
+                await asyncio.Event().wait()
+
+            def kill(self):
+                self.killed = True
+
+            async def wait(self):
+                self.waited = True
+                self.returncode = -9
+                return self.returncode
+
+        class CompletedProcess:
+            returncode = 0
+
+            async def communicate(self, _input=None):
+                return b"{}", b""
+
+        async def fake_create_subprocess_exec(_cli_path, *args, **_kwargs):
+            if args[:2] == ("reactions", "remove"):
+                cleanup_started_after_reap.append(
+                    len(add_processes) == 2
+                    and all(process.waited for process in add_processes)
+                )
+            cli_operations.append((args[0], args[1], args[-1]))
+            if args[:2] == ("reactions", "add"):
+                return HangingAddProcess()
+            return CompletedProcess()
+
+        monkeypatch.setattr(
+            _buzz_mod.asyncio,
+            "create_subprocess_exec",
+            fake_create_subprocess_exec,
+        )
+        adapter._message_handler = AsyncMock(return_value="should not run")
+
+        await adapter._dispatch_message(
+            text="review this",
+            chat_id=CHANNEL,
+            chat_type="group",
+            user_id=OTHER_PUBKEY,
+            user_name="Basar",
+            message_id="source-event",
+            created_at=1000,
+            thread_id="root-event",
+            raw_message=_event("source-event", content="@Chip review this"),
+        )
+        await asyncio.wait_for(add_started.wait(), timeout=1)
+        tasks = list(adapter._session_tasks.values())
+        assert len(tasks) == 1
+
+        tasks[0].cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await tasks[0]
+
+        assert all(process.killed and process.waited for process in add_processes)
+        assert cleanup_started_after_reap == [True, True]
+        assert cli_operations == [
+            ("reactions", "add", "👀"),
+            ("reactions", "add", "💬"),
+            ("reactions", "remove", "💬"),
+            ("reactions", "remove", "👀"),
+        ]
+        adapter._message_handler.assert_not_awaited()
 
 
 # ── Lifecycle ─────────────────────────────────────────────────────────────

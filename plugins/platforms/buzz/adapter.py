@@ -99,6 +99,7 @@ _DM_DISCOVERY_EVERY = 5
 _DEFAULT_POLL_INTERVAL = 4.0
 _MIN_POLL_INTERVAL = 1.0
 _CLI_TIMEOUT = 30.0
+_REACTION_TIMEOUT = 2.0
 
 # WebSocket transport (NIP-42 authenticated Nostr subscription).
 # kind 44100 is Buzz's channel-membership event — used for live DM discovery.
@@ -306,6 +307,13 @@ async def _exec_buzz(
             proc.communicate(input_text.encode("utf-8") if input_text is not None else None),
             timeout=timeout,
         )
+    except asyncio.CancelledError:
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+        await proc.wait()
+        raise
     except asyncio.TimeoutError:
         proc.kill()
         await proc.wait()
@@ -443,7 +451,13 @@ class BuzzAdapter(BasePlatformAdapter):
 
     # ── buzz-cli plumbing ─────────────────────────────────────────────────
 
-    async def _run_cli(self, args: List[str], *, input_text: Optional[str] = None) -> Tuple[int, str, str]:
+    async def _run_cli(
+        self,
+        args: List[str],
+        *,
+        input_text: Optional[str] = None,
+        timeout: float = _CLI_TIMEOUT,
+    ) -> Tuple[int, str, str]:
         if not self._private_key:
             self._private_key = _resolve_private_key(self._extra)
         return await _exec_buzz(
@@ -452,6 +466,7 @@ class BuzzAdapter(BasePlatformAdapter):
             relay_url=self.relay_url,
             private_key=self._private_key,
             input_text=input_text,
+            timeout=timeout,
         )
 
     # ── Connection lifecycle ──────────────────────────────────────────────
@@ -655,7 +670,7 @@ class BuzzAdapter(BasePlatformAdapter):
             "--event", str(message_id),
             "--emoji", emoji,
         ]
-        code, _out, err = await self._run_cli(args)
+        code, _out, err = await self._run_cli(args, timeout=_REACTION_TIMEOUT)
         if code != 0:
             logger.debug(
                 "Buzz: reaction add failed for message %s in %s — %s",
@@ -663,6 +678,56 @@ class BuzzAdapter(BasePlatformAdapter):
             )
             return False
         return True
+
+    async def _remove_buzz_reaction(self, chat_id: str, message_id: str, emoji: str) -> bool:
+        """Remove one of this agent's reactions from a Buzz message."""
+        if not self.cli_path or not emoji or not message_id:
+            return False
+        args = [
+            "reactions", "remove",
+            "--event", str(message_id),
+            "--emoji", emoji,
+        ]
+        code, _out, err = await self._run_cli(args, timeout=_REACTION_TIMEOUT)
+        if code != 0:
+            logger.debug(
+                "Buzz: reaction remove failed for message %s in %s — %s",
+                message_id[:12], chat_id, _cli_error_message(err, code),
+            )
+            return False
+        return True
+
+    async def on_processing_start(self, event: MessageEvent) -> None:
+        """Mark a Buzz source message as seen and actively being worked."""
+        chat_id = getattr(event.source, "chat_id", None)
+        message_id = getattr(event, "message_id", None)
+        if not chat_id or not message_id:
+            return
+        results = await asyncio.gather(
+            self.send_reaction(chat_id, message_id, "👀"),
+            self.send_reaction(chat_id, message_id, "💬"),
+            return_exceptions=True,
+        )
+        self._log_reaction_exceptions(results)
+
+    async def on_processing_complete(self, event: MessageEvent, outcome: Any) -> None:
+        """Clear temporary Buzz working reactions after processing stops."""
+        chat_id = getattr(event.source, "chat_id", None)
+        message_id = getattr(event, "message_id", None)
+        if not chat_id or not message_id:
+            return
+        results = await asyncio.gather(
+            self._remove_buzz_reaction(chat_id, message_id, "💬"),
+            self._remove_buzz_reaction(chat_id, message_id, "👀"),
+            return_exceptions=True,
+        )
+        self._log_reaction_exceptions(results)
+
+    @staticmethod
+    def _log_reaction_exceptions(results: Tuple[Any, ...]) -> None:
+        for result in results:
+            if isinstance(result, Exception):
+                logger.debug("Buzz: best-effort reaction operation failed: %s", result)
 
     async def send_image(
         self,
@@ -1047,6 +1112,8 @@ class BuzzAdapter(BasePlatformAdapter):
         # open with "@Chip" even though no mention is required there, so the
         # strip applies to both chat types.
         dispatch_text = self._strip_mention(content)
+        root_message_id, reply_to_message_id = self._thread_parents(event)
+        thread_id = None if is_dm else (root_message_id or reply_to_message_id or event_id)
 
         await self._dispatch_message(
             text=dispatch_text,
@@ -1056,7 +1123,31 @@ class BuzzAdapter(BasePlatformAdapter):
             user_name=await self._resolve_user_name(pubkey),
             message_id=event_id,
             created_at=created_at,
+            thread_id=thread_id,
+            reply_to_message_id=reply_to_message_id,
+            raw_message=event,
         )
+
+    @staticmethod
+    def _thread_parents(event: dict) -> Tuple[Optional[str], Optional[str]]:
+        """Return ``(thread root, direct parent)`` from Nostr ``e`` tags."""
+        tags = event.get("tags")
+        if not isinstance(tags, list):
+            return None, None
+        root = None
+        reply = None
+        for tag in tags:
+            if (
+                isinstance(tag, (list, tuple))
+                and len(tag) > 3
+                and tag[0] == "e"
+                and tag[1]
+            ):
+                if tag[3] == "root":
+                    root = str(tag[1])
+                elif tag[3] == "reply":
+                    reply = str(tag[1])
+        return root, reply
 
     # ── DM classification (issue #68871) ──────────────────────────────────
     #
@@ -1219,6 +1310,9 @@ class BuzzAdapter(BasePlatformAdapter):
         user_name: str,
         message_id: str,
         created_at: int,
+        thread_id: Optional[str] = None,
+        reply_to_message_id: Optional[str] = None,
+        raw_message: Optional[dict] = None,
     ) -> None:
         """Build a MessageEvent and hand it to the base class handler."""
         if not self._message_handler:
@@ -1230,6 +1324,7 @@ class BuzzAdapter(BasePlatformAdapter):
             chat_type=chat_type,
             user_id=user_id,
             user_name=user_name,
+            thread_id=thread_id,
         )
 
         event = MessageEvent(
@@ -1237,17 +1332,12 @@ class BuzzAdapter(BasePlatformAdapter):
             message_type=MessageType.TEXT,
             source=source,
             message_id=message_id,
+            raw_message=raw_message,
+            reply_to_message_id=reply_to_message_id,
             timestamp=datetime.fromtimestamp(created_at) if created_at else datetime.now(),
         )
 
         await self.handle_message(event)
-        
-        # Add a "seen" reaction after dispatching — signals to the user that
-        # their message was received and is being processed.
-        try:
-            await self.send_reaction(chat_id, message_id, "👀")
-        except Exception:
-            logger.debug("Buzz: reaction failed for message %s", message_id[:12], exc_info=True)
 
 
 # ---------------------------------------------------------------------------
