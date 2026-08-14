@@ -9,7 +9,8 @@ import { useDragTextToComposer } from '@/components/assistant-ui/thread/use-drag
 // - Selected text is formatted as quoted lines and set on the DataTransfer
 // - effectAllowed is 'copy'
 // - No selection → event is prevented (no-op)
-// - dragend cleans up the ghost
+// - dragend (component- or document-level) cleans up the ghost
+// - A stale ghost is released before a new drag starts
 
 // Minimal DataTransfer stand-in for jsdom (no native DataTransfer constructor).
 interface StubDataTransfer {
@@ -32,9 +33,17 @@ function stubDataTransfer(): StubDataTransfer {
   }
 }
 
+/** The drag ghost is the only fixed-position element createDragGhost appends. */
+function ghostCount(): number {
+  return Array.from(document.body.children).filter(el => (el as HTMLElement).style.position === 'fixed').length
+}
+
 describe('useDragTextToComposer', () => {
   afterEach(() => {
     vi.restoreAllMocks()
+    // Release any module-level ghost a test left behind. Dispatching dragend
+    // exercises the same document-level cleanup the app relies on.
+    document.dispatchEvent(new Event('dragend'))
   })
 
   function createDragEvent(selectedText: string) {
@@ -99,21 +108,51 @@ describe('useDragTextToComposer', () => {
     expect(event.preventDefault).toHaveBeenCalled()
   })
 
-  it('cleans up the drag ghost on dragend', () => {
+  it('creates a ghost on dragstart and cleans it up on dragend', () => {
     const { result } = renderHook(() => useDragTextToComposer())
     const event = createDragEvent('test')
 
-    const beforeCount = document.body.children.length
-
     result.current.onDragStart(event as unknown as React.DragEvent<HTMLElement>)
 
-    // The ghost should have been appended to the body
-    expect(document.body.children.length).toBe(beforeCount + 1)
+    expect(ghostCount()).toBe(1)
 
-    // dragend should remove it
     result.current.onDragEnd()
 
-    expect(document.body.children.length).toBe(beforeCount)
+    expect(ghostCount()).toBe(0)
+  })
+
+  it('releases the ghost via the document-level dragend listener even after the component unmounts', () => {
+    const { result, unmount } = renderHook(() => useDragTextToComposer())
+    const event = createDragEvent('survives unmount')
+
+    // Start the drag, then unmount the bubble mid-drag (streaming removes a
+    // message). The document-level listener must still release the ghost.
+    result.current.onDragStart(event as unknown as React.DragEvent<HTMLElement>)
+    expect(ghostCount()).toBe(1)
+
+    unmount()
+
+    // The browser fires dragend on the document when a drag finishes — even
+    // when the source node was removed mid-drag.
+    document.dispatchEvent(new Event('dragend'))
+
+    expect(ghostCount()).toBe(0)
+  })
+
+  it('releases a stale ghost when a new drag starts', () => {
+    const { result } = renderHook(() => useDragTextToComposer())
+    const first = createDragEvent('first drag')
+    const second = createDragEvent('second drag')
+
+    result.current.onDragStart(first as unknown as React.DragEvent<HTMLElement>)
+    expect(ghostCount()).toBe(1)
+
+    // A second drag without a dragend in between must not leak the first ghost
+    result.current.onDragStart(second as unknown as React.DragEvent<HTMLElement>)
+    expect(ghostCount()).toBe(1)
+
+    result.current.onDragEnd()
+    expect(ghostCount()).toBe(0)
   })
 
   it('is a no-op on dragend when no ghost was created', () => {
