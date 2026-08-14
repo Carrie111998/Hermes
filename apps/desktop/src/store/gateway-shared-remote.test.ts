@@ -8,12 +8,16 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 // profile except the primary. These tests pin the fix: a profile routed to
 // the shared primary activates the primary socket instead of dialing.
 
+const gatewayMocks = vi.hoisted(() => ({
+  connect: vi.fn(async (_wsUrl: string): Promise<void> => {
+    throw new Error('dialed a socket for a shared-primary profile')
+  })
+}))
+
 vi.mock('@/hermes', () => ({
   HermesGateway: class {
     connectionState = 'closed'
-    connect = vi.fn(async () => {
-      throw new Error('dialed a socket for a shared-primary profile')
-    })
+    connect = gatewayMocks.connect
     onEvent = vi.fn(() => () => {})
     onState = vi.fn(() => () => {})
   }
@@ -57,22 +61,31 @@ describe('ensureGatewayForProfile under a shared global remote', () => {
 
     await ensureGatewayForProfile('venture')
 
+    expect(gatewayMocks.connect).not.toHaveBeenCalled()
     expect($gateway.get()).toBe(primary)
   })
 
-  it('still pools a socket for profiles with their own descriptor (untagged)', async () => {
+  it('dials the exact WebSocket URL for a profile-owned remote descriptor', async () => {
     const primary = makePrimary()
+    const remoteWsUrl = 'wss://remote.invalid/api/ws?token=fake-test-token'
+
     setPrimaryGateway(primary as never, 'default')
     installDesktop({
-      // Own descriptor: no profile tag → normal pooled path (dial attempted).
-      getConnection: vi.fn(async () => ({ port: 5151, profile: 'worker', token: 't2' }))
+      getConnection: vi.fn(async () => ({
+        authMode: 'token',
+        baseUrl: 'https://remote.invalid',
+        mode: 'remote',
+        profile: 'worker',
+        token: 'fake-test-token',
+        wsUrl: remoteWsUrl
+      }))
     })
+    gatewayMocks.connect.mockResolvedValueOnce(undefined)
 
     await ensureGatewayForProfile('worker')
 
-    // The pooled path dialed (our stub throws, so the socket stays closed and
-    // reconnect is scheduled) — the important part is it did NOT silently
-    // reuse the primary.
+    expect(gatewayMocks.connect).toHaveBeenCalledOnce()
+    expect(gatewayMocks.connect).toHaveBeenCalledWith(remoteWsUrl)
     expect($gateway.get()).not.toBe(primary)
   })
 })
