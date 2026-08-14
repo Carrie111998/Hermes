@@ -24,7 +24,6 @@ import {
   type ApprovalRequest,
   clearApprovalRequest,
   registerApprovalInlineAnchor,
-  sessionApprovalInlineVisible,
   sessionApprovalRequest
 } from '@/store/prompts'
 
@@ -72,11 +71,12 @@ export const PendingApprovalFallback: FC = () => {
   const { t } = useI18n()
   const sessionId = useStore(useSessionView().$runtimeId)
   const $request = useMemo(() => sessionApprovalRequest(sessionId), [sessionId])
-  const $inlineVisible = useMemo(() => sessionApprovalInlineVisible(sessionId), [sessionId])
   const request = useStore($request)
-  const inlineVisible = useStore($inlineVisible)
 
-  if (!request || inlineVisible) {
+  // Always pin a card above the composer. The inline strip on the pending
+  // tool row is easy to miss (collapsed/off-screen); hiding this card when
+  // that strip mounts is why Desktop users never saw an approval UI.
+  if (!request) {
     return null
   }
 
@@ -86,7 +86,7 @@ export const PendingApprovalFallback: FC = () => {
       data-slot="tool-approval-fallback"
       style={{ bottom: 'calc(var(--composer-measured-height) + 0.875rem)' }}
     >
-      <div className="pointer-events-auto rounded-xl border border-primary/30 bg-(--ui-chat-surface-background) px-3 py-2 shadow-lg backdrop-blur-xl [-webkit-backdrop-filter:blur(1rem)]">
+      <div className="pointer-events-auto rounded-xl border border-primary/40 bg-(--ui-chat-surface-background) px-3 py-2.5 shadow-lg backdrop-blur-xl [-webkit-backdrop-filter:blur(1rem)]">
         <div className="flex min-w-0 items-center gap-2 text-sm text-primary">
           <AlertCircle className="size-4 shrink-0" />
           <span className="shrink-0 font-medium">{t.assistant.approval.jumpToApproval}</span>
@@ -94,6 +94,11 @@ export const PendingApprovalFallback: FC = () => {
             <span className="min-w-0 truncate text-(--ui-text-tertiary)">{request.description}</span>
           )}
         </div>
+        {request.command.trim() && (
+          <pre className="mt-2 max-h-24 overflow-auto whitespace-pre-wrap break-words rounded-md border border-(--ui-stroke-tertiary) bg-(--ui-chat-surface-background) px-2.5 py-1.5 font-mono text-xs leading-snug text-foreground">
+            {request.command.trim()}
+          </pre>
+        )}
         <ApprovalBar request={request} surface="floating" />
       </div>
     </div>
