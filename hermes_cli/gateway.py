@@ -7608,7 +7608,12 @@ def _gateway_command_inner(args):
                 print(
                     f"✓ Killed {killed} stale gateway process(es) across all profiles"
                 )
-                _wait_for_gateway_exit(timeout=10.0, force_after=5.0)
+                # kill_gateway_processes() sends SIGTERM; give those drains the
+                # service manager's own budget before escalating to SIGKILL.
+                _wait_for_gateway_exit(
+                    timeout=_GATEWAY_STOP_WAIT_SECONDS,
+                    force_after=_GATEWAY_STOP_GRACE_SECONDS,
+                )
 
         if is_termux():
             print(
@@ -7811,7 +7816,12 @@ def _gateway_command_inner(args):
             total = killed + (1 if service_stopped else 0)
             if total:
                 print(f"✓ Stopped {total} gateway process(es) across all profiles")
-            _wait_for_gateway_exit(timeout=10.0, force_after=5.0)
+            # The service stop above and kill_gateway_processes() both signal
+            # gracefully; escalate only once the manager's own budget is spent.
+            _wait_for_gateway_exit(
+                timeout=_GATEWAY_STOP_WAIT_SECONDS,
+                force_after=_GATEWAY_STOP_GRACE_SECONDS,
+            )
 
             # Start the current profile's service fresh
             print("Starting gateway...")
@@ -7905,7 +7915,13 @@ def _gateway_command_inner(args):
             if stop_profile_gateway():
                 print("✓ Stopped gateway for this profile")
 
-            _wait_for_gateway_exit(timeout=10.0, force_after=5.0)
+            # stop_profile_gateway() sends SIGTERM and polls for ~10s; keep
+            # escalating no earlier than the service manager's own budget so a
+            # slow drain finishes its teardown instead of being SIGKILLed.
+            _wait_for_gateway_exit(
+                timeout=_GATEWAY_STOP_WAIT_SECONDS,
+                force_after=_GATEWAY_STOP_GRACE_SECONDS,
+            )
 
             # Start fresh
             print("Starting gateway...")
