@@ -11,8 +11,10 @@ import { hasTextSelection } from './selection'
  * When the user selects text in a message and starts dragging, the handler:
  * 1. Reads the live selection text
  * 2. Formats it as a quoted block ("> line" per line, same as "Paste as text")
- * 3. Sets `text/plain` on the DataTransfer so the composer's drop handler
- *    (use-composer-drop) can pick it up
+ * 3. Sets `text/plain` (OS interop) AND the HERMES_QUOTE_MIME marker on the
+ *    DataTransfer — the composer's drop handler (use-composer-drop) accepts
+ *    quote drops only when the marker is present, so foreign text/plain
+ *    drags (kanban cards, external apps) keep their existing behavior
  * 4. Creates a drag ghost via the existing `createDragGhost` utility
  *
  * The ghost is destroyed on `dragend`. Cleanup is module-level (not a ref
