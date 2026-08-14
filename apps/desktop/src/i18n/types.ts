@@ -1799,6 +1799,28 @@ export interface Translations {
       addedTip: string
       connectFailed: (server: string) => string
     }
+    skillSuggestions: {
+      label: (skill: string) => string
+      tip: (skill: string) => string
+      done: (skill: string) => string
+      doneTip: string
+    }
+    repairSuggestions: {
+      label: (server: string) => string
+      tip: (server: string) => string
+      working: (server: string) => string
+      workingTip: string
+      done: (server: string) => string
+      doneTip: string
+      failed: (server: string) => string
+    }
+    cronSuggestions: {
+      label: string
+      tip: (phrase: string) => string
+      prefix: string
+      done: string
+      doneTip: string
+    }
   }
 
   statusStack: {
@@ -2131,6 +2153,7 @@ export interface Translations {
       gatewayTitle: string
       customizeTitle: string
       hideStatusbar: string
+      resetStatusbar: string
       toggleApprovalMode: string
       toggleBackendVersion: string
       toggleCommandCenter: string
