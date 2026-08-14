@@ -6,7 +6,11 @@ import pytest
 
 from devflow_delegation.agent_policy import CeilingExceeded
 from devflow_delegation.agent_runner import build_messages, dispatch_tool, run_agent
-from devflow_delegation.allowlist import TargetConfig
+from devflow_delegation.allowlist import Allowlist, TargetConfig
+from devflow_delegation.contract import parse_request
+from devflow_delegation.executor import run_executor_tick
+from devflow_delegation.ledger import DelegationLedger
+from devflow_delegation.lifecycle import transition
 
 
 def _target(**over):
@@ -366,3 +370,72 @@ def _run_main_preserves_path_when_scrubbing_the_environment(monkeypatch, git_wor
 
     assert agent_runner.main([]) == 0
     assert captured["path"] == "C:/fake/real/path"
+
+
+# --- Task 7: end-to-end -- the real executor drives a runner-shaped
+# implementation_command to VALIDATED in shadow mode. No executor change was
+# made for the agent runner; this proves implementation_command was already
+# the full integration surface. Uses a stub runner script (same contract as
+# agent_runner.main: reads DDP_REQUEST_PATH, writes inside allowed_globs,
+# prints an observable summary) so the wiring is proven without a provider.
+
+
+def test_executor_drives_an_agent_style_runner_to_validated_in_shadow(tmp_path):
+    repo = tmp_path / "repo"
+    (repo / "src").mkdir(parents=True)
+    (repo / "src" / "app.py").write_text("x = 1\n", encoding="utf-8")
+    _git(["git", "init", "--initial-branch", "main"], repo)
+    _git(["git", "config", "user.email", "t@example.test"], repo)
+    _git(["git", "config", "user.name", "T"], repo)
+    _git(["git", "add", "src/app.py"], repo)
+    _git(["git", "commit", "-m", "seed"], repo)
+
+    # A stand-in for the agent loop: same contract (reads DDP_REQUEST_PATH, writes
+    # inside allowed_globs, prints an observable summary) without a provider.
+    runner = tmp_path / "stub_runner.py"
+    runner.write_text(
+        "import json,os,pathlib\n"
+        "p=pathlib.Path(os.environ['DDP_REQUEST_PATH'])\n"
+        "rid=json.loads(p.read_text())['request_id']\n"
+        "pathlib.Path('src/fix.py').write_text('y = 2\\n')\n"
+        "print(f'agent completed: iterations=2 tokens=10 stopped=model-finished {rid}')\n",
+        encoding="utf-8",
+    )
+
+    ledger = DelegationLedger(tmp_path / "devflow" / "ledger.db")
+    request = parse_request({
+        "schema_version": "3.0", "type": "DEVFLOW_WORK_REQUEST",
+        "idempotency_key": "agent:e2e:v1",
+        "source": {"agent": "operator", "kind": "explicit", "finding_id": "e2e"},
+        "kind": "task", "title": "Agent end to end",
+        "problem_statement": "Prove the executor drives the runner.",
+        "evidence": [{"kind": "test", "summary": "e2e"}],
+        "target": {"repo": "fixture", "subsystem": "src"},
+        "severity": "low", "priority": "P3", "confidence": 1.0,
+        "acceptance_criteria": ["a scoped file exists"], "safety_notes": [],
+    })
+    ledger.insert_request(request)
+    transition(ledger, None, request.request_id, "TRIAGED", actor="operator")
+    ledger.record_human_decision(request.request_id, "operator", "approve", "e2e",
+                                 f"tok-{request.request_id}")
+    transition(ledger, None, request.request_id, "PLANNED", actor="operator")
+
+    target = TargetConfig(
+        repo="fixture", checkout_path=str(repo), default_branch="main", remote="origin",
+        allowed_globs=("src/**",), denied_globs=("**/.env",),
+        worktree_base=str(tmp_path / "worktrees"),
+        test_commands=(("python", "-c", "print('tests passed')"),),
+        required_checks=("test",), command_timeout_seconds=120,
+        risk_ceiling="low", max_autonomous_action="create_pr",
+        executor_enabled=True, synthetic_fixture=True,
+        implementation_command=("python", str(runner)),
+        github_repo="example/fixture", live_gateway_imports=False,
+    )
+
+    result = run_executor_tick(ledger, Allowlist(version="t", targets={"fixture": target}), None)
+
+    assert result == {"processed": 1, "errors": 0, "skipped": 0}
+    assert ledger.get_request(request.request_id)["state"] == "VALIDATED"
+    kinds = {a["kind"] for a in ledger.artifacts_for(request.request_id)}
+    assert "shadow" in kinds
+    assert "pr" not in kinds and "pr_number" not in kinds
