@@ -242,10 +242,17 @@ def repair(config: dict[str, Any] | None = None) -> RecoveryResult:
         )
     wait_seconds = max(0, min(int(cfg.get("repair_wait_seconds", 0)), 30))
     deadline = time.monotonic() + wait_seconds
+    transient_statuses = {
+        "REMOTE_CONTROL_MISSING",
+        "TASK_RUNNING_REMOTE_CONTROL_MISSING",
+        "TASK_QUEUED_REMOTE_CONTROL_MISSING",
+    }
     while wait_seconds and time.monotonic() < deadline:
         time.sleep(min(1.0, max(0, deadline - time.monotonic())))
         after = inspect(config)
         if after.status == "READY":
+            return after
+        if after.status not in transient_statuses:
             return after
     return RecoveryResult(
         "REPAIR_TRIGGERED",

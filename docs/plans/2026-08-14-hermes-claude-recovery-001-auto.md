@@ -1,6 +1,6 @@
 ---
 title: "HERMES-CLAUDE-RECOVERY-001: safe Claude Remote Control recovery"
-status: BLOCKED
+status: IMPLEMENTED_PENDING_CI
 date: 2026-08-14
 type: reliability
 ticket: HERMES-CLAUDE-RECOVERY-001
@@ -67,12 +67,12 @@ Hermes-scoped session.
 
 - Ticket opened: 2026-08-14.
 - Implementation completed locally on the ticket branch.
-- Focused tests: `14 passed` in
+- Focused tests: `15 passed` in
   `tests/hermes_cli/test_claude_recovery.py` using the managed `.venv`.
 - Existing parser/batch regression tests: `30 passed` in
   `tests/hermes_cli/test_subparser_routing_fallback.py` and
   `tests/hermes_cli/test_subcommands_batch.py`; combined local test evidence
-  is `44 passed`.
+  is `45 passed`.
 - Static checks: Ruff passed, `py_compile` passed, and `git diff --check`
   passed (with only pre-existing LF/CRLF warnings).
 - CLI smoke: isolated `HERMES_HOME` returned redacted JSON status
@@ -89,11 +89,17 @@ Hermes-scoped session.
 - Local operations cross-review: `PASS` for host/task ownership, idempotency,
   and the no-mutation boundary; live readiness remains unverified because no
   Hermes-scoped task is configured or enabled.
-- Independent Claude/AGY cross-review: `BLOCKED_EXTERNAL_DISPATCH`. No safe
-  callable bridge to the existing authorized Claude/AGY sessions is available
-  in this context; no KLIB session was repurposed and no headless session or
-  permission bypass was created.
-- Ticket is `BLOCKED` pending independent Claude/AGY review; no merge,
-  deployment, or scheduled-task enablement has occurred.
+- Review correction: polling now returns a definitive terminal failure observed
+  after the repair trigger instead of replacing it with generic
+  `REPAIR_TRIGGERED`; transient missing/running/queued states remain bounded by
+  the absolute deadline. Regression coverage was added.
+- Independent review round four used the same bounded read-only behavior packet
+  after the correction: Claude `PASS` and AGY `PASS`. Claude additionally
+  verified the committed source and regression test behavior. Consensus reached
+  on the correction set; no KLIB session was repurposed and no permission bypass
+  was used.
+- The external-review blocker is resolved. Current gate is
+  `IMPLEMENTED_PENDING_CI`; no PR, merge, deployment, or scheduled-task
+  enablement has occurred.
 - Existing KLIB-scoped Claude recovery evidence is not reused as Hermes
   readiness evidence.

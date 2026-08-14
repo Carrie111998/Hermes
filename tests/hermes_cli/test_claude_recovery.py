@@ -164,6 +164,41 @@ def test_repair_starts_only_existing_task_after_missing_preflight(monkeypatch):
     assert calls == [("Hermes-Claude-RemoteControl", "start")]
 
 
+def test_repair_returns_terminal_poll_failure(monkeypatch):
+    monkeypatch.setattr(recovery.platform, "system", lambda: "Windows")
+    results = iter(
+        [
+            recovery.RecoveryResult(
+                "REMOTE_CONTROL_MISSING",
+                "configured Remote Control session is not present",
+                task_state="Ready",
+                remote_count=0,
+                auth_logged_in=True,
+            ),
+            recovery.RecoveryResult(
+                "REAUTH_REQUIRED",
+                "Claude CLI is not authenticated",
+                task_state="Ready",
+                remote_count=0,
+                auth_logged_in=False,
+            ),
+        ]
+    )
+    monkeypatch.setattr(recovery, "inspect", lambda cfg: next(results))
+    monkeypatch.setattr(
+        recovery,
+        "_powershell",
+        lambda *_: subprocess.CompletedProcess(
+            ["powershell.exe"], 0, stdout="", stderr=""
+        ),
+    )
+
+    result = recovery.repair(_cfg(repair_wait_seconds=1))
+
+    assert result.status == "REAUTH_REQUIRED"
+    assert result.auth_logged_in is False
+
+
 def test_powershell_command_has_no_shell_and_uses_quoted_task(monkeypatch):
     calls = []
     monkeypatch.setattr(recovery.shutil, "which", lambda name: "powershell.exe")
