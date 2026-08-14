@@ -99,12 +99,22 @@ MESSAGE_DEDUP_TTL_SECONDS = 300
 def _is_stale_session_ret(
     ret: "Optional[int]", errcode: "Optional[int]", errmsg: "Optional[str]",
 ) -> bool:
-    """True when iLink returns ret=-2 / errcode=-2 with 'unknown error',
-    which is a stale-session signal (same as errcode=-14) rather than
-    a genuine rate limit."""
+    """True when iLink returns ret=-2 / errcode=-2 with 'unknown error'
+    or 'prepare failed', which are stale-session signals (same as errcode=-14)
+    rather than genuine rate limits.
+
+    See https://github.com/NousResearch/hermes-agent/issues/82502 for the
+    "prepare failed" variant: iLink returns it when the bot's send capability
+    is not yet initialized (target peer hasn't messaged the bot yet, so no
+    context_token exists). Treating it as a real rate limit incorrectly opens
+    the circuit breaker and swallows the actionable error.
+    """
     if ret != RATE_LIMIT_ERRCODE and errcode != RATE_LIMIT_ERRCODE:
         return False
-    return (errmsg or "").lower() == "unknown error"
+    msg = (errmsg or "").strip().lower()
+    if not msg:
+        return True
+    return msg in ("unknown error", "prepare failed")
 
 
 MEDIA_IMAGE = 1
