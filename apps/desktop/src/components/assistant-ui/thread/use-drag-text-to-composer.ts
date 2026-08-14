@@ -55,7 +55,15 @@ ensureDocumentListener()
 
 export function useDragTextToComposer() {
   const onDragStart = useCallback((event: React.DragEvent<HTMLElement>) => {
+    // Natively draggable children (links, images) own their drag: never cancel
+    // it, even without a text selection — pre-commit those dragged out fine
+    // and the native drop inserts at the caret. Only a text-selection drag is
+    // ours to take over.
     if (!hasTextSelection()) {
+      if (event.target instanceof Element && event.target.closest('a, img')) {
+        return
+      }
+
       event.preventDefault()
 
       return
@@ -70,10 +78,15 @@ export function useDragTextToComposer() {
       return
     }
 
-    const quoted = text
-      .split('\n')
-      .map(line => `> ${line}`)
-      .join('\n')
+    // A trailing newline in the selection would otherwise quote as a dangling
+    // "> " line; drop it before quoting.
+    const lines = text.split('\n')
+
+    if (lines[lines.length - 1] === '') {
+      lines.pop()
+    }
+
+    const quoted = lines.map(line => `> ${line}`).join('\n')
 
     event.dataTransfer.effectAllowed = 'copy'
     // text/plain keeps the drag interop with OS-level targets; HERMES_QUOTE_MIME

@@ -53,7 +53,8 @@ function renderDrop() {
       cwd: '/repo',
       insertInlineRefs,
       onAttachDroppedItems,
-      requestMainFocus
+      requestMainFocus,
+      target: 'main'
     })
   )
 
@@ -77,7 +78,7 @@ describe('useComposerDrop — quote drops', () => {
 
     result.current.handleDrop(event as unknown as React.DragEvent<HTMLFormElement>)
 
-    expect(insertComposer).toHaveBeenCalledWith('> hello world')
+    expect(insertComposer).toHaveBeenCalledWith('> hello world', { target: 'main' })
     expect(event.preventDefault).toHaveBeenCalled()
   })
 
@@ -92,7 +93,7 @@ describe('useComposerDrop — quote drops', () => {
 
     result.current.handleDrop(event as unknown as React.DragEvent<HTMLFormElement>)
 
-    expect(insertComposer).toHaveBeenCalledWith('> hello world')
+    expect(insertComposer).toHaveBeenCalledWith('> hello world', { target: 'main' })
   })
 
   it('ignores an empty quote drop', () => {
@@ -151,7 +152,7 @@ describe('useComposerDrop — quote drops', () => {
 
     result.current.handleInputDrop(event as unknown as React.DragEvent<HTMLDivElement>)
 
-    expect(insertComposer).toHaveBeenCalledWith('> from input drop')
+    expect(insertComposer).toHaveBeenCalledWith('> from input drop', { target: 'main' })
     expect(event.stopPropagation).toHaveBeenCalled()
   })
 
@@ -195,7 +196,8 @@ describe('useComposerDrop — quote drops', () => {
         cwd: '/repo',
         insertInlineRefs,
         onAttachDroppedItems: undefined,
-        requestMainFocus
+        requestMainFocus,
+        target: 'main'
       })
     )
 
@@ -207,7 +209,59 @@ describe('useComposerDrop — quote drops', () => {
 
     result.current.handleDrop(event as unknown as React.DragEvent<HTMLFormElement>)
 
-    expect(insertComposer).toHaveBeenCalledWith('> still works')
+    expect(insertComposer).toHaveBeenCalledWith('> still works', { target: 'main' })
+  })
+
+  it('routes quote drops to this composer\u2019s own scope, not the active composer', () => {
+    const insertInlineRefs = vi.fn(() => false)
+    const requestMainFocus = vi.fn()
+
+    const { result } = renderHook(() =>
+      useComposerDrop({
+        cwd: '/repo',
+        insertInlineRefs,
+        onAttachDroppedItems: undefined,
+        requestMainFocus,
+        target: 'tile:abc'
+      })
+    )
+
+    const event = {
+      dataTransfer: quoteTransfer('> tile quote'),
+      preventDefault: vi.fn(),
+      stopPropagation: vi.fn()
+    }
+
+    result.current.handleDrop(event as unknown as React.DragEvent<HTMLFormElement>)
+
+    // requestComposerInsert was called with an explicit { target } — the
+    // mocked focus bus records it. The second arg must be { target: 'tile:abc' }.
+    expect(insertComposer).toHaveBeenCalledWith('> tile quote', { target: 'tile:abc' })
+  })
+
+  it('routes input-area quote drops to this composer\u2019s own scope', () => {
+    const insertInlineRefs = vi.fn(() => false)
+    const requestMainFocus = vi.fn()
+
+    const { result } = renderHook(() =>
+      useComposerDrop({
+        cwd: '/repo',
+        insertInlineRefs,
+        onAttachDroppedItems: undefined,
+        requestMainFocus,
+        target: 'tile:abc'
+      })
+    )
+
+    const event = {
+      dataTransfer: quoteTransfer('> input quote'),
+      preventDefault: vi.fn(),
+      stopPropagation: vi.fn()
+    }
+
+    result.current.handleInputDrop(event as unknown as React.DragEvent<HTMLDivElement>)
+
+    expect(insertComposer).toHaveBeenCalledWith('> input quote', { target: 'tile:abc' })
   })
 
   it('does not throw when a mixed files+quote drag arrives with no attach handler wired', () => {
@@ -219,7 +273,8 @@ describe('useComposerDrop — quote drops', () => {
         cwd: '/repo',
         insertInlineRefs,
         onAttachDroppedItems: undefined,
-        requestMainFocus
+        requestMainFocus,
+        target: 'main'
       })
     )
 

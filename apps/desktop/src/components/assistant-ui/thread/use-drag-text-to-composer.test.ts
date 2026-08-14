@@ -47,7 +47,7 @@ describe('useDragTextToComposer', () => {
     document.dispatchEvent(new Event('dragend'))
   })
 
-  function createDragEvent(selectedText: string) {
+  function createDragEvent(selectedText: string, target?: Element | null) {
     const dataTransfer = stubDataTransfer()
 
     // Simulate a live selection
@@ -62,7 +62,8 @@ describe('useDragTextToComposer', () => {
       dataTransfer,
       clientX: 100,
       clientY: 200,
-      preventDefault: vi.fn()
+      preventDefault: vi.fn(),
+      target: target ?? null
     }
   }
 
@@ -85,6 +86,28 @@ describe('useDragTextToComposer', () => {
     result.current.onDragStart(event as unknown as React.DragEvent<HTMLElement>)
 
     expect(event.dataTransfer.getData('text/plain')).toBe('> line one\n> line two\n> line three')
+  })
+
+  it('drops a trailing newline before quoting', () => {
+    const { result } = renderHook(() => useDragTextToComposer())
+    const event = createDragEvent('line one\n')
+
+    result.current.onDragStart(event as unknown as React.DragEvent<HTMLElement>)
+
+    expect(event.dataTransfer.getData('text/plain')).toBe('> line one')
+  })
+
+  it('does not cancel a native link drag when nothing is selected', () => {
+    const { result } = renderHook(() => useDragTextToComposer())
+    const link = document.createElement('a')
+    const event = createDragEvent('', link)
+
+    result.current.onDragStart(event as unknown as React.DragEvent<HTMLElement>)
+
+    // The native link drag must survive: no preventDefault, no ghost, no data.
+    expect(event.preventDefault).not.toHaveBeenCalled()
+    expect(ghostCount()).toBe(0)
+    expect(event.dataTransfer.getData('text/plain')).toBe('')
   })
 
   it('prevents the drag when no text is selected', () => {

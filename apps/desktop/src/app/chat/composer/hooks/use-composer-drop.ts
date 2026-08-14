@@ -1,6 +1,6 @@
 import { type DragEvent as ReactDragEvent, useRef, useState } from 'react'
 
-import { requestComposerInsert } from '@/app/chat/composer/focus'
+import { type ComposerTarget, requestComposerInsert } from '@/app/chat/composer/focus'
 import { triggerHaptic } from '@/lib/haptics'
 
 import { extractDroppedFiles, HERMES_PATHS_MIME, HERMES_QUOTE_MIME, partitionDroppedFiles } from '../../hooks/use-composer-actions'
@@ -17,6 +17,9 @@ interface UseComposerDropArgs {
   insertInlineRefs: (refs: InlineRefInput[]) => boolean
   onAttachDroppedItems: ChatBarProps['onAttachDroppedItems']
   requestMainFocus: () => void
+  /** Focus-bus routing key of THIS composer — quote drops land here, never in
+   * whatever composer happens to be `'active'` (e.g. an open edit composer). */
+  target: ComposerTarget
 }
 
 /**
@@ -30,7 +33,8 @@ export function useComposerDrop({
   cwd,
   insertInlineRefs,
   onAttachDroppedItems,
-  requestMainFocus
+  requestMainFocus,
+  target
 }: UseComposerDropArgs) {
   const [dragActive, setDragActive] = useState(false)
   const dragDepthRef = useRef(0)
@@ -71,10 +75,6 @@ export function useComposerDrop({
   }
 
   const handleDragLeave = (event: ReactDragEvent<HTMLFormElement>) => {
-    if (!onAttachDroppedItems) {
-      return
-    }
-
     event.preventDefault()
     dragDepthRef.current = Math.max(0, dragDepthRef.current - 1)
 
@@ -118,11 +118,12 @@ export function useComposerDrop({
     }
 
     // Quote drop: selected message text dragged into the composer.
-    // Insert as a quoted block (same format as "Paste as text").
+    // Insert as a quoted block (same format as "Paste as text"), routed to
+    // THIS composer's scope — never to whatever composer is 'active'.
     const text = event.dataTransfer.getData(HERMES_QUOTE_MIME).trim()
 
     if (text) {
-      requestComposerInsert(text)
+      requestComposerInsert(text, { target })
       triggerHaptic('selection')
     }
   }
@@ -174,14 +175,14 @@ export function useComposerDrop({
       return
     }
 
-    // Quote drop onto the input area.
+    // Quote drop onto the input area, routed to THIS composer's scope.
     const text = event.dataTransfer.getData(HERMES_QUOTE_MIME).trim()
 
     if (text) {
       event.preventDefault()
       event.stopPropagation()
       resetDragState()
-      requestComposerInsert(text)
+      requestComposerInsert(text, { target })
       triggerHaptic('selection')
     }
   }
