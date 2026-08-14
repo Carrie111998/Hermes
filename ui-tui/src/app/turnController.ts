@@ -17,6 +17,7 @@ import {
   sameToolTrailGroup,
   toolTrailLabel
 } from '../lib/text.js'
+import { TurnSummaryCollector } from '../lib/turn-summary.js'
 import type { ActiveTool, ActivityItem, Msg, SubagentProgress, TodoItem } from '../types.js'
 
 import type { Notice } from './interfaces.js'
@@ -133,6 +134,11 @@ class TurnController {
   private streamTimer: Timer = null
   private streamDelay = STREAM_IDLE_BATCH_MS
   private toolProgressTimer: Timer = null
+  // Per-turn tool tally (display.turn_summary parity with the CLI). Fed from
+  // the same tool-complete feed that builds trail lines; rendered at
+  // message.complete as a dim ◈ event line.
+  private turnSummary: TurnSummaryCollector | null = null
+  private turnStartMs = 0
 
   // ── Credits notice machinery (Strategy B) ───────────────────────────
   //
@@ -555,6 +561,21 @@ class TurnController {
     this.flushPendingNotice()
   }
 
+  /**
+   * Render the completed turn's tool summary line, or '' when there is
+   * nothing to report. Wall-clock from message.start to message.complete —
+   * not the sum of tool durations, which would miss LLM reasoning time.
+   */
+  renderTurnSummary(): string {
+    if (!this.turnSummary) {
+      return ''
+    }
+
+    const elapsed = this.turnStartMs ? (Date.now() - this.turnStartMs) / 1000 : 0
+
+    return this.turnSummary.render(elapsed)
+  }
+
   recordMessageComplete(payload: {
     rendered?: string
     reasoning?: string
@@ -797,6 +818,10 @@ class TurnController {
       return
     }
 
+    const done = this.activeTools.find(tool => tool.id === toolId)
+    const name = done?.name ?? fallbackName ?? 'tool'
+    this.turnSummary?.recordTool(name, { isError: Boolean(error), result: resultText })
+
     this.recordTodos(todos)
     const line = this.completeTool(toolId, fallbackName, error, summary, duration, resultText)
 
@@ -816,6 +841,10 @@ class TurnController {
     if (this.interrupted) {
       return
     }
+
+    const done = this.activeTools.find(tool => tool.id === toolId)
+    const name = done?.name ?? fallbackName ?? 'tool'
+    this.turnSummary?.recordTool(name, { isError: Boolean(error), result: { diff: diffText } })
 
     this.flushStreamingSegment()
     this.pushInlineDiffSegment(diffText, [this.completeTool(toolId, fallbackName, error, '', duration, resultText)])
@@ -931,6 +960,10 @@ class TurnController {
     this.turnTools = []
     this.toolTokenAcc = 0
     this.persistedToolLabels.clear()
+    // Session boundary: drop per-turn summary state too so a session A tally
+    // can't bleed into session B (same rule as the notice state below).
+    this.turnSummary = null
+    this.turnStartMs = 0
     // Session boundary: drop notice state so session A's sticky can't bleed
     // into session B (R3-H5). reset()/fullReset() CLEAR — they never flush.
     this.clearNoticeState()
@@ -988,6 +1021,8 @@ class TurnController {
     this.toolTokenAcc = 0
     this.interrupted = false
     this.persistedToolLabels.clear()
+    this.turnSummary = new TurnSummaryCollector()
+    this.turnStartMs = Date.now()
     // "Flash and yield" notices clear when a new turn starts: a usage-band heads-up
     // (credits.usage, 50/75/90%) and the one-time "grant spent" transition
     // (credits.grant_spent) should show once, then get out of the way — not camp the

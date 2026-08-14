@@ -1359,6 +1359,14 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
           const msgs: Msg[] = finalMessages.length ? finalMessages : [{ role: 'assistant', text: finalText }]
           msgs.forEach(appendMessage)
 
+          // Per-turn tool summary (CLI display.turn_summary parity): the
+          // summary text (⋯ prefix) renders as a dim ◈ timeline event line.
+          const turnSummary = turnController.renderTurnSummary()
+
+          if (turnSummary) {
+            appendMessage({ kind: 'event', role: 'system', text: turnSummary })
+          }
+
           // Pet beat: celebrate a finished plan, otherwise a clean-finish wave.
           flashPet(isTodoDone(getTurnState().todos) ? 'jump' : 'wave')
 

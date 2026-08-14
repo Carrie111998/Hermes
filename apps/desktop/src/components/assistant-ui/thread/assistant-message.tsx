@@ -34,6 +34,7 @@ import { useEnterAnimation } from '@/lib/use-enter-animation'
 import { cn } from '@/lib/utils'
 import { playSpeechText, stopVoicePlayback } from '@/lib/voice-playback'
 import { notifyError } from '@/store/notifications'
+import { $turnSummaries } from '@/store/turn-summaries'
 import { $voicePlayback } from '@/store/voice-playback'
 
 // Stable empty identity for the settled-parts selector — a fresh [] per render
@@ -57,6 +58,9 @@ export const AssistantMessage: FC<{
   const messageId = useAuiState(s => s.message.id)
   const messageRuntime = useMessageRuntime()
   const { t } = useI18n()
+  // Per-turn tool summary (CLI display.turn_summary parity), computed when
+  // the turn settles in use-message-stream and published per message id.
+  const turnSummary = useStore($turnSummaries)[messageId] || ''
 
   // A reply to an inter-agent delivery is part of that exchange, not part of
   // the human conversation — collapse it under a compact notice ("Reply to
@@ -228,6 +232,14 @@ export const AssistantMessage: FC<{
       {/* Last thing in the turn — under the action bar, the way Cursor ends a
           turn on its summary rather than burying it above the controls. */}
       <ChangedFilesCard parts={settledParts} />
+      {!isRunning && turnSummary && (
+        <div
+          className="mt-1 text-[length:var(--conversation-tool-font-size)] leading-5 text-(--ui-text-tertiary)"
+          data-slot="aui_turn-summary"
+        >
+          {turnSummary}
+        </div>
+      )}
     </MessagePrimitive.Root>
   )
 }

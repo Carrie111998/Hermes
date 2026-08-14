@@ -72,6 +72,7 @@ import { invalidateSkillSuggestionIndex } from '@/store/suggestion-providers/ski
 import { clearActiveSessionTodos } from '@/store/todos'
 import { recordToolDiff } from '@/store/tool-diffs'
 import { setSessionDraftingTool } from '@/store/tool-drafting'
+import { beginTurnSummary, recordTurnTool } from '@/store/turn-summaries'
 import { reportInstallMethodWarning } from '@/store/updates'
 import { notifyWorkspaceChanged, toolChangedPath, toolMayMutateFiles } from '@/store/workspace-events'
 // Leaf import (not the `@/themes` barrel) to avoid pulling the ThemeProvider
@@ -599,6 +600,8 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
         setSessionCompacting(sessionId, false)
         compactedTurnRef.current.delete(sessionId)
         nativeSubagentSessionsRef.current.delete(sessionId)
+        // A fresh turn starts a fresh tool tally (display.turn_summary parity).
+        beginTurnSummary(sessionId)
         // A fresh turn on this session optimistically clears its billing wall;
         // if credits are still exhausted the next failure re-raises it.
         clearBillingBlock(sessionId)
@@ -867,6 +870,19 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
         if (sessionId) {
           flushQueuedDeltas(sessionId)
           upsertToolCall(sessionId, toTodoPayload(payload) ?? payload, 'complete', event.type)
+
+          // Per-turn tool tally (display.turn_summary parity), fed per event
+          // so multi-segment turns (interim-sealed tool bubble + distinct
+          // text-only final) still count every tool. inline_diff feeds the
+          // +A -B delta counter; the plain result only when no diff exists.
+          recordTurnTool(
+            sessionId,
+            payload?.name,
+            Boolean(payload?.error),
+            typeof payload?.inline_diff === 'string' && payload.inline_diff
+              ? { diff: payload.inline_diff }
+              : payload?.result
+          )
 
           if (isActiveEvent) {
             setPetActivity({ toolRunning: false })
