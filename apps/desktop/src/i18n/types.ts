@@ -1862,6 +1862,7 @@ export interface Translations {
       moveFailed: string
       moveNoFolder: string
       moveNoProjects: string
+      moveCreateNew: string
       reveal: string
       copyPath: string
       removeFromSidebar: string

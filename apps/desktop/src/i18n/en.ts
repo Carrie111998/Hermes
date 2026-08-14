@@ -2196,6 +2196,7 @@ export const en: Translations = {
       moveFailed: 'Could not move session',
       moveNoFolder: 'That project has no folder to move into',
       moveNoProjects: 'No other projects',
+      moveCreateNew: 'New project…',
       reveal: 'Reveal in folder',
       copyPath: 'Copy path',
       removeFromSidebar: 'Hide from sidebar',
