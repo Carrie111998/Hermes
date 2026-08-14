@@ -150,6 +150,20 @@ _TELEGRAM_NOISY_STATUS_RE = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 
+# Status notices addressed to the deployment OPERATOR, not chat participants.
+# The anchor is the embedded `hermes config set …` opt-out command: a status
+# that tells the reader to run the Hermes CLI is by construction directed at
+# whoever operates the install (e.g. the one-time Codex auto-compaction raise
+# notice from agent/agent_init.py). In a multi-user chat every member would
+# see it — and in a group-bot deployment the FIRST activation is usually a
+# public group, so internal provider/model/config details leaked to third
+# parties. Suppressed only on group scopes; DMs and operator surfaces
+# (CLI/TUI/local) keep the notice.
+_GATEWAY_OPERATOR_STATUS_NOTICE_RE = re.compile(
+    r"\bhermes\s+config\s+set\b",
+    re.IGNORECASE,
+)
+
 
 _HYGIENE_COOLDOWN_LADDER_MULTIPLIERS = (1, 3, 9)
 # Absolute ceiling on an escalated hygiene cooldown, mirroring
@@ -387,6 +401,35 @@ _GATEWAY_RAW_TEXT_PLATFORMS = frozenset(
 def _gateway_surface_passes_raw_text(platform: Any) -> bool:
     """True only for programmatic/local surfaces that must keep raw text."""
     return _gateway_platform_value(platform) in _GATEWAY_RAW_TEXT_PLATFORMS
+
+
+def _source_is_group_scope(source: Any) -> bool:
+    """True when the source chat is a multi-user scope (group/channel/thread).
+
+    Reuses the DM-vs-group mapping from ``gateway.slash_access`` so both
+    gates classify a chat identically. Anything that is not an explicit DM
+    counts as group — for operator-facing deliveries an unknown chat type
+    must fail closed (suppress) rather than post to a possibly-public chat.
+    """
+    from gateway.slash_access import _scope_for_chat_type
+
+    return _scope_for_chat_type(getattr(source, "chat_type", None)) == "group"
+
+
+def _adapter_sends_truly_private_notice(adapter: Any) -> bool:
+    """True when the adapter overrides ``send_private_notice`` for real.
+
+    The ``BasePlatformAdapter`` default falls back to a normal ``send`` so
+    single-recipient platforms can share one call path — but in a group chat
+    that fallback posts the notice publicly, which is exactly the leak the
+    group gate exists to prevent, so the default must not count as private.
+    Only a genuine override (e.g. Slack ephemerals) qualifies.
+    """
+    impl = getattr(type(adapter), "send_private_notice", None)
+    if impl is None:
+        # Instance-level implementations (plugin adapters, test doubles).
+        return callable(getattr(adapter, "send_private_notice", None))
+    return impl is not BasePlatformAdapter.send_private_notice
 
 
 _GATEWAY_PROVIDER_ERROR_RE = re.compile(
@@ -816,11 +859,22 @@ def _sanitize_gateway_final_response(platform: Any, text: str) -> str:
     return redacted
 
 
-def _prepare_gateway_status_message(platform: Any, event_type: str, message: str) -> Optional[str]:
+def _prepare_gateway_status_message(
+    platform: Any,
+    event_type: str,
+    message: str,
+    *,
+    group_scope: bool = False,
+) -> Optional[str]:
     """Filter/sanitize agent status callbacks before platform delivery.
 
     Local/CLI sessions keep the raw diagnostic stream. Messaging gateway
     surfaces should not receive transient auxiliary/compression chatter.
+
+    ``group_scope`` marks multi-user chats (groups/channels/threads):
+    operator-directed config notices are additionally suppressed there,
+    because every member of the chat would see them. DM delivery is
+    unchanged.
     """
     text = str(message or "").strip()
     if not text:
@@ -829,6 +883,11 @@ def _prepare_gateway_status_message(platform: Any, event_type: str, message: str
         return text
 
     text = _redact_gateway_user_facing_secrets(text)
+    if group_scope and _GATEWAY_OPERATOR_STATUS_NOTICE_RE.search(text):
+        # Operator-facing config notice (embeds a `hermes config set`
+        # opt-out) in a multi-user chat: keep it out of the group and let
+        # the operator see it in logs / their own DM instead.
+        return None
     if _TELEGRAM_NOISY_STATUS_RE.search(text):
         # Opt-in #52995: `compression.progress_notices: true` lets ROUTINE
         # compression progress statuses through to chat platforms. The
@@ -5043,6 +5102,7 @@ class TurnRunner:
             ctx.source.platform,
             event_type,
             message,
+            group_scope=_source_is_group_scope(ctx.source),
         )
         if prepared_message is None:
             logger.debug(
@@ -15451,7 +15511,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
 
     async def _deliver_platform_notice(self, source, content: str) -> None:
-        """Deliver a setup/operational notice using platform-specific privacy rules."""
+        """Deliver a setup/operational notice using platform-specific privacy rules.
+
+        Everything on this rail is operator-facing (home-channel setup
+        prompt, credit-band notices), so a multi-user chat never gets the
+        public path: in a group/channel the notice goes out only through a
+        genuinely private adapter route (Slack ephemerals) and is otherwise
+        logged and dropped. In a group-bot deployment the first activation
+        is usually a public group — delivering there exposed internal setup
+        details (/sethome, provider/model, billing) to every member and
+        invited any of them to claim the home channel. DM delivery keeps
+        its public fallback unchanged: the "public" chat IS the operator.
+        """
         adapter = self._adapter_for_source(source)
         if not adapter:
             return
@@ -15472,23 +15543,39 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if config and hasattr(config, "get_notice_delivery"):
             notice_delivery = config.get_notice_delivery(source.platform)
 
+        group_scope = _source_is_group_scope(source)
         metadata = self._thread_metadata_for_source(source)
         if notice_delivery == "private" and getattr(source, "user_id", None):
-            try:
-                result = await adapter.send_private_notice(
-                    source.chat_id,
-                    source.user_id,
-                    content,
-                    metadata=metadata,
-                )
-                if getattr(result, "success", False):
-                    return
-            except Exception:
-                logger.debug(
-                    "[%s] send_private_notice failed, falling back to public",
-                    getattr(source, "platform", "?"),
-                    exc_info=True,
-                )
+            # In a group, the BasePlatformAdapter send_private_notice
+            # default falls back to a normal public send — that fallback IS
+            # the leak, so only a real private override counts there.
+            if not group_scope or _adapter_sends_truly_private_notice(adapter):
+                try:
+                    result = await adapter.send_private_notice(
+                        source.chat_id,
+                        source.user_id,
+                        content,
+                        metadata=metadata,
+                    )
+                    if getattr(result, "success", False):
+                        return
+                except Exception:
+                    logger.debug(
+                        "[%s] send_private_notice failed%s",
+                        getattr(source, "platform", "?"),
+                        "" if group_scope else ", falling back to public",
+                        exc_info=True,
+                    )
+
+        if group_scope:
+            logger.info(
+                "Suppressing operator notice in group chat %s:%s (operator-"
+                "facing; would be visible to all members): %s",
+                getattr(getattr(source, "platform", None), "value", "?"),
+                getattr(source, "chat_id", "?"),
+                str(content or "").splitlines()[0][:120] if content else "",
+            )
+            return
 
         await adapter.send(source.chat_id, content, metadata=metadata)
 
