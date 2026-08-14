@@ -391,6 +391,15 @@ def _run_main_preserves_path_when_scrubbing_the_environment(monkeypatch, git_wor
                     "github_repo": "org/fixture",
                     "max_autonomous_action": "create_pr",
                     "synthetic_fixture": True,
+                    # Explicit unrecognized-provider model: this test is only
+                    # about PATH surviving the scrub, not credential
+                    # resolution. Omitting this falls back to TargetConfig's
+                    # real default ("deepseek/deepseek-v4-pro"), a KNOWN
+                    # provider the hermetic test env has no key for -- which
+                    # now correctly trips main()'s fail-fast (see F6) before
+                    # run_agent is ever called, for a reason unrelated to
+                    # what this test checks.
+                    "agent_model": "test/model",
                 }
             },
         }),
@@ -678,6 +687,277 @@ def test_resolve_agent_credentials_forwards_only_whats_present(monkeypatch):
     # api_key nor base_url are invented out of thin air.
     result = _resolve_agent_credentials("fakevendor/some-model", {})
     assert result == {"provider": "fakevendor"}
+
+
+# --- F6: the resolved credential in F4 assumed the key was already in the
+# ambient process environment. In production it isn't -- DEEPSEEK_API_KEY
+# (the default model's provider) lives only in the Hermes profile .env
+# (~/.hermes/profiles/main/.env with HERMES_HOME profile-scoped), which
+# nothing loads into os.environ before _resolve_agent_credentials reads it.
+# main() must load the Hermes dotenv (via hermes_cli.env_loader.
+# load_hermes_dotenv) before capturing secrets/resolving credentials, must
+# not let a loader failure crash the run, and must fail fast with a clear
+# message -- rather than silently falling through to call_llm's broken
+# "auto" auto-detect -- when a known provider still has no resolvable key
+# afterwards.
+
+
+def test_main_dotenv_load_happens_before_secret_capture(monkeypatch, git_worktree, tmp_path):
+    saved_environ = dict(os.environ)
+    try:
+        _run_main_dotenv_load_before_secret_capture(monkeypatch, git_worktree, tmp_path)
+    finally:
+        os.environ.clear()
+        os.environ.update(saved_environ)
+
+
+def _run_main_dotenv_load_before_secret_capture(monkeypatch, git_worktree, tmp_path):
+    # Default "test/model" -- unknown provider prefix, credentials resolve to
+    # {} either way. This test is only about ORDERING: does the loader run
+    # before secret_values() captures the environment to scan against?
+    request_path, allowlist_path = _write_request_and_allowlist(tmp_path)
+
+    monkeypatch.setenv("DDP_REQUEST_PATH", str(request_path))
+    monkeypatch.setenv("PATH", "C:/fake/real/path")
+    monkeypatch.chdir(git_worktree)
+
+    from devflow_delegation import agent_runner
+
+    monkeypatch.setattr("events.paths.devflow_allowlist_path", lambda: allowlist_path)
+
+    marker = "LOADER_MARKER_API_KEY"
+    monkeypatch.delenv(marker, raising=False)
+
+    def fake_load_hermes_dotenv(**kwargs):
+        # Stand-in for a value that only exists in the profile .env -- never
+        # set via monkeypatch.setenv (which would make this ambient, not
+        # loader-sourced).
+        os.environ[marker] = "fk-marker-0123456789abcdef"
+        return []
+
+    monkeypatch.setattr("hermes_cli.env_loader.load_hermes_dotenv", fake_load_hermes_dotenv)
+
+    seen = {}
+    from devflow_delegation.agent_policy import secret_values as real_secret_values
+
+    def spy_secret_values(env):
+        seen["marker_present"] = marker in env
+        return real_secret_values(env)
+
+    monkeypatch.setattr(agent_runner, "secret_values", spy_secret_values)
+    monkeypatch.setattr(agent_runner, "run_agent",
+                        lambda **k: {"iterations": 1, "tokens": 1, "stopped": "model-finished"})
+    monkeypatch.setattr(agent_runner, "self_check", lambda *a, **k: None)
+
+    assert agent_runner.main([]) == 0
+    # If the loader ran AFTER secret_values(), the marker would be absent
+    # from the dict secret_values() was handed.
+    assert seen.get("marker_present") is True
+
+
+def test_main_forwards_a_credential_available_only_via_the_dotenv_loader(monkeypatch, git_worktree, tmp_path):
+    saved_environ = dict(os.environ)
+    try:
+        _run_main_forwards_a_loader_only_credential(monkeypatch, git_worktree, tmp_path)
+    finally:
+        os.environ.clear()
+        os.environ.update(saved_environ)
+
+
+def _run_main_forwards_a_loader_only_credential(monkeypatch, git_worktree, tmp_path):
+    request_path, allowlist_path = _write_request_and_allowlist(
+        tmp_path, agent_model="fakevendor/fake-model-1")
+
+    fake_key = "fk" + "-" + "dotenv" + "-" + "0123456789abcdef"
+    monkeypatch.setenv("DDP_REQUEST_PATH", str(request_path))
+    monkeypatch.setenv("PATH", "C:/fake/real/path")
+    # Deliberately NOT ambient -- only the (faked) loader supplies this.
+    monkeypatch.delenv("FAKEVENDOR_API_KEY", raising=False)
+    monkeypatch.chdir(git_worktree)
+
+    from devflow_delegation import agent_runner
+
+    monkeypatch.setattr("events.paths.devflow_allowlist_path", lambda: allowlist_path)
+
+    fake_provider = SimpleNamespace(
+        id="fakevendor", api_key_env_vars=("FAKEVENDOR_API_KEY",), base_url_env_var="",
+    )
+    monkeypatch.setattr(
+        "hermes_cli.providers.get_provider",
+        lambda name: fake_provider if name == "fakevendor" else None,
+    )
+
+    def fake_load_hermes_dotenv(**kwargs):
+        os.environ["FAKEVENDOR_API_KEY"] = fake_key
+        return []
+
+    monkeypatch.setattr("hermes_cli.env_loader.load_hermes_dotenv", fake_load_hermes_dotenv)
+
+    captured = {}
+
+    def fake_call_llm(**kwargs):
+        captured.update(kwargs)
+        message = SimpleNamespace(content="done", tool_calls=None)
+        return SimpleNamespace(choices=[SimpleNamespace(message=message)],
+                               usage=SimpleNamespace(total_tokens=1))
+
+    monkeypatch.setattr("agent.auxiliary_client.call_llm", fake_call_llm)
+    monkeypatch.setattr(agent_runner, "self_check", lambda *a, **k: None)
+
+    assert agent_runner.main([]) == 0
+
+    # Resolved from the loader-injected value and forwarded explicitly.
+    assert captured.get("provider") == "fakevendor"
+    assert captured.get("api_key") == fake_key
+
+    # Not left behind in the scrubbed child environment -- passed as an
+    # argument, never as a var the rest of the process (or a leaked log)
+    # could observe.
+    assert "FAKEVENDOR_API_KEY" not in os.environ
+
+
+def test_main_fails_fast_when_no_credential_resolved_for_a_known_provider(
+    monkeypatch, git_worktree, tmp_path, capsys
+):
+    saved_environ = dict(os.environ)
+    try:
+        _run_main_fails_fast_when_no_credential_resolved(monkeypatch, git_worktree, tmp_path, capsys)
+    finally:
+        os.environ.clear()
+        os.environ.update(saved_environ)
+
+
+def _run_main_fails_fast_when_no_credential_resolved(monkeypatch, git_worktree, tmp_path, capsys):
+    request_path, allowlist_path = _write_request_and_allowlist(
+        tmp_path, agent_model="fakevendor/fake-model-1")
+
+    monkeypatch.setenv("DDP_REQUEST_PATH", str(request_path))
+    monkeypatch.setenv("PATH", "C:/fake/real/path")
+    monkeypatch.delenv("FAKEVENDOR_API_KEY", raising=False)
+    monkeypatch.chdir(git_worktree)
+
+    from devflow_delegation import agent_runner
+
+    monkeypatch.setattr("events.paths.devflow_allowlist_path", lambda: allowlist_path)
+
+    fake_provider = SimpleNamespace(
+        id="fakevendor", api_key_env_vars=("FAKEVENDOR_API_KEY",), base_url_env_var="",
+    )
+    monkeypatch.setattr(
+        "hermes_cli.providers.get_provider",
+        lambda name: fake_provider if name == "fakevendor" else None,
+    )
+    # The credential genuinely doesn't exist anywhere: not ambient, and the
+    # (faked) loader finds nothing either.
+    monkeypatch.setattr("hermes_cli.env_loader.load_hermes_dotenv", lambda **k: [])
+
+    def fake_call_llm(**kwargs):
+        raise AssertionError("call_llm must never be called with no resolvable credential")
+
+    monkeypatch.setattr("agent.auxiliary_client.call_llm", fake_call_llm)
+
+    def fake_run_agent(**kwargs):
+        raise AssertionError("run_agent must never start with no resolvable credential")
+
+    monkeypatch.setattr(agent_runner, "run_agent", fake_run_agent)
+
+    exit_code = agent_runner.main([])
+
+    assert exit_code == 1
+    err = capsys.readouterr().err
+    assert "no provider credential resolved" in err
+    assert "fakevendor/fake-model-1" in err
+
+
+def test_main_proceeds_when_the_dotenv_loader_raises(monkeypatch, git_worktree, tmp_path):
+    saved_environ = dict(os.environ)
+    try:
+        _run_main_proceeds_when_the_dotenv_loader_raises(monkeypatch, git_worktree, tmp_path)
+    finally:
+        os.environ.clear()
+        os.environ.update(saved_environ)
+
+
+def _run_main_proceeds_when_the_dotenv_loader_raises(monkeypatch, git_worktree, tmp_path):
+    # Unknown provider prefix ("test/model" default) -- credentials resolve
+    # to {} regardless of the loader. A raising loader must still not stop
+    # the run from reaching run_agent (the credential may legitimately
+    # already be ambient, or -- as here -- not be needed at all).
+    request_path, allowlist_path = _write_request_and_allowlist(tmp_path)
+
+    monkeypatch.setenv("DDP_REQUEST_PATH", str(request_path))
+    monkeypatch.setenv("PATH", "C:/fake/real/path")
+    monkeypatch.chdir(git_worktree)
+
+    from devflow_delegation import agent_runner
+
+    monkeypatch.setattr("events.paths.devflow_allowlist_path", lambda: allowlist_path)
+
+    def raising_loader(**kwargs):
+        raise OSError("simulated corrupt .env")
+
+    monkeypatch.setattr("hermes_cli.env_loader.load_hermes_dotenv", raising_loader)
+    monkeypatch.setattr(agent_runner, "run_agent",
+                        lambda **k: {"iterations": 1, "tokens": 1, "stopped": "model-finished"})
+    monkeypatch.setattr(agent_runner, "self_check", lambda *a, **k: None)
+
+    assert agent_runner.main([]) == 0
+
+
+def test_main_fails_fast_cleanly_when_the_dotenv_loader_raises_and_no_credential_elsewhere(
+    monkeypatch, git_worktree, tmp_path, capsys
+):
+    saved_environ = dict(os.environ)
+    try:
+        _run_main_fails_fast_cleanly_when_the_loader_raises(monkeypatch, git_worktree, tmp_path, capsys)
+    finally:
+        os.environ.clear()
+        os.environ.update(saved_environ)
+
+
+def _run_main_fails_fast_cleanly_when_the_loader_raises(monkeypatch, git_worktree, tmp_path, capsys):
+    # A known provider with a raising loader AND no ambient key: the run must
+    # still fail with the clean "no provider credential resolved" message,
+    # not crash on the loader's own exception.
+    request_path, allowlist_path = _write_request_and_allowlist(
+        tmp_path, agent_model="fakevendor/fake-model-1")
+
+    monkeypatch.setenv("DDP_REQUEST_PATH", str(request_path))
+    monkeypatch.setenv("PATH", "C:/fake/real/path")
+    monkeypatch.delenv("FAKEVENDOR_API_KEY", raising=False)
+    monkeypatch.chdir(git_worktree)
+
+    from devflow_delegation import agent_runner
+
+    monkeypatch.setattr("events.paths.devflow_allowlist_path", lambda: allowlist_path)
+
+    fake_provider = SimpleNamespace(
+        id="fakevendor", api_key_env_vars=("FAKEVENDOR_API_KEY",), base_url_env_var="",
+    )
+    monkeypatch.setattr(
+        "hermes_cli.providers.get_provider",
+        lambda name: fake_provider if name == "fakevendor" else None,
+    )
+
+    def raising_loader(**kwargs):
+        raise OSError("simulated corrupt .env with a fake secret sk-should-not-appear")
+
+    monkeypatch.setattr("hermes_cli.env_loader.load_hermes_dotenv", raising_loader)
+
+    def fake_call_llm(**kwargs):
+        raise AssertionError("call_llm must never be called with no resolvable credential")
+
+    monkeypatch.setattr("agent.auxiliary_client.call_llm", fake_call_llm)
+
+    exit_code = agent_runner.main([])
+
+    assert exit_code == 1
+    err = capsys.readouterr().err
+    assert "no provider credential resolved" in err
+    assert "fakevendor/fake-model-1" in err
+    # The loader's own exception text must not leak into the failure
+    # surface -- this is a clean, specific failure, not an echoed traceback.
+    assert "simulated corrupt" not in err
 
 
 # --- F5: the failure path printed unscanned exception text. The executor

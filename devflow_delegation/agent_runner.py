@@ -300,6 +300,42 @@ def _resolve_agent_credentials(agent_model: str, env: Mapping[str, str]) -> Dict
     return resolved
 
 
+def _load_dotenv_best_effort() -> None:
+    """Populate ``os.environ`` from the Hermes profile ``.env`` before any
+    secret capture or credential resolution runs.
+
+    Why this exists: ``_resolve_agent_credentials`` reads provider keys
+    (e.g. ``DEEPSEEK_API_KEY``) out of ``os.environ``. In this deployment
+    those keys live in ``~/.hermes/profiles/main/.env`` -- not in the
+    ambient process environment the executor spawns this runner with -- so
+    without loading that file first, credential resolution finds nothing
+    even for a correctly-configured provider. ``load_hermes_dotenv`` is the
+    canonical loader (``hermes_cli.env_loader``): with no explicit
+    ``hermes_home=``, it honors ``HERMES_HOME``, which this deployment sets
+    profile-scoped, so it lands on the right ``.env`` without this module
+    needing to know about profiles at all.
+
+    Best-effort and non-fatal: the credential may legitimately already be
+    ambient (tests, a shell that exports it directly, CI), or this call may
+    simply be a no-op (no ``.env`` present). Any failure here -- missing
+    file, import error, malformed env -- is logged and swallowed; it must
+    never crash the run. If the run genuinely has no usable credential
+    afterwards, ``main`` catches that separately and fails fast with a
+    specific message instead of silently falling through to ``call_llm``'s
+    broken "auto" auto-detect.
+    """
+    try:
+        from hermes_cli.env_loader import load_hermes_dotenv
+
+        load_hermes_dotenv()
+    except Exception:  # noqa: BLE001 -- must never block the run
+        print(
+            "WARNING: failed to load the Hermes profile .env; continuing "
+            "with the ambient environment",
+            file=sys.stderr,
+        )
+
+
 def main(argv=None) -> int:
     """Entrypoint used as a target's implementation_command."""
     del argv
@@ -314,6 +350,11 @@ def main(argv=None) -> int:
     # no-op, not an error).
     known: tuple = ()
     try:
+        # Step 1 of the credential-resolution order: load the Hermes profile
+        # .env into os.environ FIRST, before anything captures or resolves
+        # against the environment below. See _load_dotenv_best_effort.
+        _load_dotenv_best_effort()
+
         request = json.loads(Path(request_path).read_text(encoding="utf-8"))
         envelope = request.get("request") or {}
         repo = str((envelope.get("target") or {}).get("repo") or "")
@@ -345,6 +386,23 @@ def main(argv=None) -> int:
         # _resolve_agent_credentials for why: call_llm's own auto-detection
         # depends on env vars the scrub is about to remove.
         credentials = _resolve_agent_credentials(target.agent_model, os.environ)
+        # A recognized provider prefix with no resolvable api_key means the
+        # credential genuinely isn't anywhere this process can see (not
+        # ambient, not in the profile .env just loaded above). Forwarding
+        # `{"provider": ...}` alone to call_llm without an api_key would not
+        # reproduce "auto" auto-detect -- auto-detect never runs because an
+        # explicit provider= was given -- so the call would simply go out
+        # unauthenticated. Fail fast and clearly instead of making that call
+        # blind. (An UNRECOGNIZED provider prefix resolves to `{}` with no
+        # "provider" key at all -- that case is unchanged, pre-existing
+        # behavior: it falls through to call_llm's own "auto" chain, exactly
+        # as before this fix.)
+        if "provider" in credentials and not credentials.get("api_key"):
+            print(
+                f"ERROR: no provider credential resolved for model {target.agent_model}",
+                file=sys.stderr,
+            )
+            return 1
         scrubbed = scrubbed_env(os.environ)
         os.environ.clear()
         os.environ.update(scrubbed)
