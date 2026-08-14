@@ -333,6 +333,29 @@ if (DEV_CDP.port) {
   }
 }
 
+// Linux/Wayland: Electron's zygote process pool doesn't propagate
+// --ozone-platform=wayland or GPU acceleration flags to the GPU child
+// process (electron/electron#50455). The GPU process falls back to software
+// compositing (5-9x CPU overhead). --no-zygote forces each child to be spawned
+// fresh via posix_spawn with the full command line, fixing GPU flag
+// propagation so hardware acceleration works.
+//
+// The "'--ozone-platform=wayland' is not compatible with Vulkan" error
+// message still appears at startup but is cosmetic — GPU acceleration works
+// correctly with --no-zygote (confirmed by electron/electron#50455).
+//
+// Trade-off: ~100ms slower child process spawning — irrelevant for a
+// long-running desktop app.
+const IS_WAYLAND_NATIVE =
+  process.platform === 'linux' &&
+  !!process.env.WAYLAND_DISPLAY &&
+  process.env.XDG_SESSION_TYPE === 'wayland'
+
+if (IS_WAYLAND_NATIVE && !REMOTE_DISPLAY_REASON) {
+  app.commandLine.appendSwitch('no-zygote')
+  console.log('[hermes] Wayland native session detected; using --no-zygote for GPU flag propagation (electron/electron#50455)')
+}
+
 // WSLg: Chromium blocklists the Mesa vGPU → software compositing → typing lag.
 // /dev/dxg means a real GPU is available; un-blocklist it. Skipped when a remote
 // display already forced software (SSH'd-into-WSL).
