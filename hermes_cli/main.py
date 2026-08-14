@@ -4704,7 +4704,7 @@ def cmd_cron(args):
     """Cron job management."""
     from hermes_cli.cron import cron_command
 
-    cron_command(args)
+    return cron_command(args)
 
 
 def cmd_sync(args):
@@ -4968,7 +4968,7 @@ def cmd_doctor(args):
     """Check configuration and dependencies."""
     from hermes_cli.doctor import run_doctor
 
-    run_doctor(args)
+    return run_doctor(args)
 
 
 def cmd_verify(args):
