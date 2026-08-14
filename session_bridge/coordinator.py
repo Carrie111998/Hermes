@@ -4331,6 +4331,7 @@ class SessionBridgeCoordinator:
         rebuilt = 0
         failed = 0
         locally_owned = 0
+        deferred = 0
         for thread_summary in summaries:
             try:
                 projection = await self._provider_call(
@@ -4355,6 +4356,24 @@ class SessionBridgeCoordinator:
                 # degrades the provider and starves every downstream lane.
                 locally_owned += 1
                 continue
+            except (TimeoutError, StaleExternalProjection) as exc:
+                # 2026-08-13: same treatment as _scan_codex_persistent, which was the
+                # only codex path that had it. A transport timeout says something about
+                # the HOST (the app-server did not answer inside its 30s bound), and a
+                # stale projection is a no-op -- neither means this thread is bad. Left
+                # in the generic branch below they each count a failure, which degrades
+                # the provider. Observed with the tail of the backfill:
+                # ScanSummary(discovered=22, indexed=0, failed=1) recurring forever with
+                # two app-server timeouts and none of the persistent path's deferral
+                # lines, because the timeout was landing HERE instead.
+                deferred += 1
+                self._record_codex_scan_diagnostic(
+                    stage="full_history_project",
+                    native_id=getattr(thread_summary, "native_id", None),
+                    exc=exc,
+                    adapter=adapter,
+                )
+                continue
             except Exception as exc:
                 self._record_codex_scan_diagnostic(
                     stage="full_history_project",
@@ -4366,6 +4385,17 @@ class SessionBridgeCoordinator:
                 continue
             indexed += 1
             rebuilt += int(not result.first_seen)
+        if deferred:
+            # Counted, never silent: retried next cycle, never a scan failure.
+            try:
+                _LOG.warning(
+                    "codex_scan_diagnostic stage=full_history_project "
+                    "code=app_server_timeout deferred=%d indexed=%d",
+                    deferred,
+                    indexed,
+                )
+            except Exception:
+                pass
         if locally_owned:
             # Counted, never silent: these threads stay outside the bridge
             # catalog by design.
@@ -4451,6 +4481,7 @@ class SessionBridgeCoordinator:
         indexed = 0
         failed = 0
         locally_owned = 0
+        deferred = 0
         for thread_summary in summaries:
             try:
                 projection = await self._provider_call(
@@ -4475,6 +4506,17 @@ class SessionBridgeCoordinator:
                 # Hermes owns this canonical id; never adopted, never a failure.
                 locally_owned += 1
                 continue
+            except (TimeoutError, StaleExternalProjection) as exc:
+                # Host-side timeout or a no-op stale projection: retried next cycle,
+                # never a provider-degrading failure. Mirrors _scan_codex_persistent.
+                deferred += 1
+                self._record_codex_scan_diagnostic(
+                    stage="immediate_project",
+                    native_id=getattr(thread_summary, "native_id", None),
+                    exc=exc,
+                    adapter=adapter,
+                )
+                continue
             except Exception as exc:
                 self._record_codex_scan_diagnostic(
                     stage="immediate_project",
@@ -4485,6 +4527,16 @@ class SessionBridgeCoordinator:
                 failed += 1
                 continue
             indexed += 1
+        if deferred:
+            try:
+                _LOG.warning(
+                    "codex_scan_diagnostic stage=immediate_project "
+                    "code=app_server_timeout deferred=%d indexed=%d",
+                    deferred,
+                    indexed,
+                )
+            except Exception:
+                pass
         if locally_owned:
             try:
                 _LOG.info(
@@ -4570,6 +4622,7 @@ class SessionBridgeCoordinator:
         rebuilt = 0
         failed_ids: list[str] = []
         succeeded_ids: list[str] = []
+        locally_owned = 0
         for native_id in selected_ids:
             try:
                 path = paths_by_native_id.get(native_id)
@@ -4629,6 +4682,20 @@ class SessionBridgeCoordinator:
                 )
             except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
                 raise
+            except (LocalSessionOwnsCanonicalId, StaleExternalProjection):
+                # 2026-08-13: all three CODEX scan paths handled these; none of the
+                # CLAUDE paths did. Hermes materialises its own claude-provider
+                # sessions under the canonical id the bridge wants for an imported
+                # transcript -- benign, never adopted. A stale projection is a no-op.
+                # Left to the generic branch below each appends to failed_ids, which
+                # _merge_native_ids rolls into remaining_ids and _save_pending
+                # RE-STAGES, so the same transcript is retried every cycle forever:
+                # claude sat at `remaining: 1` indefinitely with degraded_reason
+                # scan_failed. Observed on claude:5dc2e902-... (a local 38-message
+                # session). Excluding it here let claude's backfill reach 0 for the
+                # first time.
+                locally_owned += 1
+                continue
             except Exception:
                 failed_ids.append(native_id)
                 continue

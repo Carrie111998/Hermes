@@ -827,6 +827,26 @@ class LocalSessionOwnsCanonicalId(ValueError):
     """
 
 
+class StaleExternalProjection(ValueError):
+    """The incoming projection is older than the persisted activity watermark.
+
+    ``_external_activity_state_key`` records the newest ``last_active`` ever
+    projected for a session, and the importer refuses to move it backwards. The
+    source can legitimately report a slightly EARLIER value on a later read --
+    ``last_active`` is ``max(summary_last_active, *message_timestamps)``, so a
+    read that returns fewer messages (pagination, a degraded app-server, a
+    truncated summary) yields a smaller max. Measured 2026-08-13 on
+    ``codex:019feec9-f523-…``: a 13-second regression.
+
+    This is a no-op, not corruption: the projection simply has nothing newer to
+    contribute. Typed (rather than a bare ValueError) so scans can count it as a
+    skip instead of a failure -- the generic handler aborts the whole batch AND
+    re-stages the id, so one non-monotonic session re-poisons the provider every
+    cycle forever. Same reasoning, and the same remedy, as
+    ``LocalSessionOwnsCanonicalId`` above.
+    """
+
+
 class SessionBridgeStore:
     """Transactional persistence for the cross-harness session bridge."""
 
@@ -3469,7 +3489,9 @@ class SessionBridgeStore:
                 and persisted_last_active is not None
                 and last_active < persisted_last_active
             ):
-                raise ValueError(f"stale projection for session {session_id!r}")
+                raise StaleExternalProjection(
+                    f"stale projection for session {session_id!r}"
+                )
 
             if rebuild:
                 pending = projected_messages

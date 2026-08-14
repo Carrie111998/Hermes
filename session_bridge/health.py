@@ -745,8 +745,22 @@ def _queue(
         ledger_code = "not_applicable"
         ledger_not_applicable = True
     elif name == "mirror_jobs":
+        # 2026-08-13: this used to copy the WORK_STATE code onto the LEDGER axis
+        # (`ledger_code = work["code"]`) while forcing state="unknown". mirror_jobs has
+        # no real ledger, so when work is unhealthy the honest ledger verdict is
+        # "not tracked" -- not a restatement of the work failure.
+        #
+        # Copying it emitted (code="mirror_manual_failure", state="unknown") on a
+        # queue_ledger axis, which breaks the axis contract two ways: that code is not in
+        # the ledger vocabulary for this scope, and it is an ERROR-class code so it may
+        # only pair with state="error". The consumer therefore rejected the axis, which
+        # voids the WHOLE evidence envelope and blanks all four session-bridge monitor
+        # rows to 'unknown'. Latent until the first mirror_jobs manual_failure row
+        # existed; enabling mirrors.automatic_creation produced one and exposed it.
+        # "not_tracked" is already the allowed unknown-state ledger code for this scope
+        # (see the else branch below, and _LEDGER_CODES["mirror_jobs"] consumer-side).
         ledger_state = "unknown"
-        ledger_code = cast(str, work["code"])
+        ledger_code = "not_tracked"
     elif ledger_valid is True:
         ledger_state = "healthy"
         ledger_code = "terminal_resolution_consistent"

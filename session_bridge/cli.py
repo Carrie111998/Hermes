@@ -236,10 +236,122 @@ def _run_continuous_sidebar_recovery_worker(
         close()
 
 
+def _kill_process_tree(pid: int) -> None:
+    """Kill a process AND its descendants. Best-effort; never raises."""
+    try:
+        if os.name == "nt":
+            subprocess.run(
+                ["taskkill", "/PID", str(pid), "/T", "/F"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=10.0,
+                check=False,
+            )
+        else:  # pragma: no cover - posix path
+            os.killpg(os.getpgid(pid), 9)
+    except Exception:
+        pass
+
+
+def _bounded_run(
+    args: Sequence[str],
+    *,
+    capture_output: bool = True,
+    text: bool = True,
+    timeout: float = 15.0,
+    stdin: object = subprocess.DEVNULL,
+    shell: bool = False,
+    check: bool = False,
+    env: Mapping[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    """A ``subprocess.run`` whose ``timeout`` actually bounds the call.
+
+    2026-08-13: ``subprocess.run(timeout=...)`` does NOT bound this workload. On
+    timeout it kills the DIRECT child and then re-enters ``communicate()`` with no
+    timeout to reap it. ``claude`` is a Node CLI that spawns grandchildren which
+    inherit the stdout/stderr pipe handles, so those pipes never reach EOF, the
+    reader threads never finish, and ``_communicate`` blocks on ``join()`` forever.
+
+    Captured live via py-spy on the wedged service -- the
+    ``session-bridge-claude-visibility`` thread parked indefinitely at::
+
+        _wait_for_tstate_lock -> join -> _communicate -> communicate -> run
+        -> _claude_visibility_preflight (cli.py:271)
+
+    which silently killed Claude visibility processing for the process lifetime:
+    the 15s bound existed but could never fire.
+
+    This implementation never lets an unbounded read block the caller:
+      * ``proc.wait(timeout=...)`` bounds the wait WITHOUT touching the pipes, so
+        a grandchild holding them cannot extend it;
+      * output is drained on daemon threads that are joined with their own small
+        bound and simply abandoned if a leaked handle keeps them alive;
+      * on timeout the whole process TREE is killed (``taskkill /T``), which is
+        what actually releases the inherited handles.
+
+    Raises ``subprocess.TimeoutExpired`` on timeout, matching the contract callers
+    already handle.
+    """
+    popen_kwargs: dict[str, Any] = {
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
+        "stdin": stdin,
+        "shell": shell,
+        "env": dict(env) if env is not None else None,
+    }
+    if text:
+        popen_kwargs.update(text=True, encoding="utf-8", errors="replace")
+
+    proc = subprocess.Popen(list(args), **popen_kwargs)
+    out_chunks: list[str] = []
+    err_chunks: list[str] = []
+
+    def _drain(stream: Any, sink: list[str]) -> None:
+        if stream is None:
+            return
+        try:
+            for line in iter(stream.readline, "" if text else b""):
+                sink.append(line if text else line.decode("utf-8", "replace"))
+        except Exception:
+            pass
+        finally:
+            try:
+                stream.close()
+            except Exception:
+                pass
+
+    readers = [
+        threading.Thread(target=_drain, args=(proc.stdout, out_chunks), daemon=True),
+        threading.Thread(target=_drain, args=(proc.stderr, err_chunks), daemon=True),
+    ]
+    for reader in readers:
+        reader.start()
+
+    try:
+        returncode = proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _kill_process_tree(proc.pid)
+        raise
+    finally:
+        # Bounded: a leaked grandchild handle must not strand the caller.
+        for reader in readers:
+            reader.join(timeout=2.0)
+
+    result: subprocess.CompletedProcess[str] = subprocess.CompletedProcess(
+        list(args), returncode, "".join(out_chunks), "".join(err_chunks)
+    )
+    if check and returncode != 0:
+        raise subprocess.CalledProcessError(
+            returncode, list(args), result.stdout, result.stderr
+        )
+    return result
+
+
 def _claude_visibility_preflight(
     command: Sequence[str],
     *,
-    runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+    runner: Callable[..., subprocess.CompletedProcess[str]] = _bounded_run,
     global_config_path: Path | str | None = None,
     user_settings_path: Path | str | None = None,
 ) -> dict[str, str] | None:

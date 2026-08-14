@@ -179,17 +179,53 @@ class _CacheEntry:
     entrypoint: str | None
 
 
+# How long a discovery listing may be reused before the tree is re-walked.
+# Bounds how late a brand-new transcript can be picked up; see discover().
+_DISCOVER_TTL_SECONDS = 60.0
+
+
 class ClaudeSourceAdapter:
     def __init__(self, projects_root: Path, *, marker_secret: bytes) -> None:
         self._projects_root = Path(projects_root)
         self._marker_secret = marker_secret
         self._cache: dict[str, _CacheEntry] = {}
+        self._discover_cache: list[Path] | None = None
+        self._discover_at: float = 0.0
 
     def discover(self) -> list[Path]:
-        return sorted(
+        """List Claude transcripts, reusing the last walk for up to the TTL.
+
+        2026-08-13: this re-ran ``rglob`` over the whole projects tree on EVERY
+        scan cycle (425 project dirs / 3,641 transcripts here). py-spy caught it
+        mid-walk on the wedged service::
+
+            _select_from (pathlib.py:205) -> rglob -> discover
+            (claude_adapter.py:189)
+
+        Provider scans share a small pool (``provider_calls_inflight`` was 2), so
+        this walk monopolised the capacity and STARVED the codex scan: codex sat
+        at indexed_total=1000 / remaining=1722 with zero progress and zero errors
+        for 20+ minutes, while claude kept indexing. Its catalog freshness then
+        aged past the 33s limit and pinned session-bridge-catalog to 'unknown'.
+
+        A directory-mtime signature was considered and rejected: transcripts live
+        at BOTH depth 1 and depth 3 under the root, and creating a file in a
+        nested subdirectory does not bump the immediate project dir's mtime, so
+        such a signature would silently miss new sessions. A TTL cannot miss
+        anything -- it only delays discovery by at most the TTL, which for a
+        mirror is well inside tolerance.
+        """
+        now = time.monotonic()
+        cached = self._discover_cache
+        if cached is not None and (now - self._discover_at) < _DISCOVER_TTL_SECONDS:
+            return list(cached)
+        discovered = sorted(
             self._projects_root.rglob("*.jsonl"),
             key=lambda path: str(path),
         )
+        self._discover_cache = discovered
+        self._discover_at = now
+        return list(discovered)
 
     def parse(
         self, path: Path, previous: ClaudeCursor | None = None

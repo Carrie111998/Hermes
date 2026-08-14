@@ -491,6 +491,19 @@ class SidebarThreadVerifier:
         return tuple(projections)
 
 
+# How long a native_id -> summary inventory index may be reused before refetching.
+# A miss always falls back to a live targeted fetch, so this can never cause a
+# thread to be reported missing -- it only bounds how stale a cached summary is.
+#
+# 2026-08-13: started at 60s, which was self-defeating. One full inventory fetch
+# pages ~2,700 codex threads over 30s-bounded app-server RPCs and takes MINUTES,
+# so a 60s TTL expired mid-backfill and the scan spent most of its time refetching
+# the inventory it had just built (observed: 300 threads indexed in the first 19s
+# after a restart, then a multi-minute stall re-paging). The TTL must comfortably
+# exceed the fetch cost for the index to pay for itself.
+_INVENTORY_INDEX_TTL_SECONDS = 900.0
+
+
 class CodexSourceAdapter:
     def __init__(
         self,
@@ -510,6 +523,12 @@ class CodexSourceAdapter:
         self._experimental_search_enabled = False
         self._seen_inventory: dict[str, CodexThreadSummary] = {}
         self._inventory_cache: dict[str, CodexThreadSummary] = {}
+        # TTL'd native_id -> summary index per inventory flavour; see
+        # _inventory_index() for why this exists.
+        self._inventory_index_cache: dict[
+            tuple[bool, tuple[str, ...] | None, bool],
+            tuple[float, dict[str, CodexThreadSummary]],
+        ] = {}
         if trusted_origins is None:
             self._trusted_origins_resolver: Callable[[], Mapping[str, str]] = dict
         elif isinstance(trusted_origins, Mapping):
@@ -1256,6 +1275,42 @@ class CodexSourceAdapter:
         marker = encode_bridge_marker(payload, self._marker_secret)
         return _projection_has_exact_marker(projection, marker=marker)
 
+    def _inventory_index(
+        self,
+        *,
+        archived: bool,
+        source_kinds: tuple[str, ...] | None,
+        state_db_only: bool,
+    ) -> dict[str, CodexThreadSummary] | None:
+        """native_id -> summary for one inventory flavour, cached for a TTL.
+
+        Collapses the per-thread full-inventory paging in find_native_thread into
+        ONE fetch per TTL. A miss here is never treated as absence: the caller
+        falls back to the original targeted fetch, so a thread created inside the
+        TTL window is still found. Returns None if the fetch fails, which also
+        routes the caller to the original path.
+        """
+        key = (archived, source_kinds, state_db_only)
+        now = time.monotonic()
+        entry = self._inventory_index_cache.get(key)
+        if entry is not None and (now - entry[0]) < _INVENTORY_INDEX_TTL_SECONDS:
+            return entry[1]
+        try:
+            summaries = self._fetch_inventory(
+                archived=archived,
+                source_kinds=source_kinds,
+                state_db_only=state_db_only,
+            )
+        except Exception:
+            return None
+        index = {
+            summary.native_id: summary
+            for summary in summaries
+            if isinstance(getattr(summary, "native_id", None), str)
+        }
+        self._inventory_index_cache[key] = (now, index)
+        return index
+
     def find_native_thread(
         self,
         native_id: str,
@@ -1267,6 +1322,24 @@ class CodexSourceAdapter:
             return None
         self._ensure_initialized()
         wanted = native_id.strip()
+
+        # 2026-08-13: try the TTL'd index BEFORE paging. This method used to page
+        # the whole inventory on every call -- one 30s-bounded app-server RPC per
+        # page -- to resolve a single thread, so a scan of N threads cost O(N x
+        # pages). py-spy caught the scan parked here (asyncio_13 ->
+        # _fetch_inventory_pages:1438 -> _fetch_inventory:1381 -> find_native_thread),
+        # and codex sat at indexed_total=1000 / remaining=1722 with no progress and
+        # no errors for 20+ minutes; its catalog freshness then aged past the 33s
+        # limit and pinned session-bridge-catalog/service/continuity to 'unknown'.
+        # Note _inventory_cache was already written here (below) but never read.
+        indexed = self._inventory_index(
+            archived=False, source_kinds=source_kinds, state_db_only=state_db_only
+        )
+        if indexed is not None:
+            hit = indexed.get(wanted)
+            if hit is not None:
+                self._inventory_cache[wanted] = hit
+                return hit
 
         active = self._fetch_inventory(
             archived=False,
