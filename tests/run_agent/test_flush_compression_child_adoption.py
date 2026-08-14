@@ -220,10 +220,17 @@ def test_turn_start_recovery_clears_guard_after_first_durable_flush(tmp_path) ->
         )
         agent = _bare_agent(db, "root")
 
-        assert recover_rotated_compression_session(agent) is not None
+        recovered = recover_rotated_compression_session(agent)
+        assert recovered is not None
         assert getattr(agent, "_pending_compression_lineage_guards", None) == {
             "tip": "root"
         }
+        # Recovery must bind durable rows with intrinsic markers, not raw
+        # id() values that can alias a newly allocated final message after the
+        # caller releases the recovered list.
+        assert agent._flushed_db_message_ids == set()
+        assert all(message.get("_db_persisted") is True for message in recovered)
+        del recovered
         final = {"role": "assistant", "content": "guarded durable write"}
 
         assert agent._flush_messages_to_session_db_unlocked(

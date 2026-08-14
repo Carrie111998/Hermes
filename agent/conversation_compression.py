@@ -76,6 +76,17 @@ from agent.session_activity import ActivityProvenance, normalize_activity_proven
 
 logger = logging.getLogger(__name__)
 
+# Keep this value aligned with run_agent._DB_PERSISTED_MARKER without importing
+# run_agent here (which would create a compression/runtime import cycle).
+_DB_PERSISTED_MARKER = "_db_persisted"
+
+
+def _mark_durable_messages(messages: List[Dict[str, Any]]) -> None:
+    """Mark DB-loaded recovery rows intrinsically; never retain raw id()s."""
+    for message in messages:
+        if isinstance(message, dict):
+            message[_DB_PERSISTED_MARKER] = True
+
 # Terminal compression outcomes published by host/hygiene timeout or cooldown
 # writers. Detached heartbeat workers must not clobber these back to
 # agent.compression after cancel (otherwise timeout is unobservable). Observing
@@ -1266,9 +1277,8 @@ def _commit_live_compression_child_adoption(
         agent._cached_system_prompt = child["system_prompt"]
     agent._last_flushed_db_idx = len(recovered)
     agent._flushed_db_message_session_id = child_session_id
-    agent._flushed_db_message_ids = {
-        id(message) for message in recovered if isinstance(message, dict)
-    }
+    _mark_durable_messages(recovered)
+    agent._flushed_db_message_ids = set()
     # Turn-start and compression-race adoption happen before this process has
     # durably written on the existing tip. Keep the stale root paired with the
     # adopted tip until that first append revalidates the whole lineage inside
