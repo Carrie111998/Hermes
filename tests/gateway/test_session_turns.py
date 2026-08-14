@@ -217,6 +217,131 @@ async def test_slow_callback_store_applies_bounded_worker_backpressure_and_recov
 
 
 @pytest.mark.asyncio
+async def test_loop_thread_full_persists_exact_resync_before_terminal(
+    session_db, monkeypatch: pytest.MonkeyPatch
+):
+    import gateway.platforms.session_turns as session_turns
+
+    monkeypatch.setattr(session_turns, "SESSION_TURN_CALLBACK_QUEUE_SIZE", 1)
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={}))
+    adapter._session_db = session_db
+    service = adapter._session_turn_service
+    store = SessionTurnStore(session_db)
+    turn_id = "loop-thread-structural-full"
+    store.reserve("s1", turn_id, _payload())
+    first_write_entered = threading.Event()
+    release_store = threading.Event()
+    original_append = store.append_event
+
+    def blocked_append(tid, event_type, data):
+        if event_type == "tool.started" and data.get("tool_call_id") == "call-1":
+            first_write_entered.set()
+            release_store.wait(timeout=2)
+        return original_append(tid, event_type, data)
+
+    monkeypatch.setattr(store, "append_event", blocked_append)
+
+    async def run_agent(**kwargs):
+        # These callbacks deliberately run on the owner loop. The pump consumes
+        # the first event and blocks in its store thread; the second fills the
+        # sole queue slot, so the third must become the durable missing range.
+        kwargs["tool_start_callback"]("call-1", "terminal", {})
+        assert await asyncio.to_thread(first_write_entered.wait, 1)
+        kwargs["tool_complete_callback"]("call-1", "terminal", {}, "ok")
+        try:
+            kwargs["tool_start_callback"]("call-2", "terminal", {})
+        finally:
+            release_store.set()
+
+    adapter._run_agent = run_agent
+    service._admit_execution(store, turn_id, "s1", _payload(), None, None)
+    await service.wait_for_turn(turn_id)
+
+    events = store.events_after(turn_id, 0)
+    names = [event["event"] for event in events]
+    marker = next(event for event in events if event["event"] == "session.resync_required")
+    assert marker["data"] == {
+        "reason": "structural_events_lost",
+        "missing_from": 3,
+        "missing_through": 3,
+    }
+    assert names.index("tool.completed") < names.index("session.resync_required")
+    assert names.index("session.resync_required") < names.index("turn.failed")
+    assert store.get(turn_id)["status"] == "failed"
+
+
+def test_callback_thread_on_stopped_loop_fails_bounded_and_marks_resync():
+    import gateway.platforms.session_turns as session_turns
+
+    loop = asyncio.new_event_loop()
+    ingress_holder = []
+    started = threading.Event()
+
+    def own_loop():
+        asyncio.set_event_loop(loop)
+        ingress_holder.append(session_turns._CallbackPersistenceIngress(loop, 1))
+        started.set()
+        loop.run_forever()
+
+    owner = threading.Thread(target=own_loop)
+    owner.start()
+    assert started.wait(timeout=1)
+    ingress = ingress_holder[0]
+    loop.call_soon_threadsafe(loop.stop)
+    owner.join(timeout=1)
+    assert not owner.is_alive()
+
+    before = time.monotonic()
+    with pytest.raises(session_turns._CallbackPersistenceOverloaded):
+        ingress.append_structural("tool.started", {"tool_call_id": "call-1"})
+    assert time.monotonic() - before < 0.5
+    assert ingress.structural_resync_range == (1, 1)
+    assert ingress.queue.empty()
+    loop.close()
+
+
+def test_callback_thread_timeout_cancels_pending_enqueue_without_late_insert(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    import gateway.platforms.session_turns as session_turns
+
+    monkeypatch.setattr(
+        session_turns, "SESSION_TURN_CALLBACK_ENQUEUE_TIMEOUT_SECONDS", 0.05
+    )
+    loop = asyncio.new_event_loop()
+    ingress_holder = []
+    blocked = threading.Event()
+    release = threading.Event()
+    processed = threading.Event()
+
+    def own_loop():
+        asyncio.set_event_loop(loop)
+        ingress = session_turns._CallbackPersistenceIngress(loop, 1)
+        ingress.append_structural("tool.started", {"tool_call_id": "retained"})
+        ingress_holder.append(ingress)
+        loop.call_soon(lambda: (blocked.set(), release.wait(timeout=1)))
+        loop.run_forever()
+
+    owner = threading.Thread(target=own_loop)
+    owner.start()
+    assert blocked.wait(timeout=1)
+    ingress = ingress_holder[0]
+
+    with pytest.raises(session_turns._CallbackPersistenceOverloaded):
+        ingress.append_structural("tool.completed", {"tool_call_id": "rejected"})
+    assert ingress.structural_resync_range == (2, 2)
+    release.set()
+    loop.call_soon_threadsafe(processed.set)
+    assert processed.wait(timeout=1)
+    assert ingress.queue.qsize() == 1
+    assert ingress.queue.get_nowait().data["tool_call_id"] == "retained"
+    loop.call_soon_threadsafe(loop.stop)
+    owner.join(timeout=1)
+    assert not owner.is_alive()
+    loop.close()
+
+
+@pytest.mark.asyncio
 async def test_failing_callback_store_never_overtakes_retained_structure_and_recovers(
     session_db, monkeypatch: pytest.MonkeyPatch
 ):
@@ -1012,6 +1137,49 @@ async def test_stop_reports_stopping_until_worker_actually_exits(session_db):
         await adapter._session_turn_service.wait_for_turn("turn-stop")
         final = await client.get("/api/sessions/s1/turns/turn-stop")
         assert (await final.json())["turn"]["status"] == "interrupted"
+
+
+@pytest.mark.asyncio
+async def test_concurrent_repeated_stop_records_and_watches_once(session_db, monkeypatch):
+    gate = asyncio.Event()
+
+    async def run_agent(**_kwargs):
+        await gate.wait()
+        return {"failed": True}, {}
+
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={}))
+    adapter._session_db = session_db
+    adapter._run_agent = run_agent
+    service = adapter._session_turn_service
+    watcher_started = 0
+
+    async def counted_watcher(_turn_id):
+        nonlocal watcher_started
+        watcher_started += 1
+        await gate.wait()
+
+    monkeypatch.setattr(service, "_interrupt_when_available", counted_watcher)
+
+    async with TestClient(TestServer(_app(adapter))) as client:
+        submitted = await client.post(
+            "/api/sessions/s1/turns",
+            headers={"Idempotency-Key": "turn-stop-concurrent"},
+            json=_payload(),
+        )
+        assert submitted.status == 202
+        await asyncio.sleep(0)
+        responses = await asyncio.gather(*[
+            client.post("/api/sessions/s1/turns/turn-stop-concurrent/stop")
+            for _ in range(8)
+        ])
+        assert all(response.status == 202 for response in responses)
+        public = [(await response.json())["turn"] for response in responses]
+        assert all(turn["status"] == "stopping" for turn in public)
+        assert watcher_started == 1
+        events = SessionTurnStore(session_db).events_after("turn-stop-concurrent", 0)
+        assert [event["event"] for event in events].count("turn.stopping") == 1
+        gate.set()
+        await service.wait_for_turn("turn-stop-concurrent")
 
 
 def test_no_transcript_duplication_store_has_no_content_columns(session_db):

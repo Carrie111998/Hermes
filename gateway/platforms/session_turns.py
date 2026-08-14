@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import concurrent.futures
 import hashlib
 import io
 import json
@@ -40,6 +41,7 @@ SESSION_TURN_LIFECYCLE_PENDING_DISPATCHERS = 32
 SESSION_TURN_LIFECYCLE_SLOW_SECONDS = 0.1
 SESSION_TURN_LIFECYCLE_FLUSH_SECONDS = 0.05
 SESSION_TURN_CALLBACK_QUEUE_SIZE = 32
+SESSION_TURN_CALLBACK_ENQUEUE_TIMEOUT_SECONDS = 1.0
 
 
 class _CallbackEventClass(Enum):
@@ -54,20 +56,30 @@ class _CallbackPersistenceEvent:
     event_class: _CallbackEventClass
     event_type: str
     data: Dict[str, Any]
+    structural_sequence: Optional[int] = None
+
+
+@dataclass
+class _StructuralSubmission:
+    """Handshake that makes timeout cancellation and enqueue mutually exclusive."""
+
+    event: _CallbackPersistenceEvent
+    lock: threading.Lock
+    cancelled: bool = False
+    enqueued: bool = False
 
 
 class _CallbackPersistenceOverloaded(RuntimeError):
-    """Stop an on-loop producer rather than lose a structural event."""
+    """Stop a producer after retaining an exact structural resync range."""
 
 
 class _CallbackPersistenceIngress:
     """Bounded sync-callback ingress to one loop-owned persistence pump.
 
-    Structural callbacks from the agent worker apply backpressure to that worker.
-    A callback unexpectedly invoked on the aiohttp loop cannot wait without
-    deadlocking, so saturation raises and safely stops its producer. Volatile
-    deltas use one coalescing loop notification and explicitly request canonical
-    resync when one cannot be retained.
+    Structural callbacks apply bounded backpressure. If a callback cannot be
+    retained, one out-of-band resync range records every rejected structural
+    ordinal; the pump persists that marker after all retained events and before
+    terminal truth. Volatile deltas use one coalescing loop notification.
     """
 
     def __init__(self, loop: asyncio.AbstractEventLoop, maxsize: int):
@@ -84,40 +96,117 @@ class _CallbackPersistenceIngress:
         self._pending_volatile: Optional[_CallbackPersistenceEvent] = None
         self._volatile_notification_pending = False
         self._accepting = True
+        self._structural_lock = threading.Lock()
+        self._next_structural_sequence = 1
+        self._structural_resync_range: Optional[tuple[int, int]] = None
+        self._producer_stopped = False
 
     def bind_pump(self, pump_task: asyncio.Task[Any]) -> None:
         self.pump_task = pump_task
 
     def append_structural(self, event_type: str, data: Dict[str, Any]) -> None:
-        event = _CallbackPersistenceEvent(
-            _CallbackEventClass.STRUCTURAL, event_type, dict(data)
-        )
-        if threading.get_ident() == self._loop_thread_id:
-            if not self._accepting:
+        # Serialize producers so the first rejected ordinal closes ingress and
+        # every later rejected fact extends one exact contiguous range.
+        with self._structural_lock:
+            sequence = self._next_structural_sequence
+            self._next_structural_sequence += 1
+            event = _CallbackPersistenceEvent(
+                _CallbackEventClass.STRUCTURAL,
+                event_type,
+                dict(data),
+                structural_sequence=sequence,
+            )
+            if self._producer_stopped or not self._accepting:
+                self._mark_structural_resync(sequence)
                 raise _CallbackPersistenceOverloaded("callback persistence closed")
-            try:
-                self.queue.put_nowait(event)
-            except asyncio.QueueFull as exc:
-                raise _CallbackPersistenceOverloaded(
-                    "structural callback persistence saturated"
-                ) from exc
-            self._observe_size()
-            return
-        future = asyncio.run_coroutine_threadsafe(self._put_structural(event), self.loop)
-        # Backpressure only the agent callback thread, never the aiohttp loop.
-        future.result()
+            if threading.get_ident() == self._loop_thread_id:
+                try:
+                    self.queue.put_nowait(event)
+                except asyncio.QueueFull as exc:
+                    self._mark_structural_resync(sequence)
+                    raise _CallbackPersistenceOverloaded(
+                        "structural callback persistence saturated"
+                    ) from exc
+                self._observe_size()
+                return
+            self._append_structural_from_callback_thread(event, sequence)
 
-    async def _put_structural(self, event: _CallbackPersistenceEvent) -> None:
+    def _append_structural_from_callback_thread(
+        self, event: _CallbackPersistenceEvent, sequence: int
+    ) -> None:
+        if self.loop.is_closed() or not self.loop.is_running():
+            self._mark_structural_resync(sequence)
+            raise _CallbackPersistenceOverloaded("callback persistence loop unavailable")
+        submission = _StructuralSubmission(event=event, lock=threading.Lock())
+        try:
+            future = asyncio.run_coroutine_threadsafe(
+                self._put_structural(submission), self.loop
+            )
+        except RuntimeError as exc:
+            self._mark_structural_resync(sequence)
+            raise _CallbackPersistenceOverloaded(
+                "callback persistence loop unavailable"
+            ) from exc
+        deadline = time.monotonic() + SESSION_TURN_CALLBACK_ENQUEUE_TIMEOUT_SECONDS
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or self.loop.is_closed() or not self.loop.is_running():
+                with submission.lock:
+                    if submission.enqueued:
+                        return
+                    submission.cancelled = True
+                future.cancel()
+                self._mark_structural_resync(sequence)
+                raise _CallbackPersistenceOverloaded(
+                    "structural callback persistence unavailable"
+                )
+            try:
+                future.result(timeout=min(0.05, remaining))
+                return
+            except concurrent.futures.TimeoutError:
+                continue
+            except Exception as exc:
+                with submission.lock:
+                    enqueued = submission.enqueued
+                if enqueued:
+                    return
+                self._mark_structural_resync(sequence)
+                raise _CallbackPersistenceOverloaded(
+                    "callback persistence unavailable"
+                ) from exc
+
+    async def _put_structural(self, submission: _StructuralSubmission) -> None:
         while self._accepting:
             if self.pump_task is not None and self.pump_task.done():
                 raise _CallbackPersistenceOverloaded("callback persistence unavailable")
-            try:
-                await asyncio.wait_for(self.queue.put(event), timeout=0.05)
-                self._observe_size()
-                return
-            except asyncio.TimeoutError:
-                continue
+            with submission.lock:
+                if submission.cancelled:
+                    raise _CallbackPersistenceOverloaded(
+                        "callback persistence enqueue cancelled"
+                    )
+                try:
+                    self.queue.put_nowait(submission.event)
+                except asyncio.QueueFull:
+                    pass
+                else:
+                    submission.enqueued = True
+                    self._observe_size()
+                    return
+            await asyncio.sleep(0.01)
         raise _CallbackPersistenceOverloaded("callback persistence closed")
+
+    def _mark_structural_resync(self, sequence: int) -> None:
+        self._producer_stopped = True
+        if self._structural_resync_range is None:
+            self._structural_resync_range = (sequence, sequence)
+        else:
+            first, last = self._structural_resync_range
+            self._structural_resync_range = (min(first, sequence), max(last, sequence))
+
+    @property
+    def structural_resync_range(self) -> Optional[tuple[int, int]]:
+        with self._structural_lock:
+            return self._structural_resync_range
 
     def append_volatile(self, event_type: str, data: Dict[str, Any]) -> None:
         event = _CallbackPersistenceEvent(
@@ -924,7 +1013,10 @@ class SessionTurnStore:
         content = self.db._decode_content(row["content"])
         return content if isinstance(content, str) else None
 
-    def request_stop(self, turn_id: str) -> Optional[Dict[str, Any]]:
+    def request_stop(
+        self, turn_id: str
+    ) -> Optional[tuple[Dict[str, Any], bool]]:
+        """Atomically request stop, record its edge once, and report ownership."""
         now = time.time()
 
         def stop(conn):
@@ -933,15 +1025,26 @@ class SessionTurnStore:
             ).fetchone()
             if row is None:
                 return None
-            if row["status"] not in TERMINAL_STATUSES:
+            transitioned = row["status"] in {"queued", "running"}
+            if transitioned:
                 conn.execute(
                     "UPDATE api_session_turns SET stop_requested = 1, status = 'stopping', "
                     "updated_at = ? WHERE turn_id = ?", (now, turn_id)
                 )
+                seq_row = conn.execute(
+                    "SELECT COALESCE(MAX(seq), 0) + 1 AS seq "
+                    "FROM api_session_turn_events WHERE turn_id = ?", (turn_id,)
+                ).fetchone()
+                conn.execute(
+                    "INSERT INTO api_session_turn_events "
+                    "(turn_id, seq, event_type, data_json, created_at) "
+                    "VALUES (?, ?, 'turn.stopping', ?, ?)",
+                    (turn_id, int(seq_row["seq"]), '{\"status\": \"stopping\"}', now),
+                )
             result = conn.execute(
                 "SELECT * FROM api_session_turns WHERE turn_id = ?", (turn_id,)
             ).fetchone()
-            return dict(result)
+            return dict(result), transitioned
         return self.db._execute_write(stop)
 
     def stop_requested(self, turn_id: str) -> bool:
@@ -1650,6 +1753,20 @@ class SessionTurnService:
                             turn_id, "assistant.delta", {"volatile": True}
                         )
                     )
+                structural_range = callback_ingress.structural_resync_range
+                if structural_range is not None:
+                    missing_from, missing_through = structural_range
+                    await self._store_operation(
+                        lambda: store.append_event(
+                            turn_id,
+                            "session.resync_required",
+                            {
+                                "reason": "structural_events_lost",
+                                "missing_from": missing_from,
+                                "missing_through": missing_through,
+                            },
+                        )
+                    )
 
             callback_event_task = asyncio.create_task(persist_callback_events())
             callback_ingress.bind_pump(callback_event_task)
@@ -2261,25 +2378,25 @@ class SessionTurnService:
             if (ref and ref[0] is not None) or turn_id not in self._tasks:
                 break
             await asyncio.sleep(0.01)
-        def stop_and_record() -> Optional[Dict[str, Any]]:
-            stopped = store.request_stop(turn_id)
-            if stopped is not None and stopped["status"] == "stopping":
-                store.append_event(
-                    turn_id, "turn.stopping", {"status": "stopping"}
-                )
-            return store.public_turn(turn_id)
+        def stop_and_read() -> tuple[Optional[Dict[str, Any]], bool]:
+            result = store.request_stop(turn_id)
+            if result is None:
+                return None, False
+            _row, transitioned = result
+            return store.public_turn(turn_id), transitioned
 
-        public = await self._store_operation(stop_and_record)
-        ref = self._agent_refs.get(turn_id)
-        agent = ref[0] if ref else None
-        if agent is not None:
-            try:
-                agent.interrupt("Stop requested via session turn API")
-            except Exception:
-                pass
-        else:
-            watcher = asyncio.create_task(self._interrupt_when_available(turn_id))
-            self._track_background_task(watcher)
+        public, transitioned = await self._store_operation(stop_and_read)
+        if transitioned:
+            ref = self._agent_refs.get(turn_id)
+            agent = ref[0] if ref else None
+            if agent is not None:
+                try:
+                    agent.interrupt("Stop requested via session turn API")
+                except Exception:
+                    pass
+            else:
+                watcher = asyncio.create_task(self._interrupt_when_available(turn_id))
+                self._track_background_task(watcher)
         return web.json_response(
             {"object": "hermes.session.turn.stop", "turn": public}, status=202
         )
