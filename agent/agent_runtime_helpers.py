@@ -2926,6 +2926,14 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
     if not isinstance(function_args, dict):
         function_args = {}
 
+    runtime_identity = {
+        "provider": str(getattr(agent, "provider", "") or "").strip(),
+        "model": str(getattr(agent, "model", "") or "").strip(),
+        "api_mode": str(getattr(agent, "api_mode", "") or "").strip(),
+        "session_id": str(getattr(agent, "session_id", "") or "").strip(),
+        "source": "agent_runtime_after_provider_response",
+    }
+
     _tool_middleware_trace = list(tool_request_middleware_trace or [])
     try:
         from hermes_cli.middleware import apply_tool_request_middleware
@@ -3138,6 +3146,7 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                 enabled_toolsets=getattr(agent, "enabled_toolsets", None),
                 disabled_toolsets=getattr(agent, "disabled_toolsets", None),
                 tool_request_middleware_trace=list(_tool_middleware_trace),
+                runtime_identity=runtime_identity,
             )
             if skip_tool_execution_middleware:
                 dispatch_kwargs["skip_tool_execution_middleware"] = True

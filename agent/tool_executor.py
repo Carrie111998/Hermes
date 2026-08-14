@@ -52,6 +52,47 @@ from tools.budget_config import BudgetConfig, DEFAULT_BUDGET, budget_for_context
 
 logger = logging.getLogger(__name__)
 
+_KANBAN_LIFECYCLE_HANDOFF_TOOLS = frozenset({
+    "kanban_complete",
+    "kanban_block",
+    "kanban_request_review",
+    "kanban_request_changes",
+})
+
+
+def _runtime_identity(agent) -> dict[str, str]:
+    """Trusted runtime route observed by the agent executing this tool call."""
+    return {
+        "provider": str(getattr(agent, "provider", "") or "").strip(),
+        "model": str(getattr(agent, "model", "") or "").strip(),
+        "api_mode": str(getattr(agent, "api_mode", "") or "").strip(),
+        "session_id": str(getattr(agent, "session_id", "") or "").strip(),
+        "source": "agent_runtime_after_provider_response",
+    }
+
+
+def _record_successful_kanban_handoff(agent, function_name: str, result: Any) -> bool:
+    """Latch a successful lifecycle transfer so this worker stops immediately."""
+    from agent.delegation_context import is_dispatcher_owned_worker_context
+
+    if not os.environ.get("HERMES_KANBAN_TASK") or not is_dispatcher_owned_worker_context():
+        return False
+    if function_name not in _KANBAN_LIFECYCLE_HANDOFF_TOOLS:
+        return False
+    try:
+        payload = json.loads(result) if isinstance(result, str) else result
+    except (TypeError, json.JSONDecodeError):
+        return False
+    if not isinstance(payload, dict) or payload.get("ok") is not True:
+        return False
+    agent._kanban_lifecycle_handoff = {
+        "tool": function_name,
+        "task_id": payload.get("task_id"),
+        "run_id": payload.get("run_id"),
+        "status": payload.get("status"),
+    }
+    return True
+
 
 def _ensure_file_checkpoint(
     agent,
@@ -2066,6 +2107,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                         tool_request_middleware_trace=list(middleware_trace),
                         enabled_toolsets=getattr(agent, "enabled_toolsets", None),
                         disabled_toolsets=getattr(agent, "disabled_toolsets", None),
+                        runtime_identity=_runtime_identity(agent),
                     )
 
                 (
@@ -2145,6 +2187,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                         tool_request_middleware_trace=list(middleware_trace),
                         enabled_toolsets=getattr(agent, "enabled_toolsets", None),
                         disabled_toolsets=getattr(agent, "disabled_toolsets", None),
+                        runtime_identity=_runtime_identity(agent),
                     )
 
                 (
@@ -2297,6 +2340,23 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         ):
             return
 
+        handoff_succeeded = _record_successful_kanban_handoff(
+            agent, function_name, display_function_result
+        )
+        if handoff_succeeded:
+            remaining_calls = assistant_message.tool_calls[i:]
+            if remaining_calls:
+                _append_cancelled_tool_results(
+                    messages,
+                    remaining_calls,
+                    reason="successful Kanban lifecycle handoff",
+                )
+                _flush_session_db_after_tool_progress(
+                    agent,
+                    messages,
+                    stage=f"Kanban lifecycle handoff {function_name}",
+                )
+
         # UI completion/progress events are projections of the canonical tool
         # row, never a competing in-memory authority.
         if not _execution_blocked and agent.tool_progress_callback:
@@ -2349,6 +2409,9 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 _fr_str = function_result if isinstance(function_result, str) else str(function_result)
                 response_preview = _fr_str[:agent.log_prefix_chars] + "..." if len(_fr_str) > agent.log_prefix_chars else _fr_str
                 print(f"  ✅ Tool {i} completed in {tool_duration:.2f}s - {response_preview}")
+
+        if handoff_succeeded:
+            break
 
         if agent._interrupt_requested and i < len(assistant_message.tool_calls):
             remaining = len(assistant_message.tool_calls) - i
@@ -2416,7 +2479,7 @@ def execute_tool_calls_segmented(agent, assistant_message, messages: list, effec
         _exec_cwd = Path(_active_env.cwd) if _active_env is not None and _active_env.cwd else None
         segments = _plan_tool_batch_segments(assistant_message.tool_calls, execution_cwd=_exec_cwd)
 
-    for kind, calls in segments:
+    for segment_index, (kind, calls) in enumerate(segments):
         if getattr(agent, "_incremental_persistence_failed", False):
             return
         segment_message = SimpleNamespace(tool_calls=list(calls))
@@ -2433,6 +2496,26 @@ def execute_tool_calls_segmented(agent, assistant_message, messages: list, effec
 
         if getattr(agent, "_incremental_persistence_failed", False):
             return
+
+        if getattr(agent, "_kanban_lifecycle_handoff", None):
+            remaining_calls = [
+                call
+                for _kind, later_calls in segments[segment_index + 1:]
+                for call in later_calls
+            ]
+            if remaining_calls:
+                _append_cancelled_tool_results(
+                    messages,
+                    remaining_calls,
+                    reason="successful Kanban lifecycle handoff",
+                )
+                if not _flush_session_db_after_tool_progress(
+                    agent,
+                    messages,
+                    stage="Kanban lifecycle handoff across tool segments",
+                ):
+                    return
+            break
 
     # ── Whole-turn finalize (budget + /steer) ─────────────────────────
     total_tools = len(assistant_message.tool_calls)

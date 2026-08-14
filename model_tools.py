@@ -1183,6 +1183,7 @@ def handle_function_call(
     tool_request_middleware_trace: Optional[List[Dict[str, Any]]] = None,
     enabled_toolsets: Optional[List[str]] = None,
     disabled_toolsets: Optional[List[str]] = None,
+    runtime_identity: Optional[Dict[str, Any]] = None,
 ) -> str:
     """
     Main function call dispatcher that routes calls to the tool registry.
@@ -1322,6 +1323,7 @@ def handle_function_call(
                 tool_request_middleware_trace=list(_tool_middleware_trace),
                 enabled_toolsets=enabled_toolsets,
                 disabled_toolsets=disabled_toolsets,
+                runtime_identity=runtime_identity,
             )
 
     _tool_original_args = dict(function_args)
@@ -1476,6 +1478,7 @@ def handle_function_call(
                         task_id=task_id,
                         session_id=session_id,
                         enabled_tools=sandbox_enabled,
+                        runtime_identity=runtime_identity,
                     )
             else:
                 def _dispatch(next_args: Dict[str, Any]) -> Any:
@@ -1484,6 +1487,7 @@ def handle_function_call(
                         task_id=task_id,
                         session_id=session_id,
                         user_task=user_task,
+                        runtime_identity=runtime_identity,
                     )
             if skip_tool_execution_middleware:
                 result = _dispatch(function_args)

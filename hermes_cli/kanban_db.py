@@ -6132,6 +6132,7 @@ def block_task(
     reason: Optional[str] = None,
     kind: Optional[str] = None,
     expected_run_id: Optional[int] = None,
+    metadata: Optional[dict] = None,
 ) -> bool:
     """Transition ``running``/``ready`` → ``blocked`` (or route elsewhere).
 
@@ -6210,6 +6211,7 @@ def block_task(
                 conn, task_id,
                 outcome="blocked", status="blocked",
                 summary=reason,
+                metadata=metadata,
             )
             if run_id is None and reason:
                 run_id = _synthesize_ended_run(
@@ -6268,6 +6270,7 @@ def block_task(
                 conn, task_id,
                 outcome="blocked", status="blocked",
                 summary=reason,
+                metadata=metadata,
             )
             if run_id is None and reason:
                 run_id = _synthesize_ended_run(
@@ -6322,6 +6325,7 @@ def block_task(
                 conn, task_id,
                 outcome="blocked", status="blocked",
                 summary=reason,
+                metadata=metadata,
             )
             # Synthesize a run when blocking a never-claimed task so the
             # reason is preserved in attempt history.
@@ -6537,6 +6541,7 @@ def request_changes(
     *,
     reason: str,
     expected_run_id: Optional[int] = None,
+    metadata: Optional[dict] = None,
 ) -> tuple[bool, Optional[str]]:
     """Finish an active review run and route the task back for rework.
 
@@ -6634,6 +6639,7 @@ def request_changes(
             outcome="changes_requested",
             status=new_status,
             summary=reason,
+            metadata=metadata,
         )
         _append_event(
             conn,

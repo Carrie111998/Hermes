@@ -1551,6 +1551,7 @@ def run_conversation(
     agent._last_compaction_in_place = False
     agent._last_compression_attempt_recorded = False
     agent._last_compression_attempt_in_place = None
+    agent._kanban_lifecycle_handoff = None
 
     # If a background memory/skill review spawned at the end of a PRIOR turn
     # (agent/background_review.py) is still running its own run_conversation()
@@ -6913,6 +6914,13 @@ def run_conversation(
                         pass
 
                 agent._execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count)
+
+                if getattr(agent, "_kanban_lifecycle_handoff", None):
+                    _turn_exit_reason = "kanban_lifecycle_handoff"
+                    # The lifecycle tool transferred custody and closed this
+                    # run. Do not ask the model for another turn: a stale
+                    # worker must not keep writing after review/rework handoff.
+                    break
 
                 if getattr(agent, "_incremental_persistence_failed", False):
                     # A tool result could not be made canonical. Do not send

@@ -370,7 +370,7 @@ def agent():
     with (
         patch(
             "run_agent.get_tool_definitions",
-            return_value=_make_tool_defs("web_search", "terminal"),
+            return_value=_make_tool_defs("web_search", "terminal", "kanban_complete"),
         ),
         patch("run_agent.check_toolset_requirements", return_value={}),
         patch("run_agent.OpenAI"),
@@ -387,6 +387,31 @@ def agent():
 
 
 class TestSegmentedDispatchIntegration:
+    def test_kanban_handoff_cancels_later_parallel_segment(self, agent, monkeypatch):
+        """A successful lifecycle barrier transfers custody. Later safe reads
+        in a separate parallel segment must receive cancelled results without
+        ever starting."""
+        calls = [
+            _tc("kanban_complete", '{"summary":"done"}', call_id="k1"),
+            _tc("web_search", '{"query":"must not run a"}', call_id="s1"),
+            _tc("web_search", '{"query":"must not run b"}', call_id="s2"),
+        ]
+        msg = SimpleNamespace(content="", tool_calls=calls)
+        messages = []
+        executed = []
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_1")
+
+        def fake_handle(name, args, task_id, **kwargs):
+            executed.append(kwargs["tool_call_id"])
+            return json.dumps({"ok": True, "task_id": "t_1", "run_id": 1})
+
+        with patch("run_agent.handle_function_call", side_effect=fake_handle):
+            agent._execute_tool_calls(msg, messages, "task-1")
+
+        assert executed == ["k1"]
+        assert [m["tool_call_id"] for m in messages] == ["k1", "s1", "s2"]
+        assert all("successful Kanban lifecycle handoff" in m["content"] for m in messages[1:])
+
     def test_mixed_batch_runs_safe_prefix_concurrently_and_barrier_after(self, agent):
         """Two web_search calls must overlap in time; terminal must start only
         after both finish; results land in the model's emission order."""
