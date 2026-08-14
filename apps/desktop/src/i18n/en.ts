@@ -218,6 +218,9 @@ export const en: Translations = {
     resetAll: 'Reset all',
     pressKey: 'Press a key…',
     set: 'set',
+    dictateMode: 'Dictation gesture',
+    hold: 'Hold',
+    toggle: 'Toggle',
     conflictWith: label => `Also bound to “${label}”`,
     categories: {
       composer: 'Composer',
@@ -257,6 +260,7 @@ export const en: Translations = {
       'workspace.openFolder': 'Open folder as project',
       'composer.focus': 'Focus composer',
       'composer.modelPicker': 'Open model picker',
+      'composer.dictate': 'Dictate into composer',
       'composer.voice': 'Start / stop voice conversation',
       'view.toggleSidebar': 'Toggle sessions sidebar',
       'view.toggleRightSidebar': 'Toggle file browser',

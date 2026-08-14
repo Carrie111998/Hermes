@@ -213,6 +213,9 @@ export const zh: Translations = {
     resetAll: '全部重置',
     pressKey: '请按下按键…',
     set: '设置',
+    dictateMode: '听写手势',
+    hold: '按住',
+    toggle: '切换',
     conflictWith: label => `已绑定到“${label}”`,
     categories: {
       composer: '输入框',
@@ -252,6 +255,7 @@ export const zh: Translations = {
       'workspace.openFolder': '打开文件夹为项目',
       'composer.focus': '聚焦输入框',
       'composer.modelPicker': '打开模型选择器',
+      'composer.dictate': '听写到输入框',
       'composer.voice': '开始 / 停止语音对话',
       'view.toggleSidebar': '切换会话侧边栏',
       'view.toggleRightSidebar': '切换文件浏览器',

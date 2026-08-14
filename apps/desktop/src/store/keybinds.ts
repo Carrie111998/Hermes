@@ -6,6 +6,18 @@ import { canonicalizeCombo } from '@/lib/keybinds/combo'
 import { arraysEqual, persistString, storedString } from '@/lib/storage'
 
 const STORAGE_KEY = 'hermes.desktop.keybinds'
+const DICTATE_MODE_STORAGE_KEY = 'hermes.desktop.dictate-mode'
+
+export type DictateMode = 'hold' | 'toggle'
+
+const storedDictateMode = storedString(DICTATE_MODE_STORAGE_KEY)
+export const $dictateMode = atom<DictateMode>(storedDictateMode === 'toggle' ? 'toggle' : 'hold')
+
+$dictateMode.subscribe(mode => persistString(DICTATE_MODE_STORAGE_KEY, mode))
+
+export function setDictateMode(mode: DictateMode): void {
+  $dictateMode.set(mode)
+}
 
 // The user's raw stored overrides. Kept verbatim so an action CONTRIBUTED
 // after module init (plugins register late) still resolves its saved rebind —

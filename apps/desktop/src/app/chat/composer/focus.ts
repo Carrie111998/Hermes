@@ -49,6 +49,7 @@ const ATTACH_IMAGES_EVENT = 'hermes:composer-attach-images'
 const INSERT_REFS_EVENT = 'hermes:composer-insert-refs'
 const SUBMIT_EVENT = 'hermes:composer-submit'
 const VOICE_TOGGLE_EVENT = 'hermes:composer-voice-toggle'
+const DICTATE_EVENT = 'hermes:composer-dictate'
 const MODEL_MENU_EVENT = 'hermes:composer-model-menu'
 
 /** Inline edit composer root — mounted only while a user bubble is being edited. */
@@ -281,6 +282,18 @@ export const requestVoiceToggle = (target: ComposerTarget | 'active' = 'active')
 
 export const onComposerVoiceToggleRequest = (handler: (target: ComposerTarget) => void) =>
   subscribe<{ target: ComposerTarget }>(VOICE_TOGGLE_EVENT, ({ target }) => handler(target))
+
+export type DictateRequest = 'cancel' | 'start' | 'stop' | 'toggle'
+
+/** Route dictation to the focused composer (or the visible main composer).
+ * This is intentionally separate from `composer.voice`: dictation only edits
+ * the draft and never submits a conversation turn. */
+export const requestComposerDictate = (request: DictateRequest, target: ComposerTarget | 'active' = 'active') =>
+  dispatch<{ request: DictateRequest; target: ComposerTarget }>(DICTATE_EVENT, { request, target: resolve(target) })
+
+export const onComposerDictateRequest = (
+  handler: (detail: { request: DictateRequest; target: ComposerTarget }) => void
+) => subscribe<{ request: DictateRequest; target: ComposerTarget }>(DICTATE_EVENT, handler)
 
 /** The chat surface inside the zone the pointer is over, if any. Mirrors the
  *  tab verbs' hover-first targeting (`tabTargetGroupId`, #74447): the model

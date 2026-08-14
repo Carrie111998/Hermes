@@ -22,12 +22,14 @@ import { arraysEqual } from '@/lib/storage'
 import {
   $bindings,
   $capture,
+  $dictateMode,
   beginCapture,
   bindingsFor,
   conflictsFor,
   endCapture,
   resetAllBindings,
-  resetBinding
+  resetBinding,
+  setDictateMode
 } from '@/store/keybinds'
 
 import { SettingsContent } from './primitives'
@@ -35,6 +37,7 @@ import { SettingsContent } from './primitives'
 export function KeybindSettings() {
   const { t } = useI18n()
   const bindings = useStore($bindings)
+  const dictateMode = useStore($dictateMode)
   const k = t.keybinds
   const [collapsed, setCollapsed] = useState<ReadonlySet<string>>(new Set())
   // Subscribe so contributed actions appear/disappear live in the map.
@@ -129,7 +132,7 @@ export function KeybindSettings() {
           ) : (
             <>
               {filteredActions?.map(action => (
-                <KeybindRow action={action} key={action.id} />
+                <KeybindRow action={action} dictateMode={dictateMode} key={action.id} />
               ))}
               {filteredReadonly?.map(shortcut => (
                 <ReadonlyRow key={shortcut.id} shortcut={shortcut} />
@@ -159,7 +162,8 @@ export function KeybindSettings() {
                   onToggle={() => toggleCategory(category)}
                   open={sectionOpen}
                 />
-                {sectionOpen && actions.map(action => <KeybindRow action={action} key={action.id} />)}
+                {sectionOpen &&
+                  actions.map(action => <KeybindRow action={action} dictateMode={dictateMode} key={action.id} />)}
                 {sectionOpen && readonly.map(shortcut => <ReadonlyRow key={shortcut.id} shortcut={shortcut} />)}
               </section>
             )
@@ -189,7 +193,7 @@ function CategoryHeader({ label, onToggle, open }: { label: string; onToggle: ()
   )
 }
 
-function KeybindRow({ action }: { action: KeybindActionMeta }) {
+function KeybindRow({ action, dictateMode }: { action: KeybindActionMeta; dictateMode?: 'hold' | 'toggle' }) {
   const { t } = useI18n()
   const k = t.keybinds
   const bindings = useStore($bindings)
@@ -210,6 +214,21 @@ function KeybindRow({ action }: { action: KeybindActionMeta }) {
   return (
     <div className="group flex items-center gap-2.5 rounded-lg px-2.5 py-1 transition-colors hover:bg-(--chrome-action-hover)">
       <span className="min-w-0 flex-1 truncate text-[0.82rem] text-foreground/90">{label}</span>
+
+      {action.id === 'composer.dictate' && (
+        <label className="flex shrink-0 items-center gap-1 text-[0.68rem] text-muted-foreground">
+          <span className="sr-only">{k.dictateMode}</span>
+          <select
+            aria-label={k.dictateMode}
+            className="rounded border border-border bg-transparent px-1 py-0.5 text-[0.68rem] outline-none"
+            onChange={event => setDictateMode(event.target.value === 'toggle' ? 'toggle' : 'hold')}
+            value={dictateMode ?? 'hold'}
+          >
+            <option value="hold">{k.hold}</option>
+            <option value="toggle">{k.toggle}</option>
+          </select>
+        </label>
+      )}
 
       {conflict && (
         <span className="flex size-4 items-center justify-center text-amber-500/90" title={k.conflictWith(conflict)}>

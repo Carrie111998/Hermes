@@ -260,6 +260,9 @@ export interface Translations {
     resetAll: string
     pressKey: string
     set: string
+    dictateMode: string
+    hold: string
+    toggle: string
     conflictWith: (label: string) => string
     categories: Record<string, string>
     actions: Record<string, string>
