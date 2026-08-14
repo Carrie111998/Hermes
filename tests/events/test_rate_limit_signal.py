@@ -46,3 +46,153 @@ def test_recovered_is_info_and_silent():
     assert route.attention is Attention.INFO
     assert route.topic_key == ALERTS
     assert route.wa_tier is None
+
+
+import json
+from unittest.mock import patch
+
+import pytest
+
+
+@pytest.fixture
+def state_file(tmp_path, monkeypatch):
+    """Point rate-limit state at a temp file."""
+    p = tmp_path / "rate_limit_state.json"
+    monkeypatch.setattr(
+        "events.rate_limit_signal._state_path", lambda: p
+    )
+    from events import rate_limit_signal
+    rate_limit_signal.reset_state_cache()
+    return p
+
+
+def test_load_state_missing_file_returns_empty(state_file):
+    from events.rate_limit_signal import _load_state
+    assert _load_state() == {}
+
+
+def test_save_then_load_roundtrip(state_file):
+    from events.rate_limit_signal import _load_state, _save_state
+    episode = {
+        "provider": "deepseek", "model": "deepseek-v4-pro",
+        "opened_at": "2026-08-14T10:00:00Z", "resets_at": "",
+        "worst_outcome": "diverted", "alerted_level": "diverted",
+        "diverted_calls": 3, "fallbacks_seen": ["openai-codex/gpt-5.6-sol"],
+    }
+    assert _save_state({"deepseek/deepseek-v4-pro": episode}) is True
+    from events import rate_limit_signal
+    rate_limit_signal.reset_state_cache()
+    loaded = _load_state()
+    assert loaded["deepseek/deepseek-v4-pro"]["diverted_calls"] == 3
+
+
+def test_malformed_state_fails_open_to_empty(state_file):
+    state_file.write_text("{not json at all", encoding="utf-8")
+    from events import rate_limit_signal
+    rate_limit_signal.reset_state_cache()
+    assert rate_limit_signal._load_state() == {}
+
+
+def test_unreadable_state_never_raises(state_file, monkeypatch):
+    from events import rate_limit_signal
+    rate_limit_signal.reset_state_cache()
+
+    def _boom(*a, **k):
+        raise OSError("disk on fire")
+
+    monkeypatch.setattr("builtins.open", _boom)
+    assert rate_limit_signal._load_state() == {}
+
+
+# --- Extra fail-open / edge-case coverage beyond the brief's four tests.
+# Kept only where it exercises behavior genuinely distinct from the tests
+# above (e.g. a non-dict JSON top level, directory creation, overwrite
+# semantics) and where it actually executes (no Windows-only skips).
+
+
+class TestLoadState:
+    """Additional load-state edge cases beyond the brief's four."""
+
+    def test_load_non_dict_toplevel_returns_empty_dict(self, tmp_path):
+        """Loading JSON that is not a dict at top level returns {}."""
+        from events import rate_limit_signal
+        state_file = tmp_path / "state.json"
+        state_file.write_text(json.dumps(["list", "not", "dict"]), encoding="utf-8")
+
+        with patch("events.paths.rate_limit_state_path", return_value=state_file):
+            rate_limit_signal.reset_state_cache()
+            result = rate_limit_signal._load_state()
+        assert result == {}
+
+
+class TestSaveState:
+    """Additional save-state edge cases beyond the brief's four."""
+
+    def test_save_creates_file_with_valid_json(self, tmp_path):
+        """Saving state creates a valid, independently-parseable JSON file."""
+        from events import rate_limit_signal
+        state_file = tmp_path / "state.json"
+        state = {
+            "deepseek/deepseek-v4-pro": {
+                "opened_at": "2026-08-14T10:00:00Z",
+                "diverted_calls": 5,
+            }
+        }
+
+        with patch("events.paths.rate_limit_state_path", return_value=state_file):
+            rate_limit_signal.reset_state_cache()
+            result = rate_limit_signal._save_state(state)
+
+        assert result is True
+        assert state_file.exists()
+        with open(state_file, encoding="utf-8") as f:
+            loaded = json.load(f)
+        assert loaded == state
+
+    def test_save_overwrites_existing_file(self, tmp_path):
+        """Saving state overwrites an existing state file (old keys dropped)."""
+        from events import rate_limit_signal
+        state_file = tmp_path / "state.json"
+        old_state = {"old-provider/model": {"diverted_calls": 1}}
+        state_file.write_text(json.dumps(old_state), encoding="utf-8")
+
+        new_state = {"new-provider/model": {"diverted_calls": 2}}
+
+        with patch("events.paths.rate_limit_state_path", return_value=state_file):
+            rate_limit_signal.reset_state_cache()
+            result = rate_limit_signal._save_state(new_state)
+
+        assert result is True
+        with open(state_file, encoding="utf-8") as f:
+            loaded = json.load(f)
+        assert loaded == new_state
+        assert "old-provider/model" not in loaded
+
+    def test_save_creates_parent_directory(self, tmp_path):
+        """Saving state creates parent directories if needed."""
+        from events import rate_limit_signal
+        state_file = tmp_path / "nested" / "dir" / "state.json"
+        state = {"provider/model": {"diverted_calls": 1}}
+
+        with patch("events.paths.rate_limit_state_path", return_value=state_file):
+            rate_limit_signal.reset_state_cache()
+            result = rate_limit_signal._save_state(state)
+
+        assert result is True
+        assert state_file.exists()
+
+
+class TestLoadSaveRoundTrip:
+    """Additional roundtrip edge case beyond the brief's roundtrip test."""
+
+    def test_empty_state_roundtrip(self, tmp_path):
+        """Save and load empty state works correctly."""
+        from events import rate_limit_signal
+        state_file = tmp_path / "state.json"
+
+        with patch("events.paths.rate_limit_state_path", return_value=state_file):
+            rate_limit_signal.reset_state_cache()
+            assert rate_limit_signal._save_state({}) is True
+            loaded = rate_limit_signal._load_state()
+
+        assert loaded == {}
