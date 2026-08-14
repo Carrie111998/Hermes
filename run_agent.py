@@ -734,6 +734,13 @@ class AIAgent:
         # False for tool-loop follow-ups (#3040).
         self._is_user_initiated_turn = False
 
+        # A new session must not inherit deterministic tool blockers from the
+        # previous conversation. Keep per-turn reset separate: turn_context.py
+        # intentionally preserves the bounded cross-turn ledger.
+        reset_guardrails = getattr(getattr(self, "_tool_guardrails", None), "reset_for_session", None)
+        if callable(reset_guardrails):
+            reset_guardrails()
+
         # Context engine reset/transition (works for built-in compressor and plugins)
         self._transition_context_engine_session(
             old_session_id=old_session_id,

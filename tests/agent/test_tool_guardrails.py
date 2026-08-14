@@ -1,6 +1,8 @@
 """Pure tool-call guardrail primitive tests."""
 
 import json
+from concurrent.futures import ThreadPoolExecutor
+from unittest.mock import patch
 
 from agent.tool_guardrails import (
     ToolCallGuardrailConfig,
@@ -80,13 +82,30 @@ def test_unattended_default_can_enable_hard_stop_without_changing_plain_default(
     assert cfg.hard_stop_enabled is True
 
 
-def test_explicit_hard_stop_value_overrides_unattended_default():
+def test_unattended_explicit_soft_value_requires_opt_in():
     cfg = ToolCallGuardrailConfig.from_mapping(
         {"hard_stop_enabled": False},
         default_hard_stop_enabled=True,
     )
 
-    assert cfg.hard_stop_enabled is False
+    assert cfg.hard_stop_enabled is True
+    assert "unattended_soft_mode=true" in cfg.configuration_warning
+
+    soft_cfg = ToolCallGuardrailConfig.from_mapping(
+        {"hard_stop_enabled": False, "unattended_soft_mode": True},
+        default_hard_stop_enabled=True,
+    )
+    assert soft_cfg.hard_stop_enabled is False
+    assert soft_cfg.configuration_warning == ""
+
+
+def test_auto_hard_stop_follows_runtime_default():
+    assert ToolCallGuardrailConfig.from_mapping(
+        {"hard_stop_enabled": "auto"}, default_hard_stop_enabled=True
+    ).hard_stop_enabled is True
+    assert ToolCallGuardrailConfig.from_mapping(
+        {"hard_stop_enabled": "auto"}, default_hard_stop_enabled=False
+    ).hard_stop_enabled is False
 
 
 def test_default_repeated_identical_failed_call_warns_without_blocking():
@@ -271,3 +290,145 @@ def test_reset_for_turn_clears_bounded_guardrail_state():
 
     assert controller.before_call("web_search", {"query": "same"}).action == "allow"
     assert controller.before_call("read_file", {"path": "/tmp/x"}).action == "allow"
+
+
+def test_cross_turn_deterministic_blocker_is_target_scoped_and_session_bounded():
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(
+            hard_stop_enabled=True,
+            cross_turn_failure_halt_after=2,
+            same_tool_failure_halt_after=99,
+        )
+    )
+    first_args = {"path": "/tmp/blocked.txt", "content": "secret-one"}
+    second_args = {"path": "/tmp/blocked.txt", "content": "secret-two"}
+    missing = '{"error":"No such file or directory"}'
+
+    controller.after_call("write_file", first_args, missing, failed=True)
+    controller.reset_for_turn()
+    controller.after_call("write_file", second_args, missing, failed=True)
+
+    blocked = controller.before_call("write_file", second_args)
+    assert blocked.action == "block"
+    assert blocked.code == "cross_turn_deterministic_blocker"
+    assert "secret-one" not in json.dumps(blocked.to_metadata())
+    assert "secret-two" not in json.dumps(blocked.to_metadata())
+
+    assert controller.before_call("write_file", {"path": "/tmp/other.txt"}).action == "allow"
+    controller.reset_for_session()
+    assert controller.before_call("write_file", second_args).action == "allow"
+
+
+def test_cross_turn_success_resets_target_blocker_progress():
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(
+            hard_stop_enabled=True,
+            cross_turn_failure_halt_after=2,
+            same_tool_failure_halt_after=99,
+        )
+    )
+    args = {"path": "/tmp/recover.txt"}
+    controller.after_call("write_file", args, '{"error":"Permission denied"}', failed=True)
+    controller.reset_for_turn()
+    controller.after_call("write_file", args, '{"bytes_written":1}', failed=False)
+    controller.reset_for_turn()
+    controller.after_call("write_file", args, '{"error":"Permission denied"}', failed=True)
+
+    assert controller.before_call("write_file", args).action == "allow"
+
+
+def test_cross_turn_ledger_distinguishes_url_and_named_targets():
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(
+            hard_stop_enabled=True,
+            cross_turn_failure_halt_after=2,
+            same_tool_failure_halt_after=99,
+        )
+    )
+    failure = '{"error":"Permission denied"}'
+
+    controller.after_call(
+        "browser_navigate", {"url": "https://one.example"}, failure, failed=True
+    )
+    controller.reset_for_turn()
+    controller.after_call(
+        "browser_navigate", {"url": "https://two.example"}, failure, failed=True
+    )
+
+    assert controller.before_call(
+        "browser_navigate", {"url": "https://two.example"}
+    ).action == "allow"
+
+    controller.reset_for_session()
+    controller.after_call(
+        "skill_manage", {"name": "skill-one"}, failure, failed=True
+    )
+    controller.reset_for_turn()
+    controller.after_call(
+        "skill_manage", {"name": "skill-two"}, failure, failed=True
+    )
+    assert controller.before_call(
+        "skill_manage", {"name": "skill-two"}
+    ).action == "allow"
+
+
+def test_cross_turn_ledger_serializes_concurrent_failures():
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(
+            hard_stop_enabled=True,
+            cross_turn_failure_halt_after=4,
+            same_tool_failure_halt_after=99,
+        )
+    )
+    args = {"path": "/tmp/concurrent.txt"}
+    failure = '{"error":"Permission denied"}'
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        list(pool.map(
+            lambda _index: controller.after_call("write_file", args, failure, failed=True),
+            range(4),
+        ))
+
+    assert controller.before_call("write_file", args).code == "cross_turn_deterministic_blocker"
+
+
+def test_cross_turn_ledger_expires_entries():
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(
+            hard_stop_enabled=True,
+            cross_turn_failure_halt_after=2,
+            cross_turn_ttl_seconds=10,
+            same_tool_failure_halt_after=99,
+        )
+    )
+    args = {"path": "/tmp/expired.txt"}
+    failure = '{"error":"Permission denied"}'
+    controller.after_call("write_file", args, failure, failed=True)
+    target_key = next(iter(controller._cross_turn_failures))
+    controller._cross_turn_failures[target_key] = (2, 0.0, "permission")
+
+    with patch("agent.tool_guardrails.time.monotonic", return_value=11.0):
+        assert controller.before_call("write_file", args).action == "allow"
+
+
+def test_cross_turn_ledger_evicts_oldest_entry_when_bounded():
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(
+            hard_stop_enabled=True,
+            cross_turn_failure_halt_after=2,
+            cross_turn_ledger_max_entries=2,
+            same_tool_failure_halt_after=99,
+        )
+    )
+    failure = '{"error":"Permission denied"}'
+    first = {"path": "/tmp/first.txt"}
+    second = {"path": "/tmp/second.txt"}
+    third = {"path": "/tmp/third.txt"}
+    controller.after_call("write_file", first, failure, failed=True)
+    controller.after_call("write_file", first, failure, failed=True)
+    controller.after_call("write_file", second, failure, failed=True)
+    controller.after_call("write_file", second, failure, failed=True)
+    controller.after_call("write_file", third, failure, failed=True)
+
+    assert len(controller._cross_turn_failures) == 2
+    assert controller.before_call("write_file", first).action == "allow"

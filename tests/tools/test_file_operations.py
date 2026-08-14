@@ -224,6 +224,23 @@ class TestWriteResult:
         d = r.to_dict()
         assert d["error"] == "Permission denied"
 
+    def test_to_dict_includes_artifact_completion_contract(self):
+        r = WriteResult(
+            artifact_status={
+                "schema": "hermes.artifact.v1",
+                "producer": "file_operations.write_file",
+                "status": "complete",
+                "persisted": True,
+                "validated": True,
+                "complete": True,
+                "delivered": False,
+            }
+        )
+        d = r.to_dict()
+        assert d["artifact_status"]["schema"] == "hermes.artifact.v1"
+        assert d["artifact_status"]["producer"] == "file_operations.write_file"
+        assert d["artifact_status"]["delivered"] is False
+
 
 class TestPatchResult:
     def test_to_dict_success(self):
@@ -833,7 +850,7 @@ class TestPatchReplacePostWriteVerification:
             f"success={result.success}, diff={result.diff}"
         )
         assert "verification failed" in result.error.lower()
-        assert "did not persist" in result.error.lower()
+        assert result.artifact_status["status"] == "unverified"
 
     def test_patch_replace_succeeds_when_file_persisted(self, mock_env):
         """Normal success path: write persists, verify read returns new bytes."""
@@ -860,6 +877,12 @@ class TestPatchReplacePostWriteVerification:
         result = ops.patch_replace("/tmp/test/a.py", "hello", "hi")
         assert result.error is None, f"Unexpected error: {result.error}"
         assert result.success is True
+        # The mock backend has no usable linter, so persistence is proven but
+        # validation remains explicitly incomplete.
+        assert result.artifact_status["status"] == "persisted"
+        assert result.artifact_status["persisted"] is True
+        assert result.artifact_status["validated"] is False
+        assert result.artifact_status["delivered"] is False
         assert state["content"] == "hi world\n", f"File not actually updated: {state['content']!r}"
 
     def test_patch_replace_fails_when_verify_read_errors(self, mock_env):
@@ -888,6 +911,7 @@ class TestPatchReplacePostWriteVerification:
         result = ops.patch_replace("/tmp/test/a.py", "hello", "hi")
         assert result.error is not None
         assert "could not re-read" in result.error.lower()
+        assert result.artifact_status["status"] == "unverified"
 
 
 # =========================================================================

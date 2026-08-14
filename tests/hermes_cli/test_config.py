@@ -1645,6 +1645,62 @@ class TestMigrationWriteInvariant:
         assert loaded["display"]["compact"] == DEFAULT_CONFIG["display"]["compact"]
 
 
+class TestToolLoopGuardrailConfigMigration:
+    def test_v35_config_gets_auto_defaults_without_materializing_section(self, tmp_path):
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(
+            "_config_version: 35\nmodel:\n  provider: openrouter\n",
+            encoding="utf-8",
+        )
+
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+            migrate_config(interactive=False, quiet=True)
+            raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+            loaded = load_config()
+
+        assert raw["_config_version"] == DEFAULT_CONFIG["_config_version"]
+        assert "tool_loop_guardrails" not in raw
+        guardrails = loaded["tool_loop_guardrails"]
+        assert guardrails["hard_stop_enabled"] == "auto"
+        assert guardrails["unattended_soft_mode"] is False
+        assert guardrails["cross_turn_failure_halt_after"] == 3
+
+    @pytest.mark.parametrize(
+        ("section", "expected_hard_stop", "expected_soft_mode"),
+        [
+            ({"hard_stop_enabled": "auto"}, "auto", False),
+            ({"hard_stop_enabled": False}, False, False),
+            (
+                {"hard_stop_enabled": False, "unattended_soft_mode": True},
+                False,
+                True,
+            ),
+        ],
+    )
+    def test_v35_guardrail_policy_survives_migration_without_rewrite(
+        self, tmp_path, section, expected_hard_stop, expected_soft_mode
+    ):
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(
+            yaml.safe_dump(
+                {
+                    "_config_version": 35,
+                    "tool_loop_guardrails": section,
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+            migrate_config(interactive=False, quiet=True)
+            raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+            loaded = load_config()
+
+        assert raw["tool_loop_guardrails"] == section
+        assert loaded["tool_loop_guardrails"]["hard_stop_enabled"] == expected_hard_stop
+        assert loaded["tool_loop_guardrails"]["unattended_soft_mode"] is expected_soft_mode
+
+
 class TestVerifyOnStopMigration:
     """v30 → v31: switch verify_on_stop OFF once, preserving explicit choices."""
 

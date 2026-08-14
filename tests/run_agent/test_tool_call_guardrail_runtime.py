@@ -72,13 +72,27 @@ def test_unattended_platforms_default_to_hard_stop():
         assert agent._tool_guardrails.config.hard_stop_enabled is True
 
 
-def test_explicit_soft_policy_is_preserved_for_unattended_platform():
+def test_unattended_explicit_soft_policy_is_rejected_without_opt_in():
     agent = _make_agent(
         "web_search",
         platform="telegram",
         config={"tool_loop_guardrails": {"hard_stop_enabled": False}},
     )
+    assert agent._tool_guardrails.config.hard_stop_enabled is True
+    assert "unattended_soft_mode=true" in agent._tool_guardrails.config.configuration_warning
+
+
+def test_unattended_soft_policy_can_be_explicitly_enabled():
+    agent = _make_agent(
+        "web_search",
+        platform="telegram",
+        config={"tool_loop_guardrails": {
+            "hard_stop_enabled": False,
+            "unattended_soft_mode": True,
+        }},
+    )
     assert agent._tool_guardrails.config.hard_stop_enabled is False
+    assert agent._tool_guardrails.config.configuration_warning == ""
 
 
 def _seed_exact_failures(agent: AIAgent, tool_name: str, args: dict, count: int = 2) -> None:

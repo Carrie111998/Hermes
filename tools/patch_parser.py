@@ -360,7 +360,7 @@ def apply_v4a_operations(operations: List[PatchOperation],
         PatchResult with results of all operations
     """
     # Import here to avoid circular imports
-    from tools.file_operations import PatchResult
+    from tools.file_operations import PatchResult, _artifact_contract
 
     # ---- Phase 1: validate ----
     validation_errors = _validate_operations(operations, file_ops)
@@ -369,6 +369,11 @@ def apply_v4a_operations(operations: List[PatchOperation],
             success=False,
             error="Patch validation failed (no files were modified):\n"
                   + "\n".join(f"  • {e}" for e in validation_errors),
+            artifact_status=_artifact_contract(
+                "file_operations.patch_v4a", "blocked",
+                persisted=False, validated=False, read_back=False,
+                evidence={"reason": "validation_failed"},
+            ),
         )
 
     # ---- Phase 2: apply ----
@@ -452,8 +457,18 @@ def apply_v4a_operations(operations: List[PatchOperation],
             lsp_diagnostics=combined_lsp,
             error="Apply phase failed (state may be inconsistent — run `git diff` to assess):\n"
                   + "\n".join(f"  • {e}" for e in errors),
+            artifact_status=_artifact_contract(
+                "file_operations.patch_v4a", "unverified",
+                persisted=bool(files_modified or files_created or files_deleted),
+                validated=False,
+                read_back=bool(lint_results),
+                evidence={"reason": "apply_phase_failed"},
+            ),
         )
 
+    lint_validated = bool(lint_results) and all(
+        item.get("status") == "ok" for item in lint_results.values()
+    )
     return PatchResult(
         success=True,
         diff=combined_diff,
@@ -462,6 +477,17 @@ def apply_v4a_operations(operations: List[PatchOperation],
         files_deleted=files_deleted,
         lint=lint_results if lint_results else None,
         lsp_diagnostics=combined_lsp,
+        artifact_status=_artifact_contract(
+            "file_operations.patch_v4a",
+            "validated" if lint_validated else "persisted",
+            persisted=True,
+            validated=lint_validated,
+            read_back=bool(lint_results),
+            evidence={
+                "format_validation": "passed" if lint_validated else "skipped_or_failed",
+                "files": len(files_modified) + len(files_created),
+            },
+        ),
     )
 
 

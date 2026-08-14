@@ -10,6 +10,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
+import threading
+import time
 from dataclasses import dataclass, field
 from typing import Any, Mapping
 
@@ -59,6 +62,22 @@ MUTATING_TOOL_NAMES = frozenset(
     }
 )
 
+DETERMINISTIC_BLOCKER_CLASSES = frozenset(
+    {"missing_target", "permission", "invalid_workdir", "malformed_input"}
+)
+_TARGET_KEYS = frozenset(
+    {
+        "path", "file", "file_path", "filename", "target", "destination",
+        "dest", "source", "src", "workdir", "cwd", "directory",
+        # Tool-specific target identifiers.  These values remain private and
+        # are only hashed for the in-memory ledger; content/prompt fields are
+        # intentionally excluded so changing payload does not evade a blocker
+        # for the same target.
+        "url", "key", "name", "job_id", "message_id", "chat_id",
+        "channel", "ref", "element", "goal", "script",
+    }
+)
+
 
 @dataclass(frozen=True)
 class ToolCallGuardrailConfig:
@@ -77,6 +96,11 @@ class ToolCallGuardrailConfig:
     same_tool_failure_halt_after: int = 8
     no_progress_warn_after: int = 2
     no_progress_block_after: int = 5
+    cross_turn_failure_halt_after: int = 3
+    cross_turn_ledger_max_entries: int = 128
+    cross_turn_ttl_seconds: int = 1800
+    unattended_soft_mode: bool = False
+    configuration_warning: str = ""
     idempotent_tools: frozenset[str] = field(default_factory=lambda: IDEMPOTENT_TOOL_NAMES)
     mutating_tools: frozenset[str] = field(default_factory=lambda: MUTATING_TOOL_NAMES)
 
@@ -90,8 +114,10 @@ class ToolCallGuardrailConfig:
         """Build config from the ``tool_loop_guardrails`` config section.
 
         ``default_hard_stop_enabled`` lets unattended runtimes choose a safe
-        default without changing the interactive CLI/TUI behavior. An
-        explicit ``hard_stop_enabled`` value in config always wins.
+        default without changing the interactive CLI/TUI behavior. The
+        ``auto`` value follows that runtime default. On unattended surfaces,
+        explicitly disabling the stop requires ``unattended_soft_mode`` so a
+        softened safety policy is observable.
         """
         if not isinstance(data, Mapping):
             return cls(hard_stop_enabled=default_hard_stop_enabled)
@@ -104,9 +130,23 @@ class ToolCallGuardrailConfig:
             hard_stop_after = {}
 
         defaults = cls(hard_stop_enabled=default_hard_stop_enabled)
+        hard_stop_value = data.get("hard_stop_enabled")
+        soft_mode = _as_bool(data.get("unattended_soft_mode"), False)
+        configuration_warning = ""
+        if isinstance(hard_stop_value, str) and hard_stop_value.strip().lower() == "auto":
+            hard_stop_enabled = default_hard_stop_enabled
+        else:
+            hard_stop_enabled = _as_bool(hard_stop_value, defaults.hard_stop_enabled)
+            if default_hard_stop_enabled and not hard_stop_enabled and not soft_mode:
+                hard_stop_enabled = True
+                configuration_warning = (
+                    "tool_loop_guardrails.hard_stop_enabled=false was ignored for "
+                    "an unattended surface; set unattended_soft_mode=true to opt "
+                    "into visibly degraded soft mode"
+                )
         return cls(
             warnings_enabled=_as_bool(data.get("warnings_enabled"), defaults.warnings_enabled),
-            hard_stop_enabled=_as_bool(data.get("hard_stop_enabled"), defaults.hard_stop_enabled),
+            hard_stop_enabled=hard_stop_enabled,
             exact_failure_warn_after=_positive_int(
                 warn_after.get("exact_failure", data.get("exact_failure_warn_after")),
                 defaults.exact_failure_warn_after,
@@ -131,6 +171,20 @@ class ToolCallGuardrailConfig:
                 hard_stop_after.get("idempotent_no_progress", data.get("no_progress_block_after")),
                 defaults.no_progress_block_after,
             ),
+            cross_turn_failure_halt_after=_positive_int(
+                data.get("cross_turn_failure_halt_after"),
+                defaults.cross_turn_failure_halt_after,
+            ),
+            cross_turn_ledger_max_entries=_positive_int(
+                data.get("cross_turn_ledger_max_entries"),
+                defaults.cross_turn_ledger_max_entries,
+            ),
+            cross_turn_ttl_seconds=_positive_int(
+                data.get("cross_turn_ttl_seconds"),
+                defaults.cross_turn_ttl_seconds,
+            ),
+            unattended_soft_mode=soft_mode,
+            configuration_warning=configuration_warning,
         )
 
 
@@ -178,8 +232,8 @@ class ToolGuardrailDecision:
             "tool_name": self.tool_name,
             "count": self.count,
         }
-        if self.signature is not None:
-            data["signature"] = self.signature.to_metadata()
+        # Argument digests and target identities are private controller state;
+        # never put them into durable tool results or transcripts.
         return data
 
 
@@ -231,11 +285,57 @@ def classify_tool_failure(tool_name: str, result: str | None) -> tuple[bool, str
     return False, ""
 
 
+def classify_failure_class(tool_name: str, result: str | None) -> str:
+    """Classify deterministic blockers without retaining their raw text."""
+    if not result:
+        return "unknown"
+    parsed = safe_json_loads(result)
+    fragments: list[str] = []
+    if isinstance(parsed, Mapping):
+        for key in ("error", "stderr", "stdout", "message", "reason"):
+            value = parsed.get(key)
+            if value:
+                fragments.append(str(value))
+        exit_code = parsed.get("exit_code")
+        if exit_code not in (None, 0) and not fragments:
+            fragments.append(f"exit code {exit_code}")
+    fragments.append(str(result)[:1200])
+    text = " ".join(fragments).lower()
+    if any(token in text for token in ("permission denied", "access denied", "approval denied", "not approved")):
+        return "permission"
+    if any(token in text for token in ("working directory", "workdir", "cwd", "directory does not exist")):
+        return "invalid_workdir"
+    if any(token in text for token in ("no such file", "file not found", "path not found", "does not exist", "missing target")):
+        return "missing_target"
+    if any(token in text for token in ("syntaxerror", "parse error", "invalid json", "malformed", "schema validation", "invalid syntax")):
+        return "malformed_input"
+    return "unknown"
+
+
+def _target_identity(tool_name: str, args: Mapping[str, Any]) -> str:
+    """Return a private target identity that never leaves the controller."""
+    targets: list[str] = []
+    for key, value in args.items():
+        key_lower = str(key).lower()
+        if key_lower in _TARGET_KEYS:
+            targets.append(f"{key_lower}={value}")
+    if not targets and tool_name == "terminal":
+        command = str(args.get("command", ""))
+        candidates = re.findall(r"(?:/[^\s'\"]+|[A-Za-z]:[\\/][^\s'\"]+)", command)
+        targets.extend(candidates[:4])
+    if not targets:
+        targets.append(tool_name)
+    canonical = json.dumps(sorted(targets), ensure_ascii=False, separators=(",", ":"), default=str)
+    return f"{tool_name}:{_sha256(canonical)}"
+
+
 class ToolCallGuardrailController:
-    """Per-turn controller for repeated failed/non-progressing tool calls."""
+    """Bounded per-turn and cross-turn controller for tool-call loops."""
 
     def __init__(self, config: ToolCallGuardrailConfig | None = None):
         self.config = config or ToolCallGuardrailConfig()
+        self._cross_turn_failures: dict[str, tuple[int, float, str]] = {}
+        self._cross_turn_lock = threading.RLock()
         self.reset_for_turn()
 
     def reset_for_turn(self) -> None:
@@ -243,6 +343,12 @@ class ToolCallGuardrailController:
         self._same_tool_failure_counts: dict[str, int] = {}
         self._no_progress: dict[ToolCallSignature, tuple[str, int]] = {}
         self._halt_decision: ToolGuardrailDecision | None = None
+
+    def reset_for_session(self) -> None:
+        """Clear all state when the agent session identity changes."""
+        with self._cross_turn_lock:
+            self._cross_turn_failures.clear()
+        self.reset_for_turn()
 
     @property
     def halt_decision(self) -> ToolGuardrailDecision | None:
@@ -252,6 +358,28 @@ class ToolCallGuardrailController:
         signature = ToolCallSignature.from_call(tool_name, _coerce_args(args))
         if not self.config.hard_stop_enabled:
             return ToolGuardrailDecision(tool_name=tool_name, signature=signature)
+
+        target_key = _target_identity(tool_name, _coerce_args(args))
+        with self._cross_turn_lock:
+            self._prune_cross_turn_failures()
+            cross_record = self._cross_turn_failures.get(target_key)
+        if cross_record is not None:
+            cross_count, _last_seen, _failure_class = cross_record
+            if cross_count >= self.config.cross_turn_failure_halt_after:
+                decision = ToolGuardrailDecision(
+                    action="block",
+                    code="cross_turn_deterministic_blocker",
+                    message=(
+                        f"Blocked {tool_name}: the same deterministic blocker persisted "
+                        f"for this target across {cross_count} failed attempts. Stop "
+                        "retrying this path; change the target or report the blocker."
+                    ),
+                    tool_name=tool_name,
+                    count=cross_count,
+                    signature=signature,
+                )
+                self._halt_decision = decision
+                return decision
 
         exact_count = self._exact_failure_counts.get(signature, 0)
         if exact_count >= self.config.exact_failure_block_after:
@@ -306,12 +434,18 @@ class ToolCallGuardrailController:
             failed, _ = classify_tool_failure(tool_name, result)
 
         if failed:
+            failure_class = classify_failure_class(tool_name, result)
             exact_count = self._exact_failure_counts.get(signature, 0) + 1
             self._exact_failure_counts[signature] = exact_count
             self._no_progress.pop(signature, None)
 
             same_count = self._same_tool_failure_counts.get(tool_name, 0) + 1
             self._same_tool_failure_counts[tool_name] = same_count
+
+            if failure_class in DETERMINISTIC_BLOCKER_CLASSES:
+                self._record_cross_turn_failure(
+                    _target_identity(tool_name, args), failure_class
+                )
 
             if self.config.hard_stop_enabled and same_count >= self.config.same_tool_failure_halt_after:
                 decision = ToolGuardrailDecision(
@@ -356,6 +490,8 @@ class ToolCallGuardrailController:
 
         self._exact_failure_counts.pop(signature, None)
         self._same_tool_failure_counts.pop(tool_name, None)
+        with self._cross_turn_lock:
+            self._cross_turn_failures.pop(_target_identity(tool_name, args), None)
 
         if not self._is_idempotent(tool_name):
             self._no_progress.pop(signature, None)
@@ -388,6 +524,34 @@ class ToolCallGuardrailController:
         if tool_name in self.config.mutating_tools:
             return False
         return tool_name in self.config.idempotent_tools
+
+    def _record_cross_turn_failure(self, target_key: str, failure_class: str) -> None:
+        with self._cross_turn_lock:
+            now = time.monotonic()
+            previous = self._cross_turn_failures.get(target_key)
+            if previous is not None and previous[2] == failure_class:
+                count = previous[0] + 1
+            else:
+                count = 1
+            self._cross_turn_failures[target_key] = (count, now, failure_class)
+            self._prune_cross_turn_failures(now=now)
+
+    def _prune_cross_turn_failures(self, *, now: float | None = None) -> None:
+        now = time.monotonic() if now is None else now
+        ttl = self.config.cross_turn_ttl_seconds
+        expired = [
+            key for key, (_count, last_seen, _failure_class) in self._cross_turn_failures.items()
+            if now - last_seen > ttl
+        ]
+        for key in expired:
+            self._cross_turn_failures.pop(key, None)
+        overflow = len(self._cross_turn_failures) - self.config.cross_turn_ledger_max_entries
+        if overflow > 0:
+            oldest = sorted(
+                self._cross_turn_failures.items(), key=lambda item: item[1][1]
+            )[:overflow]
+            for key, _value in oldest:
+                self._cross_turn_failures.pop(key, None)
 
 
 def toolguard_synthetic_result(decision: ToolGuardrailDecision) -> str:

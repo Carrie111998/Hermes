@@ -1374,6 +1374,11 @@ def init_agent(
                 default_hard_stop_enabled=_unattended_platform,
             )
         )
+        if agent._tool_guardrails.config.configuration_warning:
+            _ra().logger.warning(
+                "Tool loop guardrail configuration: %s",
+                agent._tool_guardrails.config.configuration_warning,
+            )
     except Exception as _tlg_err:
         _ra().logger.warning("Tool loop guardrail config ignored: %s", _tlg_err)
     # Cache only the derived auxiliary compression context override that is

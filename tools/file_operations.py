@@ -57,6 +57,32 @@ _OSC_SEQUENCE_RE = re.compile(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
 _FENCE_MARKER_RE = re.compile(r"'?\x07?__HERMES_FENCE_[A-Za-z0-9]+__\x07?'?")
 
 
+def _artifact_contract(
+    producer: str,
+    status: str,
+    *,
+    persisted: bool,
+    validated: bool,
+    read_back: bool,
+    evidence: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Build the stable, non-secret artifact completion contract."""
+    return {
+        "schema": "hermes.artifact.v1",
+        "producer": producer,
+        "status": status,
+        "persisted": persisted,
+        "validated": validated,
+        "complete": status == "complete",
+        "delivered": False,
+        "evidence": {
+            "read_back": read_back,
+            "delivery": "not_applicable",
+            **(evidence or {}),
+        },
+    }
+
+
 def _strip_terminal_fence_leaks(text: str) -> str:
     """Strip leaked terminal fence wrappers from file read output."""
     if not text:
@@ -188,6 +214,10 @@ class WriteResult:
     lsp_diagnostics: Optional[str] = None
     error: Optional[str] = None
     warning: Optional[str] = None
+    # Machine-readable completion contract.  It intentionally carries no
+    # content, secret, or argument digest: callers only need producer/schema,
+    # persistence, validation, and delivery state.
+    artifact_status: Optional[Dict[str, Any]] = None
 
     def to_dict(self) -> dict:
         return {k: v for k, v in self.__dict__.items() if v is not None}
@@ -205,6 +235,7 @@ class PatchResult:
     # See :class:`WriteResult.lsp_diagnostics`.
     lsp_diagnostics: Optional[str] = None
     error: Optional[str] = None
+    artifact_status: Optional[Dict[str, Any]] = None
     
     def to_dict(self) -> dict:
         result = {"success": self.success}
@@ -222,6 +253,8 @@ class PatchResult:
             result["lsp_diagnostics"] = self.lsp_diagnostics
         if self.error:
             result["error"] = self.error
+        if self.artifact_status is not None:
+            result["artifact_status"] = self.artifact_status
         return result
 
 
@@ -1388,7 +1421,14 @@ class ShellFileOperations(FileOperations):
         # Block writes to sensitive paths
         denied = get_write_denied_error(path)
         if denied:
-            return WriteResult(error=denied)
+            return WriteResult(
+                error=denied,
+                artifact_status=_artifact_contract(
+                    "file_operations.write_file", "blocked",
+                    persisted=False, validated=False, read_back=False,
+                    evidence={"reason": "write_denied"},
+                ),
+            )
 
         # ── Fail-closed pre-write syntax gate ───────────────────────────
         # Validate the CANDIDATE content BEFORE any bytes touch disk —
@@ -1425,7 +1465,12 @@ class ShellFileOperations(FileOperations):
                         f"Refusing to write '{path}': candidate content fails "
                         f"{ext} syntax validation ({_lint_err}). The file was "
                         "NOT created or modified. Fix the content and retry."
-                    )
+                    ),
+                    artifact_status=_artifact_contract(
+                        "file_operations.write_file", "blocked",
+                        persisted=False, validated=False, read_back=False,
+                        evidence={"reason": "format_validation_failed"},
+                    ),
                 )
 
         # Capture pre-write content.  Two consumers want it:
@@ -1513,7 +1558,14 @@ class ShellFileOperations(FileOperations):
         write_result = self._atomic_write(path, content)
 
         if write_result.exit_code != 0:
-            return WriteResult(error=f"Failed to write file: {write_result.stdout}")
+            return WriteResult(
+                error=f"Failed to write file: {write_result.stdout}",
+                artifact_status=_artifact_contract(
+                    "file_operations.write_file", "blocked",
+                    persisted=False, validated=False, read_back=False,
+                    evidence={"reason": "atomic_write_failed"},
+                ),
+            )
 
         # Get bytes written (wc -c is POSIX, works on Linux + macOS)
         stat_cmd = f"wc -c < {self._escape_shell_arg(path)} 2>/dev/null"
@@ -1523,6 +1575,41 @@ class ShellFileOperations(FileOperations):
             bytes_written = int(stat_result.stdout.strip())
         except ValueError:
             bytes_written = len(content.encode('utf-8'))
+
+        # A successful atomic rename is not sufficient evidence for an agent
+        # that may be writing through SSH/container backends. Re-read the
+        # target and compare the intended bytes before claiming completion.
+        verify_cmd = f"cat {self._escape_shell_arg(path)} 2>/dev/null"
+        verify_result = self._exec(verify_cmd)
+        if verify_result.exit_code != 0:
+            return WriteResult(
+                bytes_written=bytes_written,
+                dirs_created=dirs_created,
+                error=f"Post-write verification failed: could not re-read {path}",
+                artifact_status=_artifact_contract(
+                    "file_operations.write_file", "unverified",
+                    persisted=True, validated=False, read_back=False,
+                    evidence={"reason": "read_back_failed"},
+                ),
+            )
+        verify_bomless, _ = _strip_bom(verify_result.stdout)
+        expected_bomless, _ = _strip_bom(content)
+        verify_normalized = verify_bomless.replace("\r\n", "\n").replace("\r", "\n")
+        expected_normalized = expected_bomless.replace("\r\n", "\n").replace("\r", "\n")
+        if verify_normalized != expected_normalized:
+            return WriteResult(
+                bytes_written=bytes_written,
+                dirs_created=dirs_created,
+                error=(
+                    f"Post-write verification failed for {path}: on-disk content "
+                    "differs from the intended write. Re-read the file and retry."
+                ),
+                artifact_status=_artifact_contract(
+                    "file_operations.write_file", "unverified",
+                    persisted=True, validated=False, read_back=False,
+                    evidence={"reason": "read_back_mismatch"},
+                ),
+            )
 
         # Post-write lint with delta refinement.
         lint_result = self._check_lint_delta(path, pre_content=pre_content, post_content=content)
@@ -1541,11 +1628,29 @@ class ShellFileOperations(FileOperations):
             if block:
                 lsp_diagnostics = block
 
+        lint_payload = lint_result.to_dict() if lint_result else None
+        # A skipped linter is not validation evidence.  In particular,
+        # unrecognised formats such as JSONL/Markdown must remain persisted
+        # but unvalidated instead of fabricating a completed artifact.
+        lint_validated = bool(
+            lint_result and lint_result.success and not lint_result.skipped
+        )
         return WriteResult(
             bytes_written=bytes_written,
             dirs_created=dirs_created,
-            lint=lint_result.to_dict() if lint_result else None,
+            lint=lint_payload,
             lsp_diagnostics=lsp_diagnostics,
+            artifact_status=_artifact_contract(
+                "file_operations.write_file",
+                "validated" if lint_validated else "persisted",
+                persisted=True,
+                validated=lint_validated,
+                read_back=True,
+                evidence={
+                    "format_validation": "passed" if lint_validated else "skipped_or_failed",
+                    "bytes_written": bytes_written,
+                },
+            ),
         )
     
     # =========================================================================
@@ -1572,14 +1677,28 @@ class ShellFileOperations(FileOperations):
         # Block writes to sensitive paths
         denied = get_write_denied_error(path)
         if denied:
-            return PatchResult(error=denied)
+            return PatchResult(
+                error=denied,
+                artifact_status=_artifact_contract(
+                    "file_operations.patch_replace", "blocked",
+                    persisted=False, validated=False, read_back=False,
+                    evidence={"reason": "write_denied"},
+                ),
+            )
 
         # Read current content
         read_cmd = f"cat {self._escape_shell_arg(path)} 2>/dev/null"
         read_result = self._exec(read_cmd)
         
         if read_result.exit_code != 0:
-            return PatchResult(error=f"Failed to read file: {path}")
+            return PatchResult(
+                error=f"Failed to read file: {path}",
+                artifact_status=_artifact_contract(
+                    "file_operations.patch_replace", "blocked",
+                    persisted=False, validated=False, read_back=False,
+                    evidence={"reason": "read_before_write_failed"},
+                ),
+            )
         
         content = read_result.stdout
         # Strip a leading UTF-8 BOM before matching so the fuzzy matcher and
@@ -1603,7 +1722,14 @@ class ShellFileOperations(FileOperations):
                 err_msg += format_no_match_hint(err_msg, match_count, old_string, content)
             except Exception:
                 pass
-            return PatchResult(error=err_msg)
+            return PatchResult(
+                error=err_msg,
+                artifact_status=_artifact_contract(
+                    "file_operations.patch_replace", "blocked",
+                    persisted=False, validated=False, read_back=False,
+                    evidence={"reason": "replacement_not_found"},
+                ),
+            )
 
         # ── Line-ending preservation ──────────────────────────────────
         # Models nearly always send old_string/new_string with bare LF
@@ -1620,7 +1746,17 @@ class ShellFileOperations(FileOperations):
         # Write back
         write_result = self.write_file(path, new_content)
         if write_result.error:
-            return PatchResult(error=f"Failed to write changes: {write_result.error}")
+            return PatchResult(
+                error=f"Failed to write changes: {write_result.error}",
+                artifact_status=_artifact_contract(
+                    "file_operations.patch_replace",
+                    (write_result.artifact_status or {}).get("status", "blocked"),
+                    persisted=bool((write_result.artifact_status or {}).get("persisted")),
+                    validated=bool((write_result.artifact_status or {}).get("validated")),
+                    read_back=bool((write_result.artifact_status or {}).get("evidence", {}).get("read_back")),
+                    evidence={"reason": "write_file_failed"},
+                ),
+            )
 
         # Post-write verification — re-read the file and confirm the bytes we
         # intended to write actually landed. Catches silent persistence
@@ -1630,7 +1766,14 @@ class ShellFileOperations(FileOperations):
         verify_cmd = f"cat {self._escape_shell_arg(path)} 2>/dev/null"
         verify_result = self._exec(verify_cmd)
         if verify_result.exit_code != 0:
-            return PatchResult(error=f"Post-write verification failed: could not re-read {path}")
+            return PatchResult(
+                error=f"Post-write verification failed: could not re-read {path}",
+                artifact_status=_artifact_contract(
+                    "file_operations.patch_replace", "unverified",
+                    persisted=True, validated=False, read_back=False,
+                    evidence={"reason": "read_back_failed"},
+                ),
+            )
         # Normalize line endings before comparing.  On Windows, Python's
         # default text-mode ``open()`` translates ``\n`` → ``\r\n`` on
         # write, so the file on disk legitimately holds CRLFs while our
@@ -1646,13 +1789,20 @@ class ShellFileOperations(FileOperations):
         _verify_stdout_normalized = _verify_bomless.replace("\r\n", "\n").replace("\r", "\n")
         _new_content_normalized = new_content.replace("\r\n", "\n").replace("\r", "\n")
         if _verify_stdout_normalized != _new_content_normalized:
-            return PatchResult(error=(
-                f"Post-write verification failed for {path}: on-disk content "
-                f"differs from intended write "
-                f"(wrote {len(_new_content_normalized)} chars, read back "
-                f"{len(_verify_stdout_normalized)} chars after normalizing line endings). "
-                "The patch did not persist. Re-read the file and try again."
-            ))
+            return PatchResult(
+                error=(
+                    f"Post-write verification failed for {path}: on-disk content "
+                    f"differs from intended write "
+                    f"(wrote {len(_new_content_normalized)} chars, read back "
+                    f"{len(_verify_stdout_normalized)} chars after normalizing line endings). "
+                    "The patch did not persist. Re-read the file and try again."
+                ),
+                artifact_status=_artifact_contract(
+                    "file_operations.patch_replace", "unverified",
+                    persisted=True, validated=False, read_back=False,
+                    evidence={"reason": "read_back_mismatch"},
+                ),
+            )
 
         # Generate diff
         diff = self._unified_diff(content, new_content, path)
@@ -1674,6 +1824,22 @@ class ShellFileOperations(FileOperations):
             # the patch as a whole.  Keep the field separate from the
             # syntax-check ``lint`` so the agent can read both signals.
             lsp_diagnostics=write_result.lsp_diagnostics,
+            artifact_status=_artifact_contract(
+                "file_operations.patch_replace",
+                "validated" if bool(
+                    lint_result and lint_result.success and not lint_result.skipped
+                ) else "persisted",
+                persisted=True,
+                validated=bool(
+                    lint_result and lint_result.success and not lint_result.skipped
+                ),
+                read_back=True,
+                evidence={
+                    "format_validation": "passed" if bool(
+                        lint_result and lint_result.success and not lint_result.skipped
+                    ) else "skipped_or_failed",
+                },
+            ),
         )
     
     def patch_v4a(self, patch_content: str) -> PatchResult:
@@ -1700,7 +1866,14 @@ class ShellFileOperations(FileOperations):
         
         operations, parse_error = parse_v4a_patch(patch_content)
         if parse_error:
-            return PatchResult(error=f"Failed to parse patch: {parse_error}")
+            return PatchResult(
+                error=f"Failed to parse patch: {parse_error}",
+                artifact_status=_artifact_contract(
+                    "file_operations.patch_v4a", "blocked",
+                    persisted=False, validated=False, read_back=False,
+                    evidence={"reason": "malformed_patch"},
+                ),
+            )
         
         # Apply operations
         result = apply_v4a_operations(operations, self)
