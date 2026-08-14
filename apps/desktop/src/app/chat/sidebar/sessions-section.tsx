@@ -332,6 +332,20 @@ export function SidebarSessionsSection({
   // The hand-picked order is then applied INSIDE each date group, so dragging a
   // row ranks it among its own day's chats instead of freezing the whole list
   // into an undated manual mode.
+  // Only status grouping reads live dots. Including the whole dot map in the
+  // date/none memo rebuilt the virtualizer row list on every working/unread
+  // edge, remounted measured rows, and made the list jump.
+  const statusWorkingKey = useMemo(() => {
+    if (grouping !== 'status') {
+      return ''
+    }
+
+    return displayEntries
+      .filter(entry => hasLiveTurn(dotStates[entry.session.id] ?? 'idle'))
+      .map(entry => entry.session.id)
+      .join('\0')
+  }, [grouping, displayEntries, dotStates])
+
   const flatRows: SidebarListRow[] = useMemo(() => {
     const rows =
       grouping === 'date'
@@ -339,13 +353,13 @@ export function SidebarSessionsSection({
         : grouping === 'status'
           ? groupEntriesByStatus(
               displayEntries,
-              entry => hasLiveTurn(dotStates[entry.session.id] ?? 'idle'),
+              entry => statusWorkingKey.split('\0').includes(entry.session.id),
               statusDividerLabels
             )
           : toSessionRows(displayEntries)
 
     return manualOrderIds?.length ? orderRowsWithinGroups(rows, manualOrderIds) : rows
-  }, [grouping, displayEntries, dotStates, manualOrderIds, statusDividerLabels])
+  }, [grouping, displayEntries, statusWorkingKey, manualOrderIds, statusDividerLabels])
 
   // dnd-kit must see exactly the ids it renders, in render order: the sortable
   // set is derived from the rows, not from `sessions`. Feeding it the unrendered

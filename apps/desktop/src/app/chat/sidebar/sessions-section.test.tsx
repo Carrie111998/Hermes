@@ -9,22 +9,28 @@ import type { VirtualSessionListProps } from './virtual-session-list'
 
 afterEach(cleanup)
 
-vi.mock('@/i18n', () => ({
-  useI18n: () => ({
-    t: {
-      sidebar: {
-        dateDivider: {
-          earlierThisMonth: 'Earlier this month',
-          lastMonth: 'Last month',
-          lastWeek: 'Last week',
-          older: 'Older',
-          today: 'Today',
-          yesterday: 'Yesterday'
-        }
-      }
+vi.mock('@/i18n', () => {
+  const sidebar = {
+    dateDivider: {
+      earlierThisMonth: 'Earlier this month',
+      lastMonth: 'Last month',
+      lastWeek: 'Last week',
+      older: 'Older',
+      today: 'Today',
+      yesterday: 'Yesterday'
+    },
+    statusDivider: {
+      done: 'Done',
+      working: 'Working'
     }
-  })
-}))
+  }
+
+  return {
+    useI18n: () => ({
+      t: { sidebar }
+    })
+  }
+})
 
 const mockVirtualListPropsHistory: VirtualSessionListProps[] = []
 
@@ -175,5 +181,37 @@ describe('SidebarSessionsSection memoization & virtualizer stability', () => {
 
     const thirdRowsRef = mockVirtualListPropsHistory[2].rows
     expect(thirdRowsRef).not.toBe(secondRowsRef)
+  })
+
+  it('still virtualizes a status-grouped list and keeps the same rows across identical rerenders', () => {
+    mockVirtualListPropsHistory.length = 0
+
+    const sessions = generateSessions(VIRTUALIZE_THRESHOLD + 3)
+
+    const props = {
+      activeSessionId: null,
+      emptyState: <div>Empty</div>,
+      grouping: 'status' as const,
+      label: 'Sessions',
+      onArchiveSession: noop,
+      onDeleteSession: noop,
+      onResumeSession: noop,
+      onToggle: noop,
+      onTogglePin: noop,
+      open: true,
+      pinned: false,
+      sessions
+    }
+
+    const { rerender } = render(<SidebarSessionsSection {...props} />)
+
+    expect(mockVirtualListPropsHistory.length).toBe(1)
+    const initialRowsRef = mockVirtualListPropsHistory[0].rows
+    expect(initialRowsRef.some(row => row.kind === 'divider')).toBe(true)
+
+    rerender(<SidebarSessionsSection {...props} />)
+
+    expect(mockVirtualListPropsHistory.length).toBe(2)
+    expect(mockVirtualListPropsHistory[1].rows).toBe(initialRowsRef)
   })
 })

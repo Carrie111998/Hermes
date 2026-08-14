@@ -61,7 +61,10 @@ export function SidebarDateDivider({
   return (
     // group/workspace: a divider heads a group the same way a repo header does,
     // so it borrows the header's hover-revealed "+" verbatim.
-    <div className={cn('group/workspace flex select-none items-center gap-2 px-2 pb-0.5 pt-2', className)} {...props}>
+    <div
+      className={cn('group/workspace flex h-8 shrink-0 select-none items-center gap-2 px-2', className)}
+      {...props}
+    >
       <span className="shrink-0 text-[0.64rem] font-semibold uppercase tracking-[0.12em] text-(--ui-text-quaternary)">
         {label}
       </span>
