@@ -70,9 +70,11 @@ def _templates_dir() -> Path:
 _FRONTMATTER_RE = re.compile(r"\A---[ \t]*\n(.*?)\n---[ \t]*(?:\n|\Z)", re.DOTALL)
 # VULN-id format. Spec §3.3 writes ``VULN-[A-Z]{2}-\d{3}`` but the
 # spec's own fixture (§10) and live board usage include 3-letter codes
-# (``VULN-TST-001``, ``VULN-REM-004``). Accept 2-3 letters to match
-# the actual data; the spec's prose is tightened in a follow-up edit.
-_VULN_ID_RE = re.compile(r"VULN-[A-Z]{2,3}-\d{3}")
+# (``VULN-TST-001``, ``VULN-REM-004``) and digit-bearing family codes
+# (``VULN-E2E-001``, the synthetic e2e gate-review fixture). Accept a
+# letter-first alphanumeric family of 2-4 chars to match the actual
+# data; the spec's prose is tightened in a follow-up edit.
+_VULN_ID_RE = re.compile(r"VULN-[A-Z][A-Z0-9]{1,3}-\d{3}")
 _SEVERITIES = {"CRITICAL", "HIGH", "MEDIUM", "LOW"}
 _DONE_WHEN_RE = re.compile(
     r"(?im)^\s*done when\s*:[ \t]*\n?(.*?)(?=^\s*$\n|^\s*Idempotency\s*:|\Z)",
@@ -365,7 +367,7 @@ def validate_source(
     if vuln_id is None:
         res.errors.append(
             f"card {card.id!r} has no VULN-id (expected 'VULN-id: VULN-XX-NNN' "
-            f"block or VULN-[A-Z]{{2,3}}-\\d{{3}} in title/body)"
+            f"block or VULN-[A-Z][A-Z0-9]{{1,3}}-\\d{{3}} in title/body)"
         )
     else:
         res.fields["VULN_ID"] = vuln_id
@@ -497,7 +499,7 @@ def extract_severity(card: kb.Task) -> Optional[str]:
 
 def extract_vuln_id(card: kb.Task) -> Optional[str]:
     """Spec §3.3: structured block, else regex on title or body."""
-    m = re.search(r"(?im)^\s*VULN-id\s*[:=]\s*(VULN-[A-Z]{2,3}-\d{3})\s*$",
+    m = re.search(r"(?im)^\s*VULN-id\s*[:=]\s*(VULN-[A-Z][A-Z0-9]{1,3}-\d{3})\s*$",
                   card.body or "")
     if m:
         return m.group(1)
@@ -528,7 +530,7 @@ def extract_component(card: kb.Task) -> Optional[str]:
     block = _extract_full_context_block(card.body or "")
     if block:
         m = re.search(
-            r"\(VULN-[A-Z]{2,3}-\d{3}\)\s*[—-]?\s*(.+)",
+            r"\(VULN-[A-Z][A-Z0-9]{1,3}-\d{3}\)\s*[—-]?\s*(.+)",
             block,
             re.DOTALL,
         )
@@ -916,6 +918,44 @@ def _render_template(text: str, fields: dict[str, str]) -> str:
     for key, value in fields.items():
         out = out.replace("{{" + key + "}}", str(value))
     return out
+
+
+def _render_child_body(
+    planned: PlannedChild,
+    template: WorkflowTemplate,
+    validation: ValidationResult,
+    step_idx: int,
+    prev_ids: Sequence[str],
+) -> str:
+    """Render a child body with the given previous-step ids.
+
+    Used by BOTH the dry-run pass (sentinel ids) and the real-write
+    loop (real sibling ids) so the two paths produce identical body
+    shapes. The real-write loop MUST call this after each create —
+    otherwise children 2-4 leak ``<id-of-step-N-would-be-created>``
+    into the provenance ``previous step:`` line and the ``## Chain``
+    section (the JSON-output placeholder fix missed the body path).
+    """
+    chain_ids = ""
+    if planned.gate == "approval":
+        chain_ids = "\n".join(
+            f"- step `{template.steps[i].key}`: {prev_ids[i]}"
+            for i in range(len(prev_ids))
+        )
+    return _render_step_body(
+        template.step(planned.step_key),
+        fields={
+            **validation.fields,
+            "TEMPLATE_ID": template.template_id,
+            "STEP_KEY": planned.step_key,
+            "STEP_N": str(step_idx),
+            "PREV_STEP_ID": prev_ids[-1] if prev_ids else "",
+            "CHAIN_IDS": chain_ids,
+            "DONE_WHEN_MAPPED": _format_done_when_mapped(
+                validation.done_when_mapped.get(planned.step_key, []),
+            ),
+        },
+    )
 
 
 def _format_done_when_mapped(items: list[str]) -> str:
@@ -1428,30 +1468,10 @@ def _cmd_workflow_run(args: argparse.Namespace) -> int:
                 i for i, s in enumerate(template.steps, start=1)
                 if s.key == planned.step_key
             )
-            chain_ids_text = "\n".join(
-                f"- step `{s.key}`: {prev_ids[i] if i < len(prev_ids) else '?'}"
-                for i, s in enumerate(template.steps[:prev_ids.__len__()])
-            )
-            # Rebuild body with substituted prev ids
-            planned.body = _render_step_body(
-                template.step(planned.step_key),
-                fields={
-                    **validation.fields,
-                    "TEMPLATE_ID": template.template_id,
-                    "STEP_KEY": planned.step_key,
-                    "STEP_N": str(step_idx),
-                    "PREV_STEP_ID": prev_ids[-1],
-                    "CHAIN_IDS": (
-                        "\n".join(
-                            f"- step `{template.steps[i].key}`: {prev_ids[i]}"
-                            for i in range(len(prev_ids))
-                        )
-                        if planned.gate == "approval" else ""
-                    ),
-                    "DONE_WHEN_MAPPED": _format_done_when_mapped(
-                        validation.done_when_mapped.get(planned.step_key, []),
-                    ),
-                },
+            # Rebuild body with substituted prev ids (sentinels in the
+            # dry-run pass; the real-write loop re-renders with real ids).
+            planned.body = _render_child_body(
+                planned, template, validation, step_idx, prev_ids,
             )
             # Patch planned.parents: step 1 = [source]; step N (N>=2)
             # = [source, prev_step]. In the dry-run path we don't have the
@@ -1493,6 +1513,13 @@ def _cmd_workflow_run(args: argparse.Namespace) -> int:
             # Patch planned.parents + prev_ids bookkeeping so the rendered
             # plan at the bottom reports real ids (not dry-run sentinels).
             planned.parents = list(parent_ids)
+            # Re-render the body with REAL previous-step ids — the dry-run
+            # pass above filled sentinels, and production bodies must not
+            # leak <id-of-step-N-would-be-created> into the provenance
+            # "previous step:" line or the "## Chain" section.
+            planned.body = _render_child_body(
+                planned, template, validation, step_idx, prev_ids[:step_idx],
+            )
             try:
                 tid = create_child_with_sticky_block(
                     conn,

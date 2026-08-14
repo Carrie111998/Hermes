@@ -3146,6 +3146,8 @@ def create_task(
     board: Optional[str] = None,
     project_id: Optional[str] = None,
     project_source_task_id: Optional[str] = None,
+    workflow_template_id: Optional[str] = None,
+    current_step_key: Optional[str] = None,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -3185,6 +3187,15 @@ def create_task(
     in its own projects.db, a matching canonical project-linked task in this
     board can supply the repo and branch convention. Its literal worktree is
     never reused; the new task still gets its own task-id-keyed path.
+
+    ``workflow_template_id`` / ``current_step_key`` record template-routing
+    metadata on the task (informational in v1). They back the
+    ``hermes kanban workflow <template> <card-ref>`` command and the
+    ``--workflow-template-id`` / ``--step-key`` list filters; gating is
+    carried by parent links + a sticky ``block_task(kind='needs_input')``
+    on approval-gated steps. Both columns exist in the schema
+    (``workflow_template_id TEXT``, ``current_step_key TEXT``); passing
+    ``None`` leaves them unset.
     """
     model_override = (model_override or "").strip() or None
     provider_override = (provider_override or "").strip() or None
@@ -3460,8 +3471,9 @@ def create_task(
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort,
-                        goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        goal_mode, goal_max_turns, session_id,
+                        workflow_template_id, current_step_key
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -3487,6 +3499,8 @@ def create_task(
                         1 if goal_mode else 0,
                         int(goal_max_turns) if goal_max_turns is not None else None,
                         session_id,
+                        (workflow_template_id or "").strip() or None,
+                        (current_step_key or "").strip() or None,
                     ),
                 )
                 for pid in parents:

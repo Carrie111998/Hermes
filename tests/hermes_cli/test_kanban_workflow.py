@@ -632,6 +632,28 @@ def test_cmd_workflow_real_run_creates_four_cards_with_provenance(
                 f"step {i} parents must be [source, prev_real_id]; "
                 f"got {parents}, expected [{tid}, {children_ids[i - 2]}]"
             )
+    # Bodies must carry REAL previous-step ids — the provenance
+    # "previous step:" line and the "## Chain" section must not leak the
+    # dry-run sentinels (<id-of-step-N-would-be-created>) into the
+    # production cards (regression guard for the body path, which the
+    # JSON-output placeholder fix missed).
+    with kb.connect() as conn:
+        for i, cid in enumerate(children_ids, start=1):
+            body = kb.get_task(conn, cid).body
+            assert "<id-of-step-" not in body, f"step {i} body leaks a sentinel"
+            assert "__PENDING__" not in body, f"step {i} body leaks __PENDING__"
+            if i > 1:
+                assert f"previous step: {children_ids[i - 2]}" in body, (
+                    f"step {i} provenance must name the real previous child "
+                    f"{children_ids[i - 2]}"
+                )
+        # Ship card's "## Chain" section lists source + all three real
+        # sibling ids, in step order.
+        ship_body = kb.get_task(conn, ship_id).body
+        assert f"- step `corpus-recon`: {tid}" in ship_body
+        assert f"- step `repro-patch`: {children_ids[0]}" in ship_body
+        assert f"- step `regression-test`: {children_ids[1]}" in ship_body
+        assert f"- step `ship-pr`: {children_ids[2]}" in ship_body
     # Re-running is a no-op.
     args2 = argparse.Namespace(
         kanban_action="workflow",

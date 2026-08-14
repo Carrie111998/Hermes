@@ -19,25 +19,25 @@ input:
 
 steps:
   - key: corpus-recon
-    title: "{VULN_ID} child 1/4: corpus-recon"
+    title: "{{VULN_ID}} child 1/4: corpus-recon"
     assignee: default
     assignee_fallback: default
     gate: auto
     parents: [source]
   - key: repro-patch
-    title: "{VULN_ID} child 2/4: reproduce + patch"
+    title: "{{VULN_ID}} child 2/4: reproduce + patch"
     assignee: calcifer
     assignee_fallback: default
     gate: auto
     parents: [source, corpus-recon]
   - key: regression-test
-    title: "{VULN_ID} child 3/4: regression test"
+    title: "{{VULN_ID}} child 3/4: regression test"
     assignee: default
     assignee_fallback: default
     gate: auto
     parents: [source, repro-patch]
   - key: ship-pr
-    title: "{VULN_ID} child 4/4: ship + open PR"
+    title: "{{VULN_ID}} child 4/4: ship + open PR"
     assignee: calcifer
     assignee_fallback: default
     gate: approval
