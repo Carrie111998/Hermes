@@ -7851,6 +7851,16 @@ class AIAgent:
 
     def _guardrail_block_result(self, decision: ToolGuardrailDecision) -> str:
         self._set_tool_guardrail_halt(decision)
+        if decision.code == "loop_web_research_cap":
+            denial_count = self._tool_guardrails.web_budget_denial_count
+            log = logger.warning if denial_count == 1 else logger.debug
+            log(
+                "%sWeb research budget exhausted; rejected %s call %d and "
+                "will omit web tools from subsequent requests this turn",
+                self.log_prefix,
+                decision.tool_name,
+                denial_count,
+            )
         return toolguard_synthetic_result(decision)
 
     def _execute_tool_calls(self, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0) -> None:

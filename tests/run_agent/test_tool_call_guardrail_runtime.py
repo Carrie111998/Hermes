@@ -442,7 +442,7 @@ def test_web_budget_halt_response_is_actionable_and_not_an_internal_loop_dump():
 
 def test_web_budget_denial_allows_next_model_iteration_to_synthesize():
     agent = _make_agent(
-        "web_search",
+        "web_search", "web_extract", "terminal",
         max_iterations=4,
         config={
             "tool_loop_guardrails": {
@@ -471,9 +471,25 @@ def test_web_budget_denial_allows_next_model_iteration_to_synthesize():
     assert result["turn_exit_reason"].startswith("text_response")
     assert result["final_response"] == "Encontré un resultado verificado."
     assert "guardrail" not in result
-    denied = [
+    batch_results = [
         message for message in result["messages"]
-        if message.get("tool_call_id") == "c-denied"
+        if message.get("tool_call_id") in {"c-allowed", "c-denied"}
     ]
+    denied = [
+        message for message in batch_results
+        if "loop_web_research_cap" in message.get("content", "")
+    ]
+    allowed = [message for message in batch_results if message not in denied]
+    assert len(batch_results) == 2
     assert len(denied) == 1
     assert "loop_web_research_cap" in denied[0]["content"]
+    assert len(allowed) == 1
+    assert '"success": true' in allowed[0]["content"]
+
+    assert agent.client.chat.completions.create.call_count == 2
+    second_tools = agent.client.chat.completions.create.call_args_list[1].kwargs["tools"]
+    second_names = {tool["function"]["name"] for tool in second_tools}
+    assert second_names == {"terminal"}
+    assert {tool["function"]["name"] for tool in agent.tools} == {
+        "web_search", "web_extract", "terminal",
+    }

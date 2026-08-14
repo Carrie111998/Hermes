@@ -288,10 +288,22 @@ class ToolCallGuardrailController:
         # single agent loop rather than accumulating across the session.
         self._turn_web_request_count = 0
         self._turn_subagent_count = 0
+        self._web_budget_exhausted = False
+        self._web_budget_denial_count = 0
 
     @property
     def halt_decision(self) -> ToolGuardrailDecision | None:
         return self._halt_decision
+
+    @property
+    def web_budget_exhausted(self) -> bool:
+        """Whether web tools must be hidden for the rest of this turn."""
+        return self._web_budget_exhausted
+
+    @property
+    def web_budget_denial_count(self) -> int:
+        """Number of post-budget web calls rejected in this turn."""
+        return self._web_budget_denial_count
 
     def before_call(self, tool_name: str, args: Mapping[str, Any] | None) -> ToolGuardrailDecision:
         signature = ToolCallSignature.from_call(tool_name, _coerce_args(args))
@@ -463,6 +475,8 @@ class ToolCallGuardrailController:
         if tool_name in {"web_search", "web_extract"}:
             cap = caps.max_web_searches
             if cap and self._turn_web_request_count >= cap:
+                self._web_budget_exhausted = True
+                self._web_budget_denial_count += 1
                 decision = ToolGuardrailDecision(
                     action="deny",
                     code="loop_web_research_cap",
