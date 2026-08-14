@@ -551,7 +551,10 @@ class MCPOAuthManager:
         apply_oauth_provider_defaults(
             cfg, server_name=server_name, server_url=entry.server_url
         )
-        storage = HermesTokenStorage(server_name)
+        storage = HermesTokenStorage(
+            server_name,
+            require_refresh_token=bool(cfg.get("require_refresh_token")),
+        )
 
         from tools.mcp_dashboard_oauth import get_dashboard_oauth_flow
 
@@ -573,7 +576,10 @@ class MCPOAuthManager:
         _maybe_preregister_client(storage, cfg, client_metadata)
 
         resolved_port = cfg.get("_resolved_port", 0)
-        redirect_handler = _make_redirect_handler(resolved_port)
+        redirect_handler = _make_redirect_handler(
+            resolved_port,
+            extra_authorize_params=cfg.get("authorization_params") or None,
+        )
         callback_handler = _make_callback_waiter(resolved_port)
 
         return _HERMES_PROVIDER_CLS(

@@ -930,3 +930,80 @@ def test_humanize_non_registration_403_passthrough():
         )
         is None
     )
+
+
+# ---------------------------------------------------------------------------
+# oauth.authorization_params / oauth.require_refresh_token
+# ---------------------------------------------------------------------------
+
+class TestExtraAuthorizeParams:
+    """Provider-specific authorize-URL params (e.g. Dropbox token_access_type).
+
+    The SDK builds the authorization URL itself, so the redirect handler is
+    the only seam where config-declared ``authorization_params`` can be
+    appended. Without them Dropbox never issues a refresh_token and the grant
+    dies with the first access token.
+    """
+
+    def _capture_url(self, monkeypatch):
+        captured = {}
+
+        class _Flow:
+            async def publish_authorization_url(self, url):
+                captured["url"] = url
+
+        monkeypatch.setattr(
+            "tools.mcp_dashboard_oauth.get_dashboard_oauth_flow",
+            lambda: _Flow(),
+        )
+        return captured
+
+    def test_params_appended_to_authorization_url(self, monkeypatch):
+        captured = self._capture_url(monkeypatch)
+        handler = _make_redirect_handler(
+            0, extra_authorize_params={"token_access_type": "offline"}
+        )
+        asyncio.run(handler("https://x.example/authorize?client_id=abc"))
+        assert captured["url"] == (
+            "https://x.example/authorize?client_id=abc&token_access_type=offline"
+        )
+
+    def test_existing_query_keys_are_not_overridden(self, monkeypatch):
+        captured = self._capture_url(monkeypatch)
+        handler = _make_redirect_handler(
+            0,
+            extra_authorize_params={"client_id": "evil", "token_access_type": "offline"},
+        )
+        asyncio.run(handler("https://x.example/authorize?client_id=abc"))
+        assert "evil" not in captured["url"]
+        assert "token_access_type=offline" in captured["url"]
+
+    def test_no_params_leaves_url_untouched(self, monkeypatch):
+        captured = self._capture_url(monkeypatch)
+        handler = _make_redirect_handler(0)
+        asyncio.run(handler("https://x.example/authorize?client_id=abc"))
+        assert captured["url"] == "https://x.example/authorize?client_id=abc"
+
+
+class TestRequireRefreshToken:
+    def test_missing_refresh_token_logs_error(self, tmp_path, monkeypatch, caplog):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        storage = HermesTokenStorage("dropbox", require_refresh_token=True)
+        token = MagicMock()
+        token.model_dump.return_value = {"access_token": "at", "expires_in": 14400}
+        with caplog.at_level("ERROR", logger="tools.mcp_oauth"):
+            asyncio.run(storage.set_tokens(token))
+        assert any("no refresh_token" in r.message for r in caplog.records)
+
+    def test_refresh_token_present_is_silent(self, tmp_path, monkeypatch, caplog):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        storage = HermesTokenStorage("dropbox", require_refresh_token=True)
+        token = MagicMock()
+        token.model_dump.return_value = {
+            "access_token": "at",
+            "refresh_token": "rt",
+            "expires_in": 14400,
+        }
+        with caplog.at_level("ERROR", logger="tools.mcp_oauth"):
+            asyncio.run(storage.set_tokens(token))
+        assert not caplog.records
