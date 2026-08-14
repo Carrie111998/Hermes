@@ -17,6 +17,7 @@ import pytest
 
 import agent.redact as redact_module
 from hermes_cli._scan_venv_blockers import (
+    _classify_blocker,
     _is_pausable_gateway,
     _redact_sensitive_cmdline,
     main,
@@ -35,6 +36,25 @@ def _psutil_fake() -> dict:
 
 
 
+
+
+# ---------------------------------------------------------------------------
+# _classify_blocker — no command line is exposed to the Desktop policy layer
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("cmdline", "expected"),
+    [
+        ("python.exe -m hermes_cli.main serve --token should-not-matter", "desktop-backend"),
+        ("python.exe -m hermes_cli.main --profile work gateway run", "hermes-cli"),
+        ("python.exe -m hermes_cli.main kanban worker", "kanban-worker"),
+        ("C:\\x\\.hermes-runtime\\python.exe helper.py", "managed-runtime-helper"),
+        ("python.exe custom.py", "unknown"),
+    ],
+)
+def test_classify_blocker(cmdline: str, expected: str) -> None:
+    assert _classify_blocker(cmdline) == expected
 
 
 # ---------------------------------------------------------------------------
@@ -196,6 +216,8 @@ def test_main_exempts_gateway_chain_but_keeps_other_holders(monkeypatch, capsys)
     assert code == 0
     assert data["blocked"] is True
     assert [p["pid"] for p in data["processes"]] == [56]
+    assert data["processes"][0]["blocker_class"] == "unknown"
+    assert data["processes"][0]["same_install"] is True
     assert data["pausable_gateways"] == 2
 
 
@@ -211,6 +233,7 @@ def test_main_desktop_serve_backend_still_blocks(monkeypatch, capsys):
     assert code == 0
     assert data["blocked"] is True
     assert [p["pid"] for p in data["processes"]] == [78]
+    assert data["processes"][0]["blocker_class"] == "desktop-backend"
     assert data["pausable_gateways"] == 0
 
 def test_main_gateway_with_long_managed_runtime_path_is_exempt(monkeypatch, capsys):
@@ -237,9 +260,10 @@ def test_main_gateway_with_long_managed_runtime_path_is_exempt(monkeypatch, caps
     assert data["processes"] == []
     assert data["pausable_gateways"] == 1
 
-    # A long-path NON-gateway holder still blocks, with cmdline truncated for display.
+    # A long-path NON-gateway holder still blocks without leaking command lines.
     stray = (92, "python.exe", long_exe + "  -m some_other_module --serve-forever")
     code, data = _run_main_with_detector(monkeypatch, capsys, [gateway, stray])
     assert data["blocked"] is True
     assert [p["pid"] for p in data["processes"]] == [92]
-    assert len(data["processes"][0]["cmdline"]) <= 120
+    assert data["processes"][0]["name"] == "python.exe"
+    assert "cmdline" not in data["processes"][0]

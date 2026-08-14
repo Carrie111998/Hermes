@@ -22,6 +22,14 @@ import {
   scanVenvBlockers
 } from './venv-blocker-scan'
 
+const blocker = (over: any = {}) => ({
+  pid: 1,
+  name: 'python.exe',
+  blocker_class: 'hermes-cli',
+  same_install: true,
+  ...over
+})
+
 // ---------------------------------------------------------------------------
 // resolveVenvPython
 // ---------------------------------------------------------------------------
@@ -53,15 +61,15 @@ describe('resolveVenvPython', () => {
 // ---------------------------------------------------------------------------
 
 describe('formatBlockerMessage', () => {
-  it('includes PID, name, cmdline, remote-client warning, and retry suggestion', () => {
+  it('includes PID, name, category, remote-client warning, and retry suggestion without a command line', () => {
     const msg = formatBlockerMessage({
       blocked: true,
-      processes: [{ pid: 101, name: 'python.exe', cmdline: 'serve --host 10.0.0.1' }]
+      processes: [{ pid: 101, name: 'python.exe', blockerClass: 'desktop-backend', sameInstall: true }]
     })
 
     assert.ok(msg.includes('PID 101'))
     assert.ok(msg.includes('python.exe'))
-    assert.ok(msg.includes('serve'))
+    assert.ok(msg.includes('desktop-backend'))
     assert.ok(msg.includes('remote backend'))
     assert.ok(msg.includes('retry'))
     assert.ok(!msg.includes('force-venv'))
@@ -92,7 +100,7 @@ describe('parseVenvBlockerScanOutput', () => {
     const o = parseVenvBlockerScanOutput(
       ok({
         blocked: true,
-        processes: [{ pid: 1, name: 'p', cmdline: 'c' }]
+        processes: [blocker()]
       })
     )
 
@@ -119,27 +127,24 @@ describe('parseVenvBlockerScanOutput', () => {
   })
 
   it('blocked=false with non-empty processes rejected', () => {
-    assert.equal(
-      parseVenvBlockerScanOutput(ok({ processes: [{ pid: 1, name: 'p', cmdline: 'c' }] })).kind,
-      'probe-failure'
-    )
+    assert.equal(parseVenvBlockerScanOutput(ok({ processes: [blocker()] })).kind, 'probe-failure')
   })
 
   it('process pid must be positive integer', () => {
     assert.equal(
-      parseVenvBlockerScanOutput(ok({ blocked: true, processes: [{ pid: 0, name: 'p', cmdline: 'c' }] })).kind,
+      parseVenvBlockerScanOutput(ok({ blocked: true, processes: [blocker({ pid: 0 })] })).kind,
       'probe-failure'
     )
   })
 
   it('process name must be non-empty string', () => {
     assert.equal(
-      parseVenvBlockerScanOutput(ok({ blocked: true, processes: [{ pid: 1, name: '', cmdline: 'c' }] })).kind,
+      parseVenvBlockerScanOutput(ok({ blocked: true, processes: [blocker({ name: '' })] })).kind,
       'probe-failure'
     )
   })
 
-  it('process missing cmdline is rejected', () => {
+  it('process missing blocker metadata is rejected', () => {
     assert.equal(
       parseVenvBlockerScanOutput(ok({ blocked: true, processes: [{ pid: 1, name: 'p' }] })).kind,
       'probe-failure'
@@ -158,7 +163,7 @@ describe('scanVenvBlockers', () => {
   const blockedJson = JSON.stringify({
     ok: true,
     blocked: true,
-    processes: [{ pid: 1, name: 'p', cmdline: 'c' }]
+    processes: [blocker()]
   })
 
   function execReturn(json: string): any {

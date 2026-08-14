@@ -21,7 +21,8 @@ const execFileAsync = promisify(execFile)
 export interface VenvBlockerProcess {
   pid: number
   name: string
-  cmdline: string
+  blockerClass: string
+  sameInstall: boolean
 }
 
 export interface VenvBlockerScanResult {
@@ -77,7 +78,7 @@ export function parseVenvBlockerScanOutput(raw: string): ScanOutcome {
       return { kind: 'probe-failure', error: 'process entry must be an object' }
     }
 
-    const { pid, name, cmdline } = entry
+    const { pid, name, blocker_class, same_install } = entry
 
     if (!Number.isInteger(pid) || pid <= 0) {
       return { kind: 'probe-failure', error: 'process pid must be a positive integer' }
@@ -87,11 +88,20 @@ export function parseVenvBlockerScanOutput(raw: string): ScanOutcome {
       return { kind: 'probe-failure', error: 'process name must be a non-empty string' }
     }
 
-    if (typeof cmdline !== 'string') {
-      return { kind: 'probe-failure', error: 'process cmdline must be a string' }
+    if (typeof blocker_class !== 'string' || blocker_class.length === 0) {
+      return { kind: 'probe-failure', error: 'process blocker_class must be a non-empty string' }
     }
 
-    processes.push({ pid, name, cmdline })
+    if (typeof same_install !== 'boolean') {
+      return { kind: 'probe-failure', error: 'process same_install must be a boolean' }
+    }
+
+    processes.push({
+      pid,
+      name,
+      blockerClass: blocker_class,
+      sameInstall: same_install
+    })
   }
 
   // Reject inconsistent combinations
@@ -172,7 +182,8 @@ export function resolveVenvPython(updateRoot: string): string | null {
 }
 
 /**
- * Build a human-readable error message from blocker scan results.
+ * Build a human-readable error message from blocker scan results. The scan
+ * deliberately never supplies raw command lines, which can include secrets.
  * Does NOT recommend --force-venv.
  */
 export function formatBlockerMessage(result: VenvBlockerScanResult): string {
@@ -184,7 +195,7 @@ export function formatBlockerMessage(result: VenvBlockerScanResult): string {
   ]
 
   for (const proc of result.processes.slice(0, 10)) {
-    lines.push(`  PID ${proc.pid}  ${proc.name}  ${proc.cmdline}`)
+    lines.push(`  PID ${proc.pid}  ${proc.name}  (${proc.blockerClass})`)
   }
 
   if (result.processes.length > 10) {

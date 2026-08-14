@@ -221,6 +221,8 @@ import {
   wrapHandoffForDetachedConsole
 } from './updater-process'
 import { formatBlockerMessage, formatProbeFailedMessage, scanVenvBlockers } from './venv-blocker-scan'
+import { runWindowsUpdatePreflight } from './windows-update-state'
+import { runWindowsUpdateTransaction } from './windows-update-transaction'
 import { fetchMarketplaceThemes, searchMarketplaceThemes } from './vscode-marketplace'
 import { createWakeIndicatorWindowController } from './wake-indicator-window'
 import { readWindowBelow } from './window-below'
@@ -2895,7 +2897,6 @@ async function applyUpdates(opts = {}) {
   }
 
   updateInFlight = true
-
   try {
     const updater = resolveUpdaterBinary()
 
@@ -2994,29 +2995,12 @@ async function applyUpdates(opts = {}) {
     // anything.  Runs while the backend is still alive.
     preflightStateDb(HERMES_HOME, rememberLog)
 
-    // Stop our own backend(s) and wait for the venv shim to unlock BEFORE we
-    // spawn the updater. Without this the updater races a still-locked
-    // hermes.exe (held by the backend child / its grandchildren) and the update
-    // bricks. See releaseBackendLockForUpdate for the full failure analysis.
-    const lock = await releaseBackendLockForUpdate(updateRoot)
-
-    if (!lock.unlocked) {
-      // Something OUTSIDE this app holds the venv (a second window, a user
-      // terminal running hermes, an unkillable child). Handing off anyway
-      // guarantees a half-updated venv — abort loudly instead and let the
-      // user close the holder and retry. Restart our own backend so the app
-      // keeps working after the failed attempt.
-      const message =
-        'Update aborted: another process is holding the Hermes install open ' +
-        '(a second Hermes window or a terminal running hermes?). Close it and retry.'
-
-      emitUpdateProgress({ stage: 'error', message, percent: null })
-      startHermes().catch(() => {})
-
-      return { ok: false, error: message }
-    }
-
-    // Preflight: after releasing our own backends, check for remaining
+    // Windows preflight runs before any owned process is stopped. No scanner
+    // class currently documents a graceful stop + active-work safety contract,
+    // so blocked scans remain blocked rather than force-killing work or an
+    // unknown holder. A clear scan is the only authorization to hand off.
+    //
+    // Preflight checks for remaining
     // Hermes processes running from this venv.  The updater normally refuses
     // when it detects a holder, but because the updater is spawned detached
     // with stdio:ignore, the user never sees that refusal and the update
@@ -3025,30 +3009,8 @@ async function applyUpdates(opts = {}) {
     // Windows phenomenon.  ALL failures (blocked, missing python, timeout,
     // malformed output, missing psutil) abort the handoff — never proceed
     // to the detached updater when the venv state is unknown.
-    if (IS_WINDOWS) {
-      const scanOutcome = await scanVenvBlockers(updateRoot)
 
-      if (scanOutcome.kind === 'blocked') {
-        const message = formatBlockerMessage(scanOutcome.result)
-
-        rememberLog(`[updates] venv-blocked: ${scanOutcome.result.processes.length} process(es) hold the install`)
-        emitUpdateProgress({ stage: 'error', message, percent: null })
-        startHermes().catch(() => {})
-
-        return { ok: false, error: 'venv-blocked', message }
-      }
-
-      if (scanOutcome.kind === 'probe-failure') {
-        const message = formatProbeFailedMessage()
-
-        rememberLog(`[updates] venv-blocker probe failed: ${scanOutcome.error}`)
-        emitUpdateProgress({ stage: 'error', message, percent: null })
-        startHermes().catch(() => {})
-
-        return { ok: false, error: 'venv-probe-failed', message }
-      }
-    }
-
+    const launchDetachedUpdater = async () => {
     // Detached so the updater outlives this process — it needs us GONE before
     // `hermes update` will run (the venv shim is locked while we live).
     //
@@ -3157,7 +3119,80 @@ async function applyUpdates(opts = {}) {
       app.quit()
     }, UPDATE_HANDOFF_DWELL_MS)
 
-    return { ok: true, handedOff: true, updater }
+      return { ok: true, handedOff: true, updater }
+    }
+
+    if (!IS_WINDOWS) {
+      return launchDetachedUpdater()
+    }
+
+    const transaction = await runWindowsUpdateTransaction({
+      preflight: () => runWindowsUpdatePreflight({
+        scan: () => scanVenvBlockers(updateRoot),
+        // Scanner metadata is diagnostic only and cannot grant permission to
+        // stop a process. Only the directly-owned local primary backend, with
+        // a matching PID, has a documented cooperative shutdown contract.
+        canQuiesceOwned: process => {
+          const owned = backendConnectionState.getProcess()
+          return process.blockerClass === 'desktop-backend'
+            && process.sameInstall
+            && Number.isInteger(owned?.pid)
+            && owned?.pid === process.pid
+            && owned.exitCode === null
+            && !owned.killed
+        },
+        quiesceOwned: async processes => {
+          const owned = backendConnectionState.getProcess()
+          if (processes.length !== 1 || !owned || !Number.isInteger(owned.pid)
+            || processes[0].blockerClass !== 'desktop-backend' || processes[0].pid !== owned.pid) {
+            return false
+          }
+          // Invalidate first so no connection path can reuse this process as it
+          // drains. SIGTERM is cooperative here; unlike stopBackendChild it
+          // never escalates to a tree kill.
+          backendConnectionState.invalidate()
+          try {
+            owned.kill('SIGTERM')
+          } catch {
+            return false
+          }
+          return waitForBackendExitGracefully(owned)
+        },
+        onTransition: state => rememberLog(`[updates] windows preflight: ${state.phase}`)
+      }),
+      // This is the production detached updater-spawn seam; transaction tests
+      // exercise the same callback boundary and assert it is unreachable while
+      // preflight is blocked.
+      spawnUpdater: launchDetachedUpdater,
+      releaseUpdateGateBeforeReconnect: () => { updateInFlight = false },
+      reconnect: () => startHermes(),
+      onPhase: phase => {
+        rememberLog(`[updates] windows preflight: ${phase}`)
+        if (phase === 'reconnect') {
+          emitUpdateProgress({ stage: 'restart', message: 'Reconnecting Hermes after the aborted update.', percent: null })
+        }
+      }
+    })
+
+    if (transaction.kind === 'handed-off') {
+      return transaction.value
+    }
+
+    const message = transaction.preflight.blockers
+      ? formatBlockerMessage(transaction.preflight.blockers)
+      : formatProbeFailedMessage()
+    const error = transaction.preflight.blockers ? 'venv-blocked' : 'venv-probe-failed'
+    rememberLog(`[updates] ${error}: ${transaction.preflight.error || 'preflight aborted'}`)
+    emitUpdateProgress({ stage: 'error', message, percent: null })
+
+    if (transaction.kind === 'reconnect-failed') {
+      const reconnectMessage = `Update aborted and Hermes could not reconnect: ${(transaction.error as any)?.message || String(transaction.error)}`
+      rememberLog(`[updates] windows preflight: reconnect failed: ${(transaction.error as any)?.message || String(transaction.error)}`)
+      emitUpdateProgress({ stage: 'error', message: reconnectMessage, percent: null })
+      return { ok: false, error: 'reconnect-failed', message: reconnectMessage }
+    }
+
+    return { ok: false, error, message }
   } finally {
     updateInFlight = false
   }
@@ -7989,6 +8024,29 @@ async function waitForBackendExit(child, timeoutMs = 5000) {
       clearTimeout(timer)
       resolve()
     })
+  })
+}
+
+/**
+ * Observe a cooperative Desktop-owned backend shutdown without escalating to
+ * taskkill. For update preflight, an uncooperative process blocks the update.
+ */
+async function waitForBackendExitGracefully(child, timeoutMs = 5000) {
+  if (!child || child.exitCode !== null || child.signalCode !== null) {
+    return true
+  }
+
+  return await new Promise<boolean>(resolve => {
+    let settled = false
+    const finish = value => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      resolve(value)
+    }
+    const timer = setTimeout(() => finish(false), timeoutMs)
+    child.once('exit', () => finish(true))
+    child.once('error', () => finish(false))
   })
 }
 

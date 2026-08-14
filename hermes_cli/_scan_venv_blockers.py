@@ -126,6 +126,42 @@ def _is_pausable_gateway(cmdline: str) -> bool:
     return looks_like_gateway_command_line(cmdline)
 
 
+def _classify_blocker(cmdline: str) -> str:
+    """Return a stable, command-line-free ownership class for a holder.
+
+    The Desktop must be able to explain *why* an update is stopped without
+    echoing a command line (which can carry URLs or credentials).  This is
+    diagnostic metadata only: all non-exempt matches remain blockers until a
+    future class has a documented graceful-stop contract.
+    """
+    normalized = cmdline.lower()
+    if "-m hermes_cli.main" in normalized and " serve" in normalized:
+        return "desktop-backend"
+    if "kanban" in normalized:
+        return "kanban-worker"
+    if ".hermes-runtime" in normalized or "managed-runtime" in normalized:
+        return "managed-runtime-helper"
+    if "-m hermes_cli.main" in normalized:
+        return "hermes-cli"
+    return "unknown"
+
+
+def _blocker_record(pid: int, name: str, cmdline: str) -> dict[str, object]:
+    """Build the privacy-safe scan record consumed by Desktop.
+
+    ``_detect_venv_python_processes`` only returns processes resolved under
+    the active installation, so ``same_install`` is true by construction.
+    No currently reported class is automatically quiesced: callers must keep
+    the fail-closed preflight until it has an explicit stop/health contract.
+    """
+    return {
+        "pid": pid,
+        "name": name.rsplit("\\", 1)[-1].rsplit("/", 1)[-1],
+        "blocker_class": _classify_blocker(cmdline),
+        "same_install": True,
+    }
+
+
 def main() -> None:
     """Entry point.  Prints one JSON doc to stdout.  Exits 0 for valid scan."""
     try:
@@ -141,14 +177,7 @@ def main() -> None:
         _emit_probe_fail(f"scan aborted: {exc}")
 
     processes = [
-        {
-            "pid": pid,
-            "name": name,
-            # Truncate for display AFTER the gateway exemption has seen the
-            # full cmdline (long managed-runtime interpreter paths would
-            # otherwise swallow the `gateway run` argv).
-            "cmdline": _redact_sensitive_cmdline(cmdline)[:120],
-        }
+        _blocker_record(pid, name, cmdline)
         for pid, name, cmdline in matches
         if not _is_pausable_gateway(cmdline)
     ]
