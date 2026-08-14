@@ -232,11 +232,16 @@ def verify_scaffold(path: Path) -> List[str]:
     return errors
 
 
-def smoke_scaffold(path: Path) -> List[str]:
-    """Best-effort smoke test: verify files and try a lightweight Hermes probe."""
+def smoke_scaffold(path: Path) -> tuple[List[str], List[str]]:
+    """Best-effort smoke test: verify files and try a lightweight Hermes probe.
+
+    Returns ``(errors, warnings)``. The missing-CLI case is a warning, not an
+    error, because the kit is often run before Hermes is fully configured.
+    """
     errors = verify_scaffold(path)
+    warnings: List[str] = []
     if errors:
-        return errors
+        return errors, warnings
 
     soul = _find_scaffold_files(path).get("SOUL.md")
     assert soul is not None
@@ -257,9 +262,11 @@ def smoke_scaffold(path: Path) -> List[str]:
         except Exception as exc:
             errors.append(f"Hermes --version probe failed: {exc}")
     else:
-        errors.append("Hermes CLI not found on PATH; smoke test limited to file checks")
+        warnings.append(
+            "Hermes CLI not found on PATH; smoke test limited to file checks"
+        )
 
-    return errors
+    return errors, warnings
 
 
 # -----------------------------------------------------------------------------
@@ -340,12 +347,14 @@ def _cmd_verify(args: argparse.Namespace) -> int:
 
 def _cmd_smoke(args: argparse.Namespace) -> int:
     """Smoke-test a generated scaffold."""
-    errors = smoke_scaffold(Path(args.path).expanduser().resolve())
+    errors, warnings = smoke_scaffold(Path(args.path).expanduser().resolve())
     if errors:
         print("Smoke test failed:")
         for err in errors:
             print(f"  ✗ {err}")
         return 1
+    for warn in warnings:
+        print(f"  ⚠ {warn}")
     print(f"✓ {args.path} passed the smoke test.")
     return 0
 

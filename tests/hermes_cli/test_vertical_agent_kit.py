@@ -131,9 +131,10 @@ def test_smoke_scaffold_passes_for_rendered(temp_out: Path):
     }
     render_blueprint("support", temp_out, variables)
 
-    # Ensure PATH contains at least something deterministic so the probe branch
-    # is exercised consistently across platforms.
-    env_path = os.environ.get("PATH", "")
-    errors = smoke_scaffold(temp_out / "smoke-agent")
+    errors, warnings = smoke_scaffold(temp_out / "smoke-agent")
     assert not any("Missing SOUL.md" in e for e in errors)
     assert not any("empty" in e.lower() for e in errors)
+    # Missing CLI is a warning, not an error.
+    assert all(
+        "Hermes CLI not found on PATH" in w or "file checks" in w for w in warnings
+    ) or warnings == []
