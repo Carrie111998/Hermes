@@ -60,6 +60,7 @@ import {
   shouldTreatInputAsMobileReplacement,
 } from "@/lib/pty-mobile-input";
 import {
+  imageAttachPtyInput,
   imageFilesFromTransfer,
   transferMayContainImage,
   uploadChatImage,
@@ -578,7 +579,8 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     // The Chat tab is an xterm mirror of a TUI inside the gateway. Server-side
     // clipboard.paste / xclip never see the browser clipboard, so image paste
     // must upload browser bytes to HERMES_HOME/images, then drive `/image`
-    // over the PTY (same burst-then-Return timing as handleCopyLast).
+    // over the PTY. Keep each command and its Return in one frame: splitting
+    // them across a timer races the TUI's input lifecycle.
     let imageUploadDisposed = false;
     const pasteDelay = () =>
       new Promise<void>((resolve) => window.setTimeout(resolve, 40));
@@ -597,11 +599,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
           );
           return;
         }
-        ws.send(`/image ${path}`);
-        await new Promise<void>((resolve) => window.setTimeout(resolve, 100));
-        const s = wsRef.current;
-        if (!s || s.readyState !== WebSocket.OPEN) return;
-        s.send("\r");
+        ws.send(imageAttachPtyInput(path));
         await pasteDelay();
       }
       term.focus();

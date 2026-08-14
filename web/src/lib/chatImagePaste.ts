@@ -24,6 +24,11 @@ export interface ChatImageUploadResult {
   mime_type: string;
 }
 
+/** Build one atomic PTY input frame for the TUI's image slash command. */
+export function imageAttachPtyInput(path: string): string {
+  return `/image ${path}\r`;
+}
+
 function imageFileKey(file: File): string {
   return `${file.name}\0${file.type}\0${file.size}\0${file.lastModified}`;
 }
