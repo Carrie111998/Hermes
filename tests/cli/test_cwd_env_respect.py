@@ -6,6 +6,8 @@ Rules:
 - Non-local with explicit path: keep as-is.
 """
 
+import os
+
 
 _CWD_PLACEHOLDERS = (".", "auto", "cwd")
 
@@ -97,3 +99,31 @@ class TestGatewayLazyImport:
         d = {"terminal": {"cwd": "/home/user"}}
         result = _resolve_cwd(tc, d, env)
         assert result == "/fake/getcwd"
+
+
+def test_real_local_cli_config_pin_survives_dotenv_reload(tmp_path, monkeypatch):
+    """Exercise the real CLI bridge and the later config re-apply together."""
+    home = tmp_path / "hermes"
+    home.mkdir()
+    (home / "config.yaml").write_text(
+        "terminal:\n"
+        "  backend: local\n"
+        "  cwd: /configured/gateway/workspace\n",
+        encoding="utf-8",
+    )
+    launch_cwd = tmp_path / "project"
+    launch_cwd.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.delenv("_HERMES_GATEWAY", raising=False)
+    monkeypatch.chdir(launch_cwd)
+
+    import cli
+    from hermes_cli.env_loader import load_hermes_dotenv
+
+    monkeypatch.setattr(cli, "_hermes_home", home)
+    cli.load_cli_config()
+    assert os.environ["TERMINAL_CWD"] == str(launch_cwd)
+
+    load_hermes_dotenv(hermes_home=home)
+
+    assert os.environ["TERMINAL_CWD"] == str(launch_cwd)

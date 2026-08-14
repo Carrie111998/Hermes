@@ -52,6 +52,13 @@ _APPLIED_HOMES: set[str] = set()
 _SECRET_SOURCE_CACHE_LOCK = threading.RLock()
 
 
+def pin_local_cli_launch_cwd(cwd: str | os.PathLike[str]) -> None:
+    """Make a local CLI/TUI launch directory durable for this process."""
+    from hermes_cli.config import pin_local_cli_launch_cwd as _pin
+
+    _pin(cwd)
+
+
 def _known_hermes_env_keys() -> set[str]:
     """Return the combined set of known Hermes env-var keys.
 

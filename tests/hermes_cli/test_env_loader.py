@@ -539,6 +539,60 @@ def test_config_yaml_terminal_backend_overrides_stale_shell(tmp_path, monkeypatc
     assert os.getenv("TERMINAL_ENV") == "local"
 
 
+def test_local_cli_launch_cwd_survives_later_config_reapply(tmp_path, monkeypatch):
+    """A local CLI launch directory stays authoritative for the process."""
+    from hermes_cli import env_loader
+    from hermes_cli import config as config_mod
+
+    home = _seed_terminal_home(
+        tmp_path,
+        monkeypatch,
+        config_yaml=(
+            "terminal:\n"
+            "  backend: local\n"
+            "  cwd: /configured/gateway/workspace\n"
+            "  timeout: 777\n"
+        ),
+    )
+    launch_cwd = tmp_path / "project"
+    launch_cwd.mkdir()
+    monkeypatch.setattr(config_mod, "_LOCAL_CLI_LAUNCH_CWD", None)
+    monkeypatch.delenv("TERMINAL_TIMEOUT", raising=False)
+
+    env_loader.pin_local_cli_launch_cwd(launch_cwd)
+    load_hermes_dotenv(hermes_home=home)
+
+    assert os.getenv("TERMINAL_CWD") == str(launch_cwd)
+    assert os.getenv("TERMINAL_TIMEOUT") == "777"
+
+    from tools import terminal_tool
+
+    monkeypatch.setattr(terminal_tool, "_terminal_config_bridge_attempted", False)
+    terminal_tool._ensure_terminal_env_bridged()
+    assert os.getenv("TERMINAL_CWD") == str(launch_cwd)
+
+
+def test_config_cwd_still_reapplies_without_local_cli_pin(tmp_path, monkeypatch):
+    """Gateway/cron reloads still re-apply an explicit terminal.cwd."""
+    from hermes_cli import config as config_mod
+
+    home = _seed_terminal_home(
+        tmp_path,
+        monkeypatch,
+        config_yaml=(
+            "terminal:\n"
+            "  backend: local\n"
+            "  cwd: /configured/gateway/workspace\n"
+        ),
+    )
+    monkeypatch.setattr(config_mod, "_LOCAL_CLI_LAUNCH_CWD", None)
+    monkeypatch.setenv("TERMINAL_CWD", "/stale/runtime/value")
+
+    load_hermes_dotenv(hermes_home=home)
+
+    assert os.getenv("TERMINAL_CWD") == "/configured/gateway/workspace"
+
+
 def test_no_terminal_section_leaves_env_value_alone(tmp_path, monkeypatch):
     """When config.yaml has no terminal section, the .env value is still the
     user's active setting — the bridge must NOT clobber it with merged

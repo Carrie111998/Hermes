@@ -223,7 +223,7 @@ from hermes_cli.browser_connect import (
     manual_chrome_debug_command,
     try_launch_chrome_debug,
 )
-from hermes_cli.env_loader import load_hermes_dotenv
+from hermes_cli.env_loader import load_hermes_dotenv, pin_local_cli_launch_cwd
 from utils import base_url_host_matches, fast_safe_load
 
 _hermes_home = get_hermes_home()
@@ -699,7 +699,10 @@ def load_cli_config() -> Dict[str, Any]:
                 if _is_gateway:
                     continue
                 # CLI: always export (overrides stale .env or inherited values)
-                os.environ[env_var] = str(terminal_config[config_key])
+                if effective_backend == "local":
+                    pin_local_cli_launch_cwd(terminal_config[config_key])
+                else:
+                    os.environ[env_var] = str(terminal_config[config_key])
                 continue
             if _file_has_terminal_config or env_var not in os.environ:
                 val = terminal_config[config_key]
