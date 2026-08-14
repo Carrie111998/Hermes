@@ -13,26 +13,23 @@ coverage in tests/tools/test_local_env_windows_msys.py; this pins the
 ``--in`` call site actually applying it.
 """
 
-import os
 from unittest import mock
 
 from tools.environments.local import _msys_to_windows_path
 
 
-def _resolve_in_dir(raw: str) -> str:
-    """The exact resolution expression used by hermes_cli.main for --in."""
-    return os.path.abspath(os.path.expanduser(_msys_to_windows_path(raw)))
-
-
 class TestInDirMsysResolution:
-    def test_git_bash_tilde_expansion_resolves_on_windows(self):
-        with (
-            mock.patch("tools.environments.local._IS_WINDOWS", True),
-            mock.patch.dict(os.environ, {"USERPROFILE": r"C:\Users\alice"}),
-        ):
-            resolved = _resolve_in_dir("/c/Users/alice")
-            assert resolved.lower().startswith("c:"), resolved
-            assert "/c/" not in resolved
+    def test_git_bash_tilde_expansion_translates_on_windows(self):
+        # Assert the translation itself — abspath/expanduser are platform
+        # functions, and this test also runs on Linux CI where posix abspath
+        # would treat 'C:\\...' as relative and prepend the runner's cwd.
+        with mock.patch("tools.environments.local._IS_WINDOWS", True):
+            translated = _msys_to_windows_path("/c/Users/alice")
+            assert translated == "C:" + chr(92) + "Users" + chr(92) + "alice"
+            # ntpath (what the resolver uses on Windows) sees it as absolute.
+            import ntpath
+
+            assert ntpath.isabs(translated)
 
     def test_native_and_posix_forms_untouched(self):
         with mock.patch("tools.environments.local._IS_WINDOWS", True):
