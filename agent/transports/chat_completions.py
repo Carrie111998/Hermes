@@ -694,7 +694,7 @@ class ChatCompletionsTransport(ProviderTransport):
         # accidentally replace the endpoint-required value. Explicit request
         # overrides are applied below and still win.
         _fixed_top_p = params.get("fixed_top_p")
-        if _fixed_top_p is not None and "top_p" not in api_kwargs:
+        if _fixed_top_p is not None:
             api_kwargs["top_p"] = _fixed_top_p
 
         # extra_body assembly
