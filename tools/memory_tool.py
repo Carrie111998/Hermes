@@ -11,7 +11,9 @@ Provides bounded, file-backed memory that persists across sessions. Two stores:
 Both are injected into the system prompt as a frozen snapshot at session start.
 Mid-session writes update files on disk immediately (durable) but do NOT change
 the system prompt -- this preserves the prefix cache for the entire session.
-The snapshot refreshes on the next session start.
+The snapshot refreshes on the next session start. Removed/replaced entries are
+appended to MEMORY.archive.jsonl / USER.archive.jsonl so bounded active memory
+can be curated without losing older facts from disk.
 
 Entry delimiter: § (section sign). Entries can be multiline.
 Character limits (not tokens) because char counts are model-independent.
@@ -127,7 +129,7 @@ class MemoryStore:
     # turn to budget exhaustion and suppress the user's reply (issue #42405).
     _MAX_CONSOLIDATION_FAILURES_PER_TURN = 3
 
-    def __init__(self, memory_char_limit: int = 2200, user_char_limit: int = 1375):
+    def __init__(self, memory_char_limit: int = 8000, user_char_limit: int = 4000):
         self.memory_entries: List[str] = []
         self.user_entries: List[str] = []
         self.memory_char_limit = memory_char_limit
@@ -448,9 +450,11 @@ class MemoryStore:
                     "usage": f"{current:,}/{limit:,}",
                 })
 
+            old_entry = entries[idx]
             entries[idx] = new_content
             self._set_entries(target, entries)
             self.save_to_disk(target)
+            self._archive_entries(target, "replace", [old_entry])
 
         return self._success_response(target, "Entry replaced.")
 
@@ -488,9 +492,10 @@ class MemoryStore:
                 # All identical -- safe to remove just the first
 
             idx = matches[0][0]
-            entries.pop(idx)
+            old_entry = entries.pop(idx)
             self._set_entries(target, entries)
             self.save_to_disk(target)
+            self._archive_entries(target, "remove", [old_entry])
 
         return self._success_response(target, "Entry removed.")
 
@@ -527,6 +532,7 @@ class MemoryStore:
 
             # Work on a copy; only commit if the whole batch validates.
             working: List[str] = list(self._entries_for(target))
+            archived: List[tuple[str, str]] = []
             limit = self._char_limit(target)
 
             for i, op in enumerate(operations):
@@ -559,7 +565,9 @@ class MemoryStore:
                             target,
                             f"{pos}: '{old_text}' matched multiple distinct entries -- be more specific.",
                         )
+                    old_entry = working[matches[0]]
                     working[matches[0]] = content
+                    archived.append(("replace", old_entry))
 
                 elif act == "remove":
                     if not old_text:
@@ -572,7 +580,8 @@ class MemoryStore:
                             target,
                             f"{pos}: '{old_text}' matched multiple distinct entries -- be more specific.",
                         )
-                    working.pop(matches[0])
+                    old_entry = working.pop(matches[0])
+                    archived.append(("remove", old_entry))
 
                 else:
                     return self._batch_error(
@@ -598,6 +607,12 @@ class MemoryStore:
             # Commit.
             self._set_entries(target, working)
             self.save_to_disk(target)
+            if archived:
+                by_action: Dict[str, List[str]] = {}
+                for action, entry in archived:
+                    by_action.setdefault(action, []).append(entry)
+                for action, entries_for_action in by_action.items():
+                    self._archive_entries(target, action, entries_for_action)
 
         return self._success_response(target, f"Applied {len(operations)} operation(s).")
 
@@ -757,6 +772,36 @@ class MemoryStore:
         return str(bak_path)
 
     @staticmethod
+    def _archive_path_for(target: str) -> Path:
+        suffix = "USER" if target == "user" else "MEMORY"
+        return get_memory_dir() / f"{suffix}.archive.jsonl"
+
+    def _archive_entries(self, target: str, action: str, entries: List[str]) -> None:
+        """Append superseded active-memory entries to a durable JSONL archive.
+
+        The active MEMORY.md/USER.md files stay bounded for prompt caching and
+        context cost, but replace/remove operations should not make older facts
+        disappear from disk.  The archive is intentionally not injected into the
+        system prompt; users and future search tooling can inspect it without
+        turning long-lived memory into an unbounded prompt block.
+        """
+        if not entries:
+            return
+        archive_path = self._archive_path_for(target)
+        archive_path.parent.mkdir(parents=True, exist_ok=True)
+        now = time.time()
+        with archive_path.open("a", encoding="utf-8") as f:
+            for entry in entries:
+                if not entry:
+                    continue
+                f.write(json.dumps({
+                    "archived_at": now,
+                    "target": target,
+                    "action": action,
+                    "content": entry,
+                }, ensure_ascii=False) + "\n")
+
+    @staticmethod
     def _write_file(path: Path, entries: List[str]):
         """Write entries to a memory file using atomic temp-file + rename.
 
@@ -801,8 +846,8 @@ def load_on_disk_store() -> "MemoryStore":
     Falls back to the built-in defaults if config can't be loaded, so this can
     never raise on a missing/unreadable config.
     """
-    memory_char_limit = 2200
-    user_char_limit = 1375
+    memory_char_limit = 8000
+    user_char_limit = 4000
     try:
         from hermes_cli.config import load_config
 

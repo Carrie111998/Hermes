@@ -1372,14 +1372,14 @@ DEFAULT_CONFIG = {
     # bounds how long the first agent build blocks on it.  The wait returns
     # the INSTANT discovery completes, so users with no MCP servers (the common
     # case) or fast servers pay ~0s regardless of this value — the bound is
-    # only reached when a server is genuinely still connecting.  The old 0.75s
-    # default was a touch short for HTTP/OAuth servers on a cold connect; a
-    # modest bump lets more of them land in the FIRST turn's snapshot.  This is
+    # only reached when a server is genuinely still connecting.  The old 1.5s
+    # default was still a touch short for HTTP/OAuth servers on a cold connect;
+    # a modest bump lets more of them land in the FIRST turn's snapshot.  This is
     # only a turn-1 latency/UX knob: a server that misses this window is still
     # picked up automatically on the next turn by the between-turns refresh
     # (see agent/turn_context.py), so correctness never depends on it.  Keep it
     # small so a slow/dead server adds little to first-response latency.
-    "mcp_discovery_timeout": 1.5,
+    "mcp_discovery_timeout": 2.5,
 
     # Tool-output truncation thresholds. When terminal output or a
     # single read_file page exceeds these limits, Hermes truncates the
@@ -1421,14 +1421,14 @@ DEFAULT_CONFIG = {
 
     "compression": {
         "enabled": True,
-        "threshold": 0.50,            # compress when context usage exceeds this ratio.
+        "threshold": 0.65,            # compress when context usage exceeds this ratio.
                                       # Models with context windows below 512K are
                                       # floored at 0.75 (raise-only) so compaction
                                       # doesn't fire with half the window still free;
                                       # set this above 0.75 to override the floor.
-        "target_ratio": 0.20,         # fraction of threshold to preserve as recent tail
+        "target_ratio": 0.25,         # fraction of threshold to preserve as recent tail
         "protect_last_n": 20,         # minimum recent messages to keep uncompressed
-        "hygiene_hard_message_limit": 5000,  # gateway session-hygiene force-compress threshold by message count
+        "hygiene_hard_message_limit": 2500,  # gateway session-hygiene force-compress threshold by message count
         "protect_first_n": 3,         # non-system head messages always preserved
                                       # verbatim, in ADDITION to the system prompt
                                       # (which is always implicitly protected). Set to
@@ -1968,7 +1968,7 @@ DEFAULT_CONFIG = {
         # streaming.enabled master switch still gates everything — these
         # per-platform flags only take effect once streaming is enabled.
         "platforms": {
-            "telegram": {"streaming": True},
+            "telegram": {"streaming": True, "runtime_footer": {"enabled": True, "fields": ["model", "context_pct"]}},
             "discord": {"streaming": False},
         },
         # Gateway runtime-metadata footer appended to the FINAL message of a turn
@@ -2261,8 +2261,8 @@ DEFAULT_CONFIG = {
         #                     /memory reject <id>.
         # To disable memory entirely, use memory_enabled: false instead.
         "write_approval": False,
-        "memory_char_limit": 2200,   # ~800 tokens at 2.75 chars/token
-        "user_char_limit": 1375,     # ~500 tokens at 2.75 chars/token
+        "memory_char_limit": 8000,   # ~2900 tokens at 2.75 chars/token
+        "user_char_limit": 4000,     # ~1450 tokens at 2.75 chars/token
         # External memory provider plugin (empty = built-in only).
         # Set to a provider name to activate: "openviking", "mem0",
         # "hindsight", "holographic", "retaindb", "byterover".
@@ -2570,7 +2570,7 @@ DEFAULT_CONFIG = {
 
     # Telegram platform settings (gateway mode)
     "telegram": {
-        "reactions": False,            # Add 👀/✅/❌ reactions to messages during processing
+        "reactions": True,             # Add 👀/✅/❌ reactions to messages during processing
         "channel_prompts": {},         # Per-chat/topic ephemeral system prompts (topics inherit from parent group)
         "allowed_chats": "",           # If set, bot ONLY responds in these group/supergroup chat IDs (whitelist)
         "extra": {

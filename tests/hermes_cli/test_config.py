@@ -2036,3 +2036,23 @@ class TestCodexAppServerAutoConfig:
             assert raw["compression"]["codex_app_server_auto"] == "hermes"
 
 
+class TestHermesImprovedOperationalDefaults:
+    """Operational defaults keep long-running gateway agents useful."""
+
+    def test_context_memory_telegram_and_mcp_defaults(self):
+        assert DEFAULT_CONFIG["compression"]["threshold"] == 0.65
+        assert DEFAULT_CONFIG["compression"]["target_ratio"] == 0.25
+        assert DEFAULT_CONFIG["compression"]["hygiene_hard_message_limit"] == 2500
+
+        assert DEFAULT_CONFIG["memory"]["memory_char_limit"] == 8000
+        assert DEFAULT_CONFIG["memory"]["user_char_limit"] == 4000
+
+        assert DEFAULT_CONFIG["telegram"]["reactions"] is True
+        telegram_display = DEFAULT_CONFIG["display"]["platforms"]["telegram"]
+        assert telegram_display["streaming"] is True
+        assert telegram_display["runtime_footer"] == {
+            "enabled": True,
+            "fields": ["model", "context_pct"],
+        }
+
+        assert DEFAULT_CONFIG["mcp_discovery_timeout"] == 2.5
