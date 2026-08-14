@@ -504,33 +504,50 @@ def retry(fn, max_attempts=3, delay=2):
 
 
 def _parse_rpc_result(raw):
-    """Parse a tool result and preserve a recognized trailing UI hint.
+    """Parse a tool result plus at most one recognized UI-hint envelope.
 
     Some tools intentionally return a JSON payload followed by a human-facing
     ``[Hint: ...]`` line (for example, truncated ``search_files`` results).
     The normal agent loop accepts that envelope, so programmatic tool calling
     must accept it too instead of failing with ``JSONDecodeError: Extra data``.
-    Unexpected trailing bytes still fail closed as protocol corruption.
+    Unexpected, multiline, or unterminated trailing bytes still fail closed as
+    protocol corruption. Mapping results retain the hint under
+    ``_hermes_hint``; non-mapping results keep their original type.
     """
     def _loads(value):
         try:
-            return json.loads(value)
+            return json.loads(value), ""
         except json.JSONDecodeError:
             stripped = value.lstrip()
             result, end = json.JSONDecoder().raw_decode(stripped)
             trailing = stripped[end:].strip()
-            if not trailing.startswith("[Hint:"):
+            valid_hint = (
+                trailing.startswith("[Hint:")
+                and trailing.endswith("]")
+                and "\\n" not in trailing
+                and "\\r" not in trailing
+            )
+            if not valid_hint:
                 raise
-            if isinstance(result, dict):
-                result.setdefault("_hermes_hint", trailing)
-            return result
+            return result, trailing
 
-    result = _loads(raw)
+    result, hint = _loads(raw)
     if isinstance(result, str):
         try:
-            return _loads(result)
+            result, nested_hint = _loads(result)
+            hint = nested_hint or hint
         except (json.JSONDecodeError, TypeError):
-            return result
+            # Preserve ordinary plain-text tool results, but fail closed when
+            # the string starts with a valid JSON value followed by malformed
+            # or unrecognized trailing protocol bytes.
+            try:
+                json.JSONDecoder().raw_decode(result.lstrip())
+            except (json.JSONDecodeError, TypeError):
+                pass
+            else:
+                raise
+    if hint and isinstance(result, dict):
+        result.setdefault("_hermes_hint", hint)
     return result
 
 '''
@@ -666,6 +683,17 @@ def _call(tool_name, args):
 _TERMINAL_BLOCKED_PARAMS = {"background", "pty", "notify_on_complete", "watch_patterns"}
 
 
+def _send_uds_response(conn: socket.socket, result: str) -> None:
+    """Send one newline-delimited JSON string as an atomic RPC frame.
+
+    The tool result itself may contain raw newlines (notably a trailing
+    ``[Hint: ...]`` envelope). JSON-encoding the complete result escapes those
+    newlines so a stream receiver can safely use the one literal newline as
+    the frame delimiter even when ``recv()`` fragments the bytes arbitrarily.
+    """
+    conn.sendall((json.dumps(result) + "\n").encode())
+
+
 def _rpc_server_loop(
     server_sock: socket.socket,
     task_id: str,
@@ -717,7 +745,7 @@ def _rpc_server_loop(
                     request = json.loads(line.decode())
                 except (json.JSONDecodeError, UnicodeDecodeError) as exc:
                     resp = tool_error(f"Invalid RPC request: {exc}")
-                    conn.sendall((resp + "\n").encode())
+                    _send_uds_response(conn, resp)
                     continue
 
                 if not rpc_token or not secrets.compare_digest(
@@ -727,7 +755,7 @@ def _rpc_server_loop(
                     str(request.get("token") or "").encode(), rpc_token.encode()
                 ):
                     resp = tool_error("Unauthorized RPC request")
-                    conn.sendall((resp + "\n").encode())
+                    _send_uds_response(conn, resp)
                     continue
 
                 tool_name = request.get("tool", "")
@@ -740,7 +768,7 @@ def _rpc_server_loop(
                         f"Tool '{tool_name}' is not available in execute_code. "
                         f"Available: {available}"
                     )
-                    conn.sendall((resp + "\n").encode())
+                    _send_uds_response(conn, resp)
                     continue
 
                 # Enforce tool call limit
@@ -749,7 +777,7 @@ def _rpc_server_loop(
                         f"Tool call limit reached ({max_tool_calls}). "
                         "No more tool calls allowed in this execution."
                     )
-                    conn.sendall((resp + "\n").encode())
+                    _send_uds_response(conn, resp)
                     continue
 
                 # Strip forbidden terminal parameters
@@ -780,7 +808,7 @@ def _rpc_server_loop(
                     "duration": round(call_duration, 2),
                 })
 
-                conn.sendall((result + "\n").encode())
+                _send_uds_response(conn, result)
 
     except socket.timeout:
         logger.debug("RPC listener socket timeout")
