@@ -500,15 +500,10 @@ export function desktopSlashUnavailableMessage(command: string): string | null {
   return null
 }
 
-export function desktopSlashDescription(command: string, fallback = '', includeAliases = false): string {
+export function desktopSlashDescription(command: string, fallback = ''): string {
   const spec = SPEC_BY_NAME.get(canonicalDesktopSlashCommand(command))
-  const description = spec?.description || fallback
 
-  if (!includeAliases || !spec?.aliases?.length) {
-    return description
-  }
-
-  return `${description} · aliases: ${spec.aliases.join(', ')}`
+  return spec?.description || fallback
 }
 
 export function desktopSlashCommandArgumentMode(command: string): DesktopSlashArgumentMode | null {

@@ -130,7 +130,7 @@ describe('useSlashCompletions', () => {
     expect(skills).toEqual(['/work', '/research', '/docx'])
   })
 
-  it('surfaces the canonical command when a typed query matches an alias', async () => {
+  it('shows the matched alias beside its canonical command', async () => {
     const request = vi.fn().mockResolvedValue({
       items: [{ text: '/btw', display: '/btw', meta: 'Alias for /background' }]
     })
@@ -140,8 +140,21 @@ describe('useSlashCompletions', () => {
     const items = await completions(api, 'bt')
 
     expect(commandsOf(items)).toEqual(['/background'])
+    expect(items[0]?.label).toBe('background (btw)')
+    expect(items[0]?.description).toBe('Run a prompt in the background')
+  })
+
+  it('does not annotate a canonical command match with its aliases', async () => {
+    const request = vi.fn().mockResolvedValue({
+      items: [{ text: '/background', display: '/background', meta: 'Run a prompt in the background' }]
+    })
+
+    const api = harness({ request } as unknown as HermesGateway)
+
+    const items = await completions(api, 'background')
+
+    expect(commandsOf(items)).toEqual(['/background'])
     expect(items[0]?.label).toBe('background')
-    expect(items[0]?.description).toContain('aliases: /bg, /btw')
   })
 
   it('deduplicates canonical and alias matches into one command row', async () => {

@@ -199,15 +199,36 @@ export function useSlashCompletions(options: {
         const completionItems = isArgCompletion
           ? (result.items ?? [])
           : [
-              ...new Map(
-                (result.items ?? []).map(item => {
+              ...(() => {
+                const canonicalItems = new Map<string, CompletionEntry>()
+                const normalizedQuery = text.toLowerCase()
+
+                for (const item of result.items ?? []) {
                   const command = commandText(item.text)
                   const canonical = canonicalDesktopSlashCommand(command)
-                  const canonicalItem = canonical === command ? item : { ...item, text: canonical, display: canonical }
 
-                  return [canonical, canonicalItem] as const
-                })
-              ).values()
+                  const matchedAlias =
+                    !canonical.startsWith(normalizedQuery) &&
+                    command !== canonical &&
+                    command.toLowerCase().startsWith(normalizedQuery)
+                      ? command
+                      : null
+
+                  const canonicalItem = {
+                    ...item,
+                    text: canonical,
+                    display: matchedAlias ? `${canonical} (${matchedAlias.slice(1)})` : canonical
+                  }
+
+                  // Prefer the alias-labelled row when an alias — rather than
+                  // the canonical token — is what matched the typed query.
+                  if (!canonicalItems.has(canonical) || matchedAlias) {
+                    canonicalItems.set(canonical, canonicalItem)
+                  }
+                }
+
+                return canonicalItems.values()
+              })()
             ]
 
         const decorated = completionItems
@@ -230,9 +251,7 @@ export function useSlashCompletions(options: {
             // blurb). Only command rows get the registry description — looking
             // one up for `/personality none` would clobber it with the parent
             // command's text.
-            meta: isArgCompletion
-              ? textValue(item.meta)
-              : desktopSlashDescription(item.text, textValue(item.meta), true)
+            meta: isArgCompletion ? textValue(item.meta) : desktopSlashDescription(item.text, textValue(item.meta))
           }))
 
         // Keep each group contiguous so headers render once: Commands before
