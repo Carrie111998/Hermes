@@ -3120,6 +3120,23 @@ def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
     return normalize_profile_name(assignee)
 
 
+def _require_current_profiles(*assignees: Optional[str]) -> None:
+    """Revalidate dispatch identities at the authoritative graph write.
+
+    The decomposer roster is necessarily read before the model call. Profiles
+    can be removed or renamed while that call is in flight, so only this check
+    inside the same write transaction as the graph commit is authoritative.
+    """
+    from hermes_cli.profiles import profile_exists
+
+    missing = sorted({name for name in assignees if name and not profile_exists(name)})
+    if missing:
+        raise ValueError(
+            "assignee profile disappeared before graph commit: "
+            + ", ".join(missing)
+        )
+
+
 def create_task(
     conn: sqlite3.Connection,
     *,
@@ -6804,9 +6821,9 @@ def is_block_loop_escalated(conn: sqlite3.Connection, task_id: str) -> bool:
     ``block_task`` routes a task to ``triage`` (instead of ``blocked``) once
     ``block_recurrences`` hits ``BLOCK_RECURRENCE_LIMIT`` for the same cause,
     appending a ``block_loop_detected`` event. Such cards are waiting on a
-    human decision — auto-decomposition must never re-specify them. The
-    operator recovery action (:func:`recover_escalated_triage_task`) appends
-    ``triage_escalation_recovered``, which flips this predicate back.
+    human decision — auto-decomposition must never re-specify them. Historical
+    ``triage_escalation_recovered`` markers remain readable for compatibility,
+    but V1 no longer exposes a recovery authority.
     """
     row = conn.execute(
         "SELECT 1 FROM tasks WHERE id = ? AND " + _BLOCK_LOOP_ESCALATED_SQL,
@@ -6831,37 +6848,13 @@ def is_auto_decomposable_triage(conn: sqlite3.Connection, task_id: str) -> bool:
     return row is not None
 
 
-def _recover_escalated_triage_task_in_txn(
-    conn: sqlite3.Connection, task_id: str,
-) -> bool:
-    """Record escalation recovery inside the caller's write transaction."""
-    cur = conn.execute(
-        "UPDATE tasks "
-        "SET block_kind = NULL, block_recurrences = 0 "
-        "WHERE id = ? AND status = 'triage' AND " + _BLOCK_LOOP_ESCALATED_SQL,
-        (task_id,),
-    )
-    if cur.rowcount != 1:
-        return False
-    _append_event(conn, task_id, "triage_escalation_recovered", None)
-    return True
-
-
 def recover_escalated_triage_task(conn: sqlite3.Connection, task_id: str) -> bool:
-    """Audited operator acknowledgment for block-loop-escalated triage.
-
-    Clears ``block_kind`` and resets ``block_recurrences`` so the card is
-    auto-decomposable again with a fresh loop budget, and appends a
-    ``triage_escalation_recovered`` event as the durable audit trail. The
-    recurrence reset is essential: without it, one re-block would instantly
-    re-hit ``BLOCK_RECURRENCE_LIMIT`` and re-escalate the card.
-
-    Returns False when the card is not currently escalated in ``triage``.
-    Decomposition uses the same primitive inside its own write transaction,
-    so the recovery receipt and graph/status transition commit atomically.
-    """
-    with write_txn(conn):
-        return _recover_escalated_triage_task_in_txn(conn, task_id)
+    """Fail closed until an authenticated owner-only authority exists."""
+    del conn, task_id
+    raise RuntimeError(
+        "escalation recovery is unavailable; retire the root and create a "
+        "newly reviewed fresh intake"
+    )
 
 
 def _has_open_descendants(conn: sqlite3.Connection, task_id: str) -> bool:
@@ -7190,7 +7183,7 @@ def specify_triage_task(
     author: Optional[str] = None,
     auto_promote: bool = True,
     recover_escalation: bool = False,
-    reject_open_descendants: bool = False,
+    validate_assignee: bool = False,
 ) -> bool:
     """Flesh out a triage task and promote it to ``todo``.
 
@@ -7208,9 +7201,10 @@ def specify_triage_task(
     ``title`` / ``body`` / ``assignee`` actually changed — avoids noisy
     comment spam for status-only promotions.
 
-    ``recover_escalation`` writes the recovery receipt in this same
-    transaction. ``reject_open_descendants`` prevents a spec fallback from
-    replacing an existing governed graph while the LLM call was in flight.
+    ``recover_escalation`` is retained only as a compatibility argument and
+    fails closed: V1 has no authenticated owner recovery authority.
+    Existing open descendants always prevent a spec fallback from replacing a
+    governed graph while the LLM call was in flight.
     """
     if title is not None and not title.strip():
         raise ValueError("title cannot be blank")
@@ -7222,12 +7216,12 @@ def specify_triage_task(
         ).fetchone()
         if existing is None:
             return False
-        if reject_open_descendants and _has_open_descendants(conn, task_id):
+        if _has_open_descendants(conn, task_id):
             raise ValueError("task already has an open governed child graph")
-        if recover_escalation and not _recover_escalated_triage_task_in_txn(
-            conn, task_id,
-        ):
-            raise ValueError("triage escalation is no longer active")
+        if recover_escalation or is_block_loop_escalated(conn, task_id):
+            raise ValueError("authenticated owner escalation recovery is unavailable")
+        if validate_assignee:
+            _require_current_profiles(assignee or existing["assignee"])
         sets: list[str] = ["status = 'todo'"]
         params: list[Any] = []
         changed_fields: list[str] = []
@@ -7294,7 +7288,7 @@ def decompose_triage_task(
     author: Optional[str] = None,
     auto_promote: bool = True,
     recover_escalation: bool = False,
-    reject_open_descendants: bool = False,
+    validate_assignees: bool = False,
 ) -> Optional[list[str]]:
     """Fan a triage task out into child tasks and promote the root to ``todo``.
 
@@ -7321,8 +7315,8 @@ def decompose_triage_task(
 
     Validation of titles/assignees happens inside the same write_txn as
     the inserts so a malformed entry aborts the whole decomposition
-    cleanly (no orphan children). Recovery acknowledgment and the
-    no-existing-graph check are also inside that transaction when enabled.
+    cleanly (no orphan children). Profile revalidation and the mandatory
+    no-existing-graph check are also inside that transaction.
     """
     if not children:
         return None
@@ -7388,7 +7382,7 @@ def decompose_triage_task(
     child_ids: list[str] = []
     with write_txn(conn):
         root_row = conn.execute(
-            "SELECT id, status, tenant, workspace_kind, workspace_path "
+            "SELECT id, status, tenant, workspace_kind, workspace_path, project_id "
             "FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
@@ -7396,13 +7390,46 @@ def decompose_triage_task(
             return None
         if root_row["status"] != "triage":
             return None
-        if reject_open_descendants and _has_open_descendants(conn, task_id):
+        if _has_open_descendants(conn, task_id):
             raise ValueError("task already has an open governed child graph")
-        if recover_escalation and not _recover_escalated_triage_task_in_txn(
-            conn, task_id,
-        ):
-            raise ValueError("triage escalation is no longer active")
+        if recover_escalation or is_block_loop_escalated(conn, task_id):
+            raise ValueError("authenticated owner escalation recovery is unavailable")
         tenant = root_row["tenant"]
+        project_id = root_row["project_id"]
+        canonical_child_assignees = [
+            _canonical_assignee(child.get("assignee")) for child in children
+        ]
+        if validate_assignees:
+            if root_assignee is None or any(
+                assignee is None for assignee in canonical_child_assignees
+            ):
+                raise ValueError("decomposed graph requires explicit current assignees")
+            _require_current_profiles(root_assignee, *canonical_child_assignees)
+
+        needs_repo_anchor = any(
+            child.get("workspace_policy", "scratch") == "repo_write"
+            and not child.get("workspace_path")
+            and not child.get("workspace_kind")
+            for child in children
+        )
+        repo_anchor: Optional[Path] = None
+        if needs_repo_anchor:
+            root_workspace_path = root_row["workspace_path"]
+            if (
+                root_row["workspace_kind"] not in {"worktree", "dir"}
+                or not root_workspace_path
+            ):
+                raise ValueError(
+                    "repo_write child requires an explicitly repository-bound "
+                    "triage root"
+                )
+            root_path = Path(root_workspace_path).expanduser()
+            if not root_path.is_absolute():
+                raise ValueError("repository-bound triage root path must be absolute")
+            if root_path.name == task_id and root_path.parent.name == ".worktrees":
+                repo_anchor = root_path.parent.parent.resolve(strict=False)
+            else:
+                repo_anchor = root_path.resolve(strict=False)
         # Create children. Status is 'todo' regardless of parents — we
         # link them under the root AFTER creation so the dispatcher
         # sees a coherent state, and recompute_ready() at the end
@@ -7411,7 +7438,7 @@ def decompose_triage_task(
             new_id = _new_task_id()
             title = child["title"].strip()
             body = child.get("body")
-            assignee = _canonical_assignee(child.get("assignee"))
+            assignee = canonical_child_assignees[idx]
             # Workspace authority is capability-based and fail-closed. The
             # root's workspace is only an anchor; its concrete mutable path is
             # never inherited. A child receives an isolated worktree only
@@ -7431,7 +7458,12 @@ def decompose_triage_task(
                 child_ws_path = None
             elif workspace_policy == "repo_write":
                 child_ws_kind = "worktree"
-                child_ws_path = None
+                if repo_anchor is None:
+                    raise ValueError(
+                        "repo_write child requires an explicitly repository-bound "
+                        "triage root"
+                    )
+                child_ws_path = str(repo_anchor / ".worktrees" / new_id)
             else:
                 child_ws_kind = "scratch"
                 child_ws_path = None
@@ -7443,8 +7475,8 @@ def decompose_triage_task(
             conn.execute(
                 "INSERT INTO tasks "
                 "(id, title, body, assignee, status, workspace_kind, "
-                " workspace_path, tenant, created_at, created_by) "
-                "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?)",
+                " workspace_path, project_id, tenant, created_at, created_by) "
+                "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?, ?)",
                 (
                     new_id,
                     title,
@@ -7452,6 +7484,7 @@ def decompose_triage_task(
                     assignee,
                     child_ws_kind,
                     child_ws_path,
+                    project_id,
                     tenant,
                     now,
                     (author or "decomposer"),

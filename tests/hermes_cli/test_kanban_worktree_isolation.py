@@ -68,8 +68,9 @@ def test_decompose_worktree_root_applies_child_capability_policy(kanban_home):
         root = kb.create_task(conn, title="build the feature", triage=True)
         conn.execute(
             "UPDATE tasks SET workspace_kind='worktree', "
-            "workspace_path='/repo/.worktrees/root' WHERE id = ?",
-            (root,),
+            "workspace_path=?, project_id='project-one' "
+            "WHERE id = ?",
+            (f"/repo/.worktrees/{root}", root),
         )
         conn.commit()
 
@@ -105,7 +106,8 @@ def test_decompose_worktree_root_applies_child_capability_policy(kanban_home):
     assert research.workspace_kind == "scratch"
     assert research.workspace_path is None
     assert implementation.workspace_kind == "worktree"
-    assert implementation.workspace_path is None
+    assert implementation.workspace_path == f"/repo/.worktrees/{implementation.id}"
+    assert implementation.project_id == "project-one"
     assert review.workspace_kind == "scratch"
     assert review.workspace_path is None
 
@@ -142,9 +144,15 @@ def test_missing_policy_never_inherits_worktree_root(kanban_home, title):
     assert child.workspace_path is None
 
 
-def test_explicit_repo_write_siblings_get_distinct_unresolved_worktrees(kanban_home):
+def test_explicit_repo_write_siblings_get_distinct_anchored_worktrees(kanban_home):
     with kb.connect() as conn:
         root = kb.create_task(conn, title="parallel code", triage=True)
+        conn.execute(
+            "UPDATE tasks SET workspace_kind='worktree', workspace_path='/repo' "
+            "WHERE id=?",
+            (root,),
+        )
+        conn.commit()
         child_ids = kb.decompose_triage_task(
             conn,
             root,
@@ -168,8 +176,51 @@ def test_explicit_repo_write_siblings_get_distinct_unresolved_worktrees(kanban_h
         rows = [kb.get_task(conn, child_id) for child_id in child_ids]
 
     assert all(row.workspace_kind == "worktree" for row in rows)
-    assert all(row.workspace_path is None for row in rows)
+    assert [row.workspace_path for row in rows] == [
+        f"/repo/.worktrees/{rows[0].id}",
+        f"/repo/.worktrees/{rows[1].id}",
+    ]
     assert rows[0].id != rows[1].id
+
+
+def test_repo_write_child_refuses_unbound_root(kanban_home):
+    with kb.connect_closing() as conn:
+        root = kb.create_task(conn, title="unbound root", triage=True)
+        with pytest.raises(ValueError, match="repository-bound triage root"):
+            kb.decompose_triage_task(
+                conn,
+                root,
+                root_assignee="orchestrator",
+                children=[{
+                    "title": "implementation",
+                    "assignee": "engineer",
+                    "workspace_policy": "repo_write",
+                }],
+            )
+        assert kb.get_task(conn, root).status == "triage"
+        assert len(kb.list_tasks(conn, limit=100)) == 1
+
+
+def test_repo_write_child_refuses_scratch_path_as_repo_authority(kanban_home):
+    with kb.connect_closing() as conn:
+        root = kb.create_task(
+            conn,
+            title="scratch root",
+            triage=True,
+            workspace_kind="scratch",
+            workspace_path="/tmp/not-a-repo-authority",
+        )
+        with pytest.raises(ValueError, match="repository-bound triage root"):
+            kb.decompose_triage_task(
+                conn,
+                root,
+                root_assignee="orchestrator",
+                children=[{
+                    "title": "implementation",
+                    "assignee": "engineer",
+                    "workspace_policy": "repo_write",
+                }],
+            )
 
 
 
@@ -197,5 +248,3 @@ def test_resolve_worktree_falls_back_when_path_occupied(kanban_home, tmp_path):
         capture_output=True, text=True, check=True,
     ).stdout.strip()
     assert head == "wt/sibling"
-
-

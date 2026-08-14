@@ -668,7 +668,9 @@ hermes workspace manifest --repo /path/to/repo --json
 `manifest` binds the exact observed paths, heads, branches, and evidence hashes
 to a single manifest hash for owner review. The manifest is not permission to
 remove anything: V1 has no apply path, and all legacy or unverified work remains
-`blocked_review` or retained.
+`blocked_review` or retained. The V1 registry is not yet wired into the live
+dispatcher allocation path; it is report-only evidence authority, not proof
+that every currently dispatched worktree was registry-reserved.
 
 ## `hermes egress`
 

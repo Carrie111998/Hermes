@@ -64,6 +64,14 @@ def test_workspace_subcommand_requires_json_and_dry_run_for_import(tmp_path, cap
     else:
         raise AssertionError("import without --dry-run must be rejected")
 
+    for forbidden in ("apply", "remove"):
+        try:
+            parser.parse_args(["workspace", forbidden, "--repo", str(repo)])
+        except SystemExit as exc:
+            assert exc.code == 2
+        else:
+            raise AssertionError(f"workspace {forbidden} must not be exposed")
+
 
 def test_manifest_binds_exact_observation_but_remains_read_only(tmp_path, capsys):
     parser = argparse.ArgumentParser()

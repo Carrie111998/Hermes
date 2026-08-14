@@ -312,13 +312,16 @@ class Registry:
     """SQLite registry. Unavailable/corrupt registry never receives a fallback index."""
 
     _TRANSITIONS: dict[WorkspaceState, set[WorkspaceState]] = {
-        WorkspaceState.PREPARING: {WorkspaceState.ACTIVE, WorkspaceState.BLOCKED_REVIEW},
-        WorkspaceState.ACTIVE: {WorkspaceState.TERMINAL_PENDING, WorkspaceState.PRESERVED, WorkspaceState.BLOCKED_REVIEW},
-        WorkspaceState.TERMINAL_PENDING: {WorkspaceState.QUARANTINED, WorkspaceState.BLOCKED_REVIEW},
-        WorkspaceState.RETAINED_UNREVIEWED: {WorkspaceState.PRESERVED, WorkspaceState.BLOCKED_REVIEW},
-        WorkspaceState.QUARANTINED: {WorkspaceState.BLOCKED_REVIEW},  # V1 removal is hard-disabled
+        # V1 is report-only. A generic caller may only tighten authority to
+        # blocked_review; advancing lifecycle state requires future dedicated
+        # evidence- and receipt-bound kernel operations.
+        WorkspaceState.PREPARING: {WorkspaceState.BLOCKED_REVIEW},
+        WorkspaceState.ACTIVE: {WorkspaceState.BLOCKED_REVIEW},
+        WorkspaceState.TERMINAL_PENDING: {WorkspaceState.BLOCKED_REVIEW},
+        WorkspaceState.RETAINED_UNREVIEWED: {WorkspaceState.BLOCKED_REVIEW},
+        WorkspaceState.QUARANTINED: {WorkspaceState.BLOCKED_REVIEW},
         WorkspaceState.PRESERVED: {WorkspaceState.BLOCKED_REVIEW},
-        WorkspaceState.BLOCKED_REVIEW: {WorkspaceState.PRESERVED},
+        WorkspaceState.BLOCKED_REVIEW: set(),
         WorkspaceState.REMOVED: set(),
     }
 
@@ -389,6 +392,14 @@ class Registry:
                     conn.execute("UPDATE workspaces SET state=?, disposition=?, reasons=? WHERE id=?",
                                  (WorkspaceState.BLOCKED_REVIEW.value, Disposition.BLOCKED_REVIEW.value,
                                   json.dumps(["stale_or_foreign_lease"]), workspace_id))
+                    # The OS lock proves there is no concurrent manager in this
+                    # critical section. Remove only the provably stale nonce so
+                    # one dead row cannot wedge every future reconciliation
+                    # sweep. The workspace itself remains blocked_review.
+                    conn.execute(
+                        "DELETE FROM workspace_leases WHERE workspace_id=? AND nonce=?",
+                        (workspace_id, existing[0]),
+                    )
                     raise RuntimeError("stale or foreign lease requires review")
                 conn.execute("INSERT OR REPLACE INTO workspace_leases VALUES (?, ?, ?, ?, ?, ?)",
                              (workspace_id, nonce, pid, started, now, reason))
@@ -419,7 +430,7 @@ class Registry:
             conn.close()
 
     def transition(self, workspace_id: str, target: WorkspaceState, *, reason: str) -> dict[str, Any]:
-        """Validate explicit, conservative state transitions and append the reason."""
+        """Tighten a V1 record to ``blocked_review`` and append the reason."""
         conn = self.open()
         try:
             conn.execute("BEGIN IMMEDIATE")
@@ -548,14 +559,18 @@ class Registry:
             if not row or WorkspaceState(row[0]) is not WorkspaceState.PREPARING:
                 raise RuntimeError("materialization result requires a preparing reservation")
             self._append_observation(conn, workspace_id, evidence)
+            conn.execute(
+                "UPDATE workspaces SET evidence_hash=? WHERE id=?",
+                (evidence.observation_hash, workspace_id),
+            )
             payload = {"canonical_path": evidence.canonical_path, "repo_common_dir": evidence.repo_common_dir,
                        "head": evidence.head, "physical_before_bytes": None, "physical_after_bytes": None,
                        "predicate_evidence_hashes": [evidence.observation_hash], "recovery_statement": recovery_statement,
                        "outcome": "blocked" if decision.disposition is Disposition.BLOCKED_REVIEW else "retained",
                        "error": None}
             receipt_hash = self._receipt_in_conn(conn, workspace_id, "materialization", payload)
-            conn.execute("UPDATE workspaces SET state=?, disposition=?, reasons=?, evidence_hash=? WHERE id=?",
-                         (decision.state.value, decision.disposition.value, json.dumps(decision.reasons), evidence.observation_hash, workspace_id))
+            conn.execute("UPDATE workspaces SET state=?, disposition=?, reasons=? WHERE id=?",
+                         (decision.state.value, decision.disposition.value, json.dumps(decision.reasons), workspace_id))
             conn.execute("COMMIT")
         except Exception:
             conn.execute("ROLLBACK")
@@ -585,36 +600,48 @@ class Registry:
             conn.close()
         reconciled = 0
         for (workspace_id,) in rows:
-            with self.held_lease(workspace_id, reason="reconcile_preparing"):
-                conn = self.open()
-                try:
-                    conn.execute("BEGIN IMMEDIATE")
-                    row = conn.execute("SELECT state, reasons, record FROM workspaces WHERE id=?", (workspace_id,)).fetchone()
-                    if not row or WorkspaceState(row[0]) is not WorkspaceState.PREPARING:
+            try:
+                with self.held_lease(workspace_id, reason="reconcile_preparing"):
+                    conn = self.open()
+                    try:
+                        conn.execute("BEGIN IMMEDIATE")
+                        row = conn.execute("SELECT state, reasons, record FROM workspaces WHERE id=?", (workspace_id,)).fetchone()
+                        if not row or WorkspaceState(row[0]) is not WorkspaceState.PREPARING:
+                            conn.execute("COMMIT")
+                            continue
+                        reservation = json.loads(row[2]).get("reservation", {})
+                        pid, started = reservation.get("pid"), reservation.get("process_started_at")
+                        observed_start = process_start_identity(pid) if isinstance(pid, int) else None
+                        age = int(time.time()) - int(reservation.get("reserved_at", 0))
+                        interrupted = started is not None and observed_start != started
+                        unknown_and_expired = started is None and age >= 300
+                        if not (interrupted or unknown_and_expired):
+                            conn.execute("COMMIT")
+                            continue
+                        reasons = json.loads(row[1])
+                        if "interrupted_preparing" not in reasons:
+                            reasons.append("interrupted_preparing")
+                        conn.execute("UPDATE workspaces SET state=?, disposition=?, reasons=? WHERE id=?",
+                                     (WorkspaceState.BLOCKED_REVIEW.value, Disposition.BLOCKED_REVIEW.value,
+                                      json.dumps(reasons), workspace_id))
                         conn.execute("COMMIT")
-                        continue
-                    reservation = json.loads(row[2]).get("reservation", {})
-                    pid, started = reservation.get("pid"), reservation.get("process_started_at")
-                    observed_start = process_start_identity(pid) if isinstance(pid, int) else None
-                    age = int(time.time()) - int(reservation.get("reserved_at", 0))
-                    interrupted = started is not None and observed_start != started
-                    unknown_and_expired = started is None and age >= 300
-                    if not (interrupted or unknown_and_expired):
-                        conn.execute("COMMIT")
-                        continue
-                    reasons = json.loads(row[1])
-                    if "interrupted_preparing" not in reasons:
-                        reasons.append("interrupted_preparing")
-                    conn.execute("UPDATE workspaces SET state=?, disposition=?, reasons=? WHERE id=?",
-                                 (WorkspaceState.BLOCKED_REVIEW.value, Disposition.BLOCKED_REVIEW.value,
-                                  json.dumps(reasons), workspace_id))
-                    conn.execute("COMMIT")
-                    reconciled += 1
-                except Exception:
-                    conn.execute("ROLLBACK")
-                    raise
-                finally:
-                    conn.close()
+                        reconciled += 1
+                    except Exception:
+                        conn.execute("ROLLBACK")
+                        raise
+                    finally:
+                        conn.close()
+            except RuntimeError as exc:
+                # A contended or stale row is retained/blocked by held_lease.
+                # Continue so one workspace cannot starve the rest of the
+                # report-only reconciliation sweep.
+                if str(exc) in {
+                    "workspace lease held by another manager; retain-only",
+                    "foreign live workspace lease; retain-only",
+                    "stale or foreign lease requires review",
+                }:
+                    continue
+                raise
         return reconciled
 
     @staticmethod
@@ -624,18 +651,69 @@ class Registry:
         missing = sorted(required - set(payload))
         if missing:
             raise RuntimeError(f"receipt missing required immutable fields: {', '.join(missing)}")
-        if not isinstance(payload["predicate_evidence_hashes"], list) or not payload["recovery_statement"]:
+        hashes = payload["predicate_evidence_hashes"]
+        if (
+            not isinstance(hashes, list)
+            or not hashes
+            or any(not isinstance(value, str) or not value.strip() for value in hashes)
+            or len(set(hashes)) != len(hashes)
+            or not isinstance(payload["recovery_statement"], str)
+            or not payload["recovery_statement"].strip()
+        ):
             raise RuntimeError("receipt predicate evidence and recovery statement are required")
+        for field in ("canonical_path", "repo_common_dir", "head"):
+            if not isinstance(payload[field], str) or not payload[field].strip():
+                raise RuntimeError(f"receipt {field} must be a non-empty string")
 
     def _receipt_in_conn(self, conn: sqlite3.Connection, workspace_id: str, operation: str,
                          payload: dict[str, Any], *, receipt_hash: str | None = None) -> str:
         self._validate_receipt_payload(payload)
+        workspace = conn.execute(
+            "SELECT canonical_path, repo_common_dir, evidence_hash "
+            "FROM workspaces WHERE id=?",
+            (workspace_id,),
+        ).fetchone()
+        if not workspace:
+            raise RuntimeError("orphan receipt rejected: workspace is not registered")
+        predicate_hashes = payload["predicate_evidence_hashes"]
+        current_hash = workspace[2]
+        if current_hash not in predicate_hashes:
+            raise RuntimeError("receipt is not bound to the current workspace evidence")
+        placeholders = ", ".join("?" for _ in predicate_hashes)
+        observations = conn.execute(
+            f"SELECT evidence_hash, workspace_id, payload "
+            f"FROM workspace_observations WHERE evidence_hash IN ({placeholders})",
+            tuple(predicate_hashes),
+        ).fetchall()
+        if len(observations) != len(predicate_hashes):
+            raise RuntimeError("receipt references unknown predicate evidence")
+        by_hash: dict[str, dict[str, Any]] = {}
+        for evidence_hash, observed_workspace_id, observed_payload in observations:
+            if observed_workspace_id != workspace_id:
+                raise RuntimeError("receipt predicate evidence belongs to another workspace")
+            by_hash[evidence_hash] = json.loads(observed_payload)
+        current = by_hash[current_hash]
+
+        def _canonical(value: str) -> str:
+            return str(Path(value).expanduser().resolve(strict=False))
+
+        if (
+            _canonical(payload["canonical_path"]) != _canonical(workspace[0])
+            or _canonical(payload["canonical_path"]) != _canonical(current["canonical_path"])
+        ):
+            raise RuntimeError("receipt canonical_path does not match current evidence")
+        if (
+            _canonical(payload["repo_common_dir"]) != _canonical(workspace[1])
+            or _canonical(payload["repo_common_dir"]) != _canonical(current["repo_common_dir"])
+        ):
+            raise RuntimeError("receipt repo_common_dir does not match current evidence")
+        if payload["head"] != current["head"]:
+            raise RuntimeError("receipt head does not match current evidence")
+
         encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
         digest = hashlib.sha256(f"{workspace_id}\0{operation}\0{encoded}".encode("utf-8")).hexdigest()
         if receipt_hash is not None and receipt_hash != digest:
             raise RuntimeError("immutable receipt hash does not match payload")
-        if not conn.execute("SELECT 1 FROM workspaces WHERE id=?", (workspace_id,)).fetchone():
-            raise RuntimeError("orphan receipt rejected: workspace is not registered")
         existing = conn.execute("SELECT workspace_id, operation, payload FROM workspace_receipts WHERE receipt_hash=?", (digest,)).fetchone()
         if existing and existing != (workspace_id, operation, encoded):
             raise RuntimeError("immutable receipt collision")

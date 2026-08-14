@@ -280,6 +280,110 @@ def test_preparing_crash_recovery_and_validated_transitions(tmp_path):
         registry.transition("one", WorkspaceState.REMOVED, reason="no direct removal")
 
 
+def test_generic_transition_api_can_only_tighten_to_blocked_review(tmp_path):
+    registry = Registry(tmp_path / "registry.sqlite3")
+    evidence = _evidence(tmp_path)
+    registry.reserve(workspace_id="one", idempotency_key="one", evidence=evidence)
+
+    with pytest.raises(RuntimeError, match="invalid workspace state transition"):
+        registry.transition(
+            "one", WorkspaceState.ACTIVE, reason="caller cannot activate",
+        )
+    blocked = registry.transition(
+        "one", WorkspaceState.BLOCKED_REVIEW, reason="fail closed",
+    )
+    assert blocked["state"] == "blocked_review"
+    with pytest.raises(RuntimeError, match="invalid workspace state transition"):
+        registry.transition(
+            "one", WorkspaceState.PRESERVED, reason="caller cannot preserve",
+        )
+
+    conn = registry.open()
+    try:
+        conn.execute(
+            "UPDATE workspaces SET state='active' WHERE id='one'",
+        )
+    finally:
+        conn.close()
+    with pytest.raises(RuntimeError, match="invalid workspace state transition"):
+        registry.transition(
+            "one", WorkspaceState.TERMINAL_PENDING,
+            reason="caller cannot declare terminal",
+        )
+
+
+def test_receipt_requires_current_registered_evidence_and_identity(tmp_path):
+    registry = Registry(tmp_path / "registry.sqlite3")
+    evidence = _evidence(tmp_path)
+    registry.create_or_get(
+        workspace_id="one", idempotency_key="one", evidence=evidence,
+    )
+
+    with pytest.raises(RuntimeError, match="predicate evidence"):
+        registry.receipt(
+            "one", "closeout",
+            _receipt_payload(evidence, predicate_evidence_hashes=[]),
+        )
+    with pytest.raises(RuntimeError, match="unknown predicate evidence"):
+        registry.receipt(
+            "one", "closeout",
+            _receipt_payload(
+                evidence,
+                predicate_evidence_hashes=[evidence.observation_hash, "f" * 64],
+            ),
+        )
+    with pytest.raises(RuntimeError, match="canonical_path"):
+        registry.receipt(
+            "one", "closeout",
+            _receipt_payload(evidence, canonical_path=str(tmp_path / "other")),
+        )
+    with pytest.raises(RuntimeError, match="head does not match"):
+        registry.receipt(
+            "one", "closeout", _receipt_payload(evidence, head="b" * 40),
+        )
+
+
+def test_receipt_rejects_stale_or_foreign_workspace_evidence(tmp_path):
+    registry = Registry(tmp_path / "registry.sqlite3")
+    first = _evidence(tmp_path)
+    second = _evidence(tmp_path, head="b" * 40)
+    foreign = _evidence(
+        tmp_path,
+        canonical_path=str(tmp_path / "foreign"),
+        head="c" * 40,
+    )
+    registry.create_or_get(
+        workspace_id="one", idempotency_key="one", evidence=first,
+    )
+    registry.create_or_get(
+        workspace_id="two", idempotency_key="two", evidence=foreign,
+    )
+    conn = registry.open()
+    try:
+        Registry._append_observation(conn, "one", second)
+        conn.execute(
+            "UPDATE workspaces SET evidence_hash=? WHERE id='one'",
+            (second.observation_hash,),
+        )
+    finally:
+        conn.close()
+
+    with pytest.raises(RuntimeError, match="current workspace evidence"):
+        registry.receipt("one", "closeout", _receipt_payload(first))
+    with pytest.raises(RuntimeError, match="belongs to another workspace"):
+        registry.receipt(
+            "one",
+            "closeout",
+            _receipt_payload(
+                second,
+                predicate_evidence_hashes=[
+                    second.observation_hash,
+                    foreign.observation_hash,
+                ],
+            ),
+        )
+
+
 def test_two_process_reservation_returns_one_idempotent_record(tmp_path):
     registry_path = str(tmp_path / "race.sqlite3")
     initialized = Registry(registry_path).open()
@@ -316,3 +420,41 @@ def test_nonce_bound_lease_heartbeat_and_foreign_lease_are_retain_only(tmp_path)
         with registry.held_lease("one", reason="recovery"):
             pass
     assert registry.get("one")["state"] == "blocked_review"
+    conn = registry.open()
+    try:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM workspace_leases WHERE workspace_id='one'",
+        ).fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
+def test_stale_lease_row_does_not_abort_remaining_reconciliation(tmp_path):
+    registry = Registry(tmp_path / "registry.sqlite3")
+    first = _evidence(tmp_path, canonical_path=str(tmp_path / "first"))
+    second = _evidence(tmp_path, canonical_path=str(tmp_path / "second"))
+    registry.reserve(workspace_id="one", idempotency_key="one", evidence=first)
+    registry.reserve(workspace_id="two", idempotency_key="two", evidence=second)
+
+    conn = registry.open()
+    try:
+        for workspace_id in ("one", "two"):
+            record = json.loads(conn.execute(
+                "SELECT record FROM workspaces WHERE id=?", (workspace_id,),
+            ).fetchone()[0])
+            record["reservation"]["process_started_at"] = -1
+            conn.execute(
+                "UPDATE workspaces SET record=? WHERE id=?",
+                (json.dumps(record), workspace_id),
+            )
+        conn.execute(
+            "INSERT INTO workspace_leases VALUES (?, ?, ?, ?, ?, ?)",
+            ("one", "stale", 999999, -1, 1, "crashed reconcile"),
+        )
+    finally:
+        conn.close()
+
+    assert registry.reconcile_preparing() == 1
+    assert registry.get("one")["state"] == "blocked_review"
+    assert registry.get("two")["state"] == "blocked_review"
+    assert "interrupted_preparing" in registry.get("two")["reasons"]
