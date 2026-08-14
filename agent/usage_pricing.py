@@ -1338,15 +1338,13 @@ def normalize_usage(
     # hidden thinking was invisible in session accounting even though it
     # dominates output spend on models like deepseek-v4-flash (measured:
     # single calls burning 21K reasoning tokens to emit 500 visible tokens).
-    output_details = getattr(response_usage, "output_tokens_details", None)
+    output_details = _usage_field(response_usage, "output_tokens_details", None)
     if output_details:
-        reasoning_tokens = _to_int(getattr(output_details, "reasoning_tokens", 0))
+        reasoning_tokens = _to_int(_usage_field(output_details, "reasoning_tokens"))
     if not reasoning_tokens:
-        completion_details = getattr(response_usage, "completion_tokens_details", None)
+        completion_details = _usage_field(response_usage, "completion_tokens_details", None)
         if completion_details:
-            reasoning_tokens = _to_int(
-                getattr(completion_details, "reasoning_tokens", 0)
-            )
+            reasoning_tokens = _to_int(_usage_field(completion_details, "reasoning_tokens"))
 
     # Cache observability for MiniMax's Anthropic wire: on MiniMax-M3,
     # usage.cache_read_input_tokens carries a constant +128 floor and

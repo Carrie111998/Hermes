@@ -116,6 +116,54 @@ def test_normalize_usage_openai_prefers_nested_cache_write_tokens():
     assert normalized.cache_write_tokens == 200
 
 
+def test_normalize_usage_mapping_preserves_reasoning_tokens():
+    usage = {
+        "prompt_tokens": 100,
+        "completion_tokens": 20,
+        "prompt_tokens_details": {"cached_tokens": 40},
+        "completion_tokens_details": {"reasoning_tokens": 12},
+    }
+
+    normalized = normalize_usage(usage, provider="openrouter", api_mode="chat_completions")
+
+    assert normalized.reasoning_tokens == 12
+
+
+def test_normalize_usage_mapping_anthropic_fields():
+    usage = {
+        "input_tokens": 80,
+        "output_tokens": 20,
+        "cache_read_input_tokens": 50,
+        "cache_creation_input_tokens": 10,
+        "output_tokens_details": {"reasoning_tokens": 7},
+    }
+
+    normalized = normalize_usage(usage, provider="anthropic", api_mode="anthropic_messages")
+
+    assert normalized.cache_read_tokens == 50
+    assert normalized.cache_write_tokens == 10
+    assert normalized.reasoning_tokens == 7
+
+
+def test_normalize_usage_mapping_codex_fields():
+    usage = {
+        "input_tokens": 100,
+        "output_tokens": 20,
+        "input_tokens_details": {
+            "cached_tokens": 60,
+            "cache_creation_tokens": 10,
+        },
+        "output_tokens_details": {"reasoning_tokens": 5},
+    }
+
+    normalized = normalize_usage(usage, provider="openai-codex", api_mode="codex_responses")
+
+    assert normalized.input_tokens == 30
+    assert normalized.cache_read_tokens == 60
+    assert normalized.cache_write_tokens == 10
+    assert normalized.reasoning_tokens == 5
+
+
 
 
 
