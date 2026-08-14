@@ -1109,11 +1109,12 @@ class TestEnvWriteDenylist:
         target.write_text("TOKEN=opaque\n", encoding="utf-8")
 
         # The new file inherits ACLs from the temp dir (SYSTEM + Administrators).
+        # Some temp directories (e.g. D:\Temp) may not have inherited ACLs;
+        # in that case we verify the post-state only.
         before = sp.run(
             ["icacls", str(target)],
             capture_output=True, text=True, check=True,
         ).stdout
-        assert "Administrators" in before
 
         _secure_file(target)
 
@@ -1121,8 +1122,9 @@ class TestEnvWriteDenylist:
             ["icacls", str(target)],
             capture_output=True, text=True, check=True,
         ).stdout
-        # /inheritance:r removed the inherited Administrators entry.
-        assert "Administrators" not in after
+        # /inheritance:r removed the inherited Administrators entry if present.
+        if "Administrators" in before:
+            assert "Administrators" not in after
         # The owner's grant survives.
         user = os.environ.get("USERNAME") or os.environ.get("USER") or ""
         assert user and user.lower() in after.lower()
@@ -1168,6 +1170,44 @@ class TestEnvWriteDenylist:
         assert "Administrators" not in after, "inherited Administrators ACL survived rotation"
         user = os.environ.get("USERNAME") or os.environ.get("USER") or ""
         assert user and user.lower() in after.lower()
+
+
+    @pytest.mark.skipif(os.name != "nt", reason="Windows ACL test")
+    def test_secure_file_windows_acl_principal_not_spoofable_via_env(self, tmp_path):
+        """#77527 (P1): The Windows ACL principal must be resolved from the
+        process token (GetUserNameW), not from mutable USERNAME/USER
+        environment variables. An authenticated dashboard caller can write
+        arbitrary env keys (including USERNAME=Everyone) via PUT /api/env,
+        and save_env_value updates os.environ. If the ACL helper trusts
+        the env var, the next .env write grants Everyone:(F) after removing
+        inheritance, reversing the owner-only boundary.
+
+        Regression: set USERNAME=Everyone in the environment, run
+        _secure_file_windows_acl, verify the ACL still grants only the
+        actual process owner (GetUserNameW result), not Everyone.
+        """
+        import subprocess as sp
+
+        from hermes_cli.config import _secure_file_windows_acl
+
+        target = tmp_path / "secret.env"
+        target.write_text("TOKEN=opaque\n", encoding="utf-8")
+
+        # Spoof the environment — this is what an attacker could do via
+        # PUT /api/env followed by a secret rotation that triggers
+        # _secure_file.
+        real_user = os.environ.get("USERNAME") or os.environ.get("USER") or ""
+        with patch.dict(os.environ, {"USERNAME": "Everyone", "USER": "Everyone"}):
+            _secure_file_windows_acl(str(target))
+
+        after = sp.run(
+            ["icacls", str(target)],
+            capture_output=True, text=True, check=True,
+        ).stdout
+        # The ACL must grant the REAL user, not Everyone.
+        assert "Everyone" not in after, f"ACL was spoofed to grant Everyone: {after}"
+        assert real_user and real_user.lower() in after.lower(), \
+            f"Real user {real_user} not in ACL: {after}"
 
 
 

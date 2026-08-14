@@ -858,10 +858,39 @@ def _secure_file_windows_acl(path: str) -> None:
     current user full control (``/grant:r <user>:(F)``), producing an
     owner-only ACL equivalent to POSIX 0600.  ``icacls`` is invoked via
     argv (never a shell) so no quoting/injection surface exists.
+
+    The user identity is resolved from the Windows process token via
+    ``GetUserNameW`` (advapi32), not from mutable environment variables
+    (USERNAME/USER). This prevents an authenticated dashboard caller from
+    spoofing the ACL principal by writing USERNAME=Everyone into the
+    process environment before triggering a secret write.
     """
-    user = os.environ.get("USERNAME") or os.environ.get("USER") or ""
+    # Resolve the current Windows account from the process token (authoritative).
+    # Environment variables USERNAME/USER are writable via save_env_value and
+    # must not be trusted for security decisions.
+    user = ""
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        GetUserNameW = ctypes.windll.advapi32.GetUserNameW
+        size = wintypes.DWORD(0)
+        GetUserNameW(None, ctypes.byref(size))
+        if size.value > 0:
+            buffer = ctypes.create_unicode_buffer(size.value)
+            if GetUserNameW(buffer, ctypes.byref(size)):
+                user = buffer.value
+    except Exception:
+        pass
+
+    if not user:
+        # Fallback to environment only if the authoritative lookup fails.
+        # This preserves best-effort hardening on unusual configurations.
+        user = os.environ.get("USERNAME") or os.environ.get("USER") or ""
+
     if not user:
         return
+
     cmd = [
         "icacls", os.path.normpath(path),
         "/inheritance:r",
