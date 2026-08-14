@@ -12,6 +12,9 @@
 // permission; we pass titles through only when that permission is ALREADY
 // granted and never trigger the prompt for it.
 
+import { execFile } from 'node:child_process'
+import { promisify } from 'node:util'
+
 import { readHyprlandWindows } from './hyprland'
 
 export interface EnumeratedWindow {
@@ -124,10 +127,151 @@ type GetWindowsModule = {
 
 let getWindowsModule: Promise<GetWindowsModule> | null = null
 
+const execFileAsync = promisify(execFile)
+
 const loadGetWindows = (): Promise<GetWindowsModule> => {
   getWindowsModule ??= import('get-windows')
 
   return getWindowsModule
+}
+
+// `get-windows` uses a bundled Swift executable on macOS. If that helper is
+// absent or cannot launch from a packaged app, use the same CoreGraphics API
+// through macOS' built-in JavaScript bridge. `/usr/bin/osascript` is part of the
+// OS, needs no bundled native payload, and CGWindowListCopyWindowInfo exposes
+// app/bounds/z-order without an Accessibility or Screen Recording prompt.
+// Window titles are still stripped below unless Screen Recording was already
+// granted to Hermes.
+const MAC_WINDOW_ENUMERATION_JXA = `
+ObjC.import("CoreGraphics");
+
+function run() {
+  var raw = $.CGWindowListCopyWindowInfo(
+    $.kCGWindowListOptionOnScreenOnly | $.kCGWindowListExcludeDesktopElements,
+    $.kCGNullWindowID
+  );
+  var bridged = ObjC.castRefToObject(raw);
+  var windows = [];
+
+  function unwrap(dictionary, key, fallback) {
+    var value = dictionary && dictionary.objectForKey(key);
+    if (!value) return fallback;
+    var unwrapped = ObjC.unwrap(value);
+    return unwrapped === undefined || unwrapped === null ? fallback : unwrapped;
+  }
+
+  for (var index = 0; index < bridged.count; index += 1) {
+    var window = bridged.objectAtIndex(index);
+    var bounds = window.objectForKey("kCGWindowBounds");
+    var layer = Number(unwrap(window, "kCGWindowLayer", 0));
+    var alpha = Number(unwrap(window, "kCGWindowAlpha", 0));
+    var width = Number(unwrap(bounds, "Width", 0));
+    var height = Number(unwrap(bounds, "Height", 0));
+
+    // Layer zero is an ordinary application window. Excluding menu bar,
+    // notification, and desktop layers keeps those system surfaces from being
+    // mistaken for the app underneath the HUD.
+    if (layer !== 0 || alpha <= 0 || width <= 0 || height <= 0) continue;
+
+    windows.push({
+      app: String(unwrap(window, "kCGWindowOwnerName", "")),
+      bounds: {
+        x: Number(unwrap(bounds, "X", 0)),
+        y: Number(unwrap(bounds, "Y", 0)),
+        width: width,
+        height: height
+      },
+      id: Number(unwrap(window, "kCGWindowNumber", 0)),
+      pid: Number(unwrap(window, "kCGWindowOwnerPID", 0)),
+      title: String(unwrap(window, "kCGWindowName", ""))
+    });
+  }
+
+  return JSON.stringify(windows);
+}
+`
+
+export interface MacJxaCommand {
+  args: string[]
+  file: string
+  options: { encoding: 'utf8'; maxBuffer: number; timeout: number }
+}
+
+export type MacJxaExecutor = (command: MacJxaCommand) => Promise<string>
+
+const executeMacJxa: MacJxaExecutor = async command => {
+  const result = await execFileAsync(command.file, command.args, command.options)
+
+  return String(result.stdout ?? '')
+}
+
+const asRecord = (value: unknown): Record<string, unknown> | null =>
+  typeof value === 'object' && value !== null && !Array.isArray(value) ? (value as Record<string, unknown>) : null
+
+const finiteNumber = (value: unknown): number => (typeof value === 'number' && Number.isFinite(value) ? value : 0)
+
+export function parseMacWindowEnumeration(stdout: string, titlesAvailable: boolean): EnumeratedWindow[] | null {
+  let parsed: unknown
+
+  try {
+    parsed = JSON.parse(stdout)
+  } catch {
+    return null
+  }
+
+  if (!Array.isArray(parsed)) {
+    return null
+  }
+
+  const windows: EnumeratedWindow[] = []
+
+  for (const value of parsed) {
+    const window = asRecord(value)
+    const bounds = asRecord(window?.bounds)
+
+    if (!window || !bounds) {
+      continue
+    }
+
+    const width = finiteNumber(bounds.width)
+    const height = finiteNumber(bounds.height)
+
+    if (width <= 0 || height <= 0) {
+      continue
+    }
+
+    windows.push({
+      app: typeof window.app === 'string' ? window.app : '',
+      bounds: {
+        x: finiteNumber(bounds.x),
+        y: finiteNumber(bounds.y),
+        width,
+        height
+      },
+      id: finiteNumber(window.id),
+      pid: finiteNumber(window.pid),
+      title: titlesAvailable && typeof window.title === 'string' ? window.title : ''
+    })
+  }
+
+  return windows
+}
+
+export async function enumerateViaMacJxa(
+  titlesAvailable: boolean,
+  execute: MacJxaExecutor = executeMacJxa
+): Promise<EnumeratedWindow[] | null> {
+  try {
+    const stdout = await execute({
+      args: ['-l', 'JavaScript', '-e', MAC_WINDOW_ENUMERATION_JXA],
+      file: '/usr/bin/osascript',
+      options: { encoding: 'utf8', maxBuffer: 2 * 1024 * 1024, timeout: 3000 }
+    })
+
+    return parseMacWindowEnumeration(stdout, titlesAvailable)
+  } catch {
+    return null
+  }
 }
 
 /**
@@ -178,15 +322,45 @@ async function enumerateViaGetWindows(titlesAvailable: boolean): Promise<Enumera
   }))
 }
 
+type WindowEnumerator = (titlesAvailable: boolean) => Promise<EnumeratedWindow[] | null>
+
+export async function enumerateWindowsWithFallback(
+  titlesAvailable: boolean,
+  {
+    platform = process.platform,
+    primary = enumerateViaGetWindows,
+    macFallback = enumerateViaMacJxa
+  }: {
+    platform?: NodeJS.Platform
+    primary?: WindowEnumerator
+    macFallback?: WindowEnumerator
+  } = {}
+): Promise<EnumeratedWindow[] | null> {
+  const windows = await primary(titlesAvailable)
+
+  if (windows !== null || platform !== 'darwin') {
+    return windows
+  }
+
+  return macFallback(titlesAvailable)
+}
+
 export async function readWindowBelow(
   selfPid: number,
   selfBounds: EnumeratedWindow['bounds'],
-  titlesAvailable: boolean
+  titlesAvailable: boolean,
+  {
+    enumerate = enumerateWindowsWithFallback,
+    readHyprland = readHyprlandWindows
+  }: {
+    enumerate?: typeof enumerateWindowsWithFallback
+    readHyprland?: typeof readHyprlandWindows
+  } = {}
 ): Promise<WindowBelowResult | WindowBelowUnavailable> {
   // Hyprland first, and only ever on Hyprland — its own IPC sees native Wayland
   // windows, which the X11 enumerator below cannot, and it answers null
   // everywhere else so the established path stays the default.
-  const windows = (await readHyprlandWindows(selfPid)) ?? (await enumerateViaGetWindows(titlesAvailable))
+  const windows = (await readHyprland(selfPid)) ?? (await enumerate(titlesAvailable))
 
   if (!windows) {
     return {
