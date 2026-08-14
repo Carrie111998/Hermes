@@ -15,6 +15,27 @@ zero-tools end state) loudly turns that silent failure into an actionable one.
 from typing import Callable, List
 
 
+def partition_cli_toolsets(
+    config: dict,
+    toolsets: List[str],
+    is_valid_toolset: Callable[[str], bool],
+) -> tuple[List[str], List[str]]:
+    """Split names by the CLI ``--toolsets`` acceptance contract.
+
+    Configured MCP server names are accepted before live MCP discovery registers
+    their aliases. Every other name must already resolve as a built-in, plugin,
+    or registry-backed toolset.
+    """
+    mcp_servers = config.get("mcp_servers") or {}
+    mcp_names = set(mcp_servers) if isinstance(mcp_servers, dict) else set()
+    accepted = []
+    rejected = []
+    for toolset in toolsets:
+        target = accepted if is_valid_toolset(toolset) or toolset in mcp_names else rejected
+        target.append(toolset)
+    return accepted, rejected
+
+
 def validate_platform_toolsets(
     platform_toolsets: object,
     is_valid_toolset: Callable[[str], bool],
