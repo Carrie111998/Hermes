@@ -311,7 +311,9 @@ class TestBackendCdpResolution:
 
     def test_existing_bu_env_wins(self, monkeypatch):
         env = {"BU_CDP_WS": "ws://operator-override:9222"}
-        assert bu_cli._resolve_backend_cdp(env, "t1") is None
+        err, cloud_session_task_id = bu_cli._resolve_backend_cdp(env, "t1")
+        assert err is None
+        assert cloud_session_task_id is None
         assert env["BU_CDP_WS"] == "ws://operator-override:9222"
 
     def test_cdp_override_exported(self, monkeypatch):
@@ -319,7 +321,9 @@ class TestBackendCdpResolution:
 
         monkeypatch.setattr(bt, "_get_cdp_override", lambda: "http://127.0.0.1:9222")
         env = self._env()
-        assert bu_cli._resolve_backend_cdp(env, "t1") is None
+        err, cloud_session_task_id = bu_cli._resolve_backend_cdp(env, "t1")
+        assert err is None
+        assert cloud_session_task_id is None
         assert env["BU_CDP_URL"] == "http://127.0.0.1:9222"
 
     def test_ws_override_uses_bu_cdp_ws(self, monkeypatch):
@@ -327,7 +331,9 @@ class TestBackendCdpResolution:
 
         monkeypatch.setattr(bt, "_get_cdp_override", lambda: "wss://connect.example/x")
         env = self._env()
-        assert bu_cli._resolve_backend_cdp(env, "t1") is None
+        err, cloud_session_task_id = bu_cli._resolve_backend_cdp(env, "t1")
+        assert err is None
+        assert cloud_session_task_id is None
         assert env["BU_CDP_WS"] == "wss://connect.example/x"
 
     def test_cloud_provider_session_exported(self, monkeypatch):
@@ -340,7 +346,13 @@ class TestBackendCdpResolution:
             lambda task_id: {"cdp_url": "wss://browser.example/cdp/abc"},
         )
         env = self._env()
-        assert bu_cli._resolve_backend_cdp(env, "t1") is None
+        err, cloud_session_task_id = bu_cli._resolve_backend_cdp(env, "t1")
+        assert err is None
+        # M1 regression (browser_exec activity heartbeat): a resolved
+        # cloud-provider session must report the key it registered activity
+        # for, so the caller can keep it fresh for the duration of a
+        # long-running exec instead of only at resolution time.
+        assert cloud_session_task_id == "t1"
         assert env["BU_CDP_WS"] == "wss://browser.example/cdp/abc"
 
     def test_no_provider_leaves_env_untouched(self, monkeypatch):
@@ -349,7 +361,9 @@ class TestBackendCdpResolution:
         monkeypatch.setattr(bt, "_get_cdp_override", lambda: "")
         monkeypatch.setattr(bt, "_get_cloud_provider", lambda: None)
         env = self._env()
-        assert bu_cli._resolve_backend_cdp(env, "t1") is None
+        err, cloud_session_task_id = bu_cli._resolve_backend_cdp(env, "t1")
+        assert err is None
+        assert cloud_session_task_id is None
         assert "BU_CDP_WS" not in env and "BU_CDP_URL" not in env
 
     def test_provider_failure_returns_error(self, monkeypatch):
@@ -361,8 +375,9 @@ class TestBackendCdpResolution:
         monkeypatch.setattr(bt, "_get_cdp_override", lambda: "")
         monkeypatch.setattr(bt, "_get_cloud_provider", lambda: object())
         monkeypatch.setattr(bt, "_get_session_info", boom)
-        err = bu_cli._resolve_backend_cdp(self._env(), "t1")
+        err, cloud_session_task_id = bu_cli._resolve_backend_cdp(self._env(), "t1")
         assert err and "api down" in err
+        assert cloud_session_task_id is None
 
     def test_provider_without_cdp_returns_error(self, monkeypatch):
         import tools.browser_tool as bt
@@ -370,8 +385,9 @@ class TestBackendCdpResolution:
         monkeypatch.setattr(bt, "_get_cdp_override", lambda: "")
         monkeypatch.setattr(bt, "_get_cloud_provider", lambda: object())
         monkeypatch.setattr(bt, "_get_session_info", lambda task_id: {"cdp_url": None})
-        err = bu_cli._resolve_backend_cdp(self._env(), "t1")
+        err, cloud_session_task_id = bu_cli._resolve_backend_cdp(self._env(), "t1")
         assert err and "no" in err.lower() and "CDP" in err
+        assert cloud_session_task_id is None
 
     def test_named_session_skips_backend_resolution(self, tmp_path, monkeypatch):
         """session=<name> (BU_NAME cloud browser) must not consume a backend
@@ -703,6 +719,50 @@ class TestBrowserExec:
         monkeypatch.setattr(bu_cli, "_MIN_TIMEOUT_S", 1)
         result = json.loads(bu_cli.browser_exec("print(1)", timeout_s=1))
         assert "timed out" in result["error"]
+
+    def test_long_exec_keeps_cloud_session_activity_fresh(self, tmp_path, monkeypatch):
+        """A long-running browser_exec (subprocess.run's blocking wait made
+        zero further calls into the session tracker) must not let the
+        inactivity reaper's clock run out from under the still-working CLI.
+
+        Regression: browser_exec's subprocess wait only refreshed the
+        resolved cloud-provider session's activity timestamp once, at
+        _resolve_backend_cdp()'s _get_session_info() call — never again for
+        the whole (up to 1800s) run. This drives a fake CLI that sleeps
+        across several heartbeat intervals and asserts
+        _update_session_activity is called repeatedly, not just once.
+        """
+        import tools.browser_tool as bt
+
+        monkeypatch.setattr(bt, "_get_cdp_override", lambda: "")
+        monkeypatch.setattr(bt, "_get_cloud_provider", lambda: object())
+        monkeypatch.setattr(
+            bt, "_get_session_info",
+            lambda task_id: {"cdp_url": "wss://browser.example/cdp/abc"},
+        )
+        heartbeat_calls = []
+        real_update = bt._update_session_activity
+
+        def spy_update(task_id):
+            heartbeat_calls.append(task_id)
+            return real_update(task_id)
+
+        monkeypatch.setattr(bt, "_update_session_activity", spy_update)
+        # Tiny heartbeat interval so the sleeping fake CLI spans several
+        # heartbeats without a slow test.
+        monkeypatch.setattr(bu_cli, "_CLOUD_SESSION_HEARTBEAT_INTERVAL_S", 0.05)
+
+        cli = _fake_cli(tmp_path, "cat > /dev/null\nsleep 0.3\necho done\n")
+        monkeypatch.setattr(bu_cli, "_find_cli", lambda: [cli])
+
+        result = json.loads(bu_cli.browser_exec("print(1)", task_id="t42"))
+
+        assert result["success"] is True
+        assert "done" in result["output"]
+        assert len(heartbeat_calls) >= 2, (
+            f"expected repeated heartbeats during the run, got {heartbeat_calls!r}"
+        )
+        assert all(tid == "t42" for tid in heartbeat_calls)
 
 
 class TestFindCliManagedBin:

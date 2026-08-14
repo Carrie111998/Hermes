@@ -10,6 +10,7 @@ import os
 import re
 import shutil
 import subprocess
+import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -28,6 +29,14 @@ _DEFAULT_TIMEOUT_S = 300
 _MIN_TIMEOUT_S = 5
 _MAX_TIMEOUT_S = 1800
 _STDERR_CAP_CHARS = 4000
+
+# How often to refresh a resolved cloud-provider session's activity timestamp
+# while the (synchronous, long-running) browser-use CLI subprocess is still
+# working. Must stay comfortably under browser.inactivity_timeout's default
+# (120s, see tools/browser_tool.py) so the background reaper never tears the
+# session down mid-exec just because browser_exec itself made no further
+# Python-side calls into the session tracker for the duration of the run.
+_CLOUD_SESSION_HEARTBEAT_INTERVAL_S = 20
 
 # Filesystem-safe task ids for per-task workspace dirs.
 _TASK_ID_SAFE_RE = re.compile(r"[^A-Za-z0-9._-]+")
@@ -366,7 +375,111 @@ def _native_screenshot_result(result: Dict[str, Any], path: str) -> Optional[Dic
         return None
 
 
-def _resolve_backend_cdp(env: dict, task_id: Optional[str]) -> Optional[str]:
+def _drain_pipe(pipe, chunks: List[str]) -> None:
+    """Read a text-mode pipe to EOF, appending each line to *chunks*.
+
+    Runs on a background thread so the parent can poll/wait on the process
+    without risking a deadlock from a full stdout/stderr OS pipe buffer
+    while the browser-use CLI is still writing (long-running exec, 300s
+    default / 1800s max timeout).
+    """
+    try:
+        for line in iter(pipe.readline, ""):
+            chunks.append(line)
+    except Exception:
+        pass
+    finally:
+        try:
+            pipe.close()
+        except Exception:
+            pass
+
+
+def _run_cli_with_activity_heartbeat(
+    cmd: List[str],
+    code: str,
+    env: dict,
+    timeout: float,
+    cloud_session_task_id: Optional[str],
+    popen_extra: dict,
+) -> "tuple[str, str, int]":
+    """Run the browser-use CLI, keeping a resolved cloud session's activity
+    timestamp fresh for the whole run instead of only at session resolution.
+
+    ``subprocess.run(..., timeout=timeout)`` blocks for up to 1800s making no
+    further calls into ``tools/browser_tool.py``'s per-task session tracker
+    (``_get_session_info`` only touches it once, before the CLI subprocess is
+    even started) — so the background inactivity reaper (30s poll, 120s
+    default threshold, see ``_cleanup_inactive_browser_sessions``) can tear
+    the cloud browser down while the CLI is still actively driving it over
+    CDP. Polling with a bounded wait between heartbeats keeps the session
+    alive for cloud-provider sessions without changing behavior for local
+    Chrome / explicit BU_NAME sessions (``cloud_session_task_id`` is ``None``
+    there, so no heartbeat calls are made).
+
+    Returns ``(stdout, stderr, returncode)``. Raises ``subprocess.TimeoutExpired``
+    on overall timeout (mirroring ``subprocess.run``'s contract) and ``OSError``
+    if the subprocess fails to launch.
+    """
+    proc = subprocess.Popen(
+        cmd,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=env,
+        **popen_extra,
+    )
+    stdout_chunks: List[str] = []
+    stderr_chunks: List[str] = []
+    stdout_thread = threading.Thread(
+        target=_drain_pipe, args=(proc.stdout, stdout_chunks), daemon=True,
+    )
+    stderr_thread = threading.Thread(
+        target=_drain_pipe, args=(proc.stderr, stderr_chunks), daemon=True,
+    )
+    stdout_thread.start()
+    stderr_thread.start()
+    try:
+        proc.stdin.write(code)
+        proc.stdin.close()
+    except Exception:
+        # e.g. a broken pipe because the CLI already exited — proc.wait()
+        # below surfaces the real failure via a non-zero returncode.
+        pass
+
+    deadline = time.monotonic() + timeout
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            proc.kill()
+            proc.wait()
+            stdout_thread.join(timeout=5)
+            stderr_thread.join(timeout=5)
+            raise subprocess.TimeoutExpired(cmd, timeout)
+        try:
+            proc.wait(timeout=min(_CLOUD_SESSION_HEARTBEAT_INTERVAL_S, remaining))
+            break
+        except subprocess.TimeoutExpired:
+            if cloud_session_task_id:
+                try:
+                    from tools.browser_tool import _update_session_activity
+
+                    _update_session_activity(cloud_session_task_id)
+                except Exception as e:
+                    logger.debug(
+                        "Cloud session activity heartbeat failed for %s: %s",
+                        cloud_session_task_id, e,
+                    )
+
+    stdout_thread.join(timeout=5)
+    stderr_thread.join(timeout=5)
+    return "".join(stdout_chunks), "".join(stderr_chunks), proc.returncode
+
+
+def _resolve_backend_cdp(
+    env: dict, task_id: Optional[str]
+) -> "tuple[Optional[str], Optional[str]]":
     """Point the harness at the configured browser backend's CDP endpoint.
 
     Resolution order (first hit wins):
@@ -383,10 +496,20 @@ def _resolve_backend_cdp(env: dict, task_id: Optional[str]) -> Optional[str]:
     4. Nothing configured: return None; the harness attaches to local
        Chrome (or Browser Use cloud via BU_AUTOSPAWN for legacy configs).
 
-    Returns an error string on provider failure, None on success.
+    Returns ``(error, cloud_session_task_id)``. ``error`` is a message on
+    provider failure, ``None`` on success. ``cloud_session_task_id`` is the
+    key this call registered activity for with the legacy stack's
+    per-task session tracker (``tools/browser_tool.py``'s
+    ``_session_last_activity`` / inactivity reaper), or ``None`` when no
+    cloud-provider session was resolved (local CDP override, no provider
+    configured, or a Browser Use direct-API config that manages its own
+    session) — the caller uses this to know whether it must keep the
+    session's activity timestamp fresh for the duration of a long-running
+    ``browser_exec`` call, or the inactivity reaper will tear the session
+    down out from under the still-running CLI subprocess.
     """
     if env.get("BU_CDP_WS") or env.get("BU_CDP_URL"):
-        return None
+        return None, None
 
     try:
         from tools.browser_tool import (
@@ -396,7 +519,7 @@ def _resolve_backend_cdp(env: dict, task_id: Optional[str]) -> Optional[str]:
         )
     except Exception as e:  # pragma: no cover — stubbed browser_tool in tests
         logger.debug("browser_tool backend resolution unavailable: %s", e)
-        return None
+        return None, None
 
     try:
         override = _get_cdp_override()
@@ -404,7 +527,7 @@ def _resolve_backend_cdp(env: dict, task_id: Optional[str]) -> Optional[str]:
         override = ""
     if override:
         env["BU_CDP_URL" if override.startswith(("http://", "https://")) else "BU_CDP_WS"] = override
-        return None
+        return None, None
 
     try:
         provider = _get_cloud_provider()
@@ -412,7 +535,7 @@ def _resolve_backend_cdp(env: dict, task_id: Optional[str]) -> Optional[str]:
         logger.debug("Cloud provider lookup failed: %s", e)
         provider = None
     if provider is None:
-        return None
+        return None, None
 
     # Browser Use direct-API configs: the CLI talks to Browser Use cloud
     # natively (BU_AUTOSPAWN / auth login) — routing through the legacy
@@ -424,25 +547,26 @@ def _resolve_backend_cdp(env: dict, task_id: Optional[str]) -> Optional[str]:
     if provider_key == _BACKEND_KEY and not is_truthy_value(
         _read_browser_cfg().get("use_gateway"), default=False
     ):
-        return None
+        return None, None
 
+    session_task_id = task_id or "browser-exec-default"
     try:
-        session_info = _get_session_info(task_id or "browser-exec-default")
+        session_info = _get_session_info(session_task_id)
     except Exception as e:
         return (
             f"Cloud browser provider {type(provider).__name__} failed to "
             f"provide a session: {e}. Fix the provider configuration or "
             "switch backends via `hermes tools` → Browser Automation."
-        )
+        ), None
     cdp = str((session_info or {}).get("cdp_url") or "")
     if not cdp:
         return (
             f"Cloud browser provider {type(provider).__name__} returned no "
             "CDP endpoint, so Browser Use mode cannot drive it. Switch to "
             "the built-in browser tools for this provider."
-        )
+        ), None
     env["BU_CDP_URL" if cdp.startswith(("http://", "https://")) else "BU_CDP_WS"] = cdp
-    return None
+    return None, session_task_id
 
 
 def browser_exec(
@@ -471,6 +595,7 @@ def browser_exec(
         )
 
     env = _base_subprocess_env()
+    cloud_session_task_id: Optional[str] = None
     if session:
         if not _SESSION_RE.match(session):
             return tool_error(
@@ -482,7 +607,7 @@ def browser_exec(
         # Route through the configured browser backend (Browserbase,
         # Firecrawl, Nous gateway, CDP override, …). Explicit BU_NAME cloud
         # sessions manage their own browser and skip backend resolution.
-        backend_err = _resolve_backend_cdp(env, task_id)
+        backend_err, cloud_session_task_id = _resolve_backend_cdp(env, task_id)
         if backend_err:
             return tool_error(backend_err)
 
@@ -515,14 +640,8 @@ def browser_exec(
 
     started = time.time()
     try:
-        proc = subprocess.run(
-            cmd,
-            input=code,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            env=env,
-            **popen_extra,
+        stdout_text, stderr_text, returncode = _run_cli_with_activity_heartbeat(
+            cmd, code, env, timeout, cloud_session_task_id, popen_extra,
         )
     except subprocess.TimeoutExpired:
         return tool_error(
@@ -536,21 +655,21 @@ def browser_exec(
         return tool_error(f"Failed to launch browser-use CLI: {e}")
 
     result = {
-        "success": proc.returncode == 0,
-        "exit_code": proc.returncode,
-        "output": proc.stdout,
+        "success": returncode == 0,
+        "exit_code": returncode,
+        "output": stdout_text,
     }
     if workspace:
         result["workspace"] = workspace
     if session:
         result["session"] = session
-    stderr = (proc.stderr or "").strip()
+    stderr = (stderr_text or "").strip()
     if stderr:
         if len(stderr) > _STDERR_CAP_CHARS:
             stderr = stderr[:_STDERR_CAP_CHARS] + "\n… (stderr truncated)"
         result["stderr"] = stderr
 
-    screenshot = _find_screenshot(proc.stdout, started)
+    screenshot = _find_screenshot(stdout_text, started)
     if screenshot:
         result["screenshot_path"] = screenshot
         native = _native_screenshot_result(result, screenshot)
