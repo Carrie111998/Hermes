@@ -3998,7 +3998,10 @@ def install_from_quarantine(
         trust_level=bundle.trust_level,
         scan_verdict=scan_result.verdict,
         skill_hash=content_hash(install_dir),
-        install_path=str(install_dir.relative_to(_skills_dir())),
+        # ``install_dir`` is resolved by _resolve_lock_install_path().  Resolve
+        # the root too so platform aliases such as macOS /var -> /private/var
+        # do not turn a valid install into a spurious ``relative_to`` failure.
+        install_path=str(install_dir.relative_to(_skills_dir().resolve())),
         files=list(bundle.files.keys()),
         metadata=bundle.metadata,
         scan_provenance=scan_provenance or getattr(scan_result, "scan_provenance", None),
