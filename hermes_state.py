@@ -7946,7 +7946,71 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     _CONTENT_JSON_PREFIX = "\x00json:"
 
     @classmethod
-    def _encode_content(cls, content: Any) -> Any:
+    def _apply_content_hook(
+        cls,
+        hook_name: str,
+        content: Any,
+        session_id: Optional[str],
+        role: Optional[str],
+    ) -> Any:
+        """Run an at-rest content transform, returning replacement content.
+
+        Fired on the sqlite boundary so a plugin can rewrite message content
+        on the way in and back on the way out without core owning any policy.
+        The first non-``None`` return wins; with no plugin registered the cost
+        is one dict lookup on the memoized manager.
+
+        ``plugins.invoke_hook`` is called directly rather than through
+        ``hermes_cli.lifecycle`` so ``observe_lifecycle`` does not run on a
+        path that executes for every message read and write.
+
+        Invoked with ``strict=True``: a swallowed exception here means
+        untransformed content reaches disk (store) or the model (load), so
+        callback failures must propagate. An unimportable plugin layer is a
+        separate case. The state layer is used standalone by migrations and
+        tooling, where "no plugins" legitimately means "no transform".
+        """
+        try:
+            from hermes_cli import plugins as _plugins
+        except Exception:
+            return content
+        if not _plugins.has_hook(hook_name):
+            return content
+        for result in _plugins.invoke_hook(
+            hook_name,
+            strict=True,
+            content=content,
+            session_id=session_id or "",
+            role=role or "",
+        ):
+            if result is not None:
+                return result
+        return content
+
+    @classmethod
+    def _encode_content(
+        cls,
+        content: Any,
+        *,
+        session_id: Optional[str] = None,
+        role: Optional[str] = None,
+    ) -> Any:
+        """Serialize content for sqlite, then apply the at-rest store transform.
+
+        ``session_id`` and ``role`` are optional so existing callers keep
+        working; they are threaded through wherever available so a plugin can
+        select a per-session key. See :meth:`_serialize_content` for the
+        serialization contract and :meth:`_apply_content_hook` for the hook.
+        """
+        return cls._apply_content_hook(
+            "transform_message_store",
+            cls._serialize_content(content),
+            session_id,
+            role,
+        )
+
+    @classmethod
+    def _serialize_content(cls, content: Any) -> Any:
         """Serialize structured (list/dict) message content for sqlite.
 
         sqlite3 can only bind ``str``, ``bytes``, ``int``, ``float``, and ``None``
@@ -7958,6 +8022,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         Returns the value unchanged when it's already a safe scalar, or a
         sentinel-prefixed JSON string for lists/dicts. Paired with
         :meth:`_decode_content` on read.
+
+        Transforms compose outside this method: the store hook runs on the
+        serialized form, and the load hook runs before deserialization, so a
+        plugin always sees the same flat representation in both directions.
         """
         if isinstance(content, str):
             # Lone UTF-16 surrogates reach here inside tool results scraped
@@ -7981,8 +8049,21 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return _sanitize_surrogates(str(content))
 
     @classmethod
-    def _decode_content(cls, content: Any) -> Any:
-        """Reverse :meth:`_encode_content`; returns scalars unchanged."""
+    def _decode_content(
+        cls,
+        content: Any,
+        *,
+        session_id: Optional[str] = None,
+        role: Optional[str] = None,
+    ) -> Any:
+        """Reverse :meth:`_encode_content`; returns scalars unchanged.
+
+        Applies the at-rest load transform first, so the plugin sees exactly
+        the bytes it produced on store, then deserializes.
+        """
+        content = cls._apply_content_hook(
+            "transform_message_load", content, session_id, role
+        )
         if isinstance(content, str) and content.startswith(cls._CONTENT_JSON_PREFIX):
             try:
                 return json.loads(content[len(cls._CONTENT_JSON_PREFIX):])
@@ -8163,7 +8244,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         tool_calls_json = json.dumps(tool_calls) if tool_calls else None
         # Multimodal content (list of parts) must be JSON-encoded: sqlite3
         # cannot bind list/dict parameters directly.
-        stored_content = self._encode_content(content)
+        stored_content = self._encode_content(
+            content, session_id=session_id, role=role
+        )
 
         message_timestamp = time.time()
         if timestamp is not None:
@@ -8330,7 +8413,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             row = conn.execute(
                 "SELECT id FROM messages WHERE session_id = ? AND role = ? "
                 "AND content = ? AND active = 1 ORDER BY id DESC LIMIT 1",
-                (session_id, role, self._encode_content(content)),
+                (session_id, role, self._encode_content(
+                        content, session_id=session_id, role=role
+                    )),
             ).fetchone()
             if row is None:
                 return False
@@ -8474,7 +8559,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                         continue
                     reaction["seen"] = True
                     changed = True
-                    content = self._decode_content(row["content"])
+                    content = self._decode_content(
+                        row["content"], session_id=session_id, role=row["role"]
+                    )
                     pending.append(
                         {
                             "row_id": row["id"],
@@ -8616,7 +8703,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 (
                     session_id,
                     role,
-                    self._encode_content(msg.get("content")),
+                    self._encode_content(
+                        msg.get("content"), session_id=session_id, role=role
+                    ),
                     msg.get("tool_call_id"),
                     tool_calls_json,
                     _scrub_surrogates(msg.get("tool_name")),
@@ -8838,7 +8927,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         tail shape), nothing is written. Returns the number of rows updated
         (0 or 1).
         """
-        encoded = self._encode_content(content)
+        encoded = self._encode_content(
+            content, session_id=session_id, role="user"
+        )
 
         def _do(conn):
             cursor = conn.execute(
@@ -8909,7 +9000,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         for row in rows:
             msg = dict(row)
             if "content" in msg:
-                msg["content"] = self._decode_content(msg["content"])
+                msg["content"] = self._decode_content(
+                    msg["content"], session_id=session_id, role=msg.get("role")
+                )
             if msg.get("tool_calls"):
                 try:
                     msg["tool_calls"] = json.loads(msg["tool_calls"])
@@ -9003,7 +9096,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         for row in rows:
             msg = dict(row)
             if "content" in msg:
-                msg["content"] = self._decode_content(msg["content"])
+                msg["content"] = self._decode_content(
+                    msg["content"], session_id=session_id, role=msg.get("role")
+                )
             if msg.get("tool_calls"):
                 try:
                     msg["tool_calls"] = json.loads(msg["tool_calls"])
@@ -9154,7 +9249,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         with self._read_ctx() as conn:
             placeholders = ",".join("?" for _ in session_ids)
             rows = conn.execute(
-                f"SELECT {self._CONVERSATION_ROW_COLUMNS} "
+                f"SELECT session_id, {self._CONVERSATION_ROW_COLUMNS} "
                 f"FROM messages WHERE session_id IN ({placeholders})"
                 # Order by AUTOINCREMENT id (true insertion order), NOT timestamp:
                 # append_message stamps rows with time.time(), which is not
@@ -9204,7 +9299,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         """
         messages = []
         for row in rows:
-            content = self._decode_content(row["content"])
+            # include_ancestors=True mixes rows from parent sessions into this
+            # result, so a transform must see the session that stored the row -
+            # not the tip session that asked for it.
+            content = self._decode_content(
+                row["content"], session_id=row["session_id"], role=row["role"]
+            )
             if row["role"] in {"user", "assistant"} and isinstance(content, str):
                 content = sanitize_context(content).strip()
             msg = {"role": row["role"], "content": content}
@@ -9596,7 +9696,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             )
 
         # Decode content for callers (prefill the prompt buffer).
-        target_row["content"] = self._decode_content(target_row.get("content"))
+        target_row["content"] = self._decode_content(
+            target_row.get("content"),
+            session_id=session_id,
+            role=target_row.get("role"),
+        )
 
         rewound: List[int] = []
 
