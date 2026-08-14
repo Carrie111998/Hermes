@@ -1105,6 +1105,10 @@ def _arm_exit_watchdog(timeout_s: float | None = None) -> None:
                 _stream.flush()
             except Exception:
                 pass
+        # Best-effort memory session-end flush before the hard exit — the
+        # finally/atexit cleanup never ran (that's why we're here). No-op when
+        # _run_cleanup already ran (guard), never raises.
+        _emit_session_end_before_hard_exit()
         os._exit(0)
 
     try:
@@ -18759,6 +18763,11 @@ def main(
                     _sig_mod.alarm(2)
             except Exception:
                 pass
+            # Hand this worker's last turns to the memory provider before the
+            # hard exit — the finally/atexit cleanup never runs on this path.
+            # Flush is bounded by the SIGALRM deadman armed above; a raising
+            # provider is swallowed. Never emits twice (_cleanup_done guard).
+            _emit_session_end_before_hard_exit()
             try:
                 import logging as _lg
                 _lg.shutdown()
