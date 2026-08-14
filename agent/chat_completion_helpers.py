@@ -2295,6 +2295,26 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
             "Fallback activated: %s → %s (%s)",
             old_model, fb_model, fb_provider,
         )
+        
+        # 4. Record fallback activation event (Task 4.2)
+        try:
+            db = getattr(agent, "_session_db", None)
+            if db and hasattr(db, "record_fallback_event"):
+                reason_str = reason.value if hasattr(reason, "value") else str(reason)
+                task_id = getattr(agent, "_active_task_id", None)
+                run_id = getattr(agent, "_relay_pending_turn_id", None) or str(getattr(agent, "session_id", None) or "")
+                if task_id:
+                    db.record_fallback_event(
+                        session_id=str(getattr(agent, "session_id", None) or ""),
+                        task_id=task_id,
+                        run_id=run_id,
+                        model=fb_model,
+                        provider=fb_provider,
+                        reason=reason_str
+                    )
+        except Exception as e:
+            logger.debug(f"Failed to record fallback event: {e}")
+
         # Reset the stale-call circuit breaker (#58962): the streak measured
         # the OLD provider's unresponsiveness.  Carrying it over would
         # short-circuit the freshly activated fallback before it gets a

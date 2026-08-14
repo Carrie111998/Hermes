@@ -11147,6 +11147,29 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             )
         self._execute_write(_do)
 
+    def record_fallback_event(self, session_id: str, task_id: str, run_id: str, model: str, provider: str, reason: str) -> None:
+        """
+        Records a fallback event into task_run_identity_events as per OpenSpec Task 4.2.
+        """
+        def _do(conn):
+            import time
+            import uuid
+            import json
+            
+            evt_id = f"evt_{uuid.uuid4().hex[:8]}"
+            identity_snapshot = json.dumps({
+                "effective_model": model,
+                "effective_provider": provider,
+                "reason": reason
+            })
+            
+            conn.execute(
+                "INSERT INTO task_run_identity_events (id, run_id, task_id, identity_snapshot, event_type, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (evt_id, run_id, task_id, identity_snapshot, "fallback_activated", time.time())
+            )
+        self._execute_write(_do)
+
     def enforce_openspec_transaction(self, task_id: str, new_status: str, expected_contract_hash: str) -> bool:
         """
         Task 4.1 Implement Central Validator Hook

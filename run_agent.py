@@ -7928,10 +7928,12 @@ class AIAgent:
             "task_id": effective_task_id,
             "platform": getattr(self, "platform", None) or "",
         }
+        
         relay_turn_id = (
             f"{session_id or 'session'}:{effective_task_id}:{uuid.uuid4().hex[:8]}"
         )
         self._relay_pending_turn_id = relay_turn_id
+
         relay_parent_session_id = (
             str(getattr(self, "_parent_session_id", None) or "")
             if task_context["platform"] == "subagent"
@@ -7965,6 +7967,50 @@ class AIAgent:
                     parent_session_id=getattr(self, "_parent_session_id", None) or "",
                 )
                 task_started = True
+                
+                # OpenSpec task_run_identity_events capture
+                # Only capture if relay metrics are enabled and we just started a run
+                try:
+                    db = getattr(self, "_session_db", None)
+                    if db:
+                        import time
+                        import json
+                        evt_id = f"evt_{uuid.uuid4().hex[:8]}"
+                        identity_payload = json.dumps({
+                            "requested_model": getattr(self, "model", None) or "",
+                            "requested_provider": getattr(self, "provider", None) or "",
+                            "effective_model": getattr(self, "_active_model", getattr(self, "model", None)) or "",
+                            "effective_provider": getattr(self, "_active_provider", getattr(self, "provider", None)) or "",
+                            "base_url": getattr(self, "base_url", None) or ""
+                        })
+                        # Extract the task run id generated during `start_task_run`.
+                        # If we can't reliably get the current active task_runs id from relay, 
+                        # relay_turn_id is a safe proxy, but best is to rely on what relay inserted.
+                        # For robustness, we will use the actual DB run_id if available, or fallback.
+                        # `relay_turn` acts as the run identity in this context.
+                        # Note: `task_runs` table is often managed by Kanban/external orchestrator and we 
+                        # just tie into it if it exists. We'll use relay_turn_id to guarantee uniqueness.
+                        
+                        run_id = relay_turn_id
+                        # Check if a kanban run is actually active for this task, to link it
+                        try:
+                            active_run_id = None
+                            cursor = db._conn.cursor()
+                            cursor.execute("SELECT current_run_id FROM tasks WHERE id = ?", (effective_task_id,))
+                            row = cursor.fetchone()
+                            if row and row[0]:
+                                active_run_id = str(row[0])
+                            run_id = active_run_id or run_id
+                        except Exception:
+                            pass
+                            
+                        db._execute_write(lambda conn: conn.execute(
+                            "INSERT INTO task_run_identity_events (id, run_id, task_id, identity_snapshot, event_type, created_at) "
+                            "VALUES (?, ?, ?, ?, ?, ?)",
+                            (evt_id, run_id, effective_task_id, identity_payload, "task_start", time.time())
+                        ))
+                except Exception as e:
+                    logger.debug(f"Failed to record task_run_identity_events: {e}")
             # Publish the conversation id for ambient Nous Portal tagging. Every
             # LLM call made inside this turn — main loop, compression, vision,
             # web_extract, session_search, MoA slots, background-review forks
