@@ -12,6 +12,7 @@ import os
 import re
 from pathlib import Path
 import time
+import traceback
 from typing import Any, NoReturn, Protocol, cast
 import uuid
 
@@ -4214,8 +4215,8 @@ class SessionBridgeCoordinator:
                     raise ValueError("unsupported scan provider")
             except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
                 raise
-            except Exception:
-                self._mark_scan_failure(provider)
+            except Exception as exc:
+                self._mark_scan_failure(provider, stage="incremental_scan", exc=exc)
                 return ScanSummary(
                     provider=provider,
                     discovered=0,
@@ -4226,7 +4227,9 @@ class SessionBridgeCoordinator:
                 )
 
             if summary.failed:
-                self._mark_scan_failure(provider)
+                self._mark_scan_failure(
+                    provider, stage="incremental_summary_failed", summary=summary
+                )
             else:
                 await self._complete_backfill_if_drained(provider, discovery_mode)
                 self._mark_scan_success(provider)
@@ -4251,8 +4254,8 @@ class SessionBridgeCoordinator:
                     raise ValueError("unsupported scan provider")
             except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
                 raise
-            except Exception:
-                self._mark_scan_failure(provider)
+            except Exception as exc:
+                self._mark_scan_failure(provider, stage="full_history_scan", exc=exc)
                 return ScanSummary(
                     provider=provider,
                     discovered=0,
@@ -4263,7 +4266,9 @@ class SessionBridgeCoordinator:
                 )
 
             if summary.failed:
-                self._mark_scan_failure(provider)
+                self._mark_scan_failure(
+                    provider, stage="full_history_summary_failed", summary=summary
+                )
             else:
                 self._mark_scan_success(provider)
             return ScanSummary(
@@ -5191,9 +5196,67 @@ class SessionBridgeCoordinator:
         if not task.cancelled():
             task.exception()
 
-    def _mark_scan_failure(self, provider: Provider) -> None:
+    def _mark_scan_failure(
+        self,
+        provider: Provider,
+        *,
+        stage: str = "unspecified",
+        exc: BaseException | None = None,
+        summary: object = None,
+    ) -> None:
         self._provider_health[provider]["degraded_reason"] = "scan_failed"
         self._record_error_code(f"{provider.value}_scan_failed")
+        self._record_scan_diagnostic(provider, stage=stage, exc=exc, summary=summary)
+
+    def _record_scan_diagnostic(
+        self,
+        provider: Provider,
+        *,
+        stage: str,
+        exc: BaseException | None,
+        summary: object,
+    ) -> None:
+        """Emit a diagnostic for ANY provider scan failure.
+
+        Codex had _record_codex_scan_diagnostic; claude had NO equivalent, so a
+        claude scan failure produced `work_state=error, degraded_reason=scan_failed`
+        with zero evidence anywhere in the logs -- undiagnosable without attaching a
+        debugger. Both `except Exception` call sites also discarded the exception
+        object entirely, so even its type was lost.
+
+        Redaction reuses the codex helper (redact_sensitive_text + path scrubbing,
+        capped at _CODEX_DIAGNOSTIC_MAX_CHARS); it is provider-agnostic despite the
+        name, so transcript content and filesystem paths never reach the log.
+        Best-effort throughout: instrumentation must never itself fail a scan.
+        """
+        try:
+            exc_type = type(exc).__name__ if exc is not None else "none"
+            detail = _redacted_codex_diagnostic_text(str(exc)) if exc is not None else ""
+            frames: tuple[str, ...] = ()
+            if exc is not None and exc.__traceback__ is not None:
+                raw = traceback.format_tb(exc.__traceback__)[-_CODEX_DIAGNOSTIC_MAX_LINES:]
+                frames = tuple(
+                    _redacted_codex_diagnostic_text(" ".join(line.split()))
+                    for line in raw
+                )
+            summary_text = (
+                _redacted_codex_diagnostic_text(repr(summary))
+                if summary is not None
+                else ""
+            )
+            _LOG.warning(
+                "provider_scan_diagnostic provider=%s stage=%s code=%s exc=%s "
+                "detail=%r summary=%r tb=%r",
+                provider.value,
+                stage,
+                f"{provider.value}_scan_failed",
+                exc_type,
+                detail,
+                summary_text,
+                frames,
+            )
+        except Exception:
+            pass
 
     def _mark_scan_success(self, provider: Provider) -> None:
         self._mark_provider_success(provider)
