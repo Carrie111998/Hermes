@@ -14,6 +14,7 @@ The fix routes all frontend-polled RPCs through ``_LONG_HANDLERS`` so
 the WS read loop is never blocked.
 """
 
+from pathlib import Path
 import io
 import json
 import sys
@@ -38,7 +39,7 @@ def server():
     # the whole test would poison modules first imported inside test bodies
     # (see tests/tui_gateway/test_protocol.py for the full rationale).
     with patch.dict("sys.modules", {
-        "hermes_constants": MagicMock(get_hermes_home=MagicMock(return_value="/tmp/hermes_test")),
+        "hermes_constants": MagicMock(get_hermes_home=MagicMock(return_value=Path("/tmp/hermes_test"))),
         "hermes_cli.env_loader": MagicMock(),
         "hermes_cli.banner": MagicMock(),
         "hermes_state": MagicMock(),
