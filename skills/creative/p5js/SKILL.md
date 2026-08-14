@@ -1,6 +1,6 @@
 ---
 name: p5js
-description: "Use when creating p5.js sketches — generative art, shaders, interactive, 3D."
+description: "Create p5.js sketches (gen art, shaders)."
 version: 1.0.0
 platforms: [linux, macos, windows]
 metadata:

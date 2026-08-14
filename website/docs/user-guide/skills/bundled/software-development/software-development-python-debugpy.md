@@ -1,14 +1,14 @@
 ---
-title: "Python Debugpy — Debug Python: pdb REPL + debugpy remote (DAP)"
+title: "Python Debugpy — Debug Python via pdb/debugpy (DAP)"
 sidebar_label: "Python Debugpy"
-description: "Debug Python: pdb REPL + debugpy remote (DAP)"
+description: "Debug Python via pdb/debugpy (DAP)"
 ---
 
 {/* This page is auto-generated from the skill's SKILL.md by website/scripts/generate-skill-docs.py. Edit the source SKILL.md, not this page. */}
 
 # Python Debugpy
 
-Debug Python: pdb REPL + debugpy remote (DAP).
+Debug Python via pdb/debugpy (DAP).
 
 ## Skill metadata
 

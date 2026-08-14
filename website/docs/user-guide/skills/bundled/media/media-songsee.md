@@ -1,14 +1,14 @@
 ---
-title: "Songsee — Audio spectrograms/features (mel, chroma, MFCC) via CLI"
+title: "Songsee — Analyze audio features (spectrograms, MFCC)"
 sidebar_label: "Songsee"
-description: "Audio spectrograms/features (mel, chroma, MFCC) via CLI"
+description: "Analyze audio features (spectrograms, MFCC)"
 ---
 
 {/* This page is auto-generated from the skill's SKILL.md by website/scripts/generate-skill-docs.py. Edit the source SKILL.md, not this page. */}
 
 # Songsee
 
-Audio spectrograms/features (mel, chroma, MFCC) via CLI.
+Analyze audio features (spectrograms, MFCC).
 
 ## Skill metadata
 

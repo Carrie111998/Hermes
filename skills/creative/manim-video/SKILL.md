@@ -1,6 +1,6 @@
 ---
 name: manim-video
-description: "Use when creating mathematical animations — Manim CE, 3Blue1Brown style."
+description: "Create math animations with Manim CE."
 version: 1.0.0
 platforms: [linux, macos, windows]
 ---

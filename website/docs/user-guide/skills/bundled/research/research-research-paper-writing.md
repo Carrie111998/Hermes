@@ -1,14 +1,14 @@
 ---
-title: "Research Paper Writing — Write ML papers for NeurIPS/ICML/ICLR: design→submit"
+title: "Research Paper Writing — Write ML papers for NeurIPS/ICML/ICLR"
 sidebar_label: "Research Paper Writing"
-description: "Write ML papers for NeurIPS/ICML/ICLR: design→submit"
+description: "Write ML papers for NeurIPS/ICML/ICLR"
 ---
 
 {/* This page is auto-generated from the skill's SKILL.md by website/scripts/generate-skill-docs.py. Edit the source SKILL.md, not this page. */}
 
 # Research Paper Writing
 
-Write ML papers for NeurIPS/ICML/ICLR: design→submit.
+Write ML papers for NeurIPS/ICML/ICLR.
 
 ## Skill metadata
 

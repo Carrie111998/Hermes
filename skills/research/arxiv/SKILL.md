@@ -1,6 +1,6 @@
 ---
 name: arxiv
-description: "Use when searching arXiv papers by keyword, author, category, or paper ID."
+description: "Search arXiv papers (keyword, author)."
 version: 1.0.0
 author: Hermes Agent
 license: MIT

@@ -1,14 +1,14 @@
 ---
-title: "Imessage — Send and receive iMessages/SMS via the imsg CLI on macOS"
+title: "Imessage — Send/receive iMessages/SMS via imsg CLI"
 sidebar_label: "Imessage"
-description: "Send and receive iMessages/SMS via the imsg CLI on macOS"
+description: "Send/receive iMessages/SMS via imsg CLI"
 ---
 
 {/* This page is auto-generated from the skill's SKILL.md by website/scripts/generate-skill-docs.py. Edit the source SKILL.md, not this page. */}
 
 # Imessage
 
-Send and receive iMessages/SMS via the imsg CLI on macOS.
+Send/receive iMessages/SMS via imsg CLI.
 
 ## Skill metadata
 

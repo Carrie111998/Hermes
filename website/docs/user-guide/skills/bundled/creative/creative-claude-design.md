@@ -1,14 +1,14 @@
 ---
-title: "Claude Design — Design one-off HTML artifacts (landing, deck, prototype)"
+title: "Claude Design — Design one-off HTML artifacts (decks, demos)"
 sidebar_label: "Claude Design"
-description: "Design one-off HTML artifacts (landing, deck, prototype)"
+description: "Design one-off HTML artifacts (decks, demos)"
 ---
 
 {/* This page is auto-generated from the skill's SKILL.md by website/scripts/generate-skill-docs.py. Edit the source SKILL.md, not this page. */}
 
 # Claude Design
 
-Design one-off HTML artifacts (landing, deck, prototype).
+Design one-off HTML artifacts (decks, demos).
 
 ## Skill metadata
 

@@ -1,6 +1,6 @@
 ---
 name: hermes-agent
-description: "Use when configuring, extending, or troubleshooting Hermes Agent itself — CLI, config, models, providers, tools."
+description: "Configure or troubleshoot Hermes Agent itself."
 version: 3.1.0
 author: Hermes Agent + Teknium
 license: MIT

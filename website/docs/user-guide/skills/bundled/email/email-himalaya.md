@@ -1,14 +1,14 @@
 ---
-title: "Himalaya — Himalaya CLI: IMAP/SMTP email from terminal"
+title: "Himalaya — Send/read email via Himalaya CLI"
 sidebar_label: "Himalaya"
-description: "Himalaya CLI: IMAP/SMTP email from terminal"
+description: "Send/read email via Himalaya CLI"
 ---
 
 {/* This page is auto-generated from the skill's SKILL.md by website/scripts/generate-skill-docs.py. Edit the source SKILL.md, not this page. */}
 
 # Himalaya
 
-Himalaya CLI: IMAP/SMTP email from terminal.
+Send/read email via Himalaya CLI.
 
 ## Skill metadata
 
@@ -228,13 +228,13 @@ Note: `himalaya message write` without piped input opens `$EDITOR`. This works w
 
 ### Move/Copy Emails
 
-Move to folder:
+Move to folder (target folder comes first, then the message ID):
 
 ```bash
 himalaya message move "Archive" 42
 ```
 
-Copy to folder:
+Copy to folder (target folder comes first, then the message ID):
 
 ```bash
 himalaya message copy "Important" 42

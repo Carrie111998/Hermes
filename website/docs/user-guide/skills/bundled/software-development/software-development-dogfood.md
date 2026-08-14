@@ -1,14 +1,14 @@
 ---
-title: "Dogfood — Exploratory QA of web apps: find bugs, evidence, reports"
+title: "Dogfood — Do exploratory QA of web apps"
 sidebar_label: "Dogfood"
-description: "Exploratory QA of web apps: find bugs, evidence, reports"
+description: "Do exploratory QA of web apps"
 ---
 
 {/* This page is auto-generated from the skill's SKILL.md by website/scripts/generate-skill-docs.py. Edit the source SKILL.md, not this page. */}
 
 # Dogfood
 
-Exploratory QA of web apps: find bugs, evidence, reports.
+Do exploratory QA of web apps.
 
 ## Skill metadata
 

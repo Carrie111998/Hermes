@@ -1,6 +1,6 @@
 ---
 name: powerpoint
-description: "Use when creating, reading, or editing .pptx decks, slides, notes, or templates."
+description: "Create/read/edit .pptx decks."
 version: 2.0.0
 author: Anthropic (adapted by Nous Research)
 license: Proprietary. LICENSE.txt has complete terms

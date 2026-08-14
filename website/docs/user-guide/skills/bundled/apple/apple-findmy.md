@@ -8,7 +8,7 @@ description: "Track Apple devices/AirTags via FindMy"
 
 # Findmy
 
-Track Apple devices/AirTags via FindMy.app on macOS.
+Track Apple devices/AirTags via FindMy.app.
 
 ## Skill metadata
 

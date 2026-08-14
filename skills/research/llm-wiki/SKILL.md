@@ -1,6 +1,6 @@
 ---
 name: llm-wiki
-description: "Use when building or querying Karpathy's LLM Wiki — interlinked markdown knowledge base."
+description: "Query Karpathy's LLM Wiki."
 version: 2.1.0
 author: Hermes Agent
 license: MIT

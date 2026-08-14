@@ -1,6 +1,6 @@
 ---
 name: comfyui
-description: "Use when generating images, video, or audio with ComfyUI — install, manage nodes/models, run workflows."
+description: "Generate images/video/audio with ComfyUI."
 version: 5.1.0
 author: [kshitijk4poor, alt-glitch, purzbeats]
 license: MIT

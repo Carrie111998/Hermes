@@ -1,14 +1,14 @@
 ---
-title: "Maps — Geocode, POIs, routes, timezones via OpenStreetMap/OSRM"
+title: "Maps — Geocode/find routes via OSM/OSRM"
 sidebar_label: "Maps"
-description: "Geocode, POIs, routes, timezones via OpenStreetMap/OSRM"
+description: "Geocode/find routes via OSM/OSRM"
 ---
 
 {/* This page is auto-generated from the skill's SKILL.md by website/scripts/generate-skill-docs.py. Edit the source SKILL.md, not this page. */}
 
 # Maps
 
-Geocode, POIs, routes, timezones via OpenStreetMap/OSRM.
+Geocode/find routes via OSM/OSRM.
 
 ## Skill metadata
 

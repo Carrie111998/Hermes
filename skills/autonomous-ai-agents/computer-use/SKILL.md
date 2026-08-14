@@ -1,6 +1,6 @@
 ---
 name: computer-use
-description: "Use when driving the user's desktop in the background — clicking, typing, scrolling. macOS/Windows/Linux."
+description: "Drive the desktop in background (click, type)."
 version: 2.0.0
 platforms: [macos, windows, linux]
 metadata:

@@ -1,14 +1,14 @@
 ---
-title: "Youtube Content — YouTube transcripts to summaries, threads, blogs"
+title: "Youtube Content — Convert YouTube transcripts to summaries"
 sidebar_label: "Youtube Content"
-description: "YouTube transcripts to summaries, threads, blogs"
+description: "Convert YouTube transcripts to summaries"
 ---
 
 {/* This page is auto-generated from the skill's SKILL.md by website/scripts/generate-skill-docs.py. Edit the source SKILL.md, not this page. */}
 
 # Youtube Content
 
-YouTube transcripts to summaries, threads, blogs.
+Convert YouTube transcripts to summaries.
 
 ## Skill metadata
 

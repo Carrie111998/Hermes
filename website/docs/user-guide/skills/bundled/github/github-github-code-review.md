@@ -1,14 +1,14 @@
 ---
-title: "Github Code Review — Review PRs: diffs, inline comments via gh or REST"
+title: "Github Code Review — Review GitHub PRs (diffs, inline comments)"
 sidebar_label: "Github Code Review"
-description: "Review PRs: diffs, inline comments via gh or REST"
+description: "Review GitHub PRs (diffs, inline comments)"
 ---
 
 {/* This page is auto-generated from the skill's SKILL.md by website/scripts/generate-skill-docs.py. Edit the source SKILL.md, not this page. */}
 
 # Github Code Review
 
-Review PRs: diffs, inline comments via gh or REST.
+Review GitHub PRs (diffs, inline comments).
 
 ## Skill metadata
 

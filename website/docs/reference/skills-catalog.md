@@ -16,132 +16,132 @@ If a skill is missing from this list but present in the repo, the catalog is reg
 
 | Skill | Description | Path |
 |-------|-------------|------|
-| [`apple-notes`](/docs/user-guide/skills/bundled/apple/apple-apple-notes) | Manage Apple Notes via memo CLI: create, search, edit. | `apple/apple-notes` |
-| [`apple-reminders`](/docs/user-guide/skills/bundled/apple/apple-apple-reminders) | Apple Reminders via remindctl: add, list, complete. | `apple/apple-reminders` |
-| [`findmy`](/docs/user-guide/skills/bundled/apple/apple-findmy) | Track Apple devices/AirTags via FindMy.app on macOS. | `apple/findmy` |
-| [`imessage`](/docs/user-guide/skills/bundled/apple/apple-imessage) | Send and receive iMessages/SMS via the imsg CLI on macOS. | `apple/imessage` |
+| [`apple-notes`](/docs/user-guide/skills/bundled/apple/apple-apple-notes) | Search and edit Apple Notes via memo CLI. | `apple/apple-notes` |
+| [`apple-reminders`](/docs/user-guide/skills/bundled/apple/apple-apple-reminders) | Manage Apple Reminders via remindctl CLI. | `apple/apple-reminders` |
+| [`findmy`](/docs/user-guide/skills/bundled/apple/apple-findmy) | Track Apple devices/AirTags via FindMy.app. | `apple/findmy` |
+| [`imessage`](/docs/user-guide/skills/bundled/apple/apple-imessage) | Send/receive iMessages/SMS via imsg CLI. | `apple/imessage` |
 
 ## autonomous-ai-agents
 
 | Skill | Description | Path |
 |-------|-------------|------|
-| [`claude-code`](/docs/user-guide/skills/bundled/autonomous-ai-agents/autonomous-ai-agents-claude-code) | Delegate coding to Claude Code CLI (features, PRs). | `autonomous-ai-agents/claude-code` |
-| [`codex`](/docs/user-guide/skills/bundled/autonomous-ai-agents/autonomous-ai-agents-codex) | Delegate coding to OpenAI Codex CLI (features, PRs). | `autonomous-ai-agents/codex` |
-| [`computer-use`](/docs/user-guide/skills/bundled/autonomous-ai-agents/autonomous-ai-agents-computer-use) | Drive the user's desktop in the background — clicking, typing, scrolling, dragging — without stealing the cursor, keyboard focus, or switching virtual desktops / Spaces. Cross-platform: macOS, Windows, Linux. Works with any tool-capable... | `autonomous-ai-agents/computer-use` |
-| [`hermes-agent`](/docs/user-guide/skills/bundled/autonomous-ai-agents/autonomous-ai-agents-hermes-agent) | Use, configure, theme, extend, and orchestrate Hermes Agent. | `autonomous-ai-agents/hermes-agent` |
-| [`opencode`](/docs/user-guide/skills/bundled/autonomous-ai-agents/autonomous-ai-agents-opencode) | Delegate coding to OpenCode CLI (features, PR review). | `autonomous-ai-agents/opencode` |
+| [`claude-code`](/docs/user-guide/skills/bundled/autonomous-ai-agents/autonomous-ai-agents-claude-code) | Delegate coding to Claude Code CLI (PRs, edits). | `autonomous-ai-agents/claude-code` |
+| [`codex`](/docs/user-guide/skills/bundled/autonomous-ai-agents/autonomous-ai-agents-codex) | Delegate coding to OpenAI Codex CLI (PRs). | `autonomous-ai-agents/codex` |
+| [`computer-use`](/docs/user-guide/skills/bundled/autonomous-ai-agents/autonomous-ai-agents-computer-use) | Drive the desktop in background (click, type). | `autonomous-ai-agents/computer-use` |
+| [`hermes-agent`](/docs/user-guide/skills/bundled/autonomous-ai-agents/autonomous-ai-agents-hermes-agent) | Configure or troubleshoot Hermes Agent itself. | `autonomous-ai-agents/hermes-agent` |
+| [`opencode`](/docs/user-guide/skills/bundled/autonomous-ai-agents/autonomous-ai-agents-opencode) | Delegate coding to OpenCode CLI (PR review). | `autonomous-ai-agents/opencode` |
 
 ## creative
 
 | Skill | Description | Path |
 |-------|-------------|------|
-| [`architecture-diagram`](/docs/user-guide/skills/bundled/creative/creative-architecture-diagram) | Dark-themed SVG architecture/cloud/infra diagrams as HTML. | `creative/architecture-diagram` |
-| [`ascii-art`](/docs/user-guide/skills/bundled/creative/creative-ascii-art) | ASCII art: pyfiglet, cowsay, boxes, image-to-ascii. | `creative/ascii-art` |
-| [`ascii-video`](/docs/user-guide/skills/bundled/creative/creative-ascii-video) | ASCII video: convert video/audio to colored ASCII MP4/GIF. | `creative/ascii-video` |
-| [`baoyu-infographic`](/docs/user-guide/skills/bundled/creative/creative-baoyu-infographic) | Infographics: 21 layouts x 21 styles (信息图, 可视化). | `creative/baoyu-infographic` |
-| [`claude-design`](/docs/user-guide/skills/bundled/creative/creative-claude-design) | Design one-off HTML artifacts (landing, deck, prototype). | `creative/claude-design` |
-| [`comfyui`](/docs/user-guide/skills/bundled/creative/creative-comfyui) | Generate images, video, and audio via diffusion workflows. | `creative/comfyui` |
-| [`design-md`](/docs/user-guide/skills/bundled/creative/creative-design-md) | Author/validate/export Google's DESIGN.md token spec files. | `creative/design-md` |
-| [`excalidraw`](/docs/user-guide/skills/bundled/creative/creative-excalidraw) | Hand-drawn Excalidraw JSON diagrams (arch, flow, seq). | `creative/excalidraw` |
-| [`humanizer`](/docs/user-guide/skills/bundled/creative/creative-humanizer) | Humanize text: strip AI-isms and add real voice. | `creative/humanizer` |
-| [`manim-video`](/docs/user-guide/skills/bundled/creative/creative-manim-video) | Manim CE animations: 3Blue1Brown math/algo videos. | `creative/manim-video` |
-| [`p5js`](/docs/user-guide/skills/bundled/creative/creative-p5js) | p5.js sketches: gen art, shaders, interactive, 3D. | `creative/p5js` |
-| [`popular-web-designs`](/docs/user-guide/skills/bundled/creative/creative-popular-web-designs) | 54 real design systems (Stripe, Linear, Vercel) as HTML/CSS. | `creative/popular-web-designs` |
-| [`pretext`](/docs/user-guide/skills/bundled/creative/creative-pretext) | Build creative browser demos with DOM-free text layout. | `creative/pretext` |
-| [`sketch`](/docs/user-guide/skills/bundled/creative/creative-sketch) | Throwaway HTML mockups: 2-3 design variants to compare. | `creative/sketch` |
-| [`songwriting-and-ai-music`](/docs/user-guide/skills/bundled/creative/creative-songwriting-and-ai-music) | Songwriting craft and Suno AI music prompts. | `creative/songwriting-and-ai-music` |
+| [`architecture-diagram`](/docs/user-guide/skills/bundled/creative/creative-architecture-diagram) | Create dark-themed SVG/HTML architecture diagrams. | `creative/architecture-diagram` |
+| [`ascii-art`](/docs/user-guide/skills/bundled/creative/creative-ascii-art) | Generate ASCII art (pyfiglet, cowsay, img2ascii). | `creative/ascii-art` |
+| [`ascii-video`](/docs/user-guide/skills/bundled/creative/creative-ascii-video) | Convert video/audio to colored ASCII MP4/GIF. | `creative/ascii-video` |
+| [`baoyu-infographic`](/docs/user-guide/skills/bundled/creative/creative-baoyu-infographic) | Create infographics (21 layouts, data viz). | `creative/baoyu-infographic` |
+| [`claude-design`](/docs/user-guide/skills/bundled/creative/creative-claude-design) | Design one-off HTML artifacts (decks, demos). | `creative/claude-design` |
+| [`comfyui`](/docs/user-guide/skills/bundled/creative/creative-comfyui) | Generate images/video/audio with ComfyUI. | `creative/comfyui` |
+| [`design-md`](/docs/user-guide/skills/bundled/creative/creative-design-md) | Author/export Google DESIGN.md token specs. | `creative/design-md` |
+| [`excalidraw`](/docs/user-guide/skills/bundled/creative/creative-excalidraw) | Create Excalidraw diagrams (arch, flow). | `creative/excalidraw` |
+| [`humanizer`](/docs/user-guide/skills/bundled/creative/creative-humanizer) | Humanize text — strip AI-isms, add voice. | `creative/humanizer` |
+| [`manim-video`](/docs/user-guide/skills/bundled/creative/creative-manim-video) | Create math animations with Manim CE. | `creative/manim-video` |
+| [`p5js`](/docs/user-guide/skills/bundled/creative/creative-p5js) | Create p5.js sketches (gen art, shaders). | `creative/p5js` |
+| [`popular-web-designs`](/docs/user-guide/skills/bundled/creative/creative-popular-web-designs) | Reference real design systems as HTML/CSS. | `creative/popular-web-designs` |
+| [`pretext`](/docs/user-guide/skills/bundled/creative/creative-pretext) | Build creative browser text demos. | `creative/pretext` |
+| [`sketch`](/docs/user-guide/skills/bundled/creative/creative-sketch) | Create throwaway HTML mockups (A/B compare). | `creative/sketch` |
+| [`songwriting-and-ai-music`](/docs/user-guide/skills/bundled/creative/creative-songwriting-and-ai-music) | Write songs or generate AI music with Suno. | `creative/songwriting-and-ai-music` |
 | [`touchdesigner-mcp`](/docs/user-guide/skills/bundled/creative/creative-touchdesigner-mcp) | Control TouchDesigner via twozero MCP. | `creative/touchdesigner-mcp` |
 
 ## email
 
 | Skill | Description | Path |
 |-------|-------------|------|
-| [`himalaya`](/docs/user-guide/skills/bundled/email/email-himalaya) | Himalaya CLI: IMAP/SMTP email from terminal. | `email/himalaya` |
+| [`himalaya`](/docs/user-guide/skills/bundled/email/email-himalaya) | Send/read email via Himalaya CLI. | `email/himalaya` |
 
 ## github
 
 | Skill | Description | Path |
 |-------|-------------|------|
-| [`codebase-inspection`](/docs/user-guide/skills/bundled/github/github-codebase-inspection) | Inspect codebases w/ pygount: LOC, languages, ratios. | `github/codebase-inspection` |
-| [`github-auth`](/docs/user-guide/skills/bundled/github/github-github-auth) | GitHub auth setup: HTTPS tokens, SSH keys, gh CLI login. | `github/github-auth` |
-| [`github-code-review`](/docs/user-guide/skills/bundled/github/github-github-code-review) | Review PRs: diffs, inline comments via gh or REST. | `github/github-code-review` |
-| [`github-issues`](/docs/user-guide/skills/bundled/github/github-github-issues) | Create, triage, label, assign GitHub issues via gh or REST. | `github/github-issues` |
-| [`github-pr-workflow`](/docs/user-guide/skills/bundled/github/github-github-pr-workflow) | GitHub PR lifecycle: branch, commit, open, CI, merge. | `github/github-pr-workflow` |
-| [`github-repo-management`](/docs/user-guide/skills/bundled/github/github-github-repo-management) | Clone/create/fork repos; manage remotes, releases. | `github/github-repo-management` |
+| [`codebase-inspection`](/docs/user-guide/skills/bundled/github/github-codebase-inspection) | Inspect codebases with pygount (LOC, ratios). | `github/codebase-inspection` |
+| [`github-auth`](/docs/user-guide/skills/bundled/github/github-github-auth) | Set up GitHub auth (tokens, SSH, gh CLI). | `github/github-auth` |
+| [`github-code-review`](/docs/user-guide/skills/bundled/github/github-github-code-review) | Review GitHub PRs (diffs, inline comments). | `github/github-code-review` |
+| [`github-issues`](/docs/user-guide/skills/bundled/github/github-github-issues) | Create/triage GitHub issues via gh CLI. | `github/github-issues` |
+| [`github-pr-workflow`](/docs/user-guide/skills/bundled/github/github-github-pr-workflow) | Manage GitHub PR lifecycle (branch→merge). | `github/github-pr-workflow` |
+| [`github-repo-management`](/docs/user-guide/skills/bundled/github/github-github-repo-management) | Clone/create/fork GitHub repos. | `github/github-repo-management` |
 
 ## media
 
 | Skill | Description | Path |
 |-------|-------------|------|
-| [`gif-search`](/docs/user-guide/skills/bundled/media/media-gif-search) | Search/download GIFs from Tenor via curl + jq. | `media/gif-search` |
-| [`songsee`](/docs/user-guide/skills/bundled/media/media-songsee) | Audio spectrograms/features (mel, chroma, MFCC) via CLI. | `media/songsee` |
-| [`youtube-content`](/docs/user-guide/skills/bundled/media/media-youtube-content) | YouTube transcripts to summaries, threads, blogs. | `media/youtube-content` |
+| [`gif-search`](/docs/user-guide/skills/bundled/media/media-gif-search) | Search/download GIFs from Tenor. | `media/gif-search` |
+| [`songsee`](/docs/user-guide/skills/bundled/media/media-songsee) | Analyze audio features (spectrograms, MFCC). | `media/songsee` |
+| [`youtube-content`](/docs/user-guide/skills/bundled/media/media-youtube-content) | Convert YouTube transcripts to summaries. | `media/youtube-content` |
 
 ## mlops
 
 | Skill | Description | Path |
 |-------|-------------|------|
-| [`huggingface-hub`](/docs/user-guide/skills/bundled/mlops/mlops-huggingface-hub) | HuggingFace hf CLI: search/download/upload models, datasets. | `mlops/huggingface-hub` |
-| [`llama-cpp`](/docs/user-guide/skills/bundled/mlops/mlops-inference-llama-cpp) | llama.cpp local GGUF inference + HF Hub model discovery. | `mlops/inference/llama-cpp` |
-| [`evaluating-llms-harness`](/docs/user-guide/skills/bundled/mlops/mlops-evaluation-evaluating-llms-harness) | lm-eval-harness: benchmark LLMs (MMLU, GSM8K, etc.). | `mlops/evaluation/evaluating-llms-harness` |
-| [`serving-llms-vllm`](/docs/user-guide/skills/bundled/mlops/mlops-inference-serving-llms-vllm) | vLLM: high-throughput LLM serving, OpenAI API, quantization. | `mlops/inference/serving-llms-vllm` |
-| [`weights-and-biases`](/docs/user-guide/skills/bundled/mlops/mlops-evaluation-weights-and-biases) | W&B: log ML experiments, sweeps, model registry, dashboards. | `mlops/evaluation/weights-and-biases` |
+| [`evaluating-llms-harness`](/docs/user-guide/skills/bundled/mlops/mlops-evaluation-evaluating-llms-harness) | Benchmark LLMs with lm-eval-harness. | `mlops/evaluation/evaluating-llms-harness` |
+| [`huggingface-hub`](/docs/user-guide/skills/bundled/mlops/mlops-huggingface-hub) | Search/download models via HuggingFace hf. | `mlops/huggingface-hub` |
+| [`llama-cpp`](/docs/user-guide/skills/bundled/mlops/mlops-inference-llama-cpp) | Run local GGUF inference with llama.cpp. | `mlops/inference/llama-cpp` |
+| [`serving-llms-vllm`](/docs/user-guide/skills/bundled/mlops/mlops-inference-serving-llms-vllm) | Serve LLMs with vLLM (OpenAI API compat). | `mlops/inference/serving-llms-vllm` |
+| [`weights-and-biases`](/docs/user-guide/skills/bundled/mlops/mlops-evaluation-weights-and-biases) | Log ML experiments to Weights & Biases. | `mlops/evaluation/weights-and-biases` |
 
 ## note-taking
 
 | Skill | Description | Path |
 |-------|-------------|------|
-| [`obsidian`](/docs/user-guide/skills/bundled/note-taking/note-taking-obsidian) | Read, search, create, and edit notes in the Obsidian vault. | `note-taking/obsidian` |
+| [`obsidian`](/docs/user-guide/skills/bundled/note-taking/note-taking-obsidian) | Read/search/edit Obsidian vault notes. | `note-taking/obsidian` |
 
 ## productivity
 
 | Skill | Description | Path |
 |-------|-------------|------|
-| [`airtable`](/docs/user-guide/skills/bundled/productivity/productivity-airtable) | Airtable REST API via curl. Records CRUD, filters, upserts. | `productivity/airtable` |
-| [`docx`](/docs/user-guide/skills/bundled/productivity/productivity-docx) | Create, read, edit Word .docx documents and templates. | `productivity/docx` |
-| [`google-workspace`](/docs/user-guide/skills/bundled/productivity/productivity-google-workspace) | Gmail, Calendar, Drive, Docs, Sheets via gws CLI or Python. | `productivity/google-workspace` |
-| [`maps`](/docs/user-guide/skills/bundled/productivity/productivity-maps) | Geocode, POIs, routes, timezones via OpenStreetMap/OSRM. | `productivity/maps` |
-| [`nano-pdf`](/docs/user-guide/skills/bundled/productivity/productivity-nano-pdf) | Edit text in existing PDFs via natural-language prompts. | `productivity/nano-pdf` |
-| [`notion`](/docs/user-guide/skills/bundled/productivity/productivity-notion) | Notion API + ntn CLI: pages, databases, markdown, Workers. | `productivity/notion` |
-| [`ocr-and-documents`](/docs/user-guide/skills/bundled/productivity/productivity-ocr-and-documents) | Extract text from PDFs/scans (pymupdf, marker-pdf). | `productivity/ocr-and-documents` |
-| [`pdf`](/docs/user-guide/skills/bundled/productivity/productivity-pdf) | Create, merge, split, fill, and secure PDF files. | `productivity/pdf` |
-| [`powerpoint`](/docs/user-guide/skills/bundled/productivity/productivity-powerpoint) | Create, read, edit .pptx decks, slides, notes, templates. | `productivity/powerpoint` |
-| [`teams-meeting-pipeline`](/docs/user-guide/skills/bundled/productivity/productivity-teams-meeting-pipeline) | Teams meeting summaries, job replay, Graph subscriptions. | `productivity/teams-meeting-pipeline` |
-| [`xlsx`](/docs/user-guide/skills/bundled/productivity/productivity-xlsx) | Create, read, edit Excel .xlsx spreadsheets and CSVs. | `productivity/xlsx` |
+| [`airtable`](/docs/user-guide/skills/bundled/productivity/productivity-airtable) | Work with Airtable via REST API. | `productivity/airtable` |
+| [`docx`](/docs/user-guide/skills/bundled/productivity/productivity-docx) | Create/read/edit Word .docx documents. | `productivity/docx` |
+| [`google-workspace`](/docs/user-guide/skills/bundled/productivity/productivity-google-workspace) | Work with Gmail/Calendar/Drive via gws CLI. | `productivity/google-workspace` |
+| [`maps`](/docs/user-guide/skills/bundled/productivity/productivity-maps) | Geocode/find routes via OSM/OSRM. | `productivity/maps` |
+| [`nano-pdf`](/docs/user-guide/skills/bundled/productivity/productivity-nano-pdf) | Edit PDF text via nano-pdf CLI. | `productivity/nano-pdf` |
+| [`notion`](/docs/user-guide/skills/bundled/productivity/productivity-notion) | Work with Notion API via ntn CLI. | `productivity/notion` |
+| [`ocr-and-documents`](/docs/user-guide/skills/bundled/productivity/productivity-ocr-and-documents) | Extract text from PDFs (pymupdf, marker). | `productivity/ocr-and-documents` |
+| [`pdf`](/docs/user-guide/skills/bundled/productivity/productivity-pdf) | Create/merge/split PDF files. | `productivity/pdf` |
+| [`powerpoint`](/docs/user-guide/skills/bundled/productivity/productivity-powerpoint) | Create/read/edit .pptx decks. | `productivity/powerpoint` |
+| [`teams-meeting-pipeline`](/docs/user-guide/skills/bundled/productivity/productivity-teams-meeting-pipeline) | Summarize Teams meetings via Graph API. | `productivity/teams-meeting-pipeline` |
+| [`xlsx`](/docs/user-guide/skills/bundled/productivity/productivity-xlsx) | Create/read/edit Excel .xlsx/CSV files. | `productivity/xlsx` |
 
 ## research
 
 | Skill | Description | Path |
 |-------|-------------|------|
-| [`arxiv`](/docs/user-guide/skills/bundled/research/research-arxiv) | Search arXiv papers by keyword, author, category, or ID. | `research/arxiv` |
-| [`blogwatcher`](/docs/user-guide/skills/bundled/research/research-blogwatcher) | Monitor blogs and RSS/Atom feeds via blogwatcher-cli tool. | `research/blogwatcher` |
-| [`llm-wiki`](/docs/user-guide/skills/bundled/research/research-llm-wiki) | Karpathy's LLM Wiki: build/query interlinked markdown KB. | `research/llm-wiki` |
-| [`polymarket`](/docs/user-guide/skills/bundled/research/research-polymarket) | Query Polymarket: markets, prices, orderbooks, history. | `research/polymarket` |
-| [`research-paper-writing`](/docs/user-guide/skills/bundled/research/research-research-paper-writing) | Write ML papers for NeurIPS/ICML/ICLR: design→submit. | `research/research-paper-writing` |
+| [`arxiv`](/docs/user-guide/skills/bundled/research/research-arxiv) | Search arXiv papers (keyword, author). | `research/arxiv` |
+| [`blogwatcher`](/docs/user-guide/skills/bundled/research/research-blogwatcher) | Monitor blogs/RSS feeds via blogwatcher. | `research/blogwatcher` |
+| [`llm-wiki`](/docs/user-guide/skills/bundled/research/research-llm-wiki) | Query Karpathy's LLM Wiki. | `research/llm-wiki` |
+| [`polymarket`](/docs/user-guide/skills/bundled/research/research-polymarket) | Query Polymarket (markets, prices). | `research/polymarket` |
+| [`research-paper-writing`](/docs/user-guide/skills/bundled/research/research-research-paper-writing) | Write ML papers for NeurIPS/ICML/ICLR. | `research/research-paper-writing` |
 
 ## smart-home
 
 | Skill | Description | Path |
 |-------|-------------|------|
-| [`openhue`](/docs/user-guide/skills/bundled/smart-home/smart-home-openhue) | Control Philips Hue lights, scenes, rooms via OpenHue CLI. | `smart-home/openhue` |
+| [`openhue`](/docs/user-guide/skills/bundled/smart-home/smart-home-openhue) | Control Philips Hue lights via OpenHue. | `smart-home/openhue` |
 
 ## social-media
 
 | Skill | Description | Path |
 |-------|-------------|------|
-| [`xurl`](/docs/user-guide/skills/bundled/social-media/social-media-xurl) | X/Twitter via xurl CLI: raw post search, posting, DM, media. | `social-media/xurl` |
+| [`xurl`](/docs/user-guide/skills/bundled/social-media/social-media-xurl) | Post/search X/Twitter via xurl CLI. | `social-media/xurl` |
 
 ## software-development
 
 | Skill | Description | Path |
 |-------|-------------|------|
-| [`dogfood`](/docs/user-guide/skills/bundled/software-development/software-development-dogfood) | Exploratory QA of web apps: find bugs, evidence, reports. | `software-development/dogfood` |
-| [`hermes-agent-skill-authoring`](/docs/user-guide/skills/bundled/software-development/software-development-hermes-agent-skill-authoring) | Author in-repo SKILL.md files: frontmatter and structure. | `software-development/hermes-agent-skill-authoring` |
-| [`node-inspect-debugger`](/docs/user-guide/skills/bundled/software-development/software-development-node-inspect-debugger) | Debug Node.js via --inspect + Chrome DevTools Protocol CLI. | `software-development/node-inspect-debugger` |
-| [`plan`](/docs/user-guide/skills/bundled/software-development/software-development-plan) | Write a markdown plan to .hermes/plans/; no execution. | `software-development/plan` |
-| [`python-debugpy`](/docs/user-guide/skills/bundled/software-development/software-development-python-debugpy) | Debug Python: pdb REPL + debugpy remote (DAP). | `software-development/python-debugpy` |
-| [`requesting-code-review`](/docs/user-guide/skills/bundled/software-development/software-development-requesting-code-review) | Pre-commit review: security scan, quality gates, auto-fix. | `software-development/requesting-code-review` |
-| [`simplify-code`](/docs/user-guide/skills/bundled/software-development/software-development-simplify-code) | Parallel 4-agent cleanup of recent code changes. | `software-development/simplify-code` |
-| [`spike`](/docs/user-guide/skills/bundled/software-development/software-development-spike) | Throwaway experiments to validate an idea before build. | `software-development/spike` |
-| [`systematic-debugging`](/docs/user-guide/skills/bundled/software-development/software-development-systematic-debugging) | 4-phase root cause debugging: understand bugs before fixing. | `software-development/systematic-debugging` |
-| [`test-driven-development`](/docs/user-guide/skills/bundled/software-development/software-development-test-driven-development) | TDD: enforce RED-GREEN-REFACTOR, tests before code. | `software-development/test-driven-development` |
+| [`dogfood`](/docs/user-guide/skills/bundled/software-development/software-development-dogfood) | Do exploratory QA of web apps. | `software-development/dogfood` |
+| [`hermes-agent-skill-authoring`](/docs/user-guide/skills/bundled/software-development/software-development-hermes-agent-skill-authoring) | Create or revise SKILL.md files. | `software-development/hermes-agent-skill-authoring` |
+| [`node-inspect-debugger`](/docs/user-guide/skills/bundled/software-development/software-development-node-inspect-debugger) | Debug Node.js via --inspect + CDP. | `software-development/node-inspect-debugger` |
+| [`plan`](/docs/user-guide/skills/bundled/software-development/software-development-plan) | Write actionable markdown plans. | `software-development/plan` |
+| [`python-debugpy`](/docs/user-guide/skills/bundled/software-development/software-development-python-debugpy) | Debug Python via pdb/debugpy (DAP). | `software-development/python-debugpy` |
+| [`requesting-code-review`](/docs/user-guide/skills/bundled/software-development/software-development-requesting-code-review) | Run pre-commit review (scan, auto-fix). | `software-development/requesting-code-review` |
+| [`simplify-code`](/docs/user-guide/skills/bundled/software-development/software-development-simplify-code) | Clean up code (parallel multi-agent). | `software-development/simplify-code` |
+| [`spike`](/docs/user-guide/skills/bundled/software-development/software-development-spike) | Run throwaway experiments (spike). | `software-development/spike` |
+| [`systematic-debugging`](/docs/user-guide/skills/bundled/software-development/software-development-systematic-debugging) | Debug with 4-phase root cause method. | `software-development/systematic-debugging` |
+| [`test-driven-development`](/docs/user-guide/skills/bundled/software-development/software-development-test-driven-development) | Write tests with TDD (RED-GREEN-REFACTOR). | `software-development/test-driven-development` |

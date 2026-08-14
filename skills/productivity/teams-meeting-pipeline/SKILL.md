@@ -1,6 +1,6 @@
 ---
 name: teams-meeting-pipeline
-description: "Use when summarizing Teams meetings, replaying jobs, or managing Graph subscriptions."
+description: "Summarize Teams meetings via Graph API."
 version: 1.1.0
 author: Hermes Agent + Teknium
 license: MIT

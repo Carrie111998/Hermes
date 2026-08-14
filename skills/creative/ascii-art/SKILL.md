@@ -1,6 +1,6 @@
 ---
 name: ascii-art
-description: "Use when generating ASCII art — pyfiglet, cowsay, boxes, image-to-ascii conversion."
+description: "Generate ASCII art (pyfiglet, cowsay, img2ascii)."
 version: 4.0.0
 author: 0xbyt4, Hermes Agent
 license: MIT

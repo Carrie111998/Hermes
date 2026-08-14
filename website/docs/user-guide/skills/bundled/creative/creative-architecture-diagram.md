@@ -1,14 +1,14 @@
 ---
-title: "Architecture Diagram — Dark-themed SVG architecture/cloud/infra diagrams as HTML"
+title: "Architecture Diagram — Create dark-themed SVG/HTML architecture diagrams"
 sidebar_label: "Architecture Diagram"
-description: "Dark-themed SVG architecture/cloud/infra diagrams as HTML"
+description: "Create dark-themed SVG/HTML architecture diagrams"
 ---
 
 {/* This page is auto-generated from the skill's SKILL.md by website/scripts/generate-skill-docs.py. Edit the source SKILL.md, not this page. */}
 
 # Architecture Diagram
 
-Dark-themed SVG architecture/cloud/infra diagrams as HTML.
+Create dark-themed SVG/HTML architecture diagrams.
 
 ## Skill metadata
 

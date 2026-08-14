@@ -1,14 +1,14 @@
 ---
-title: "Opencode — Delegate coding to OpenCode CLI (features, PR review)"
+title: "Opencode — Delegate coding to OpenCode CLI (PR review)"
 sidebar_label: "Opencode"
-description: "Delegate coding to OpenCode CLI (features, PR review)"
+description: "Delegate coding to OpenCode CLI (PR review)"
 ---
 
 {/* This page is auto-generated from the skill's SKILL.md by website/scripts/generate-skill-docs.py. Edit the source SKILL.md, not this page. */}
 
 # Opencode
 
-Delegate coding to OpenCode CLI (features, PR review).
+Delegate coding to OpenCode CLI (PR review).
 
 ## Skill metadata
 

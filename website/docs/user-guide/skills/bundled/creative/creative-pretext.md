@@ -1,14 +1,14 @@
 ---
-title: "Pretext — Build creative browser demos with DOM-free text layout"
+title: "Pretext — Build creative browser text demos"
 sidebar_label: "Pretext"
-description: "Build creative browser demos with DOM-free text layout"
+description: "Build creative browser text demos"
 ---
 
 {/* This page is auto-generated from the skill's SKILL.md by website/scripts/generate-skill-docs.py. Edit the source SKILL.md, not this page. */}
 
 # Pretext
 
-Build creative browser demos with DOM-free text layout.
+Build creative browser text demos.
 
 ## Skill metadata
 

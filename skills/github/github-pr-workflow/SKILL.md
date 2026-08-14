@@ -1,6 +1,6 @@
 ---
 name: github-pr-workflow
-description: "Use when managing GitHub PR lifecycle — branch, commit, open, CI, merge."
+description: "Manage GitHub PR lifecycle (branch→merge)."
 version: 1.1.0
 author: Hermes Agent
 license: MIT

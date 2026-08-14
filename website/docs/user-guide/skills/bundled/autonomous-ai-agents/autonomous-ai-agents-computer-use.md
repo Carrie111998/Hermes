@@ -1,18 +1,14 @@
 ---
-title: "Computer Use"
+title: "Computer Use — Drive the desktop in background (click, type)"
 sidebar_label: "Computer Use"
-description: "Drive the user's desktop in the background — clicking, typing, scrolling, dragging — without stealing the cursor, keyboard focus, or switching virtual deskto..."
+description: "Drive the desktop in background (click, type)"
 ---
 
 {/* This page is auto-generated from the skill's SKILL.md by website/scripts/generate-skill-docs.py. Edit the source SKILL.md, not this page. */}
 
 # Computer Use
 
-Drive the user's desktop in the background — clicking, typing,
-scrolling, dragging — without stealing the cursor, keyboard focus,
-or switching virtual desktops / Spaces. Cross-platform: macOS,
-Windows, Linux. Works with any tool-capable model. Load this skill
-whenever the `computer_use` tool is available.
+Drive the desktop in background (click, type).
 
 ## Skill metadata
 

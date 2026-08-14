@@ -1,14 +1,14 @@
 ---
-title: "Github Pr Workflow — GitHub PR lifecycle: branch, commit, open, CI, merge"
+title: "Github Pr Workflow — Manage GitHub PR lifecycle (branch→merge)"
 sidebar_label: "Github Pr Workflow"
-description: "GitHub PR lifecycle: branch, commit, open, CI, merge"
+description: "Manage GitHub PR lifecycle (branch→merge)"
 ---
 
 {/* This page is auto-generated from the skill's SKILL.md by website/scripts/generate-skill-docs.py. Edit the source SKILL.md, not this page. */}
 
 # Github Pr Workflow
 
-GitHub PR lifecycle: branch, commit, open, CI, merge.
+Manage GitHub PR lifecycle (branch→merge).
 
 ## Skill metadata
 

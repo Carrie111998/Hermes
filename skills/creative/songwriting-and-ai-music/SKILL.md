@@ -1,6 +1,6 @@
 ---
 name: songwriting-and-ai-music
-description: "Use when writing songs or generating AI music with Suno. Lyrics craft + music prompts."
+description: "Write songs or generate AI music with Suno."
 tags: [songwriting, music, suno, parody, lyrics, creative]
 platforms: [linux, macos, windows]
 triggers:

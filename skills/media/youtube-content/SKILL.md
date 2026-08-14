@@ -1,6 +1,6 @@
 ---
 name: youtube-content
-description: "Use when converting YouTube transcripts to summaries, threads, or blog posts."
+description: "Convert YouTube transcripts to summaries."
 platforms: [linux, macos, windows]
 ---
 

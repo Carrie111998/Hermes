@@ -1,6 +1,6 @@
 ---
 name: evaluating-llms-harness
-description: "Use when benchmarking LLMs with lm-eval-harness — MMLU, GSM8K, and other standard tasks."
+description: "Benchmark LLMs with lm-eval-harness."
 version: 1.0.1
 author: Orchestra Research
 license: MIT

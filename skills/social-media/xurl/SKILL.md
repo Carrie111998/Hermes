@@ -1,6 +1,6 @@
 ---
 name: xurl
-description: "Use when posting to or searching X/Twitter via xurl CLI — raw post search, DMs, media upload."
+description: "Post/search X/Twitter via xurl CLI."
 version: 1.1.3
 author: xdevplatform + openclaw + Hermes Agent
 license: MIT

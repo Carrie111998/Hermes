@@ -1,14 +1,14 @@
 ---
-title: "Popular Web Designs — 54 real design systems (Stripe, Linear, Vercel) as HTML/CSS"
+title: "Popular Web Designs — Reference real design systems as HTML/CSS"
 sidebar_label: "Popular Web Designs"
-description: "54 real design systems (Stripe, Linear, Vercel) as HTML/CSS"
+description: "Reference real design systems as HTML/CSS"
 ---
 
 {/* This page is auto-generated from the skill's SKILL.md by website/scripts/generate-skill-docs.py. Edit the source SKILL.md, not this page. */}
 
 # Popular Web Designs
 
-54 real design systems (Stripe, Linear, Vercel) as HTML/CSS.
+Reference real design systems as HTML/CSS.
 
 ## Skill metadata
 

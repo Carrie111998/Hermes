@@ -1,6 +1,6 @@
 ---
 name: excalidraw
-description: "Use when creating hand-drawn Excalidraw diagrams — architecture, flowcharts, sequence diagrams."
+description: "Create Excalidraw diagrams (arch, flow)."
 version: 1.0.1
 author: Hermes Agent
 license: MIT

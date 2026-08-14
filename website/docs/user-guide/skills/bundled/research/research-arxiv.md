@@ -1,14 +1,14 @@
 ---
-title: "Arxiv — Search arXiv papers by keyword, author, category, or ID"
+title: "Arxiv — Search arXiv papers (keyword, author)"
 sidebar_label: "Arxiv"
-description: "Search arXiv papers by keyword, author, category, or ID"
+description: "Search arXiv papers (keyword, author)"
 ---
 
 {/* This page is auto-generated from the skill's SKILL.md by website/scripts/generate-skill-docs.py. Edit the source SKILL.md, not this page. */}
 
 # Arxiv
 
-Search arXiv papers by keyword, author, category, or ID.
+Search arXiv papers (keyword, author).
 
 ## Skill metadata
 

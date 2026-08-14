@@ -1,14 +1,14 @@
 ---
-title: "Ascii Video — ASCII video: convert video/audio to colored ASCII MP4/GIF"
+title: "Ascii Video — Convert video/audio to colored ASCII MP4/GIF"
 sidebar_label: "Ascii Video"
-description: "ASCII video: convert video/audio to colored ASCII MP4/GIF"
+description: "Convert video/audio to colored ASCII MP4/GIF"
 ---
 
 {/* This page is auto-generated from the skill's SKILL.md by website/scripts/generate-skill-docs.py. Edit the source SKILL.md, not this page. */}
 
 # Ascii Video
 
-ASCII video: convert video/audio to colored ASCII MP4/GIF.
+Convert video/audio to colored ASCII MP4/GIF.
 
 ## Skill metadata
 

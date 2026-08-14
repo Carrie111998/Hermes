@@ -1,14 +1,14 @@
 ---
-title: "Simplify Code — Parallel 4-agent cleanup of recent code changes"
+title: "Simplify Code — Clean up code (parallel multi-agent)"
 sidebar_label: "Simplify Code"
-description: "Parallel 4-agent cleanup of recent code changes"
+description: "Clean up code (parallel multi-agent)"
 ---
 
 {/* This page is auto-generated from the skill's SKILL.md by website/scripts/generate-skill-docs.py. Edit the source SKILL.md, not this page. */}
 
 # Simplify Code
 
-Parallel 4-agent cleanup of recent code changes.
+Clean up code (parallel multi-agent).
 
 ## Skill metadata
 

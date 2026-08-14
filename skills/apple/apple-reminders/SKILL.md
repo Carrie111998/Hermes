@@ -1,6 +1,6 @@
 ---
 name: apple-reminders
-description: "Use when adding, listing, or completing Apple Reminders via remindctl CLI on macOS."
+description: "Manage Apple Reminders via remindctl CLI."
 version: 1.0.0
 author: Hermes Agent
 license: MIT

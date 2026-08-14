@@ -1,14 +1,14 @@
 ---
-title: "Llama Cpp — llama"
+title: "Llama Cpp — Run local GGUF inference with llama"
 sidebar_label: "Llama Cpp"
-description: "llama"
+description: "Run local GGUF inference with llama"
 ---
 
 {/* This page is auto-generated from the skill's SKILL.md by website/scripts/generate-skill-docs.py. Edit the source SKILL.md, not this page. */}
 
 # Llama Cpp
 
-llama.cpp local GGUF inference + HF Hub model discovery.
+Run local GGUF inference with llama.cpp.
 
 ## Skill metadata
 

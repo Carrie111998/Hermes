@@ -1,6 +1,6 @@
 ---
 name: node-inspect-debugger
-description: "Use when debugging Node.js via --inspect and Chrome DevTools Protocol."
+description: "Debug Node.js via --inspect + CDP."
 version: 1.0.0
 author: Hermes Agent
 license: MIT

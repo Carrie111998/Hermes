@@ -1,6 +1,6 @@
 ---
 name: maps
-description: "Use when geocoding, finding POIs, calculating routes, or checking timezones via OpenStreetMap/OSRM."
+description: "Geocode/find routes via OSM/OSRM."
 version: 1.2.0
 author: Mibayy
 license: MIT

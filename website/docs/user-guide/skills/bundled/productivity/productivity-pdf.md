@@ -1,14 +1,14 @@
 ---
-title: "Pdf — Create, merge, split, fill, and secure PDF files"
+title: "Pdf — Create/merge/split PDF files"
 sidebar_label: "Pdf"
-description: "Create, merge, split, fill, and secure PDF files"
+description: "Create/merge/split PDF files"
 ---
 
 {/* This page is auto-generated from the skill's SKILL.md by website/scripts/generate-skill-docs.py. Edit the source SKILL.md, not this page. */}
 
 # Pdf
 
-Create, merge, split, fill, and secure PDF files.
+Create/merge/split PDF files.
 
 ## Skill metadata
 

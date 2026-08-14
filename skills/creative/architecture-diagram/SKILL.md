@@ -1,6 +1,6 @@
 ---
 name: architecture-diagram
-description: "Use when creating dark-themed SVG architecture or infrastructure diagrams as HTML."
+description: "Create dark-themed SVG/HTML architecture diagrams."
 version: 1.0.0
 author: Cocoon AI (hello@cocoon-ai.com), ported by Hermes Agent
 license: MIT

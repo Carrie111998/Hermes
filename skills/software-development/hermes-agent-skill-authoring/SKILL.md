@@ -1,6 +1,6 @@
 ---
 name: hermes-agent-skill-authoring
-description: "Use when creating or revising any SKILL.md. Covers routing descriptions, progressive disclosure, gotchas flywheel, eval-first workflow."
+description: "Create or revise SKILL.md files."
 version: 2.0.0
 author: Hermes Agent
 license: MIT

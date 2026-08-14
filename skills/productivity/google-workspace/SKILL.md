@@ -1,6 +1,6 @@
 ---
 name: google-workspace
-description: "Use when working with Gmail, Calendar, Drive, Docs, or Sheets via gws CLI."
+description: "Work with Gmail/Calendar/Drive via gws CLI."
 version: 1.1.0
 author: Nous Research
 license: MIT

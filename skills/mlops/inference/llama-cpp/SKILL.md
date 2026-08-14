@@ -1,6 +1,6 @@
 ---
 name: llama-cpp
-description: "Use when running local GGUF inference with llama.cpp + HuggingFace Hub model discovery."
+description: "Run local GGUF inference with llama.cpp."
 version: 2.1.2
 author: Orchestra Research
 license: MIT

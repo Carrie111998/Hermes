@@ -1,6 +1,6 @@
 ---
 name: dogfood
-description: "Use when doing exploratory QA of web apps — find bugs, collect evidence, write reports."
+description: "Do exploratory QA of web apps."
 version: 1.0.0
 platforms: [linux, macos, windows]
 metadata:

@@ -1,6 +1,6 @@
 ---
 name: huggingface-hub
-description: "Use when searching, downloading, or uploading models and datasets via HuggingFace hf CLI."
+description: "Search/download models via HuggingFace hf."
 version: 1.0.1
 author: Hugging Face
 license: MIT

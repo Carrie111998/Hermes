@@ -1,14 +1,14 @@
 ---
-title: "Baoyu Infographic — Infographics: 21 layouts x 21 styles (信息图, 可视化)"
+title: "Baoyu Infographic — Create infographics (21 layouts, data viz)"
 sidebar_label: "Baoyu Infographic"
-description: "Infographics: 21 layouts x 21 styles (信息图, 可视化)"
+description: "Create infographics (21 layouts, data viz)"
 ---
 
 {/* This page is auto-generated from the skill's SKILL.md by website/scripts/generate-skill-docs.py. Edit the source SKILL.md, not this page. */}
 
 # Baoyu Infographic
 
-Infographics: 21 layouts x 21 styles (信息图, 可视化).
+Create infographics (21 layouts, data viz).
 
 ## Skill metadata
 

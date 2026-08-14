@@ -1,14 +1,14 @@
 ---
-title: "Spike — Throwaway experiments to validate an idea before build"
+title: "Spike — Run throwaway experiments (spike)"
 sidebar_label: "Spike"
-description: "Throwaway experiments to validate an idea before build"
+description: "Run throwaway experiments (spike)"
 ---
 
 {/* This page is auto-generated from the skill's SKILL.md by website/scripts/generate-skill-docs.py. Edit the source SKILL.md, not this page. */}
 
 # Spike
 
-Throwaway experiments to validate an idea before build.
+Run throwaway experiments (spike).
 
 ## Skill metadata
 

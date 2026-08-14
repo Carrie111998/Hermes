@@ -1,14 +1,14 @@
 ---
-title: "Gif Search — Search/download GIFs from Tenor via curl + jq"
+title: "Gif Search — Search/download GIFs from Tenor"
 sidebar_label: "Gif Search"
-description: "Search/download GIFs from Tenor via curl + jq"
+description: "Search/download GIFs from Tenor"
 ---
 
 {/* This page is auto-generated from the skill's SKILL.md by website/scripts/generate-skill-docs.py. Edit the source SKILL.md, not this page. */}
 
 # Gif Search
 
-Search/download GIFs from Tenor via curl + jq.
+Search/download GIFs from Tenor.
 
 ## Skill metadata
 

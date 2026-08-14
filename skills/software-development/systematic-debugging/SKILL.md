@@ -1,6 +1,6 @@
 ---
 name: systematic-debugging
-description: "Use when debugging with 4-phase root cause method — understand bugs before fixing."
+description: "Debug with 4-phase root cause method."
 version: 1.1.0
 author: Hermes Agent (adapted from obra/superpowers)
 license: MIT

@@ -1,6 +1,6 @@
 ---
 name: baoyu-infographic
-description: "Use when creating infographics — 21 layouts × 21 styles for data visualization."
+description: "Create infographics (21 layouts, data viz)."
 version: 1.56.1
 author: 宝玉 (JimLiu)
 license: MIT

@@ -1,14 +1,14 @@
 ---
-title: "Comfyui — Generate images, video, and audio via diffusion workflows"
+title: "Comfyui — Generate images/video/audio with ComfyUI"
 sidebar_label: "Comfyui"
-description: "Generate images, video, and audio via diffusion workflows"
+description: "Generate images/video/audio with ComfyUI"
 ---
 
 {/* This page is auto-generated from the skill's SKILL.md by website/scripts/generate-skill-docs.py. Edit the source SKILL.md, not this page. */}
 
 # Comfyui
 
-Generate images, video, and audio via diffusion workflows.
+Generate images/video/audio with ComfyUI.
 
 ## Skill metadata
 

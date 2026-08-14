@@ -1,14 +1,14 @@
 ---
-title: "Github Auth — GitHub auth setup: HTTPS tokens, SSH keys, gh CLI login"
+title: "Github Auth — Set up GitHub auth (tokens, SSH, gh CLI)"
 sidebar_label: "Github Auth"
-description: "GitHub auth setup: HTTPS tokens, SSH keys, gh CLI login"
+description: "Set up GitHub auth (tokens, SSH, gh CLI)"
 ---
 
 {/* This page is auto-generated from the skill's SKILL.md by website/scripts/generate-skill-docs.py. Edit the source SKILL.md, not this page. */}
 
 # Github Auth
 
-GitHub auth setup: HTTPS tokens, SSH keys, gh CLI login.
+Set up GitHub auth (tokens, SSH, gh CLI).
 
 ## Skill metadata
 

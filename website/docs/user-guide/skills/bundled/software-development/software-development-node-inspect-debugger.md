@@ -8,7 +8,7 @@ description: "Debug Node"
 
 # Node Inspect Debugger
 
-Debug Node.js via --inspect + Chrome DevTools Protocol CLI.
+Debug Node.js via --inspect + CDP.
 
 ## Skill metadata
 

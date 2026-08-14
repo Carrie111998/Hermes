@@ -1,14 +1,14 @@
 ---
-title: "Manim Video — Manim CE animations: 3Blue1Brown math/algo videos"
+title: "Manim Video — Create math animations with Manim CE"
 sidebar_label: "Manim Video"
-description: "Manim CE animations: 3Blue1Brown math/algo videos"
+description: "Create math animations with Manim CE"
 ---
 
 {/* This page is auto-generated from the skill's SKILL.md by website/scripts/generate-skill-docs.py. Edit the source SKILL.md, not this page. */}
 
 # Manim Video
 
-Manim CE animations: 3Blue1Brown math/algo videos.
+Create math animations with Manim CE.
 
 ## Skill metadata
 

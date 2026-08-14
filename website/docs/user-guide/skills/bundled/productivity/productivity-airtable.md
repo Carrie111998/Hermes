@@ -1,14 +1,14 @@
 ---
-title: "Airtable — Airtable REST API via curl"
+title: "Airtable — Work with Airtable via REST API"
 sidebar_label: "Airtable"
-description: "Airtable REST API via curl"
+description: "Work with Airtable via REST API"
 ---
 
 {/* This page is auto-generated from the skill's SKILL.md by website/scripts/generate-skill-docs.py. Edit the source SKILL.md, not this page. */}
 
 # Airtable
 
-Airtable REST API via curl. Records CRUD, filters, upserts.
+Work with Airtable via REST API.
 
 ## Skill metadata
 

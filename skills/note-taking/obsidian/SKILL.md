@@ -1,6 +1,6 @@
 ---
 name: obsidian
-description: "Use when reading, searching, creating, or editing notes in the Obsidian vault."
+description: "Read/search/edit Obsidian vault notes."
 platforms: [linux, macos, windows]
 ---
 

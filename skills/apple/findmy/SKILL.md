@@ -1,6 +1,6 @@
 ---
 name: findmy
-description: "Use when tracking Apple devices or AirTags via FindMy.app on macOS."
+description: "Track Apple devices/AirTags via FindMy.app."
 version: 1.0.0
 author: Hermes Agent
 license: MIT

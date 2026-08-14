@@ -1,6 +1,6 @@
 ---
 name: simplify-code
-description: "Use when cleaning up recent code changes — parallel multi-agent review for simplification."
+description: "Clean up code (parallel multi-agent)."
 version: 1.1.0
 author: Hermes Agent (inspired by Claude Code /simplify)
 license: MIT

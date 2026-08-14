@@ -1,6 +1,6 @@
 ---
 name: blogwatcher
-description: "Use when monitoring blogs or RSS/Atom feeds via blogwatcher-cli."
+description: "Monitor blogs/RSS feeds via blogwatcher."
 version: 2.0.0
 author: JulienTant (fork of Hyaxia/blogwatcher)
 license: MIT

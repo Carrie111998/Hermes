@@ -1,6 +1,6 @@
 ---
 name: gif-search
-description: "Use when searching for or downloading GIFs from Tenor via curl + jq."
+description: "Search/download GIFs from Tenor."
 version: 1.1.0
 author: Hermes Agent
 license: MIT

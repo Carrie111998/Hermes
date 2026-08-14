@@ -1,14 +1,14 @@
 ---
-title: "Excalidraw — Hand-drawn Excalidraw JSON diagrams (arch, flow, seq)"
+title: "Excalidraw — Create Excalidraw diagrams (arch, flow)"
 sidebar_label: "Excalidraw"
-description: "Hand-drawn Excalidraw JSON diagrams (arch, flow, seq)"
+description: "Create Excalidraw diagrams (arch, flow)"
 ---
 
 {/* This page is auto-generated from the skill's SKILL.md by website/scripts/generate-skill-docs.py. Edit the source SKILL.md, not this page. */}
 
 # Excalidraw
 
-Hand-drawn Excalidraw JSON diagrams (arch, flow, seq).
+Create Excalidraw diagrams (arch, flow).
 
 ## Skill metadata
 
@@ -16,7 +16,7 @@ Hand-drawn Excalidraw JSON diagrams (arch, flow, seq).
 |---|---|
 | Source | Bundled (installed by default) |
 | Path | `skills/creative/excalidraw` |
-| Version | `1.0.0` |
+| Version | `1.0.1` |
 | Author | Hermes Agent |
 | License | MIT |
 | Platforms | linux, macos, windows |
@@ -66,7 +66,7 @@ Save to any path, e.g. `~/diagrams/my_diagram.excalidraw`.
 Run the upload script (located in this skill's `scripts/` directory) via terminal:
 
 ```bash
-python skills/diagramming/excalidraw/scripts/upload.py ~/diagrams/my_diagram.excalidraw
+python skills/creative/excalidraw/scripts/upload.py ~/diagrams/my_diagram.excalidraw
 ```
 
 This uploads to excalidraw.com (no account needed) and prints a shareable URL. Requires the `cryptography` pip package (`pip install cryptography`).

@@ -1,14 +1,14 @@
 ---
-title: "Hermes Agent — Use, configure, theme, extend, and orchestrate Hermes Agent"
+title: "Hermes Agent — Configure or troubleshoot Hermes Agent itself"
 sidebar_label: "Hermes Agent"
-description: "Use, configure, theme, extend, and orchestrate Hermes Agent"
+description: "Configure or troubleshoot Hermes Agent itself"
 ---
 
 {/* This page is auto-generated from the skill's SKILL.md by website/scripts/generate-skill-docs.py. Edit the source SKILL.md, not this page. */}
 
 # Hermes Agent
 
-Use, configure, theme, extend, and orchestrate Hermes Agent.
+Configure or troubleshoot Hermes Agent itself.
 
 ## Skill metadata
 

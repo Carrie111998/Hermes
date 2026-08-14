@@ -1,14 +1,14 @@
 ---
-title: "Hermes Agent Skill Authoring — Author in-repo SKILL"
+title: "Hermes Agent Skill Authoring — Create or revise SKILL"
 sidebar_label: "Hermes Agent Skill Authoring"
-description: "Author in-repo SKILL"
+description: "Create or revise SKILL"
 ---
 
 {/* This page is auto-generated from the skill's SKILL.md by website/scripts/generate-skill-docs.py. Edit the source SKILL.md, not this page. */}
 
 # Hermes Agent Skill Authoring
 
-Author in-repo SKILL.md files: frontmatter and structure.
+Create or revise SKILL.md files.
 
 ## Skill metadata
 
@@ -16,11 +16,11 @@ Author in-repo SKILL.md files: frontmatter and structure.
 |---|---|
 | Source | Bundled (installed by default) |
 | Path | `skills/software-development/hermes-agent-skill-authoring` |
-| Version | `1.1.0` |
+| Version | `2.0.0` |
 | Author | Hermes Agent |
 | License | MIT |
 | Platforms | linux, macos, windows |
-| Tags | `skills`, `authoring`, `hermes-agent`, `conventions`, `skill-md` |
+| Tags | `skills`, `authoring`, `hermes-agent`, `conventions`, `skill-md`, `context-engineering` |
 | Related skills | [`plan`](/docs/user-guide/skills/bundled/software-development/software-development-plan), [`requesting-code-review`](/docs/user-guide/skills/bundled/software-development/software-development-requesting-code-review) |
 
 ## Reference: full SKILL.md
@@ -29,39 +29,162 @@ Author in-repo SKILL.md files: frontmatter and structure.
 The following is the complete skill definition that Hermes loads when this skill is triggered. This is what the agent sees as instructions when the skill is active.
 :::
 
-# Authoring Hermes-Agent Skills (in-repo)
+# Authoring Hermes-Agent Skills
 
 ## Overview
 
-There are two places a SKILL.md can live:
+A skill is a **folder** (not just a markdown file) that builds context for the model. It can include scripts, references, assets, templates, and data the agent discovers and uses. Writing a skill is fundamentally different from writing software or human documentation — you are engineering the model's context, not its runtime.
 
-1. **User-local:** `~/.hermes/skills/<maybe-category>/<name>/SKILL.md` — personal, not shared. Created via `skill_manage(action='create')`.
-2. **In-repo (this skill is about this case):** `/home/bb/hermes-agent/skills/<category>/<name>/SKILL.md` — committed, shipped with the package. Use `write_file` + `git add`. `skill_manage(action='create')` does NOT target this tree.
+Two locations:
+
+1. **User-local:** `~/.hermes/skills/<category>/<name>/SKILL.md` — personal. Created via `skill_manage(action='create')`.
+2. **In-repo:** `<repo>/skills/<category>/<name>/SKILL.md` — committed, shipped with the package. Use `write_file` + `git add`. `skill_manage(action='create')` does NOT target this tree.
 
 ## When to Use
 
-- User asks you to add a skill "in this branch / repo / commit"
-- You're committing a reusable workflow that should ship with hermes-agent
-- You're editing an existing skill under `/home/bb/hermes-agent/skills/` (use `patch` for small edits, `write_file` for rewrites; `skill_manage` still works for patch on in-repo skills, but not for `create`)
+- Creating a new skill (user-local or in-repo)
+- Revising an existing skill's description, body, or supporting files
+- Reviewing a skill PR from another engineer
 
-## Required Frontmatter
+**Don't use for:** tasks the model already does well (a skill that restates default behavior adds context cost without value); rapidly-changing references that will drift (use MCP or live fetch instead).
+
+## The Decision Test: Do You Need a Skill?
+
+Before writing anything, apply this test to every proposed skill and every sentence within it:
+
+> **"Would the agent get this wrong — or behave inconsistently — without this instruction?"**
+
+If the answer is no, the skill (or sentence) **cannot afford to exist**. Every skill is a tax: its description costs ~100 tokens in **every session, for every user, always**. Its body costs ~5,000 tokens every time it loads. Skills with fluff degrade not just themselves but every other skill through routing interference.
+
+**You need a skill when:**
+- The agent gets it wrong without special context (internal APIs, gotchas, non-obvious conventions)
+- You need deterministic consistency across runs (deployment steps, code review standards)
+- Your knowledge is durable but not in training data (enterprise workflows, team processes, taste/judgment)
+
+**You don't need a skill when:**
+- The model already knows how to do it (e.g., standard git workflows)
+- The instructions duplicate what's already in the system prompt or global context
+- The reference changes faster than you can maintain it (use live fetch instead)
+
+**Warning:** Research shows that LLM-self-generated skills provide no benefit on average — "models cannot reliably author the procedural knowledge they benefit from consuming." A skill born from real failure cases and human expertise is valuable; a skill an AI wrote by summarizing what it already knows is noise.
+
+## Skill Types (Pick One)
+
+Skills that try to do too much straddle categories and confuse the routing. Know which type you're building:
+
+| Type | What it does | Example |
+|---|---|---|
+| **Library/API reference** | How to correctly use a library/CLI/SDK, with gotchas | Internal billing library edge cases |
+| **Product verification** | How to test/verify code works | Signup flow driver with state assertions |
+| **Data fetching** | Connect to data/monitoring stacks | Grafana datasource UIDs, Datadog field refs |
+| **Process automation** | Multi-step workflow → one command | Standup post, weekly recap |
+| **Code scaffolding** | Generate framework boilerplate | New service with auth/logging pre-wired |
+| **Code quality/review** | Enforce standards, review code | Adversarial review, code style enforcement |
+| **CI/CD & deployment** | Build, deploy, monitor | PR babysitter, gradual rollout with auto-rollback |
+| **Runbooks** | Symptom → investigation → report | Service debugging, log correlator |
+| **Infrastructure ops** | Maintenance with guardrails | Orphan cleanup with soak period |
+
+## The Description: Routing Trigger, Not Documentation
+
+The description is the **single most important line** in the skill. It is not a summary of what the skill does — it is **instructions to the model about when to load the skill**.
+
+### How to write it
+
+1. **Start with "Use when"** — front-load the trigger within the first 57 chars (that's all the system prompt index shows).
+2. **Write in user language** — use the words a frustrated user would type: "babysit PR," "watch CI," "cherry-pick prod fix." Not "monitors pull request status and retries failed checks."
+3. **Be dense and terse** — ~100 tokens per skill is the index budget, paid every session.
+4. **Include trigger keywords** — if users say "deploy," include "deploy" in the description.
+5. **Avoid off-target triggers** — a description that matches too broadly steals routing from other skills. Every new skill risks making every existing skill slightly worse.
+
+### Good vs Bad
+
+- ✅ `Use when debugging Hermes skill discovery failures. Diagnose frontmatter, indexing, loading.`
+- ✅ `Use when writing Java tests. Enforces coverage via knowledge graph, generates JUnit5 + Mockito.`
+- ❌ `This skill contains detailed guidance for agents working on skill discovery failures.` (documentation tone, trigger buried)
+- ❌ `Helps with various development tasks.` (too broad, matches everything)
+
+### Off-target side effects
+
+Adding a skill with a description that overlaps an existing skill's domain causes **routing confusion** — the model loads the wrong skill or loads both, wasting context. Before merging, check: does the new description compete with any existing skill for the same queries?
+
+## Writing the Body
+
+### Skip the obvious
+
+The model already knows how to code and can read your codebase. A skill that restates what the model would do by default adds context without adding value. Focus on information that **pushes the model out of its normal way of thinking**.
+
+### Don't railroad
+
+Write intent, not step-by-step commands. The model handles edge cases better with flexible guidance than with rigid command sequences.
+
+- ✅ `Cherry-pick the commit onto a clean branch. Resolve conflicts preserving intent. If it can't land cleanly, explain why.`
+- ❌ `git log # find the commit; git checkout main; git checkout -b <clean-branch>; git cherry-pick <commit>;`
+
+Overly prescriptive instructions are fragile — when something goes wrong (and it will), the model follows the script instead of adapting.
+
+### Build the gotchas section
+
+**Gotchas are the highest-signal content in any skill.** They are the special cases, footguns, and failure modes that the model cannot learn from training data. Examples:
+
+- "The `subscriptions` table is append-only. The row you want is the one with the highest version, not the most recent `created_at`."
+- "This field is called `@request_id` in the API gateway and `trace_id` in the billing service. They're the same value."
+- "Staging returns 200 even when the webhook didn't process. Check `payment_events` for the real state."
+
+Add a gotcha every time the agent trips up during testing or production. The gotchas section should **grow organically over time** — this is the maintenance flywheel.
+
+### Write completion criteria into steps
+
+Each ordered step should say how the agent knows it's done. "Every modified file accounted for" beats "summarize changes."
+
+## Progressive Disclosure: The 3-Tier Cost Model
+
+A skill is a folder, and the file system is a form of context engineering. Think in three tiers:
+
+| Tier | What loads | Token budget | When you pay |
+|---|---|---|---|
+| **Index** | `name: description` for every skill | ~100 tokens/skill | Every session, every user, **always** |
+| **Load** | Full SKILL.md body | ~5,000 tokens | When the skill is invoked |
+| **Runtime** | `references/`, `scripts/`, `assets/`, `templates/` | Unbounded | Only when the agent reads them |
+
+**Rules:**
+- **Index tier:** Every word matters. Description must be dense, terse, trigger-focused.
+- **Load tier:** Every sentence must change behavior. If it doesn't, it's wasted context that persists until compaction. Multiple skills loading simultaneously multiplies this cost.
+- **Runtime tier:** Lowest bar for inclusion. Put unbounded conditional logic, heavy reference docs, and templates here. The agent only pays when it needs them.
+
+### Folder structure
+
+<!-- ascii-guard-ignore -->
+```
+<skill-name>/
+├── SKILL.md              # Hub: frontmatter + always-needed instructions + gotchas
+├── references/           # Heavy docs loaded conditionally ("Read api-errors.md if API returns non-200")
+├── scripts/              # Deterministic code the agent would otherwise reinvent every run
+├── assets/               # Output templates, schemas the agent copies and fills
+├── templates/            # Input templates for scaffolding
+└── config.json           # First-run user setup (ask once, store, reuse)
+```
+<!-- ascii-guard-ignore-end -->
+
+For intricate skills with 100+ topics, use **multilevel hierarchy**: group into subject areas (20 areas × 15 topics is easier to route than 300 flat topics). Add quick-reference guides to help the model navigate.
+
+## Frontmatter Requirements
 
 Source of truth: `tools/skill_manager_tool.py::_validate_frontmatter`. Hard requirements:
 
-- Starts with `---` as the first bytes (no leading blank line).
+- Starts with `---` at byte 0 (no leading blank line or BOM).
 - Closes with `\n---\n` before the body.
 - Parses as a YAML mapping.
-- `name` field present.
-- `description` field present, ≤ **1024 chars** (`MAX_DESCRIPTION_LENGTH`).
+- `name` field present (lowercase, hyphens, ≤64 chars).
+- `description` field present, ≤ **1024 chars**. First 57 chars are shown in the system prompt skill index; longer text visible via `skills_list()`/`skill_view()`.
 - Non-empty body after the closing `---`.
 
-Peer-matched shape used by every skill under `skills/software-development/`:
+Peer-matched frontmatter:
 
 ```yaml
 ---
-name: my-skill-name               # lowercase, hyphens, ≤64 chars (MAX_NAME_LENGTH)
+name: my-skill-name
 description: Use when <trigger>. <one-line behavior>.
-version: 1.1.0
+version: 2.0.0
 author: Hermes Agent
 license: MIT
 metadata:
@@ -71,111 +194,85 @@ metadata:
 ---
 ```
 
-`version` / `author` / `license` / `metadata` are NOT enforced by the validator, but every peer has them — omit and your skill sticks out.
+`version`/`author`/`license`/`metadata` are not validator-enforced, but every peer has them.
 
 ## Size Limits
 
 - Description: ≤ 1024 chars (enforced).
-- Full SKILL.md: ≤ 100,000 chars (enforced as `MAX_SKILL_CONTENT_CHARS`, ~36k tokens).
-- Peer skills in `software-development/` sit at **8-14k chars**. Aim for that range. If you're pushing past 20k, split into `references/*.md` and reference them from SKILL.md.
+- Full SKILL.md: ≤ 100,000 chars (~36k tokens). Peer skills sit at **8-14k chars**. Push past 20k → split into `references/*.md`.
 
-## Writing Quality Principles
+## Store Scripts, Don't Reconstruct
 
-A skill exists to make the agent's process more predictable. Predictability does **not** mean identical output every run; it means the agent reliably follows the same useful discipline.
+Give the agent code to compose, not reconstruct. One of the most powerful tools in a skill is pre-written scripts and helper functions. This lets the model spend its turns on deciding **what to do next** rather than rebuilding boilerplate.
 
-Use these quality checks when writing or editing any skill:
+For example, a data-fetching skill might include helper functions that the agent composes into analysis scripts on the fly.
 
-1. **Optimize for process predictability.** Ask: what behavior should change when this skill loads? If a line does not change behavior, cut it.
-2. **Choose the right context load.** A model-invoked Hermes skill pays for its description every turn. Keep descriptions focused on trigger classes and the skill's distinctive behavior. Put details in the body or linked references.
-3. **Use an information hierarchy.** Put always-needed steps in `SKILL.md`; put branch-specific or bulky reference material in `references/`, `templates/`, or `scripts/` and point to it only when needed.
-4. **End steps with completion criteria.** Each ordered step should say how the agent knows it is done. Good criteria are checkable and, when it matters, exhaustive: "every modified file accounted for" beats "summarize changes."
-5. **Co-locate rules with the concept they govern.** Avoid scattering one idea across the file. Keep definition, caveats, examples, and verification near each other.
-6. **Use strong leading words.** Prefer compact concepts the model already knows — e.g. "tight loop," "tracer bullet," "root cause," "regression test" — over long repeated explanations. A good leading word saves tokens and anchors behavior.
-7. **Prune duplication and no-ops.** Keep each meaning in one source of truth. Sentence by sentence, ask whether the sentence changes agent behavior versus the default. If not, delete it rather than polishing it.
-8. **Watch for premature completion.** If agents tend to rush a step, first sharpen that step's completion criterion. Split the sequence only when later steps distract from doing the current step well.
+## Skill Memory
 
-Common quality failures:
+Some skills benefit from storing data between runs:
+- Append-only log files (e.g., `standups.log` for a standup skill — next run reads history and reports deltas)
+- JSON state files
+- SQLite for complex state
 
-- **Premature completion** — the skill lets the agent move on before the work is genuinely done.
-- **Duplication** — the same rule appears in multiple places and drifts.
-- **Sediment** — stale lines remain because adding felt safer than deleting.
-- **Sprawl** — too much always-visible material; push branch-specific reference behind pointers.
-- **No-op prose** — generic advice the agent would already follow without the skill.
-
-## Peer-Matched Structure
-
-Every in-repo skill follows roughly:
-
-```
-# <Title>
-
-## Overview
-One or two paragraphs: what and why.
-
-## When to Use
-- Bulleted triggers
-- "Don't use for:" counter-triggers
-
-## <Topic sections specific to the skill>
-- Quick-reference tables are common
-- Code blocks with exact commands
-- Hermes-specific recipes (tests via scripts/run_tests.sh, ui-tui paths, etc.)
-
-## Common Pitfalls
-Numbered list of mistakes and their fixes.
-
-## Verification Checklist
-- [ ] Checkbox list of post-action verifications
-
-## One-Shot Recipes (optional)
-Named scenarios → concrete command sequences.
-```
-
-Not every section is mandatory, but `Overview` + `When to Use` + actionable body + pitfalls are the minimum for the skill to feel like a peer.
-
-## Directory Placement
-
-```
-skills/<category>/<skill-name>/SKILL.md
-```
-
-Categories currently in repo (confirm with `ls skills/`): `autonomous-ai-agents`, `creative`, `data-science`, `devops`, `email`, `gaming`, `github`, `leisure`, `mcp`, `media`, `mlops/*`, `note-taking`, `productivity`, `red-teaming`, `research`, `smart-home`, `social-media`, `software-development`.
-
-Pick the closest existing category. Don't invent new top-level categories casually.
+This gives the skill a form of memory without polluting the model's context.
 
 ## Workflow
 
-1. **Survey peers** in the target category:
-   ```
-   ls skills/<category>/
-   ```
-   Read 2-3 peer SKILL.md files to match tone and structure.
-2. **Check validator constraints** in `tools/skill_manager_tool.py` if unsure.
-3. **Draft** with `write_file` to `skills/<category>/<name>/SKILL.md`.
-4. **Validate locally**:
-   ```python
-   import yaml, re, pathlib
-   content = pathlib.Path("skills/<category>/<name>/SKILL.md").read_text()
-   assert content.startswith("---")
-   m = re.search(r'\n---\s*\n', content[3:])
-   fm = yaml.safe_load(content[3:m.start()+3])
-   assert "name" in fm and "description" in fm
-   assert len(fm["description"]) <= 1024
-   assert len(content) <= 100_000
-   ```
-5. **Git add + commit** on the active branch.
-6. **Note:** the CURRENT session's skill loader is cached — `skill_view` / `skills_list` will not see the new skill until a new session. This is expected, not a bug.
+### Step 0: Write evals first
 
-## Cross-Referencing Other Skills
+Before writing the body, define what success looks like:
+- **Positive examples:** real queries where the skill should load and help
+- **Negative examples:** queries where it should NOT load (prevents off-target routing)
+- **Neighbor confusion:** queries near the domain boundary that might route to the wrong skill
 
-`metadata.hermes.related_skills` unions both trees (`skills/` in-repo and `~/.hermes/skills/`) at load time. You CAN reference a user-local skill from an in-repo skill, but it won't resolve for other users who clone the repo fresh. Prefer referencing only in-repo skills from in-repo skills. If a frequently-referenced skill lives only in `~/.hermes/skills/`, consider promoting it to the repo.
+At minimum, verify the skill loads when needed and doesn't load when not needed.
 
-## Editing Existing In-Repo Skills
+### Step 1: Write the description
 
-- **Small fix (typo, added pitfall, tightened trigger):** `skill_manage(action='patch', name=..., old_string=..., new_string=...)` works fine on in-repo skills.
-- **Major rewrite:** `write_file` the whole SKILL.md. `skill_manage(action='edit')` also works but requires supplying the full new content.
-- **Adding supporting files:** `write_file` to `skills/<category>/<name>/references/<file>.md`, `templates/<file>`, or `scripts/<file>`. `skill_manage(action='write_file')` also works and enforces the references/templates/scripts/assets subdir allowlist.
-- **Always commit** the edit — in-repo skills are source, not runtime state.
+The hardest line. Get the routing trigger right before writing any body content. Test: does this description correctly route to this skill and not to a neighbor?
+
+### Step 2: Write the body
+
+Skip the obvious. Focus on gotchas, non-obvious conventions, and completion criteria. Don't railroad with rigid command sequences.
+
+### Step 3: Use the hierarchy
+
+Break conditional or heavy content into `references/`, `scripts/`, `assets/`. The SKILL.md is the hub; everything else is a spoke loaded on demand.
+
+### Step 4: Iterate
+
+Run evals. Add gotchas as you discover failure cases. Small word changes in descriptions can have outsized routing impact — test after every description change.
+
+### Step 5: Ship + commit
+
+For in-repo skills: `git add` + `git commit`. For user-local: `skill_manage(action='create')` handles it.
+
+**Note:** The current session's skill loader is cached — new skills won't appear until a fresh session.
+
+## Measuring Skills
+
+At scale, you need data to answer: which skills earn their context tax? Which under-trigger? Which degrade neighbors? This covers usage telemetry (Anthropic's PreToolUse hook pattern), three tiers of eval suites (loading precision/recall, progressive loading, end-to-end task completion), and cross-model testing.
+
+**→ See `references/skill-measurement.md`** for eval suite templates, lifecycle management, and a minimum viable eval quick-start.
+
+## Maintenance: The Gotchas Flywheel
+
+After shipping, the skill enters maintenance mode:
+
+- **Gotchas are append-mostly.** The gotchas section accrues the most value over time. Add a line every time the agent fails in testing or production.
+- **Don't change the description without re-running evals.** Description changes affect routing, including spillover effects on other skills. If you're changing the routing trigger, you need eval evidence supporting the change.
+- **Skills should get shorter or sharper over time.** When adding a rule, remove the old wording it replaces. Don't layer advice forever.
+- **Prune sediment.** Stale lines remain because adding felt safer than deleting. Apply the decision test: if the sentence doesn't change behavior, delete it.
+
+## Quality Checklist (Per Sentence)
+
+Apply to every sentence in the skill:
+
+1. **"Would the agent get this wrong without this?"** — If no, delete it.
+2. **Does it change behavior?** — If it's generic advice ("be careful," "use best practices"), delete or replace with a checkable criterion.
+3. **Is it in the right tier?** — Always-needed → SKILL.md body. Conditional → `references/`. Deterministic logic → `scripts/`.
+4. **Does it railroad?** — Replace rigid command sequences with intent-based instructions.
+5. **Is it duplicated?** — Keep each meaning in one source of truth. If it exists elsewhere, reference, don't copy.
 
 ## Common Pitfalls
 
@@ -183,32 +280,36 @@ Pick the closest existing category. Don't invent new top-level categories casual
 
 2. **Leading whitespace before `---`.** The validator checks `content.startswith("---")`; any leading blank line or BOM fails validation.
 
-3. **Description too generic.** Peer descriptions start with "Use when ..." and describe the *trigger class*, not the one task. "Use when debugging X" > "Debug X".
+3. **Description written as documentation, not routing trigger.** "This skill does X" is wrong. "Use when &lt;trigger>" is right. Include the words users actually say.
 
-4. **Forgetting the author/license/metadata block.** Not validator-enforced, but every peer has it; omitting makes the skill look half-finished.
+4. **Description too broad, causing routing interference.** A new skill's description that overlaps existing skills degrades their routing. Check for off-target matches before merging.
 
-5. **Writing a skill that duplicates a peer.** Before creating, `ls skills/<category>/` and open 2-3 peers. Prefer extending an existing skill to creating a narrow sibling.
+5. **Writing no-op prose.** "Be careful," "be thorough," "use best practices" rarely change model behavior. Replace with a checkable completion criterion or delete.
 
-6. **Expecting the current session to see the new skill.** It won't. The skill loader is initialized at session start. Verify in a fresh session or via `skill_view` using the exact path.
+6. **Railroading with rigid command sequences.** Write intent ("cherry-pick onto clean branch"), not scripts (`git checkout main; git checkout -b ...`). Prescriptive sequences are fragile when things go wrong.
 
-7. **Letting skills accumulate sediment.** A skill should get shorter or sharper over time. When adding a rule, remove the old wording it replaces; don't layer advice forever.
+7. **Letting skills accumulate sediment.** A skill should get shorter or sharper over time. When adding a rule, remove the old wording it replaces.
 
-8. **Writing no-op prose.** "Be careful," "be thorough," and "use best practices" rarely change model behavior. Replace with a checkable completion criterion or a stronger leading word.
+8. **Changing the description post-ship without evals.** Description changes affect routing with spillover effects on other skills. Re-run evals first.
 
-9. **Linking to skills that don't exist in-repo.** `related_skills: [some-user-local-skill]` works for you but breaks for other clones. Prefer only in-repo links.
+9. **Forgetting the author/license/metadata block.** Not validator-enforced, but every peer has it.
+
+10. **Expecting the current session to see the new skill.** The skill loader is cached at session start. Verify in a fresh session.
+
+11. **Self-generating skills without human input.** LLM-generated skills that merely summarize what the model already knows provide no benefit. Real value comes from failure cases, gotchas, and human expertise not in training data.
 
 ## Verification Checklist
 
-- [ ] File is at `skills/<category>/<name>/SKILL.md` (not in `~/.hermes/skills/`)
-- [ ] Frontmatter starts at byte 0 with `---`, closes with `\n---\n`
-- [ ] `name`, `description`, `version`, `author`, `license`, `metadata.hermes.{tags, related_skills}` all present
-- [ ] Name ≤ 64 chars, lowercase + hyphens
-- [ ] Description ≤ 1024 chars and starts with "Use when ..."
-- [ ] Total file ≤ 100,000 chars (aim for 8-15k)
-- [ ] Structure: `# Title` → `## Overview` → `## When to Use` → body → `## Common Pitfalls` → `## Verification Checklist`
+- [ ] Decision test passed: "Would the agent get this wrong without this skill?" → Yes
+- [ ] Description starts with "Use when" and front-loads trigger within 57 chars
+- [ ] Description uses user language (what users say when they need this)
+- [ ] Description checked for off-target routing overlap with existing skills
+- [ ] Frontmatter: `---` at byte 0, `\n---\n` close, name ≤64 chars lowercase+hyphens
+- [ ] Body: no no-op prose, no railroaded command sequences
+- [ ] Gotchas section present (even if initially empty — it will grow)
+- [ ] Heavy/conditional content in `references/`, deterministic logic in `scripts/`
 - [ ] Each ordered step has a checkable completion criterion
-- [ ] Description is trigger-focused and avoids duplicated body content
-- [ ] Bulky or branch-specific reference is progressively disclosed in linked files
-- [ ] No-op prose and duplicated rules removed
-- [ ] `related_skills` references resolve in-repo (or are explicitly OK to be user-local)
-- [ ] `git add skills/<category>/<name>/ && git commit` completed on the intended branch
+- [ ] Total file ≤ 100,000 chars (aim for 8-15k)
+- [ ] `related_skills` references resolve (in-repo for in-repo skills)
+- [ ] Evals written: positive (loads when needed) + negative (doesn't load when not)
+- [ ] For in-repo: `git add` + `git commit` completed

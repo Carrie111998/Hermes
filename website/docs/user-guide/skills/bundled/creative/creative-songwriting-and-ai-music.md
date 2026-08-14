@@ -1,14 +1,14 @@
 ---
-title: "Songwriting And Ai Music — Songwriting craft and Suno AI music prompts"
+title: "Songwriting And Ai Music — Write songs or generate AI music with Suno"
 sidebar_label: "Songwriting And Ai Music"
-description: "Songwriting craft and Suno AI music prompts"
+description: "Write songs or generate AI music with Suno"
 ---
 
 {/* This page is auto-generated from the skill's SKILL.md by website/scripts/generate-skill-docs.py. Edit the source SKILL.md, not this page. */}
 
 # Songwriting And Ai Music
 
-Songwriting craft and Suno AI music prompts.
+Write songs or generate AI music with Suno.
 
 ## Skill metadata
 

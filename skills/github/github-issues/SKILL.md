@@ -1,6 +1,6 @@
 ---
 name: github-issues
-description: "Use when creating, triaging, or assigning GitHub issues via gh CLI or REST API."
+description: "Create/triage GitHub issues via gh CLI."
 version: 1.1.0
 author: Hermes Agent
 license: MIT

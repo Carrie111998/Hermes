@@ -1,14 +1,14 @@
 ---
-title: "Github Issues — Create, triage, label, assign GitHub issues via gh or REST"
+title: "Github Issues — Create/triage GitHub issues via gh CLI"
 sidebar_label: "Github Issues"
-description: "Create, triage, label, assign GitHub issues via gh or REST"
+description: "Create/triage GitHub issues via gh CLI"
 ---
 
 {/* This page is auto-generated from the skill's SKILL.md by website/scripts/generate-skill-docs.py. Edit the source SKILL.md, not this page. */}
 
 # Github Issues
 
-Create, triage, label, assign GitHub issues via gh or REST.
+Create/triage GitHub issues via gh CLI.
 
 ## Skill metadata
 

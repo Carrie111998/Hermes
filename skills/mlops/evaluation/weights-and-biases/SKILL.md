@@ -1,6 +1,6 @@
 ---
 name: weights-and-biases
-description: "Use when logging ML experiments, sweeps, or model registry to Weights & Biases."
+description: "Log ML experiments to Weights & Biases."
 version: 1.0.1
 author: Orchestra Research
 license: MIT

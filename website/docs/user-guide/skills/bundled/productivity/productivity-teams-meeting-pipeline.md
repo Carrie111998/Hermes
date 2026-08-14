@@ -1,14 +1,14 @@
 ---
-title: "Teams Meeting Pipeline — Teams meeting summaries, job replay, Graph subscriptions"
+title: "Teams Meeting Pipeline — Summarize Teams meetings via Graph API"
 sidebar_label: "Teams Meeting Pipeline"
-description: "Teams meeting summaries, job replay, Graph subscriptions"
+description: "Summarize Teams meetings via Graph API"
 ---
 
 {/* This page is auto-generated from the skill's SKILL.md by website/scripts/generate-skill-docs.py. Edit the source SKILL.md, not this page. */}
 
 # Teams Meeting Pipeline
 
-Teams meeting summaries, job replay, Graph subscriptions.
+Summarize Teams meetings via Graph API.
 
 ## Skill metadata
 

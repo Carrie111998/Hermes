@@ -1,14 +1,14 @@
 ---
-title: "Ocr And Documents — Extract text from PDFs/scans (pymupdf, marker-pdf)"
+title: "Ocr And Documents — Extract text from PDFs (pymupdf, marker)"
 sidebar_label: "Ocr And Documents"
-description: "Extract text from PDFs/scans (pymupdf, marker-pdf)"
+description: "Extract text from PDFs (pymupdf, marker)"
 ---
 
 {/* This page is auto-generated from the skill's SKILL.md by website/scripts/generate-skill-docs.py. Edit the source SKILL.md, not this page. */}
 
 # Ocr And Documents
 
-Extract text from PDFs/scans (pymupdf, marker-pdf).
+Extract text from PDFs (pymupdf, marker).
 
 ## Skill metadata
 

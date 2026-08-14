@@ -1,14 +1,14 @@
 ---
-title: "Polymarket — Query Polymarket: markets, prices, orderbooks, history"
+title: "Polymarket — Query Polymarket (markets, prices)"
 sidebar_label: "Polymarket"
-description: "Query Polymarket: markets, prices, orderbooks, history"
+description: "Query Polymarket (markets, prices)"
 ---
 
 {/* This page is auto-generated from the skill's SKILL.md by website/scripts/generate-skill-docs.py. Edit the source SKILL.md, not this page. */}
 
 # Polymarket
 
-Query Polymarket: markets, prices, orderbooks, history.
+Query Polymarket (markets, prices).
 
 ## Skill metadata
 

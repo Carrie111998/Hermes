@@ -1,14 +1,14 @@
 ---
-title: "Github Repo Management — Clone/create/fork repos; manage remotes, releases"
+title: "Github Repo Management — Clone/create/fork GitHub repos"
 sidebar_label: "Github Repo Management"
-description: "Clone/create/fork repos; manage remotes, releases"
+description: "Clone/create/fork GitHub repos"
 ---
 
 {/* This page is auto-generated from the skill's SKILL.md by website/scripts/generate-skill-docs.py. Edit the source SKILL.md, not this page. */}
 
 # Github Repo Management
 
-Clone/create/fork repos; manage remotes, releases.
+Clone/create/fork GitHub repos.
 
 ## Skill metadata
 

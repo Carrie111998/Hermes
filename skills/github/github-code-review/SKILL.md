@@ -1,6 +1,6 @@
 ---
 name: github-code-review
-description: "Use when reviewing GitHub PRs — diffs, inline comments via gh CLI or REST API."
+description: "Review GitHub PRs (diffs, inline comments)."
 version: 1.1.0
 author: Hermes Agent
 license: MIT

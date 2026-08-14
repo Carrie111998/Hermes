@@ -1,14 +1,14 @@
 ---
-title: "Notion — Notion API + ntn CLI: pages, databases, markdown, Workers"
+title: "Notion — Work with Notion API via ntn CLI"
 sidebar_label: "Notion"
-description: "Notion API + ntn CLI: pages, databases, markdown, Workers"
+description: "Work with Notion API via ntn CLI"
 ---
 
 {/* This page is auto-generated from the skill's SKILL.md by website/scripts/generate-skill-docs.py. Edit the source SKILL.md, not this page. */}
 
 # Notion
 
-Notion API + ntn CLI: pages, databases, markdown, Workers.
+Work with Notion API via ntn CLI.
 
 ## Skill metadata
 

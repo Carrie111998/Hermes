@@ -1,14 +1,14 @@
 ---
-title: "Codebase Inspection — Inspect codebases w/ pygount: LOC, languages, ratios"
+title: "Codebase Inspection — Inspect codebases with pygount (LOC, ratios)"
 sidebar_label: "Codebase Inspection"
-description: "Inspect codebases w/ pygount: LOC, languages, ratios"
+description: "Inspect codebases with pygount (LOC, ratios)"
 ---
 
 {/* This page is auto-generated from the skill's SKILL.md by website/scripts/generate-skill-docs.py. Edit the source SKILL.md, not this page. */}
 
 # Codebase Inspection
 
-Inspect codebases w/ pygount: LOC, languages, ratios.
+Inspect codebases with pygount (LOC, ratios).
 
 ## Skill metadata
 

@@ -1,6 +1,6 @@
 ---
 name: popular-web-designs
-description: "Use when referencing real design systems (Stripe, Linear, Vercel) as HTML/CSS templates."
+description: "Reference real design systems as HTML/CSS."
 version: 1.0.0
 author: Hermes Agent + Teknium (design systems sourced from VoltAgent/awesome-design-md)
 license: MIT

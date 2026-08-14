@@ -1,14 +1,14 @@
 ---
-title: "Blogwatcher — Monitor blogs and RSS/Atom feeds via blogwatcher-cli tool"
+title: "Blogwatcher — Monitor blogs/RSS feeds via blogwatcher"
 sidebar_label: "Blogwatcher"
-description: "Monitor blogs and RSS/Atom feeds via blogwatcher-cli tool"
+description: "Monitor blogs/RSS feeds via blogwatcher"
 ---
 
 {/* This page is auto-generated from the skill's SKILL.md by website/scripts/generate-skill-docs.py. Edit the source SKILL.md, not this page. */}
 
 # Blogwatcher
 
-Monitor blogs and RSS/Atom feeds via blogwatcher-cli tool.
+Monitor blogs/RSS feeds via blogwatcher.
 
 ## Skill metadata
 

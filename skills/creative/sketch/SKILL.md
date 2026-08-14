@@ -1,6 +1,6 @@
 ---
 name: sketch
-description: "Use when creating throwaway HTML mockups — 2-3 design variants to compare quickly."
+description: "Create throwaway HTML mockups (A/B compare)."
 version: 1.0.1
 author: Hermes Agent (adapted from gsd-build/get-shit-done)
 license: MIT
