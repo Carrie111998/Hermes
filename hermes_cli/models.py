@@ -25,13 +25,17 @@ if TYPE_CHECKING:
     from typing import TypeGuard
 
 from hermes_cli import __version__ as _HERMES_VERSION
-from hermes_cli.urllib_security import open_credentialed_url
+from hermes_cli.urllib_security import (
+    open_credentialed_url,
+    read_credentialed_url_bytes_limited,
+)
 
 logger = logging.getLogger(__name__)
 
 # Identify ourselves so endpoints fronted by Cloudflare's Browser Integrity
 # Check (error 1010) don't reject the default ``Python-urllib/*`` signature.
 _HERMES_USER_AGENT = f"hermes-cli/{_HERMES_VERSION}"
+_MODEL_CATALOG_MAX_BYTES = 4 * 1024 * 1024
 
 COPILOT_BASE_URL = "https://api.githubcopilot.com"
 COPILOT_MODELS_URL = f"{COPILOT_BASE_URL}/models"
@@ -42,6 +46,19 @@ COPILOT_REASONING_EFFORTS_O_SERIES = ["low", "medium", "high"]
 def _urlopen_model_catalog_request(req: urllib.request.Request, *, timeout: float):
     """Open catalog requests without forwarding headers across origins."""
     return open_credentialed_url(req, timeout=timeout)
+
+
+def _read_model_catalog_request(
+    req: urllib.request.Request,
+    *,
+    timeout: float,
+) -> bytes:
+    """Read a generic model catalog with one cap across redirects and body."""
+    return read_credentialed_url_bytes_limited(
+        req,
+        timeout=timeout,
+        max_bytes=_MODEL_CATALOG_MAX_BYTES,
+    )
 
 
 # Fallback OpenRouter snapshot used when the live catalog is unavailable.
@@ -4633,15 +4650,16 @@ def probe_api_models(
         tried.append(url)
         req = urllib.request.Request(url, headers=headers)
         try:
-            with _urlopen_model_catalog_request(req, timeout=timeout) as resp:
-                data = json.loads(resp.read().decode())
-                return {
-                    "models": [m.get("id", "") for m in data.get("data", [])],
-                    "probed_url": url,
-                    "resolved_base_url": candidate_base.rstrip("/"),
-                    "suggested_base_url": alternate_base if alternate_base != candidate_base else normalized,
-                    "used_fallback": is_fallback,
-                }
+            data = json.loads(
+                _read_model_catalog_request(req, timeout=timeout).decode()
+            )
+            return {
+                "models": [m.get("id", "") for m in data.get("data", [])],
+                "probed_url": url,
+                "resolved_base_url": candidate_base.rstrip("/"),
+                "suggested_base_url": alternate_base if alternate_base != candidate_base else normalized,
+                "used_fallback": is_fallback,
+            }
         except Exception:
             continue
 
