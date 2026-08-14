@@ -1,0 +1,45 @@
+# Nous-approved MCP catalog entry.
+# Presence in this directory = approval. Merged via PR review.
+manifest_version: 1
+
+name: ambush-feeds
+description: Create, manage, and review personalized real-time news feeds from Ambush.
+source: https://app.ambush.ai/developers
+
+# Ambush hosts a Streamable HTTP MCP server with native OAuth 2.1 discovery,
+# Dynamic Client Registration, and PKCE. Hermes handles the browser flow and
+# stores the resulting credentials; no API key or local process is required.
+transport:
+  type: http
+  url: https://api.ambush.ai/mcp
+
+auth:
+  type: oauth
+
+# Enable the complete day-to-day feed lifecycle by default while leaving the
+# irreversible delete_feed tool opt-in. Its MCP annotations are destructive,
+# but keeping it out of the default surface also prevents accidental selection
+# by models that do not enforce annotation-aware confirmations.
+tools:
+  default_enabled:
+    - list_feeds
+    - get_feed
+    - list_channels
+    - create_feed
+    - update_feed
+    - route_feed_channel
+    - update_feed_channel_route
+    - list_emissions
+
+post_install: |
+  Hermes opens a browser to sign in to Ambush and authorize this connection.
+  If you close that flow before it finishes, resume it with:
+    hermes mcp login ambush-feeds
+
+  Start a new Hermes session after authorization so the tools are loaded.
+  Feed data is scoped to the Ambush account that approved the connection; no
+  Ambush API key needs to be copied into Hermes.
+
+  Eight day-to-day tools are enabled by default. Permanent feed deletion is
+  available but unchecked; opt in only when you need it with:
+    hermes mcp configure ambush-feeds

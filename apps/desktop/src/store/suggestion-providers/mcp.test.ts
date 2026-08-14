@@ -26,6 +26,22 @@ describe('matchSuggestions', () => {
     ])
   })
 
+  it('suggests Ambush Feeds for feed intent without matching the common noun alone', () => {
+    const index = MCP_DIRECTORY.map(entry => ({
+      hosts: entry.hosts,
+      keywords: entry.keywords,
+      server: entry.name
+    }))
+
+    expect(matchSuggestions('set up ambush feeds for security news ', index)).toContainEqual({
+      keyword: 'ambush feeds',
+      server: 'ambush-feeds'
+    })
+    expect(matchSuggestions('the convoy drove into an ambush ', index)).not.toContainEqual(
+      expect.objectContaining({ server: 'ambush-feeds' })
+    )
+  })
+
   it('is case-insensitive against the draft', () => {
     expect(matchSuggestions('open FIGMA please', INDEX)).toEqual([{ keyword: 'figma', server: 'figma' }])
   })

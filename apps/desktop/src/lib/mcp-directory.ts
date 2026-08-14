@@ -36,6 +36,14 @@ export interface McpDirectoryEntry {
 
 export const MCP_DIRECTORY: McpDirectoryEntry[] = [
   {
+    description: 'Create and manage personalized news feeds and review emitted stories.',
+    docs: 'https://app.ambush.ai/developers',
+    hosts: ['ambush.ai'],
+    keywords: ['ambush feeds', 'news feed', 'news monitoring', 'personalized news'],
+    name: 'ambush-feeds',
+    url: 'https://api.ambush.ai/mcp'
+  },
+  {
     description: 'Jira issues and Confluence pages via Atlassian’s hosted MCP.',
     docs: 'https://support.atlassian.com/rovo/docs/getting-started-with-the-atlassian-remote-mcp-server/',
     hosts: ['atlassian.net', 'atlassian.com', 'jira.com'],

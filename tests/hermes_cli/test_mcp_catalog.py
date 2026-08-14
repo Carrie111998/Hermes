@@ -158,6 +158,20 @@ class TestManifestParsing:
         assert cfg["url"] == "https://mcp.example.com/sse"
         assert cfg["headers"] == {"Authorization": "Bearer ${MCP_DEMO_API_KEY}"}
 
+    def test_http_oauth_builds_native_oauth_config(self, catalog_dir):
+        body = _basic_manifest(
+            transport={"type": "http", "url": "https://mcp.example.com/mcp"},
+            auth={"type": "oauth"},
+        )
+        _write_manifest(catalog_dir, "demo", body)
+        from hermes_cli.mcp_catalog import _build_server_config
+
+        cfg = _build_server_config(_entry("demo"), None)
+        assert cfg == {
+            "url": "https://mcp.example.com/mcp",
+            "auth": "oauth",
+        }
+
     def test_http_api_key_requires_matching_env_declaration(self, catalog_dir):
         """http+api_key manifests must declare the env key the header references.
 
