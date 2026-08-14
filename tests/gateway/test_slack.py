@@ -4323,6 +4323,9 @@ class TestThreadAttachmentContext:
         a = adapter_with_session_store
         a._has_active_session_for_thread = MagicMock(return_value=False)
         a._register_mentioned_thread = MagicMock()
+        a.set_authorization_check(
+            lambda user_id, chat_type=None, chat_id=None: True
+        )
         a._user_name_cache = {
             ("T_TEAM", "U_ALICE"): "Alice",
             ("T_TEAM", "U_USER"): "User",
@@ -4458,6 +4461,62 @@ class TestThreadAttachmentContext:
         msg_event = a.handle_message.await_args.args[0]
         assert msg_event.media_urls == ["/tmp/BATCH-20260813.pdf"]
         assert "[thread parent] Alice: [file: BATCH-20260813.pdf (application/pdf)]" in msg_event.channel_context
+
+    @pytest.mark.asyncio
+    async def test_unverified_root_sender_attachment_is_not_hydrated(
+        self, adapter_with_session_store
+    ):
+        """Prior files are indirect input. A root sender rejected by the
+        configured allowlist remains marked unverified and cannot inject a
+        document as ordinary media into a verified reply turn."""
+        a = self._prep(adapter_with_session_store)
+        a.set_authorization_check(
+            lambda user_id, chat_type=None, chat_id=None: user_id == "U_USER"
+        )
+        a._download_slack_file_bytes = AsyncMock(return_value=b"%PDF-1.7\n")
+        a._app.client.conversations_replies = self._replies(
+            root_files=[
+                {
+                    "id": "F_UNVERIFIED",
+                    "name": "instructions.pdf",
+                    "mimetype": "application/pdf",
+                    "size": 1024,
+                    "url_private_download": "https://files.slack.com/T1-FUNVERIFIED/file.pdf",
+                }
+            ]
+        )
+
+        await a._handle_slack_message(self._thread_event())
+
+        msg_event = a.handle_message.await_args.args[0]
+        assert msg_event.media_urls == []
+        assert msg_event.media_types == []
+        assert msg_event.message_type == MessageType.TEXT
+        assert "[thread parent] [unverified] Alice:" in msg_event.channel_context
+        assert "[file: instructions.pdf (application/pdf)]" in msg_event.channel_context
+        assert "[Slack attachment notice]" in msg_event.text
+        assert "unverified sender" in msg_event.text
+        assert "not available to this turn" in msg_event.text
+        assert '"status": "blocked_unverified_sender"' in msg_event.channel_context
+        assert '"uploader_id": "U_ALICE"' in msg_event.channel_context
+        assert '"uploader_trust": "unverified"' in msg_event.channel_context
+        a._download_slack_file_bytes.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_unverified_root_without_files_has_no_attachment_notice(
+        self, adapter_with_session_store
+    ):
+        a = self._prep(adapter_with_session_store)
+        a.set_authorization_check(
+            lambda user_id, chat_type=None, chat_id=None: user_id == "U_USER"
+        )
+        a._app.client.conversations_replies = self._replies(root_files=None)
+
+        await a._handle_slack_message(self._thread_event())
+
+        msg_event = a.handle_message.await_args.args[0]
+        assert "[Slack attachment notice]" not in msg_event.text
+        assert "[Slack thread-root attachment provenance]" not in msg_event.channel_context
 
     @pytest.mark.asyncio
     async def test_slack_connect_root_stub_resolves_before_download(
@@ -4798,6 +4857,8 @@ class TestThreadAttachmentContext:
         assert '\"mime\": \"application/pdf\"' in context
         assert '\"declared_size\": 1024' in context
         assert '\"downloaded_size\": 9' in context
+        assert '\"uploader_id\": \"U_ALICE\"' in context
+        assert '\"uploader_trust\": \"authorized\"' in context
         assert "url_private" not in context
         assert "https://" not in context
         assert "sig=secret" not in context

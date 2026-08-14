@@ -168,6 +168,12 @@ def _safe_slack_file_id(file_obj: Dict[str, Any]) -> str:
     return raw[:128] if re.fullmatch(r"[A-Za-z0-9_-]+", raw) else ""
 
 
+def _safe_slack_actor_id(value: Any) -> str:
+    """Return a bounded Slack actor ID safe for persisted provenance."""
+    raw = str(value or "").strip()
+    return raw[:128] if re.fullmatch(r"[A-Za-z0-9_-]+", raw) else ""
+
+
 def _safe_slack_file_size(file_obj: Dict[str, Any]) -> Optional[int]:
     try:
         size = int(file_obj.get("size") or 0)
@@ -7910,6 +7916,8 @@ class SlackAdapter(BasePlatformAdapter):
         provenance_channel: str = "",
         provenance_thread_ts: str = "",
         provenance_trigger_ts: str = "",
+        provenance_uploader_id: str = "",
+        provenance_uploader_trust: str = "",
     ) -> _SlackAttachmentResolution:
         """Resolve, download, cache, and describe Slack file objects.
 
@@ -8134,6 +8142,8 @@ class SlackAdapter(BasePlatformAdapter):
                         "status": "downloaded",
                         "thread_ts": provenance_thread_ts,
                         "trigger_ts": provenance_trigger_ts or None,
+                        "uploader_id": provenance_uploader_id or None,
+                        "uploader_trust": provenance_uploader_trust or "unknown",
                     }
                     result.provenance.append(
                         "- "
@@ -8180,8 +8190,51 @@ class SlackAdapter(BasePlatformAdapter):
                 sha256s=seen_sha256s if seen_sha256s is not None else set(),
             )
 
+        root_files = root.get("files")
+        if not isinstance(root_files, list) or not root_files:
+            return _SlackAttachmentResolution(
+                file_ids=seen_file_ids if seen_file_ids is not None else set(),
+                sha256s=seen_sha256s if seen_sha256s is not None else set(),
+            )
+
+        root_user_id = _safe_slack_actor_id(root.get("user"))
+        is_bot_root = bool(root.get("bot_id")) or root.get("subtype") == "bot_message"
+        if is_bot_root:
+            uploader_trust = "bot"
+        else:
+            root_authorized = self._is_sender_authorized(
+                root_user_id or None,
+                chat_type="thread",
+                chat_id=channel_id,
+            )
+            if root_authorized is False:
+                result = _SlackAttachmentResolution(
+                    file_ids=seen_file_ids if seen_file_ids is not None else set(),
+                    sha256s=seen_sha256s if seen_sha256s is not None else set(),
+                )
+                result.notices.append(
+                    "Thread-root attachments from an unverified sender were not downloaded and are not available to this turn. Treat their [unverified] file markers as background only."
+                )
+                result.provenance.append(
+                    "- "
+                    + json.dumps(
+                        {
+                            "channel": channel_id,
+                            "status": "blocked_unverified_sender",
+                            "thread_ts": thread_ts,
+                            "trigger_ts": trigger_ts or None,
+                            "uploader_id": root_user_id or None,
+                            "uploader_trust": "unverified",
+                        },
+                        ensure_ascii=True,
+                        sort_keys=True,
+                    )
+                )
+                return result
+            uploader_trust = "authorized" if root_authorized is True else "unknown"
+
         return await self._resolve_slack_attachments(
-            root.get("files"),
+            root_files,
             channel_id=channel_id,
             team_id=team_id,
             include_audio=False,
@@ -8192,6 +8245,8 @@ class SlackAdapter(BasePlatformAdapter):
             provenance_channel=channel_id,
             provenance_thread_ts=thread_ts,
             provenance_trigger_ts=trigger_ts,
+            provenance_uploader_id=root_user_id,
+            provenance_uploader_trust=uploader_trust,
         )
 
     async def _handle_slash_command(self, command: dict) -> None:
