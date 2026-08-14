@@ -12,6 +12,7 @@ import pytest
 from gateway.config import Platform
 from gateway.platforms.base import MessageEvent
 from gateway.session import SessionSource
+from tests.gateway.restart_test_helpers import make_restart_runner
 
 
 def _make_event(text="/background", platform=Platform.TELEGRAM,
@@ -38,6 +39,7 @@ def _make_runner():
     runner._fallback_model = None
     runner._running_agents = {}
     runner._background_tasks = set()
+    runner._background_agent_tasks = set()
 
     mock_store = MagicMock()
     runner.session_store = mock_store
@@ -80,6 +82,42 @@ class TestHandleBackgroundCommand:
         event = _make_event(text="/background   ")
         result = await runner._handle_background_command(event)
         assert "Usage:" in result
+
+    @pytest.mark.asyncio
+    async def test_shutdown_drain_rejects_before_creating_task(self):
+        runner, _adapter = make_restart_runner()
+        runner._draining = True
+        runner._run_background_task = AsyncMock()
+
+        result = await runner._handle_message(
+            _make_event(text="/background summarize the incident")
+        )
+
+        assert result == (
+            "⏳ Gateway is shutting down and is not accepting new work right now."
+        )
+        runner._run_background_task.assert_not_called()
+        assert runner._background_tasks == set()
+        assert runner._background_agent_tasks == set()
+
+    @pytest.mark.asyncio
+    async def test_external_drain_rejects_before_creating_task(self):
+        runner, _adapter = make_restart_runner()
+        runner._external_drain_active = True
+        runner._run_background_task = AsyncMock()
+
+        result = await runner._handle_message(
+            _make_event(text="/background summarize the incident")
+        )
+
+        assert result == (
+            "⏳ This agent is draining for a maintenance action and isn't "
+            "accepting new turns right now. It'll be back in a moment — "
+            "please resend shortly."
+        )
+        runner._run_background_task.assert_not_called()
+        assert runner._background_tasks == set()
+        assert runner._background_agent_tasks == set()
 
 
 # ---------------------------------------------------------------------------

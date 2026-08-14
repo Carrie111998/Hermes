@@ -144,6 +144,44 @@ async def test_request_restart_defers_stop_until_active_turn_finishes():
 
 
 @pytest.mark.asyncio
+async def test_background_command_task_blocks_active_work_drain_until_done():
+    runner, _adapter = make_restart_runner()
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def background_agent(*_args, **_kwargs):
+        started.set()
+        await release.wait()
+
+    runner._run_background_task = AsyncMock(side_effect=background_agent)
+    event = MessageEvent(
+        text="/background summarize the incident",
+        message_type=MessageType.TEXT,
+        source=make_restart_source(),
+        message_id="bg1",
+    )
+
+    await runner._handle_background_command(event)
+    await started.wait()
+    task = next(iter(runner._background_agent_tasks))
+
+    assert task in runner._background_tasks
+    assert runner._running_agent_count() == 0
+    assert runner._active_work_count() == 1
+
+    drain_task = asyncio.create_task(runner._drain_active_agents(2.0))
+    await asyncio.sleep(0)
+    assert not drain_task.done()
+
+    release.set()
+    _snapshot, timed_out = await drain_task
+    await task
+
+    assert timed_out is False
+    assert runner._active_work_count() == 0
+
+
+@pytest.mark.asyncio
 async def test_request_restart_after_turn_timeout_zero_enters_stop_immediately():
     """restart_after_turn_timeout=0 preserves legacy immediate drain."""
     runner, _adapter = make_restart_runner()

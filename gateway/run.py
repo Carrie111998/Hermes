@@ -6753,8 +6753,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # capture / STT pipeline, which otherwise produces a second delayed reply.
         self._recent_voice_transcripts: Dict[tuple[int, int], List[tuple[float, str]]] = {}
 
-        # Track background tasks to prevent garbage collection mid-execution
+        # Track background tasks to prevent garbage collection mid-execution.
+        # /background agent tasks are also tracked separately so drain accounting
+        # can exclude long-lived gateway watcher tasks.
         self._background_tasks: set = set()
+        self._background_agent_tasks: set[asyncio.Task] = set()
 
         # Event-loop liveness heartbeat (#66892): rewritten every 30s while
         # the loop is dispatching. External supervisors use the file mtime /
@@ -7974,9 +7977,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """All agent work the gateway must expose and drain as one total."""
         return (
             self._running_agent_count()
+            + self._active_background_agent_task_count()
             + self._active_cron_job_count()
             + self._active_api_run_count()
         )
+
+    def _active_background_agent_task_count(self) -> int:
+        """Count live agents started by the gateway /background command."""
+        tasks = getattr(self, "_background_agent_tasks", ()) or ()
+        return sum(not task.done() for task in tasks)
 
     def _active_cron_job_count(self) -> int:
         """Count of cron jobs currently executing, from the cron scheduler's
@@ -9976,36 +9985,39 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     async def _drain_active_agents(self, timeout: float) -> tuple[Dict[str, Any], bool]:
         snapshot = self._snapshot_running_agents()
         last_active_count = self._running_agent_count()
+        last_background_count = self._active_background_agent_task_count()
         last_cron_count = self._active_cron_job_count()
         last_api_count = self._active_api_run_count()
         last_status_at = 0.0
 
         def _maybe_update_status(force: bool = False) -> None:
-            nonlocal last_active_count, last_cron_count, last_api_count, last_status_at
+            nonlocal last_active_count, last_background_count, last_cron_count, last_api_count, last_status_at
             now = asyncio.get_running_loop().time()
             active_count = self._running_agent_count()
+            background_count = self._active_background_agent_task_count()
             cron_count = self._active_cron_job_count()
             api_count = self._active_api_run_count()
             if (
                 force
                 or active_count != last_active_count
+                or background_count != last_background_count
                 or cron_count != last_cron_count
                 or api_count != last_api_count
                 or (now - last_status_at) >= 1.0
             ):
                 self._update_runtime_status("draining")
                 last_active_count = active_count
+                last_background_count = background_count
                 last_cron_count = cron_count
                 last_api_count = api_count
                 last_status_at = now
 
-        # Cron jobs run on the scheduler's own thread pool, outside
-        # ``self._running_agents`` — fold their in-flight count into the
-        # same wait/timeout this method already applies to chat sessions,
-        # or a cron job's tool work gets killed with zero warning the
-        # instant it's the only active thing running (#60432).
+        # Cron jobs and /background agents run outside ``self._running_agents``;
+        # fold their in-flight counts into the same wait/timeout this method
+        # already applies to chat sessions, or their tool work can be killed as
+        # soon as it is the only active work (#60432).
         # API-server / desk sessions have the same structural gap (#63529).
-        if not self._running_agents and last_cron_count == 0 and last_api_count == 0:
+        if self._active_work_count() == 0:
             _maybe_update_status(force=True)
             return snapshot, False
 
@@ -10015,20 +10027,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         deadline = asyncio.get_running_loop().time() + timeout
         while (
-            (
-                len(self._running_agents)
-                or self._active_cron_job_count()
-                or self._active_api_run_count()
-            )
+            self._active_work_count()
             and asyncio.get_running_loop().time() < deadline
         ):
             _maybe_update_status()
             await asyncio.sleep(0.1)
-        timed_out = (
-            bool(len(self._running_agents))
-            or bool(self._active_cron_job_count())
-            or bool(self._active_api_run_count())
-        )
+        timed_out = bool(self._active_work_count())
         _maybe_update_status(force=True)
         return snapshot, timed_out
 

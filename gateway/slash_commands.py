@@ -3348,6 +3348,15 @@ class GatewaySlashCommandsMixin:
         When it completes, sends the result back to the same chat without
         modifying the active session's conversation history.
         """
+        if self._draining:
+            return f"⏳ Gateway is {self._status_action_gerund()} and is not accepting new work right now."
+        if self._external_drain_active:
+            return (
+                "⏳ This agent is draining for a maintenance action and isn't "
+                "accepting new turns right now. It'll be back in a moment — "
+                "please resend shortly."
+            )
+
         prompt = event.get_command_args().strip()
         if not prompt:
             return t("gateway.background.usage")
@@ -3374,6 +3383,11 @@ class GatewaySlashCommandsMixin:
         )
         self._background_tasks.add(_task)
         _task.add_done_callback(self._background_tasks.discard)
+        background_agent_tasks = getattr(self, "_background_agent_tasks", None)
+        if background_agent_tasks is None:
+            background_agent_tasks = self._background_agent_tasks = set()
+        background_agent_tasks.add(_task)
+        _task.add_done_callback(background_agent_tasks.discard)
 
         preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
         return t("gateway.background.started", preview=preview, task_id=task_id)
