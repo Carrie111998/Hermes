@@ -359,6 +359,86 @@ def test_remote_checkpoint_claim_releases_only_after_lease_expiry(kanban_home):
         assert kb.release_stale_claims(conn) == 1
 
 
+def test_stale_recovery_keeps_expired_live_local_checkpoint_fence(kanban_home, monkeypatch):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="fenced", assignee="worker")
+        task = kb.claim_task(conn, task_id)
+        assert task is not None
+        assert kb.checkpoint_task(
+            conn, task_id, summary="handoff", expected_run_id=task.current_run_id,
+        )
+        conn.execute(
+            "UPDATE tasks SET claim_expires = ? WHERE id = ?",
+            (int(time.time()) - 1, task_id),
+        )
+        conn.commit()
+        monkeypatch.setattr(kb, "_pid_alive", lambda _pid: True)
+
+        assert kb.release_stale_claims(conn) == 0
+        row = conn.execute(
+            "SELECT claim_lock, worker_pid FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        assert row["claim_lock"] is not None
+        assert row["worker_pid"] is not None
+
+
+@pytest.mark.parametrize("transition", ["complete", "block", "review", "reclaim"])
+def test_lifecycle_transitions_keep_live_checkpoint_fence(
+    kanban_home, monkeypatch, transition,
+):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="fenced", assignee="worker")
+        task = kb.claim_task(conn, task_id)
+        assert task is not None
+        assert kb.checkpoint_task(
+            conn, task_id, summary="handoff", expected_run_id=task.current_run_id,
+        )
+        monkeypatch.setattr(kb, "_pid_alive", lambda _pid: True)
+        if transition == "complete":
+            assert kb.complete_task(conn, task_id, result="done")
+        elif transition == "block":
+            assert kb.block_task(conn, task_id, reason="wait", kind="needs_input")
+        elif transition == "review":
+            assert kb.request_review(conn, task_id, summary="review")
+        else:
+            assert not kb.reclaim_task(conn, task_id, reason="operator retry")
+        assert kb.release_checkpoint_claims(conn) == 0
+        row = conn.execute(
+            "SELECT claim_lock, worker_pid FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        assert row["claim_lock"] is not None
+        assert row["worker_pid"] is not None
+
+
+def test_failed_rewind_records_durable_retry_after_cursor_race(kanban_home):
+    with kb.connect() as conn1, kb.connect() as conn2:
+        task_id = kb.create_task(conn1, title="notify", assignee="worker")
+        kb.add_notify_sub(conn1, task_id=task_id, platform="telegram", chat_id="chat")
+        kb.add_comment(conn1, task_id, "human", "decision")
+        old, claimed, events = kb.claim_unseen_events_for_sub(
+            conn1, task_id=task_id, platform="telegram", chat_id="chat",
+        )
+        kb._append_event(conn1, task_id, "blocked", {"kind": "needs_input"})
+        conn1.commit()
+        kb.claim_unseen_events_for_sub(
+            conn2, task_id=task_id, platform="telegram", chat_id="chat",
+        )
+        assert not kb.rewind_notify_cursor(
+            conn1, task_id=task_id, platform="telegram", chat_id="chat",
+            claimed_cursor=claimed, old_cursor=old,
+            claimed_event_ids=[event.id for event in events],
+        )
+        _old, cursor, retry = kb.claim_unseen_events_for_sub(
+            conn2, task_id=task_id, platform="telegram", chat_id="chat",
+        )
+        assert events[0].id in [event.id for event in retry]
+        kb.advance_notify_cursor(
+            conn2, task_id=task_id, platform="telegram", chat_id="chat",
+            new_cursor=cursor,
+        )
+        assert conn2.execute("SELECT COUNT(*) FROM kanban_notify_retries").fetchone()[0] == 0
+
+
 def test_checkpoint_advertisement_is_config_gated_and_rejects_future_dates(
     kanban_home, monkeypatch,
 ):
@@ -384,8 +464,9 @@ def test_checkpoint_advertisement_is_config_gated_and_rejects_future_dates(
 
 
 def test_checkpoint_successor_context_includes_live_git_state_and_handoff(
-    kanban_home, tmp_path,
+    kanban_home, tmp_path, monkeypatch,
 ):
+    monkeypatch.setattr(kb, "safe_checkpoint_enabled", lambda: True)
     repo = tmp_path / "repo"
     _init_git_repo(repo)
     (repo / "README.md").write_text("changed\n", encoding="utf-8")
@@ -1059,6 +1140,10 @@ class TestSharedBoardPaths:
             max_runtime_seconds=120,
         )
         (tmp_path / "ws").mkdir()
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: {"kanban": {"deadline_warning_fraction": 0.75}},
+        )
         before_spawn = int(time.time())
         kb._default_spawn(task, str(tmp_path / "ws"))
 

@@ -1743,7 +1743,8 @@ def terminate_run_endpoint(
                 status_code=409,
                 detail=(
                     f"cannot terminate run {run_id}: task {r.task_id} is no "
-                    "longer in a reclaimable state"
+                    "longer in a reclaimable state (a live checkpoint "
+                    "predecessor may still hold its fence)"
                 ),
             )
         return {"ok": True, "run_id": run_id, "task_id": r.task_id}
@@ -1781,7 +1782,8 @@ def reclaim_task_endpoint(
                 status_code=409,
                 detail=(
                     f"cannot reclaim {task_id}: not in a claimable state "
-                    "(not running, or unknown id)"
+                    "(not running, unknown, or a live checkpoint predecessor "
+                    "still holds its fence)"
                 ),
             )
         return {"ok": True, "task_id": task_id}

@@ -143,7 +143,11 @@ def _safe_checkpoint_enabled() -> bool:
         cfg = load_config() or {}
         kanban = cfg.get("kanban") if isinstance(cfg, dict) else None
         checkpoint = kanban.get("safe_checkpoint") if isinstance(kanban, dict) else None
-        return bool(checkpoint.get("enabled", False)) if isinstance(checkpoint, dict) else False
+        if not isinstance(checkpoint, dict):
+            return False
+        from hermes_cli.kanban_config import enabled
+
+        return enabled(checkpoint.get("enabled", False))
     except Exception:
         return False
 
@@ -969,6 +973,12 @@ def _handle_checkpoint(args: dict, **kw) -> str:
         return delegated_err
     if not _safe_checkpoint_enabled():
         return tool_error("kanban_checkpoint is disabled by kanban.safe_checkpoint.enabled")
+    # Checkpointing is a worker-only rollover protocol.  Orchestrators can
+    # manage lifecycle state, but have no predecessor process to fence.
+    if not (os.environ.get("HERMES_KANBAN_TASK") and _is_dispatcher_owned_worker()):
+        return tool_error(
+            "kanban_checkpoint requires a dispatcher-spawned worker context"
+        )
     tid = _default_task_id(args.get("task_id"))
     if not tid:
         return tool_error(
@@ -977,6 +987,11 @@ def _handle_checkpoint(args: dict, **kw) -> str:
     ownership_err = _enforce_worker_task_ownership(tid)
     if ownership_err:
         return ownership_err
+    run_id = _worker_run_id(tid)
+    if run_id is None:
+        return tool_error(
+            "kanban_checkpoint requires a valid HERMES_KANBAN_RUN_ID for this worker"
+        )
     summary = args.get("summary")
     if not summary or not str(summary).strip():
         return tool_error("summary is required")
@@ -1007,7 +1022,7 @@ def _handle_checkpoint(args: dict, **kw) -> str:
                 tid,
                 summary=summary,
                 metadata=metadata,
-                expected_run_id=_worker_run_id(tid),
+                expected_run_id=run_id,
             )
             if not ok:
                 return tool_error(

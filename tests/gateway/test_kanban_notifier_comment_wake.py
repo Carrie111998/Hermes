@@ -141,6 +141,26 @@ def test_human_comment_wakes_once_silently_and_preserves_block(tmp_path, monkeyp
     assert len(adapter.handled) == 1
 
 
+def test_comment_before_needs_input_block_does_not_wake(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "comments.db"))
+    kb.init_db()
+    task_id = _commentable_task(status="ready")
+    conn = kb.connect()
+    try:
+        kb.add_comment(conn, task_id, "human", "An older comment")
+        assert kb.block_task(conn, task_id, reason="Need a fresh decision", kind="needs_input")
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+
+    # The blocked lifecycle event can still trigger its ordinary terminal
+    # wake; the older comment must not be selected as a human decision.
+    assert len(adapter.handled) == 1
+    assert "newest human comment as the decision" not in adapter.handled[0].text
+
+
 def test_push_comment_wake_failure_retries_before_advancing_cursor(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "comments.db"))
     kb.init_db()

@@ -69,9 +69,11 @@ def _resolve_human_comment_wake_settings(
         # decision unread.
         return True, False
     kcfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
+    from hermes_cli.kanban_config import enabled
+
     return (
-        bool(kcfg.get("human_comment_wake", True)),
-        bool(kcfg.get("human_comment_wake_overrides_mute", False)),
+        enabled(kcfg.get("human_comment_wake", True)),
+        enabled(kcfg.get("human_comment_wake_overrides_mute", False)),
     )
 
 
@@ -467,6 +469,13 @@ class GatewayKanbanWatchersMixin:
                                     if not events:
                                         continue
                                     task = _kb.get_task(conn, sub["task_id"])
+                                    block_event_id = (
+                                        _kb.latest_needs_input_block_event_id(conn, sub["task_id"])
+                                        if task
+                                        and task.status == "blocked"
+                                        and task.block_kind == "needs_input"
+                                        else None
+                                    )
                                     logger.debug(
                                         "kanban notifier: claimed %d event(s) for %s on board %s cursor %s→%s",
                                         len(events), sub["task_id"], slug, old_cursor, cursor,
@@ -477,6 +486,7 @@ class GatewayKanbanWatchersMixin:
                                         "cursor": cursor,
                                         "events": events,
                                         "task": task,
+                                        "block_event_id": block_event_id,
                                         "board": slug,
                                     })
                                 except Exception as sub_exc:
@@ -527,6 +537,7 @@ class GatewayKanbanWatchersMixin:
                             sub,
                             d["cursor"],
                             d.get("old_cursor", 0),
+                            [event.id for event in d["events"]],
                             board_slug,
                         )
                         continue
@@ -769,6 +780,7 @@ class GatewayKanbanWatchersMixin:
                                     sub,
                                     d["cursor"],
                                     d.get("old_cursor", 0),
+                                    [event.id for event in d["events"]],
                                     board_slug,
                                 )
                             # Rewind the pre-send claim on transient failure so
@@ -819,7 +831,7 @@ class GatewayKanbanWatchersMixin:
                                 event for event in d["events"]
                                 if event.kind == "commented"
                             ]
-                            if _comment_events:
+                            if _comment_events and d.get("block_event_id") is not None:
                                 _comment_event = _comment_events[-1]
                                 _comment_author = str(
                                     (_comment_event.payload or {}).get("author") or ""
@@ -829,6 +841,7 @@ class GatewayKanbanWatchersMixin:
                                     _comment_author
                                     and _comment_author != _assignee_name
                                     and _comment_author != _notifier_name
+                                    and _comment_event.id > d["block_event_id"]
                                 ):
                                     _comment_wake = _comment_author
                         # Terminal events wake only modes that opt in, while a
@@ -973,6 +986,7 @@ class GatewayKanbanWatchersMixin:
                                         sub,
                                         d["cursor"],
                                         d.get("old_cursor", 0),
+                                        [event.id for event in d["events"]],
                                         board_slug,
                                     )
                                 continue
@@ -1059,6 +1073,7 @@ class GatewayKanbanWatchersMixin:
                                         sub,
                                         d["cursor"],
                                         d.get("old_cursor", 0),
+                                        [event.id for event in d["events"]],
                                         board_slug,
                                     )
                                 continue
@@ -1068,10 +1083,9 @@ class GatewayKanbanWatchersMixin:
                         # push subs): advance cursor. The cursor is the dedup
                         # mechanism — it prevents re-delivery of the same
                         # event on subsequent ticks.
-                        if not _comment_wake:
-                            await asyncio.to_thread(
-                                self._kanban_advance, sub, d["cursor"], board_slug,
-                            )
+                        await asyncio.to_thread(
+                            self._kanban_advance, sub, d["cursor"], board_slug,
+                        )
                         if not _is_push_adapter:
                             # Nothing left to deliver on this path (the wake,
                             # if any, already succeeded above).
@@ -1156,6 +1170,7 @@ class GatewayKanbanWatchersMixin:
         sub: dict,
         claimed_cursor: int,
         old_cursor: int,
+        claimed_event_ids: list[int],
         board: Optional[str] = None,
     ) -> None:
         """Sync helper: undo a claimed notification cursor after send failure."""
@@ -1170,6 +1185,7 @@ class GatewayKanbanWatchersMixin:
                 thread_id=sub.get("thread_id") or "",
                 claimed_cursor=claimed_cursor,
                 old_cursor=old_cursor,
+                claimed_event_ids=claimed_event_ids,
             )
         finally:
             conn.close()

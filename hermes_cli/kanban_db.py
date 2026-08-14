@@ -344,6 +344,7 @@ def _fire_dispatch_tick_hook(
             result.auto_assigned_default,
             result.respawn_guarded,
             result.skipped_per_profile_capped,
+            result.skipped_workspace_conflict,
             result.skipped_unassigned,
             result.skipped_nonspawnable,
         )):
@@ -1523,6 +1524,18 @@ CREATE TABLE IF NOT EXISTS kanban_notify_subs (
     PRIMARY KEY (task_id, platform, chat_id, thread_id)
 );
 
+-- A failed delivery may race a later watcher that advances the subscription
+-- cursor.  Keep the individual event durable until a later successful send.
+CREATE TABLE IF NOT EXISTS kanban_notify_retries (
+    task_id       TEXT NOT NULL,
+    platform      TEXT NOT NULL,
+    chat_id       TEXT NOT NULL,
+    thread_id     TEXT NOT NULL DEFAULT '',
+    event_id      INTEGER NOT NULL,
+    created_at    INTEGER NOT NULL,
+    PRIMARY KEY (task_id, platform, chat_id, thread_id, event_id)
+);
+
 CREATE INDEX IF NOT EXISTS idx_tasks_assignee_status ON tasks(assignee, status);
 CREATE INDEX IF NOT EXISTS idx_tasks_status          ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_links_child           ON task_links(child_id);
@@ -1533,6 +1546,7 @@ CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, start
 CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
+CREATE INDEX IF NOT EXISTS idx_notify_retries_sub    ON kanban_notify_retries(task_id, platform, chat_id, thread_id);
 """
 
 
@@ -3191,28 +3205,28 @@ def _profile_skill_names(profile_name: str) -> set[str]:
     override: changing ``HERMES_HOME`` here would leak the assignee's profile
     into other gateway conversations running in this process.
     """
-    from agent.skill_utils import get_skills_dir, iter_skill_index_files, parse_frontmatter
+    from agent.skill_utils import get_all_skills_dirs, iter_skill_index_files, parse_frontmatter
     from hermes_constants import reset_hermes_home_override
     from hermes_constants import set_hermes_home_override
     from hermes_cli.profiles import get_profile_dir
 
     token = set_hermes_home_override(get_profile_dir(profile_name))
     try:
-        skills_dir = get_skills_dir()
         names: set[str] = set()
-        if not skills_dir.is_dir():
-            return names
-        for skill_file in iter_skill_index_files(skills_dir, "SKILL.md"):
-            names.add(skill_file.parent.name)
-            try:
-                frontmatter, _ = parse_frontmatter(
-                    skill_file.read_text(encoding="utf-8")
-                )
-            except Exception:
+        for skills_dir in get_all_skills_dirs():
+            if not skills_dir.is_dir():
                 continue
-            declared_name = str(frontmatter.get("name") or "").strip()
-            if declared_name:
-                names.add(declared_name)
+            for skill_file in iter_skill_index_files(skills_dir, "SKILL.md"):
+                names.add(skill_file.parent.name)
+                try:
+                    frontmatter, _ = parse_frontmatter(
+                        skill_file.read_text(encoding="utf-8")
+                    )
+                except Exception:
+                    continue
+                declared_name = str(frontmatter.get("name") or "").strip()
+                if declared_name:
+                    names.add(declared_name)
         return names
     finally:
         reset_hermes_home_override(token)
@@ -4532,6 +4546,16 @@ def list_events(conn: sqlite3.Connection, task_id: str) -> list[Event]:
     return out
 
 
+def latest_needs_input_block_event_id(
+    conn: sqlite3.Connection, task_id: str,
+) -> Optional[int]:
+    """Return the event that established the current human-input block."""
+    for event in reversed(list_events(conn, task_id)):
+        if event.kind == "blocked" and (event.payload or {}).get("kind") == "needs_input":
+            return int(event.id)
+    return None
+
+
 def _append_event(
     conn: sqlite3.Connection,
     task_id: str,
@@ -5211,40 +5235,10 @@ def release_stale_claims(
     """
     now = int(time.time())
     reclaimed = 0
-    # A remote checkpoint has no trustworthy local PID. Its retained fence is
-    # released only after the lease expires, including for callers that invoke
-    # this established stale-claim recovery path directly.
-    checkpoint_rows = conn.execute(
-        "SELECT id, claim_lock, worker_pid, claim_expires FROM tasks "
-        "WHERE status = 'ready' AND claim_lock IS NOT NULL "
-        "AND current_run_id IS NULL AND claim_expires IS NOT NULL "
-        "AND claim_expires < ?",
-        (now,),
-    ).fetchall()
-    for row in checkpoint_rows:
-        with write_txn(conn):
-            cur = conn.execute(
-                "UPDATE tasks SET claim_lock = NULL, claim_expires = NULL, "
-                "worker_pid = NULL WHERE id = ? AND status = 'ready' "
-                "AND current_run_id IS NULL AND claim_lock IS ? "
-                "AND claim_expires IS NOT NULL AND claim_expires < ?",
-                (row["id"], row["claim_lock"], now),
-            )
-            if cur.rowcount != 1:
-                continue
-            _append_event(
-                conn,
-                row["id"],
-                "checkpoint_released",
-                {
-                    "previous_worker_pid": (
-                        int(row["worker_pid"])
-                        if row["worker_pid"] is not None else None
-                    ),
-                    "reason": "claim_expired",
-                },
-            )
-            reclaimed += 1
+    # Keep stale recovery and the regular dispatcher on the same release
+    # primitive.  A host-local checkpoint fence outlives its lease while the
+    # predecessor PID is alive; only a remote fence is lease-released.
+    reclaimed += release_checkpoint_claims(conn)
     host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
     stale = conn.execute(
         "SELECT id, claim_lock, worker_pid, claim_expires, last_heartbeat_at, "
@@ -5399,13 +5393,36 @@ def reclaim_task(
     reclaimable state (not running, or doesn't exist).
     """
     row = conn.execute(
-        "SELECT status, claim_lock, worker_pid FROM tasks WHERE id = ?",
+        "SELECT status, claim_lock, worker_pid, claim_expires, current_run_id "
+        "FROM tasks WHERE id = ?",
         (task_id,),
     ).fetchone()
     if not row:
         return False
     if row["status"] != "running" and row["claim_lock"] is None:
         # Nothing to reclaim — already ready / blocked / done.
+        return False
+    # A ready (or manually transitioned) checkpoint has no active run but
+    # deliberately retains its predecessor fence.  Reclaim must not turn an
+    # operator click into a concurrent successor beside that live process.
+    if row["current_run_id"] is None and row["claim_lock"]:
+        host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
+        local = str(row["claim_lock"]).startswith(host_prefix)
+        if (local and row["worker_pid"] and _pid_alive(row["worker_pid"])) or (
+            not local and (
+                row["claim_expires"] is None
+                or int(row["claim_expires"]) >= int(time.time())
+            )
+        ):
+            _log.warning(
+                "kanban reclaim refused for fenced task %s: predecessor remains active",
+                task_id,
+            )
+            return False
+        # The predecessor is gone (or a remote lease expired).  Keep the
+        # actual fence clear in the one central release path; this reclaim is
+        # now a no-op because the task is already safely ready/transitioned.
+        release_checkpoint_claims(conn)
         return False
     prev_lock = row["claim_lock"]
     termination = _terminate_reclaimed_worker(
@@ -5715,9 +5732,9 @@ def complete_task(
                    SET status       = 'done',
                        result       = ?,
                        completed_at = ?,
-                       claim_lock   = NULL,
-                       claim_expires= NULL,
-                       worker_pid   = NULL,
+                       claim_lock   = CASE WHEN current_run_id IS NULL AND claim_lock IS NOT NULL THEN claim_lock ELSE NULL END,
+                       claim_expires= CASE WHEN current_run_id IS NULL AND claim_lock IS NOT NULL THEN claim_expires ELSE NULL END,
+                       worker_pid   = CASE WHEN current_run_id IS NULL AND claim_lock IS NOT NULL THEN worker_pid ELSE NULL END,
                        block_kind   = NULL,
                        block_recurrences = 0
                  WHERE id = ?
@@ -5732,9 +5749,9 @@ def complete_task(
                    SET status       = 'done',
                        result       = ?,
                        completed_at = ?,
-                       claim_lock   = NULL,
-                       claim_expires= NULL,
-                       worker_pid   = NULL,
+                       claim_lock   = CASE WHEN current_run_id IS NULL AND claim_lock IS NOT NULL THEN claim_lock ELSE NULL END,
+                       claim_expires= CASE WHEN current_run_id IS NULL AND claim_lock IS NOT NULL THEN claim_expires ELSE NULL END,
+                       worker_pid   = CASE WHEN current_run_id IS NULL AND claim_lock IS NOT NULL THEN worker_pid ELSE NULL END,
                        block_kind   = NULL,
                        block_recurrences = 0
                  WHERE id = ?
@@ -5937,7 +5954,7 @@ def release_checkpoint_claims(conn: sqlite3.Connection) -> int:
     host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
     rows = conn.execute(
         "SELECT id, claim_lock, claim_expires, worker_pid FROM tasks "
-        "WHERE status = 'ready' AND claim_lock IS NOT NULL "
+        "WHERE status != 'running' AND claim_lock IS NOT NULL "
         "AND current_run_id IS NULL"
     ).fetchall()
     released = 0
@@ -5953,8 +5970,8 @@ def release_checkpoint_claims(conn: sqlite3.Connection) -> int:
         with write_txn(conn):
             cur = conn.execute(
                 "UPDATE tasks SET claim_lock = NULL, claim_expires = NULL, "
-                "worker_pid = NULL WHERE id = ? AND status = 'ready' "
-                "AND claim_lock IS ?",
+                "worker_pid = NULL WHERE id = ? AND status != 'running' "
+                "AND current_run_id IS NULL AND claim_lock IS ?",
                 (row["id"], row["claim_lock"]),
             )
             if cur.rowcount == 1:
@@ -6661,9 +6678,9 @@ def block_task(
                 """
                 UPDATE tasks
                    SET status        = 'todo',
-                       claim_lock    = NULL,
-                       claim_expires = NULL,
-                       worker_pid    = NULL,
+                       claim_lock    = CASE WHEN current_run_id IS NULL AND claim_lock IS NOT NULL THEN claim_lock ELSE NULL END,
+                       claim_expires = CASE WHEN current_run_id IS NULL AND claim_lock IS NOT NULL THEN claim_expires ELSE NULL END,
+                       worker_pid    = CASE WHEN current_run_id IS NULL AND claim_lock IS NOT NULL THEN worker_pid ELSE NULL END,
                        block_kind    = ?
                  WHERE id = ?
                    AND status IN ('running', 'ready')
@@ -6718,9 +6735,9 @@ def block_task(
                 """
                 UPDATE tasks
                    SET status        = 'triage',
-                       claim_lock    = NULL,
-                       claim_expires = NULL,
-                       worker_pid    = NULL,
+                       claim_lock    = CASE WHEN current_run_id IS NULL AND claim_lock IS NOT NULL THEN claim_lock ELSE NULL END,
+                       claim_expires = CASE WHEN current_run_id IS NULL AND claim_lock IS NOT NULL THEN claim_expires ELSE NULL END,
+                       worker_pid    = CASE WHEN current_run_id IS NULL AND claim_lock IS NOT NULL THEN worker_pid ELSE NULL END,
                        block_kind    = ?,
                        block_recurrences = ?
                  WHERE id = ?
@@ -6757,9 +6774,9 @@ def block_task(
                     """
                     UPDATE tasks
                        SET status        = 'blocked',
-                           claim_lock    = NULL,
-                           claim_expires = NULL,
-                           worker_pid    = NULL,
+                           claim_lock    = CASE WHEN current_run_id IS NULL AND claim_lock IS NOT NULL THEN claim_lock ELSE NULL END,
+                           claim_expires = CASE WHEN current_run_id IS NULL AND claim_lock IS NOT NULL THEN claim_expires ELSE NULL END,
+                           worker_pid    = CASE WHEN current_run_id IS NULL AND claim_lock IS NOT NULL THEN worker_pid ELSE NULL END,
                            block_kind    = ?,
                            block_recurrences = ?
                      WHERE id = ?
@@ -6772,9 +6789,9 @@ def block_task(
                     """
                     UPDATE tasks
                        SET status        = 'blocked',
-                           claim_lock    = NULL,
-                           claim_expires = NULL,
-                           worker_pid    = NULL,
+                           claim_lock    = CASE WHEN current_run_id IS NULL AND claim_lock IS NOT NULL THEN claim_lock ELSE NULL END,
+                           claim_expires = CASE WHEN current_run_id IS NULL AND claim_lock IS NOT NULL THEN claim_expires ELSE NULL END,
+                           worker_pid    = CASE WHEN current_run_id IS NULL AND claim_lock IS NOT NULL THEN worker_pid ELSE NULL END,
                            block_kind    = ?,
                            block_recurrences = ?
                      WHERE id = ?
@@ -6951,9 +6968,9 @@ def request_review(
             """
             UPDATE tasks
                SET status        = 'review',
-                   claim_lock    = NULL,
-                   claim_expires = NULL,
-                   worker_pid    = NULL
+                   claim_lock    = CASE WHEN current_run_id IS NULL AND claim_lock IS NOT NULL THEN claim_lock ELSE NULL END,
+                   claim_expires = CASE WHEN current_run_id IS NULL AND claim_lock IS NOT NULL THEN claim_expires ELSE NULL END,
+                   worker_pid    = CASE WHEN current_run_id IS NULL AND claim_lock IS NOT NULL THEN worker_pid ELSE NULL END
             """ + assignee_sql + """
              WHERE id = ?
                AND status IN ('running', 'ready')
@@ -7086,9 +7103,9 @@ def request_changes(
             UPDATE tasks
                SET status = ?,
                    assignee = COALESCE(?, assignee),
-                   claim_lock = NULL,
-                   claim_expires = NULL,
-                   worker_pid = NULL
+                   claim_lock = CASE WHEN current_run_id IS NULL AND claim_lock IS NOT NULL THEN claim_lock ELSE NULL END,
+                   claim_expires = CASE WHEN current_run_id IS NULL AND claim_lock IS NOT NULL THEN claim_expires ELSE NULL END,
+                   worker_pid = CASE WHEN current_run_id IS NULL AND claim_lock IS NOT NULL THEN worker_pid ELSE NULL END
              WHERE id = ? AND status = 'running' AND current_run_id = ?
             """,
             (new_status, implementer, task_id, int(current_run_id)),
@@ -7343,7 +7360,9 @@ def reopen_review_task(conn: sqlite3.Connection, task_id: str) -> bool:
         )
         cur = conn.execute(
             "UPDATE tasks SET status = ?, current_run_id = NULL, "
-            "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
+            "claim_lock = CASE WHEN current_run_id IS NULL AND claim_lock IS NOT NULL THEN claim_lock ELSE NULL END, "
+            "claim_expires = CASE WHEN current_run_id IS NULL AND claim_lock IS NOT NULL THEN claim_expires ELSE NULL END, "
+            "worker_pid = CASE WHEN current_run_id IS NULL AND claim_lock IS NOT NULL THEN worker_pid ELSE NULL END "
             # consecutive_failures deliberately PRESERVED: review reopen is
             # not a success signal; only complete_task resets the breaker
             # counter (mirrors unblock_task, #35072).
@@ -7471,7 +7490,9 @@ def invalidate_descendants_for_parent_reopen(
             # docstring for why this diverges from reopen_review_task.
             conn.execute(
                 "UPDATE tasks SET status = 'todo', completed_at = NULL, "
-                "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, "
+                "claim_lock = CASE WHEN current_run_id IS NULL AND claim_lock IS NOT NULL THEN claim_lock ELSE NULL END, "
+                "claim_expires = CASE WHEN current_run_id IS NULL AND claim_lock IS NOT NULL THEN claim_expires ELSE NULL END, "
+                "worker_pid = CASE WHEN current_run_id IS NULL AND claim_lock IS NOT NULL THEN worker_pid ELSE NULL END, "
                 "current_run_id = NULL, consecutive_failures = 0 WHERE id = ?",
                 (row["id"],),
             )
@@ -7863,7 +7884,9 @@ def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
     with write_txn(conn):
         cur = conn.execute(
             "UPDATE tasks SET status = 'archived', "
-            "    claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
+            "    claim_lock = CASE WHEN current_run_id IS NULL AND claim_lock IS NOT NULL THEN claim_lock ELSE NULL END, "
+            "    claim_expires = CASE WHEN current_run_id IS NULL AND claim_lock IS NOT NULL THEN claim_expires ELSE NULL END, "
+            "    worker_pid = CASE WHEN current_run_id IS NULL AND claim_lock IS NOT NULL THEN worker_pid ELSE NULL END "
             "WHERE id = ? AND status != 'archived'",
             (task_id,),
         )
@@ -8189,8 +8212,8 @@ def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
       where ``<board-root>`` is the active board's root. The path is the
       same for the dispatcher and every profile worker, so handoff is
       path-stable.
-    - ``dir:<path>``: the path stored in ``workspace_path``.  Created
-      if missing.  MUST be absolute — relative paths are rejected to
+    - ``dir:<path>``: the path stored in ``workspace_path``. It must already
+      exist. MUST be absolute — relative paths are rejected to
       prevent confused-deputy traversal where ``../../../tmp/attacker``
       resolves against the dispatcher's CWD instead of a meaningful
       root.  Users who want a kanban-root-relative workspace should
@@ -8236,7 +8259,11 @@ def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
                 f"{task.workspace_path!r}; use an absolute path "
                 f"(relative paths are ambiguous against the dispatcher's CWD)"
             )
-        p.mkdir(parents=True, exist_ok=True)
+        if not p.is_dir():
+            raise ValueError(
+                f"task {task.id} workspace preflight failed: expected an existing "
+                f"directory, got {str(p)!r}"
+            )
         return p
     if kind == "worktree":
         p, _branch_name = _resolve_worktree_workspace(task, board=board)
@@ -8377,9 +8404,9 @@ def schedule_task(
         sql = """
             UPDATE tasks
                SET status       = 'scheduled',
-                   claim_lock   = NULL,
-                   claim_expires= NULL,
-                   worker_pid   = NULL
+                   claim_lock   = CASE WHEN current_run_id IS NULL AND claim_lock IS NOT NULL THEN claim_lock ELSE NULL END,
+                   claim_expires= CASE WHEN current_run_id IS NULL AND claim_lock IS NOT NULL THEN claim_expires ELSE NULL END,
+                   worker_pid   = CASE WHEN current_run_id IS NULL AND claim_lock IS NOT NULL THEN worker_pid ELSE NULL END
              WHERE id = ?
                AND status IN ('todo', 'ready', 'running', 'blocked')
         """
@@ -10061,7 +10088,11 @@ def safe_checkpoint_enabled() -> bool:
 
         kanban = (load_config() or {}).get("kanban") or {}
         checkpoint = kanban.get("safe_checkpoint") if isinstance(kanban, dict) else None
-        return bool(checkpoint.get("enabled", False)) if isinstance(checkpoint, dict) else False
+        if not isinstance(checkpoint, dict):
+            return False
+        from hermes_cli.kanban_config import enabled
+
+        return enabled(checkpoint.get("enabled", False))
     except Exception:
         return False
 
@@ -10266,6 +10297,10 @@ def _dispatch_once_locked(
         "WHERE status = 'ready' AND claim_lock IS NULL "
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
+    # A dry run has no task rows to query on later iterations, so model its
+    # own would-be workspace claims explicitly.  Otherwise serialize mode
+    # falsely reports every same-workspace card as concurrently spawnable.
+    dry_run_workspace_owners: dict[str, list[str]] = {}
     spawned = 0
     # Per-profile concurrency cap (#21582): when set, track how many
     # workers each assignee already has in flight, and refuse to spawn
@@ -10413,6 +10448,11 @@ def _dispatch_once_locked(
                 workspace_path, running_task_ids = workspace_conflicts_with_running(
                     conn, candidate, board=board,
                 )
+                if dry_run and workspace_path is not None:
+                    running_task_ids = [
+                        *running_task_ids,
+                        *dry_run_workspace_owners.get(str(workspace_path), []),
+                    ]
                 if workspace_path is not None and running_task_ids:
                     message = workspace_conflict_message(
                         candidate.id, workspace_path, running_task_ids,
@@ -10428,6 +10468,16 @@ def _dispatch_once_locked(
         if dry_run:
             result.spawned.append((row["id"], row_assignee, ""))
             spawned += 1
+            if workspace_policy == "serialize":
+                candidate = get_task(conn, row["id"])
+                if candidate is not None:
+                    workspace_path, _ = workspace_conflicts_with_running(
+                        conn, candidate, board=board,
+                    )
+                    if workspace_path is not None:
+                        dry_run_workspace_owners.setdefault(
+                            str(workspace_path), [],
+                        ).append(candidate.id)
             # Increment per-profile counter even in dry_run so the cap
             # check sees the would-be spawn on subsequent iterations.
             # Without this, dry_run reports every task as spawnable and
@@ -10565,6 +10615,11 @@ def _dispatch_once_locked(
                 workspace_path, running_task_ids = workspace_conflicts_with_running(
                     conn, candidate, board=board,
                 )
+                if dry_run and workspace_path is not None:
+                    running_task_ids = [
+                        *running_task_ids,
+                        *dry_run_workspace_owners.get(str(workspace_path), []),
+                    ]
                 if workspace_path is not None and running_task_ids:
                     message = workspace_conflict_message(
                         candidate.id, workspace_path, running_task_ids,
@@ -10580,6 +10635,16 @@ def _dispatch_once_locked(
         if dry_run:
             result.spawned.append((row["id"], row["assignee"], ""))
             spawned += 1
+            if workspace_policy == "serialize":
+                candidate = get_task(conn, row["id"])
+                if candidate is not None:
+                    workspace_path, _ = workspace_conflicts_with_running(
+                        conn, candidate, board=board,
+                    )
+                    if workspace_path is not None:
+                        dry_run_workspace_owners.setdefault(
+                            str(workspace_path), [],
+                        ).append(candidate.id)
             if _per_profile_cap is not None:
                 _per_profile_running[row["assignee"]] = (
                     _per_profile_running.get(row["assignee"], 0) + 1
@@ -11037,7 +11102,17 @@ def _default_spawn(
         runtime_cap = int(task.max_runtime_seconds) if task.max_runtime_seconds else 0
     except (TypeError, ValueError):
         runtime_cap = 0
-    if runtime_cap > 0:
+    try:
+        from hermes_cli.config import load_config
+
+        deadline_fraction = float(
+            ((load_config() or {}).get("kanban") or {}).get(
+                "deadline_warning_fraction", 0.0,
+            )
+        )
+    except (AttributeError, TypeError, ValueError):
+        deadline_fraction = 0.0
+    if runtime_cap > 0 and 0.0 < deadline_fraction <= 1.0:
         env["HERMES_KANBAN_RUNTIME_CAP_SECONDS"] = str(runtime_cap)
         env["HERMES_KANBAN_RUNTIME_DEADLINE"] = str(int(time.time()) + runtime_cap)
     else:
@@ -11342,7 +11417,7 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
         lines.append(f"Branch:   {task.branch_name}")
     lines.append("")
 
-    git_state = _live_workspace_git_state(task.workspace_path)
+    git_state = _live_workspace_git_state(task.workspace_path) if safe_checkpoint_enabled() else []
     if git_state:
         lines.append("## Live Git state")
         lines.extend(git_state)
@@ -12080,7 +12155,7 @@ def claim_unseen_events_for_sub(
         if row is None:
             return 0, 0, []
         old_cursor = int(row["last_event_id"])
-        new_cursor, events = unseen_events_for_sub(
+        new_cursor, unseen_events = unseen_events_for_sub(
             conn,
             task_id=task_id,
             platform=platform,
@@ -12088,14 +12163,34 @@ def claim_unseen_events_for_sub(
             thread_id=thread_id,
             kinds=kinds,
         )
+        retry_rows = conn.execute(
+            "SELECT e.* FROM kanban_notify_retries r "
+            "JOIN task_events e ON e.id = r.event_id "
+            "WHERE r.task_id = ? AND r.platform = ? AND r.chat_id = ? "
+            "AND r.thread_id = ? ORDER BY e.id ASC",
+            (task_id, platform, chat_id, thread_id or ""),
+        ).fetchall()
+        retry_events = [
+            Event(
+                id=row["id"], task_id=row["task_id"], kind=row["kind"],
+                payload=(json.loads(row["payload"]) if row["payload"] else None),
+                created_at=row["created_at"],
+                run_id=(int(row["run_id"]) if row["run_id"] is not None else None),
+            )
+            for row in retry_rows
+        ]
+        events_by_id = {event.id: event for event in retry_events}
+        events_by_id.update({event.id: event for event in unseen_events})
+        events = [events_by_id[event_id] for event_id in sorted(events_by_id)]
         if not events:
             return old_cursor, old_cursor, []
-        conn.execute(
-            "UPDATE kanban_notify_subs SET last_event_id = ? "
-            "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ? "
-            "AND last_event_id = ?",
-            (int(new_cursor), task_id, platform, chat_id, thread_id or "", int(old_cursor)),
-        )
+        if new_cursor > old_cursor:
+            conn.execute(
+                "UPDATE kanban_notify_subs SET last_event_id = ? "
+                "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ? "
+                "AND last_event_id = ?",
+                (int(new_cursor), task_id, platform, chat_id, thread_id or "", int(old_cursor)),
+            )
         return old_cursor, new_cursor, events
 
 
@@ -12114,6 +12209,11 @@ def advance_notify_cursor(
             "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?",
             (int(new_cursor), task_id, platform, chat_id, thread_id or ""),
         )
+        conn.execute(
+            "DELETE FROM kanban_notify_retries WHERE task_id = ? AND platform = ? "
+            "AND chat_id = ? AND thread_id = ? AND event_id <= ?",
+            (task_id, platform, chat_id, thread_id or "", int(new_cursor)),
+        )
 
 
 def rewind_notify_cursor(
@@ -12125,6 +12225,7 @@ def rewind_notify_cursor(
     thread_id: Optional[str] = None,
     claimed_cursor: int,
     old_cursor: int,
+    claimed_event_ids: Optional[Iterable[int]] = None,
 ) -> bool:
     """Undo a notification claim when delivery fails.
 
@@ -12142,6 +12243,17 @@ def rewind_notify_cursor(
                 int(claimed_cursor),
             ),
         )
+        if cur.rowcount == 0 and claimed_event_ids:
+            now = int(time.time())
+            conn.executemany(
+                "INSERT OR IGNORE INTO kanban_notify_retries "
+                "(task_id, platform, chat_id, thread_id, event_id, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                [
+                    (task_id, platform, chat_id, thread_id or "", int(event_id), now)
+                    for event_id in claimed_event_ids
+                ],
+            )
     return cur.rowcount > 0
 
 

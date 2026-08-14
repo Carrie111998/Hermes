@@ -18,7 +18,9 @@ import time
 from typing import Any, Iterable, Optional
 
 
-_TERMINAL_KANBAN_TOOLS = frozenset({"kanban_complete", "kanban_block"})
+_TERMINAL_KANBAN_TOOLS = frozenset({
+    "kanban_complete", "kanban_block", "kanban_checkpoint",
+})
 
 _DEFAULT_MAX_ATTEMPTS = 2
 
@@ -55,7 +57,9 @@ def _safe_checkpoint_enabled() -> bool:
         checkpoint = ((load_config() or {}).get("kanban") or {}).get(
             "safe_checkpoint"
         ) or {}
-        return bool(checkpoint.get("enabled", False))
+        from hermes_cli.kanban_config import enabled
+
+        return enabled(checkpoint.get("enabled", False))
     except Exception:
         return False
 

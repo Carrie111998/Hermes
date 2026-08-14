@@ -62,10 +62,12 @@ def worker_env(monkeypatch, tmp_path):
     conn = kb.connect()
     try:
         tid = kb.create_task(conn, title="worker-test", assignee="test-worker")
-        kb.claim_task(conn, tid)
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None and claimed.current_run_id is not None
     finally:
         conn.close()
     monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(claimed.current_run_id))
     return tid
 
 
@@ -121,6 +123,19 @@ def test_checkpoint_tool_is_exposed_when_configuration_is_enabled(
     assert "kanban_checkpoint" in names
 
 
+@pytest.mark.parametrize("value", ["false", "NO", "0", "off", "", "true"])
+def test_checkpoint_string_config_values_fail_closed(value, monkeypatch):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    config = {"kanban": {"safe_checkpoint": {"enabled": value}}}
+    monkeypatch.setattr(kt, "load_config", lambda: config)
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: config)
+
+    assert kt._safe_checkpoint_enabled() is False
+    assert kb.safe_checkpoint_enabled() is False
+
+
 def test_checkpoint_requires_fresh_database_advertisement_even_with_env_flag(
     worker_env, monkeypatch,
 ):
@@ -136,6 +151,17 @@ def test_checkpoint_requires_fresh_database_advertisement_even_with_env_flag(
     assert "fresh safe-checkpoint support" in payload["error"]
     with kb.connect() as conn:
         assert kb.get_task(conn, worker_env).status == "running"
+
+
+def test_checkpoint_fails_closed_without_a_worker_run_id(worker_env, monkeypatch):
+    from tools import kanban_tools as kt
+
+    monkeypatch.setattr(kt, "_safe_checkpoint_enabled", lambda: True)
+    monkeypatch.delenv("HERMES_KANBAN_RUN_ID", raising=False)
+
+    payload = json.loads(kt._handle_checkpoint({"summary": "safe boundary"}))
+
+    assert "HERMES_KANBAN_RUN_ID" in payload["error"]
 
 
 def test_canonical_handoff_is_recursively_redacted_and_bounded():

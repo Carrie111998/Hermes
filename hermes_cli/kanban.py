@@ -1903,7 +1903,8 @@ def _cmd_reclaim(args: argparse.Namespace) -> int:
         )
     if not ok:
         print(
-            f"cannot reclaim {args.task_id} (not running or unknown id)",
+            f"cannot reclaim {args.task_id} (not running, unknown, or a live "
+            "checkpoint predecessor still holds its fence)",
             file=sys.stderr,
         )
         return 1

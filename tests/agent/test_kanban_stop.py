@@ -80,6 +80,22 @@ def test_no_nudge_after_kanban_complete(clear_kanban_env):
     assert build_kanban_stop_nudge(messages=messages) is None
 
 
+def test_no_nudge_after_kanban_checkpoint(clear_kanban_env):
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_abc")
+    messages = [{
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [{
+            "id": "1",
+            "type": "function",
+            "function": {"name": "kanban_checkpoint", "arguments": "{}"},
+        }],
+    }]
+
+    assert session_called_kanban_terminal(messages) is True
+    assert build_kanban_stop_nudge(messages=messages) is None
+
+
 def test_deadline_warning_is_disabled_by_default(clear_kanban_env, monkeypatch):
     clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_deadline")
     clear_kanban_env.setenv("HERMES_KANBAN_RUNTIME_DEADLINE", "200")
@@ -176,4 +192,3 @@ def test_deadline_warning_waits_until_after_threshold_and_finishes_or_blocks(
 # without a terminal call, the dispatcher's bounded retry (streak of 3)
 # handles it.  See also tests/hermes_cli/test_kanban_core_functionality.py
 # for the dispatcher-side streak tests.
-

@@ -74,6 +74,7 @@ def test_workspace_conflict_allow_preserves_parallel_dispatch(
     """The default-compatible allow policy leaves shared directories alone."""
     workspace_policy("allow")
     shared = tmp_path / "shared"
+    shared.mkdir()
     with kb.connect() as conn:
         _running_dir_task(conn, shared)
         candidate = _ready_dir_task(conn, shared)
@@ -94,6 +95,7 @@ def test_workspace_conflict_warn_dispatches_and_logs(
 ) -> None:
     workspace_policy("warn")
     shared = tmp_path / "shared"
+    shared.mkdir()
     with kb.connect() as conn:
         blocker = _running_dir_task(conn, shared)
         candidate = _ready_dir_task(conn, shared)
@@ -114,6 +116,7 @@ def test_workspace_conflict_serialize_defers_then_dispatches_after_completion(
 ) -> None:
     workspace_policy("serialize")
     shared = tmp_path / "shared"
+    shared.mkdir()
     with kb.connect() as conn:
         blocker = _running_dir_task(conn, shared)
         candidate = _ready_dir_task(conn, shared)
@@ -128,6 +131,27 @@ def test_workspace_conflict_serialize_defers_then_dispatches_after_completion(
         assert kb.complete_task(conn, blocker, result="finished")
         dispatched = kb.dispatch_once(conn, spawn_fn=lambda *_args: None)
         assert [task_id for task_id, _assignee, _path in dispatched.spawned] == [candidate]
+
+
+def test_workspace_conflict_serialize_dry_run_models_intra_tick_ownership(
+    kanban_home: Path,
+    workspace_policy,
+    spawnable_profiles: None,
+    tmp_path: Path,
+) -> None:
+    workspace_policy("serialize")
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    with kb.connect() as conn:
+        first = _ready_dir_task(conn, shared, title="first")
+        second = _ready_dir_task(conn, shared, title="second")
+
+        result = kb.dispatch_once(conn, dry_run=True, spawn_fn=lambda *_args: None)
+
+    assert [task_id for task_id, _assignee, _path in result.spawned] == [first]
+    assert result.skipped_workspace_conflict == [
+        (second, [first], str(shared.resolve()))
+    ]
 
 
 def test_workspace_conflict_serialize_never_blocks_scratch(

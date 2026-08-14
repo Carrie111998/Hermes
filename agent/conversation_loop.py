@@ -7101,6 +7101,32 @@ def run_conversation(
                                 pass
                     break
 
+                # Tool-heavy workers can otherwise run past the advisory
+                # checkpoint threshold forever: the final-response path below
+                # is never reached. Inject the same once-per-run nudge before
+                # the next model turn.
+                try:
+                    from agent.kanban_stop import build_kanban_deadline_warning
+
+                    _tool_deadline_warning = build_kanban_deadline_warning(
+                        issued=getattr(agent, "_kanban_deadline_warning_issued", False),
+                    )
+                except Exception:
+                    logger.debug("kanban tool-path deadline-warning check failed", exc_info=True)
+                    _tool_deadline_warning = None
+                if _tool_deadline_warning:
+                    agent._kanban_deadline_warning_issued = True
+                    messages.append({
+                        "role": "user",
+                        "content": _tool_deadline_warning,
+                        "_kanban_deadline_warning_synthetic": True,
+                    })
+                    agent._session_messages = messages
+                    logger.info(
+                        "kanban deadline-warning nudge issued on tool path task=%s",
+                        os.environ.get("HERMES_KANBAN_TASK", ""),
+                    )
+
                 # Reset per-turn retry counters after successful tool
                 # execution so a single truncation doesn't poison the
                 # entire conversation.
