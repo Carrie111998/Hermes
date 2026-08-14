@@ -8,8 +8,10 @@ Two stages, both off the critical path:
    turn finishes (which measured p50 151s / p90 1212s on real sessions).
 2. **Upgrade** — one small-model call that replaces the derived title with a
    proper one. Runs on a cheap/fast tier, with thinking disabled and the
-   response constrained to a JSON object, so there is no reasoning preamble to
-   strip and nothing to parse out of prose.
+   response as free text, so title extraction goes through the JSON scan +
+   prose fallback in ``_extract_title_text`` (strict ``json_schema`` response
+   formats are avoided because some local providers abort and return empty
+   ``content`` under them).
 
 Provenance (``derived`` < ``llm`` < ``user``) is enforced by the storage layer,
 so stage 2 can only ever replace stage 1, and neither can replace a name the
@@ -94,24 +96,6 @@ _TITLE_PROMPT_TEMPLATE = (
 
 _LANGUAGE_RULE_MATCH_USER = "- Write the title in the same language as the user's message."
 _LANGUAGE_RULE_PINNED = "- Write the title in {language}."
-
-# JSON schema constraining the response to a single title field. Removes the
-# whole class of "model answered the prompt instead of titling it" failures
-# that produced titles like "<title>...</title>" and "User: Yep, that's the
-# catch —" in real session history.
-_TITLE_RESPONSE_FORMAT = {
-    "type": "json_schema",
-    "json_schema": {
-        "name": "session_title",
-        "strict": True,
-        "schema": {
-            "type": "object",
-            "properties": {"title": {"type": "string"}},
-            "required": ["title"],
-            "additionalProperties": False,
-        },
-    },
-}
 
 # Control-tag wrappers that surround machine-authored content inside what is
 # nominally a "user" message. Titling from these is what produces a session
@@ -348,8 +332,9 @@ def generate_title(
     """Generate a session title from the user's opening message.
 
     Runs on the ``title_generation`` auxiliary task, which resolves to a
-    small/fast model tier. Thinking is disabled and the response is constrained
-    to ``{"title": "..."}`` so there is no preamble or reasoning to strip.
+    small/fast model tier. Thinking is disabled and the response is free text;
+    the title is extracted via ``_extract_title_text``'s JSON scan + prose
+    fallback, so there is no rigid format to break strict local providers.
 
     Titles come from the user's message alone — every surveyed implementation
     that titles well (Claude Code, OpenCode, Cursor, OpenClaw) does the same.
