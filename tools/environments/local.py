@@ -394,8 +394,8 @@ def _is_hermes_internal_secret(key: str) -> bool:
     return False
 
 
-def _applied_secret_values_for_current_home() -> frozenset[str]:
-    """Return the values of externally-applied secrets for the current home.
+def _applied_secret_values_for_child_env() -> frozenset[str]:
+    """Return the values of externally-applied secrets across all homes.
 
     Value-based (provenance-aware) companion to the name-shape predicates.
     External secret sources (Bitwarden / 1Password / command) may apply
@@ -405,28 +405,28 @@ def _applied_secret_values_for_current_home() -> frozenset[str]:
     spawned child.  Any env var carrying one of these values is itself a
     secret-bearing var and must be stripped from child environments.
 
-    The home is resolved exactly the way ``hermes_cli.env_loader`` keys its
-    snapshot (``str(Path(home).resolve())``) via
-    ``hermes_constants.get_hermes_home()`` — context override →
-    ``HERMES_HOME`` env var → platform default — the same resolution the
-    spawn factories in this module use to bridge ``HERMES_HOME`` into the
-    child.  Multiplexed gateways therefore scrub with the *routed profile's*
-    values, never another profile's.
+    In multiplex mode, external secrets applied to the launch profile or any
+    hydrated profile can remain present in process-global ``os.environ``
+    while turns are routed under context-local ``HERMES_HOME`` overrides.
+    Scrubbing compares against all known applied secret values across all
+    homes so a child spawned for profile B never inherits profile A's
+    arbitrary-name secrets from parent ``os.environ``.
 
-    Fail-open by design: an empty snapshot, an unresolvable home, or an
-    ``env_loader`` import failure all degrade to the empty set (no extra
-    scrubbing), preserving today's behavior.  Empty-string values are
-    excluded — they carry no secret material and must not cause every
-    empty-valued env var to be stripped.
+    Explicit ``env_passthrough`` registrations continue to win: if profile B
+    explicitly registers a variable in its passthrough list, that variable
+    still reaches profile B's child even if its value matches an applied secret.
+
+    Fail-open by design: an empty snapshot or an ``env_loader`` import failure
+    all degrade to the empty set (no extra scrubbing), preserving default
+    behavior.  Empty-string values are excluded — they carry no secret material
+    and must not cause every empty-valued env var to be stripped.
     """
     try:
-        from hermes_cli.env_loader import get_secret_source_values
-        from hermes_constants import get_hermes_home
+        from hermes_cli.env_loader import get_all_secret_source_values
 
-        snapshot = get_secret_source_values(get_hermes_home())
+        return get_all_secret_source_values()
     except Exception:  # noqa: BLE001 — the scrub must never break a spawn
         return frozenset()
-    return frozenset(value for value in snapshot.values() if value)
 
 
 def _inject_context_hermes_home(env: dict) -> None:
@@ -499,12 +499,12 @@ def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = Non
         _is_passthrough = lambda _: False  # noqa: E731
         _resolve_passthrough_value = lambda _name, fallback: fallback  # noqa: E731
 
-    # Provenance-aware value set for the current home (#77164): any base or
+    # Provenance-aware value set for child envs (#77164): any base or
     # extra var whose value matches an externally-applied secret value is
     # scrubbed even when its name has no credential shape (DATABASE_URL,
     # FOO, 1Password item keys).  Passthrough-registered vars keep winning:
     # the explicit env_passthrough contract outranks the value scrub.
-    applied_secret_values = _applied_secret_values_for_current_home()
+    applied_secret_values = _applied_secret_values_for_child_env()
 
     sanitized: dict[str, str] = {}
 
@@ -673,11 +673,11 @@ def hermes_subprocess_env(*, inherit_credentials: bool = False) -> dict[str, str
     # Provenance-aware value scrub (#77164): values applied by external
     # secret sources (Bitwarden / 1Password / command) may sit in the env
     # under names no shape predicate matches (``DATABASE_URL``, ``FOO``,
-    # 1Password item keys).  Strip any key carrying a value from the current
-    # home's applied-secrets snapshot.  This surface has no env_passthrough
+    # 1Password item keys).  Strip any key carrying a value from any
+    # applied-secrets snapshot.  This surface has no env_passthrough
     # concept, so the scrub is unconditional (mirroring the Tier-1 strip).
     # Fail-open: an empty snapshot or import failure scrubs nothing.
-    applied_secret_values = _applied_secret_values_for_current_home()
+    applied_secret_values = _applied_secret_values_for_child_env()
     if applied_secret_values:
         for key in list(env):
             if env.get(key) in applied_secret_values:
@@ -1339,7 +1339,7 @@ def _make_run_env(env: dict) -> dict:
     # _sanitize_subprocess_env: externally-applied secret values are
     # stripped regardless of the var's name shape, while explicitly
     # passthrough-registered vars keep their value.
-    applied_secret_values = _applied_secret_values_for_current_home()
+    applied_secret_values = _applied_secret_values_for_child_env()
 
     merged = dict(os.environ | env)
     run_env = {}

@@ -489,9 +489,10 @@ class TestProvenanceScrub:
         finally:
             env_loader._SECRET_SOURCE_VALUES_BY_HOME.pop(home_key, None)
 
-    def test_scrub_never_uses_another_profiles_snapshot(self, tmp_path, monkeypatch):
-        """Cross-profile isolation: values snapshotted for home A must never
-        be used to scrub a child built for home B."""
+    def test_scrub_removes_applied_secrets_across_all_profiles(self, tmp_path, monkeypatch):
+        """Cross-profile boundary: external secrets applied to Profile A must
+        be scrubbed from a child spawned for Profile B even when Profile A's
+        values remain in the parent process environment."""
         from hermes_cli import env_loader
         from tools.environments.local import _sanitize_subprocess_env
 
@@ -503,11 +504,11 @@ class TestProvenanceScrub:
         key_a = self._seed_applied_secrets(home_a, {"FOO": "«redacted:profile-a-secret»"})
         try:
             monkeypatch.setenv("HERMES_HOME", str(home_b))
-            # Same value as profile-a's secret, but we're building for B.
+            # FOO is profile-A's secret sitting in base env, building for B without passthrough.
             result = _sanitize_subprocess_env(
                 {"FOO": "«redacted:profile-a-secret»", "PATH": "/usr/bin"}
             )
-            assert result["FOO"] == "«redacted:profile-a-secret»"
+            assert "FOO" not in result
             assert result["PATH"] == "/usr/bin"
         finally:
             env_loader._SECRET_SOURCE_VALUES_BY_HOME.pop(key_a, None)
@@ -558,6 +559,55 @@ class TestProvenanceScrub:
             assert out.stdout.strip() == db_url
         finally:
             env_loader._SECRET_SOURCE_VALUES_BY_HOME.pop(home_key, None)
+
+    def test_multiplex_cross_profile_applied_secret_scrubbed_e2e(self, tmp_path, monkeypatch):
+        """Multiplex E2E: when profile A's external secret source populated
+        process-global os.environ, spawning a child under profile B's context
+        strips profile A's arbitrary-name secret while profile B's passthrough
+        still resolves."""
+        import json
+        import subprocess
+        import sys
+
+        from hermes_cli import env_loader
+        from tools.environments.local import build_subprocess_env
+        from tools.env_passthrough import clear_env_passthrough, register_env_passthrough
+
+        home_a = tmp_path / "profile-a"
+        home_b = tmp_path / "profile-b"
+        home_a.mkdir()
+        home_b.mkdir()
+
+        secret_a = "«redacted:profile-a-secret-value»"
+        secret_b = "«redacted:profile-b-passthrough-value»"
+        key_a = self._seed_applied_secrets(home_a, {"FOO": secret_a})
+        key_b = self._seed_applied_secrets(home_b, {"BAR": secret_b})
+        try:
+            monkeypatch.setenv("HERMES_HOME", str(home_b))
+            monkeypatch.setenv("FOO", secret_a)
+            monkeypatch.setenv("BAR", secret_b)
+            monkeypatch.setenv("MY_VAR", "ordinary-value")
+
+            register_env_passthrough(["BAR"])
+            try:
+                env = build_subprocess_env()
+                out = subprocess.run(
+                    [sys.executable, "-c",
+                     "import os, json; print(json.dumps({"
+                     "'foo': os.environ.get('FOO'), "
+                     "'bar': os.environ.get('BAR'), "
+                     "'my_var': os.environ.get('MY_VAR')}))"],
+                    env=env, capture_output=True, text=True, timeout=60, check=True,
+                )
+                res = json.loads(out.stdout)
+                assert res["foo"] is None
+                assert res["bar"] == secret_b
+                assert res["my_var"] == "ordinary-value"
+            finally:
+                clear_env_passthrough()
+        finally:
+            env_loader._SECRET_SOURCE_VALUES_BY_HOME.pop(key_a, None)
+            env_loader._SECRET_SOURCE_VALUES_BY_HOME.pop(key_b, None)
 
     def test_make_run_env_scrubs_applied_value_and_passthrough_wins(self, tmp_path, monkeypatch):
         """The terminal run-env path (_make_run_env) applies the same
