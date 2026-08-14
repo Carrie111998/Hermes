@@ -1271,6 +1271,21 @@ class TestBangPrefixCommands:
             evt["thread_ts"] = thread_ts
         return evt
 
+    @pytest.mark.asyncio
+    async def test_delete_bang_command_reaches_gateway_as_command(self, adapter):
+        """``!delete`` is a registered thread-safe deterministic command."""
+        await adapter._handle_slack_message(
+            self._make_event(
+                "!delete",
+                thread_ts="1111111111.000001",
+            )
+        )
+
+        msg_event = adapter.handle_message.call_args[0][0]
+        assert msg_event.text == "/delete"
+        assert msg_event.message_type == MessageType.COMMAND
+        assert msg_event.get_command() == "delete"
+
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(

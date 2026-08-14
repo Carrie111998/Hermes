@@ -15082,6 +15082,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if handler_key:
             special = {
                 "start": self._busy_start_command,
+                "delete": self._busy_delete_command,
                 "stop": self._busy_stop_command,
                 "new": self._busy_new_command,
                 "queue": self._busy_queue_command,
@@ -15131,6 +15132,195 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             f"⏳ Agent is running — `/{name}` can't run "
             f"mid-turn. Wait for the current response or `/stop` first."
         )
+
+    async def _handle_slack_delete_command(self, event: MessageEvent):
+        """Execute the owner-only Slack thread scrub outside the model path.
+
+        Deterministic gateway code end to end: the deletion request and the
+        owner token never enter model context. Silent on success; on failure
+        exactly one sanitized report (IDs and error codes only) goes to the
+        SLACK_ERRORS_CHANNEL channel. Rerunning `!delete` is the retry path;
+        already-absent state counts as success.
+        """
+        from gateway.slack_thread_delete import (
+            SlackSdkOwnerClient,
+            SlackThreadDeleteService,
+        )
+
+        source = event.source
+        workspace_id = str(getattr(source, "scope_id", None) or "")
+        channel_id = str(getattr(source, "chat_id", None) or "")
+        thread_ts = str(getattr(source, "thread_id", None) or "")
+        trigger_ts = str(getattr(event, "message_id", None) or "")
+        if (
+            source.platform != Platform.SLACK
+            or re.fullmatch(r"[A-Z0-9]{2,40}", workspace_id) is None
+            or re.fullmatch(r"[A-Z0-9]{2,40}", channel_id) is None
+            or re.fullmatch(r"[0-9]{1,20}\.[0-9]{1,20}", thread_ts) is None
+            or thread_ts == trigger_ts
+            or re.fullmatch(r"[0-9]{1,20}\.[0-9]{1,20}", trigger_ts) is None
+        ):
+            return ""
+        invoker_user_id = str(getattr(source, "user_id", None) or "")
+
+        errors_channel = os.environ.get("SLACK_ERRORS_CHANNEL", "").strip()
+        owner_token = os.environ.get("SLACK_OWNER_USER_TOKEN", "").strip()
+        if not owner_token:
+            report = SlackThreadDeleteService._format_report(
+                workspace_id=workspace_id,
+                channel_id=channel_id,
+                thread_ts=thread_ts,
+                failures=["auth:token_missing"],
+            )
+            adapter = self._adapter_for_source(source)
+            send = getattr(adapter, "send", None)
+            if errors_channel and callable(send):
+                try:
+                    result = send(
+                        errors_channel, report,
+                        metadata={"slack_team_id": workspace_id},
+                    )
+                    if inspect.isawaitable(result):
+                        await result
+                except Exception:
+                    logger.error("Slack delete failure report delivery failed")
+            else:
+                logger.error("Slack delete failed (%s); no errors channel", report)
+            return ""
+
+        from gateway.platforms.api_server import ResponseStore
+
+        session_key = self._session_key_for_source(source)
+        entry = await self.async_session_store.get_entry(session_key)
+        expected_session_id = str(getattr(entry, "session_id", None) or "")
+
+        delete_generation: Optional[int] = None
+
+        async def _quiesce() -> None:
+            nonlocal delete_generation
+            if (event.metadata or {}).get("slack_delete_quiesced") is False:
+                raise RuntimeError("active_turn_not_stopped")
+            await self._interrupt_and_clear_session(
+                session_key,
+                source,
+                interrupt_reason="delete_command",
+                invalidation_reason="delete_command",
+                release_running_state=False,
+            )
+            delete_generation = self._session_run_generation.get(session_key)
+            self._evict_cached_agent(session_key)
+            self._clear_conversation_scope(session_key, reason="delete_command")
+
+        async def _report_failure(text: str) -> Any:
+            if not errors_channel:
+                raise RuntimeError("errors_channel_unconfigured")
+            if owner_client is not None:
+                return await owner_client.chat_postMessage(
+                    channel=errors_channel, text=text
+                )
+            raise RuntimeError("report_transport_unavailable")
+
+        async def _local_scrub() -> list[str]:
+            failures: list[str] = []
+            session_db = getattr(self, "_session_db", None)
+            if session_db is None:
+                return ["session:db_unavailable"]
+            if not expected_session_id:
+                return failures
+            try:
+                target_ids = await session_db.get_history_delete_targets(
+                    expected_session_id
+                )
+            except Exception as exc:
+                return [f"session:{expected_session_id}:{type(exc).__name__}"]
+            try:
+                response_store = ResponseStore(require_durable=True)
+                try:
+                    await asyncio.to_thread(
+                        response_store.delete_for_sessions, target_ids
+                    )
+                finally:
+                    response_store.close()
+            except Exception as exc:
+                return [f"session:{expected_session_id}:{type(exc).__name__}"]
+            try:
+                count, file_failures = await session_db.delete_history_lineage(
+                    expected_session_id, sessions_dir=self.config.sessions_dir
+                )
+                failures.extend(file_failures)
+                if target_ids and count == 0 and not file_failures:
+                    failures.append(
+                        f"session:{expected_session_id}:delete_failed"
+                    )
+            except Exception as exc:
+                failures.append(
+                    f"session:{expected_session_id}:{type(exc).__name__}"
+                )
+            if failures:
+                return failures
+            try:
+                removed = await self.async_session_store.remove_route_if_session_matches(
+                    session_key, expected_session_id
+                )
+                current = await self.async_session_store.get_entry(session_key)
+                if (
+                    not removed
+                    and current is not None
+                    and current.session_id == expected_session_id
+                ):
+                    failures.append(f"route:{expected_session_id}:delete_failed")
+            except Exception as exc:
+                failures.append(f"route:{expected_session_id}:{type(exc).__name__}")
+            return failures
+
+        owner_client = None
+        report_attempted = False
+
+        async def _single_report(text: str) -> None:
+            nonlocal report_attempted
+            if report_attempted:
+                return
+            report_attempted = True
+            await _report_failure(text)
+
+        try:
+            owner_client = SlackSdkOwnerClient(owner_token)
+            service = SlackThreadDeleteService(
+                owner_client, report_failure=_single_report
+            )
+            await service.execute(
+                channel_id=channel_id,
+                thread_ts=thread_ts,
+                trigger_ts=trigger_ts,
+                invoker_user_id=invoker_user_id,
+                workspace_id=workspace_id,
+                quiesce=_quiesce,
+                local_scrub=_local_scrub,
+            )
+            if service.report_delivery_failed:
+                logger.error("Slack delete failure report delivery failed")
+        except Exception as exc:
+            report = SlackThreadDeleteService._format_report(
+                workspace_id=workspace_id,
+                channel_id=channel_id,
+                thread_ts=thread_ts,
+                failures=[f"local:orchestration:{type(exc).__name__}"],
+            )
+            try:
+                await _single_report(report)
+            except Exception:
+                logger.error("Slack delete failure report delivery failed")
+        finally:
+            if owner_client is not None:
+                try:
+                    await owner_client.close()
+                except Exception:
+                    logger.error("Slack owner client close failed")
+            if delete_generation is not None:
+                self._release_running_agent_state(
+                    session_key, run_generation=delete_generation
+                )
+        return ""
 
     async def _handle_pause_command(self, event: MessageEvent):
         """`/pause [reason]` engages the global emergency stop; `/pause off`
@@ -15188,6 +15378,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
         logger.info("STOP for session %s — agent interrupted, session lock released", quick_key)
         return EphemeralReply(t("gateway.stop.stopped"))
+
+    async def _busy_delete_command(self, event: MessageEvent, quick_key: str, source):
+        return await self._handle_slack_delete_command(event)
 
     async def _busy_new_command(self, event: MessageEvent, quick_key: str, source):
         # /reset and /new must bypass the running-agent guard so they
@@ -16192,6 +16385,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         if canonical == "pause":
             return await self._handle_pause_command(event)
+
+        if canonical == "delete":
+            return await self._handle_slack_delete_command(event)
 
         if canonical == "new":
             if await asyncio.to_thread(self._is_telegram_topic_root_lobby, source):

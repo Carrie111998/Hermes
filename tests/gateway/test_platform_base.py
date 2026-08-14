@@ -1,8 +1,9 @@
 """Tests for gateway/platforms/base.py — MessageEvent, media extraction, message truncation."""
 
+import asyncio
 import os
 import time
-from unittest.mock import patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -10,6 +11,9 @@ from gateway.platforms.base import (
     BasePlatformAdapter,
     GATEWAY_SECRET_CAPTURE_UNSUPPORTED_MESSAGE,
     MessageEvent,
+    MessageType,
+    Platform,
+    SessionSource,
     cache_audio_from_bytes,
     cache_image_from_bytes,
     cache_video_from_bytes,
@@ -20,6 +24,77 @@ from gateway.platforms.base import (
     _prefix_within_utf16_limit,
     cache_audio_from_bytes,
 )
+
+
+@pytest.mark.asyncio
+async def test_delete_cancels_old_turn_before_handler_and_fails_closed():
+    """/delete cancels the in-flight turn BEFORE the runner handles the
+    command, discards queued input, marks quiesced, and releases the guard."""
+
+    class StubAdapter(BasePlatformAdapter):
+        async def connect(self, *, is_reconnect: bool = False):
+            return True
+
+        async def disconnect(self):
+            return None
+
+        async def send(self, chat_id, content, reply_to=None, metadata=None):
+            from gateway.platforms.base import SendResult
+            return SendResult(success=True)
+
+        async def get_chat_info(self, chat_id):
+            return {}
+
+    adapter = object.__new__(StubAdapter)
+    adapter.platform = Platform.SLACK
+    old_started = asyncio.Event()
+    old_cancelled = asyncio.Event()
+
+    async def old_turn():
+        old_started.set()
+        try:
+            await asyncio.Future()
+        finally:
+            old_cancelled.set()
+
+    old_task = asyncio.create_task(old_turn())
+    await old_started.wait()
+    session_key = "slack:C:T"
+    old_guard = asyncio.Event()
+    adapter._active_sessions = {session_key: old_guard}
+    adapter._session_tasks = {session_key: old_task}
+    adapter._pending_messages = {session_key: MagicMock()}
+    adapter._expected_cancelled_tasks = set()
+    adapter._background_tasks = set()
+    adapter._typing_paused = set()
+    adapter._unwrap_ephemeral = lambda response: (response, 0)
+    adapter._send_with_retry = AsyncMock()
+    adapter._discard_text_debounce = MagicMock()
+    event = MessageEvent(
+        text="/delete",
+        message_type=MessageType.COMMAND,
+        source=SessionSource(
+            platform=Platform.SLACK,
+            chat_id="C",
+            chat_type="channel",
+            user_id="U",
+            thread_id="T",
+        ),
+        metadata={},
+    )
+
+    async def handler(_event):
+        assert old_cancelled.is_set()
+        assert session_key in adapter._active_sessions
+        assert session_key not in adapter._pending_messages
+        return ""
+
+    adapter._message_handler = handler
+    await adapter._dispatch_active_session_command(event, session_key, "delete")
+
+    assert event.metadata["slack_delete_quiesced"] is True
+    assert session_key not in adapter._active_sessions
+    assert old_task.done()
 
 
 def test_media_delivery_denies_encrypted_bitwarden_cache(tmp_path, monkeypatch):

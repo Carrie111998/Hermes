@@ -1761,6 +1761,32 @@ class SessionStore:
         else:
             self._save_entries()
 
+    def get_entry(self, session_key: str) -> Optional[SessionEntry]:
+        """Return the current route entry without creating a session."""
+        with self._lock:
+            self._ensure_loaded_locked()
+            return self._entries.get(session_key)
+
+    def remove_route_if_session_matches(
+        self, session_key: str, expected_session_id: str
+    ) -> bool:
+        """Compare-and-delete one route, preserving any replacement session."""
+        with self._lock:
+            entry = self._entries.get(session_key)
+            if entry is None or entry.session_id != expected_session_id:
+                return False
+            self._entries.pop(session_key, None)
+            data, generation = self._snapshot_routing_locked()
+        try:
+            self._persist_routing_data(data, generation)
+        except Exception:
+            # Roll back the live map only when no newer route replaced it.
+            with self._lock:
+                if session_key not in self._entries:
+                    self._entries[session_key] = entry
+            raise
+        return True
+
     def _resolve_profile_for_key(self, source: Optional[SessionSource] = None) -> Optional[str]:
         """Return the profile namespace for session keys, or None when off.
 

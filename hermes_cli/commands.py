@@ -103,6 +103,10 @@ COMMAND_REGISTRY: list[CommandDef] = [
     # Session
     CommandDef("start", "Acknowledge platform start pings without a reply", "Session",
                gateway_only=True, busy_policy="dispatch", busy_handler="start"),
+    CommandDef("delete", "Delete this Slack thread and its local Hermes records", "Session",
+               gateway_only=True, cli_only=True,
+               gateway_config_gate="gateway.slack.enabled",
+               busy_policy="interrupt_then_dispatch", busy_handler="delete"),
     CommandDef("new", "Start a new session (fresh session ID + history)", "Session",
                aliases=("reset",), args_hint="[name]",
                busy_policy="interrupt_then_dispatch", busy_handler="new"),
@@ -1277,7 +1281,7 @@ _SLACK_PRIORITY_ALIASES = ("btw", "bg")
 #     native slash.
 #   - pause: global emergency stop; reached via /hermes pause [off] on
 #     Slack. Added at the 50-cap — a native slot would clamp /platform.
-_SLACK_VIA_HERMES_ONLY = frozenset({"topup", "moa", "debug", "egress", "init", "version", "diff", "update", "heartbeat", "refine", "pause"})
+_SLACK_VIA_HERMES_ONLY = frozenset({"topup", "moa", "debug", "egress", "init", "version", "diff", "update", "heartbeat", "refine", "pause", "delete"})
 
 
 def _sanitize_slack_name(raw: str) -> str:

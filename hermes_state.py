@@ -9905,31 +9905,71 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         self._execute_write(_do)
 
     @staticmethod
-    def _remove_session_files(sessions_dir: Optional[Path], session_id: str) -> None:
-        """Remove on-disk transcript files for a session.
-
-        Cleans up ``{session_id}.json``, ``{session_id}.jsonl``, and any
-        ``request_dump_{session_id}_*.json`` files left by the gateway.
-        Silently skips files that don't exist and swallows OSError so a
-        filesystem hiccup never blocks a DB operation.
-        """
+    def _remove_session_files(
+        sessions_dir: Optional[Path], session_id: str
+    ) -> List[str]:
+        """Remove on-disk transcript files and return sanitized failures."""
         if sessions_dir is None:
-            return
+            return []
+        failures: List[str] = []
         for suffix in (".json", ".jsonl"):
             p = sessions_dir / f"{session_id}{suffix}"
             try:
                 p.unlink(missing_ok=True)
             except OSError:
-                pass
-        # request_dump files use session_id as a prefix component
+                failures.append(f"session:{session_id}:transcript_unlink_failed")
         try:
             for p in sessions_dir.glob(f"request_dump_{session_id}_*.json"):
                 try:
                     p.unlink(missing_ok=True)
                 except OSError:
-                    pass
+                    failures.append(f"session:{session_id}:request_dump_unlink_failed")
         except OSError:
-            pass
+            failures.append(f"session:{session_id}:request_dump_scan_failed")
+        return failures
+
+    def get_history_delete_targets(self, session_id: str) -> List[str]:
+        """Return all sessions that can retain copied history from ``session_id``."""
+        targets: set[str] = set()
+        pending = list(self.get_compression_lineage(session_id))
+        while pending:
+            current_id = pending.pop()
+            if current_id in targets:
+                continue
+            session = self.get_session(current_id)
+            if not session:
+                continue
+            targets.add(current_id)
+            with self._lock:
+                if self._conn is None:
+                    raise RuntimeError("SessionDB connection is closed")
+                rows = self._conn.execute(
+                    "SELECT * FROM sessions WHERE parent_session_id = ?",
+                    (current_id,),
+                ).fetchall()
+            for row in rows:
+                child = dict(row)
+                child_id = str(child["id"])
+                if self._is_compression_child_row(child) or self._is_explicit_fork_child_row(child):
+                    pending.append(child_id)
+        return sorted(targets, key=lambda value: (value != session_id, value))
+
+    def delete_history_lineage(
+        self, session_id: str, sessions_dir: Optional[Path] = None
+    ) -> tuple[int, List[str]]:
+        """Delete a session plus every branch/compression/delegate descendant.
+
+        Transcript files are removed first. If any unlink fails, database rows
+        remain intact so a later ``!delete`` can rediscover and retry them.
+        Returns ``(deleted_row_count, sanitized_file_failures)``.
+        """
+        targets = self.get_history_delete_targets(session_id)
+        file_failures: List[str] = []
+        for target_id in targets:
+            file_failures.extend(self._remove_session_files(sessions_dir, target_id))
+        if file_failures:
+            return 0, file_failures
+        return self.delete_sessions(targets, sessions_dir=None), []
 
     def get_session_delete_targets(self, session_id: str) -> List[str]:
         """Return every session row that :meth:`delete_session` would remove.

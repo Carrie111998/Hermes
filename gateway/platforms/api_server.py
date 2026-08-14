@@ -826,7 +826,10 @@ class ResponseStore:
     if the on-disk path is unavailable.
     """
 
-    def __init__(self, max_size: int = MAX_STORED_RESPONSES, db_path: str = None):
+    def __init__(
+        self, max_size: int = MAX_STORED_RESPONSES, db_path: str = None,
+        *, require_durable: bool = False,
+    ):
         self._max_size = max_size
         if db_path is None:
             try:
@@ -838,6 +841,10 @@ class ResponseStore:
         try:
             self._conn = sqlite3.connect(db_path, check_same_thread=False)
         except Exception:
+            # Privacy deletion must never "succeed" against a silent
+            # in-memory fallback while the durable store keeps the rows.
+            if require_durable:
+                raise
             self._conn = sqlite3.connect(":memory:", check_same_thread=False)
             self._db_path = None
         # Use shared WAL-fallback helper so response_store.db degrades
@@ -954,6 +961,47 @@ class ResponseStore:
         )
         self._conn.commit()
         return cursor.rowcount > 0
+
+    def delete_for_sessions(self, session_ids: list[str]) -> int:
+        """Delete responses whose stored payload belongs to any session ID."""
+        wanted = {str(session_id) for session_id in session_ids if session_id}
+        if not wanted:
+            return 0
+        try:
+            response_ids = [
+                row[0]
+                for row in self._conn.execute(
+                    "SELECT response_id FROM responses "
+                    f"WHERE json_extract(data, '$.session_id') IN ({','.join('?' for _ in wanted)})",
+                    list(wanted),
+                ).fetchall()
+            ]
+        except sqlite3.OperationalError:
+            # JSON1 is absent in some minimal SQLite builds; keep a bounded
+            # compatibility scan instead of retaining history silently.
+            response_ids = []
+            for response_id, raw_data in self._conn.execute(
+                "SELECT response_id, data FROM responses"
+            ).fetchall():
+                try:
+                    data = json.loads(raw_data)
+                except (json.JSONDecodeError, TypeError):
+                    continue
+                if str(data.get("session_id") or "") in wanted:
+                    response_ids.append(response_id)
+        if not response_ids:
+            return 0
+        placeholders = ",".join("?" for _ in response_ids)
+        with self._conn:
+            self._conn.execute(
+                f"DELETE FROM conversations WHERE response_id IN ({placeholders})",
+                response_ids,
+            )
+            cursor = self._conn.execute(
+                f"DELETE FROM responses WHERE response_id IN ({placeholders})",
+                response_ids,
+            )
+        return cursor.rowcount
 
     def get_conversation(self, name: str) -> Optional[str]:
         """Get the latest response_id for a conversation name."""

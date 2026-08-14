@@ -5813,12 +5813,17 @@ class BasePlatformAdapter(ABC):
         *,
         release_guard: bool = True,
         discard_pending: bool = True,
+        require_exit: bool = False,
     ) -> None:
         """Cancel in-flight processing for a single session.
 
         ``release_guard=False`` keeps the adapter-level session guard in place
         so reset-like commands can finish atomically before follow-up messages
         are allowed to start a fresh background task.
+
+        ``require_exit=True`` re-raises the 5s cancellation timeout instead of
+        proceeding, so callers that must not overlap the old turn (/delete)
+        can fail closed.
 
         Bounded by a 5s timeout so a wedged finally block in the cancelled
         task (typing-task cleanup, on_processing_complete hook, etc.) can't
@@ -5845,6 +5850,8 @@ class BasePlatformAdapter(ABC):
                     "unblocking dispatch and letting the task unwind in the background",
                     self.name, session_key,
                 )
+                if require_exit:
+                    raise
             except Exception:
                 logger.debug(
                     "[%s] Session cancellation raised while unwinding %s",
@@ -5907,6 +5914,21 @@ class BasePlatformAdapter(ABC):
         thread_meta = _thread_metadata_for_source(event.source, _reply_anchor_for_event(event))
 
         try:
+            if cmd == "delete":
+                # Privacy deletion must not overlap the old turn: cancel it
+                # BEFORE the runner handles the command, and fail closed
+                # (quiesced=False) if it did not exit within the timeout.
+                event.metadata = dict(event.metadata or {})
+                try:
+                    await self.cancel_session_processing(
+                        session_key,
+                        release_guard=False,
+                        discard_pending=True,
+                        require_exit=True,
+                    )
+                    event.metadata["slack_delete_quiesced"] = True
+                except asyncio.TimeoutError:
+                    event.metadata["slack_delete_quiesced"] = False
             response = await self._message_handler(event)
             _text, _eph_ttl = self._unwrap_ephemeral(response)
             # Send the response BEFORE cancelling the old task so the send
@@ -5936,11 +5958,13 @@ class BasePlatformAdapter(ABC):
                     )
             # Old adapter task (if any) is cancelled AFTER the response has
             # been sent — keeps ordering deterministic and avoids the race.
-            await self.cancel_session_processing(
-                session_key,
-                release_guard=False,
-                discard_pending=False,
-            )
+            # For /delete the old task was already cancelled above.
+            if cmd != "delete":
+                await self.cancel_session_processing(
+                    session_key,
+                    release_guard=False,
+                    discard_pending=False,
+                )
         except Exception:
             # On failure, restore the original guard if one still exists so
             # we don't leave the session in a half-reset state.
@@ -5950,6 +5974,13 @@ class BasePlatformAdapter(ABC):
                 else:
                     self._release_session_guard(session_key, guard=command_guard)
             raise
+
+        if cmd == "delete":
+            # Never drain a queued follow-up into a thread being scrubbed.
+            self._pending_messages.pop(session_key, None)
+            self._discard_text_debounce(session_key)
+            self._release_session_guard(session_key, guard=command_guard)
+            return
 
         await self._drain_pending_after_session_command(session_key, command_guard)
 
