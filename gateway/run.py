@@ -16232,9 +16232,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return await self._handle_status_command(event)
 
         if canonical == "egress":
-            from hermes_cli.proxy_cli import format_status_text
+            from hermes_cli.slash_exec import CommandContext, CommandReply, execute_command
 
-            return format_status_text()
+            text = None
+            try:
+                text = execute_command("egress", CommandContext(surface="gateway")).text
+            except LookupError:
+                from hermes_cli.proxy_cli import format_status_text
+
+                text = format_status_text()
+            return text
 
         if canonical == "context":
             return await self._handle_context_command(event)
@@ -16533,6 +16540,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         if canonical == "voice":
             return await self._handle_voice_command(event)
+
+        try:
+            from hermes_cli.slash_exec import CommandContext, execute_command, get_executor_keys
+
+            if canonical in get_executor_keys():
+                return execute_command(canonical, CommandContext(surface="gateway")).text
+        except LookupError:
+            pass
 
         if self._draining:
             return f"⏳ Gateway is {self._status_action_gerund()} and is not accepting new work right now."

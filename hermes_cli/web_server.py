@@ -345,6 +345,10 @@ app.include_router(_memory_oauth_router)
 
 
 def _resolve_session_token() -> str:
+    # The desktop shell mints the token and injects it via
+    # HERMES_DASHBOARD_SESSION_TOKEN so its main process can authenticate
+    # the /api calls it makes on the user's behalf; honor that value when
+    # present so desktop-spawned backends keep `/api/ws` auth consistent.
     return os.environ.get("HERMES_DASHBOARD_SESSION_TOKEN") or secrets.token_urlsafe(32)
 
 

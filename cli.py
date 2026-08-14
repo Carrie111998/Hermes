@@ -10756,12 +10756,16 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         elif canonical == "context":
             self._show_context_breakdown(cmd_original)
         elif canonical == "egress":
-            from hermes_cli.slash_exec import CommandContext, execute_command
+            from hermes_cli.slash_exec import CommandContext, CommandReply, execute_command
 
-            self._console_print(
-                execute_command("egress", CommandContext(surface="cli")).text,
-                highlight=False, markup=False,
-            )
+            text = None
+            try:
+                text = execute_command("egress", CommandContext(surface="cli")).text
+            except LookupError:
+                from hermes_cli.proxy_cli import format_status_text
+
+                text = format_status_text()
+            self._console_print(text, highlight=False, markup=False)
         elif canonical == "statusbar":
             self._status_bar_visible = not self._status_bar_visible
             state = "visible" if self._status_bar_visible else "hidden"
@@ -10999,6 +11003,20 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         elif canonical == "indicator":
             self._handle_indicator_command(cmd_original)
         else:
+            # Shared registry-owned executors — only run commands that are
+            # actually migrated. This keeps /briefing, /backup, /cleanup,
+            # /health, /logs, /dashboard, /capture, /listen, /voicectl and
+            # any future `execute=` command working without per-command
+            # elif clutter here.
+            try:
+                from hermes_cli.slash_exec import CommandContext, execute_command, get_executor_keys
+
+                if canonical in get_executor_keys():
+                    text = execute_command(canonical, CommandContext(surface="cli")).text
+                    self._console_print(text, highlight=False, markup=False)
+            except LookupError:
+                pass
+            
             # Check for user-defined quick commands (bypass agent loop, no LLM call)
             base_cmd = cmd_lower.split()[0]
             skill_commands = _ensure_skill_commands()

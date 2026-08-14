@@ -19,9 +19,19 @@ prompt_toolkit and without cycles.
 
 from __future__ import annotations
 
+import shutil
+import subprocess
+import sys
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any
+
+
+def _resolve_python_executable() -> str:
+    return shutil.which("python") or shutil.which("python3") or sys.executable
+
+
+_PYTHON = _resolve_python_executable()
 
 __all__ = [
     "CommandContext",
@@ -165,6 +175,317 @@ def _exec_help(ctx: CommandContext) -> CommandReply:
     return CommandReply("\n".join(lines), format="markdown")
 
 
+def _exec_status(ctx: CommandContext) -> CommandReply:
+    """Core /status text — lightweight Hermes dashboard."""
+    from pathlib import Path
+    import json
+    from datetime import datetime
+
+    ROOT = Path.home() / ".hermes"
+
+    def load_json(path: Path) -> dict:
+        if path.exists():
+            try:
+                return json.loads(path.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+        return {}
+
+    now = datetime.now().strftime("%d.%m.%Y %H:%M")
+    gateway = load_json(ROOT / "gateway_state.json")
+    platform = gateway.get("platforms", {}).get("telegram", {})
+    lines = [
+        f"📊 Hermes Status {now}",
+        f"- Gateway: {gateway.get('gateway_state', 'unknown')}",
+        f"- Telegram: {platform.get('state', 'unknown')}",
+    ]
+
+    hardware = load_json(ROOT / "hardware_monitor_state.json")
+    if hardware:
+        alerts = [k for k in ["cpu", "mem", "gpu", "temp", "disk"] if hardware.get(f"{k}_last_alert")]
+        if alerts:
+            lines.append(f"- Letzte Alarme: {', '.join([a.upper() for a in alerts])}")
+        else:
+            lines.append("- Hardware-Alarme: keine")
+
+    capture = load_json(ROOT / "visual_capture_state.json").get("last_capture", {})
+    if capture:
+        lines.append(f"- Letzter Capture: {capture.get('mode', '—')} ({capture.get('time', '')})")
+
+    return CommandReply("\n".join(lines))
+
+
+def _exec_morning_briefing(ctx: CommandContext) -> CommandReply:
+    """Core /briefing text — run morning briefing script."""
+    import subprocess
+    from pathlib import Path
+
+    script = Path.home() / ".hermes" / "scripts" / "hermes_morning_briefing.py"
+    try:
+        proc = subprocess.run(
+            [_PYTHON, str(script)],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        text = (proc.stdout or "").strip() or "Morning Briefing konnte nicht erstellt werden."
+        return CommandReply(text)
+    except Exception as exc:
+        return CommandReply(f"Morning Briefing fehlgeschlagen: {exc}")
+
+
+def _exec_manual_backup(ctx: CommandContext) -> CommandReply:
+    """Run the backup script now."""
+    import subprocess
+    from pathlib import Path
+
+    script = Path.home() / ".hermes" / "scripts" / "weekly_backup.py"
+    try:
+        proc = subprocess.run(
+            [_PYTHON, str(script)],
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+        out = (proc.stdout or "").strip()
+        err = (proc.stderr or "").strip()
+        if proc.returncode == 0:
+            return CommandReply(out or "Backup erfolgreich gestartet.")
+        return CommandReply(f"Backup fehlgeschlagen:\n{err or out}")
+    except subprocess.TimeoutExpired:
+        return CommandReply("Backup läuft noch... Das kann bei großen Datenmengen ein paar Minuten dauern.")
+    except Exception as exc:
+        return CommandReply(f"Backup fehlgeschlagen: {exc}")
+
+
+def _exec_manual_cleanup(ctx: CommandContext) -> CommandReply:
+    """Run the auto-cleanup script now."""
+    import subprocess
+    from pathlib import Path
+
+    script = Path.home() / ".hermes" / "scripts" / "hermes_cleanup.py"
+    try:
+        proc = subprocess.run(
+            [_PYTHON, str(script)],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        out = (proc.stdout or "").strip()
+        err = (proc.stderr or "").strip()
+        if proc.returncode == 0:
+            return CommandReply(out or "Cleanup erfolgreich.")
+        return CommandReply(f"Cleanup fehlgeschlagen:\n{err or out}")
+    except subprocess.TimeoutExpired:
+        return CommandReply("Cleanup läuft noch...")
+    except Exception as exc:
+        return CommandReply(f"Cleanup fehlgeschlagen: {exc}")
+
+
+def _exec_health(ctx: CommandContext) -> CommandReply:
+    """Show system health summary."""
+    import subprocess
+    from pathlib import Path
+
+    lines = ["Health-Check:"]
+
+    # Gateway
+    try:
+        proc = subprocess.run(
+            [_PYTHON, "-c",
+             "import json; p=__import__('pathlib').Path.home()/'.hermes'/'gateway_state.json'; "
+             "print(json.loads(p.read_text(encoding='utf-8')).get('gateway_state','?'))"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        gw = (proc.stdout or "").strip() or "?"
+    except Exception:
+        gw = "?"
+    lines.append(f"- Gateway: {gw}")
+
+    # Telegram
+    try:
+        proc = subprocess.run(
+            [_PYTHON, "-c",
+             "import json; p=__import__('pathlib').Path.home()/'.hermes'/'gateway_state.json'; "
+             "print(json.loads(p.read_text(encoding='utf-8')).get('platforms',{}).get('telegram',{}).get('state','?'))"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        tg = (proc.stdout or "").strip() or "?"
+    except Exception:
+        tg = "?"
+    lines.append(f"- Telegram: {tg}")
+
+    # Hardware quick metrics
+    script = Path.home() / ".hermes" / "scripts" / "hermes_hardware_monitor.py"
+    try:
+        proc = subprocess.run(
+            [_PYTHON, str(script), "--status"],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        text = (proc.stdout or "").strip()
+        if text:
+            lines.append("")
+            lines.append("Hardware:")
+            for raw in text.splitlines()[:12]:
+                lines.append(f"- {raw}")
+    except Exception:
+        pass
+
+    return CommandReply("\n".join(lines))
+
+
+def _exec_logs(ctx: CommandContext) -> CommandReply:
+    """Show recent Hermes logs."""
+    from pathlib import Path
+    import os
+
+    logs_dir = Path.home() / ".hermes" / "logs"
+    candidates = [
+        logs_dir / "gateway.log",
+        logs_dir / "gateway_error.log",
+        logs_dir / "agent.log",
+    ]
+    parts = []
+    for path in candidates:
+        if not path.exists():
+            continue
+        try:
+            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+            tail = "\n".join(lines[-80:])
+            parts.append(f"=== {path.name} ===\n{tail}")
+        except Exception as exc:
+            parts.append(f"=== {path.name} ===\nFehler: {exc}")
+
+    if not parts:
+        return CommandReply("Keine Logdateien gefunden.")
+    return CommandReply("\n\n".join(parts))
+
+
+def _exec_dashboard(ctx: CommandContext) -> CommandReply:
+    """Run the dashboard script now."""
+    import subprocess
+    from pathlib import Path
+
+    script = Path.home() / ".hermes" / "scripts" / "hermes_dashboard.py"
+    try:
+        proc = subprocess.run(
+            [_PYTHON, str(script)],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        text = (proc.stdout or "").strip() or "Dashboard konnte nicht erstellt werden."
+        return CommandReply(text)
+    except Exception as exc:
+        return CommandReply(f"Dashboard fehlgeschlagen: {exc}")
+
+
+def _exec_capture(ctx: CommandContext) -> CommandReply:
+    """Trigger a visual capture now."""
+    import subprocess
+    from pathlib import Path
+
+    script = Path.home() / ".hermes" / "scripts" / "hermes_visual_capture.py"
+    try:
+        proc = subprocess.run(
+            [_PYTHON, str(script), "--now"],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        text = (proc.stdout or "").strip() or "Capture fehlgeschlagen."
+        return CommandReply(text)
+    except Exception as exc:
+        return CommandReply(f"Capture fehlgeschlagen: {exc}")
+
+
+def _exec_update(ctx: CommandContext) -> CommandReply:
+    """Core /update text — non-blocking update status for gateway/Telegram."""
+    from pathlib import Path
+
+    project_root = Path.home() / ".hermes" / "hermes-agent"
+    git_dir = project_root / ".git"
+
+    if not git_dir.exists():
+        return CommandReply("Update-Status:\n- Installationspfad ist kein Git-Repo\n- Automatisches Update läuft täglich um 05:00 via Cron")
+
+    try:
+        import subprocess
+        git_cmd = ["git"]
+        if sys.platform == "win32":
+            git_cmd = ["git", "-c", "windows.appendAtomically=false"]
+
+        # Quick local check only — no network fetch
+        rev_local = subprocess.run(
+            git_cmd + ["rev-parse", "HEAD"],
+            cwd=project_root,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        ).stdout.strip()[:12]
+
+        branch = subprocess.run(
+            git_cmd + ["rev-parse", "--abbrev-ref", "HEAD"],
+            cwd=project_root,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        ).stdout.strip()
+
+        return CommandReply(
+            f"Update-Status:\n- Branch: {branch}\n- Lokaler Commit: {rev_local}\n- Volles Update läuft täglich um 05:00\n- Manuell: `hermes update` im Terminal"
+        )
+    except Exception as exc:
+        return CommandReply(f"Update-Status nicht verfügbar: {exc}")
+
+
+def _exec_listen(ctx: CommandContext) -> CommandReply:
+    """Run local STT listen script and return transcript."""
+    from pathlib import Path
+
+    script = Path.home() / ".hermes" / "scripts" / "hermes_voice_listen.py"
+    try:
+        proc = subprocess.run(
+            [_PYTHON, str(script), "listen", "8"],
+            capture_output=True,
+            text=True,
+            timeout=180,
+        )
+        text = (proc.stdout or "").strip()
+        if text:
+            return CommandReply(f"🎤 {text}")
+        err = (proc.stderr or "").strip()
+        return CommandReply(f"Kein Transkript.\n{err or 'Bitte Mikro prüfen.'}")
+    except Exception as exc:
+        return CommandReply(f"Spracheingabe fehlgeschlagen: {exc}")
+
+
+def _exec_voice_control(ctx: CommandContext) -> CommandReply:
+    """Voice control status or test."""
+    from pathlib import Path
+
+    script = Path.home() / ".hermes" / "scripts" / "hermes_voice_listen.py"
+    try:
+        proc = subprocess.run(
+            [_PYTHON, str(script), "status"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        text = (proc.stdout or "").strip()
+        if text:
+            return CommandReply(text)
+        return CommandReply("Sprachmodul: Status nicht verfügbar.")
+    except Exception as exc:
+        return CommandReply(f"Sprachstatus fehlgeschlagen: {exc}")
+
+
 def _exec_commands(ctx: CommandContext) -> CommandReply:
     """Core gateway /commands body — paginated command + skill listing.
 
@@ -238,7 +559,22 @@ EXECUTORS: dict[str, Callable[[CommandContext], CommandReply]] = {
     "bundles": _exec_bundles,
     "gateway_help": _exec_help,
     "gateway_commands": _exec_commands,
+    "status": _exec_status,
+    "morning_briefing": _exec_morning_briefing,
+    "manual_backup": _exec_manual_backup,
+    "manual_cleanup": _exec_manual_cleanup,
+    "health": _exec_health,
+    "logs": _exec_logs,
+    "dashboard": _exec_dashboard,
+    "capture": _exec_capture,
+    "update": _exec_update,
+    "listen": _exec_listen,
+    "voice_control": _exec_voice_control,
 }
+
+
+def get_executor_keys() -> frozenset[str]:
+    return frozenset(EXECUTORS)
 
 
 def resolve_executor(cmd_def: Any) -> Callable[[CommandContext], CommandReply] | None:
