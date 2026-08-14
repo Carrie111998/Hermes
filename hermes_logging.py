@@ -180,58 +180,6 @@ def clear_session_context() -> None:
 # Record factory — injects session_tag into every LogRecord at creation
 # ---------------------------------------------------------------------------
 
-_PTB_BOOTSTRAP_ABORT_MSG = "%s Failed run number %s of %s. Aborting."
-_PTB_BOOTSTRAP_PREFIXES = (
-    "Network Retry Loop (Bootstrap delete Webhook):",
-    "Network Retry Loop (Bootstrap delete Webhook): Timed out: Timed out.",
-)
-_PTB_SHUTDOWN_ACK_MSG = (
-    "Error while calling `get_updates` one more time to mark all fetched updates. "
-    "Suppressing error to ensure graceful shutdown. When polling for "
-    "updates is restarted, updates may be fetched again. Please adjust timeouts "
-    "via `ApplicationBuilder` or the parameter `get_updates_request` of `Bot`."
-)
-
-
-def _normalize_recovered_telegram_retry(record: logging.LogRecord) -> None:
-    """Demote only PTB retry records owned by Hermes' Telegram watchdog.
-
-    python-telegram-bot logs these bounded bootstrap/shutdown retries at ERROR
-    even though the adapter catches them and continues its independent retry
-    loop. This predicate intentionally matches the pinned SDK's raw templates
-    and argument shapes without rendering arbitrary logging values.
-    """
-    if type(record.levelno) is not int or record.levelno != logging.ERROR:
-        return
-    if type(record.name) is not str or type(record.msg) is not str:
-        return
-    if type(record.args) is not tuple:
-        return
-
-    matched = False
-    if record.name == "telegram.ext" and record.msg == _PTB_BOOTSTRAP_ABORT_MSG:
-        args = record.args
-        if (
-            len(args) == 3
-            and type(args[0]) is str
-            and type(args[1]) is int
-            and type(args[2]) is int
-            and args[0] in _PTB_BOOTSTRAP_PREFIXES
-            and args[1] == 0
-            and args[2] == 0
-        ):
-            matched = True
-    elif (
-        record.name == "telegram.ext.Updater"
-        and record.msg == _PTB_SHUTDOWN_ACK_MSG
-        and len(record.args) == 0
-    ):
-        matched = True
-
-    if matched:
-        record.levelno = logging.WARNING
-        record.levelname = "WARNING"
-
 def _install_session_record_factory() -> None:
     """Replace the global LogRecord factory with one that adds ``session_tag``.
 
@@ -251,7 +199,6 @@ def _install_session_record_factory() -> None:
 
     def _session_record_factory(*args, **kwargs):
         record = current_factory(*args, **kwargs)
-        _normalize_recovered_telegram_retry(record)
         sid = getattr(_session_context, "session_id", None)
         record.session_tag = f" [{sid}]" if sid else ""  # type: ignore[attr-defined]
         return record

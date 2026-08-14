@@ -2234,6 +2234,7 @@ class TelegramAdapter(BasePlatformAdapter):
             return
         if generation != self._polling_generation:
             return
+        recovered_network_errors = self._polling_network_error_count
         self._polling_progress_event.set()
         self._polling_network_error_count = 0
         if generation == self._polling_conflict_recovery_generation:
@@ -2241,6 +2242,11 @@ class TelegramAdapter(BasePlatformAdapter):
         else:
             self._polling_conflict_count = 0
         self._send_path_degraded = False
+        if recovered_network_errors > 0:
+            logger.info(
+                "[%s] Telegram polling recovered after successful getUpdates progress",
+                self.name,
+            )
 
     def _observe_polling_request_result(self, request, generation, result):
         """Record getUpdates progress from an observed do_request result.

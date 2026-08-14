@@ -1,6 +1,7 @@
 """Integration coverage for polling progress against the installed PTB runtime."""
 
 import asyncio
+import logging
 
 import pytest
 pytest.importorskip("telegram", reason="python-telegram-bot not installed")
@@ -211,7 +212,8 @@ async def test_real_base_request_unsuccessful_200_envelope_cannot_record_progres
 
 
 @pytest.mark.asyncio
-async def test_real_base_request_valid_success_envelope_records_progress():
+async def test_real_base_request_valid_success_envelope_records_progress(caplog):
+    caplog.set_level(logging.INFO, logger=tg_adapter.__name__)
     adapter = TelegramAdapter(PlatformConfig(enabled=True, token="123456:test-token"))
     generation, progress = adapter._begin_polling_generation()
     adapter._polling_network_error_count = 4
@@ -233,6 +235,18 @@ async def test_real_base_request_valid_success_envelope_records_progress():
     assert adapter._polling_network_error_count == 0
     assert adapter._polling_conflict_count == 0
     assert adapter._send_path_degraded is False
+    assert "Telegram polling recovered after successful getUpdates progress" in caplog.text
+
+
+def test_initial_polling_progress_does_not_claim_recovery(caplog):
+    caplog.set_level(logging.INFO, logger=tg_adapter.__name__)
+    adapter = TelegramAdapter(PlatformConfig(enabled=True, token="123456:test-token"))
+    generation, progress = adapter._begin_polling_generation()
+
+    adapter._record_polling_progress(generation)
+
+    assert progress.is_set()
+    assert "Telegram polling recovered after successful getUpdates progress" not in caplog.text
 
 
 
