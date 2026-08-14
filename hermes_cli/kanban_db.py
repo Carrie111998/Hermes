@@ -93,6 +93,7 @@ from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missi
 from hermes_cli.kanban_intake import (
     ACTIVE_REQUALIFICATION_STATUSES,
     DEFAULT_POLICY_VERSION,
+    qualification_max_total_attempts,
 )
 from hermes_cli.kanban_repository import (
     EvidenceWorkspaceError,
@@ -223,6 +224,7 @@ PRODUCT_QUALIFICATION_DEFAULTS: dict[str, Any] = {
     "required": False,
     "contract_version": 1,
     "policy_version": DEFAULT_POLICY_VERSION,
+    "max_total_attempts": 3,
     # Break-glass override is introduced separately and is never a normal path.
     "paths": ["po", "hermes"],
     "work_types": ["story", "bug", "maintenance", "ops", "spike"],
@@ -235,6 +237,16 @@ PRODUCT_QUALIFICATION_DEFAULTS: dict[str, Any] = {
         "release_measure": None,
     },
 }
+
+
+@dataclass(frozen=True)
+class RetryState:
+    attempts_used: int
+    attempts_limit: int
+    allowed: bool
+    reason: Optional[str]
+
+
 DEFAULT_PRODUCT_WORKFLOW: dict[str, Any] = {
     "handoff_v2": True,
     "assignees": PRODUCT_WORKFLOW_DEFAULT_ASSIGNEES,
@@ -7033,6 +7045,18 @@ def claim_qualification_intake(
             raise ValueError(f"unknown qualification intake: {intake_id}")
         if current["status"] != "pending":
             return None
+        retry_state = qualification_retry_state(
+            conn,
+            intake_id,
+            qualification_max_total_attempts(read_board_metadata(_board_slug_for_connection(conn))),
+        )
+        if not retry_state.allowed:
+            conn.execute(
+                "UPDATE qualification_intake SET status = 'attention_required', updated_at = ? "
+                "WHERE id = ? AND status = 'pending'",
+                (started, intake_id),
+            )
+            return None
         cursor = conn.execute(
             """
             INSERT INTO qualification_intake_runs (
@@ -7085,6 +7109,31 @@ def claim_qualification_intake(
             created_at=started,
         )
     return get_qualification_intake_run(conn, run_id)
+
+
+def qualification_retry_state(
+    conn: sqlite3.Connection, intake_id: str, max_total_attempts: int
+) -> RetryState:
+    limit = int(max_total_attempts)
+    if limit < 1:
+        raise ValueError("max_total_attempts must be positive")
+    exists = conn.execute(
+        "SELECT 1 FROM qualification_intake WHERE id = ?", (intake_id,)
+    ).fetchone()
+    if exists is None:
+        raise ValueError(f"unknown qualification intake: {intake_id}")
+    used = int(
+        conn.execute(
+            "SELECT COUNT(*) FROM qualification_intake_runs WHERE intake_id = ?",
+            (intake_id,),
+        ).fetchone()[0]
+    )
+    return RetryState(
+        attempts_used=used,
+        attempts_limit=limit,
+        allowed=used < limit,
+        reason=None if used < limit else "attempt_budget_exhausted",
+    )
 
 
 def get_qualification_intake_run(
@@ -7513,6 +7562,13 @@ def retry_qualification_intake(
             raise ValueError("intake must be attention_required before retry")
         if row["current_run_id"] is not None:
             raise ValueError("cannot retry an intake with an active run")
+        retry_state = qualification_retry_state(
+            conn,
+            intake_id,
+            qualification_max_total_attempts(read_board_metadata(_board_slug_for_connection(conn))),
+        )
+        if not retry_state.allowed:
+            raise ValueError("attempt_budget_exhausted")
         updated = conn.execute(
             "UPDATE qualification_intake SET status = 'pending', updated_at = ? "
             "WHERE id = ? AND status = 'attention_required'",

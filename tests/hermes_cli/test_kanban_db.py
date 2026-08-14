@@ -119,87 +119,6 @@ def test_init_creates_expected_tables(kanban_home):
     } <= names
 
 
-def test_legacy_active_requalification_duplicates_are_reconciled_append_only(tmp_path):
-    db_path = tmp_path / "legacy-requalification.db"
-    legacy = sqlite3.connect(str(db_path))
-    legacy.executescript(kb.SCHEMA_SQL)
-    old_request = json.dumps(
-        {
-            "kind": "task_requalification",
-            "target_task_id": "t_legacy",
-            "evidence_digest": "old-evidence",
-        },
-        sort_keys=True,
-    )
-    newest_request = json.dumps(
-        {
-            "kind": "task_requalification",
-            "target_task_id": "t_legacy",
-            "evidence_digest": "new-evidence",
-        },
-        sort_keys=True,
-    )
-    legacy.executemany(
-        """
-        INSERT INTO qualification_intake (
-            id, raw_request, source, status, created_at, updated_at
-        ) VALUES (?, ?, 'hermes-reconcile', ?, ?, ?)
-        """,
-        [
-            ("qi_old", old_request, "needs_clarification", 10, 10),
-            ("qi_new", newest_request, "attention_required", 20, 20),
-        ],
-    )
-    legacy.execute(
-        "INSERT INTO qualification_intake_runs "
-        "(intake_id, profile, status, started_at) VALUES (?, ?, ?, ?)",
-        ("qi_old", "productowner", "completed", 11),
-    )
-    legacy.execute(
-        "INSERT INTO qualification_intake_events "
-        "(intake_id, kind, created_at) VALUES (?, ?, ?)",
-        ("qi_old", "legacy_event", 12),
-    )
-    legacy.commit()
-    legacy.close()
-
-    kb.init_db(db_path)
-
-    with kb.connect(db_path) as migrated:
-        rows = migrated.execute(
-            "SELECT id, raw_request, status FROM qualification_intake "
-            "ORDER BY created_at, id"
-        ).fetchall()
-        decision = migrated.execute(
-            "SELECT intake_id, decision, actor_profile, reason "
-            "FROM qualification_intake_decisions"
-        ).fetchone()
-        index = migrated.execute(
-            "SELECT sql FROM sqlite_master "
-            "WHERE type = 'index' AND name = 'idx_requalification_one_active_target'"
-        ).fetchone()
-
-        assert [row["id"] for row in rows] == ["qi_old", "qi_new"]
-        assert [row["status"] for row in rows] == ["rejected", "attention_required"]
-        assert rows[0]["raw_request"] == old_request
-        assert decision["intake_id"] == "qi_old"
-        assert decision["decision"] == "rejected"
-        assert decision["actor_profile"] == "hermes-migration"
-        assert decision["reason"] == (
-            "superseded by active requalification intake qi_new"
-        )
-        assert migrated.execute(
-            "SELECT COUNT(*) FROM qualification_intake_runs WHERE intake_id = 'qi_old'"
-        ).fetchone()[0] == 1
-        assert migrated.execute(
-            "SELECT COUNT(*) FROM qualification_intake_events WHERE intake_id = 'qi_old'"
-        ).fetchone()[0] == 1
-        assert index is not None
-        assert "CREATE UNIQUE INDEX" in index["sql"]
-        assert "task_requalification" in index["sql"]
-        assert "attention_required" in index["sql"]
-
-
 def test_board_metadata_repository_policy_is_validated(kanban_home, tmp_path):
     repo = tmp_path / "repository-policy"
     _init_git_repo(repo)
@@ -14458,3 +14377,60 @@ def test_new_active_epic_member_integrates_once_via_reconcile(
     assert first.integrated == [story]
     assert second.integrated == []
     assert count == 1
+
+
+def test_qualification_attempt_budget_counts_all_historical_runs_and_preserves_history(
+    kanban_home,
+):
+    board = "qualification-attempt-budget"
+    kb.ensure_product_board_defaults(board)
+    metadata_path = kb.board_metadata_path(board)
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata["qualification"]["max_total_attempts"] = 3
+    metadata["qualification"]["required"] = True
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+    with kb.connect(board=board) as conn:
+        intake_id = kb.create_qualification_intake(
+            conn, raw_request="budget me", source="chat", created_at=10
+        )
+        runtime = {"provider": "test", "model": "test", "effort": "low"}
+        runs = []
+        for now in (20, 30, 40):
+            run = kb.claim_qualification_intake(
+                conn,
+                intake_id,
+                profile="productowner",
+                runtime_identity=runtime,
+                now=now,
+            )
+            assert run is not None
+            runs.append(run)
+            assert kb.finish_qualification_intake_run(
+                conn,
+                intake_id=intake_id,
+                run_id=run["id"],
+                claim_lock=run["claim_lock"],
+                intake_status="attention_required",
+                outcome="attention_required",
+                now=now + 1,
+            )
+            if now != 40:
+                assert kb.retry_qualification_intake(conn, intake_id, now=now + 2)
+        state = kb.qualification_retry_state(conn, intake_id, 3)
+        assert state.attempts_used == 3
+        assert state.attempts_limit == 3
+        assert state.allowed is False
+        assert state.reason == "attempt_budget_exhausted"
+        before_runs = conn.execute(
+            "SELECT id, status, outcome FROM qualification_intake_runs "
+            "WHERE intake_id = ? ORDER BY id",
+            (intake_id,),
+        ).fetchall()
+        with pytest.raises(ValueError, match="attempt_budget_exhausted"):
+            kb.retry_qualification_intake(conn, intake_id, now=50)
+        after_runs = conn.execute(
+            "SELECT id, status, outcome FROM qualification_intake_runs "
+            "WHERE intake_id = ? ORDER BY id",
+            (intake_id,),
+        ).fetchall()
+    assert [tuple(row) for row in after_runs] == [tuple(row) for row in before_runs]

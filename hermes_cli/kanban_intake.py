@@ -528,6 +528,18 @@ def qualification_required(board_metadata: Mapping[str, Any]) -> bool:
     return isinstance(policy, Mapping) and policy.get("required") is True
 
 
+def qualification_max_total_attempts(board_metadata: Mapping[str, Any]) -> int:
+    """Return the bounded total qualification-attempt budget for a board."""
+
+    policy = board_metadata.get("qualification")
+    value = policy.get("max_total_attempts") if isinstance(policy, Mapping) else None
+    try:
+        attempts = int(value)
+    except (TypeError, ValueError):
+        attempts = 3
+    return attempts if attempts > 0 else 3
+
+
 def intake_payload(intake: Mapping[str, Any]) -> dict[str, Any]:
     """Return the structured request stored in an intake, or an empty mapping."""
 

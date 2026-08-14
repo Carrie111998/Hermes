@@ -883,6 +883,11 @@ def get_work_inbox_status(
             "WHERE intake_id = ? ORDER BY id DESC LIMIT 1",
             (intake_id,),
         ).fetchone()
+        retry_state = kanban_db.qualification_retry_state(
+            conn,
+            intake_id,
+            kanban_intake.qualification_max_total_attempts(metadata),
+        )
         response = {
             "intake_id": intake_id,
             "status": record["status"],
@@ -894,6 +899,13 @@ def get_work_inbox_status(
                 else None
             ),
             "items": _materialized_intake_items(conn, intake_id),
+            "actions": (
+                [{"id": "retry", "method": "POST", "target": "work-inbox"}]
+                if record["status"] == "attention_required" and retry_state.allowed
+                else []
+            ),
+            "attempts_used": retry_state.attempts_used,
+            "attempts_limit": retry_state.attempts_limit,
         }
         if failure_path is not None:
             response["failure_path"] = failure_path
