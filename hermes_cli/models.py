@@ -81,7 +81,8 @@ OPENROUTER_MODELS: list[tuple[str, str]] = [
     # MiniMax
     ("minimax/minimax-m3",                     ""),
     # Z-AI
-    ("z-ai/glm-5.2",                           "default"),
+    ("z-ai/glm-5.3",                           "default"),
+    ("z-ai/glm-5.2",                           ""),
     ("z-ai/glm-5.1",                           ""),
     # Xiaomi
     ("xiaomi/mimo-v2.5-pro",                   ""),
@@ -255,6 +256,7 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         # MiniMax
         "minimax/minimax-m3",
         # Z-AI
+        "z-ai/glm-5.3",
         "z-ai/glm-5.2",
         "z-ai/glm-5.1",
         # Xiaomi
@@ -329,6 +331,7 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "gemini-3.1-flash-lite-preview",
     ],
     "zai": [
+        "glm-5.3",
         "glm-5.2",
         "glm-5.1",
         "glm-5",
@@ -346,6 +349,7 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning",
         # Third-party agentic models hosted on build.nvidia.com
         # (map to OpenRouter defaults — users get familiar picks on NIM)
+        "z-ai/glm-5.3",
         "z-ai/glm-5.2",
         "moonshotai/kimi-k2.6",
         "minimaxai/minimax-m3",
@@ -481,6 +485,7 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "minimax-m3",
         "minimax-m2.7",
         "minimax-m2.5",
+        "glm-5.3",
         "glm-5.2",
         "glm-5.1",
         "glm-5",
@@ -502,6 +507,7 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "kimi-k2.7-code",
         "kimi-k2.6",
         "kimi-k2.5",
+        "glm-5.3",
         "glm-5.2",
         "glm-5.1",
         "glm-5",
