@@ -235,7 +235,7 @@ class GatewayKanbanWatchersMixin:
         # but is not a block (see kanban_db.request_review); the task is not
         # archived, so the subscription stays alive and later review
         # cycles keep notifying.
-        TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "block_loop_detected", "review_requested", "commented")
+        TERMINAL_KINDS = ("completed", "checkpointed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "block_loop_detected", "review_requested", "commented")
         # Subscriptions are removed only when the task reaches the irreversible
         # archived status. ``done`` is reversible in review/controller flows,
         # so removing its subscription would silence a later reopen. We used
@@ -584,6 +584,16 @@ class GatewayKanbanWatchersMixin:
                             if ev.payload and ev.payload.get("reason"):
                                 reason = f": {str(ev.payload['reason'])[:160]}"
                             msg = f"⏸ {board_tag}{tag}Kanban {sub['task_id']} blocked{reason}"
+                        elif kind == "checkpointed":
+                            handoff = ""
+                            if ev.payload and ev.payload.get("next_worker_start_here"):
+                                handoff = f"\nNext: {str(ev.payload['next_worker_start_here'])[:200]}"
+                            elif ev.payload and ev.payload.get("summary"):
+                                handoff = f"\n{str(ev.payload['summary'])[:200]}"
+                            msg = (
+                                f"💾 {board_tag}{tag}Kanban {sub['task_id']} checkpointed"
+                                f" — {title}; a fresh worker will resume{handoff}"
+                            )
                         elif kind == "gave_up":
                             err = ""
                             if ev.payload and ev.payload.get("error"):
@@ -1319,6 +1329,12 @@ class GatewayKanbanWatchersMixin:
                 "kanban dispatcher: disabled via config kanban.dispatch_in_gateway=false"
             )
             return
+        checkpoint_cfg = kanban_cfg.get("safe_checkpoint", {})
+        safe_checkpoint_enabled = bool(
+            checkpoint_cfg.get("enabled", False)
+            if isinstance(checkpoint_cfg, dict)
+            else False
+        )
 
         try:
             from hermes_cli import kanban_db as _kb
@@ -1564,6 +1580,7 @@ class GatewayKanbanWatchersMixin:
                     default_assignee=default_assignee,
                     max_in_progress_per_profile=max_in_progress_per_profile,
                     reconcile_orphans=reconcile_orphans,
+                    advertise_capabilities=safe_checkpoint_enabled,
                 )
             except sqlite3.DatabaseError as exc:
                 if _is_corrupt_board_db_error(exc):

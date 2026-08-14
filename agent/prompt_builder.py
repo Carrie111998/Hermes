@@ -339,6 +339,21 @@ KANBAN_GUIDANCE = (
     "cross-agent handoffs that outlive one API loop."
 )
 
+
+def kanban_guidance_with_checkpoint(prompt_hint: str = "") -> str:
+    """Add the opt-in rollover guidance without changing the default prompt."""
+    hint = prompt_hint.strip() or (
+        "Checkpoint at a coherent stopping point when context pressure is high."
+    )
+    return (
+        KANBAN_GUIDANCE
+        + "\n\n## Context rollover\n"
+        + hint
+        + " Use `kanban_checkpoint(summary=..., metadata=...)` to save a "
+        "durable handoff, then end this worker session. Do not checkpoint "
+        "during a file write, migration, or destructive operation.\n"
+    )
+
 TOOL_USE_ENFORCEMENT_GUIDANCE = (
     "# Tool-use enforcement\n"
     "You MUST use your tools to take action — do not describe what you would do "

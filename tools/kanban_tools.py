@@ -47,6 +47,8 @@ logger = logging.getLogger(__name__)
 
 KANBAN_LIST_DEFAULT_LIMIT = 50
 KANBAN_LIST_MAX_LIMIT = 200
+_HANDOFF_MAX_SERIALIZED_BYTES = 8 * 1024
+_HANDOFF_TRUNCATION_MARKER = "[truncated to fit canonical handoff limit]"
 
 
 def _profile_has_kanban_toolset() -> bool:
@@ -135,6 +137,22 @@ def _check_kanban_orchestrator_mode() -> bool:
     return _profile_has_kanban_toolset()
 
 
+def _safe_checkpoint_enabled() -> bool:
+    """Read the checkpoint policy defensively so the feature fails closed."""
+    try:
+        cfg = load_config() or {}
+        kanban = cfg.get("kanban") if isinstance(cfg, dict) else None
+        checkpoint = kanban.get("safe_checkpoint") if isinstance(kanban, dict) else None
+        return bool(checkpoint.get("enabled", False)) if isinstance(checkpoint, dict) else False
+    except Exception:
+        return False
+
+
+def _check_safe_checkpoint_mode() -> bool:
+    """Expose checkpointing only to enabled Kanban worker/orchestrator sessions."""
+    return _safe_checkpoint_enabled() and _check_kanban_mode()
+
+
 # ---------------------------------------------------------------------------
 # Shared helpers
 # ---------------------------------------------------------------------------
@@ -178,6 +196,134 @@ def _stamp_worker_session_metadata(
     stamped = dict(metadata or {})
     stamped["worker_session_id"] = session_id
     return stamped
+
+
+_HANDOFF_FIELDS = (
+    "completed_scope",
+    "changed_files",
+    "decisions_and_contracts",
+    "validation",
+    "known_failures",
+    "dirty_worktree_state",
+    "remaining_work",
+    "next_worker_start_here",
+)
+
+
+def _redact_handoff_value(value: Any) -> Any:
+    """Recursively redact durable handoff values before they reach SQLite."""
+    if isinstance(value, str):
+        return redact_sensitive_text(value, force=True)
+    if isinstance(value, list):
+        return [_redact_handoff_value(item) for item in value]
+    if isinstance(value, tuple):
+        return [_redact_handoff_value(item) for item in value]
+    if isinstance(value, dict):
+        return {str(key): _redact_handoff_value(item) for key, item in value.items()}
+    return value
+
+
+def _serialized_handoff_size(value: dict) -> int:
+    return len(json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+
+
+def _truncate_deepest_values(value: Any) -> bool:
+    """Replace one deepest non-marker value, keeping the handoff shape readable."""
+    candidates: list[tuple[int, Any, Any]] = []
+
+    def visit(current: Any, depth: int) -> None:
+        if isinstance(current, dict):
+            for key, child in current.items():
+                if isinstance(child, (dict, list)):
+                    visit(child, depth + 1)
+                elif child != _HANDOFF_TRUNCATION_MARKER:
+                    candidates.append((depth + 1, current, key))
+        elif isinstance(current, list):
+            for index, child in enumerate(current):
+                if isinstance(child, (dict, list)):
+                    visit(child, depth + 1)
+                elif child != _HANDOFF_TRUNCATION_MARKER:
+                    candidates.append((depth + 1, current, index))
+
+    visit(value, 0)
+    if not candidates:
+        return False
+    _, parent, key = max(candidates, key=lambda candidate: candidate[0])
+    parent[key] = _HANDOFF_TRUNCATION_MARKER
+    return True
+
+
+def _bounded_handoff_metadata(source: dict) -> dict:
+    """Apply the total durable-handoff budget, trimming deepest values first."""
+    source["handoff_truncated"] = False
+    while _serialized_handoff_size(source) > _HANDOFF_MAX_SERIALIZED_BYTES:
+        source["handoff_truncated"] = True
+        if not _truncate_deepest_values(source):
+            # Keys alone cannot realistically exceed the budget through a tool call,
+            # but retain a valid canonical envelope if hostile direct callers do.
+            return {
+                "handoff": {
+                    "completed_scope": [_HANDOFF_TRUNCATION_MARKER],
+                    "changed_files": [],
+                    "decisions_and_contracts": [],
+                    "validation": [],
+                    "known_failures": [],
+                    "dirty_worktree_state": _HANDOFF_TRUNCATION_MARKER,
+                    "remaining_work": [],
+                    "next_worker_start_here": _HANDOFF_TRUNCATION_MARKER,
+                },
+                "handoff_truncated": True,
+            }
+    if not source["handoff_truncated"]:
+        source.pop("handoff_truncated", None)
+    return source
+
+
+def _canonical_handoff(summary: str, metadata: Optional[dict]) -> dict:
+    """Return a redacted, size-bounded, stable successor handoff envelope."""
+    source = _redact_handoff_value(dict(metadata or {}))
+    existing = source.get("handoff")
+    handoff = dict(existing) if isinstance(existing, dict) else {}
+    aliases = {
+        "changed_files": ("changed_files",),
+        "decisions_and_contracts": ("decisions_and_contracts", "decisions"),
+        "validation": ("validation", "gates", "tests_run", "tests"),
+        "known_failures": ("known_failures", "warnings", "failures"),
+        "dirty_worktree_state": ("dirty_worktree_state", "control_state"),
+        "remaining_work": ("remaining_work", "next_steps"),
+        "next_worker_start_here": ("next_worker_start_here", "start_here"),
+    }
+    handoff.setdefault("completed_scope", [summary.strip()] if summary.strip() else [])
+    for field, candidates in aliases.items():
+        if field in handoff:
+            continue
+        for candidate in candidates:
+            if candidate in source:
+                handoff[field] = source[candidate]
+                break
+        else:
+            handoff[field] = [] if field in {
+                "changed_files", "decisions_and_contracts", "validation",
+                "known_failures", "remaining_work",
+            } else ""
+    list_fields = {
+        "completed_scope", "changed_files", "decisions_and_contracts",
+        "validation", "known_failures", "remaining_work",
+    }
+    for field in list_fields:
+        value = handoff.get(field)
+        if value is None:
+            handoff[field] = []
+        elif not isinstance(value, list):
+            handoff[field] = [value]
+    for field in {"dirty_worktree_state", "next_worker_start_here"}:
+        value = handoff.get(field)
+        if value is None:
+            handoff[field] = ""
+        elif not isinstance(value, str):
+            handoff[field] = str(value)
+    source["handoff"] = {field: handoff.get(field) for field in _HANDOFF_FIELDS}
+    return _bounded_handoff_metadata(source)
 
 
 def _enforce_worker_task_ownership(tid: str) -> Optional[str]:
@@ -741,6 +887,8 @@ def _handle_complete(args: dict, **kw) -> str:
         return tool_error(
             f"metadata must be an object/dict, got {type(metadata).__name__}"
         )
+    if _safe_checkpoint_enabled():
+        metadata = _canonical_handoff(str(summary or result).strip(), metadata)
     metadata = _stamp_worker_session_metadata(tid, metadata)
     board = args.get("board")
     try:
@@ -812,6 +960,77 @@ def _handle_complete(args: dict, **kw) -> str:
     except Exception as e:
         logger.exception("kanban_complete failed")
         return tool_error(f"kanban_complete: {e}")
+
+
+def _handle_checkpoint(args: dict, **kw) -> str:
+    """Persist a handoff and requeue this task for a fresh worker session."""
+    delegated_err = _reject_delegated_child_mutation("kanban_checkpoint")
+    if delegated_err:
+        return delegated_err
+    if not _safe_checkpoint_enabled():
+        return tool_error("kanban_checkpoint is disabled by kanban.safe_checkpoint.enabled")
+    tid = _default_task_id(args.get("task_id"))
+    if not tid:
+        return tool_error(
+            "task_id is required (or set HERMES_KANBAN_TASK in the env)"
+        )
+    ownership_err = _enforce_worker_task_ownership(tid)
+    if ownership_err:
+        return ownership_err
+    summary = args.get("summary")
+    if not summary or not str(summary).strip():
+        return tool_error("summary is required")
+    metadata = args.get("metadata")
+    if metadata is not None and not isinstance(metadata, dict):
+        return tool_error(
+            f"metadata must be an object/dict, got {type(metadata).__name__}"
+        )
+    summary = redact_sensitive_text(str(summary), force=True)
+    metadata = _canonical_handoff(summary, metadata)
+    metadata = _stamp_worker_session_metadata(tid, metadata)
+    board = args.get("board")
+    try:
+        kb, conn = _connect(board=board)
+        try:
+            # The worker env is only a dispatcher hint. The durable, fresh DB
+            # advertisement is the authority and is intentionally checked even
+            # when HERMES_KANBAN_SAFE_CHECKPOINT=1 is present.
+            if not kb.dispatcher_supports_safe_checkpoint(conn):
+                return tool_error(
+                    "kanban_checkpoint is unavailable until a persistent "
+                    "dispatcher/gateway advertises fresh safe-checkpoint support. "
+                    "Finish this card if it remains safe to do so, otherwise "
+                    "call kanban_block with this restart requirement."
+                )
+            ok = kb.checkpoint_task(
+                conn,
+                tid,
+                summary=summary,
+                metadata=metadata,
+                expected_run_id=_worker_run_id(tid),
+            )
+            if not ok:
+                return tool_error(
+                    f"could not checkpoint {tid} (unknown, no longer running, "
+                    "or the run was superseded)"
+                )
+            run = kb.latest_run(conn, tid)
+            return _ok(
+                task_id=tid,
+                run_id=run.id if run else None,
+                status="ready",
+                instruction=(
+                    "Checkpoint saved. End this worker session now; its claim "
+                    "will release after this process exits."
+                ),
+            )
+        finally:
+            conn.close()
+    except ValueError as e:
+        return tool_error(f"kanban_checkpoint: {e}")
+    except Exception as e:
+        logger.exception("kanban_checkpoint failed")
+        return tool_error(f"kanban_checkpoint: {e}")
 
 
 def _handle_block(args: dict, **kw) -> str:
@@ -1856,6 +2075,39 @@ KANBAN_COMPLETE_SCHEMA = {
     },
 }
 
+KANBAN_CHECKPOINT_SCHEMA = {
+    "name": "kanban_checkpoint",
+    "description": (
+        "End this worker attempt successfully and requeue the SAME task for a "
+        "fresh-context worker while preserving its assigned workspace. This is "
+        "not completion and not a failure. Save a compact successor handoff, "
+        "call this once at a coherent stopping point, then end the session. "
+        "Do not checkpoint during a file write, migration, or destructive operation."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "task_id": {
+                "type": "string",
+                "description": _DESC_TASK_ID_DEFAULT,
+            },
+            "summary": {
+                "type": "string",
+                "description": "What is complete and what remains, in 1-3 sentences.",
+            },
+            "metadata": {
+                "type": "object",
+                "description": (
+                    "Structured successor facts. Prefer metadata.handoff with "
+                    "the same fields documented by kanban_complete."
+                ),
+            },
+            "board": _board_schema_prop(),
+        },
+        "required": ["summary"],
+    },
+}
+
 KANBAN_BLOCK_SCHEMA = {
     "name": "kanban_block",
     "description": (
@@ -2378,6 +2630,15 @@ registry.register(
     handler=_handle_complete,
     check_fn=_check_kanban_mode,
     emoji="✔",
+)
+
+registry.register(
+    name="kanban_checkpoint",
+    toolset="kanban",
+    schema=KANBAN_CHECKPOINT_SCHEMA,
+    handler=_handle_checkpoint,
+    check_fn=_check_safe_checkpoint_mode,
+    emoji="💾",
 )
 
 registry.register(

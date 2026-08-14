@@ -1470,11 +1470,18 @@ CREATE TABLE IF NOT EXISTS task_runs (
     started_at          INTEGER NOT NULL,
     ended_at            INTEGER,
     outcome             TEXT,
-    -- outcome: completed | blocked | crashed | timed_out | spawn_failed |
+    -- outcome: completed | checkpointed | blocked | crashed | timed_out | spawn_failed |
     --          gave_up | reclaimed | (null while still running)
     summary             TEXT,
     metadata            TEXT,
     error               TEXT
+);
+
+-- Small board-scoped capability records for cross-process handshakes.
+CREATE TABLE IF NOT EXISTS board_meta (
+    key        TEXT PRIMARY KEY,
+    value      TEXT NOT NULL,
+    updated_at INTEGER NOT NULL
 );
 
 -- Files attached to a task (PDFs, images, source documents). The blob
@@ -4949,7 +4956,7 @@ def release_stale_claims(
     *,
     signal_fn=None,
 ) -> int:
-    """Reset any ``running`` task whose claim has expired.
+    """Reset expired running claims and release expired checkpoint fences.
 
     A stale-by-TTL claim whose host-local worker PID is still alive is
     *extended* (with a ``claim_extended`` event) instead of being
@@ -4976,6 +4983,40 @@ def release_stale_claims(
     """
     now = int(time.time())
     reclaimed = 0
+    # A remote checkpoint has no trustworthy local PID. Its retained fence is
+    # released only after the lease expires, including for callers that invoke
+    # this established stale-claim recovery path directly.
+    checkpoint_rows = conn.execute(
+        "SELECT id, claim_lock, worker_pid, claim_expires FROM tasks "
+        "WHERE status = 'ready' AND claim_lock IS NOT NULL "
+        "AND current_run_id IS NULL AND claim_expires IS NOT NULL "
+        "AND claim_expires < ?",
+        (now,),
+    ).fetchall()
+    for row in checkpoint_rows:
+        with write_txn(conn):
+            cur = conn.execute(
+                "UPDATE tasks SET claim_lock = NULL, claim_expires = NULL, "
+                "worker_pid = NULL WHERE id = ? AND status = 'ready' "
+                "AND current_run_id IS NULL AND claim_lock IS ? "
+                "AND claim_expires IS NOT NULL AND claim_expires < ?",
+                (row["id"], row["claim_lock"], now),
+            )
+            if cur.rowcount != 1:
+                continue
+            _append_event(
+                conn,
+                row["id"],
+                "checkpoint_released",
+                {
+                    "previous_worker_pid": (
+                        int(row["worker_pid"])
+                        if row["worker_pid"] is not None else None
+                    ),
+                    "reason": "claim_expired",
+                },
+            )
+            reclaimed += 1
     host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
     stale = conn.execute(
         "SELECT id, claim_lock, worker_pid, claim_expires, last_heartbeat_at, "
@@ -5590,6 +5631,167 @@ def complete_task(
             summary=(summary if summary is not None else result),
         )
     return True
+
+
+def checkpoint_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    summary: str,
+    metadata: Optional[dict] = None,
+    expected_run_id: Optional[int] = None,
+) -> bool:
+    """Close the current attempt and requeue the task without releasing its claim.
+
+    The old worker keeps its claim fence until ``release_checkpoint_claims``
+    confirms its local PID exited, or a remote claim expires. That prevents a
+    fresh worker from writing the same workspace while this worker is still
+    producing its final response.
+    """
+    if not summary or not summary.strip():
+        raise ValueError("checkpoint summary is required")
+    with write_txn(conn):
+        claim = conn.execute(
+            "SELECT claim_lock, worker_pid FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if not claim:
+            return False
+        host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
+        # The dispatcher normally persists the child PID immediately after
+        # spawn, but a very fast worker can checkpoint before that write wins.
+        # Record this process as the local predecessor in that race; otherwise
+        # the ready task could be spawned again while this worker still exits.
+        fence_pid = (
+            os.getpid()
+            if (claim["claim_lock"] or "").startswith(host_prefix)
+            and claim["worker_pid"] is None
+            else None
+        )
+        params: list[Any] = [task_id]
+        run_guard = ""
+        if expected_run_id is not None:
+            run_guard = " AND current_run_id = ?"
+            params.append(int(expected_run_id))
+        cur = conn.execute(
+            """
+            UPDATE tasks
+               SET status = 'ready',
+                   last_heartbeat_at = NULL,
+                   worker_pid = COALESCE(worker_pid, ?)
+             WHERE id = ?
+               AND status = 'running'
+            """ + run_guard,
+            tuple([fence_pid, *params]),
+        )
+        if cur.rowcount != 1:
+            return False
+        run_id = _end_run(
+            conn,
+            task_id,
+            outcome="checkpointed",
+            status="released",
+            summary=summary.strip(),
+            metadata=metadata,
+        )
+        payload = {"summary": summary.strip().splitlines()[0][:400]}
+        handoff = (metadata or {}).get("handoff") if isinstance(metadata, dict) else None
+        if isinstance(handoff, dict) and handoff.get("next_worker_start_here"):
+            payload["next_worker_start_here"] = str(
+                handoff["next_worker_start_here"]
+            )[:400]
+        _append_event(conn, task_id, "checkpointed", payload, run_id=run_id)
+    return True
+
+
+def release_checkpoint_claims(conn: sqlite3.Connection) -> int:
+    """Release a checkpoint fence only after its predecessor is definitely gone."""
+    now = int(time.time())
+    host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
+    rows = conn.execute(
+        "SELECT id, claim_lock, claim_expires, worker_pid FROM tasks "
+        "WHERE status = 'ready' AND claim_lock IS NOT NULL "
+        "AND current_run_id IS NULL"
+    ).fetchall()
+    released = 0
+    for row in rows:
+        lock = row["claim_lock"] or ""
+        host_local = lock.startswith(host_prefix)
+        pid = row["worker_pid"]
+        if host_local and pid and _pid_alive(pid):
+            continue
+        expires = row["claim_expires"]
+        if not host_local and (expires is None or int(expires) >= now):
+            continue
+        with write_txn(conn):
+            cur = conn.execute(
+                "UPDATE tasks SET claim_lock = NULL, claim_expires = NULL, "
+                "worker_pid = NULL WHERE id = ? AND status = 'ready' "
+                "AND claim_lock IS ?",
+                (row["id"], row["claim_lock"]),
+            )
+            if cur.rowcount == 1:
+                _append_event(
+                    conn,
+                    row["id"],
+                    "checkpoint_released",
+                    {
+                        "previous_worker_pid": int(pid) if pid else None,
+                        "reason": "worker_exited" if host_local else "claim_expired",
+                    },
+                )
+                released += 1
+    return released
+
+
+_DISPATCHER_CAPABILITIES_META_KEY = "dispatcher_capabilities"
+_SAFE_CHECKPOINT_CAPABILITY_MAX_AGE_SECONDS = 300
+
+
+def advertise_dispatcher_capabilities(conn: sqlite3.Connection) -> None:
+    """Record the capabilities of the persistent dispatcher currently ticking."""
+    if not safe_checkpoint_enabled():
+        return
+    now = int(time.time())
+    value = json.dumps(
+        {"safe_checkpoint": True, "advertised_at": now}, separators=(",", ":")
+    )
+    with write_txn(conn):
+        conn.execute(
+            "INSERT INTO board_meta (key, value, updated_at) VALUES (?, ?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value, "
+            "updated_at = excluded.updated_at",
+            (_DISPATCHER_CAPABILITIES_META_KEY, value, now),
+        )
+
+
+def dispatcher_supports_safe_checkpoint(
+    conn: sqlite3.Connection,
+    *,
+    max_age_seconds: int = _SAFE_CHECKPOINT_CAPABILITY_MAX_AGE_SECONDS,
+) -> bool:
+    """Return whether the board carries a fresh, non-future capability advert."""
+    row = conn.execute(
+        "SELECT value, updated_at FROM board_meta WHERE key = ?",
+        (_DISPATCHER_CAPABILITIES_META_KEY,),
+    ).fetchone()
+    if not row:
+        return False
+    try:
+        updated_at = int(row["updated_at"])
+    except (TypeError, ValueError):
+        return False
+    now = int(time.time())
+    if updated_at > now or updated_at < now - max_age_seconds:
+        return False
+    try:
+        value = json.loads(row["value"])
+    except (TypeError, json.JSONDecodeError):
+        return False
+    return (
+        isinstance(value, dict)
+        and bool(value.get("safe_checkpoint"))
+        and value.get("advertised_at") == updated_at
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -9519,6 +9721,18 @@ def review_dispatch_enabled() -> bool:
         return True
 
 
+def safe_checkpoint_enabled() -> bool:
+    """Return the checkpoint policy switch, failing closed on config errors."""
+    try:
+        from hermes_cli.config import load_config
+
+        kanban = (load_config() or {}).get("kanban") or {}
+        checkpoint = kanban.get("safe_checkpoint") if isinstance(kanban, dict) else None
+        return bool(checkpoint.get("enabled", False)) if isinstance(checkpoint, dict) else False
+    except Exception:
+        return False
+
+
 def dispatch_once(
     conn: sqlite3.Connection,
     *,
@@ -9533,6 +9747,7 @@ def dispatch_once(
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
     reconcile_orphans: bool = True,
+    advertise_capabilities: bool = False,
 ) -> DispatchResult:
     """Run one dispatcher tick under the board's single-writer lock.
 
@@ -9568,6 +9783,7 @@ def dispatch_once(
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
             reconcile_orphans=reconcile_orphans,
+            advertise_capabilities=advertise_capabilities,
         )
         _fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
         return result
@@ -9588,6 +9804,7 @@ def dispatch_once(
                 default_assignee=default_assignee,
                 max_in_progress_per_profile=max_in_progress_per_profile,
                 reconcile_orphans=reconcile_orphans,
+                advertise_capabilities=advertise_capabilities,
             )
             # Still under the dispatch lock: run the periodic PASSIVE WAL
             # checkpoint (see _maybe_checkpoint_wal; the -wal file size is
@@ -9615,6 +9832,7 @@ def _dispatch_once_locked(
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
     reconcile_orphans: bool = True,
+    advertise_capabilities: bool = False,
 ) -> DispatchResult:
     """Run one dispatcher tick.
 
@@ -9647,6 +9865,14 @@ def _dispatch_once_locked(
     # Reap zombie children from previously spawned workers. See
     # reap_worker_zombies() for the full rationale.
     reap_worker_zombies()
+    # A checkpointed task is ready but remains fenced by the predecessor's
+    # claim until the local PID exits or a remote lease expires.
+    release_checkpoint_claims(conn)
+    safe_checkpoint_dispatcher = bool(
+        advertise_capabilities and not dry_run and safe_checkpoint_enabled()
+    )
+    if safe_checkpoint_dispatcher:
+        advertise_dispatcher_capabilities(conn)
 
     result = DispatchResult()
     result.reclaimed = release_stale_claims(conn)
@@ -9885,14 +10111,17 @@ def _dispatch_once_locked(
         try:
             # Back-compat: older spawn_fn signatures accept only
             # (task, workspace). Test stubs in the suite rely on that.
-            # Introspect the callable and pass `board` only when supported.
+            # Introspect the callable and pass optional dispatcher context only
+            # when supported; older test and plugin spawn functions stay valid.
             import inspect
             try:
                 sig = inspect.signature(_spawn)
+                spawn_kwargs = {}
                 if "board" in sig.parameters:
-                    pid = _spawn(claimed, str(workspace), board=board)
-                else:
-                    pid = _spawn(claimed, str(workspace))
+                    spawn_kwargs["board"] = board
+                if "safe_checkpoint_enabled" in sig.parameters:
+                    spawn_kwargs["safe_checkpoint_enabled"] = safe_checkpoint_dispatcher
+                pid = _spawn(claimed, str(workspace), **spawn_kwargs)
             except (TypeError, ValueError):
                 pid = _spawn(claimed, str(workspace))
             if pid:
@@ -10021,10 +10250,12 @@ def _dispatch_once_locked(
             import inspect
             try:
                 sig = inspect.signature(_spawn)
+                spawn_kwargs = {}
                 if "board" in sig.parameters:
-                    pid = _spawn(claimed, str(workspace), board=board)
-                else:
-                    pid = _spawn(claimed, str(workspace))
+                    spawn_kwargs["board"] = board
+                if "safe_checkpoint_enabled" in sig.parameters:
+                    spawn_kwargs["safe_checkpoint_enabled"] = safe_checkpoint_dispatcher
+                pid = _spawn(claimed, str(workspace), **spawn_kwargs)
             except (TypeError, ValueError):
                 pid = _spawn(claimed, str(workspace))
             if pid:
@@ -10343,6 +10574,7 @@ def _default_spawn(
     workspace: str,
     *,
     board: Optional[str] = None,
+    safe_checkpoint_enabled: bool = False,
 ) -> Optional[int]:
     """Fire-and-forget ``hermes -p <profile> chat -q ...`` subprocess.
 
@@ -10461,6 +10693,13 @@ def _default_spawn(
     # what the tool reads — set it explicitly here so comments are
     # attributed correctly regardless of how the child loads config.
     env["HERMES_PROFILE"] = profile_arg
+    # This is diagnostic only: checkpointing still requires a fresh DB advert.
+    # It is set exclusively for workers spawned by a persistent dispatcher that
+    # advertised the matching capability in the same tick.
+    if safe_checkpoint_enabled:
+        env["HERMES_KANBAN_SAFE_CHECKPOINT"] = "1"
+    else:
+        env.pop("HERMES_KANBAN_SAFE_CHECKPOINT", None)
 
     # A worker must NEVER boot the interactive TUI: an inherited HERMES_TUI=1
     # or a `display.interface: tui` in the profile's config would send the
@@ -10599,6 +10838,7 @@ def run_daemon(
                     conn,
                     max_spawn=max_spawn,
                     failure_limit=failure_limit,
+                    advertise_capabilities=safe_checkpoint_enabled(),
                 )
             if on_tick is not None:
                 try:
@@ -10615,6 +10855,42 @@ def run_daemon(
 # ---------------------------------------------------------------------------
 # Worker context builder (what a spawned worker sees)
 # ---------------------------------------------------------------------------
+
+def _live_workspace_git_state(workspace: Optional[str]) -> list[str]:
+    """Return a compact live Git snapshot for a successor worker, if available."""
+    if not workspace or not os.path.isdir(workspace):
+        return []
+    try:
+        head = subprocess.run(
+            ["git", "-C", workspace, "rev-parse", "--short", "HEAD"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=5,
+            check=False,
+        )
+        status = subprocess.run(
+            ["git", "-C", workspace, "status", "--short", "--branch"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=5,
+            check=False,
+        )
+    except Exception:
+        return []
+    if head.returncode != 0 or status.returncode != 0:
+        return []
+    status_text = (status.stdout or "").strip()
+    if len(status_text) > 4096:
+        status_text = status_text[:4096] + "\n… [truncated]"
+    lines = [f"HEAD: {(head.stdout or '').strip() or '(unknown)'}"]
+    if status_text:
+        lines.extend(status_text.splitlines())
+    return lines
+
 
 def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     """Return the full text a worker should read to understand its task.
@@ -10677,6 +10953,12 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     if task.branch_name:
         lines.append(f"Branch:   {task.branch_name}")
     lines.append("")
+
+    git_state = _live_workspace_git_state(task.workspace_path)
+    if git_state:
+        lines.append("## Live Git state")
+        lines.extend(git_state)
+        lines.append("")
 
     if task.body and task.body.strip():
         lines.append("## Body")

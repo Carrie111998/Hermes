@@ -80,6 +80,82 @@ def test_show_defaults_to_env_task_id(worker_env):
     assert "runs" in d
 
 
+def test_checkpoint_tool_is_hidden_and_refused_when_disabled(worker_env):
+    """The default must retain the exact pre-checkpoint worker surface."""
+    from tools import kanban_tools as kt
+    from tools.registry import invalidate_check_fn_cache, registry
+    from toolsets import resolve_toolset
+
+    assert kt._check_safe_checkpoint_mode() is False
+    invalidate_check_fn_cache()
+    names = {
+        schema["function"].get("name")
+        for schema in registry.get_definitions(set(resolve_toolset("kanban")), quiet=True)
+        if "function" in schema
+    }
+    assert "kanban_checkpoint" not in names
+    assert "disabled" in json.loads(
+        kt._handle_checkpoint({"summary": "safe boundary"})
+    )["error"]
+
+
+def test_checkpoint_tool_is_exposed_when_configuration_is_enabled(
+    worker_env, monkeypatch,
+):
+    from tools import kanban_tools as kt
+    from tools.registry import invalidate_check_fn_cache, registry
+    from toolsets import resolve_toolset
+
+    monkeypatch.setattr(
+        kt,
+        "load_config",
+        lambda: {"kanban": {"safe_checkpoint": {"enabled": True}}},
+    )
+    assert kt._check_safe_checkpoint_mode() is True
+    invalidate_check_fn_cache()
+    names = {
+        schema["function"].get("name")
+        for schema in registry.get_definitions(set(resolve_toolset("kanban")), quiet=True)
+        if "function" in schema
+    }
+    assert "kanban_checkpoint" in names
+
+
+def test_checkpoint_requires_fresh_database_advertisement_even_with_env_flag(
+    worker_env, monkeypatch,
+):
+    """HERMES_KANBAN_SAFE_CHECKPOINT is a hint, never an authorization bypass."""
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    monkeypatch.setattr(kt, "_safe_checkpoint_enabled", lambda: True)
+    monkeypatch.setenv("HERMES_KANBAN_SAFE_CHECKPOINT", "1")
+
+    payload = json.loads(kt._handle_checkpoint({"summary": "safe boundary"}))
+
+    assert "fresh safe-checkpoint support" in payload["error"]
+    with kb.connect() as conn:
+        assert kb.get_task(conn, worker_env).status == "running"
+
+
+def test_canonical_handoff_is_recursively_redacted_and_bounded():
+    from tools import kanban_tools as kt
+
+    secret = "sk-proj-abcdefghijklmnopqrstuvwxyz0123456789"
+    handoff = kt._canonical_handoff(
+        "summary",
+        {
+            "nested": {"token": secret, "large": ["x" * 9000]},
+            "handoff": {"validation": [{"credential": secret}]},
+        },
+    )
+
+    serialized = json.dumps(handoff, ensure_ascii=False).encode("utf-8")
+    assert len(serialized) <= kt._HANDOFF_MAX_SERIALIZED_BYTES
+    assert secret not in serialized.decode("utf-8")
+    assert handoff["handoff_truncated"] is True
+
+
 def test_list_filters_tasks(monkeypatch, worker_env):
     """kanban_list gives orchestrators filtered board discovery."""
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
@@ -130,6 +206,50 @@ def test_complete_happy_path(worker_env):
         assert run.metadata == {"files": 2}
     finally:
         conn.close()
+
+
+def test_checkpoint_requeues_with_canonical_handoff(worker_env, monkeypatch):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    monkeypatch.setattr(kt, "_safe_checkpoint_enabled", lambda: True)
+    monkeypatch.setattr(kb, "safe_checkpoint_enabled", lambda: True)
+    with kb.connect() as conn:
+        kb.advertise_dispatcher_capabilities(conn)
+
+    payload = json.loads(kt._handle_checkpoint({
+        "summary": "auth path complete; cancellation work remains",
+        "metadata": {
+            "changed_files": ["rest/copilot/v1/stream.py"],
+            "next_worker_start_here": "Add disconnect tests.",
+        },
+    }))
+
+    assert payload["ok"] is True
+    assert payload["status"] == "ready"
+    with kb.connect() as conn:
+        task = kb.get_task(conn, worker_env)
+        run = kb.latest_run(conn, worker_env)
+        events = kb.list_events(conn, worker_env)
+    assert task.status == "ready"
+    assert task.current_run_id is None
+    assert run.outcome == "checkpointed"
+    assert run.status == "released"
+    assert run.metadata["handoff"]["changed_files"] == ["rest/copilot/v1/stream.py"]
+    assert events[-1].kind == "checkpointed"
+
+
+def test_enabled_completion_uses_the_same_canonical_handoff(worker_env, monkeypatch):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    monkeypatch.setattr(kt, "_safe_checkpoint_enabled", lambda: True)
+    assert json.loads(kt._handle_complete({"summary": "finished slice"}))["ok"]
+
+    with kb.connect() as conn:
+        metadata = kb.latest_run(conn, worker_env).metadata
+    assert set(metadata["handoff"]) == set(kt._HANDOFF_FIELDS)
+    assert metadata["handoff"]["completed_scope"] == ["finished slice"]
 
 
 def test_complete_retry_with_empty_created_cards_succeeds(worker_env):
@@ -565,6 +685,17 @@ def test_kanban_guidance_prompt_size_bounded():
         f"KANBAN_GUIDANCE is {len(KANBAN_GUIDANCE)} chars; it is injected into "
         "every kanban worker's system prompt — trim it or consciously re-bound "
         "this invariant with justification."
+    )
+
+
+def test_checkpoint_guidance_uses_config_hint_or_generic_context_pressure_line():
+    from agent.prompt_builder import kanban_guidance_with_checkpoint
+
+    assert "Checkpoint at a coherent stopping point when context pressure is high." in (
+        kanban_guidance_with_checkpoint()
+    )
+    assert "team-specific rollover cue" in kanban_guidance_with_checkpoint(
+        "team-specific rollover cue"
     )
 
 

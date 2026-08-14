@@ -1172,7 +1172,8 @@ kanban task.
   `tail`, plus less-commonly-used `watch`, `stats`, `runs`, `log`,
   `assignees`, `heartbeat`, `notify-*`, `dispatch`, `daemon`, `gc`.
 - **Worker/orchestrator toolset:** `tools/kanban_tools.py` exposes
-  `kanban_show`, `kanban_complete`, `kanban_request_review`,
+  `kanban_show`, `kanban_complete`, `kanban_checkpoint` (when
+  `kanban.safe_checkpoint.enabled` is true), `kanban_request_review`,
   `kanban_request_changes`, `kanban_block`,
   `kanban_heartbeat`, `kanban_comment`, `kanban_create`, `kanban_link`,
   `kanban_attach`, `kanban_attach_url`, `kanban_attachments`; profiles that
@@ -1199,7 +1200,9 @@ Isolation model:
 - **Workflow policy:** `kanban.human_comment_wake` defaults on to wake a
   `needs_input` worker after a human reply when its subscription permits
   wakes. `kanban.human_comment_wake_overrides_mute` makes human replies wake
-  even passive `notify` subscriptions. Safe checkpoints, workspace
+  even passive `notify` subscriptions. Safe checkpoints fence a checkpointed
+  task's claim until its old worker exits and require a fresh persistent
+  dispatcher advertisement in `board_meta`; workspace
   collision handling, creation validation/default subscriptions, and runtime
   deadline nudges are separately configured under `kanban.*`; their defaults
   preserve existing dispatch behavior.

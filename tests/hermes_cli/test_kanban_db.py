@@ -200,6 +200,108 @@ def test_schedule_task_parks_time_delay_without_dispatching(kanban_home):
         assert any(e.kind == "scheduled" and e.payload == {"reason": "run next week"} for e in events)
 
 
+def test_checkpoint_claim_releases_only_after_old_worker_exits(kanban_home, monkeypatch):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="roll over", assignee="coder")
+        host = kb._claimer_id().split(":", 1)[0]
+        task = kb.claim_task(conn, task_id, claimer=f"{host}:worker")
+        assert task is not None
+
+        assert kb.checkpoint_task(
+            conn,
+            task_id,
+            summary="first slice complete",
+            expected_run_id=task.current_run_id,
+        )
+        checkpointed = kb.get_task(conn, task_id)
+        assert checkpointed.status == "ready"
+        assert checkpointed.claim_lock == f"{host}:worker"
+        assert checkpointed.worker_pid == os.getpid()
+
+        monkeypatch.setattr(kb, "_pid_alive", lambda _pid: True)
+        assert kb.release_checkpoint_claims(conn) == 0
+        assert kb.claim_task(conn, task_id) is None
+
+        monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+        assert kb.release_checkpoint_claims(conn) == 1
+        assert kb.claim_task(conn, task_id) is not None
+
+
+def test_remote_checkpoint_claim_releases_only_after_lease_expiry(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="remote roll over", assignee="coder")
+        task = kb.claim_task(conn, task_id, claimer="other-host:worker")
+        assert task is not None
+        assert kb.checkpoint_task(
+            conn,
+            task_id,
+            summary="first slice complete",
+            expected_run_id=task.current_run_id,
+        )
+        assert kb.release_checkpoint_claims(conn) == 0
+        conn.execute(
+            "UPDATE tasks SET claim_expires = ? WHERE id = ?",
+            (int(time.time()) - 1, task_id),
+        )
+        conn.commit()
+        assert kb.release_stale_claims(conn) == 1
+
+
+def test_checkpoint_advertisement_is_config_gated_and_rejects_future_dates(
+    kanban_home, monkeypatch,
+):
+    with kb.connect() as conn:
+        kb._dispatch_once_locked(conn, advertise_capabilities=True)
+        assert kb.dispatcher_supports_safe_checkpoint(conn) is False
+
+        monkeypatch.setattr(kb, "safe_checkpoint_enabled", lambda: True)
+        kb._dispatch_once_locked(conn, advertise_capabilities=True)
+        assert kb.dispatcher_supports_safe_checkpoint(conn) is True
+
+        future = int(time.time()) + 60
+        conn.execute(
+            "UPDATE board_meta SET value = ?, updated_at = ? WHERE key = ?",
+            (
+                '{"safe_checkpoint":true,"advertised_at":%d}' % future,
+                future,
+                kb._DISPATCHER_CAPABILITIES_META_KEY,
+            ),
+        )
+        conn.commit()
+        assert kb.dispatcher_supports_safe_checkpoint(conn) is False
+
+
+def test_checkpoint_successor_context_includes_live_git_state_and_handoff(
+    kanban_home, tmp_path,
+):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    (repo / "README.md").write_text("changed\n", encoding="utf-8")
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="resume from checkpoint",
+            assignee="coder",
+            workspace_kind="dir",
+            workspace_path=str(repo),
+        )
+        task = kb.claim_task(conn, task_id)
+        assert task is not None
+        assert kb.checkpoint_task(
+            conn,
+            task_id,
+            summary="implementation slice complete",
+            metadata={"handoff": {"next_worker_start_here": "Run targeted tests."}},
+            expected_run_id=task.current_run_id,
+        )
+        context = kb.build_worker_context(conn, task_id)
+
+    assert "## Live Git state" in context
+    assert "README.md" in context
+    assert "implementation slice complete" in context
+    assert "Run targeted tests." in context
+
+
 
 
 

@@ -1522,10 +1522,24 @@ def init_agent(
     # Resolving the ~835-token block once here avoids re-running the
     # membership test + reference on every system-prompt rebuild
     # (init + each context compression).
-    from agent.prompt_builder import KANBAN_GUIDANCE
-    agent._kanban_worker_guidance = (
-        KANBAN_GUIDANCE if "kanban_show" in agent.valid_tool_names else ""
-    )
+    from agent.prompt_builder import KANBAN_GUIDANCE, kanban_guidance_with_checkpoint
+    if "kanban_show" not in agent.valid_tool_names:
+        agent._kanban_worker_guidance = ""
+    elif "kanban_checkpoint" not in agent.valid_tool_names:
+        agent._kanban_worker_guidance = KANBAN_GUIDANCE
+    else:
+        try:
+            from hermes_cli.config import load_config
+
+            checkpoint = ((load_config() or {}).get("kanban") or {}).get(
+                "safe_checkpoint"
+            ) or {}
+            hint = checkpoint.get("prompt_hint", "") if isinstance(checkpoint, dict) else ""
+        except Exception:
+            hint = ""
+        agent._kanban_worker_guidance = kanban_guidance_with_checkpoint(
+            hint if isinstance(hint, str) else ""
+        )
 
     # Check tool requirements
     if agent.tools and not agent.quiet_mode:
