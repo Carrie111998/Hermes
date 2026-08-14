@@ -1100,6 +1100,8 @@ class DiscordAdapter(BasePlatformAdapter):
         self._voice_mixers: Dict[int, Any] = {}  # guild_id -> VoiceMixer
         self._ambient_pcm_cache: Optional[bytes] = None  # decoded ambient bed
         self._voice_fx_cfg: Dict[str, Any] = self._load_voice_fx_config()
+        # Post-STT keyword gate for voice-channel utterances. Empty = disabled.
+        self._voice_keywords = self._load_voice_keywords()
         # Track threads where the bot has participated so follow-up messages
         # in those threads don't require @mention.  Persisted to disk so the
         # set survives gateway restarts.
@@ -4293,6 +4295,60 @@ class DiscordAdapter(BasePlatformAdapter):
             logger.debug("Could not load discord.voice_fx config: %s", e)
         return defaults
 
+    def _load_voice_keywords(self) -> List[str]:
+        """Read post-STT keyword gate from ``discord.voice_keywords`` in config.yaml.
+
+        Returns a normalized list of lowercase keywords (leading/trailing
+        whitespace stripped, empties dropped). An empty list means the gate is
+        disabled and every allowed user's speech is processed as before.
+        """
+        try:
+            from hermes_cli.config import read_raw_config
+            cfg = read_raw_config() or {}
+            raw = (cfg.get("discord") or {}).get("voice_keywords") or []
+            if isinstance(raw, str):
+                # tolerate both a JSON-ish list string ('["hey hermes"]') and a
+                # comma-separated string ('hey hermes,jarvis')
+                import json as _json
+                try:
+                    parsed = _json.loads(raw)
+                    if isinstance(parsed, list):
+                        raw = parsed
+                except Exception:
+                    raw = [p for p in raw.split(",") if p.strip()]
+            keywords = []
+            for item in raw or []:
+                kw = str(item).strip().lower()
+                if kw:
+                    keywords.append(kw)
+            return keywords
+        except Exception as e:
+            logger.debug("Could not load discord.voice_keywords config: %s", e)
+            return []
+
+    def _matches_voice_keyword(self, transcript: str) -> Optional[str]:
+        """If *transcript* starts with a configured keyword, return the strip of
+        the keyword; otherwise return None (utterance is filtered out).
+
+        Matching is case-insensitive and requires a word boundary after the
+        keyword (whitespace, punctuation, or end of text) so a stray prefix
+        like "hey hermesphone" does not trigger. An empty config returns the
+        original transcript (gate disabled).
+        """
+        if not self._voice_keywords:
+            return transcript
+        text = transcript.strip()
+        low = text.lower()
+        for kw in self._voice_keywords:
+            if low == kw:
+                return ""  # user said only the keyword, nothing follows
+            if low.startswith(kw):
+                rest = text[len(kw):]
+                # boundary check: next char must be a separator or end-of-text
+                if not rest or rest[0].isspace() or rest[0] in ",;:!?.":
+                    return rest.lstrip(" \t,;:!?.")
+        return None
+
     def _load_discord_int_config(self, key: str, default: int, *, minimum: int = 0) -> int:
         """Read a non-secret integer from the top-level ``discord`` config."""
         try:
@@ -4909,6 +4965,21 @@ class DiscordAdapter(BasePlatformAdapter):
             transcript = result.get("transcript", "").strip()
             if not transcript or is_whisper_hallucination(transcript):
                 return
+
+            # Post-STT keyword gate: when discord.voice_keywords is configured,
+            # only utterances starting with a keyword proceed (keyword stripped).
+            if self._voice_keywords:
+                stripped = self._matches_voice_keyword(transcript)
+                if stripped is None:
+                    logger.info(
+                        "Voice input filtered out (no keyword prefix): %s",
+                        transcript[:80],
+                    )
+                    return
+                if not stripped.strip():
+                    logger.info("Voice keyword only, nothing to process.")
+                    return
+                transcript = stripped
 
             logger.info("Voice input from user %d: %s", user_id, transcript[:100])
 

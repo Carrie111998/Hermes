@@ -2049,6 +2049,13 @@ DEFAULT_CONFIG = {
         # The adapter also probes clip duration and extends this floor by a
         # padding window, so long TTS readbacks are not cut at exactly 120s.
         "voice_playback_timeout_seconds": 120,
+        # Discord voice-channel keyword gate (applied AFTER speech-to-text).
+        # If non-empty, a voice utterance is ONLY processed when its transcript
+        # starts with one of these phrases (case-insensitive, word boundary).
+        # The matched keyword is stripped before the rest reaches the agent.
+        # Empty list (default) = no gate, the bot processes every allowed
+        # user's speech as before.
+        "voice_keywords": [],
         # Voice-channel audio effects (the continuous mixer). OFF by default.
         # When enabled, the bot installs a software mixer on the outgoing voice
         # stream so a low ambient "thinking" bed, verbal acknowledgements, and
