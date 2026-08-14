@@ -8,10 +8,19 @@ change in the worktree and print something observable.
 from __future__ import annotations
 
 import json
+import os
+import subprocess
+import sys
 from pathlib import Path
 from typing import Any, Callable, Dict, List
 
-from devflow_delegation.agent_policy import Budget
+from devflow_delegation.agent_policy import (
+    Budget,
+    CeilingExceeded,
+    scan_for_secrets,
+    scrubbed_env,
+    secret_values,
+)
 from devflow_delegation.agent_tools import (
     TOOL_SCHEMAS,
     ToolError,
@@ -20,7 +29,7 @@ from devflow_delegation.agent_tools import (
     run_tests,
     write_file,
 )
-from devflow_delegation.allowlist import TargetConfig
+from devflow_delegation.allowlist import TargetConfig, load_allowlist, path_allowed, resolve_target
 
 _SYSTEM_PROMPT = """You are a bounded software-fixing agent working inside an \
 isolated git worktree.
@@ -151,3 +160,123 @@ def run_agent(
             result = dispatch_tool(call.function.name, args, worktree=worktree, target=target)
             messages.append({"role": "tool", "tool_call_id": call.id, "content": result})
     return {"iterations": budget.iterations, "tokens": budget.tokens, "stopped": stopped}
+
+
+# --- Self-check and CLI entrypoint ------------------------------------------
+#
+# This is the last line of defense before the executor sees the agent's work.
+# The executor (executor.py, unmodified here) re-validates changed paths
+# against allowed_globs on its own, but it checks WHERE the agent wrote, never
+# WHAT it wrote -- a secret written into an otherwise-allowed path would sail
+# straight through that check. self_check closes that gap by scanning diff
+# content for credential material before the executor ever looks at the
+# worktree.
+
+_METADATA_RELATIVE_PATH = ".ddp_request.json"
+
+
+def _git_output(argv: List[str], worktree: Path) -> str:
+    completed = subprocess.run(
+        argv, cwd=str(worktree), capture_output=True, text=True,
+        encoding="utf-8", errors="replace", shell=False, timeout=60,
+    )
+    if completed.returncode != 0:
+        raise RuntimeError(f"git failed: {' '.join(argv)}: {completed.stderr.strip()}")
+    return completed.stdout
+
+
+def changed_paths(worktree: Path) -> List[str]:
+    """Tracked-modified plus untracked paths, excluding the request metadata file."""
+    tracked = _git_output(["git", "diff", "--name-only", "HEAD"], worktree)
+    untracked = _git_output(["git", "ls-files", "--others", "--exclude-standard"], worktree)
+    paths = {
+        line.replace("\\", "/").strip()
+        for line in (tracked + "\n" + untracked).splitlines()
+        if line.strip()
+    }
+    paths.discard(_METADATA_RELATIVE_PATH)
+    return sorted(paths)
+
+
+def self_check(worktree: Path, target: TargetConfig, *, known_values) -> None:
+    """Refuse to hand a bad change to the executor. Raises RuntimeError on any breach."""
+    paths = changed_paths(worktree)
+    if not paths:
+        raise RuntimeError("agent produced no meaningful diff")
+    if len(paths) > target.agent_max_files:
+        raise RuntimeError(
+            f"agent touched {len(paths)} files, ceiling is {target.agent_max_files}"
+        )
+    rejected = [path for path in paths if not path_allowed(target, path)]
+    if rejected:
+        raise RuntimeError(f"agent wrote out-of-scope paths: {', '.join(rejected)}")
+    diff = _git_output(["git", "diff", "HEAD"], worktree)
+    for path in paths:
+        candidate = Path(worktree) / path
+        if candidate.is_file():
+            diff += candidate.read_text(encoding="utf-8", errors="replace")
+    findings = scan_for_secrets(diff, known_values=known_values)
+    if findings:
+        raise RuntimeError(f"agent diff contains secret material: {', '.join(sorted(set(findings)))}")
+
+
+def main(argv=None) -> int:
+    """Entrypoint used as a target's implementation_command."""
+    del argv
+    worktree = Path.cwd().resolve()
+    request_path = os.environ.get("DDP_REQUEST_PATH", "")
+    if not request_path or not Path(request_path).is_file():
+        print("ERROR: DDP_REQUEST_PATH is unset or missing", file=sys.stderr)
+        return 1
+    try:
+        request = json.loads(Path(request_path).read_text(encoding="utf-8"))
+        envelope = request.get("request") or {}
+        repo = str((envelope.get("target") or {}).get("repo") or "")
+        from events import paths as event_paths
+
+        target = resolve_target(load_allowlist(event_paths.devflow_allowlist_path()), repo)
+        if target is None:
+            print(f"ERROR: target unresolved: {repo}", file=sys.stderr)
+            return 1
+
+        # Capture secret-shaped values to scan for BEFORE scrubbing (self_check
+        # needs them), and compute the scrubbed replacement env from a SNAPSHOT
+        # of the current environment before clearing it.
+        #
+        # The brief's reference implementation called
+        # `os.environ.update(scrubbed_env({"PATH": os.environ.get("PATH", "")}))`
+        # AFTER `os.environ.clear()`. `os.environ.get("PATH", "")` at that point
+        # always reads "" -- the clear() already ran -- so every subsequent
+        # subprocess call in this process (git in self_check, run_tests inside
+        # the agent loop) would inherit an empty PATH and fail to resolve
+        # executables at all. Passing only `{"PATH": ...}` as the scrub source
+        # would also have dropped every other allow-listed var (SYSTEMROOT,
+        # TEMP, HOME, ...) that scrubbed_env is designed to let through.
+        # Fixed by scrubbing a full pre-clear snapshot instead of a
+        # single-key dict assembled from an already-cleared environ.
+        known = secret_values(dict(os.environ))
+        scrubbed = scrubbed_env(os.environ)
+        os.environ.clear()
+        os.environ.update(scrubbed)
+        os.environ["DDP_REQUEST_PATH"] = request_path
+
+        from agent.auxiliary_client import call_llm
+
+        result = run_agent(worktree=worktree, target=target, request=request,
+                           provider_call=call_llm)
+        self_check(worktree, target, known_values=known)
+    except CeilingExceeded as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+    except Exception as exc:  # fail closed on anything unexpected
+        print(f"ERROR: agent run failed: {exc}", file=sys.stderr)
+        return 1
+    print(
+        f"agent completed: iterations={result['iterations']} tokens={result['tokens']} "
+        f"stopped={result['stopped']}"
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

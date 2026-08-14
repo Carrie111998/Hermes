@@ -1,4 +1,5 @@
 import json
+import os
 from types import SimpleNamespace
 
 import pytest
@@ -218,3 +219,150 @@ def test_build_messages_delimits_the_untrusted_request_block():
     # not just free text splicing.
     assert "<untrusted" in body.lower()
     assert body.lower().count("untrusted") >= 2  # an opening and a closing marker
+
+
+# --- Task 6: self-check and CLI entrypoint ---
+
+
+import subprocess
+
+from devflow_delegation.agent_runner import changed_paths, main, self_check
+
+
+def _git(args, cwd):
+    subprocess.run(args, cwd=str(cwd), check=True, capture_output=True, text=True)
+
+
+@pytest.fixture
+def git_worktree(tmp_path):
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "app.py").write_text("x = 1\n", encoding="utf-8")
+    _git(["git", "init", "--initial-branch", "main"], tmp_path)
+    _git(["git", "config", "user.email", "t@example.test"], tmp_path)
+    _git(["git", "config", "user.name", "T"], tmp_path)
+    _git(["git", "add", "src/app.py"], tmp_path)
+    _git(["git", "commit", "-m", "seed"], tmp_path)
+    return tmp_path
+
+
+def test_changed_paths_sees_modified_and_new_files(git_worktree):
+    (git_worktree / "src" / "app.py").write_text("x = 2\n", encoding="utf-8")
+    (git_worktree / "src" / "new.py").write_text("y = 1\n", encoding="utf-8")
+    assert set(changed_paths(git_worktree)) == {"src/app.py", "src/new.py"}
+
+
+def test_self_check_passes_for_a_clean_scoped_change(git_worktree):
+    (git_worktree / "src" / "app.py").write_text("x = 2\n", encoding="utf-8")
+    self_check(git_worktree, _target(), known_values=("sk-live-abc",))
+
+
+def test_self_check_rejects_an_empty_diff(git_worktree):
+    with pytest.raises(RuntimeError, match="no meaningful diff"):
+        self_check(git_worktree, _target(), known_values=())
+
+
+def test_self_check_rejects_a_change_outside_allowed_globs(git_worktree):
+    (git_worktree / "sneaky.py").write_text("x = 1\n", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="out-of-scope"):
+        self_check(git_worktree, _target(), known_values=())
+
+
+def test_self_check_rejects_a_leaked_credential(git_worktree):
+    # allowed_globs validates WHERE the agent wrote, never WHAT. This is the check
+    # that stops a secret in an allowed path from reaching a real PR.
+    (git_worktree / "src" / "app.py").write_text("TOKEN = 'sk-live-abc'\n", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="secret"):
+        self_check(git_worktree, _target(), known_values=("sk-live-abc",))
+
+
+def test_self_check_rejects_too_many_files(git_worktree):
+    for index in range(5):
+        (git_worktree / "src" / f"f{index}.py").write_text("x = 1\n", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="files"):
+        self_check(git_worktree, _target(agent_max_files=3), known_values=())
+
+
+def test_main_exits_nonzero_when_the_request_path_is_missing(monkeypatch, git_worktree):
+    monkeypatch.delenv("DDP_REQUEST_PATH", raising=False)
+    monkeypatch.chdir(git_worktree)
+    assert main([]) == 1
+
+
+# --- environ-scrub ordering: a regression test for a defect found in the brief.
+#
+# The brief's reference `main()` read `os.environ.get("PATH", "")` AFTER
+# `os.environ.clear()`, which always observes an empty environ -- PATH (and
+# every other allow-listed var: SYSTEMROOT, TEMP, HOME, ...) would be wiped,
+# not merely scrubbed. That breaks every subprocess call made afterwards
+# (git in self_check, run_tests in the agent loop). The fix snapshots and
+# scrubs the environment BEFORE clearing it. This test drives `main()` for
+# real (with run_agent/self_check swapped for lightweight fakes so no LLM or
+# network call happens) and asserts PATH is still populated inside run_agent.
+def test_main_preserves_path_when_scrubbing_the_environment(monkeypatch, git_worktree, tmp_path):
+    # main() calls os.environ.clear() for real -- correct in production, where
+    # main() only ever runs as a freshly-spawned child process (the executor's
+    # implementation_command), so clearing affects a throwaway copy of the
+    # environment that dies with the process. Here it runs in-process inside
+    # the shared pytest worker, so without an explicit full snapshot/restore
+    # the clear() would leak into every test that runs afterward in this
+    # session (monkeypatch's own env teardown only restores the handful of
+    # keys IT touched via setenv/delenv, not a wholesale clear() of every var
+    # it never knew about). Save and restore the entire environ by hand.
+    saved_environ = dict(os.environ)
+    try:
+        _run_main_preserves_path_when_scrubbing_the_environment(monkeypatch, git_worktree, tmp_path)
+    finally:
+        os.environ.clear()
+        os.environ.update(saved_environ)
+
+
+def _run_main_preserves_path_when_scrubbing_the_environment(monkeypatch, git_worktree, tmp_path):
+    request_path = tmp_path / "request.json"
+    request_path.write_text(
+        json.dumps({
+            "request_id": "dwr_test",
+            "request": {
+                "target": {"repo": "fixture"},
+                "title": "t", "problem_statement": "p", "acceptance_criteria": [],
+            },
+        }),
+        encoding="utf-8",
+    )
+    allowlist_path = tmp_path / "allowlist.json"
+    allowlist_path.write_text(
+        json.dumps({
+            "version": "1",
+            "targets": {
+                "fixture": {
+                    "repo": "fixture", "checkout_path": "/unused",
+                    "allowed_globs": ["src/**"],
+                    "executor_enabled": True,
+                    "implementation_command": ["python", "-m", "devflow_delegation.agent_runner"],
+                    "github_repo": "org/fixture",
+                    "max_autonomous_action": "create_pr",
+                    "synthetic_fixture": True,
+                }
+            },
+        }),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setenv("DDP_REQUEST_PATH", str(request_path))
+    monkeypatch.setenv("PATH", "C:/fake/real/path")
+    monkeypatch.chdir(git_worktree)
+
+    from devflow_delegation import agent_runner
+
+    monkeypatch.setattr("events.paths.devflow_allowlist_path", lambda: allowlist_path)
+
+    captured = {}
+
+    def fake_run_agent(**kwargs):
+        captured["path"] = os.environ.get("PATH", "")
+        return {"iterations": 1, "tokens": 1, "stopped": "model-finished"}
+
+    monkeypatch.setattr(agent_runner, "run_agent", fake_run_agent)
+    monkeypatch.setattr(agent_runner, "self_check", lambda *a, **k: None)
+
+    assert agent_runner.main([]) == 0
+    assert captured["path"] == "C:/fake/real/path"
