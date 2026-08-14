@@ -1,6 +1,7 @@
 """Tests for TUI gateway slash_worker profile_home propagation (#40677)."""
 
 import os
+from pathlib import Path
 import subprocess
 import sys
 from unittest.mock import MagicMock, patch, call
@@ -11,7 +12,7 @@ import pytest
 def test_slash_worker_accepts_profile_home():
     """_SlashWorker.__init__ accepts profile_home parameter."""
     with patch.dict("sys.modules", {
-        "hermes_constants": MagicMock(get_hermes_home=MagicMock(return_value="/tmp/hermes_test")),
+        "hermes_constants": MagicMock(get_hermes_home=MagicMock(return_value=Path("/tmp/hermes_test"))),
     }):
         with patch("subprocess.Popen") as mock_popen:
             mock_popen.return_value.stdout = MagicMock()
