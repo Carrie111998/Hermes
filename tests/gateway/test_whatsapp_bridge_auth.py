@@ -1,5 +1,6 @@
 """Security regressions for authenticated WhatsApp bridge IPC."""
 
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 
@@ -12,6 +13,32 @@ def test_bridge_token_is_persistent_on_disk(tmp_path: Path):
     assert first == second
     assert len(first) >= 32
     assert (tmp_path / ".bridge-token").read_text(encoding="utf-8").strip() == first
+
+
+def test_concurrent_bridge_token_creation_reuses_exclusive_winner(
+    tmp_path: Path,
+):
+    from plugins.platforms.whatsapp import adapter
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        tokens = list(
+            executor.map(adapter._load_or_create_bridge_token, [tmp_path] * 8)
+        )
+
+    persisted = (tmp_path / ".bridge-token").read_text(encoding="utf-8").strip()
+    assert tokens == [persisted] * len(tokens)
+
+
+def test_malformed_persisted_bridge_token_is_replaced(tmp_path: Path):
+    from plugins.platforms.whatsapp.adapter import _load_or_create_bridge_token
+
+    token_path = tmp_path / ".bridge-token"
+    token_path.write_text("truncated", encoding="utf-8")
+
+    token = _load_or_create_bridge_token(tmp_path)
+
+    assert len(token) >= 32
+    assert token_path.read_text(encoding="utf-8") == token
 
 
 def test_health_authentication_requires_challenge_bound_proof():

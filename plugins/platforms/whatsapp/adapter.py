@@ -16,6 +16,7 @@ with different backends via a bridge pattern.
 """
 
 import asyncio
+from contextlib import contextmanager
 import hashlib
 import hmac
 import logging
@@ -377,33 +378,67 @@ def _bridge_source_hash(bridge_path: Path) -> str:
     return digest.hexdigest()[:16]
 
 
+@contextmanager
+def _bridge_token_lock(lock_path: Path):
+    """Hold a crash-released cross-process lock for bridge-token updates."""
+    handle = open(lock_path, "a+b")
+    locked = False
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            if lock_path.stat().st_size == 0:
+                handle.write(b"\0")
+                handle.flush()
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        locked = True
+        yield
+    finally:
+        try:
+            if locked and os.name == "nt":
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            elif locked:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            handle.close()
+
+
 def _load_or_create_bridge_token(session_path: Path) -> str:
     """Return the persistent per-session secret used to authenticate bridge IPC."""
     session_path.mkdir(parents=True, exist_ok=True)
     token_path = session_path / ".bridge-token"
-    try:
-        existing = token_path.read_text(encoding="utf-8").strip()
-        if len(existing) >= 32:
-            return existing
-    except OSError:
-        pass
+    lock_path = token_path.with_name(f"{token_path.name}.lock")
 
-    token = secrets.token_urlsafe(32)
-    temp_path = token_path.with_name(
-        f"{token_path.name}.{secrets.token_hex(8)}.tmp"
-    )
-    fd = os.open(temp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(token)
+    with _bridge_token_lock(lock_path):
         try:
-            temp_path.chmod(0o600)
+            existing = token_path.read_text(encoding="utf-8").strip()
+            if len(existing) >= 32:
+                return existing
         except OSError:
             pass
-        os.replace(temp_path, token_path)
-    finally:
-        temp_path.unlink(missing_ok=True)
-    return token
+
+        token = secrets.token_urlsafe(32)
+        temp_path = token_path.with_name(
+            f"{token_path.name}.{secrets.token_hex(8)}.tmp"
+        )
+        fd = os.open(temp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as token_file:
+                token_file.write(token)
+            try:
+                temp_path.chmod(0o600)
+            except OSError:
+                pass
+            os.replace(temp_path, token_path)
+        finally:
+            temp_path.unlink(missing_ok=True)
+        return token
 
 
 def _bridge_auth_headers(token: str, challenge: str = "") -> Dict[str, str]:
