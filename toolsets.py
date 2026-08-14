@@ -311,6 +311,19 @@ TOOLSETS = {
         "includes": []
     },
 
+    "kanban_lifecycle": {
+        "description": (
+            "Minimal task lifecycle surface for locked-down dispatcher workers: "
+            "inspect the assigned task, heartbeat, block, or complete. Excludes "
+            "board routing, child creation, comments, attachments, network fetches, "
+            "and every non-Kanban tool."
+        ),
+        "tools": [
+            "kanban_show", "kanban_complete", "kanban_block", "kanban_heartbeat",
+        ],
+        "includes": [],
+    },
+
     "kanban": {
         "description": (
             "Kanban multi-agent coordination — only active when the agent "

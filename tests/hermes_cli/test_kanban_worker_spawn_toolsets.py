@@ -161,3 +161,57 @@ toolsets:
     assert "web" in resolved
     assert "kanban" in resolved  # recovered worker lifecycle surface
     assert resolved != ["kanban"]
+
+
+def test_lifecycle_only_worker_surface_excludes_broader_kanban_tools(monkeypatch):
+    """A minimal worker profile must not be widened back to the full Kanban API."""
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_lifecycle_only")
+
+    from model_tools import _clear_tool_defs_cache, get_tool_definitions
+
+    _clear_tool_defs_cache()
+    try:
+        definitions = get_tool_definitions(
+            enabled_toolsets=["kanban_lifecycle"],
+            disabled_toolsets=[],
+            quiet_mode=True,
+        )
+        names = {
+            item.get("function", {}).get("name")
+            for item in definitions
+            if item.get("function", {}).get("name")
+        }
+        assert names == {
+            "kanban_show",
+            "kanban_complete",
+            "kanban_block",
+            "kanban_heartbeat",
+        }
+    finally:
+        _clear_tool_defs_cache()
+
+
+def test_resolve_worker_cli_toolsets_preserves_lifecycle_only_profile(monkeypatch, tmp_path):
+    root = tmp_path / ".hermes"
+    profile = root / "profiles" / "dashboardcontrol"
+    profile.mkdir(parents=True)
+    root.joinpath("config.yaml").write_text("{}\n", encoding="utf-8")
+    profile.joinpath("config.yaml").write_text(
+        """
+platform_toolsets:
+  cli:
+    - kanban_lifecycle
+toolsets:
+  - kanban_lifecycle
+agent:
+  disabled_toolsets: []
+""".lstrip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(root))
+
+    from hermes_cli import kanban_db as kb
+
+    resolved = kb._resolve_worker_cli_toolsets(str(profile))
+
+    assert resolved == ["kanban_lifecycle"]
