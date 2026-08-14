@@ -248,6 +248,134 @@ class TestSessionContext:
         assert "tagged message" in content
 
 
+class TestRecoveredTelegramRetryNormalization:
+    ABORT_MSG = "%s Failed run number %s of %s. Aborting."
+    SHUTDOWN_MSG = (
+        "Error while calling `get_updates` one more time to mark all fetched updates. "
+        "Suppressing error to ensure graceful shutdown. When polling for "
+        "updates is restarted, updates may be fetched again. Please adjust timeouts "
+        "via `ApplicationBuilder` or the parameter `get_updates_request` of `Bot`."
+    )
+
+    @staticmethod
+    def _record(name, level, msg, args=(), exc_info=None):
+        return logging.getLogRecordFactory()(
+            name, level, __file__, 1, msg, args, exc_info, None
+        )
+
+    @pytest.mark.parametrize(
+        "prefix",
+        [
+            "Network Retry Loop (Bootstrap delete Webhook):",
+            "Network Retry Loop (Bootstrap delete Webhook): Timed out: Timed out.",
+        ],
+    )
+    def test_exact_adapter_owned_bootstrap_retry_is_warning(self, prefix):
+        marker = (RuntimeError, RuntimeError("transport failed"), None)
+        record = self._record(
+            "telegram.ext",
+            logging.ERROR,
+            self.ABORT_MSG,
+            (prefix, 0, 0),
+            marker,
+        )
+        assert record.levelno == logging.WARNING
+        assert record.levelname == "WARNING"
+        assert record.msg == self.ABORT_MSG
+        assert record.args == (prefix, 0, 0)
+        assert record.exc_info is marker
+
+    def test_exact_suppressed_shutdown_ack_error_is_warning(self):
+        record = self._record(
+            "telegram.ext.Updater", logging.ERROR, self.SHUTDOWN_MSG
+        )
+        assert record.levelno == logging.WARNING
+        assert record.msg == self.SHUTDOWN_MSG
+        assert record.args == ()
+
+    @pytest.mark.parametrize(
+        ("name", "level", "msg", "args"),
+        [
+            ("telegram.ext.other", logging.ERROR, ABORT_MSG, ("Network Retry Loop (Bootstrap delete Webhook):", 0, 0)),
+            ("telegram.ext", logging.CRITICAL, ABORT_MSG, ("Network Retry Loop (Bootstrap delete Webhook):", 0, 0)),
+            ("telegram.ext", logging.ERROR, ABORT_MSG + " fatal", ("Network Retry Loop (Bootstrap delete Webhook):", 0, 0)),
+            ("telegram.ext", logging.ERROR, ABORT_MSG, ("Network Retry Loop (Bootstrap delete Webhook):", 1, 0)),
+            ("telegram.ext", logging.ERROR, ABORT_MSG, ("Network Retry Loop (Bootstrap delete Webhook):", False, 0)),
+            ("telegram.ext", logging.ERROR, ABORT_MSG, ("Network Retry Loop (Bootstrap delete Webhook): Invalid token.", 0, 0)),
+            ("telegram.ext.Updater", logging.ERROR, SHUTDOWN_MSG, ("extra",)),
+        ],
+    )
+    def test_lookalikes_and_unowned_errors_remain_error(self, name, level, msg, args):
+        record = self._record(name, level, msg, args)
+        assert record.levelno == level
+
+    def test_total_predicate_does_not_touch_hostile_values(self):
+        class Hostile:
+            def __eq__(self, other):
+                raise AssertionError("equality invoked")
+
+            def __bool__(self):
+                raise AssertionError("truth invoked")
+
+            def __hash__(self):
+                raise AssertionError("hash invoked")
+
+        record = logging.LogRecord(
+            "telegram.ext", logging.ERROR, __file__, 1, self.ABORT_MSG, (), None
+        )
+        record.levelno = Hostile()
+        record.msg = Hostile()
+        record.args = (Hostile(), Hostile(), Hostile())
+        hermes_logging._normalize_recovered_telegram_retry(record)
+        assert type(record.levelno) is Hostile
+
+    @pytest.mark.parametrize("hostile_field", ["name", "msg", "args"])
+    def test_total_predicate_rejects_each_hostile_field_without_rendering(
+        self, hostile_field
+    ):
+        class Hostile:
+            def __eq__(self, other):
+                raise AssertionError("equality invoked")
+
+            def __bool__(self):
+                raise AssertionError("truth invoked")
+
+            def __hash__(self):
+                raise AssertionError("hash invoked")
+
+        record = logging.LogRecord(
+            "telegram.ext",
+            logging.ERROR,
+            __file__,
+            1,
+            self.ABORT_MSG,
+            ("Network Retry Loop (Bootstrap delete Webhook):", 0, 0),
+            None,
+        )
+        setattr(record, hostile_field, Hostile())
+        hermes_logging._normalize_recovered_telegram_retry(record)
+        assert record.levelno == logging.ERROR
+
+    def test_huge_and_unhashable_arguments_fail_closed(self):
+        for args in (
+            ("Network Retry Loop (Bootstrap delete Webhook):", 10**10000, 0),
+            ["Network Retry Loop (Bootstrap delete Webhook):", 0, 0],
+            {"prefix": "Network Retry Loop (Bootstrap delete Webhook):"},
+        ):
+            record = logging.LogRecord(
+                "telegram.ext",
+                logging.ERROR,
+                __file__,
+                1,
+                self.ABORT_MSG,
+                (),
+                None,
+            )
+            record.args = args
+            hermes_logging._normalize_recovered_telegram_retry(record)
+            assert record.levelno == logging.ERROR
+
+
 
 
 
