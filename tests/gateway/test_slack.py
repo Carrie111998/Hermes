@@ -4225,15 +4225,15 @@ class TestEnsureDmConversation:
 
 
 # ---------------------------------------------------------------------------
-# TestThreadImageContext — C1-images: images/files in prior thread messages
+# TestThreadAttachmentContext — images/files in prior thread messages
 # must be visible to the agent when it joins the conversation (#69185,
 # #32315, #66136). Prior messages' attachments surface as text markers in
-# the fetched thread context; the thread ROOT's images are additionally
-# downloaded and delivered with the cold-start turn.
+# the fetched thread context; supported attachments on the thread ROOT are
+# additionally downloaded and delivered with the cold-start turn.
 # ---------------------------------------------------------------------------
 
 
-class TestThreadImageContext:
+class TestThreadAttachmentContext:
     """Thread-context visibility of images/files posted before the mention."""
 
     # -- _slack_file_marker / _render_message_text unit coverage -----------
@@ -4393,6 +4393,40 @@ class TestThreadImageContext:
         # The context marker AND the delivered image coexist.
         assert "[image: chart.png]" in msg_event.channel_context
         a._download_slack_file.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_cold_start_delivers_thread_root_pdf(
+        self, adapter_with_session_store
+    ):
+        """A PDF attached to the thread root is downloaded and surfaced as a
+        document on the first turn, not reduced to a filename-only marker."""
+        a = self._prep(adapter_with_session_store)
+        a._download_slack_file_bytes = AsyncMock(return_value=b"%PDF-1.7\n")
+        a._app.client.conversations_replies = self._replies(
+            root_files=[
+                {
+                    "id": "F_PDF",
+                    "name": "BATCH-20260813.pdf",
+                    "mimetype": "application/pdf",
+                    "size": 1024,
+                    "url_private_download": "https://files.slack.com/T1-FPDF/batch.pdf",
+                }
+            ]
+        )
+
+        with patch(
+            "plugins.platforms.slack.adapter.cache_document_from_bytes",
+            return_value="/tmp/BATCH-20260813.pdf",
+        ):
+            await a._handle_slack_message(self._thread_event())
+
+        a.handle_message.assert_awaited_once()
+        msg_event = a.handle_message.call_args[0][0]
+        assert msg_event.media_urls == ["/tmp/BATCH-20260813.pdf"]
+        assert msg_event.media_types == ["application/pdf"]
+        assert msg_event.message_type == MessageType.DOCUMENT
+        assert "[file: BATCH-20260813.pdf (application/pdf)]" in msg_event.channel_context
+        a._download_slack_file_bytes.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_root_image_download_failure_degrades_to_marker(

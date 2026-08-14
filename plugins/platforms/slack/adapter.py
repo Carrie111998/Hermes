@@ -127,12 +127,13 @@ _SLACK_SPECIAL_MENTION_RE = re.compile(
     r"<!(?:everyone|channel|here)(?:\|[^>\n]*)?>", re.IGNORECASE
 )
 
-# Cap on how many thread-root images are downloaded and delivered when the
-# bot is mentioned mid-thread (cold-start hydrate). Prior thread messages'
-# attachments are surfaced as text markers only — the root is special
-# because it is very often the artifact the mention is about ("@bot what's
-# in this chart?" posted as a reply under an image).
-_THREAD_ROOT_IMAGE_MAX = 4
+# Cap on how many thread-root attachments are downloaded and delivered when
+# the bot is mentioned mid-thread (cold-start hydrate). Prior thread messages'
+# attachments are surfaced as text markers only. The root is special because
+# it is very often the artifact the mention is about (an image, PDF, or other
+# document posted before the bot joined the thread).
+_THREAD_ROOT_ATTACHMENT_MAX = 4
+_THREAD_ROOT_DOCUMENT_MAX_BYTES = 20 * 1024 * 1024
 
 
 def _slack_file_marker(file_obj: Dict[str, Any]) -> str:
@@ -6289,11 +6290,11 @@ class SlackAdapter(BasePlatformAdapter):
         # command routing can misclassify it as conversational text.
         # ``channel_context`` is prepended only after command dispatch.
         channel_context = None
-        # Thread-root images recovered on the cold-start hydrate: when the
+        # Thread-root attachments recovered on the cold-start hydrate: when the
         # bot is mentioned mid-thread for the first time, the thread root is
-        # very often the artifact the mention is about ("@bot what's in this
-        # chart?" replying under an image post) — deliver its images with
-        # this first turn. One-time by construction: the cold-start path is
+        # very often the artifact the mention is about (for example, a chart or
+        # PDF) — deliver supported files with this first turn. One-time by
+        # construction: the cold-start path is
         # guarded by _has_active_session_for_thread, so subsequent turns in
         # the same session never re-deliver (adapted from #69185).
         thread_root_media_urls: List[str] = []
@@ -6314,15 +6315,15 @@ class SlackAdapter(BasePlatformAdapter):
             )
             if thread_context:
                 channel_context = thread_context
-            # Deliver the thread root's images with this first turn. The
+            # Deliver the thread root's attachments with this first turn. The
             # root is always a PRIOR message here (is_thread_reply implies
             # thread_ts != ts); the trigger's own files ride event["files"].
             (
                 thread_root_media_urls,
                 thread_root_media_types,
-            ) = await self._collect_thread_root_images(
+            ) = await self._collect_thread_root_attachments(
                 channel_id=channel_id,
-                thread_ts=event_thread_ts,
+                thread_ts=event_thread_ts or "",
                 team_id=team_id,
             )
             # Record the trigger ts as the consumption watermark: everything
@@ -8056,28 +8057,27 @@ class SlackAdapter(BasePlatformAdapter):
             logger.debug("[Slack] Failed to fetch thread parent text: %s", exc)
             return ""
 
-    async def _collect_thread_root_images(
+    async def _collect_thread_root_attachments(
         self,
         channel_id: str,
         thread_ts: str,
         team_id: str = "",
     ) -> Tuple[List[str], List[str]]:
-        """Download and cache the thread-root message's image attachments.
+        """Download and cache supported thread-root message attachments.
 
         Called only on the cold-start hydrate path (first turn of a new
-        thread session), so images are delivered exactly once per session —
+        thread session), so attachments are delivered exactly once per session —
         after that the session history carries the turn. The root message
         is read from the thread-context cache populated by the immediately
         preceding :meth:`_fetch_thread_context` call, so this normally costs
         zero extra Slack API calls; Slack Connect stub files
         (``file_access="check_file_info"``) are resolved via ``files.info``.
 
-        Only ``image/*`` attachments are downloaded (bounded by
-        ``_THREAD_ROOT_IMAGE_MAX``); other root attachments stay text-only
-        markers in the thread context. Failures are best-effort — the
-        markers from :meth:`_render_message_text` already tell the agent the
-        image exists, so a failed download degrades to "ask for a re-share",
-        never to an error turn.
+        Images and document-like files are downloaded, bounded by
+        ``_THREAD_ROOT_ATTACHMENT_MAX``. Audio and video remain text-only
+        markers because their specialized pipelines are not part of this
+        context-recovery path. Failures are best-effort: the marker from
+        :meth:`_render_message_text` still tells the agent the file exists.
 
         Returns ``(media_urls, media_types)`` of cached local paths.
         """
@@ -8104,7 +8104,7 @@ class SlackAdapter(BasePlatformAdapter):
                 return media_urls, media_types
 
             for f in files:
-                if len(media_urls) >= _THREAD_ROOT_IMAGE_MAX:
+                if len(media_urls) >= _THREAD_ROOT_ATTACHMENT_MAX:
                     break
                 if not isinstance(f, dict):
                     continue
@@ -8124,26 +8124,49 @@ class SlackAdapter(BasePlatformAdapter):
                         continue
                 mimetype = str(f.get("mimetype") or "")
                 url = f.get("url_private_download") or f.get("url_private", "")
-                if not mimetype.startswith("image/") or not url:
+                if not url:
                     continue
                 try:
-                    ext = "." + mimetype.split("/")[-1].split(";")[0]
-                    if ext not in {".jpg", ".jpeg", ".png", ".gif", ".webp"}:
-                        ext = ".jpg"
-                    cached_path = await self._download_slack_file(
-                        url, ext, team_id=team_id
+                    if mimetype.startswith("image/"):
+                        ext = "." + mimetype.split("/")[-1].split(";")[0]
+                        if ext not in {".jpg", ".jpeg", ".png", ".gif", ".webp"}:
+                            ext = ".jpg"
+                        cached_path = await self._download_slack_file(
+                            url, ext, team_id=team_id
+                        )
+                        media_urls.append(cached_path)
+                        media_types.append(mimetype)
+                        continue
+
+                    # Preserve audio/video as markers. Their STT/video paths
+                    # require different handling than a cold-start context file.
+                    if mimetype.startswith(("audio/", "video/")):
+                        continue
+
+                    size = int(f.get("size") or 0)
+                    if not size or size > _THREAD_ROOT_DOCUMENT_MAX_BYTES:
+                        continue
+                    filename = str(f.get("name") or "document.bin")
+                    raw_bytes = await self._download_slack_file_bytes(
+                        url, team_id=team_id
                     )
+                    cached_path = cache_document_from_bytes(raw_bytes, filename)
+                    ext = os.path.splitext(filename)[1].lower()
                     media_urls.append(cached_path)
-                    media_types.append(mimetype)
+                    media_types.append(
+                        SUPPORTED_DOCUMENT_TYPES.get(
+                            ext, mimetype or "application/octet-stream"
+                        )
+                    )
                 except Exception as exc:
                     logger.warning(
-                        "[Slack] Failed to cache thread-root image %s: %s",
+                        "[Slack] Failed to cache thread-root attachment %s: %s",
                         f.get("id") or f.get("name") or "unknown",
                         exc,
                     )
         except Exception as exc:  # pragma: no cover - defensive
             logger.debug(
-                "[Slack] Thread-root image recovery failed: %s", exc
+                "[Slack] Thread-root attachment recovery failed: %s", exc
             )
         return media_urls, media_types
 
