@@ -2146,20 +2146,43 @@ def warn_deprecated_cwd_env_vars(config: Optional[Dict[str, Any]] = None) -> Non
 
     These env vars are deprecated — the canonical setting is terminal.cwd
     in config.yaml.  Prints a migration hint to stderr.
+
+    The check reads the ON-DISK ``.env`` (via ``load_env()``), never
+    ``os.environ``.  Reading the process env cannot answer the question this
+    warning claims to answer:
+
+      * ``cli.py`` FORCE-EXPORTS ``terminal.cwd`` into
+        ``os.environ["TERMINAL_CWD"]`` on every CLI start, and for the
+        ``local`` backend it first rewrites that value to ``os.getcwd()``.
+        So an ordinary config.yaml carrying the default ``cwd: .`` always
+        produced ``TERMINAL_CWD=<current dir>`` in the process env, which the
+        old code then reported as "found in .env" — naming a file the user
+        never edited and a value that appears nowhere in it.  The
+        ``config_has_explicit_cwd`` guard below made this *worse*, not
+        better: the false positive fired precisely when config.yaml was at
+        its default, i.e. for every clean install.
+      * ``load_env()`` also skips commented-out lines, so the shipped
+        ``.env.example`` scaffold line ``# TERMINAL_CWD=.`` cannot trip the
+        warning either.
+
+    ``hermes doctor`` already gets this right — see
+    ``doctor._DEPRECATED_ENV_VARS``, whose comment reads "checked in the .env
+    file, not process env, so config→env bridges like terminal.cwd →
+    TERMINAL_CWD do not false-positive".  This brings startup into line with
+    doctor instead of contradicting it.
+
+    *config* is retained for signature compatibility with existing callers
+    and is deliberately no longer consulted: if the key really is in ``.env``
+    it shadows config.yaml and is worth reporting whatever ``terminal.cwd``
+    happens to say.
     """
-    messaging_cwd = os.environ.get("MESSAGING_CWD")
-    terminal_cwd_env = os.environ.get("TERMINAL_CWD")
+    try:
+        dotenv = load_env()
+    except Exception:
+        return
 
-    if config is None:
-        try:
-            config = load_config()
-        except Exception:
-            return
-
-    terminal_cfg = config.get("terminal", {})
-    config_cwd = terminal_cfg.get("cwd", ".") if isinstance(terminal_cfg, dict) else "."
-    # Only warn if config.yaml doesn't have an explicit path
-    config_has_explicit_cwd = config_cwd not in {".", "auto", "cwd", ""}
+    messaging_cwd = (dotenv.get("MESSAGING_CWD") or "").strip()
+    terminal_cwd_env = (dotenv.get("TERMINAL_CWD") or "").strip()
 
     lines: list[str] = []
     if messaging_cwd:
@@ -2167,8 +2190,7 @@ def warn_deprecated_cwd_env_vars(config: Optional[Dict[str, Any]] = None) -> Non
             f"  \033[33m⚠\033[0m MESSAGING_CWD={messaging_cwd} found in .env — "
             f"this is deprecated."
         )
-    if terminal_cwd_env and not config_has_explicit_cwd:
-        # TERMINAL_CWD in env but not from config bridge — likely from .env
+    if terminal_cwd_env:
         lines.append(
             f"  \033[33m⚠\033[0m TERMINAL_CWD={terminal_cwd_env} found in .env — "
             f"this is deprecated."
