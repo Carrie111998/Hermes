@@ -9758,6 +9758,51 @@ def _plan_goal_compression_recovery(
     )
 
 
+def _strip_interrupt_sentinel(text: str) -> str:
+    """Drop Hermes' local "waiting for model response" cancellation sentinel.
+
+    It's cancellation metadata, not assistant prose — ACP (#41720) and the
+    gateway's chat platforms (#7921) already suppress it before delivery;
+    the dashboard/TUI websocket surface never got the same guard, so it was
+    rendered verbatim as if the agent had actually said it.
+    """
+    from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX
+
+    if not text:
+        return ""
+    if str(text).strip().startswith(INTERRUPT_WAITING_FOR_MODEL_PREFIX):
+        return ""
+    return text
+
+
+def _extract_chat_reply_text(result: dict) -> str:
+    """Sentinel-stripped ``final_response`` text for the main chat reply
+    (message.complete) delivery site."""
+    return _strip_interrupt_sentinel(result.get("final_response", ""))
+
+
+def _extract_background_complete_text(result: Any) -> str:
+    """Sentinel-stripped completion text for the background.complete
+    delivery site (a `hermes chat -q`-style background task)."""
+    raw = (
+        result.get("final_response", str(result))
+        if isinstance(result, dict)
+        else str(result)
+    )
+    return _strip_interrupt_sentinel(raw)
+
+
+def _extract_preview_restart_text(result: Any) -> str:
+    """Sentinel-stripped completion text for the preview.restart.complete
+    delivery site (the hidden restart-preview agent)."""
+    raw = (
+        result.get("final_response", str(result))
+        if isinstance(result, dict)
+        else str(result)
+    )
+    return _strip_interrupt_sentinel(raw)
+
+
 def _run_prompt_submit(
     rid,
     sid: str,
@@ -10213,7 +10258,7 @@ def _run_prompt_submit(
                     sid, session, clear_pending_title=False, restart_slash_worker=True,
                 )
 
-                raw = result.get("final_response", "")
+                raw = _extract_chat_reply_text(result)
                 status = (
                     "interrupted"
                     if result.get("interrupted")

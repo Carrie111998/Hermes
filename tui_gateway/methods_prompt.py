@@ -1125,11 +1125,7 @@ def _(rid, params: dict) -> dict:
                 parent,
                 {
                     "task_id": task_id,
-                    "text": (
-                        result.get("final_response", str(result))
-                        if isinstance(result, dict)
-                        else str(result)
-                    ),
+                    "text": _extract_background_complete_text(result),
                 },
             )
         except Exception as e:
@@ -1233,11 +1229,7 @@ def _(rid, params: dict) -> dict:
                 task_id=task_id,
                 conversation_history=parent_history or None,
             )
-            text = (
-                result.get("final_response", str(result))
-                if isinstance(result, dict)
-                else str(result)
-            )
+            text = _extract_preview_restart_text(result)
             _emit("preview.restart.complete", parent, {"task_id": task_id, "text": text})
         except Exception as e:
             _emit(
