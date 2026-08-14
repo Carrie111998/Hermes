@@ -110,11 +110,28 @@ class TestKittenTtsPostSetup:
         """A wheel whose hash matches the pin must be handed to pip."""
         tc = no_kittentts_installed
 
-        # The branch does `import hashlib as _hl`; point it at a stub whose
-        # sha256() returns the pinned digest so the valid-hash path is taken.
-        fake_hl = types.ModuleType("hashlib")
-        fake_hl.sha256 = lambda data: SimpleNamespace(hexdigest=lambda: PIN_HEX)
-        monkeypatch.setitem(sys.modules, "hashlib", fake_hl)
+        # The helper does `import hashlib as _hl`; point it at a stub whose
+        # sha256() returns the pinned digest for both wheels (kittentts AND
+        # soundfile) so the valid-hash path is taken for the whole install.
+        import hashlib as _real_hl_mod
+
+        KITTENTTS_PIN = "482a436c4f1f3192153710376e459ff3689517ebcda7c2b051e2fd4187b41851"
+        SOUNDFILE_PIN = "8ba81ae3a89fd5ab3bef8a8eb481fbbe794e806309675a89b4df48b8d31908a8"
+
+        class _FakeSha256:
+            def __init__(self, data=b""):
+                self._data = data
+
+            def hexdigest(self):
+                if b"verified kittentts bytes" in self._data:
+                    return KITTENTTS_PIN
+                if b"verified soundfile bytes" in self._data:
+                    return SOUNDFILE_PIN
+                return _real_hl_mod.sha256(self._data).hexdigest()
+
+        monkeypatch.setattr(
+            _real_hl_mod, "sha256", lambda data=b"": _FakeSha256(data)
+        )
 
         pip_calls: list = []
 
@@ -123,17 +140,28 @@ class TestKittenTtsPostSetup:
             return SimpleNamespace(returncode=0, stderr="")
 
         monkeypatch.setattr(tc, "_pip_install", fake_pip)
-        _fake_download(monkeypatch, tc, b"fake but 'verified' wheel bytes")
+
+        def fake_run(cmd, **kwargs):
+            i = cmd.index("-o")
+            dest = Path(cmd[i + 1])
+            dest.write_bytes(
+                b"verified soundfile bytes"
+                if "soundfile" in dest.name
+                else b"verified kittentts bytes"
+            )
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        monkeypatch.setattr(tc.subprocess, "run", fake_run)
 
         tc._run_post_setup("kittentts")
 
         captured = capsys.readouterr()
         text = captured.out + captured.err
-        assert "wheel sha256 verified" in text
+        assert "wheels sha256 verified" in text
         assert pip_calls, "expected _pip_install to run for a valid hash"
-        # _pip_install(["-U", wheel_path, "soundfile", "--quiet"], ...)
+        # _pip_install(["-U", wheel_path, soundfile_path, "--quiet"], ...)
         assert pip_calls[0][1].endswith(".whl")
-        assert "soundfile" in pip_calls[0]
+        assert "soundfile" in pip_calls[0][2]
 
     def test_already_installed_skips_download(self, monkeypatch, capsys):
         """If kittentts is importable, no download/hash/install work runs."""
