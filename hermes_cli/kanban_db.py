@@ -11445,17 +11445,12 @@ def claim_unseen_events_for_sub(
 ) -> tuple[int, int, list[Event]]:
     """Atomically claim unseen notification events for one subscription.
 
-    Returns ``(old_cursor, new_cursor, events)``. When events are returned,
-    ``kanban_notify_subs.last_event_id`` has already been advanced to
-    ``new_cursor`` inside a ``BEGIN IMMEDIATE`` transaction. That makes the
-    notifier's read/claim step single-owner across multiple gateway watcher
-    processes pointed at the same board DB: concurrent watchers serialize on
-    SQLite's writer lock, and only the first process sees and claims a given
-    event range.
-
-    Callers should send the claimed events, then either leave the cursor at
-    ``new_cursor`` on success or call :func:`rewind_notify_cursor` if delivery
-    failed before any terminal unsubscribe removed the row.
+    Returns ``(old_cursor, candidate_cursor, events)`` without advancing the
+    durable completion cursor. Callers materialize deterministic delivery
+    children first, then call :func:`advance_notify_cursor`; that operation is
+    transactionally gated on durable completion of every required child.
+    Re-reading before completion may return the same range, which is safe
+    because child IDs and idempotency evidence are deterministic.
     """
     with write_txn(conn):
         row = conn.execute(

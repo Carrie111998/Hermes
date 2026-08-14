@@ -152,7 +152,7 @@ def test_notify_sub_crud(kanban_home):
         conn.close()
 
 
-def test_notify_claim_is_single_owner_and_rewindable(kanban_home):
+def test_notify_claim_does_not_advance_before_durable_delivery_completion(kanban_home):
     conn1 = kb.connect()
     conn2 = kb.connect()
     try:
@@ -174,8 +174,9 @@ def test_notify_claim_is_single_owner_and_rewindable(kanban_home):
         assert claimed_cursor > old_cursor
         assert [ev.kind for ev in events] == ["completed"]
 
-        # A concurrent notifier instance sees the advanced cursor and cannot
-        # claim/send the same event range.
+        # Claiming alone must not record durable completion. A concurrent
+        # notifier may observe the same range and relies on deterministic
+        # child IDs/idempotency evidence until all required children finish.
         _, _, duplicate_events = kb.claim_unseen_events_for_sub(
             conn2,
             task_id=tid,
@@ -183,16 +184,9 @@ def test_notify_claim_is_single_owner_and_rewindable(kanban_home):
             chat_id="123",
             kinds=["completed", "blocked"],
         )
-        assert duplicate_events == []
+        assert [ev.kind for ev in duplicate_events] == ["completed"]
+        assert int(kb.list_notify_subs(conn1, tid)[0]["last_event_id"]) == old_cursor
 
-        assert kb.rewind_notify_cursor(
-            conn1,
-            task_id=tid,
-            platform="telegram",
-            chat_id="123",
-            claimed_cursor=claimed_cursor,
-            old_cursor=old_cursor,
-        ) is True
         _, retried_events = kb.unseen_events_for_sub(
             conn2,
             task_id=tid,

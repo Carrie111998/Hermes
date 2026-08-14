@@ -2666,6 +2666,130 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
     return 2
 
 
+def _cmd_watch(args: argparse.Namespace) -> int:
+    """Live-stream task_events to the terminal without mutating board state."""
+    kinds = (
+        {k.strip() for k in args.kinds.split(",") if k.strip()}
+        if args.kinds else None
+    )
+    cursor = 0
+    print("Watching kanban events. Ctrl-C to stop.", flush=True)
+    with kb.connect_closing() as conn:
+        row = conn.execute(
+            "SELECT COALESCE(MAX(id), 0) AS m FROM task_events"
+        ).fetchone()
+        cursor = int(row["m"])
+
+    try:
+        while True:
+            with kb.connect_closing() as conn:
+                rows = conn.execute(
+                    "SELECT e.id, e.task_id, e.kind, e.payload, e.created_at, "
+                    "       t.assignee, t.tenant "
+                    "FROM task_events e LEFT JOIN tasks t ON t.id = e.task_id "
+                    "WHERE e.id > ? ORDER BY e.id ASC LIMIT 200",
+                    (cursor,),
+                ).fetchall()
+            for row in rows:
+                cursor = max(cursor, int(row["id"]))
+                if kinds and row["kind"] not in kinds:
+                    continue
+                if args.assignee and row["assignee"] != args.assignee:
+                    continue
+                if args.tenant and row["tenant"] != args.tenant:
+                    continue
+                try:
+                    payload = json.loads(row["payload"]) if row["payload"] else None
+                except Exception:
+                    payload = None
+                suffix = f" {payload}" if payload else ""
+                print(
+                    f"[{_fmt_ts(row['created_at'])}] {row['task_id']:10s} "
+                    f"{row['kind']:18s} (@{row['assignee'] or '-'}){suffix}",
+                    flush=True,
+                )
+            time.sleep(max(0.1, args.interval))
+    except KeyboardInterrupt:
+        print("\n(stopped)")
+        return 0
+
+
+def _cmd_stats(args: argparse.Namespace) -> int:
+    with kb.connect_closing() as conn:
+        stats = kb.board_stats(conn)
+    if getattr(args, "json", False):
+        print(json.dumps(stats, indent=2, ensure_ascii=False))
+        return 0
+    print("By status:")
+    for key in ("triage", "todo", "scheduled", "ready", "running", "blocked", "done"):
+        print(f"  {key:8s}  {stats['by_status'].get(key, 0)}")
+    if stats["by_assignee"]:
+        print("\nBy assignee:")
+        for who, counts in sorted(stats["by_assignee"].items()):
+            parts = ", ".join(f"{key}={value}" for key, value in sorted(counts.items()))
+            print(f"  {who:20s}  {parts}")
+    age = stats["oldest_ready_age_seconds"]
+    if age is not None:
+        print(f"\nOldest ready task age: {int(age)}s")
+    return 0
+
+
+def _cmd_notify_subscribe(args: argparse.Namespace) -> int:
+    with kb.connect_closing() as conn:
+        if kb.get_task(conn, args.task_id) is None:
+            print(f"no such task: {args.task_id}", file=sys.stderr)
+            return 1
+        kb.add_notify_sub(
+            conn, task_id=args.task_id,
+            platform=args.platform, chat_id=args.chat_id,
+            chat_type=args.chat_type,
+            thread_id=args.thread_id, user_id=args.user_id,
+            user_id_alt=getattr(args, "user_id_alt", None),
+            notifier_profile=args.notifier_profile or _profile_author(),
+            delivery_mode=getattr(args, "delivery_mode", None),
+        )
+    print(f"Subscribed {args.platform}:{args.chat_id}"
+          + (f":{args.thread_id}" if args.thread_id else "")
+          + f" to {args.task_id}")
+    return 0
+
+
+def _cmd_notify_list(args: argparse.Namespace) -> int:
+    with kb.connect_closing() as conn:
+        subs = kb.list_notify_subs(conn, args.task_id)
+    if getattr(args, "json", False):
+        print(json.dumps(subs, indent=2, ensure_ascii=False))
+        return 0
+    if not subs:
+        print("(no subscriptions)")
+        return 0
+    for sub in subs:
+        thread = f":{sub['thread_id']}" if sub.get("thread_id") else ""
+        owner = f"  owner={sub['notifier_profile']}" if sub.get("notifier_profile") else ""
+        delivery_mode = sub.get("delivery_mode") or "notify"
+        mode = "" if delivery_mode == "notify" else f"  mode={delivery_mode}"
+        chat_type = sub.get("chat_type") or "dm"
+        chat_type_text = "" if chat_type == "dm" else f"  chat_type={chat_type}"
+        user_alt = f"  user_id_alt={sub['user_id_alt']}" if sub.get("user_id_alt") else ""
+        print(f"  {sub['task_id']:10s}  {sub['platform']}:{sub['chat_id']}{thread}"
+              f"  (since event {sub['last_event_id']}){owner}{chat_type_text}{user_alt}{mode}")
+    return 0
+
+
+def _cmd_notify_unsubscribe(args: argparse.Namespace) -> int:
+    with kb.connect_closing() as conn:
+        removed = kb.remove_notify_sub(
+            conn, task_id=args.task_id,
+            platform=args.platform, chat_id=args.chat_id,
+            thread_id=args.thread_id,
+        )
+    if not removed:
+        print("(no such subscription)", file=sys.stderr)
+        return 1
+    print(f"Unsubscribed from {args.task_id}")
+    return 0
+
+
 def _cmd_log(args: argparse.Namespace) -> int:
     content = kb.read_worker_log(args.task_id, tail_bytes=args.tail)
     if content is None:
