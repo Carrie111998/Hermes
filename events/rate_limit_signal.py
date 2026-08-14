@@ -100,3 +100,30 @@ def _save_state(state: Dict[str, Any]) -> bool:
     except Exception:
         logger.debug("rate_limit_signal: state write failed (swallowed)", exc_info=True)
         return False
+
+
+def _should_alert(episode: Optional[Dict[str, Any]], outcome: str,
+                  fallback_key: str) -> bool:
+    """Decide whether this hit is worth an alert.
+
+    Fires on exactly three transitions:
+      1. a brand-new episode;
+      2. the outcome worsens past what was last alerted (diverted ->
+         chain_exhausted / no_fallback), which is WARN becoming ACT;
+      3. a NEW fallback target appears — the leading indicator that the
+         previous absorber has also died, caught while still degrading
+         rather than after it breaks.
+
+    Everything else folds into diverted_calls silently.
+    """
+    if not episode:
+        return True
+
+    alerted = (episode.get("alerted_level") or "").strip().lower()
+    if _SEVERITY.get(outcome, 0) > _SEVERITY.get(alerted, 0):
+        return True
+
+    if fallback_key and fallback_key not in (episode.get("fallbacks_seen") or []):
+        return True
+
+    return False

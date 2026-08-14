@@ -221,3 +221,46 @@ class TestLoadSaveRoundTrip:
             loaded = rate_limit_signal._load_state()
 
         assert loaded == {}
+
+
+def test_first_hit_always_alerts():
+    from events.rate_limit_signal import _should_alert
+    assert _should_alert(None, "diverted", "openai-codex/gpt-5.6-sol") is True
+
+
+def test_repeat_same_outcome_is_silent():
+    from events.rate_limit_signal import _should_alert
+    ep = {
+        "worst_outcome": "diverted", "alerted_level": "diverted",
+        "fallbacks_seen": ["openai-codex/gpt-5.6-sol"],
+    }
+    assert _should_alert(ep, "diverted", "openai-codex/gpt-5.6-sol") is False
+
+
+def test_worsening_to_chain_exhausted_alerts():
+    from events.rate_limit_signal import _should_alert
+    ep = {
+        "worst_outcome": "diverted", "alerted_level": "diverted",
+        "fallbacks_seen": ["openai-codex/gpt-5.6-sol"],
+    }
+    assert _should_alert(ep, "chain_exhausted", "") is True
+
+
+def test_new_fallback_target_alerts():
+    """A second model absorbing traffic means the first one also died."""
+    from events.rate_limit_signal import _should_alert
+    ep = {
+        "worst_outcome": "diverted", "alerted_level": "diverted",
+        "fallbacks_seen": ["openai-codex/gpt-5.6-sol"],
+    }
+    assert _should_alert(ep, "diverted", "anthropic/claude-opus-5") is True
+
+
+def test_severity_never_downgrades():
+    """Once ACT-level, a later diverted hit must not re-alert as if new."""
+    from events.rate_limit_signal import _should_alert
+    ep = {
+        "worst_outcome": "chain_exhausted", "alerted_level": "chain_exhausted",
+        "fallbacks_seen": [],
+    }
+    assert _should_alert(ep, "diverted", "") is False
