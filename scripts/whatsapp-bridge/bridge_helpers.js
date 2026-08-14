@@ -18,6 +18,82 @@ export function normalizeWhatsAppId(value) {
   return String(value).replace(':', '@');
 }
 
+const DELIVERY_STATUS = new Map([
+  [2, 'sent'],
+  [3, 'delivered'],
+  [4, 'read'],
+  [5, 'read'],
+  ['SERVER_ACK', 'sent'],
+  ['DELIVERY_ACK', 'delivered'],
+  ['READ', 'read'],
+  ['PLAYED', 'read'],
+]);
+
+function validOutboundReceiptKey(key) {
+  return key?.fromMe === true
+    && typeof key.id === 'string'
+    && /^[A-Za-z0-9_-]{1,191}$/.test(key.id);
+}
+
+function timestampIso(value) {
+  if (value === null || value === undefined) return null;
+  const seconds = typeof value?.toNumber === 'function' ? value.toNumber() : Number(value);
+  if (!Number.isFinite(seconds) || seconds <= 0) return null;
+  try {
+    return new Date(seconds * 1000).toISOString();
+  } catch {
+    return null;
+  }
+}
+
+export function deliveryReceiptFromMessageUpdate({ key, update, now = () => new Date().toISOString() }) {
+  if (!validOutboundReceiptKey(key)) return null;
+  const rawStatus = update?.status;
+  const numericStatus = typeof rawStatus === 'string' && /^\d+$/.test(rawStatus)
+    ? Number(rawStatus)
+    : rawStatus;
+  const status = DELIVERY_STATUS.get(numericStatus);
+  if (!status) return null;
+  return { messageId: key.id, status, occurredAt: now() };
+}
+
+export function deliveryReceiptFromUserReceiptUpdate({
+  key,
+  receipt,
+  now = () => new Date().toISOString(),
+}) {
+  if (!validOutboundReceiptKey(key) || !receipt || typeof receipt !== 'object') return null;
+  const readAt = timestampIso(receipt.playedTimestamp) || timestampIso(receipt.readTimestamp);
+  if (readAt) return { messageId: key.id, status: 'read', occurredAt: readAt };
+  const deliveredAt = timestampIso(receipt.receiptTimestamp);
+  const hasDeliveredDevice = Array.isArray(receipt.deliveredDeviceJid)
+    && receipt.deliveredDeviceJid.length > 0;
+  if (deliveredAt || hasDeliveredDevice) {
+    return { messageId: key.id, status: 'delivered', occurredAt: deliveredAt || now() };
+  }
+  return null;
+}
+
+export function acknowledgeDeliveryReceipts(queue, acknowledgements) {
+  const keys = new Set();
+  for (const acknowledgement of acknowledgements || []) {
+    const messageId = acknowledgement?.messageId;
+    const status = acknowledgement?.status;
+    if (typeof messageId !== 'string' || !/^[A-Za-z0-9_-]{1,191}$/.test(messageId)) continue;
+    if (!['sent', 'delivered', 'read'].includes(status)) continue;
+    keys.add(`${messageId}:${status}`);
+  }
+  let removed = 0;
+  for (let index = queue.length - 1; index >= 0; index -= 1) {
+    const receipt = queue[index];
+    if (keys.has(`${receipt?.messageId}:${receipt?.status}`)) {
+      queue.splice(index, 1);
+      removed += 1;
+    }
+  }
+  return removed;
+}
+
 export function getMessageContent(msg) {
   const content = msg?.message || {};
   if (content.ephemeralMessage?.message) return content.ephemeralMessage.message;

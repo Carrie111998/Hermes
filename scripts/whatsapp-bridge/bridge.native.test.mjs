@@ -15,7 +15,10 @@ import { getAggregateVotesInPollMessage } from '@whiskeysockets/baileys';
 import {
   buildPollPayload,
   buildTextSendPayload,
+  acknowledgeDeliveryReceipts,
   createBoundedMessageStore,
+  deliveryReceiptFromMessageUpdate,
+  deliveryReceiptFromUserReceiptUpdate,
   appendMediaFailureNote,
   extractBridgeEvent,
   inboundReadReceiptKeys,
@@ -23,6 +26,80 @@ import {
   pollCreationMessageFromPayload,
   pollUpdateForAggregation,
 } from './bridge_helpers.js';
+
+// -- outbound delivery/read receipts --------------------------------------
+{
+  const key = { id: 'outbound-1', remoteJid: '15551234567@s.whatsapp.net', fromMe: true };
+  const now = () => '2026-08-14T12:00:00.000Z';
+
+  assert.deepEqual(deliveryReceiptFromMessageUpdate({ key, update: { status: 2 }, now }), {
+    messageId: 'outbound-1',
+    status: 'sent',
+    occurredAt: '2026-08-14T12:00:00.000Z',
+  });
+  assert.equal(
+    deliveryReceiptFromMessageUpdate({ key, update: { status: 3 }, now }).status,
+    'delivered',
+  );
+  assert.equal(
+    deliveryReceiptFromMessageUpdate({ key, update: { status: 4 }, now }).status,
+    'read',
+  );
+  assert.equal(
+    deliveryReceiptFromMessageUpdate({ key, update: { status: 5 }, now }).status,
+    'read',
+  );
+  assert.equal(
+    deliveryReceiptFromMessageUpdate({ key: { ...key, fromMe: false }, update: { status: 4 }, now }),
+    null,
+  );
+  assert.equal(
+    deliveryReceiptFromMessageUpdate({ key: { ...key, id: '' }, update: { status: 4 }, now }),
+    null,
+  );
+  assert.equal(deliveryReceiptFromMessageUpdate({ key, update: { status: 1 }, now }), null);
+
+  assert.deepEqual(
+    deliveryReceiptFromUserReceiptUpdate({
+      key,
+      receipt: { receiptTimestamp: 1_723_636_800 },
+      now,
+    }),
+    {
+      messageId: 'outbound-1',
+      status: 'delivered',
+      occurredAt: '2024-08-14T12:00:00.000Z',
+    },
+  );
+  assert.equal(
+    deliveryReceiptFromUserReceiptUpdate({
+      key,
+      receipt: { receiptTimestamp: 1, readTimestamp: 1_723_636_900 },
+      now,
+    }).status,
+    'read',
+  );
+  assert.equal(
+    deliveryReceiptFromUserReceiptUpdate({ key, receipt: {}, now }),
+    null,
+  );
+  console.log('  ✓ outbound delivery receipts are normalized without recipient identifiers');
+}
+
+{
+  const queue = [
+    { messageId: 'outbound-1', status: 'delivered', occurredAt: '2026-08-14T12:00:00Z' },
+    { messageId: 'outbound-1', status: 'read', occurredAt: '2026-08-14T12:01:00Z' },
+  ];
+  const acknowledged = acknowledgeDeliveryReceipts(queue, [
+    { messageId: 'outbound-1', status: 'delivered' },
+  ]);
+  assert.equal(acknowledged, 1);
+  assert.deepEqual(queue, [
+    { messageId: 'outbound-1', status: 'read', occurredAt: '2026-08-14T12:01:00Z' },
+  ]);
+  console.log('  ✓ receipts remain queued until their exact status is acknowledged');
+}
 
 // -- inbound read receipts ------------------------------------------------
 {

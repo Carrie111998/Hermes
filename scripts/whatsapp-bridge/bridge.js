@@ -7,6 +7,7 @@
  *
  * Endpoints (matches gateway/platforms/whatsapp.py expectations):
  *   GET  /messages       - Long-poll for new incoming messages
+ *   GET  /receipts       - Poll outbound delivery/read receipts
  *   POST /send           - Send a message { chatId, message, replyTo? }
  *   POST /edit           - Edit a sent message { chatId, messageId, message }
  *   POST /send-media     - Send media natively { chatId, filePath, mediaType?, caption?, fileName? }
@@ -35,11 +36,14 @@ import { createOutboundIdTracker } from './outbound_ids.js';
 import { classifyOwnerMessageGate } from './owner_message_gate.js';
 import {
   buildPollPayload,
+  acknowledgeDeliveryReceipts,
   createReconnectScheduler,
   createVersionResolver,
   buildLocationPayload,
   buildTextSendPayload,
   createBoundedMessageStore,
+  deliveryReceiptFromMessageUpdate,
+  deliveryReceiptFromUserReceiptUpdate,
   extractBridgeEvent,
   inboundReadReceiptKeys,
   inferMediaType,
@@ -269,7 +273,9 @@ const logger = pino({ level: 'warn' });
 
 // Message queue for polling
 const messageQueue = [];
+const receiptQueue = [];
 const MAX_QUEUE_SIZE = 100;
+const MAX_RECEIPT_QUEUE_SIZE = 1000;
 
 // Track recently sent message IDs.  Two purposes:
 //   1. Prevent echo-back loops with media in self-chat mode.
@@ -280,7 +286,17 @@ const MAX_QUEUE_SIZE = 100;
 // sustained sending.
 const recentlySentIds = createOutboundIdTracker(512);
 const recentlyProcessedPollUpdates = createOutboundIdTracker(512);
+const recentlyProcessedReceipts = createOutboundIdTracker(2048);
 const messageStore = createBoundedMessageStore(512);
+
+function enqueueDeliveryReceipt(receipt) {
+  if (!receipt) return;
+  const dedupeId = `${receipt.messageId}:${receipt.status}`;
+  if (recentlyProcessedReceipts.has(dedupeId)) return;
+  recentlyProcessedReceipts.remember(dedupeId);
+  receiptQueue.push(receipt);
+  if (receiptQueue.length > MAX_RECEIPT_QUEUE_SIZE) receiptQueue.shift();
+}
 
 function normalizePollUpdateOptions(aggregation, pollUpdateMessage, meId) {
   const selected = [];
@@ -480,6 +496,7 @@ async function startSocket() {
 
   sock.ev.on('messages.update', async (updates) => {
     for (const { key, update } of updates || []) {
+      enqueueDeliveryReceipt(deliveryReceiptFromMessageUpdate({ key, update }));
       if (!update?.pollUpdates) continue;
       const pollCreationId = key?.id || update.pollUpdates?.[0]?.pollCreationMessageKey?.id;
       const pollCreation = messageStore.get(pollCreationId);
@@ -526,6 +543,12 @@ async function startSocket() {
         aggregation,
       });
       enqueuePollUpdateEvent({ key, update: { ...update, pollUpdates }, selectedOptions, aggregation });
+    }
+  });
+
+  sock.ev.on('message-receipt.update', (updates) => {
+    for (const { key, receipt } of updates || []) {
+      enqueueDeliveryReceipt(deliveryReceiptFromUserReceiptUpdate({ key, receipt }));
     }
   });
 
@@ -817,6 +840,32 @@ app.use((req, res, next) => {
 app.get('/messages', (req, res) => {
   const msgs = messageQueue.splice(0, messageQueue.length);
   res.json(msgs);
+});
+
+// Poll outbound delivery/read receipts independently from inbound messages.
+app.get('/receipts', (req, res) => {
+  res.json(receiptQueue.slice(0, MAX_QUEUE_SIZE));
+});
+
+app.post('/receipts/ack', (req, res) => {
+  const acknowledgements = req.body?.receipts;
+  if (!Array.isArray(acknowledgements) || acknowledgements.length > MAX_QUEUE_SIZE) {
+    return res.status(400).json({ error: 'receipts must be a bounded array' });
+  }
+  for (const acknowledgement of acknowledgements) {
+    if (
+      !acknowledgement
+      || typeof acknowledgement !== 'object'
+      || Object.keys(acknowledgement).sort().join(',') !== 'messageId,status'
+      || typeof acknowledgement.messageId !== 'string'
+      || !/^[A-Za-z0-9_-]{1,191}$/.test(acknowledgement.messageId)
+      || !['sent', 'delivered', 'read'].includes(acknowledgement.status)
+    ) {
+      return res.status(400).json({ error: 'invalid receipt acknowledgement' });
+    }
+  }
+  const acknowledged = acknowledgeDeliveryReceipts(receiptQueue, acknowledgements);
+  return res.json({ success: true, acknowledged });
 });
 
 // Send a message
