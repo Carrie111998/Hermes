@@ -1718,20 +1718,42 @@ export function getActionStatus(name: string, lines = 200): Promise<ActionStatus
   })
 }
 
-export function transcribeAudio(dataUrl: string, mimeType?: string): Promise<AudioTranscriptionResponse> {
-  return window.hermesDesktop.api<AudioTranscriptionResponse>({
-    path: '/api/audio/transcribe',
-    method: 'POST',
-    ...profileScoped(),
-    body: {
-      data_url: dataUrl,
-      mime_type: mimeType
-    },
-    // Transcription blocks until provider STT, file handling, and response
-    // encoding finish. Remote providers and long clips regularly exceed the
-    // default 15s Electron backend timeout.
-    timeoutMs: audioTranscribeRequestTimeoutMs(dataUrl)
-  })
+export async function transcribeAudio(
+  dataUrl: string,
+  mimeType?: string,
+  signal?: AbortSignal
+): Promise<AudioTranscriptionResponse> {
+  const requestId = signal && window.hermesDesktop.cancelApiRequest ? crypto.randomUUID() : undefined
+  const cancel = () => {
+    if (requestId) {
+      window.hermesDesktop.cancelApiRequest?.(requestId)
+    }
+  }
+
+  if (signal?.aborted) {
+    throw new DOMException('The transcription was canceled.', 'AbortError')
+  }
+
+  signal?.addEventListener('abort', cancel, { once: true })
+
+  try {
+    return await window.hermesDesktop.api<AudioTranscriptionResponse>({
+      path: '/api/audio/transcribe',
+      method: 'POST',
+      ...profileScoped(),
+      body: {
+        data_url: dataUrl,
+        mime_type: mimeType
+      },
+      // Transcription blocks until provider STT, file handling, and response
+      // encoding finish. Remote providers and long clips regularly exceed the
+      // default 15s Electron backend timeout.
+      timeoutMs: audioTranscribeRequestTimeoutMs(dataUrl),
+      ...(requestId ? { requestId } : {})
+    })
+  } finally {
+    signal?.removeEventListener('abort', cancel)
+  }
 }
 
 export function speakText(text: string): Promise<AudioSpeakResponse> {

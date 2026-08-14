@@ -56,7 +56,7 @@ export interface ChatBarProps {
   onRemoveAttachment?: (id: string) => void
   onSteer?: (text: string) => Promise<boolean> | boolean
   onSubmit: (value: string, options?: SubmitTextOptions) => Promise<boolean> | boolean
-  onTranscribeAudio?: (audio: Blob) => Promise<string>
+  onTranscribeAudio?: (audio: Blob, signal?: AbortSignal) => Promise<string>
 }
 
 export type VoiceStatus = 'idle' | 'recording' | 'transcribing'

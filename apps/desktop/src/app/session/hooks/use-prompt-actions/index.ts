@@ -607,13 +607,13 @@ export function usePromptActions({
   )
 
   const transcribeVoiceAudio = useCallback(
-    async (audio: Blob) => {
+    async (audio: Blob, signal?: AbortSignal) => {
       if (!sttEnabled) {
         throw new Error(copy.sttDisabled)
       }
 
       const dataUrl = await blobToDataUrl(audio)
-      const result = await transcribeAudio(dataUrl, audio.type)
+      const result = await transcribeAudio(dataUrl, audio.type, signal)
 
       return result.transcript
     },

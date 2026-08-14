@@ -445,6 +445,29 @@ describe('Hermes REST helpers', () => {
     })
   })
 
+  it('cancels an in-flight transcription through the desktop bridge', async () => {
+    const cancelApiRequest = vi.fn()
+    Object.defineProperty(window, 'hermesDesktop', {
+      configurable: true,
+      value: { api, cancelApiRequest }
+    })
+    vi.spyOn(crypto, 'randomUUID').mockReturnValue('00000000-0000-4000-8000-000000000001')
+    const controller = new AbortController()
+    api.mockImplementationOnce(
+      () =>
+        new Promise((_resolve, reject) => {
+          controller.signal.addEventListener('abort', () => reject(new DOMException('canceled', 'AbortError')))
+        })
+    )
+
+    const request = transcribeAudio('data:audio/webm;base64,AA==', 'audio/webm', controller.signal)
+    controller.abort()
+
+    await expect(request).rejects.toMatchObject({ name: 'AbortError' })
+    expect(cancelApiRequest).toHaveBeenCalledWith('00000000-0000-4000-8000-000000000001')
+    expect(api).toHaveBeenCalledWith(expect.objectContaining({ requestId: '00000000-0000-4000-8000-000000000001' }))
+  })
+
   it('defaults model options to configured providers only', async () => {
     await getGlobalModelOptions()
 

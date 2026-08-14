@@ -9,7 +9,7 @@ import { useMicRecorder } from './use-mic-recorder'
 
 interface VoiceRecorderOptions {
   maxRecordingSeconds: number
-  onTranscribeAudio?: (audio: Blob) => Promise<string>
+  onTranscribeAudio?: (audio: Blob, signal?: AbortSignal) => Promise<string>
   focusInput: () => void
   onTranscript: (text: string) => void
 }
@@ -28,6 +28,8 @@ export function useVoiceRecorder({
   const startedAtRef = useRef(0)
   const intervalRef = useRef<number | null>(null)
   const timeoutRef = useRef<number | null>(null)
+  const transcriptionRef = useRef<{ controller: AbortController; generation: number } | null>(null)
+  const generationRef = useRef(0)
 
   const clearTimers = () => {
     if (intervalRef.current) {
@@ -41,7 +43,13 @@ export function useVoiceRecorder({
     }
   }
 
-  useEffect(() => () => clearTimers(), [])
+  useEffect(
+    () => () => {
+      clearTimers()
+      transcriptionRef.current?.controller.abort()
+    },
+    []
+  )
 
   const stop = async () => {
     clearTimers()
@@ -60,9 +68,16 @@ export function useVoiceRecorder({
     }
 
     setVoiceStatus('transcribing')
+    const generation = ++generationRef.current
+    const controller = new AbortController()
+    transcriptionRef.current = { controller, generation }
 
     try {
-      const transcript = (await onTranscribeAudio(result.audio)).trim()
+      const transcript = (await onTranscribeAudio(result.audio, controller.signal)).trim()
+
+      if (controller.signal.aborted || generation !== generationRef.current) {
+        return
+      }
 
       if (!transcript) {
         notify({ kind: 'warning', title: voiceCopy.noSpeechDetected, message: voiceCopy.tryRecordingAgain })
@@ -70,10 +85,15 @@ export function useVoiceRecorder({
         onTranscript(transcript)
       }
     } catch (error) {
-      notifyError(error, voiceCopy.transcriptionFailed)
+      if (!controller.signal.aborted && generation === generationRef.current) {
+        notifyError(error, voiceCopy.transcriptionFailed)
+      }
     } finally {
-      setVoiceStatus('idle')
-      focusInput()
+      if (generation === generationRef.current) {
+        transcriptionRef.current = null
+        setVoiceStatus('idle')
+        focusInput()
+      }
     }
   }
 
@@ -101,6 +121,12 @@ export function useVoiceRecorder({
   const dictate = () => {
     if (recording) {
       void stop()
+    } else if (voiceStatus === 'transcribing') {
+      generationRef.current += 1
+      transcriptionRef.current?.controller.abort()
+      transcriptionRef.current = null
+      setVoiceStatus('idle')
+      focusInput()
     } else if (voiceStatus === 'idle') {
       void start()
     }
