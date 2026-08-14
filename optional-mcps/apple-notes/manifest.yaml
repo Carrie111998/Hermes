@@ -17,7 +17,7 @@ transport:
   command: "npx"
   args:
     - "-y"
-    - "apple-notes-mcp@2.7.4"
+    - "apple-notes-mcp@2.7.5"
 
 # Drives Apple Notes locally via AppleScript; no credentials.
 auth:
