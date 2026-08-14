@@ -7087,6 +7087,23 @@ def _gateway_command_inner(args):
         gateway_setup()
         return
 
+    if subcmd == "replay-buzz":
+        from plugins.platforms.buzz.replay import run_replay_cli
+
+        home = Path(get_hermes_home())
+        profile = home.name if home.parent.name == "profiles" else "default"
+        rc = run_replay_cli(
+            profile,
+            str(args.event_id),
+            expected_parent_event_id=(
+                str(args.parent_event_id) if getattr(args, "parent_event_id", None) else None
+            ),
+            wait_timeout=float(getattr(args, "wait_timeout", 900.0)),
+        )
+        if rc:
+            raise SystemExit(rc)
+        return
+
     # Service management commands
     if subcmd == "install":
         if is_managed():

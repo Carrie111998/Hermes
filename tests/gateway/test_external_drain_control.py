@@ -53,8 +53,8 @@ class TestMarkerContract:
 class TestSuppressNotification:
     """The generic suppress_notification flag on the drain marker.
 
-    Gates ONLY the gateway's home-channel shutdown broadcast (NAS auto-update
-    sets it true). Default-false so legacy/operator drains behave as before.
+    Gates all gateway lifecycle shutdown broadcasts (NAS auto-update sets it
+    true). Default-false so legacy/operator drains behave as before.
     The reader reuses the NS-570 epoch-staleness check so an orphaned marker
     can never silence a fresh gateway.
     """
@@ -325,4 +325,3 @@ class TestNewTurnGate:
         result = await runner._handle_message(event)
         assert result is not None
         assert "draining" in result.lower()
-

@@ -6432,6 +6432,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Set on gateway stop so the recreate-on-shutdown path can't resurrect
         # the pool during a real shutdown.
         self._executor_closing = False
+        # A cancelled asyncio wrapper does not stop its executor worker. Keep
+        # per-session worker ownership until the worker's real finally runs so
+        # governed replay can hold the gateway lock fail-closed.
+        self._turn_worker_waiters_lock = threading.Lock()
+        self._turn_worker_waiters: Dict[str, set[threading.Event]] = {}
         # ALL per-session state (turn / conversation / persistent scopes)
         # lives in one container — see gateway/session_state.py.  Access via
         # self._session_state(key) (get-or-create) or
@@ -9978,6 +9983,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         messages can be delivered. Best-effort: individual send failures are
         logged and swallowed so they never block the shutdown sequence.
         """
+        try:
+            from gateway.drain_control import drain_notification_suppressed
+
+            if drain_notification_suppressed():
+                logger.info(
+                    "All shutdown notifications suppressed by maintenance "
+                    "drain marker (suppress_notification=true)"
+                )
+                return
+        except Exception as e:
+            # Never let a maintenance-marker read block shutdown. The normal
+            # notification path is the safe fallback when the marker cannot
+            # be read.
+            logger.debug("maintenance shutdown-notification check failed: %s", e)
+
         active = self._snapshot_running_agents()
         restart_source = self._restart_command_source if self._restart_requested else None
 
@@ -10088,19 +10108,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             logger.debug("Skipping home-channel shutdown notifications for in-chat restart")
             return
 
-        # Suppress ONLY the home-channel broadcast when the drain that is ending
-        # in this shutdown asked us to be quiet (e.g. a NAS auto-update image
-        # migration — drain-gated, then the machine is recreated). On the
-        # always-on Hermes Cloud fleet that broadcast would otherwise fire on
-        # every routine auto-update, spamming home channels with operator-
-        # flavoured "gateway shutting down" pings the user doesn't care about.
-        # The per-active-session interrupt pings above are deliberately NOT
-        # gated: on a drained shutdown they're empty by construction, and in the
-        # force-interrupt (deadline-exceeded) case they carry the genuinely
-        # useful "your task was cut off, message me to resume" hint. The flag is
-        # only honoured for a CURRENT-epoch marker (drain_notification_suppressed
-        # reuses the NS-570 staleness check), so an orphaned marker can never
-        # silence a fresh gateway's legitimate broadcast.
+        # The initial maintenance-marker check above returns before either the
+        # active-session or home-channel phase. Keep this defensive re-check in
+        # the home phase so a marker activated between phases cannot produce a
+        # home-channel lifecycle broadcast. Only a CURRENT-epoch marker is
+        # honoured (drain_notification_suppressed reuses the NS-570 staleness
+        # check), so an orphaned marker can never silence a fresh gateway.
         try:
             from gateway.drain_control import drain_notification_suppressed
             if drain_notification_suppressed():
@@ -22965,6 +22978,117 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             *args,
         )
 
+    def _start_turn_executor(
+        self,
+        func: Callable[[], Any],
+        *,
+        session_key: Optional[str],
+        agent_holder: list,
+        worker_done: Optional[threading.Event] = None,
+    ) -> tuple[asyncio.Future, threading.Event]:
+        """Submit a turn worker with ownership covering its full cleanup."""
+        loop = asyncio.get_running_loop()
+        ctx = copy_context()
+        worker_done = worker_done or threading.Event()
+        submission_gate = threading.Event()
+        submission_state = {"accepted": False}
+
+        def _publish_submission(accepted: bool) -> None:
+            submission_state["accepted"] = accepted
+            submission_gate.set()
+
+        def _run_sync_with_timeout_lifecycle():
+            try:
+                return func()
+            finally:
+                try:
+                    _finished_agent = agent_holder[0] if agent_holder else None
+                    if _finished_agent is not None:
+                        _finished_agent._gateway_turn_process_task_id = ""
+                        _finished_agent._gateway_turn_process_baseline = frozenset()
+                finally:
+                    # Replay ownership ends only after every final marker write.
+                    worker_done.set()
+                    self._unregister_turn_worker(session_key, worker_done)
+
+        def _gated_worker():
+            submission_gate.wait()
+            if not submission_state["accepted"]:
+                return None
+            return _run_sync_with_timeout_lifecycle()
+
+        self._register_turn_worker(session_key, worker_done)
+        try:
+            executor_task = loop.run_in_executor(
+                self._get_executor(),
+                ctx.run,
+                _gated_worker,
+            )
+        except BaseException:
+            # ThreadPoolExecutor can queue the work item before a replacement
+            # Thread.start failure escapes submit(). Make queued work inert
+            # before releasing replay ownership.
+            _publish_submission(False)
+            worker_done.set()
+            self._unregister_turn_worker(session_key, worker_done)
+            raise
+        _publish_submission(True)
+        return executor_task, worker_done
+
+    def _turn_worker_state(self) -> tuple[threading.Lock, Dict[str, set[threading.Event]]]:
+        lock = getattr(self, "_turn_worker_waiters_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            self._turn_worker_waiters_lock = lock
+        waiters = getattr(self, "_turn_worker_waiters", None)
+        if waiters is None:
+            waiters = {}
+            self._turn_worker_waiters = waiters
+        return lock, waiters
+
+    def _register_turn_worker(self, session_key: Optional[str], worker_done: threading.Event) -> None:
+        if not session_key:
+            return
+        lock, waiters = self._turn_worker_state()
+        with lock:
+            waiters.setdefault(session_key, set()).add(worker_done)
+
+    def _unregister_turn_worker(self, session_key: Optional[str], worker_done: threading.Event) -> None:
+        if not session_key:
+            return
+        lock, waiters_by_session = self._turn_worker_state()
+        with lock:
+            waiters = waiters_by_session.get(session_key)
+            if not waiters:
+                return
+            waiters.discard(worker_done)
+            if not waiters:
+                waiters_by_session.pop(session_key, None)
+
+    async def wait_for_session_quiescence(self, session_key: Optional[str]) -> None:
+        """Wait until every executor worker for one session has really exited."""
+        lock, waiters_by_session = self._turn_worker_state()
+        while True:
+            with lock:
+                waiters = list(waiters_by_session.get(session_key or "", ()))
+            if not waiters:
+                return
+            await asyncio.gather(*(asyncio.to_thread(waiter.wait) for waiter in waiters))
+
+    async def wait_for_all_session_quiescence(self) -> None:
+        """Wait for all tracked turn workers before closing runner resources."""
+        lock, waiters_by_session = self._turn_worker_state()
+        while True:
+            with lock:
+                waiters = [
+                    waiter
+                    for session_waiters in waiters_by_session.values()
+                    for waiter in session_waiters
+                ]
+            if not waiters:
+                return
+            await asyncio.gather(*(asyncio.to_thread(waiter.wait) for waiter in waiters))
+
     def _get_executor(self) -> concurrent.futures.ThreadPoolExecutor:
         """Return the gateway-owned executor for blocking agent work."""
         lock = getattr(self, "_executor_lock", None)
@@ -27041,27 +27165,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 else (lambda: True)
             )
 
-            def _run_sync_with_timeout_lifecycle():
-                try:
-                    return run_sync()
-                finally:
-                    _turn_worker_done.set()
-                    # `.turn.agent` on the session state is only reset to
-                    # _AGENT_PENDING_SENTINEL when the *next* turn is
-                    # claimed (see _session_state(...).turn.agent = ... at
-                    # claim time), so a stale reference to this exact agent
-                    # instance stays reachable from
-                    # _interrupt_and_clear_session() until then. Clearing
-                    # the ownership markers here — the instant this turn's
-                    # own worker finishes — closes that window: an
-                    # explicit /stop landing on the already-finished turn
-                    # no longer reaps background work the turn deliberately
-                    # left running (#76115).
-                    _finished_agent = agent_holder[0] if agent_holder else None
-                    if _finished_agent is not None:
-                        _finished_agent._gateway_turn_process_task_id = ""
-                        _finished_agent._gateway_turn_process_baseline = frozenset()
-
             if _agent_timeout is not None:
                 threading.Thread(
                     target=_watch_gateway_turn_inactivity,
@@ -27079,8 +27182,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     name=f"gateway-turn-watchdog-{_turn_task_id[:12]}",
                     daemon=True,
                 ).start()
-            _executor_task = asyncio.ensure_future(
-                self._run_in_executor_with_context(_run_sync_with_timeout_lifecycle)
+            _executor_task, _turn_worker_done = self._start_turn_executor(
+                run_sync,
+                session_key=session_key,
+                agent_holder=agent_holder,
+                worker_done=_turn_worker_done,
             )
 
             _inactivity_timeout = False

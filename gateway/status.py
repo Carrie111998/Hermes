@@ -686,24 +686,21 @@ def _running_pid_cache_signature(
 
 
 def _cleanup_invalid_pid_path(pid_path: Path, *, cleanup_stale: bool) -> None:
-    """Delete a stale gateway PID file (and its sibling lock metadata).
+    """Delete a stale gateway PID file without unlinking its lock inode.
 
     Called from ``get_running_pid()`` after the runtime lock has already been
     confirmed inactive, so the on-disk metadata is known to belong to a dead
     process.  Unlike ``remove_pid_file()`` (which defensively refuses to delete
     a PID file whose ``pid`` field differs from ``os.getpid()`` to protect
-    ``--replace`` handoffs), this path force-unlinks both files so the next
-    startup sees a clean slate.
+    ``--replace`` handoffs), this path force-unlinks only the PID marker. The
+    lock path is retained because another process may acquire it between the
+    inactive probe and cleanup; the next startup safely reuses that inode.
     """
     if not cleanup_stale:
         return
     _clear_running_pid_cache()
     try:
         pid_path.unlink(missing_ok=True)
-    except Exception:
-        pass
-    try:
-        _get_gateway_lock_path(pid_path).unlink(missing_ok=True)
     except Exception:
         pass
 
@@ -2217,6 +2214,13 @@ def get_running_pid(
 
         if _record_matches_live_gateway_pid(record, pid):
             return pid
+
+    # An active lock is authoritative even when its owner is not a gateway
+    # process (for example, the governed Buzz replay). Never unlink the lock
+    # inode while another process holds it: startup must fail closed at the
+    # subsequent acquire rather than replace the live owner's lock.
+    if lock_active:
+        return None
 
     _cleanup_invalid_pid_path(resolved_pid_path, cleanup_stale=cleanup_stale)
     if pid_path is None:

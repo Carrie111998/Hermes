@@ -1,4 +1,8 @@
 import asyncio
+import os
+import subprocess
+import sys
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -165,6 +169,75 @@ async def test_startup_aborts_when_restart_begins_during_platform_connect(tmp_pa
         call.args[:2] == (Platform.SLACK.value, "connected")
         for call in runner._update_platform_runtime_status.call_args_list
     )
+
+
+@pytest.mark.asyncio
+async def test_start_gateway_rejects_replay_lock_before_replacing_inode(tmp_path, monkeypatch):
+    """The real startup preflight must fail closed on a replay-held lock."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    patch_startup_side_effects(monkeypatch, tmp_path)
+
+    holder_code = (
+        "import sys\n"
+        "from gateway.status import acquire_gateway_runtime_lock, release_gateway_runtime_lock\n"
+        "if sys.stdin.readline().strip() != 'go':\n"
+        "    raise SystemExit(2)\n"
+        "print(acquire_gateway_runtime_lock(), flush=True)\n"
+        "sys.stdin.readline()\n"
+        "release_gateway_runtime_lock()\n"
+    )
+    holder = subprocess.Popen(
+        [sys.executable, "-c", holder_code],
+        env={**os.environ, "PYTHONPATH": str(Path(__file__).parents[2])},
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert holder.stdin is not None
+        holder.stdin.write("go\n")
+        holder.stdin.flush()
+        assert holder.stdout is not None
+        assert holder.stdout.readline().strip() == "True"
+        lock_path = tmp_path / "gateway.lock"
+        old_inode = lock_path.stat().st_ino
+
+        class CleanExitRunner:
+            def __init__(self, config):
+                self.config = config
+                self.adapters = {}
+                self.should_exit_cleanly = True
+                self.should_exit_with_failure = False
+                self.exit_reason = None
+                self.exit_code = None
+                self._running = False
+
+            async def start(self):
+                return True
+
+        monkeypatch.setattr(gateway_run, "GatewayRunner", CleanExitRunner)
+        monkeypatch.setattr("tools.skills_sync.sync_skills", lambda quiet=True: None)
+        monkeypatch.setattr("hermes_logging.setup_logging", lambda hermes_home, mode: None)
+        monkeypatch.setattr("hermes_logging._add_rotating_handler", lambda *args, **kwargs: None)
+        monkeypatch.setattr(
+            "hermes_cli.security_audit_startup.log_startup_security_warnings",
+            lambda **kwargs: None,
+        )
+
+        result = await gateway_run.start_gateway(
+            config=GatewayConfig(), replace=False, verbosity=None
+        )
+
+        assert result is False
+        assert lock_path.exists()
+        assert lock_path.stat().st_ino == old_inode
+    finally:
+        if holder.stdin is not None:
+            holder.stdin.write("stop\n")
+            holder.stdin.flush()
+        holder.terminate()
+        holder.wait(timeout=3)
 
 
 @pytest.mark.asyncio

@@ -182,12 +182,12 @@ def write_drain_request(
     this drain" flag. When the drain culminates in a process exit (e.g. NAS
     recreates the machine for an auto-update image migration), the gateway's
     shutdown path reads it via :func:`drain_notification_suppressed` and skips
-    the *home-channel* "gateway shutting down" broadcast — the operator-flavoured
-    ping that would otherwise fire on every routine auto-update, potentially
-    dozens of times a day. It NEVER suppresses the per-active-session interrupt
-    ping. The gateway stays agnostic about *why* the drain is quiet; the policy
-    of which drain causes set the flag lives entirely in the caller (NAS). The
-    field defaults False so legacy/operator drains behave exactly as before.
+    every active-session and home-channel lifecycle broadcast. These are
+    operator-facing pings, not business messages, and they should not fire on
+    a maintenance restart. The gateway stays agnostic about *why* the drain is
+    quiet; the policy of which drain causes set the flag lives entirely in the
+    caller (NAS). The field defaults False so legacy/operator drains behave
+    exactly as before.
     """
     payload = {
         "action": "drain",
@@ -323,7 +323,7 @@ def drain_requested(*, home: Optional[Path] = None) -> bool:
 
 
 def drain_notification_suppressed(*, home: Optional[Path] = None) -> bool:
-    """True iff an ACTIVE drain marker asks to suppress the shutdown broadcast.
+    """True iff an ACTIVE drain marker asks to suppress shutdown broadcasts.
 
     "Active" means exactly what :func:`drain_requested` means — a marker present
     AND stamped with the current instantiation epoch AND not past its max-age.
@@ -337,8 +337,8 @@ def drain_notification_suppressed(*, home: Optional[Path] = None) -> bool:
     legacy marker without the field, a corrupt/contentless ``{}`` body, or an
     absent marker all read as "not suppressed" (False) — fail toward the louder,
     more-visible behaviour, consistent with :func:`read_drain_request`'s
-    never-raise contract. The gateway's shutdown path uses this to skip ONLY the
-    home-channel broadcast; the per-active-session interrupt ping is unaffected.
+    never-raise contract. The gateway's shutdown path uses this to skip both
+    active-session and home-channel lifecycle broadcasts.
     """
     body = read_drain_request(home=home)
     if body is None:
