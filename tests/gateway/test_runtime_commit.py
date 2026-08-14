@@ -19,3 +19,10 @@ def test_running_git_commit_soft_fails_without_git(monkeypatch):
     monkeypatch.setattr("shutil.which", lambda _name: None)
 
     assert run._running_git_commit() == "unknown"
+
+
+def test_running_git_commit_uses_baked_sha_when_git_is_unavailable(monkeypatch):
+    monkeypatch.setattr("shutil.which", lambda _name: None)
+    monkeypatch.setattr("hermes_cli.build_info.get_build_sha", lambda short: "feedbeef")
+
+    assert run._running_git_commit() == "feedbeef"

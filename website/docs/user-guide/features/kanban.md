@@ -643,7 +643,7 @@ Workflow policy keys:
 | `default_subscriptions` | `[]` | Notify-subscribe targets added on every task creation path. Each target is `platform:chat_id[:thread_id]`, matching `kanban_notify-subscribe`; duplicate inherited or session-auto targets remain one subscription. |
 | `validate_on_create` | `"warn"` | Creation validation policy: `off`, `warn` (log violations but create), or `strict` (reject). Checks skills, profiles, and explicit-workspace policy. |
 | `require_explicit_workspace` | `false` | When validation is active, treat an implicit `scratch` workspace as a violation. |
-| `deadline_warning_fraction` | `0.0` | Fraction of a task's runtime cap at which to nudge the worker to checkpoint. `0` disables the nudge. |
+| `deadline_warning_fraction` | `0.0` | Fraction of a task's runtime cap at which to nudge the worker to checkpoint. Valid values are `0 < f <= 1`; `0` disables the nudge. With safe checkpoints disabled, the nudge says to finish or block at a coherent boundary and does not promise a rollover. |
 
 And the two auxiliary LLM slots:
 
@@ -1151,6 +1151,7 @@ Every transition appends a row to `task_events`. Each row carries an optional `r
 | `claimed` | `{lock, expires, run_id}` | Dispatcher atomically claimed a `ready` task for spawn. |
 | `completed` | `{result_len, summary?}` | Worker wrote `--result` / `--summary` and task hit `done`. `summary` is the first-line handoff (400-char cap); full version lives on the run row. If `complete_task` is called on a never-claimed task with handoff fields, a zero-duration run is synthesized so `run_id` still points at something. |
 | `checkpointed` | `{summary, next_worker_start_here?}` | Worker recorded a context rollover. The task is ready for a fresh worker but its old claim remains fenced until the old process exits or a remote lease expires. |
+| `checkpoint_released` | `{previous_worker_pid, reason}` | The retained checkpoint fence was cleared only after the local predecessor exited (`worker_exited`) or a remote lease expired (`claim_expired`). |
 | `blocked` | `{reason, kind, recurrences}` | Worker or human flipped the task to `blocked`. `kind` is the typed block reason (`needs_input`, `capability`, `transient`, or `null` for a generic block); `recurrences` is the unblock-loop counter. Synthesizes a zero-duration run when called on a never-claimed task with `--reason`. |
 | `dependency_wait` | `{reason, kind}` | Worker blocked with `kind=dependency` — the task is only waiting on another task, so it routes to `todo` (parent-gated, auto-promoted) instead of `blocked`. No human needed. |
 | `block_loop_detected` | `{reason, kind, recurrences, limit}` | A task was unblocked and re-blocked for the same reason `BLOCK_RECURRENCE_LIMIT` times (default 2). Instead of landing in `blocked` again — where a cron would keep unblocking it — it routes to `triage` for a human decision, breaking the unblock↔re-block loop. |

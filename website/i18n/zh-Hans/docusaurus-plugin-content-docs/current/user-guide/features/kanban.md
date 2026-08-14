@@ -435,6 +435,7 @@ hermes dashboard        # 导航栏中出现 "Kanban" 标签页，位于 "Skills
 | `auto_decompose_per_tick` | `3` | 每个调度器 tick 的分解上限。超出部分推迟到下一个 tick。 |
 | `orchestrator_profile` | `""` | 拥有分解权的配置文件。空 = 回退到活动默认配置文件。 |
 | `default_assignee` | `""` | LLM 选择未知配置文件时子任务的落地位置。空 = 回退到活动默认配置文件。 |
+| `deadline_warning_fraction` | `0.0` | 在任务运行上限的指定比例时提醒 worker。有效范围为 `0 < f <= 1`；`0` 禁用提醒。安全检查点关闭时，提醒 worker 在连贯边界完成或阻塞，不承诺会话轮换。 |
 | `auto_subscribe_on_create` | `true` | 当 `kanban_create` 在持久 gateway/TUI 会话中运行时，终止事件会通过合成状态回合恢复原始 agent。设为 `false` 可让完成保持被动，或要求显式调用 `kanban_notify-subscribe`。此设置独立于 `auto_decompose`。 |
 
 以及两个辅助 LLM 槽：
@@ -830,6 +831,7 @@ hermes kanban runs t_abcd
 | `promoted` | — | 因所有父任务达到 `done` 而 `todo → ready`。`run_id` 为 `NULL`。 |
 | `claimed` | `{lock, expires, run_id}` | 调度器原子性认领 `ready` 任务以启动。 |
 | `completed` | `{result_len, summary?}` | Worker 写入 `--result` / `--summary` 且任务达到 `done`。`summary` 是第一行交接（400 字符上限）；完整版本存在于运行行上。如果在从未认领的任务上调用 `complete_task` 并带有交接字段，则合成零持续时间运行，以便 `run_id` 仍然指向某处。 |
+| `checkpoint_released` | `{previous_worker_pid, reason}` | 仅当本地前任进程退出（`worker_exited`）或远程租约过期（`claim_expired`）后，才会清除保留的检查点围栏。 |
 | `blocked` | `{reason}` | Worker 或人类将任务翻转为 `blocked`。在带有 `--reason` 的从未认领任务上调用时合成零持续时间运行。 |
 | `unblocked` | — | `blocked → ready`，手动或通过 `/unblock`。`run_id` 为 `NULL`。 |
 | `archived` | — | 从默认看板中隐藏。如果任务仍在运行，携带作为副作用被回收的运行的 `run_id`。 |

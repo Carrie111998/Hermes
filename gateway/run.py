@@ -101,21 +101,25 @@ def _running_git_commit() -> str:
     import subprocess
 
     git = shutil.which("git")
-    if not git:
-        return "unknown"
+    if git:
+        try:
+            result = subprocess.run(
+                [git, "rev-parse", "--short", "HEAD"],
+                cwd=str(Path(__file__).resolve().parent.parent),
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                return result.stdout.strip()
+        except (OSError, subprocess.SubprocessError):
+            logger.debug("Could not resolve gateway git commit", exc_info=True)
     try:
-        result = subprocess.run(
-            [git, "rev-parse", "--short", "HEAD"],
-            cwd=str(Path(__file__).resolve().parent.parent),
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        if result.returncode == 0 and result.stdout.strip():
-            return result.stdout.strip()
-    except (OSError, subprocess.SubprocessError):
-        logger.debug("Could not resolve gateway git commit", exc_info=True)
-    return "unknown"
+        from hermes_cli.build_info import get_build_sha
+
+        return get_build_sha(short=8) or "unknown"
+    except Exception:
+        return "unknown"
 
 
 def _kanban_dispatch_in_gateway_enabled() -> bool:
