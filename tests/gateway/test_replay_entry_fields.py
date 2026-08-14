@@ -227,6 +227,89 @@ class TestReasoningOnlyAssistantTurnsSurviveReload:
         ]
 
 
+class TestCodexReasoningOnlyTurnsSurviveReload:
+    """Codex Responses item carriers are the case where an empty ``content``
+    is not a degenerate row but the designed representation.
+
+    A commentary-phase assistant turn persists with ``content: ""`` because
+    its text lives in ``codex_message_items``; OpenAI's docs require those
+    items be replayed on every assistant message for prefix-cache hits.
+    Dropping the row on reload discards them.
+    """
+
+    def test_codex_message_items_only_turn_is_preserved(self):
+        msg_items = [
+            {
+                "type": "message",
+                "role": "assistant",
+                "phase": "commentary",
+                "content": [{"type": "output_text", "text": "working on it"}],
+            }
+        ]
+        assistant = _assistant_rows([
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "", "codex_message_items": msg_items},
+        ])
+        assert len(assistant) == 1
+        assert assistant[0]["codex_message_items"] == msg_items
+
+    def test_codex_reasoning_items_only_turn_is_preserved(self):
+        codex_items = [{"type": "reasoning", "encrypted_content": "blob"}]
+        assistant = _assistant_rows([
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "", "codex_reasoning_items": codex_items},
+        ])
+        assert len(assistant) == 1
+        assert assistant[0]["codex_reasoning_items"] == codex_items
+
+
+class TestEmptyAssistantShellsStillDrop:
+    """Negative cases: the recovery must not resurrect rows that carry no
+    replay state at all.
+
+    These already dropped before the change and must keep dropping -- they
+    guard the fix against over-reaching, which is the failure mode that
+    would turn it into a source of empty assistant turns.
+    """
+
+    def test_truly_empty_assistant_shell_still_drops(self):
+        assert _assistant_rows([
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": ""},
+        ]) == []
+
+    def test_assistant_shell_with_none_content_still_drops(self):
+        assert _assistant_rows([
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": None},
+        ]) == []
+
+    def test_assistant_shell_with_all_falsy_replay_fields_still_drops(self):
+        """Every contract field present but empty carries no information --
+        matching `_build_replay_entry`, which drops them individually."""
+        assert _assistant_rows([
+            {"role": "user", "content": "hi"},
+            {
+                "role": "assistant",
+                "content": "",
+                "reasoning": "",
+                "reasoning_details": [],
+                "codex_reasoning_items": [],
+                "codex_message_items": [],
+                "finish_reason": "",
+            },
+        ]) == []
+
+    def test_non_assistant_empty_row_still_drops(self):
+        """The new arm is assistant-scoped; an empty user row is untouched
+        and must not pick up reasoning fields."""
+        agent_history, _observed = _build_gateway_agent_history([
+            {"role": "user", "content": "", "reasoning": "not mine"},
+            {"role": "assistant", "content": "answer"},
+        ])
+        assert [m["role"] for m in agent_history] == ["assistant"]
+
+
 class TestGatewayHistoryBuildForwardsSidecar:
     def test_end_to_end_history_build_keeps_sidecar(self):
         history = [
