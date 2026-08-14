@@ -4532,6 +4532,7 @@ def _apply_model_switch(
     pin_session_override: bool = True,
     parsed_flags: Any | None = None,
     persist_override: bool | None = None,
+    picker_selected: bool = False,
 ) -> dict:
     from hermes_cli.model_switch import (
         parse_model_switch_args,
@@ -4623,6 +4624,7 @@ def _apply_model_switch(
         explicit_provider=explicit_provider,
         user_providers=user_provs,
         custom_providers=custom_provs,
+        picker_selected=picker_selected,
     )
     if not result.success:
         raise ValueError(result.error_message or "model switch failed")
@@ -4804,6 +4806,7 @@ def _apply_pending_model_switch(sid: str, session: dict) -> None:
             session,
             pending["raw"],
             confirm_expensive_model=bool(pending.get("confirm_expensive_model")),
+            picker_selected=bool(pending.get("picker_selected")),
         )
         # A queued pick is a deliberate user action; honour the expensive-model
         # confirm by NOT applying it silently — surface the warning and drop the
@@ -10907,6 +10910,7 @@ def _(rid, params: dict) -> dict:
         try:
             if not value:
                 return _err(rid, 4002, "model value required")
+            picker_selected = bool(params.get("picker_selected", False))
             if session:
                 from hermes_cli.model_switch import parse_model_switch_args
 
@@ -10931,6 +10935,7 @@ def _(rid, params: dict) -> dict:
                         "confirm_expensive_model": bool(
                             params.get("confirm_expensive_model", False)
                         ),
+                        "picker_selected": picker_selected,
                         # The resolved model/provider the next turn will run on.
                         # _session_info reports these while the switch is pending
                         # so the end-of-turn settle keeps showing the user's pick
@@ -10970,6 +10975,7 @@ def _(rid, params: dict) -> dict:
                         params.get("confirm_expensive_model", False)
                     ),
                     parsed_flags=parsed_flags,
+                    picker_selected=picker_selected,
                 )
             else:
                 result = _apply_model_switch(
@@ -10979,6 +10985,7 @@ def _(rid, params: dict) -> dict:
                     confirm_expensive_model=bool(
                         params.get("confirm_expensive_model", False)
                     ),
+                    picker_selected=picker_selected,
                 )
             return _ok(
                 rid,

@@ -236,7 +236,8 @@ describe('useModelControls', () => {
     expect(requestGateway).toHaveBeenCalledWith('config.set', {
       session_id: 'session-1',
       key: 'model',
-      value: 'claude-sonnet-4.6 --provider anthropic --session'
+      value: 'claude-sonnet-4.6 --provider anthropic --session',
+      picker_selected: true
     })
     expect(requestGateway).not.toHaveBeenCalledWith('slash.exec', expect.anything())
   })
@@ -333,7 +334,8 @@ describe('useModelControls', () => {
     expect(requestGateway).toHaveBeenCalledWith('config.set', {
       session_id: 'session-1',
       key: 'model',
-      value: 'BeastMode --provider moa --session'
+      value: 'BeastMode --provider moa --session',
+      picker_selected: true
     })
   })
 
@@ -547,7 +549,8 @@ describe('useModelControls', () => {
     expect(requestGateway).toHaveBeenCalledWith('config.set', {
       session_id: 'tile-runtime',
       key: 'model',
-      value: 'tile-model --provider anthropic --session'
+      value: 'tile-model --provider anthropic --session',
+      picker_selected: true
     })
     // Primary footer untouched — the busy primary must not absorb a tile pick.
     expect($currentModel.get()).toBe('primary/model')

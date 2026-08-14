@@ -9909,6 +9909,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     explicit_provider=provider_data.get("slug"),
                     user_providers=state.get("user_provs"),
                     custom_providers=state.get("custom_provs"),
+                    picker_selected=True,
                 )
                 # Capture before close — picker state is cleared on close.
                 _picker_custom_provs = state.get("custom_provs")
