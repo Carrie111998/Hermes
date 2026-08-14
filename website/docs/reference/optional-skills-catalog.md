@@ -36,6 +36,7 @@ hermes skills uninstall <skill-name>
 | [**grok**](/docs/user-guide/skills/optional/autonomous-ai-agents/autonomous-ai-agents-grok) | Delegate coding to xAI Grok Build CLI (features, PRs). |
 | [**honcho**](/docs/user-guide/skills/optional/autonomous-ai-agents/autonomous-ai-agents-honcho) | Configure and troubleshoot Honcho memory for Hermes. |
 | [**openhands**](/docs/user-guide/skills/optional/autonomous-ai-agents/autonomous-ai-agents-openhands) | Delegate coding to OpenHands CLI (model-agnostic, LiteLLM). |
+| [**recovering-mcp-tunnel-account-context**](/docs/user-guide/skills/optional/autonomous-ai-agents/autonomous-ai-agents-recovering-mcp-tunnel-account-context) | Use when MCP tunnel setup fails before daemon traffic. |
 
 ## blockchain
 

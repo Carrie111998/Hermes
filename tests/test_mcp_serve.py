@@ -208,18 +208,19 @@ def mock_session_db(tmp_path, populated_sessions_dir):
 
 
 class _FakeTool:
-    def __init__(self, fn):
+    def __init__(self, fn, annotations=None):
         self.name = fn.__name__
         self.description = inspect.getdoc(fn) or ""
         self.fn = fn
+        self.annotations = annotations
 
 
 class _FakeToolManager:
     def __init__(self):
         self._tools = {}
 
-    def add_tool(self, fn):
-        self._tools[fn.__name__] = _FakeTool(fn)
+    def add_tool(self, fn, annotations=None):
+        self._tools[fn.__name__] = _FakeTool(fn, annotations=annotations)
 
     async def call_tool(self, name, args=None):
         return self._tools[name].fn(**(args or {}))
@@ -232,9 +233,9 @@ class _FakeFastMCP:
     def __init__(self, *args, **kwargs):
         self._tool_manager = _FakeToolManager()
 
-    def tool(self):
+    def tool(self, **kwargs):
         def decorator(fn):
-            self._tool_manager.add_tool(fn)
+            self._tool_manager.add_tool(fn, annotations=kwargs.get("annotations"))
             return fn
 
         return decorator
@@ -506,6 +507,20 @@ def mcp_server_e2e(populated_sessions_dir, mock_session_db, monkeypatch):
 
     bridge = mcp_serve.EventBridge()
     server = mcp_serve.create_mcp_server(event_bridge=bridge)
+    return server, bridge
+
+
+@pytest.fixture
+def mcp_server_read_only_e2e(populated_sessions_dir, mock_session_db, monkeypatch):
+    """Create the restricted MCP surface used by read-only connectors."""
+    pytest.importorskip("mcp", reason="MCP SDK not installed")
+    import mcp_serve
+    monkeypatch.setattr(mcp_serve, "_get_sessions_dir", lambda: populated_sessions_dir)
+    monkeypatch.setattr(mcp_serve, "_get_session_db", lambda: mock_session_db)
+    monkeypatch.setattr(mcp_serve, "_load_channel_directory", lambda: {})
+
+    bridge = mcp_serve.EventBridge()
+    server = mcp_serve.create_mcp_server(event_bridge=bridge, read_only=True)
     return server, bridge
 
 
@@ -942,6 +957,33 @@ class TestToolRegistration:
         for tool in server._tool_manager.list_tools():
             assert tool.description, f"Tool {tool.name} has no description"
 
+    def test_read_only_mode_exposes_only_non_mutating_tools(
+        self, mcp_server_read_only_e2e, _event_loop
+    ):
+        server, _ = mcp_server_read_only_e2e
+        tool_names = {tool.name for tool in server._tool_manager.list_tools()}
+
+        # Security allowlist — intentionally an exact set, not a relation to
+        # the default surface. "default minus the two mutating tools" would
+        # silently pass a future mutating tool that was wrongly registered
+        # unconditionally; the exact set fails closed and forces every new
+        # tool to make an explicit read-only membership decision here.
+        assert tool_names == {
+            "conversations_list", "conversation_get", "messages_read",
+            "attachments_fetch", "events_poll", "events_wait",
+            "channels_list", "permissions_list_open",
+        }
+
+    def test_read_only_mode_marks_every_tool_read_only(
+        self, mcp_server_read_only_e2e, _event_loop
+    ):
+        server, _ = mcp_server_read_only_e2e
+
+        for tool in server._tool_manager.list_tools():
+            assert tool.annotations is not None, tool.name
+            assert tool.annotations.readOnlyHint is True, tool.name
+            assert tool.annotations.destructiveHint is False, tool.name
+
 
 # ---------------------------------------------------------------------------
 # 5. SERVER LIFECYCLE / CLI INTEGRATION
@@ -1009,10 +1051,10 @@ class TestCliIntegration:
         monkeypatch.setattr("mcp_serve.run_mcp_server", mock_run)
 
         import argparse
-        args = argparse.Namespace(mcp_action="serve", verbose=True)
+        args = argparse.Namespace(mcp_action="serve", verbose=True, read_only=True)
         from hermes_cli.mcp_config import mcp_command
         mcp_command(args)
-        mock_run.assert_called_once_with(verbose=True)
+        mock_run.assert_called_once_with(verbose=True, read_only=True)
 
 
 # ---------------------------------------------------------------------------

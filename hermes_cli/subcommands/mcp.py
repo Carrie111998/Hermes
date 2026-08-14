@@ -36,6 +36,11 @@ def build_mcp_parser(subparsers, *, cmd_mcp: Callable) -> None:
         action="store_true",
         help="Enable verbose logging on stderr",
     )
+    mcp_serve_p.add_argument(
+        "--read-only",
+        action="store_true",
+        help="Expose only non-mutating tools with read-only MCP annotations",
+    )
     add_accept_hooks_flag(mcp_serve_p)
 
     mcp_add_p = mcp_sub.add_parser(

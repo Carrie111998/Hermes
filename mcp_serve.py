@@ -50,10 +50,12 @@ logger = logging.getLogger("hermes.mcp_serve")
 _MCP_SERVER_AVAILABLE = False
 try:
     from mcp.server.fastmcp import FastMCP
+    from mcp.types import ToolAnnotations
 
     _MCP_SERVER_AVAILABLE = True
 except ImportError:
     FastMCP = None  # type: ignore[assignment,misc]
+    ToolAnnotations = None  # type: ignore[assignment,misc]
 
 
 # ---------------------------------------------------------------------------
@@ -587,8 +589,11 @@ class EventBridge:
 # MCP Server
 # ---------------------------------------------------------------------------
 
-def create_mcp_server(event_bridge: Optional[EventBridge] = None) -> "FastMCP":
-    """Create and return the Hermes MCP server with all tools registered."""
+def create_mcp_server(
+    event_bridge: Optional[EventBridge] = None,
+    read_only: bool = False,
+) -> "FastMCP":
+    """Create the Hermes MCP server, optionally omitting mutating tools."""
     if not _MCP_SERVER_AVAILABLE:
         raise ImportError(
             "MCP server requires the 'mcp' package. "
@@ -605,10 +610,22 @@ def create_mcp_server(event_bridge: Optional[EventBridge] = None) -> "FastMCP":
     )
 
     bridge = event_bridge or EventBridge()
+    read_only_annotations = ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    )
+
+    def register_mutating_tool(fn):
+        """Register a mutating tool unless this server is restricted."""
+        if read_only:
+            return fn
+        return mcp.tool()(fn)
 
     # -- conversations_list ------------------------------------------------
 
-    @mcp.tool()
+    @mcp.tool(annotations=read_only_annotations)
     def conversations_list(
         platform: Optional[str] = None,
         limit: int = 50,
@@ -665,7 +682,7 @@ def create_mcp_server(event_bridge: Optional[EventBridge] = None) -> "FastMCP":
 
     # -- conversation_get --------------------------------------------------
 
-    @mcp.tool()
+    @mcp.tool(annotations=read_only_annotations)
     def conversation_get(session_key: str) -> str:
         """Get detailed info about one conversation by its session key.
 
@@ -698,7 +715,7 @@ def create_mcp_server(event_bridge: Optional[EventBridge] = None) -> "FastMCP":
 
     # -- messages_read -----------------------------------------------------
 
-    @mcp.tool()
+    @mcp.tool(annotations=read_only_annotations)
     def messages_read(
         session_key: str,
         limit: int = 50,
@@ -755,7 +772,7 @@ def create_mcp_server(event_bridge: Optional[EventBridge] = None) -> "FastMCP":
 
     # -- attachments_fetch -------------------------------------------------
 
-    @mcp.tool()
+    @mcp.tool(annotations=read_only_annotations)
     def attachments_fetch(
         session_key: str,
         message_id: str,
@@ -807,7 +824,7 @@ def create_mcp_server(event_bridge: Optional[EventBridge] = None) -> "FastMCP":
 
     # -- events_poll -------------------------------------------------------
 
-    @mcp.tool()
+    @mcp.tool(annotations=read_only_annotations)
     def events_poll(
         after_cursor: int = 0,
         session_key: Optional[str] = None,
@@ -836,7 +853,7 @@ def create_mcp_server(event_bridge: Optional[EventBridge] = None) -> "FastMCP":
 
     # -- events_wait -------------------------------------------------------
 
-    @mcp.tool()
+    @mcp.tool(annotations=read_only_annotations)
     def events_wait(
         after_cursor: int = 0,
         session_key: Optional[str] = None,
@@ -870,7 +887,7 @@ def create_mcp_server(event_bridge: Optional[EventBridge] = None) -> "FastMCP":
 
     # -- messages_send -----------------------------------------------------
 
-    @mcp.tool()
+    @register_mutating_tool
     def messages_send(
         target: str,
         message: str,
@@ -906,7 +923,7 @@ def create_mcp_server(event_bridge: Optional[EventBridge] = None) -> "FastMCP":
 
     # -- channels_list -----------------------------------------------------
 
-    @mcp.tool()
+    @mcp.tool(annotations=read_only_annotations)
     def channels_list(platform: Optional[str] = None) -> str:
         """List available messaging channels and targets across platforms.
 
@@ -960,7 +977,7 @@ def create_mcp_server(event_bridge: Optional[EventBridge] = None) -> "FastMCP":
 
     # -- permissions_list_open ---------------------------------------------
 
-    @mcp.tool()
+    @mcp.tool(annotations=read_only_annotations)
     def permissions_list_open() -> str:
         """List pending approval requests observed during this bridge session.
 
@@ -976,7 +993,7 @@ def create_mcp_server(event_bridge: Optional[EventBridge] = None) -> "FastMCP":
 
     # -- permissions_respond -----------------------------------------------
 
-    @mcp.tool()
+    @register_mutating_tool
     def permissions_respond(
         id: str,
         decision: str,
@@ -1003,7 +1020,7 @@ def create_mcp_server(event_bridge: Optional[EventBridge] = None) -> "FastMCP":
 # Entry point
 # ---------------------------------------------------------------------------
 
-def run_mcp_server(verbose: bool = False) -> None:
+def run_mcp_server(verbose: bool = False, read_only: bool = False) -> None:
     """Start the Hermes MCP server on stdio."""
     if not _MCP_SERVER_AVAILABLE:
         print(
@@ -1021,7 +1038,7 @@ def run_mcp_server(verbose: bool = False) -> None:
     bridge = EventBridge()
     bridge.start()
 
-    server = create_mcp_server(event_bridge=bridge)
+    server = create_mcp_server(event_bridge=bridge, read_only=read_only)
 
     import asyncio
 
