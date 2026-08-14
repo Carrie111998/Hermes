@@ -174,9 +174,8 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
         ("delivery_claim", "TEXT"),
         ("delivery_claimed_at", "REAL"),
         # Raw api_server session id (X-Hermes-Session-Id) of the ORIGINATING
-        # request — the wake self-post target. Without persisting it,
-        # completions recovered after a process restart are unroutable on
-        # api_server (the in-memory record that carried it is gone).
+        # request. The gateway parks non-push completions by this id so the
+        # next real client turn can consume them after a restart.
         ("origin_session_id", "TEXT"),
     ):
         if name not in columns:
@@ -558,6 +557,61 @@ def complete_completion_delivery(delegation_id: str, claim_id: str) -> bool:
             (now, now, delegation_id, claim_id),
         )
         return cur.rowcount == 1
+
+
+def defer_completion_delivery(delegation_id: str, claim_id: str) -> bool:
+    """Park a claimed API completion until the next real client turn."""
+    now = time.time()
+    with _DB_LOCK, _transaction() as conn:
+        cur = conn.execute(
+            """UPDATE async_delegations SET delivery_state='deferred',
+                      updated_at=?, delivery_claim=NULL,
+                      delivery_claimed_at=NULL
+               WHERE delegation_id=? AND delivery_state='pending'
+                 AND delivery_claim=?""",
+            (now, delegation_id, claim_id),
+        )
+        return cur.rowcount == 1
+
+
+def consume_deferred_completions(origin_session_id: str) -> List[Dict[str, Any]]:
+    """Atomically take deferred completions for one real API client turn."""
+    if not origin_session_id:
+        return []
+    now = time.time()
+    events: List[Dict[str, Any]] = []
+    with _DB_LOCK, _transaction() as conn:
+        rows = conn.execute(
+            """SELECT delegation_id, event_json
+               FROM async_delegations
+               WHERE delivery_state='deferred' AND event_json IS NOT NULL
+                 AND (origin_session_id=? OR
+                      (origin_session_id='' AND origin_session=?))
+               ORDER BY completed_at, delegation_id""",
+            (origin_session_id, origin_session_id),
+        ).fetchall()
+        for delegation_id, payload in rows:
+            try:
+                event = json.loads(payload)
+            except (TypeError, ValueError):
+                event = None
+            if not isinstance(event, dict):
+                conn.execute(
+                    """UPDATE async_delegations SET delivery_state='dropped',
+                              updated_at=? WHERE delegation_id=?
+                       AND delivery_state='deferred'""",
+                    (now, delegation_id),
+                )
+                continue
+            cur = conn.execute(
+                """UPDATE async_delegations SET delivery_state='delivered',
+                          delivered_at=?, updated_at=?
+                   WHERE delegation_id=? AND delivery_state='deferred'""",
+                (now, now, delegation_id),
+            )
+            if cur.rowcount == 1:
+                events.append(event)
+    return events
 
 
 def complete_event_delivery(evt: Dict[str, Any], claim_id: str) -> None:

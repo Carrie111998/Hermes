@@ -65,6 +65,60 @@ def _drain_for(delegation_id, timeout=5.0):
     return None
 
 
+def _persist_completed_event(*, delegation_id: str, origin_session_id: str) -> dict:
+    event = {
+        "type": "async_delegation",
+        "delegation_id": delegation_id,
+        "session_key": origin_session_id,
+        "origin_session_id": origin_session_id,
+        "status": "completed",
+        "summary": "background result",
+        "dispatched_at": 1000.0,
+        "completed_at": 1001.0,
+    }
+    ad._persist_dispatch({
+        "delegation_id": delegation_id,
+        "session_key": origin_session_id,
+        "origin_session_id": origin_session_id,
+        "dispatched_at": 1000.0,
+    })
+    ad._persist_completion(event, {"status": "completed", "summary": "background result"})
+    return event
+
+
+def test_api_server_delivery_can_be_deferred_without_acknowledging_it():
+    _persist_completed_event(
+        delegation_id="deleg_api_deferred",
+        origin_session_id="raw-api-session",
+    )
+    claim_id = "gateway:test-claim"
+    assert ad.claim_completion_delivery("deleg_api_deferred", claim_id)
+
+    assert ad.defer_completion_delivery("deleg_api_deferred", claim_id)
+
+    row = ad.get_durable_delegation("deleg_api_deferred")
+    assert row is not None
+    assert row["delivery_state"] == "deferred"
+
+
+def test_deferred_completion_is_consumed_once_by_its_origin_session():
+    event = _persist_completed_event(
+        delegation_id="deleg_api_consume",
+        origin_session_id="raw-api-session",
+    )
+    claim_id = "gateway:test-claim"
+    assert ad.claim_completion_delivery("deleg_api_consume", claim_id)
+    assert ad.defer_completion_delivery("deleg_api_consume", claim_id)
+
+    assert ad.consume_deferred_completions("different-session") == []
+    assert ad.consume_deferred_completions("raw-api-session") == [event]
+    assert ad.consume_deferred_completions("raw-api-session") == []
+
+    row = ad.get_durable_delegation("deleg_api_consume")
+    assert row is not None
+    assert row["delivery_state"] == "delivered"
+
+
 def test_active_for_session_counts_every_live_delegation_state():
     with ad._records_lock:
         ad._records.update(
@@ -200,6 +254,27 @@ def test_rich_reinjection_block_is_self_contained():
         "API calls: 7",
     ]:
         assert needle in text, f"missing {needle!r}"
+
+
+def test_deferred_reinjection_text_is_context_not_an_action_request():
+    from tools.process_registry import _format_async_delegation
+
+    text = _format_async_delegation(
+        {
+            "type": "async_delegation",
+            "delegation_id": "deleg_context_only",
+            "goal": "research",
+            "status": "completed",
+            "summary": "result",
+            "is_batch": True,
+            "results": [{"task_index": 0, "status": "completed", "summary": "result"}],
+            "goals": ["research"],
+        },
+        actionable=False,
+    )
+
+    assert "background context" in text
+    assert "act on these" not in text
 
 
 def test_dispatch_rejected_at_capacity():

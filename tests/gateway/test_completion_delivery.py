@@ -195,12 +195,65 @@ def _persist_pending_completion(event):
         "session_key": event["session_key"],
         "origin_ui_session_id": "",
         "parent_session_id": event.get("parent_session_id"),
+        "origin_session_id": event.get("origin_session_id", ""),
         "dispatched_at": event["dispatched_at"],
     })
     async_delegation._persist_completion(event, {
         "status": "completed",
         "summary": event["summary"],
     })
+
+
+def test_api_server_async_completion_defers_without_starting_a_turn(
+    monkeypatch, isolated_registry,
+):
+    from tools import async_delegation
+    import gateway.wake as wake_module
+
+    event = _async_event("deleg_api_deferred")
+    event["session_key"] = "raw-api-session"
+    event["origin_session_id"] = "raw-api-session"
+    _persist_pending_completion(event)
+
+    api_adapter = SimpleNamespace(supports_async_delivery=False)
+    runner = _runner(api_adapter)
+    runner.adapters = {Platform.API_SERVER: api_adapter}
+    self_post = AsyncMock()
+    monkeypatch.setattr(wake_module, "_self_post_chat_completion", self_post)
+
+    delivered = asyncio.run(
+        runner._deliver_completion_notification("completion context", event)
+    )
+
+    assert delivered is True
+    self_post.assert_not_awaited()
+    row = async_delegation.get_durable_delegation("deleg_api_deferred")
+    assert row is not None
+    assert row["delivery_state"] == "deferred"
+
+
+def test_api_server_coalesced_async_completions_all_remain_deferred(
+    isolated_registry,
+):
+    from tools import async_delegation
+
+    events = [_async_event(f"deleg_api_batch_{index}") for index in range(2)]
+    for event in events:
+        event["session_key"] = "raw-api-session"
+        event["origin_session_id"] = "raw-api-session"
+        _persist_pending_completion(event)
+
+    api_adapter = SimpleNamespace(supports_async_delivery=False)
+    runner = _runner(api_adapter)
+    runner.adapters = {Platform.API_SERVER: api_adapter}
+
+    delivered = asyncio.run(runner._deliver_async_delegation_group(events))
+
+    assert delivered is True
+    for event in events:
+        row = async_delegation.get_durable_delegation(event["delegation_id"])
+        assert row is not None
+        assert row["delivery_state"] == "deferred"
 
 
 def test_explicit_kill_returns_output_before_consuming_notification(monkeypatch):
