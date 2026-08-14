@@ -1257,7 +1257,7 @@ def _pricing_entry_from_metadata(
     usd_rate = _ONE
     if currency != "USD":
         usd_rate = _to_decimal(pricing.get("rate"))
-        if usd_rate is None or usd_rate <= _ZERO:
+        if usd_rate is None or not usd_rate.is_finite() or usd_rate <= _ZERO:
             # The endpoint has told us the values are not USD, but has not
             # supplied a safe conversion contract. Unknown is more honest than
             # silently relabelling foreign currency as dollars.

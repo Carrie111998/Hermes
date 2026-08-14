@@ -1,4 +1,7 @@
+from decimal import Decimal
 from types import SimpleNamespace
+
+import pytest
 
 from agent.usage_pricing import (
     CanonicalUsage,
@@ -8,13 +11,6 @@ from agent.usage_pricing import (
     normalize_usage,
     resolve_billing_route,
 )
-from decimal import Decimal
-
-
-
-
-
-
 
 
 def test_normalize_usage_reads_deepseek_native_cache_hit_tokens():
@@ -422,6 +418,30 @@ def test_custom_endpoint_rejects_non_usd_pricing_without_rate(monkeypatch):
                     "prompt": "0.000008137",
                     "completion": "0.000020133",
                     "currency": "RUB",
+                }
+            }
+        },
+    )
+
+    assert (
+        get_pricing_entry(
+            "model", provider="custom", base_url="https://router.example/v1"
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize("rate", ["NaN", "Infinity"])
+def test_custom_endpoint_rejects_nonfinite_currency_rate(monkeypatch, rate):
+    monkeypatch.setattr(
+        "agent.usage_pricing.fetch_endpoint_model_metadata",
+        lambda *_args, **_kwargs: {
+            "model": {
+                "pricing": {
+                    "prompt": "0.000008137",
+                    "completion": "0.000020133",
+                    "currency": "RUB",
+                    "rate": rate,
                 }
             }
         },
