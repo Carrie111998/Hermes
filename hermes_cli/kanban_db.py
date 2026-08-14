@@ -133,6 +133,8 @@ VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
 # not dispatcher spawn/crash/timeout failures.
 BLOCK_RECURRENCE_LIMIT = 2
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
+_CREATE_VALIDATION_POLICIES = frozenset({"off", "warn", "strict"})
+_WORKSPACE_KIND_UNSET = object()
 
 
 def normalize_reasoning_effort(effort: Optional[str]) -> Optional[str]:
@@ -3162,6 +3164,129 @@ def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
     return normalize_profile_name(assignee)
 
 
+def create_validation_policy() -> str:
+    """Return the task-creation validation policy, preserving legacy writes on error."""
+    try:
+        from hermes_cli.config import load_config
+
+        value = (load_config() or {}).get("kanban", {}).get(
+            "validate_on_create", "warn",
+        )
+    except Exception:
+        return "off"
+    policy = str(value).strip().lower()
+    if policy in _CREATE_VALIDATION_POLICIES:
+        return policy
+    _log.warning(
+        "kanban: invalid validate_on_create=%r; preserving historical off policy",
+        value,
+    )
+    return "off"
+
+
+def _profile_skill_names(profile_name: str) -> set[str]:
+    """Return names in one profile's active local skill registry.
+
+    ``get_skills_dir`` is intentionally evaluated under a context-local home
+    override: changing ``HERMES_HOME`` here would leak the assignee's profile
+    into other gateway conversations running in this process.
+    """
+    from agent.skill_utils import get_skills_dir, iter_skill_index_files, parse_frontmatter
+    from hermes_constants import reset_hermes_home_override
+    from hermes_constants import set_hermes_home_override
+    from hermes_cli.profiles import get_profile_dir
+
+    token = set_hermes_home_override(get_profile_dir(profile_name))
+    try:
+        skills_dir = get_skills_dir()
+        names: set[str] = set()
+        if not skills_dir.is_dir():
+            return names
+        for skill_file in iter_skill_index_files(skills_dir, "SKILL.md"):
+            names.add(skill_file.parent.name)
+            try:
+                frontmatter, _ = parse_frontmatter(
+                    skill_file.read_text(encoding="utf-8")
+                )
+            except Exception:
+                continue
+            declared_name = str(frontmatter.get("name") or "").strip()
+            if declared_name:
+                names.add(declared_name)
+        return names
+    finally:
+        reset_hermes_home_override(token)
+
+
+def _task_creation_violations(
+    *,
+    assignee: Optional[str],
+    skills: Optional[Iterable[str]],
+    workspace_kind: str,
+    workspace_explicit: bool,
+) -> list[str]:
+    """Return all configured task-creation contract violations."""
+    violations: list[str] = []
+    profile_is_real = False
+    if assignee:
+        from hermes_cli.profiles import profile_exists
+
+        profile_is_real = profile_exists(assignee)
+        if not profile_is_real:
+            violations.append(f"assignee profile {assignee!r} does not exist")
+
+    if skills and assignee and profile_is_real:
+        available_skills = _profile_skill_names(assignee)
+        for skill_name in skills:
+            if skill_name not in available_skills:
+                violations.append(
+                    f"skill {skill_name!r} is not installed for assignee profile {assignee!r}"
+                )
+
+    try:
+        from hermes_cli.config import load_config
+
+        require_explicit_workspace = bool(
+            (load_config() or {}).get("kanban", {}).get(
+                "require_explicit_workspace", False,
+            )
+        )
+    except Exception:
+        require_explicit_workspace = False
+    if (
+        require_explicit_workspace
+        and workspace_kind == "scratch"
+        and not workspace_explicit
+    ):
+        violations.append("workspace was an implicit scratch default; choose --workspace scratch explicitly")
+    return violations
+
+
+def _validate_task_creation(
+    *,
+    assignee: Optional[str],
+    skills: Optional[Iterable[str]],
+    workspace_kind: str,
+    workspace_explicit: bool,
+) -> None:
+    """Warn about or reject task-creation contract violations."""
+    policy = create_validation_policy()
+    if policy == "off":
+        return
+    violations = _task_creation_violations(
+        assignee=assignee,
+        skills=skills,
+        workspace_kind=workspace_kind,
+        workspace_explicit=workspace_explicit,
+    )
+    if not violations:
+        return
+    if policy == "strict":
+        raise ValueError("kanban task creation rejected: " + "; ".join(violations))
+    for violation in violations:
+        _log.warning("kanban task creation validation: %s", violation)
+
+
 def create_task(
     conn: sqlite3.Connection,
     *,
@@ -3169,8 +3294,9 @@ def create_task(
     body: Optional[str] = None,
     assignee: Optional[str] = None,
     created_by: Optional[str] = None,
-    workspace_kind: str = "scratch",
+    workspace_kind: Any = _WORKSPACE_KIND_UNSET,
     workspace_path: Optional[str] = None,
+    workspace_explicit: Optional[bool] = None,
     branch_name: Optional[str] = None,
     tenant: Optional[str] = None,
     priority: int = 0,
@@ -3230,6 +3356,13 @@ def create_task(
     board can supply the repo and branch convention. Its literal worktree is
     never reused; the new task still gets its own task-id-keyed path.
     """
+    workspace_explicit = (
+        workspace_kind is not _WORKSPACE_KIND_UNSET or workspace_path is not None
+        if workspace_explicit is None
+        else bool(workspace_explicit)
+    )
+    if workspace_kind is _WORKSPACE_KIND_UNSET:
+        workspace_kind = "scratch"
     model_override = (model_override or "").strip() or None
     provider_override = (provider_override or "").strip() or None
     reasoning_effort = normalize_reasoning_effort(reasoning_effort)
@@ -3414,6 +3547,13 @@ def create_task(
         ).fetchone()
         if row:
             return row["id"]
+
+    _validate_task_creation(
+        assignee=assignee,
+        skills=skills_list,
+        workspace_kind=workspace_kind,
+        workspace_explicit=workspace_explicit,
+    )
 
     now = int(time.time())
     default_notify_targets = _default_notify_subscription_targets()
@@ -10821,6 +10961,11 @@ def _default_spawn(
     import subprocess
     if not task.assignee:
         raise ValueError(f"task {task.id} has no assignee")
+    if not workspace or not os.path.isabs(workspace) or not os.path.isdir(workspace):
+        raise ValueError(
+            f"task {task.id} workspace preflight failed: expected an existing "
+            f"absolute directory, got {workspace!r}"
+        )
 
     from hermes_cli.profiles import normalize_profile_name
 

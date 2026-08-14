@@ -1605,6 +1605,7 @@ def _handle_create(args: dict, **kw) -> str:
     # preserving the repository/branch convention without sharing a checkout.
     workspace_kind = args.get("workspace_kind")
     workspace_path = args.get("workspace_path")
+    workspace_explicit = workspace_kind is not None or workspace_path is not None
     project_id = args.get("project") or args.get("project_id")
     project_source_task_id = None
     _inherit_project = workspace_kind is None and workspace_path is None
@@ -1662,6 +1663,7 @@ def _handle_create(args: dict, **kw) -> str:
                 priority=int(priority) if priority is not None else 0,
                 workspace_kind=str(workspace_kind),
                 workspace_path=workspace_path,
+                workspace_explicit=workspace_explicit,
                 project_id=project_id,
                 project_source_task_id=project_source_task_id,
                 triage=triage,

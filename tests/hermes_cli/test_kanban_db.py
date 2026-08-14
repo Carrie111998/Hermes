@@ -40,6 +40,118 @@ def _init_git_repo(repo: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Task-creation validation
+# ---------------------------------------------------------------------------
+
+
+def _set_creation_validation(
+    home: Path, policy: str, *, require_explicit_workspace: bool = False,
+) -> None:
+    home.joinpath("config.yaml").write_text(
+        "kanban:\n"
+        f"  validate_on_create: {policy}\n"
+        f"  require_explicit_workspace: {str(require_explicit_workspace).lower()}\n",
+        encoding="utf-8",
+    )
+
+
+def _create_profile(home: Path, name: str) -> Path:
+    profile = home / "profiles" / name
+    (profile / "skills").mkdir(parents=True)
+    return profile
+
+
+def test_create_validation_off_preserves_creation_without_validation_log(
+    kanban_home: Path, caplog: pytest.LogCaptureFixture,
+) -> None:
+    _set_creation_validation(
+        kanban_home, "off", require_explicit_workspace=True,
+    )
+
+    with kb.connect() as conn, caplog.at_level("WARNING"):
+        task_id = kb.create_task(
+            conn, title="legacy fixture", assignee="not-a-profile", skills=["missing"],
+        )
+
+    assert task_id
+    assert "kanban task creation validation" not in caplog.text
+
+
+def test_create_validation_warn_logs_but_creates(
+    kanban_home: Path, caplog: pytest.LogCaptureFixture,
+) -> None:
+    _set_creation_validation(kanban_home, "warn", require_explicit_workspace=True)
+    _create_profile(kanban_home, "worker")
+
+    with kb.connect() as conn, caplog.at_level("WARNING"):
+        task_id = kb.create_task(conn, title="warn", assignee="worker", skills=["missing"])
+        task = kb.get_task(conn, task_id)
+
+    assert task is not None
+    validation_records = [
+        record.message
+        for record in caplog.records
+        if record.message.startswith("kanban task creation validation:")
+    ]
+    assert validation_records == [
+        "kanban task creation validation: skill 'missing' is not installed for assignee profile 'worker'",
+        "kanban task creation validation: workspace was an implicit scratch default; choose --workspace scratch explicitly",
+    ]
+
+
+def test_create_validation_strict_rejects_missing_assignee_profile(kanban_home: Path) -> None:
+    _set_creation_validation(kanban_home, "strict")
+
+    with kb.connect() as conn, pytest.raises(ValueError, match="assignee profile 'not-a-profile' does not exist"):
+        kb.create_task(conn, title="bad profile", assignee="not-a-profile")
+
+
+def test_create_validation_strict_rejects_missing_profile_skill(kanban_home: Path) -> None:
+    _set_creation_validation(kanban_home, "strict")
+    _create_profile(kanban_home, "worker")
+
+    with kb.connect() as conn, pytest.raises(ValueError, match="skill 'missing' is not installed for assignee profile 'worker'"):
+        kb.create_task(conn, title="bad skill", assignee="worker", skills=["missing"])
+
+
+def test_create_validation_uses_assignee_profile_skill_registry(kanban_home: Path) -> None:
+    _set_creation_validation(kanban_home, "strict")
+    profile = _create_profile(kanban_home, "worker")
+    skill = profile / "skills" / "skill-directory"
+    skill.mkdir()
+    skill.joinpath("SKILL.md").write_text(
+        "---\nname: registered-skill\n---\n", encoding="utf-8",
+    )
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn, title="known skill", assignee="worker", skills=["registered-skill"],
+        )
+
+    assert task_id
+
+
+def test_create_validation_strict_rejects_implicit_scratch_workspace(kanban_home: Path) -> None:
+    _set_creation_validation(kanban_home, "strict", require_explicit_workspace=True)
+    _create_profile(kanban_home, "worker")
+
+    with kb.connect() as conn, pytest.raises(ValueError, match="implicit scratch default"):
+        kb.create_task(conn, title="implicit", assignee="worker")
+
+
+def test_create_validation_allows_explicit_scratch_workspace(kanban_home: Path) -> None:
+    _set_creation_validation(kanban_home, "strict", require_explicit_workspace=True)
+    _create_profile(kanban_home, "worker")
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn, title="explicit", assignee="worker", workspace_kind="scratch",
+        )
+
+    assert task_id
+
+
+# ---------------------------------------------------------------------------
 # Schema / init
 # ---------------------------------------------------------------------------
 
@@ -945,6 +1057,7 @@ class TestSharedBoardPaths:
             tenant=None,
             branch_name="wt/t_dispatch_env",
         )
+        (tmp_path / "ws").mkdir()
         kb._default_spawn(task, str(tmp_path / "ws"))
 
         env = captured["env"]
@@ -961,6 +1074,37 @@ class TestSharedBoardPaths:
                 assert env[key] == "kanban"
                 continue
             assert key not in env
+
+
+@pytest.mark.parametrize("workspace_state", ["missing", "relative", "nonexistent"])
+def test_default_spawn_rejects_nonabsolute_or_missing_workspace(
+    tmp_path: Path, workspace_state: str,
+) -> None:
+    task = kb.Task(
+        id="t_workspace_preflight",
+        title="x",
+        body=None,
+        assignee="worker",
+        status="ready",
+        priority=0,
+        created_by=None,
+        created_at=0,
+        started_at=None,
+        completed_at=None,
+        workspace_kind="dir",
+        workspace_path=None,
+        claim_lock=None,
+        claim_expires=None,
+        tenant=None,
+    )
+    candidate = {
+        "missing": None,
+        "relative": "relative/workspace",
+        "nonexistent": str(tmp_path / "missing"),
+    }[workspace_state]
+
+    with pytest.raises(ValueError, match="workspace preflight failed"):
+        kb._default_spawn(task, candidate)
 
 
 # ---------------------------------------------------------------------------

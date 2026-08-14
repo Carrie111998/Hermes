@@ -256,6 +256,7 @@ class TestWorkerSpawnEnv:
 
         monkeypatch.setattr(subprocess, "Popen", fake_popen)
         kb.create_board("spawntest")
+        (fresh_home / "ws").mkdir()
 
         task = kb.Task(
             id="t_abc",
@@ -300,6 +301,7 @@ class TestWorkerSpawnEnv:
 
         monkeypatch.setattr(subprocess, "Popen", fake_popen)
         monkeypatch.setenv("HERMES_KANBAN_SAFE_CHECKPOINT", "1")
+        (fresh_home / "ws").mkdir()
         task = kb.Task(
             id="t_checkpoint", title="worker test", body=None, assignee="teknium",
             status="ready", priority=0, created_by="user", created_at=0,
@@ -370,5 +372,4 @@ class TestCLI:
         assert titlesA == ["Task A"]
         assert titlesB == ["Task B"]
         assert titlesD == []
-
 
