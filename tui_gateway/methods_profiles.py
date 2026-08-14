@@ -250,11 +250,22 @@ def _(rid, params: dict) -> dict:
         freshly created profile has only a ``model`` section, so voice fell
         back to defaults (local whisper, often not installed) and dictation
         "didn't work in bot mode" while working on the primary profile.
+
+        Reads/writes go through the canonical loaders scoped to the target
+        profile via the context-local HERMES_HOME override — the same
+        mechanism as ``_write_profile_model`` (config-read-guard: no raw
+        yaml on config.yaml).
         """
         try:
-            import yaml as _yaml
-
-            from hermes_cli.config import load_config_readonly
+            from hermes_cli.config import (
+                load_config_readonly,
+                read_user_config_raw,
+                save_config,
+            )
+            from hermes_constants import (
+                reset_hermes_home_override,
+                set_hermes_home_override,
+            )
 
             src_cfg = load_config_readonly() or {}
             sections = {
@@ -263,22 +274,22 @@ def _(rid, params: dict) -> dict:
             if not sections:
                 return False
 
-            cfg_path = path / "config.yaml"
-            dst_cfg = {}
-            if cfg_path.exists():
-                dst_cfg = _yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
-            changed = False
-            for key, value in sections.items():
-                if key not in dst_cfg:
-                    dst_cfg[key] = value
-                    changed = True
-            if changed:
-                tmp = cfg_path.with_suffix(".yaml.tmp")
-                tmp.write_text(
-                    _yaml.safe_dump(dst_cfg, sort_keys=False, allow_unicode=True),
-                    encoding="utf-8",
-                )
-                tmp.replace(cfg_path)
+            token = set_hermes_home_override(str(path))
+            try:
+                # Write-back round-trip on the raw file: load_config() would
+                # merge DEFAULT_CONFIG, making every section look present and
+                # the mirror a no-op (and save_config would then persist the
+                # entire default tree into the fresh profile).
+                dst_cfg = read_user_config_raw() or {}
+                changed = False
+                for key, value in sections.items():
+                    if key not in dst_cfg:
+                        dst_cfg[key] = value
+                        changed = True
+                if changed:
+                    save_config(dst_cfg)
+            finally:
+                reset_hermes_home_override(token)
             return changed
         except Exception:
             return False
