@@ -32,8 +32,10 @@ from agent.image_gen_provider import (
     DEFAULT_ASPECT_RATIO,
     ImageGenProvider,
     error_response,
+    normalize_image_file_size,
     normalize_reference_images,
     resolve_aspect_ratio,
+    resolve_output_size_enforcement,
     save_b64_image,
     save_url_image,
     success_response,
@@ -261,6 +263,10 @@ class OpenAIImageGenProvider(ImageGenProvider):
 
         tier_id, meta = _resolve_model()
         size = _SIZES.get(aspect, _SIZES["square"])
+        enforce_output_size = resolve_output_size_enforcement(
+            _load_openai_config(),
+            "openai",
+        )
 
         # Collect source images (primary + references) for image-to-image.
         sources: List[str] = []
@@ -355,9 +361,12 @@ class OpenAIImageGenProvider(ImageGenProvider):
         url = getattr(first, "url", None)
         revised_prompt = getattr(first, "revised_prompt", None)
 
+        normalization_meta: Dict[str, Any] = {}
         if b64:
             try:
                 saved_path = save_b64_image(b64, prefix=f"openai_{tier_id}")
+                if enforce_output_size:
+                    normalization_meta = normalize_image_file_size(saved_path, size)
             except Exception as exc:
                 return error_response(
                     error=f"Could not save image to cache: {exc}",
@@ -375,6 +384,8 @@ class OpenAIImageGenProvider(ImageGenProvider):
             # it expires — same rationale as the xAI provider (#26942).
             try:
                 saved_path = save_url_image(url, prefix=f"openai_{tier_id}")
+                if enforce_output_size:
+                    normalization_meta = normalize_image_file_size(saved_path, size)
             except Exception as exc:
                 logger.warning(
                     "OpenAI image URL %s could not be cached (%s); falling back to bare URL.",
@@ -395,6 +406,7 @@ class OpenAIImageGenProvider(ImageGenProvider):
             )
 
         extra: Dict[str, Any] = {"size": size, "quality": meta["quality"]}
+        extra.update(normalization_meta)
         if revised_prompt:
             extra["revised_prompt"] = revised_prompt
 
