@@ -284,7 +284,10 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
 from gateway.config import Platform, PlatformConfig
-from gateway.platforms.whatsapp_common import WhatsAppBehaviorMixin
+from gateway.platforms.whatsapp_common import (
+    WhatsAppBehaviorMixin,
+    has_valid_whatsapp_creds as _has_valid_creds,
+)
 from gateway.whatsapp_identity import to_whatsapp_jid
 from gateway.platforms.base import (
     BasePlatformAdapter,
@@ -376,33 +379,6 @@ def check_whatsapp_requirements() -> bool:
         return result.returncode == 0
     except Exception:
         return False
-
-
-def _has_valid_creds(creds_path: Path) -> bool:
-    """Return True only when ``creds.json`` is real, usable pairing state.
-
-    Existence alone is not enough: in ``--pair-only`` mode the bridge writes
-    ``creds.json`` *after* emitting the ``connected`` event and then exits on
-    its own, so a supervisor that kills the bridge on ``connected`` can leave a
-    0-byte (or half-written) ``creds.json`` behind. That truncated file still
-    passes ``Path.exists()``, so a pairing that was actually lost is reported
-    as paired and the gateway proceeds on unusable credentials. Validate that
-    the file is non-empty, parses as JSON, and carries the Baileys identity
-    keys that a genuine pairing always contains.
-    """
-    import json
-
-    try:
-        if creds_path.stat().st_size == 0:
-            return False
-        data = json.loads(creds_path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return False
-    return bool(
-        isinstance(data, dict)
-        and data.get("noiseKey")
-        and data.get("signedIdentityKey")
-    )
 
 
 class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):

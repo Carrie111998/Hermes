@@ -57,3 +57,12 @@ def test_valid_creds_pass(tmp_path):
     p = tmp_path / "creds.json"
     p.write_text(json.dumps(_GOOD_CREDS), encoding="utf-8")
     assert _has_valid_creds(p) is True
+
+
+def test_adapter_reexports_shared_validator():
+    """The adapter's ``_has_valid_creds`` and the wizard both resolve to the
+    single ``whatsapp_common`` implementation, so validation can never drift
+    between the gateway reader and the pairing wizard (issue #85391)."""
+    from gateway.platforms.whatsapp_common import has_valid_whatsapp_creds
+
+    assert _has_valid_creds is has_valid_whatsapp_creds

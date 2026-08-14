@@ -2980,7 +2980,15 @@ def cmd_whatsapp(args):
     session_dir = _whatsapp_session_path()
     session_dir.mkdir(parents=True, exist_ok=True)
 
-    if (session_dir / "creds.json").exists():
+    # Validate creds *content*, not mere existence, through the same helper the
+    # gateway adapter uses. A 0-byte / truncated ``creds.json`` (the bridge
+    # writes it after emitting ``connected`` in --pair-only mode, so a
+    # supervisor can leave it half-written) otherwise passes ``exists()`` here
+    # and gets reported as paired while the gateway then rejects it — the exact
+    # "enabled but not paired" restart loop this PR guards against.
+    from gateway.platforms.whatsapp_common import has_valid_whatsapp_creds
+
+    if has_valid_whatsapp_creds(session_dir / "creds.json"):
         print("✓ Existing WhatsApp session found")
         try:
             response = input(
@@ -3033,9 +3041,10 @@ def cmd_whatsapp(args):
 
     # ── Step 7: Post-pairing ─────────────────────────────────────────────
     print()
-    if (session_dir / "creds.json").exists():
-        # Only enable WhatsApp now that pairing actually succeeded.  If the
-        # user Ctrl+C'd at any earlier step, WHATSAPP_ENABLED stays unset
+    if has_valid_whatsapp_creds(session_dir / "creds.json"):
+        # Only enable WhatsApp now that pairing actually succeeded — and left
+        # *valid* creds behind, not a truncated file the bridge wrote then lost.
+        # If the user Ctrl+C'd at any earlier step, WHATSAPP_ENABLED stays unset
         # and `hermes gateway` skips it cleanly instead of paying a 30s
         # bridge timeout + queueing the platform for indefinite retries.
         save_env_value("WHATSAPP_ENABLED", "true")

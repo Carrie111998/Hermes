@@ -49,3 +49,25 @@ def test_agrees_with_adapter_default(monkeypatch, tmp_path):
         "platforms/whatsapp/session", "whatsapp/session"
     )
     assert wizard == adapter_default
+
+
+def test_wizard_rejects_empty_creds_in_resolved_dir(monkeypatch, tmp_path):
+    """A 0-byte ``creds.json`` in the wizard's resolved session dir must not
+    count as an existing pairing.
+
+    The wizard now gates both its "existing session" and "paired successfully"
+    checks on ``has_valid_whatsapp_creds`` (content), not ``Path.exists()``, so
+    a truncated file the gateway would reject is never reported as paired here
+    either — closing the sibling path of issue #85391 Bug 2 that the initial
+    fix left in the pairing wizard.
+    """
+    from gateway.platforms.whatsapp_common import has_valid_whatsapp_creds
+
+    monkeypatch.setattr(hermes_constants, "get_hermes_home", lambda: tmp_path)
+    session_dir = _whatsapp_session_path()
+    session_dir.mkdir(parents=True, exist_ok=True)
+    creds = session_dir / "creds.json"
+    creds.write_text("", encoding="utf-8")  # exists() is True; pairing is not real
+
+    assert creds.exists()
+    assert has_valid_whatsapp_creds(creds) is False
