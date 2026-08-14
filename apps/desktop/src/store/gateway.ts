@@ -264,7 +264,7 @@ async function sharedPrimaryRoute(profile: string): Promise<boolean> {
   try {
     const conn = await desktop.getConnection(profile)
 
-    return Boolean(conn && typeof conn === 'object' && (conn as { profile?: string }).profile)
+    return Boolean(conn && typeof conn === 'object' && (conn as { sharedPrimary?: boolean }).sharedPrimary === true)
   } catch {
     return false
   }
