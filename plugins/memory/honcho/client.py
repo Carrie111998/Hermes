@@ -454,12 +454,9 @@ class HonchoClientConfig:
     # Session resolution
     session_strategy: str = "per-directory"
     session_peer_prefix: bool = False
-    # When True, the resolved session name is additionally prefixed with the
-    # AI peer id (``{ai_peer}-``). Symmetric counterpart to
-    # ``session_peer_prefix`` (which prefixes the user peer). This keeps
-    # sessions disjoint when several AI peers share one workspace + peerName +
-    # gateway chat key; without it the gateway_session_key branch in
-    # resolve_session_name() yields the same name for every AI peer.
+    # Prefixes every resolved session name with ``{ai_peer}-``. The
+    # gateway_session_key branch is AI-peer-agnostic, so several AI peers
+    # sharing one workspace + peerName + chat key would collide on one session.
     session_ai_peer_prefix: bool = False
     sessions: dict[str, str] = field(default_factory=dict)
     # Raw global config for anything else consumers need
