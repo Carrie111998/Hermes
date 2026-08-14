@@ -107,7 +107,7 @@ class _DDGHTMLParser(HTMLParser):
     def handle_data(self, data: str) -> None:
         if self._field and self._current is not None:
             current = str(self._current[self._field])
-            self._current[self._field] = f"{current} {data}".strip()
+            self._current[self._field] = " ".join(f"{current} {data}".split())
 
 
 def _run_ddg_html_search(query: str, safe_limit: int) -> list[dict[str, Any]]:
