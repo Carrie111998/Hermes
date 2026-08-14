@@ -4,9 +4,14 @@ from types import SimpleNamespace
 
 import pytest
 
+from hermes_cli import providers as provider_registry
 from hermes_cli import runtime_provider as rp
 from hermes_cli.providers import (
+    DeepSeekModelCapabilities,
     deepseek_api_mode,
+    deepseek_model_capabilities,
+    deepseek_native_web_search_models,
+    deepseek_supports_native_web_search,
     deepseek_supports_responses,
     determine_api_mode,
     normalize_deepseek_base_url,
@@ -19,10 +24,14 @@ from hermes_cli.providers import (
         "deepseek-v4-flash",
         "DEEPSEEK-V4-FLASH",
         "deepseek/deepseek-v4-flash",
+        "deepseek-v4-pro",
+        "DEEPSEEK-V4-PRO",
+        "deepseek/deepseek-v4-pro",
     ],
 )
-def test_only_v4_flash_supports_responses(model):
+def test_documented_v4_models_support_responses_and_native_search(model):
     assert deepseek_supports_responses(model)
+    assert deepseek_supports_native_web_search(model)
     assert deepseek_api_mode(model) == "codex_responses"
     assert determine_api_mode("deepseek", "https://api.deepseek.com/v1", model) == "codex_responses"
 
@@ -31,7 +40,7 @@ def test_only_v4_flash_supports_responses(model):
     "model",
     [
         "",
-        "deepseek-v4-pro",
+        "deepseek-v4-pro-20260801",
         "deepseek-chat",
         "deepseek-reasoner",
         "deepseek-v4-flash-20260423",
@@ -40,8 +49,32 @@ def test_only_v4_flash_supports_responses(model):
 )
 def test_other_deepseek_models_stay_on_chat_completions(model):
     assert not deepseek_supports_responses(model)
+    assert not deepseek_supports_native_web_search(model)
     assert deepseek_api_mode(model) == "chat_completions"
 
+
+def test_v4_pro_has_ga_responses_and_native_search_capabilities():
+    assert deepseek_model_capabilities("deepseek-v4-pro") == DeepSeekModelCapabilities(
+        responses_api=True,
+        native_web_search=True,
+    )
+    enabled = deepseek_native_web_search_models()
+    assert "deepseek-v4-flash" in enabled
+    assert "deepseek-v4-pro" in enabled
+
+
+def test_native_search_capability_fails_closed_without_responses(monkeypatch):
+    monkeypatch.setitem(
+        provider_registry._DEEPSEEK_MODEL_CAPABILITIES,
+        "deepseek-v4-future",
+        DeepSeekModelCapabilities(
+            responses_api=False,
+            native_web_search=True,
+        ),
+    )
+
+    assert not deepseek_supports_native_web_search("deepseek-v4-future")
+    assert deepseek_api_mode("deepseek-v4-future") == "chat_completions"
 
 
 @pytest.mark.parametrize(
@@ -125,17 +158,17 @@ def test_runtime_normalizes_retired_alias_before_wire_selection(deepseek_runtime
     assert resolved["base_url"] == "https://api.deepseek.com"
 
 
-def test_runtime_target_pro_overrides_stale_persisted_responses_mode(deepseek_runtime, monkeypatch):
+def test_runtime_target_pro_overrides_stale_persisted_chat_mode(deepseek_runtime, monkeypatch):
     monkeypatch.setattr(rp, "_get_model_config", lambda: {
         "provider": "deepseek",
         "default": "deepseek-v4-flash",
-        "api_mode": "codex_responses",
+        "api_mode": "chat_completions",
     })
     resolved = rp.resolve_runtime_provider(
         requested="deepseek", target_model="deepseek-v4-pro"
     )
-    assert resolved["api_mode"] == "chat_completions"
-    assert resolved["base_url"] == "https://api.deepseek.com/v1"
+    assert resolved["api_mode"] == "codex_responses"
+    assert resolved["base_url"] == "https://api.deepseek.com"
 
 
 @pytest.mark.parametrize(
@@ -150,10 +183,10 @@ def test_runtime_target_pro_overrides_stale_persisted_responses_mode(deepseek_ru
         ),
         (
             "deepseek-v4-pro",
-            "codex_responses",
-            "https://api.deepseek.com",
             "chat_completions",
             "https://api.deepseek.com/v1",
+            "codex_responses",
+            "https://api.deepseek.com",
         ),
     ],
 )
@@ -246,7 +279,7 @@ def test_direct_agent_init_normalizes_alias_before_wire_selection(monkeypatch, t
     assert agent.base_url == "https://api.deepseek.com"
 
 
-def test_direct_agent_init_keeps_pro_on_chat_completions(monkeypatch, tmp_path):
+def test_direct_agent_init_routes_pro_to_responses(monkeypatch, tmp_path):
     from unittest.mock import MagicMock
 
     from run_agent import AIAgent
@@ -257,20 +290,23 @@ def test_direct_agent_init_keeps_pro_on_chat_completions(monkeypatch, tmp_path):
     monkeypatch.setattr("run_agent.check_toolset_requirements", lambda: {})
     agent = AIAgent(
         api_key="sk-test",
-        base_url="https://api.deepseek.com",
+        base_url="https://api.deepseek.com/v1",
         provider="deepseek",
-        api_mode="codex_responses",
+        api_mode="chat_completions",
         model="deepseek-v4-pro",
         max_iterations=1,
         quiet_mode=True,
         skip_context_files=True,
         skip_memory=True,
     )
-    assert agent.api_mode == "chat_completions"
-    assert agent.base_url == "https://api.deepseek.com/v1"
+    assert agent.api_mode == "codex_responses"
+    assert agent.base_url == "https://api.deepseek.com"
 
 
-def test_main_request_builder_uses_explicit_native_search_backend(monkeypatch, tmp_path):
+@pytest.mark.parametrize("model", ["deepseek-v4-flash", "deepseek-v4-pro"])
+def test_main_request_builder_uses_explicit_native_search_backend(
+    monkeypatch, tmp_path, model
+):
     from unittest.mock import MagicMock
 
     from run_agent import AIAgent
@@ -291,7 +327,7 @@ def test_main_request_builder_uses_explicit_native_search_backend(monkeypatch, t
         api_key="sk-test",
         base_url="https://api.deepseek.com/v1",
         provider="deepseek",
-        model="deepseek-v4-flash",
+        model=model,
         max_iterations=1,
         quiet_mode=True,
         skip_context_files=True,

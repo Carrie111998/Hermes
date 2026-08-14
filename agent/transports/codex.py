@@ -594,6 +594,18 @@ class ResponsesApiTransport(ProviderTransport):
                 XAI_GROK46_EFFORTS if is_grok_46_family(model)
                 else XAI_LEGACY_EFFORTS
             )
+        elif is_deepseek_responses:
+            from agent.reasoning_effort import (
+                DEEPSEEK_RESPONSES_EFFORTS,
+                DEEPSEEK_RESPONSES_OVERRIDES,
+            )
+
+            _supported = DEEPSEEK_RESPONSES_EFFORTS
+            reasoning_effort = clamp_effort(
+                reasoning_effort,
+                _supported,
+                DEEPSEEK_RESPONSES_OVERRIDES,
+            )
         elif (params.get("provider") or "").strip().lower() == "actual":
             # Actual Computer relays to SGLang/vLLM backends:
             # none/low/medium/high/max.
@@ -603,7 +615,8 @@ class ResponsesApiTransport(ProviderTransport):
             # (live-verified: "max" is gpt-5.6-only, "minimal" always
             # rejected). #68365 premise confirmed.
             _supported = codex_supported_efforts(model)
-        reasoning_effort = clamp_effort(reasoning_effort, _supported)
+        if not is_deepseek_responses:
+            reasoning_effort = clamp_effort(reasoning_effort, _supported)
 
         response_tools = _responses_tools(tools)
 
@@ -789,6 +802,11 @@ class ResponsesApiTransport(ProviderTransport):
             and not is_deepseek_responses
         ):
             kwargs["include"] = []
+        elif is_deepseek_responses:
+            # DeepSeek thinking is enabled by default. Omitting ``reasoning``
+            # therefore does not honor reasoning.enabled=false; ``none`` is
+            # the provider's explicit Responses API disable value.
+            kwargs["reasoning"] = {"effort": "none"}
 
         request_overrides = params.get("request_overrides")
         if request_overrides:

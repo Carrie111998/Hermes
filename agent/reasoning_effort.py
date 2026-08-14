@@ -129,6 +129,16 @@ GLM53_OVERRIDES: dict[str, str] = {"xhigh": "max"}
 DEEPSEEK_V4_EFFORTS: tuple[str, ...] = ("low", "medium", "high", "max")
 DEEPSEEK_V4_OVERRIDES: dict[str, str] = {"xhigh": "max"}
 
+#: DeepSeek Responses API accepts none/low/high/max. Its documented mapping
+#: promotes medium to high and maps xhigh to high; ``none`` disables thinking.
+DEEPSEEK_RESPONSES_EFFORTS: tuple[str, ...] = ("none", "low", "high", "max")
+DEEPSEEK_RESPONSES_OVERRIDES: dict[str, str] = {
+    "minimal": "low",
+    "medium": "high",
+    "xhigh": "high",
+    "ultra": "max",
+}
+
 #: Ollama Cloud /v1/chat/completions: accepts {none, low, medium, high, max};
 #: rejects ``minimal`` with HTTP 400. ``xhigh`` requests the top tier.
 OLLAMA_CLOUD_EFFORTS: tuple[str, ...] = ("none", "low", "medium", "high", "max")
