@@ -19,6 +19,7 @@ import asyncio
 import dataclasses
 import hashlib
 import inspect
+import json
 import logging
 import os
 import re
@@ -571,6 +572,44 @@ class GatewaySlashCommandsMixin:
             output = output[:3800] + "\n" + t("gateway.kanban.truncated_suffix")
         return output or t("gateway.kanban.no_output")
 
+    def _resolve_active_runtime_route(self, session_key: str) -> tuple[str, str, bool]:
+        """Resolve the live/cached agent's active runtime model route.
+
+        Provider fallback can switch ``agent.model``/``agent.provider`` after
+        the session row was created (#83910). Returns ``(model, provider,
+        fallback_active)`` so /status and /model can label the route that
+        actually answered calls instead of presenting the configured primary
+        as "current". Empty strings when no agent route is known (idle
+        session that never ran).
+        """
+        from gateway.run import _AGENT_PENDING_SENTINEL
+
+        agent = None
+        if hasattr(self, "_running_agents"):
+            agent = self._running_agents.get(session_key)
+        if agent is None or agent is _AGENT_PENDING_SENTINEL:
+            agent = None
+            cache_lock = getattr(self, "_agent_cache_lock", None)
+            cache = getattr(self, "_agent_cache", None)
+            if cache_lock is not None and cache is not None:
+                try:
+                    with cache_lock:
+                        cached = cache.get(session_key)
+                    if cached:
+                        agent = cached[0]
+                except Exception:
+                    agent = None
+        if agent is None or agent is _AGENT_PENDING_SENTINEL:
+            return "", "", False
+        model = getattr(agent, "model", None)
+        provider = getattr(agent, "provider", None)
+        fallback_active = bool(getattr(agent, "_fallback_activated", False))
+        return (
+            model.strip() if isinstance(model, str) else "",
+            provider.strip() if isinstance(provider, str) else "",
+            fallback_active,
+        )
+
     async def _handle_status_command(self, event: MessageEvent) -> str:
         """Handle /status command."""
         from gateway.run import _AGENT_PENDING_SENTINEL, _load_gateway_config, _resolve_gateway_model
@@ -651,10 +690,14 @@ class GatewaySlashCommandsMixin:
         base_url = ""
         context_used = 0
         context_total = 0
+        fallback_active = False
         if status_agent is not None and status_agent is not _AGENT_PENDING_SENTINEL:
             model_name = _clean_str(getattr(status_agent, "model", ""))
             provider_name = _clean_str(getattr(status_agent, "provider", ""))
             base_url = _clean_str(getattr(status_agent, "base_url", ""))
+            fallback_active = bool(
+                getattr(status_agent, "_fallback_activated", False)
+            )
             ctx = getattr(status_agent, "context_compressor", None)
             if ctx is not None:
                 context_used = _int_value(getattr(ctx, "last_prompt_tokens", 0))
@@ -665,8 +708,21 @@ class GatewaySlashCommandsMixin:
         base_url = base_url or _clean_str(session_row.get("billing_base_url"))
         context_used = context_used or _int_value(getattr(session_entry, "last_prompt_tokens", 0))
 
+        # Between turns the live agent may be gone; trust the persisted
+        # gateway_runtime metadata (written by _sync_session_model_from_agent
+        # after each turn) for the fallback flag (#83910).
+        if not fallback_active:
+            try:
+                _mc = session_row.get("model_config")
+                if isinstance(_mc, str) and _mc:
+                    _parsed = json.loads(_mc)
+                    _gateway_runtime = (_parsed or {}).get("gateway_runtime") or {}
+                    fallback_active = bool(_gateway_runtime.get("fallback_active"))
+            except Exception:
+                pass
+
         user_config: dict[str, Any] = {}
-        if not model_name or not provider_name or not context_total:
+        if not model_name or not provider_name or not context_total or fallback_active:
             try:
                 user_config = _load_gateway_config()
             except Exception:
@@ -686,7 +742,18 @@ class GatewaySlashCommandsMixin:
         model_line = ""
         if model_name:
             if provider_name:
-                model_line = t("gateway.status.model_provider", model=model_name, provider=provider_name)
+                if fallback_active:
+                    model_line = t(
+                        "gateway.status.model_fallback",
+                        model=model_name,
+                        provider=provider_name,
+                    )
+                else:
+                    model_line = t(
+                        "gateway.status.model_provider",
+                        model=model_name,
+                        provider=provider_name,
+                    )
             else:
                 model_line = t("gateway.status.model", model=model_name)
 
@@ -715,6 +782,27 @@ class GatewaySlashCommandsMixin:
         ])
         if model_line:
             lines.append(model_line)
+            if fallback_active:
+                # The runtime route is on fallback — surface the configured
+                # primary so the user sees both layers of state (#83910).
+                _cfg_model = ""
+                _cfg_provider = ""
+                _status_model_cfg = (
+                    user_config.get("model", {})
+                    if isinstance(user_config, dict)
+                    else {}
+                )
+                if isinstance(_status_model_cfg, dict):
+                    _cfg_model = _clean_str(_status_model_cfg.get("default"))
+                    _cfg_provider = _clean_str(_status_model_cfg.get("provider"))
+                if _cfg_model and _cfg_model != model_name:
+                    lines.append(
+                        t(
+                            "gateway.status.model_configured_primary",
+                            model=_cfg_model,
+                            provider=_cfg_provider or "unknown",
+                        )
+                    )
         if context_line:
             lines.append(context_line)
         lines.extend([
@@ -1765,6 +1853,11 @@ class GatewaySlashCommandsMixin:
         current_provider = "openrouter"
         current_base_url = ""
         current_api_key = ""
+        # Raw config values, kept separate from the session override below so
+        # the no-args listing can distinguish the configured primary from a
+        # session /model override and from the active runtime route (#83910).
+        configured_model = ""
+        configured_provider = ""
         user_provs = None
         custom_provs = None
         excluded_provs = []
@@ -1777,6 +1870,8 @@ class GatewaySlashCommandsMixin:
                     current_model = model_cfg.get("default", "")
                     current_provider = model_cfg.get("provider", current_provider)
                     current_base_url = model_cfg.get("base_url", "")
+                    configured_model = current_model
+                    configured_provider = current_provider
                 user_provs = cfg.get("providers")
                 try:
                     from hermes_cli.config import get_compatible_custom_providers
@@ -2124,7 +2219,41 @@ class GatewaySlashCommandsMixin:
 
             # Fallback: text list (for platforms without picker or if picker failed)
             provider_label = get_label(current_provider)
-            lines = [t("gateway.model.current_label", model=current_model or "unknown", provider=provider_label), ""]
+
+            # Distinguish the configured primary from the live runtime route.
+            # When provider fallback is active the running agent answers from
+            # a different model/provider, so the configured value must not be
+            # labeled "Current" (#83910).
+            runtime_model, runtime_provider, fallback_active = (
+                self._resolve_active_runtime_route(session_key)
+            )
+            lines: list[str] = []
+            if fallback_active and runtime_model:
+                lines.append(
+                    t(
+                        "gateway.model.configured_primary_label",
+                        model=configured_model or "unknown",
+                        provider=get_label(configured_provider) if configured_provider else "",
+                    )
+                )
+                if override and override.get("model"):
+                    lines.append(
+                        t(
+                            "gateway.model.session_override_label",
+                            model=override.get("model"),
+                            provider=get_label(override.get("provider") or ""),
+                        )
+                    )
+                lines.append(
+                    t(
+                        "gateway.model.active_route_label",
+                        model=runtime_model,
+                        provider=get_label(runtime_provider) if runtime_provider else runtime_provider,
+                    )
+                )
+                lines.append("")
+            else:
+                lines = [t("gateway.model.current_label", model=current_model or "unknown", provider=provider_label), ""]
 
             try:
                 # Offload blocking provider-listing off the event loop so the
