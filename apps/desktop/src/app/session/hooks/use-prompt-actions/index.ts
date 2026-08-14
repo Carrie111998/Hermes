@@ -572,6 +572,7 @@ export function usePromptActions({
     branchCurrentSession,
     busyRef,
     copy,
+    commandDescs: t.composer.commandDescs,
     createBackendSessionForSend,
     getRoutedStoredSessionId,
     getRuntimeIdForStoredSession,
