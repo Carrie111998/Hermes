@@ -1071,13 +1071,19 @@ class TeamsAdapter(BasePlatformAdapter):
         hermes_action = data.get("hermes_action", "")
         session_key = data.get("session_key", "")
 
-        if not hermes_action or not session_key:
+        if not hermes_action:
             return InvokeResponse(
                 status=200,
                 body=AdaptiveCardActionMessageResponse(value="Unknown action."),
             )
 
-        # Only authorized users may click approval buttons.
+        # Cache conversation ref so proactive follow-ups (claim results, etc.)
+        # can land back in the same channel/thread.
+        conv_id = getattr(getattr(ctx.activity, "conversation", None), "id", None)
+        if conv_id:
+            self._conv_refs[conv_id] = ctx.conversation_ref
+
+        # Only authorized users may click approval / custom card buttons.
         # Default-deny: require either TEAMS_ALLOWED_USERS or an explicit
         # TEAMS_ALLOW_ALL_USERS=true opt-in. Without one of these set, the
         # bot silently treated every clicker as authorized — meaning any
@@ -1107,6 +1113,15 @@ class TeamsAdapter(BasePlatformAdapter):
                     body=AdaptiveCardActionMessageResponse(value="⛔ Not authorized."),
                 )
 
+        # Plugin-registered Action.Execute handlers (firm workflows, etc.).
+        # Checked before built-in approvals so custom actions don't need a
+        # session_key. First matching non-None result wins.
+        plugin_response = await self._dispatch_plugin_card_action(
+            hermes_action, ctx=ctx, data=data
+        )
+        if plugin_response is not None:
+            return plugin_response
+
         choice_map = {
             "approve_once": "once",
             "approve_session": "session",
@@ -1115,6 +1130,12 @@ class TeamsAdapter(BasePlatformAdapter):
         }
         choice = choice_map.get(hermes_action)
         if not choice:
+            return InvokeResponse(
+                status=200,
+                body=AdaptiveCardActionMessageResponse(value="Unknown action."),
+            )
+
+        if not session_key:
             return InvokeResponse(
                 status=200,
                 body=AdaptiveCardActionMessageResponse(value="Unknown action."),
@@ -1153,6 +1174,87 @@ class TeamsAdapter(BasePlatformAdapter):
             body=AdaptiveCardActionCardResponse(
                 value=AdaptiveCard().with_version("1.4").with_body(body)
             ),
+        )
+
+    async def _dispatch_plugin_card_action(
+        self,
+        hermes_action: str,
+        *,
+        ctx: "ActivityContext[AdaptiveCardInvokeActivity]",
+        data: Dict[str, Any],
+    ) -> "Optional[InvokeResponse]":
+        """Dispatch a card invoke to plugin-registered Teams handlers."""
+        try:
+            from hermes_cli.plugins import get_plugin_manager
+
+            handlers = get_plugin_manager().get_teams_card_action_handlers()
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("[teams] Could not load plugin card action handlers: %s", exc)
+            return None
+
+        for action_id, callback, plugin_name in handlers:
+            if action_id != hermes_action:
+                continue
+            try:
+                result = await callback(ctx=ctx, data=data, adapter=self)
+            except Exception as exc:
+                logger.error(
+                    "[teams] Plugin '%s' card action '%s' raised: %s",
+                    plugin_name,
+                    hermes_action,
+                    exc,
+                    exc_info=True,
+                )
+                return InvokeResponse(
+                    status=200,
+                    body=AdaptiveCardActionMessageResponse(
+                        value=f"⚠️ Action failed ({plugin_name}). Check gateway logs."
+                    ),
+                )
+            if result is None:
+                continue
+            return self._coerce_card_action_response(result)
+
+        return None
+
+    def _coerce_card_action_response(self, result: Any) -> "InvokeResponse":
+        """Normalize plugin handler return values into an InvokeResponse."""
+        if isinstance(result, InvokeResponse):
+            return result
+        if isinstance(result, str):
+            return InvokeResponse(
+                status=200,
+                body=AdaptiveCardActionMessageResponse(value=result),
+            )
+        # AdaptiveCard SDK object
+        if AdaptiveCard is not None and isinstance(result, AdaptiveCard):
+            return InvokeResponse(
+                status=200,
+                body=AdaptiveCardActionCardResponse(value=result),
+            )
+        # Raw Adaptive Card dict → rebuild via SDK when possible
+        if isinstance(result, dict) and result.get("type") == "AdaptiveCard":
+            try:
+                card = AdaptiveCard().with_version(str(result.get("version") or "1.4"))
+                # Prefer message response with a short status if body is complex;
+                # plugins that need a full replace should return AdaptiveCard.
+                title = "Done."
+                for block in result.get("body") or []:
+                    if isinstance(block, dict) and block.get("type") == "TextBlock":
+                        title = str(block.get("text") or title)
+                        break
+                return InvokeResponse(
+                    status=200,
+                    body=AdaptiveCardActionMessageResponse(value=title),
+                )
+            except Exception:
+                return InvokeResponse(
+                    status=200,
+                    body=AdaptiveCardActionMessageResponse(value="Done."),
+                )
+        return InvokeResponse(
+            status=200,
+            body=AdaptiveCardActionMessageResponse(value=str(result)),
         )
 
     async def send_exec_approval(

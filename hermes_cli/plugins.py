@@ -2927,6 +2927,64 @@ class PluginContext:
         )
         return handle
 
+    # -- teams card action handler registration -----------------------------
+
+    def register_teams_card_action_handler(
+        self,
+        hermes_action: str,
+        callback: Callable,
+    ) -> PluginRegistration:
+        """Register a Teams Adaptive Card ``Action.Execute`` handler.
+
+        Hermes' Teams adapter dispatches card invokes whose
+        ``data.hermes_action`` matches ``hermes_action`` to the callback
+        (after the built-in approval actions). Use this for firm-specific
+        workflows (e.g. claim a referral) without patching the adapter.
+
+        Callback signature::
+
+            async def handler(*, ctx, data, adapter) -> Any:
+                # ctx: ActivityContext for the card invoke
+                # data: action.data dict from the Adaptive Card
+                # adapter: TeamsAdapter instance
+                # Return a short status string, an AdaptiveCard / card dict,
+                # an InvokeResponse, or None to decline the match.
+
+        Args:
+            hermes_action: Exact ``data.hermes_action`` string to match.
+            callback: Async callable receiving ``ctx``, ``data``, ``adapter``.
+
+        Raises:
+            ValueError: if ``callback`` is not callable, or ``hermes_action``
+                is empty.
+        """
+        if not callable(callback):
+            raise ValueError(
+                f"Plugin '{self.manifest.name}' tried to register a Teams "
+                f"card action handler with a non-callable callback."
+            )
+        if not isinstance(hermes_action, str) or not hermes_action.strip():
+            raise ValueError(
+                f"Plugin '{self.manifest.name}' tried to register a Teams "
+                f"card action handler with an empty hermes_action."
+            )
+        key = hermes_action.strip()
+        entry = (key, callback, self.manifest.name)
+        self._manager._teams_card_action_handlers.append(entry)
+        handle = self._track(
+            "teams_card_action_handler",
+            key,
+            lambda: self._manager._remove_identity(
+                self._manager._teams_card_action_handlers, entry
+            ),
+        )
+        logger.debug(
+            "Plugin %s registered Teams card action handler: %s",
+            self.manifest.name,
+            key,
+        )
+        return handle
+
     # -- hook registration --------------------------------------------------
 
     # -- auxiliary task registration ---------------------------------------
@@ -3437,6 +3495,11 @@ class PluginManager:
         # ``re.Pattern``, or a constraint dict); ``callback`` is an async
         # function with the slack_bolt signature ``(ack, body, action)``.
         self._slack_action_handlers: List[tuple] = []
+        # Teams Adaptive Card Action.Execute handlers registered by plugins.
+        # Each entry is (hermes_action, callback, plugin_name). The Teams
+        # adapter dispatches on ``data.hermes_action`` at card-invoke time.
+        # Callback: ``async def handler(*, ctx, data, adapter) -> Any``.
+        self._teams_card_action_handlers: List[tuple] = []
         # Registration handles are kept both per plugin (ownership lookup) and
         # globally (reverse-order teardown for overrides spanning plugins).
         #
@@ -3717,6 +3780,7 @@ class PluginManager:
             self._system_prompt_sections.clear()
             self._approval_transports.clear()
             self._slack_action_handlers.clear()
+            self._teams_card_action_handlers.clear()
             self._context_engine = None
             self._discovered = False
         else:
@@ -5289,6 +5353,17 @@ class PluginManager:
         :meth:`PluginContext.register_slack_action_handler`.
         """
         return list(self._slack_action_handlers)
+
+    def get_teams_card_action_handlers(self) -> List[tuple]:
+        """Return plugin-registered Teams Adaptive Card action handlers.
+
+        Each entry is a ``(hermes_action, callback, plugin_name)`` tuple.
+        Consumed by the Teams adapter on ``Action.Execute`` invokes.
+
+        Plugins register handlers via
+        :meth:`PluginContext.register_teams_card_action_handler`.
+        """
+        return list(self._teams_card_action_handlers)
 
     # -----------------------------------------------------------------------
     # Introspection
