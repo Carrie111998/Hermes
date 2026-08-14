@@ -11272,6 +11272,28 @@ def remove_notify_sub(
     return cur.rowcount > 0
 
 
+def remove_notify_sub_if_claim_owned(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    platform: str,
+    chat_id: str,
+    claim_token: str,
+    thread_id: Optional[str] = None,
+) -> bool:
+    """Delete a subscription only while ``claim_token`` still owns its lease."""
+    if not claim_token:
+        return False
+    with write_txn(conn):
+        cur = conn.execute(
+            "DELETE FROM kanban_notify_subs WHERE task_id = ? "
+            "AND platform = ? AND chat_id = ? AND thread_id = ? "
+            "AND claim_token = ?",
+            (task_id, platform, chat_id, thread_id or "", claim_token),
+        )
+    return cur.rowcount > 0
+
+
 def purge_stale_done_notify_subs(
     conn: sqlite3.Connection,
     *,

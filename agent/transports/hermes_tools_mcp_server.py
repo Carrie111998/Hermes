@@ -168,10 +168,15 @@ def _effective_exposed_tools() -> tuple[str, ...]:
     ``platform_toolsets`` and ``agent.disabled_toolsets``. Dispatcher workers
     carry a task-scoped environment and retain only their lifecycle surface.
     """
-    from agent.delegation_context import is_delegated_child_process_context
+    from agent.delegation_context import (
+        is_delegated_child_process_context,
+        is_dispatcher_owned_worker_context,
+    )
 
-    worker = bool(os.environ.get("HERMES_KANBAN_TASK")) and not (
-        is_delegated_child_process_context()
+    worker = (
+        bool(os.environ.get("HERMES_KANBAN_TASK"))
+        and not is_delegated_child_process_context()
+        and is_dispatcher_owned_worker_context()
     )
     return tuple(
         name

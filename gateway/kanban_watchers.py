@@ -761,7 +761,12 @@ class GatewayKanbanWatchersMixin:
                                     "%s on %s after %d consecutive send failures",
                                     sub["task_id"], platform_str, fails,
                                 )
-                                await asyncio.to_thread(self._kanban_unsub, sub, board_slug)
+                                await asyncio.to_thread(
+                                    self._kanban_unsub,
+                                    sub,
+                                    d["claim_token"],
+                                    board_slug,
+                                )
                                 sub_fail_counts.pop(sub_key, None)
                             else:
                                 await asyncio.to_thread(
@@ -887,7 +892,12 @@ class GatewayKanbanWatchersMixin:
                                         "%s on %s after %d consecutive wake failures",
                                         sub["task_id"], platform_str, fails,
                                     )
-                                    await asyncio.to_thread(self._kanban_unsub, sub, board_slug)
+                                    await asyncio.to_thread(
+                                        self._kanban_unsub,
+                                        sub,
+                                        d["claim_token"],
+                                        board_slug,
+                                    )
                                     sub_fail_counts.pop(sub_key, None)
                                 else:
                                     # Rewind the pre-send claim so the next
@@ -987,7 +997,12 @@ class GatewayKanbanWatchersMixin:
                                         "%s on %s after %d consecutive wake failures",
                                         sub["task_id"], platform_str, fails,
                                     )
-                                    await asyncio.to_thread(self._kanban_unsub, sub, board_slug)
+                                    await asyncio.to_thread(
+                                        self._kanban_unsub,
+                                        sub,
+                                        d["claim_token"],
+                                        board_slug,
+                                    )
                                     sub_fail_counts.pop(sub_key, None)
                                 else:
                                     # Rewind the pre-send claim so the next
@@ -1004,16 +1019,24 @@ class GatewayKanbanWatchersMixin:
 
                         # Delivery complete (text ping for push adapters, wake
                         # self-post for non-push, wake injection for wake-only
-                        # push subs): advance cursor. The cursor is the dedup
-                        # mechanism — it prevents re-delivery of the same
-                        # event on subsequent ticks.
-                        await asyncio.to_thread(
-                            self._kanban_advance,
-                            sub,
-                            d["claim_token"],
-                            d["cursor"],
-                            board_slug,
-                        )
+                        # push subs): settle the claim. Archived tasks remove
+                        # their subscription atomically while this token owns it;
+                        # reversible tasks advance the cursor.
+                        if task_terminal:
+                            await asyncio.to_thread(
+                                self._kanban_unsub,
+                                sub,
+                                d["claim_token"],
+                                board_slug,
+                            )
+                        else:
+                            await asyncio.to_thread(
+                                self._kanban_advance,
+                                sub,
+                                d["claim_token"],
+                                d["cursor"],
+                                board_slug,
+                            )
                         if not _is_push_adapter:
                             # Nothing left to deliver on this path (the wake,
                             # if any, already succeeded above).
@@ -1040,10 +1063,7 @@ class GatewayKanbanWatchersMixin:
                                     "kanban notifier: wakeup injection failed for %s: %s",
                                     sub["task_id"], _wk_err, exc_info=True,
                                 )
-                        if task_terminal:
-                            await asyncio.to_thread(
-                                self._kanban_unsub, sub, board_slug,
-                            )
+
             except Exception as exc:
                 logger.warning("kanban notifier tick failed: %s", exc)
             # Sleep with cancellation checks.
@@ -1075,16 +1095,23 @@ class GatewayKanbanWatchersMixin:
         finally:
             conn.close()
 
-    def _kanban_unsub(self, sub: dict, board: Optional[str] = None) -> None:
+    def _kanban_unsub(
+        self,
+        sub: dict,
+        claim_token: str,
+        board: Optional[str] = None,
+    ) -> None:
+        """Drop a subscription only while this notifier owns its lease."""
         from hermes_cli import kanban_db as _kb
         conn = _kb.connect(board=board)
         try:
-            _kb.remove_notify_sub(
+            _kb.remove_notify_sub_if_claim_owned(
                 conn,
                 task_id=sub["task_id"],
                 platform=sub["platform"],
                 chat_id=sub["chat_id"],
                 thread_id=sub.get("thread_id") or "",
+                claim_token=claim_token,
             )
         finally:
             conn.close()

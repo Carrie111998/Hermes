@@ -268,6 +268,55 @@ def test_expired_notify_claim_rejects_stale_settlement(kanban_home):
         conn2.close()
 
 
+def test_stale_notify_claim_cannot_delete_new_owner_subscription(kanban_home):
+    conn1 = kb.connect()
+    conn2 = kb.connect()
+    try:
+        tid = kb.create_task(conn1, title="owned delete", assignee="w")
+        kb.add_notify_sub(conn1, task_id=tid, platform="telegram", chat_id="123")
+        kb._append_event(conn1, tid, "review_requested", {"summary": "first"})
+        conn1.commit()
+        token_a, _, _, _ = kb.claim_unseen_events_for_sub(
+            conn1,
+            task_id=tid,
+            platform="telegram",
+            chat_id="123",
+            kinds=["review_requested"],
+            now=100,
+            lease_seconds=10,
+        )
+        token_b, _, _, _ = kb.claim_unseen_events_for_sub(
+            conn2,
+            task_id=tid,
+            platform="telegram",
+            chat_id="123",
+            kinds=["review_requested"],
+            now=110,
+            lease_seconds=10,
+        )
+        assert token_a and token_b and token_a != token_b
+
+        assert kb.remove_notify_sub_if_claim_owned(
+            conn1,
+            task_id=tid,
+            platform="telegram",
+            chat_id="123",
+            claim_token=token_a,
+        ) is False
+        assert len(kb.list_notify_subs(conn1, tid)) == 1
+        assert kb.remove_notify_sub_if_claim_owned(
+            conn2,
+            task_id=tid,
+            platform="telegram",
+            chat_id="123",
+            claim_token=token_b,
+        ) is True
+        assert kb.list_notify_subs(conn1, tid) == []
+    finally:
+        conn1.close()
+        conn2.close()
+
+
 def test_notify_claim_lease_prevents_later_success_from_losing_earlier_failure(
     kanban_home,
 ):

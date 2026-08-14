@@ -96,7 +96,7 @@ def _store(path: Path, entries: dict[str, dict]) -> None:
 
 def record_turn_start(
     home: Path | str, session_key: str, prompt: str, *, attempts: int = 0
-) -> None:
+) -> bool:
     """Persist the marker for a turn that is about to run.
 
     ``attempts`` counts how many auto-continues led to this run: 0 for a
@@ -104,7 +104,7 @@ def record_turn_start(
     breaker reads it back on the next resume.
     """
     if not session_key or not prompt:
-        return
+        return False
     now = time.time()
     entry = {
         "attempts": max(0, int(attempts)),
@@ -117,8 +117,10 @@ def record_turn_start(
             entries = _prune(_load(path), now)
             entries[session_key] = entry
             _store(path, entries)
+        return True
     except Exception:
         logger.debug("failed to record turn marker for %s", session_key, exc_info=True)
+        return False
 
 
 def clear_turn_marker(home: Path | str, session_key: str) -> None:

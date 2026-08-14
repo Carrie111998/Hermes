@@ -131,6 +131,17 @@ class TestModuleSurface:
         } <= names
         assert not {"kanban_list", "kanban_create", "kanban_unblock", "kanban_link"} & names
 
+    def test_non_dispatcher_context_cannot_inherit_worker_mcp_tools(self, monkeypatch):
+        from agent.delegation_context import non_dispatcher_owned_context
+        from agent.transports import hermes_tools_mcp_server as m
+
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_worker")
+        with non_dispatcher_owned_context():
+            assert not any(
+                name.startswith("kanban_")
+                for name in m._effective_exposed_tools()
+            )
+
 
 
 class TestMain:

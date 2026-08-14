@@ -24,7 +24,7 @@ import types
 
 import pytest
 
-from tui_gateway import server
+from tui_gateway import server, turn_marker
 from tui_gateway.turn_marker import (
     clear_turn_marker,
     read_turn_marker,
@@ -88,6 +88,20 @@ def marker_home(monkeypatch, tmp_path):
     return tmp_path
 
 
+@pytest.fixture(autouse=True)
+def restore_session_context_latch():
+    """Turn tests must not leak process-global session context state."""
+    from gateway import session_context
+
+    session_context.reset_session_vars()
+    session_context._session_context_engaged = False
+    try:
+        yield
+    finally:
+        session_context.reset_session_vars()
+        session_context._session_context_engaged = False
+
+
 @pytest.fixture()
 def turn_env(monkeypatch, tmp_path, marker_home):
     """Neutralize the turn pipeline's environment-heavy side paths."""
@@ -105,7 +119,7 @@ def turn_env(monkeypatch, tmp_path, marker_home):
 
 
 def test_marker_roundtrip(tmp_path):
-    record_turn_start(tmp_path, "abc", "fix the bug", attempts=1)
+    assert record_turn_start(tmp_path, "abc", "fix the bug", attempts=1) is True
 
     marker = read_turn_marker(tmp_path, "abc")
     assert marker is not None
@@ -115,6 +129,37 @@ def test_marker_roundtrip(tmp_path):
 
     clear_turn_marker(tmp_path, "abc")
     assert read_turn_marker(tmp_path, "abc") is None
+
+
+def test_marker_reports_persistence_failure(tmp_path, monkeypatch):
+    def fail_store(*args, **kwargs):
+        raise OSError("disk unavailable")
+
+    monkeypatch.setattr(turn_marker, "_store", fail_store)
+    assert record_turn_start(tmp_path, "abc", "fix the bug") is False
+    assert read_turn_marker(tmp_path, "abc") is None
+
+
+def test_kanban_claims_settle_only_after_marker_persists(monkeypatch, tmp_path):
+    settled = []
+    claims = [{"claim_token": "lease"}]
+    monkeypatch.setattr(
+        server,
+        "_settle_tui_kanban_claims",
+        lambda *args, **kwargs: settled.append((args, kwargs)),
+    )
+    monkeypatch.setattr(server, "record_turn_start", lambda *args, **kwargs: False)
+
+    assert server._record_tui_kanban_handoff(
+        tmp_path, "session-key", "prompt", attempts=0, claims=claims
+    ) is False
+    assert settled == []
+
+    monkeypatch.setattr(server, "record_turn_start", lambda *args, **kwargs: True)
+    assert server._record_tui_kanban_handoff(
+        tmp_path, "session-key", "prompt", attempts=0, claims=claims
+    ) is True
+    assert len(settled) == 1
 
 
 def test_marker_survives_corrupt_sidecar(tmp_path):
