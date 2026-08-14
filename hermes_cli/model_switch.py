@@ -1344,6 +1344,7 @@ def switch_model(
     new_model = raw_input.strip()
     target_provider = current_provider
     resolved_moa_preset = False
+    config_routed = False
 
     # =================================================================
     # PATH A: Explicit --provider given
@@ -1474,6 +1475,21 @@ def switch_model(
         if alias_result is not None:
             _, new_model, resolved_alias = alias_result
 
+        if not resolved_alias:
+            configured_matches = _configured_provider_matches(
+                new_model, user_providers, custom_providers
+            )
+            explicit_candidates = {
+                target_provider,
+                explicit_provider.strip().lower(),
+                f"custom:{explicit_provider.strip().lower()}",
+            }
+            for candidate in explicit_candidates:
+                if candidate in configured_matches:
+                    new_model = configured_matches[candidate]
+                    config_routed = True
+                    break
+
     # =================================================================
     # PATH B: No explicit provider — resolve from model input
     # =================================================================
@@ -1603,7 +1619,6 @@ def switch_model(
         # detection.  Unlike step e this is deliberately NOT gated on
         # ``not is_custom`` — switching from a local/custom provider A to a
         # configured provider B that declares the typed model is the point.
-        config_routed = False
         if (
             not resolved_alias
             and not resolved_in_current_catalog
@@ -1816,6 +1831,20 @@ def switch_model(
             "recognized": False,
             "message": f"Could not validate `{new_model}`: {e}",
         }
+
+    # An exact saved declaration is authoritative for model identity, but not
+    # for endpoint health. Keep validation and all hard failures; suppress only
+    # the non-blocking discovery warning emitted when an optional custom
+    # endpoint /models listing is unavailable or lags the inference endpoint.
+    validation_message = str(validation.get("message") or "")
+    if (
+        config_routed
+        and validation.get("accepted")
+        and not validation.get("recognized")
+        and "custom endpoint" in validation_message.lower()
+        and "model listing" in validation_message.lower()
+    ):
+        validation = {**validation, "message": None}
 
     # Override rejection if model is in the user's saved provider config.
     # API /v1/models may not list cloud/aliased models even though the server supports them.
