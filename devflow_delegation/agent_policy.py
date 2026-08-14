@@ -16,10 +16,25 @@ _SECRET_NAME_MARKERS = ("KEY", "TOKEN", "SECRET", "PASSWORD", "PASSWD", "CRED", 
 
 # Deny-by-default: only these names survive scrubbing. Everything else is dropped,
 # including innocuous-looking vars, because an allow-list cannot go stale unsafely.
+#
+# Membership is tested as `name.upper() in _ENV_ALLOW` (see scrubbed_env below),
+# because Windows env var names are case-insensitive but are commonly supplied
+# in mixed case (e.g. "SystemDrive", "ProgramData") -- so every entry here MUST
+# be uppercase, or a correctly-cased Windows var will silently fail to match.
+#
+# The Windows path/identity vars below (SYSTEMDRIVE..PUBLIC) are OS path and
+# machine-identity information, not credentials -- that's why they're safe to
+# pass through. Do not "tidy" them away: without %SystemDrive% (etc.) actually
+# expanding, a Windows subprocess falls back to creating a literal
+# "%SystemDrive%" directory on disk instead of resolving the real path (see the
+# regression test in tests/devflow_delegation/test_agent_policy.py).
 _ENV_ALLOW = frozenset({
     "PATH", "PATHEXT", "SYSTEMROOT", "WINDIR", "COMSPEC", "TEMP", "TMP", "TMPDIR",
     "HOME", "USERPROFILE", "LANG", "LC_ALL", "TZ", "OS", "NUMBER_OF_PROCESSORS",
     "PYTHONIOENCODING", "PYTHONUTF8", "PYTHONPATH", "DDP_REQUEST_PATH",
+    "SYSTEMDRIVE", "PROGRAMDATA", "PROGRAMFILES", "PROGRAMFILES(X86)", "PROGRAMW6432",
+    "LOCALAPPDATA", "APPDATA", "ALLUSERSPROFILE", "HOMEDRIVE", "HOMEPATH",
+    "USERNAME", "COMPUTERNAME", "PROCESSOR_ARCHITECTURE", "PUBLIC",
 })
 
 _MIN_SECRET_LEN = 8

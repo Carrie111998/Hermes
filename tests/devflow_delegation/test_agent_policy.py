@@ -29,6 +29,38 @@ def test_scrubbed_env_always_sets_git_terminal_prompt_off():
     assert scrubbed_env({"PATH": "/usr/bin"})["GIT_TERMINAL_PROMPT"] == "0"
 
 
+def test_scrubbed_env_keeps_windows_path_and_identity_vars_in_native_case():
+    # Windows supplies these in mixed case (SystemDrive, ProgramData, ...), and
+    # env var names are case-insensitive on Windows. A subprocess that can't
+    # expand e.g. %SystemDrive% will fall back to creating a literal
+    # "%SystemDrive%" directory -- this is a regression test for exactly that
+    # failure mode (observed in a live agent run: a literal "%SystemDrive%"
+    # directory was created inside the git worktree and counted as an
+    # agent-authored change, blowing the file-count ceiling).
+    base = {
+        "SystemDrive": "C:", "ProgramData": r"C:\ProgramData",
+        "ProgramFiles": r"C:\Program Files", "ProgramFiles(x86)": r"C:\Program Files (x86)",
+        "ProgramW6432": r"C:\Program Files", "LOCALAPPDATA": r"C:\Users\diego\AppData\Local",
+        "APPDATA": r"C:\Users\diego\AppData\Roaming", "ALLUSERSPROFILE": r"C:\ProgramData",
+        "HOMEDRIVE": "C:", "HOMEPATH": r"\Users\diego", "USERNAME": "diego",
+        "COMPUTERNAME": "DESKTOP-X", "PROCESSOR_ARCHITECTURE": "AMD64",
+        "PUBLIC": r"C:\Users\Public",
+    }
+    env = scrubbed_env(base)
+    for name, value in base.items():
+        assert env[name] == value, f"{name} was scrubbed away"
+
+
+def test_scrubbed_env_secret_shaped_name_still_dropped_even_with_new_allowlist_prefix():
+    # A name that happens to share a prefix with a newly allow-listed var but is
+    # still secret-shaped (contains KEY/TOKEN/etc.) must still be dropped -- the
+    # secret-name veto applies to every entry, old and new.
+    base = {"PROGRAMDATA_API_KEY": "sk-live-abc", "APPDATA_TOKEN": "t-123"}
+    env = scrubbed_env(base)
+    assert "PROGRAMDATA_API_KEY" not in env
+    assert "APPDATA_TOKEN" not in env
+
+
 def test_secret_values_returns_the_values_that_were_dropped():
     values = secret_values({"PATH": "/usr/bin", "OPENAI_API_KEY": "sk-live-abc", "X_TOKEN": "t-123"})
     assert "sk-live-abc" in values
