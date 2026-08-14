@@ -1700,9 +1700,11 @@ KANBAN_SHOW_SCHEMA = {
         "Read a task's full state — title, body, assignee, parent task "
         "handoffs, your prior attempts on this task if any, comments, "
         "and recent events. Use this to (re)orient yourself before "
-        "starting work, especially on retries. The response includes a "
+        "starting work, especially on retries. When a dispatcher-owned "
+        "worker reads its own task, the response also includes a "
         "pre-formatted ``worker_context`` string suitable for inclusion "
-        "verbatim in your reasoning."
+        "verbatim in its reasoning; other callers receive only the "
+        "structured task fields."
     ),
     "parameters": {
         "type": "object",
