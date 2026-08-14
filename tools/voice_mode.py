@@ -13,6 +13,7 @@ import difflib
 import logging
 import math
 import os
+import queue
 import signal
 import platform
 import re
@@ -1725,6 +1726,96 @@ def play_audio_file(file_path: str) -> bool:
         return _play_audio_file_impl(file_path)
     finally:
         mark_audio_output_active(False)
+
+
+# ---------------------------------------------------------------------------
+# Per-session serial playback queue (#23065)
+#
+# play_audio_file_queued(file_path, key) serializes playback per *key* (a
+# chat/session id): requests sharing a key play one at a time in arrival
+# order — nothing overlaps and nothing is dropped. Different keys still
+# barge-in each other through the global arbitration inside play_audio_file
+# (a user-initiated read-aloud in another session wins, which is the desired
+# interrupt semantics). If a queued item is barged-in (returns False), the
+# rest of that key's queue is drained (all report False) and the worker
+# pauses — auto-continuing would immediately re-fight the newer playback.
+# ---------------------------------------------------------------------------
+class _PlaybackQueue:
+    """Per-key serial executor. One daemon worker per active key; the worker
+    exits after _IDLE_TIMEOUT of inactivity so many long-lived keys (gateway
+    chats) don't pile up threads."""
+
+    _IDLE_TIMEOUT = 5.0
+
+    def __init__(self) -> None:
+        self._q: "queue.Queue[tuple[str, threading.Event, list[bool]]]" = queue.Queue()
+        self._lock = threading.Lock()
+        self._worker_started = False
+
+    def submit_and_wait(self, file_path: str) -> bool:
+        done = threading.Event()
+        result: list[bool] = [False]
+        with self._lock:
+            self._q.put((file_path, done, result))
+            if not self._worker_started:
+                self._worker_started = True
+                threading.Thread(
+                    target=self._run, daemon=True, name="tts-playback-queue"
+                ).start()
+        done.wait()
+        return result[0]
+
+    def _run(self) -> None:
+        try:
+            while True:
+                try:
+                    file_path, done, result = self._q.get(timeout=self._IDLE_TIMEOUT)
+                except queue.Empty:
+                    with self._lock:
+                        if self._q.empty():
+                            return  # idle -> next submit restarts us
+                        continue
+                played = play_audio_file(file_path)
+                result[0] = played
+                done.set()
+                if not played:
+                    # Barged-in by a newer playback (cross-key) or stopped:
+                    # drain the rest of this key's queue — auto-continuing
+                    # would immediately re-interrupt whoever superseded us.
+                    self._drain()
+                    return
+        finally:
+            with self._lock:
+                self._worker_started = False
+
+    def _drain(self) -> None:
+        while True:
+            try:
+                _, done, result = self._q.get_nowait()
+            except queue.Empty:
+                return
+            result[0] = False
+            done.set()
+
+
+_PLAYBACK_QUEUES: Dict[str, _PlaybackQueue] = {}
+_PLAYBACK_QUEUES_LOCK = threading.Lock()
+
+
+def play_audio_file_queued(file_path: str, key: Optional[str] = None) -> bool:
+    """Play *file_path*, serialized per *key* (session/chat id).
+
+    Without a key this is exactly :func:`play_audio_file` (global barge-in).
+    With a key, requests sharing the key play in arrival order with no
+    overlap (#23065: auto_tts replies must not stack). A cross-key request
+    still barges in (latest user intent wins); the interrupted key's queue
+    is drained so it cannot immediately re-fight the newer playback.
+    """
+    if not key:
+        return play_audio_file(file_path)
+    with _PLAYBACK_QUEUES_LOCK:
+        q = _PLAYBACK_QUEUES.setdefault(key, _PlaybackQueue())
+    return q.submit_and_wait(file_path)
 
 
 def _play_audio_file_impl(file_path: str) -> bool:

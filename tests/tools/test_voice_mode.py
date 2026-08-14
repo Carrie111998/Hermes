@@ -1868,3 +1868,135 @@ class TestCrossProcessArbitration:
 
         # Must not raise; stale pidfiles are normal (crashed process).
         vm._interrupt_other_process_playback()
+
+
+class TestQueuedPlayback:
+    """Per-key serial playback queue (#23065).
+
+    play_audio_file_queued(file_path, key) plays requests sharing a key in
+    arrival order with no overlap; different keys barge-in each other via the
+    global arbitration; a barged-in key's queue is drained so it can't
+    immediately re-fight the newer playback.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _isolate(self, monkeypatch):
+        import tools.voice_mode as vm
+
+        monkeypatch.setattr(vm, "_PLAYBACK_QUEUES", {})
+        monkeypatch.setattr(vm, "_import_audio", lambda: (MagicMock(), None))
+
+    def _install_fake_popen(self, monkeypatch, dur=0.2):
+        import tools.voice_mode as vm
+
+        state = {"active": 0, "max": 0, "spawns": 0}
+
+        class FP:
+            pid = 3000
+
+            def __init__(self):
+                self.terminated = False
+                self.returncode = None
+                self.args = []
+
+            def poll(self):
+                return -15 if self.terminated else None
+
+            def terminate(self):
+                self.terminated = True
+
+            def kill(self):
+                self.terminated = True
+
+            def communicate(self, input=None, timeout=None):
+                return b"", b""
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def wait(self, timeout=None):
+                state["active"] += 1
+                state["max"] = max(state["max"], state["active"])
+                deadline = time.monotonic() + dur
+                while self.poll() is None and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                state["active"] -= 1
+                if self.terminated:
+                    return -15
+                self.returncode = 0
+                return 0
+
+        def _fp(cmd, **kw):
+            state["spawns"] += 1
+            return FP()
+
+        monkeypatch.setattr("subprocess.Popen", _fp)
+        return state
+
+    @pytest.mark.macos_only
+    def test_same_key_serializes(self, monkeypatch, sample_wav):
+        import tools.voice_mode as vm
+
+        state = self._install_fake_popen(monkeypatch, dur=0.2)
+        results = {}
+
+        def sub(tag):
+            results[tag] = vm.play_audio_file_queued(sample_wav, key="chat-1")
+
+        t0 = time.monotonic()
+        t1 = threading.Thread(target=lambda: sub("a"))
+        t2 = threading.Thread(target=lambda: sub("b"))
+        t1.start()
+        time.sleep(0.05)
+        t2.start()  # arrives while "a" is still playing -> must queue
+        t1.join()
+        t2.join()
+        elapsed = time.monotonic() - t0
+
+        assert results["a"] is True
+        assert results["b"] is True
+        assert state["max"] == 1, "same-key plays must never overlap"
+        assert elapsed >= 0.35, f"serialized ~2x dur expected, got {elapsed:.2f}s"
+
+    @pytest.mark.macos_only
+    def test_no_key_is_plain_barge_in(self, monkeypatch, sample_wav):
+        import tools.voice_mode as vm
+
+        self._install_fake_popen(monkeypatch)
+        assert vm.play_audio_file_queued(sample_wav) is True
+        assert vm.play_audio_file_queued(sample_wav, key=None) is True
+
+    @pytest.mark.macos_only
+    def test_cross_key_barge_in_drains_queued(self, monkeypatch, sample_wav):
+        import tools.voice_mode as vm
+
+        self._install_fake_popen(monkeypatch, dur=0.4)
+        results = {}
+
+        def pa():
+            results["A"] = vm.play_audio_file_queued(sample_wav, key="k1")
+
+        def pb():
+            results["B"] = vm.play_audio_file_queued(sample_wav, key="k1")
+
+        def pc():
+            results["C"] = vm.play_audio_file_queued(sample_wav, key="k2")
+
+        ta = threading.Thread(target=pa)
+        tb = threading.Thread(target=pb)
+        tc = threading.Thread(target=pc)
+        ta.start()
+        time.sleep(0.05)
+        tb.start()  # queues behind A (same key)
+        time.sleep(0.05)
+        tc.start()  # different key -> barges in, interrupting A
+        ta.join()
+        tb.join()
+        tc.join()
+
+        assert results["A"] is False, "A barged-in by C"
+        assert results["C"] is True, "C (latest) plays through"
+        assert results["B"] is False, "B drained after A was interrupted"

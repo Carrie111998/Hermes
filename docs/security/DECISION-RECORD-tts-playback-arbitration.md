@@ -76,6 +76,27 @@ next player in the list.**
   next `_interrupt` reads them, the comm check fails or the PID is dead, and
   the file is overwritten by the next player.
 
+## Decision 6: Per-session serial queue vs global barge-in (follow-up, #23065)
+
+After review triage cross-linked #23065 (serial TTS playback for auto_tts),
+we added `play_audio_file_queued(file_path, key)` as a **complementary**
+layer rather than replacing barge-in:
+
+- **Same key** (a chat/session id) → requests play in arrival order, one at
+  a time: nothing overlaps, nothing is dropped (the #23065 auto_tts
+  contract).
+- **Different keys / no key** → the global barge-in arbitration still rules:
+  a user-initiated read-aloud in another session interrupts, latest intent
+  wins.
+- **Interrupted queue** → when a queued item is barged-in (returns False),
+  the rest of that key's queue is drained (all report False) and the worker
+  pauses. Auto-continuing would immediately re-fight the newer playback.
+
+Implementation: `_PlaybackQueue` — one daemon worker per active key, worker
+exits after 5s idle (many gateway chats don't pile up threads), restarted on
+next submit. Callers that want serialized auto-tts pass their session/chat id
+as `key`; the existing desktop read-aloud path stays key-less (barge-in).
+
 ## Consequences
 
 - **Positive:** no audio stacking within or across Hermes processes; barge-in
