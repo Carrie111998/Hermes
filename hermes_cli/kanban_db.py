@@ -8526,6 +8526,212 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
         return True
 
 
+CONFIGURE_TASK_SNAPSHOT_FIELDS = TASK_SNAPSHOT_FIELDS + (
+    "source_policy",
+    "max_retries",
+    "max_runtime_seconds",
+    "goal_mode",
+)
+CONFIGURE_TASK_ELIGIBLE_STATUSES = frozenset(
+    {"triage", "todo", "scheduled", "ready", "blocked", "review"}
+)
+
+
+def _execution_source_policy(row: Mapping[str, Any]) -> str:
+    required = bool(row["source_commit_required"])
+    forbidden = bool(row["source_commit_forbidden"])
+    if required and forbidden:
+        raise RuntimeError(
+            "task has conflicting source commit policy flags; repair the task "
+            "before changing its execution contract"
+        )
+    if required:
+        return "required"
+    if forbidden:
+        return "forbidden"
+    return "none"
+
+
+def execution_contract_from_row(row: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "source_policy": _execution_source_policy(row),
+        "max_retries": row["max_retries"],
+        "max_runtime_seconds": row["max_runtime_seconds"],
+        "goal_mode": bool(row["goal_mode"]),
+    }
+
+
+def task_execution_contract(task: Task) -> dict[str, Any]:
+    if task.source_commit_required and task.source_commit_forbidden:
+        raise RuntimeError("task has conflicting source commit policy flags")
+    source_policy = "none"
+    if task.source_commit_required:
+        source_policy = "required"
+    elif task.source_commit_forbidden:
+        source_policy = "forbidden"
+    return {
+        "source_policy": source_policy,
+        "max_retries": task.max_retries,
+        "max_runtime_seconds": task.max_runtime_seconds,
+        "goal_mode": bool(task.goal_mode),
+    }
+
+
+def configure_task_snapshot_from_row(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        **task_snapshot_from_row(row),
+        **execution_contract_from_row(row),
+    }
+
+
+def _validate_optional_positive_int(value: Any, field_name: str) -> None:
+    if value is not None and (type(value) is not int or value < 1):
+        raise ValueError(f"{field_name} must be a positive integer or null")
+
+
+def _validate_execution_contract_values(
+    *,
+    source_policy: Any,
+    max_retries: Any,
+    max_runtime_seconds: Any,
+    goal_mode: Any,
+) -> None:
+    if source_policy not in {"none", "required", "forbidden"}:
+        raise ValueError(
+            "source_policy must be one of 'none', 'required', or 'forbidden'"
+        )
+    _validate_optional_positive_int(max_retries, "max_retries")
+    _validate_optional_positive_int(max_runtime_seconds, "max_runtime_seconds")
+    if type(goal_mode) is not bool:
+        raise ValueError("goal_mode must be a boolean")
+
+
+def _validate_configure_task_expected(expected: Mapping[str, Any]) -> None:
+    if not isinstance(expected, Mapping):
+        raise ValueError("expected must be the complete task snapshot object")
+    fields = set(CONFIGURE_TASK_SNAPSHOT_FIELDS)
+    missing = sorted(fields - set(expected))
+    extra = sorted(set(expected) - fields)
+    if missing:
+        raise ValueError(
+            f"expected is missing task snapshot field(s): {', '.join(missing)}"
+        )
+    if extra:
+        raise ValueError(
+            f"expected has unsupported task snapshot field(s): {', '.join(extra)}"
+        )
+    if not isinstance(expected["status"], str):
+        raise ValueError("expected.status must be a string")
+    if not isinstance(expected["title"], str):
+        raise ValueError("expected.title must be a string")
+    for field_name in ("assignee", "current_step_key"):
+        if expected[field_name] is not None and not isinstance(
+            expected[field_name], str
+        ):
+            raise ValueError(f"expected.{field_name} must be a string or null")
+    current_run_id = expected["current_run_id"]
+    if current_run_id is not None and type(current_run_id) is not int:
+        raise ValueError("expected.current_run_id must be an integer or null")
+    _validate_execution_contract_values(
+        source_policy=expected["source_policy"],
+        max_retries=expected["max_retries"],
+        max_runtime_seconds=expected["max_runtime_seconds"],
+        goal_mode=expected["goal_mode"],
+    )
+
+
+def _task_has_active_execution(
+    conn: sqlite3.Connection, row: sqlite3.Row
+) -> bool:
+    keys = set(row.keys())
+    if "running" in keys and bool(row["running"]):
+        return True
+    if "current_run_id" in keys and row["current_run_id"] is not None:
+        return True
+    if "claim_lock" in keys and row["claim_lock"] is not None:
+        return True
+    return conn.execute(
+        "SELECT 1 FROM task_runs WHERE task_id = ? AND status = 'running' LIMIT 1",
+        (row["id"],),
+    ).fetchone() is not None
+
+
+def configure_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    expected: Mapping[str, Any],
+    source_policy: str,
+    max_retries: Optional[int],
+    max_runtime_seconds: Optional[int],
+    goal_mode: bool,
+) -> bool:
+    """CAS-replace an idle Default-board card's execution contract atomically."""
+    _validate_configure_task_expected(expected)
+    _validate_execution_contract_values(
+        source_policy=source_policy,
+        max_retries=max_retries,
+        max_runtime_seconds=max_runtime_seconds,
+        goal_mode=goal_mode,
+    )
+
+    with write_txn(conn):
+        row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        if row is None:
+            return False
+        current = configure_task_snapshot_from_row(row)
+        normalized_expected = dict(expected)
+        normalized_expected["assignee"] = _canonical_assignee(
+            normalized_expected["assignee"]
+        )
+        if current != normalized_expected:
+            raise TaskSnapshotConflict("configure task", current)
+        if _task_has_active_execution(conn, row):
+            raise RuntimeError(
+                f"cannot configure task {task_id}: it has an active/current run"
+            )
+        if row["status"] not in CONFIGURE_TASK_ELIGIBLE_STATUSES:
+            raise RuntimeError(
+                f"cannot configure task {task_id}: status {row['status']!r} is not eligible"
+            )
+
+        before = execution_contract_from_row(row)
+        conn.execute(
+            """
+            UPDATE tasks
+               SET source_commit_required = ?,
+                   source_commit_forbidden = ?,
+                   max_retries = ?,
+                   max_runtime_seconds = ?,
+                   goal_mode = ?
+             WHERE id = ?
+            """,
+            (
+                1 if source_policy == "required" else 0,
+                1 if source_policy == "forbidden" else 0,
+                max_retries,
+                max_runtime_seconds,
+                1 if goal_mode else 0,
+                task_id,
+            ),
+        )
+        after_row = conn.execute(
+            "SELECT * FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if after_row is None:
+            raise RuntimeError(f"task disappeared while configuring {task_id}")
+        _append_event(
+            conn,
+            task_id,
+            "execution_contract_configured",
+            {
+                "before": before,
+                "after": execution_contract_from_row(after_row),
+            },
+        )
+        return True
+
+
 def set_model_override(
     conn: sqlite3.Connection,
     task_id: str,

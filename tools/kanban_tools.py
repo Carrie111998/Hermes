@@ -828,6 +828,16 @@ def _require_orchestrator_tool(tool_name: str) -> Optional[str]:
     return None
 
 
+def _require_configured_orchestrator_tool(tool_name: str) -> Optional[str]:
+    """Re-check configured orchestrator authority at execution time."""
+    if _check_kanban_orchestrator_mode():
+        return None
+    return tool_error(
+        f"{tool_name} requires a configured Kanban orchestrator profile "
+        "outside dispatcher-worker and delegated-child contexts."
+    )
+
+
 def _task_summary_dict(kb, conn, task) -> dict[str, Any]:
     """Compact task shape for board-listing tools."""
     parents = kb.parent_ids(conn, task.id)
@@ -1160,6 +1170,7 @@ def _handle_show(args: dict, **kw) -> str:
                     "running": t.running,
                     "blocked": t.blocked,
                     "work_item_kind": t.work_item_kind,
+                    **kb.task_execution_contract(t),
                 }
 
             def _run_dict(
@@ -2669,6 +2680,83 @@ def _handle_unblock(args: dict, **kw) -> str:
         return tool_error(f"kanban_unblock: {e}")
 
 
+def _handle_configure(args: dict, **kw) -> str:
+    """CAS-replace an eligible existing card's four execution fields."""
+    from hermes_cli import kanban_db as kb_module
+
+    delegated_err = _reject_delegated_child_mutation("kanban_configure")
+    if delegated_err:
+        return delegated_err
+    guard = _require_configured_orchestrator_tool("kanban_configure")
+    if guard:
+        return guard
+
+    required = {
+        "task_id",
+        "source_policy",
+        "max_retries",
+        "max_runtime_seconds",
+        "goal_mode",
+        "expected",
+    }
+    missing = sorted(required - set(args))
+    if missing:
+        return tool_error(
+            f"kanban_configure: missing required argument(s): {', '.join(missing)}"
+        )
+    task_id = args.get("task_id")
+    if not isinstance(task_id, str) or not task_id.strip():
+        return tool_error("kanban_configure: task_id must be a non-empty string")
+    board = args.get("board")
+
+    try:
+        kb, conn = _connect(board=board)
+        try:
+            from hermes_cli import kanban_intake
+
+            active_board = board or kb._board_slug_for_connection(conn)
+            if kanban_intake.qualification_required(
+                kb.read_board_metadata(active_board)
+            ):
+                return tool_error(
+                    "kanban_configure: strict-board execution configuration "
+                    "is owned by the Work Contract"
+                )
+            if active_board != kb.DEFAULT_BOARD:
+                return tool_error(
+                    "kanban_configure: execution contracts can only be changed "
+                    "on the Default board"
+                )
+            ok = kb.configure_task(
+                conn,
+                task_id.strip(),
+                expected=args["expected"],
+                source_policy=args["source_policy"],
+                max_retries=args["max_retries"],
+                max_runtime_seconds=args["max_runtime_seconds"],
+                goal_mode=args["goal_mode"],
+            )
+            if not ok:
+                return tool_error(f"kanban_configure: task {task_id} not found")
+            task = kb.get_task(conn, task_id.strip())
+            if task is None:
+                return tool_error(
+                    f"kanban_configure: task {task_id} disappeared after configuration"
+                )
+            return _ok(task_id=task.id, **kb.task_execution_contract(task))
+        finally:
+            conn.close()
+    except kb_module.TaskSnapshotConflict:
+        return tool_error(
+            "kanban_configure conflict: task changed; refresh with kanban_show"
+        )
+    except (ValueError, RuntimeError) as exc:
+        return tool_error(f"kanban_configure: {exc}")
+    except Exception as exc:
+        logger.exception("kanban_configure failed")
+        return tool_error(f"kanban_configure: {exc}")
+
+
 def _handle_link(args: dict, **kw) -> str:
     """Add a parent→child dependency edge after the fact."""
     delegated_err = _reject_delegated_child_mutation("kanban_link")
@@ -2966,6 +3054,78 @@ KANBAN_COMPLETE_SCHEMA = {
             "board": _board_schema_prop(),
         },
         "required": [],
+    },
+}
+
+
+_KANBAN_CONFIGURE_EXPECTED_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "status": {"type": "string"},
+        "title": {"type": "string"},
+        "assignee": {"type": ["string", "null"]},
+        "current_step_key": {"type": ["string", "null"]},
+        "current_run_id": {"type": ["integer", "null"]},
+        "source_policy": {
+            "type": "string",
+            "enum": ["none", "required", "forbidden"],
+        },
+        "max_retries": {"type": ["integer", "null"], "minimum": 1},
+        "max_runtime_seconds": {
+            "type": ["integer", "null"],
+            "minimum": 1,
+        },
+        "goal_mode": {"type": "boolean"},
+    },
+    "required": [
+        "status",
+        "title",
+        "assignee",
+        "current_step_key",
+        "current_run_id",
+        "source_policy",
+        "max_retries",
+        "max_runtime_seconds",
+        "goal_mode",
+    ],
+    "additionalProperties": False,
+}
+
+KANBAN_CONFIGURE_SCHEMA = {
+    "name": "kanban_configure",
+    "description": (
+        "Atomically replace source_policy, max_retries, max_runtime_seconds, "
+        "and goal_mode on one eligible existing Default-board card. "
+        "Configured-orchestrator-only. Call kanban_show immediately first and "
+        "copy the nine current lifecycle/execution fields into expected. "
+        "Refuses stale, active, terminal, delegated, worker, and strict-board calls."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "task_id": {"type": "string", "description": "Existing task id."},
+            "source_policy": {
+                "type": "string",
+                "enum": ["none", "required", "forbidden"],
+            },
+            "max_retries": {"type": ["integer", "null"], "minimum": 1},
+            "max_runtime_seconds": {
+                "type": ["integer", "null"],
+                "minimum": 1,
+            },
+            "goal_mode": {"type": "boolean"},
+            "expected": _KANBAN_CONFIGURE_EXPECTED_SCHEMA,
+            "board": _board_schema_prop(),
+        },
+        "required": [
+            "task_id",
+            "source_policy",
+            "max_retries",
+            "max_runtime_seconds",
+            "goal_mode",
+            "expected",
+        ],
+        "additionalProperties": False,
     },
 }
 
@@ -3891,6 +4051,15 @@ registry.register(
     handler=_handle_unblock,
     check_fn=_check_kanban_orchestrator_mode,
     emoji="▶",
+)
+
+registry.register(
+    name="kanban_configure",
+    toolset="kanban",
+    schema=KANBAN_CONFIGURE_SCHEMA,
+    handler=_handle_configure,
+    check_fn=_check_kanban_orchestrator_mode,
+    emoji="⚙",
 )
 
 registry.register(

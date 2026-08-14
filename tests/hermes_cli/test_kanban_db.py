@@ -14377,3 +14377,282 @@ def test_new_active_epic_member_integrates_once_via_reconcile(
     assert first.integrated == [story]
     assert second.integrated == []
     assert count == 1
+
+
+def _configure_task_expected(task):
+    if task.source_commit_required:
+        source_policy = "required"
+    elif task.source_commit_forbidden:
+        source_policy = "forbidden"
+    else:
+        source_policy = "none"
+    return {
+        "status": task.status,
+        "title": task.title,
+        "assignee": task.assignee,
+        "current_step_key": task.current_step_key,
+        "current_run_id": task.current_run_id,
+        "source_policy": source_policy,
+        "max_retries": task.max_retries,
+        "max_runtime_seconds": task.max_runtime_seconds,
+        "goal_mode": task.goal_mode,
+    }
+
+
+def _configure_task_row_and_events(conn, task_id):
+    row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    return dict(row), [
+        (event.kind, event.payload) for event in kb.list_events(conn, task_id)
+    ]
+
+
+def test_configure_task_atomically_clears_contract_and_records_exact_event(
+    kanban_home,
+):
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="configure existing card",
+            assignee="developer",
+            source_commit_required=True,
+            max_retries=3,
+            max_runtime_seconds=900,
+            goal_mode=True,
+        )
+        before = kb.get_task(conn, task_id)
+        assert before is not None
+
+        assert kb.configure_task(
+            conn,
+            task_id,
+            expected=_configure_task_expected(before),
+            source_policy="none",
+            max_retries=None,
+            max_runtime_seconds=None,
+            goal_mode=False,
+        ) is True
+
+        after = kb.get_task(conn, task_id)
+        configured = kb.list_events(conn, task_id)[-1]
+
+    assert after is not None
+    assert after.source_commit_required is False
+    assert after.source_commit_forbidden is False
+    assert after.max_retries is None
+    assert after.max_runtime_seconds is None
+    assert after.goal_mode is False
+    assert configured.kind == "execution_contract_configured"
+    assert configured.payload == {
+        "before": {
+            "source_policy": "required",
+            "max_retries": 3,
+            "max_runtime_seconds": 900,
+            "goal_mode": True,
+        },
+        "after": {
+            "source_policy": "none",
+            "max_retries": None,
+            "max_runtime_seconds": None,
+            "goal_mode": False,
+        },
+    }
+
+
+@pytest.mark.parametrize(
+    ("status", "blocked"),
+    [
+        ("triage", 0),
+        ("todo", 0),
+        ("scheduled", 0),
+        ("ready", 0),
+        ("blocked", 1),
+        ("review", 0),
+    ],
+)
+def test_configure_task_allows_each_eligible_status(kanban_home, status, blocked):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title=f"eligible {status}")
+        conn.execute(
+            "UPDATE tasks SET status = ?, blocked = ? WHERE id = ?",
+            (status, blocked, task_id),
+        )
+        conn.commit()
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+
+        assert kb.configure_task(
+            conn,
+            task_id,
+            expected=_configure_task_expected(task),
+            source_policy="forbidden",
+            max_retries=2,
+            max_runtime_seconds=120,
+            goal_mode=True,
+        ) is True
+
+
+@pytest.mark.parametrize("stale_field", ["title", "max_retries"])
+def test_configure_task_cas_rejects_stale_lifecycle_and_execution_fields(
+    kanban_home, stale_field
+):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="stale card")
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        expected = _configure_task_expected(task)
+        if stale_field == "title":
+            conn.execute(
+                "UPDATE tasks SET title = ? WHERE id = ?", ("changed", task_id)
+            )
+        else:
+            conn.execute(
+                "UPDATE tasks SET max_retries = ? WHERE id = ?", (4, task_id)
+            )
+        conn.commit()
+        before = _configure_task_row_and_events(conn, task_id)
+
+        with pytest.raises(kb.TaskSnapshotConflict):
+            kb.configure_task(
+                conn,
+                task_id,
+                expected=expected,
+                source_policy="required",
+                max_retries=1,
+                max_runtime_seconds=300,
+                goal_mode=True,
+            )
+
+        assert _configure_task_row_and_events(conn, task_id) == before
+
+
+def test_configure_task_refuses_second_write_with_same_expectation(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="single CAS write")
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        expected = _configure_task_expected(task)
+        values = {
+            "source_policy": "required",
+            "max_retries": 1,
+            "max_runtime_seconds": 300,
+            "goal_mode": True,
+        }
+        assert kb.configure_task(
+            conn, task_id, expected=expected, **values
+        ) is True
+        before_replay = _configure_task_row_and_events(conn, task_id)
+
+        with pytest.raises(kb.TaskSnapshotConflict):
+            kb.configure_task(conn, task_id, expected=expected, **values)
+
+        assert _configure_task_row_and_events(conn, task_id) == before_replay
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("source_policy", "sometimes"),
+        ("max_retries", 0),
+        ("max_retries", True),
+        ("max_runtime_seconds", 0),
+        ("max_runtime_seconds", True),
+        ("goal_mode", "false"),
+    ],
+)
+def test_configure_task_rejects_invalid_values_without_mutation(
+    kanban_home, field, value
+):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="invalid contract")
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        values = {
+            "source_policy": "none",
+            "max_retries": None,
+            "max_runtime_seconds": None,
+            "goal_mode": False,
+        }
+        values[field] = value
+        before = _configure_task_row_and_events(conn, task_id)
+
+        with pytest.raises(ValueError):
+            kb.configure_task(
+                conn,
+                task_id,
+                expected=_configure_task_expected(task),
+                **values,
+            )
+
+        assert _configure_task_row_and_events(conn, task_id) == before
+
+
+def test_configure_task_rejects_incomplete_expected_snapshot_without_mutation(
+    kanban_home,
+):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="incomplete expectation")
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        expected = _configure_task_expected(task)
+        expected.pop("goal_mode")
+        before = _configure_task_row_and_events(conn, task_id)
+
+        with pytest.raises(ValueError, match="expected"):
+            kb.configure_task(
+                conn,
+                task_id,
+                expected=expected,
+                source_policy="none",
+                max_retries=None,
+                max_runtime_seconds=None,
+                goal_mode=False,
+            )
+
+        assert _configure_task_row_and_events(conn, task_id) == before
+
+
+@pytest.mark.parametrize("status", ["running", "done", "archived"])
+def test_configure_task_refuses_terminal_status_without_mutation(
+    kanban_home, status
+):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title=f"terminal {status}")
+        conn.execute("UPDATE tasks SET status = ? WHERE id = ?", (status, task_id))
+        conn.commit()
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        before = _configure_task_row_and_events(conn, task_id)
+
+        with pytest.raises(RuntimeError, match="status"):
+            kb.configure_task(
+                conn,
+                task_id,
+                expected=_configure_task_expected(task),
+                source_policy="required",
+                max_retries=1,
+                max_runtime_seconds=300,
+                goal_mode=True,
+            )
+
+        assert _configure_task_row_and_events(conn, task_id) == before
+
+
+def test_configure_task_refuses_active_current_run_without_mutation(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="active run")
+        claimed = kb.claim_task(conn, task_id)
+        assert claimed is not None and claimed.current_run_id is not None
+        before = _configure_task_row_and_events(conn, task_id)
+
+        with pytest.raises(RuntimeError, match="active/current run"):
+            kb.configure_task(
+                conn,
+                task_id,
+                expected=_configure_task_expected(claimed),
+                source_policy="required",
+                max_retries=1,
+                max_runtime_seconds=300,
+                goal_mode=True,
+            )
+
+        assert _configure_task_row_and_events(conn, task_id) == before
