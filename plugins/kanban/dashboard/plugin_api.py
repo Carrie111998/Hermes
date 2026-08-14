@@ -895,6 +895,32 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
         # --- status -------------------------------------------------------
         if payload.status is not None:
             s = payload.status
+            # Task 5.3 Implement Bulk Updates Openspec Constraint (Single task update path)
+            try:
+                from hermes_state import SessionDB
+                state = SessionDB.get_instance() if hasattr(SessionDB, 'get_instance') else SessionDB._instance
+                if state:
+                    contract_hash = None
+                    if hasattr(task, 'keys'):
+                        contract_hash = task['openspec_contract_hash'] if 'openspec_contract_hash' in task.keys() else None
+                    else:
+                        contract_hash = getattr(task, 'openspec_contract_hash', None)
+                        
+                    if contract_hash is None:
+                        try:
+                            def _do_get_hash(s_conn):
+                                cursor = s_conn.execute("SELECT openspec_contract_hash FROM tasks WHERE id = ?", (task_id,))
+                                row = cursor.fetchone()
+                                return row[0] if row else None
+                            contract_hash = state._execute_read(_do_get_hash)
+                        except Exception:
+                            pass
+                            
+                    if not state.enforce_openspec_transaction(task_id, s, contract_hash):
+                        raise HTTPException(status_code=409, detail="OpenSpec transaction constraint violated")
+            except ImportError:
+                pass
+            
             ok = True
             if s == "done":
                 ok = kanban_db.complete_task(
@@ -1318,6 +1344,7 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
             entry: dict[str, Any] = {"id": tid, "ok": True}
             try:
                 task = kanban_db.get_task(conn, tid)
+
                 if task is None:
                     entry.update(ok=False, error="not found")
                     results.append(entry)
@@ -1327,6 +1354,38 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
                         entry.update(ok=False, error="archive refused")
                 if payload.status is not None and not payload.archive:
                     s = payload.status
+                    # Task 5.3 Implement Bulk Updates Openspec Constraint
+                    try:
+                        from hermes_state import SessionDB
+                        state = SessionDB.get_instance() if hasattr(SessionDB, 'get_instance') else SessionDB._instance
+                        if state:
+                            # kanban_db.get_task returns a Task object, not a sqlite Row or dict!
+                            # Let's get the hash safely.
+                            contract_hash = getattr(task, 'openspec_contract_hash', None)
+                            
+                            # Fallback to state DB if not found in Kanban task
+                            if contract_hash is None:
+                                try:
+                                    def _do_get_hash(s_conn):
+                                        cursor = s_conn.execute("SELECT openspec_contract_hash FROM tasks WHERE id = ?", (tid,))
+                                        row = cursor.fetchone()
+                                        return row[0] if row else None
+                                    contract_hash = state._execute_read(_do_get_hash)
+                                except Exception:
+                                    pass
+                                    
+                            try:
+                                if not state.enforce_openspec_transaction(tid, s, contract_hash):
+                                    entry.update(ok=False, error="OpenSpec transaction constraint violated")
+                                    results.append(entry)
+                                    continue
+                            except Exception as e:
+                                entry.update(ok=False, error=str(e))
+                                results.append(entry)
+                                continue
+                    except ImportError:
+                        pass
+
                     if s == "done":
                         ok = kanban_db.complete_task(
                             conn, tid,

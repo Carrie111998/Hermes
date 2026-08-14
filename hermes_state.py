@@ -11199,8 +11199,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 raise ValueError(f"OpenSpec contract hash mismatch. Expected {expected_contract_hash}, got {contract_hash}")
                 
             # Execute status update with concurrency check (fail-closed)
+            # Use IS instead of = to handle NULL values for generic tasks correctly
             cursor = conn.execute(
-                "UPDATE tasks SET status = ? WHERE id = ? AND status = ? AND openspec_contract_hash = ?",
+                "UPDATE tasks SET status = ? WHERE id = ? AND status = ? AND openspec_contract_hash IS ?",
                 (new_status, task_id, current_status, expected_contract_hash)
             )
             
