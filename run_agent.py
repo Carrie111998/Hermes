@@ -8027,7 +8027,67 @@ class AIAgent:
         persist_user_display_metadata: Optional[Dict[str, Any]] = None,
         moa_config: Optional[dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        """Forwarder — see ``agent.conversation_loop.run_conversation``."""
+        """Admission gate + forwarder to the owned turn.
+
+        Every surface — CLI, gateway, HTTP API, TUI, ACP, cron, batch — funnels
+        through here, which is why the durable conversation authority lives at
+        this one boundary instead of being re-implemented per surface.
+
+        Admission runs BEFORE the transcript is loaded, so a refused turn
+        leaves the conversation byte-identical: no session row, no message, and
+        crucially no synthetic "someone else is here" message spliced into
+        history (which would break role alternation and invalidate the
+        conversation's prompt cache). The refusal is a typed
+        :class:`ConversationOwnershipConflict`; adapters may project it into a
+        dedicated status/code or their existing generic error contract.
+
+        The grant is held for the whole turn — model execution, tool calls, and
+        the durable turn-end publication — and released on EVERY exit path
+        including interrupt and cancellation.
+        """
+        from agent.session_ownership import (
+            ownership_admission_surface,
+            own_conversation,
+            should_own_conversation,
+        )
+
+        with own_conversation(
+            getattr(self, "_session_db", None),
+            str(getattr(self, "session_id", "") or ""),
+            surface=ownership_admission_surface(self),
+            enabled=should_own_conversation(self),
+        ):
+            return self._run_owned_conversation(
+                user_message,
+                system_message,
+                conversation_history,
+                task_id,
+                stream_callback,
+                persist_user_message,
+                persist_user_timestamp,
+                persist_user_display_kind,
+                persist_user_display_metadata,
+                moa_config,
+            )
+
+    def _run_owned_conversation(
+        self,
+        user_message: Any,
+        system_message: str = None,
+        conversation_history: List[Dict[str, Any]] = None,
+        task_id: str = None,
+        stream_callback: Optional[callable] = None,
+        persist_user_message: Optional[Any] = None,
+        persist_user_timestamp: Optional[float] = None,
+        persist_user_display_kind: Optional[str] = None,
+        persist_user_display_metadata: Optional[Dict[str, Any]] = None,
+        moa_config: Optional[dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Forwarder — see ``agent.conversation_loop.run_conversation``.
+
+        Runs with the conversation already owned (or with ownership explicitly
+        not applicable — subagents, persist-disabled forks, store-less agents).
+        """
         from agent.aux_accounting import (
             reset_accounting_context,
             set_accounting_context,

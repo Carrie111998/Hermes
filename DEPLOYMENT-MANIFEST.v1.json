@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "candidate": "current-upstream-session-ownership",
+  "upstream_base": "2ae96939f53b0cc0aa82868fc9a44702f3dd6c09",
+  "branch": "fix/current-upstream-session-ownership",
+  "installation_target": "C:\\Users\\cwm4t\\AppData\\Local\\hermes\\hermes-agent",
+  "source_worktree": "C:\\Users\\cwm4t\\AppData\\Local\\Temp\\hermes-current-upstream-session-ownership",
+  "deployment_status": "not_deployed",
+  "deployment_authorized": false,
+  "push_status": "not_pushed",
+  "accepted_commit": null,
+  "accepted_patch_sha256": null,
+  "accepted_patch_bytes": null,
+  "source_file_sha256": {},
+  "deployed_file_sha256": {},
+  "running_process_source_sha256": {},
+  "retirement_condition": "Retire this temporary candidate when equivalent durable cross-process conversation ownership and fencing is present on accepted upstream main and passes the same focused and client compatibility gates.",
+  "notes": [
+    "Hash fields are populated after the immutable candidate is approved and committed.",
+    "Deployment fields remain empty because production deployment was explicitly excluded pending separate authorization.",
+    "The final external attestation is stored outside Git to avoid self-referential commit/hash fields."
+  ]
+}

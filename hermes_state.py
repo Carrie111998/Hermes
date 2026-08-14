@@ -35,6 +35,15 @@ from pathlib import Path
 
 from agent.memory_manager import sanitize_context
 from agent.session_activity import ActivityProvenance
+from agent.session_ownership import (
+    DEFAULT_OWNERSHIP_TTL_SECONDS,
+    ConversationOwnershipConflict,
+    ConversationOwnershipError,
+    ConversationOwnershipUnavailable,
+    OwnershipGrant,
+    StaleConversationOwnershipError,
+    holder_process_is_dead,
+)
 from agent.message_sanitization import _sanitize_surrogates
 from agent.skill_commands import (
     SKILL_EXCERPT_JOINT,
@@ -5224,8 +5233,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return cursor.rowcount
 
         try:
-            rows = self._execute_write(_do)
+            rows = self._execute_conversation_write(session_id, _do)
             return bool(rows)
+        except ConversationOwnershipError:
+            raise
         except Exception:
             return False
 
@@ -5746,6 +5757,506 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         if row is None:
             return None
         return row["holder"] if isinstance(row, sqlite3.Row) else row[0]
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Canonical conversation ownership — the durable cross-process authority
+    # ──────────────────────────────────────────────────────────────────────
+    #
+    # ONE owner per user-facing conversation, across processes and surfaces.
+    # ``gateway/turn_lease.py`` already serialises turns per resolved session
+    # id inside a single process; it cannot see a second process, and says so
+    # in its own docstring. This is the DB-level lease it defers to.
+    #
+    # Relationship to ``compression_locks`` above — two tables, ONE authority
+    # each, answering different questions:
+    #
+    #   conversation_ownership : may this process mutate the conversation?
+    #   compression_locks      : which rotation inside an owned conversation
+    #                            wins when two paths compress at once?
+    #
+    # The second is strictly narrower and lives inside the first. Ownership
+    # never consults it and it never grants ownership.
+    #
+    # Two deliberate departures from the compression lock's mechanics:
+    #
+    #   * FENCING. The row is UPDATEd in place on takeover, never deleted, so
+    #     ``fence_token`` is monotonic per root and a writer that stalled
+    #     through a handover is detectable. Release blanks ``holder`` and
+    #     leaves the token, so the released grant cannot pass validation and
+    #     the next acquirer still gets a strictly newer token.
+    #   * FAIL CLOSED. ``try_acquire_compression_lock`` returns False on
+    #     ``sqlite3.Error`` because skipping compression is safe; skipping
+    #     ownership would let both racers proceed. Every failure here raises
+    #     :class:`ConversationOwnershipUnavailable`.
+    _OWNERSHIP_SELECT_SQL = (
+        "SELECT holder, fence_token, surface, session_id, acquired_at, "
+        "refreshed_at, expires_at FROM conversation_ownership "
+        "WHERE conversation_root = ?"
+    )
+
+    @staticmethod
+    def _ownership_row_to_dict(row: Any) -> Dict[str, Any]:
+        if isinstance(row, sqlite3.Row) or hasattr(row, "keys"):
+            return {key: row[key] for key in row.keys()}
+        keys = (
+            "holder", "fence_token", "surface", "session_id",
+            "acquired_at", "refreshed_at", "expires_at",
+        )
+        return dict(zip(keys, row))
+
+    def try_acquire_conversation_ownership(
+        self,
+        conversation_root: str,
+        holder: str,
+        *,
+        ttl_seconds: float = DEFAULT_OWNERSHIP_TTL_SECONDS,
+        surface: str = "",
+        session_id: str = "",
+    ) -> OwnershipGrant:
+        """Take exclusive ownership of ``conversation_root`` or refuse.
+
+        Returns an :class:`OwnershipGrant` carrying the fence token the caller
+        must present for every subsequent mutation. Raises
+        :class:`ConversationOwnershipConflict` when a live holder owns it, and
+        :class:`ConversationOwnershipUnavailable` when the authority itself
+        cannot be consulted. It never returns without a decision.
+
+        Callers acquire at ADMISSION — before the transcript is loaded — so a
+        refusal leaves the conversation byte-identical and no synthetic message
+        is ever appended to explain it.
+
+        A grant is reclaimed early when the holder's process is provably gone
+        (:func:`holder_process_is_dead`), so a killed CLI does not strand the
+        conversation for the full TTL; otherwise ``expires_at`` is the backstop.
+        """
+        if not conversation_root:
+            raise ValueError("conversation_root is required")
+        if not holder:
+            raise ValueError("holder is required")
+        ttl = max(0.001, float(ttl_seconds or DEFAULT_OWNERSHIP_TTL_SECONDS))
+
+        def _do(conn):
+            # Sample only after _execute_write has obtained BEGIN IMMEDIATE.
+            # SQLite lock patience must not consume this grant's useful TTL.
+            now = time.time()
+            expires_at = now + ttl
+            row = conn.execute(
+                self._OWNERSHIP_SELECT_SQL, (conversation_root,)
+            ).fetchone()
+            if row is None:
+                conn.execute(
+                    "INSERT INTO conversation_ownership "
+                    "(conversation_root, holder, fence_token, surface, "
+                    "session_id, acquired_at, refreshed_at, expires_at) "
+                    "VALUES (?, ?, 1, ?, ?, ?, ?, ?)",
+                    (conversation_root, holder, surface, session_id,
+                     now, now, expires_at),
+                )
+                return 1, None, now, expires_at
+
+            current = self._ownership_row_to_dict(row)
+            current_holder = str(current.get("holder") or "")
+            current_fence = int(current.get("fence_token") or 0)
+            current_expires = float(current.get("expires_at") or 0.0)
+
+            if current_holder == holder:
+                # Same holder re-acquiring (a retried admission): extend, keep
+                # the token so any fenced write already issued stays valid.
+                conn.execute(
+                    "UPDATE conversation_ownership SET refreshed_at = ?, "
+                    "expires_at = ?, session_id = ?, surface = ? "
+                    "WHERE conversation_root = ?",
+                    (now, expires_at, session_id, surface, conversation_root),
+                )
+                return current_fence, None, now, expires_at
+
+            reclaimable = (
+                not current_holder
+                or current_expires < now
+                or holder_process_is_dead(current_holder)
+            )
+            if not reclaimable:
+                return None, current, now, expires_at
+
+            fence = current_fence + 1
+            conn.execute(
+                "UPDATE conversation_ownership SET holder = ?, fence_token = ?, "
+                "surface = ?, session_id = ?, acquired_at = ?, refreshed_at = ?, "
+                "expires_at = ? WHERE conversation_root = ?",
+                (holder, fence, surface, session_id, now, now, expires_at,
+                 conversation_root),
+            )
+            return fence, (current if current_holder else None), now, expires_at
+
+        try:
+            fence, blocking, acquired_at, expires_at = self._execute_write(_do)
+        except ConversationOwnershipError:
+            raise
+        except Exception as exc:
+            # Fail closed. A store that cannot answer this cannot serve the
+            # transcript write either, so nothing is lost by refusing — and a
+            # silent grant here would let both racers into the conversation.
+            raise ConversationOwnershipUnavailable(conversation_root, exc) from exc
+
+        if fence is None:
+            blocking = blocking or {}
+            raise ConversationOwnershipConflict(
+                conversation_root,
+                holder=str(blocking.get("holder") or ""),
+                surface=str(blocking.get("surface") or ""),
+                session_id=str(blocking.get("session_id") or ""),
+                fence_token=int(blocking.get("fence_token") or 0),
+                expires_at=float(blocking.get("expires_at") or 0.0),
+            )
+        if blocking:
+            logger.warning(
+                "Reclaimed conversation ownership for %s from a dead or expired "
+                "holder (%s, surface=%s)",
+                conversation_root,
+                blocking.get("holder"),
+                blocking.get("surface") or "unknown",
+            )
+        return OwnershipGrant(
+            conversation_root=conversation_root,
+            holder=holder,
+            fence_token=int(fence),
+            surface=surface,
+            session_id=session_id,
+            acquired_at=acquired_at,
+            expires_at=expires_at,
+            ttl_seconds=ttl,
+        )
+
+    def refresh_conversation_ownership(
+        self,
+        grant: OwnershipGrant,
+        ttl_seconds: Optional[float] = None,
+    ) -> bool:
+        """Extend ``grant``'s lease iff it is still the current owner.
+
+        Identity is ``(holder, fence_token)``, deliberately NOT ``expires_at``:
+        a live owner whose refresher thread was starved past its own TTL must
+        be able to revive a row nobody has claimed. A row someone else already
+        took has a different holder, so this matches nothing and returns False
+        — which is how the refresher learns it lost the conversation.
+        """
+        if grant is None or not grant.conversation_root or not grant.holder:
+            return False
+        ttl = max(
+            0.001, float(ttl_seconds or grant.ttl_seconds or DEFAULT_OWNERSHIP_TTL_SECONDS)
+        )
+        def _do(conn):
+            # As with acquire, sample after BEGIN IMMEDIATE so writer-lock
+            # patience cannot consume the refreshed lease before publication.
+            now = time.time()
+            expires_at = now + ttl
+            cur = conn.execute(
+                "UPDATE conversation_ownership SET refreshed_at = ?, expires_at = ? "
+                "WHERE conversation_root = ? AND holder = ? AND fence_token = ?",
+                (now, expires_at, grant.conversation_root, grant.holder,
+                 grant.fence_token),
+            )
+            return cur.rowcount > 0, expires_at
+
+        try:
+            refreshed, expires_at = self._execute_write(_do)
+            refreshed = bool(refreshed)
+        except Exception as exc:
+            logger.warning(
+                "refresh_conversation_ownership(%s) failed: %s",
+                grant.conversation_root, exc,
+            )
+            return False
+        if refreshed:
+            grant.expires_at = expires_at
+        return refreshed
+
+    def release_conversation_ownership(self, grant: OwnershipGrant) -> None:
+        """Release ``grant`` iff it is still the current owner. Idempotent.
+
+        Blanks ``holder`` and leaves ``fence_token`` in place: the released
+        grant can no longer pass a fenced write (holder mismatch) and the next
+        acquirer still gets a strictly newer token. A nested grant is a no-op —
+        the outer scope owns the lifetime.
+
+        Holder- AND fence-scoped so a late unwind can never free a newer
+        owner's grant (the #28686 ownership lesson).
+        """
+        if grant is None or grant.nested or not grant.conversation_root:
+            return
+        if not grant.holder:
+            return
+
+        def _do(conn):
+            conn.execute(
+                "UPDATE conversation_ownership SET holder = '', expires_at = 0 "
+                "WHERE conversation_root = ? AND holder = ? AND fence_token = ?",
+                (grant.conversation_root, grant.holder, grant.fence_token),
+            )
+
+        try:
+            self._execute_write(_do)
+        except Exception as exc:
+            # Best effort: the TTL is the backstop, and a dead holder is
+            # reclaimed by process-liveness anyway.
+            logger.warning(
+                "release_conversation_ownership(%s) failed: %s",
+                grant.conversation_root, exc,
+            )
+        finally:
+            grant.released = True
+
+    def get_conversation_owner(
+        self, conversation_root: str
+    ) -> Optional[Dict[str, Any]]:
+        """The current live owner row for ``conversation_root``, or None.
+
+        Diagnostics and conflict projection only — never the admission path.
+        """
+        if not conversation_root:
+            return None
+        row = self._conn.execute(
+            self._OWNERSHIP_SELECT_SQL, (conversation_root,)
+        ).fetchone()
+        if row is None:
+            return None
+        owner = self._ownership_row_to_dict(row)
+        if not str(owner.get("holder") or ""):
+            return None
+        if float(owner.get("expires_at") or 0.0) < time.time():
+            return None
+        owner["conversation_root"] = conversation_root
+        return owner
+
+    @staticmethod
+    def _conversation_root_in_transaction(
+        conn: sqlite3.Connection,
+        session_id: str,
+    ) -> str:
+        """Resolve lineage identity without leaving the active transaction."""
+        current = session_id
+        chain: list[str] = []
+        seen: set[str] = set()
+        # Mirror ``_session_lineage_root_to_tip`` exactly; admission and
+        # transactional guards must resolve the same authority key even on
+        # malformed deep or cyclic lineage.
+        for _ in range(100):
+            if not current or current in seen:
+                break
+            seen.add(current)
+            chain.append(current)
+            row = conn.execute(
+                "SELECT parent_session_id FROM sessions WHERE id = ?",
+                (current,),
+            ).fetchone()
+            if row is None:
+                break
+            parent = row["parent_session_id"] if hasattr(row, "keys") else row[0]
+            current = str(parent) if parent else ""
+        return chain[-1] if chain and chain[-1] else session_id
+
+    def _refuse_live_conversation_owner(
+        self,
+        conn: sqlite3.Connection,
+        conversation_root: str,
+        *,
+        allow_current_grant: bool = True,
+    ) -> None:
+        """Refuse a destructive mutation covered by a live owner.
+
+        ``parent_session_id`` is mutable.  Orphaning a child can therefore
+        change the ownership key seen by a new process from ``root`` to
+        ``child`` while an admitted turn still pins ``root``.  Checking the
+        covering row in the SAME write transaction as the lineage mutation
+        prevents that split authority.  Ordinary fenced mutations may allow
+        this thread's exact grant; a re-rooting mutation must set
+        ``allow_current_grant=False`` because even the current holder would
+        otherwise leave its pinned old key live beside the child's new key.
+        """
+        if not conversation_root:
+            return
+        row = conn.execute(
+            self._OWNERSHIP_SELECT_SQL, (conversation_root,)
+        ).fetchone()
+        if row is None:
+            return
+        owner = self._ownership_row_to_dict(row)
+        holder = str(owner.get("holder") or "")
+        expires_at = float(owner.get("expires_at") or 0.0)
+        if not holder or expires_at < time.time():
+            return
+
+        from agent.session_ownership import current_grant
+
+        grant = current_grant(self, conversation_root)
+        if allow_current_grant and (
+            grant is not None
+            and grant.holder == holder
+            and int(grant.fence_token) == int(owner.get("fence_token") or 0)
+        ):
+            return
+        raise ConversationOwnershipConflict(
+            conversation_root,
+            holder=holder,
+            surface=str(owner.get("surface") or ""),
+            session_id=str(owner.get("session_id") or ""),
+            fence_token=int(owner.get("fence_token") or 0),
+            expires_at=expires_at,
+        )
+
+    def _conversation_has_live_owner(
+        self,
+        conn: sqlite3.Connection,
+        conversation_root: str,
+    ) -> bool:
+        """Whether maintenance must skip this lineage in the active transaction."""
+        if not conversation_root:
+            return False
+        row = conn.execute(
+            self._OWNERSHIP_SELECT_SQL, (conversation_root,)
+        ).fetchone()
+        if row is None:
+            return False
+        owner = self._ownership_row_to_dict(row)
+        return bool(str(owner.get("holder") or "")) and float(
+            owner.get("expires_at") or 0.0
+        ) >= time.time()
+
+    @staticmethod
+    def _is_below_concurrent_delegate_boundary(
+        conn: sqlite3.Connection, session_id: str
+    ) -> bool:
+        """Whether the target is at/below a real delegate lineage boundary.
+
+        Delegate/subagent agents intentionally run concurrently with their
+        parent turn and do not acquire the parent's grant. Their own segment and
+        descendants they rotate into are independently writable, while keeping
+        the user-facing conversation root for tagging. A source label on a
+        re-rooted row is not enough: the delegate row must still have a parent.
+        """
+        current = session_id
+        seen: set[str] = set()
+        crossed_delegate_boundary = False
+        for _ in range(100):
+            if not current or current in seen:
+                return False
+            seen.add(current)
+            row = conn.execute(
+                "SELECT source, parent_session_id, model_config "
+                "FROM sessions WHERE id = ?",
+                (current,),
+            ).fetchone()
+            if row is None:
+                return False
+            if hasattr(row, "keys"):
+                source = row["source"]
+                parent = row["parent_session_id"]
+                model_config = row["model_config"]
+            else:
+                source, parent, model_config = row[0], row[1], row[2]
+            delegate_from = ""
+            if model_config:
+                try:
+                    parsed_config = json.loads(model_config)
+                    if isinstance(parsed_config, dict):
+                        delegate_from = str(parsed_config.get("_delegate_from") or "")
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    delegate_from = ""
+            if (
+                (
+                    str(source or "").strip().lower() in {"delegate", "subagent"}
+                    or (delegate_from and delegate_from == str(parent or ""))
+                )
+                and parent
+            ):
+                crossed_delegate_boundary = True
+            if not parent:
+                return crossed_delegate_boundary
+            current = str(parent)
+        return False
+
+    def execute_fenced_write(
+        self,
+        grant: OwnershipGrant,
+        fn: Callable[[sqlite3.Connection], T],
+        *,
+        patience_s: Optional[float] = None,
+    ) -> T:
+        """Run *fn* only if ``grant`` is still the owner, in ONE transaction.
+
+        The fence check and the mutation share a transaction, so a handover
+        cannot slip between them. On a stale grant *fn* never runs at all —
+        this is refuse-before-mutate, not mutate-then-notice.
+
+        Validation is against the root the grant PINNED at acquire time; it is
+        never recomputed. Deleting an ancestor re-roots a session mid-turn, and
+        a grant that chased the recomputed root would silently stop fencing
+        exactly when lineage is being rewritten.
+        """
+        if grant is None or not grant.conversation_root:
+            raise ValueError("a conversation ownership grant is required")
+
+        def _do(conn):
+            row = conn.execute(
+                self._OWNERSHIP_SELECT_SQL, (grant.conversation_root,)
+            ).fetchone()
+            current = self._ownership_row_to_dict(row) if row is not None else {}
+            current_holder = str(current.get("holder") or "")
+            current_fence = current.get("fence_token")
+            if (
+                row is None
+                or current_holder != grant.holder
+                or int(current_fence or 0) != int(grant.fence_token)
+                or float(current.get("expires_at") or 0.0) < time.time()
+            ):
+                raise StaleConversationOwnershipError(
+                    grant.conversation_root,
+                    expected_fence_token=int(grant.fence_token),
+                    actual_fence_token=(
+                        int(current_fence) if current_fence is not None else None
+                    ),
+                    actual_holder=current_holder or None,
+                )
+            return fn(conn)
+
+        return self._execute_write(_do, patience_s=patience_s)
+
+    def _execute_conversation_write(
+        self,
+        session_id: str,
+        fn: Callable[[sqlite3.Connection], T],
+        *,
+        patience_s: Optional[float] = None,
+        allow_delegate_publication: bool = False,
+    ) -> T:
+        """Fence ``fn`` against any durable owner of ``session_id``.
+
+        A matching process-local grant takes the strict holder/fence path.
+        Callers without a local grant retain legacy behavior only when no live
+        durable owner exists; a foreign owner is checked and refused inside the
+        same write transaction as ``fn``. Explicit delegate/subagent lineage
+        segments are a narrow exception only when the caller marks ``fn`` as
+        transcript publication; lineage mutation never bypasses the owner.
+        """
+        from agent.session_ownership import current_grant_for_session
+
+        grant = current_grant_for_session(self, session_id)
+        if grant is not None:
+            return self.execute_fenced_write(grant, fn, patience_s=patience_s)
+
+        def _do_unowned(conn: sqlite3.Connection) -> T:
+            if (
+                allow_delegate_publication
+                and self._is_below_concurrent_delegate_boundary(conn, session_id)
+            ):
+                return fn(conn)
+            root = self._conversation_root_in_transaction(conn, session_id)
+            self._refuse_live_conversation_owner(
+                conn, root, allow_current_grant=False
+            )
+            return fn(conn)
+
+        return self._execute_write(_do_unowned, patience_s=patience_s)
 
     def touch_session_activity(
         self,
@@ -8192,8 +8703,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # a sibling process legitimately holding the write lock for seconds
         # (VACUUM, TRUNCATE checkpoint at close, an older pre-bounded-merge
         # process's FTS optimize) can't destroy a healthy turn (#74478).
-        return self._execute_write(
-            _do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S
+        return self._execute_conversation_write(
+            session_id,
+            _do,
+            patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S,
+            allow_delegate_publication=True,
         )
 
     def append_messages_batch(
@@ -8265,8 +8779,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return inserted
 
         # Same criticality as append_message: this IS the turn's transcript.
-        return self._execute_write(
-            _do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S
+        return self._execute_conversation_write(
+            session_id,
+            _do,
+            patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S,
+            allow_delegate_publication=True,
         )
 
     def set_latest_matching_message_display_kind(
@@ -8687,7 +9204,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 (total_messages, total_tool_calls, session_id),
             )
 
-        self._execute_write(_do)
+        self._execute_conversation_write(session_id, _do)
 
     def has_archived_messages(self, session_id: str) -> bool:
         """Return True if the session has any soft-archived (``active = 0``) rows.
@@ -8776,7 +9293,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 )
             return inserted
 
-        return self._execute_write(_do)
+        return self._execute_conversation_write(
+            session_id, _do, allow_delegate_publication=True
+        )
 
     def set_latest_user_api_content(
         self, session_id: str, content: Any, api_content: str
@@ -9577,7 +10096,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             )
             return ids
 
-        rewound = self._execute_write(_do)
+        rewound = self._execute_conversation_write(session_id, _do)
 
         # 2) Compute new head id (largest still-active row id in session).
         with self._lock:
@@ -9615,7 +10134,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 )
             return len(ids)
 
-        return self._execute_write(_do)
+        return self._execute_conversation_write(session_id, _do)
 
     # =========================================================================
     # Search
@@ -9981,6 +10500,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             )
             if cursor.fetchone() is None:
                 return False
+            root = self._conversation_root_in_transaction(conn, session_id)
+            self._refuse_live_conversation_owner(
+                conn, root, allow_current_grant=False
+            )
             if expected_ids is not None:
                 actual_ids = {
                     session_id,
@@ -10000,7 +10523,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             self._delete_unreferenced_system_prompts(conn)
             return True
 
-        deleted = self._execute_write(_do)
+        deleted = self._execute_conversation_write(session_id, _do)
         if deleted:
             for delegate_id in removed_delegate_ids:
                 self._remove_session_files(sessions_dir, delegate_id)
@@ -10046,7 +10569,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 self._delete_unreferenced_system_prompts(conn)
             return cursor.rowcount > 0
 
-        deleted = self._execute_write(_do)
+        deleted = self._execute_conversation_write(session_id, _do)
         if deleted:
             self._remove_session_files(sessions_dir, session_id)
         return bool(deleted)
@@ -10101,6 +10624,19 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 unique_ids,
             )
             existing = [row["id"] for row in cursor.fetchall()]
+            if not existing:
+                return 0
+
+            # Preserve the bulk API's succeed-on-the-rest contract: an owned
+            # lineage is skipped rather than aborting deletion of unrelated
+            # sessions in the same request.
+            existing = [
+                sid
+                for sid in existing
+                if not self._conversation_has_live_owner(
+                    conn, self._conversation_root_in_transaction(conn, sid)
+                )
+            ]
             if not existing:
                 return 0
 
@@ -10200,6 +10736,16 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             )
             session_ids = {row["id"] for row in cursor.fetchall()}
 
+            if not session_ids:
+                return 0
+
+            session_ids = {
+                sid
+                for sid in session_ids
+                if not self._conversation_has_live_owner(
+                    conn, self._conversation_root_in_transaction(conn, sid)
+                )
+            }
             if not session_ids:
                 return 0
 
@@ -10541,6 +11087,16 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             )
             session_ids = {row["id"] for row in cursor.fetchall()}
 
+            if not session_ids:
+                return 0
+
+            session_ids = {
+                sid
+                for sid in session_ids
+                if not self._conversation_has_live_owner(
+                    conn, self._conversation_root_in_transaction(conn, sid)
+                )
+            }
             if not session_ids:
                 return 0
 

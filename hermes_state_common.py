@@ -383,6 +383,32 @@ CREATE TABLE IF NOT EXISTS compression_locks (
     expires_at REAL NOT NULL
 );
 
+-- Durable cross-process ownership of one user-facing conversation.
+--
+-- Keyed by CONVERSATION ROOT (see SessionDB.get_conversation_root), not by
+-- session_id: compression rotates session_id to a fresh segment mid-turn and
+-- delegate subagents hang off their parent, so a session-id key would hand one
+-- conversation to two owners the moment it rotated.
+--
+-- Deliberately NOT a foreign key onto sessions(id): a surface acquires before
+-- the session row exists (CLI admission happens before history load), and a
+-- grant must survive ancestor deletion re-rooting its children.
+--
+-- ``fence_token`` is monotonic per root and survives handover: the row is
+-- UPDATEd in place on takeover rather than deleted, so a slow writer holding
+-- an older token can be rejected instead of silently publishing over newer
+-- history. This is what makes the authority a fence and not just a lock.
+CREATE TABLE IF NOT EXISTS conversation_ownership (
+    conversation_root TEXT PRIMARY KEY,
+    holder TEXT NOT NULL,
+    fence_token INTEGER NOT NULL,
+    surface TEXT NOT NULL DEFAULT '',
+    session_id TEXT NOT NULL DEFAULT '',
+    acquired_at REAL NOT NULL,
+    refreshed_at REAL NOT NULL,
+    expires_at REAL NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS async_delegations (
     delegation_id TEXT PRIMARY KEY,
     origin_session TEXT NOT NULL,
@@ -419,6 +445,8 @@ CREATE INDEX IF NOT EXISTS idx_messages_assistant_calls_by_session
     ON messages(session_id)
     WHERE role = 'assistant' AND tool_calls IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_compression_locks_expires ON compression_locks(expires_at);
+CREATE INDEX IF NOT EXISTS idx_conversation_ownership_expires
+    ON conversation_ownership(expires_at);
 CREATE INDEX IF NOT EXISTS idx_session_model_usage_session ON session_model_usage(session_id);
 CREATE INDEX IF NOT EXISTS idx_session_model_usage_model ON session_model_usage(model);
 CREATE INDEX IF NOT EXISTS idx_async_delegations_delivery
