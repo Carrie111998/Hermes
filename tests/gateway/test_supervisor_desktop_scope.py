@@ -58,6 +58,20 @@ class TestInnermostUnitKinds:
         )
         assert _innermost_systemd_unit_kinds(p) == {"service"}
 
+    def test_user_service_leaf_under_user_manager(self, tmp_path):
+        """systemctl --user unit: .service leaf under user@N.service → service.
+
+        This is the shape where a naive "any .service in the path" and the
+        leaf-inward scan agree, but a naive "last component only" parse and
+        an outer-first scan would disagree — pin it explicitly.
+        """
+        p = _write_cgroup(
+            tmp_path,
+            "0::/user.slice/user-1000.slice/user@1000.service/app.slice/"
+            "hermes-gateway.service\n",
+        )
+        assert _innermost_systemd_unit_kinds(p) == {"service"}
+
     def test_cgroup_v1_multiline(self, tmp_path):
         """v1 exposes many hierarchies; the systemd one carries the unit."""
         p = _write_cgroup(

@@ -34,7 +34,10 @@ DEFAULT_GATEWAY_RESTART_AFTER_TURN_TIMEOUT = float(
 )
 
 
-def _innermost_systemd_unit_kinds(cgroup_path: str = "/proc/self/cgroup") -> set:
+_PROC_SELF_CGROUP = "/proc/self/cgroup"
+
+
+def _innermost_systemd_unit_kinds(cgroup_path: str = _PROC_SELF_CGROUP) -> set[str]:
     """Return the innermost systemd unit suffixes owning this process.
 
     Each ``/proc/self/cgroup`` line is scanned from the leaf toward the
@@ -53,7 +56,7 @@ def _innermost_systemd_unit_kinds(cgroup_path: str = "/proc/self/cgroup") -> set
     to pin cgroup detection hermetically, or a CI runner that itself runs
     inside a systemd unit flips the result under the test.
     """
-    kinds: set = set()
+    kinds: set[str] = set()
     try:
         with open(cgroup_path, encoding="utf-8") as fh:
             for line in fh:
@@ -71,7 +74,7 @@ def _innermost_systemd_unit_kinds(cgroup_path: str = "/proc/self/cgroup") -> set
 
 def is_gateway_supervisor_process(
     environ: Mapping[str, str] | None = None,
-    cgroup_path: str = "/proc/self/cgroup",
+    cgroup_path: str = _PROC_SELF_CGROUP,
 ) -> bool:
     """Return whether this gateway process is owned by a supervisor."""
     env = os.environ if environ is None else environ
