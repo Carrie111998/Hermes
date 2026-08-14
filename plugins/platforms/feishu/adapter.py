@@ -3069,6 +3069,12 @@ class FeishuAdapter(BasePlatformAdapter):
 
         context = getattr(event, "context", None)
         chat_id = str(getattr(context, "open_chat_id", "") or "")
+        # The card callback token is a short-lived card-update credential,
+        # NOT an IM message ID. Use the original card message's real ID
+        # (present in the callback context) so processing-status reactions
+        # and reply anchoring work; fall back to the token only when the
+        # payload omits it.
+        card_message_id = str(getattr(context, "open_message_id", "") or "")
         operator = getattr(event, "operator", None)
         open_id = str(getattr(operator, "open_id", "") or "")
         if not chat_id or not open_id:
@@ -3103,7 +3109,7 @@ class FeishuAdapter(BasePlatformAdapter):
             message_type=MessageType.COMMAND,
             source=source,
             raw_message=data,
-            message_id=token or str(uuid.uuid4()),
+            message_id=card_message_id or token or str(uuid.uuid4()),
             channel_prompt=self._resolve_channel_prompt(chat_id),
             timestamp=datetime.now(),
         )
