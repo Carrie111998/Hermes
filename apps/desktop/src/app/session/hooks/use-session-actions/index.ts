@@ -5,7 +5,7 @@ import type { NavigateFunction } from 'react-router'
 import { revealTreePane } from '@/components/pane-shell/tree/store'
 import { deleteSession, getAllSessionMessages, getLatestSessionMessages, setSessionArchived } from '@/hermes'
 import { useI18n } from '@/i18n'
-import { type ChatMessage, preserveLocalAssistantErrors, toChatMessages } from '@/lib/chat-messages'
+import { type ChatMessage, preserveLocalAssistantErrors, preserveMcpUiCards, toChatMessages } from '@/lib/chat-messages'
 import { isMissingRpcMethod } from '@/lib/gateway-rpc'
 import { recoverInFlightTurnJournal } from '@/lib/inflight-turn-journal'
 import { setSessionYolo } from '@/lib/yolo-session'
@@ -814,7 +814,7 @@ export function useSessionActions({
                 state => ({
                   ...state,
                   ...(runtimeInfo ?? {}),
-                  messages: activatedMessages,
+                  messages: preserveMcpUiCards(activatedMessages, cachedViewState.messages, storedSessionId),
                   busy: running,
                   awaitingResponse: running,
                   // Adopting someone else's turn: we'll stream its reply
@@ -1042,7 +1042,7 @@ export function useSessionActions({
           state => ({
             ...state,
             ...(runtimeInfo ?? {}),
-            messages: messagesForView,
+            messages: preserveMcpUiCards(messagesForView, currentMessages, storedSessionId),
             busy: resumedRunning,
             awaitingResponse: resumedRunning && !recoveredInFlightTail,
             adoptedRunningTurn: state.adoptedRunningTurn || resumedRunning,

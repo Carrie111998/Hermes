@@ -19,6 +19,7 @@ import {
   terminalContextBlocksFromDraft
 } from '@/store/composer'
 import { $hudMode } from '@/store/hud'
+import { buildOutgoingUserText } from '@/store/mcp-app'
 import { clearNotifications, notify, notifyError } from '@/store/notifications'
 import { requestDesktopOnboarding } from '@/store/onboarding'
 import {
@@ -146,8 +147,9 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
           .join('\n')
 
         return (
-          [contextRefs, terminalContextBlocks, visibleText].filter(Boolean).join('\n\n') ||
-          (present.some(a => a.kind === 'image') ? 'What do you see in this image?' : '')
+          buildOutgoingUserText(
+            [contextRefs, terminalContextBlocks, visibleText].filter(Boolean).join('\n\n')
+          ) || (present.some(a => a.kind === 'image') ? 'What do you see in this image?' : '')
         )
       }
 

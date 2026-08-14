@@ -9,7 +9,7 @@ import { readActiveTerminal } from '@/app/right-sidebar/terminal/buffer'
 import { closeAgentTerminalByProc } from '@/app/right-sidebar/terminal/terminals'
 import { burstVibeHearts } from '@/components/chat/vibe-hearts'
 import { translateNow } from '@/i18n'
-import { type GatewayEventPayload, textPart } from '@/lib/chat-messages'
+import { cacheMcpUi, type GatewayEventPayload, textPart } from '@/lib/chat-messages'
 import { coerceGatewayText, coerceThinkingText, normalizePersonalityValue } from '@/lib/chat-runtime'
 import { playCompletionSound } from '@/lib/completion-sound'
 import { resolveGatewayEventSessionId } from '@/lib/gateway-events'
@@ -867,6 +867,14 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
         if (sessionId) {
           flushQueuedDeltas(sessionId)
           upsertToolCall(sessionId, toTodoPayload(payload) ?? payload, 'complete', event.type)
+
+          // MCP Apps ui is live-only (single-use pop server-side, never
+          // persisted). Stash it per-session so preserveMcpUiCards can restore
+          // it after a session switch replaces $messages.
+          if (payload?.ui) {
+            const tcid = payload.tool_id || payload.tool_call_id || payload.id || ''
+            if (tcid) cacheMcpUi(sessionId, tcid, payload.ui)
+          }
 
           if (isActiveEvent) {
             setPetActivity({ toolRunning: false })

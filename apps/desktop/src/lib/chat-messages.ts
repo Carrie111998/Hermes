@@ -50,6 +50,8 @@ export type GatewayEventPayload = {
   error?: string | boolean
   inline_diff?: string
   duration_s?: number
+  // MCP Apps: interactive UI card carried on tool.complete (server, uri, html, csp)
+  ui?: unknown
   todos?: unknown
   model?: string
   provider?: string
@@ -564,6 +566,26 @@ function findToolPartIndex(
       return stableIndex
     }
 
+    // Adopt the synthetic generating row. `tool.generating` emits name-only
+    // (no id, no args), then `tool.start` arrives with the stable id — for
+    // tools without a context preview (every MCP tool) the contextual
+    // matching below can never link them, orphaning the synthetic row as a
+    // forever-spinning "Running …" line next to the completed one. Only
+    // synthetic rows (`live-tool:` ids) are adoptable, so a parallel
+    // same-name call can't steal a row already claimed by another id.
+    const syntheticIndex = parts.findIndex(
+      part =>
+        part.type === 'tool-call' &&
+        part.toolName === name &&
+        part.result === undefined &&
+        typeof part.toolCallId === 'string' &&
+        part.toolCallId.startsWith('live-tool:')
+    )
+
+    if (syntheticIndex >= 0) {
+      return syntheticIndex
+    }
+
     // Some live streams start without an id, then complete with one. Fall
     // through to pending same-name/context matching so the completion updates
     // the synthetic live row instead of appending a duplicate completed row.
@@ -667,6 +689,7 @@ function toolResult(
     ...(payload?.preview ? { preview: payload.preview } : {}),
     ...(payload?.duration_s !== undefined ? { duration_s: payload.duration_s } : {}),
     ...carryTodos(payload, prevResult, prevArgs),
+    ...(payload?.ui ? { ui: payload.ui } : {}),
     ...(payload?.error ? { error: payload.error } : {})
   }
 }
@@ -1112,6 +1135,155 @@ export function toChatMessages(messages: SessionMessage[]): ChatMessage[] {
       m => chatMessageText(m).trim() || m.parts.some(part => part.type !== 'text') || m.attachmentRefs?.length
     )
   )
+}
+
+// MCP Apps ui payloads live only on the live tool.complete event (single-use
+// pop server-side) and are never persisted. $messages is a global singleton
+// replaced on session switch, so preserveMcpUiCards can't carry ui across a
+// switch from state.messages alone. A per-session cache fills that gap: the
+// tool.complete handler stashes ui here, and hydration consults it when
+// state.messages has already been replaced by another session.
+//
+// The cache is mirrored to localStorage so it survives HMR reloads AND app
+// restarts (both wipe the in-memory Map). localStorage persists across restarts
+// so cards remain visible even after closing and reopening the app.
+const _mcpUiBySession = new Map<string, Map<string, unknown>>()
+const _SS_PREFIX = 'mcp-ui:'
+
+function _loadSessionFromStorage(sessionId: string): Map<string, unknown> | undefined {
+  try {
+    const raw = localStorage.getItem(_SS_PREFIX + sessionId)
+    if (!raw) return undefined
+    const obj = JSON.parse(raw) as Record<string, unknown>
+    const m = new Map(Object.entries(obj))
+    // Prime the in-memory cache too.
+    _mcpUiBySession.set(sessionId, m)
+    return m
+  } catch {
+    return undefined
+  }
+}
+
+function _persistSessionToStorage(sessionId: string, m: Map<string, unknown>): void {
+  try {
+    const obj: Record<string, unknown> = {}
+    for (const [k, v] of m) obj[k] = v
+    localStorage.setItem(_SS_PREFIX + sessionId, JSON.stringify(obj))
+  } catch {
+    // QuotaExceeded — drop silently; the in-memory cache still works.
+  }
+}
+
+export function cacheMcpUi(sessionId: string, toolCallId: string, ui: unknown): void {
+  if (!sessionId || !toolCallId || !ui) return
+  let m = _mcpUiBySession.get(sessionId)
+  if (!m) {
+    m = new Map()
+    _mcpUiBySession.set(sessionId, m)
+  }
+  m.set(toolCallId, ui)
+  _persistSessionToStorage(sessionId, m)
+}
+
+export function clearCachedMcpUi(sessionId: string): void {
+  _mcpUiBySession.delete(sessionId)
+  try {
+    localStorage.removeItem(_SS_PREFIX + sessionId)
+  } catch {
+    // ignore
+  }
+}
+
+export function preserveMcpUiCards(
+  nextMessages: ChatMessage[],
+  currentMessages: ChatMessage[],
+  sessionId?: string
+): ChatMessage[] {
+  const uiByToolCallId = new Map<string, unknown>()
+
+  for (const message of currentMessages) {
+    for (const part of message.parts) {
+      if (part.type !== 'tool-call' || !part.toolCallId || !part.result) {
+        continue
+      }
+
+      const ui = (part.result as { ui?: unknown }).ui
+
+      if (ui) {
+        uiByToolCallId.set(part.toolCallId, ui)
+      }
+    }
+  }
+
+  // Fall back to the per-session cache when $messages was already replaced
+  // by another session (state.messages no longer has our ui).  Check both
+  // the in-memory Map and localStorage (survives HMR reload + app restart).
+  if (sessionId) {
+    let cached = _mcpUiBySession.get(sessionId)
+    if (!cached) {
+      cached = _loadSessionFromStorage(sessionId)
+    }
+    if (cached) {
+      for (const [id, ui] of cached) {
+        if (!uiByToolCallId.has(id)) {
+          uiByToolCallId.set(id, ui)
+        }
+      }
+    }
+  }
+
+  // Fallback: cacheMcpUi keys by the event's session_id (stored session
+  // ID), but resume/preserveMcpUiCards may receive a runtime session ID
+  // from the route. Scan all mcp-ui:* entries for matching tool-call IDs
+  // when the precise lookup came up empty.
+  if (!uiByToolCallId.size) {
+    const nextToolCallIds = new Set(
+      nextMessages
+        .flatMap(m => m.parts)
+        .filter(p => p.type === 'tool-call')
+        .map(p => (p as { toolCallId?: string }).toolCallId)
+        .filter(Boolean) as Set<string>
+    )
+    if (nextToolCallIds.size) {
+      for (const key of Object.keys(localStorage)) {
+        if (!key.startsWith(_SS_PREFIX)) continue
+        const entry = _loadSessionFromStorage(key.slice(_SS_PREFIX.length))
+        if (!entry) continue
+        for (const [id, ui] of entry) {
+          if (nextToolCallIds.has(id) && !uiByToolCallId.has(id)) {
+            uiByToolCallId.set(id, ui)
+          }
+        }
+      }
+    }
+  }
+
+
+  if (!uiByToolCallId.size) {
+    return nextMessages
+  }
+
+  return nextMessages.map(message => {
+    let changed = false
+
+    const parts = message.parts.map(part => {
+      if (part.type !== 'tool-call' || !part.toolCallId) {
+        return part
+      }
+
+      const ui = uiByToolCallId.get(part.toolCallId)
+
+      if (!ui || (part.result as { ui?: unknown } | undefined)?.ui) {
+        return part
+      }
+
+      changed = true
+
+      return { ...part, result: { ...(part.result as object), ui } }
+    })
+
+    return changed ? { ...message, parts } : message
+  })
 }
 
 export function preserveLocalAssistantErrors(

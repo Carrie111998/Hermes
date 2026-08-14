@@ -25,7 +25,7 @@ import { FloatingPet } from '@/components/pet/floating-pet'
 import { RemoteDisplayBanner } from '@/components/remote-display-banner'
 import { emitGatewayEvent } from '@/contrib/events'
 import { getLatestSessionMessages, triggerCronJob } from '@/hermes'
-import { type ChatMessage, chatMessageText, preserveLocalAssistantErrors, toChatMessages } from '@/lib/chat-messages'
+import { type ChatMessage, chatMessageText, preserveLocalAssistantErrors, preserveMcpUiCards, toChatMessages } from '@/lib/chat-messages'
 import { sessionMessagesSignature } from '@/lib/session-signatures'
 import { isMessagingSource } from '@/lib/session-source'
 import { latestSessionTodos } from '@/lib/todos'
@@ -36,6 +36,7 @@ import { $desktopBoot } from '@/store/boot'
 import { requestVoiceConversationStart } from '@/store/composer'
 import { $cronReviewRequest, setCronFocusJobId } from '@/store/cron'
 import { $pinnedSessionIds, pinSession, restoreWorktree, unpinSession } from '@/store/layout'
+import { $mcpAppUserMessage, clearMcpAppUserMessage } from '@/store/mcp-app'
 import { $previewTarget } from '@/store/preview'
 import {
   $activeGatewayProfile,
@@ -349,7 +350,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
           const messages = toChatMessages(latest.messages)
           updateSessionState(
             runtimeSessionId,
-            state => ({ ...state, messages: preserveLocalAssistantErrors(messages, state.messages) }),
+            state => ({ ...state, messages: preserveMcpUiCards(preserveLocalAssistantErrors(messages, state.messages), state.messages, storedSessionId) }),
             storedSessionId
           )
 
@@ -405,7 +406,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
 
       updateSessionState(
         runtimeSessionId,
-        state => ({ ...state, messages: preserveLocalAssistantErrors(messages, state.messages) }),
+        state => ({ ...state, messages: preserveMcpUiCards(preserveLocalAssistantErrors(messages, state.messages), state.messages, storedSessionId) }),
         storedSessionId
       )
     } catch {
@@ -608,6 +609,22 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     sttEnabled,
     updateSessionState
   })
+
+  // MCP Apps card→agent delegation (`ui/message` from a card, staged via
+  // src/store/mcp-app.ts): route through the normal send path so the agent
+  // picks up e.g. "checkout_id=… 帮我下单" exactly like a typed message.
+  const mcpAppUserMessage = useStore($mcpAppUserMessage)
+
+  useEffect(() => {
+    if (!mcpAppUserMessage) {
+      return
+    }
+
+    clearMcpAppUserMessage()
+    // `fromQueue` bypasses the busy guard: a card button click is an explicit
+    // user action, not a stray Enter — the gateway queues the turn internally.
+    void submitText(mcpAppUserMessage.text, { fromQueue: true })
+  }, [mcpAppUserMessage, submitText])
 
   // Runs outside the selected ChatBar so queues belonging to background
   // sessions continue once those sessions are idle.
