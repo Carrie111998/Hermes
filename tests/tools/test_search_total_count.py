@@ -21,9 +21,11 @@ def _real_shell_env(cwd):
     """A terminal env that actually runs commands (matches test_file_operations)."""
 
     def execute(command, **kwargs):
+        # The search pipeline uses `set -o pipefail`, a bash builtin — run
+        # under bash like the real terminal env (tools/environments/local.py
+        # executes via bash), not /bin/sh (dash on Debian/Ubuntu rejects it).
         completed = subprocess.run(
-            command,
-            shell=True,
+            ["/bin/bash", "-c", command],
             text=True,
             capture_output=True,
             cwd=kwargs.get("cwd") or cwd,
