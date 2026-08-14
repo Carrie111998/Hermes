@@ -39,7 +39,7 @@ def _init_git_repo(repo: Path) -> None:
     subprocess.run(["git", "-C", str(repo), "commit", "-m", "init"], check=True, capture_output=True, text=True)
 
 
-def test_dispatch_blocks_before_claim_when_required_path_is_absent(
+def test_dispatch_blocks_before_claim_when_required_path_is_only_untracked(
     kanban_home, tmp_path
 ):
     repo = tmp_path / "repo"
@@ -63,6 +63,20 @@ def test_dispatch_blocks_before_claim_when_required_path_is_absent(
             base_ref=base_ref,
             required_paths=["scripts/run-replay.ts"],
         )
+        candidate = kb.get_task(conn, task_id)
+        assert candidate is not None
+        workspace, _branch_name = kb._resolve_worktree_workspace(candidate)
+        (workspace / "scripts").mkdir()
+        (workspace / "scripts" / "run-replay.ts").write_text(
+            "export {};\n", encoding="utf-8"
+        )
+        git_status = subprocess.run(
+            ["git", "-C", str(workspace), "status", "--short"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+        assert "?? scripts/" in git_status
         result = kb.dispatch_once(
             conn, spawn_fn=lambda *_args, **_kwargs: pytest.fail("spawned")
         )
@@ -75,8 +89,9 @@ def test_dispatch_blocks_before_claim_when_required_path_is_absent(
     assert "scripts/run-replay.ts" in (task.last_failure_error or "")
 
 
+@pytest.mark.parametrize("required_path", ["scripts", "scripts/run-replay.ts"])
 def test_dispatch_materializes_declared_base_with_required_path(
-    kanban_home, tmp_path
+    kanban_home, tmp_path, required_path
 ):
     repo = tmp_path / "repo"
     _init_git_repo(repo)
@@ -106,7 +121,7 @@ def test_dispatch_materializes_declared_base_with_required_path(
             workspace_path=str(repo),
             branch_name="docs/replay",
             base_ref=base_ref,
-            required_paths=["scripts/run-replay.ts"],
+            required_paths=[required_path],
         )
         result = kb.dispatch_once(
             conn, spawn_fn=lambda _task, workspace: spawned.append(workspace)

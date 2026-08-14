@@ -7837,10 +7837,19 @@ def _check_implementation_prerequisites(
         )
         if result.returncode != 0:
             return f"task branch does not contain required base revision {task.base_ref!r}"
-    missing = [
-        path for path in task.required_paths or []
-        if not (workspace / path).exists()
-    ]
+    missing = []
+    for path in task.required_paths or []:
+        result = subprocess.run(
+            ["git", "-C", str(workspace), "cat-file", "-e", f"HEAD:{path}"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=30,
+            check=False,
+        )
+        if result.returncode != 0:
+            missing.append(path)
     if missing:
         return "required implementation path(s) absent: " + ", ".join(missing)
     return None
