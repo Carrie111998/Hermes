@@ -1,5 +1,6 @@
-import { type RefObject, useEffect, useRef } from 'react'
+import { type RefObject, useLayoutEffect, useRef } from 'react'
 
+import { usePaneVisible } from '@/components/pane-shell/pane-visibility'
 import { SLASH_COMMAND_RE } from '@/lib/chat-runtime'
 import { triggerHaptic } from '@/lib/haptics'
 import { hasClarifyRequest, skipClarifyRequest } from '@/store/clarify'
@@ -76,6 +77,7 @@ export function useComposerSubmit({
   setComposerText,
   stashAt
 }: UseComposerSubmitArgs) {
+  const paneVisible = usePaneVisible()
   const scope = useComposerScope()
 
   // Shared send primitive: fire onSubmit, and if the gateway rejects (accepted
@@ -108,14 +110,14 @@ export function useComposerSubmit({
   const dispatchSubmitRef = useRef(dispatchSubmit)
   dispatchSubmitRef.current = dispatchSubmit
 
-  useEffect(
+  useLayoutEffect(
     () =>
       onComposerSubmitRequest(({ target, text }) => {
-        if (target === 'main' && !inputDisabled) {
+        if (target === scope.target && paneVisible && !inputDisabled) {
           dispatchSubmitRef.current(text)
         }
       }),
-    [inputDisabled]
+    [inputDisabled, paneVisible, scope.target]
   )
 
   const submitDraft = () => {
