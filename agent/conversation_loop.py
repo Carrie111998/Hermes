@@ -45,6 +45,7 @@ from agent.turn_context import (
     reanchor_current_turn_user_idx,
 )
 from agent.turn_retry_state import TurnRetryState
+from agent.turn_finalizer import persist_completed_text_turn
 from agent.runtime_cwd import resolve_agent_cwd
 from agent.message_sanitization import (
     close_interrupted_tool_sequence,
@@ -7770,24 +7771,12 @@ def run_conversation(
                     final_response = None
                     continue
 
-                messages.append(final_msg)
-                # Make the completed answer durable before leaving the loop —
-                # a session torn down before finalize_turn's _persist_session
-                # otherwise loses a reply the user already saw (#81641). Same
-                # contract as the tool-call exit (#49045) and the verify exits
-                # above; _DB_PERSISTED_MARKER keeps _persist_session idempotent.
-                # Unlike the tool-call exit, failure must NOT abort the turn:
-                # no side effect follows and _persist_session retries the write.
-                # Full incident narrative: tests/run_agent/test_81641_*.py.
-                try:
-                    agent._flush_messages_to_session_db(messages, conversation_history)
-                except Exception:
-                    logger.warning(
-                        "final text-turn flush failed (session=%s) — reply is "
-                        "not yet durable; relying on finalize_turn retry",
-                        getattr(agent, "session_id", None) or "none",
-                        exc_info=True,
-                    )
+                persist_completed_text_turn(
+                    agent=agent,
+                    messages=messages,
+                    conversation_history=conversation_history,
+                    final_msg=final_msg,
+                )
 
                 _turn_exit_reason = f"text_response(finish_reason={finish_reason})"
                 if not agent.quiet_mode:

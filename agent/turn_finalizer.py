@@ -796,3 +796,57 @@ def finalize_turn(
     agent._turn_received_provider_response = False
 
     return result
+
+
+def persist_completed_text_turn(
+    *,
+    agent,
+    messages,
+    conversation_history,
+    final_msg,
+) -> None:
+    """Append the final assistant message and best-effort flush it to the DB.
+
+    Extracted from ``run_conversation`` (slice CL-R5-1): the final-message
+    append + best-effort SessionDB flush/warning block that runs when a
+    completed text turn is about to leave the loop.
+
+    Ordering contract (preserved from the original inline block):
+
+    1. ``final_msg`` is appended to ``messages`` first — the reply is part of
+       the transcript regardless of flush outcome.
+    2. The completed answer is flushed to the session DB before the loop
+       yields control, so a session torn down before ``finalize_turn``'s
+       ``_persist_session`` does not lose a reply the user already saw
+       (#81641).
+    3. A flush failure is best-effort: it is logged as a warning with
+       traceback info and swallowed. The turn must NOT abort — no side
+       effect follows and ``_persist_session`` retries the write.
+
+    The caller owns all control flow: this helper never raises, never breaks
+    or returns from the caller's loop, and never touches exit-reason or
+    completion-output state. ``logger`` resolves through this module's
+    established logging seam (lazy import of ``agent.conversation_loop``'s
+    logger) so the warning keeps the exact ``agent.conversation_loop`` logger
+    identity without an import cycle.
+    """
+    from agent.conversation_loop import logger
+
+    messages.append(final_msg)
+    # Make the completed answer durable before leaving the loop —
+    # a session torn down before finalize_turn's _persist_session
+    # otherwise loses a reply the user already saw (#81641). Same
+    # contract as the tool-call exit (#49045) and the verify exits
+    # above; _DB_PERSISTED_MARKER keeps _persist_session idempotent.
+    # Unlike the tool-call exit, failure must NOT abort the turn:
+    # no side effect follows and _persist_session retries the write.
+    # Full incident narrative: tests/run_agent/test_81641_*.py.
+    try:
+        agent._flush_messages_to_session_db(messages, conversation_history)
+    except Exception:
+        logger.warning(
+            "final text-turn flush failed (session=%s) — reply is "
+            "not yet durable; relying on finalize_turn retry",
+            getattr(agent, "session_id", None) or "none",
+            exc_info=True,
+        )
