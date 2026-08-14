@@ -27,6 +27,57 @@ describe('subagent store', () => {
     expect(item?.summary).toBe('done')
   })
 
+  it('treats a backend timeout as terminal failure instead of running forever', () => {
+    upsertSubagent(
+      's1',
+      {
+        goal: 'slow audit',
+        status: 'running',
+        subagent_id: 'a1',
+        task_index: 0,
+        tool_name: 'search_files'
+      },
+      true,
+      'subagent.start'
+    )
+    upsertSubagent(
+      's1',
+      { status: 'timeout', subagent_id: 'a1', task_index: 0, text: 'Timed out after 600s' },
+      false,
+      'subagent.complete'
+    )
+
+    const items = listFor('s1')
+    expect(items[0]?.status).toBe('failed')
+    expect(items[0]?.currentTool).toBeUndefined()
+    expect(activeSubagentCount(items)).toBe(0)
+    expect(failedSubagentCount(items)).toBe(1)
+  })
+
+  it.each(['running', 'queued'] as const)(
+    'treats a completion event with %s payload status as terminal failure',
+    status => {
+      upsertSubagent(
+        's1',
+        {
+          goal: 'inconsistent completion',
+          status: 'running',
+          subagent_id: 'a1',
+          task_index: 0,
+          tool_name: 'search_files'
+        },
+        true,
+        'subagent.start'
+      )
+      upsertSubagent('s1', { status, subagent_id: 'a1', task_index: 0 }, false, 'subagent.complete')
+
+      const items = listFor('s1')
+      expect(items[0]?.status).toBe('failed')
+      expect(items[0]?.currentTool).toBeUndefined()
+      expect(activeSubagentCount(items)).toBe(0)
+    }
+  )
+
   it('builds parent/child trees', () => {
     upsertSubagent('s1', { goal: 'parent', status: 'running', subagent_id: 'p', task_index: 0 })
     upsertSubagent('s1', { goal: 'child', parent_id: 'p', status: 'queued', subagent_id: 'c', task_index: 1 })

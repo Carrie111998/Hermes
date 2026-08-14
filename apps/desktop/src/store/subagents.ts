@@ -55,8 +55,25 @@ const str = (v: unknown) => (isStr(v) ? v : '')
 const num = (v: unknown) => (typeof v === 'number' && Number.isFinite(v) ? v : undefined)
 const strList = (v: unknown) => (Array.isArray(v) ? v.filter(isStr) : [])
 
-const asStatus = (v: unknown): SubagentStatus =>
-  v === 'completed' || v === 'failed' || v === 'interrupted' || v === 'queued' ? v : 'running'
+const asStatus = (value: unknown, eventType = ''): SubagentStatus => {
+  if (value === 'completed' || value === 'failed' || value === 'interrupted') {
+    return value
+  }
+
+  if (value === 'cancelled' || value === 'canceled') {
+    return 'interrupted'
+  }
+
+  if (value === 'error' || value === 'stalled' || value === 'timeout' || value === 'unknown') {
+    return 'failed'
+  }
+
+  if (eventType.endsWith('.complete')) {
+    return 'failed'
+  }
+
+  return value === 'queued' || value === 'running' ? value : 'running'
+}
 
 const compact = (text: string, max = PREVIEW_MAX) => {
   const line = text.replace(/\s+/g, ' ').trim()
@@ -148,7 +165,7 @@ function streamFromPayload(
 
 function toProgress(payload: SubagentPayload, prev: SubagentProgress | undefined, eventType = ''): SubagentProgress {
   const at = Date.now()
-  const status = asStatus(payload.status)
+  const status = asStatus(payload.status, eventType)
   const tool = str(payload.tool_name)
   const stream = streamFromPayload(payload, status, eventType, at).reduce(appendStream, prev?.stream ?? [])
   const filesRead = strList(payload.files_read)
