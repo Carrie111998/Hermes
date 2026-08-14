@@ -17,7 +17,11 @@ These tests pin the expanded whitelist so it doesn't regress.
 from __future__ import annotations
 
 
-from gateway.run import _ASSISTANT_REPLAY_FIELDS, _build_replay_entry
+from gateway.run import (
+    _ASSISTANT_REPLAY_FIELDS,
+    _build_gateway_agent_history,
+    _build_replay_entry,
+)
 
 
 class TestBuildReplayEntry:
@@ -132,10 +136,99 @@ class TestReplayEntryApiContentSidecar:
         assert entry["api_content"] == "a <memory-context>"
 
 
+def _assistant_rows(history):
+    """Rebuild replay history via the PRODUCTION builder and return the
+    assistant rows.
+
+    These tests deliberately exercise ``_build_gateway_agent_history``
+    itself rather than a local copy of its filtering logic: the dispatch
+    under test lives in the builder, so a replica would pass no matter what
+    the builder does.
+    """
+    agent_history, _observed = _build_gateway_agent_history(history)
+    return [m for m in agent_history if m.get("role") == "assistant"]
+
+
+class TestReasoningOnlyAssistantTurnsSurviveReload:
+    """An assistant turn whose only payload is reasoning state must survive
+    the transcript -> agent_history rebuild.
+
+    The builder's row dispatch keeps rich rows (tool_calls / tool results)
+    and rows with truthy ``content``.  A row with empty ``content`` carrying
+    only the fields named by ``_ASSISTANT_REPLAY_FIELDS`` matched neither
+    arm and was dropped outright, losing multi-turn thinking fidelity on
+    reload.
+    """
+
+    def test_reasoning_content_only_turn_is_preserved(self):
+        """DeepSeek/Kimi thinking-mode shape: content empty, reasoning_content set."""
+        assistant = _assistant_rows([
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "", "reasoning_content": "step by step"},
+        ])
+        assert len(assistant) == 1
+        assert assistant[0]["reasoning_content"] == "step by step"
+        assert assistant[0]["content"] == ""
+
+    def test_reasoning_only_turn_with_none_content_is_preserved(self):
+        """A dead stream persists ``content=None``; the reasoning still replays."""
+        assistant = _assistant_rows([
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": None, "reasoning": "thinking"},
+        ])
+        assert len(assistant) == 1
+        assert assistant[0]["reasoning"] == "thinking"
+        # `content` is normalized to "" -- the shape the API builders expect.
+        assert assistant[0]["content"] == ""
+
+    def test_reasoning_details_only_turn_is_preserved(self):
+        """``content`` may be absent entirely, not merely falsy."""
+        details = [{"type": "reasoning.summary", "summary": "s"}]
+        assistant = _assistant_rows([
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "reasoning_details": details},
+        ])
+        assert len(assistant) == 1
+        assert assistant[0]["reasoning_details"] == details
+
+    def test_reasoning_only_turn_keeps_position_between_user_turns(self):
+        """The recovered row must replay in transcript order, not be appended."""
+        agent_history, _observed = _build_gateway_agent_history([
+            {"role": "user", "content": "first"},
+            {"role": "assistant", "content": "", "reasoning_content": "mulling"},
+            {"role": "user", "content": "second"},
+        ])
+        assert [m["role"] for m in agent_history] == ["user", "assistant", "user"]
+        assert agent_history[1]["reasoning_content"] == "mulling"
+
+    def test_assistant_timestamp_is_still_dropped(self):
+        """Assistant timestamps are deliberately not replayed; recovering the
+        row must not start leaking them."""
+        assistant = _assistant_rows([
+            {"role": "user", "content": "hi"},
+            {
+                "role": "assistant",
+                "content": "",
+                "reasoning_content": "thinking",
+                "timestamp": 12345.6,
+            },
+        ])
+        assert len(assistant) == 1
+        assert "timestamp" not in assistant[0]
+
+    def test_truthy_content_turn_is_unaffected(self):
+        """Control: the pre-existing hot path is unchanged."""
+        assistant = _assistant_rows([
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "answer", "reasoning_content": "thinking"},
+        ])
+        assert assistant == [
+            {"role": "assistant", "content": "answer", "reasoning_content": "thinking"}
+        ]
+
+
 class TestGatewayHistoryBuildForwardsSidecar:
     def test_end_to_end_history_build_keeps_sidecar(self):
-        from gateway.run import _build_gateway_agent_history
-
         history = [
             {"role": "user", "content": "hi", "api_content": "hi\n\nCTX", "timestamp": 123.0},
             {"role": "assistant", "content": "hello"},
