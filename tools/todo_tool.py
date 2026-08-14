@@ -59,9 +59,10 @@ LEGACY_TODO_INJECTION_HEADERS = (
 TODO_INJECTION_HEADERS = (TODO_INJECTION_HEADER, *LEGACY_TODO_INJECTION_HEADERS)
 TODO_INJECTION_RECONCILIATION_GUIDANCE = (
     "Reconcile these candidates with the preserved ## Key Decisions and ## "
-    "Completed Actions before continuing. If preserved findings or the latest "
-    "user message invalidate an item, cancel or rewrite it rather than acting "
-    "on the stale wording."
+    "Completed Actions before continuing. A completed investigation item "
+    "(trace/check/verify) can invalidate a pending action item below it — if "
+    "a preserved finding or the latest user message contradicts an item's "
+    "premise, cancel or rewrite it rather than acting on the stale wording."
 )
 
 
