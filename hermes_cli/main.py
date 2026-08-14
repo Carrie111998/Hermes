@@ -448,6 +448,7 @@ from hermes_cli.subcommands.setup import build_setup_parser
 from hermes_cli.subcommands.whatsapp import build_whatsapp_parser
 from hermes_cli.subcommands.slack import build_slack_parser
 from hermes_cli.subcommands.login import build_login_parser
+from hermes_cli.subcommands.workspace import build_workspace_parser, cmd_workspace
 from hermes_cli.subcommands.logout import build_logout_parser
 from hermes_cli.subcommands.auth import build_auth_parser
 from hermes_cli.subcommands.status import build_status_parser
@@ -11849,6 +11850,9 @@ def main():
 
     kanban_parser = _build_kanban_parser(subparsers)
     kanban_parser.set_defaults(func=cmd_kanban)
+
+    # V1 workspace lifecycle controls are intentionally inventory/classify-only.
+    build_workspace_parser(subparsers, cmd_workspace=cmd_workspace)
 
     # =========================================================================
     # project command — named, multi-folder workspaces
