@@ -84,6 +84,7 @@ from .store import (
     SessionBridgeStore,
     SidebarSource,
     SidebarSourcePage,
+    StaleExternalProjection,
     redact_codex_thread_id,
 )
 from .worktree import (
