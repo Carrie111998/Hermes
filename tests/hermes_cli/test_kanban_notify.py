@@ -797,10 +797,8 @@ async def test_gateway_autosubscribe_roundtrips_user_id_alt_for_session_key(
 
 
 @pytest.mark.asyncio
-async def test_notifier_artifact_delivery_skips_missing_files(kanban_home, tmp_path, monkeypatch):
-    """Missing artifact paths are silently skipped — they may have been
-    referenced by name only. The notifier must not crash and must still
-    deliver any artifacts that do exist."""
+async def test_notifier_artifact_delivery_retries_missing_files(kanban_home, tmp_path, monkeypatch):
+    """Existing artifacts send once while missing paths remain durable and retryable."""
     import hermes_cli.kanban_db as kb
     from gateway.run import GatewayRunner
     from gateway.config import Platform
@@ -846,6 +844,7 @@ async def test_notifier_artifact_delivery_skips_missing_files(kanban_home, tmp_p
 
     async def _send_document(chat_id, file_path, metadata=None, **_kw):
         documents_uploaded.append(file_path)
+        runner._running = False
 
     fake_adapter.send = AsyncMock(side_effect=_send)
     fake_adapter.send_document = AsyncMock(side_effect=_send_document)
@@ -856,8 +855,14 @@ async def test_notifier_artifact_delivery_skips_missing_files(kanban_home, tmp_p
     runner.adapters = {Platform.TELEGRAM: fake_adapter}
 
     _orig_sleep = asyncio.sleep
+    _sleep_calls = 0
 
     async def _fast_sleep(_):
+        nonlocal _sleep_calls
+        _sleep_calls += 1
+        # Initial delay, then exactly one completed polling iteration.
+        if _sleep_calls >= 2:
+            runner._running = False
         await _orig_sleep(0)
 
     with patch("gateway.run.asyncio.sleep", side_effect=_fast_sleep):
@@ -866,9 +871,19 @@ async def test_notifier_artifact_delivery_skips_missing_files(kanban_home, tmp_p
             timeout=10.0,
         )
 
-    # Only the real file was uploaded.
-    assert len(documents_uploaded) == 1
-    assert "real.pdf" in documents_uploaded[0]
+    # The missing artifact failure must keep the completion claim retryable and
+    # preserve the subscription rather than silently treating the path as sent.
+    conn = kb.connect()
+    try:
+        subs = kb.list_notify_subs(conn, tid)
+        assert len(subs) == 1
+        completed_event = conn.execute(
+            "select max(id) from task_events where task_id=? and kind='completed'",
+            (tid,),
+        ).fetchone()[0]
+        assert subs[0]["last_event_id"] < completed_event
+    finally:
+        conn.close()
 
 
 # ---------------------------------------------------------------------------
@@ -1017,13 +1032,44 @@ def test_create_with_parents_inherits_delivery_metadata(kanban_home):
 # Stale done-subscription GC (purge_stale_done_notify_subs)
 # ---------------------------------------------------------------------------
 
-def _make_done_task_with_sub(kb, conn, *, title, chat_id):
+def _make_done_task_with_sub(kb, conn, *, title, chat_id, materialize=True):
     tid = kb.create_task(conn, title=title, assignee="worker1")
     kb.add_notify_sub(
         conn, task_id=tid, platform="telegram", chat_id=chat_id,
         notifier_profile="default",
     )
     assert kb.complete_task(conn, tid, summary="done")
+    if materialize:
+        from hermes_cli.kanban_delivery_outbox import (
+            due_children,
+            lease_child,
+            mark_sending,
+            mark_sent,
+            materialize_parent,
+        )
+
+        event_id = conn.execute(
+            "SELECT MAX(id) FROM task_events WHERE task_id=? AND kind='completed'",
+            (tid,),
+        ).fetchone()[0]
+        parent_id = materialize_parent(
+            conn,
+            source={
+                "board_uuid": "test-board",
+                "event_id": str(event_id),
+                "subscription_id": f"{tid}:telegram:{chat_id}:",
+            },
+            capability={
+                "version": "route-capability-v1",
+                "supports_async_delivery": True,
+                "creator_wake_applicable": False,
+            },
+            text="done",
+        )
+        for child in due_children(conn, parent_id=parent_id, now=1):
+            token = lease_child(conn, child["child_id"], "test", now=1, lease_seconds=10)
+            mark_sending(conn, child["child_id"], token, now=2)
+            mark_sent(conn, child["child_id"], token, receipt="test-receipt", now=3)
     return tid
 
 
@@ -1039,6 +1085,24 @@ def _backdate_task(kb, conn, tid, *, days):
             "UPDATE tasks SET completed_at = ?, created_at = ? WHERE id = ?",
             (past, past, tid),
         )
+
+
+def test_completed_subscription_without_parent_cannot_be_removed_or_gced(kanban_home):
+    import hermes_cli.kanban_db as kb
+
+    conn = kb.connect()
+    try:
+        tid = _make_done_task_with_sub(
+            kb, conn, title="unmaterialized", chat_id="c-lost", materialize=False
+        )
+        _backdate_task(kb, conn, tid, days=365)
+        assert kb.remove_notify_sub(
+            conn, task_id=tid, platform="telegram", chat_id="c-lost"
+        ) is False
+        assert kb.purge_stale_done_notify_subs(conn, max_age_days=30) == 0
+        assert len(kb.list_notify_subs(conn, tid)) == 1
+    finally:
+        conn.close()
 
 
 def test_gc_purges_stale_done_sub_keeps_fresh_one(kanban_home):

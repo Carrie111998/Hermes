@@ -88,3 +88,43 @@ def test_semantic_database_corruption_quarantines_immediately(monkeypatch, tmp_p
     finally:
         lease.release()
     assert second[0][1]["status"] == "quarantined"
+
+
+def test_runtime_health_tracks_stuck_ready_per_board_without_losing_sibling_parity(
+    monkeypatch, tmp_path
+):
+    from hermes_cli import kanban_dispatcher as runtime
+
+    runtime.reset_runtime_health_for_tests()
+    lease = _lease(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        "hermes_cli.kanban_db.list_boards",
+        lambda **_kw: [{"slug": "stuck"}, {"slug": "idle"}],
+    )
+
+    class Conn:
+        def __init__(self, slug):
+            self.slug = slug
+
+        def close(self):
+            pass
+
+    class Result:
+        spawned = []
+
+    monkeypatch.setattr("hermes_cli.kanban_db.connect", lambda board=None: Conn(board))
+    monkeypatch.setattr(
+        "hermes_cli.kanban_db.dispatch_once_authorized", lambda *_a, **_kw: Result()
+    )
+    monkeypatch.setattr(
+        "hermes_cli.kanban_db.has_spawnable_ready",
+        lambda conn: conn.slug == "stuck",
+    )
+    monkeypatch.setattr("hermes_cli.kanban_db.has_spawnable_review", lambda _conn: False)
+    try:
+        result = runtime.run_dispatcher_tick(lease, config={})
+    finally:
+        lease.release()
+
+    assert [slug for slug, _ in result] == ["stuck", "idle"]
+    assert runtime.runtime_health()["stuck_ready_ticks"] == {"stuck": 1}

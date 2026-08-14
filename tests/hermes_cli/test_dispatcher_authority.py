@@ -18,6 +18,32 @@ def test_machine_authority_is_process_global_across_profile_and_cwd(tmp_path, mo
     assert canonical_lock_path() == first == state / "kanban" / ".dispatcher.lock"
 
 
+def test_machine_authority_unwraps_arbitrarily_nested_profile_homes(tmp_path, monkeypatch):
+    from hermes_cli.dispatcher_authority import canonical_lock_path
+
+    root = tmp_path / ".hermes"
+    monkeypatch.delenv("HERMES_STATE_ROOT", raising=False)
+    monkeypatch.setenv(
+        "HERMES_HOME", str(root / "profiles" / "athena" / "profiles" / "athena")
+    )
+    first = canonical_lock_path()
+    monkeypatch.setenv(
+        "HERMES_HOME", str(root / "profiles" / "kevin" / "profiles" / "kevin")
+    )
+    assert canonical_lock_path() == first == root / "kanban" / ".dispatcher.lock"
+
+
+def test_machine_authority_ignores_nonconventional_profile_subtrees(tmp_path, monkeypatch):
+    from hermes_cli.dispatcher_authority import canonical_lock_path
+
+    root = tmp_path / ".hermes"
+    monkeypatch.delenv("HERMES_STATE_ROOT", raising=False)
+    monkeypatch.setenv("HERMES_HOME", str(root / "tenant-a" / "deep" / "home"))
+    first = canonical_lock_path()
+    monkeypatch.setenv("HERMES_HOME", str(root / "other-layout" / "profile-home"))
+    assert canonical_lock_path() == first == root / "kanban" / ".dispatcher.lock"
+
+
 def test_exactly_one_authority_holder_and_contender_fails_closed(tmp_path, monkeypatch):
     from hermes_cli.dispatcher_authority import AcquireState, acquire_machine_dispatcher
 

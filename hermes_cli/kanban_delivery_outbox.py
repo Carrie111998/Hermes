@@ -11,6 +11,22 @@ from typing import Any, Iterable, Mapping
 
 STATES = ("pending", "leased", "sending", "sent", "failed", "dead", "audited")
 
+# Frozen adapter/version pairs understood by the persisted v1 capability
+# snapshot.  Adding a gateway adapter does not implicitly make old outbox
+# readers understand its delivery semantics; support is an explicit schema
+# decision here.
+_ROUTE_ADAPTER_VERSIONS = {
+    name: frozenset({"1"})
+    for name in (
+        "a2a", "api_server", "bluebubbles", "buzz", "dingtalk", "discord",
+        "email", "feishu", "google_chat", "homeassistant", "irc", "line",
+        "local", "matrix", "mattermost", "msgraph_webhook", "ntfy", "photon",
+        "qqbot", "raft", "relay", "signal", "simplex", "slack", "sms",
+        "teams", "telegram", "webhook", "wecom", "wecom_callback", "weixin",
+        "whatsapp", "whatsapp_cloud", "yuanbao",
+    )
+}
+
 
 class CapabilityError(ValueError):
     pass
@@ -166,13 +182,21 @@ def _validate_capability(capability: Mapping[str, Any]) -> dict[str, Any]:
         if cap.get(field) not in versions:
             raise CapabilityError(f"unregistered {field}")
     adapter = cap.get("adapter_type")
+    adapter_version = cap.get("adapter_version")
     transport = cap.get("artifact_transport")
-    if adapter is not None and (not isinstance(adapter, str) or not adapter.strip()):
-        raise CapabilityError("adapter_type must be a registered non-empty name")
-    if transport is not None and transport not in {
-        adapter, "local", "creator_session"
-    }:
+    if adapter is None:
+        if adapter_version is not None:
+            raise CapabilityError("adapter_version requires a registered adapter_type")
+    else:
+        if not isinstance(adapter, str) or adapter not in _ROUTE_ADAPTER_VERSIONS:
+            raise CapabilityError("unregistered adapter_type")
+        if adapter_version not in _ROUTE_ADAPTER_VERSIONS[adapter]:
+            raise CapabilityError("unregistered adapter_version")
+    registered_transports = set(_ROUTE_ADAPTER_VERSIONS) | {"creator_session"}
+    if transport is not None and transport not in registered_transports:
         raise CapabilityError("unregistered artifact transport")
+    if adapter is not None and transport not in {None, adapter, "local", "creator_session"}:
+        raise CapabilityError("artifact transport is incompatible with adapter")
     return cap
 
 
@@ -186,15 +210,20 @@ def materialize_parent(
 ) -> str:
     source_frozen = dict(source)
     subscription_id = str(source_frozen.get("subscription_id") or "")
-    if not subscription_id:
-        raise CapabilityError("immutable subscription_id is required")
-    parent_id = _digest("kanban-delivery-parent-v2", source_frozen)
+    identity = {
+        key: str(source_frozen.get(key) or "")
+        for key in ("board_uuid", "event_id", "subscription_id")
+    }
+    if not subscription_id or not all(identity.values()):
+        raise CapabilityError(
+            "immutable board_uuid, event_id and subscription_id are required"
+        )
+    # Parent identity is the stable event/subscription tuple. Route, text,
+    # capability and artifact bytes belong to the immutable snapshot checked
+    # below; including them in the key would let drift create a second parent
+    # instead of rejecting the incompatible retry.
+    parent_id = _digest("kanban-delivery-parent-v3", identity)
     init_schema(conn)
-    existing = conn.execute(
-        "SELECT parent_id FROM kanban_delivery_parents WHERE parent_id=?", (parent_id,)
-    ).fetchone()
-    if existing:
-        return str(existing[0])
     cap = _validate_capability(capability)
     children: list[dict[str, Any]] = []
     if cap["supports_async_delivery"]:
@@ -238,16 +267,31 @@ def materialize_parent(
         children.append(
             {"kind": "artifact_upload", "ordinal": ordinal + 1, "required": not bool(item.get("optional", False)), "component": item, "policy": cap.get("artifact_policy_version") or "artifact-policy-v1"}
         )
-    cap_json = _canonical(cap)
     manifest = []
     for child in children:
         child["child_id"] = _digest(parent_id, child["kind"], child["ordinal"], child["component"])
         manifest.append(child)
     manifest_sha = _digest(manifest)
+    existing = conn.execute(
+        "SELECT parent_id,source_json,capability_sha256,manifest_sha256 "
+        "FROM kanban_delivery_parents WHERE parent_id=?",
+        (parent_id,),
+    ).fetchone()
+    cap_json = _canonical(cap)
+    cap_sha = hashlib.sha256(cap_json.encode()).hexdigest()
+    if existing:
+        exact = (
+            existing[1] == _canonical(source_frozen)
+            and existing[2] == cap_sha
+            and existing[3] == manifest_sha
+        )
+        if not exact:
+            raise CapabilityError("existing parent retry snapshot is incompatible")
+        return str(existing[0])
     with conn:
         conn.execute(
             "INSERT INTO kanban_delivery_parents(parent_id,source_json,capability_version,capability_json,capability_sha256,manifest_sha256,subscription_id,child_count,required_child_count) VALUES(?,?,?,?,?,?,?,?,?)",
-            (parent_id, _canonical(source_frozen), cap["version"], cap_json, hashlib.sha256(cap_json.encode()).hexdigest(), manifest_sha, subscription_id, len(manifest), sum(bool(x["required"]) for x in manifest)),
+            (parent_id, _canonical(source_frozen), cap["version"], cap_json, cap_sha, manifest_sha, subscription_id, len(manifest), sum(bool(x["required"]) for x in manifest)),
         )
         for child in manifest:
             conn.execute(

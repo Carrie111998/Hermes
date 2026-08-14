@@ -88,16 +88,43 @@ def test_push_with_required_creator_wake_freezes_text_and_wake_children(authorit
     ]
 
 
-def test_materialization_is_deterministic_and_capability_drift_cannot_reshape(authority_lease):
-    from hermes_cli.kanban_delivery_outbox import init_schema, materialize_parent
+def test_materialization_is_deterministic_and_rejects_any_retry_snapshot_drift(authority_lease):
+    from hermes_cli.kanban_delivery_outbox import CapabilityError, init_schema, materialize_parent
 
     conn = _conn()
     init_schema(conn)
     first = materialize_parent(conn, source=_source("e1"), capability=_push(), text="done")
-    second = materialize_parent(conn, source=_source("e1"), capability=_non_push(), text="changed")
-    assert first == second
+    assert materialize_parent(
+        conn, source=_source("e1"), capability=_push(), text="done"
+    ) == first
+    with pytest.raises(CapabilityError, match="snapshot"):
+        materialize_parent(
+            conn, source=_source("e1"), capability=_non_push(), text="changed"
+        )
+    drifted_source = _source("e1")
+    drifted_source["destination"] = "changed-route"
+    with pytest.raises(CapabilityError, match="snapshot"):
+        materialize_parent(
+            conn, source=drifted_source, capability=_push(), text="done"
+        )
     rows = conn.execute("select kind from kanban_delivery_children where parent_id=?", (first,)).fetchall()
     assert [r["kind"] for r in rows] == ["primary_text"]
+
+
+def test_route_capability_registry_rejects_unknown_adapter_version_and_transport(authority_lease):
+    from hermes_cli.kanban_delivery_outbox import CapabilityError, init_schema, materialize_parent
+
+    conn = _conn()
+    init_schema(conn)
+    invalid = _push()
+    invalid.update(
+        adapter_type="not-registered",
+        adapter_version="unregistered-version",
+        artifact_transport="not-registered",
+    )
+    with pytest.raises(CapabilityError, match="unregistered"):
+        materialize_parent(conn, source=_source("e1"), capability=invalid, text="done")
+    assert conn.execute("select count(*) from kanban_delivery_parents").fetchone()[0] == 0
 
 
 def test_invalid_non_push_without_wake_is_atomic(authority_lease):

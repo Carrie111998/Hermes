@@ -52,17 +52,23 @@ def canonical_lock_path() -> Path:
     if raw:
         root = Path(raw)
     else:
-        # HERMES_HOME is deliberately profile-scoped for gateway/worker
-        # isolation.  The dispatcher authority is not: two profiles on one
-        # installation must resolve the same inode.  Derive the installation
-        # root from the conventional <root>/profiles/<name> shape without
-        # importing the profile-aware process-home helper.
+        # Profile activation may use arbitrary/nested layouts below the
+        # machine installation root.  HERMES_HOME is profile-scoped, so it may
+        # identify that root only by containing the conventional ``.hermes``
+        # ancestor; its trailing shape must never participate in lock identity.
         home = Path(os.environ.get("HERMES_HOME") or (Path.home() / ".hermes"))
-        parts = home.parts
-        if len(parts) >= 2 and parts[-2] == "profiles":
-            root = home.parent.parent
+        installation = next(
+            (candidate for candidate in (home, *home.parents) if candidate.name == ".hermes"),
+            None,
+        )
+        if installation is not None:
+            root = installation
         else:
+            # Backward-compatible custom roots retain the conventional
+            # <root>/profiles/<name> derivation, including nested wrappers.
             root = home
+            while root.parent.name == "profiles":
+                root = root.parent.parent
     return root.expanduser().resolve(strict=False) / "kanban" / ".dispatcher.lock"
 
 

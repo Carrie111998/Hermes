@@ -632,6 +632,39 @@ def test_required_artifact_failure_is_durable_and_blocks_subscription_cursor(
     ]
 
 
+def test_missing_artifact_at_retry_ceiling_keeps_subscription_and_no_parent(
+    tmp_path, monkeypatch,
+):
+    db_path = tmp_path / "missing-artifact.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    artifact = tmp_path / "vanished.pdf"
+    artifact.write_bytes(b"exact bytes")
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="missing artifact", assignee="worker")
+        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
+        kb.complete_task(
+            conn, tid, summary="done", metadata={"artifacts": [str(artifact)]}
+        )
+    finally:
+        conn.close()
+    artifact.unlink()
+
+    runner = _make_runner(RecordingAdapter())
+    runner._kanban_sub_fail_counts = {(tid, "telegram", "chat-1", ""): 11}
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    conn = kb.connect()
+    try:
+        assert len(kb.list_notify_subs(conn, tid)) == 1
+        assert conn.execute("SELECT COUNT(*) FROM kanban_delivery_parents").fetchone()[0] == 0
+        assert _unseen_terminal_events(tid)
+    finally:
+        conn.close()
+    assert runner._kanban_sub_fail_counts[(tid, "telegram", "chat-1", "")] == 11
+
+
 def test_notifier_delivers_block_loop_detected_triage_ping(tmp_path, monkeypatch):
     """A `block_loop_detected` event must reach the subscriber as a triage ping.
 

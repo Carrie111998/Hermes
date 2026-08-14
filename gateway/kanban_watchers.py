@@ -717,7 +717,7 @@ class GatewayKanbanWatchersMixin:
                                 sub["task_id"], platform_str, fails,
                                 MAX_SEND_FAILURES, exc,
                             )
-                            if fails >= MAX_SEND_FAILURES:
+                            if fails >= MAX_SEND_FAILURES and kind != "completed":
                                 logger.warning(
                                     "kanban notifier: dropping subscription "
                                     "%s on %s after %d consecutive send failures",
@@ -726,6 +726,15 @@ class GatewayKanbanWatchersMixin:
                                 await asyncio.to_thread(self._kanban_unsub, sub, board_slug)
                                 sub_fail_counts.pop(sub_key, None)
                             else:
+                                if kind == "completed" and fails >= MAX_SEND_FAILURES:
+                                    # Completion delivery is loss-intolerant. A
+                                    # pre-materialization artifact/capability
+                                    # failure has no durable parent yet, so a
+                                    # generic retry ceiling must never convert
+                                    # it into an unsubscribe. Keep the counter
+                                    # below terminal range and retry after the
+                                    # exact advertised bytes become available.
+                                    sub_fail_counts[sub_key] = MAX_SEND_FAILURES - 1
                                 await asyncio.to_thread(
                                     self._kanban_rewind,
                                     sub,
@@ -920,16 +929,35 @@ class GatewayKanbanWatchersMixin:
                             )
 
                         if _is_push_adapter and not send_passive and _wake_kinds:
-                            # Wake-only (delivery_mode='wake') push sub: the
-                            # text ping was intentionally skipped above, so
-                            # the wake IS the sole delivery. It must succeed
-                            # BEFORE the cursor advances — advancing first
-                            # would let a failed wake (previously swallowed
-                            # by the best-effort except below) permanently
-                            # lose the event. Mirrors the non-push
-                            # (api_server) self-post ordering above.
+                            # Wake-only completion is still a durable delivery:
+                            # materialize a wake child before advancing. Other
+                            # terminal events retain the legacy direct wake.
+                            completion_event = next(
+                                (
+                                    item
+                                    for item in d.get("events", [])
+                                    if getattr(item, "kind", None) == "completed"
+                                ),
+                                None,
+                            )
                             try:
-                                await _push_wake()
+                                if completion_event is not None:
+                                    complete = await self._deliver_kanban_completed_event(
+                                        adapter=adapter,
+                                        sub=sub,
+                                        event=completion_event,
+                                        task=task,
+                                        text=_synth,
+                                        metadata={},
+                                        board=board_slug,
+                                    )
+                                    if not complete:
+                                        raise RuntimeError(
+                                            "durable wake-only parent remains incomplete"
+                                        )
+                                    durable_completion_processed = True
+                                else:
+                                    await _push_wake()
                                 sub_fail_counts.pop(sub_key, None)
                             except Exception as _wk_err:
                                 fails = sub_fail_counts.get(sub_key, 0) + 1
@@ -940,7 +968,7 @@ class GatewayKanbanWatchersMixin:
                                     sub["task_id"], fails,
                                     MAX_SEND_FAILURES, _wk_err, exc_info=True,
                                 )
-                                if fails >= MAX_SEND_FAILURES:
+                                if fails >= MAX_SEND_FAILURES and completion_event is None:
                                     logger.warning(
                                         "kanban notifier: dropping subscription "
                                         "%s on %s after %d consecutive wake failures",
@@ -949,9 +977,8 @@ class GatewayKanbanWatchersMixin:
                                     await asyncio.to_thread(self._kanban_unsub, sub, board_slug)
                                     sub_fail_counts.pop(sub_key, None)
                                 else:
-                                    # Rewind the pre-send claim so the next
-                                    # tick retries the wake — the event is
-                                    # NOT lost.
+                                    if fails >= MAX_SEND_FAILURES:
+                                        sub_fail_counts[sub_key] = MAX_SEND_FAILURES - 1
                                     await asyncio.to_thread(
                                         self._kanban_rewind,
                                         sub,
@@ -1111,17 +1138,18 @@ class GatewayKanbanWatchersMixin:
                 )
             push = adapter_supports_push(adapter)
             mode = sub.get("delivery_mode") or "notify"
+            delivery_push = push and mode != "wake"
             wake = mode in ("notify+wake", "wake")
             creator_session = (
-                sub.get("chat_id") if not push
+                sub.get("chat_id") if not delivery_push
                 else getattr(task, "session_id", None)
             )
             capability = {
                 "version": "route-capability-v1",
                 "adapter_type": (sub.get("platform") or "unknown").lower(),
                 "adapter_version": str(getattr(adapter, "delivery_capability_version", "1")),
-                "route_kind": "push" if push else "non_push",
-                "supports_async_delivery": push,
+                "route_kind": "push" if delivery_push else "non_push",
+                "supports_async_delivery": delivery_push,
                 "creator_wake_applicable": bool(wake or not push),
                 "creator_session_id": creator_session,
                 "wake_required": bool(mode == "wake" or not push),

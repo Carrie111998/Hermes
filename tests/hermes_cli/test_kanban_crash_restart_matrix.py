@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import multiprocessing as mp
+import json
 import os
 import signal
 import sqlite3
+import sys
 import time
+
+import pytest
 
 from hermes_cli.kanban_delivery_outbox import (
     due_children,
@@ -124,6 +128,40 @@ def _crash_mid_artifacts(db_path: str, first: str, second: str, ready) -> None:
     mark_sending(conn, second, token2, now=10)
     conn.close()
     ready.send("middle")
+    os.kill(os.getpid(), signal.SIGKILL)
+
+
+def _spawn_scoped_worker_then_crash(
+    task,
+    workspace: str,
+    state_root: str,
+    hermes_home: str,
+    hermes_executable: str,
+    systemd_run: str,
+    systemctl: str,
+    ready,
+) -> None:
+    os.environ["HERMES_STATE_ROOT"] = state_root
+    os.environ["HERMES_HOME"] = hermes_home
+    from hermes_cli import kanban_db as kb
+    from hermes_cli.dispatcher_authority import acquire_machine_dispatcher
+    from hermes_cli import worker_scope
+
+    kb._resolve_hermes_argv = lambda: [sys.executable, hermes_executable]
+    original_which = worker_scope.shutil.which
+    worker_scope.shutil.which = lambda name: {
+        "systemd-run": systemd_run,
+        "systemctl": systemctl,
+    }.get(name, original_which(name))
+
+    acquired = acquire_machine_dispatcher("production-spawn-crash")
+    if acquired.lease is None:
+        ready.send(("authority_failed", None))
+        return
+    pid = kb._invoke_worker_spawn(
+        acquired.lease, None, task, workspace, board="default"
+    )
+    ready.send(("spawned", pid))
     os.kill(os.getpid(), signal.SIGKILL)
 
 
@@ -249,17 +287,19 @@ def test_c_capability_shape_survives_sigkill_restart_and_route_drift(tmp_path, m
     conn = sqlite3.connect(db, isolation_level=None)
     conn.row_factory = sqlite3.Row
     init_schema(conn)
-    replay_parent = materialize_parent(
-        conn,
-        source=_source("c1"),
-        capability=_push(),
-        text="route-drifted",
-    )
+    from hermes_cli.kanban_delivery_outbox import CapabilityError
+
+    with pytest.raises(CapabilityError, match="snapshot"):
+        materialize_parent(
+            conn,
+            source=_source("c1"),
+            capability=_push(),
+            text="route-drifted",
+        )
     rows = conn.execute(
         "SELECT kind FROM kanban_delivery_children WHERE parent_id=? ORDER BY ordinal",
-        (replay_parent,),
+        (original_parent,),
     ).fetchall()
-    assert replay_parent == original_parent
     assert [row["kind"] for row in rows] == ["creator_wake"]
     conn.close()
     restarted.lease.release()
@@ -301,40 +341,145 @@ def test_d_dashboard_status_only_maps_dispatcher_crash_to_503_without_board_stat
 
 
 def test_p_pinned_worker_survives_dispatcher_sigkill_and_restart(tmp_path, monkeypatch):
+    from hermes_cli import kanban_db as kb
     from hermes_cli.dispatcher_authority import acquire_machine_dispatcher
 
-    expected = {
-        "HERMES_PROFILE": "specialist",
-        "HERMES_KANBAN_TASK": "t_exact",
-        "HERMES_KANBAN_RUN_ID": "77",
-        "HERMES_KANBAN_CLAIM_TOKEN": "opaque-claim",
-        "HERMES_MODEL": "exact-model",
-        "HERMES_PROVIDER": "exact-provider",
-        "HERMES_ENABLED_TOOLSETS": "web,terminal",
-    }
-    for key, value in expected.items():
-        monkeypatch.setenv(key, value)
     state_root = str(tmp_path / "state")
     monkeypatch.setenv("HERMES_STATE_ROOT", state_root)
+    root = tmp_path / ".hermes"
+    profile = root / "profiles" / "specialist"
+    profile.mkdir(parents=True)
+    profile.joinpath("config.yaml").write_text(
+        "platform_toolsets:\n  cli:\n    - terminal\n    - file\n",
+        encoding="utf-8",
+    )
+    root.joinpath("config.yaml").write_text("kanban: {}\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(root))
 
-    worker_parent, worker_child = mp.Pipe(duplex=False)
-    worker = mp.Process(target=_pinned_worker, args=(worker_child,))
-    worker.start()
-    assert worker_parent.recv() == expected
+    observation = tmp_path / "worker-observation.json"
+    stop_file = tmp_path / "stop-worker"
+    monkeypatch.setenv("P_OBSERVATION", str(observation))
+    monkeypatch.setenv("P_STOP_FILE", str(stop_file))
+    fake_hermes = tmp_path / "fake_hermes.py"
+    fake_hermes.write_text(
+        """import json, os, sys, time
+keys = [
+ 'HERMES_PROFILE', 'HERMES_HOME', 'HERMES_KANBAN_TASK',
+ 'HERMES_KANBAN_WORKSPACE', 'HERMES_KANBAN_BOARD', 'HERMES_KANBAN_DB',
+ 'HERMES_KANBAN_WORKSPACES_ROOT', 'HERMES_KANBAN_RUN_ID',
+ 'HERMES_KANBAN_CLAIM_LOCK', 'HERMES_KANBAN_MODEL',
+ 'HERMES_KANBAN_PROVIDER', 'HERMES_KANBAN_TOOLSETS', 'TERMINAL_CWD',
+]
+payload = {'pid': os.getpid(), 'argv': sys.argv[1:], 'env': {k: os.environ.get(k) for k in keys}}
+with open(os.environ['P_OBSERVATION'], 'w', encoding='utf-8') as fh:
+ json.dump(payload, fh, sort_keys=True)
+while not os.path.exists(os.environ['P_STOP_FILE']):
+ time.sleep(0.02)
+""",
+        encoding="utf-8",
+    )
+    fake_systemctl = tmp_path / "systemctl"
+    fake_systemctl.write_text("#!/bin/sh\nprintf 'running\\n'\n", encoding="utf-8")
+    fake_systemctl.chmod(0o755)
+    fake_systemd_run = tmp_path / "systemd-run"
+    fake_systemd_run.write_text(
+        """#!/usr/bin/env python3
+import os, sys
+args = sys.argv[1:]
+for arg in args:
+ if arg.startswith('--setenv='):
+  key, value = arg[len('--setenv='):].split('=', 1)
+  os.environ[key] = value
+command = args[args.index('--') + 1:]
+os.execvpe(command[0], command, os.environ)
+""",
+        encoding="utf-8",
+    )
+    fake_systemd_run.chmod(0o755)
 
-    holder_parent, holder_child = mp.Pipe(duplex=False)
-    holder = mp.Process(target=_authority_holder, args=(state_root, holder_child))
-    holder.start()
-    assert holder_parent.recv() == "acquired"
-    assert holder.pid is not None
-    os.kill(holder.pid, signal.SIGKILL)
-    holder.join(timeout=5)
-    assert holder.exitcode == -signal.SIGKILL
-    assert worker.is_alive()
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    task = kb.Task(
+        id="t_exact",
+        title="production P",
+        body=None,
+        assignee="specialist",
+        status="running",
+        priority=0,
+        created_by="test",
+        created_at=1,
+        started_at=1,
+        completed_at=None,
+        workspace_kind="dir",
+        workspace_path=str(workspace),
+        claim_lock="opaque-claim",
+        claim_expires=999,
+        tenant=None,
+        current_run_id=77,
+        model_override="exact-model",
+        provider_override="exact-provider",
+    )
+    dispatch_parent, dispatch_child = mp.Pipe(duplex=False)
+    dispatcher = mp.Process(
+        target=_spawn_scoped_worker_then_crash,
+        args=(
+            task,
+            str(workspace),
+            state_root,
+            str(root),
+            str(fake_hermes),
+            str(fake_systemd_run),
+            str(fake_systemctl),
+            dispatch_child,
+        ),
+    )
+    dispatcher.start()
+    status, worker_pid = dispatch_parent.recv()
+    assert status == "spawned"
+    dispatcher.join(timeout=5)
+    assert dispatcher.exitcode == -signal.SIGKILL
+
+    deadline = time.time() + 5
+    while not observation.exists() and time.time() < deadline:
+        time.sleep(0.02)
+    observed = json.loads(observation.read_text(encoding="utf-8"))
+    assert observed["pid"] == worker_pid
+    expected_env = {
+        "HERMES_PROFILE": "specialist",
+        "HERMES_HOME": str(profile),
+        "HERMES_KANBAN_TASK": "t_exact",
+        "HERMES_KANBAN_WORKSPACE": str(workspace),
+        "HERMES_KANBAN_BOARD": "default",
+        "HERMES_KANBAN_RUN_ID": "77",
+        "HERMES_KANBAN_CLAIM_LOCK": "opaque-claim",
+        "HERMES_KANBAN_MODEL": "exact-model",
+        "HERMES_KANBAN_PROVIDER": "exact-provider",
+        "HERMES_KANBAN_TOOLSETS": "bfl,file,kanban,terminal",
+        "TERMINAL_CWD": str(workspace),
+    }
+    for key, value in expected_env.items():
+        assert observed["env"][key] == value
+    assert observed["env"]["HERMES_KANBAN_DB"] == str(root / "kanban.db")
+    assert observed["env"]["HERMES_KANBAN_WORKSPACES_ROOT"] == str(
+        root / "kanban" / "workspaces"
+    )
+    assert observed["argv"] == [
+        "-p", "specialist", "--cli", "--accept-hooks",
+        "-m", "exact-model", "--provider", "exact-provider",
+        "--toolsets", "bfl,file,kanban,terminal", "chat", "-q",
+        "work kanban task t_exact",
+    ]
+    os.kill(worker_pid, 0)
 
     restarted = acquire_machine_dispatcher("post-worker-crash-restart")
     assert restarted.lease is not None
-    assert worker.is_alive()
+    os.kill(worker_pid, 0)
     restarted.lease.release()
-    worker.terminate()
-    worker.join(timeout=5)
+    stop_file.write_text("stop", encoding="utf-8")
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        try:
+            os.kill(worker_pid, 0)
+        except ProcessLookupError:
+            break
+        time.sleep(0.02)

@@ -9,6 +9,7 @@ from hermes_cli.dispatcher_authority import require_dispatcher_lease
 
 _BOARD_FAILURES: dict[str, int] = {}
 _QUARANTINED: dict[str, str] = {}
+_STUCK_READY_TICKS: dict[str, int] = {}
 
 
 def _load_kanban_config() -> dict[str, Any]:
@@ -66,12 +67,14 @@ def _strict_bool(cfg: Mapping[str, Any], key: str, default: bool) -> bool:
 def reset_runtime_health_for_tests() -> None:
     _BOARD_FAILURES.clear()
     _QUARANTINED.clear()
+    _STUCK_READY_TICKS.clear()
 
 
 def runtime_health() -> dict[str, Any]:
     return {
         "board_failures": dict(_BOARD_FAILURES),
         "quarantined": dict(_QUARANTINED),
+        "stuck_ready_ticks": dict(_STUCK_READY_TICKS),
     }
 
 
@@ -120,8 +123,22 @@ def run_dispatcher_tick(lease, *, config: Mapping[str, Any] | None = None):
                 reconcile_orphans=reconcile,
             )
             _BOARD_FAILURES.pop(slug, None)
+            try:
+                spawnable = kb.has_spawnable_ready(conn) or (
+                    kb.review_dispatch_enabled() and kb.has_spawnable_review(conn)
+                )
+            except Exception:
+                # Telemetry must never turn an otherwise successful board tick
+                # into a quarantine candidate.
+                _STUCK_READY_TICKS.pop(slug, None)
+            else:
+                if spawnable and not bool(getattr(result, "spawned", None)):
+                    _STUCK_READY_TICKS[slug] = _STUCK_READY_TICKS.get(slug, 0) + 1
+                else:
+                    _STUCK_READY_TICKS.pop(slug, None)
             results.append((slug, result))
         except Exception as exc:
+            _STUCK_READY_TICKS.pop(slug, None)
             failures = _BOARD_FAILURES.get(slug, 0) + 1
             _BOARD_FAILURES[slug] = failures
             immediate = isinstance(exc, sqlite3.DatabaseError)

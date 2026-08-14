@@ -10336,6 +10336,9 @@ def _invoke_worker_spawn(
     board: Optional[str],
 ) -> Optional[int]:
     """Invoke the guarded production spawner or a non-installed test double."""
+    from hermes_cli.dispatcher_authority import require_dispatcher_lease
+
+    require_dispatcher_lease(lease, "_invoke_worker_spawn")
     if spawn_fn is None:
         return _default_spawn(lease, task, workspace, board=board)
     import inspect
@@ -11310,7 +11313,16 @@ def remove_notify_sub(
 ) -> bool:
     with write_txn(conn):
         subscription_id = ":".join([task_id, platform, chat_id, thread_id or ""])
-        if not _delivery_subscription_complete(conn, subscription_id):
+        completion_ids = [
+            int(row["id"])
+            for row in conn.execute(
+                "SELECT id FROM task_events WHERE task_id=? AND kind='completed'",
+                (task_id,),
+            ).fetchall()
+        ]
+        if not _delivery_subscription_complete(
+            conn, subscription_id, required_event_ids=completion_ids
+        ):
             return False
         cur = conn.execute(
             "DELETE FROM kanban_notify_subs WHERE task_id = ? "
@@ -11321,23 +11333,36 @@ def remove_notify_sub(
 
 
 def _delivery_subscription_complete(
-    conn: sqlite3.Connection, subscription_id: str
+    conn: sqlite3.Connection,
+    subscription_id: str,
+    *,
+    required_event_ids: Iterable[int] = (),
 ) -> bool:
-    """Authoritatively gate cursor/removal on every frozen child."""
+    """Gate completion on exact materialized events and all frozen children."""
+    required = {str(int(event_id)) for event_id in required_event_ids}
     try:
-        row = conn.execute(
-            "SELECT 1 FROM kanban_delivery_parents p "
-            "WHERE p.subscription_id=? AND EXISTS ("
-            " SELECT 1 FROM kanban_delivery_children c "
+        rows = conn.execute(
+            "SELECT p.source_json, EXISTS ("
+            " SELECT 1 FROM kanban_delivery_children c"
             " WHERE c.parent_id=p.parent_id AND c.state NOT IN ('sent','audited')"
-            ") LIMIT 1",
+            ") AS incomplete FROM kanban_delivery_parents p "
+            "WHERE p.subscription_id=?",
             (subscription_id,),
-        ).fetchone()
+        ).fetchall()
     except sqlite3.OperationalError as exc:
         if "no such table" in str(exc).lower() or "no such column" in str(exc).lower():
-            return True
+            return not required
         raise
-    return row is None
+    materialized: set[str] = set()
+    for row in rows:
+        if row["incomplete"]:
+            return False
+        try:
+            event_id = str(json.loads(row["source_json"])["event_id"])
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            return False
+        materialized.add(event_id)
+    return required <= materialized
 
 
 def purge_stale_done_notify_subs(
@@ -11370,19 +11395,40 @@ def purge_stale_done_notify_subs(
     if days <= 0:
         return 0
     cutoff = int(time.time()) - days * 86400
+    removed = 0
     with write_txn(conn):
-        cur = conn.execute(
-            "DELETE FROM kanban_notify_subs WHERE task_id IN ("
-            " SELECT t.id FROM tasks t"
-            " WHERE t.status = 'done'"
-            " AND COALESCE("
-            "  (SELECT MAX(e.created_at) FROM task_events e"
-            "   WHERE e.task_id = t.id),"
-            "  t.completed_at, t.created_at, 0"
-            " ) < ?)",
+        rows = conn.execute(
+            "SELECT s.task_id,s.platform,s.chat_id,s.thread_id "
+            "FROM kanban_notify_subs s JOIN tasks t ON t.id=s.task_id "
+            "WHERE t.status='done' AND COALESCE("
+            " (SELECT MAX(e.created_at) FROM task_events e WHERE e.task_id=t.id),"
+            " t.completed_at,t.created_at,0) < ?",
             (cutoff,),
-        )
-    return int(cur.rowcount or 0)
+        ).fetchall()
+        for row in rows:
+            subscription_id = ":".join(
+                [row["task_id"], row["platform"], row["chat_id"], row["thread_id"] or ""]
+            )
+            completion_ids = [
+                int(event["id"])
+                for event in conn.execute(
+                    "SELECT id FROM task_events WHERE task_id=? AND kind='completed'",
+                    (row["task_id"],),
+                ).fetchall()
+            ]
+            if not _delivery_subscription_complete(
+                conn, subscription_id, required_event_ids=completion_ids
+            ):
+                continue
+            removed += int(
+                conn.execute(
+                    "DELETE FROM kanban_notify_subs WHERE task_id=? AND platform=? "
+                    "AND chat_id=? AND thread_id=?",
+                    (row["task_id"], row["platform"], row["chat_id"], row["thread_id"] or ""),
+                ).rowcount
+                or 0
+            )
+    return removed
 
 
 def unseen_events_for_sub(
@@ -11488,7 +11534,24 @@ def advance_notify_cursor(
 ) -> bool:
     with write_txn(conn):
         subscription_id = ":".join([task_id, platform, chat_id, thread_id or ""])
-        if not _delivery_subscription_complete(conn, subscription_id):
+        sub = conn.execute(
+            "SELECT last_event_id FROM kanban_notify_subs "
+            "WHERE task_id=? AND platform=? AND chat_id=? AND thread_id=?",
+            (task_id, platform, chat_id, thread_id or ""),
+        ).fetchone()
+        if sub is None:
+            return False
+        completion_ids = [
+            int(row["id"])
+            for row in conn.execute(
+                "SELECT id FROM task_events WHERE task_id=? AND kind='completed' "
+                "AND id>? AND id<=?",
+                (task_id, int(sub["last_event_id"]), int(new_cursor)),
+            ).fetchall()
+        ]
+        if not _delivery_subscription_complete(
+            conn, subscription_id, required_event_ids=completion_ids
+        ):
             return False
         cur = conn.execute(
             "UPDATE kanban_notify_subs SET last_event_id = ? "

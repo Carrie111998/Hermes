@@ -7,6 +7,13 @@
     "test_id": "embedded_dispatcher_authority"
   },
   {
+    "symbol": "gateway.kanban_watchers.GatewayKanbanWatchersMixin._owns_kanban_dispatcher_lock",
+    "exposure": "embedded authority status helper",
+    "mutation_class": "authority_status",
+    "authority_policy": "PROVEN_READ_ONLY",
+    "test_id": "embedded_dispatcher_authority"
+  },
+  {
     "symbol": "hermes_cli.kanban._cmd_dispatcher",
     "exposure": "hermes kanban dispatcher",
     "mutation_class": "dispatch_mutation",
@@ -77,11 +84,109 @@
     "test_id": "private_locked_tick_lease"
   },
   {
+    "symbol": "hermes_cli.kanban_db.run_daemon",
+    "exposure": "installed daemon facade",
+    "mutation_class": "dispatch_mutation",
+    "authority_policy": "GUARDED_DISPATCH_MUTATION",
+    "test_id": "daemon_lease"
+  },
+  {
+    "symbol": "hermes_cli.kanban_db._invoke_worker_spawn",
+    "exposure": "installed worker spawn facade",
+    "mutation_class": "process_spawn",
+    "authority_policy": "GUARDED_DISPATCH_MUTATION",
+    "test_id": "spawn_facade_lease"
+  },
+  {
     "symbol": "hermes_cli.kanban_db._default_spawn",
     "exposure": "production worker spawner",
     "mutation_class": "process_spawn",
     "authority_policy": "GUARDED_DISPATCH_MUTATION",
     "test_id": "worker_spawn_lease"
+  },
+  {
+    "symbol": "hermes_cli.kanban_delivery_outbox.init_schema",
+    "exposure": "delivery schema initializer",
+    "mutation_class": "delivery_schema_mutation",
+    "authority_policy": "IDEMPOTENT_SCHEMA_MUTATION",
+    "test_id": "outbox_schema_idempotence"
+  },
+  {
+    "symbol": "hermes_cli.kanban_delivery_outbox._ensure_column",
+    "exposure": "delivery schema migration helper",
+    "mutation_class": "delivery_schema_mutation",
+    "authority_policy": "IDEMPOTENT_SCHEMA_MUTATION",
+    "test_id": "outbox_schema_idempotence"
+  },
+  {
+    "symbol": "hermes_cli.kanban_delivery_outbox.materialize_parent",
+    "exposure": "completion snapshot materializer",
+    "mutation_class": "delivery_materialization",
+    "authority_policy": "DETERMINISTIC_DELIVERY_MUTATION",
+    "test_id": "exact_retry_snapshot"
+  },
+  {
+    "symbol": "hermes_cli.kanban_delivery_outbox.lease_child",
+    "exposure": "delivery child lease issuer",
+    "mutation_class": "delivery_transition",
+    "authority_policy": "TOKEN_MINTING_DELIVERY_MUTATION",
+    "test_id": "child_lease_cas"
+  },
+  {
+    "symbol": "hermes_cli.kanban_delivery_outbox.recover_expired",
+    "exposure": "expired delivery recovery",
+    "mutation_class": "delivery_transition",
+    "authority_policy": "LEASE_EXPIRY_DELIVERY_MUTATION",
+    "test_id": "expired_delivery_recovery"
+  },
+  {
+    "symbol": "hermes_cli.kanban_delivery_outbox.mark_sending",
+    "exposure": "delivery send transition",
+    "mutation_class": "delivery_transition",
+    "authority_policy": "TOKEN_GUARDED_DELIVERY_MUTATION",
+    "test_id": "child_token_transition"
+  },
+  {
+    "symbol": "hermes_cli.kanban_delivery_outbox.mark_sent",
+    "exposure": "delivery acknowledgement transition",
+    "mutation_class": "delivery_transition",
+    "authority_policy": "TOKEN_GUARDED_DELIVERY_MUTATION",
+    "test_id": "child_token_transition"
+  },
+  {
+    "symbol": "hermes_cli.kanban_delivery_outbox.mark_failed",
+    "exposure": "delivery failure transition",
+    "mutation_class": "delivery_transition",
+    "authority_policy": "TOKEN_GUARDED_DELIVERY_MUTATION",
+    "test_id": "child_token_transition"
+  },
+  {
+    "symbol": "hermes_cli.kanban_delivery_outbox.mark_dead",
+    "exposure": "delivery terminal transition",
+    "mutation_class": "delivery_transition",
+    "authority_policy": "STATE_GUARDED_DELIVERY_MUTATION",
+    "test_id": "dead_state_transition"
+  },
+  {
+    "symbol": "hermes_cli.kanban_delivery_outbox.audit_dead_child",
+    "exposure": "delivery audit transition",
+    "mutation_class": "delivery_transition",
+    "authority_policy": "AUDITED_DELIVERY_MUTATION",
+    "test_id": "terminal_audit_transition"
+  },
+  {
+    "symbol": "hermes_cli.kanban_delivery_outbox._derive_parent",
+    "exposure": "delivery parent derivation helper",
+    "mutation_class": "delivery_transition",
+    "authority_policy": "CHILD_STATE_DERIVED_MUTATION",
+    "test_id": "parent_state_derivation"
+  },
+  {
+    "symbol": "hermes_cli.kanban_delivery_outbox.process_parent",
+    "exposure": "delivery processing facade",
+    "mutation_class": "delivery_transition",
+    "authority_policy": "TOKEN_GUARDED_DELIVERY_MUTATION",
+    "test_id": "composite_child_processing"
   },
   {
     "symbol": "hermes_cli.kanban_db.remove_notify_sub",

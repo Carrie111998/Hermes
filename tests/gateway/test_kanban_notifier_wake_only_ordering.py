@@ -147,7 +147,17 @@ def test_wake_only_failure_rewinds_and_redelivers(tmp_path, monkeypatch):
     )
     assert len(_subs(tid)) == 1, "one transient failure must not drop the sub"
 
-    # Next tick: the same event is claimed and the wake retried.
+    # Next polling interval: make the durable child due (production cadence is
+    # five seconds; this single-tick harness does not advance wall time).
+    conn = kb.connect()
+    try:
+        conn.execute(
+            "update kanban_delivery_children set next_attempt_at=0 "
+            "where state='failed'"
+        )
+        conn.commit()
+    finally:
+        conn.close()
     runner2 = _make_runner(adapter)
     runner2._kanban_sub_fail_counts = runner._kanban_sub_fail_counts
     asyncio.run(_run_one_notifier_tick(monkeypatch, runner2))
@@ -177,8 +187,8 @@ def test_notify_wake_failure_is_durable_and_rewinds(tmp_path, monkeypatch):
     # pre-existing task_terminal behavior, unrelated to the wake outcome.)
 
 
-def test_wake_only_failure_cap_drops_subscription(tmp_path, monkeypatch):
-    """After MAX_SEND_FAILURES consecutive wake failures the sub is dropped."""
+def test_wake_only_completion_failure_cap_retains_subscription(tmp_path, monkeypatch):
+    """Completion wake failures remain durable beyond the generic retry ceiling."""
     monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "wake-cap.db"))
     kb.init_db()
     tid = _make_completed_task("wake")
@@ -192,10 +202,8 @@ def test_wake_only_failure_cap_drops_subscription(tmp_path, monkeypatch):
     asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
 
     assert len(adapter.handled) == 1
-    assert _subs(tid) == [], (
-        "subscription must drop after MAX_SEND_FAILURES consecutive "
-        "wake-only delivery failures, like text sends do"
-    )
-    assert runner._kanban_sub_fail_counts == {}, (
-        "counter entry must clear when the subscription is dropped"
-    )
+    assert len(_subs(tid)) == 1
+    assert _unseen_terminal_events(tid), "completion must remain retryable"
+    assert runner._kanban_sub_fail_counts[
+        (tid, "telegram", "chat-1", "")
+    ] == 11
