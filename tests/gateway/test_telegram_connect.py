@@ -54,3 +54,17 @@ class TestTelegramUnconfiguredNonRetryable:
         assert adapter.fatal_error_retryable is False
         assert adapter.fatal_error_code == "missing_dependency"
 
+
+def test_lazy_install_rebinds_type_handler(monkeypatch):
+    """A transient missing SDK import must not leave TypeHandler as typing.Any."""
+    import typing
+
+    import tools.lazy_deps
+    from telegram.ext import TypeHandler
+
+    monkeypatch.setattr(telegram_mod, "TELEGRAM_AVAILABLE", False)
+    monkeypatch.setattr(telegram_mod, "TypeHandler", typing.Any)
+    monkeypatch.setattr(tools.lazy_deps, "ensure", lambda *_args, **_kwargs: None)
+
+    assert telegram_mod.check_telegram_requirements() is True
+    assert telegram_mod.TypeHandler is TypeHandler
