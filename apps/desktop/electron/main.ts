@@ -85,6 +85,12 @@ import { describeCrashReason, installCrashForensics } from './crash-forensics'
 import { adoptServedDashboardToken } from './dashboard-token'
 import { loadOrCreateInstallationId, sshOwnershipId } from './desktop-installation'
 import {
+  applyDesktopPrimaryProfile,
+  DESKTOP_PROFILE_NAME_RE,
+  readDesktopPrimaryProfile,
+  writeDesktopPrimaryProfile
+} from './desktop-primary-profile'
+import {
   buildPosixCleanupScript,
   buildWindowsCleanupScript,
   modeRemovesAgent,
@@ -651,7 +657,7 @@ const DESKTOP_WINDOW_STATE_PATH = path.join(app.getPath('userData'), 'window-sta
 const DESKTOP_PROFILE_CONFIG_PATH = path.join(app.getPath('userData'), 'active-profile.json')
 // Mirrors hermes_cli.profiles._PROFILE_ID_RE so we never hand the backend a
 // value its profile resolver would reject and exit on.
-const PROFILE_NAME_RE = /^[a-z0-9][a-z0-9_-]{0,63}$/
+const PROFILE_NAME_RE = DESKTOP_PROFILE_NAME_RE
 // Branch we track for self-update. The GUI work has merged to main, so this
 // tracks main. User can also override at runtime via
 // hermesDesktop.updates.setBranch().
@@ -6893,32 +6899,11 @@ function writeDesktopConnectionConfig(config) {
 // a valid stored value (pins the root HERMES_HOME explicitly); null means "no
 // preference" and preserves the legacy launch (no --profile flag).
 function readActiveDesktopProfile() {
-  try {
-    const raw = fs.readFileSync(DESKTOP_PROFILE_CONFIG_PATH, 'utf8')
-    const parsed = JSON.parse(raw)
-    const name = parsed && typeof parsed.profile === 'string' ? parsed.profile.trim() : ''
-
-    if (name && (name === 'default' || PROFILE_NAME_RE.test(name))) {
-      return name
-    }
-  } catch {
-    // Missing or malformed → no preference.
-  }
-
-  return null
+  return readDesktopPrimaryProfile(DESKTOP_PROFILE_CONFIG_PATH)
 }
 
 function writeActiveDesktopProfile(name) {
-  const value = typeof name === 'string' ? name.trim() : ''
-
-  if (value && value !== 'default' && !PROFILE_NAME_RE.test(value)) {
-    throw new Error(`Invalid profile name: ${value}`)
-  }
-
-  fs.mkdirSync(path.dirname(DESKTOP_PROFILE_CONFIG_PATH), { recursive: true })
-  writeFileAtomic(DESKTOP_PROFILE_CONFIG_PATH, JSON.stringify({ profile: value || null }, null, 2))
-
-  return value || null
+  return writeDesktopPrimaryProfile(DESKTOP_PROFILE_CONFIG_PATH, name)
 }
 
 // Sanitize a connection config into the renderer-facing shape. With no
@@ -10553,13 +10538,13 @@ ipcMain.handle('hermes:connection-config:apply', async (_event, payload) => {
 
 ipcMain.handle('hermes:profile:get', async () => ({ profile: readActiveDesktopProfile() }))
 ipcMain.handle('hermes:profile:set', async (_event, name) => {
-  const next = writeActiveDesktopProfile(name)
-
-  // Switching profiles is a backend re-home: relaunch the dashboard under the
-  // new HERMES_HOME. Pool backends keep their own homes, so only the primary
-  // is torn down.
-  await teardownPrimaryBackendAndWait()
-  mainWindow?.reload()
+  const next = await applyDesktopPrimaryProfile(DESKTOP_PROFILE_CONFIG_PATH, name, {
+    // Switching profiles is a backend re-home: relaunch the dashboard under
+    // the new HERMES_HOME. Pool backends keep their own homes, so only the
+    // primary is torn down.
+    teardownPrimary: teardownPrimaryBackendAndWait,
+    reload: () => mainWindow?.reload()
+  })
 
   return { profile: next }
 })

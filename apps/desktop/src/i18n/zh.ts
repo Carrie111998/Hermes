@@ -1801,6 +1801,8 @@ export const zh: Translations = {
     skills: count => `${count} 个技能`,
     env: 'env',
     defaultBadge: '默认',
+    primaryDesktopBadge: '桌面主配置档案',
+    makePrimaryDesktop: '设为桌面主配置档案',
     rename: '重命名',
     renameMenu: '重命名…',
     editSoul: '编辑 SOUL.md…',
@@ -1850,6 +1852,7 @@ export const zh: Translations = {
     failedCopy: '复制安装命令失败',
     failedLoadSoul: '加载 SOUL.md 失败',
     failedSaveSoul: '保存 SOUL.md 失败',
+    failedSetPrimaryDesktop: '更改桌面主配置档案失败',
     failedCreate: '创建配置档案失败',
     failedRename: '重命名配置档案失败'
   },

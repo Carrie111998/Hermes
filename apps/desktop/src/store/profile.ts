@@ -25,11 +25,24 @@ export function normalizeProfileKey(name: string | null | undefined): string {
   return value || 'default'
 }
 
-// The profile the running local backend is actually scoped to (mirrors
-// /api/profiles/active `current`). "default" is the root ~/.hermes. This is the
-// display source of truth for the statusbar pill; the desktop's *stored*
-// preference (which may be unset) lives in the Electron main process.
+// Last known profile for the primary local backend. "default" is the root
+// ~/.hermes. During startup this may temporarily fall back to the persisted
+// preference; $primaryDesktopProfileState keeps that distinct from a confirmed
+// running backend for controls that can restart the Desktop.
 export const $activeProfile = atom<string>('default')
+
+export interface PrimaryDesktopProfileState {
+  current: string | null
+  persisted: string | null | undefined
+}
+
+// `current` is non-null only after /api/profiles/active confirms the running
+// primary. `persisted` is undefined only when Electron's profile.get failed;
+// null is its meaningful "no --profile preference" value.
+export const $primaryDesktopProfileState = atom<PrimaryDesktopProfileState>({
+  current: null,
+  persisted: undefined
+})
 
 // Cached profile list for the picker. Refreshed lazily; the dropdown also
 // re-fetches on open so a profile created elsewhere shows up.
@@ -107,19 +120,44 @@ interface ActiveProfileResponse {
   current: string
 }
 
+// Pull the primary backend's actual profile. If it is not ready yet, fall back
+// to Electron's persisted preference so primary-profile controls never mistake
+// their initial "default" atom value for confirmed state.
+export async function refreshPrimaryProfile(): Promise<PrimaryDesktopProfileState> {
+  const [currentResult, persistedResult] = await Promise.allSettled([
+    window.hermesDesktop.api<ActiveProfileResponse>({
+      path: '/api/profiles/active',
+      timeoutMs: STARTUP_REQUEST_TIMEOUT_MS
+    }),
+    window.hermesDesktop.profile.get()
+  ])
+
+  const current = currentResult.status === 'fulfilled' ? normalizeProfileKey(currentResult.value.current) : null
+
+  const persisted =
+    persistedResult.status === 'fulfilled'
+      ? persistedResult.value.profile
+        ? normalizeProfileKey(persistedResult.value.profile)
+        : null
+      : undefined
+
+  const state = { current, persisted }
+
+  $primaryDesktopProfileState.set(state)
+
+  if (current) {
+    setActiveProfile(current)
+  } else if (persisted) {
+    setActiveProfile(persisted)
+  }
+
+  return state
+}
+
 // Pull the running backend's current profile + the available profile list.
 // Best-effort: failures (backend not up yet) leave the prior values intact.
 export async function refreshActiveProfile(): Promise<void> {
-  try {
-    const res = await window.hermesDesktop.api<ActiveProfileResponse>({
-      path: '/api/profiles/active',
-      timeoutMs: STARTUP_REQUEST_TIMEOUT_MS
-    })
-
-    setActiveProfile(res.current || 'default')
-  } catch {
-    // Backend may not be ready; keep the last known value.
-  }
+  await refreshPrimaryProfile()
 
   try {
     await refreshProfiles()
@@ -133,12 +171,55 @@ export async function refreshActiveProfile(): Promise<void> {
 // (the renderer is torn down). We optimistically reflect the selection first so
 // the pill updates instantly if the reload is delayed.
 export async function switchProfile(name: string): Promise<void> {
-  if (!name || name === $activeProfile.get()) {
+  if (!name) {
     return
   }
 
-  setActiveProfile(name)
-  await window.hermesDesktop.profile.set(name)
+  const target = normalizeProfileKey(name)
+  const previousState = $primaryDesktopProfileState.get()
+  let persisted: string | null | undefined
+
+  try {
+    const preference = await window.hermesDesktop.profile.get()
+    persisted = preference.profile ? normalizeProfileKey(preference.profile) : null
+  } catch {
+    persisted = undefined
+  }
+
+  if (previousState.current === target && persisted === target) {
+    return
+  }
+
+  const previous = $activeProfile.get()
+  const switchingState = { current: null, persisted: target }
+
+  setActiveProfile(target)
+  $primaryDesktopProfileState.set(switchingState)
+
+  try {
+    await window.hermesDesktop.profile.set(target)
+  } catch (error) {
+    if (normalizeProfileKey($activeProfile.get()) === target) {
+      setActiveProfile(previous)
+    }
+
+    if ($primaryDesktopProfileState.get() === switchingState) {
+      let failedPersisted: string | null | undefined
+
+      try {
+        const preference = await window.hermesDesktop.profile.get()
+        failedPersisted = preference.profile ? normalizeProfileKey(preference.profile) : null
+      } catch {
+        failedPersisted = undefined
+      }
+
+      if ($primaryDesktopProfileState.get() === switchingState) {
+        $primaryDesktopProfileState.set({ current: previousState.current, persisted: failedPersisted })
+      }
+    }
+
+    throw error
+  }
 }
 
 // ── Swap-minimal gateway routing ──────────────────────────────────────────

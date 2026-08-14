@@ -1,9 +1,9 @@
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import type * as Nanostores from 'nanostores'
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { deleteProfile } from '@/hermes'
-import { refreshProfiles, selectProfile, setActiveProfile } from '@/store/profile'
+import { refreshPrimaryProfile, refreshProfiles, selectProfile, setActiveProfile, switchProfile } from '@/store/profile'
 import type { ProfileInfo } from '@/types/hermes'
 
 import { ProfilesView } from './index'
@@ -39,27 +39,45 @@ vi.mock('@/store/notifications', () => ({
   notifyError: vi.fn()
 }))
 
-const { $activeGatewayProfile: activeGateway, $profileColors } = vi.hoisted(() => {
+const {
+  $activeGatewayProfile: activeGateway,
+  $activeProfile: activePrimary,
+  $primaryDesktopProfileState: primaryDesktopState,
+  $profileColors
+} = vi.hoisted(() => {
   const { atom } = require('nanostores') as typeof Nanostores
 
   return {
     $activeGatewayProfile: atom<string>('default'),
+    $activeProfile: atom<string>('default'),
+    $primaryDesktopProfileState: atom({ current: 'default', persisted: 'default' as null | string | undefined }),
     $profileColors: atom<Record<string, string>>({})
   }
 })
 
 vi.mock('@/store/profile', () => ({
   $activeGatewayProfile: activeGateway,
+  $activeProfile: activePrimary,
+  $primaryDesktopProfileState: primaryDesktopState,
   $profileColors,
   normalizeProfileKey: (name: null | string | undefined) => (name ?? '').trim() || 'default',
+  refreshPrimaryProfile: vi.fn(async () => undefined),
   refreshProfiles: vi.fn(async () => [] as ProfileInfo[]),
   selectProfile: vi.fn(),
-  setActiveProfile: vi.fn()
+  setActiveProfile: vi.fn(),
+  switchProfile: vi.fn()
 }))
 
 // The one non-default profile these tests act on. Its name doubles as the row's
 // accessible name, so the delete helper queries by it rather than a literal.
 const NAMED_PROFILE = 'work'
+
+beforeEach(() => {
+  activePrimary.set('default')
+  primaryDesktopState.set({ current: 'default', persisted: 'default' })
+  vi.mocked(refreshPrimaryProfile).mockReset()
+  vi.mocked(refreshPrimaryProfile).mockResolvedValue(primaryDesktopState.get())
+})
 
 function makeProfile(name: string, isDefault = false): ProfileInfo {
   return {
@@ -151,5 +169,50 @@ describe('ProfilesView', () => {
     await waitFor(() => expect(screen.queryByRole('button', { name: 'Delete' })).toBeNull())
     expect(selectProfile).not.toHaveBeenCalled()
     expect(setActiveProfile).not.toHaveBeenCalled()
+  })
+
+  it('offers an explicit action that switches the primary Desktop profile back to default', async () => {
+    vi.mocked(refreshProfiles).mockResolvedValue([makeProfile('default', true), makeProfile(NAMED_PROFILE)])
+    vi.mocked(refreshPrimaryProfile).mockImplementationOnce(async () => {
+      activePrimary.set(NAMED_PROFILE)
+      const state = { current: NAMED_PROFILE, persisted: NAMED_PROFILE }
+      primaryDesktopState.set(state)
+
+      return state
+    })
+
+    await renderProfilesView()
+    expect(refreshPrimaryProfile).toHaveBeenCalledOnce()
+    realClick(await findRowMenu('default'))
+    fireEvent.click(await screen.findByRole('menuitem', { name: 'Make primary Desktop profile' }))
+
+    await waitFor(() => expect(switchProfile).toHaveBeenCalledWith('default'))
+  })
+
+  it('supports making a named profile primary', async () => {
+    vi.mocked(switchProfile).mockClear()
+    vi.mocked(refreshProfiles).mockResolvedValue([makeProfile('default', true), makeProfile(NAMED_PROFILE)])
+    activePrimary.set('default')
+
+    await renderProfilesView()
+    realClick(await findRowMenu(NAMED_PROFILE))
+    fireEvent.click(await screen.findByRole('menuitem', { name: 'Make primary Desktop profile' }))
+
+    await waitFor(() => expect(switchProfile).toHaveBeenCalledWith(NAMED_PROFILE))
+  })
+
+  it('marks the current primary Desktop profile and disables its restart action', async () => {
+    vi.mocked(switchProfile).mockClear()
+    vi.mocked(refreshProfiles).mockResolvedValue([makeProfile('default', true), makeProfile(NAMED_PROFILE)])
+    activePrimary.set('default')
+
+    await renderProfilesView()
+    expect(await screen.findByText('Primary for Desktop')).toBeTruthy()
+    realClick(await findRowMenu('default'))
+    const action = await screen.findByRole('menuitem', { name: 'Make primary Desktop profile' })
+
+    expect(action.getAttribute('data-disabled')).not.toBeNull()
+    fireEvent.click(action)
+    expect(switchProfile).not.toHaveBeenCalled()
   })
 })

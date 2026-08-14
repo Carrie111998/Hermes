@@ -1317,6 +1317,8 @@ export const ar = defineLocale({
     skills: count => `${count} مهارة`,
     env: 'البيئة',
     defaultBadge: 'افتراضي',
+    primaryDesktopBadge: 'ملف سطح المكتب الأساسي',
+    makePrimaryDesktop: 'تعيين كملف سطح المكتب الأساسي',
     rename: 'إعادة تسمية',
     copySetup: 'نسخ الإعداد',
     copying: 'جار النسخ...',
@@ -1365,6 +1367,7 @@ export const ar = defineLocale({
     failedCopy: 'فشل النسخ',
     failedLoadSoul: 'فشل تحميل التعليمات',
     failedSaveSoul: 'فشل حفظ التعليمات',
+    failedSetPrimaryDesktop: 'فشل تغيير ملف سطح المكتب الأساسي',
     failedCreate: 'فشل الإنشاء',
     failedRename: 'فشل إعادة التسمية'
   },

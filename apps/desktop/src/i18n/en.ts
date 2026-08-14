@@ -1609,6 +1609,8 @@ export const en: Translations = {
     skills: count => `${count} ${count === 1 ? 'skill' : 'skills'}`,
     env: 'env',
     defaultBadge: 'Default',
+    primaryDesktopBadge: 'Primary for Desktop',
+    makePrimaryDesktop: 'Make primary Desktop profile',
     rename: 'Rename',
     renameMenu: 'Rename…',
     editSoul: 'Edit SOUL.md…',
@@ -1658,6 +1660,7 @@ export const en: Translations = {
     failedCopy: 'Failed to copy setup command',
     failedLoadSoul: 'Failed to load SOUL.md',
     failedSaveSoul: 'Failed to save SOUL.md',
+    failedSetPrimaryDesktop: 'Failed to change the primary Desktop profile',
     failedCreate: 'Failed to create profile',
     failedRename: 'Failed to rename profile'
   },

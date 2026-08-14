@@ -1431,6 +1431,8 @@ export const ja = defineLocale({
     skills: count => `${count} スキル`,
     env: 'env',
     defaultBadge: 'デフォルト',
+    primaryDesktopBadge: 'デスクトップのプライマリ',
+    makePrimaryDesktop: 'デスクトップのプライマリプロファイルに設定',
     rename: '名前を変更',
     renameMenu: '名前を変更…',
     editSoul: 'SOUL.md を編集…',
@@ -1481,6 +1483,7 @@ export const ja = defineLocale({
     failedCopy: 'セットアップコマンドのコピーに失敗しました',
     failedLoadSoul: 'SOUL.md の読み込みに失敗しました',
     failedSaveSoul: 'SOUL.md の保存に失敗しました',
+    failedSetPrimaryDesktop: 'デスクトップのプライマリプロファイルを変更できませんでした',
     failedCreate: 'プロファイルの作成に失敗しました',
     failedRename: 'プロファイルの名前変更に失敗しました'
   },

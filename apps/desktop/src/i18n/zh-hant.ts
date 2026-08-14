@@ -1379,6 +1379,8 @@ export const zhHant = defineLocale({
     skills: count => `${count} 個技能`,
     env: 'env',
     defaultBadge: '預設',
+    primaryDesktopBadge: '桌面主要設定檔',
+    makePrimaryDesktop: '設為桌面主要設定檔',
     rename: '重新命名',
     renameMenu: '重新命名…',
     editSoul: '編輯 SOUL.md…',
@@ -1428,6 +1430,7 @@ export const zhHant = defineLocale({
     failedCopy: '複製安裝指令失敗',
     failedLoadSoul: '載入 SOUL.md 失敗',
     failedSaveSoul: '儲存 SOUL.md 失敗',
+    failedSetPrimaryDesktop: '變更桌面主要設定檔失敗',
     failedCreate: '建立設定檔失敗',
     failedRename: '重新命名設定檔失敗'
   },

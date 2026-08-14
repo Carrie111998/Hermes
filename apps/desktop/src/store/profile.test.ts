@@ -14,13 +14,24 @@ const resetStarmapGraph = vi.fn()
 vi.mock('@/store/gateway', () => ({ $gateway, ensureGatewayForProfile, openGatewayForProfile }))
 vi.mock('@/hermes', () => ({
   getProfiles: vi.fn(async () => ({ profiles: [] })),
-  setApiRequestProfile: vi.fn()
+  setApiRequestProfile: vi.fn(),
+  STARTUP_REQUEST_TIMEOUT_MS: 10_000
 }))
 vi.mock('@/lib/query-client', () => ({ invalidateProfileScopedQueries: vi.fn() }))
 vi.mock('@/store/starmap', () => ({ resetStarmapGraph }))
 
-const { $activeGatewayProfile, $profiles, ensureGatewayProfile, prewarmProfileBackend, refreshProfiles } =
-  await import('./profile')
+const {
+  $activeGatewayProfile,
+  $activeProfile,
+  $primaryDesktopProfileState,
+  $profiles,
+  ensureGatewayProfile,
+  prewarmProfileBackend,
+  refreshPrimaryProfile,
+  refreshProfiles,
+  selectProfile,
+  switchProfile
+} = await import('./profile')
 
 const { $connection } = await import('./session')
 const { invalidateProfileScopedQueries } = await import('@/lib/query-client')
@@ -43,16 +54,33 @@ const localConn = (over: Partial<HermesConnection> = {}): HermesConnection =>
   ({ baseUrl: '', mode: 'local', profile: 'default', ...over }) as HermesConnection
 
 const getConnection = vi.fn<(profile?: string | null) => Promise<HermesConnection>>()
+const getPrimaryProfile = vi.fn<() => Promise<{ profile: string | null }>>()
+const setPrimaryProfile = vi.fn<(profile: string) => Promise<{ profile: string | null }>>()
+const desktopApi = vi.fn<(request: { path: string; timeoutMs?: number }) => Promise<unknown>>()
 
 beforeEach(() => {
   getConnection.mockReset()
+  getPrimaryProfile.mockReset()
+  getPrimaryProfile.mockResolvedValue({ profile: 'default' })
+  setPrimaryProfile.mockReset()
+  setPrimaryProfile.mockResolvedValue({ profile: 'default' })
+  desktopApi.mockReset()
+  desktopApi.mockResolvedValue({ active: 'default', current: 'default' })
   ensureGatewayForProfile.mockClear()
   openGatewayForProfile.mockClear()
   $gateway.set({ id: 'live-socket' })
+  $activeProfile.set('default')
+  $primaryDesktopProfileState.set({ current: 'default', persisted: 'default' })
   $activeGatewayProfile.set('default')
   $connection.set(localConn())
   $profiles.set([])
-  vi.stubGlobal('window', { hermesDesktop: { getConnection } })
+  vi.stubGlobal('window', {
+    hermesDesktop: {
+      api: desktopApi,
+      getConnection,
+      profile: { get: getPrimaryProfile, set: setPrimaryProfile }
+    }
+  })
   vi.mocked(invalidateProfileScopedQueries).mockClear()
   resetStarmapGraph.mockClear()
 })
@@ -170,5 +198,93 @@ describe('refreshProfiles shared rail list (#49289)', () => {
     await expect(refreshProfiles()).rejects.toThrow('backend unavailable')
 
     expect($profiles.get().map(profile => profile.name)).toEqual(['default', 'test1'])
+  })
+})
+
+describe('primary Desktop profile refresh', () => {
+  it('reads the actual primary backend independently from workspace routing', async () => {
+    $activeGatewayProfile.set('workspace')
+    desktopApi.mockResolvedValueOnce({ active: 'dev', current: 'dev' })
+
+    await refreshPrimaryProfile()
+
+    expect(desktopApi).toHaveBeenCalledWith(expect.objectContaining({ path: '/api/profiles/active' }))
+    expect(desktopApi.mock.calls[0]?.[0]).not.toHaveProperty('profile')
+    expect($activeProfile.get()).toBe('dev')
+    expect($primaryDesktopProfileState.get()).toEqual({ current: 'dev', persisted: 'default' })
+    expect(getPrimaryProfile).toHaveBeenCalledOnce()
+  })
+
+  it('falls back to the persisted primary while the backend is unavailable', async () => {
+    desktopApi.mockRejectedValueOnce(new Error('backend starting'))
+    getPrimaryProfile.mockResolvedValueOnce({ profile: 'dev' })
+
+    await refreshPrimaryProfile()
+
+    expect($activeProfile.get()).toBe('dev')
+    expect($primaryDesktopProfileState.get()).toEqual({ current: null, persisted: 'dev' })
+  })
+})
+
+describe('persisted Desktop primary profile switching (#85991)', () => {
+  it('persists named to default through the Desktop profile IPC', async () => {
+    $activeProfile.set('dev')
+    $primaryDesktopProfileState.set({ current: 'dev', persisted: 'dev' })
+    getPrimaryProfile.mockResolvedValueOnce({ profile: 'dev' })
+
+    await switchProfile('default')
+
+    expect(setPrimaryProfile).toHaveBeenCalledWith('default')
+  })
+
+  it('persists default to a named primary profile through the same IPC', async () => {
+    await switchProfile('dev')
+
+    expect(setPrimaryProfile).toHaveBeenCalledWith('dev')
+  })
+
+  it('does not invoke the IPC for the already-primary profile', async () => {
+    $activeProfile.set('dev')
+    $primaryDesktopProfileState.set({ current: 'dev', persisted: 'dev' })
+    getPrimaryProfile.mockResolvedValueOnce({ profile: 'dev' })
+
+    await switchProfile('dev')
+
+    expect(setPrimaryProfile).not.toHaveBeenCalled()
+  })
+
+  it('keeps a failed re-home retryable when persistence already succeeded', async () => {
+    setPrimaryProfile.mockImplementationOnce(async profile => {
+      getPrimaryProfile.mockResolvedValue({ profile })
+      throw new Error('backend did not stop')
+    })
+
+    await expect(switchProfile('dev')).rejects.toThrow('backend did not stop')
+    expect($activeProfile.get()).toBe('default')
+    expect($primaryDesktopProfileState.get()).toEqual({ current: 'default', persisted: 'dev' })
+
+    setPrimaryProfile.mockResolvedValueOnce({ profile: 'dev' })
+    await switchProfile('dev')
+    expect(setPrimaryProfile).toHaveBeenCalledTimes(2)
+  })
+
+  it('keeps a persisted target retryable when the running primary is unconfirmed', async () => {
+    $primaryDesktopProfileState.set({ current: null, persisted: 'default' })
+    getPrimaryProfile.mockResolvedValueOnce({ profile: 'default' })
+
+    await switchProfile('default')
+
+    expect(setPrimaryProfile).toHaveBeenCalledWith('default')
+  })
+
+  it('keeps an actual workspace switch independent from persisted primary state', async () => {
+    $activeProfile.set('dev')
+    $activeGatewayProfile.set('dev')
+    getConnection.mockResolvedValue(localConn())
+
+    selectProfile('default')
+
+    await vi.waitFor(() => expect(ensureGatewayForProfile).toHaveBeenCalledWith('default'))
+    expect(setPrimaryProfile).not.toHaveBeenCalled()
   })
 })

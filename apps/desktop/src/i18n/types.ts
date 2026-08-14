@@ -1346,6 +1346,8 @@ export interface Translations {
     skills: (count: number) => string
     env: string
     defaultBadge: string
+    primaryDesktopBadge: string
+    makePrimaryDesktop: string
     rename: string
     renameMenu: string
     editSoul: string
@@ -1395,6 +1397,7 @@ export interface Translations {
     failedCopy: string
     failedLoadSoul: string
     failedSaveSoul: string
+    failedSetPrimaryDesktop: string
     failedCreate: string
     failedRename: string
   }

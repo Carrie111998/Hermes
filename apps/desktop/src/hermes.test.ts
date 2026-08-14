@@ -41,7 +41,7 @@ describe('Hermes REST helpers', () => {
     api = vi.fn().mockResolvedValue(emptySessionsResponse)
     Object.defineProperty(window, 'hermesDesktop', {
       configurable: true,
-      value: { api }
+      value: { api, profile: { get: vi.fn(async () => ({ profile: 'default' })) } }
     })
   })
 
