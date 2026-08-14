@@ -40,6 +40,19 @@ def _push() -> dict:
     }
 
 
+def _non_push() -> dict:
+    capability = _push()
+    capability.update(
+        adapter_type="api_server",
+        route_kind="non_push",
+        supports_async_delivery=False,
+        creator_wake_applicable=True,
+        creator_session_id="session-1",
+        artifact_transport="creator_session",
+    )
+    return capability
+
+
 def _authority_holder(state_root: str, ready) -> None:
     os.environ["HERMES_STATE_ROOT"] = state_root
     from hermes_cli.dispatcher_authority import acquire_machine_dispatcher
@@ -48,6 +61,43 @@ def _authority_holder(state_root: str, ready) -> None:
     ready.send(acquired.state.value)
     if acquired.lease is None:
         return
+    while True:
+        time.sleep(10)
+
+
+def _materialize_then_crash(db_path: str, state_root: str, ready) -> None:
+    os.environ["HERMES_STATE_ROOT"] = state_root
+    from hermes_cli.dispatcher_authority import acquire_machine_dispatcher
+
+    acquired = acquire_machine_dispatcher("capability-crash")
+    if acquired.lease is None:
+        ready.send(("authority_failed", None))
+        return
+    conn = sqlite3.connect(db_path, isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    init_schema(conn)
+    parent_id = materialize_parent(
+        conn,
+        source=_source("c1"),
+        capability=_non_push(),
+        text="must-not-send",
+    )
+    conn.close()
+    ready.send(("materialized", parent_id))
+    os.kill(os.getpid(), signal.SIGKILL)
+
+
+def _pinned_worker(ready) -> None:
+    keys = (
+        "HERMES_PROFILE",
+        "HERMES_KANBAN_TASK",
+        "HERMES_KANBAN_RUN_ID",
+        "HERMES_KANBAN_CLAIM_TOKEN",
+        "HERMES_MODEL",
+        "HERMES_PROVIDER",
+        "HERMES_ENABLED_TOOLSETS",
+    )
+    ready.send({key: os.environ.get(key) for key in keys})
     while True:
         time.sleep(10)
 
@@ -178,3 +228,113 @@ def test_n_partial_artifact_batch_preserves_sent_sibling_and_retries_only_incomp
     assert states == {first: "sent", second: "failed"}
     assert [row["child_id"] for row in due_children(conn, parent_id=parent_id, now=12)] == [second]
     conn.close()
+
+
+def test_c_capability_shape_survives_sigkill_restart_and_route_drift(tmp_path, monkeypatch):
+    from hermes_cli.dispatcher_authority import acquire_machine_dispatcher
+
+    db = tmp_path / "capability.db"
+    state_root = str(tmp_path / "state")
+    parent, child = mp.Pipe(duplex=False)
+    proc = mp.Process(target=_materialize_then_crash, args=(str(db), state_root, child))
+    proc.start()
+    state, original_parent = parent.recv()
+    assert state == "materialized"
+    proc.join(timeout=5)
+    assert proc.exitcode == -signal.SIGKILL
+
+    monkeypatch.setenv("HERMES_STATE_ROOT", state_root)
+    restarted = acquire_machine_dispatcher("capability-restart")
+    assert restarted.lease is not None
+    conn = sqlite3.connect(db, isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    init_schema(conn)
+    replay_parent = materialize_parent(
+        conn,
+        source=_source("c1"),
+        capability=_push(),
+        text="route-drifted",
+    )
+    rows = conn.execute(
+        "SELECT kind FROM kanban_delivery_children WHERE parent_id=? ORDER BY ordinal",
+        (replay_parent,),
+    ).fetchall()
+    assert replay_parent == original_parent
+    assert [row["kind"] for row in rows] == ["creator_wake"]
+    conn.close()
+    restarted.lease.release()
+
+
+def test_d_dashboard_status_only_maps_dispatcher_crash_to_503_without_board_state(tmp_path, monkeypatch):
+    from fastapi import HTTPException
+    from plugins.kanban.dashboard import plugin_api
+
+    state_root = str(tmp_path / "state")
+    hermes_home = tmp_path / "profile-home"
+    monkeypatch.setenv("HERMES_STATE_ROOT", state_root)
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    parent, child = mp.Pipe(duplex=False)
+    proc = mp.Process(target=_authority_holder, args=(state_root, child))
+    proc.start()
+    assert parent.recv() == "acquired"
+
+    try:
+        plugin_api.dispatch(board="must-not-resolve")
+    except HTTPException as exc:
+        assert exc.status_code == 409
+        assert exc.detail["dispatch_performed"] is False
+    else:
+        raise AssertionError("status-only dashboard endpoint unexpectedly returned success")
+
+    assert proc.pid is not None
+    os.kill(proc.pid, signal.SIGKILL)
+    proc.join(timeout=5)
+    assert proc.exitcode == -signal.SIGKILL
+    try:
+        plugin_api.dispatch(board="must-not-resolve")
+    except HTTPException as exc:
+        assert exc.status_code == 503
+        assert exc.detail["dispatch_nudge_accepted"] is False
+    else:
+        raise AssertionError("crashed dispatcher status unexpectedly returned success")
+    assert not hermes_home.exists()
+
+
+def test_p_pinned_worker_survives_dispatcher_sigkill_and_restart(tmp_path, monkeypatch):
+    from hermes_cli.dispatcher_authority import acquire_machine_dispatcher
+
+    expected = {
+        "HERMES_PROFILE": "specialist",
+        "HERMES_KANBAN_TASK": "t_exact",
+        "HERMES_KANBAN_RUN_ID": "77",
+        "HERMES_KANBAN_CLAIM_TOKEN": "opaque-claim",
+        "HERMES_MODEL": "exact-model",
+        "HERMES_PROVIDER": "exact-provider",
+        "HERMES_ENABLED_TOOLSETS": "web,terminal",
+    }
+    for key, value in expected.items():
+        monkeypatch.setenv(key, value)
+    state_root = str(tmp_path / "state")
+    monkeypatch.setenv("HERMES_STATE_ROOT", state_root)
+
+    worker_parent, worker_child = mp.Pipe(duplex=False)
+    worker = mp.Process(target=_pinned_worker, args=(worker_child,))
+    worker.start()
+    assert worker_parent.recv() == expected
+
+    holder_parent, holder_child = mp.Pipe(duplex=False)
+    holder = mp.Process(target=_authority_holder, args=(state_root, holder_child))
+    holder.start()
+    assert holder_parent.recv() == "acquired"
+    assert holder.pid is not None
+    os.kill(holder.pid, signal.SIGKILL)
+    holder.join(timeout=5)
+    assert holder.exitcode == -signal.SIGKILL
+    assert worker.is_alive()
+
+    restarted = acquire_machine_dispatcher("post-worker-crash-restart")
+    assert restarted.lease is not None
+    assert worker.is_alive()
+    restarted.lease.release()
+    worker.terminate()
+    worker.join(timeout=5)

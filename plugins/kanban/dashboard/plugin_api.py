@@ -2275,7 +2275,7 @@ def get_task_log(
 
 
 # ---------------------------------------------------------------------------
-# Dispatch nudge (optional quick-path so the UI doesn't wait 60 s)
+# Dispatcher status compatibility endpoint (strictly non-mutating)
 # ---------------------------------------------------------------------------
 
 @router.post("/dispatch")
