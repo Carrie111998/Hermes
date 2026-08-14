@@ -18,11 +18,16 @@ from hermes_cli.kanban_story_integration import (
     claim_next_intent,
     enqueue_approved_story,
     integration_intent_from_row,
+    prepare_claimed_intent,
 )
 from hermes_cli.kanban_product_outcomes import (
     ApprovedCandidate,
     CandidateEligibility,
     PassedTest,
+)
+from hermes_cli.kanban_repository import (
+    VerificationResult,
+    build_verification_receipt_key,
 )
 
 
@@ -698,3 +703,232 @@ def test_claim_next_intent_refuses_stale_authority_before_repository_access(
 
     assert claimed is None
     assert repository_calls == []
+
+
+def _passed_candidate(tmp_path, contract, key):
+    profile = contract.verification["story_integration"]
+    receipt_key = build_verification_receipt_key(
+        profile,
+        tmp_path,
+        candidate_sha=CANDIDATE_SHA,
+        contract_digest=contract.digest,
+        generated_policy_digest=contract.generated_policy_digest,
+        gate_kind="story_integration",
+        profile_name="story_integration",
+    )
+    verification = VerificationResult(
+        status="passed",
+        source_sha=SOURCE_SHA,
+        candidate_sha=CANDIDATE_SHA,
+        contract_digest=contract.digest,
+        profile="story_integration",
+        steps=(),
+        key=receipt_key,
+    )
+    return kb.IntegrationCandidate(
+        pre_sha=TARGET_SHA,
+        candidate_sha=CANDIDATE_SHA,
+        source_branch="story/one",
+        source_sha=SOURCE_SHA,
+        target_branch=kb.epic_branch_for(key.epic_id),
+        target_worktree=None,
+        scratch_worktree=tmp_path / "removed-scratch",
+        repo_root=tmp_path,
+        candidate_ref="refs/hermes/integration-candidates/exact",
+        verification_result=verification,
+    )
+
+
+def test_prepare_claimed_candidate_persists_exact_receipt_atomically_without_apply(
+    tmp_path, monkeypatch
+):
+    db_path = tmp_path / "prepared.db"
+    board_metadata = _claim_board_metadata(tmp_path)
+    monkeypatch.setattr(kb, "product_board_metadata", lambda _board=None: board_metadata)
+    monkeypatch.setattr(
+        kb,
+        "_fast_forward_target",
+        lambda *_args, **_kwargs: pytest.fail("preparation must not move the target ref"),
+    )
+    with kb.connect(db_path) as conn:
+        key = _insert_claimable_intent(conn)
+        claimed = claim_next_intent(
+            conn,
+            "owner",
+            60,
+            repository_check=lambda _contract, approved, _passed: CandidateEligibility(
+                source_sha=approved.source_sha, non_empty=True
+            ),
+        )
+        assert claimed is not None
+        contract = kb.repository_contract_for_metadata(board_metadata)
+        assert contract is not None
+        candidate = _passed_candidate(tmp_path, contract, key)
+
+        def candidate_builder(
+            repo_root,
+            target_branch,
+            source_branch,
+            message,
+            **kwargs,
+        ):
+            assert conn.in_transaction is False
+            assert repo_root == tmp_path.resolve()
+            assert target_branch == kb.epic_branch_for(key.epic_id)
+            assert source_branch == "story/one"
+            assert message == f"integrate story {key.story_id}"
+            assert kwargs["expected_source_sha"] == SOURCE_SHA
+            return candidate
+
+        prepared = prepare_claimed_intent(
+            conn, claimed, candidate_builder=candidate_builder
+        )
+        replay = prepare_claimed_intent(
+            conn,
+            prepared,
+            candidate_builder=lambda *_args, **_kwargs: pytest.fail(
+                "prepared replay must reuse the exact receipt"
+            ),
+        )
+        events = [
+            event
+            for event in kb.list_events(conn, key.story_id)
+            if event.kind == "repository_verification"
+        ]
+
+    assert replay == prepared
+    assert prepared.status == "prepared"
+    assert prepared.claim_lock is None
+    assert prepared.claim_expires is None
+    assert prepared.target_pre_sha == TARGET_SHA
+    assert prepared.candidate_sha == CANDIDATE_SHA
+    assert prepared.candidate_ref == "refs/hermes/integration-candidates/exact"
+    assert len(events) == 1
+    assert prepared.verification_event_id == events[0].id
+    assert events[0].payload["receipt"]["key"]["candidate_sha"] == CANDIDATE_SHA
+
+
+def test_prepare_claimed_candidate_crash_replay_leaves_one_durable_prepared_record(
+    tmp_path, monkeypatch
+):
+    db_path = tmp_path / "prepared-replay.db"
+    board_metadata = _claim_board_metadata(tmp_path)
+    monkeypatch.setattr(kb, "product_board_metadata", lambda _board=None: board_metadata)
+    with kb.connect(db_path) as conn:
+        key = _insert_claimable_intent(conn)
+        claimed = claim_next_intent(
+            conn,
+            "owner",
+            60,
+            repository_check=lambda _contract, approved, _passed: CandidateEligibility(
+                source_sha=approved.source_sha, non_empty=True
+            ),
+        )
+        assert claimed is not None
+        contract = kb.repository_contract_for_metadata(board_metadata)
+        assert contract is not None
+        candidate = _passed_candidate(tmp_path, contract, key)
+        real_append = kb._append_event
+        attempts = 0
+
+        def interrupt_after_event(*args, **kwargs):
+            nonlocal attempts
+            event_id = real_append(*args, **kwargs)
+            attempts += 1
+            if attempts == 1:
+                raise RuntimeError("simulated crash before prepared state commit")
+            return event_id
+
+        monkeypatch.setattr(kb, "_append_event", interrupt_after_event)
+        builder_calls = []
+
+        def candidate_builder(*_args, **_kwargs):
+            assert conn.in_transaction is False
+            builder_calls.append(True)
+            return candidate
+
+        with pytest.raises(RuntimeError, match="simulated crash"):
+            prepare_claimed_intent(
+                conn, claimed, candidate_builder=candidate_builder
+            )
+        interrupted = conn.execute(
+            "SELECT * FROM story_integration_intents WHERE epic_id=? AND story_id=? "
+            "AND source_sha=?",
+            (key.epic_id, key.story_id, key.source_sha),
+        ).fetchone()
+        assert interrupted["status"] == "running"
+        assert interrupted["verification_event_id"] is None
+
+        prepared = prepare_claimed_intent(
+            conn, claimed, candidate_builder=candidate_builder
+        )
+        prepared_count = conn.execute(
+            "SELECT COUNT(*) FROM story_integration_intents WHERE status='prepared'"
+        ).fetchone()[0]
+        event_count = conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id=? "
+            "AND kind='repository_verification'",
+            (key.story_id,),
+        ).fetchone()[0]
+
+    assert prepared.status == "prepared"
+    assert builder_calls == [True, True]
+    assert prepared_count == 1
+    assert event_count == 1
+
+
+def test_prepare_claimed_candidate_refuses_active_db_transaction(
+    tmp_path, monkeypatch
+):
+    db_path = tmp_path / "prepared-transaction.db"
+    board_metadata = _claim_board_metadata(tmp_path)
+    monkeypatch.setattr(kb, "product_board_metadata", lambda _board=None: board_metadata)
+    with kb.connect(db_path) as conn:
+        _insert_claimable_intent(conn)
+        claimed = claim_next_intent(
+            conn,
+            "owner",
+            60,
+            repository_check=lambda _contract, approved, _passed: CandidateEligibility(
+                source_sha=approved.source_sha, non_empty=True
+            ),
+        )
+        assert claimed is not None
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            with pytest.raises(ValueError, match="no active DB transaction"):
+                prepare_claimed_intent(
+                    conn,
+                    claimed,
+                    candidate_builder=lambda *_args, **_kwargs: pytest.fail(
+                        "candidate must not build inside a DB transaction"
+                    ),
+                )
+        finally:
+            conn.execute("ROLLBACK")
+
+
+def test_prepared_candidate_replay_rejects_mismatched_receipt(
+    tmp_path, monkeypatch
+):
+    db_path = tmp_path / "prepared-mismatch.db"
+    board_metadata = _claim_board_metadata(tmp_path)
+    monkeypatch.setattr(kb, "product_board_metadata", lambda _board=None: board_metadata)
+    with kb.connect(db_path) as conn:
+        _insert_intent(conn)
+        row = conn.execute("SELECT * FROM story_integration_intents").fetchone()
+        prepared = integration_intent_from_row(row)
+        conn.execute(
+            "INSERT INTO task_events "
+            "(task_id, kind, payload, created_at) VALUES (?, 'repository_verification', ?, ?)",
+            (prepared.key.story_id, json.dumps({"status": "passed"}), 100),
+        )
+
+        with pytest.raises(ValueError, match="receipt"):
+            prepare_claimed_intent(
+                conn,
+                prepared,
+                candidate_builder=lambda *_args, **_kwargs: pytest.fail(
+                    "mismatched prepared receipt must not rebuild"
+                ),
+            )

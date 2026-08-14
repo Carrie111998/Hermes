@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 import secrets
 import sqlite3
@@ -16,7 +17,12 @@ from hermes_cli.kanban_product_outcomes import (
     PassedTest,
     candidate_eligibility,
 )
-from hermes_cli.kanban_repository import RepositoryContract
+from hermes_cli.kanban_repository import (
+    RepositoryContract,
+    VerificationResult,
+    verification_receipt_matches,
+    verification_result_payload,
+)
 
 
 IntegrationStatus: TypeAlias = Literal[
@@ -337,6 +343,184 @@ def claim_next_intent(
     ):
         return None
     return intent
+
+
+def _current_intent(
+    conn: sqlite3.Connection, key: IntegrationKey
+) -> IntegrationIntent:
+    row = conn.execute(
+        "SELECT * FROM story_integration_intents "
+        "WHERE epic_id=? AND story_id=? AND source_sha=?",
+        (key.epic_id, key.story_id, key.source_sha),
+    ).fetchone()
+    if row is None:
+        raise ValueError("integration intent no longer exists")
+    return integration_intent_from_row(row)
+
+
+def _prepared_receipt_is_exact(
+    conn: sqlite3.Connection,
+    intent: IntegrationIntent,
+    contract: RepositoryContract,
+) -> bool:
+    if (
+        intent.status != "prepared"
+        or intent.target_pre_sha is None
+        or intent.candidate_sha is None
+        or not intent.candidate_ref
+        or intent.verification_event_id is None
+    ):
+        return False
+    row = conn.execute(
+        "SELECT payload FROM task_events WHERE id=? AND task_id=? "
+        "AND kind='repository_verification'",
+        (intent.verification_event_id, intent.key.story_id),
+    ).fetchone()
+    if row is None:
+        return False
+    try:
+        payload = json.loads(row["payload"]) if row["payload"] else None
+    except (TypeError, ValueError):
+        return False
+    return isinstance(payload, Mapping) and verification_receipt_matches(
+        payload,
+        source_sha=intent.key.source_sha,
+        candidate_sha=intent.candidate_sha,
+        contract_digest=contract.digest,
+        gate_kind="story_integration",
+        subject_id=intent.key.story_id,
+        profile_name="story_integration",
+    )
+
+
+def prepare_claimed_intent(
+    conn: sqlite3.Connection,
+    intent: IntegrationIntent,
+    *,
+    board: str | None = None,
+    candidate_builder: Callable[..., object] | None = None,
+) -> IntegrationIntent:
+    """Build, verify, and durably prepare one exact claimed story candidate.
+
+    Repository work runs before the state transaction.  The transaction then
+    records the exact verification event and prepared row together; it never
+    moves the Epic ref or finalizes an integration fact.
+    """
+
+    from hermes_cli import kanban_db as kb
+
+    if not isinstance(intent, IntegrationIntent):
+        raise ValueError("claimed integration intent is required")
+    slug = board if board is not None else kb._known_board_slug_for_connection(conn)
+    metadata = kb.product_board_metadata(slug)
+    contract = (
+        kb.repository_contract_for_metadata(metadata)
+        if metadata is not None
+        else None
+    )
+    if contract is None or "story_integration" not in contract.verification:
+        raise ValueError("story integration repository contract is required")
+
+    current = _current_intent(conn, intent.key)
+    if current.status == "prepared":
+        if not _prepared_receipt_is_exact(conn, current, contract):
+            raise ValueError("prepared integration receipt does not match")
+        return current
+    if (
+        current != intent
+        or current.status != "running"
+        or not current.claim_lock
+    ):
+        raise ValueError("integration claim changed before preparation")
+    if conn.in_transaction:
+        raise ValueError("candidate preparation requires no active DB transaction")
+
+    target_branch = kb.epic_branch_for(intent.key.epic_id)
+    builder = candidate_builder or kb._build_verified_merge_candidate
+    candidate = builder(
+        contract.repo_root,
+        target_branch,
+        intent.source_branch,
+        f"integrate story {intent.key.story_id}",
+        expected_source_sha=intent.key.source_sha,
+        verification_profile=contract.verification["story_integration"],
+        verification_contract_digest=contract.digest,
+        verification_scope="story_integration",
+        verification_subject_id=intent.key.story_id,
+        verification_profile_name="story_integration",
+        verification_generated_policy_digest=contract.generated_policy_digest,
+    )
+    if conn.in_transaction:
+        raise ValueError("candidate builder opened a DB transaction")
+    if not isinstance(candidate, kb.IntegrationCandidate):
+        raise ValueError("candidate builder returned an invalid candidate")
+    verification = candidate.verification_result
+    if (
+        candidate.repo_root.resolve() != contract.repo_root
+        or candidate.target_branch != target_branch
+        or candidate.source_branch != intent.source_branch
+        or candidate.source_sha != intent.key.source_sha
+        or _FULL_SHA_RE.fullmatch(candidate.pre_sha) is None
+        or _FULL_SHA_RE.fullmatch(candidate.candidate_sha) is None
+        or not candidate.candidate_ref.startswith(
+            "refs/hermes/integration-candidates/"
+        )
+        or not isinstance(verification, VerificationResult)
+        or verification.status != "passed"
+    ):
+        raise ValueError("candidate builder returned mismatched preparation evidence")
+    payload = verification_result_payload(
+        verification,
+        scope="story_integration",
+        subject_id=intent.key.story_id,
+    )
+    if not verification_receipt_matches(
+        payload,
+        source_sha=intent.key.source_sha,
+        candidate_sha=candidate.candidate_sha,
+        contract_digest=contract.digest,
+        gate_kind="story_integration",
+        subject_id=intent.key.story_id,
+        profile_name="story_integration",
+    ):
+        raise ValueError("candidate verification receipt does not match")
+
+    now = int(time.time())
+    with kb.authorized_governance_write(), kb.write_txn(conn):
+        locked = _current_intent(conn, intent.key)
+        if locked != current:
+            raise ValueError("integration claim changed during preparation")
+        event_id = kb._append_event(
+            conn,
+            intent.key.story_id,
+            "repository_verification",
+            payload,
+        )
+        updated = conn.execute(
+            "UPDATE story_integration_intents SET status='prepared', "
+            "claim_lock=NULL, claim_expires=NULL, target_pre_sha=?, "
+            "candidate_sha=?, candidate_ref=?, verification_event_id=?, "
+            "last_failure_code=NULL, updated_at=? "
+            "WHERE epic_id=? AND story_id=? AND source_sha=? "
+            "AND status='running' AND claim_lock=?",
+            (
+                candidate.pre_sha,
+                candidate.candidate_sha,
+                candidate.candidate_ref,
+                event_id,
+                now,
+                intent.key.epic_id,
+                intent.key.story_id,
+                intent.key.source_sha,
+                current.claim_lock,
+            ),
+        )
+        if updated.rowcount != 1:
+            raise ValueError("integration claim changed during preparation")
+        prepared = _current_intent(conn, intent.key)
+        if not _prepared_receipt_is_exact(conn, prepared, contract):
+            raise ValueError("prepared integration receipt was not durable")
+        return prepared
 
 
 def enqueue_approved_story(

@@ -375,6 +375,64 @@ def build_verification_receipt(
         ),
         created_at=int(created_at),
     )
+
+
+def verification_result_payload(
+    result: VerificationResult,
+    *,
+    scope: str,
+    subject_id: str,
+    created_at: int | None = None,
+) -> dict[str, Any]:
+    """Serialize bounded verification evidence with an exact passed receipt."""
+
+    payload: dict[str, Any] = {
+        "scope": scope,
+        "subject_id": subject_id,
+        "status": result.status,
+        "source_sha": result.source_sha,
+        "candidate_sha": result.candidate_sha,
+        "contract_digest": result.contract_digest,
+        "profile": result.profile,
+        "error": result.error,
+        "rework_eligible": result.status == "failed",
+        "steps": [
+            {
+                "argv": list(step.argv),
+                "workdir": str(step.workdir),
+                "status": step.status,
+                "returncode": step.returncode,
+                "duration_seconds": step.duration_seconds,
+                "stdout_tail": step.stdout_tail,
+                "stderr_tail": step.stderr_tail,
+                "error": step.error,
+            }
+            for step in result.steps
+        ],
+    }
+    if result.status == "passed":
+        receipt = build_verification_receipt(
+            result,
+            subject_id=subject_id,
+            created_at=int(time.time()) if created_at is None else int(created_at),
+        )
+        payload["receipt"] = {
+            "key": {
+                "candidate_sha": receipt.key.candidate_sha,
+                "contract_digest": receipt.key.contract_digest,
+                "command_set_digest": receipt.key.command_set_digest,
+                "runtime_toolchain_digest": receipt.key.runtime_toolchain_digest,
+                "generated_policy_digest": receipt.key.generated_policy_digest,
+                "gate_kind": receipt.key.gate_kind,
+                "executor_policy": receipt.key.executor_policy,
+                "digest": receipt.key.digest,
+            },
+            "result_digest": receipt.result_digest,
+            "created_at": receipt.created_at,
+        }
+    return payload
+
+
 def verification_receipt_from_payload(
     payload: Mapping[str, object],
 ) -> VerificationReceipt | None:
@@ -498,6 +556,35 @@ def verification_receipt_from_payload(
         return VerificationReceipt(result.key, result_digest, created_at)
     except (KeyError, TypeError, ValueError):
         return None
+
+
+def verification_receipt_matches(
+    payload: Mapping[str, object],
+    *,
+    source_sha: str,
+    candidate_sha: str,
+    contract_digest: str,
+    gate_kind: str,
+    subject_id: str,
+    profile_name: str,
+) -> bool:
+    """Whether a persisted passed receipt exactly identifies one verification."""
+
+    receipt = verification_receipt_from_payload(payload)
+    return bool(
+        receipt is not None
+        and payload.get("source_sha") == source_sha
+        and payload.get("candidate_sha") == candidate_sha
+        and payload.get("contract_digest") == contract_digest
+        and payload.get("scope") == gate_kind
+        and payload.get("subject_id") == subject_id
+        and payload.get("profile") == profile_name
+        and receipt.key.candidate_sha == candidate_sha
+        and receipt.key.contract_digest == contract_digest
+        and receipt.key.gate_kind == gate_kind
+        and receipt.key.executor_policy
+        == f"hermes_repository_verifier:v1:{profile_name}"
+    )
 
 
 def run_verification(

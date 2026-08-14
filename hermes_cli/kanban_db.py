@@ -106,7 +106,6 @@ from hermes_cli.kanban_repository import (
     VerificationResult,
     VerificationStepResult,
     build_verification_receipt_key,
-    build_verification_receipt,
     inspect_evidence_workspace,
     load_repository_contract,
     refresh_story_branch,
@@ -114,6 +113,7 @@ from hermes_cli.kanban_repository import (
     restore_generated_paths,
     run_verification,
     verification_receipt_from_payload,
+    verification_result_payload,
 )
 from hermes_cli.kanban_product_outcomes import (
     ApprovedCandidate,
@@ -14285,53 +14285,12 @@ def _verification_result_payload(
     result: VerificationResult, *, scope: str, subject_id: str
 ) -> dict[str, Any]:
     """Serialize bounded repository verification evidence for a task event."""
-    payload: dict[str, Any] = {
-        "scope": scope,
-        "subject_id": subject_id,
-        "status": result.status,
-        "source_sha": result.source_sha,
-        "candidate_sha": result.candidate_sha,
-        "contract_digest": result.contract_digest,
-        "profile": result.profile,
-        "error": result.error,
-        "rework_eligible": result.status == "failed",
-        "steps": [
-            {
-                "argv": list(step.argv),
-                "workdir": str(step.workdir),
-                "status": step.status,
-                "returncode": step.returncode,
-                "duration_seconds": step.duration_seconds,
-                "stdout_tail": step.stdout_tail,
-                "stderr_tail": step.stderr_tail,
-                "error": step.error,
-            }
-            for step in result.steps
-        ],
-    }
-    if result.status == "passed":
-        try:
-            receipt = build_verification_receipt(
-                result, subject_id=subject_id, created_at=int(time.time())
-            )
-        except (TypeError, ValueError) as exc:
-            raise ValueError("passed verification result cannot produce receipt") from exc
-        else:
-            payload["receipt"] = {
-                "key": {
-                    "candidate_sha": receipt.key.candidate_sha,
-                    "contract_digest": receipt.key.contract_digest,
-                    "command_set_digest": receipt.key.command_set_digest,
-                    "runtime_toolchain_digest": receipt.key.runtime_toolchain_digest,
-                    "generated_policy_digest": receipt.key.generated_policy_digest,
-                    "gate_kind": receipt.key.gate_kind,
-                    "executor_policy": receipt.key.executor_policy,
-                    "digest": receipt.key.digest,
-                },
-                "result_digest": receipt.result_digest,
-                "created_at": receipt.created_at,
-            }
-    return payload
+    try:
+        return verification_result_payload(
+            result, scope=scope, subject_id=subject_id
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError("passed verification result cannot produce receipt") from exc
 
 
 def _verification_needs_attention(result: Optional[VerificationResult]) -> bool:

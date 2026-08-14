@@ -14458,7 +14458,7 @@ def test_reconcile_keeps_prior_member_state_when_sibling_advances_tip(
     assert calls == []
 
 
-def test_explicit_integration_verification_is_not_skipped_by_durable_state(
+def test_explicit_legacy_integration_verification_cannot_bypass_claimed_intent(
     kanban_home, tmp_path
 ):
     repo = tmp_path / "repo"
@@ -14466,43 +14466,32 @@ def test_explicit_integration_verification_is_not_skipped_by_durable_state(
     board = "v2-explicit-integration-verification"
     _v2_product_board_with_repo(board, repo)
     epic, story, _epic_branch, story_sha = _make_epic_and_done_story(board, repo)
+    pre_sha = _git_output(repo, "rev-parse", kb.epic_branch_for(epic))
+    verify_calls = []
+    ownership_calls = []
+
+    def verify(candidate):
+        verify_calls.append(candidate)
+        return True
+
+    def before_apply():
+        ownership_calls.append(True)
+        return True
 
     with kb.connect(board=board) as conn:
-        assert kb.integrate_story_to_epic(conn, story, board=board) == "integrated"
-        verify_calls = []
-        ownership_calls = []
-
-        def verify(candidate):
-            verify_calls.append(candidate)
-            return True
-
-        def before_apply():
-            ownership_calls.append(True)
-            return True
-
-        assert (
-            kb.integrate_story_to_epic(
-                conn,
-                story,
-                board=board,
-                expected_source_sha="different-source-sha",
-            )
-            == "verify_failed"
-        )
-        assert (
-            kb.integrate_story_to_epic(
-                conn,
-                story,
-                board=board,
-                candidate_verify_fn=verify,
-                expected_source_sha=story_sha,
-                before_apply_fn=before_apply,
-            )
-            == "already_integrated"
+        result = kb.integrate_story_to_epic(
+            conn,
+            story,
+            board=board,
+            candidate_verify_fn=verify,
+            expected_source_sha=story_sha,
+            before_apply_fn=before_apply,
         )
 
-    assert len(verify_calls) == 1
-    assert ownership_calls == [True]
+    assert result is None
+    assert verify_calls == []
+    assert ownership_calls == []
+    assert _git_output(repo, "rev-parse", kb.epic_branch_for(epic)) == pre_sha
 
 
 def test_integration_state_survives_member_event_gc_and_restart(

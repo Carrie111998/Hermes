@@ -23,7 +23,9 @@ from hermes_cli.kanban_repository import (
     resolve_commit,
     restore_generated_paths,
     run_verification,
+    verification_receipt_matches,
     verification_receipt_from_payload,
+    verification_result_payload,
 )
 
 
@@ -780,6 +782,51 @@ def test_build_verification_receipt_rejects_nonpassing_result(tmp_path: Path):
 
 def test_verification_receipt_from_payload_rejects_malformed_receipt():
     assert verification_receipt_from_payload({}) is None
+
+
+def test_verification_receipt_match_requires_exact_candidate_contract_and_subject(
+    repository: Path,
+):
+    profile = VerificationProfile(
+        (VerificationCommand(("bash", "scripts/run_tests.sh"), PurePosixPath("."), 60),)
+    )
+    candidate_sha = "a" * 40
+    contract_digest = "b" * 64
+    result = run_verification(
+        profile,
+        repository,
+        source_sha="c" * 40,
+        candidate_sha=candidate_sha,
+        contract_digest=contract_digest,
+        scope="story_integration",
+        subject_id="story-1",
+        profile_name="story_integration",
+        generated_policy_digest="d" * 64,
+    )
+    assert result.status == "passed"
+    payload = verification_result_payload(
+        result, scope="story_integration", subject_id="story-1", created_at=123
+    )
+
+    expected = {
+        "source_sha": "c" * 40,
+        "candidate_sha": candidate_sha,
+        "contract_digest": contract_digest,
+        "gate_kind": "story_integration",
+        "subject_id": "story-1",
+        "profile_name": "story_integration",
+    }
+    assert verification_receipt_matches(payload, **expected)
+    for field, wrong in (
+        ("source_sha", "e" * 40),
+        ("candidate_sha", "e" * 40),
+        ("contract_digest", "e" * 64),
+        ("gate_kind", "epic_release"),
+        ("subject_id", "story-2"),
+        ("profile_name", "epic_release"),
+    ):
+        mismatch = {**expected, field: wrong}
+        assert not verification_receipt_matches(payload, **mismatch)
 
 
 def test_run_verification_missing_executable_is_configuration_error(tmp_path: Path):
