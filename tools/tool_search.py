@@ -987,7 +987,7 @@ def validate_deferred_call_args(name: str, args: Dict[str, Any]) -> Optional[str
         return None
 
 
-def resolve_underlying_call(args: Dict[str, Any]) -> Tuple[Optional[str], Dict[str, Any], Optional[str]]:
+def resolve_underlying_call(args: Dict[str, Any], allowed_names: Optional[Any] = None) -> Tuple[Optional[str], Dict[str, Any], Optional[str]]:
     """Parse a ``tool_call`` invocation into (underlying_name, args, error_msg).
 
     Used by:
@@ -1025,7 +1025,14 @@ def resolve_underlying_call(args: Dict[str, Any]) -> Tuple[Optional[str], Dict[s
         # ``is_deferrable_tool_name`` reports False for them. Admit them only
         # when the caller vouches for them via ``allowed_names`` (its
         # validated provider-tool scope); the caller re-checks scope after.
-        if allowed_names is not None and name in allowed_names:
+        # Core/bridge tools stay rejected even if mistakenly listed in
+        # ``allowed_names`` — they must be invoked directly, never via bridge.
+        if (
+            allowed_names is not None
+            and name in allowed_names
+            and name not in BRIDGE_TOOL_NAMES
+            and name not in _core_tool_names()
+        ):
             return name, raw_args, None
         return None, {}, (
             f"'{name}' is not a deferrable tool. If it appears in the model-facing tools "
