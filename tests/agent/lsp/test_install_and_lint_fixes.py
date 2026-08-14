@@ -78,7 +78,7 @@ def test_install_pip_finds_windows_scripts_launcher(tmp_path, monkeypatch):
         scripts_dir = install_mod.hermes_lsp_bin_dir().parent / "python-packages" / "Scripts"
         scripts_dir.mkdir(parents=True, exist_ok=True)
         launcher = scripts_dir / "fake-language-server.exe"
-        launcher.write_text("launcher\n")
+        launcher.write_text("launcher\n", encoding="utf-8")
         launcher.chmod(0o755)
         return MagicMock(returncode=0, stderr="")
 
@@ -89,6 +89,64 @@ def test_install_pip_finds_windows_scripts_launcher(tmp_path, monkeypatch):
     assert resolved is not None
     assert resolved.endswith("fake-language-server.exe")
     assert (install_mod.hermes_lsp_bin_dir() / "fake-language-server.exe").exists()
+
+
+def test_native_binary_candidates_windows_prefers_wrappers(monkeypatch):
+    """On Windows the ``.cmd``/``.exe``/``.bat`` wrappers must be probed before
+    the extension-less name, which is a POSIX shim CreateProcess can't launch
+    (#86445). The bare name stays last as a fallback."""
+    from pathlib import Path
+
+    from agent.lsp import install as install_mod
+
+    monkeypatch.setattr(install_mod, "_is_windows", lambda: True)
+    base = Path("/x/pyright-langserver")
+    names = [c.name for c in install_mod._native_binary_candidates(base)]
+    assert names == [
+        "pyright-langserver.cmd",
+        "pyright-langserver.exe",
+        "pyright-langserver.bat",
+        "pyright-langserver",
+    ]
+
+
+def test_native_binary_candidates_posix_is_bare_only(monkeypatch):
+    """Off Windows the candidate list is just the bare name (unchanged)."""
+    from pathlib import Path
+
+    from agent.lsp import install as install_mod
+
+    monkeypatch.setattr(install_mod, "_is_windows", lambda: False)
+    assert install_mod._native_binary_candidates(Path("/x/gopls")) == [Path("/x/gopls")]
+
+
+@pytest.mark.windows_only
+def test_existing_binary_windows_skips_posix_shim_for_cmd(tmp_path, monkeypatch):
+    """A staged POSIX shim (extension-less) sits beside its ``.cmd`` wrapper.
+    On Windows ``os.access(_, X_OK)`` is True for both, so ``_existing_binary``
+    must return the ``.cmd`` — not the shim that fails with WinError 193
+    (#86445).
+
+    ``windows_only``: the shim-vs-``.cmd`` selection hinges on Windows'
+    ``os.access(_, X_OK)`` semantics (True for any file); the candidate ordering
+    itself is asserted host-agnostically in
+    ``test_native_binary_candidates_windows_prefers_wrappers``.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    from agent.lsp import install as install_mod
+
+    bin_dir = install_mod.hermes_lsp_bin_dir()
+    shim = bin_dir / "pyright-langserver"
+    shim.write_text("#!/bin/sh\n", encoding="utf-8")
+    shim.chmod(0o755)  # X_OK True on the POSIX test host, mirroring Windows
+    wrapper = bin_dir / "pyright-langserver.cmd"
+    wrapper.write_text("@echo off\n", encoding="utf-8")
+    wrapper.chmod(0o755)
+
+    resolved = install_mod._existing_binary("pyright-langserver")
+    assert resolved is not None
+    assert resolved.endswith("pyright-langserver.cmd")
 
 
 # ---------------------------------------------------------------------------
@@ -157,7 +215,7 @@ def test_check_lint_returns_error_for_real_ts_type_errors(tmp_path):
     from tools.file_operations import ShellFileOperations
 
     ts_file = tmp_path / "bad.ts"
-    ts_file.write_text("const x: string = 42;\n")
+    ts_file.write_text("const x: string = 42;\n", encoding="utf-8")
 
     env = LocalEnvironment()
     fops = ShellFileOperations(env)

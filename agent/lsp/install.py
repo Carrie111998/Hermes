@@ -132,16 +132,26 @@ def hermes_lsp_bin_dir() -> Path:
 
 
 def _native_binary_candidates(base: Path) -> list[Path]:
-    """Return platform-native executable candidates for a staged binary."""
-    candidates = [base]
-    if _is_windows():
-        existing = {str(base).lower()}
-        for suffix in _WINDOWS_WRAPPER_SUFFIXES:
-            candidate = Path(str(base) + suffix)
-            key = str(candidate).lower()
-            if key not in existing:
-                candidates.append(candidate)
-                existing.add(key)
+    """Return platform-native executable candidates for a staged binary.
+
+    On Windows npm stages an extension-less POSIX ``#!/bin/sh`` shim *and* a
+    ``.cmd`` wrapper next to it. ``CreateProcess`` cannot launch the shim
+    (``WinError 193``), and ``os.access(path, os.X_OK)`` returns True for *any*
+    existing file on Windows — so the wrapper suffixes must be probed **before**
+    the bare name, or ``_existing_binary`` selects the shim and the real
+    ``.cmd``/``.exe``/``.bat`` beside it is never reached (#86445). The bare name
+    stays last as a fallback for a genuinely extension-less native binary.
+    """
+    if not _is_windows():
+        return [base]
+    candidates: list[Path] = []
+    seen: set[str] = set()
+    for suffix in (*_WINDOWS_WRAPPER_SUFFIXES, ""):
+        candidate = Path(str(base) + suffix)
+        key = str(candidate).lower()
+        if key not in seen:
+            candidates.append(candidate)
+            seen.add(key)
     return candidates
 
 
