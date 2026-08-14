@@ -22,6 +22,8 @@ from hermes_cli.kanban_repository import (
     RepositoryContract,
     VerificationResult,
     advance_prepared_candidate_ref,
+    delete_prepared_candidate_ref,
+    inspect_prepared_candidate_ref,
     verification_receipt_matches,
     verification_result_payload,
 )
@@ -78,6 +80,24 @@ class IntegrationIntent:
     last_failure_code: str | None
     created_at: int
     updated_at: int
+
+
+@dataclass(frozen=True)
+class IntegrationFact:
+    epic_id: str
+    story_id: str
+    source_sha: str
+    candidate_sha: str
+    integrated_at: int
+
+
+@dataclass(frozen=True)
+class RecoveryCounts:
+    advanced: int = 0
+    finalized: int = 0
+    reset: int = 0
+    deferred: int = 0
+    cleaned: int = 0
 
 
 def _value(row: Row, field: str) -> object:
@@ -571,6 +591,308 @@ def advance_prepared_intent(
         pre_sha=current.target_pre_sha,
         candidate_sha=current.candidate_sha,
     )
+
+
+def _integration_fact(
+    conn: sqlite3.Connection, key: IntegrationKey
+) -> IntegrationFact | None:
+    row = conn.execute(
+        "SELECT epic_id, story_id, source_sha, candidate_sha, integrated_at "
+        "FROM epic_story_integrations WHERE epic_id=? AND story_id=? AND source_sha=?",
+        (key.epic_id, key.story_id, key.source_sha),
+    ).fetchone()
+    if row is None:
+        return None
+    candidate_sha = _full_sha(row, "candidate_sha")
+    source_sha = _full_sha(row, "source_sha")
+    assert candidate_sha is not None and source_sha is not None
+    return IntegrationFact(
+        epic_id=_text(row, "epic_id"),
+        story_id=_text(row, "story_id"),
+        source_sha=source_sha,
+        candidate_sha=candidate_sha,
+        integrated_at=_integer(row, "integrated_at"),
+    )
+
+
+def _finalize_prepared_intent(
+    conn: sqlite3.Connection,
+    intent: IntegrationIntent,
+    contract: RepositoryContract,
+    target_tip_sha: str,
+) -> IntegrationFact:
+    """Commit the successful integration fact and terminal state together."""
+
+    from hermes_cli import kanban_db as kb
+
+    now = int(time.time())
+    with kb.authorized_governance_write(), kb.write_txn(conn):
+        current = _current_intent(conn, intent.key)
+        existing = _integration_fact(conn, intent.key)
+        if current.status == "integrated":
+            if existing is None or existing.candidate_sha != current.candidate_sha:
+                raise ValueError("integrated intent does not match its durable fact")
+            story = conn.execute(
+                "SELECT status, current_step_key FROM tasks WHERE id=?",
+                (intent.key.story_id,),
+            ).fetchone()
+            if story is None or tuple(story) != ("done", "done"):
+                raise ValueError("integrated intent does not match terminal story state")
+            return existing
+        if current != intent or current.status != "prepared":
+            raise ValueError("prepared integration intent changed before finalization")
+        if not _prepared_receipt_is_exact(conn, current, contract):
+            raise ValueError("prepared integration receipt does not match")
+        assert current.candidate_sha is not None
+        if existing is not None and existing.candidate_sha != current.candidate_sha:
+            raise ValueError("integration fact candidate does not match prepared intent")
+        if existing is None:
+            conn.execute(
+                "INSERT INTO epic_story_integrations "
+                "(epic_id, story_id, source_sha, candidate_sha, integrated_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (
+                    current.key.epic_id,
+                    current.key.story_id,
+                    current.key.source_sha,
+                    current.candidate_sha,
+                    now,
+                ),
+            )
+        updated = conn.execute(
+            "UPDATE story_integration_intents SET status='integrated', "
+            "claim_lock=NULL, claim_expires=NULL, last_failure_code=NULL, updated_at=? "
+            "WHERE epic_id=? AND story_id=? AND source_sha=? AND status='prepared' "
+            "AND candidate_sha=?",
+            (
+                now,
+                current.key.epic_id,
+                current.key.story_id,
+                current.key.source_sha,
+                current.candidate_sha,
+            ),
+        )
+        if updated.rowcount != 1:
+            raise ValueError("prepared integration intent changed during finalization")
+        story_updated = conn.execute(
+            "UPDATE tasks SET status='done', current_step_key='done', "
+            "completed_at=COALESCE(completed_at, ?), assignee=NULL, running=0, "
+            "blocked=0, claim_lock=NULL, claim_expires=NULL, worker_pid=NULL, "
+            "current_run_id=NULL, block_kind=NULL, block_recurrences=0 "
+            "WHERE id=? AND workflow_template_id='product' "
+            "AND current_step_key='integration_pending' AND status='review'",
+            (now, current.key.story_id),
+        )
+        if story_updated.rowcount != 1:
+            raise ValueError("story phase changed during integration finalization")
+        kb._append_event(
+            conn,
+            current.key.story_id,
+            "story_integrated",
+            {
+                "epic_id": current.key.epic_id,
+                "story_id": current.key.story_id,
+                "source_branch": current.source_branch,
+                "source_sha": current.key.source_sha,
+                "target_branch": kb.epic_branch_for(current.key.epic_id),
+                "candidate_sha": current.candidate_sha,
+                "target_tip_sha": target_tip_sha,
+            },
+        )
+        kb._append_event(
+            conn,
+            current.key.epic_id,
+            kb.EPIC_BASE_PINNED_EVENT,
+            {
+                "branch": kb.epic_branch_for(current.key.epic_id),
+                "base_sha": target_tip_sha,
+            },
+        )
+        conn.execute(
+            "UPDATE epic_release_snapshots SET status='invalidated', updated_at=? "
+            "WHERE epic_id=? AND status IN ('awaiting_push', 'ci_pending', 'ci_failed')",
+            (now, current.key.epic_id),
+        )
+        fact = _integration_fact(conn, current.key)
+        if fact is None or fact.candidate_sha != current.candidate_sha:
+            raise RuntimeError("integration fact was not durable")
+        return fact
+
+
+def _cleanup_integrated_candidate(
+    conn: sqlite3.Connection,
+    intent: IntegrationIntent,
+    contract: RepositoryContract,
+) -> bool:
+    """Delete and clear a retained ref only after its exact fact is durable."""
+
+    from hermes_cli import kanban_db as kb
+
+    current = _current_intent(conn, intent.key)
+    if current.status != "integrated" or not current.candidate_ref:
+        return False
+    fact = _integration_fact(conn, current.key)
+    if (
+        fact is None
+        or current.candidate_sha is None
+        or fact.candidate_sha != current.candidate_sha
+    ):
+        raise ValueError("candidate cleanup requires the exact durable fact")
+    if not delete_prepared_candidate_ref(
+        contract.repo_root,
+        candidate_ref=current.candidate_ref,
+        candidate_sha=current.candidate_sha,
+    ):
+        return False
+    with kb.authorized_governance_write(), kb.write_txn(conn):
+        cleared = conn.execute(
+            "UPDATE story_integration_intents SET candidate_ref=NULL, updated_at=? "
+            "WHERE epic_id=? AND story_id=? AND source_sha=? AND status='integrated' "
+            "AND candidate_ref=? AND candidate_sha=?",
+            (
+                int(time.time()),
+                current.key.epic_id,
+                current.key.story_id,
+                current.key.source_sha,
+                current.candidate_ref,
+                current.candidate_sha,
+            ),
+        )
+        return cleared.rowcount == 1
+
+
+def finish_intent(
+    conn: sqlite3.Connection,
+    intent: IntegrationIntent,
+    cas_result: PreparedRefCASResult,
+    *,
+    board: str | None = None,
+) -> IntegrationFact:
+    """Finalize one successful/reflected CAS and then release its exact ref."""
+
+    from hermes_cli import kanban_db as kb
+
+    if not isinstance(intent, IntegrationIntent):
+        raise ValueError("prepared integration intent is required")
+    if (
+        not isinstance(cas_result, PreparedRefCASResult)
+        or cas_result.kind not in {"advanced", "reflected"}
+        or intent.candidate_sha is None
+        or cas_result.current_sha != intent.candidate_sha
+    ):
+        raise ValueError("successful exact candidate CAS result is required")
+    slug = board if board is not None else kb._known_board_slug_for_connection(conn)
+    metadata = kb.product_board_metadata(slug)
+    contract = (
+        kb.repository_contract_for_metadata(metadata)
+        if metadata is not None
+        else None
+    )
+    if contract is None or "story_integration" not in contract.verification:
+        raise ValueError("story integration repository contract is required")
+
+    assert cas_result.current_sha is not None
+    fact = _finalize_prepared_intent(
+        conn, intent, contract, cas_result.current_sha
+    )
+    _cleanup_integrated_candidate(conn, intent, contract)
+    return fact
+
+
+def recover_expired_intents(
+    conn: sqlite3.Connection,
+    *,
+    board: str | None = None,
+) -> RecoveryCounts:
+    """Converge every prepared/integrated crash boundary deterministically."""
+
+    from hermes_cli import kanban_db as kb
+
+    slug = board if board is not None else kb._known_board_slug_for_connection(conn)
+    metadata = kb.product_board_metadata(slug)
+    contract = (
+        kb.repository_contract_for_metadata(metadata)
+        if metadata is not None
+        else None
+    )
+    if contract is None or "story_integration" not in contract.verification:
+        return RecoveryCounts()
+
+    counts = RecoveryCounts()
+    rows = conn.execute(
+        "SELECT * FROM story_integration_intents "
+        "WHERE status IN ('prepared', 'integrated') "
+        "ORDER BY updated_at, epic_id, story_id, source_sha"
+    ).fetchall()
+    for row in rows:
+        intent = integration_intent_from_row(row)
+        advanced = finalized = reset = deferred = cleaned = 0
+        try:
+            if intent.status == "integrated":
+                cleaned = int(_cleanup_integrated_candidate(conn, intent, contract))
+            elif not _prepared_receipt_is_exact(conn, intent, contract):
+                deferred = 1
+            else:
+                assert intent.target_pre_sha is not None and intent.candidate_sha is not None
+                target_ref = f"refs/heads/{kb.epic_branch_for(intent.key.epic_id)}"
+                boundary = inspect_prepared_candidate_ref(
+                    contract.repo_root,
+                    target_ref=target_ref,
+                    pre_sha=intent.target_pre_sha,
+                    candidate_sha=intent.candidate_sha,
+                )
+                if boundary.kind == "preimage":
+                    cas_result = advance_prepared_intent(conn, intent, board=slug)
+                    if (
+                        cas_result.kind in {"advanced", "reflected"}
+                        and cas_result.current_sha == intent.candidate_sha
+                    ):
+                        advanced = 1
+                        assert cas_result.current_sha is not None
+                        _finalize_prepared_intent(
+                            conn, intent, contract, cas_result.current_sha
+                        )
+                        finalized = 1
+                        cleaned = int(
+                            _cleanup_integrated_candidate(conn, intent, contract)
+                        )
+                    else:
+                        deferred = 1
+                elif boundary.kind in {"candidate", "descendant"}:
+                    assert boundary.current_sha is not None
+                    _finalize_prepared_intent(
+                        conn, intent, contract, boundary.current_sha
+                    )
+                    finalized = 1
+                    cleaned = int(_cleanup_integrated_candidate(conn, intent, contract))
+                else:
+                    with kb.authorized_governance_write(), kb.write_txn(conn):
+                        changed = conn.execute(
+                            "UPDATE story_integration_intents SET status='pending', "
+                            "claim_lock=NULL, claim_expires=NULL, target_pre_sha=NULL, "
+                            "candidate_sha=NULL, candidate_ref=NULL, "
+                            "verification_event_id=NULL, last_failure_code='target_moved', "
+                            "updated_at=? WHERE epic_id=? AND story_id=? AND source_sha=? "
+                            "AND status='prepared' AND candidate_sha=?",
+                            (
+                                int(time.time()),
+                                intent.key.epic_id,
+                                intent.key.story_id,
+                                intent.key.source_sha,
+                                intent.candidate_sha,
+                            ),
+                        )
+                        reset = int(changed.rowcount == 1)
+        except Exception:
+            deferred = 1
+        counts = RecoveryCounts(
+            counts.advanced + advanced,
+            counts.finalized + finalized,
+            counts.reset + reset,
+            counts.deferred + deferred,
+            counts.cleaned + cleaned,
+        )
+    return counts
 
 
 def enqueue_approved_story(

@@ -12,6 +12,7 @@ from hermes_cli.kanban_repository import (
     EvidenceWorkspaceError,
     EvidenceWorkspaceResult,
     PreparedRefCASResult,
+    PreparedRefRecoveryResult,
     RepositoryConfigurationError,
     RefreshRequest,
     VerificationCommand,
@@ -19,7 +20,9 @@ from hermes_cli.kanban_repository import (
     advance_prepared_candidate_ref,
     build_verification_receipt,
     build_verification_receipt_key,
+    delete_prepared_candidate_ref,
     inspect_evidence_workspace,
+    inspect_prepared_candidate_ref,
     load_repository_contract,
     refresh_story_branch,
     resolve_commit,
@@ -524,6 +527,77 @@ def test_prepared_ref_cas_recognizes_reflected_cas_without_second_update(
     assert first == PreparedRefCASResult("advanced", candidate_sha)
     assert reflected == PreparedRefCASResult("reflected", candidate_sha)
     assert not any(call[:1] == ("update-ref",) for call in calls)
+
+
+@pytest.mark.parametrize(
+    ("scenario", "expected_kind"),
+    [
+        ("preimage", "preimage"),
+        ("candidate", "candidate"),
+        ("descendant", "descendant"),
+        ("diverged", "diverged"),
+    ],
+)
+def test_prepared_candidate_ref_inspection_classifies_recovery_boundary(
+    repository: Path, scenario: str, expected_kind: str
+):
+    target_ref, _candidate_ref, pre_sha, candidate_sha = _prepared_ref_fixture(
+        repository
+    )
+    expected_current = pre_sha
+    if scenario == "candidate":
+        _git(repository, "update-ref", target_ref, candidate_sha, pre_sha)
+        expected_current = candidate_sha
+    elif scenario == "descendant":
+        later_sha = _commit(repository, "later.txt", "later\n", "later")
+        _git(repository, "update-ref", target_ref, later_sha, pre_sha)
+        expected_current = later_sha
+    elif scenario == "diverged":
+        _git(repository, "switch", "main")
+        expected_current = _commit(
+            repository, "operator.txt", "operator\n", "operator"
+        )
+
+    result = inspect_prepared_candidate_ref(
+        repository,
+        target_ref=target_ref,
+        pre_sha=pre_sha,
+        candidate_sha=candidate_sha,
+    )
+
+    assert result == PreparedRefRecoveryResult(expected_kind, expected_current)
+
+
+def test_delete_prepared_candidate_ref_uses_exact_old_value_and_preserves_mismatch(
+    repository: Path, monkeypatch: pytest.MonkeyPatch
+):
+    _target_ref, candidate_ref, _pre_sha, candidate_sha = _prepared_ref_fixture(
+        repository
+    )
+    real_git = repository_module._prepared_ref_git
+    calls: list[tuple[str, ...]] = []
+
+    def capture(path: Path, *args: str):
+        calls.append(args)
+        return real_git(path, *args)
+
+    monkeypatch.setattr(repository_module, "_prepared_ref_git", capture)
+
+    assert delete_prepared_candidate_ref(
+        repository, candidate_ref=candidate_ref, candidate_sha="f" * 40
+    ) is False
+    assert _git(repository, "rev-parse", candidate_ref) == candidate_sha
+    assert delete_prepared_candidate_ref(
+        repository, candidate_ref=candidate_ref, candidate_sha=candidate_sha
+    ) is True
+    assert subprocess.run(
+        ["git", "-C", str(repository), "rev-parse", "--verify", candidate_ref],
+        capture_output=True,
+        text=True,
+    ).returncode != 0
+    assert [call for call in calls if call[:2] == ("update-ref", "-d")] == [
+        ("update-ref", "-d", candidate_ref, candidate_sha)
+    ]
 
 
 @pytest.mark.parametrize(

@@ -139,6 +139,14 @@ class PreparedRefCASResult:
     current_sha: str | None
 
 
+@dataclass(frozen=True)
+class PreparedRefRecoveryResult:
+    """Relationship between a prepared candidate and the current target tip."""
+
+    kind: Literal["preimage", "candidate", "descendant", "diverged"]
+    current_sha: str | None
+
+
 _VERIFICATION_OUTPUT_TAIL_CHARS = 4096
 _VERIFICATION_ENV_KEYS = (
     "HOME",
@@ -1526,6 +1534,75 @@ def advance_prepared_candidate_ref(
     if reflected_sha == candidate_sha:
         return PreparedRefCASResult("reflected", reflected_sha)
     return PreparedRefCASResult("target_moved", reflected_sha)
+
+
+def inspect_prepared_candidate_ref(
+    repo_root: Path,
+    *,
+    target_ref: str,
+    pre_sha: str,
+    candidate_sha: str,
+) -> PreparedRefRecoveryResult:
+    """Classify the four deterministic recovery states of a prepared CAS."""
+
+    root = Path(repo_root).expanduser().resolve(strict=False)
+    if (
+        not isinstance(target_ref, str)
+        or not target_ref.startswith("refs/heads/")
+        or target_ref != target_ref.strip()
+        or "\x00" in target_ref
+    ):
+        raise RepositoryConfigurationError("malformed_target_ref")
+    if not isinstance(pre_sha, str) or FULL_SHA.fullmatch(pre_sha) is None:
+        raise RepositoryConfigurationError("malformed_pre_sha")
+    if not isinstance(candidate_sha, str) or FULL_SHA.fullmatch(candidate_sha) is None:
+        raise RepositoryConfigurationError("malformed_candidate_sha")
+
+    current_sha = _prepared_ref_sha(root, target_ref)
+    if current_sha == pre_sha:
+        return PreparedRefRecoveryResult("preimage", current_sha)
+    if current_sha == candidate_sha:
+        return PreparedRefRecoveryResult("candidate", current_sha)
+    if current_sha is None:
+        return PreparedRefRecoveryResult("diverged", None)
+    ancestor = _prepared_ref_git(
+        root, "merge-base", "--is-ancestor", candidate_sha, current_sha
+    )
+    if ancestor.returncode == 0:
+        return PreparedRefRecoveryResult("descendant", current_sha)
+    if ancestor.returncode == 1:
+        return PreparedRefRecoveryResult("diverged", current_sha)
+    raise RepositoryConfigurationError("ancestry_check_failed")
+
+
+def delete_prepared_candidate_ref(
+    repo_root: Path,
+    *,
+    candidate_ref: str,
+    candidate_sha: str,
+) -> bool:
+    """Delete only the retained candidate ref that still pins the exact SHA."""
+
+    root = Path(repo_root).expanduser().resolve(strict=False)
+    if (
+        not isinstance(candidate_ref, str)
+        or not candidate_ref.startswith("refs/hermes/integration-candidates/")
+        or candidate_ref != candidate_ref.strip()
+        or "\x00" in candidate_ref
+    ):
+        raise RepositoryConfigurationError("malformed_candidate_ref")
+    if not isinstance(candidate_sha, str) or FULL_SHA.fullmatch(candidate_sha) is None:
+        raise RepositoryConfigurationError("malformed_candidate_sha")
+
+    retained_sha = _prepared_ref_sha(root, candidate_ref)
+    if retained_sha is None:
+        return True
+    if retained_sha != candidate_sha:
+        return False
+    deleted = _prepared_ref_git(
+        root, "update-ref", "-d", candidate_ref, candidate_sha
+    )
+    return deleted.returncode == 0 and _prepared_ref_sha(root, candidate_ref) is None
 
 
 def _refresh_git(

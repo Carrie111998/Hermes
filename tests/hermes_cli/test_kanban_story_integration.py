@@ -14,13 +14,17 @@ import pytest
 from hermes_cli import kanban_db as kb
 import hermes_cli.kanban_story_integration as integration_module
 from hermes_cli.kanban_story_integration import (
+    IntegrationFact,
     IntegrationIntent,
     IntegrationKey,
+    RecoveryCounts,
     advance_prepared_intent,
     claim_next_intent,
     enqueue_approved_story,
+    finish_intent,
     integration_intent_from_row,
     prepare_claimed_intent,
+    recover_expired_intents,
 )
 from hermes_cli.kanban_product_outcomes import (
     ApprovedCandidate,
@@ -29,6 +33,7 @@ from hermes_cli.kanban_product_outcomes import (
 )
 from hermes_cli.kanban_repository import (
     PreparedRefCASResult,
+    PreparedRefRecoveryResult,
     VerificationResult,
     build_verification_receipt_key,
 )
@@ -44,6 +49,7 @@ def _claim_board_metadata(repo_root) -> dict[str, object]:
     return {
         "preset": "product",
         "default_workdir": str(repo_root),
+        "product_workflow": {"handoff_v2": True},
         "repository": {
             "base_ref": "refs/remotes/origin/main",
             "target_branch": "main",
@@ -1013,3 +1019,284 @@ def test_prepared_candidate_replay_rejects_mismatched_receipt(
                     "mismatched prepared receipt must not rebuild"
                 ),
             )
+
+
+def _prepared_intent(tmp_path, monkeypatch, conn):
+    board_metadata = _claim_board_metadata(tmp_path)
+    monkeypatch.setattr(kb, "product_board_metadata", lambda _board=None: board_metadata)
+    key = _insert_claimable_intent(conn)
+    claimed = claim_next_intent(
+        conn,
+        "owner",
+        60,
+        repository_check=lambda _contract, approved, _passed: CandidateEligibility(
+            source_sha=approved.source_sha, non_empty=True
+        ),
+    )
+    assert claimed is not None
+    contract = kb.repository_contract_for_metadata(board_metadata)
+    assert contract is not None
+    prepared = prepare_claimed_intent(
+        conn,
+        claimed,
+        candidate_builder=lambda *_args, **_kwargs: _passed_candidate(
+            tmp_path, contract, key
+        ),
+    )
+    return key, prepared
+
+
+def _insert_active_release_snapshot(conn, epic_id: str) -> int:
+    return int(
+        conn.execute(
+            """
+            INSERT INTO epic_release_snapshots (
+                epic_id, epic_tip_sha, target_branch, target_pre_sha,
+                release_candidate_sha, candidate_ref,
+                aggregate_verification_event_id, repository_contract_digest,
+                status, created_at, updated_at
+            ) VALUES (?, ?, 'main', ?, ?, ?, 1, ?, 'awaiting_push', 1, 1)
+            """,
+            (
+                epic_id,
+                TARGET_SHA,
+                TARGET_SHA,
+                CANDIDATE_SHA,
+                "refs/hermes/integration-candidates/release",
+                "d" * 64,
+            ),
+        ).lastrowid
+    )
+
+
+def test_finish_intent_atomically_persists_fact_task_event_and_snapshot_invalidation(
+    tmp_path, monkeypatch
+):
+    with kb.connect(tmp_path / "finish.db") as conn:
+        key, prepared = _prepared_intent(tmp_path, monkeypatch, conn)
+        snapshot_id = _insert_active_release_snapshot(conn, key.epic_id)
+        cleanup_observations = []
+
+        def cleanup(_repo_root, *, candidate_ref, candidate_sha):
+            fact = conn.execute(
+                "SELECT candidate_sha FROM epic_story_integrations "
+                "WHERE epic_id=? AND story_id=? AND source_sha=?",
+                (key.epic_id, key.story_id, key.source_sha),
+            ).fetchone()
+            story = conn.execute(
+                "SELECT status, current_step_key FROM tasks WHERE id=?",
+                (key.story_id,),
+            ).fetchone()
+            cleanup_observations.append(
+                (fact["candidate_sha"], tuple(story), candidate_ref, candidate_sha)
+            )
+            return True
+
+        monkeypatch.setattr(
+            integration_module, "delete_prepared_candidate_ref", cleanup
+        )
+        fact = finish_intent(
+            conn,
+            prepared,
+            PreparedRefCASResult("advanced", CANDIDATE_SHA),
+        )
+        replay = finish_intent(
+            conn,
+            prepared,
+            PreparedRefCASResult("reflected", CANDIDATE_SHA),
+        )
+        intent = conn.execute(
+            "SELECT status, candidate_ref FROM story_integration_intents "
+            "WHERE epic_id=? AND story_id=? AND source_sha=?",
+            (key.epic_id, key.story_id, key.source_sha),
+        ).fetchone()
+        snapshot = conn.execute(
+            "SELECT status FROM epic_release_snapshots WHERE id=?", (snapshot_id,)
+        ).fetchone()
+        events = conn.execute(
+            "SELECT kind, payload FROM task_events WHERE task_id=? "
+            "AND kind='story_integrated'",
+            (key.story_id,),
+        ).fetchall()
+
+    assert fact == replay == IntegrationFact(
+        key.epic_id, key.story_id, SOURCE_SHA, CANDIDATE_SHA, fact.integrated_at
+    )
+    assert tuple(intent) == ("integrated", None)
+    assert snapshot["status"] == "invalidated"
+    assert len(events) == 1
+    assert json.loads(events[0]["payload"])["candidate_sha"] == CANDIDATE_SHA
+    assert cleanup_observations == [
+        (
+            CANDIDATE_SHA,
+            ("done", "done"),
+            "refs/hermes/integration-candidates/exact",
+            CANDIDATE_SHA,
+        )
+    ]
+
+
+def test_finish_intent_rolls_back_every_state_when_event_write_interrupts(
+    tmp_path, monkeypatch
+):
+    with kb.connect(tmp_path / "finish-rollback.db") as conn:
+        key, prepared = _prepared_intent(tmp_path, monkeypatch, conn)
+        snapshot_id = _insert_active_release_snapshot(conn, key.epic_id)
+        real_append = kb._append_event
+
+        def interrupt(conn, task_id, kind, *args, **kwargs):
+            if kind == "story_integrated":
+                raise RuntimeError("simulated crash before fact commit")
+            return real_append(conn, task_id, kind, *args, **kwargs)
+
+        monkeypatch.setattr(kb, "_append_event", interrupt)
+        monkeypatch.setattr(
+            integration_module,
+            "delete_prepared_candidate_ref",
+            lambda *_args, **_kwargs: pytest.fail(
+                "candidate cleanup must happen only after a durable fact"
+            ),
+        )
+        with pytest.raises(RuntimeError, match="simulated crash"):
+            finish_intent(
+                conn,
+                prepared,
+                PreparedRefCASResult("advanced", CANDIDATE_SHA),
+            )
+        fact_count = conn.execute(
+            "SELECT COUNT(*) FROM epic_story_integrations WHERE story_id=?",
+            (key.story_id,),
+        ).fetchone()[0]
+        intent = conn.execute(
+            "SELECT status, candidate_ref FROM story_integration_intents "
+            "WHERE story_id=?",
+            (key.story_id,),
+        ).fetchone()
+        story = conn.execute(
+            "SELECT status, current_step_key FROM tasks WHERE id=?",
+            (key.story_id,),
+        ).fetchone()
+        snapshot = conn.execute(
+            "SELECT status FROM epic_release_snapshots WHERE id=?", (snapshot_id,)
+        ).fetchone()
+
+    assert fact_count == 0
+    assert tuple(intent) == (
+        "prepared",
+        "refs/hermes/integration-candidates/exact",
+    )
+    assert tuple(story) == ("review", "integration_pending")
+    assert snapshot["status"] == "awaiting_push"
+
+
+@pytest.mark.parametrize(
+    ("boundary", "current_sha", "expected"),
+    [
+        ("preimage", TARGET_SHA, RecoveryCounts(1, 1, 0, 0, 1)),
+        ("candidate", CANDIDATE_SHA, RecoveryCounts(0, 1, 0, 0, 1)),
+        ("descendant", "5" * 40, RecoveryCounts(0, 1, 0, 0, 1)),
+        ("diverged", "6" * 40, RecoveryCounts(0, 0, 1, 0, 0)),
+    ],
+)
+def test_recover_prepared_intent_handles_each_target_boundary(
+    tmp_path, monkeypatch, boundary, current_sha, expected
+):
+    with kb.connect(tmp_path / f"recover-{boundary}.db") as conn:
+        key, _prepared = _prepared_intent(tmp_path, monkeypatch, conn)
+        monkeypatch.setattr(
+            integration_module,
+            "inspect_prepared_candidate_ref",
+            lambda *_args, **_kwargs: PreparedRefRecoveryResult(
+                boundary, current_sha
+            ),
+        )
+        advance_calls = []
+
+        def advance(*_args, **_kwargs):
+            advance_calls.append(True)
+            return PreparedRefCASResult("advanced", CANDIDATE_SHA)
+
+        monkeypatch.setattr(integration_module, "advance_prepared_intent", advance)
+        monkeypatch.setattr(
+            integration_module, "delete_prepared_candidate_ref", lambda *_a, **_k: True
+        )
+
+        result = recover_expired_intents(conn)
+        row = conn.execute(
+            "SELECT status, target_pre_sha, candidate_sha, candidate_ref, "
+            "verification_event_id, last_failure_code "
+            "FROM story_integration_intents WHERE story_id=?",
+            (key.story_id,),
+        ).fetchone()
+        fact = conn.execute(
+            "SELECT candidate_sha FROM epic_story_integrations WHERE story_id=?",
+            (key.story_id,),
+        ).fetchone()
+        story = conn.execute(
+            "SELECT status, current_step_key FROM tasks WHERE id=?",
+            (key.story_id,),
+        ).fetchone()
+        pin = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? AND kind=? "
+            "ORDER BY id DESC LIMIT 1",
+            (key.epic_id, kb.EPIC_BASE_PINNED_EVENT),
+        ).fetchone()
+
+    assert result == expected
+    assert advance_calls == ([True] if boundary == "preimage" else [])
+    if boundary == "diverged":
+        assert tuple(row) == ("pending", None, None, None, None, "target_moved")
+        assert fact is None
+        assert tuple(story) == ("review", "integration_pending")
+    else:
+        assert row["status"] == "integrated"
+        assert row["candidate_ref"] is None
+        assert fact["candidate_sha"] == CANDIDATE_SHA
+        assert tuple(story) == ("done", "done")
+        expected_tip = current_sha if boundary == "descendant" else CANDIDATE_SHA
+        assert json.loads(pin["payload"])["base_sha"] == expected_tip
+
+
+def test_integrated_fact_recovery_and_epic_readiness_survive_verification_event_pruning(
+    tmp_path, monkeypatch
+):
+    with kb.connect(tmp_path / "pruning.db") as conn:
+        key, prepared = _prepared_intent(tmp_path, monkeypatch, conn)
+        monkeypatch.setattr(
+            integration_module, "delete_prepared_candidate_ref", lambda *_a, **_k: False
+        )
+        finish_intent(
+            conn,
+            prepared,
+            PreparedRefCASResult("reflected", CANDIDATE_SHA),
+        )
+        conn.execute(
+            "DELETE FROM task_events WHERE id=?", (prepared.verification_event_id,)
+        )
+        cleanup_observed_fact = []
+
+        def cleanup(_root, **_kwargs):
+            cleanup_observed_fact.append(
+                conn.execute(
+                    "SELECT candidate_sha FROM epic_story_integrations "
+                    "WHERE story_id=?",
+                    (key.story_id,),
+                ).fetchone()["candidate_sha"]
+            )
+            return True
+
+        monkeypatch.setattr(
+            integration_module, "delete_prepared_candidate_ref", cleanup
+        )
+        recovered = recover_expired_intents(conn)
+        ready = kb.epic_ready(conn, key.epic_id, verify_fn=lambda _branch: True)
+        row = conn.execute(
+            "SELECT status, candidate_ref FROM story_integration_intents "
+            "WHERE story_id=?",
+            (key.story_id,),
+        ).fetchone()
+
+    assert recovered == RecoveryCounts(0, 0, 0, 0, 1)
+    assert cleanup_observed_fact == [CANDIDATE_SHA]
+    assert tuple(row) == ("integrated", None)
+    assert ready is True

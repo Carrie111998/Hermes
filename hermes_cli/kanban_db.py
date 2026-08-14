@@ -14925,506 +14925,6 @@ def merge_epic_to_main(
         return "verify_failed"
 
 
-def _integrate_story_fail_safe(
-    conn: sqlite3.Connection,
-    story_id: str,
-    reason: str,
-    *,
-    board: Optional[str],
-    notify_fn: Optional[Callable[[str, str, Optional[str]], None]],
-) -> None:
-    """Block the STORY + emit an event + notify. Never raises.
-
-    Mirrors :func:`_merge_epic_fail_safe`, but a failed story->epic
-    integration merge blocks the STORY (the thing whose merge failed), not
-    the epic -- the epic branch itself is left untouched on a conflict.
-    """
-    try:
-        set_running(conn, story_id, False, board=board)
-        set_blocked(conn, story_id, True, board=board, reason=reason)
-        with write_txn(conn):
-            _append_event(
-                conn, story_id, "blocked",
-                {"reason": reason, "kind": "story_integration_failed"},
-            )
-    except Exception:
-        pass
-    if notify_fn is not None:
-        try:
-            notify_fn(story_id, reason, board)
-        except Exception:
-            pass
-
-
-def integrate_story_to_epic(
-    conn: sqlite3.Connection,
-    story_id: str,
-    *,
-    board: Optional[str] = None,
-    board_meta: Optional[dict] = None,
-    notify_fn: Optional[Callable[[str, str, Optional[str]], None]] = None,
-    candidate_verify_fn: Any = _RECONCILE_INTEGRATION_VERIFY_UNSET,
-    expected_source_sha: Optional[str] = None,
-    before_apply_fn: Optional[Callable[[], bool]] = None,
-) -> Optional[str]:
-    """Merge a Done story's branch into its epic's integration branch, LOCALLY.
-
-    Phase 4 branches each v2 story off its epic's integration branch
-    (:func:`_story_base_branch`) onto its own branch, but nothing merges a
-    completed story's commits BACK into the epic branch -- so a downstream
-    sibling story never sees an upstream story's work, and
-    :func:`merge_epic_to_main` has nothing real to carry to main. This
-    closes that gap. Today the only caller is the bounded :func:`reconcile`
-    safety net (W3); wiring a fast path in on story completion is a natural
-    future call site but out of scope here.
-
-    Returns ``None`` on a non-``handoff_v2`` board, a story with no epic
-    parent, or when the repo / epic branch / story branch can't be resolved
-    (no git mutation in any of these cases -- mirrors
-    :func:`merge_epic_to_main`'s ``"not_ready"`` short-circuits, collapsed to
-    ``None`` here since there's no separate not-ready state to report);
-    ``"already_integrated"`` when the story branch is already an ancestor of
-    the epic branch (idempotent -- no re-merge); ``"conflict"`` when the
-    merge fails (aborted; the STORY -- not the epic -- is blocked and
-    ``notify_fn`` invoked, mirroring :func:`_merge_epic_fail_safe`'s
-    fail-safe pattern via :func:`_integrate_story_fail_safe`); ``"integrated"``
-    on success.
-
-    The merge happens in a DEDICATED epic worktree
-    (``<repo_root>/.worktrees/epic-<epic_id>``) -- never in ``repo_root``'s
-    own checkout -- so this never disturbs whatever branch ``repo_root`` (or
-    any other card's worktree) happens to have checked out.
-    
-    ``board_meta`` is an already-read board metadata snapshot. Release
-    orchestration passes the one snapshot it validated policy against, so a
-    board edit mid-operation cannot make a later step disagree with the gate
-    that admitted it. ``None`` reads fresh, exactly as before.
-    """
-    # =========================================================================
-    # LOCAL only -- never `git push` / touch origin. Production deploys and
-    # `git push origin` are HUMAN-ONLY. This function must NEVER call
-    # `git push`, and must NEVER import or call web_git.py's push helpers
-    # (`_review_push` / `review_push` / `review_create_pr`). Only local git
-    # verbs below: merge-base, worktree add, merge, merge --abort.
-    # =========================================================================
-    meta = board_meta if board_meta is not None else product_board_metadata(board)
-    if meta is None or not _handoff_v2_enabled(meta):
-        return None
-    _validate_stored_product_workflow_state(conn, story_id)
-
-    if _is_epic_task(conn, story_id):
-        return None
-    epic_id = epic_id_for_task(conn, story_id)
-    if epic_id is None:
-        return None
-    # Epic-member integration is now owned exclusively by a claimed durable
-    # intent.  The legacy/manual merge path remains defined only until E03 can
-    # remove it, but it may no longer act on a current member.
-    return None
-
-    epic = get_task(conn, epic_id)
-    if epic is None or epic.status in {"done", "archived"}:
-        return None
-
-    # Durable integration state is checked before resolving the repository or
-    # any Git ref only for the ordinary reconcile fast path. Explicit source,
-    # candidate, or ownership controls must retain their verification semantics
-    # and must never be hidden by an older integration row.
-    authority_records = _terminal_run_records(conn, story_id)
-    authority_phase_present = any(
-        record.phase in {"test", "review"} for record in authority_records
-    )
-    reviewed_candidate = latest_review_authority(authority_records)
-    passed_test = (
-        latest_test_authority(authority_records, reviewed_candidate.source_sha)
-        if reviewed_candidate is not None
-        else None
-    )
-    ordinary_reconcile = (
-        candidate_verify_fn is _RECONCILE_INTEGRATION_VERIFY_UNSET
-        and expected_source_sha is None
-        and before_apply_fn is None
-    )
-    if ordinary_reconcile:
-        if reviewed_candidate is not None:
-            already_integrated = conn.execute(
-                """
-                SELECT 1
-                  FROM epic_story_integrations
-                 WHERE epic_id=?
-                   AND story_id=?
-                   AND source_sha=?
-                 LIMIT 1
-                """,
-                (epic_id, story_id, reviewed_candidate[1]),
-            ).fetchone()
-        else:
-            already_integrated = conn.execute(
-                """
-                SELECT 1
-                  FROM epic_story_integrations AS integration
-                  JOIN tasks AS story ON story.id = integration.story_id
-                 WHERE integration.epic_id=?
-                   AND integration.story_id=?
-                   AND story.status='done'
-                   AND story.completed_at IS NOT NULL
-                   AND integration.integrated_at >= story.completed_at
-                 LIMIT 1
-                """,
-                (epic_id, story_id),
-            ).fetchone()
-        if already_integrated is not None:
-            return "already_integrated"
-    if authority_phase_present and (
-        reviewed_candidate is None or passed_test is None
-    ):
-        # A product Test/Review attempt exists, so legacy ancestor replay is
-        # not allowed to create a new integration fact without current,
-        # dispatcher-pinned authority from both phases.
-        return None
-
-    try:
-        board_default = str(meta.get("default_workdir") or "").strip()
-        repo_root = _git_toplevel(Path(board_default).expanduser()) if board_default else None
-        if repo_root is None:
-            return None
-        epic_branch = epic_branch_for(epic_id)
-        story = get_task(conn, story_id)
-        story_branch = (story.branch_name or "").strip() if story is not None else ""
-        if (
-            not story_branch
-            or not _git_branch_exists(repo_root, epic_branch)
-            or not _git_branch_exists(repo_root, story_branch)
-        ):
-            return None
-        contract = repository_contract_for_metadata(meta, repo_root=repo_root)
-        if reviewed_candidate is not None:
-            if reviewed_candidate.branch != story_branch:
-                return None
-            if (
-                expected_source_sha is not None
-                and expected_source_sha != reviewed_candidate.source_sha
-            ):
-                return None
-            assert passed_test is not None
-            try:
-                candidate_eligibility(
-                    repo_root, reviewed_candidate, passed_test
-                )
-            except CandidateEligibilityError:
-                # No candidate intent/fact has been written yet.  Leave the
-                # existing integration state untouched for a later replay.
-                return "verify_failed"
-        if ordinary_reconcile and reviewed_candidate is None:
-            current_source_sha = _git_ref_sha(repo_root, story_branch)
-            if current_source_sha and conn.execute(
-                """
-                SELECT 1 FROM epic_story_integrations
-                 WHERE epic_id=? AND story_id=? AND source_sha=?
-                 LIMIT 1
-                """,
-                (epic_id, story_id, current_source_sha),
-            ).fetchone() is not None:
-                return "already_integrated"
-    except Exception:
-        return None
-
-    def _run(args: list[str], *, cwd: Path, timeout: int = 60):
-        try:
-            return subprocess.run(
-                ["git", "-C", str(cwd), *args],
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-                check=False,
-            )
-        except Exception:
-            return None
-
-    try:
-        ancestor_result = _run(
-            ["merge-base", "--is-ancestor", story_branch, epic_branch], cwd=repo_root,
-        )
-        already_integrated = ancestor_result is not None and ancestor_result.returncode == 0
-        if (
-            already_integrated
-            and candidate_verify_fn is _RECONCILE_INTEGRATION_VERIFY_UNSET
-            and expected_source_sha is None
-        ):
-            if reviewed_candidate is not None:
-                # A reviewed source that is already an ancestor may have been
-                # applied by an earlier crash, but without the exact durable
-                # composite fact the ancestor relation alone is not replay
-                # authority.
-                return "verify_failed"
-            _record_story_integration(
-                conn, story_id, epic_id, epic_branch,
-                {
-                    "source_branch": story_branch,
-                    "source_sha": _git_ref_sha(repo_root, story_branch),
-                    "target_branch": epic_branch,
-                    "candidate_sha": _git_ref_sha(repo_root, epic_branch),
-                    "already_integrated": True,
-                },
-            )
-            return "already_integrated"
-
-        if (
-            candidate_verify_fn is not _RECONCILE_INTEGRATION_VERIFY_UNSET
-            or expected_source_sha is not None
-            or reviewed_candidate is not None
-        ):
-            reviewed_source_sha = (
-                reviewed_candidate.source_sha
-                if reviewed_candidate is not None
-                else expected_source_sha
-            )
-            existing_integration = (
-                reviewed_source_sha is not None
-                and conn.execute(
-                    """
-                    SELECT 1
-                      FROM epic_story_integrations
-                     WHERE epic_id=? AND story_id=? AND source_sha=?
-                     LIMIT 1
-                    """,
-                    (epic_id, story_id, reviewed_source_sha),
-                ).fetchone()
-                is not None
-            )
-            candidate_source_branch = story_branch
-            candidate_expected_source_sha = expected_source_sha
-            reviewed_source_ref: Optional[str] = None
-            try:
-                if reviewed_candidate is not None:
-                    reviewed_source_ref = f"hermes/reviewed-{secrets.token_hex(6)}"
-                    retained = _integration_git(
-                        repo_root,
-                        [
-                            "update-ref",
-                            f"refs/heads/{reviewed_source_ref}",
-                            reviewed_candidate[1],
-                        ],
-                    )
-                    if retained.returncode != 0:
-                        raise IntegrationCandidateError(
-                            "could not retain reviewed source candidate"
-                        )
-                    candidate_source_branch = reviewed_source_ref
-                    candidate_expected_source_sha = reviewed_candidate[1]
-                effective_verify_fn = (
-                    (lambda _path: True)
-                    if reviewed_candidate is not None
-                    and candidate_verify_fn is _RECONCILE_INTEGRATION_VERIFY_UNSET
-                    else (
-                        None
-                        if candidate_verify_fn is _RECONCILE_INTEGRATION_VERIFY_UNSET
-                        else candidate_verify_fn
-                    )
-                )
-                try:
-                    candidate = _build_verified_merge_candidate(
-                        repo_root,
-                        epic_branch,
-                        candidate_source_branch,
-                        f"integrate story {story_id}",
-                        effective_verify_fn,
-                        expected_source_sha=candidate_expected_source_sha,
-                        allow_empty_contribution=existing_integration,
-                        verification_profile=(
-                            contract.verification.get("story_integration")
-                            if contract is not None
-                            else None
-                        ),
-                        verification_contract_digest=(
-                            contract.digest if contract is not None else None
-                        ),
-                        verification_scope="story_integration",
-                        verification_subject_id=story_id,
-                        verification_profile_name="story_integration",
-                        verification_generated_policy_digest=(
-                            contract.generated_policy_digest if contract is not None else ""
-                        ),
-                        configured_verification_fn=(
-                            lambda path, source, candidate: _run_or_reuse_configured_verification(
-                                conn, task_id=story_id, candidate_path=path, source_sha=source,
-                                candidate_sha=candidate, contract=contract,
-                                profile_name="story_integration", gate_kind="story_integration"
-                            )
-                        ) if (
-                            contract is not None
-                            and candidate_verify_fn is _RECONCILE_INTEGRATION_VERIFY_UNSET
-                        ) else None,
-                    )
-                finally:
-                    if reviewed_source_ref is not None:
-                        released = _integration_git(
-                            repo_root,
-                            [
-                                "update-ref",
-                                "-d",
-                                f"refs/heads/{reviewed_source_ref}",
-                            ],
-                        )
-                        if released.returncode != 0:
-                            raise IntegrationCandidateError(
-                                "could not remove reviewed source candidate"
-                            )
-                if before_apply_fn is not None and not before_apply_fn():
-                    return "ownership_conflict"
-                if not _fast_forward_target(candidate):
-                    reason = (
-                        "epic target moved or became dirty; candidate retained at "
-                        f"{candidate.candidate_ref}"
-                    )
-                    with write_txn(conn):
-                        _append_event(
-                            conn,
-                            story_id,
-                            "story_integration_failed",
-                            {"reason": reason, "release_candidate": True},
-                        )
-                    return "verify_failed"
-            except IntegrationCandidateError as exc:
-                with write_txn(conn):
-                    if exc.verification_result is not None:
-                        _append_event(
-                            conn,
-                            story_id,
-                            "repository_verification",
-                            _verification_result_payload(
-                                exc.verification_result,
-                                scope="story_integration",
-                                subject_id=story_id,
-                            ),
-                        )
-                    _append_event(
-                        conn,
-                        story_id,
-                        "story_integration_failed",
-                        {"reason": str(exc), "release_candidate": True},
-                    )
-                if _verification_needs_attention(exc.verification_result):
-                    return "attention_required"
-                return "conflict" if "merge conflict" in str(exc) else "verify_failed"
-
-            if candidate.verification_result is not None and not candidate.verification_result.reused:
-                with write_txn(conn):
-                    _append_event(
-                        conn,
-                        story_id,
-                        "repository_verification",
-                        _verification_result_payload(
-                            candidate.verification_result,
-                            scope="story_integration",
-                            subject_id=story_id,
-                        ),
-                    )
-            _record_story_integration(
-                conn, story_id, epic_id, epic_branch,
-                {
-                    "source_branch": story_branch,
-                    "source_sha": candidate.source_sha,
-                    "target_branch": epic_branch,
-                    "pre_sha": candidate.pre_sha,
-                    "candidate_sha": candidate.candidate_sha,
-                    "target": str(candidate.target_worktree or epic_branch),
-                    "test_command": "bash scripts/run_tests.sh",
-                    "already_integrated": already_integrated,
-                },
-            )
-            return "already_integrated" if already_integrated else "integrated"
-
-        epic_worktree = repo_root / ".worktrees" / f"epic-{epic_id}"
-        _ensure_git_worktree(repo_root, epic_worktree, epic_branch)
-        if not _worktree_is_clean(epic_worktree):
-            reason = f"epic integration worktree is dirty; preserved at {epic_worktree}"
-            _integrate_story_fail_safe(
-                conn, story_id, reason, board=board, notify_fn=notify_fn
-            )
-            return "verify_failed"
-
-        merge_result = _run(
-            ["merge", "--no-ff", story_branch, "-m", f"integrate story {story_id}"],
-            cwd=epic_worktree, timeout=120,
-        )
-        if merge_result is None or merge_result.returncode != 0:
-            _run(["merge", "--abort"], cwd=epic_worktree)
-            reason = (
-                "story→epic merge conflict"
-                if _worktree_is_clean(epic_worktree)
-                else f"story→epic merge conflict; preserved dirty worktree at {epic_worktree}"
-            )
-            _integrate_story_fail_safe(conn, story_id, reason, board=board, notify_fn=notify_fn)
-            return "conflict"
-
-        _record_story_integration(
-            conn, story_id, epic_id, epic_branch,
-            {
-                "source_branch": story_branch,
-                "source_sha": _git_ref_sha(repo_root, story_branch),
-                "target_branch": epic_branch,
-                "candidate_sha": _git_ref_sha(repo_root, epic_branch),
-            },
-        )
-        return "integrated"
-    except Exception:
-        return None
-
-
-def _record_story_integration(
-    conn: sqlite3.Connection,
-    story_id: str,
-    epic_id: str,
-    epic_branch: str,
-    payload: dict,
-) -> None:
-    """Record a story→epic integration and refresh the epic's base pin.
-
-    The pin must follow the epic tip, not stay at the original base. Story
-    cards go ``done`` after integration, so ``gc_events`` prunes their
-    ``story_integrated_to_epic`` rows after its retention window — recovery
-    would then fall back to the first pin and branch a later sibling off a
-    base missing every already-integrated story. The epic itself stays
-    non-terminal until release, so its own events survive.
-    """
-    candidate_sha = str(payload.get("candidate_sha") or "").strip()
-    # Only pin when the tip actually moved. A re-entrant integration pass
-    # re-records `already_integrated` for a story whose work is long since in
-    # the epic branch, at whatever rate the dispatcher ticks — on live boards
-    # that is tens of thousands of identical events. Writing a pin for each of
-    # those would double that churn while recording nothing new, and recovery
-    # only ever reads the newest pin.
-    pin_sha = (
-        candidate_sha
-        if candidate_sha and candidate_sha != _epic_base_pinned_sha(conn, epic_id)
-        else None
-    )
-    with write_txn(conn):
-        _append_event(conn, story_id, "story_integrated_to_epic", payload)
-        source_sha = str(payload.get("source_sha") or "").strip()
-        if source_sha:
-            conn.execute(
-                """
-                INSERT OR IGNORE INTO epic_story_integrations
-                    (epic_id, story_id, source_sha, candidate_sha, integrated_at)
-                VALUES (?, ?, ?, ?, ?)
-                """,
-                (
-                    epic_id,
-                    story_id,
-                    source_sha,
-                    candidate_sha or None,
-                    int(time.time()),
-                ),
-            )
-        if pin_sha:
-            _append_event(
-                conn, epic_id, EPIC_BASE_PINNED_EVENT,
-                {"branch": epic_branch, "base_sha": pin_sha},
-            )
-
-
 def _merge_standalone_story_to_main(
     conn: sqlite3.Connection,
     story_id: str,
@@ -15443,10 +14943,8 @@ def _merge_standalone_story_to_main(
 
     The common case for imported / single-story product boards: a finished
     story with no epic parent, whose work would otherwise strand on its
-    per-card branch (:func:`integrate_story_to_epic` returns ``None`` -- "no
-    epic parent" -- so nothing carries it anywhere, and
-    :func:`merge_epic_to_main` never runs). This closes that gap for the
-    standalone case, mirroring :func:`merge_epic_to_main` exactly.
+    per-card branch because the epic release path does not apply. This closes
+    that gap for the standalone case, mirroring :func:`merge_epic_to_main`.
 
     Returns ``None`` on a non-``handoff_v2`` board or a story that actually HAS
     an epic parent (that path is the epic integration + merge); ``"not_ready"``
@@ -15457,7 +14955,7 @@ def _merge_standalone_story_to_main(
     isolated candidate is dirty or the suite isn't green (the target remains
     unchanged); ``"merged"`` on success. On both failure outcomes the
     STORY (not an epic) is cleared of ``running``, blocked, and ``notify_fn``
-    invoked -- see :func:`_integrate_story_fail_safe`.
+    invoked.
     """
     # =========================================================================
     # LOCAL main only -- never `git push` / touch origin. Same hard autonomy
@@ -15468,7 +14966,7 @@ def _merge_standalone_story_to_main(
     if meta is None or not _handoff_v2_enabled(meta):
         return None
     _validate_stored_product_workflow_state(conn, story_id)
-    # A story WITH an epic goes through integrate_story_to_epic + merge_epic_to_main.
+    # Epic members are owned by the durable story-integration coordinator.
     if _is_epic_task(conn, story_id) or epic_id_for_task(conn, story_id) is not None:
         return None
     story = get_task(conn, story_id)
@@ -15518,7 +15016,23 @@ def _merge_standalone_story_to_main(
         return "not_ready"
 
     def _fail(reason: str) -> None:
-        _integrate_story_fail_safe(conn, story_id, reason, board=board, notify_fn=notify_fn)
+        try:
+            set_running(conn, story_id, False, board=board)
+            set_blocked(conn, story_id, True, board=board, reason=reason)
+            with write_txn(conn):
+                _append_event(
+                    conn,
+                    story_id,
+                    "blocked",
+                    {"reason": reason, "kind": "standalone_merge_failed"},
+                )
+        except Exception:
+            pass
+        if notify_fn is not None:
+            try:
+                notify_fn(story_id, reason, board)
+            except Exception:
+                pass
 
     try:
         ancestor_result = _integration_git(
@@ -16076,17 +15590,16 @@ def release_product_task(
     is_epic = _is_epic_task(conn, task_id)
     epic_id = epic_id_for_task(conn, task_id)
     if is_epic:
-        target_branch = epic_branch_for(task_id)
         integrated_children = all(
             (child := get_task(conn, child_id)) is not None
             and child.status == "done"
-            and any(
-                event.kind == "story_integrated_to_epic"
-                and isinstance(event.payload, dict)
-                and event.payload.get("target_branch") == target_branch
-                and bool(event.payload.get("candidate_sha"))
-                for event in list_events(conn, child_id)
-            )
+            and conn.execute(
+                "SELECT 1 FROM epic_story_integrations "
+                "WHERE epic_id=? AND story_id=? AND candidate_sha IS NOT NULL "
+                "LIMIT 1",
+                (task_id, child_id),
+            ).fetchone()
+            is not None
             for child_id in children
         )
         if not integrated_children:
@@ -16102,16 +15615,10 @@ def release_product_task(
         )
         integration_kinds = {"epic_merged"}
     elif epic_id is not None:
-        integration_status = integrate_story_to_epic(
-            conn,
-            task_id,
-            board=board,
-            board_meta=meta,
-            candidate_verify_fn=candidate_verify_fn,
-            expected_source_sha=source_sha,
-            before_apply_fn=before_apply_fn,
-        )
-        integration_kinds = {"story_integrated_to_epic"}
+        # Epic-member release is engine-owned and is completed only by the
+        # durable integration intent finalizer, never by this legacy release
+        # surface.
+        raise ReleaseEvidenceError(task_id, ["durable_story_integration"])
     else:
         integration_status = _merge_standalone_story_to_main(
             conn,
@@ -18032,9 +17539,8 @@ class ReconcileResult:
     """Task ids spawned this pass via :func:`_spawn_one_v2` (claim-CAS makes
     this fire-once)."""
     integrated: list[str] = field(default_factory=list)
-    """Story task ids merged into their epic's integration branch this pass
-    via :func:`integrate_story_to_epic` (at most one per pass -- see the
-    added step at the end of :func:`reconcile`'s docstring)."""
+    """Story task ids durably finalized into their epic integration branch
+    by the claimed intent coordinator this pass."""
     merged_to_main: list[str] = field(default_factory=list)
     """Story ids (standalone) or epic ids whose branch was merged into LOCAL
     main this pass via :func:`_merge_standalone_story_to_main` /
@@ -18101,14 +17607,10 @@ def reconcile(
        inert requalification intake. A pending intake makes the step
        idempotent. All other waits and terminal states are left untouched.
 
-    4. **Story->epic integration (W3).** At most ONE ``done`` story whose
-       branch is not yet an ancestor of its epic's integration branch is
-       merged in via :func:`integrate_story_to_epic` this pass -- the safety
-       net for the same reason steps 1-2 exist: nothing else guarantees a
-       completed story's commits land in the epic branch. Bounded to one per
-       pass (mirroring the one-action discipline above); already-integrated
-       stories are skipped without counting against the bound, so this step
-       still fires on the first genuinely unintegrated candidate.
+    4. **Story->epic integration.** Recover every prepared crash boundary,
+       then claim, prepare, advance, and atomically finalize at most one new
+       durable integration intent. The immutable integration fact, terminal
+       story state, event, and release-snapshot invalidation commit together.
 
     Non-v2 boards return an empty ``ReconcileResult`` (a no-op); legacy
     boards keep using ``dispatch_once`` unchanged.
@@ -18228,14 +17730,67 @@ def reconcile(
             result.requalification_requested.append(task_id)
             break
 
-    # Step 4: integrate at most one un-integrated Done story into its epic
-    # branch this pass (W3). Scans done cards in completion order;
-    # "already_integrated" / no-epic-parent / unresolvable cards are skipped
-    # (not counted as this pass's action) so a real integration can still
-    # happen this pass even if earlier done cards are already merged.
+    # Step 4: converge prepared crash boundaries, then advance at most one new
+    # pending intent through the claimed coordinator. Facts observed before
+    # recovery let the result report only stories finalized by this pass.
+    from hermes_cli.kanban_story_integration import (
+        advance_prepared_intent,
+        claim_next_intent,
+        finish_intent,
+        prepare_claimed_intent,
+        recover_expired_intents,
+    )
+
+    facts_before = {
+        (row["epic_id"], row["story_id"], row["source_sha"])
+        for row in conn.execute(
+            "SELECT epic_id, story_id, source_sha FROM epic_story_integrations"
+        ).fetchall()
+    }
+    recovery = recover_expired_intents(conn, board=board)
+    facts_after_recovery = {
+        (row["epic_id"], row["story_id"], row["source_sha"])
+        for row in conn.execute(
+            "SELECT epic_id, story_id, source_sha FROM epic_story_integrations"
+        ).fetchall()
+    }
+    result.integrated.extend(
+        sorted({story_id for _epic_id, story_id, _source in facts_after_recovery - facts_before})
+    )
+    if recovery.finalized == 0:
+        claimed_intent = claim_next_intent(
+            conn,
+            _claimer_id(),
+            _resolve_claim_ttl_seconds(ttl_seconds),
+            board=board,
+        )
+        if claimed_intent is not None:
+            try:
+                prepared_intent = prepare_claimed_intent(
+                    conn, claimed_intent, board=board
+                )
+                cas_result = advance_prepared_intent(
+                    conn, prepared_intent, board=board
+                )
+                if (
+                    cas_result.kind in {"advanced", "reflected"}
+                    and cas_result.current_sha == prepared_intent.candidate_sha
+                ):
+                    fact = finish_intent(
+                        conn, prepared_intent, cas_result, board=board
+                    )
+                    result.integrated.append(fact.story_id)
+            except Exception:
+                # The durable intent remains running/prepared for the next
+                # recovery pass; failure taxonomy/attention routing is owned
+                # by the follow-up coordinator task.
+                pass
+
+    # Step 5 (merge-back): carry finished work to LOCAL main. OFF unless the
+    # board opts into product_workflow.merge_after_green.
     done_rows = conn.execute(
         """
-        SELECT t.id
+        SELECT t.id, em.epic_id
           FROM tasks t
           LEFT JOIN epic_memberships em ON em.task_id = t.id
           LEFT JOIN tasks e ON e.id = em.epic_id
@@ -18244,32 +17799,28 @@ def reconcile(
          ORDER BY t.completed_at ASC
         """
     ).fetchall()
-    # Step 5 (merge-back): carry finished work to LOCAL main. OFF unless the
-    # board opts into product_workflow.merge_after_green -- when off, behavior
-    # is byte-for-byte the pre-existing integrate-one-per-pass loop.
     merge_after_green = _product_merge_after_green(product_board_metadata(board))
-    for row in done_rows:
-        story_id = row["id"]
-        outcome = integrate_story_to_epic(conn, story_id, board=board)
-        if outcome == "integrated":
-            result.integrated.append(story_id)
-            if merge_after_green:
-                epic_id = epic_id_for_task(conn, story_id)
-                if epic_id and epic_ready(conn, epic_id, board=board):
-                    if merge_epic_to_main(conn, epic_id, board=board) == "merged":
-                        result.merged_to_main.append(epic_id)
-            break
-        if merge_after_green:
-            if outcome == "already_integrated":
-                epic_id = epic_id_for_task(conn, story_id)
-                if epic_id and epic_ready(conn, epic_id, board=board):
+    if merge_after_green:
+        attempted_epics: set[str] = set()
+        for row in done_rows:
+            story_id = row["id"]
+            epic_id = row["epic_id"]
+            if epic_id is not None:
+                if epic_id in attempted_epics:
+                    continue
+                attempted_epics.add(epic_id)
+                integrated = conn.execute(
+                    "SELECT 1 FROM epic_story_integrations "
+                    "WHERE epic_id=? AND story_id=? LIMIT 1",
+                    (epic_id, story_id),
+                ).fetchone()
+                if integrated is not None and epic_ready(conn, epic_id, board=board):
                     if merge_epic_to_main(conn, epic_id, board=board) == "merged":
                         result.merged_to_main.append(epic_id)
                         break
-            elif outcome is None:
-                if _merge_standalone_story_to_main(conn, story_id, board=board) == "merged":
-                    result.merged_to_main.append(story_id)
-                    break
+            elif _merge_standalone_story_to_main(conn, story_id, board=board) == "merged":
+                result.merged_to_main.append(story_id)
+                break
 
     return result
 
