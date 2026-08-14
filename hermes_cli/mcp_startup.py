@@ -68,7 +68,8 @@ def _resolve_discovery_timeout(explicit: "float | None") -> float:
         val = float(raw)
         return val if val > 0 else default
     except Exception:
-        return 1.5
+        from hermes_cli.config import DEFAULT_CONFIG
+        return float(DEFAULT_CONFIG.get("mcp_discovery_timeout", 1.5))
 
 
 def _discover_mcp_tools_without_interactive_oauth() -> None:
