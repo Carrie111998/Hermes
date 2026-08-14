@@ -4756,6 +4756,57 @@ def _run_source_snapshot(conn: sqlite3.Connection, task_id: str, run_id: int) ->
     return snapshot if isinstance(snapshot, dict) else None
 
 
+def _run_preclaim_receipt(conn: sqlite3.Connection, task: Task, run_id: int) -> Optional[dict[str, Any]]:
+    """Return a receipt only when it still authorizes this exact source run."""
+    row = conn.execute(
+        "SELECT preclaim_receipt FROM task_runs WHERE id = ? AND task_id = ? AND ended_at IS NULL",
+        (run_id, task.id),
+    ).fetchone()
+    try:
+        receipt = json.loads(row["preclaim_receipt"]) if row and row["preclaim_receipt"] else None
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(receipt, dict) or receipt.get("version") != 1:
+        return None
+    if receipt.get("task_id") != task.id or receipt.get("run_id") != run_id:
+        return None
+    snapshot = _run_source_snapshot(conn, task.id, run_id)
+    expected = sorted(
+        str(e.get("source_id")) for e in ((snapshot or {}).get("sources") or [])
+        if isinstance(e, dict)
+    )
+    if sorted(receipt.get("source_ids") or []) != expected:
+        return None
+    if receipt.get("required_capabilities") != (task.required_capabilities or []):
+        return None
+    if receipt.get("claim_lock") != task.claim_lock or int(receipt.get("claim_expires") or 0) != int(task.claim_expires or 0):
+        return None
+    if int(receipt.get("checked_at") or 0) <= 0 or int(task.claim_expires or 0) < int(time.time()):
+        return None
+    backend = str(os.environ.get("HERMES_KANBAN_RUNTIME_BACKEND") or os.environ.get("TERMINAL_ENV") or "local").strip().lower() or "local"
+    if receipt.get("backend") != backend:
+        return None
+    required_sha = receipt.get("required_repo_sha")
+    binding = receipt.get("repo_binding")
+    if required_sha:
+        if not isinstance(binding, dict) or binding.get("sha") != required_sha:
+            return None
+        workspace = binding.get("workspace")
+        if not isinstance(workspace, str) or not workspace:
+            return None
+        try:
+            actual_sha = subprocess.check_output(
+                ["git", "-C", workspace, "rev-parse", "HEAD"],
+                text=True,
+                stderr=subprocess.DEVNULL,
+            ).strip()
+        except (OSError, subprocess.CalledProcessError):
+            return None
+        if not hmac.compare_digest(actual_sha, str(required_sha)):
+            return None
+    return receipt
+
+
 def _cursor_for(snapshot: Mapping[str, Any], source_id: str, offset: int) -> str:
     payload = json.dumps({"s": source_id, "o": offset}, sort_keys=True, separators=(",", ":")).encode()
     mac = hmac.new(str(snapshot["nonce"]).encode(), payload, hashlib.sha256).digest()
@@ -4780,7 +4831,8 @@ def read_task_source(conn: sqlite3.Connection, task_id: str, source_id: str, *, 
     if task is None:
         raise ValueError("source is not available for this task")
     snapshot = _run_source_snapshot(conn, task_id, run_id) if run_id is not None else None
-    if run_id is not None and (task.current_run_id != run_id or snapshot is None):
+    receipt = _run_preclaim_receipt(conn, task, run_id) if run_id is not None else None
+    if run_id is not None and (task.current_run_id != run_id or snapshot is None or receipt is None):
         raise ValueError("source is not available for this run")
     entries = snapshot.get("sources", []) if snapshot else (task.source_manifest or [])
     entry = next((e for e in entries if isinstance(e, dict) and e.get("source_id") == source_id), None)
@@ -4796,10 +4848,10 @@ def read_task_source(conn: sqlite3.Connection, task_id: str, source_id: str, *, 
     return {"source_id": source_id, "media_type": entry["media_type"], "size": len(data), "sha256": entry["sha256"], "provenance": entry["provenance"], "offset": offset, "next_offset": next_offset, "eof": next_offset >= len(data), "next_cursor": (_cursor_for(snapshot, source_id, next_offset) if snapshot and next_offset < len(data) else None), "bytes": page}
 
 
-def _preclaim_source_diagnostics(conn: sqlite3.Connection, task_id: str) -> tuple[list[dict[str, str]], list[dict[str, Any]]]:
+def _preclaim_source_diagnostics(conn: sqlite3.Connection, task_id: str) -> tuple[list[dict[str, str]], list[dict[str, Any]], Optional[dict[str, Any]]]:
     task = get_task(conn, task_id)
     if task is None:
-        return [{"code": "task_missing"}], []
+        return [{"code": "task_missing"}], [], None
     diagnostics: list[dict[str, str]] = []
     snapshot: list[dict[str, Any]] = []
     for entry in task.source_manifest or []:
@@ -4821,22 +4873,53 @@ def _preclaim_source_diagnostics(conn: sqlite3.Connection, task_id: str) -> tupl
                     diagnostics.append({"code": "repository_sha_mismatch"})
             except (OSError, subprocess.CalledProcessError):
                 diagnostics.append({"code": "repository_unavailable"})
-    if task.required_capabilities:
+    # Resolve once and carry the exact launch-time contract into the receipt.
+    # A remote executor cannot safely access host attachment paths or validate
+    # host git state until a version-pinned materializer exists; fail closed.
+    contract: Optional[dict[str, Any]] = None
+    needs_runtime_contract = bool(task.required_capabilities or task.source_manifest or task.required_repo_sha)
+    if task.assignee and needs_runtime_contract:
         try:
             from hermes_cli.profiles import resolve_profile_env
-            enabled = set(_resolve_worker_cli_toolsets(resolve_profile_env(task.assignee)) or []) if task.assignee else set()
+            contract = _resolve_worker_runtime_contract(resolve_profile_env(task.assignee))
         except Exception as exc:
             diagnostics.append({"code": "capability_unproven", "detail": f"profile_resolution:{exc}"})
-            enabled = set()
-        # kanban_read_source is registered in the kanban toolset; callers may
-        # declare either the concrete tool or an enabled toolset capability.
-        for capability in task.required_capabilities:
-            if capability == "kanban_source_reader":
-                if "kanban" not in enabled:
-                    diagnostics.append({"code": "capability_unproven", "detail": capability})
-            elif capability not in enabled:
+    elif not task.required_capabilities:
+        # Unassigned local claims are supported for direct/operator workflows.
+        # They have no capability assertion to prove, but source sealing still
+        # uses the local dispatcher filesystem.
+        contract = {"toolsets": [], "backend": "local"}
+    if contract is None:
+        diagnostics.append({"code": "capability_unproven", "detail": "runtime_contract"})
+        enabled: set[str] = set()
+        backend = "unknown"
+    else:
+        enabled = set(contract["toolsets"])
+        backend = str(contract["backend"])
+    if backend != "local" and (task.source_manifest or task.required_repo_sha):
+        diagnostics.append({
+            "code": "remote_materialization_unsupported",
+            "detail": backend,
+        })
+    # kanban_read_source is registered in the kanban toolset; callers may
+    # declare either the concrete tool or an enabled toolset capability.
+    for capability in task.required_capabilities or []:
+        if capability == "kanban_source_reader":
+            if "kanban" not in enabled:
                 diagnostics.append({"code": "capability_unproven", "detail": capability})
-    return diagnostics, snapshot
+        elif capability not in enabled:
+            diagnostics.append({"code": "capability_unproven", "detail": capability})
+    if contract is not None:
+        requested = sorted(set(str(item) for item in contract.get("requested_toolsets", []) if isinstance(item, str)))
+        effective = sorted(enabled)
+        contract = {
+            **contract,
+            "requested_toolsets": requested,
+            "effective_toolsets": effective,
+            "shadowed_toolsets": sorted(set(requested) - set(effective)),
+            "backend": backend,
+        }
+    return diagnostics, snapshot, contract
 
 
 def claim_task(
@@ -4880,7 +4963,7 @@ def claim_task(
                 {"reason": "parents_not_done"},
             )
             return None
-        diagnostics, sealed_sources = _preclaim_source_diagnostics(conn, task_id)
+        diagnostics, sealed_sources, contract = _preclaim_source_diagnostics(conn, task_id)
         if diagnostics:
             _append_event(conn, task_id, "preclaim_denied", {"diagnostics": diagnostics})
             return None
@@ -4926,6 +5009,29 @@ def claim_task(
             "FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
+        claimed_task = get_task(conn, task_id)
+        if claimed_task is None or contract is None:
+            raise RuntimeError("preclaim contract disappeared after claim")
+        receipt = {
+            "version": 1,
+            "task_id": task_id,
+            "required_capabilities": claimed_task.required_capabilities or [],
+            "requested_toolsets": contract["requested_toolsets"],
+            "effective_toolsets": contract["effective_toolsets"],
+            "shadowed_toolsets": contract["shadowed_toolsets"],
+            "source_ids": [s["source_id"] for s in sealed_sources],
+            "required_repo_sha": claimed_task.required_repo_sha,
+            # HEAD-only is the bounded policy. Persist the checked workspace so
+            # runtime validation never guesses from the worker's ambient cwd.
+            "repo_binding": (
+                {"workspace": claimed_task.workspace_path, "sha": claimed_task.required_repo_sha}
+                if claimed_task.required_repo_sha else None
+            ),
+            "backend": contract["backend"],
+            "checked_at": now,
+            "claim_lock": lock,
+            "claim_expires": expires,
+        }
         run_cur = conn.execute(
             """
             INSERT INTO task_runs (
@@ -4942,11 +5048,16 @@ def claim_task(
                 expires,
                 trow["max_runtime_seconds"] if trow else None,
                 now,
-                json.dumps({"version": 1, "capabilities": (get_task(conn, task_id).required_capabilities if get_task(conn, task_id) else []), "sources_checked": [s["source_id"] for s in sealed_sources], "checked_at": now}, sort_keys=True, separators=(",", ":")),
+                json.dumps(receipt, sort_keys=True, separators=(",", ":")),
                 json.dumps({"version": 1, "task_id": task_id, "nonce": secrets.token_urlsafe(32), "sources": sealed_sources}, sort_keys=True, separators=(",", ":")),
             ),
         )
         run_id = run_cur.lastrowid
+        receipt["run_id"] = run_id
+        conn.execute(
+            "UPDATE task_runs SET preclaim_receipt = ? WHERE id = ?",
+            (json.dumps(receipt, sort_keys=True, separators=(",", ":")), run_id),
+        )
         conn.execute(
             "UPDATE tasks SET current_run_id = ? WHERE id = ?",
             (run_id, task_id),
@@ -10658,16 +10769,14 @@ def _worker_terminal_timeout_env(
     return str(desired)
 
 
-def _resolve_worker_cli_toolsets(hermes_home: Optional[str]) -> Optional[list[str]]:
-    """Return the assigned profile's effective CLI toolsets for a worker.
+def _resolve_worker_runtime_contract(hermes_home: Optional[str]) -> Optional[dict[str, Any]]:
+    """Resolve the exact CLI capability/backend contract for one worker.
 
-    Dispatcher-spawned workers are launched from a long-lived gateway process,
-    then the child re-enters the CLI with ``-p <assignee>``. Resolve the
-    assignee profile's CLI tool surface at dispatch time and pass it as an
-    explicit ``--toolsets`` pin so worker startup cannot fall back to a stale
-    root/active-profile config or a profile whose top-level ``toolsets`` entry
-    is only the kanban orchestrator surface. ``model_tools`` still appends the
-    task-scoped kanban lifecycle tools when ``HERMES_KANBAN_TASK`` is set.
+    This is deliberately the single resolver used by both preclaim and launch:
+    a preclaim must never approve a capability set different from the one
+    pinned into ``--toolsets``.  Remote terminal backends currently have no
+    immutable attachment/repository materializer, so source-bearing work is
+    denied before a run is created rather than hoping host paths are mounted.
     """
     if not hermes_home:
         return None
@@ -10680,16 +10789,22 @@ def _resolve_worker_cli_toolsets(hermes_home: Optional[str]) -> Optional[list[st
         try:
             cfg = load_config()
             toolsets = sorted(_get_platform_tools(cfg, "cli"))
+            terminal = cfg.get("terminal") or {}
+            backend = str(terminal.get("backend") or "local").strip().lower() if isinstance(terminal, dict) else "local"
+            requested = cfg.get("toolsets")
+            requested_toolsets = [str(item) for item in requested if isinstance(item, str)] if isinstance(requested, list) else []
         finally:
             reset_hermes_home_override(token)
-        return toolsets or None
+        return {"toolsets": toolsets, "requested_toolsets": requested_toolsets, "backend": backend or "local"}
     except Exception as exc:
-        _log.debug(
-            "kanban worker: could not resolve CLI toolsets for HERMES_HOME=%r (%s)",
-            hermes_home,
-            exc,
-        )
+        _log.debug("kanban worker: could not resolve runtime contract for HERMES_HOME=%r (%s)", hermes_home, exc)
         return None
+
+
+def _resolve_worker_cli_toolsets(hermes_home: Optional[str]) -> Optional[list[str]]:
+    """Compatibility wrapper returning the launch-pinned effective toolsets."""
+    contract = _resolve_worker_runtime_contract(hermes_home)
+    return list(contract["toolsets"]) if contract and contract["toolsets"] else None
 
 
 _retagged_workspace_roots: set[str] = set()

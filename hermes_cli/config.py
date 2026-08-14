@@ -2116,6 +2116,35 @@ def validate_config_structure(config: Optional[Dict[str, Any]] = None) -> List["
                 f"Move '{key}' under the appropriate section",
             ))
 
+    # ── Top-level toolsets shadowed by explicit platform allowlists ────────
+    # Dispatch workers resolve their CLI surface through _get_platform_tools,
+    # where an explicit platform_toolsets.<platform> list is authoritative.
+    # Preserve a diagnostic for legacy top-level `toolsets` declarations that
+    # look active in config.yaml but will be absent at launch.
+    requested_toolsets = config.get("toolsets")
+    platform_toolsets = config.get("platform_toolsets")
+    if isinstance(requested_toolsets, list) and isinstance(platform_toolsets, dict):
+        try:
+            from hermes_cli.tools_config import _get_platform_tools
+            for platform, explicit in platform_toolsets.items():
+                if not isinstance(platform, str) or not isinstance(explicit, list):
+                    continue
+                effective = set(_get_platform_tools(config, platform))
+                shadowed = sorted(
+                    str(name) for name in requested_toolsets
+                    if isinstance(name, str) and name not in effective
+                )
+                if shadowed:
+                    issues.append(ConfigIssue(
+                        "warning",
+                        f"Top-level toolsets are shadowed by explicit platform_toolsets.{platform}: {', '.join(shadowed)}",
+                        f"Add the required toolsets to platform_toolsets.{platform}; workers use the effective platform allowlist at launch",
+                    ))
+        except Exception:
+            # Validation must remain best-effort if tool registry loading is
+            # unavailable (minimal installs and partial plugin environments).
+            pass
+
     return issues
 
 
