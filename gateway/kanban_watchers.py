@@ -487,6 +487,7 @@ class GatewayKanbanWatchersMixin:
                                 "; will retry" if task_status == "ready" else ""
                             )
                             limit = None
+                            msg = None
                             if ev.payload:
                                 # Iteration-budget exhaustion carries the
                                 # budget (budget_used/budget_max), not a
@@ -503,7 +504,7 @@ class GatewayKanbanWatchersMixin:
                                 else:
                                     if ev.payload.get("limit_seconds"):
                                         limit = int(ev.payload["limit_seconds"])
-                            if limit is None and "iteration budget" not in msg:
+                            if limit is None and (msg is None or "iteration budget" not in msg):
                                 # Legacy events / metadata-less payloads:
                                 # fall back to the task's configured runtime,
                                 # never an invented zero.
@@ -513,7 +514,7 @@ class GatewayKanbanWatchersMixin:
                                     f"⏱ {board_tag}{tag}Kanban {sub['task_id']} timed out "
                                     f"(max_runtime={limit}s){retry_suffix}"
                                 )
-                            elif "iteration budget" not in msg:
+                            elif msg is None or "iteration budget" not in msg:
                                 msg = (
                                     f"⏱ {board_tag}{tag}Kanban {sub['task_id']} timed out "
                                     f"(max_runtime=?s){retry_suffix}"
