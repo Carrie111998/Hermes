@@ -5,6 +5,7 @@ import json
 import re
 import subprocess
 import sys
+from functools import lru_cache
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -29,7 +30,8 @@ def _baseline_test_paths() -> set[str]:
     return {line for line in result.stdout.splitlines() if re.match(r"tests/test_.*\.py$|tests/.+/test_.*\.py$", line)}
 
 
-def _collected_node_ids(path: str) -> set[str]:
+@lru_cache(maxsize=None)
+def _collected_node_ids(path: str) -> frozenset[str]:
     result = subprocess.run(
         [sys.executable, "-m", "pytest", "--collect-only", "-q", path],
         cwd=ROOT,
@@ -40,11 +42,11 @@ def _collected_node_ids(path: str) -> set[str]:
     if result.returncode not in {0, 5}:
         raise ValueError(f"cannot collect selectors for {path}: {result.stderr.strip() or result.stdout.strip()}")
     prefix = f"{path}::"
-    return {
+    return frozenset(
         line.strip().split(" ", 1)[0]
         for line in result.stdout.splitlines()
         if line.strip().startswith(prefix)
-    }
+    )
 
 
 def load_manifest() -> dict:

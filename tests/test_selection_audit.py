@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 from pathlib import Path
 
 import pytest
@@ -89,3 +90,26 @@ def test_nonexistent_node_selector_fails_closed(tmp_path: Path, monkeypatch: pyt
     monkeypatch.setattr(audit, "MANIFEST", manifest)
     with pytest.raises(ValueError, match="does not exist"):
         audit.load_manifest()
+
+
+def test_collected_node_ids_are_cached_per_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append(command)
+        path = command[-1]
+        return SimpleNamespace(
+            returncode=0,
+            stdout=f"{path}::test_example\n",
+            stderr="",
+        )
+
+    audit._collected_node_ids.cache_clear()
+    monkeypatch.setattr(audit.subprocess, "run", fake_run)
+    try:
+        expected = frozenset({"tests/example/test_cached.py::test_example"})
+        assert audit._collected_node_ids("tests/example/test_cached.py") == expected
+        assert audit._collected_node_ids("tests/example/test_cached.py") == expected
+        assert len(calls) == 1
+    finally:
+        audit._collected_node_ids.cache_clear()
