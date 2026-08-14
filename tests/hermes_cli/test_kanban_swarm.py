@@ -9,6 +9,9 @@ from hermes_cli.kanban_swarm import (
 )
 
 
+FUTURE = "2030-01-01T00:00:00Z"
+
+
 def test_create_swarm_builds_parallel_workers_verifier_and_synthesizer(tmp_path):
     conn = kb.connect(tmp_path / "kanban.db")
     try:
@@ -258,5 +261,33 @@ def test_swarm_verifier_and_synthesis_are_dependency_gated(tmp_path):
         synthesizer = kb.get_task(conn, created.synthesizer_id)
         assert synthesizer is not None
         assert synthesizer.status == "ready"
+    finally:
+        conn.close()
+
+
+def test_swarm_workflow_children_inherit_release_deadline(tmp_path):
+    conn = kb.connect(tmp_path / "kanban.db")
+    try:
+        created = create_swarm(
+            conn,
+            goal="Wait for the coordinated release.",
+            workers=[
+                SwarmWorkerSpec(profile="a", title="Branch A", body="A"),
+                SwarmWorkerSpec(profile="b", title="Branch B", body="B"),
+            ],
+            verifier_assignee="reviewer",
+            synthesizer_assignee="writer",
+            not_before=FUTURE,
+        )
+
+        workers = [kb.get_task(conn, tid) for tid in created.worker_ids]
+        verifier = kb.get_task(conn, created.verifier_id)
+        synthesizer = kb.get_task(conn, created.synthesizer_id)
+        assert [task.not_before for task in workers] == [FUTURE, FUTURE]
+        assert [task.status for task in workers] == ["scheduled", "scheduled"]
+        assert verifier.not_before == FUTURE
+        assert verifier.status == "scheduled"
+        assert synthesizer.not_before == FUTURE
+        assert synthesizer.status == "scheduled"
     finally:
         conn.close()

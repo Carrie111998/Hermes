@@ -10,6 +10,7 @@ Usage:
 """
 
 import contextlib
+from contextvars import ContextVar
 from contextlib import asynccontextmanager, contextmanager
 
 import asyncio
@@ -350,6 +351,157 @@ def _resolve_session_token() -> str:
 
 _SESSION_TOKEN = _resolve_session_token()
 _SESSION_HEADER_NAME = "X-Hermes-Session-Token"
+
+
+def _make_dashboard_auth_provenance(auth_app: FastAPI):
+    """Build the private request-lifetime lease boundary for owner provenance.
+
+    The lease registry, signing secret, seal, and ContextVar deliberately live
+    only in this closure.  The module exposes the verifier and the canonical
+    gated-auth runner, never a constructor, registry, or setter that an
+    in-process plugin/worker could use to self-assert authentication.
+    """
+    lease_secret = secrets.token_bytes(32)
+    lease_seal = object()
+    lease_context: ContextVar[Optional[str]] = ContextVar(
+        "hermes_dashboard_auth_lease", default=None
+    )
+    active_leases: dict[str, tuple[object, bytes, FastAPI, dict, str, str]] = {}
+    active_leases_lock = threading.RLock()
+
+    def _register_lease(
+        request: Request,
+        identity: str,
+        authenticated_by: str,
+    ) -> tuple[str, object]:
+        lease_id = secrets.token_urlsafe(32)
+        signature = hmac.new(
+            lease_secret,
+            lease_id.encode("ascii"),
+            hashlib.sha256,
+        ).digest()
+        record = (
+            lease_seal,
+            signature,
+            auth_app,
+            request.scope,
+            identity,
+            authenticated_by,
+        )
+        with active_leases_lock:
+            active_leases[lease_id] = record
+        try:
+            context_token = lease_context.set(lease_id)
+        except BaseException:
+            with active_leases_lock:
+                active_leases.pop(lease_id, None)
+            raise
+        return lease_id, context_token
+
+    def _issue_gated_lease(request: Request) -> Optional[tuple[str, object]]:
+        """Issue only from the session attached by canonical gated auth."""
+        if request.app is not auth_app:
+            return None
+        from hermes_cli.dashboard_auth.middleware import _path_is_public
+
+        # The canonical middleware calls its downstream callback for public
+        # bootstrap paths and for token-auth seam requests without performing
+        # interactive session authentication. Neither path can issue owner
+        # provenance, even if a caller pre-populated request.state.session.
+        if (
+            _path_is_public(request.url.path)
+            or getattr(request.state, "token_authenticated", False)
+        ):
+            return None
+        session = getattr(request.state, "session", None)
+        identity = str(getattr(session, "user_id", "") or "").strip()
+        provider = str(getattr(session, "provider", "") or "").strip()
+        if not identity or not provider:
+            return None
+        return _register_lease(
+            request,
+            identity,
+            f"dashboard_session:{provider}",
+        )
+
+    def _revoke_lease(lease_id: str, context_token: object) -> None:
+        # Remove from the shared registry first: copied contexts retain their
+        # ContextVar value, but cannot use it after request completion.
+        with active_leases_lock:
+            active_leases.pop(lease_id, None)
+        try:
+            lease_context.reset(context_token)
+        except (LookupError, ValueError):
+            # Registry revocation is the security boundary.  A context can be
+            # copied or moved by framework cleanup; never let reset failure
+            # leak the active lease or mask the request's original exception.
+            pass
+
+    def verify(request: Request) -> Optional[tuple[str, str]]:
+        """Verify an active, app/scope/session-bound gated-auth lease."""
+        if request.app is not auth_app:
+            return None
+        lease_id = lease_context.get()
+        if not isinstance(lease_id, str) or not lease_id or not lease_id.isascii():
+            return None
+        expected_signature = hmac.new(
+            lease_secret,
+            lease_id.encode("ascii"),
+            hashlib.sha256,
+        ).digest()
+        with active_leases_lock:
+            record = active_leases.get(lease_id)
+            if record is None:
+                return None
+            (
+                record_seal,
+                signature,
+                lease_app,
+                lease_scope,
+                identity,
+                authenticated_by,
+            ) = record
+            if (
+                record_seal is not lease_seal
+                or not hmac.compare_digest(signature, expected_signature)
+                or lease_app is not auth_app
+                or request.scope is not lease_scope
+            ):
+                return None
+            session = getattr(request.state, "session", None)
+            current_identity = str(getattr(session, "user_id", "") or "").strip()
+            provider = str(getattr(session, "provider", "") or "").strip()
+            if (
+                not current_identity
+                or not provider
+                or current_identity != identity
+                or authenticated_by != f"dashboard_session:{provider}"
+            ):
+                return None
+            return identity, authenticated_by
+
+    async def run_gated_auth(request: Request, call_next):
+        """Run canonical auth, then bracket downstream work with one lease."""
+        from hermes_cli.dashboard_auth.middleware import gated_auth_middleware
+
+        async def authenticated_call_next(authenticated_request: Request):
+            lease = _issue_gated_lease(authenticated_request)
+            if lease is None:
+                return await call_next(authenticated_request)
+            lease_id, context_token = lease
+            try:
+                return await call_next(authenticated_request)
+            finally:
+                _revoke_lease(lease_id, context_token)
+
+        return await gated_auth_middleware(request, authenticated_call_next)
+
+    return verify, run_gated_auth
+
+
+_verify_dashboard_auth_lease, _run_dashboard_gated_auth = (
+    _make_dashboard_auth_provenance(app)
+)
 _SSH_OWNER_NONCE: Optional[str] = None
 
 
@@ -430,6 +582,17 @@ def _has_valid_session_token(request: Request) -> bool:
     auth = request.headers.get("authorization", "")
     expected = f"Bearer {_SESSION_TOKEN}"
     return hmac.compare_digest(auth.encode(), expected.encode())
+
+
+def verified_dashboard_owner(request: Request) -> Optional[tuple[str, str]]:
+    """Return owner provenance only for a request authenticated by this app."""
+    if request.app is not app:
+        return None
+    if getattr(request.app.state, "auth_required", False):
+        return _verify_dashboard_auth_lease(request)
+    if _has_valid_session_token(request):
+        return f"local:{os.getuid()}", "dashboard_session_token"
+    return None
 
 
 # Routes that may also authenticate via a ``?token=`` query param, for download
@@ -660,8 +823,7 @@ async def _plugin_api_runtime_gate(request: Request, call_next):
 
 @app.middleware("http")
 async def _dashboard_auth_gate(request: Request, call_next):
-    from hermes_cli.dashboard_auth.middleware import gated_auth_middleware
-    return await gated_auth_middleware(request, call_next)
+    return await _run_dashboard_gated_auth(request, call_next)
 
 
 @app.middleware("http")

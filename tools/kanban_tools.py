@@ -503,6 +503,7 @@ def _task_summary_dict(kb, conn, task) -> dict[str, Any]:
         "current_run_id": task.current_run_id,
         "model_override": task.model_override,
         "provider_override": task.provider_override,
+        "not_before": task.not_before,
         "parents": parents,
         "children": children,
         "parent_count": len(parents),
@@ -549,6 +550,7 @@ def _handle_show(args: dict, **kw) -> str:
                     "current_run_id": t.current_run_id,
                     "model_override": t.model_override,
                     "provider_override": t.provider_override,
+                    "not_before": t.not_before,
                 }
 
             def _run_dict(r):
@@ -1360,6 +1362,7 @@ def _handle_create(args: dict, **kw) -> str:
         )
     body = args.get("body")
     parents = args.get("parents") or []
+    not_before = args.get("not_before")
     tenant = args.get("tenant") or os.environ.get("HERMES_TENANT")
     # Stamp the originating session id when the agent loop runs under
     # ACP (which sets HERMES_SESSION_ID before invoking tools). NULL on
@@ -1461,6 +1464,7 @@ def _handle_create(args: dict, **kw) -> str:
                 initial_status=str(initial_status),
                 created_by=os.environ.get("HERMES_PROFILE") or "worker",
                 session_id=session_id,
+                not_before=not_before,
             )
             new_task = kb.get_task(conn, new_tid)
             subscribed = _maybe_auto_subscribe(conn, new_tid)
@@ -1470,6 +1474,7 @@ def _handle_create(args: dict, **kw) -> str:
                 workspace_kind=new_task.workspace_kind if new_task else None,
                 workspace_path=new_task.workspace_path if new_task else None,
                 project_id=new_task.project_id if new_task else None,
+                not_before=new_task.not_before if new_task else None,
                 subscribed=subscribed,
             )
         finally:
@@ -2172,6 +2177,15 @@ KANBAN_CREATE_SCHEMA = {
                     "auto-promotes to 'ready'. Typical fan-in: list "
                     "all the researcher task ids when creating a "
                     "synthesizer task."
+                ),
+            },
+            "not_before": {
+                "type": "string",
+                "description": (
+                    "Optional timezone-aware UTC instant. The task remains "
+                    "outside the dispatchable queue until this deadline; "
+                    "when parents have a later deadline, the latest parent "
+                    "deadline is inherited."
                 ),
             },
             "tenant": {

@@ -70,7 +70,8 @@ Output a single JSON object with this exact shape:
         "title": "<concrete task title, imperative voice, <= 80 chars>",
         "body":  "<detailed spec for the worker on this child task>",
         "assignee": "<profile name from the roster, or null for default>",
-        "parents": [<int>, ...]
+        "parents": [<int>, ...],
+        "not_before": "<optional timezone-aware UTC instant>"
       },
       ...
     ]
@@ -89,6 +90,8 @@ Rules:
     and the system will route to the default_assignee.
   - Each child task body is what a fresh worker will read with no other
     context — be specific about goal, approach, and acceptance criteria.
+  - If the root task has a release deadline, child deadlines may be later but
+    never earlier. Omit "not_before" unless a child needs a later deadline.
 
 When the task is genuinely a single unit of work (no useful decomposition),
 return:
@@ -427,6 +430,7 @@ def decompose_task(
             "body": body.strip(),
             "assignee": chosen,
             "parents": clean_parents,
+            "not_before": entry.get("not_before"),
         })
 
     try:

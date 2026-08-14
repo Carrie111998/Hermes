@@ -44,7 +44,7 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Optional
 
-from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile, WebSocket, WebSocketDisconnect, status as http_status
+from fastapi import APIRouter, File, Form, HTTPException, Query, Request, UploadFile, WebSocket, WebSocketDisconnect, status as http_status
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
@@ -114,6 +114,8 @@ def _resolve_board(board: Optional[str]) -> Optional[str]:
             detail=f"board {normed!r} does not exist",
         )
     return normed
+
+
 
 
 def _conn(board: Optional[str] = None):
@@ -618,6 +620,9 @@ class CreateTaskBody(BaseModel):
     # Explicit project link; when omitted, create_task inherits the board's
     # scoped project (if any) so a project-scoped board anchors every task.
     project_id: Optional[str] = None
+    # Optional machine-enforced release deadline. Parent tasks with a later
+    # deadline are inherited by the kernel during creation.
+    not_before: Optional[str] = None
 
 
 @router.post("/tasks")
@@ -646,6 +651,7 @@ def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
             provider_override=payload.provider_override,
             reasoning_effort=payload.reasoning_effort,
             project_id=payload.project_id,
+            not_before=payload.not_before,
             board=board,
         )
         task = kanban_db.get_task(conn, task_id)
@@ -827,6 +833,9 @@ def remove_attachment(attachment_id: int, board: Optional[str] = Query(None)):
 
 class UpdateTaskBody(BaseModel):
     status: Optional[str] = None
+    # Supplying this field invokes the authenticated dashboard owner control
+    # plane; the client never supplies actor/authentication identity.
+    not_before_override_reason: Optional[str] = None
     assignee: Optional[str] = None
     priority: Optional[int] = None
     title: Optional[str] = None
@@ -867,7 +876,12 @@ def _reopen_if_review(conn, task_id: str, current) -> Optional[bool]:
 
 
 @router.patch("/tasks/{task_id}")
-def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Query(None)):
+def update_task(
+    request: Request,
+    task_id: str,
+    payload: UpdateTaskBody,
+    board: Optional[str] = Query(None),
+):
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
@@ -878,6 +892,29 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
         review_assignee_deferred = (
             payload.status == "review" and payload.assignee is not None
         )
+        not_before_override = None
+        if payload.not_before_override_reason is not None:
+            if payload.status is None:
+                raise HTTPException(
+                    status_code=400,
+                    detail="not-before override requires a status transition",
+                )
+            if payload.status not in {"ready", "done"}:
+                raise HTTPException(
+                    status_code=400,
+                    detail="not-before override only releases ready or done transitions",
+                )
+            try:
+                not_before_override = kanban_db.mint_owner_not_before_override(
+                    conn,
+                    task_id,
+                    request=request,
+                    reason=payload.not_before_override_reason,
+                )
+            except PermissionError as exc:
+                raise HTTPException(status_code=403, detail=str(exc))
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc))
 
         # --- assignee ----------------------------------------------------
         # For a combined assignee+review patch, request_review must capture
@@ -902,6 +939,7 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
                     result=payload.result,
                     summary=payload.summary,
                     metadata=payload.metadata,
+                    not_before_override=not_before_override,
                 )
             elif s == "blocked":
                 ok = kanban_db.block_task(conn, task_id, reason=payload.block_reason)
@@ -928,11 +966,24 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
                 # reopen_review_task via _reopen_if_review.
                 current = kanban_db.get_task(conn, task_id)
                 if current and current.status in ("blocked", "scheduled"):
-                    ok = kanban_db.unblock_task(conn, task_id)
+                    ok = kanban_db.unblock_task(
+                        conn,
+                        task_id,
+                        not_before_override=not_before_override,
+                    )
                 else:
                     reopened = _reopen_if_review(conn, task_id, current)
                     # Direct status write for drag-drop (todo -> ready etc).
-                    ok = reopened if reopened is not None else _set_status_direct(conn, task_id, "ready")
+                    ok = (
+                        reopened
+                        if reopened is not None
+                        else _set_status_direct(
+                            conn,
+                            task_id,
+                            "ready",
+                            not_before_override=not_before_override,
+                        )
+                    )
             elif s == "archived":
                 ok = kanban_db.archive_task(conn, task_id)
             elif s == "running":
@@ -1118,7 +1169,11 @@ def _invalidate_descendants_for_parent_reopen(
 
 
 def _set_status_direct(
-    conn: sqlite3.Connection, task_id: str, new_status: str,
+    conn: sqlite3.Connection,
+    task_id: str,
+    new_status: str,
+    *,
+    not_before_override: Optional[kanban_db.OwnerNotBeforeOverride] = None,
 ) -> bool:
     """Direct status write for drag-drop moves that aren't covered by the
     structured complete/block/unblock/archive verbs (e.g. todo<->ready,
@@ -1152,6 +1207,18 @@ def _set_status_direct(
                     if kanban_db._parents_satisfied(conn, task_id)
                     else "todo"
                 )
+        override_gate = None
+        if new_status in {"ready", "running"}:
+            override_gate = kanban_db._pending_not_before_override(
+                conn, task_id, not_before_override
+            )
+        if new_status in {"ready", "running"} and kanban_db._not_before_blocks(
+            conn,
+            task_id,
+            operation=f"dashboard_status:{new_status}",
+            override=not_before_override,
+        ):
+            return False
 
         # Guard: don't allow promoting to 'ready' unless all parents are done.
         # Prevents the dispatcher from spawning a child whose upstream work
@@ -1189,6 +1256,11 @@ def _set_status_direct(
             ),
         )
         if cur.rowcount != 1:
+            return False
+        if not kanban_db._consume_not_before_override(
+            conn, task_id, operation=f"dashboard_status:{new_status}",
+            override=not_before_override, expected_not_before=override_gate,
+        ):
             return False
         run_id = None
         if was_running and effective_status != "running" and prev["current_run_id"]:

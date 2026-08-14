@@ -81,6 +81,7 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "session_id": t.session_id,
         "workflow_template_id": t.workflow_template_id,
         "current_step_key": t.current_step_key,
+        "not_before": t.not_before,
     }
 
 
@@ -354,6 +355,16 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                                "durations (90s, 30m, 2h, 1d). When exceeded, "
                                "the dispatcher SIGTERMs (then SIGKILLs) the worker "
                                "and re-queues the task.")
+    p_create.add_argument(
+        "--not-before",
+        default=None,
+        metavar="ISO8601_UTC",
+        help=(
+            "Optional timezone-aware ISO8601 instant. Numeric offsets are "
+            "accepted and normalized to UTC; dispatch and lifecycle guards "
+            "enforce the release deadline."
+        ),
+    )
     p_create.add_argument("--created-by", default="user",
                           help="Author name recorded on the task (default: user)")
     p_create.add_argument("--skill", action="append", default=[], dest="skills",
@@ -418,6 +429,12 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_swarm.add_argument("--synthesizer", required=True, help="Synthesizer/writer profile")
     p_swarm.add_argument("--tenant", default=None, help="Tenant namespace")
     p_swarm.add_argument("--priority", type=int, default=0, help="Priority tiebreaker")
+    p_swarm.add_argument(
+        "--not-before",
+        default=None,
+        metavar="ISO8601_UTC",
+        help="Release deadline inherited by all workflow child tasks",
+    )
     p_swarm.add_argument("--created-by", default=None, help="Creator/anchor profile")
     p_swarm.add_argument("--idempotency-key", default=None, help="Dedup key for the root card")
     p_swarm.add_argument("--json", action="store_true", help="Emit JSON output")
@@ -1586,6 +1603,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
             goal_mode=bool(getattr(args, "goal_mode", False)),
             goal_max_turns=getattr(args, "goal_max_turns", None),
             initial_status=getattr(args, "initial_status", "running"),
+            not_before=getattr(args, "not_before", None),
         )
         task = kb.get_task(conn, task_id)
     if getattr(args, "json", False):
@@ -1626,6 +1644,7 @@ def _cmd_swarm(args: argparse.Namespace) -> int:
             tenant=args.tenant,
             created_by=args.created_by or _profile_author(),
             priority=args.priority,
+            not_before=getattr(args, "not_before", None),
             idempotency_key=getattr(args, "idempotency_key", None),
         )
     if getattr(args, "json", False):

@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import argparse
 import concurrent.futures
+import json
 import os
 import sqlite3
 import subprocess
@@ -153,12 +155,16 @@ def test_connect_migrates_legacy_db_before_optional_column_indexes(tmp_path):
                 "SELECT name FROM sqlite_master WHERE type = 'index'"
             )
         }
+        legacy_task = kb.get_task(migrated, "legacy")
 
     # Additive columns added by migration:
     assert "session_id" in task_columns
     assert "tenant" in task_columns
     assert "idempotency_key" in task_columns
+    assert "not_before" in task_columns
     assert "run_id" in event_columns
+    assert legacy_task is not None
+    assert legacy_task.not_before is None
     # And their indexes — the regression scope of this test:
     assert "idx_tasks_session_id" in indexes
     assert "idx_tasks_tenant" in indexes
@@ -166,9 +172,166 @@ def test_connect_migrates_legacy_db_before_optional_column_indexes(tmp_path):
     assert "idx_events_run" in indexes
 
 
+def test_init_db_migrates_single_task_dispatch_lease_key_without_data_loss(tmp_path):
+    db_path = tmp_path / "legacy-dispatch-lease.db"
+    kb.init_db(db_path)
+
+    with sqlite3.connect(str(db_path)) as conn:
+        conn.execute("DROP TRIGGER kanban_not_before_reject_leased_change")
+        conn.execute("DROP INDEX idx_not_before_dispatch_leases_expiry")
+        conn.execute("DROP TABLE kanban_not_before_dispatch_leases")
+        conn.execute(
+            """
+            CREATE TABLE kanban_not_before_dispatch_leases (
+                task_id TEXT PRIMARY KEY,
+                lease_hash TEXT NOT NULL,
+                issued_at INTEGER NOT NULL,
+                expires_at INTEGER NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            "INSERT INTO kanban_not_before_dispatch_leases VALUES (?, ?, ?, ?)",
+            ("t_legacy", "legacy-hash", 100, 200),
+        )
+
+    kb.init_db(db_path)
+    with kb.connect(db_path=db_path) as conn:
+        primary_key = {
+            row["name"]: row["pk"]
+            for row in conn.execute(
+                "PRAGMA table_info(kanban_not_before_dispatch_leases)"
+            )
+        }
+        assert primary_key == {
+            "task_id": 1,
+            "lease_hash": 2,
+            "issued_at": 0,
+            "expires_at": 0,
+        }
+        row = conn.execute(
+            "SELECT task_id, lease_hash, issued_at, expires_at "
+            "FROM kanban_not_before_dispatch_leases"
+        ).fetchone()
+        assert tuple(row) == ("t_legacy", "legacy-hash", 100, 200)
+        conn.execute(
+            "INSERT INTO kanban_not_before_dispatch_leases VALUES (?, ?, ?, ?)",
+            ("t_legacy", "second-hash", 101, 201),
+        )
+        assert conn.execute(
+            "SELECT COUNT(*) FROM kanban_not_before_dispatch_leases "
+            "WHERE task_id = 't_legacy'"
+        ).fetchone()[0] == 2
+
+
 # ---------------------------------------------------------------------------
 # Task creation + status inference
 # ---------------------------------------------------------------------------
+
+
+def test_not_before_round_trip_event_and_worker_context(kanban_home):
+    supplied = "2026-08-08T11:26:00.123456789+02:30"
+    canonical = "2026-08-08T08:56:00.123456789Z"
+
+    with kb.connect() as conn:
+        columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(tasks)")
+        }
+        task_id = kb.create_task(
+            conn,
+            title="wait for the release window",
+            assignee="ops",
+            not_before=supplied,
+        )
+        task = kb.get_task(conn, task_id)
+        created = next(
+            event
+            for event in kb.list_events(conn, task_id)
+            if event.kind == "created"
+        )
+        context = kb.build_worker_context(conn, task_id)
+
+    assert "not_before" in columns
+    assert task is not None
+    assert task.not_before == canonical
+    assert created.payload["not_before"] == canonical
+    assert f"Not before: {canonical}" in context
+
+
+def test_not_before_absent_remains_null_and_out_of_worker_context(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="ordinary task", assignee="ops")
+        task = kb.get_task(conn, task_id)
+        created = next(
+            event
+            for event in kb.list_events(conn, task_id)
+            if event.kind == "created"
+        )
+        context = kb.build_worker_context(conn, task_id)
+
+    assert task is not None
+    assert task.not_before is None
+    assert created.payload["not_before"] is None
+    assert "Not before:" not in context
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "",
+        "2026-08-08",
+        "2026-08-08T11:26:00",
+        "2026-08-08T11:26:00 UTC",
+        "2026-13-08T11:26:00Z",
+        "not-a-timestamp",
+    ],
+)
+def test_not_before_rejects_empty_date_only_naive_and_malformed_values(
+    kanban_home, value,
+):
+    with kb.connect() as conn:
+        with pytest.raises(ValueError, match="timezone-aware ISO8601 instant"):
+            kb.create_task(conn, title="unsafe gate", not_before=value)
+        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
+
+
+def _run_kanban_cli(argv: list[str]) -> int:
+    from hermes_cli import kanban as kanban_cli
+
+    parser = argparse.ArgumentParser(prog="hermes")
+    subparsers = parser.add_subparsers(dest="command")
+    kanban_cli.build_parser(subparsers)
+    args = parser.parse_args(["kanban", *argv])
+    return kanban_cli.kanban_command(args)
+
+
+def test_create_cli_parses_and_serializes_not_before(kanban_home, capsys):
+    value = "2026-08-08T11:26:00.500000Z"
+
+    assert _run_kanban_cli(
+        ["create", "clocked task", "--not-before", value, "--json"]
+    ) == 0
+    payload = json.loads(capsys.readouterr().out)
+
+    assert payload["not_before"] == value
+
+
+def test_create_cli_without_not_before_serializes_null(kanban_home, capsys):
+    assert _run_kanban_cli(["create", "ordinary task", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+
+    assert payload["not_before"] is None
+
+
+def test_create_cli_refuses_naive_not_before_without_writing(kanban_home, capsys):
+    assert _run_kanban_cli(
+        ["create", "unsafe task", "--not-before", "2026-08-08T11:26:00"]
+    ) == 1
+    captured = capsys.readouterr()
+
+    assert "timezone-aware ISO8601 instant" in captured.err
+    with kb.connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
 
 
 

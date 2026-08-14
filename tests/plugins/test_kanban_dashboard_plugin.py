@@ -14,6 +14,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from fastapi import FastAPI
@@ -41,6 +42,32 @@ def _load_plugin_router():
     sys.modules[spec.name] = mod
     spec.loader.exec_module(mod)
     return mod.router
+
+
+def _loopback_request():
+    from hermes_cli import web_server
+    from starlette.requests import Request
+
+    return Request(
+        {
+            "type": "http",
+            "method": "PATCH",
+            "path": "/api/plugins/kanban/tasks",
+            "query_string": b"",
+            "headers": [
+                (b"host", b"127.0.0.1"),
+                (
+                    web_server._SESSION_HEADER_NAME.lower().encode(),
+                    web_server._SESSION_TOKEN.encode(),
+                ),
+            ],
+            "client": ("127.0.0.1", 1234),
+            "server": ("127.0.0.1", 9119),
+            "scheme": "http",
+            "root_path": "",
+            "app": web_server.app,
+        }
+    )
 
 
 @pytest.fixture
@@ -116,6 +143,77 @@ def test_create_task_appears_on_board(client):
     assert "researcher" in data["assignees"]
 
 
+def test_create_task_persists_not_before_gate(client):
+    r = client.post(
+        "/api/plugins/kanban/tasks",
+        json={
+            "title": "scheduled dashboard task",
+            "assignee": "researcher",
+            "not_before": "2030-01-01T00:00:00Z",
+        },
+    )
+    assert r.status_code == 200, r.text
+    task = r.json()["task"]
+    assert task["not_before"] == "2030-01-01T00:00:00Z"
+    assert task["status"] == "scheduled"
+
+
+def test_not_before_override_requires_verified_dashboard_owner(client, kanban_home):
+    created = client.post(
+        "/api/plugins/kanban/tasks",
+        json={
+            "title": "owner release",
+            "assignee": "worker",
+            "not_before": "2030-01-01T00:00:00Z",
+        },
+    ).json()["task"]
+
+    forged = client.patch(
+        f"/api/plugins/kanban/tasks/{created['id']}",
+        json={"status": "ready", "not_before_override_reason": "emergency"},
+    )
+    assert forged.status_code == 403
+
+    app = FastAPI()
+
+    @app.middleware("http")
+    async def verified_owner(request, call_next):
+        request.state.session = SimpleNamespace(
+            user_id="alex",
+            provider="test-owner-auth",
+        )
+        return await call_next(request)
+
+    app.include_router(_load_plugin_router(), prefix="/api/plugins/kanban")
+    owner_client = TestClient(app)
+    released = owner_client.patch(
+        f"/api/plugins/kanban/tasks/{created['id']}",
+        json={"status": "ready", "not_before_override_reason": "emergency"},
+    )
+    assert released.status_code == 403
+    assert "owner-authenticated" in released.json()["detail"]
+    with kb.connect() as conn:
+        assert kb.get_task(conn, created["id"]).not_before == "2030-01-01T00:00:00Z"
+
+
+def test_real_loopback_dashboard_owner_route(kanban_home):
+    from hermes_cli import web_server
+
+    with TestClient(web_server.app) as dashboard:
+        headers = {web_server._SESSION_HEADER_NAME: web_server._SESSION_TOKEN}
+        created = dashboard.post(
+            "/api/plugins/kanban/tasks",
+            headers=headers,
+            json={"title": "real owner route", "not_before": "2030-01-01T00:00:00Z"},
+        )
+        assert created.status_code == 200, created.text
+        task_id = created.json()["task"]["id"]
+        released = dashboard.patch(
+            f"/api/plugins/kanban/tasks/{task_id}", headers=headers,
+            json={"status": "ready", "not_before_override_reason": "approved"},
+        )
+        assert released.status_code == 200, released.text
+        assert released.json()["task"]["not_before"] is None
 def test_patch_board_sets_project_directory(client, tmp_path):
     """Board-level default_workdir must be editable after creation."""
     kb.create_board("late-config")
@@ -941,4 +1039,46 @@ def test_specify_happy_path(client, monkeypatch):
 # Final result visibility for Done cards
 # ---------------------------------------------------------------------------
 
+def test_dashboard_direct_status_failure_preserves_override(kanban_home):
+    """Parent validation failure must not burn the dashboard release token."""
+    _load_plugin_router()
+    plugin = sys.modules["hermes_dashboard_plugin_kanban_test"]
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="unfinished parent")
+        child = kb.create_task(
+            conn, title="gated child", parents=[parent], not_before="2030-01-01T00:00:00Z"
+        )
+        conn.execute("UPDATE tasks SET status = 'todo' WHERE id = ?", (child,))
+        override = kb.mint_owner_not_before_override(
+            conn, child, request=_loopback_request(), reason="approved"
+        )
 
+        assert plugin._set_status_direct(
+            conn, child, "ready", not_before_override=override
+        ) is False
+        assert kb.get_task(conn, child).not_before == "2030-01-01T00:00:00Z"
+        used = conn.execute(
+            "SELECT used_at FROM kanban_not_before_overrides WHERE task_id = ?",
+            (child,),
+        ).fetchone()
+        assert used["used_at"] is None
+
+
+def test_dashboard_direct_status_success_consumes_override(kanban_home):
+    _load_plugin_router()
+    plugin = sys.modules["hermes_dashboard_plugin_kanban_test"]
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="direct release", not_before="2030-01-01T00:00:00Z")
+        conn.execute("UPDATE tasks SET status = 'todo' WHERE id = ?", (task_id,))
+        override = kb.mint_owner_not_before_override(
+            conn, task_id, request=_loopback_request(), reason="approved"
+        )
+        assert plugin._set_status_direct(
+            conn, task_id, "ready", not_before_override=override
+        ) is True
+        assert kb.get_task(conn, task_id).not_before is None
+        used = conn.execute(
+            "SELECT used_at FROM kanban_not_before_overrides WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()
+        assert used["used_at"] is not None
