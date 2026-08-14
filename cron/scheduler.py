@@ -3421,6 +3421,93 @@ def _preflight_job_config(job: dict, cfg: dict) -> Optional[str]:
             return reason
     return None
 
+# Transport error type names treated as transient network/DNS failures.
+# Mirrors the classifiers in agent/error_classifier.py and gateway/run.py:
+# name-based so provider SDKs that re-raise wrapped errors still classify.
+_TRANSIENT_NETWORK_ERROR_TYPES = frozenset({
+    "ConnectError", "ConnectTimeout", "ReadTimeout", "WriteTimeout",
+    "PoolTimeout", "RemoteProtocolError", "ReadError", "WriteError",
+    "ServerDisconnectedError", "ClientConnectorError", "ClientOSError",
+    "APIConnectionError", "APITimeoutError",
+    # DNS / socket-level failures: socket.gaierror (getaddrinfo) and
+    # socket.timeout (non-httpx sync sockets).
+    "gaierror", "timeout",
+})
+
+
+def _is_transient_network_error(exc: BaseException) -> bool:
+    """True when ``exc`` is a transient network/DNS failure (cause-chain aware).
+
+    A short DNS outage surfaces as ``httpx.ConnectError`` wrapping
+    ``socket.gaierror`` (``[Errno 8] nodename nor servname provided, or not
+    known``), or as a bare ``TimeoutError`` / ``ConnectionError``. These mean
+    the primary provider is unreachable *right now* — not that its credentials
+    are dead — so ``run_job`` treats them like ``AuthError`` and walks
+    ``fallback_providers`` instead of killing the job (#83976). Walks the
+    cause chain (bounded) so SDK-wrapped errors still classify. Deliberately
+    does NOT treat every ``OSError`` as transient (e.g. ``FileNotFoundError``)
+    — only builtins with network/time semantics and transport type names.
+    """
+    seen: set[int] = set()
+    cur: Optional[BaseException] = exc
+    depth = 0
+    while cur is not None and depth < 12:
+        ident = id(cur)
+        if ident in seen:
+            break
+        seen.add(ident)
+        depth += 1
+        # ConnectionError / TimeoutError builtins carry network/time semantics
+        # by definition (they also cover ConnectionResetError, BrokenPipeError,
+        # asyncio.TimeoutError, ...).
+        if isinstance(cur, (ConnectionError, TimeoutError)):
+            return True
+        if type(cur).__name__ in _TRANSIENT_NETWORK_ERROR_TYPES:
+            return True
+        cur = cur.__cause__ or cur.__context__
+    return False
+
+
+def _resolve_fallback_runtime(_cfg: dict, job_id: str):
+    """Walk the bounded ``fallback_providers`` chain after a primary resolve failure.
+
+    Returns the first usable ``(runtime, model)`` pair, or ``(None, None)``
+    when every rung fails. The chain is a finite config list, so the walk is
+    inherently bounded — a transient DNS blip can never loop forever.
+    """
+    from hermes_cli.runtime_provider import resolve_runtime_provider
+
+    for entry in get_fallback_chain(_cfg):
+        if not isinstance(entry, dict):
+            continue
+        fb_provider = str(entry.get("provider") or "").strip()
+        fb_model = str(entry.get("model") or "").strip()
+        if not fb_provider or not fb_model:
+            continue
+        try:
+            from hermes_cli.fallback_config import resolve_entry_api_key
+
+            fb_kwargs = {
+                "requested": fb_provider,
+                "target_model": fb_model,
+            }
+            if entry.get("base_url"):
+                fb_kwargs["explicit_base_url"] = entry["base_url"]
+            fb_api_key = resolve_entry_api_key(entry)
+            if fb_api_key:
+                fb_kwargs["explicit_api_key"] = fb_api_key
+            runtime = resolve_runtime_provider(**fb_kwargs)
+            logger.info(
+                "Job '%s': fallback resolved to %s model %s",
+                job_id,
+                runtime.get("provider"),
+                fb_model,
+            )
+            return runtime, fb_model
+        except Exception as fb_exc:
+            logger.debug("Job '%s': fallback %s failed: %s", job_id, fb_provider, fb_exc)
+    return None, None
+
 
 def run_job(
     job: dict, *, defer_agent_teardown: Optional[list] = None,
@@ -4183,43 +4270,26 @@ def run_job(
                 or primary_provider_for_drift
             )
             logger.warning("Job '%s': primary auth failed (%s), trying fallback", job_id, auth_exc)
-            fb_list = get_fallback_chain(_cfg)
-            runtime = None
-            for entry in fb_list:
-                if not isinstance(entry, dict):
-                    continue
-                fb_provider = str(entry.get("provider") or "").strip()
-                fb_model = str(entry.get("model") or "").strip()
-                if not fb_provider or not fb_model:
-                    continue
-                try:
-                    from hermes_cli.fallback_config import resolve_entry_api_key
-
-                    fb_kwargs = {
-                        "requested": fb_provider,
-                        "target_model": fb_model,
-                    }
-                    if entry.get("base_url"):
-                        fb_kwargs["explicit_base_url"] = entry["base_url"]
-                    fb_api_key = resolve_entry_api_key(entry)
-                    if fb_api_key:
-                        fb_kwargs["explicit_api_key"] = fb_api_key
-                    runtime = resolve_runtime_provider(**fb_kwargs)
-                    model = fb_model
-                    logger.info(
-                        "Job '%s': fallback resolved to %s model %s",
-                        job_id,
-                        runtime.get("provider"),
-                        fb_model,
-                    )
-                    break
-                except Exception as fb_exc:
-                    logger.debug("Job '%s': fallback %s failed: %s", job_id, fb_provider, fb_exc)
+            runtime, model = _resolve_fallback_runtime(_cfg, job_id)
             if runtime is None:
                 raise RuntimeError(format_runtime_provider_error(auth_exc)) from auth_exc
         except Exception as exc:
-            message = format_runtime_provider_error(exc)
-            raise RuntimeError(message) from exc
+            if not _is_transient_network_error(exc):
+                message = format_runtime_provider_error(exc)
+                raise RuntimeError(message) from exc
+            # Transient network/DNS failure during primary resolve (e.g.
+            # httpx.ConnectError wrapping socket.gaierror on a short DNS
+            # outage): the primary provider is unreachable right now, not
+            # dead. Walk the same bounded fallback_providers chain as
+            # AuthError so a healthy rung keeps the job alive (#83976).
+            logger.warning(
+                "Job '%s': primary resolve hit transient network error (%s), trying fallback",
+                job_id,
+                exc,
+            )
+            runtime, model = _resolve_fallback_runtime(_cfg, job_id)
+            if runtime is None:
+                raise RuntimeError(format_runtime_provider_error(exc)) from exc
 
         reasoning_config = resolve_reasoning_config(
             _cfg if isinstance(_cfg, dict) else {}, str(model)

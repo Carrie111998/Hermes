@@ -5,8 +5,10 @@ import itertools
 import json
 import logging
 import os
+import socket
 from unittest.mock import AsyncMock, patch, MagicMock
 
+import httpx
 import pytest
 
 from cron.scheduler import (
@@ -786,6 +788,134 @@ class TestRunJobConfigEnvVarExpansion:
         kwargs = mock_agent_cls.call_args.kwargs
         assert kwargs["provider"] == "openrouter"
         assert kwargs["model"] == "z-ai/glm-5.2"
+
+
+    def test_connect_error_primary_triggers_fallback(self, tmp_path):
+        """Transient DNS/ConnectError on primary resolve must walk fallback_providers (#83976).
+
+        A short DNS outage (httpx.ConnectError wrapping socket.gaierror, as
+        seen on macOS + Cloudflare WARP) used to kill the whole cron job
+        because run_job only fell back on AuthError.
+        """
+        (tmp_path / "config.yaml").write_text(
+            "model:\n"
+            "  default: gpt-5.6-sol\n"
+            "  provider: openai-codex\n"
+            "fallback_providers:\n"
+            "  - provider: anthropic\n"
+            "  - provider: openrouter\n"
+            "    model: z-ai/glm-5.2\n",
+            encoding="utf-8",
+        )
+        job = {
+            "id": "dns-fallback",
+            "name": "dns fallback",
+            "prompt": "hi",
+            "provider_snapshot": "openai-codex",
+            "model_snapshot": "gpt-5.6-sol",
+        }
+        fake_db = MagicMock()
+        requested = []
+
+        def resolve_runtime(**kwargs):
+            requested.append(kwargs.get("requested"))
+            if kwargs.get("requested") in (None, "openai-codex"):
+                raise httpx.ConnectError(
+                    "[Errno 8] nodename nor servname provided, or not known"
+                ) from socket.gaierror(-2, "Name or service not known")
+            assert kwargs["requested"] == "openrouter"
+            assert kwargs["target_model"] == "z-ai/glm-5.2"
+            return {**self._RUNTIME, "provider": "openrouter"}
+
+        with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("cron.scheduler._resolve_origin", return_value=None), \
+             patch("hermes_cli.env_loader.load_hermes_dotenv"), \
+             patch("hermes_cli.env_loader.reset_secret_source_cache"), \
+             patch("hermes_state.SessionDB", return_value=fake_db), \
+             patch("hermes_cli.runtime_provider.resolve_runtime_provider",
+                   side_effect=resolve_runtime), \
+             patch("tools.mcp_tool.discover_mcp_tools", return_value=[]), \
+             patch("run_agent.AIAgent") as mock_agent_cls:
+            mock_agent = MagicMock()
+            mock_agent.run_conversation.return_value = {"final_response": "ok"}
+            mock_agent_cls.return_value = mock_agent
+            success, _, _, error = run_job(job)
+
+        assert success is True
+        assert error is None
+        assert requested == [None, "openrouter"]
+        kwargs = mock_agent_cls.call_args.kwargs
+        assert kwargs["provider"] == "openrouter"
+        assert kwargs["model"] == "z-ai/glm-5.2"
+
+    def test_connect_error_all_fallbacks_fail_is_bounded(self, tmp_path):
+        """Every rung failing on ConnectError fails the job — without looping forever."""
+        (tmp_path / "config.yaml").write_text(
+            "model:\n"
+            "  default: gpt-5.6-sol\n"
+            "  provider: openai-codex\n"
+            "fallback_providers:\n"
+            "  - provider: openrouter\n"
+            "    model: z-ai/glm-5.2\n"
+            "  - provider: anthropic\n"
+            "    model: claude-fable-5\n",
+            encoding="utf-8",
+        )
+        job = {
+            "id": "dns-all-fail",
+            "name": "dns all fail",
+            "prompt": "hi",
+            "provider_snapshot": "openai-codex",
+            "model_snapshot": "gpt-5.6-sol",
+        }
+        fake_db = MagicMock()
+        requested = []
+
+        def resolve_runtime(**kwargs):
+            requested.append(kwargs.get("requested"))
+            raise httpx.ConnectError("connection refused")
+
+        with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("cron.scheduler._resolve_origin", return_value=None), \
+             patch("hermes_cli.env_loader.load_hermes_dotenv"), \
+             patch("hermes_cli.env_loader.reset_secret_source_cache"), \
+             patch("hermes_state.SessionDB", return_value=fake_db), \
+             patch("hermes_cli.runtime_provider.resolve_runtime_provider",
+                   side_effect=resolve_runtime), \
+             patch("tools.mcp_tool.discover_mcp_tools", return_value=[]), \
+             patch("run_agent.AIAgent") as mock_agent_cls:
+            success, _, _, error = run_job(job)
+
+        assert success is False
+        assert error is not None
+        # Bounded: exactly one primary attempt + one attempt per fallback rung.
+        assert requested == [None, "openrouter", "anthropic"]
+        # The job must fail with the actionable provider error, not hang.
+        mock_agent_cls.assert_not_called()
+
+    def test_transient_network_error_classifier(self):
+        """_is_transient_network_error classifies DNS/transport failures only."""
+        from cron.scheduler import _is_transient_network_error
+        from hermes_cli.auth import AuthError
+
+        dns_exc = httpx.ConnectError(
+            "[Errno 8] nodename nor servname provided, or not known"
+        )
+        dns_exc.__cause__ = socket.gaierror(-2, "Name or service not known")
+        assert _is_transient_network_error(dns_exc) is True
+        assert _is_transient_network_error(httpx.ConnectError("refused")) is True
+        assert _is_transient_network_error(httpx.ConnectTimeout("timed out")) is True
+        assert _is_transient_network_error(TimeoutError("timed out")) is True
+        assert _is_transient_network_error(ConnectionError("reset")) is True
+        assert _is_transient_network_error(socket.gaierror(-2, "no such host")) is True
+        # SDK-wrapped transport errors classify through the cause chain.
+        wrapped = RuntimeError("upstream unavailable")
+        wrapped.__cause__ = httpx.ConnectError("refused")
+        assert _is_transient_network_error(wrapped) is True
+        # Non-network failures must NOT trigger fallback.
+        assert _is_transient_network_error(AuthError("No Codex credentials stored")) is False
+        assert _is_transient_network_error(ValueError("bad config")) is False
+        assert _is_transient_network_error(FileNotFoundError("missing")) is False
 
 
     def test_unexpanded_ref_passthrough_when_var_unset(self, tmp_path, monkeypatch):
