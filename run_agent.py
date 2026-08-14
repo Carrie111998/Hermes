@@ -7250,11 +7250,25 @@ class AIAgent:
             opts = self._lmstudio_reasoning_options_cached()
             # "off-only" (or absent) means no real reasoning capability.
             return any(opt and opt != "off" for opt in opts)
-        # Ollama Cloud (and any Ollama-compatible server): the native
-        # /api/show capabilities list is authoritative — emit reasoning_effort
-        # only for models that declare the "thinking" capability. deepseek-v4
-        # has it; gemma3 / qwen3-coder don't. Cached per (model, base_url).
-        if base_url_host_matches(self._base_url_lower, "ollama.com"):
+        # Ollama Cloud (and any Ollama-compatible server, local included): the
+        # native /api/show capabilities list is authoritative — emit
+        # reasoning_effort only for models that declare the "thinking"
+        # capability. deepseek-v4 has it; gemma3 / qwen3-coder don't. Cached
+        # per (model, base_url).
+        #
+        # Local Ollama (``http://localhost:11434/v1`` and friends) previously
+        # fell through this gate to the OpenRouter-only branch below, which
+        # always returned False — so reasoning_effort was silently never
+        # emitted even for local thinking-capable models (deepseek-r1), AND
+        # (via the separate CustomProfile defect) it WAS emitted unguarded
+        # for non-thinking local models, 400ing with `"<model>" does not
+        # support thinking`. Port 11434 is Ollama's universal default across
+        # every platform/install method, so it is as reliable a signal as the
+        # ollama.com hostname for Ollama Cloud.
+        if (
+            base_url_host_matches(self._base_url_lower, "ollama.com")
+            or ":11434" in self._base_url_lower
+        ):
             return self._ollama_supports_thinking_cached()
         if "openrouter" not in self._base_url_lower:
             return False
