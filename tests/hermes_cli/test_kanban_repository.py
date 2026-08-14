@@ -20,6 +20,7 @@ from hermes_cli.kanban_repository import (
     advance_prepared_candidate_ref,
     build_verification_receipt,
     build_verification_receipt_key,
+    commit_contains,
     delete_prepared_candidate_ref,
     inspect_evidence_workspace,
     inspect_prepared_candidate_ref,
@@ -339,6 +340,30 @@ def test_resolve_commit_rejects_ambiguous_ref(repository: Path):
         resolve_commit(repository, "shared")
 
     assert exc_info.value.code == "missing_ref"
+
+
+def test_commit_contains_accepts_equal_and_ancestor_commits(repository: Path):
+    base_sha = _git(repository, "rev-parse", "HEAD")
+    child_sha = _commit(repository, "child.txt", "child\n", "child")
+
+    assert commit_contains(repository, child_sha, child_sha) is True
+    assert commit_contains(repository, child_sha, base_sha) is True
+    assert commit_contains(repository, base_sha, child_sha) is False
+    with pytest.raises(RepositoryConfigurationError) as missing:
+        commit_contains(repository, "f" * 40, "f" * 40)
+    assert missing.value.code == "ancestry_check_failed"
+
+
+@pytest.mark.parametrize("field", ["descendant_sha", "ancestor_sha"])
+def test_commit_contains_refuses_malformed_fact_sha(repository: Path, field: str):
+    sha = _git(repository, "rev-parse", "HEAD")
+    values = {"descendant_sha": sha, "ancestor_sha": sha}
+    values[field] = "not-a-full-sha"
+
+    with pytest.raises(RepositoryConfigurationError) as exc_info:
+        commit_contains(repository, **values)
+
+    assert exc_info.value.code == f"malformed_{field}"
 
 
 def _git(repo: Path, *args: str) -> str:

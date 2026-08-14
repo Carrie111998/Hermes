@@ -107,6 +107,7 @@ from hermes_cli.kanban_repository import (
     VerificationStepResult,
     advance_prepared_candidate_ref,
     build_verification_receipt_key,
+    commit_contains,
     inspect_evidence_workspace,
     load_repository_contract,
     refresh_story_branch,
@@ -115,6 +116,11 @@ from hermes_cli.kanban_repository import (
     run_verification,
     verification_receipt_from_payload,
     verification_result_payload,
+)
+from hermes_cli.kanban_epic_release import (
+    EpicReadiness,
+    EpicTerminalSource,
+    derive_epic_readiness,
 )
 from hermes_cli.kanban_product_outcomes import (
     ApprovedCandidate,
@@ -14766,6 +14772,63 @@ def _default_epic_verify(
         return False
 
 
+def epic_readiness(
+    conn: sqlite3.Connection,
+    epic_id: str,
+    *,
+    board: Optional[str] = None,
+    board_meta: Optional[dict] = None,
+) -> EpicReadiness:
+    """Return the strict, read-only fact derivation for one governed Epic."""
+
+    meta = board_meta if board_meta is not None else product_board_metadata(board)
+    if meta is None or not _handoff_v2_enabled(meta) or not _is_epic_task(conn, epic_id):
+        return EpicReadiness(epic_id, None, (), ("not_governed_epic",))
+    try:
+        contract = repository_contract_for_metadata(meta)
+        if contract is None:
+            return EpicReadiness(epic_id, None, (), ("missing_repository_contract",))
+        epic_branch = epic_branch_for(epic_id)
+        epic_tip_sha = resolve_commit(
+            contract.repo_root, f"refs/heads/{epic_branch}"
+        )
+
+        def current_terminal_source(story_id: str) -> Optional[EpicTerminalSource]:
+            terminal_runs = _terminal_run_records(conn, story_id)
+            approved = latest_review_authority(terminal_runs)
+            if approved is None:
+                return None
+            passed = latest_test_authority(terminal_runs, approved.source_sha)
+            if passed is None:
+                return None
+            try:
+                eligibility = candidate_eligibility(
+                    contract.repo_root,
+                    approved,
+                    passed,
+                )
+            except CandidateEligibilityError:
+                return EpicTerminalSource(approved.source_sha, False)
+            return EpicTerminalSource(
+                eligibility.source_sha,
+                eligibility.non_empty,
+            )
+
+        return derive_epic_readiness(
+            conn,
+            epic_id,
+            epic_tip_sha=epic_tip_sha,
+            current_terminal_source=current_terminal_source,
+            commit_contains=lambda descendant, ancestor: commit_contains(
+                contract.repo_root,
+                descendant_sha=descendant,
+                ancestor_sha=ancestor,
+            ),
+        )
+    except (RepositoryConfigurationError, OSError, ValueError):
+        return EpicReadiness(epic_id, None, (), ("repository_unavailable",))
+
+
 def epic_ready(
     conn: sqlite3.Connection,
     epic_id: str,
@@ -14773,20 +14836,14 @@ def epic_ready(
     board: Optional[str] = None,
     verify_fn: Optional[Callable[[str], bool]] = None,
 ) -> bool:
-    """Whether ``epic_id`` is ready to merge its branch to main.
+    """Whether ``epic_id`` has exact current facts and a green local suite.
 
-    ``True`` only when: the board has opted into ``handoff_v2``; the epic
-    has at least one child; every child is strictly ``status == 'done'``
-    (the softer release_measure-unblocks relaxation used elsewhere for
-    dependency satisfaction does NOT apply here -- a story sitting in the
-    human release gate is not done); AND the suite is green on the epic's
-    integration branch.
-
-    Cheap checks short-circuit before the expensive suite verification --
-    ``verify_fn`` is not called unless every child is done. ``verify_fn(
-    epic_branch) -> bool`` is the injectable suite-green probe, defaulting to
-    :func:`_default_epic_verify` (the real, slow suite run).
+    Repository-governed boards derive the cheap gate from current membership,
+    terminal Review authority, integration intents/facts, and commit ancestry.
+    Older handoff-v2 boards without repository policy retain their legacy
+    all-members-done gate.
     """
+
     meta = product_board_metadata(board)
     if meta is None or not _handoff_v2_enabled(meta):
         return False
@@ -14795,10 +14852,14 @@ def epic_ready(
     children = list_epic_members(conn, epic_id)
     if not children:
         return False
-    for child_id in children:
-        child = get_task(conn, child_id)
-        if child is None or child.status != "done":
+    if "repository" in meta:
+        if not epic_readiness(conn, epic_id, board=board, board_meta=meta).ready:
             return False
+    else:
+        for child_id in children:
+            child = get_task(conn, child_id)
+            if child is None or child.status != "done":
+                return False
     verify = verify_fn or (
         lambda branch: _default_epic_verify(branch, board=board)
     )

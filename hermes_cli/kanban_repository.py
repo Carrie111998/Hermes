@@ -1438,6 +1438,44 @@ def resolve_commit(repo_root: Path, ref: str) -> str:
     return sha
 
 
+def commit_contains(
+    repo_root: Path,
+    descendant_sha: str,
+    ancestor_sha: str,
+) -> bool:
+    """Return whether one exact commit contains another, including equality."""
+
+    for field, value in (
+        ("descendant_sha", descendant_sha),
+        ("ancestor_sha", ancestor_sha),
+    ):
+        if not isinstance(value, str) or FULL_SHA.fullmatch(value) is None:
+            raise RepositoryConfigurationError(f"malformed_{field}")
+    try:
+        completed = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(Path(repo_root).expanduser().resolve(strict=False)),
+                "merge-base",
+                "--is-ancestor",
+                ancestor_sha,
+                descendant_sha,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RepositoryConfigurationError("ancestry_check_failed") from exc
+    if completed.returncode == 0:
+        return True
+    if completed.returncode == 1:
+        return False
+    raise RepositoryConfigurationError("ancestry_check_failed")
+
+
 def _prepared_ref_git(
     repo_root: Path, *args: str
 ) -> subprocess.CompletedProcess[str]:

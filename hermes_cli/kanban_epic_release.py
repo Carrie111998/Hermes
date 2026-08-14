@@ -1,8 +1,8 @@
-"""Frozen row types for immutable Epic release snapshots.
+"""Read-only Epic readiness and frozen immutable-release row types.
 
 Lifecycle transitions, candidate preparation, and CI observation are introduced
 by later cards. This module is intentionally limited to strict persistence
-parsing.
+parsing and derivation from current durable facts.
 """
 
 from __future__ import annotations
@@ -10,7 +10,7 @@ from __future__ import annotations
 import re
 import sqlite3
 from dataclasses import dataclass
-from typing import Literal, Mapping, TypeAlias, cast
+from typing import Callable, Literal, Mapping, TypeAlias, cast
 
 
 EpicReleaseStatus: TypeAlias = Literal[
@@ -53,6 +53,32 @@ class EpicReleaseMember:
     source_sha: str
     candidate_sha: str
     integrated_at: int
+
+
+@dataclass(frozen=True)
+class EpicReadinessMember:
+    story_id: str
+    source_sha: str
+    candidate_sha: str
+    integrated_at: int
+
+
+@dataclass(frozen=True)
+class EpicTerminalSource:
+    source_sha: str
+    governed_non_empty: bool
+
+
+@dataclass(frozen=True)
+class EpicReadiness:
+    epic_id: str
+    epic_tip_sha: str | None
+    members: tuple[EpicReadinessMember, ...]
+    blockers: tuple[str, ...]
+
+    @property
+    def ready(self) -> bool:
+        return not self.blockers and bool(self.members)
 
 
 def _value(row: Row, field: str) -> object:
@@ -134,4 +160,136 @@ def epic_release_member_from_row(row: Row) -> EpicReleaseMember:
         source_sha=source_sha,
         candidate_sha=candidate_sha,
         integrated_at=_integer(row, "integrated_at"),
+    )
+
+
+def derive_epic_readiness(
+    conn: sqlite3.Connection,
+    epic_id: str,
+    *,
+    epic_tip_sha: str,
+    current_terminal_source: Callable[[str], EpicTerminalSource | None],
+    commit_contains: Callable[[str, str], bool],
+) -> EpicReadiness:
+    """Derive release readiness solely from current rows and commit ancestry.
+
+    Story verification events are deliberately absent from this derivation.
+    They remain audit evidence, while the terminal Review authority, durable
+    integration intent/fact, and repository graph are current authority.
+    """
+
+    members = tuple(
+        str(row["task_id"])
+        for row in conn.execute(
+            "SELECT task_id FROM epic_memberships WHERE epic_id=? ORDER BY task_id",
+            (epic_id,),
+        ).fetchall()
+    )
+    if not members:
+        return EpicReadiness(epic_id, epic_tip_sha, (), ("no_members",))
+
+    blockers: list[str] = []
+    ready_members: list[EpicReadinessMember] = []
+    active_intent_statuses = (
+        "pending",
+        "running",
+        "prepared",
+        "rework_required",
+        "attention_required",
+    )
+    active_placeholders = ",".join("?" for _ in active_intent_statuses)
+
+    for story_id in members:
+        prefix = f"{story_id}:"
+        task = conn.execute(
+            "SELECT status, current_step_key, running, blocked, current_run_id "
+            "FROM tasks WHERE id=?",
+            (story_id,),
+        ).fetchone()
+        if (
+            task is None
+            or task["status"] != "done"
+            or task["current_step_key"] != "done"
+            or bool(task["running"])
+            or bool(task["blocked"])
+            or task["current_run_id"] is not None
+        ):
+            blockers.append(prefix + "nonterminal_member")
+        if conn.execute(
+            "SELECT 1 FROM task_runs WHERE task_id=? AND step_key='review' "
+            "AND (status='running' OR ended_at IS NULL) LIMIT 1",
+            (story_id,),
+        ).fetchone() is not None:
+            blockers.append(prefix + "active_review")
+        if conn.execute(
+            "SELECT 1 FROM product_rework_directives "
+            "WHERE task_id=? AND status='active' LIMIT 1",
+            (story_id,),
+        ).fetchone() is not None:
+            blockers.append(prefix + "active_directive")
+        if conn.execute(
+            f"SELECT 1 FROM story_integration_intents "  # noqa: S608 -- placeholders only
+            f"WHERE epic_id=? AND story_id=? AND status IN ({active_placeholders}) LIMIT 1",
+            (epic_id, story_id, *active_intent_statuses),
+        ).fetchone() is not None:
+            blockers.append(prefix + "active_intent")
+
+        terminal_source = current_terminal_source(story_id)
+        source_sha = terminal_source.source_sha if terminal_source is not None else None
+        if not isinstance(source_sha, str) or _FULL_SHA_RE.fullmatch(source_sha) is None:
+            blockers.append(prefix + "missing_terminal_source")
+            continue
+        if not terminal_source.governed_non_empty:
+            blockers.append(prefix + "ungoverned_contribution")
+            continue
+        fact = conn.execute(
+            "SELECT candidate_sha, integrated_at FROM epic_story_integrations "
+            "WHERE epic_id=? AND story_id=? AND source_sha=?",
+            (epic_id, story_id, source_sha),
+        ).fetchone()
+        if fact is None:
+            blockers.append(prefix + "missing_integration_fact")
+            continue
+        candidate_sha = fact["candidate_sha"]
+        if (
+            not isinstance(candidate_sha, str)
+            or _FULL_SHA_RE.fullmatch(candidate_sha) is None
+        ):
+            blockers.append(prefix + "invalid_candidate")
+            continue
+        intent = conn.execute(
+            "SELECT candidate_sha FROM story_integration_intents "
+            "WHERE epic_id=? AND story_id=? AND source_sha=? AND status='integrated'",
+            (epic_id, story_id, source_sha),
+        ).fetchone()
+        if intent is None:
+            blockers.append(prefix + "missing_integrated_intent")
+            continue
+        if intent["candidate_sha"] != candidate_sha:
+            blockers.append(prefix + "candidate_mismatch")
+            continue
+        try:
+            candidate_has_source = bool(commit_contains(candidate_sha, source_sha))
+            tip_has_candidate = bool(commit_contains(epic_tip_sha, candidate_sha))
+        except Exception:
+            blockers.append(prefix + "ancestry_unavailable")
+            continue
+        if not candidate_has_source:
+            blockers.append(prefix + "candidate_missing_source")
+        if not tip_has_candidate:
+            blockers.append(prefix + "epic_tip_missing_candidate")
+        ready_members.append(
+            EpicReadinessMember(
+                story_id=story_id,
+                source_sha=source_sha,
+                candidate_sha=candidate_sha,
+                integrated_at=int(fact["integrated_at"]),
+            )
+        )
+
+    return EpicReadiness(
+        epic_id=epic_id,
+        epic_tip_sha=epic_tip_sha,
+        members=tuple(ready_members),
+        blockers=tuple(blockers),
     )
