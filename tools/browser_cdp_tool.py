@@ -53,14 +53,20 @@ def _redact_cdp_output(value: Any) -> Any:
     if isinstance(value, tuple):
         return tuple(_redact_cdp_output(item) for item in value)
     if isinstance(value, dict):
-        return {
-            (
+        redacted = {}
+        for key, item in value.items():
+            redacted_key = (
                 redact_sensitive_text(key, force=True)
                 if isinstance(key, str)
                 else key
-            ): _redact_cdp_output(item)
-            for key, item in value.items()
-        }
+            )
+            unique_key = redacted_key
+            duplicate = 2
+            while unique_key in redacted:
+                unique_key = f"{redacted_key} [duplicate {duplicate}]"
+                duplicate += 1
+            redacted[unique_key] = _redact_cdp_output(item)
+        return redacted
     return value
 
 # ``websockets`` is a direct hermes-agent dependency because the browser CDP
