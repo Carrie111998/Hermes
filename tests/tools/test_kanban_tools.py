@@ -1052,6 +1052,64 @@ def test_create_does_not_subscribe_in_cli_session(monkeypatch, worker_env):
     assert _list_subs_for_task(d["task_id"]) == []
 
 
+def test_create_applies_default_subscriptions(monkeypatch, worker_env):
+    """Tool-created tasks use the same create_task default-subscription seam."""
+    home = os.environ["HERMES_HOME"]
+    from pathlib import Path
+
+    Path(home, "config.yaml").write_text(
+        "kanban:\n  default_subscriptions: [slack:ops-channel]\n",
+        encoding="utf-8",
+    )
+    monkeypatch.delenv("HERMES_SESSION_PLATFORM", raising=False)
+    monkeypatch.delenv("HERMES_SESSION_CHAT_ID", raising=False)
+    monkeypatch.delenv("HERMES_SESSION_KEY", raising=False)
+
+    from tools import kanban_tools as kt
+
+    payload = json.loads(kt._handle_create({
+        "title": "tool default subscription",
+        "assignee": "peer",
+    }))
+
+    assert payload["ok"] is True
+    assert payload["subscribed"] is False
+    subs = _list_subs_for_task(payload["task_id"])
+    assert [
+        (sub["platform"], sub["chat_id"], sub["thread_id"])
+        for sub in subs
+    ] == [("slack", "ops-channel", "")]
+
+
+def test_create_dedupes_default_subscription_with_session_auto_subscribe(
+    monkeypatch, worker_env,
+):
+    """The existing auto-subscribe path keeps its delivery mode and one row."""
+    home = os.environ["HERMES_HOME"]
+    from pathlib import Path
+
+    Path(home, "config.yaml").write_text(
+        "kanban:\n  default_subscriptions: [telegram:chat-42:thread-7]\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "telegram")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "chat-42")
+    monkeypatch.setenv("HERMES_SESSION_THREAD_ID", "thread-7")
+
+    from tools import kanban_tools as kt
+
+    payload = json.loads(kt._handle_create({
+        "title": "dedupe default and auto",
+        "assignee": "peer",
+    }))
+
+    assert payload["ok"] is True
+    assert payload["subscribed"] is True
+    subs = _list_subs_for_task(payload["task_id"])
+    assert len(subs) == 1
+    assert subs[0]["delivery_mode"] == "notify+wake"
+
+
 def test_create_respects_auto_subscribe_on_create_false(monkeypatch, worker_env, tmp_path):
     """The config gate kanban.auto_subscribe_on_create=false must
     suppress auto-subscription even when the session has a delivery

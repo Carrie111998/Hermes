@@ -640,7 +640,7 @@ Workflow policy keys:
 | `safe_checkpoint.enabled` | `false` | Enable fenced safe checkpoints, including the worker tool, prompt guidance, and persistent-dispatcher capability advertisement. |
 | `safe_checkpoint.prompt_hint` | `""` | Optional extra guidance on when workers should checkpoint. Empty uses the built-in generic context-pressure guidance. |
 | `workspace_conflict` | `"allow"` | Workspace collision policy: `allow` preserves current behavior; `warn` dispatches and logs; `serialize` skips candidates sharing a running task's workspace. |
-| `default_subscriptions` | `[]` | Notify-subscribe targets added on every task creation path. Entries use the same format as `kanban_notify-subscribe`. |
+| `default_subscriptions` | `[]` | Notify-subscribe targets added on every task creation path. Each target is `platform:chat_id[:thread_id]`, matching `kanban_notify-subscribe`; duplicate inherited or session-auto targets remain one subscription. |
 | `validate_on_create` | `"warn"` | Creation validation policy: `off`, `warn` (log violations but create), or `strict` (reject). Checks skills, profiles, and explicit-workspace policy. |
 | `require_explicit_workspace` | `false` | When validation is active, treat an implicit `scratch` workspace as a violation. |
 | `deadline_warning_fraction` | `0.0` | Fraction of a task's runtime cap at which to nudge the worker to checkpoint. `0` disables the nudge. |

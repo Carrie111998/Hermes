@@ -3416,6 +3416,7 @@ def create_task(
             return row["id"]
 
     now = int(time.time())
+    default_notify_targets = _default_notify_subscription_targets()
 
     # Resolve workspace_path from board-level default_workdir when the
     # caller did not specify one explicitly. Board defaults represent
@@ -3562,6 +3563,9 @@ def create_task(
                     },
                 )
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
+                _apply_default_notify_subs(
+                    conn, task_id, default_notify_targets, created_at=now
+                )
             return task_id
         except sqlite3.IntegrityError:
             if attempt == 1:
@@ -3633,6 +3637,90 @@ def _inherit_notify_subs(
             *parent_ids,
         ),
     )
+
+
+def _default_notify_subscription_targets() -> tuple[tuple[str, str, str], ...]:
+    """Load configured ``platform:chat_id[:thread_id]`` subscription targets.
+
+    Invalid entries are ignored rather than making task creation unavailable:
+    these targets are a delivery convenience, while a malformed config should
+    not prevent work from entering the board.  De-duplicate here as well as at
+    the database boundary so a repeated config entry has no extra write cost.
+    """
+    try:
+        from hermes_cli.config import load_config
+
+        values = (load_config() or {}).get("kanban", {}).get(
+            "default_subscriptions", []
+        )
+    except Exception as exc:
+        _log.warning("kanban: could not load default_subscriptions: %r", exc)
+        return ()
+    if not values:
+        return ()
+    if not isinstance(values, list):
+        _log.warning(
+            "kanban: default_subscriptions must be a list, ignoring %r", values
+        )
+        return ()
+
+    targets: list[tuple[str, str, str]] = []
+    for value in values:
+        if not isinstance(value, str):
+            _log.warning("kanban: ignoring non-string default subscription %r", value)
+            continue
+        platform, separator, remainder = value.strip().partition(":")
+        chat_id, thread_separator, thread_id = remainder.partition(":")
+        platform = platform.strip().lower()
+        chat_id = chat_id.strip()
+        thread_id = thread_id.strip() if thread_separator else ""
+        if not separator or not platform or not chat_id or (
+            thread_separator and not thread_id
+        ):
+            _log.warning(
+                "kanban: ignoring invalid default subscription %r; "
+                "expected platform:chat_id[:thread_id]",
+                value,
+            )
+            continue
+        target = (platform, chat_id, thread_id)
+        if target not in targets:
+            targets.append(target)
+    return tuple(targets)
+
+
+def _apply_default_notify_subs(
+    conn: sqlite3.Connection,
+    task_id: str,
+    targets: Iterable[tuple[str, str, str]],
+    *,
+    created_at: int,
+) -> None:
+    """Insert configured task-creation subscriptions without overwriting rows.
+
+    This runs after parent inheritance.  The unique subscription key makes it
+    additive for parent rows and for a later session auto-subscription, while
+    leaving their richer routing and delivery settings untouched.
+    """
+    for platform, chat_id, thread_id in targets:
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO kanban_notify_subs
+                (task_id, platform, chat_id, thread_id, chat_type,
+                 delivery_mode, created_at, last_event_id)
+            VALUES (?, ?, ?, ?, 'dm', ?, ?,
+                    COALESCE((SELECT MAX(id) FROM task_events WHERE task_id = ?), 0))
+            """,
+            (
+                task_id,
+                platform,
+                chat_id,
+                thread_id,
+                "notify+wake" if platform == "api_server" else "notify",
+                created_at,
+                task_id,
+            ),
+        )
 
 
 def get_task(conn: sqlite3.Connection, task_id: str) -> Optional[Task]:

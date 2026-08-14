@@ -57,6 +57,27 @@ def test_kanban_list_json_includes_session_id(kanban_home):
     )
 
 
+def test_cli_create_applies_default_subscriptions(kanban_home):
+    (kanban_home / "config.yaml").write_text(
+        "kanban:\n  default_subscriptions: [discord:ops-channel:thread-9]\n",
+        encoding="utf-8",
+    )
+
+    assert kc.run_slash("create 'CLI default subscription' --assignee worker")
+    with kb.connect() as conn:
+        task = next(
+            task
+            for task in kb.list_tasks(conn, limit=10)
+            if task.title == "CLI default subscription"
+        )
+        subs = kb.list_notify_subs(conn, task.id)
+
+    assert [
+        (sub["platform"], sub["chat_id"], sub["thread_id"])
+        for sub in subs
+    ] == [("discord", "ops-channel", "thread-9")]
+
+
 def test_kanban_show_text_renders_graph_with_open_connection(kanban_home):
     with kb.connect_closing() as conn:
         parent_id = kb.create_task(conn, title="parent task")
@@ -177,5 +198,4 @@ def test_run_slash_reclaim_running_task(kanban_home):
 # ---------------------------------------------------------------------------
 # /kanban help / no-args / unknown-action UX (issue #21794)
 # ---------------------------------------------------------------------------
-
 
