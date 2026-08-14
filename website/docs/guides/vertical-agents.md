@@ -91,7 +91,7 @@ Skills are the right home for *procedure*: when to use which tool, in what order
 - rigid answer templates — they rot and break when the model changes
 - environment facts that change per user — that is `USER.md`
 
-See [Working with Skills](/guides/work-with-skills) for the frontmatter fields and loading model, and [Skills System](/user-guide/features/skills) for per-platform enable/disable (`skills.disabled` globally and `skills.platform_disabled.<platform>` in `config.yaml`, or the `hermes skills config` TUI). Mid-session rescans are possible with `/reload-skills`, but it only re-reads the skill index — the system prompt is rebuilt on the next session, so the four-layer reload cadence above still applies.
+See [Working with Skills](/guides/work-with-skills) for the frontmatter fields and loading model, and [Skills System](/user-guide/features/skills) for per-platform enable/disable (`skills.disabled` globally and `skills.platform_disabled.<platform>` in `config.yaml`, or the `hermes skills config` TUI). Mid-session rescans are possible with `/reload-skills` — it re-reads skills from disk, so it also picks up edits to an existing skill's `SKILL.md`, not just newly added or removed skills. The system prompt is rebuilt on the next session, so the four-layer reload cadence above still applies.
 
 ## Tool Pruning Through Native Config
 
