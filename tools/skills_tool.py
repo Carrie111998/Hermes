@@ -211,7 +211,10 @@ def load_env() -> Dict[str, str]:
     if not env_path.exists():
         return env_vars
 
-    with env_path.open(encoding="utf-8") as f:
+    # utf-8-sig: users hand-edit .env in Notepad, which prepends a BOM that
+    # would otherwise glue U+FEFF onto the first key name (same dialect as
+    # the canonical readers in hermes_cli/config.py).
+    with env_path.open(encoding="utf-8-sig", errors="replace") as f:
         for line in f:
             line = line.strip()
             if line and not line.startswith("#") and "=" in line:
@@ -726,7 +729,7 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
             skill_dir = skill_md.parent
 
             try:
-                content = skill_md.read_text(encoding="utf-8")[:4000]
+                content = skill_md.read_text(encoding="utf-8-sig", errors="replace")[:4000]
                 frontmatter, body = _parse_frontmatter(content)
 
                 if not skill_matches_platform(frontmatter):
@@ -884,7 +887,12 @@ def _serve_plugin_skill(
         )
 
     try:
-        content = skill_md.read_text(encoding="utf-8")
+        # utf-8-sig + errors="replace": SKILL.md files are user-authored and
+        # sometimes carry a Notepad BOM or stray non-UTF-8 bytes. Pinning
+        # UTF-8 with replacement keeps skill_view deterministic across
+        # platforms — falling back to the machine locale (cp1252/GBK) would
+        # make the same skill render differently per host (see PR #51701).
+        content = skill_md.read_text(encoding="utf-8-sig", errors="replace")
     except Exception as e:
         return json.dumps(
             {"success": False, "error": f"Failed to read skill '{namespace}:{bare}': {e}"},
@@ -941,7 +949,7 @@ def _serve_plugin_skill(
                 ensure_ascii=False,
             )
         try:
-            content = target.read_text(encoding="utf-8")
+            content = target.read_text(encoding="utf-8-sig", errors="replace")
         except UnicodeDecodeError:
             return json.dumps(
                 {
@@ -1106,7 +1114,41 @@ def skill_view(
 
             discover_plugins()  # idempotent
             pm = get_plugin_manager()
+            active_memory_provider = None
+            try:
+                from plugins.memory import (
+                    _get_active_memory_provider,
+                    _prune_inactive_memory_provider_skills,
+                )
+
+                active_memory_provider = _get_active_memory_provider()
+                _prune_inactive_memory_provider_skills(active_memory_provider)
+            except Exception as exc:
+                logger.debug(
+                    "Failed pruning inactive memory-provider skills: %s",
+                    exc,
+                )
+
             plugin_skill_md = pm.find_plugin_skill(name)
+
+            # Memory provider plugins are loaded through plugins.memory rather
+            # than the general PluginManager. If a memory provider shim also
+            # registers skills, load the namespaced provider once so its
+            # collector can forward those skills into the plugin skill registry
+            # before declaring the qualified skill missing.
+            if plugin_skill_md is None:
+                try:
+                    from plugins.memory import load_memory_provider
+
+                    if namespace == active_memory_provider:
+                        load_memory_provider(namespace)
+                        plugin_skill_md = pm.find_plugin_skill(name)
+                except Exception as exc:
+                    logger.debug(
+                        "Failed lazy memory-provider skill load for %s: %s",
+                        namespace,
+                        exc,
+                    )
 
             if plugin_skill_md is not None:
                 if not plugin_skill_md.exists():
@@ -1251,7 +1293,7 @@ def skill_view(
                     _record(found_skill_md.parent, found_skill_md)
                     continue
                 try:
-                    fm_content = found_skill_md.read_text(encoding="utf-8")
+                    fm_content = found_skill_md.read_text(encoding="utf-8-sig", errors="replace")
                     fm, _ = _parse_frontmatter(fm_content)
                 except Exception:
                     fm = {}
@@ -1309,7 +1351,7 @@ def skill_view(
 
         # Read the file once — reused for platform check and main content below
         try:
-            content = skill_md.read_text(encoding="utf-8")
+            content = skill_md.read_text(encoding="utf-8-sig", errors="replace")
         except Exception as e:
             return json.dumps(
                 {
@@ -1454,7 +1496,7 @@ def skill_view(
 
             # Read the file content
             try:
-                content = target_file.read_text(encoding="utf-8")
+                content = target_file.read_text(encoding="utf-8-sig", errors="replace")
             except UnicodeDecodeError:
                 # Binary file - return info about it instead
                 return json.dumps(
@@ -1681,7 +1723,7 @@ def skill_view(
                                     / "_org"
                                     / prov_org
                                     / ORG_PROVENANCE_FILE
-                                ).read_text(encoding="utf-8")
+                                ).read_text(encoding="utf-8-sig", errors="replace")
                             )
                             author = str(
                                 prov.get("author_device")

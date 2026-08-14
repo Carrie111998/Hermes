@@ -722,6 +722,13 @@ export const zhHant = defineLocale({
       existingToken: value => `現有 Token ${value}`,
       savedToken: '已儲存',
       pasteSessionToken: '貼上工作階段 Token',
+      plainTextConfirmTitle: '以純文字儲存閘道 Token？',
+      plainTextConfirmDesc:
+        '在此裝置上找不到作業系統的金鑰環服務，因此 Token 將以未加密的純文字儲存在應用程式的連線設定檔中，以該使用者身分執行的任何處理程序皆可讀取。請安裝或啟用 GNOME Keyring 或 KWallet 以進行加密儲存。',
+      plainTextConfirmAction: '以純文字儲存',
+      plainTextStoredTitle: 'Token 以純文字儲存',
+      plainTextStoredDesc:
+        '安全儲存無法使用，因此已儲存的 Token 以未加密方式儲存在此裝置上應用程式的連線設定檔中。請安裝或啟用 GNOME Keyring 或 KWallet 以將其加密。',
       testRemote: '測試遠端',
       saveForRestart: '儲存至下次重新啟動',
       saveAndReconnect: '儲存並重新連線',
@@ -1429,6 +1436,13 @@ export const zhHant = defineLocale({
     close: '關閉排程',
     title: '排程工作',
     count: count => `${count} 個工作`,
+    modelImpact: {
+      title: '排程工作需要檢查',
+      message: count => `在您檢查模型設定之前，${count} 個排程工作將被略過。`,
+      detailMore: (names, remaining) => `${names}，以及另外 ${remaining} 個`,
+      review: '檢查排程工作',
+      saveFailed: 'Hermes 未儲存該模型變更。'
+    },
     search: '搜尋排程工作…',
     loading: '正在載入排程工作…',
     states: {
@@ -1620,7 +1634,8 @@ export const zhHant = defineLocale({
       'new-session': '新工作階段',
       skills: '技能與工具',
       messaging: '訊息平台',
-      artifacts: '成品'
+      artifacts: '成品',
+      cron: '排程工作'
     },
     searchAria: '搜尋工作階段',
     searchPlaceholder: '搜尋工作階段…',
@@ -1641,6 +1656,7 @@ export const zhHant = defineLocale({
     noWorkspace: '無工作區',
     projectEmpty: '尚無工作階段',
     noSessions: '尚無工作階段',
+    noFilterMatches: '沒有工作階段符合這些篩選條件',
     projects: {
       sectionLabel: '專案',
       home: '主頁',
@@ -1726,6 +1742,7 @@ export const zhHant = defineLocale({
       waitingForAnswer: '等待您的回答',
       finishedUnread: '已完成 — 未讀',
       backgroundRunning: '背景任務執行中',
+      draftSession: '草稿 — 尚未傳送',
       handoffOrigin: platform => `從 ${platform} 轉接`,
       ownedByProfile: profile => `設定檔：${profile}`,
       renamed: '已重新命名',
@@ -1745,6 +1762,10 @@ export const zhHant = defineLocale({
       thisWeek: '本週',
       lastWeek: '上週',
       thisMonth: '本月'
+    },
+    statusDivider: {
+      working: '進行中',
+      done: '已完成'
     }
   },
 
@@ -1835,6 +1856,7 @@ export const zhHant = defineLocale({
     editingQueuedInComposer: '在輸入框中編輯排隊回合',
     queueEdit: '編輯',
     queueSendNext: '下一個',
+    queueSteer: '引導 — 立即修正目前回合',
     queueSend: '傳送',
     queueDelete: '刪除',
     queueResume: '繼續',
