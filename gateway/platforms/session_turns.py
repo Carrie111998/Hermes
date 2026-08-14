@@ -73,6 +73,10 @@ class _CallbackPersistenceOverloaded(RuntimeError):
     """Stop a producer after retaining an exact structural resync range."""
 
 
+class _InterruptDeliveryFailed(RuntimeError):
+    """Privacy-safe internal signal that an agent rejected an interrupt call."""
+
+
 class _CallbackPersistenceIngress:
     """Bounded sync-callback ingress to one loop-owned persistence pump.
 
@@ -1888,11 +1892,14 @@ class SessionTurnService:
                             assert current is not None
                             self._interruption_owners[turn_id] = current
                             try:
-                                agent.interrupt(
+                                self._deliver_interrupt(
+                                    agent,
                                     "Session turn coordinator cancellation requested"
                                 )
-                            except Exception:
-                                pass
+                            except _InterruptDeliveryFailed:
+                                self._release_direct_interruption_owner(
+                                    turn_id, current
+                                )
                         else:
                             watcher = asyncio.create_task(
                                 self._interrupt_when_available(turn_id)
@@ -2489,9 +2496,14 @@ class SessionTurnService:
                 assert current is not None
                 self._interruption_owners[turn_id] = current
                 try:
-                    agent.interrupt("Stop requested via session turn API")
-                except Exception:
-                    pass
+                    self._deliver_interrupt(
+                        agent, "Stop requested via session turn API"
+                    )
+                except _InterruptDeliveryFailed:
+                    # The durable row remains truthfully stopping.  This exact
+                    # handoff did not deliver the request, so relinquish only
+                    # its generation and let a later stop retry safely.
+                    self._release_direct_interruption_owner(turn_id, current)
             else:
                 watcher = asyncio.create_task(self._interrupt_when_available(turn_id))
                 self._interruption_owners[turn_id] = watcher
@@ -2549,6 +2561,26 @@ class SessionTurnService:
         logger.error("session_turn_interrupt_watcher_failed reason=%s", reason)
         return True
 
+    def _release_direct_interruption_owner(
+        self, turn_id: str, owner: asyncio.Task[Any]
+    ) -> bool:
+        """Conditionally release one failed synchronous interruption handoff."""
+        if self._interruption_owners.get(turn_id) is not owner:
+            return False
+        self._interruption_owners.pop(turn_id, None)
+        logger.error(
+            "session_turn_interrupt_delivery_failed reason=internal_error"
+        )
+        return True
+
+    @staticmethod
+    def _deliver_interrupt(agent: Any, reason: str) -> None:
+        """Deliver an interrupt or raise a typed signal with no provider detail."""
+        try:
+            agent.interrupt(reason)
+        except Exception:
+            raise _InterruptDeliveryFailed from None
+
     async def _interrupt_when_available(self, turn_id: str) -> None:
         """Close the small race between stop admission and agent construction."""
         while True:
@@ -2558,10 +2590,7 @@ class SessionTurnService:
             ref = self._agent_refs.get(turn_id)
             agent = ref[0] if ref else None
             if agent is not None:
-                try:
-                    agent.interrupt("Stop requested via session turn API")
-                except Exception:
-                    pass
+                self._deliver_interrupt(agent, "Stop requested via session turn API")
                 return
             await asyncio.sleep(0.01)
 

@@ -1383,6 +1383,115 @@ async def test_failed_stop_watcher_releases_owner_and_concurrent_retry_runs_once
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("delivery_path", ["direct", "watcher"])
+async def test_interrupt_exception_releases_owner_and_concurrent_retry_terminalizes_once(
+    session_db,
+    caplog: pytest.LogCaptureFixture,
+    delivery_path: str,
+):
+    """A real Agent.interrupt exception is retryable on both delivery paths."""
+    runner_entered = asyncio.Event()
+    publish_agent = asyncio.Event()
+    agent_ready = asyncio.Event()
+    interrupt_delivered = asyncio.Event()
+    worker_release = asyncio.Event()
+
+    class Agent:
+        attempts = 0
+        delivered = 0
+
+        def interrupt(self, _reason):
+            self.attempts += 1
+            if self.attempts == 1:
+                raise RuntimeError("private direct provider interrupt secret")
+            self.delivered += 1
+            interrupt_delivered.set()
+
+    agent = Agent()
+
+    async def run_agent(**kwargs):
+        runner_entered.set()
+        if delivery_path == "watcher":
+            await publish_agent.wait()
+        kwargs["agent_ref"][0] = agent
+        agent_ready.set()
+        await worker_release.wait()
+        return {"final_response": "discarded", "messages": []}, {}
+
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={}))
+    adapter._session_db = session_db
+    adapter._run_agent = run_agent
+    service = adapter._session_turn_service
+    turn_id = f"interrupt-exception-{delivery_path}"
+
+    async with TestClient(TestServer(_app(adapter))) as client:
+        submitted = await client.post(
+            "/api/sessions/s1/turns",
+            headers={"Idempotency-Key": turn_id},
+            json=_payload(),
+        )
+        assert submitted.status == 202
+        await asyncio.wait_for(runner_entered.wait(), 1)
+        if delivery_path == "direct":
+            await asyncio.wait_for(agent_ready.wait(), 1)
+
+        first = await client.post(f"/api/sessions/s1/turns/{turn_id}/stop")
+        assert first.status == 202
+        first_body = await first.json()
+        assert first_body["turn"]["status"] == "stopping"
+        assert "private direct provider interrupt secret" not in await first.text()
+
+        if delivery_path == "watcher":
+            publish_agent.set()
+            await asyncio.wait_for(agent_ready.wait(), 1)
+
+        deadline = time.monotonic() + 1
+        while turn_id in service._interruption_owners and time.monotonic() < deadline:
+            await asyncio.sleep(0)
+        assert agent.attempts == 1
+        assert agent.delivered == 0
+        assert turn_id not in service._interruption_owners
+
+        # All retries race for one handoff generation.  One interrupt is
+        # delivered; its owner then survives through authoritative worker exit.
+        retries = await asyncio.gather(
+            *[
+                client.post(f"/api/sessions/s1/turns/{turn_id}/stop")
+                for _ in range(12)
+            ]
+        )
+        assert all(response.status == 202 for response in retries)
+        await asyncio.wait_for(interrupt_delivered.wait(), 1)
+        assert agent.attempts == 2
+        assert agent.delivered == 1
+        assert turn_id in service._interruption_owners
+
+        worker_release.set()
+        await service.wait_for_turn(turn_id)
+        terminal = await client.get(f"/api/sessions/s1/turns/{turn_id}")
+        assert terminal.status == 200
+        assert (await terminal.json())["turn"]["status"] == "interrupted"
+
+        later = await asyncio.gather(
+            *[
+                client.post(f"/api/sessions/s1/turns/{turn_id}/stop")
+                for _ in range(3)
+            ]
+        )
+        assert all(response.status == 200 for response in later)
+
+    assert agent.attempts == 2
+    assert agent.delivered == 1
+    assert turn_id not in service._interruption_owners
+    assert turn_id not in service._interruption_watcher_owners
+    assert "private direct provider interrupt secret" not in caplog.text
+    if delivery_path == "watcher":
+        assert "session_turn_interrupt_watcher_failed reason=internal_error" in caplog.text
+    else:
+        assert "session_turn_interrupt_delivery_failed reason=internal_error" in caplog.text
+
+
+@pytest.mark.asyncio
 async def test_concurrent_repeated_stop_records_and_watches_once(session_db, monkeypatch):
     gate = asyncio.Event()
 
