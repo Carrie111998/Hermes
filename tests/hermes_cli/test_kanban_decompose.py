@@ -83,8 +83,20 @@ def test_decompose_with_fanout_creates_children(kanban_home):
         "fanout": True,
         "rationale": "test split",
         "tasks": [
-            {"title": "research", "body": "look it up", "assignee": "researcher", "parents": []},
-            {"title": "build", "body": "code it", "assignee": "engineer", "parents": [0]},
+            {
+                "title": "research",
+                "body": "look it up",
+                "assignee": "researcher",
+                "parents": [],
+                "workspace_policy": "scratch",
+            },
+            {
+                "title": "build",
+                "body": "code it",
+                "assignee": "engineer",
+                "parents": [0],
+                "workspace_policy": "repo_write",
+            },
         ],
     })
 
@@ -111,6 +123,43 @@ def test_decompose_with_fanout_creates_children(kanban_home):
     assert c1.status == "todo"
     assert c0.assignee == "researcher"
     assert c1.assignee == "engineer"
+    assert c0.workspace_kind == "scratch"
+    assert c0.workspace_path is None
+    assert c1.workspace_kind == "worktree"
+    assert c1.workspace_path is None
+
+
+def test_invalid_workspace_policy_fails_closed_to_scratch(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="audit a repository", triage=True)
+
+    llm_payload = jsonlib.dumps({
+        "fanout": True,
+        "rationale": "one review lane",
+        "tasks": [{
+            "title": "Review the implementation",
+            "body": "Inspect and report; do not modify repository files.",
+            "assignee": "reviewer",
+            "parents": [],
+            "workspace_policy": "shared_root",
+        }],
+    })
+
+    patches = _patch_list_profiles(["orchestrator", "reviewer"])
+    for p in patches:
+        p.start()
+    try:
+        with _patch_aux_client(llm_payload):
+            outcome = decomp.decompose_task(tid, author="me")
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert outcome.ok, outcome.reason
+    with kb.connect() as conn:
+        child = kb.get_task(conn, outcome.child_ids[0])
+    assert child.workspace_kind == "scratch"
+    assert child.workspace_path is None
 
 
 def test_decompose_fanout_false_invalid_llm_assignee_uses_default(kanban_home):

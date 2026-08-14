@@ -133,6 +133,7 @@ VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
 # not dispatcher spawn/crash/timeout failures.
 BLOCK_RECURRENCE_LIMIT = 2
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
+VALID_DECOMPOSE_WORKSPACE_POLICIES = {"scratch", "repo_write"}
 
 
 def normalize_reasoning_effort(effort: Optional[str]) -> Optional[str]:
@@ -7309,6 +7310,7 @@ def decompose_triage_task(
             "body": "...",                     # optional
             "assignee": "profile-name",        # optional, None -> default fallback
             "parents": [0, 2],                 # indices into this same children list
+            "workspace_policy": "scratch",     # scratch | repo_write
         }
 
     Returns the list of created child task ids (in input order) on
@@ -7345,6 +7347,12 @@ def decompose_triage_task(
                 )
             if p == idx:
                 raise ValueError(f"child[{idx}] cannot list itself as a parent")
+        workspace_policy = child.get("workspace_policy", "scratch")
+        if workspace_policy not in VALID_DECOMPOSE_WORKSPACE_POLICIES:
+            raise ValueError(
+                f"child[{idx}].workspace_policy must be one of "
+                f"{sorted(VALID_DECOMPOSE_WORKSPACE_POLICIES)}"
+            )
 
     # Detect cycles in the sibling parent graph (Kahn's topological sort).
     # link_tasks() calls _would_cycle() for every new edge; here we check
@@ -7395,13 +7403,6 @@ def decompose_triage_task(
         ):
             raise ValueError("triage escalation is no longer active")
         tenant = root_row["tenant"]
-        # Children inherit the root's workspace by default so a fan-out
-        # of a code-gen task lands in the parent's project dir/worktree
-        # rather than throwaway scratch tmp dirs. A child dict can still
-        # override with its own 'workspace_kind' / 'workspace_path'.
-        root_ws_kind = root_row["workspace_kind"] or "scratch"
-        root_ws_path = root_row["workspace_path"]
-
         # Create children. Status is 'todo' regardless of parents — we
         # link them under the root AFTER creation so the dispatcher
         # sees a coherent state, and recompute_ready() at the end
@@ -7411,27 +7412,34 @@ def decompose_triage_task(
             title = child["title"].strip()
             body = child.get("body")
             assignee = _canonical_assignee(child.get("assignee"))
-            # Per-child override wins; otherwise inherit the root's
-            # workspace. A child that sets workspace_kind without a path
-            # falls back to the root path only when kinds match (so a
-            # child can't accidentally point a 'dir' at the root's
-            # worktree path or vice versa).
-            child_ws_kind = child.get("workspace_kind") or root_ws_kind
-            if child.get("workspace_path"):
-                child_ws_path = child.get("workspace_path")
-            elif child_ws_kind == "worktree":
-                # Never share one worktree checkout between siblings: the
-                # root's literal path would put every child in the same
-                # directory on the first-dispatched sibling's branch, with
-                # no lock — siblings can be promoted and dispatched
-                # concurrently. Leave the path unset so dispatch
-                # materializes a fresh <repo>/.worktrees/<child-id> per
-                # child from the board anchor.
+            # Workspace authority is capability-based and fail-closed. The
+            # root's workspace is only an anchor; its concrete mutable path is
+            # never inherited. A child receives an isolated worktree only
+            # when the decomposition explicitly declares repository writes.
+            # Missing policy means scratch, so research/QA/review/ops lanes do
+            # not mint branches because a code-producing root happened to use
+            # a worktree. Explicit kind/path values remain a governed API
+            # override for non-LLM callers.
+            explicit_kind = child.get("workspace_kind")
+            explicit_path = child.get("workspace_path")
+            workspace_policy = child.get("workspace_policy", "scratch")
+            if explicit_path:
+                child_ws_kind = explicit_kind or "dir"
+                child_ws_path = explicit_path
+            elif explicit_kind:
+                child_ws_kind = explicit_kind
                 child_ws_path = None
-            elif child_ws_kind == root_ws_kind:
-                child_ws_path = root_ws_path
+            elif workspace_policy == "repo_write":
+                child_ws_kind = "worktree"
+                child_ws_path = None
             else:
+                child_ws_kind = "scratch"
                 child_ws_path = None
+            if child_ws_kind not in VALID_WORKSPACE_KINDS:
+                raise ValueError(
+                    f"child[{idx}].workspace_kind must be one of "
+                    f"{sorted(VALID_WORKSPACE_KINDS)}"
+                )
             conn.execute(
                 "INSERT INTO tasks "
                 "(id, title, body, assignee, status, workspace_kind, "
