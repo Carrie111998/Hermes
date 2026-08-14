@@ -168,8 +168,16 @@ def classify(evidence: Evidence) -> Decision:
 def _run_git(repo: Path, args: list[str], timeout: float = 5.0) -> tuple[str, str, str]:
     """Read-only Git probe returning (kind, stdout, stderr), never mutating."""
     try:
-        result = subprocess.run(["git", *args], cwd=repo, text=True,
-                                capture_output=True, timeout=timeout, check=False)
+        result = subprocess.run(
+            ["git", *args],
+            cwd=repo,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            capture_output=True,
+            timeout=timeout,
+            check=False,
+        )
     except subprocess.TimeoutExpired:
         return "timeout", "", "timeout"
     except (OSError, ValueError) as exc:
