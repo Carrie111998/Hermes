@@ -1056,8 +1056,10 @@ class TestSharedBoardPaths:
             claim_expires=None,
             tenant=None,
             branch_name="wt/t_dispatch_env",
+            max_runtime_seconds=120,
         )
         (tmp_path / "ws").mkdir()
+        before_spawn = int(time.time())
         kb._default_spawn(task, str(tmp_path / "ws"))
 
         env = captured["env"]
@@ -1067,6 +1069,8 @@ class TestSharedBoardPaths:
         )
         assert env["HERMES_KANBAN_TASK"] == "t_dispatch_env"
         assert env["HERMES_KANBAN_BRANCH"] == "wt/t_dispatch_env"
+        assert env["HERMES_KANBAN_RUNTIME_CAP_SECONDS"] == "120"
+        assert before_spawn + 120 <= int(env["HERMES_KANBAN_RUNTIME_DEADLINE"])
         for key in sc._VAR_MAP:
             if key == "HERMES_SESSION_SOURCE":
                 # Re-set by the dispatcher, so what matters is that it carries

@@ -14,12 +14,50 @@ loop continues instead of exiting.
 from __future__ import annotations
 
 import os
+import time
 from typing import Any, Iterable, Optional
 
 
 _TERMINAL_KANBAN_TOOLS = frozenset({"kanban_complete", "kanban_block"})
 
 _DEFAULT_MAX_ATTEMPTS = 2
+
+
+def _is_dispatcher_kanban_worker() -> bool:
+    """Return whether this execution owns a dispatcher-spawned task."""
+    if not (os.environ.get("HERMES_KANBAN_TASK") or "").strip():
+        return False
+    try:
+        from agent.delegation_context import is_dispatcher_owned_worker_context
+
+        return is_dispatcher_owned_worker_context()
+    except Exception:
+        return False
+
+
+def _deadline_warning_fraction() -> float:
+    """Read the deadline-warning policy, failing closed on bad config."""
+    try:
+        from hermes_cli.config import load_config
+
+        kanban = (load_config() or {}).get("kanban") or {}
+        fraction = float(kanban.get("deadline_warning_fraction", 0.0))
+    except (AttributeError, TypeError, ValueError):
+        return 0.0
+    return fraction if 0.0 < fraction <= 1.0 else 0.0
+
+
+def _safe_checkpoint_enabled() -> bool:
+    """Return the checkpoint policy switch, failing closed on config errors."""
+    try:
+        from hermes_cli.config import load_config
+
+        checkpoint = ((load_config() or {}).get("kanban") or {}).get(
+            "safe_checkpoint"
+        ) or {}
+        return bool(checkpoint.get("enabled", False))
+    except Exception:
+        return False
 
 
 def kanban_stop_nudge_enabled() -> bool:
@@ -33,6 +71,46 @@ def kanban_stop_nudge_enabled() -> bool:
         return False
     task = (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
     return bool(task)
+
+
+def build_kanban_deadline_warning(
+    *,
+    issued: bool = False,
+    now: Optional[float] = None,
+) -> Optional[str]:
+    """Return a one-shot checkpoint/finalize nudge near a worker deadline.
+
+    The dispatcher supplies an absolute deadline and the run cap at spawn.
+    This is deliberately advisory: timeout enforcement remains exclusively in
+    the dispatcher.
+    """
+    if issued or not _is_dispatcher_kanban_worker():
+        return None
+    fraction = _deadline_warning_fraction()
+    if fraction == 0.0:
+        return None
+    try:
+        deadline = float(os.environ["HERMES_KANBAN_RUNTIME_DEADLINE"])
+        cap_seconds = float(os.environ["HERMES_KANBAN_RUNTIME_CAP_SECONDS"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if deadline <= 0.0 or cap_seconds <= 0.0:
+        return None
+
+    current_time = time.time() if now is None else now
+    warning_at = deadline - cap_seconds * (1.0 - fraction)
+    if current_time <= warning_at:
+        return None
+
+    percent = f"{fraction * 100:g}%"
+    if _safe_checkpoint_enabled():
+        action = "Checkpoint now at a coherent boundary, or finish/block."
+    else:
+        action = (
+            "Safe checkpointing is disabled; finish or block at a coherent "
+            "boundary."
+        )
+    return f"[System: You are past {percent} of your runtime cap. {action}]"
 
 
 def _tool_call_name(tc: Any) -> str:
@@ -102,6 +180,7 @@ def build_kanban_stop_nudge(
 
 
 __all__ = [
+    "build_kanban_deadline_warning",
     "build_kanban_stop_nudge",
     "kanban_stop_nudge_enabled",
     "session_called_kanban_terminal",

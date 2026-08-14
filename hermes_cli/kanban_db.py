@@ -11030,6 +11030,19 @@ def _default_spawn(
         env["HERMES_KANBAN_RUN_ID"] = str(task.current_run_id)
     if task.claim_lock:
         env["HERMES_KANBAN_CLAIM_LOCK"] = task.claim_lock
+    # Give the worker an advisory absolute deadline. The dispatcher remains
+    # the sole timeout enforcer; the child uses this only for a one-shot
+    # coherent-boundary nudge.
+    try:
+        runtime_cap = int(task.max_runtime_seconds) if task.max_runtime_seconds else 0
+    except (TypeError, ValueError):
+        runtime_cap = 0
+    if runtime_cap > 0:
+        env["HERMES_KANBAN_RUNTIME_CAP_SECONDS"] = str(runtime_cap)
+        env["HERMES_KANBAN_RUNTIME_DEADLINE"] = str(int(time.time()) + runtime_cap)
+    else:
+        env.pop("HERMES_KANBAN_RUNTIME_CAP_SECONDS", None)
+        env.pop("HERMES_KANBAN_RUNTIME_DEADLINE", None)
     # Goal-loop mode: the worker reads these and wraps its run in the
     # Ralph-style /goal judge loop (see cli.py quiet-mode path). Only set
     # when enabled so non-goal tasks keep a clean env.

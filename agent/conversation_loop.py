@@ -7876,6 +7876,47 @@ def run_conversation(
                     continue
 
                 # ── Kanban worker terminal-tool stop guard ─────────────
+                # A dispatcher-provided runtime deadline can request one
+                # advisory continuation before the ordinary terminal guard.
+                # This remains a nudge only: the dispatcher owns actual
+                # timeout enforcement and process termination.
+                try:
+                    from agent.kanban_stop import build_kanban_deadline_warning
+
+                    _deadline_warning = build_kanban_deadline_warning(
+                        issued=getattr(agent, "_kanban_deadline_warning_issued", False),
+                    )
+                except Exception:
+                    logger.debug("kanban deadline-warning check failed", exc_info=True)
+                    _deadline_warning = None
+
+                if _deadline_warning:
+                    agent._kanban_deadline_warning_issued = True
+                    final_msg["finish_reason"] = "kanban_deadline_warning"
+                    agent._emit_interim_assistant_message(final_msg)
+                    messages.append(final_msg)
+                    try:
+                        agent._flush_messages_to_session_db(messages, conversation_history)
+                    except Exception:
+                        logger.debug("kanban deadline-warning interim flush failed", exc_info=True)
+                    messages.append({
+                        "role": "user",
+                        "content": _deadline_warning,
+                        "_kanban_deadline_warning_synthetic": True,
+                    })
+                    agent._session_messages = messages
+                    logger.info(
+                        "kanban deadline-warning nudge issued task=%s",
+                        os.environ.get("HERMES_KANBAN_TASK", ""),
+                    )
+                    _pending_verification_response = final_response
+                    _pending_verification_response_previewed = (
+                        agent._interim_content_was_streamed(final_response or "")
+                    )
+                    final_response = None
+                    continue
+
+                # ── Kanban worker terminal-tool stop guard ─────────────
                 # Workers must end with kanban_complete / kanban_block.
                 # Models sometimes narrate the next step ("Let me write the
                 # report") and stop with finish_reason=stop — a clean exit
