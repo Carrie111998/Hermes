@@ -217,12 +217,15 @@ class TestDDGSProviderSearch:
 
 
 def _assert_worker_reaped(prov) -> None:
-    """Assert the last DDGS worker process has exited."""
+    """Assert the last DDGS worker process and communicator have exited."""
     proc = prov._last_worker_proc
     assert proc is not None, "expected a DDGS worker process to have been started"
     assert proc.poll() is not None, (
         f"DDGS worker still alive (pid={proc.pid}, returncode={proc.returncode})"
     )
+    thread = prov._last_worker_thread
+    assert thread is not None, "expected a DDGS communicator thread"
+    assert not thread.is_alive(), "DDGS communicator thread still alive"
 
 
 @pytest.mark.live_system_guard_bypass
