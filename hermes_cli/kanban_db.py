@@ -2419,6 +2419,10 @@ def connect(
                     # stale PRAGMA snapshots during gateway startup.
                     conn.executescript(SCHEMA_SQL)
                     _migrate_add_optional_columns(conn)
+                    # Durable composite notification outbox migration is
+                    # transactional/idempotent and board-local.
+                    from hermes_cli.kanban_delivery_outbox import init_schema as _init_delivery_outbox
+                    _init_delivery_outbox(conn)
                     _INITIALIZED_PATHS.add(resolved)
         except Exception:
             conn.close()
@@ -9482,6 +9486,18 @@ def review_dispatch_enabled() -> bool:
         return True
 
 
+def dispatch_once_authorized(
+    lease,
+    conn: sqlite3.Connection,
+    **kwargs,
+) -> DispatchResult:
+    """Production mutation facade; validates authority before any tick work."""
+    from hermes_cli.dispatcher_authority import require_dispatcher_lease
+
+    require_dispatcher_lease(lease, "dispatch_once")
+    return dispatch_once(conn, **kwargs)
+
+
 def dispatch_once(
     conn: sqlite3.Connection,
     *,
@@ -10467,7 +10483,13 @@ def _default_spawn(
         cmd.extend(["--reasoning", task.reasoning_effort])
     worker_toolsets = _resolve_worker_cli_toolsets(env.get("HERMES_HOME"))
     if worker_toolsets:
-        cmd.extend(["--toolsets", ",".join(worker_toolsets)])
+        joined_toolsets = ",".join(worker_toolsets)
+        env["HERMES_KANBAN_TOOLSETS"] = joined_toolsets
+        cmd.extend(["--toolsets", joined_toolsets])
+    if task.model_override:
+        env["HERMES_KANBAN_MODEL"] = task.model_override
+    if task.provider_override:
+        env["HERMES_KANBAN_PROVIDER"] = task.provider_override
     cmd.extend([
         "chat",
         "-q", prompt,
@@ -10479,6 +10501,21 @@ def _default_spawn(
         # turn, prints text, exits rc=0, and the dispatcher records a
         # protocol violation (incident 2026-06-09 t_d9cbe312).
         cmd.append("-Q")
+    # Run in an independent transient scope when the host supports it. Operators
+    # may require fail-closed isolation with kanban.require_worker_scope=true;
+    # otherwise unsupported non-systemd hosts retain the bounded legacy fallback.
+    try:
+        from hermes_cli.config import load_config as _load_worker_config
+        _worker_cfg = (_load_worker_config() or {}).get("kanban", {})
+    except Exception:
+        _worker_cfg = {}
+    from hermes_cli.worker_scope import build_scoped_worker_command
+    cmd = build_scoped_worker_command(
+        cmd,
+        env=env,
+        require_isolation=bool(_worker_cfg.get("require_worker_scope", False)),
+    )
+
     # Redirect output to a per-task log under <board-root>/logs/.
     # Anchored at the board root (not the shared kanban root), so
     # `hermes kanban log` on a specific board reads its own file and

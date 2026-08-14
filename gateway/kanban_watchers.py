@@ -167,14 +167,25 @@ class GatewayKanbanWatchersMixin:
     """Kanban watcher / notifier / dispatcher loops for GatewayRunner."""
 
     def _owns_kanban_dispatcher_lock(self) -> bool:
-        """Return whether this gateway currently owns the singleton lock."""
-        return getattr(self, "_kanban_dispatcher_lock_handle", None) is not None
+        """Return whether this gateway currently owns a validated authority lease."""
+        lease = getattr(self, "_kanban_dispatcher_authority_lease", None)
+        if lease is None:
+            # Backward-compatible test/rolling-upgrade observation only. New
+            # production acquisition never writes this legacy attribute.
+            return getattr(self, "_kanban_dispatcher_lock_handle", None) is not None
+        try:
+            from hermes_cli.dispatcher_authority import require_dispatcher_lease
+            require_dispatcher_lease(lease, "embedded-status")
+            return True
+        except Exception:
+            return False
 
     def _release_kanban_dispatcher_lock(self) -> None:
-        """Clear notifier-visible ownership before releasing the OS lock."""
-        handle = getattr(self, "_kanban_dispatcher_lock_handle", None)
-        self._kanban_dispatcher_lock_handle = None
-        _release_singleton_lock(handle)
+        """Clear notifier-visible ownership before releasing authority."""
+        lease = getattr(self, "_kanban_dispatcher_authority_lease", None)
+        self._kanban_dispatcher_authority_lease = None
+        if lease is not None:
+            lease.release()
 
     async def _kanban_notifier_watcher(self, interval: float = 5.0) -> None:
         """Poll ``kanban_notify_subs`` and deliver terminal events to users.
@@ -1229,30 +1240,17 @@ class GatewayKanbanWatchersMixin:
             logger.warning("kanban dispatcher: kanban_db not importable; dispatcher disabled")
             return
 
-        # Single-dispatcher backstop. dispatch_in_gateway defaults to true, so a
-        # new profile gateway (or a same-profile restart race) can silently
-        # start a second dispatcher; concurrent dispatchers double reclaim
-        # frequency, double claim-attempt events, and — with
-        # wal_autocheckpoint=0 — concurrent manual WAL checkpoints can corrupt
-        # index pages. The lock lives at the machine-global kanban root
-        # (shared across profiles by design), so it serialises ALL gateways.
-        self._kanban_dispatcher_lock_handle = None
-        _lock_path = _kb.kanban_home() / "kanban" / ".dispatcher.lock"
-        _lock_handle, _lock_state = _acquire_singleton_lock(_lock_path)
-        if _lock_state == "contended":
-            logger.info(
-                "kanban dispatcher: another gateway already holds the dispatcher "
-                "lock (%s); this gateway will NOT dispatch.", _lock_path,
-            )
+        # Acquire the same fail-closed machine-global lifetime authority used by
+        # the standalone foreground runtime before any board/runtime construction.
+        from hermes_cli.dispatcher_authority import AcquireState, acquire_machine_dispatcher
+
+        _authority = acquire_machine_dispatcher("embedded-gateway")
+        if _authority.state is not AcquireState.ACQUIRED or _authority.lease is None:
+            reason = _authority.error_class or _authority.owner_hint or _authority.state.value
+            logger.error("kanban dispatcher: authority denied (%s); disabled", reason)
             return
-        if _lock_state == "held":
-            self._kanban_dispatcher_lock_handle = _lock_handle  # hold for process lifetime
-            logger.info("kanban dispatcher: holding singleton dispatcher lock (%s)", _lock_path)
-        else:
-            logger.warning(
-                "kanban dispatcher: advisory lock unavailable at %s; proceeding "
-                "on config control alone.", _lock_path,
-            )
+        self._kanban_dispatcher_authority_lease = _authority.lease
+        logger.info("kanban dispatcher: holding machine-global dispatcher authority")
 
         try:
             interval = float(kanban_cfg.get("dispatch_interval_seconds", 60) or 60)
@@ -1457,7 +1455,8 @@ class GatewayKanbanWatchersMixin:
                 # re-ran the migration on a second connection, racing
                 # the first. See the matching comment in
                 # `_kanban_notifier_watcher` and issue #21378.
-                return _kb.dispatch_once(
+                return _kb.dispatch_once_authorized(
+                    self._kanban_dispatcher_authority_lease,
                     conn,
                     board=slug,
                     max_spawn=max_spawn,

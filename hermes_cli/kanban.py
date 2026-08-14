@@ -748,10 +748,18 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_tail.add_argument("task_id")
     p_tail.add_argument("--interval", type=float, default=1.0)
 
-    # --- dispatch ---
+    # --- dispatcher (supported guarded foreground runtime) ---
+    p_dispatcher = sub.add_parser(
+        "dispatcher",
+        help="Run the machine-global guarded dispatcher in the foreground",
+    )
+    p_dispatcher.add_argument("--interval", type=float, default=60.0)
+    p_dispatcher.add_argument("--once", action="store_true", help="Run one guarded tick then exit")
+
+    # --- dispatch (disabled legacy compatibility command) ---
     p_disp = sub.add_parser(
         "dispatch",
-        help="One dispatcher pass: reclaim stale, promote ready, spawn workers",
+        help="DISABLED — use `hermes kanban dispatcher`",
     )
     p_disp.add_argument("--dry-run", action="store_true",
                         help="Don't actually spawn processes; just print what would happen")
@@ -1136,6 +1144,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "promote":  _cmd_promote,
             "archive":  _cmd_archive,
             "tail":     _cmd_tail,
+            "dispatcher": _cmd_dispatcher,
             "dispatch": _cmd_dispatch,
             "daemon":   _cmd_daemon,
             "watch":    _cmd_watch,
@@ -2616,7 +2625,40 @@ def _cmd_tail(args: argparse.Namespace) -> int:
         return 0
 
 
+def _cmd_dispatcher(args: argparse.Namespace) -> int:
+    """Run the supported guarded, feature-parity foreground dispatcher."""
+    from hermes_cli.dispatcher_authority import AcquireState, acquire_machine_dispatcher
+    from hermes_cli.kanban_dispatcher import run_foreground_dispatcher
+
+    acquired = acquire_machine_dispatcher("foreground")
+    if acquired.state is not AcquireState.ACQUIRED or acquired.lease is None:
+        reason = acquired.error_class or acquired.owner_hint or acquired.state.value
+        print(f"kanban dispatcher authority denied: {reason}", file=sys.stderr)
+        return 3
+    try:
+        return run_foreground_dispatcher(
+            lease=acquired.lease,
+            interval=float(getattr(args, "interval", 60.0)),
+            once=bool(getattr(args, "once", False)),
+        )
+    finally:
+        acquired.lease.release()
+
+
 def _cmd_dispatch(args: argparse.Namespace) -> int:
+    """Disabled legacy one-shot entry point; never opens or mutates a board."""
+    print(
+        "hermes kanban dispatch is disabled because dispatch mutation requires a "
+        "machine-global lifetime authority. Run `hermes kanban dispatcher` for "
+        "the supported foreground runtime.",
+        file=sys.stderr,
+    )
+    return 2
+
+
+def _cmd_dispatch_legacy_removed(args: argparse.Namespace) -> int:
+    # Historical implementation retained temporarily below for source archaeology;
+    # it is unreachable from every installed parser/handler.
     # Honour kanban.default_assignee as the fallback for unassigned ready
     # tasks (#27145), kanban.max_in_progress as the global concurrency cap
     # (#33488), kanban.max_in_progress_per_profile as the per-profile
@@ -2724,7 +2766,17 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
 
 
 def _cmd_daemon(args: argparse.Namespace) -> int:
-    """Deprecated — the dispatcher now runs inside the gateway.
+    """Disabled legacy daemon, including --force; always non-mutating."""
+    print(
+        "hermes kanban daemon is disabled; `--force` has no bypass semantics. "
+        "Run `hermes kanban dispatcher` for the guarded foreground runtime.",
+        file=sys.stderr,
+    )
+    return 2
+
+
+def _cmd_daemon_legacy_removed(args: argparse.Namespace) -> int:
+    """Unreachable historical implementation retained for source archaeology.
 
     Left in as a stub so users with the old command in scripts/systemd
     units get a clear migration message instead of a cryptic

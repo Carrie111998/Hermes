@@ -1,0 +1,44 @@
+[
+  {
+    "symbol": "gateway.kanban_watchers.KanbanWatchersMixin._kanban_dispatcher_watcher",
+    "exposure": "embedded gateway compatibility adapter",
+    "mutation_class": "dispatch_mutation",
+    "authority_policy": "GUARDED_DISPATCH_MUTATION",
+    "test_id": "embedded_dispatcher_authority"
+  },
+  {
+    "symbol": "hermes_cli.kanban._cmd_dispatcher",
+    "exposure": "hermes kanban dispatcher",
+    "mutation_class": "dispatch_mutation",
+    "authority_policy": "GUARDED_DISPATCH_MUTATION",
+    "test_id": "foreground_dispatcher_authority"
+  },
+  {
+    "symbol": "hermes_cli.kanban._cmd_dispatch",
+    "exposure": "hermes kanban dispatch",
+    "mutation_class": "historical_dispatch_mutation",
+    "authority_policy": "DISABLED_NONZERO",
+    "test_id": "legacy_dispatch_disabled"
+  },
+  {
+    "symbol": "hermes_cli.kanban._cmd_daemon",
+    "exposure": "hermes kanban daemon [--force]",
+    "mutation_class": "historical_dispatch_mutation",
+    "authority_policy": "DISABLED_NONZERO",
+    "test_id": "legacy_daemon_disabled"
+  },
+  {
+    "symbol": "plugins.kanban.dashboard.plugin_api.dispatch",
+    "exposure": "POST /dispatch",
+    "mutation_class": "historical_dispatch_mutation_status_only",
+    "authority_policy": "DISABLED_NONZERO",
+    "test_id": "dashboard_dispatch_status_only"
+  },
+  {
+    "symbol": "hermes_cli.kanban_db.dispatch_once_authorized",
+    "exposure": "installed library facade",
+    "mutation_class": "dispatch_mutation",
+    "authority_policy": "GUARDED_DISPATCH_MUTATION",
+    "test_id": "direct_helper_lease"
+  }
+]

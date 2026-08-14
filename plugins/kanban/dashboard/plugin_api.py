@@ -2284,19 +2284,23 @@ def dispatch(
     max_n: int = Query(8, alias="max"),
     board: Optional[str] = Query(None),
 ):
-    board = _resolve_board(board)
-    conn = _conn(board=board)
-    try:
-        result = kanban_db.dispatch_once(
-            conn, dry_run=dry_run, max_spawn=max_n, board=board,
-        )
-        # DispatchResult is a dataclass.
-        try:
-            return asdict(result)
-        except TypeError:
-            return {"result": str(result)}
-    finally:
-        conn.close()
+    """Non-mutating compatibility endpoint for standalone dispatch status."""
+    del dry_run, max_n, board
+    from hermes_cli.dispatcher_authority import read_status_no_side_effects
+
+    status = read_status_no_side_effects()
+    detail = {
+        "dispatch_nudge_accepted": False,
+        "dispatch_performed": False,
+        "state": "managed_automatically" if status.healthy else "unavailable",
+        "owner": status.owner_hint,
+        "mode": status.mode,
+        "version": status.version,
+        "freshness_seconds": status.freshness_seconds,
+        "error_class": status.error_class,
+        "guidance": "Inspect the standalone `hermes kanban dispatcher` service.",
+    }
+    raise HTTPException(status_code=409 if status.healthy else 503, detail=detail)
 
 
 # ---------------------------------------------------------------------------
