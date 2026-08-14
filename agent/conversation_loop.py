@@ -1472,7 +1472,19 @@ def run_conversation(
                 )
                 
                 api_duration = time.time() - api_start_time
-                
+
+                # D — the call SUCCEEDED. If this provider/model had an open
+                # rate-limit episode, close it and emit RECOVERED. This is the
+                # only recovery signal: every other hook fires on failure, so
+                # inferring recovery from silence would mistake an idle window
+                # for a healthy provider. clear() is a cheap no-op when no
+                # episode is open, which is the overwhelmingly common case.
+                try:
+                    from events.rate_limit_signal import clear as _clear_rl
+                    _clear_rl(provider=agent.provider, model=agent.model)
+                except Exception:
+                    pass
+
                 # Stop thinking spinner silently -- the response box or tool
                 # execution messages that follow are more informative.
                 if thinking_spinner:

@@ -182,3 +182,45 @@ def _agent_with_chain(chain):
     agent._credential_pool = None
     agent._rate_limited_until = 0
     return agent
+
+
+def test_successful_call_clears_open_episode(state_file_agent):
+    """D: a success on a limited provider closes the episode exactly once."""
+    from events.rate_limit_signal import record, clear, _load_state
+
+    record(provider="deepseek", model="deepseek-v4-pro",
+           reason="rate_limit", detector="runtime",
+           fallback_provider="openai-codex", fallback_model="gpt-5.6-sol",
+           bus=_NullBus())
+    assert _load_state(), "precondition: episode must be open"
+
+    assert clear(provider="deepseek", model="deepseek-v4-pro",
+                 bus=_NullBus()) is True
+    assert _load_state() == {}
+
+    # Idempotent: a second success must not emit a second RECOVERED.
+    assert clear(provider="deepseek", model="deepseek-v4-pro",
+                 bus=_NullBus()) is False
+
+
+def test_clear_hook_is_present_in_conversation_loop():
+    """Positive control for the WIRING, not just the function."""
+    import inspect
+    from agent import conversation_loop
+    src = inspect.getsource(conversation_loop)
+    assert "rate_limit_signal import clear" in src, \
+        "D hook is unwired — clear() is never called from the success path"
+
+
+class _NullBus:
+    def emit(self, **kw):
+        return "evt"
+
+
+@pytest.fixture
+def state_file_agent(tmp_path, monkeypatch):
+    p = tmp_path / "rate_limit_state.json"
+    monkeypatch.setattr("events.rate_limit_signal._state_path", lambda: p)
+    from events import rate_limit_signal
+    rate_limit_signal.reset_state_cache()
+    return p
