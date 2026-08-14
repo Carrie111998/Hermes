@@ -773,7 +773,18 @@ def _print_update_completion(message: str) -> None:
         print(f"=== hermes-update completed {action_id} ===")
 
 
-def _update_via_zip(args):
+# Top-level install-tree entries a ZIP update must never replace.
+# venv/node_modules/.git/.env are the classic preserves. ``mcp-tokens`` is
+# defensive: MCP OAuth tokens / RFC 7591 client registrations normally live
+# at ``$HERMES_HOME/mcp-tokens`` (outside the install tree, issue #84843),
+# but legacy layouts with HERMES_HOME == install root keep them in-tree —
+# replacing that directory would orphan the persisted client registration and
+# turn the next token refresh into OAuthNonInteractiveError (cron) after a
+# self-update.
+_ZIP_UPDATE_PRESERVE = frozenset({"venv", "node_modules", ".git", ".env", "mcp-tokens"})
+
+
+def _update_via_zip(args, mcp_tokens_before: Optional[dict] = None):
     """Update Hermes Agent by downloading a ZIP archive.
 
     Used on Windows when git file I/O is broken (antivirus, NTFS filter
@@ -849,8 +860,10 @@ def _update_via_zip(args):
                     extracted = candidate
                     break
 
-        # Copy updated files over existing installation, preserving venv/node_modules/.git
-        preserve = {"venv", "node_modules", ".git", ".env"}
+        # Copy updated files over existing installation, preserving
+        # venv/node_modules/.git/.env plus any legacy in-tree mcp-tokens/
+        # (see _ZIP_UPDATE_PRESERVE, issue #84843).
+        preserve = _ZIP_UPDATE_PRESERVE
         entries = [i for i in os.listdir(extracted) if i not in preserve]
 
         # Two-phase replace (#76104). Phase 1 copies every entry — directories
@@ -1112,6 +1125,12 @@ def _update_via_zip(args):
             "Post-update state.db integrity check (zip path) failed: %s", exc
         )
 
+    # MCP OAuth tokens must survive the self-update (#84843): persisted
+    # client registrations live in $HERMES_HOME/mcp-tokens, outside the
+    # install tree, and the preserve set above also protects legacy in-tree
+    # copies. Verify, non-fatal.
+    _verify_mcp_tokens_preserved(mcp_tokens_before)
+
     print()
     if node_failures:
         print(
@@ -1133,6 +1152,78 @@ def _update_via_zip(args):
     # Don't stop a working dashboard when the Node refresh failed — see the
     # git-update path for rationale (#30271).
     _finish_dashboard_update_cleanup(node_failures)
+
+
+def _snapshot_mcp_tokens() -> dict:
+    """Baseline of ``$HERMES_HOME/mcp-tokens`` for post-update verification.
+
+    MCP OAuth tokens and RFC 7591 client registrations are persisted at
+    ``HERMES_HOME/mcp-tokens/`` — outside the install tree — and a
+    self-update must never invalidate them (issue #84843). Records
+    ``{filename: (size, mtime_ns)}`` per token file so the post-update check
+    can detect a vanished or replaced file. Never raises: an absent or
+    unreadable token dir yields an empty baseline, which the verifier treats
+    as "nothing persisted to preserve".
+    """
+    try:
+        tokens_dir = Path(get_hermes_home()) / "mcp-tokens"
+        if not tokens_dir.is_dir():
+            return {}
+        return {
+            p.name: (p.stat().st_size, p.stat().st_mtime_ns)
+            for p in tokens_dir.iterdir()
+            if p.is_file()
+        }
+    except Exception:
+        return {}
+
+
+def _verify_mcp_tokens_preserved(before: Optional[dict] = None) -> None:
+    """Post-update sanity check: MCP OAuth tokens must survive self-update.
+
+    Tokens/client registrations live in ``$HERMES_HOME/mcp-tokens``, outside
+    the install tree, so no update path should delete them. Losing them
+    orphans the persisted OAuth client and the next token refresh falls back
+    to an interactive browser flow — which raises ``OAuthNonInteractiveError``
+    in cron/headless contexts after a self-update (issue #84843). Non-fatal:
+    on a problem it warns via logger (and prints nothing alarming) and lets
+    the update finish; the update flow never blocks on this check.
+    """
+    try:
+        tokens_dir = Path(get_hermes_home()) / "mcp-tokens"
+        if before:
+            if not tokens_dir.is_dir():
+                logger.warning(
+                    "MCP OAuth token dir %s vanished during update — "
+                    "clients will need re-registration (#84843)",
+                    tokens_dir,
+                )
+                return
+            missing = [name for name in before if not (tokens_dir / name).exists()]
+            changed = [
+                name
+                for name, (size, _mtime) in before.items()
+                if (tokens_dir / name).exists()
+                and (tokens_dir / name).stat().st_size != size
+            ]
+            if missing or changed:
+                logger.warning(
+                    "MCP OAuth token files changed during update — "
+                    "missing=%s changed=%s (#84843)",
+                    missing,
+                    changed,
+                )
+                return
+            print(f"  ✓ {len(before)} MCP OAuth token file(s) preserved")
+            return
+        # No baseline (defensive call): just report what is there.
+        if tokens_dir.is_dir():
+            count = sum(1 for p in tokens_dir.iterdir() if p.is_file())
+            if count:
+                print(f"  ✓ {count} MCP OAuth token file(s) preserved")
+    except Exception as exc:
+        logger.debug("MCP token preservation check failed: %s", exc)
+
 
 def _stash_local_changes_if_needed(git_cmd: list[str], cwd: Path) -> Optional[str]:
     status = subprocess.run(
@@ -3922,6 +4013,11 @@ def _cmd_update_impl(args, gateway_mode: bool):
     # post-update cron-jobs safety net uses it to detect job loss.
     pre_update_snapshot_id = _m()._run_pre_update_backup(args)
 
+    # Pre-update baseline for the MCP OAuth token preservation check
+    # (#84843): tokens/client registrations persist in $HERMES_HOME/mcp-tokens
+    # and must never be invalidated by a self-update.
+    mcp_tokens_before = _snapshot_mcp_tokens()
+
     _windows_gateway_resume = _m()._pause_windows_gateways_for_update()
     if _windows_gateway_resume:
         import atexit as _atexit
@@ -4054,7 +4150,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
     if use_zip_update:
         # ZIP-based update for Windows when git is broken
         try:
-            _update_via_zip(args)
+            _update_via_zip(args, mcp_tokens_before)
         finally:
             _m()._resume_windows_gateways_after_update(_windows_gateway_resume)
         return
@@ -4946,6 +5042,11 @@ def _cmd_update_impl(args, gateway_mode: bool):
             # Never let the cron safety net break an otherwise-good update.
             logger.debug("Cron jobs auto-restore check failed: %s", exc)
 
+        # Post-update sanity check: MCP OAuth tokens must survive the
+        # self-update (#84843). Tokens live outside the install tree, so a
+        # git pull/reset never touches them — verify, non-fatal.
+        _verify_mcp_tokens_preserved(mcp_tokens_before)
+
         print()
         if node_failures:
             print(
@@ -5784,7 +5885,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
             print(f"⚠ Git update failed: {e}")
             print("→ Falling back to ZIP download...")
             print()
-            _update_via_zip(args)
+            _update_via_zip(args, mcp_tokens_before)
         else:
             print(f"✗ Update failed: {e}")
             sys.exit(1)
