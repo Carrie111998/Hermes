@@ -835,7 +835,13 @@ class EmailAdapter(BasePlatformAdapter):
                     if uid in self._seen_uids:
                         continue
 
-                    status, msg_data = imap.uid("fetch", uid, "(RFC822)")
+                    # Use BODY.PEEK[] instead of RFC822 so the fetch does not set the
+                    # \Seen flag on the server. RFC822 is aliased to BODY[]
+                    # by RFC 3501; Gmail (and most IMAP servers) auto-flag
+                    # any non-PEEK body fetch, which silently marks incoming
+                    # mail as read for every user of the gateway. PEEK returns
+                    # identical bytes without touching flags.
+                    status, msg_data = imap.uid("fetch", uid, "(BODY.PEEK[])")
                     if status != "OK":
                         # Transient per-UID fetch refusal: leave the UID out of
                         # _seen_uids so the next poll retries it.
