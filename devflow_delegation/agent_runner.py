@@ -141,8 +141,17 @@ def run_agent(
     target: TargetConfig,
     request: Dict[str, Any],
     provider_call: Callable[..., Any],
+    model: str = None,
 ) -> Dict[str, Any]:
-    """Drive the bounded tool-calling loop. Raises CeilingExceeded on any breach."""
+    """Drive the bounded tool-calling loop. Raises CeilingExceeded on any breach.
+
+    ``model`` overrides the string forwarded to ``provider_call`` as
+    ``model=``. When omitted (the default), falls back to
+    ``target.agent_model`` verbatim -- the historical behavior. ``main()``
+    passes an explicit bare model name here when a provider prefix was
+    successfully resolved (see ``_resolve_agent_credentials``), so the
+    "<provider>/<model>" convention's prefix never reaches the live API call.
+    """
     messages = build_messages(request, target)
     budget = Budget(
         max_iterations=target.agent_max_iterations,
@@ -151,9 +160,10 @@ def run_agent(
     )
     budget.start()
     stopped = "model-finished"
+    model_to_forward = target.agent_model if model is None else model
     while True:
         response = provider_call(
-            model=target.agent_model,
+            model=model_to_forward,
             messages=messages,
             tools=TOOL_SCHEMAS,
             max_tokens=target.agent_max_tokens,
@@ -266,7 +276,13 @@ def _resolve_agent_credentials(agent_model: str, env: Mapping[str, str]) -> Dict
     identity -- NOT ``agent/auxiliary_client.py``, which this runner may not
     modify), its credential env var(s) are read from ``env`` and returned so
     the caller can forward them explicitly. The ``model=`` string itself is
-    left untouched here; only ``provider``/``api_key``/``base_url`` are added.
+    left untouched HERE; only ``provider``/``api_key``/``base_url`` are added
+    to the returned dict. The caller (``main``) uses this dict's "provider"
+    key purely as the "a known provider prefix resolved" signal to decide
+    whether to strip that one leading "<prefix>/" segment off
+    ``target.agent_model`` before forwarding it to ``run_agent`` -- a live
+    provider API rejects the "<provider>/<model>" convention string verbatim
+    as a model name, it only accepts the bare model.
 
     If the prefix doesn't resolve to a known provider (no "/", or an id
     ``hermes_cli.providers`` doesn't recognize -- e.g. a test fixture's
@@ -298,6 +314,32 @@ def _resolve_agent_credentials(agent_model: str, env: Mapping[str, str]) -> Dict
         if base_url:
             resolved["base_url"] = base_url
     return resolved
+
+
+def _model_to_forward(agent_model: str, credentials: Mapping[str, str]) -> str:
+    """Bare model name to forward to ``provider_call`` as ``model=``.
+
+    ``credentials`` is whatever ``_resolve_agent_credentials(agent_model,
+    ...)`` returned for this same ``agent_model`` -- its "provider" key is
+    the "a known provider prefix resolved" signal. A live provider API
+    rejects the full "<provider>/<model>" convention string as a model name
+    (see the module-level bug this fixes: a 400 quoting exactly that string
+    back), so once a provider resolved, this strips the ONE leading
+    "<prefix>/" segment via ``partition`` (not the two-arg ``split`` used for
+    prefix detection elsewhere) -- a model that itself contains slashes, e.g.
+    an OpenRouter-style "openrouter/vendor/model-name", only has its resolved
+    provider segment removed, leaving "vendor/model-name" intact.
+
+    Two cases must leave ``agent_model`` untouched, and both do so simply
+    because ``credentials`` lacks a "provider" key for them (no special-casing
+    needed here): a prefix ``hermes_cli.providers`` doesn't recognize, and a
+    bare model with no "/" at all (nothing for a real provider prefix to have
+    matched, so credential resolution never got a "provider" key to set).
+    """
+    if "provider" not in credentials:
+        return agent_model
+    _, _, rest = str(agent_model or "").partition("/")
+    return rest or agent_model
 
 
 def _load_dotenv_best_effort() -> None:
@@ -414,8 +456,10 @@ def main(argv=None) -> int:
             functools.partial(call_llm, **credentials) if credentials else call_llm
         )
 
+        resolved_model = _model_to_forward(target.agent_model, credentials)
+
         result = run_agent(worktree=worktree, target=target, request=request,
-                           provider_call=provider_call)
+                           provider_call=provider_call, model=resolved_model)
         self_check(worktree, target, known_values=known)
     except CeilingExceeded as exc:
         # str(exc) here is our own ceiling message (safe), but route it

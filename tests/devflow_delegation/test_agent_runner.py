@@ -654,8 +654,14 @@ def _run_main_forwards_the_resolved_provider_credential(monkeypatch, git_worktre
     assert captured.get("provider") == "fakevendor"
     assert captured.get("api_key") == fake_key
     assert captured.get("base_url") == "https://fake.example.test/v1"
-    # The model string itself is untouched by this fix.
-    assert captured.get("model") == "fakevendor/fake-model-1"
+    # Live-provider-call bugfix: a real API rejects the full
+    # "<provider>/<model>" convention string as a model name (confirmed live
+    # -- a 400 quoting "deepseek/deepseek-v4-pro" back verbatim). Once a
+    # provider prefix resolves, only the bare model (everything after the
+    # first "/") is forwarded as `model=`. This assertion used to read
+    # "fakevendor/fake-model-1" (the full string) -- that pinned the bug
+    # itself; corrected to the bare model the live call actually needs.
+    assert captured.get("model") == "fake-model-1"
 
     # And captured BEFORE the scrub: by the time call_llm actually runs (which
     # just happened, above), the raw var is already gone from the child
@@ -687,6 +693,186 @@ def test_resolve_agent_credentials_forwards_only_whats_present(monkeypatch):
     # api_key nor base_url are invented out of thin air.
     result = _resolve_agent_credentials("fakevendor/some-model", {})
     assert result == {"provider": "fakevendor"}
+
+
+# --- F7 (live-provider-call bugfix): main() correctly resolves provider/
+# api_key/base_url via _resolve_agent_credentials and forwards them to
+# call_llm explicitly, but forwarded the FULL `agent_model` string (prefix
+# included) as `model=`. Confirmed live: DeepSeek's API 400'd on
+# "deepseek/deepseek-v4-pro", quoting the string back and naming
+# "deepseek-v4-pro" as the actual supported name. Note this was a 400, not a
+# 401 -- credential resolution (F4/F6 above) was already correct; only the
+# model name was wrong. `_model_to_forward` is the unit under test: it takes
+# `agent_model` plus whatever `_resolve_agent_credentials` returned for it,
+# and decides what to forward as `model=`.
+
+
+def test_model_to_forward_strips_the_resolved_provider_prefix():
+    from devflow_delegation.agent_runner import _model_to_forward
+
+    assert _model_to_forward(
+        "deepseek/deepseek-v4-pro", {"provider": "deepseek", "api_key": "k"}
+    ) == "deepseek-v4-pro"
+
+
+def test_model_to_forward_strips_only_the_first_segment_of_a_multi_slash_model():
+    from devflow_delegation.agent_runner import _model_to_forward
+
+    # An OpenRouter-style model that itself contains a "/" (vendor/model).
+    # Only the resolved provider's own leading segment must be removed --
+    # partition (not a repeated split) is what keeps the rest intact.
+    assert _model_to_forward(
+        "openrouter/vendor/model-name", {"provider": "openrouter", "api_key": "k"}
+    ) == "vendor/model-name"
+
+
+def test_model_to_forward_leaves_an_unrecognized_prefix_unchanged():
+    from devflow_delegation.agent_runner import _model_to_forward
+
+    # No "provider" key -- exactly what _resolve_agent_credentials returns
+    # for a prefix hermes_cli.providers doesn't recognize (e.g. a test
+    # fixture's "test/model"). Behavior must be unchanged: forward verbatim.
+    assert _model_to_forward("test/model", {}) == "test/model"
+
+
+def test_model_to_forward_leaves_a_bare_model_with_no_slash_unchanged():
+    from devflow_delegation.agent_runner import _model_to_forward
+
+    # No "/" at all in the configured model -- nothing to strip, and nothing
+    # for a provider prefix to have matched, so credentials is also {} here.
+    assert _model_to_forward("gpt-5.6-sol", {}) == "gpt-5.6-sol"
+
+
+def test_run_agent_forwards_an_explicit_model_override(worktree):
+    # run_agent's new `model=` kwarg is what main() uses to hand the already-
+    # stripped bare model through to provider_call, without touching
+    # `target.agent_model` (which stays "<provider>/<model>" for everything
+    # else -- logging, TargetConfig, etc).
+    seen = {}
+
+    def provider_call(**kwargs):
+        seen.update(kwargs)
+        return _message(content="done")
+
+    run_agent(worktree=worktree, target=_target(agent_model="deepseek/deepseek-v4-pro"),
+              request=_request(), provider_call=provider_call, model="deepseek-v4-pro")
+
+    assert seen["model"] == "deepseek-v4-pro"
+
+
+def test_run_agent_defaults_to_the_configured_model_when_no_override_given(worktree):
+    # No `model=` argument at all -- must fall back to target.agent_model
+    # exactly as before this fix (covers callers other than main(), and the
+    # pre-existing test_run_agent_passes_the_configured_model_and_tools case).
+    seen = {}
+
+    def provider_call(**kwargs):
+        seen.update(kwargs)
+        return _message(content="done")
+
+    run_agent(worktree=worktree, target=_target(agent_model="deepseek/deepseek-v4-pro"),
+              request=_request(), provider_call=provider_call)
+
+    assert seen["model"] == "deepseek/deepseek-v4-pro"
+
+
+def test_main_forwards_a_bare_model_for_a_multi_slash_openrouter_style_model(
+    monkeypatch, git_worktree, tmp_path
+):
+    # End-to-end (main()-level) proof for the multi-slash case, mirroring
+    # F4's pattern: a resolved provider whose model itself contains a "/".
+    saved_environ = dict(os.environ)
+    try:
+        _run_main_forwards_a_bare_model_for_a_multi_slash_model(monkeypatch, git_worktree, tmp_path)
+    finally:
+        os.environ.clear()
+        os.environ.update(saved_environ)
+
+
+def _run_main_forwards_a_bare_model_for_a_multi_slash_model(monkeypatch, git_worktree, tmp_path):
+    request_path, allowlist_path = _write_request_and_allowlist(
+        tmp_path, agent_model="openrouter/vendor/model-name")
+
+    fake_key = "fk" + "-" + "router" + "-" + "0123456789abcdef"
+    monkeypatch.setenv("DDP_REQUEST_PATH", str(request_path))
+    monkeypatch.setenv("PATH", "C:/fake/real/path")
+    monkeypatch.setenv("OPENROUTER_API_KEY", fake_key)
+    monkeypatch.chdir(git_worktree)
+
+    from devflow_delegation import agent_runner
+
+    monkeypatch.setattr("events.paths.devflow_allowlist_path", lambda: allowlist_path)
+
+    fake_provider = SimpleNamespace(
+        id="openrouter", api_key_env_vars=("OPENROUTER_API_KEY",), base_url_env_var="",
+    )
+    monkeypatch.setattr(
+        "hermes_cli.providers.get_provider",
+        lambda name: fake_provider if name == "openrouter" else None,
+    )
+
+    captured = {}
+
+    def fake_call_llm(**kwargs):
+        captured.update(kwargs)
+        message = SimpleNamespace(content="done", tool_calls=None)
+        return SimpleNamespace(choices=[SimpleNamespace(message=message)],
+                               usage=SimpleNamespace(total_tokens=1))
+
+    monkeypatch.setattr("agent.auxiliary_client.call_llm", fake_call_llm)
+    monkeypatch.setattr(agent_runner, "self_check", lambda *a, **k: None)
+
+    assert agent_runner.main([]) == 0
+
+    assert captured.get("provider") == "openrouter"
+    assert captured.get("api_key") == fake_key
+    # Only the resolved provider's own leading segment ("openrouter/") is
+    # stripped -- "vendor/model-name" is the model, not the provider id.
+    assert captured.get("model") == "vendor/model-name"
+
+
+def test_main_forwards_the_configured_model_unchanged_for_an_unrecognized_prefix(
+    monkeypatch, git_worktree, tmp_path
+):
+    # End-to-end proof that main() leaves an unrecognized-provider model
+    # string exactly as configured -- unchanged, pre-existing behavior.
+    saved_environ = dict(os.environ)
+    try:
+        _run_main_forwards_the_configured_model_unchanged(monkeypatch, git_worktree, tmp_path)
+    finally:
+        os.environ.clear()
+        os.environ.update(saved_environ)
+
+
+def _run_main_forwards_the_configured_model_unchanged(monkeypatch, git_worktree, tmp_path):
+    # "test/model" -- the fixture default used throughout this file -- has no
+    # matching entry in hermes_cli.providers.
+    request_path, allowlist_path = _write_request_and_allowlist(tmp_path, agent_model="test/model")
+
+    monkeypatch.setenv("DDP_REQUEST_PATH", str(request_path))
+    monkeypatch.setenv("PATH", "C:/fake/real/path")
+    monkeypatch.chdir(git_worktree)
+
+    from devflow_delegation import agent_runner
+
+    monkeypatch.setattr("events.paths.devflow_allowlist_path", lambda: allowlist_path)
+    monkeypatch.setattr("hermes_cli.providers.get_provider", lambda name: None)
+
+    captured = {}
+
+    def fake_call_llm(**kwargs):
+        captured.update(kwargs)
+        message = SimpleNamespace(content="done", tool_calls=None)
+        return SimpleNamespace(choices=[SimpleNamespace(message=message)],
+                               usage=SimpleNamespace(total_tokens=1))
+
+    monkeypatch.setattr("agent.auxiliary_client.call_llm", fake_call_llm)
+    monkeypatch.setattr(agent_runner, "self_check", lambda *a, **k: None)
+
+    assert agent_runner.main([]) == 0
+
+    assert captured.get("model") == "test/model"
+    assert "provider" not in captured
 
 
 # --- F6: the resolved credential in F4 assumed the key was already in the
