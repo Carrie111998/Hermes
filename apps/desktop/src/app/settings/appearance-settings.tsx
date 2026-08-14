@@ -91,7 +91,8 @@ function matchUiScalePreset(percent: number): UiScalePreset | null {
 const UI_SCALE_MIN = 25
 const UI_SCALE_MAX = 500
 
-function sanitizeZoomInput(raw: string): number | null {
+/** Exported for testing. */
+export function sanitizeZoomInput(raw: string): number | null {
   const trimmed = raw.trim()
 
   if (!trimmed) {
@@ -116,7 +117,8 @@ function sanitizeZoomInput(raw: string): number | null {
  * shows the live zoom percent, commits on Enter or blur, and reverts
  * to the current zoom if the input is invalid or out of range.
  */
-function ZoomNumericEntry({ percent, onCommit }: { percent: number; onCommit: (value: number) => void }) {
+/** Exported for testing. */
+export function ZoomNumericEntry({ percent, onCommit }: { percent: number; onCommit: (value: number) => void }) {
   const { t } = useI18n()
   // Local text state so the user can type freely (including intermediate
   // states like "20" before "200"). Synced from the prop when the zoom
