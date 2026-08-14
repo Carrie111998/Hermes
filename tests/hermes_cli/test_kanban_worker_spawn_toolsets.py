@@ -123,11 +123,16 @@ def test_default_spawn_model_override_survives_real_cli_parse(monkeypatch, tmp_p
     kb._default_spawn(task, str(workspace))
 
     parser, _subparsers, _chat_parser = build_top_level_parser()
+    # The worker may be wrapped in a transient systemd scope. Unwrap the command
+    # after ``--`` before validating the Hermes CLI contract itself.
+    worker_cmd = captured["cmd"]
+    if "--" in worker_cmd:
+        worker_cmd = worker_cmd[worker_cmd.index("--") + 1 :]
     # Profile selection is attached by the outer CLI bootstrap rather than
     # build_top_level_parser(); remove that already-validated prefix and parse
     # the worker flags/subcommand through the real shared parser.
-    assert captured["cmd"][1:3] == ["-p", "elias"]
-    args = parser.parse_args(captured["cmd"][3:])
+    assert worker_cmd[1:3] == ["-p", "elias"]
+    args = parser.parse_args(worker_cmd[3:])
 
     assert args.command == "chat"
     assert args.model == "gpt-5.6-sol"
