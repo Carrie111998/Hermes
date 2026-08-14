@@ -307,7 +307,7 @@ model:
             "api_mode": "chat_completions",
         }
 
-    def _capture_real_child(task_index, goal, child, parent_agent):
+    def _capture_real_child(task_index, goal, child, parent_agent, **_kwargs):
         observed["child"] = child
         assert isinstance(child, AIAgent)
         child = cast(Any, child)
@@ -496,7 +496,7 @@ model:
     monkeypatch.setattr("tools.delegate_tool._build_child_preserving_parent_tools", _fake_build)
     monkeypatch.setattr(
         "tools.delegate_tool._run_single_child",
-        lambda task_index, goal, child, parent_agent: {
+        lambda task_index, goal, child, parent_agent, **_kwargs: {
             "task_index": task_index,
             "status": "completed",
             "summary": "done",
@@ -609,7 +609,7 @@ model:
     monkeypatch.setattr("tools.delegate_tool._build_child_preserving_parent_tools", _fake_build)
     monkeypatch.setattr(
         "tools.delegate_tool._run_single_child",
-        lambda task_index, goal, child, parent_agent: {
+        lambda task_index, goal, child, parent_agent, **_kwargs: {
             "task_index": task_index,
             "status": "completed",
             "summary": "done",
@@ -822,7 +822,7 @@ def test_omitted_targeting_fields_preserve_legacy_child_construction(monkeypatch
     monkeypatch.setattr("tools.delegate_tool._build_child_preserving_parent_tools", _fake_build)
     monkeypatch.setattr(
         "tools.delegate_tool._run_single_child",
-        lambda task_index, goal, child, parent_agent: {
+        lambda task_index, goal, child, parent_agent, **_kwargs: {
             "task_index": task_index,
             "status": "completed",
             "summary": "legacy complete",
@@ -871,7 +871,7 @@ def test_required_toolsets_use_loaded_parent_capabilities_when_enabled_toolsets_
     monkeypatch.setattr("tools.delegate_tool._build_child_preserving_parent_tools", _fake_build)
     monkeypatch.setattr(
         "tools.delegate_tool._run_single_child",
-        lambda task_index, goal, child, parent_agent: {
+        lambda task_index, goal, child, parent_agent, **_kwargs: {
             "task_index": task_index,
             "status": "completed",
             "summary": "loaded capability complete",
@@ -923,7 +923,7 @@ def test_required_toolsets_expand_configured_parent_composites_before_preflight(
     monkeypatch.setattr("tools.delegate_tool._build_child_preserving_parent_tools", _fake_build)
     monkeypatch.setattr(
         "tools.delegate_tool._run_single_child",
-        lambda task_index, goal, child, parent_agent: {
+        lambda task_index, goal, child, parent_agent, **_kwargs: {
             "task_index": task_index,
             "status": "completed",
             "summary": "composite capability complete",
@@ -1178,7 +1178,7 @@ def test_required_toolsets_accept_configured_atomic_parent_capability(monkeypatc
     monkeypatch.setattr("tools.delegate_tool._build_child_preserving_parent_tools", _fake_child)
     monkeypatch.setattr(
         "tools.delegate_tool._run_single_child",
-        lambda task_index, goal, child, parent_agent: {
+        lambda task_index, goal, child, parent_agent, **_kwargs: {
             "task_index": task_index,
             "status": "completed",
             "summary": "atomic capability complete",
