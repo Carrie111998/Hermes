@@ -28,13 +28,22 @@ VALID_STATUSES = {"pending", "in_progress", "completed", "cancelled"}
 # replayed from caller-supplied history on the API server) from inflating the
 # re-injection block. Generous relative to real plans — a todo item is a short
 # task description, and active lists are a handful of items, not hundreds.
+MAX_TODO_ID_CHARS = 256
 MAX_TODO_CONTENT_CHARS = 4000
 MAX_TODO_ITEMS = 256
+# The complete snapshot crosses compaction as one synthetic message. Per-item
+# caps alone still let a 256-item plan refill the context with about a million
+# characters. Preserve the priority-ordered head and report omitted items.
+MAX_TODO_INJECTION_CHARS = 16_000
 # Upper bound on a single todo tool-result payload accepted during history
 # hydration. The gateway/API server replays caller-supplied conversation
 # history to rebuild the store, so an oversized forged result is dropped
 # before it is parsed and re-injected (see AIAgent._hydrate_todo_store).
 MAX_TODO_RESULT_CHARS = 512_000
+# The tool result is replayed during gateway/API hydration. Leave JSON and
+# summary overhead below the result cap instead of accepting state that the
+# next fresh agent must reject before restoring it.
+MAX_TODO_STATE_CHARS = 450_000
 _TRUNCATION_MARKER = "… [truncated]"
 # Persisted as ordinary message content. ContextCompressor uses this stable
 # header to distinguish the synthetic post-compaction row from a real user.
@@ -85,7 +94,7 @@ class TodoStore:
             # Merge mode: update existing items by id, append new ones
             existing = {item["id"]: item for item in self._items}
             for t in self._dedupe_by_id(todos):
-                item_id = str(t.get("id", "")).strip()
+                item_id = self._cap_id(str(t.get("id", "")).strip())
                 if not item_id:
                     continue  # Can't merge without an id
 
@@ -116,6 +125,7 @@ class TodoStore:
         # (list order is priority).
         if len(self._items) > MAX_TODO_ITEMS:
             self._items = self._items[:MAX_TODO_ITEMS]
+        self._bound_persisted_state()
         return self.read()
 
     def read(self) -> List[Dict[str, str]]:
@@ -154,11 +164,40 @@ class TodoStore:
             return None
 
         lines = [TODO_INJECTION_HEADER, TODO_INJECTION_RECONCILIATION_GUIDANCE]
-        for item in active_items:
+        for index, item in enumerate(active_items):
             marker = markers.get(item["status"], "[?]")
-            lines.append(f"- {marker} {item['id']}. {item['content']} ({item['status']})")
+            line = f"- {marker} {item['id']}. {item['content']} ({item['status']})"
+            omitted_count = len(active_items) - index
+            omission = (
+                f"- … {omitted_count} lower-priority active item(s) omitted; "
+                "higher-priority items were preserved."
+            )
+            if len("\n".join([*lines, line, omission])) > MAX_TODO_INJECTION_CHARS:
+                lines.append(omission)
+                break
+            lines.append(line)
 
         return "\n".join(lines)
+
+    @staticmethod
+    def _cap_id(item_id: str) -> str:
+        """Keep item identity bounded because it is persisted and re-injected."""
+        if len(item_id) > MAX_TODO_ID_CHARS:
+            keep = MAX_TODO_ID_CHARS - len(_TRUNCATION_MARKER)
+            return item_id[:keep] + _TRUNCATION_MARKER
+        return item_id
+
+    def _bound_persisted_state(self) -> None:
+        """Keep highest-priority state small enough for history hydration."""
+        total = 0
+        bounded = []
+        for item in self._items:
+            item_chars = sum(len(str(value)) for value in item.values())
+            if bounded and total + item_chars > MAX_TODO_STATE_CHARS:
+                break
+            bounded.append(item)
+            total += item_chars
+        self._items = bounded
 
     @staticmethod
     def _cap_content(content: str) -> str:
@@ -184,7 +223,7 @@ class TodoStore:
         if not isinstance(item, dict):
             return {"id": "?", "content": "(invalid item)", "status": "pending"}
 
-        item_id = str(item.get("id", "")).strip()
+        item_id = TodoStore._cap_id(str(item.get("id", "")).strip())
         if not item_id:
             item_id = "?"
 
@@ -209,7 +248,7 @@ class TodoStore:
                 # Non-dict items get a synthetic key so _validate can handle them
                 last_index[f"__invalid_{i}"] = i
                 continue
-            item_id = str(item.get("id", "")).strip() or "?"
+            item_id = TodoStore._cap_id(str(item.get("id", "")).strip()) or "?"
             last_index[item_id] = i
         return [todos[i] for i in sorted(last_index.values())]
 

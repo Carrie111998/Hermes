@@ -140,6 +140,16 @@ class TestTodoStoreBounds:
         assert len(item["content"]) <= MAX_TODO_CONTENT_CHARS
         assert item["content"].endswith("… [truncated]")
 
+    def test_oversized_id_is_truncated_before_persistence(self):
+        from tools.todo_tool import MAX_TODO_ID_CHARS
+
+        store = TodoStore()
+        store.write([{"id": "i" * 10_000, "content": "task", "status": "pending"}])
+
+        item_id = store.read()[0]["id"]
+        assert len(item_id) == MAX_TODO_ID_CHARS
+        assert item_id.endswith("… [truncated]")
+
     def test_injection_block_is_bounded(self):
         from tools.todo_tool import (
             MAX_TODO_CONTENT_CHARS,
@@ -156,6 +166,44 @@ class TestTodoStoreBounds:
             + len(TODO_INJECTION_RECONCILIATION_GUIDANCE)
             + 100
         )
+
+    def test_injection_has_an_aggregate_cap_and_keeps_priority_head(self):
+        from tools.todo_tool import MAX_TODO_INJECTION_CHARS
+
+        store = TodoStore()
+        store.write([
+            {
+                "id": str(index),
+                "content": f"priority-{index}: " + "A" * 4000,
+                "status": "pending",
+            }
+            for index in range(256)
+        ])
+
+        injection = store.format_for_injection()
+
+        assert len(injection) <= MAX_TODO_INJECTION_CHARS
+        assert "priority-0" in injection
+        assert "priority-255" not in injection
+        assert "higher-priority items were preserved" in injection
+
+    def test_maximal_store_serializes_within_hydration_limit(self):
+        from tools.todo_tool import MAX_TODO_RESULT_CHARS
+
+        store = TodoStore()
+        payload = todo_tool(
+            todos=[
+                {
+                    "id": str(index),
+                    "content": "A" * 4000,
+                    "status": "pending",
+                }
+                for index in range(256)
+            ],
+            store=store,
+        )
+
+        assert len(payload) <= MAX_TODO_RESULT_CHARS
 
 
     def test_item_count_is_bounded(self):
