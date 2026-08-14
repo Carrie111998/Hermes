@@ -56,6 +56,20 @@ _OPENROUTER_PROVIDER_SORT_VALUES = {"throughput", "latency", "price"}
 # narrower non-rate-limit case.  See issue #24996.
 _FALLBACK_EXHAUSTED_COOLDOWN_S = 5.0
 
+# The failover reasons that mean "this backend ran out of allowance" as opposed
+# to "this backend is broken". Read by try_activate_fallback() at four separate
+# decision points -- two BEHAVIORAL (the 60s primary cooldown and the #24996
+# exhausted-chain cooldown, both keyed on ``reason``) and two TELEMETRY (the
+# A1/A2 rate-limit detector hooks, keyed on ``telemetry_reason or reason``).
+# It was spelled out inline at all four, which is precisely what hid the
+# coupling between them: a change made "for telemetry" at one site silently
+# moved a behavioral branch at another. One name, one definition, four uses.
+_RATE_LIMIT_CLASS_REASONS = frozenset({
+    FailoverReason.rate_limit,
+    FailoverReason.billing,
+    FailoverReason.upstream_rate_limit,
+})
+
 
 def _ra():
     """Lazy ``run_agent`` reference.
@@ -1534,7 +1548,12 @@ def _fallback_entry_unavailable_without_network(agent, fb: dict) -> Optional[str
 
 
 
-def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool:
+def try_activate_fallback(
+    agent,
+    reason: "FailoverReason | None" = None,
+    *,
+    telemetry_reason: "FailoverReason | None" = None,
+) -> bool:
     """Switch to the next fallback model/provider in the chain.
 
     Called when the current model is failing after retries.  Swaps the
@@ -1545,8 +1564,23 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
     Uses the centralized provider router (resolve_provider_client) for
     auth resolution and client construction — no duplicated provider→key
     mappings.
+
+    ``reason`` is BEHAVIORAL. A rate-limit-class value arms
+    ``agent._rate_limited_until``, which ``restore_primary_runtime()`` reads to
+    decide whether the agent stays on the fallback — i.e. passing it changes
+    which model answers the next call.
+
+    ``telemetry_reason`` is ATTRIBUTION ONLY. It labels the failover for the
+    rate-limit detector hooks below and is deliberately invisible to every
+    behavioral branch in this function. A caller that merely *suspects* a rate
+    limit (e.g. an empty/malformed response) can therefore make the incident
+    visible without silently pinning the agent to its fallback for 60s. Do not
+    "simplify" the two into one parameter — that coupling is the bug this split
+    exists to prevent.
     """
-    if reason in {FailoverReason.rate_limit, FailoverReason.billing, FailoverReason.upstream_rate_limit}:
+    # Attribution only. Read by the A1/A2 detector hooks and NOWHERE else.
+    attributed_reason = telemetry_reason or reason
+    if reason in _RATE_LIMIT_CLASS_REASONS:
         # Only start cooldown when leaving the primary provider.  If we're
         # already on a fallback and chain-switching, the primary wasn't the
         # source of the 429 so the cooldown should not be reset/extended.
@@ -1564,13 +1598,29 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         # provider again.  Guards the cross-turn replay storm in #24996.
         if (
             len(agent._fallback_chain) > 0
-            and reason not in {FailoverReason.rate_limit, FailoverReason.billing, FailoverReason.upstream_rate_limit}
+            and reason not in _RATE_LIMIT_CLASS_REASONS
         ):
             _existing_cooldown = getattr(agent, "_rate_limited_until", 0) or 0
             agent._rate_limited_until = max(
                 _existing_cooldown,
                 time.monotonic() + _FALLBACK_EXHAUSTED_COOLDOWN_S,
             )
+        # A2 — nothing absorbed the traffic. This is the ACT case: runs stop
+        # working rather than silently degrading, and it is invisible in every
+        # other surface today.
+        if attributed_reason in _RATE_LIMIT_CLASS_REASONS:
+            try:
+                from events.rate_limit_signal import record
+                record(
+                    provider=getattr(agent, "provider", "") or "",
+                    model=getattr(agent, "model", "") or "",
+                    reason=attributed_reason.value,
+                    detector="runtime",
+                    outcome=("chain_exhausted" if agent._fallback_chain
+                             else "no_fallback"),
+                )
+            except Exception:
+                pass
         return False
     fb = agent._fallback_chain[agent._fallback_index]
     agent._fallback_index += 1
@@ -1581,11 +1631,11 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         agent._unavailable_fallback_keys = unavailable
     if fb_key in unavailable:
         logger.debug("Fallback skip: %s previously marked unavailable", fb_key)
-        return agent._try_activate_fallback(reason)
+        return agent._try_activate_fallback(reason, telemetry_reason=telemetry_reason)
     fb_provider = (fb.get("provider") or "").strip().lower()
     fb_model = (fb.get("model") or "").strip()
     if not fb_provider or not fb_model:
-        return agent._try_activate_fallback(reason)  # skip invalid, try next
+        return agent._try_activate_fallback(reason, telemetry_reason=telemetry_reason)  # skip invalid, try next
 
     local_skip_reason = _fallback_entry_unavailable_without_network(agent, fb)
     if local_skip_reason:
@@ -1596,7 +1646,7 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
             fb_model,
             local_skip_reason,
         )
-        return agent._try_activate_fallback(reason)
+        return agent._try_activate_fallback(reason, telemetry_reason=telemetry_reason)
 
     # Skip entries that resolve to the current (provider, model) — falling
     # back to the same backend that just failed loops the failure. Compare
@@ -1611,7 +1661,7 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
             "Fallback skip: chain entry %s/%s matches current provider/model",
             fb_provider, fb_model,
         )
-        return agent._try_activate_fallback(reason)
+        return agent._try_activate_fallback(reason, telemetry_reason=telemetry_reason)
     if (
         fb_base_url_for_dedup
         and current_base_url
@@ -1622,7 +1672,7 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
             "Fallback skip: chain entry base_url %s matches current backend",
             fb_base_url_for_dedup,
         )
-        return agent._try_activate_fallback(reason)
+        return agent._try_activate_fallback(reason, telemetry_reason=telemetry_reason)
 
     # Use centralized router for client construction.
     # raw_codex=True because the main agent needs direct responses.stream()
@@ -1654,7 +1704,7 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
                 "Fallback to %s failed: provider not configured",
                 fb_provider)
             unavailable.add(fb_key)
-            return agent._try_activate_fallback(reason)  # try next in chain
+            return agent._try_activate_fallback(reason, telemetry_reason=telemetry_reason)  # try next in chain
         try:
             from hermes_cli.model_normalize import normalize_model_for_provider
 
@@ -1717,6 +1767,24 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         if hasattr(agent, "_transport_cache"):
             agent._transport_cache.clear()
         agent._fallback_activated = True
+
+        # A1 — the swap succeeded: old_provider/old_model got limited and
+        # fb_provider/fb_model is absorbing the traffic. Fire-and-forget;
+        # a telemetry defect must never break a model call.
+        if attributed_reason in _RATE_LIMIT_CLASS_REASONS:
+            try:
+                from events.rate_limit_signal import record
+                record(
+                    provider=old_provider or "",
+                    model=old_model or "",
+                    reason=attributed_reason.value,
+                    detector="runtime",
+                    outcome="diverted",
+                    fallback_provider=fb_provider,
+                    fallback_model=fb_model,
+                )
+            except Exception:
+                pass
 
         # Rebind the credential pool to the fallback provider when the provider
         # changes.  Keeping the primary pool attached would make downstream
@@ -1896,7 +1964,7 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         if fb_provider == "nous":
             unavailable.add(fb_key)
         logger.error("Failed to activate fallback %s: %s", fb_model, e)
-        return agent._try_activate_fallback(reason)  # try next in chain
+        return agent._try_activate_fallback(reason, telemetry_reason=telemetry_reason)  # try next in chain
 
 
 

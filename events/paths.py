@@ -85,6 +85,16 @@ def whatsapp_throttle_path() -> Path:
     return notifications_home() / "whatsapp_throttle.json"
 
 
+def rate_limit_state_path() -> Path:
+    """Episode state for model rate limiting.
+
+    Canonical root, never profile-scoped: a provider rate limit is global,
+    so profile-scoped state would give every profile a private (and wrong)
+    view of the same outage.
+    """
+    return notifications_home() / "rate_limit_state.json"
+
+
 def cron_stale_thresholds_path() -> Path:
     """Optional per-job stale-threshold overrides (CronStaleMonitor).
 

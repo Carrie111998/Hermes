@@ -135,6 +135,32 @@ def record_nous_rate_limit(
     except Exception as exc:
         logger.debug("Failed to write Nous rate limit state: %s", exc)
 
+    # A3 — Nous 429s reach _try_activate_fallback() bare (no reason), so the
+    # runtime detector cannot see them. This is the honest detection point, and
+    # it has a real reset time from the response headers.
+    #
+    # Deliberately OUTSIDE the try above. The rate limit is a fact about the
+    # provider; whether we managed to write our own breaker file to disk is a
+    # fact about the disk. Inside the try, an atomic_replace failure (full disk,
+    # the Windows reader race) would be swallowed by that handler and the
+    # detector would never fire — coupling rate-limit visibility to an unrelated
+    # write. reset_at is computed before the try and is still in scope here.
+    try:
+        from datetime import datetime, timezone
+        from events.rate_limit_signal import record
+        record(
+            provider="nous",
+            model=os.environ.get("HERMES_NOUS_MODEL", "") or "nous-portal",
+            reason="rate_limit",
+            detector="nous_guard",
+            outcome="diverted",
+            resets_at=datetime.fromtimestamp(
+                reset_at, tz=timezone.utc
+            ).isoformat(timespec="seconds"),
+        )
+    except Exception:
+        pass
+
 
 def nous_rate_limit_remaining() -> Optional[float]:
     """Check if Nous Portal is currently rate-limited.

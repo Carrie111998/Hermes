@@ -192,6 +192,12 @@ _POLICY: Dict[EventType, _Spec] = {
     # action_required regardless of this line.
     _E.RESOURCE_PRESSURE: _Spec(Attention.WARN, SECURITY),
     _E.CODE_DRIFT: _Spec(Attention.WARN, ALERTS),           # hook: resolved → INFO
+    # Base case is the common one: the limit was hit and a fallback absorbed
+    # it, which is degraded-but-working. The conditional hook below upgrades
+    # to ACT when nothing absorbed it. Deliberately NOT ACT by default —
+    # ACT always pages WhatsApp, and paging for every successfully-diverted
+    # 429 would make this feature intolerable within a week.
+    _E.MODEL_RATE_LIMITED: _Spec(Attention.WARN, ALERTS),
     # The boot report fires only when a boot broke something (2026-07-27):
     # degraded host, not an operator action. HIGH default + WARN means it
     # survives significant_only but does not page unless emitted CRITICAL.
@@ -444,6 +450,17 @@ def classify(
     elif et == EventType.CODE_DRIFT:
         if payload.get("status") == "resolved":
             attention = Attention.INFO   # recovery — closure telemetry
+            wa = "none"
+
+    elif et == EventType.MODEL_RATE_LIMITED:
+        _outcome = (payload.get("outcome") or "").strip().lower()
+        if _outcome in {"chain_exhausted", "no_fallback"}:
+            # Nothing absorbed the traffic — runs are failing, not degrading.
+            # This is the case that needs a decision, so it pages.
+            attention = Attention.ACT
+            topic_key = ACTION_REQUIRED
+        elif _outcome == "recovered":
+            attention = Attention.INFO
             wa = "none"
 
     elif et == EventType.JOB_HIGH_SCORE:
