@@ -3509,8 +3509,31 @@ class APIServerAdapter(BasePlatformAdapter):
                 }))
                 await queue.put(_event_payload("message.started", {"message": {"id": message_id, "role": "assistant"}}))
                 history = await self._conversation_history_for_session(session_id)
+                # Optional resume seed: a deterministically-maintained state file
+                # (e.g. campaign save-state), set via HERMES_PRETURN_CONTEXT_FILE.
+                # It is for RESUMING, not for play — seeded ONLY on the very first
+                # turn of a brand-new conversation (empty history), so a new chat
+                # opens knowing exactly where the last one left off. It is NOT
+                # re-seeded mid-session, including after a compression: the recent
+                # turns are still in context there, so re-injecting the last scene
+                # would be redundant, bloat the transcript, and bust the KV cache.
+                agent_user_message = user_message
+                _ctxf = os.environ.get("HERMES_PRETURN_CONTEXT_FILE", "").strip()
+                if _ctxf and isinstance(agent_user_message, str) and agent_user_message:
+                    _marker = "[CURRENT CAMPAIGN STATE"
+                    if not history:
+                        try:
+                            with open(os.path.expanduser(_ctxf), encoding="utf-8") as _cf:
+                                _ctx = _cf.read().strip()
+                            if _ctx:
+                                agent_user_message = (
+                                    f"{agent_user_message}\n\n"
+                                    f"{_marker} — authoritative, maintained externally]\n{_ctx}"
+                                )
+                        except OSError:
+                            pass
                 result, usage = await self._run_agent(
-                    user_message=user_message,
+                    user_message=agent_user_message,
                     conversation_history=history,
                     ephemeral_system_prompt=system_prompt,
                     session_id=session_id,
@@ -3526,7 +3549,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 )
                 final_response = _resolve_media_to_data_urls(result.get("final_response", "") if isinstance(result, dict) else "")
                 effective_session_id = result.get("session_id", session_id) if isinstance(result, dict) else session_id
-                turn_messages = self._turn_transcript_messages(history, user_message, result) if isinstance(result, dict) else []
+                turn_messages = self._turn_transcript_messages(history, agent_user_message, result) if isinstance(result, dict) else []
                 effective_runtime = {}
                 if isinstance(result, dict):
                     effective_runtime = result.get("runtime") or {}
@@ -3561,6 +3584,25 @@ class APIServerAdapter(BasePlatformAdapter):
                     "usage": usage,
                     "runtime": effective_runtime,
                 }))
+                # Optional post-turn hook: fire a user-configured command as a
+                # detached, non-blocking subprocess once a turn has completed and
+                # its transcript is persisted. Set HERMES_POST_TURN_HOOK to the
+                # command (e.g. a deterministic vault-ingest script). A hook
+                # failure must never affect the turn.
+                _hook = os.environ.get("HERMES_POST_TURN_HOOK", "").strip()
+                if _hook:
+                    try:
+                        import shlex, subprocess
+                        subprocess.Popen(
+                            shlex.split(_hook),
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                            start_new_session=True,
+                            env={**os.environ,
+                                 "HERMES_TURN_SESSION_ID": str(effective_session_id or "")},
+                        )
+                    except Exception:
+                        logger.debug("[api_server] post-turn hook failed", exc_info=True)
             except Exception as exc:
                 logger.exception("[api_server] session chat stream failed")
                 await queue.put(_event_payload("error", {"message": _redact_api_error_text(exc)}))
