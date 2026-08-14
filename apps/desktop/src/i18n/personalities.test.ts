@@ -8,10 +8,10 @@ import { BUILTIN_PERSONALITIES } from '@/app/settings/constants'
 import { TRANSLATIONS } from './catalog'
 import type { Locale } from './types'
 
-// All locales the type system promises. The catalog completeness test
-// iterates over this so adding a new locale (e.g. `fr`, `ko`) automatically
-// gets the personalities-map assertion for free.
-const ALL_LOCALES: Locale[] = ['en', 'zh', 'zh-hant', 'ja', 'ar']
+// Every locale the catalog ships. Deriving from TRANSLATIONS (instead of a
+// parallel list) means adding a new locale automatically gets the
+// personalities-map assertion for free — no list to forget to update.
+const ALL_LOCALES: Locale[] = Object.keys(TRANSLATIONS) as Locale[]
 
 describe('desktop i18n — builtin personality labels', () => {
   // Every builtin ID the renderer can show in the `display.personality`
