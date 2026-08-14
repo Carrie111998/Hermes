@@ -9,11 +9,13 @@ successful transcript flush — not silently discarded (#78182, #82616).
 import json
 import logging
 import threading
+from types import SimpleNamespace
 
 import pytest
 
 from gateway import shutdown_flush
 from gateway.session import SessionStore
+from hermes_state import CompressionSessionClosedError, SessionDB
 
 
 def _make_store(db):
@@ -22,7 +24,11 @@ def _make_store(db):
     store._transcript_retry_lock = threading.Lock()
     store._dirty_transcripts = {}
     store._transcript_append_failures = {}
+    store._transcript_reroutes = {}
     store._fts_rebuild_attempted = True
+    setattr(store, "_entries", {"route": SimpleNamespace(session_id="root")})
+    setattr(store, "_lock", threading.RLock())
+    store._save = lambda: None
     return store
 
 
@@ -37,6 +43,30 @@ class BrokenThenHealedDb:
         if self.broken:
             raise RuntimeError("db unavailable")
         self.rows.append(kwargs)
+
+
+class CompressionRerouteDb:
+    """First parent write is transient; later parent writes require reroute."""
+
+    def __init__(self, replay_failures=0):
+        self.parent_attempts = 0
+        self.replay_failures = replay_failures
+        self.rows = []
+
+    def append_message(self, **kwargs):
+        if kwargs["session_id"] == "root":
+            self.parent_attempts += 1
+            if self.parent_attempts == 1:
+                raise RuntimeError("db unavailable before compression")
+            raise CompressionSessionClosedError("root")
+        if kwargs.get("content") == "older" and self.replay_failures:
+            self.replay_failures -= 1
+            raise RuntimeError("spool replay still unavailable")
+        self.rows.append(kwargs)
+
+    def find_live_compression_child(self, session_id):
+        assert session_id == "root"
+        return {"id": "child", "parent_session_id": "root"}
 
 
 @pytest.fixture()
@@ -195,6 +225,158 @@ class TestSpoolOnDrop:
         # Spool files survive the failed replay for the next attempt.
         assert len(_spool_files(spool_home)) == 3
         assert "sess-r" in getattr(store, "_spooled_drop_sessions", set())
+
+
+class TestCompressionRerouteSpool:
+    def test_real_db_runtime_reroute_replays_root_spool_into_tip(
+        self, spool_home, monkeypatch
+    ):
+        monkeypatch.setattr(SessionStore, "_MAX_PENDING_PER_SESSION", 1)
+        db = SessionDB(db_path=spool_home / "state.db")
+        try:
+            db.create_session("root", source="telegram")
+            store = _make_store(db)
+            real_append = store._append_transcript_message
+            fail_once = True
+
+            def _transient_then_real(session_id, message, **kwargs):
+                nonlocal fail_once
+                if fail_once:
+                    fail_once = False
+                    raise RuntimeError("transient writer outage")
+                return real_append(session_id, message, **kwargs)
+
+            store._append_transcript_message = _transient_then_real
+            store.append_to_transcript(
+                "root", {"role": "user", "content": "older"}
+            )
+            db.publish_compression_child(
+                parent_session_id="root",
+                child_session_id="child",
+                source="telegram",
+                messages=[{"role": "user", "content": "first summary"}],
+                require_compression_lease=False,
+            )
+            db.publish_compression_child(
+                parent_session_id="child",
+                child_session_id="tip",
+                source="telegram",
+                messages=[{"role": "user", "content": "second summary"}],
+                require_compression_lease=False,
+            )
+
+            store.append_to_transcript(
+                "root", {"role": "assistant", "content": "newer"}
+            )
+
+            assert [
+                row["content"] for row in db.get_messages_as_conversation("tip")
+            ] == ["second summary", "newer", "older"]
+            assert _spool_files(spool_home) == []
+            assert store._entries["route"].session_id == "tip"
+        finally:
+            db.close()
+
+    def test_runtime_reroute_replays_parent_spool_into_child(
+        self, spool_home, monkeypatch
+    ):
+        monkeypatch.setattr(SessionStore, "_MAX_PENDING_PER_SESSION", 1)
+        db = CompressionRerouteDb()
+        store = _make_store(db)
+
+        store.append_to_transcript(
+            "root", {"role": "user", "content": "older"}
+        )
+        store.append_to_transcript(
+            "root", {"role": "assistant", "content": "newer"}
+        )
+
+        assert [row["session_id"] for row in db.rows] == ["child", "child"]
+        assert [row["content"] for row in db.rows] == ["newer", "older"]
+        assert _spool_files(spool_home) == []
+        assert "root" not in getattr(store, "_spooled_drop_sessions", set())
+
+    def test_failed_parent_spool_replay_retries_on_future_child_append(
+        self, spool_home, monkeypatch
+    ):
+        monkeypatch.setattr(SessionStore, "_MAX_PENDING_PER_SESSION", 1)
+        db = CompressionRerouteDb(replay_failures=1)
+        store = _make_store(db)
+
+        store.append_to_transcript(
+            "root", {"role": "user", "content": "older"}
+        )
+        store.append_to_transcript(
+            "root", {"role": "assistant", "content": "newer"}
+        )
+        assert len(_spool_files(spool_home)) == 1
+
+        store.append_to_transcript(
+            "child", {"role": "assistant", "content": "future"}
+        )
+
+        assert [row["content"] for row in db.rows] == [
+            "newer",
+            "future",
+            "older",
+        ]
+        assert _spool_files(spool_home) == []
+
+    def test_startup_recovery_follows_unique_compression_lineage(
+        self, spool_home
+    ):
+        db = SessionDB(db_path=spool_home / "state.db")
+        try:
+            db.create_session("root", source="telegram")
+            db.publish_compression_child(
+                parent_session_id="root",
+                child_session_id="child",
+                source="telegram",
+                messages=[{"role": "user", "content": "first summary"}],
+                require_compression_lease=False,
+            )
+            db.publish_compression_child(
+                parent_session_id="child",
+                child_session_id="tip",
+                source="telegram",
+                messages=[{"role": "user", "content": "second summary"}],
+                require_compression_lease=False,
+            )
+            shutdown_flush.spool_dropped_transcript_message(
+                "root", {"role": "assistant", "content": "older"}
+            )
+
+            assert shutdown_flush.recover_pending_to_db(db) == 1
+            assert [
+                row["content"] for row in db.get_messages_as_conversation("tip")
+            ] == ["second summary", "older"]
+            assert _spool_files(spool_home) == []
+        finally:
+            db.close()
+
+    def test_startup_recovery_keeps_spool_when_lineage_is_ambiguous(
+        self, spool_home
+    ):
+        db = SessionDB(db_path=spool_home / "state.db")
+        try:
+            db.create_session("root", source="telegram")
+            db.end_session("root", "compression")
+            db.create_session(
+                "child-a", source="telegram", parent_session_id="root"
+            )
+            db.create_session(
+                "child-b", source="telegram", parent_session_id="root"
+            )
+            shutdown_flush.spool_dropped_transcript_message(
+                "root", {"role": "assistant", "content": "older"}
+            )
+
+            assert shutdown_flush.recover_pending_to_db(db) == 0
+            assert len(_spool_files(spool_home)) == 1
+            assert db.get_messages_as_conversation("child-a") == []
+            assert db.get_messages_as_conversation("child-b") == []
+        finally:
+            db.close()
 
 
 class TestSpoolPrimitives:

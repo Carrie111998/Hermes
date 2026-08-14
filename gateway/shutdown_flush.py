@@ -326,8 +326,10 @@ def recover_pending_to_db(
             if payload.get("reason") == "shutdown-with-unpersisted-agent-history":
                 continue
             # Cap-dropped transcript payloads carry the full message dict
-            # keyed by session_id — replay directly (#78182). This handles
-            # spool files that were never drained before a restart.
+            # keyed by session_id. Replay directly while it is writable, or
+            # follow its unique compression lineage with the same transactional
+            # root guard as the live gateway path (#78182). This handles spool
+            # files that were never drained before a restart.
             if payload.get("reason") == TRANSCRIPT_CAP_DROP_REASON:
                 data = payload.get("data", {}) or {}
                 spooled_sid = data.get("session_id", "")
@@ -339,12 +341,34 @@ def recover_pending_to_db(
                         path,
                     )
                     continue
-                session_db.append_message(
-                    session_id=spooled_sid,
-                    role=message.get("role", "unknown"),
-                    content=message.get("content") or "",
-                    timestamp=message.get("timestamp") or payload.get("ts"),
-                )
+                append_kwargs = {
+                    "role": message.get("role", "unknown"),
+                    "content": message.get("content") or "",
+                    "timestamp": message.get("timestamp") or payload.get("ts"),
+                }
+                try:
+                    session_db.append_message(
+                        session_id=spooled_sid,
+                        **append_kwargs,
+                    )
+                except Exception as append_exc:
+                    from hermes_state import CompressionSessionClosedError
+
+                    if not isinstance(
+                        append_exc, CompressionSessionClosedError
+                    ):
+                        raise
+                    child = session_db.find_live_compression_child(spooled_sid)
+                    child_id = (
+                        str(child.get("id") or "") if child else ""
+                    )
+                    if not child_id:
+                        raise
+                    session_db.append_message(
+                        session_id=child_id,
+                        compression_lineage_root=spooled_sid,
+                        **append_kwargs,
+                    )
                 recovered += 1
                 path.unlink(missing_ok=True)
                 continue

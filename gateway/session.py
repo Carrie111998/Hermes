@@ -3483,14 +3483,7 @@ class SessionStore:
             drain_lock = threading.RLock()
             self._transcript_drain_lock = drain_lock
         with drain_lock:
-            reroutes = getattr(self, "_transcript_reroutes", None)
-            if reroutes is None:
-                reroutes = {}
-                self._transcript_reroutes = reroutes
-            seen = set()
-            while session_id in reroutes and session_id not in seen:
-                seen.add(session_id)
-                session_id = reroutes[session_id]
+            session_id = self._resolve_transcript_reroute_target(session_id)
             self._append_to_transcript_serialized(session_id, message)
 
     def _append_to_transcript_serialized(
@@ -3603,6 +3596,7 @@ class SessionStore:
                                         entry.session_id = child_id
                                 self._save()
                             if not pending:
+                                self._drain_spooled_drops_for_target(child_id)
                                 return
                             msg = pending[0]
                             session_id = child_id
@@ -3660,33 +3654,78 @@ class SessionStore:
                     # DB write just succeeded and the in-memory backlog is
                     # clear: replay any cap-dropped messages spooled to disk
                     # for this session (#78182).
-                    self._drain_spooled_drops(session_id)
+                    self._drain_spooled_drops_for_target(session_id)
                     return
                 continue
 
-    def _drain_spooled_drops(self, session_id: str) -> None:
+    def _resolve_transcript_reroute_target(self, session_id: str) -> str:
+        """Follow the process-local transcript reroute chain without looping."""
+        reroutes = getattr(self, "_transcript_reroutes", None)
+        if reroutes is None:
+            reroutes = {}
+            self._transcript_reroutes = reroutes
+        seen = set()
+        while session_id in reroutes and session_id not in seen:
+            seen.add(session_id)
+            session_id = reroutes[session_id]
+        return session_id
+
+    def _drain_spooled_drops_for_target(self, target_session_id: str) -> None:
+        """Replay every tracked source spool now routed to ``target_session_id``."""
+        spooled_sessions = getattr(self, "_spooled_drop_sessions", None)
+        if not spooled_sessions:
+            return
+        for source_session_id in sorted(tuple(spooled_sessions)):
+            if (
+                self._resolve_transcript_reroute_target(source_session_id)
+                == target_session_id
+            ):
+                self._drain_spooled_drops(
+                    source_session_id,
+                    target_session_id=target_session_id,
+                )
+
+    def _drain_spooled_drops(
+        self,
+        spool_session_id: str,
+        *,
+        target_session_id: Optional[str] = None,
+    ) -> None:
         """Replay cap-dropped spooled transcript messages after DB recovery.
 
-        Best-effort: replay failures keep the spool files for the next
-        successful flush; nothing here may raise into the caller.
+        ``spool_session_id`` remains the on-disk selector. A rerouted replay
+        writes to ``target_session_id`` under the original root guard; failures
+        therefore keep both the source-keyed file and process-local reroute for
+        the next successful child flush. Nothing here may raise into the caller.
         """
         spooled_sessions = getattr(self, "_spooled_drop_sessions", None)
-        if not spooled_sessions or session_id not in spooled_sessions:
+        if not spooled_sessions or spool_session_id not in spooled_sessions:
             return
+        target_session_id = target_session_id or spool_session_id
+        lineage_kwargs = (
+            {"compression_lineage_root": spool_session_id}
+            if target_session_id != spool_session_id
+            else {}
+        )
         try:
             from gateway.shutdown_flush import drain_transcript_spool
 
             _replayed, remaining = drain_transcript_spool(
-                session_id,
+                spool_session_id,
                 lambda message: self._append_transcript_message(
-                    session_id, message
+                    target_session_id,
+                    message,
+                    **lineage_kwargs,
                 ),
             )
             if not remaining:
-                spooled_sessions.discard(session_id)
+                spooled_sessions.discard(spool_session_id)
         except Exception as exc:
             logger.warning(
-                "Failed to drain transcript spool for %s: %s", session_id, exc
+                "Failed to drain transcript spool for %s into %s: %s",
+                spool_session_id,
+                target_session_id,
+                exc,
             )
 
     def _append_transcript_message(
