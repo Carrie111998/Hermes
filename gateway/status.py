@@ -588,6 +588,8 @@ def _build_runtime_status_record() -> dict[str, Any]:
         "restart_requested": False,
         "active_agents": 0,
         "platforms": {},
+        "git_commit": None,
+        "kanban_dispatch_in_gateway": None,
         "updated_at": _utc_now_iso(),
     })
     return payload
@@ -990,6 +992,8 @@ def write_runtime_status(
     needs_attention: Any = _UNSET,
     retrying_since: Any = _UNSET,
     served_profiles: Any = _UNSET,
+    git_commit: Any = _UNSET,
+    kanban_dispatch_in_gateway: Any = _UNSET,
 ) -> None:
     """Persist gateway runtime health information for diagnostics/status."""
     path = _get_runtime_status_path()
@@ -1016,6 +1020,10 @@ def write_runtime_status(
         # for a single-profile gateway. Lets `hermes status` show per-profile
         # coverage without a second probe.
         payload["served_profiles"] = list(served_profiles or [])
+    if git_commit is not _UNSET:
+        payload["git_commit"] = git_commit
+    if kanban_dispatch_in_gateway is not _UNSET:
+        payload["kanban_dispatch_in_gateway"] = bool(kanban_dispatch_in_gateway)
 
     if platform is not _UNSET:
         platform_payload = payload["platforms"].get(platform, {})
