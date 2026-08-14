@@ -227,7 +227,7 @@ class TestContainerSystemdSupport:
 
 @pytest.mark.skipif(
     sys.platform == "win32",
-    reason="systemd user-linger is Linux-only (drives os.getuid())",
+    reason="systemd user-linger is Linux-only (drives os.getuid())",  # windows-footgun: ok
 )
 def test_systemd_install_checks_linger_status(monkeypatch, tmp_path, capsys):
     unit_path = tmp_path / "systemd" / "user" / "hermes-gateway.service"
@@ -493,6 +493,116 @@ class TestReapUnsupervisedGatewayOrphansMacOS:
 
         assert result is False  # no orphans reaped
         assert killed_pids == []  # nothing was killed
+
+
+class TestReapUnsupervisedGatewayOrphansDetached:
+    """The orphan reaper must spare detached (service-supervised) gateways.
+
+    Regression guard for #86287: on Windows there is no systemd, so the reap
+    proceeds and would SIGTERM the scheduled-task / ``gateway start`` gateway
+    (launched with ``HERMES_GATEWAY_DETACHED=1``) every time the desktop
+    backend starts — dropping the user's independently-managed gateway.
+    """
+
+    def test_detached_gateway_is_spared_but_plain_orphan_is_reaped(self, monkeypatch):
+        detached_pid = 4321
+        orphan_pid = 99998
+
+        # No service supervisor (Windows/WSL-style) → reap proceeds to the scan.
+        monkeypatch.setattr(gateway, "is_macos", lambda: False)
+        monkeypatch.setattr(gateway, "supports_systemd_services", lambda: False)
+        monkeypatch.setattr(
+            gateway,
+            "find_gateway_pids",
+            lambda exclude_pids=None: [
+                p for p in [detached_pid, orphan_pid] if p not in (exclude_pids or set())
+            ],
+        )
+        # Only the detached PID carries the supervised marker.
+        monkeypatch.setattr(
+            gateway,
+            "_is_detached_gateway_process",
+            lambda pid: pid == detached_pid,
+        )
+
+        killed_pids = []
+        monkeypatch.setattr(gateway.os, "kill", lambda pid, sig: killed_pids.append((pid, sig)))
+        monkeypatch.setattr("gateway.status._pid_exists", lambda pid: False)
+        monkeypatch.setattr("gateway.status.write_planned_stop_marker", lambda pid: None)
+        monkeypatch.setattr("time.sleep", lambda _: None)
+        monkeypatch.setattr("time.monotonic", lambda: 1.0)
+
+        result = gateway._reap_unsupervised_gateway_orphans()
+
+        assert result is True
+        killed = [pid for pid, _ in killed_pids]
+        assert orphan_pid in killed        # the real orphan was reaped
+        assert detached_pid not in killed  # the supervised gateway was spared
+
+    def test_only_detached_gateway_running_reaps_nothing(self, monkeypatch):
+        detached_pid = 4321
+
+        monkeypatch.setattr(gateway, "is_macos", lambda: False)
+        monkeypatch.setattr(gateway, "supports_systemd_services", lambda: False)
+        monkeypatch.setattr(
+            gateway,
+            "find_gateway_pids",
+            lambda exclude_pids=None: [
+                p for p in [detached_pid] if p not in (exclude_pids or set())
+            ],
+        )
+        monkeypatch.setattr(gateway, "_is_detached_gateway_process", lambda pid: True)
+
+        killed_pids = []
+        monkeypatch.setattr(gateway.os, "kill", lambda pid, sig: killed_pids.append((pid, sig)))
+
+        result = gateway._reap_unsupervised_gateway_orphans()
+
+        assert result is False
+        assert killed_pids == []
+
+
+class TestIsDetachedGatewayProcess:
+    """Unit coverage for the HERMES_GATEWAY_DETACHED probe (#86287)."""
+
+    def test_marker_truthy_values_detected(self, monkeypatch):
+        import sys as _sys
+        import types
+
+        for raw in ("1", "true", "YES", "on"):
+            fake_psutil = types.SimpleNamespace(
+                Process=lambda pid, _raw=raw: types.SimpleNamespace(
+                    environ=lambda: {"HERMES_GATEWAY_DETACHED": _raw}
+                )
+            )
+            monkeypatch.setitem(_sys.modules, "psutil", fake_psutil)
+            assert gateway._is_detached_gateway_process(4321) is True
+
+    def test_missing_or_falsey_marker_not_detached(self, monkeypatch):
+        import sys as _sys
+        import types
+
+        for env in ({}, {"HERMES_GATEWAY_DETACHED": ""}, {"HERMES_GATEWAY_DETACHED": "0"}):
+            fake_psutil = types.SimpleNamespace(
+                Process=lambda pid, _env=env: types.SimpleNamespace(environ=lambda: _env)
+            )
+            monkeypatch.setitem(_sys.modules, "psutil", fake_psutil)
+            assert gateway._is_detached_gateway_process(4321) is False
+
+    def test_environ_read_failure_falls_back_to_false(self, monkeypatch):
+        import sys as _sys
+        import types
+
+        def _boom(pid):
+            raise RuntimeError("access denied")
+
+        fake_psutil = types.SimpleNamespace(Process=_boom)
+        monkeypatch.setitem(_sys.modules, "psutil", fake_psutil)
+        assert gateway._is_detached_gateway_process(4321) is False
+
+    def test_invalid_pid_short_circuits(self):
+        assert gateway._is_detached_gateway_process(0) is False
+        assert gateway._is_detached_gateway_process(-1) is False
 
 
 def test_module_has_logger():

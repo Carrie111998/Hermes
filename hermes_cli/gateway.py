@@ -1525,6 +1525,34 @@ def kill_gateway_processes(
     return killed
 
 
+def _is_detached_gateway_process(pid: int) -> bool:
+    """Return True when a gateway PID was launched service-style (detached).
+
+    The Windows scheduled-task / service wrappers (e.g. the ``Hermes_Gateway``
+    task, ``hermes gateway start``, and the post-update windowless respawn) set
+    ``HERMES_GATEWAY_DETACHED=1`` in the gateway's environment
+    (:func:`hermes_cli.gateway_windows._build_gateway_argv` /
+    :func:`windowless_gateway_restart_spec`). Such a gateway is *supervised* by
+    its launcher, not an orphan, so the desktop backend's startup reap must not
+    kill it — otherwise opening Hermes Desktop silently SIGTERMs the user's
+    independently-managed gateway (#86287).
+
+    Best-effort: if the target process environment can't be read (no psutil,
+    permission denied on a cross-session process, process already gone) we
+    conservatively return ``False`` so the legacy reap behaviour is unchanged.
+    """
+    if pid is None or pid <= 0:
+        return False
+    try:
+        import psutil  # type: ignore
+
+        env = psutil.Process(pid).environ()
+    except Exception:
+        return False
+    detached = (env or {}).get("HERMES_GATEWAY_DETACHED", "").strip().lower()
+    return detached in {"1", "true", "yes", "on"}
+
+
 def _reap_unsupervised_gateway_orphans(extra_exclude: set | None = None) -> bool:
     """Kill no-supervisor gateway orphans the pidfile/runtime record can't see.
 
@@ -1569,6 +1597,13 @@ def _reap_unsupervised_gateway_orphans(extra_exclude: set | None = None) -> bool
         # find_gateway_pids() includes no-supervisor `gateway restart` runtimes
         # for the current profile when no systemd supervisor is present.
         orphans = [p for p in find_gateway_pids(exclude_pids=own) if p and p > 0]
+        # A detached gateway (Windows scheduled-task / service / `gateway start`
+        # launch, marked HERMES_GATEWAY_DETACHED=1) is *supervised* by its
+        # launcher, not an orphan. Reaping it would kill the user's
+        # independently-managed gateway whenever the desktop backend starts
+        # (#86287). The WSL/no-systemd `gateway restart` orphan the reap exists
+        # for (#51325) carries no such marker, so it stays reapable.
+        orphans = [p for p in orphans if not _is_detached_gateway_process(p)]
     except Exception:
         return False
     if not orphans:
