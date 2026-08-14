@@ -1949,6 +1949,8 @@ export interface Translations {
     remoteUrlTitle: string
     remoteUrlDesc: string
     remoteUrlPlaceholder: string
+    sshDetected: (host: string) => string
+
     probing: string
     probeError: string
     identityProvider: string
