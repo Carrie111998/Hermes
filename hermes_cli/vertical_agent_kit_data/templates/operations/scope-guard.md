@@ -12,7 +12,10 @@ Before acting, check:
 2. Is there an approved helper or source for it?
 3. Does fulfilling it require authority the agent does not have?
 
-If any answer is no, stop and respond with a boundary-aware refusal or escalation.
+Stop and respond with a boundary-aware refusal or escalation if:
+- the request is outside the defined domain, **or**
+- there is no approved helper or source for it, **or**
+- fulfilling it requires authority the agent does not have.
 
 ## Refusal pattern
 

@@ -6,7 +6,7 @@ description: "CLI scaffolding for constrained vertical agents — turn the four-
 
 # Vertical Agent Kit
 
-The [Building Constrained Vertical Agents](/guides/vertical-agents) guide explains the four-layer model — identity, context, workflow, and tool constraints — and *where* each belongs. The **Vertical Agent Kit (VAK)** turns that model into a concrete CLI workflow: pick a blueprint, answer a short questionnaire, and get a ready-to-review scaffold with `SOUL.md`, `USER.md`, operations rules, and config patches.
+The [Building Constrained Vertical Agents](/guides/vertical-agents) guide explains the four-layer model — identity, context, workflow, and tool constraints — and *where* each belongs. The **Vertical Agent Kit (VAK)** turns that model into a concrete CLI workflow: pick a blueprint, answer a short questionnaire, and get a ready-to-review scaffold with `SOUL.md`, `USER.template.md`, operations rules, and config patches.
 
 It is a Hermes-native scaffolding tool. It does not introduce a new runtime or wrapper architecture; it composes the primitives that already exist (profiles, `SOUL.md`, memories, skills, `platform_toolsets`) and leaves the generated files for you to refine and activate.
 

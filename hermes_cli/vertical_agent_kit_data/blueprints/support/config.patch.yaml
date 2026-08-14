@@ -7,10 +7,16 @@ skills:
     - ticket-triage
     - escalation-routing
 
-platform_toolset:
-  helpers:
-    - help_center_lookup
-    - ticket_lookup
-    - account_lookup
-  generic_tools:
-    - execute_code: disabled_by_default
+platform_toolsets:
+  cli: [web, terminal, file, skills, todo]
+
+agent:
+  disabled_toolsets:
+    - image_gen
+    - tts
+    - browser
+
+code_execution:
+  mode: strict
+  timeout: 300
+  max_tool_calls: 50

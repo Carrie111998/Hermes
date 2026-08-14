@@ -34,6 +34,7 @@ _DEFAULT_BLUEPRINTS = ["support", "research"]
 
 
 def _get_logger():
+    """Return a logger, lazily initializing from hermes_logging if available."""
     global logger
     if logger is None:
         try:
@@ -102,6 +103,17 @@ def _render_template(text: str, variables: Dict[str, str]) -> str:
     return Template(re.sub(r"\{\{(\w+)\}\}", r"${\1}", text)).safe_substitute(variables)
 
 
+def _validate_profile_name(profile_name: str) -> str:
+    """Return a safe directory name or raise ValueError for invalid input."""
+    profile_name = profile_name.strip()
+    if not profile_name or profile_name in {".", ".."}:
+        raise ValueError("Profile name cannot be empty, '.', or '..'")
+    # Reject path separators, parent references, and absolute paths.
+    if any(c in profile_name for c in "\\/:") or ".." in profile_name:
+        raise ValueError(f"Invalid profile name: {profile_name}")
+    return profile_name
+
+
 def render_blueprint(
     blueprint_name: str,
     output_dir: Path,
@@ -117,7 +129,18 @@ def render_blueprint(
     if src is None:
         raise ValueError(f"Unknown blueprint: {blueprint_name}")
 
-    dest = output_dir / variables.get("PROFILE_NAME", blueprint_name)
+    profile_name = _validate_profile_name(
+        variables.get("PROFILE_NAME", blueprint_name)
+    )
+    output_dir = output_dir.expanduser().resolve()
+    dest = output_dir / profile_name
+
+    # Ensure dest is strictly contained within output_dir.
+    try:
+        dest.relative_to(output_dir)
+    except ValueError as exc:
+        raise ValueError(f"Profile name escapes output directory: {profile_name}") from exc
+
     if dest.exists() and not overwrite:
         raise FileExistsError(f"Destination already exists: {dest}")
     if dest.exists():
@@ -204,11 +227,11 @@ def _prompt_for_variables(blueprint_name: str) -> Dict[str, str]:
 
 
 def _find_scaffold_files(path: Path) -> Dict[str, Optional[Path]]:
-    """Locate the expected files inside a scaffold directory."""
+    """Locate the expected files directly inside a scaffold directory."""
     return {
-        "SOUL.md": next(path.rglob("SOUL.md"), None),
-        "USER.template.md": next(path.rglob("USER.template.md"), None),
-        "OPERATIONS.md": next(path.rglob("OPERATIONS.md"), None),
+        "SOUL.md": path / "SOUL.md" if (path / "SOUL.md").exists() else None,
+        "USER.template.md": path / "USER.template.md" if (path / "USER.template.md").exists() else None,
+        "OPERATIONS.md": path / "OPERATIONS.md" if (path / "OPERATIONS.md").exists() else None,
     }
 
 
@@ -278,11 +301,20 @@ def _cmd_init(args: argparse.Namespace) -> int:
     """Run the init wizard and render the chosen blueprint."""
     try:
         variables = _prompt_for_variables(args.blueprint or "")
+    except (EOFError, KeyboardInterrupt):
+        print("\nAborted.", file=sys.stderr)
+        return 130
     except ValueError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
 
     output_dir = Path(variables["OUTPUT_DIR"]).expanduser().resolve()
+    try:
+        profile_name = _validate_profile_name(variables["PROFILE_NAME"])
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
     try:
         written = render_blueprint(
             variables["BLUEPRINT"],
@@ -298,7 +330,7 @@ def _cmd_init(args: argparse.Namespace) -> int:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
 
-    print(f"\n✓ Scaffolded {variables['BLUEPRINT']} agent into {output_dir / variables['PROFILE_NAME']}")
+    print(f"\n✓ Scaffolded {variables['BLUEPRINT']} agent into {output_dir / profile_name}")
     print("Files generated:")
     for f in written:
         print(f"  - {f.relative_to(output_dir)}")
@@ -308,8 +340,8 @@ def _cmd_init(args: argparse.Namespace) -> int:
         f"\nNext steps:\n"
         f"  1. Review SOUL.md, OPERATIONS.md, and USER.template.md.\n"
         f"  2. Copy USER.template.md to {user_target} if this is the default profile.\n"
-        f"  3. Create a Hermes profile: hermes profile create {variables['PROFILE_NAME']} --clone\n"
-        f"  4. Verify: hermes vertical-agent verify {output_dir / variables['PROFILE_NAME']}"
+        f"  3. Create a Hermes profile: hermes profile create {profile_name} --clone\n"
+        f"  4. Verify: hermes vertical-agent verify {output_dir / profile_name}"
     )
     return 0
 

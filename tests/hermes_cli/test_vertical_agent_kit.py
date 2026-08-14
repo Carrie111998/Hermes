@@ -6,8 +6,6 @@ scaffolds and do not touch the operator's real ``~/.hermes``.
 
 from __future__ import annotations
 
-import os
-import tempfile
 from pathlib import Path
 
 import pytest
@@ -116,7 +114,7 @@ def test_verify_scaffold_missing_files(temp_out: Path):
     assert any("Missing SOUL.md" in e for e in errors)
 
 
-def test_smoke_scaffold_passes_for_rendered(temp_out: Path):
+def test_smoke_scaffold_passes_for_rendered(temp_out: Path, monkeypatch):
     variables = {
         "PROFILE_NAME": "smoke-agent",
         "ROLE": "r",
@@ -131,10 +129,10 @@ def test_smoke_scaffold_passes_for_rendered(temp_out: Path):
     }
     render_blueprint("support", temp_out, variables)
 
+    # Simulate a host where hermes is not on PATH.
+    monkeypatch.setattr("shutil.which", lambda _cmd: None)
+
     errors, warnings = smoke_scaffold(temp_out / "smoke-agent")
-    assert not any("Missing SOUL.md" in e for e in errors)
-    assert not any("empty" in e.lower() for e in errors)
-    # Missing CLI is a warning, not an error.
-    assert all(
-        "Hermes CLI not found on PATH" in w or "file checks" in w for w in warnings
-    ) or warnings == []
+    assert errors == []
+    assert any("Hermes CLI not found on PATH" in w for w in warnings)
+
