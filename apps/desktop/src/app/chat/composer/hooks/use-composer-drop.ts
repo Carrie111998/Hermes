@@ -3,9 +3,14 @@ import { type DragEvent as ReactDragEvent, useRef, useState } from 'react'
 import { requestComposerInsert } from '@/app/chat/composer/focus'
 import { triggerHaptic } from '@/lib/haptics'
 
-import { extractDroppedFiles, HERMES_PATHS_MIME, partitionDroppedFiles } from '../../hooks/use-composer-actions'
+import { extractDroppedFiles, HERMES_PATHS_MIME, HERMES_QUOTE_MIME, partitionDroppedFiles } from '../../hooks/use-composer-actions'
 import { dragHasAttachments, droppedFileInlineRefs, type InlineRefInput } from '../inline-refs'
 import type { ChatBarProps } from '../types'
+
+/** True when the drag carries a message-bubble quote (HERMES_QUOTE_MIME).
+ * Deliberately NOT keyed on `text/plain`: foreign text/plain drags (kanban
+ * cards, external apps) must keep their existing behavior untouched. */
+const hasQuoteData = (transfer: DataTransfer) => Array.from(transfer.types || []).includes(HERMES_QUOTE_MIME)
 
 interface UseComposerDropArgs {
   cwd: ChatBarProps['cwd']
@@ -36,11 +41,11 @@ export function useComposerDrop({
   }
 
   const handleDragEnter = (event: ReactDragEvent<HTMLFormElement>) => {
-    if (!onAttachDroppedItems && !event.dataTransfer.types.includes('text/plain')) {
+    if (!onAttachDroppedItems && !hasQuoteData(event.dataTransfer)) {
       return
     }
 
-    if (!dragHasAttachments(event.dataTransfer, HERMES_PATHS_MIME) && !event.dataTransfer.types.includes('text/plain')) {
+    if (!dragHasAttachments(event.dataTransfer, HERMES_PATHS_MIME) && !hasQuoteData(event.dataTransfer)) {
       return
     }
 
@@ -53,11 +58,11 @@ export function useComposerDrop({
   }
 
   const handleDragOver = (event: ReactDragEvent<HTMLFormElement>) => {
-    if (!onAttachDroppedItems && !event.dataTransfer.types.includes('text/plain')) {
+    if (!onAttachDroppedItems && !hasQuoteData(event.dataTransfer)) {
       return
     }
 
-    if (!dragHasAttachments(event.dataTransfer, HERMES_PATHS_MIME) && !event.dataTransfer.types.includes('text/plain')) {
+    if (!dragHasAttachments(event.dataTransfer, HERMES_PATHS_MIME) && !hasQuoteData(event.dataTransfer)) {
       return
     }
 
@@ -79,7 +84,7 @@ export function useComposerDrop({
   }
 
   const handleDrop = (event: ReactDragEvent<HTMLFormElement>) => {
-    if (!onAttachDroppedItems && !event.dataTransfer.types.includes('text/plain')) {
+    if (!onAttachDroppedItems && !hasQuoteData(event.dataTransfer)) {
       return
     }
 
@@ -112,9 +117,9 @@ export function useComposerDrop({
       return
     }
 
-    // Text drop: selected message text dragged into the composer.
+    // Quote drop: selected message text dragged into the composer.
     // Insert as a quoted block (same format as "Paste as text").
-    const text = event.dataTransfer.getData('text/plain').trim()
+    const text = event.dataTransfer.getData(HERMES_QUOTE_MIME).trim()
 
     if (text) {
       requestComposerInsert(text)
@@ -123,7 +128,7 @@ export function useComposerDrop({
   }
 
   const handleInputDragOver = (event: ReactDragEvent<HTMLDivElement>) => {
-    if (!dragHasAttachments(event.dataTransfer, HERMES_PATHS_MIME) && !event.dataTransfer.types.includes('text/plain')) {
+    if (!dragHasAttachments(event.dataTransfer, HERMES_PATHS_MIME) && !hasQuoteData(event.dataTransfer)) {
       return
     }
 
@@ -133,7 +138,7 @@ export function useComposerDrop({
   }
 
   const handleInputDrop = (event: ReactDragEvent<HTMLDivElement>) => {
-    if (!dragHasAttachments(event.dataTransfer, HERMES_PATHS_MIME) && !event.dataTransfer.types.includes('text/plain')) {
+    if (!dragHasAttachments(event.dataTransfer, HERMES_PATHS_MIME) && !hasQuoteData(event.dataTransfer)) {
       return
     }
 
@@ -169,8 +174,8 @@ export function useComposerDrop({
       return
     }
 
-    // Text drop onto the input area.
-    const text = event.dataTransfer.getData('text/plain').trim()
+    // Quote drop onto the input area.
+    const text = event.dataTransfer.getData(HERMES_QUOTE_MIME).trim()
 
     if (text) {
       event.preventDefault()

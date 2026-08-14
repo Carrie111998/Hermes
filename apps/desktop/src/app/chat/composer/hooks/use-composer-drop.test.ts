@@ -2,12 +2,14 @@ import { renderHook } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { useComposerDrop } from '@/app/chat/composer/hooks/use-composer-drop'
+import { HERMES_QUOTE_MIME } from '@/app/chat/hooks/use-composer-actions'
 
-// Composer drop-handler tests for the text-drop path added alongside the
-// existing file-drop engine. A drag of selected message text carries only
-// `text/plain` — no HERMES_PATHS_MIME, no Files — and must reach the composer
-// as a quoted block via requestComposerInsert, without disturbing the
-// file-drop paths that already existed.
+// Composer drop-handler tests for the quote-drop path added alongside the
+// existing file-drop engine. A drag of selected message text carries the
+// HERMES_QUOTE_MIME marker — no HERMES_PATHS_MIME, no Files — and must reach
+// the composer as a quoted block via requestComposerInsert, without
+// disturbing the file-drop paths that already existed. Foreign text/plain
+// drags (kanban cards, external apps) must be ignored entirely.
 
 const insertComposer = vi.hoisted(() => vi.fn())
 
@@ -17,14 +19,27 @@ vi.mock('@/app/chat/composer/focus', () => ({
 
 // Minimal DataTransfer stand-in for jsdom. `types` is the only field the
 // guards read; `getData` serves the drop handlers.
-function textTransfer(text: string) {
+function quoteTransfer(text: string) {
+  return {
+    dropEffect: 'none',
+    effectAllowed: 'none',
+    files: { length: 0, item: () => null },
+    getData: (format: string) => (format === HERMES_QUOTE_MIME ? text : ''),
+    items: [] as unknown[],
+    types: text.length > 0 ? [HERMES_QUOTE_MIME] : []
+  }
+}
+
+/** A foreign text/plain drag (kanban card id, external app text) — carries
+ * NO HERMES_QUOTE_MIME and must be left alone. */
+function foreignTextTransfer(text: string) {
   return {
     dropEffect: 'none',
     effectAllowed: 'none',
     files: { length: 0, item: () => null },
     getData: (format: string) => (format === 'text/plain' ? text : ''),
     items: [] as unknown[],
-    types: text.length > 0 ? ['text/plain'] : []
+    types: ['text/plain']
   }
 }
 
@@ -45,7 +60,7 @@ function renderDrop() {
   return { insertInlineRefs, onAttachDroppedItems, requestMainFocus, result }
 }
 
-describe('useComposerDrop — text drops', () => {
+describe('useComposerDrop — quote drops', () => {
   afterEach(() => {
     vi.restoreAllMocks()
     insertComposer.mockReset()
@@ -55,7 +70,7 @@ describe('useComposerDrop — text drops', () => {
     const { result } = renderDrop()
 
     const event = {
-      dataTransfer: textTransfer('> hello world'),
+      dataTransfer: quoteTransfer('> hello world'),
       preventDefault: vi.fn(),
       stopPropagation: vi.fn()
     }
@@ -70,7 +85,7 @@ describe('useComposerDrop — text drops', () => {
     const { result } = renderDrop()
 
     const event = {
-      dataTransfer: textTransfer('  > hello world\n\n  '),
+      dataTransfer: quoteTransfer('  > hello world\n\n  '),
       preventDefault: vi.fn(),
       stopPropagation: vi.fn()
     }
@@ -80,11 +95,11 @@ describe('useComposerDrop — text drops', () => {
     expect(insertComposer).toHaveBeenCalledWith('> hello world')
   })
 
-  it('ignores an empty text drop', () => {
+  it('ignores an empty quote drop', () => {
     const { result } = renderDrop()
 
     const event = {
-      dataTransfer: textTransfer(''),
+      dataTransfer: quoteTransfer(''),
       preventDefault: vi.fn(),
       stopPropagation: vi.fn()
     }
@@ -94,11 +109,42 @@ describe('useComposerDrop — text drops', () => {
     expect(insertComposer).not.toHaveBeenCalled()
   })
 
+  it('ignores a foreign text/plain drop (kanban card, external app text)', () => {
+    const { result } = renderDrop()
+
+    const event = {
+      dataTransfer: foreignTextTransfer('task-123'),
+      preventDefault: vi.fn(),
+      stopPropagation: vi.fn()
+    }
+
+    result.current.handleDrop(event as unknown as React.DragEvent<HTMLFormElement>)
+
+    // The quote never reaches the composer. (preventDefault alone matches the
+    // pre-existing file-drop path: with an attach handler wired, any drop is
+    // swallowed — what matters is that no insertion happens.)
+    expect(insertComposer).not.toHaveBeenCalled()
+  })
+
+  it('ignores a foreign text/plain drag-over on the form', () => {
+    const { result } = renderDrop()
+
+    const event = {
+      dataTransfer: foreignTextTransfer('task-123'),
+      preventDefault: vi.fn(),
+      stopPropagation: vi.fn()
+    }
+
+    result.current.handleDragOver(event as unknown as React.DragEvent<HTMLFormElement>)
+
+    expect(event.preventDefault).not.toHaveBeenCalled()
+  })
+
   it('inserts text dropped onto the input area', () => {
     const { result } = renderDrop()
 
     const event = {
-      dataTransfer: textTransfer('> from input drop'),
+      dataTransfer: quoteTransfer('> from input drop'),
       preventDefault: vi.fn(),
       stopPropagation: vi.fn()
     }
@@ -109,11 +155,11 @@ describe('useComposerDrop — text drops', () => {
     expect(event.stopPropagation).toHaveBeenCalled()
   })
 
-  it('text drag-over accepts the drop with copy effect on the form', () => {
+  it('quote drag-over accepts the drop with copy effect on the form', () => {
     const { result } = renderDrop()
 
     const event = {
-      dataTransfer: textTransfer('> hello'),
+      dataTransfer: quoteTransfer('> hello'),
       preventDefault: vi.fn(),
       stopPropagation: vi.fn()
     }
@@ -124,11 +170,11 @@ describe('useComposerDrop — text drops', () => {
     expect(event.dataTransfer.dropEffect).toBe('copy')
   })
 
-  it('text drag-over accepts the drop on the input area', () => {
+  it('quote drag-over accepts the drop on the input area', () => {
     const { result } = renderDrop()
 
     const event = {
-      dataTransfer: textTransfer('> hello'),
+      dataTransfer: quoteTransfer('> hello'),
       preventDefault: vi.fn(),
       stopPropagation: vi.fn()
     }
@@ -140,7 +186,7 @@ describe('useComposerDrop — text drops', () => {
     expect(event.dataTransfer.dropEffect).toBe('copy')
   })
 
-  it('text drops work even when no attach handler is wired', () => {
+  it('quote drops work even when no attach handler is wired', () => {
     const insertInlineRefs = vi.fn(() => false)
     const requestMainFocus = vi.fn()
 
@@ -154,7 +200,7 @@ describe('useComposerDrop — text drops', () => {
     )
 
     const event = {
-      dataTransfer: textTransfer('> still works'),
+      dataTransfer: quoteTransfer('> still works'),
       preventDefault: vi.fn(),
       stopPropagation: vi.fn()
     }
@@ -164,7 +210,7 @@ describe('useComposerDrop — text drops', () => {
     expect(insertComposer).toHaveBeenCalledWith('> still works')
   })
 
-  it('does not throw when a mixed files+text drag arrives with no attach handler wired', () => {
+  it('does not throw when a mixed files+quote drag arrives with no attach handler wired', () => {
     const insertInlineRefs = vi.fn(() => false)
     const requestMainFocus = vi.fn()
 
@@ -177,7 +223,7 @@ describe('useComposerDrop — text drops', () => {
       })
     )
 
-    // A drag carrying BOTH a file and text/plain: the text/plain guard lets it
+    // A drag carrying BOTH a file and the quote MIME: the quote guard lets it
     // through the top-level check, the file branch runs, but there is no
     // attach handler to hand osDrops to. Regression guard for the TypeError
     // that used to fire on `onAttachDroppedItems!(osDrops)`.
@@ -186,9 +232,9 @@ describe('useComposerDrop — text drops', () => {
         dropEffect: 'none',
         effectAllowed: 'none',
         files: { length: 1, item: () => new File(['x'], 'notes.txt') },
-        getData: (format: string) => (format === 'text/plain' ? '> text' : ''),
+        getData: (format: string) => (format === HERMES_QUOTE_MIME ? '> text' : ''),
         items: [{ kind: 'file', getAsFile: () => new File(['x'], 'notes.txt'), webkitGetAsEntry: () => null }],
-        types: ['Files', 'text/plain']
+        types: ['Files', HERMES_QUOTE_MIME]
       },
       preventDefault: vi.fn(),
       stopPropagation: vi.fn()

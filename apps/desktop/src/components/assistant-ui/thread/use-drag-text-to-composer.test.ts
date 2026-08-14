@@ -1,6 +1,7 @@
 import { renderHook } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
+import { HERMES_QUOTE_MIME } from '@/app/chat/hooks/use-composer-actions'
 import { useDragTextToComposer } from '@/components/assistant-ui/thread/use-drag-text-to-composer'
 
 // The drag-text-to-composer hook is a thin wrapper around the HTML5 Drag and
@@ -65,14 +66,16 @@ describe('useDragTextToComposer', () => {
     }
   }
 
-  it('sets text/plain with quoted text on dragstart', () => {
+  it('sets text/plain AND the quote MIME on dragstart', () => {
     const { result } = renderHook(() => useDragTextToComposer())
     const event = createDragEvent('hello world')
 
     result.current.onDragStart(event as unknown as React.DragEvent<HTMLElement>)
 
     expect(event.dataTransfer.effectAllowed).toBe('copy')
+    // text/plain for OS interop, HERMES_QUOTE_MIME as the composer's marker
     expect(event.dataTransfer.getData('text/plain')).toBe('> hello world')
+    expect(event.dataTransfer.getData(HERMES_QUOTE_MIME)).toBe('> hello world')
   })
 
   it('quotes each line separately', () => {

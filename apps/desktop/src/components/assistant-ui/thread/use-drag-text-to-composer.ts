@@ -1,5 +1,6 @@
 import { useCallback } from 'react'
 
+import { HERMES_QUOTE_MIME } from '@/app/chat/hooks/use-composer-actions'
 import { createDragGhost, type DragGhost } from '@/lib/drag-ghost'
 
 import { hasTextSelection } from './selection'
@@ -73,7 +74,11 @@ export function useDragTextToComposer() {
       .join('\n')
 
     event.dataTransfer.effectAllowed = 'copy'
+    // text/plain keeps the drag interop with OS-level targets; HERMES_QUOTE_MIME
+    // is the marker the composer's drop handler keys on, so foreign text/plain
+    // drags (kanban cards, external apps) keep their existing behavior.
     event.dataTransfer.setData('text/plain', quoted)
+    event.dataTransfer.setData(HERMES_QUOTE_MIME, quoted)
 
     // Drag ghost: a flat, pointer-following chip showing what's being dragged.
     // Truncate to ~40 chars so the chip stays compact. Release any stale ghost
