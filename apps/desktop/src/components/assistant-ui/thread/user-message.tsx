@@ -77,6 +77,37 @@ export const StopGlyph = <StopFilled aria-hidden className="size-3.5 -translate-
 // Shape: see tools/process_registry.py format_process_notification().
 const PROCESS_NOTIFICATION_RE = /^\[IMPORTANT: Background process [\s\S]*\]$/
 
+// Agent-to-agent deliveries ("Message from 🤖 <sender>: …", the Bot Mode /
+// multi-profile convention; legacy "[Message from agent '<sender>'] …" too).
+// They arrive on the user role because the recipient's turn runs on it, but
+// they are NOT the human speaking — render them as an attributed inter-agent
+// card instead of a user bubble.
+export const AGENT_MESSAGE_RE = /^(?:Message from (?:🤖\s*)?([^:\n]{1,64}):\s*|\[Message from agent '([^']{1,64})'\]\s*)([\s\S]*)$/u
+
+const AgentMessageNote: FC<{ text: string }> = ({ text }) => {
+  const match = AGENT_MESSAGE_RE.exec(text)
+  const sender = (match?.[1] || match?.[2] || 'agent').trim()
+  const body = (match?.[3] || '').trim()
+
+  return (
+    <div
+      className="flex w-full min-w-0 max-w-[min(92%,48rem)] flex-col gap-1 self-start rounded-xl border border-(--ui-stroke-tertiary) bg-(--ui-bg-secondary,rgba(255,255,255,0.03)) px-3 py-2"
+      data-slot="aui_agent-message-note"
+    >
+      <span className="flex items-center gap-1.5 text-[0.6875rem] font-medium uppercase tracking-wider text-(--ui-text-tertiary)">
+        <span aria-hidden className="text-[0.8125rem] leading-none">
+          🤖
+        </span>
+        <span className="wrap-anywhere normal-case">{sender}</span>
+        <span className="font-normal normal-case tracking-normal text-(--ui-text-quaternary)">· agent message</span>
+      </span>
+      <span className="wrap-anywhere text-[length:var(--conversation-text-font-size)] leading-(--dt-line-height) text-foreground/90">
+        <UserMessageText text={body || text} />
+      </span>
+    </div>
+  )
+}
+
 const ProcessNotificationNote: FC<{ text: string }> = ({ text }) => {
   const body = text.replace(/^\[IMPORTANT:\s*/, '').replace(/\]$/, '')
   const newline = body.indexOf('\n')
@@ -225,6 +256,19 @@ export const UserMessage: FC<{
         data-slot="aui_user-message-root"
       >
         <ProcessNotificationNote text={messageText.trim()} />
+      </MessagePrimitive.Root>
+    )
+  }
+
+  // Agent-to-agent delivery, not a human prompt — attributed inter-agent card.
+  if (AGENT_MESSAGE_RE.test(messageText.trim())) {
+    return (
+      <MessagePrimitive.Root
+        className="flex w-full min-w-0 flex-col items-stretch pb-(--conversation-turn-gap)"
+        data-role="user"
+        data-slot="aui_user-message-root"
+      >
+        <AgentMessageNote text={messageText.trim()} />
       </MessagePrimitive.Root>
     )
   }
