@@ -1532,12 +1532,16 @@ def classify_persistence_error(exc_or_str) -> str:
     # survived RPC wrapping).
     if isinstance(exc_or_str, SessionTurnLeaseLostError):
         return "turn_lease"
-    if isinstance(exc_or_str, CompressionSessionBusyError):
+    if isinstance(exc_or_str, (CompressionSessionBusyError, CompressionSessionClosedError)):
         return "compression"
     text = str(exc_or_str).lower()
     if "turn lease" in text:
         return "turn_lease"
-    if "being compressed" in text or "compression lease" in text:
+    if (
+        "being compressed" in text
+        or "compression lease" in text
+        or "closed by compression" in text
+    ):
         return "compression"
     if (
         "locked" in text
