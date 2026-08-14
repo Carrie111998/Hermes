@@ -4951,6 +4951,31 @@ def launchd_stop():
     print("✓ Service stopped")
 
 
+# Graceful-stop budget the CLI must not pre-empt.
+#
+# Every service manager we install already grants the gateway a drain window
+# before escalating SIGTERM -> SIGKILL itself: the launchd plist sets
+# ``ExitTimeOut`` to 25s (see the template in ``generate_launchd_plist``) and
+# the systemd unit sets ``TimeoutStopSec`` to ``max(60, drain + 30)``. 25s is
+# therefore the smallest budget any installed manager honours, and the CLI
+# must not force-kill inside it.
+#
+# The budget is not cosmetic. ``gateway/run.py`` runs its post-drain teardown
+# after the drain completes -- closing the SQLite session databases (releasing
+# the WAL write lock), removing the PID file, releasing the runtime lock, and
+# finally touching the ``.clean_shutdown`` marker. A SIGKILL sent inside the
+# budget skips all of it, so the next start finds a held WAL lock
+# ("database is locked"), a stale PID ("bot token already in use (PID ...)"),
+# and a missing ``.clean_shutdown`` marker, which suspends recently-active
+# sessions.
+_GATEWAY_STOP_GRACE_SECONDS = 25.0
+
+# Total time to wait for exit: the grace budget plus headroom to observe the
+# escalation actually land. The wait returns as soon as the PID is gone, so
+# this is a ceiling on a wedged stop, not an added delay on a healthy one.
+_GATEWAY_STOP_WAIT_SECONDS = _GATEWAY_STOP_GRACE_SECONDS + 5.0
+
+
 def _wait_for_gateway_exit(
     timeout: float = 10.0, force_after: float | None = 5.0
 ) -> bool:
