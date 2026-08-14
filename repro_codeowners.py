@@ -18,10 +18,12 @@ if not codeowners.exists():
     sys.exit(1)
 
 text = codeowners.read_text(encoding="utf-8")
-workflow_covered = any(
-    line.strip() and not line.strip().startswith("#") and "workflow" in line
+lines = {
+    line.strip()
     for line in text.splitlines()
-)
+    if line.strip() and not line.lstrip().startswith("#")
+}
+workflow_covered = ".github/workflows/ @NousResearch/hermes-maintainers" in lines
 if workflow_covered:
     print("PASS: workflow paths covered by CODEOWNERS")
     sys.exit(0)
