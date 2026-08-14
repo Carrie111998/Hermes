@@ -147,6 +147,21 @@ describe('useDragTextToComposer', () => {
     expect(ghostCount()).toBe(0)
   })
 
+  it('shows a line count in the ghost for multi-line selections', () => {
+    const { result } = renderHook(() => useDragTextToComposer())
+    const event = createDragEvent('line one\nline two')
+
+    result.current.onDragStart(event as unknown as React.DragEvent<HTMLElement>)
+
+    const ghost = Array.from(document.body.children).find(
+      el => (el as HTMLElement).style.position === 'fixed'
+    ) as HTMLElement | undefined
+
+    expect(ghost?.textContent).toContain('2 lines')
+
+    result.current.onDragEnd()
+  })
+
   it('releases the ghost via the document-level dragend listener even after the component unmounts', () => {
     const { result, unmount } = renderHook(() => useDragTextToComposer())
     const event = createDragEvent('survives unmount')

@@ -96,10 +96,14 @@ export function useDragTextToComposer() {
     event.dataTransfer.setData(HERMES_QUOTE_MIME, quoted)
 
     // Drag ghost: a flat, pointer-following chip showing what's being dragged.
-    // Truncate to ~40 chars so the chip stays compact. Release any stale ghost
-    // first (a previous drag whose dragend was swallowed).
+    // Truncate the preview to ~40 chars; multi-line selections get a line
+    // count so a selection that spans message bubbles is identifiable at a
+    // glance (the payload is the live document selection — what-you-see-is-
+    // what-you-drag, matching native Chromium drag-text behavior).
     releaseGhost()
-    activeGhost = createDragGhost(text.length > 40 ? text.slice(0, 40) + '…' : text)
+    const preview = text.length > 40 ? text.slice(0, 40) + '…' : text
+    const label = lines.length > 1 ? `${preview} (${lines.length} lines)` : preview
+    activeGhost = createDragGhost(label)
     activeGhost.moveTo(event.clientX, event.clientY)
   }, [])
 
