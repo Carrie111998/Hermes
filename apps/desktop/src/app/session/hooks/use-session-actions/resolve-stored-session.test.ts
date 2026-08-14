@@ -151,6 +151,66 @@ describe('resolveStoredSession profile ownership', () => {
     expect(mockGetSession).toHaveBeenNthCalledWith(2, 's1', 'default')
   })
 
+  it('recovers a materialized twin when the uncached active-backend hit is the legacy shadow', async () => {
+    const activeShadow = session({
+      id: 's1',
+      message_count: 0,
+      profile: 'meta',
+      source: 'unknown',
+      title: 'Real conversation'
+    })
+
+    const materialized = session({
+      id: 's1',
+      message_count: 4,
+      profile: 'default',
+      source: 'desktop',
+      title: 'Real conversation'
+    })
+
+    mockGetSession.mockResolvedValueOnce(activeShadow)
+    mockGetSession.mockResolvedValueOnce(materialized)
+
+    const resolved = await resolveStoredSession('s1')
+
+    expect(resolved).toBe(materialized)
+    expect($sessions.get()[0]).toBe(materialized)
+    expect(mockGetSession).toHaveBeenNthCalledWith(1, 's1')
+    expect(mockGetSession).toHaveBeenNthCalledWith(2, 's1', 'default')
+  })
+
+  it('recovers a later materialized twin when the first scoped probe yields the legacy shadow', async () => {
+    $profiles.set(profiles('meta', 'other', 'default'))
+
+    const probedShadow = session({
+      id: 's1',
+      message_count: 0,
+      profile: 'other',
+      source: 'unknown',
+      title: 'Real conversation'
+    })
+
+    const materialized = session({
+      id: 's1',
+      message_count: 4,
+      profile: 'default',
+      source: 'desktop',
+      title: 'Real conversation'
+    })
+
+    mockGetSession.mockRejectedValueOnce(new Error('404: Session not found'))
+    mockGetSession.mockResolvedValueOnce(probedShadow)
+    mockGetSession.mockResolvedValueOnce(materialized)
+
+    const resolved = await resolveStoredSession('s1')
+
+    expect(resolved).toBe(materialized)
+    expect($sessions.get()[0]).toBe(materialized)
+    expect(mockGetSession).toHaveBeenNthCalledWith(1, 's1')
+    expect(mockGetSession).toHaveBeenNthCalledWith(2, 's1', 'other')
+    expect(mockGetSession).toHaveBeenNthCalledWith(3, 's1', 'default')
+  })
+
   it('keeps probing past an earlier zero-message known-source for a transcript-bearing twin', async () => {
     // Profile order meta → other → default: remember the first known-source
     // (desktop/0) compression-root candidate, but keep probing so a later
@@ -278,6 +338,8 @@ describe('resolveStoredSession profile ownership', () => {
   })
 
   it('keeps a titled empty unknown row when no other profile owns a materialized twin', async () => {
+    const newer = session({ id: 'newer', profile: 'meta' })
+
     const emptyDraft = session({
       id: 's1',
       message_count: 0,
@@ -286,7 +348,9 @@ describe('resolveStoredSession profile ownership', () => {
       title: 'Untitled draft'
     })
 
-    $sessions.set([emptyDraft])
+    const older = session({ id: 'older', profile: 'default' })
+
+    $sessions.set([newer, emptyDraft, older])
     mockGetSession.mockResolvedValueOnce(emptyDraft)
     mockGetSession.mockRejectedValueOnce(new Error('404: Session not found'))
 
@@ -296,7 +360,8 @@ describe('resolveStoredSession profile ownership', () => {
     expect(resolved?.message_count).toBe(0)
     expect(resolved?.source).toBe('unknown')
     expect(resolved?.title).toBe('Untitled draft')
-    expect($sessions.get().find(s => s.id === 's1')?.profile).toBe('meta')
+    expect($sessions.get().map(row => row.id)).toEqual(['s1', 'newer', 'older'])
+    expect($sessions.get()[0]).toBe(emptyDraft)
     expect(mockGetSession).toHaveBeenNthCalledWith(1, 's1')
     expect(mockGetSession).toHaveBeenNthCalledWith(2, 's1', 'default')
   })
@@ -348,6 +413,23 @@ describe('resolveStoredSession profile ownership', () => {
         title: 'Different conversation'
       })
     )
+
+    const resolved = await resolveStoredSession('s1')
+
+    expect(resolved).toBe(ambiguous)
+    expect(mockGetSession).not.toHaveBeenCalled()
+  })
+
+  it('does not treat a whitespace-only title as the legacy title shadow', async () => {
+    const ambiguous = session({
+      id: 's1',
+      message_count: 0,
+      profile: 'meta',
+      source: 'unknown',
+      title: '   '
+    })
+
+    $sessions.set([ambiguous])
 
     const resolved = await resolveStoredSession('s1')
 
@@ -449,6 +531,34 @@ describe('resolveStoredSession profile ownership', () => {
     expect(resolved?.profile).toBe('default')
     expect(resolved?.message_count).toBe(4)
     expect(resolved?.source).toBe('desktop')
+    expect(mockGetSession).toHaveBeenNthCalledWith(1, 's1')
+    expect(mockGetSession).toHaveBeenNthCalledWith(2, 's1', 'default')
+  })
+
+  it('defers a titled unknown/0 shadow when message_count is a padded numeric string zero', async () => {
+    const emptyShadow = sessionFromRuntimeJson({
+      id: 's1',
+      message_count: ' 0 ',
+      profile: 'meta',
+      source: 'unknown',
+      title: 'Real conversation'
+    })
+
+    const materialized = session({
+      id: 's1',
+      message_count: 4,
+      profile: 'default',
+      source: 'desktop',
+      title: 'Real conversation'
+    })
+
+    $sessions.set([emptyShadow])
+    mockGetSession.mockResolvedValueOnce(emptyShadow)
+    mockGetSession.mockResolvedValueOnce(materialized)
+
+    const resolved = await resolveStoredSession('s1')
+
+    expect(resolved).toBe(materialized)
     expect(mockGetSession).toHaveBeenNthCalledWith(1, 's1')
     expect(mockGetSession).toHaveBeenNthCalledWith(2, 's1', 'default')
   })
@@ -566,7 +676,7 @@ describe('resolveStoredSession profile ownership', () => {
       })
 
       $sessions.set([row])
-      mockGetSession.mockReset()
+      mockGetSession.mockClear()
 
       const resolved = await resolveStoredSession('s1')
 
