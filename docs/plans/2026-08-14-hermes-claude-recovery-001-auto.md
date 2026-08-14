@@ -1,6 +1,6 @@
 ---
 title: "HERMES-CLAUDE-RECOVERY-001: safe Claude Remote Control recovery"
-status: IMPLEMENTED_PENDING_CI
+status: MERGED_DEPLOYED
 date: 2026-08-14
 type: reliability
 ticket: HERMES-CLAUDE-RECOVERY-001
@@ -98,8 +98,20 @@ Hermes-scoped session.
   verified the committed source and regression test behavior. Consensus reached
   on the correction set; no KLIB session was repurposed and no permission bypass
   was used.
-- The external-review blocker is resolved. Current gate is
-  `IMPLEMENTED_PENDING_CI`; no PR, merge, deployment, or scheduled-task
-  enablement has occurred.
+- GitHub CI rerun `31768361031` passed all required checks, including 8/8
+  Python test slices, lints, security scans, e2e, and common-ancestor checks.
+- PR #12 merged into `main` at
+  `7018f93aaee7aa0319ee342ea860ad90da206c9b`.
+- DGX deployment used isolated release
+  `/home/cwliao/.hermes/releases/v2026.8.14-hermes-claude-recovery-7018f93aaee`
+  with the merged SHA and archive checksum markers. Remote `compileall`
+  passed before activation.
+- The service now uses drop-in
+  `25-hermes-claude-recovery-7018f93aa.conf`; verified MainPID `1969858`,
+  active/running state, `ExecMainStatus=0`, `NRestarts=0`, matching cwd and
+  `PYTHONPATH`, and no Traceback/ERROR for the new PID. Rollback is preserved
+  by the preceding drop-in and release snapshot.
+- Ticket status is `MERGED_DEPLOYED`; no Hermes-scoped scheduled task was
+  enabled and no Telegram end-to-end readiness claim is made.
 - Existing KLIB-scoped Claude recovery evidence is not reused as Hermes
   readiness evidence.
