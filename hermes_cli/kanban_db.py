@@ -10265,6 +10265,11 @@ def _resolve_worker_cli_toolsets(hermes_home: Optional[str]) -> Optional[list[st
             toolsets = sorted(_get_platform_tools(cfg, "cli"))
         finally:
             reset_hermes_home_override(token)
+        # ``kanban`` is configurable and default-off for ordinary sessions,
+        # but dispatcher workers must always retain their task-scoped lifecycle
+        # surface regardless of the assignee profile's chat configuration.
+        if "kanban" not in toolsets:
+            toolsets.append("kanban")
         return toolsets or None
     except Exception as exc:
         _log.debug(
