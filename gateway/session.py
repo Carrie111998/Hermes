@@ -3563,7 +3563,11 @@ class SessionStore:
                     child_id = str(child["id"]) if child and child.get("id") else ""
                     if child_id:
                         try:
-                            self._append_transcript_message(child_id, msg)
+                            self._append_transcript_message(
+                                child_id,
+                                msg,
+                                compression_lineage_root=session_id,
+                            )
                         except Exception as reroute_exc:
                             exc = reroute_exc
                         else:
@@ -3685,7 +3689,13 @@ class SessionStore:
                 "Failed to drain transcript spool for %s: %s", session_id, exc
             )
 
-    def _append_transcript_message(self, session_id: str, message: Dict[str, Any]) -> None:
+    def _append_transcript_message(
+        self,
+        session_id: str,
+        message: Dict[str, Any],
+        *,
+        compression_lineage_root: Optional[str] = None,
+    ) -> None:
         """Write one transcript row. Caller handles retry queuing."""
         self._db.append_message(
             session_id=session_id,
@@ -3712,6 +3722,7 @@ class SessionStore:
             # #82888). DB-only; stripped from provider-bound payloads.
             display_kind=message.get("display_kind"),
             display_metadata=message.get("display_metadata"),
+            compression_lineage_root=compression_lineage_root,
         )
 
     # Maximum in-memory pending messages per session before dropping the

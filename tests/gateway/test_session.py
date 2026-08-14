@@ -1373,6 +1373,50 @@ class TestGatewaySessionDbRecovery:
         ]
         db.close()
 
+    def test_compression_closed_ancestor_reroutes_to_unique_live_tip(self, tmp_path):
+        import threading
+        from types import SimpleNamespace
+
+        db = SessionDB(db_path=tmp_path / "state.db")
+        db.create_session("root", source="telegram")
+        db.publish_compression_child(
+            parent_session_id="root",
+            child_session_id="child",
+            source="telegram",
+            messages=[{"role": "user", "content": "first summary"}],
+            require_compression_lease=False,
+        )
+        db.publish_compression_child(
+            parent_session_id="child",
+            child_session_id="grandchild",
+            source="telegram",
+            messages=[{"role": "user", "content": "second summary"}],
+            require_compression_lease=False,
+        )
+
+        store = object.__new__(SessionStore)
+        store._db = db
+        store._lock = threading.RLock()
+        store._entries = {"route": SimpleNamespace(session_id="root")}
+        store._loaded = True
+        store._save = lambda: None
+        store._transcript_retry_lock = threading.Lock()
+        store._dirty_transcripts = {}
+        store._transcript_append_failures = {}
+        store._transcript_reroutes = {}
+        store._fts_rebuild_attempted = False
+
+        store.append_to_transcript(
+            "root", {"role": "assistant", "content": "routed to live tip"}
+        )
+
+        assert store._entries["route"].session_id == "grandchild"
+        assert "root" not in store._dirty_transcripts
+        assert [
+            m["content"] for m in db.get_messages_as_conversation("grandchild")
+        ] == ["second summary", "routed to live tip"]
+        db.close()
+
     def test_transcript_reroute_migrates_remaining_backlog_to_child(self):
         import threading
         from types import SimpleNamespace
@@ -1401,10 +1445,14 @@ class TestGatewaySessionDbRecovery:
         child_attempts = []
         failed_old_2 = False
 
-        def _append(session_id, message):
+        def _append(
+            session_id, message, *, compression_lineage_root=None
+        ):
             nonlocal failed_old_2
             if session_id == "parent":
                 raise CompressionSessionClosedError("parent")
+            if message["content"] == "old-1":
+                assert compression_lineage_root == "parent"
             child_attempts.append(message["content"])
             if message["content"] == "old-2" and not failed_old_2:
                 failed_old_2 = True

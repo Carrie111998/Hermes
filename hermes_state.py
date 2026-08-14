@@ -4918,23 +4918,16 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         "  AND COALESCE({alias}source, '') != 'tool'\n"
     )
 
-    def find_live_compression_child(
-        self, parent_session_id: str
+    def _find_live_compression_child_on_conn(
+        self, conn, parent_session_id: str
     ) -> Optional[Dict[str, Any]]:
-        """Return the unique live direct child of a compression-ended session.
-
-        A stale agent may observe that another compression path already rotated
-        its parent. Recovery is safe only when the durable lineage identifies
-        exactly one live direct continuation. Multiple children are treated as
-        ambiguous and fail closed rather than guessing which transcript owns
-        subsequent messages.
-        """
-        if not parent_session_id:
-            return None
-        with self._lock:
-            parent = self._conn.execute(
+        """Resolve a unique continuation tip on the caller's SQLite snapshot."""
+        current = parent_session_id
+        seen = {current}
+        for _ in range(100):
+            parent = conn.execute(
                 "SELECT ended_at, end_reason FROM sessions WHERE id = ?",
-                (parent_session_id,),
+                (current,),
             ).fetchone()
             if (
                 parent is None
@@ -4942,7 +4935,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 or parent["end_reason"] != "compression"
             ):
                 return None
-            rows = self._conn.execute(
+            rows = conn.execute(
                 """
                 SELECT s.*,
                        COALESCE(sp.prompt, s.system_prompt)
@@ -4950,16 +4943,57 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 FROM sessions s
                 LEFT JOIN system_prompts sp ON sp.hash = s.system_prompt_hash
                 WHERE s.parent_session_id = ?
-                  AND s.ended_at IS NULL
                 """
                 + self._NON_CONTINUATION_CHILD_FILTER_SQL.format(alias="s.")
                 + """
                 ORDER BY s.started_at ASC
                 LIMIT 2
                 """,
-                (parent_session_id, parent_session_id, parent_session_id),
+                (current, current, current),
             ).fetchall()
-        return self._session_row_dict(rows[0]) if len(rows) == 1 else None
+            if len(rows) != 1:
+                return None
+            child = rows[0]
+            child_session_id = str(child["id"] or "")
+            if not child_session_id or child_session_id in seen:
+                return None
+            if child["ended_at"] is None:
+                return self._session_row_dict(child)
+            if child["end_reason"] != "compression":
+                return None
+            seen.add(child_session_id)
+            current = child_session_id
+        return None
+
+    def find_live_compression_child(
+        self, parent_session_id: str
+    ) -> Optional[Dict[str, Any]]:
+        """Return the unique live tip of a compression continuation chain.
+
+        A stale agent may lag behind several completed compression rotations.
+        Recovery is safe only when every durable edge from the stale parent to
+        the live tip has exactly one canonical continuation. Any sibling,
+        cycle, missing handoff, or non-compression closure is ambiguous and
+        fails closed rather than guessing which transcript owns subsequent
+        messages. The complete walk uses one SQLite read snapshot so concurrent
+        writers cannot splice together observations from different lineages.
+        """
+        if not parent_session_id:
+            return None
+        with self._lock:
+            conn = self._conn
+            if conn is None:
+                return None
+            owns_transaction = not conn.in_transaction
+            if owns_transaction:
+                conn.execute("BEGIN")
+            try:
+                return self._find_live_compression_child_on_conn(
+                    conn, parent_session_id
+                )
+            finally:
+                if owns_transaction:
+                    conn.rollback()
 
     def reopen_orphaned_compression_session(self, session_id: str) -> bool:
         """Reopen a compression parent only when no continuation was published.
@@ -8024,14 +8058,20 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         return None
 
     def _check_transcript_write_guards(
-        self, conn, session_id: str, compression_lock_holder: Optional[str]
+        self,
+        conn,
+        session_id: str,
+        compression_lock_holder: Optional[str],
+        compression_lineage_root: Optional[str] = None,
     ) -> None:
         """Transcript-append admission checks, run INSIDE the write txn.
 
         Shared by :meth:`append_message` and :meth:`append_messages_batch` so
         the two writers can never diverge on these correctness invariants
         (this guard has already needed targeted fixes — see the #74478
-        patience note below).
+        patience note below). A rerouted writer supplies its stale lineage root;
+        the expected tip is then re-resolved under this transaction's
+        ``BEGIN IMMEDIATE`` before any transcript row is inserted.
         """
         active_lock = conn.execute(
             "SELECT holder FROM compression_locks "
@@ -8055,6 +8095,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             and session["end_reason"] == "compression"
         ):
             raise CompressionSessionClosedError(session_id)
+        if compression_lineage_root:
+            tip = self._find_live_compression_child_on_conn(
+                conn, compression_lineage_root
+            )
+            tip_session_id = str(tip.get("id") or "") if tip else ""
+            if tip_session_id != session_id:
+                raise CompressionSessionClosedError(compression_lineage_root)
 
     @staticmethod
     def _decode_display_metadata(raw: Any) -> Optional[Dict[str, Any]]:
@@ -8124,6 +8171,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         display_kind: Optional[str] = None,
         display_metadata: Optional[Dict[str, Any]] = None,
         compression_lock_holder: Optional[str] = None,
+        compression_lineage_root: Optional[str] = None,
     ) -> int:
         """
         Append a message to a session. Returns the message row ID.
@@ -8144,6 +8192,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         (which sqlite3 cannot bind and which the conversation loop scrubs
         from every outgoing payload anyway, so the scrubbed form IS the
         wire bytes).
+
+        ``compression_lineage_root`` is set only by a reroute from a stale
+        compression parent. The expected ``session_id`` tip is revalidated
+        inside this method's write transaction before the row is inserted.
         """
         # Display metadata is presentation-only and never changes the model
         # context role/content replayed to providers.
@@ -8182,7 +8234,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         def _do(conn):
             self._check_transcript_write_guards(
-                conn, session_id, compression_lock_holder
+                conn,
+                session_id,
+                compression_lock_holder,
+                compression_lineage_root,
             )
             cursor = conn.execute(
                 """INSERT INTO messages (session_id, role, content, tool_call_id,
@@ -8245,6 +8300,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         messages: List[Dict[str, Any]],
         compression_lock_holder: Optional[str] = None,
         chunk_rows: Optional[int] = None,
+        compression_lineage_root: Optional[str] = None,
     ) -> int:
         """Append multiple messages atomically in ONE write transaction.
 
@@ -8262,7 +8318,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         Atomicity contract: all rows land or none do (the caller re-flushes
         unstamped messages on the next attempt). The same admission guards
         as :meth:`append_message` run once for the batch — same session,
-        same instant.
+        same instant. A rerouted stale writer may pass
+        ``compression_lineage_root`` so the selected tip is revalidated inside
+        that same write transaction before any row lands.
 
         ``chunk_rows`` bounds the transaction size for LARGE copies (branch
         seeds can be thousands of rows; measured: 10k rows ≈ 2.4s inside one
@@ -8283,12 +8341,16 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     session_id,
                     messages[start:start + chunk_rows],
                     compression_lock_holder=compression_lock_holder,
+                    compression_lineage_root=compression_lineage_root,
                 )
             return inserted_total
 
         def _do(conn):
             self._check_transcript_write_guards(
-                conn, session_id, compression_lock_holder
+                conn,
+                session_id,
+                compression_lock_holder,
+                compression_lineage_root,
             )
             inserted, tool_calls_total = self._insert_message_rows(
                 conn, session_id, messages
