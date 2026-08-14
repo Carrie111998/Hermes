@@ -52,11 +52,27 @@ def _is_glm_5_2(model: str | None) -> bool:
     Covers the canonical ``glm-5.2`` plus the ``glm-5-2`` / ``glm-5p2``
     variants seen on relays (Fireworks ``glm-5p2``, etc.) and any
     vendor-prefixed form (``z-ai/glm-5.2``, ``zai-org-glm-5-2``).
+    GLM-5.3 (same base model, native reasoning_effort) is included:
+    ``glm-5.3`` / ``glm-5-3`` / ``glm-5p3``.
     """
     m = (model or "").strip().lower()
     if not m:
         return False
-    return any(token in m for token in ("glm-5.2", "glm-5-2", "glm-5p2"))
+    return any(
+        token in m
+        for token in (
+            "glm-5.2", "glm-5-2", "glm-5p2",
+            "glm-5.3", "glm-5-3", "glm-5p3",
+        )
+    )
+
+
+def _is_glm_5_3(model: str | None) -> bool:
+    """Detect GLM-5.3 across the alias spellings providers use."""
+    m = (model or "").strip().lower()
+    if not m:
+        return False
+    return any(token in m for token in ("glm-5.3", "glm-5-3", "glm-5p3"))
 
 
 def _glm_5_2_reasoning_effort(reasoning_config: dict | None) -> str | None:
@@ -96,9 +112,13 @@ class ZaiProfile(ProviderProfile):
 
         # Only emit when the user expressed a preference; omitting the field
         # keeps the server default (enabled) exactly as before.
+        # GLM-5.3 silently ignores thinking.disabled (no error, but thinking
+        # still runs) — don't send a no-op param for it. reasoning_effort
+        # (wired below) is 5.3's actual effort control.
         if isinstance(reasoning_config, dict):
             enabled = reasoning_config.get("enabled") is not False
-            extra_body["thinking"] = {"type": "enabled" if enabled else "disabled"}
+            if enabled or not _is_glm_5_3(model):
+                extra_body["thinking"] = {"type": "enabled" if enabled else "disabled"}
 
         if _is_glm_5_2(model):
             effort = _glm_5_2_reasoning_effort(reasoning_config)
