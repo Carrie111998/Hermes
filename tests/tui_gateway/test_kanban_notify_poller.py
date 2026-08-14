@@ -53,6 +53,13 @@ def _sub_rows(tid: str) -> list:
         conn.close()
 
 
+def _deliver(batch):
+    from tui_gateway.server import _settle_tui_kanban_claims
+
+    _settle_tui_kanban_claims(batch.claims, delivered=True)
+    return batch
+
+
 class TestCollectKanbanNotifications:
     def test_zero_sub_board_is_never_opened_writable(self):
         conn = kb.connect()
@@ -69,7 +76,7 @@ class TestCollectKanbanNotifications:
         tid = _create_subscribed_task()
         _complete(tid, summary="shipped the fix")
 
-        first = _collect_kanban_notifications(_session())
+        first = _deliver(_collect_kanban_notifications(_session()))
 
         assert len(first) == 1
         assert tid in first[0]
@@ -93,7 +100,7 @@ class TestCollectKanbanNotifications:
         finally:
             conn.close()
 
-        reopened = _collect_kanban_notifications(_session())
+        reopened = _deliver(_collect_kanban_notifications(_session()))
 
         assert len(reopened) == 2
         assert "ready" in reopened[0]
@@ -114,6 +121,25 @@ class TestCollectKanbanNotifications:
         assert _collect_kanban_notifications(_session()) == []
         assert _sub_rows(tid) == []
 
+    def test_matching_tui_sub_claim_is_not_committed_before_durable_handoff(self):
+        from tui_gateway.server import _settle_tui_kanban_claims
+
+        tid = _create_subscribed_task()
+        pre_cursor = _sub_rows(tid)[0]["last_event_id"]
+        conn = kb.connect()
+        try:
+            kb.block_task(conn, tid, reason="waiting on durable handoff")
+        finally:
+            conn.close()
+
+        batch = _collect_kanban_notifications(_session())
+        assert len(batch) == 1
+        assert _sub_rows(tid)[0]["last_event_id"] == pre_cursor
+
+        _settle_tui_kanban_claims(batch.claims, delivered=True)
+        assert _sub_rows(tid)[0]["last_event_id"] > pre_cursor
+        assert _collect_kanban_notifications(_session()) == []
+
     def test_matching_tui_sub_delivers_and_advances_cursor(self):
         tid = _create_subscribed_task()
         pre_cursor = _sub_rows(tid)[0]["last_event_id"]
@@ -124,7 +150,7 @@ class TestCollectKanbanNotifications:
             conn.close()
 
         with patch.object(kb, "connect", wraps=kb.connect) as spy_connect:
-            first = _collect_kanban_notifications(_session())
+            first = _deliver(_collect_kanban_notifications(_session()))
             second = _collect_kanban_notifications(_session())
 
         assert len(first) == 1
@@ -177,11 +203,11 @@ class TestCollectKanbanNotifications:
 
         monkeypatch.setattr(kb, "count_notify_subs", fail_probe)
         with patch.object(kb, "connect", wraps=kb.connect) as spy_connect:
-            texts = _collect_kanban_notifications(_session())
+            texts = _deliver(_collect_kanban_notifications(_session()))
 
         assert len(texts) == 1
         assert tid in texts[0]
-        spy_connect.assert_called_once()
+        assert spy_connect.called
 
     def test_no_session_key_is_a_noop(self):
         tid = _create_subscribed_task()
@@ -218,7 +244,7 @@ class TestCollectKanbanNotifications:
         # active while the poller collects (as a profile-bound RPC would set).
         token = set_hermes_home_override(str(other_profile_home))
         try:
-            texts = _collect_kanban_notifications(session)
+            texts = _deliver(_collect_kanban_notifications(session))
         finally:
             reset_hermes_home_override(token)
 
@@ -281,11 +307,13 @@ class TestNotificationPollerLoopKanbanWiring:
         monkeypatch.setattr(
             server, "_emit", lambda event, sid, payload=None: emits.append((event, payload))
         )
-        monkeypatch.setattr(
-            server,
-            "_run_prompt_submit",
-            lambda rid, sid, sess, text: submits.append(text),
-        )
+        def fake_prompt_submit(rid, sid, sess, text, *, kanban_claims=None):
+            server._settle_tui_kanban_claims(
+                list(kanban_claims or []), delivered=True
+            )
+            submits.append(text)
+
+        monkeypatch.setattr(server, "_run_prompt_submit", fake_prompt_submit)
         stop = threading.Event()
         thread = threading.Thread(
             target=server._notification_poller_loop,

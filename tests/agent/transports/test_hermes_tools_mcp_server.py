@@ -107,8 +107,29 @@ class TestModuleSurface:
             f"because codex has built-in equivalents: {leaked}"
         )
 
+    def test_ordinary_codex_mcp_session_has_no_kanban_authority(self, monkeypatch):
+        from agent.transports import hermes_tools_mcp_server as m
 
+        monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+        assert not any(
+            name.startswith("kanban_") for name in m._effective_exposed_tools()
+        )
 
+    def test_dispatcher_worker_codex_mcp_retains_only_lifecycle_tools(self, monkeypatch):
+        from agent.transports import hermes_tools_mcp_server as m
+
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_worker")
+        names = set(m._effective_exposed_tools())
+        assert {
+            "kanban_complete",
+            "kanban_block",
+            "kanban_request_review",
+            "kanban_request_changes",
+            "kanban_comment",
+            "kanban_heartbeat",
+            "kanban_show",
+        } <= names
+        assert not {"kanban_list", "kanban_create", "kanban_unblock", "kanban_link"} & names
 
 
 

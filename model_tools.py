@@ -1361,6 +1361,15 @@ def handle_function_call(
                     f"toolset '{toolset}' applies to this session."
                 )
             )
+        if enabled_toolsets is not None and toolset not in {
+            str(name).strip() for name in enabled_toolsets
+        }:
+            return _return_bridge_result(
+                tool_error(
+                    f"Tool '{function_name}' is unavailable because toolset "
+                    f"'{toolset}' is not enabled for this session."
+                )
+            )
         if enabled_tools is not None and function_name not in set(enabled_tools):
             return _return_bridge_result(
                 tool_error(

@@ -20,9 +20,9 @@ Scope (what we expose):
   - image_generate                       — image generation
   - skill_view, skills_list              — Hermes' skill library
   - text_to_speech                       — TTS
-  - kanban_* (complete/block/comment/    — kanban worker + orchestrator
-    heartbeat/show/list/create/            handoff (stateless: read env var,
-    unblock/link)                          write ~/.hermes/kanban.db)
+  - kanban lifecycle tools              — dispatcher-owned worker handoff only
+    (complete/block/review/comment/        (stateless: read the task-scoped env,
+    heartbeat/show)                        write ~/.hermes/kanban.db)
 
 What we DO NOT expose:
   - terminal / shell                     — codex's own shell tool
@@ -127,12 +127,9 @@ EXPOSED_TOOLS: tuple[str, ...] = (
     "skill_view",
     "skills_list",
     "text_to_speech",
-    # Kanban worker handoff tools — gated on HERMES_KANBAN_TASK env var
-    # (set by the kanban dispatcher when spawning a worker). Without these
-    # in the callback, a worker spawned with openai_runtime=codex_app_server
-    # could do the work but couldn't report completion back to the kernel,
-    # making it hang until timeout. Stateless dispatch — they just read
-    # the env var and write to ~/.hermes/kanban.db.
+    # Kanban task-worker handoff tools. ``_effective_exposed_tools`` strips all
+    # Kanban names from ordinary stateless MCP sessions and retains only the
+    # lifecycle subset for a dispatcher-owned worker process.
     "kanban_complete",
     "kanban_block",
     "kanban_request_review",
@@ -149,6 +146,39 @@ EXPOSED_TOOLS: tuple[str, ...] = (
     "kanban_unblock",
     "kanban_link",
 )
+
+_WORKER_KANBAN_TOOLS = frozenset(
+    {
+        "kanban_complete",
+        "kanban_block",
+        "kanban_request_review",
+        "kanban_request_changes",
+        "kanban_comment",
+        "kanban_heartbeat",
+        "kanban_show",
+    }
+)
+
+
+def _effective_exposed_tools() -> tuple[str, ...]:
+    """Return the stateless MCP surface for this exact process authority.
+
+    Ordinary Codex app-server sessions have no platform/session grant inside
+    this callback process, so exposing profile-wide Kanban tools would bypass
+    ``platform_toolsets`` and ``agent.disabled_toolsets``. Dispatcher workers
+    carry a task-scoped environment and retain only their lifecycle surface.
+    """
+    from agent.delegation_context import is_delegated_child_process_context
+
+    worker = bool(os.environ.get("HERMES_KANBAN_TASK")) and not (
+        is_delegated_child_process_context()
+    )
+    return tuple(
+        name
+        for name in EXPOSED_TOOLS
+        if not name.startswith("kanban_")
+        or (worker and name in _WORKER_KANBAN_TOOLS)
+    )
 
 
 def _build_server() -> Any:
@@ -189,7 +219,7 @@ def _build_server() -> Any:
 
     exposed_count = 0
 
-    for name in EXPOSED_TOOLS:
+    for name in _effective_exposed_tools():
         spec = all_defs.get(name)
         if spec is None:
             logger.debug(

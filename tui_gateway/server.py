@@ -9323,7 +9323,54 @@ def _format_kanban_event_text(sub: dict, task, ev, board_slug: str) -> Optional[
     return None
 
 
-def _collect_kanban_notifications(session: dict) -> list:
+class _TuiKanbanNotificationBatch(list):
+    """List-compatible TUI texts plus the durable claims behind them."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.claims: list[dict] = []
+
+
+def _settle_tui_kanban_claims(claims: list[dict], *, delivered: bool) -> None:
+    """Settle claims after durable handoff, or release them after rejection."""
+    from hermes_cli import kanban_db as _kb
+
+    for claim in claims:
+        conn = None
+        try:
+            conn = _kb.connect(board=claim["board"])
+            sub = claim["sub"]
+            settled = _kb.finish_notify_claim(
+                conn,
+                task_id=sub["task_id"],
+                platform=sub["platform"],
+                chat_id=sub["chat_id"],
+                thread_id=sub.get("thread_id") or "",
+                claim_token=claim["claim_token"],
+                delivered_cursor=(
+                    claim["claim_cursor"] if delivered else claim["old_cursor"]
+                ),
+            )
+            if settled and delivered and claim.get("unsubscribe"):
+                _kb.remove_notify_sub(
+                    conn,
+                    task_id=sub["task_id"],
+                    platform=sub["platform"],
+                    chat_id=sub["chat_id"],
+                    thread_id=sub.get("thread_id") or "",
+                )
+        except Exception as exc:
+            logger.warning(
+                "TUI kanban claim settlement failed for %s: %s",
+                claim.get("sub", {}).get("task_id", "<unknown>"),
+                exc,
+            )
+        finally:
+            if conn is not None:
+                conn.close()
+
+
+def _collect_kanban_notifications(session: dict) -> _TuiKanbanNotificationBatch:
     """Claim unseen terminal kanban events for this TUI session's subscriptions.
 
     ``kanban_create`` auto-subscribes TUI/desktop sessions with
@@ -9333,25 +9380,26 @@ def _collect_kanban_notifications(session: dict) -> list:
     poller is the delivery path for them (issue #59890). Uses the same
     atomic cursor-claim (``claim_unseen_events_for_sub``) as the gateway
     notifier. Its SQLite lease serializes a subscription even if multiple TUI
-    pollers overlap; settlement advances the cursor only after formatting.
+    pollers overlap. The returned batch carries unsettled claims; the caller
+    advances them only after the prompt is durably recorded for crash recovery.
 
     Returns the list of formatted notification texts (may be empty).
     """
     session_key = str(session.get("session_key") or "")
     if not session_key or session.get("_finalized"):
-        return []
+        return _TuiKanbanNotificationBatch()
     try:
         from hermes_cli import kanban_db as _kb
     except Exception:
-        return []
-    texts: list = []
+        return _TuiKanbanNotificationBatch()
+    texts = _TuiKanbanNotificationBatch()
     try:
         boards = _kb.list_boards(include_archived=False)
     except Exception:
         try:
             boards = [_kb.read_board_metadata(_kb.DEFAULT_BOARD)]
         except Exception:
-            return []
+            return _TuiKanbanNotificationBatch()
     # Poll each resolved DB path once — multiple slugs can point at the same
     # DB when HERMES_KANBAN_DB pins the board path (same guard as the gateway
     # notifier).
@@ -9397,45 +9445,40 @@ def _collect_kanban_notifications(session: dict) -> list:
                     continue
                 if sub.get("chat_id") != session_key:
                     continue
-                claim_token, _old, claim_cursor, events = _kb.claim_unseen_events_for_sub(
-                    conn,
-                    task_id=sub["task_id"],
-                    platform=sub["platform"],
-                    chat_id=sub["chat_id"],
-                    thread_id=sub.get("thread_id") or "",
-                    kinds=_KANBAN_NOTIFY_KINDS,
+                claim_token, old_cursor, claim_cursor, events = (
+                    _kb.claim_unseen_events_for_sub(
+                        conn,
+                        task_id=sub["task_id"],
+                        platform=sub["platform"],
+                        chat_id=sub["chat_id"],
+                        thread_id=sub.get("thread_id") or "",
+                        kinds=_KANBAN_NOTIFY_KINDS,
+                    )
                 )
                 if not events:
                     continue
                 task = _kb.get_task(conn, sub["task_id"])
+                claim_texts: list[str] = []
                 for ev in events:
                     text = _format_kanban_event_text(sub, task, ev, slug)
                     if text:
-                        texts.append(text)
-                _kb.finish_notify_claim(
-                    conn,
-                    task_id=sub["task_id"],
-                    platform=sub["platform"],
-                    chat_id=sub["chat_id"],
-                    thread_id=sub.get("thread_id") or "",
-                    claim_token=claim_token,
-                    delivered_cursor=claim_cursor,
-                )
-                # Unsubscribe only on archive. ``done`` is reversible in
-                # review/controller flows, so retaining the subscription lets
-                # a later reopen notify the same originating TUI/Desktop
-                # session. The claimed cursor prevents historical replay.
-                if task and getattr(task, "status", "") == "archived":
-                    try:
-                        _kb.remove_notify_sub(
-                            conn,
-                            task_id=sub["task_id"],
-                            platform=sub["platform"],
-                            chat_id=sub["chat_id"],
-                            thread_id=sub.get("thread_id") or "",
-                        )
-                    except Exception:
-                        pass
+                        claim_texts.append(text)
+                claim = {
+                    "board": slug,
+                    "sub": dict(sub),
+                    "claim_token": claim_token,
+                    "old_cursor": old_cursor,
+                    "claim_cursor": claim_cursor,
+                    "unsubscribe": bool(
+                        task and getattr(task, "status", "") == "archived"
+                    ),
+                }
+                if claim_texts:
+                    texts.extend(claim_texts)
+                    texts.claims.append(claim)
+                else:
+                    # Silent transitions need no prompt handoff.
+                    _settle_tui_kanban_claims([claim], delivered=True)
         finally:
             conn.close()
     return texts
@@ -9494,23 +9537,40 @@ def _notification_poller_loop(
             if _kanban_texts:
                 for _kb_text in _kanban_texts:
                     _emit("status.update", sid, {"kind": "process", "text": _kb_text})
-                # Events are cursor-claimed (never re-queued), so buffer them
-                # until the session is idle instead of dropping the agent turn.
+                # Keep texts and unsettled claims together until the session is
+                # idle. The cursor commits only after the crash-recovery marker.
                 session.setdefault("_kanban_pending", []).extend(_kanban_texts)
+                session.setdefault("_kanban_claims_pending", []).extend(
+                    getattr(_kanban_texts, "claims", [])
+                )
             _pending = session.get("_kanban_pending") or []
             if _pending:
                 _batch: list = []
+                _batch_claims: list[dict] = []
                 with session["history_lock"]:
                     if not session.get("running"):
                         session["running"] = True
                         _batch = list(_pending)
+                        _batch_claims = list(
+                            session.get("_kanban_claims_pending") or []
+                        )
                         session["_kanban_pending"] = []
+                        session["_kanban_claims_pending"] = []
                 if _batch:
                     rid = f"__notif__{int(time.time() * 1000)}"
                     try:
                         _emit("message.start", sid)
-                        _run_prompt_submit(rid, sid, session, "\n".join(_batch))
+                        _run_prompt_submit(
+                            rid,
+                            sid,
+                            session,
+                            "\n".join(_batch),
+                            kanban_claims=_batch_claims,
+                        )
                     except Exception as exc:
+                        _settle_tui_kanban_claims(
+                            _batch_claims, delivered=False
+                        )
                         print(
                             f"[tui_gateway] kanban notification dispatch failed: "
                             f"{type(exc).__name__}: {exc}",
@@ -9957,6 +10017,7 @@ def _run_prompt_submit(
     display_metadata: dict | None = None,
     image_paths: list[str] | None = None,
     queued_prompt_generation: int | None = None,
+    kanban_claims: list[dict] | None = None,
 ) -> None:
     with session["history_lock"]:
         if (
@@ -10014,6 +10075,11 @@ def _run_prompt_submit(
         marker_text = session.pop("_auto_continue_prompt", None) or text
         if isinstance(marker_text, str) and marker_text.strip():
             record_turn_start(marker_home, marker_key, marker_text, attempts=marker_attempt)
+            # This marker is the durable handoff: process restart resumes the
+            # exact prompt. A crash before it exists leaves the leased events
+            # visible again; a crash afterward may duplicate but cannot lose.
+            if kanban_claims:
+                _settle_tui_kanban_claims(kanban_claims, delivered=True)
         try:
             from tools.approval import (
                 reset_current_session_key,

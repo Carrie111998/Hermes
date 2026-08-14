@@ -57,6 +57,18 @@ class TestHandleFunctionCall:
         assert "disabled toolset" in result["error"]
         dispatch.assert_not_called()
 
+    def test_kanban_dispatch_requires_enabled_toolset_when_grant_list_is_absent(self):
+        with patch("model_tools.registry.dispatch") as dispatch:
+            result = json.loads(
+                handle_function_call(
+                    "kanban_list",
+                    {},
+                    enabled_toolsets=["web"],
+                )
+            )
+
+        assert "toolset 'kanban' is not enabled" in result["error"]
+        dispatch.assert_not_called()
 
 
     def test_post_tool_call_receives_non_negative_integer_duration_ms(self):
