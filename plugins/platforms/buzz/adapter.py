@@ -25,11 +25,12 @@ Configuration in config.yaml::
             cli_path: ""               # path to the buzz binary (default: PATH, then ~/bin/buzz)
             credentials_file: ""       # JSON file holding the nsec (fallback for BUZZ_PRIVATE_KEY)
             allowed_users: []          # empty = allow all; entries are hex pubkeys or npubs
+            thread_replies: true       # false = post flat to channel timeline (no --reply-to from metadata)
 
 Or via environment variables (overrides config.yaml):
     BUZZ_RELAY_URL, BUZZ_CHANNELS, BUZZ_HOME_CHANNEL, BUZZ_POLL_INTERVAL,
     BUZZ_CLI_PATH, BUZZ_CREDENTIALS_FILE, BUZZ_ALLOWED_USERS,
-    BUZZ_ALLOW_ALL_USERS
+    BUZZ_ALLOW_ALL_USERS, BUZZ_THREAD_REPLIES
 
 The only secret is BUZZ_PRIVATE_KEY (nsec or hex) — it belongs in
 ``~/.hermes/.env``.  It is passed to the CLI via the subprocess
@@ -392,6 +393,18 @@ class BuzzAdapter(BasePlatformAdapter):
             _rm_cfg = _rm_raw
         self.require_mention = str(_rm_cfg).strip().lower() not in ("false", "0", "no", "off")
 
+        # Thread replies: when True (default), metadata["thread_id"] is used as
+        # --reply-to, threading responses under the incoming message.  When
+        # False, replies are posted flat to the channel timeline — only an
+        # explicit reply_to argument threads.  Env (BUZZ_THREAD_REPLIES)
+        # overrides config.yaml.
+        _tr_raw = os.getenv("BUZZ_THREAD_REPLIES")
+        if _tr_raw is None:
+            _tr_cfg = extra.get("thread_replies", True)
+        else:
+            _tr_cfg = _tr_raw
+        self.thread_replies = str(_tr_cfg).strip().lower() not in ("false", "0", "no", "off")
+
         # Inbound transport: "auto" (WebSocket with poll fallback, default),
         # "websocket" (require WS; fail connect when it can't authenticate),
         # or "poll" (CLI polling only). Env (BUZZ_TRANSPORT) overrides
@@ -436,6 +449,12 @@ class BuzzAdapter(BasePlatformAdapter):
         self._channel_meta: Dict[str, dict] = {}
         self._user_names: Dict[str, str] = {}
         self._poll_count = 0
+        # event_id -> thread_root_event_id for inbound messages that were
+        # NIP-10 replies.  Used by send() when thread_replies is disabled to
+        # determine whether the gateway's reply_to (incoming message_id) was
+        # a top-level message or a deliberate in-thread reply.  The response
+        # is anchored to the thread root to avoid nested sub-threads.
+        self._inbound_thread_roots: Dict[str, str] = {}
 
     @property
     def name(self) -> str:
@@ -609,7 +628,32 @@ class BuzzAdapter(BasePlatformAdapter):
         if not content:
             return SendResult(success=False, error="Empty message")
         args = ["messages", "send", "--channel", str(chat_id), "--content", "-"]
-        reply_target = reply_to or (metadata or {}).get("thread_id")
+        # Pass our own pubkey via --mention so the Buzz CLI treats any
+        # unresolved @Name text in the content (e.g. prose like "@-mention"
+        # or "@mentioned") as presentation-only instead of rejecting the
+        # send with "mention does not match a current channel member".
+        # Per buzz-cli help: "Supplying any explicit identity permits
+        # unresolved or ambiguous @Name text as presentation-only; uniquely
+        # resolved member names still notify."
+        if self._self_pubkey:
+            args += ["--mention", self._self_pubkey]
+        # When thread_replies is disabled, post flat to the channel timeline
+        # by default — ignore both metadata["thread_id"] and the gateway's
+        # default reply_to (which is event.message_id for non-Telegram
+        # platforms).  However, if the incoming message was itself a NIP-10
+        # reply (user deliberately replied in a thread), anchor the response
+        # to the thread ROOT so it stays in the thread without creating a
+        # nested sub-thread.
+        if self.thread_replies:
+            reply_target = reply_to or (metadata or {}).get("thread_id")
+        elif reply_to and reply_to in self._inbound_thread_roots:
+            # User replied in a thread — anchor to the root, not the reply.
+            reply_target = self._inbound_thread_roots[reply_to]
+        else:
+            reply_target = None
+        # Clean up the thread-root entry to prevent unbounded growth.
+        if reply_to and reply_to in self._inbound_thread_roots:
+            del self._inbound_thread_roots[reply_to]
         if reply_target:
             args += ["--reply-to", str(reply_target)]
         code, out, err = await self._run_cli(args, input_text=content)
@@ -1005,6 +1049,60 @@ class BuzzAdapter(BasePlatformAdapter):
             await self._handle_event(channel_id, state, event)
         self._trim_seen(state)
 
+    @staticmethod
+    def _extract_reply_parent(event: dict) -> str | None:
+        """Extract the NIP-10 reply-to event id from a Buzz message event.
+
+        NIP-10 ``e`` tags come in two shapes:
+          - Positional:  ["e", <event-id>, <relay-url>, <marker>]
+          - Tagged:      ["e", <event-id>, <relay-url>, <marker>, <event-id-of-root>]
+
+        A ``reply`` marker (or the last positional ``e`` when markers are
+        absent) identifies the direct parent.  Returns ``None`` for
+        top-level messages with no reply ``e`` tag.
+        """
+        tags = event.get("tags")
+        if not isinstance(tags, list):
+            return None
+        last_e: str | None = None
+        for tag in tags:
+            if not isinstance(tag, list) or len(tag) < 2 or tag[0] != "e":
+                continue
+            eid = str(tag[1] or "")
+            if not eid:
+                continue
+            marker = tag[3] if len(tag) > 3 else ""
+            if marker == "reply":
+                return eid
+            last_e = eid  # fall back to last e tag seen
+        return last_e
+
+    @staticmethod
+    def _extract_thread_root(event: dict) -> str | None:
+        """Extract the NIP-10 root event id from a Buzz message event.
+
+        The root is the top-level message that started the thread.  In
+        NIP-10 tagged format this is the ``e`` tag with marker ``root``
+        (or the first ``e`` tag when markers are absent).  Returns
+        ``None`` for top-level messages.
+        """
+        tags = event.get("tags")
+        if not isinstance(tags, list):
+            return None
+        first_e: str | None = None
+        for tag in tags:
+            if not isinstance(tag, list) or len(tag) < 2 or tag[0] != "e":
+                continue
+            eid = str(tag[1] or "")
+            if not eid:
+                continue
+            marker = tag[3] if len(tag) > 3 else ""
+            if marker == "root":
+                return eid
+            if first_e is None:
+                first_e = eid  # fall back to first e tag
+        return first_e
+
     async def _handle_event(self, channel_id: str, state: dict, event: dict) -> None:
         """De-dupe, filter, and dispatch a single ``messages get`` event."""
         event_id = str(event.get("id") or "")
@@ -1048,6 +1146,15 @@ class BuzzAdapter(BasePlatformAdapter):
         # strip applies to both chat types.
         dispatch_text = self._strip_mention(content)
 
+        # Extract NIP-10 thread root so the adapter knows whether the user
+        # deliberately replied in a thread.  When thread_replies is disabled,
+        # only an inbound reply triggers outbound threading, and the response
+        # is anchored to the thread root (not the user's individual reply) to
+        # avoid creating nested sub-threads.
+        thread_root = self._extract_thread_root(event)
+        if thread_root:
+            self._inbound_thread_roots[event_id] = thread_root
+
         await self._dispatch_message(
             text=dispatch_text,
             chat_id=channel_id,
@@ -1056,6 +1163,7 @@ class BuzzAdapter(BasePlatformAdapter):
             user_name=await self._resolve_user_name(pubkey),
             message_id=event_id,
             created_at=created_at,
+            reply_to_message_id=thread_root,
         )
 
     # ── DM classification (issue #68871) ──────────────────────────────────
@@ -1219,6 +1327,7 @@ class BuzzAdapter(BasePlatformAdapter):
         user_name: str,
         message_id: str,
         created_at: int,
+        reply_to_message_id: Optional[str] = None,
     ) -> None:
         """Build a MessageEvent and hand it to the base class handler."""
         if not self._message_handler:
@@ -1238,6 +1347,7 @@ class BuzzAdapter(BasePlatformAdapter):
             source=source,
             message_id=message_id,
             timestamp=datetime.fromtimestamp(created_at) if created_at else datetime.now(),
+            reply_to_message_id=reply_to_message_id,
         )
 
         await self.handle_message(event)
@@ -1390,6 +1500,19 @@ async def _standalone_send(
         args += ["--reply-to", str(thread_id)]
     for path in media_files or []:
         args += ["--file", str(path)]
+    # Resolve our own pubkey and pass it via --mention so the Buzz CLI
+    # treats unresolved @Name text (prose like "@-mention") as
+    # presentation-only instead of rejecting the send.
+    try:
+        pcode, pout, _ = await _exec_buzz(
+            cli_path, ["users", "get"], relay_url=relay, private_key=private_key
+        )
+        if pcode == 0:
+            _profiles = _parse_json_list(pout)
+            if _profiles and _profiles[0].get("pubkey"):
+                args += ["--mention", str(_profiles[0]["pubkey"])]
+    except Exception:
+        pass  # best-effort; send proceeds without --mention
     try:
         code, out, err = await _exec_buzz(
             cli_path, args, relay_url=relay, private_key=private_key, input_text=message
