@@ -67,6 +67,33 @@ class TestGuessCategoryProtectedTrees:
         assert dg.guess_category(p) is None
 
 
+class TestCacheOwnership:
+    """Only explicitly plugin-owned cache roots are auto-managed."""
+
+    def test_vision_temporary_root_is_categorised_as_temp(self, _isolate_env):
+        dg = _load_lib()
+        p = _isolate_env / "cache" / "vision" / "temp_vision_images" / "capture.png"
+        p.parent.mkdir(parents=True)
+        p.write_text("x")
+
+        assert dg.guess_category(p) == "temp"
+    def test_video_temporary_root_is_categorised_as_temp(self, _isolate_env):
+        dg = _load_lib()
+        p = _isolate_env / "cache" / "video" / "temp_video_files" / "render.mp4"
+        p.parent.mkdir(parents=True)
+        p.write_text("x")
+
+        assert dg.guess_category(p) == "temp"
+
+    def test_unmanaged_cache_path_is_not_categorised(self, _isolate_env):
+        dg = _load_lib()
+        p = _isolate_env / "cache" / "tool" / "rtk-bin" / "rtk"
+        p.parent.mkdir(parents=True)
+        p.write_text("x")
+
+        assert dg.guess_category(p) is None
+
+
 class TestQuickEmptyDirSweepProtectedTrees:
     """Empty-dir sweep must not rmdir inside persistent subtrees."""
 
@@ -121,6 +148,36 @@ class TestQuickRevalidatesTrackedEntries:
         summary = dg.quick()
         assert summary["deleted"] == 0
         assert p.exists(), "path outside HERMES_HOME must never be deleted"
+
+    def test_stale_temp_entry_in_unmanaged_cache_is_not_deleted(self, _isolate_env):
+        dg = _load_lib()
+        p = _isolate_env / "cache" / "tool" / "rtk-bin" / "rtk"
+        p.parent.mkdir(parents=True)
+        p.write_text("x")
+        self._seed_tracked(_isolate_env, {
+            "path": str(p), "category": "temp",
+            "timestamp": _old_ts(8), "size": 1,
+        })
+
+        summary = dg.quick()
+
+        assert summary["deleted"] == 0
+        assert p.exists(), "unmanaged cache file must survive stale temp tracking"
+
+    def test_dry_run_omits_stale_temp_entry_in_unmanaged_cache(self, _isolate_env):
+        dg = _load_lib()
+        p = _isolate_env / "cache" / "tool" / "rtk-bin" / "rtk"
+        p.parent.mkdir(parents=True)
+        p.write_text("x")
+        self._seed_tracked(_isolate_env, {
+            "path": str(p), "category": "temp",
+            "timestamp": _old_ts(8), "size": 1,
+        })
+
+        auto, prompt = dg.dry_run()
+
+        assert auto == []
+        assert prompt == []
 
     def test_legitimate_test_file_still_deleted(self, _isolate_env):
         """The fix must not break the feature: real test files are still cleaned."""

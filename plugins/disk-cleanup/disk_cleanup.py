@@ -184,6 +184,20 @@ _EMPTY_DIR_SWEEP_PRUNE_DIRS = frozenset({
     "site-packages", "__pycache__",
 })
 
+# Auto-cleanup is opt-in for cache paths.  Cache contains durable binaries,
+# indexes, and downloaded state, so only tool-owned ephemeral subtrees may be
+# classified as temp.  Keep this path-component based for platform stability.
+_MANAGED_EPHEMERAL_CACHE_ROOTS = frozenset({
+    ("cache", "vision", "temp_vision_images"),
+    ("cache", "video", "temp_video_files"),
+})
+
+
+def _is_managed_ephemeral_path(rel: Path) -> bool:
+    """Return whether a HERMES_HOME-relative path is plugin-owned temporary data."""
+    parts = rel.parts
+    return any(parts[:len(root)] == root for root in _MANAGED_EPHEMERAL_CACHE_ROOTS)
+
 
 # Paths under $HERMES_HOME that must NEVER be deleted by quick(),
 # regardless of what the stored category says.  This is a defense-in-depth
@@ -298,12 +312,12 @@ def dry_run() -> Tuple[List[Dict], List[Dict]]:
         cat = item["category"]
         size = item["size"]
 
-        # Re-validate stale "cron-output" entries (fixes #37721).
-        if cat == "cron-output":
-            re_cat = guess_category(p)
-            if re_cat != "cron-output":
-                # Stale entry — would be skipped by quick(); omit from
-                # dry-run output too.
+        # Re-validate every auto-delete category so dry-run and quick() share
+        # the same ownership boundary.  Legacy tracking may point at a path
+        # that is now protected or outside HERMES_HOME.
+        if cat in ("test", "temp", "cron-output"):
+            re_cat = guess_category(p) if is_safe_path(p) else None
+            if re_cat != cat:
                 continue
 
         if cat == "test":
@@ -595,6 +609,8 @@ def guess_category(path: Path) -> Optional[str]:
     try:
         rel = path.resolve().relative_to(hermes_home)
         top = rel.parts[0] if rel.parts else ""
+        if _is_managed_ephemeral_path(rel):
+            return "temp"
         if top in _PROTECTED_TOP_LEVEL:
             return None
         if top == "cron" or top == "cronjobs":
