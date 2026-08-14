@@ -5,6 +5,7 @@ import uuid
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+from agent.tool_guardrails import ToolCallGuardrailConfig
 from run_agent import AIAgent
 
 
@@ -411,7 +412,10 @@ def test_guardrail_halt_emits_final_response_through_stream_delta_callback():
 
     assert result["turn_exit_reason"] == "guardrail_halt"
     halt_text = result["final_response"]
-    assert "stopped retrying" in halt_text
+    assert "repeated failures" in halt_text
+    assert "change strategy" in halt_text
+    assert "repeated_exact_failure_block" not in halt_text
+    assert "non-progressing" not in halt_text
 
     # The halt message must have been pushed through the callback at least
     # once.  Empty-queue SSE writers were the bug — clients saw no content
@@ -420,3 +424,39 @@ def test_guardrail_halt_emits_final_response_through_stream_delta_callback():
     assert halt_text in text_deltas, (
         f"halt message was never streamed; callback only saw {deltas!r}"
     )
+
+
+def test_web_search_loop_cap_message_hides_internal_code_and_uses_available_results():
+    agent = _make_agent("web_search")
+    agent._tool_guardrails.config = ToolCallGuardrailConfig.from_mapping(
+        {"loop_caps": {"max_web_searches": 1}}
+    )
+    responses = [
+        _mock_response(
+            content="",
+            finish_reason="tool_calls",
+            tool_calls=[_mock_tool_call("web_search", json.dumps({"query": "first"}), "c1")],
+        ),
+        _mock_response(
+            content="",
+            finish_reason="tool_calls",
+            tool_calls=[_mock_tool_call("web_search", json.dumps({"query": "second"}), "c2")],
+        ),
+    ]
+    agent.client.chat.completions.create.side_effect = responses
+    agent._disable_streaming = True
+
+    with (
+        patch("run_agent.handle_function_call", return_value=json.dumps({"results": ["usable"]})),
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation("compare two shops")
+
+    assert result["turn_exit_reason"] == "guardrail_halt"
+    halt_text = result["final_response"]
+    assert "search limit" in halt_text
+    assert "available results" in halt_text
+    assert "loop_web_search_cap" not in halt_text
+    assert "non-progressing" not in halt_text
