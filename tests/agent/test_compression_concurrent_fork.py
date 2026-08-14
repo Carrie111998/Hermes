@@ -757,10 +757,75 @@ def test_delayed_contender_adopts_unique_rotated_child(tmp_path: Path) -> None:
     agent.context_compressor.compress.assert_not_called()
     lifecycle_args, lifecycle_kwargs = agent.context_compressor.on_session_start.call_args
     assert lifecycle_args == (child_sid,)
-    assert lifecycle_kwargs["boundary_reason"] == "compression"
+    # Adoption binds a child that another writer already published. Its durable
+    # counters are authoritative, so this is a resume — not the fresh-child
+    # compression lifecycle that copies state from the parent.
+    assert lifecycle_kwargs["boundary_reason"] == "resume"
     assert lifecycle_kwargs["old_session_id"] == parent_sid
     assert lifecycle_kwargs["session_db"] is db
 
+
+def test_in_place_compaction_carries_pending_lineage_guard(tmp_path: Path) -> None:
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        db.create_session("root", source="webui")
+        db.publish_compression_child(
+            parent_session_id="root",
+            child_session_id="tip",
+            source="webui",
+            messages=[{"role": "user", "content": "durable tip"}],
+            require_compression_lease=False,
+        )
+        agent = _build_agent_with_db(db, "tip")
+        setattr(agent, "compression_in_place", True)
+        setattr(agent, "_pending_compression_lineage_guards", {"tip": "root"})
+        archive_spy = MagicMock(wraps=db.archive_and_compact)
+        db.archive_and_compact = archive_spy
+
+        agent._compress_context(
+            [{"role": "user", "content": "x" * 1000}],
+            "sys",
+            approx_tokens=120_000,
+        )
+
+        assert archive_spy.call_args.kwargs["compression_lineage_root"] == "root"
+        assert getattr(agent, "_pending_compression_lineage_guards", None) == {}
+    finally:
+        db.close()
+
+
+def test_rotation_publication_carries_pending_lineage_guard_without_preflush_rows(
+    tmp_path: Path,
+) -> None:
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        db.create_session("root", source="webui")
+        db.publish_compression_child(
+            parent_session_id="root",
+            child_session_id="tip",
+            source="webui",
+            messages=[{"role": "user", "content": "durable tip"}],
+            require_compression_lease=False,
+        )
+        agent = _build_agent_with_db(db, "tip")
+        setattr(agent, "_pending_compression_lineage_guards", {"tip": "root"})
+        publish_spy = MagicMock(wraps=db.publish_compression_child)
+        db.publish_compression_child = publish_spy
+        messages = [
+            {"role": "user", "content": "stale", "_db_persisted": True},
+            {
+                "role": "assistant",
+                "content": "x" * 1000,
+                "_db_persisted": True,
+            },
+        ]
+
+        agent._compress_context(messages, "sys", approx_tokens=120_000)
+
+        assert publish_spy.call_args.kwargs["compression_lineage_root"] == "root"
+        assert getattr(agent, "_pending_compression_lineage_guards", None) == {}
+    finally:
+        db.close()
 
 
 

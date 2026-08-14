@@ -5089,14 +5089,24 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         profile_name: str = None,
         compression_lock_holder: str = None,
         require_compression_lease: bool = True,
+        compression_lineage_root: Optional[str] = None,
     ) -> None:
         """Atomically close a parent and publish its durable compression child.
 
         The parent closure, child row, and compacted handoff become visible in
         one transaction. Readers can therefore observe either the live parent or
         a complete child, never an ended parent with a missing/empty child.
+
+        A stale process that previously adopted ``parent_session_id`` supplies
+        ``compression_lineage_root`` until its first durable write. The parent
+        must still be that root's unique live tip inside this transaction.
         """
         def _do(conn):
+            self._check_compression_lineage_tip(
+                conn,
+                parent_session_id,
+                compression_lineage_root,
+            )
             lock_row = conn.execute(
                 "SELECT holder, expires_at FROM compression_locks WHERE session_id = ?",
                 (parent_session_id,),
@@ -8057,6 +8067,23 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         )
         return None
 
+    def _check_compression_lineage_tip(
+        self,
+        conn,
+        session_id: str,
+        compression_lineage_root: Optional[str],
+    ) -> None:
+        """Require ``session_id`` to remain the root's unique live tip."""
+        if not compression_lineage_root:
+            return
+        tip = self._find_live_compression_child_on_conn(
+            conn,
+            compression_lineage_root,
+        )
+        tip_session_id = str(tip.get("id") or "") if tip else ""
+        if tip_session_id != session_id:
+            raise CompressionSessionClosedError(compression_lineage_root)
+
     def _check_transcript_write_guards(
         self,
         conn,
@@ -8095,13 +8122,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             and session["end_reason"] == "compression"
         ):
             raise CompressionSessionClosedError(session_id)
-        if compression_lineage_root:
-            tip = self._find_live_compression_child_on_conn(
-                conn, compression_lineage_root
-            )
-            tip_session_id = str(tip.get("id") or "") if tip else ""
-            if tip_session_id != session_id:
-                raise CompressionSessionClosedError(compression_lineage_root)
+        self._check_compression_lineage_tip(
+            conn,
+            session_id,
+            compression_lineage_root,
+        )
 
     @staticmethod
     def _decode_display_metadata(raw: Any) -> Optional[Dict[str, Any]]:
@@ -8814,6 +8839,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         session_id: str,
         compacted_messages: List[Dict[str, Any]],
         model_config_patch: Optional[Dict[str, Any]] = None,
+        compression_lineage_root: Optional[str] = None,
     ) -> int:
         """Non-destructive in-place compaction for a single durable session id.
 
@@ -8838,10 +8864,17 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         for compaction. ``message_count`` is set to the ACTIVE (compacted) count,
         matching what the live load returns. ``model_config_patch`` is merged
         into the session's JSON config in the same transaction; a ``None``
-        value removes that key. Returns the new active count.
+        value removes that key. ``compression_lineage_root`` revalidates a
+        previously adopted tip before this write becomes the first durable
+        mutation by that stale process. Returns the new active count.
         """
 
         def _do(conn):
+            self._check_compression_lineage_tip(
+                conn,
+                session_id,
+                compression_lineage_root,
+            )
             patched_model_config = None
             if model_config_patch is not None:
                 # on_missing="raise": a prune/compaction must not commit

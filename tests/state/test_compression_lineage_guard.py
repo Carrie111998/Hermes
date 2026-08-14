@@ -7,7 +7,7 @@ import time
 
 import pytest
 
-from hermes_state import SessionDB
+from hermes_state import CompressionSessionClosedError, SessionDB
 
 
 @pytest.fixture()
@@ -75,16 +75,35 @@ def test_find_live_compression_child_fails_closed_on_ambiguous_chain(
     assert db.find_live_compression_child("parent") is None
 
 
-def test_find_live_compression_child_uses_one_snapshot_during_walk(tmp_path) -> None:
+@pytest.mark.parametrize("requested_journal_mode", ["wal", "delete"])
+def test_find_live_compression_child_uses_one_snapshot_during_walk(
+    tmp_path,
+    requested_journal_mode: str,
+) -> None:
     path = tmp_path / "state.db"
     reader = SessionDB(db_path=path)
-    writer = SessionDB(db_path=path)
+    writer = None
+    thread = None
     try:
         _compression_parent(reader)
         reader.create_session("child", source="webui", parent_session_id="parent")
         reader.end_session("child", "compression")
+        pragma = {
+            "wal": "PRAGMA journal_mode=WAL",
+            "delete": "PRAGMA journal_mode=DELETE",
+        }[requested_journal_mode]
+        reader_conn = reader._conn
+        assert reader_conn is not None
+        journal_mode = str(reader_conn.execute(pragma).fetchone()[0]).lower()
+        assert journal_mode == requested_journal_mode
+        writer = SessionDB(db_path=path)
+        writer_conn = writer._conn
+        assert writer_conn is not None
+        writer_conn.execute("PRAGMA busy_timeout=5000")
         ready = threading.Event()
-        proceed = threading.Event()
+        writer_started = threading.Event()
+        writer_finished = threading.Event()
+        writer_errors = []
 
         class PausingConnection:
             def __init__(self, inner):
@@ -101,7 +120,17 @@ def test_find_live_compression_child_uses_one_snapshot_during_walk(tmp_path) -> 
                 ):
                     self.paused = True
                     ready.set()
-                    assert proceed.wait(5)
+                    assert writer_started.wait(5)
+                    if journal_mode == "wal":
+                        # WAL permits the mutation to commit while this reader
+                        # keeps observing its original snapshot.
+                        assert writer_finished.wait(5)
+                    else:
+                        # Rollback journals cannot commit the writer while this
+                        # read transaction owns its shared lock. Do not wait
+                        # here: returning lets the read snapshot finish, after
+                        # which the writer's bounded busy wait can complete.
+                        assert writer_started.is_set()
                 return cursor
 
             def __getattr__(self, name):
@@ -111,13 +140,21 @@ def test_find_live_compression_child_uses_one_snapshot_during_walk(tmp_path) -> 
 
         def mutate_lineage() -> None:
             assert ready.wait(5)
-            writer.create_session(
-                "ambiguous-sibling", source="webui", parent_session_id="parent"
-            )
-            writer.create_session(
-                "grandchild", source="webui", parent_session_id="child"
-            )
-            proceed.set()
+            assert writer is not None
+            writer_started.set()
+            try:
+                writer.create_session(
+                    "ambiguous-sibling",
+                    source="webui",
+                    parent_session_id="parent",
+                )
+                writer.create_session(
+                    "grandchild", source="webui", parent_session_id="child"
+                )
+            except BaseException as exc:  # surface thread failures in the test
+                writer_errors.append(exc)
+            finally:
+                writer_finished.set()
 
         thread = threading.Thread(target=mutate_lineage)
         thread.start()
@@ -125,11 +162,15 @@ def test_find_live_compression_child_uses_one_snapshot_during_walk(tmp_path) -> 
         thread.join(timeout=5)
 
         assert not thread.is_alive()
+        assert writer_errors == []
         assert observed is None
         assert reader.find_live_compression_child("parent") is None
     finally:
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=5)
         reader.close()
-        writer.close()
+        if writer is not None:
+            writer.close()
 
 
 def test_batch_append_revalidates_compression_tip_inside_write_transaction(
@@ -147,6 +188,47 @@ def test_batch_append_revalidates_compression_tip_inside_write_transaction(
         )
 
     assert db.get_messages("child") == []
+
+
+def test_compression_publication_revalidates_pending_lineage_root(
+    db: SessionDB,
+) -> None:
+    _compression_parent(db, "root")
+    db.create_session("tip", source="webui", parent_session_id="root")
+    db.create_session("late-sibling", source="webui", parent_session_id="root")
+
+    with pytest.raises(CompressionSessionClosedError):
+        db.publish_compression_child(
+            parent_session_id="tip",
+            child_session_id="next-tip",
+            source="webui",
+            messages=[{"role": "user", "content": "must not publish"}],
+            require_compression_lease=False,
+            compression_lineage_root="root",
+        )
+
+    assert db.get_session("tip")["ended_at"] is None
+    assert db.get_session("next-tip") is None
+
+
+def test_in_place_compaction_revalidates_pending_lineage_root(
+    db: SessionDB,
+) -> None:
+    _compression_parent(db, "root")
+    db.create_session("tip", source="webui", parent_session_id="root")
+    db.append_message("tip", "user", "original tip transcript")
+    db.create_session("late-sibling", source="webui", parent_session_id="root")
+
+    with pytest.raises(CompressionSessionClosedError):
+        db.archive_and_compact(
+            "tip",
+            [{"role": "user", "content": "must not compact"}],
+            compression_lineage_root="root",
+        )
+
+    assert [row["content"] for row in db.get_messages("tip")] == [
+        "original tip transcript"
+    ]
 
 
 def test_single_append_revalidates_compression_tip_inside_write_transaction(
