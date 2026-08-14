@@ -458,6 +458,43 @@ class TestSignalReadReceipts:
         finally:
             set_multiplex_active(False)
 
+    def test_secondary_receipt_auth_denies_when_profile_home_is_unresolved(
+        self, monkeypatch
+    ):
+        """A broken owner resolver must not fall back to the process allowlist."""
+        from agent.secret_scope import set_multiplex_active
+        from gateway.config import GatewayConfig
+        from gateway.run import GatewayRunner
+
+        monkeypatch.setenv("SIGNAL_ALLOWED_USERS", "+15551239999")
+        adapter = _make_signal_adapter(monkeypatch, send_read_receipts=True)
+        runner = object.__new__(GatewayRunner)
+        runner.config = GatewayConfig(multiplex_profiles=True)
+        runner.adapters = {}
+        runner._profile_adapters = {"work": {Platform.SIGNAL: adapter}}
+        runner.pairing_store = MagicMock()
+        runner.pairing_store.is_approved.return_value = False
+        runner.pairing_stores = {"work": MagicMock()}
+        runner.pairing_stores["work"].is_approved.return_value = False
+        adapter.gateway_runner = runner
+
+        with patch(
+            "hermes_cli.profiles.get_profile_dir",
+            side_effect=RuntimeError("profile home unavailable"),
+        ):
+            adapter.set_authorization_check(
+                runner._make_adapter_auth_check(
+                    Platform.SIGNAL,
+                    profile_name="work",
+                )
+            )
+
+        set_multiplex_active(True)
+        try:
+            assert adapter._read_receipt_target(_make_receipt_event(adapter)) is None
+        finally:
+            set_multiplex_active(False)
+
     @pytest.mark.parametrize(
         ("stale_env", "stale_value"),
         [

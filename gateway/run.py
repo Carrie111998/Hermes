@@ -14813,10 +14813,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         their legacy environment path.
         """
         auth_profile_home: Optional[Path] = None
-        if (
+        requires_auth_profile_scope = (
             platform == Platform.SIGNAL
             and getattr(self.config, "multiplex_profiles", False)
-        ):
+        )
+        if requires_auth_profile_scope:
             try:
                 if profile_name:
                     from hermes_cli.profiles import get_profile_dir
@@ -14829,9 +14830,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # as the synthetic profile name "custom".
                     auth_profile_home = Path(get_hermes_home())
             except Exception:
-                # Match the existing profile-handler factory: a path-resolution
-                # failure preserves the legacy callback rather than disabling
-                # adapter authorization globally.
+                # A multiplexed Signal receipt has no safe process-env fallback:
+                # the process may currently hold another profile's allowlist.
                 auth_profile_home = None
 
         def check(
@@ -14848,6 +14848,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 user_id=user_id,
                 profile=profile_name,
             )
+            if requires_auth_profile_scope and auth_profile_home is None:
+                return False
             if auth_profile_home is not None:
                 with _profile_runtime_scope(auth_profile_home):
                     return self._is_user_authorized(source)
