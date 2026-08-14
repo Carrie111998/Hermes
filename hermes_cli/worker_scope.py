@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import re
 import shutil
+import subprocess
 from typing import Mapping, Sequence
 
 
@@ -42,6 +43,19 @@ def build_scoped_worker_command(
     if not systemd_run or not systemctl:
         if require_isolation:
             raise WorkerIsolationError("systemd transient scope backend unavailable")
+        return list(command)
+    probe = subprocess.run(
+        [systemctl, "--user", "is-system-running"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        timeout=5,
+        check=False,
+    )
+    if probe.returncode != 0 or probe.stdout.strip() != "running":
+        if require_isolation:
+            raise WorkerIsolationError("systemd user manager/bus is not healthy")
         return list(command)
     task = _unit_fragment(env.get("HERMES_KANBAN_TASK", "task"))
     run = _unit_fragment(env.get("HERMES_KANBAN_RUN_ID", "run"))

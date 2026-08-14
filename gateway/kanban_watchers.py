@@ -1091,10 +1091,12 @@ class GatewayKanbanWatchersMixin:
         conn = _kb.connect(board=board)
         try:
             payload = getattr(event, "payload", None) or {}
-            artifact_paths = [
-                str(path) for path in (payload.get("artifacts") or [])
-                if isinstance(path, str) and os.path.isfile(os.path.expanduser(path))
-            ]
+            advertised = payload.get("artifacts") or []
+            if not isinstance(advertised, (list, tuple)) or any(
+                not isinstance(path, str) or not path for path in advertised
+            ):
+                raise RuntimeError("invalid advertised artifact manifest")
+            artifact_paths = [str(path) for path in advertised]
             artifacts = []
             for ordinal, path in enumerate(artifact_paths):
                 expanded = os.path.expanduser(path)
@@ -1147,13 +1149,23 @@ class GatewayKanbanWatchersMixin:
 
             async def _send(child: dict) -> str:
                 component = child["component"]
+                child_metadata = dict(metadata)
+                child_metadata["kanban_delivery_child_id"] = child["child_id"]
+                child_metadata["idempotency_key"] = child["child_id"]
                 if child["kind"] == "primary_text":
-                    result = await adapter.send(sub["chat_id"], component["text"], metadata=metadata)
+                    result = await adapter.send(
+                        sub["chat_id"], component["text"], metadata=child_metadata
+                    )
                 elif child["kind"] == "artifact_upload":
+                    current_digest = hashlib.sha256(
+                        Path(component["path"]).read_bytes()
+                    ).hexdigest()
+                    if current_digest != component["sha256"]:
+                        raise RuntimeError("frozen artifact digest mismatch")
                     result = await adapter.send_document(
                         chat_id=sub["chat_id"],
                         file_path=component["path"],
-                        metadata=metadata,
+                        metadata=child_metadata,
                     )
                 else:
                     if not component.get("creator_session_id"):

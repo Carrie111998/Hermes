@@ -2288,19 +2288,22 @@ def dispatch(
     del dry_run, max_n, board
     from hermes_cli.dispatcher_authority import read_status_no_side_effects
 
-    status = read_status_no_side_effects()
+    try:
+        status = read_status_no_side_effects()
+    except Exception:
+        status = None
     detail = {
         "dispatch_nudge_accepted": False,
         "dispatch_performed": False,
-        "state": "managed_automatically" if status.healthy else "unavailable",
-        "owner": status.owner_hint,
-        "mode": status.mode,
-        "version": status.version,
-        "freshness_seconds": status.freshness_seconds,
-        "error_class": status.error_class,
+        "state": "managed_automatically" if status and status.healthy else "unavailable",
+        "owner": status.owner_hint if status else None,
+        "mode": status.mode if status else "machine-global",
+        "version": status.version if status else "dispatcher-authority-v1",
+        "freshness_seconds": status.freshness_seconds if status else None,
+        "error_class": status.error_class if status else "status_backend_error",
         "guidance": "Inspect the standalone `hermes kanban dispatcher` service.",
     }
-    raise HTTPException(status_code=409 if status.healthy else 503, detail=detail)
+    raise HTTPException(status_code=409 if status and status.healthy else 503, detail=detail)
 
 
 # ---------------------------------------------------------------------------

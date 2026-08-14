@@ -9495,7 +9495,7 @@ def dispatch_once_authorized(
     from hermes_cli.dispatcher_authority import require_dispatcher_lease
 
     require_dispatcher_lease(lease, "dispatch_once")
-    return _dispatch_once(conn, **kwargs)
+    return _dispatch_once(lease, conn, **kwargs)
 
 
 def dispatch_once(
@@ -9507,15 +9507,8 @@ def dispatch_once(
     return dispatch_once_authorized(lease, conn, **kwargs)
 
 
-def _dispatch_once_for_tests(
-    conn: sqlite3.Connection,
-    **kwargs,
-) -> DispatchResult:
-    """Non-installed test seam for mutation contract fixtures only."""
-    return _dispatch_once(conn, **kwargs)
-
-
 def _dispatch_once(
+    lease,
     conn: sqlite3.Connection,
     *,
     spawn_fn=None,
@@ -9545,33 +9538,21 @@ def _dispatch_once(
     boards tick in parallel. See :func:`_dispatch_tick_lock` for the
     cross-process / cross-platform mechanics.
     """
+    from hermes_cli.dispatcher_authority import require_dispatcher_lease
+
+    require_dispatcher_lease(lease, "_dispatch_once")
     try:
         db_path = kanban_db_path(board=board)
-    except Exception:
-        # Path resolution should never fail, but if it somehow does we
-        # must not lose the tick — fall through to an unguarded dispatch
-        # rather than dropping work.
-        result = _dispatch_once_locked(
-            conn,
-            spawn_fn=spawn_fn,
-            ttl_seconds=ttl_seconds,
-            dry_run=dry_run,
-            max_spawn=max_spawn,
-            max_in_progress=max_in_progress,
-            failure_limit=failure_limit,
-            stale_timeout_seconds=stale_timeout_seconds,
-            board=board,
-            default_assignee=default_assignee,
-            max_in_progress_per_profile=max_in_progress_per_profile,
-            reconcile_orphans=reconcile_orphans,
-        )
-        _fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
-        return result
+    except Exception as exc:
+        # A board lock that cannot be resolved cannot provide the mandatory
+        # defence-in-depth boundary.  Never degrade to an unguarded mutation.
+        raise RuntimeError("dispatch tick lock path is unavailable") from exc
     with _dispatch_tick_lock(db_path) as held:
         if not held:
             result = DispatchResult(skipped_locked=True)
         else:
             result = _dispatch_once_locked(
+                lease,
                 conn,
                 spawn_fn=spawn_fn,
                 ttl_seconds=ttl_seconds,
@@ -9598,6 +9579,7 @@ def _dispatch_once(
 
 
 def _dispatch_once_locked(
+    lease,
     conn: sqlite3.Connection,
     *,
     spawn_fn=None,
@@ -9640,6 +9622,9 @@ def _dispatch_once_locked(
     ``board`` pins workspace/log/db resolution for this tick to a specific
     board. When omitted, the current-board resolution chain is used.
     """
+    from hermes_cli.dispatcher_authority import require_dispatcher_lease
+
+    require_dispatcher_lease(lease, "_dispatch_once_locked")
     # Reap zombie children from previously spawned workers. See
     # reap_worker_zombies() for the full rationale.
     reap_worker_zombies()
@@ -9877,20 +9862,10 @@ def _dispatch_once_locked(
         if claimed.workspace_kind == "worktree":
             set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
         _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
-        _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         try:
-            # Back-compat: older spawn_fn signatures accept only
-            # (task, workspace). Test stubs in the suite rely on that.
-            # Introspect the callable and pass `board` only when supported.
-            import inspect
-            try:
-                sig = inspect.signature(_spawn)
-                if "board" in sig.parameters:
-                    pid = _spawn(claimed, str(workspace), board=board)
-                else:
-                    pid = _spawn(claimed, str(workspace))
-            except (TypeError, ValueError):
-                pid = _spawn(claimed, str(workspace))
+            pid = _invoke_worker_spawn(
+                lease, spawn_fn, claimed, str(workspace), board=board
+            )
             if pid:
                 _set_worker_pid(conn, claimed.id, int(pid))
             # Worker-lifecycle observer (RFC #58548): fires AFTER spawn_fn
@@ -10012,17 +9987,10 @@ def _dispatch_once_locked(
         claimed.skills = list(
             dict.fromkeys([*(claimed.skills or []), "sdlc-review"])
         )
-        _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         try:
-            import inspect
-            try:
-                sig = inspect.signature(_spawn)
-                if "board" in sig.parameters:
-                    pid = _spawn(claimed, str(workspace), board=board)
-                else:
-                    pid = _spawn(claimed, str(workspace))
-            except (TypeError, ValueError):
-                pid = _spawn(claimed, str(workspace))
+            pid = _invoke_worker_spawn(
+                lease, spawn_fn, claimed, str(workspace), board=board
+            )
             if pid:
                 _set_worker_pid(conn, claimed.id, int(pid))
             # Worker-lifecycle observer (RFC #58548): same contract as the
@@ -10308,6 +10276,31 @@ def _resolve_worker_cli_toolsets(hermes_home: Optional[str]) -> Optional[list[st
         return None
 
 
+def _resolve_effective_worker_pins(
+    hermes_home: Optional[str], task: Task
+) -> tuple[str, str, list[str]]:
+    """Freeze the exact effective model/provider/toolsets before spawning."""
+    if not hermes_home:
+        raise RuntimeError("worker profile home is unresolved")
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    from hermes_cli.config import load_config
+    from hermes_cli.tools_config import _get_platform_tools
+
+    token = set_hermes_home_override(hermes_home)
+    try:
+        cfg = load_config()
+        model_cfg = cfg.get("model") if isinstance(cfg, dict) else None
+        model_cfg = model_cfg if isinstance(model_cfg, dict) else {}
+        model = str(task.model_override or model_cfg.get("default") or "").strip()
+        provider = str(task.provider_override or model_cfg.get("provider") or "").strip()
+        toolsets = sorted(_get_platform_tools(cfg, "cli"))
+    finally:
+        reset_hermes_home_override(token)
+    if not model or not provider or not toolsets:
+        raise RuntimeError("worker effective model/provider/toolsets could not be pinned")
+    return model, provider, toolsets
+
+
 _retagged_workspace_roots: set[str] = set()
 
 
@@ -10334,7 +10327,30 @@ def _retag_legacy_worker_sessions(workspaces_root_path: str) -> None:
         _log.debug("kanban worker: legacy session retag skipped (%s)", exc)
 
 
+def _invoke_worker_spawn(
+    lease,
+    spawn_fn,
+    task: Task,
+    workspace: str,
+    *,
+    board: Optional[str],
+) -> Optional[int]:
+    """Invoke the guarded production spawner or a non-installed test double."""
+    if spawn_fn is None:
+        return _default_spawn(lease, task, workspace, board=board)
+    import inspect
+
+    try:
+        signature = inspect.signature(spawn_fn)
+        if "board" in signature.parameters:
+            return spawn_fn(task, workspace, board=board)
+    except (TypeError, ValueError):
+        pass
+    return spawn_fn(task, workspace)
+
+
 def _default_spawn(
+    lease,
     task: Task,
     workspace: str,
     *,
@@ -10352,6 +10368,9 @@ def _default_spawn(
     vars all resolve to the same board the dispatcher claimed the task
     from. Workers cannot accidentally see other boards.
     """
+    from hermes_cli.dispatcher_authority import require_dispatcher_lease
+
+    require_dispatcher_lease(lease, "_default_spawn")
     import subprocess
     if not task.assignee:
         raise ValueError(f"task {task.id} has no assignee")
@@ -10387,6 +10406,9 @@ def _default_spawn(
         # This only happens in test fixtures where the isolated
         # HERMES_HOME never had profiles created.
         pass
+    effective_model, effective_provider, worker_toolsets = _resolve_effective_worker_pins(
+        env.get("HERMES_HOME"), task
+    )
     if task.tenant:
         env["HERMES_TENANT"] = task.tenant
     env["HERMES_KANBAN_TASK"] = task.id
@@ -10485,28 +10507,17 @@ def _default_spawn(
         for sk in task.skills:
             if sk:
                 cmd.extend(["--skills", sk])
-    if task.model_override:
-        cmd.extend(["-m", task.model_override])
-        # Pin the provider too when the override names one, so the worker
-        # resolves the model against the intended backend instead of the
-        # profile's configured provider (mixing model X with provider Y is
-        # the classic mis-set that stalls a board).
-        if task.provider_override:
-            cmd.extend(["--provider", task.provider_override])
+    cmd.extend(["-m", effective_model, "--provider", effective_provider])
     # Per-task thinking depth. Independent of the model override — a task can
     # run the profile's own model at a different depth — so this is its own
     # branch, not a nested one.
     if task.reasoning_effort:
         cmd.extend(["--reasoning", task.reasoning_effort])
-    worker_toolsets = _resolve_worker_cli_toolsets(env.get("HERMES_HOME"))
-    if worker_toolsets:
-        joined_toolsets = ",".join(worker_toolsets)
-        env["HERMES_KANBAN_TOOLSETS"] = joined_toolsets
-        cmd.extend(["--toolsets", joined_toolsets])
-    if task.model_override:
-        env["HERMES_KANBAN_MODEL"] = task.model_override
-    if task.provider_override:
-        env["HERMES_KANBAN_PROVIDER"] = task.provider_override
+    joined_toolsets = ",".join(worker_toolsets)
+    env["HERMES_KANBAN_TOOLSETS"] = joined_toolsets
+    env["HERMES_KANBAN_MODEL"] = effective_model
+    env["HERMES_KANBAN_PROVIDER"] = effective_provider
+    cmd.extend(["--toolsets", joined_toolsets])
     cmd.extend([
         "chat",
         "-q", prompt,
@@ -10524,13 +10535,13 @@ def _default_spawn(
     try:
         from hermes_cli.config import load_config as _load_worker_config
         _worker_cfg = (_load_worker_config() or {}).get("kanban", {})
-    except Exception:
-        _worker_cfg = {}
+    except Exception as exc:
+        raise RuntimeError("worker isolation config unavailable") from exc
     from hermes_cli.worker_scope import build_scoped_worker_command
     cmd = build_scoped_worker_command(
         cmd,
         env=env,
-        require_isolation=bool(_worker_cfg.get("require_worker_scope", False)),
+        require_isolation=True,
     )
 
     # Redirect output to a per-task log under <board-root>/logs/.
@@ -10575,6 +10586,7 @@ def _default_spawn(
 # ---------------------------------------------------------------------------
 
 def run_daemon(
+    lease,
     *,
     interval: float = 60.0,
     max_spawn: Optional[int] = None,
@@ -10591,6 +10603,9 @@ def run_daemon(
     """
     import signal
     import threading
+    from hermes_cli.dispatcher_authority import require_dispatcher_lease
+
+    require_dispatcher_lease(lease, "run_daemon")
 
     if stop_event is None:
         stop_event = threading.Event()
@@ -10612,7 +10627,8 @@ def run_daemon(
     while not stop_event.is_set():
         try:
             with contextlib.closing(connect()) as conn:
-                res = _dispatch_once_for_tests(
+                res = dispatch_once_authorized(
+                    lease,
                     conn,
                     max_spawn=max_spawn,
                     failure_limit=failure_limit,
@@ -11293,12 +11309,35 @@ def remove_notify_sub(
     thread_id: Optional[str] = None,
 ) -> bool:
     with write_txn(conn):
+        subscription_id = ":".join([task_id, platform, chat_id, thread_id or ""])
+        if not _delivery_subscription_complete(conn, subscription_id):
+            return False
         cur = conn.execute(
             "DELETE FROM kanban_notify_subs WHERE task_id = ? "
             "AND platform = ? AND chat_id = ? AND thread_id = ?",
             (task_id, platform, chat_id, thread_id or ""),
         )
     return cur.rowcount > 0
+
+
+def _delivery_subscription_complete(
+    conn: sqlite3.Connection, subscription_id: str
+) -> bool:
+    """Authoritatively gate cursor/removal on every frozen child."""
+    try:
+        row = conn.execute(
+            "SELECT 1 FROM kanban_delivery_parents p "
+            "WHERE p.subscription_id=? AND EXISTS ("
+            " SELECT 1 FROM kanban_delivery_children c "
+            " WHERE c.parent_id=p.parent_id AND c.state NOT IN ('sent','audited')"
+            ") LIMIT 1",
+            (subscription_id,),
+        ).fetchone()
+    except sqlite3.OperationalError as exc:
+        if "no such table" in str(exc).lower() or "no such column" in str(exc).lower():
+            return True
+        raise
+    return row is None
 
 
 def purge_stale_done_notify_subs(
@@ -11437,12 +11476,9 @@ def claim_unseen_events_for_sub(
         )
         if not events:
             return old_cursor, old_cursor, []
-        conn.execute(
-            "UPDATE kanban_notify_subs SET last_event_id = ? "
-            "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ? "
-            "AND last_event_id = ?",
-            (int(new_cursor), task_id, platform, chat_id, thread_id or "", int(old_cursor)),
-        )
+        # Do not pre-advance the delivery-completion cursor merely to claim
+        # work. Deterministic parent IDs and child leases serialize consumers
+        # without creating a crash-loss window before materialization/ack.
         return old_cursor, new_cursor, events
 
 
@@ -11454,13 +11490,17 @@ def advance_notify_cursor(
     chat_id: str,
     thread_id: Optional[str] = None,
     new_cursor: int,
-) -> None:
+) -> bool:
     with write_txn(conn):
-        conn.execute(
+        subscription_id = ":".join([task_id, platform, chat_id, thread_id or ""])
+        if not _delivery_subscription_complete(conn, subscription_id):
+            return False
+        cur = conn.execute(
             "UPDATE kanban_notify_subs SET last_event_id = ? "
             "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?",
             (int(new_cursor), task_id, platform, chat_id, thread_id or ""),
         )
+    return cur.rowcount > 0
 
 
 def rewind_notify_cursor(

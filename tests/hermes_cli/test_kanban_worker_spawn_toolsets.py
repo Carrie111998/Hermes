@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import subprocess
 
+from tests.dispatcher_test_support import spawn_worker
+
 
 def _make_task(kb, *, assignee: str):
     return kb.Task(
@@ -78,7 +80,7 @@ agent:
 
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    pid = kb._default_spawn(_make_task(kb, assignee="elias"), str(workspace))
+    pid = spawn_worker(kb, _make_task(kb, assignee="elias"), str(workspace))
 
     assert pid == 4242
     assert captured["env"]["HERMES_HOME"] == str(profile)
@@ -120,7 +122,7 @@ def test_default_spawn_model_override_survives_real_cli_parse(monkeypatch, tmp_p
     workspace.mkdir()
     task = _make_task(kb, assignee="elias")
     task.model_override = "gpt-5.6-sol"
-    kb._default_spawn(task, str(workspace))
+    spawn_worker(kb, task, str(workspace))
 
     parser, _subparsers, _chat_parser = build_top_level_parser()
     # The worker may be wrapped in a transient systemd scope. Unwrap the command

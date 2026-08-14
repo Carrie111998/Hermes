@@ -1,14 +1,21 @@
 from __future__ import annotations
 
 import shutil
+from types import SimpleNamespace
 
 import pytest
 
 
 def test_scope_command_pins_identity_and_uses_systemd_scope(monkeypatch):
+    from hermes_cli import worker_scope
     from hermes_cli.worker_scope import build_scoped_worker_command
 
     monkeypatch.setattr(shutil, "which", lambda name: f"/usr/bin/{name}" if name in {"systemd-run", "systemctl"} else None)
+    monkeypatch.setattr(
+        worker_scope.subprocess,
+        "run",
+        lambda *_a, **_k: SimpleNamespace(returncode=0, stdout="running\n"),
+    )
     env = {
         "HERMES_PROFILE": "researcher",
         "HERMES_KANBAN_TASK": "t_12345678",

@@ -27,6 +27,7 @@ from pathlib import Path
 import pytest
 
 from hermes_cli import kanban_db as kb
+from tests.dispatcher_test_support import dispatch_once
 
 
 @pytest.fixture
@@ -155,7 +156,7 @@ class TestDispatchOnceReconciles:
         tid = kb.create_task(conn, title="zombie", assignee="w")
         _orphan_running(conn, tid)
 
-        result = kb._dispatch_once_for_tests(conn, spawn_fn=lambda *a, **k: (True, ""),
+        result = dispatch_once(kb, conn, spawn_fn=lambda *a, **k: (True, ""),
                                   dry_run=True)
 
         assert tid in result.reconciled_orphans
@@ -169,7 +170,7 @@ class TestDispatchOnceReconciles:
         tid = kb.create_task(conn, title="zombie", assignee="w")
         _orphan_running(conn, tid)
 
-        result = kb._dispatch_once_for_tests(conn, spawn_fn=lambda *a, **k: (True, ""),
+        result = dispatch_once(kb, conn, spawn_fn=lambda *a, **k: (True, ""),
                                   dry_run=True, reconcile_orphans=False)
 
         assert result.reconciled_orphans == []

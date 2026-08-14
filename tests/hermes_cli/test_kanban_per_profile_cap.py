@@ -12,6 +12,8 @@ import tempfile
 
 import pytest
 
+from tests.dispatcher_test_support import dispatch_once
+
 
 @pytest.fixture()
 def isolated_kanban_home_with_profiles(monkeypatch):
@@ -41,7 +43,7 @@ def test_cap_2_balances_two_profiles(isolated_kanban_home_with_profiles):
         for i in range(3):
             kb.create_task(conn, title=f"b{i}", assignee="beta")
     with kb.connect_closing() as conn:
-        res = kb._dispatch_once_for_tests(
+        res = dispatch_once(kb,
             conn, spawn_fn=_fake_spawn, dry_run=True,
             max_in_progress_per_profile=2,
         )
@@ -66,7 +68,7 @@ def test_capped_tasks_dispatched_on_subsequent_tick(isolated_kanban_home_with_pr
 
     # First tick: cap=1, only 1 alpha dispatched
     with kb.connect_closing() as conn:
-        res1 = kb._dispatch_once_for_tests(
+        res1 = dispatch_once(kb,
             conn, spawn_fn=_fake_spawn, dry_run=False,
             max_in_progress_per_profile=1,
         )
@@ -85,7 +87,7 @@ def test_capped_tasks_dispatched_on_subsequent_tick(isolated_kanban_home_with_pr
 
     # Second tick: 1 more alpha should now dispatch
     with kb.connect_closing() as conn:
-        res2 = kb._dispatch_once_for_tests(
+        res2 = dispatch_once(kb,
             conn, spawn_fn=_fake_spawn, dry_run=False,
             max_in_progress_per_profile=1,
         )

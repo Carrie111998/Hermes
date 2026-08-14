@@ -118,13 +118,21 @@ def test_kanban_notifier_replays_telegram_dm_topic_delivery_metadata(tmp_path, m
     asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
 
     assert len(adapter.sent) == 1
-    assert adapter.sent[0]["metadata"] == {
+    sent_metadata = adapter.sent[0]["metadata"]
+    assert {k: sent_metadata[k] for k in (
+        "chat_type",
+        "direct_messages_topic_id",
+        "telegram_dm_topic_reply_fallback",
+        "telegram_reply_to_message_id",
+        "thread_id",
+    )} == {
         "chat_type": "dm",
         "direct_messages_topic_id": "20197",
         "telegram_dm_topic_reply_fallback": True,
         "telegram_reply_to_message_id": "462",
         "thread_id": "20197",
     }
+    assert sent_metadata["idempotency_key"] == sent_metadata["kanban_delivery_child_id"]
     assert len(adapter.handled) == 1
     assert adapter.handled[0].source.chat_type == "dm"
     assert adapter.handled[0].source.thread_id == "20197"

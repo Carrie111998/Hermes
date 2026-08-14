@@ -1,6 +1,6 @@
 [
   {
-    "symbol": "gateway.kanban_watchers.KanbanWatchersMixin._kanban_dispatcher_watcher",
+    "symbol": "gateway.kanban_watchers.GatewayKanbanWatchersMixin._kanban_dispatcher_watcher",
     "exposure": "embedded gateway compatibility adapter",
     "mutation_class": "dispatch_mutation",
     "authority_policy": "GUARDED_DISPATCH_MUTATION",
@@ -12,6 +12,20 @@
     "mutation_class": "dispatch_mutation",
     "authority_policy": "GUARDED_DISPATCH_MUTATION",
     "test_id": "foreground_dispatcher_authority"
+  },
+  {
+    "symbol": "hermes_cli.kanban_dispatcher.run_foreground_dispatcher",
+    "exposure": "shared foreground runtime",
+    "mutation_class": "dispatch_mutation",
+    "authority_policy": "GUARDED_DISPATCH_MUTATION",
+    "test_id": "foreground_runtime_lease"
+  },
+  {
+    "symbol": "hermes_cli.kanban_dispatcher.run_dispatcher_tick",
+    "exposure": "shared multi-board tick",
+    "mutation_class": "dispatch_mutation",
+    "authority_policy": "GUARDED_DISPATCH_MUTATION",
+    "test_id": "runtime_tick_lease"
   },
   {
     "symbol": "hermes_cli.kanban._cmd_dispatch",
@@ -40,5 +54,47 @@
     "mutation_class": "dispatch_mutation",
     "authority_policy": "GUARDED_DISPATCH_MUTATION",
     "test_id": "direct_helper_lease"
+  },
+  {
+    "symbol": "hermes_cli.kanban_db.dispatch_once",
+    "exposure": "installed compatibility facade",
+    "mutation_class": "dispatch_mutation",
+    "authority_policy": "GUARDED_DISPATCH_MUTATION",
+    "test_id": "compat_helper_lease"
+  },
+  {
+    "symbol": "hermes_cli.kanban_db._dispatch_once",
+    "exposure": "private tick lock wrapper",
+    "mutation_class": "dispatch_mutation",
+    "authority_policy": "GUARDED_DISPATCH_MUTATION",
+    "test_id": "private_tick_lease"
+  },
+  {
+    "symbol": "hermes_cli.kanban_db._dispatch_once_locked",
+    "exposure": "private tick implementation",
+    "mutation_class": "dispatch_mutation",
+    "authority_policy": "GUARDED_DISPATCH_MUTATION",
+    "test_id": "private_locked_tick_lease"
+  },
+  {
+    "symbol": "hermes_cli.kanban_db._default_spawn",
+    "exposure": "production worker spawner",
+    "mutation_class": "process_spawn",
+    "authority_policy": "GUARDED_DISPATCH_MUTATION",
+    "test_id": "worker_spawn_lease"
+  },
+  {
+    "symbol": "hermes_cli.kanban_db.remove_notify_sub",
+    "exposure": "delivery completion subscription gate",
+    "mutation_class": "delivery_completion",
+    "authority_policy": "TOKEN_GUARDED_DELIVERY_COMPLETION",
+    "test_id": "subscription_completion_token"
+  },
+  {
+    "symbol": "hermes_cli.kanban_db.advance_notify_cursor",
+    "exposure": "delivery completion cursor gate",
+    "mutation_class": "delivery_completion",
+    "authority_policy": "TOKEN_GUARDED_DELIVERY_COMPLETION",
+    "test_id": "cursor_completion_token"
   }
 ]

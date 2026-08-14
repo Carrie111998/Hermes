@@ -17,6 +17,7 @@ from pathlib import Path
 import pytest
 
 from hermes_cli import kanban_db as kb
+from tests.dispatcher_test_support import dispatch_once
 
 
 @pytest.fixture
@@ -55,7 +56,7 @@ def test_held_lock_skips_the_tick_without_writes(conn):
     # Hold the lock, then attempt a contended tick.
     with kb._dispatch_tick_lock(db_path) as held:
         assert held is True  # we genuinely acquired it
-        result = kb._dispatch_once_for_tests(conn, spawn_fn=spy_spawn)
+        result = dispatch_once(kb, conn, spawn_fn=spy_spawn)
 
     assert result.skipped_locked is True
     assert result.spawned == []

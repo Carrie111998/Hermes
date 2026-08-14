@@ -13,7 +13,7 @@ def test_manifest_classifies_all_mandatory_installed_entrypoints():
     rows = json.loads(manifest_path.read_text(encoding="utf-8"))
     by_symbol = {row["symbol"]: row for row in rows}
     required = {
-        "gateway.kanban_watchers.KanbanWatchersMixin._kanban_dispatcher_watcher": "GUARDED_DISPATCH_MUTATION",
+        "gateway.kanban_watchers.GatewayKanbanWatchersMixin._kanban_dispatcher_watcher": "GUARDED_DISPATCH_MUTATION",
         "hermes_cli.kanban._cmd_dispatcher": "GUARDED_DISPATCH_MUTATION",
         "hermes_cli.kanban._cmd_dispatch": "DISABLED_NONZERO",
         "hermes_cli.kanban._cmd_daemon": "DISABLED_NONZERO",

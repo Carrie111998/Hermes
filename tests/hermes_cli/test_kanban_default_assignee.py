@@ -12,6 +12,8 @@ import tempfile
 
 import pytest
 
+from tests.dispatcher_test_support import dispatch_once
+
 
 @pytest.fixture()
 def isolated_kanban_home(monkeypatch):
@@ -41,7 +43,7 @@ def test_unassigned_task_auto_assigned_with_default_assignee(isolated_kanban_hom
         kb.create_board(slug="default", name="Test")
         task_id = kb.create_task(conn, title="t1", assignee=None)
     with kb.connect_closing() as conn:
-        res = kb._dispatch_once_for_tests(
+        res = dispatch_once(kb,
             conn, spawn_fn=_fake_spawn, dry_run=False,
             default_assignee="default",
         )
@@ -80,7 +82,7 @@ def test_explicitly_assigned_task_untouched_by_default_assignee(isolated_kanban_
         kb.create_board(slug="default", name="Test")
         task_id = kb.create_task(conn, title="t1", assignee="default")
     with kb.connect_closing() as conn:
-        res = kb._dispatch_once_for_tests(
+        res = dispatch_once(kb,
             conn, spawn_fn=_fake_spawn, dry_run=False,
             default_assignee="someother",
         )

@@ -26,6 +26,7 @@ from pathlib import Path
 import pytest
 
 from hermes_cli import kanban_db as kb
+from tests.dispatcher_test_support import dispatch_once
 
 
 @pytest.fixture
@@ -400,7 +401,7 @@ def test_review_dispatch_gate_prevents_phantom_reviewer(
             cfgmod, "load_config",
             lambda *a, **k: {"kanban": {"review_dispatch": False}},
         )
-        res_off = kb._dispatch_once_for_tests(conn, dry_run=True)
+        res_off = dispatch_once(kb, conn, dry_run=True)
         assert tid not in [s[0] for s in res_off.spawned]
         assert kb.get_task(conn, tid).status == "review"
 
@@ -410,7 +411,7 @@ def test_review_dispatch_gate_prevents_phantom_reviewer(
             cfgmod, "load_config",
             lambda *a, **k: {"kanban": {"review_dispatch": True}},
         )
-        res_on = kb._dispatch_once_for_tests(conn, dry_run=True)
+        res_on = dispatch_once(kb, conn, dry_run=True)
         assert tid in [s[0] for s in res_on.spawned]
 
 
@@ -452,7 +453,7 @@ def test_active_pr_guard_skipped_for_review_lane_but_defers_ready_lane(
         assert kb.check_respawn_guard(conn, ready_id) == "active_pr"
         assert kb.check_respawn_guard(conn, review_id, lane="review") is None
 
-        res = kb._dispatch_once_for_tests(conn, dry_run=True)
+        res = dispatch_once(kb, conn, dry_run=True)
         spawned_ids = [s[0] for s in res.spawned]
         guarded = dict(res.respawn_guarded)
         assert review_id in spawned_ids
@@ -513,7 +514,7 @@ def test_review_dispatch_preserves_task_skills_and_adds_reviewer_skill(
             "check_respawn_guard",
             lambda _conn, _task_id, **_kw: "rate_limit_cooldown",
         )
-        guarded = kb._dispatch_once_for_tests(conn, spawn_fn=spawn)
+        guarded = dispatch_once(kb, conn, spawn_fn=spawn)
         assert guarded.respawn_guarded == [(task_id, "rate_limit_cooldown")]
         assert not guarded.spawned
         guarded_task = kb.get_task(conn, task_id)
@@ -521,7 +522,7 @@ def test_review_dispatch_preserves_task_skills_and_adds_reviewer_skill(
         assert guarded_task.status == "review"
 
         monkeypatch.setattr(kb, "check_respawn_guard", lambda _conn, _task_id, **_kw: None)
-        result = kb._dispatch_once_for_tests(conn, spawn_fn=spawn)
+        result = dispatch_once(kb, conn, spawn_fn=spawn)
 
     assert task_id in [task[0] for task in result.spawned]
     assert captured == [["domain-specific-review", "sdlc-review"]]
@@ -559,7 +560,7 @@ def test_review_dispatch_honors_global_and_per_profile_caps(
             )
             review_ids.append(task_id)
 
-        globally_capped = kb._dispatch_once_for_tests(
+        globally_capped = dispatch_once(kb,
             conn,
             dry_run=True,
             max_in_progress=1,
@@ -573,7 +574,7 @@ def test_review_dispatch_honors_global_and_per_profile_caps(
             running_id,
             expected_run_id=running.current_run_id,
         )
-        global_dry_run = kb._dispatch_once_for_tests(
+        global_dry_run = dispatch_once(kb,
             conn,
             dry_run=True,
             max_in_progress=1,
@@ -582,7 +583,7 @@ def test_review_dispatch_honors_global_and_per_profile_caps(
             task for task in global_dry_run.spawned if task[0] in review_ids
         ]) == 1
 
-        per_profile_capped = kb._dispatch_once_for_tests(
+        per_profile_capped = dispatch_once(kb,
             conn,
             dry_run=True,
             max_in_progress=10,

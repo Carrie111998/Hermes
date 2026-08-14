@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import subprocess
 
+from tests.dispatcher_test_support import spawn_worker
+
 
 def _make_task(kb, *, assignee: str = "w"):
     return kb.Task(
@@ -52,7 +54,7 @@ def _capture_spawn_env(kb, monkeypatch, workspace: str) -> dict:
         return FakeProc()
 
     monkeypatch.setattr(subprocess, "Popen", fake_popen)
-    kb._default_spawn(_make_task(kb), workspace)
+    spawn_worker(kb, _make_task(kb), workspace)
     return captured
 
 

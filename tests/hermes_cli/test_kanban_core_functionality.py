@@ -22,6 +22,7 @@ from types import SimpleNamespace
 import pytest
 
 from hermes_cli import kanban_db as kb
+from tests.dispatcher_test_support import spawn_worker
 from hermes_cli.kanban import run_slash
 
 
@@ -723,7 +724,7 @@ def test_default_spawn_does_not_auto_load_any_skill(kanban_home, monkeypatch):
                              assignee="some-profile")
         task = kb.get_task(conn, tid)
         workspace = kb.resolve_workspace(task)
-        pid = kb._default_spawn(task, str(workspace))
+        pid = spawn_worker(kb, task, str(workspace))
         assert pid == 99999
     finally:
         conn.close()

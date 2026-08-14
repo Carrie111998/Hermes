@@ -10,6 +10,7 @@ import os
 import pytest
 
 from hermes_state import SessionDB
+from tests.dispatcher_test_support import spawn_worker
 
 
 @pytest.fixture()
@@ -57,7 +58,7 @@ def test_worker_spawn_tags_session_source_kanban(monkeypatch, tmp_path):
     workspace = str(tmp_path / "ws")
     os.makedirs(workspace, exist_ok=True)
 
-    kb._default_spawn(task, workspace)
+    spawn_worker(kb, task, workspace)
 
     assert captured["env"]["HERMES_SESSION_SOURCE"] == "kanban"
 

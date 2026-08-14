@@ -12,6 +12,8 @@ or future reviews. Not a pass/fail test — records numbers so we know
 when a change regresses latency by 10x and can decide whether to care.
 """
 
+from tests.dispatcher_test_support import dispatch_once
+
 import json
 import os
 import random
@@ -77,7 +79,7 @@ def main():
         seed_tasks(conn, kb, n, assignee=None)  # no assignee → won't spawn
         r = bench(
             f"dispatch_once (n={n}, no spawn)",
-            lambda: kb._dispatch_once_for_tests(conn, spawn_fn=lambda *_: None),
+            lambda: dispatch_once(kb, conn, spawn_fn=lambda *_: None),
             iterations=5,
         )
         print(f"  min={r['min_ms']:.1f} median={r['median_ms']:.1f} max={r['max_ms']:.1f} ms")

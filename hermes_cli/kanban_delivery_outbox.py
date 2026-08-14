@@ -3,8 +3,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import secrets
 import sqlite3
+from pathlib import Path
 from typing import Any, Iterable, Mapping
 
 STATES = ("pending", "leased", "sending", "sent", "failed", "dead", "audited")
@@ -26,6 +28,7 @@ CREATE TABLE IF NOT EXISTS kanban_delivery_parents (
  capability_json TEXT NOT NULL,
  capability_sha256 TEXT NOT NULL,
  manifest_sha256 TEXT NOT NULL,
+ subscription_id TEXT NOT NULL,
  child_count INTEGER NOT NULL,
  required_child_count INTEGER NOT NULL,
  state TEXT NOT NULL DEFAULT 'pending',
@@ -50,6 +53,8 @@ CREATE TABLE IF NOT EXISTS kanban_delivery_children (
  sending_at INTEGER,
  sent_at INTEGER,
  safe_receipt TEXT,
+ correlation_key TEXT NOT NULL,
+ idempotency_mode TEXT NOT NULL DEFAULT 'correlation-only',
  last_error_class TEXT,
  created_at INTEGER NOT NULL DEFAULT (unixepoch()),
  updated_at INTEGER NOT NULL DEFAULT (unixepoch()),
@@ -63,6 +68,12 @@ CREATE TABLE IF NOT EXISTS kanban_delivery_attempts (
  started_at INTEGER NOT NULL,
  ended_at INTEGER,
  transition TEXT NOT NULL,
+ from_state TEXT NOT NULL,
+ to_state TEXT NOT NULL,
+ policy_version TEXT NOT NULL,
+ idempotency_requested INTEGER NOT NULL DEFAULT 0,
+ idempotency_confirmed INTEGER NOT NULL DEFAULT 0,
+ duplicate_evidence TEXT,
  safe_receipt TEXT,
  error_class TEXT,
  UNIQUE(child_id, attempt_number)
@@ -74,6 +85,9 @@ CREATE TABLE IF NOT EXISTS kanban_delivery_audit (
  reason_code TEXT NOT NULL,
  evidence_sha256 TEXT NOT NULL,
  completion_permitted INTEGER NOT NULL,
+ policy_version TEXT NOT NULL DEFAULT 'terminal-audit-v1',
+ from_state TEXT NOT NULL DEFAULT 'dead',
+ to_state TEXT NOT NULL DEFAULT 'audited',
  created_at INTEGER NOT NULL DEFAULT (unixepoch())
 );
 """
@@ -81,7 +95,25 @@ CREATE TABLE IF NOT EXISTS kanban_delivery_audit (
 
 def init_schema(conn: sqlite3.Connection) -> None:
     conn.executescript(_SCHEMA)
+    _ensure_column(conn, "kanban_delivery_parents", "subscription_id", "TEXT NOT NULL DEFAULT ''")
+    _ensure_column(conn, "kanban_delivery_children", "correlation_key", "TEXT NOT NULL DEFAULT ''")
+    _ensure_column(conn, "kanban_delivery_children", "idempotency_mode", "TEXT NOT NULL DEFAULT 'correlation-only'")
+    _ensure_column(conn, "kanban_delivery_attempts", "from_state", "TEXT NOT NULL DEFAULT 'pending'")
+    _ensure_column(conn, "kanban_delivery_attempts", "to_state", "TEXT NOT NULL DEFAULT 'leased'")
+    _ensure_column(conn, "kanban_delivery_attempts", "policy_version", "TEXT NOT NULL DEFAULT 'retry-v1'")
+    _ensure_column(conn, "kanban_delivery_attempts", "idempotency_requested", "INTEGER NOT NULL DEFAULT 0")
+    _ensure_column(conn, "kanban_delivery_attempts", "idempotency_confirmed", "INTEGER NOT NULL DEFAULT 0")
+    _ensure_column(conn, "kanban_delivery_attempts", "duplicate_evidence", "TEXT")
+    _ensure_column(conn, "kanban_delivery_audit", "policy_version", "TEXT NOT NULL DEFAULT 'terminal-audit-v1'")
+    _ensure_column(conn, "kanban_delivery_audit", "from_state", "TEXT NOT NULL DEFAULT 'dead'")
+    _ensure_column(conn, "kanban_delivery_audit", "to_state", "TEXT NOT NULL DEFAULT 'audited'")
     conn.commit()
+
+
+def _ensure_column(conn: sqlite3.Connection, table: str, column: str, declaration: str) -> None:
+    present = {str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})")}
+    if column not in present:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {declaration}")
 
 
 def _canonical(value: Any) -> str:
@@ -99,15 +131,48 @@ def _digest(*parts: Any) -> str:
 
 def _validate_capability(capability: Mapping[str, Any]) -> dict[str, Any]:
     cap = dict(capability)
+    allowed = {
+        "version", "adapter_type", "adapter_version", "route_kind",
+        "supports_async_delivery", "creator_wake_applicable",
+        "creator_session_id", "wake_required", "wake_policy_version",
+        "artifact_transport", "artifact_policy_version", "idempotency_mode",
+    }
+    unknown = sorted(set(cap) - allowed)
+    if unknown:
+        raise CapabilityError(f"unknown route capability fields: {','.join(unknown)}")
     if cap.get("version") != "route-capability-v1":
         raise CapabilityError("unknown route capability version")
     push = cap.get("supports_async_delivery")
     if not isinstance(push, bool):
         raise CapabilityError("supports_async_delivery must be boolean")
-    if not push and (
-        not cap.get("creator_wake_applicable") or not cap.get("creator_session_id")
-    ):
+    route_kind = cap.get("route_kind")
+    if route_kind is not None and route_kind not in ("push", "non_push"):
+        raise CapabilityError("route_kind must be push or non_push")
+    if route_kind is not None and (route_kind == "push") is not push:
+        raise CapabilityError("route_kind contradicts supports_async_delivery")
+    wake_applicable = cap.get("creator_wake_applicable")
+    if not isinstance(wake_applicable, bool):
+        raise CapabilityError("creator_wake_applicable must be boolean")
+    if not push and (not wake_applicable or not cap.get("creator_session_id")):
         raise CapabilityError("non-push route requires a stable creator wake target")
+    if cap.get("wake_required") and not wake_applicable:
+        raise CapabilityError("required wake must be applicable")
+    registered = {
+        "wake_policy_version": {None, "wake-policy-v1"},
+        "artifact_policy_version": {None, "artifact-policy-v1"},
+        "idempotency_mode": {None, "correlation-only", "adapter-key-v1"},
+    }
+    for field, versions in registered.items():
+        if cap.get(field) not in versions:
+            raise CapabilityError(f"unregistered {field}")
+    adapter = cap.get("adapter_type")
+    transport = cap.get("artifact_transport")
+    if adapter is not None and (not isinstance(adapter, str) or not adapter.strip()):
+        raise CapabilityError("adapter_type must be a registered non-empty name")
+    if transport is not None and transport not in {
+        adapter, "local", "creator_session"
+    }:
+        raise CapabilityError("unregistered artifact transport")
     return cap
 
 
@@ -120,7 +185,11 @@ def materialize_parent(
     artifacts: Iterable[Mapping[str, Any]] = (),
 ) -> str:
     source_frozen = dict(source)
+    subscription_id = str(source_frozen.get("subscription_id") or "")
+    if not subscription_id:
+        raise CapabilityError("immutable subscription_id is required")
     parent_id = _digest("kanban-delivery-parent-v2", source_frozen)
+    init_schema(conn)
     existing = conn.execute(
         "SELECT parent_id FROM kanban_delivery_parents WHERE parent_id=?", (parent_id,)
     ).fetchone()
@@ -147,8 +216,25 @@ def materialize_parent(
     for index, artifact in enumerate(artifacts):
         item = dict(artifact)
         ordinal = int(item.get("ordinal", index))
+        if set(item) - {"manifest_id", "sha256", "ordinal", "path", "optional"}:
+            raise CapabilityError("unknown artifact manifest fields")
         if not item.get("manifest_id") or not item.get("sha256"):
             raise CapabilityError("artifact manifest identity and sha256 are required")
+        expected = str(item["sha256"]).lower()
+        if len(expected) != 64 or any(ch not in "0123456789abcdef" for ch in expected):
+            raise CapabilityError("artifact sha256 must be a lowercase hex digest")
+        raw_path = item.get("path")
+        if not isinstance(raw_path, str) or not raw_path:
+            raise CapabilityError("artifact transport path is required")
+        path = Path(os.path.expanduser(raw_path)).resolve(strict=False)
+        try:
+            actual = hashlib.sha256(path.read_bytes()).hexdigest()
+        except (OSError, ValueError) as exc:
+            raise CapabilityError("advertised artifact is unavailable") from exc
+        if actual != expected:
+            raise CapabilityError("advertised artifact digest mismatch")
+        item["path"] = str(path)
+        item["sha256"] = expected
         children.append(
             {"kind": "artifact_upload", "ordinal": ordinal + 1, "required": not bool(item.get("optional", False)), "component": item, "policy": cap.get("artifact_policy_version") or "artifact-policy-v1"}
         )
@@ -160,13 +246,13 @@ def materialize_parent(
     manifest_sha = _digest(manifest)
     with conn:
         conn.execute(
-            "INSERT INTO kanban_delivery_parents(parent_id,source_json,capability_version,capability_json,capability_sha256,manifest_sha256,child_count,required_child_count) VALUES(?,?,?,?,?,?,?,?)",
-            (parent_id, _canonical(source_frozen), cap["version"], cap_json, hashlib.sha256(cap_json.encode()).hexdigest(), manifest_sha, len(manifest), sum(bool(x["required"]) for x in manifest)),
+            "INSERT INTO kanban_delivery_parents(parent_id,source_json,capability_version,capability_json,capability_sha256,manifest_sha256,subscription_id,child_count,required_child_count) VALUES(?,?,?,?,?,?,?,?,?)",
+            (parent_id, _canonical(source_frozen), cap["version"], cap_json, hashlib.sha256(cap_json.encode()).hexdigest(), manifest_sha, subscription_id, len(manifest), sum(bool(x["required"]) for x in manifest)),
         )
         for child in manifest:
             conn.execute(
-                "INSERT INTO kanban_delivery_children(child_id,parent_id,kind,ordinal,component_json,required,policy_version) VALUES(?,?,?,?,?,?,?)",
-                (child["child_id"], parent_id, child["kind"], child["ordinal"], _canonical(child["component"]), int(child["required"]), child["policy"]),
+                "INSERT INTO kanban_delivery_children(child_id,parent_id,kind,ordinal,component_json,required,policy_version,correlation_key,idempotency_mode) VALUES(?,?,?,?,?,?,?,?,?)",
+                (child["child_id"], parent_id, child["kind"], child["ordinal"], _canonical(child["component"]), int(child["required"]), child["policy"], child["child_id"], cap.get("idempotency_mode") or "correlation-only"),
             )
     return parent_id
 
@@ -186,8 +272,8 @@ def lease_child(conn: sqlite3.Connection, child_id: str, owner: str, *, now: int
         if changed != 1:
             raise TransitionError("lease compare-and-swap failed")
         conn.execute(
-            "INSERT INTO kanban_delivery_attempts(child_id,attempt_number,lease_token_hash,started_at,transition) VALUES(?,?,?,?,?)",
-            (child_id, attempt, token_hash, now, "leased"),
+            "INSERT INTO kanban_delivery_attempts(child_id,attempt_number,lease_token_hash,started_at,transition,from_state,to_state,policy_version,idempotency_requested) VALUES(?,?,?,?,?,?,?,?,?)",
+            (child_id, attempt, token_hash, now, "leased", row[0], "leased", "retry-v1", 1),
         )
     return token
 
@@ -272,7 +358,7 @@ def mark_sent(conn: sqlite3.Connection, child_id: str, token: str, *, receipt: s
         row = conn.execute("SELECT state,lease_token_hash,parent_id,attempt_count FROM kanban_delivery_children WHERE child_id=?", (child_id,)).fetchone()
         token_hash = _assert_token(row, token, "sending")
         conn.execute("UPDATE kanban_delivery_children SET state='sent',sent_at=?,safe_receipt=?,lease_owner=NULL,lease_token_hash=NULL,lease_expires_at=NULL,updated_at=? WHERE child_id=?", (now, receipt, now, child_id))
-        conn.execute("UPDATE kanban_delivery_attempts SET ended_at=?,transition='sent',safe_receipt=? WHERE child_id=? AND attempt_number=? AND lease_token_hash=?", (now, receipt, child_id, row[3], token_hash))
+        conn.execute("UPDATE kanban_delivery_attempts SET ended_at=?,transition='sent',from_state='sending',to_state='sent',safe_receipt=?,idempotency_confirmed=1 WHERE child_id=? AND attempt_number=? AND lease_token_hash=?", (now, receipt, child_id, row[3], token_hash))
         _derive_parent(conn, row[2], now)
 
 

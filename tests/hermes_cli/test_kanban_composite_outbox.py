@@ -2,8 +2,20 @@ from __future__ import annotations
 
 import sqlite3
 import asyncio
+import hashlib
 
 import pytest
+
+
+@pytest.fixture
+def authority_lease(tmp_path, monkeypatch):
+    from hermes_cli.dispatcher_authority import acquire_machine_dispatcher
+
+    monkeypatch.setenv("HERMES_STATE_ROOT", str(tmp_path / "state"))
+    acquired = acquire_machine_dispatcher("outbox-test")
+    assert acquired.lease is not None
+    yield acquired.lease
+    acquired.lease.release()
 
 
 def _conn():
@@ -39,7 +51,7 @@ def _non_push():
     return row
 
 
-def test_push_and_non_push_freeze_different_required_shapes():
+def test_push_and_non_push_freeze_different_required_shapes(authority_lease):
     from hermes_cli.kanban_delivery_outbox import init_schema, materialize_parent
 
     conn = _conn()
@@ -52,7 +64,7 @@ def test_push_and_non_push_freeze_different_required_shapes():
     assert wake_kinds == ["creator_wake"]
 
 
-def test_push_with_required_creator_wake_freezes_text_and_wake_children():
+def test_push_with_required_creator_wake_freezes_text_and_wake_children(authority_lease):
     from hermes_cli.kanban_delivery_outbox import init_schema, materialize_parent
 
     conn = _conn()
@@ -76,7 +88,7 @@ def test_push_with_required_creator_wake_freezes_text_and_wake_children():
     ]
 
 
-def test_materialization_is_deterministic_and_capability_drift_cannot_reshape():
+def test_materialization_is_deterministic_and_capability_drift_cannot_reshape(authority_lease):
     from hermes_cli.kanban_delivery_outbox import init_schema, materialize_parent
 
     conn = _conn()
@@ -88,7 +100,7 @@ def test_materialization_is_deterministic_and_capability_drift_cannot_reshape():
     assert [r["kind"] for r in rows] == ["primary_text"]
 
 
-def test_invalid_non_push_without_wake_is_atomic():
+def test_invalid_non_push_without_wake_is_atomic(authority_lease):
     from hermes_cli.kanban_delivery_outbox import CapabilityError, init_schema, materialize_parent
 
     conn = _conn()
@@ -101,7 +113,7 @@ def test_invalid_non_push_without_wake_is_atomic():
     assert conn.execute("select count(*) from kanban_delivery_children").fetchone()[0] == 0
 
 
-def test_seven_state_transitions_attempts_receipt_and_parent_gate():
+def test_seven_state_transitions_attempts_receipt_and_parent_gate(tmp_path, authority_lease):
     from hermes_cli.kanban_delivery_outbox import (
         init_schema,
         lease_child,
@@ -114,12 +126,19 @@ def test_seven_state_transitions_attempts_receipt_and_parent_gate():
 
     conn = _conn()
     init_schema(conn)
+    artifact_path = tmp_path / "artifact.bin"
+    artifact_path.write_bytes(b"artifact")
     parent = materialize_parent(
         conn,
         source=_source("e1"),
         capability=_push(),
         text="done",
-        artifacts=[{"manifest_id": "m1", "sha256": "a" * 64, "ordinal": 0}],
+        artifacts=[{
+            "manifest_id": "m1",
+            "sha256": hashlib.sha256(b"artifact").hexdigest(),
+            "ordinal": 0,
+            "path": str(artifact_path),
+        }],
     )
     children = conn.execute("select child_id from kanban_delivery_children where parent_id=? order by ordinal", (parent,)).fetchall()
     text, artifact = [r[0] for r in children]
@@ -137,7 +156,7 @@ def test_seven_state_transitions_attempts_receipt_and_parent_gate():
     assert conn.execute("select count(*) from kanban_delivery_attempts").fetchone()[0] == 3
 
 
-def test_due_children_preserve_payload_and_recover_expired_uncertain_send():
+def test_due_children_preserve_payload_and_recover_expired_uncertain_send(authority_lease):
     from hermes_cli.kanban_delivery_outbox import (
         due_children,
         init_schema,
@@ -168,7 +187,7 @@ def test_due_children_preserve_payload_and_recover_expired_uncertain_send():
     assert retried["last_error_class"] == "uncertain_after_expired_sending"
 
 
-def test_audit_requires_explicit_completion_permission_and_is_append_only():
+def test_audit_requires_explicit_completion_permission_and_is_append_only(authority_lease):
     from hermes_cli.kanban_delivery_outbox import (
         audit_dead_child,
         init_schema,
@@ -204,7 +223,7 @@ def test_audit_requires_explicit_completion_permission_and_is_append_only():
     assert conn.execute("select count(*) from kanban_delivery_audit").fetchone()[0] == 1
 
 
-def test_process_parent_acks_each_child_and_retries_only_failed_sibling():
+def test_process_parent_acks_each_child_and_retries_only_failed_sibling(tmp_path, authority_lease):
     from hermes_cli.kanban_delivery_outbox import (
         init_schema,
         materialize_parent,
@@ -214,12 +233,18 @@ def test_process_parent_acks_each_child_and_retries_only_failed_sibling():
 
     conn = _conn()
     init_schema(conn)
+    artifact_path = tmp_path / "artifact.bin"
+    artifact_path.write_bytes(b"artifact")
     parent = materialize_parent(
         conn,
         source=_source("e1"),
         capability=_push(),
         text="done",
-        artifacts=[{"manifest_id": "m1", "sha256": "a" * 64, "path": "/tmp/a"}],
+        artifacts=[{
+            "manifest_id": "m1",
+            "sha256": hashlib.sha256(b"artifact").hexdigest(),
+            "path": str(artifact_path),
+        }],
     )
     calls = []
 

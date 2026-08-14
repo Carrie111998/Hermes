@@ -52,12 +52,17 @@ def canonical_lock_path() -> Path:
     if raw:
         root = Path(raw)
     else:
-        try:
-            from hermes_constants import get_process_hermes_home
-
-            root = get_process_hermes_home()
-        except Exception:
-            root = Path.home() / ".hermes"
+        # HERMES_HOME is deliberately profile-scoped for gateway/worker
+        # isolation.  The dispatcher authority is not: two profiles on one
+        # installation must resolve the same inode.  Derive the installation
+        # root from the conventional <root>/profiles/<name> shape without
+        # importing the profile-aware process-home helper.
+        home = Path(os.environ.get("HERMES_HOME") or (Path.home() / ".hermes"))
+        parts = home.parts
+        if len(parts) >= 2 and parts[-2] == "profiles":
+            root = home.parent.parent
+        else:
+            root = home
     return root.expanduser().resolve(strict=False) / "kanban" / ".dispatcher.lock"
 
 
@@ -167,7 +172,6 @@ def acquire_machine_dispatcher(context: str) -> AcquireResult:
         os.close(fd)
         return AcquireResult(AcquireState.UNAVAILABLE, error_class=_classify_os_error(exc))
     try:
-        lease = DispatcherLease(_LEASE_FACTORY_TOKEN, fd, path)
         payload = json.dumps(
             {"pid": os.getpid(), "mode": context, "version": "dispatcher-authority-v1", "at": int(time.time())},
             sort_keys=True,
@@ -175,6 +179,7 @@ def acquire_machine_dispatcher(context: str) -> AcquireResult:
         os.ftruncate(fd, 0)
         os.write(fd, payload)
         os.fsync(fd)
+        lease = DispatcherLease(_LEASE_FACTORY_TOKEN, fd, path)
         return AcquireResult(AcquireState.ACQUIRED, lease=lease, owner_hint=f"pid:{os.getpid()}")
     except BaseException as exc:
         try:
@@ -210,9 +215,25 @@ def read_status_no_side_effects() -> AuthorityStatus:
         data = json.loads(raw.decode("utf-8")) if raw else {}
         owner = f"pid:{int(data['pid'])}" if data.get("pid") else None
         age = max(0, int(time.time()) - int(data.get("at", 0))) if data.get("at") else None
-        # A status read never tries flock: the lock holder's recorded live PID is
-        # validated with a signal-free procfs existence check.
-        healthy = bool(owner and Path(f"/proc/{data['pid']}").exists())
+        # A live PID in stale bytes is not authority.  Probe the existing inode
+        # non-blockingly: successfully taking the lock proves it was unlocked,
+        # while EWOULDBLOCK proves a process currently retains lifetime
+        # authority.  The probe neither creates nor rewrites the file.
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            healthy = bool(owner and Path(f"/proc/{data['pid']}").exists())
+        except BaseException as exc:
+            return AuthorityStatus(
+                False,
+                "unavailable",
+                owner_hint=owner,
+                error_class=_classify_os_error(exc),
+                freshness_seconds=age,
+            )
+        else:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            healthy = False
         return AuthorityStatus(
             healthy,
             "held" if healthy else "unavailable",

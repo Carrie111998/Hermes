@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 from hermes_cli import kanban_db as kb
+from tests.dispatcher_test_support import dispatch_once
 
 
 # ---------------------------------------------------------------------------
@@ -213,11 +214,11 @@ def test_dispatch_tick_runs_wal_checkpoint_at_interval(tmp_path, monkeypatch):
     conn = kb.connect(db_path=db_path)
     proxy = _ConnProxy(conn, executed)
     try:
-        kb._dispatch_once_for_tests(proxy, spawn_fn=lambda *a, **k: None, dry_run=True)
+        dispatch_once(kb, proxy, spawn_fn=lambda *a, **k: None, dry_run=True)
         assert len(executed) == 1, "first tick should checkpoint"
 
-        kb._dispatch_once_for_tests(proxy, spawn_fn=lambda *a, **k: None, dry_run=True)
-        kb._dispatch_once_for_tests(proxy, spawn_fn=lambda *a, **k: None, dry_run=True)
+        dispatch_once(kb, proxy, spawn_fn=lambda *a, **k: None, dry_run=True)
+        dispatch_once(kb, proxy, spawn_fn=lambda *a, **k: None, dry_run=True)
         assert len(executed) == 1, "ticks inside the interval must not checkpoint"
 
         # Age the per-path timestamp past the interval → next tick fires.
@@ -225,7 +226,7 @@ def test_dispatch_tick_runs_wal_checkpoint_at_interval(tmp_path, monkeypatch):
         kb._LAST_WAL_CHECKPOINT[key] -= (
             kb._WAL_CHECKPOINT_INTERVAL_SECONDS + 1.0
         )
-        kb._dispatch_once_for_tests(proxy, spawn_fn=lambda *a, **k: None, dry_run=True)
+        dispatch_once(kb, proxy, spawn_fn=lambda *a, **k: None, dry_run=True)
         assert len(executed) == 2, "tick after the interval should checkpoint"
         # PASSIVE, not TRUNCATE: CLI kanban commands in other processes write
         # to the same board without holding the dispatch flock, so a TRUNCATE

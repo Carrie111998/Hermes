@@ -18,6 +18,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from hermes_cli import kanban_db as kb
+from tests.dispatcher_test_support import spawn_worker
 
 
 # ---------------------------------------------------------------------------
@@ -131,7 +132,7 @@ def _spawn_and_capture(monkeypatch, tmp_path, task):
     monkeypatch.setattr(subprocess, "Popen", fake_popen)
     workspace = tmp_path / "ws"
     workspace.mkdir(exist_ok=True)
-    kb._default_spawn(task, str(workspace))
+    spawn_worker(kb, task, str(workspace))
     return captured["cmd"]
 
 
@@ -255,7 +256,8 @@ def test_spawn_passes_reasoning_without_a_model(monkeypatch, tmp_path, conn):
     tid = kb.create_task(conn, title="t", assignee="elias", reasoning_effort="high")
     task = kb.get_task(conn, tid)
     cmd = _spawn_and_capture(monkeypatch, tmp_path, task)
-    assert "-m" not in cmd
+    assert cmd[cmd.index("-m") + 1] == "test-model"
+    assert cmd[cmd.index("--provider") + 1] == "test-provider"
     i = cmd.index("--reasoning")
     assert cmd[i + 1] == "high"
 
