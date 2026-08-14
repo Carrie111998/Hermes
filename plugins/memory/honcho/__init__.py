@@ -43,7 +43,8 @@ _INTERNAL_GATEWAY_TURN_RE = re.compile(
     r"\[Your active task list was preserved across context compression\]|"
     r"\[IMPORTANT: Background process \d+ matched watch pattern[^\n]*|"
     r"A background fan-out of \d+ subagent\(s\) you dispatched earlier has finished\.|"
-    r"A background subagent you dispatched earlier has finished\."
+    r"A background subagent you dispatched earlier has finished\.|"
+    r"work kanban task t_[a-zA-Z0-9_-]+"
     r")",
     re.IGNORECASE,
 )
