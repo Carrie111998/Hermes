@@ -11163,3 +11163,46 @@ class AsyncSessionDB:
             return await asyncio.to_thread(attr, *args, **kwargs)
 
         return _offloaded
+
+def remediate_qa_failure(db: sqlite3.Connection, task_id: str) -> None:
+    """
+    Implement Task 2.2 from kanban-openspec-enforcement Proposal.
+    Execute T1 (done -> todo) and T3 (blocked -> todo) status swaps with rowcount == 1 guarantees.
+    Append qa_remediation_initiated events on the task.
+    """
+    import time
+    import json
+    
+    # Extract provenance from review_requested event
+    cursor = db.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'review_requested' ORDER BY created_at DESC LIMIT 1",
+        (task_id,)
+    )
+    row = cursor.fetchone()
+    if not row:
+        raise ValueError(f"No review_requested event found for task {task_id}")
+        
+    payload = json.loads(row[0])
+    provenance_run_id = payload.get("provenance_run_id")
+    provenance_event_id = payload.get("provenance_event_id")
+    
+    cursor = db.execute(
+        "UPDATE tasks SET status = 'todo' WHERE id = ? AND status IN ('done', 'blocked')",
+        (task_id,)
+    )
+    if cursor.rowcount != 1:
+        raise ValueError(f"Expected to update 1 row, but updated {cursor.rowcount}. Task {task_id} may not exist or not be in 'done' or 'blocked' state.")
+        
+    event_payload = json.dumps({
+        "provenance_run_id": provenance_run_id,
+        "provenance_event_id": provenance_event_id
+    })
+    
+    # Note: Using random id or UUID could work, but lets just use a timestamp based simple one if we don't have a helper
+    import uuid
+    evt_id = f"evt_{uuid.uuid4().hex[:8]}"
+    db.execute(
+        "INSERT INTO task_events (id, task_id, kind, payload, created_at) VALUES (?, ?, ?, ?, ?)",
+        (evt_id, task_id, 'qa_remediation_initiated', event_payload, int(time.time()))
+    )
+    db.commit()
