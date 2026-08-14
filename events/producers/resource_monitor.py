@@ -81,14 +81,23 @@ _GB = 1024 ** 3
 
 # Default thresholds — tuned to the 2026-06-11 incident shape.
 DEFAULT_COMMIT_PCT_THRESHOLD = 85.0      # commit charge > this % of the limit
-# Raised 15.0 -> 60.0 on 2026-08-14. 15 GB sat BELOW the amplitude of normal daily
-# churn on this box: the Docker data VHDX routinely allocates 40-50 GB of transient
-# blocks between nightly fstrim runs (audit history: 46 -> 95 GB in one night on
-# 08-13/14). A 15 GB trigger therefore fired only once the disk was already hours
-# from zero -- it tripped on 11 separate days since 07-17, five of them reaching
-# 0.0 GB free. 60 GB gives roughly a full churn cycle of warning instead.
-DEFAULT_DISK_FREE_GB_THRESHOLD = 60.0    # C: free below this many GB
-# Second, lower disk axis added 2026-08-14. ``disk_low`` at 60 GB is an EARLY
+# Raised 15.0 -> 60.0 on 2026-08-14, then corrected 60.0 -> 45.0 the same day.
+# 15 GB sat BELOW the amplitude of normal daily churn on this box: the Docker data
+# VHDX routinely allocates 40-50 GB of transient blocks between nightly fstrim runs
+# (audit history: 46 -> 95 GB in one night on 08-13/14). A 15 GB trigger therefore
+# fired only once the disk was already hours from zero -- it tripped on 11 separate
+# days since 07-17, five of them reaching 0.0 GB free.
+#
+# But 60 GB overshot: this machine's BEST case, immediately after a full VHDX
+# reclaim, is ~56.6 GB free. The axis was breaching at the instant it deployed
+# (16:20:28Z) and could never clear, because clearing needed >75 GB and the churn
+# cycle tops out ~20 GB below that. It re-emitted every cooldown for as long as it
+# was live -- ~96 events/day into a topic the two-stage redesign existed to
+# de-noise. THE INVARIANT: this trigger must sit BELOW the post-reclaim ceiling and
+# its disarm must sit below it too, or the axis is latched from birth. 45 GB still
+# gives most of a churn cycle of warning while leaving the disarm reachable.
+DEFAULT_DISK_FREE_GB_THRESHOLD = 45.0    # C: free below this many GB
+# Second, lower disk axis added 2026-08-14. ``disk_low`` at 45 GB is an EARLY
 # WARNING and must stay cheap to receive (routing keeps it a WARN in the alerts
 # topic), or it pages every cooldown for a whole day while the disk sits at
 # 55 GB and everyone learns to ignore it. ``disk_critical`` is the one that
@@ -106,13 +115,18 @@ DEFAULT_PHYS_PCT_THRESHOLD = 92.0        # physical RAM used > this %
 # clear of its trigger. Re-arming at the trigger itself let threshold hover
 # storm (2026-06-11 22:52-23:21Z: six alerts in 29 min at commit 84.x<->85.x).
 DEFAULT_COMMIT_PCT_DISARM = 80.0             # commit back below this % clears
-DEFAULT_DISK_FREE_GB_DISARM = 75.0           # C: free back above this clears
+# 52, not 75: the disarm must be REACHABLE. Post-reclaim steady state on this box
+# is ~55-56.6 GB, so 52 leaves ~4.6 GB of headroom above the trim-cycle ceiling --
+# enough that a genuinely recovered disk actually unlatches the episode. A disarm
+# set above the ceiling (75 on 2026-08-14) is indistinguishable from having no
+# disarm at all: the axis latches on first sample and re-pings forever.
+DEFAULT_DISK_FREE_GB_DISARM = 52.0           # C: free back above this clears
 # Every latching axis MUST have a disarm level. Without one it enters
 # ``_latched`` via ``reasons`` but can never leave through ``comfortably_clear``,
 # so a single breach latches the episode FOREVER -- ``was_in_episode`` stays
 # True, no later rising edge ever fires, and the monitor silently degrades to
 # cooldown-only re-pings. That is the phys-axis bug documented above; do not
-# repeat it. Gap mirrors the low axis (60 -> 75).
+# repeat it. Gap mirrors the low axis (45 -> 52).
 DEFAULT_DISK_FREE_GB_CRITICAL_DISARM = 40.0  # C: free back above this clears
 DEFAULT_PAGEFILE_GROWTH_GB_DISARM = 1.0      # in-window growth below this clears
 # The phys axis (2026-07-16) postdates the original disarm set (2026-06-12), so

@@ -16,6 +16,8 @@ import pytest
 from events.bus import EventBus
 from events.schema import EventType, Priority
 from events.producers.resource_monitor import (
+    DEFAULT_DISK_FREE_GB_DISARM,
+    DEFAULT_DISK_FREE_GB_THRESHOLD,
     ResourcePressureMonitor,
     ResourceSample,
     sample_resources,
@@ -101,9 +103,9 @@ class TestDiskThreshold:
         assert _pressure_events(bus) == []
 
     def test_disk_critical_is_a_separate_axis_from_disk_low(self, bus):
-        # 50 GB: below the 60 GB early-warning axis, above the 25 GB paging one.
+        # 35 GB: below the 45 GB early-warning axis, above the 25 GB paging one.
         monitor = ResourcePressureMonitor(bus)
-        monitor.evaluate(make_sample(disk_free_gb=50.0), now=0.0)
+        monitor.evaluate(make_sample(disk_free_gb=35.0), now=0.0)
         reasons = _pressure_events(bus)[0].payload["reasons"]
         assert "disk_low" in reasons
         assert "disk_critical" not in reasons
@@ -128,8 +130,26 @@ class TestDiskThreshold:
         # Regression 2026-08-14: the old 15 GB default fired only once the disk was
         # hours from zero, because Docker's VHDX can allocate 40-50 GB overnight.
         monitor = ResourcePressureMonitor(bus)
-        assert monitor.evaluate(make_sample(disk_free_gb=50.0), now=0.0)
+        assert monitor.evaluate(make_sample(disk_free_gb=35.0), now=0.0)
         assert "disk_low" in _pressure_events(bus)[0].payload["reasons"]
+
+    def test_default_disarm_is_reachable_on_this_hardware(self, bus):
+        # Regression 2026-08-14 (same day, second defect): the trigger was briefly
+        # set to 60 GB with a 75 GB disarm on a box whose post-reclaim CEILING is
+        # ~56.6 GB free. The axis breached on its first sample and could never
+        # unlatch, re-pinging every cooldown forever. Pin the invariant that makes
+        # that impossible: a fully-reclaimed disk must read as comfortably clear.
+        POST_RECLAIM_CEILING_GB = 56.6
+        assert DEFAULT_DISK_FREE_GB_THRESHOLD < POST_RECLAIM_CEILING_GB
+        assert DEFAULT_DISK_FREE_GB_DISARM < POST_RECLAIM_CEILING_GB
+        # ...and prove it end-to-end: breach, then recover to the real ceiling.
+        monitor = ResourcePressureMonitor(bus)
+        assert monitor.evaluate(make_sample(disk_free_gb=35.0), now=0.0)
+        assert monitor.evaluate(
+            make_sample(disk_free_gb=POST_RECLAIM_CEILING_GB), now=60.0) is None
+        # Cleared for real, so the next breach is a fresh rising edge.
+        assert monitor.evaluate(make_sample(disk_free_gb=35.0), now=120.0)
+        assert len(_pressure_events(bus)) == 2
 
 
 class TestPagefileGrowthTrigger:
@@ -302,11 +322,11 @@ class TestHysteresis:
     def test_disk_band_holds_episode(self, bus):
         monitor = ResourcePressureMonitor(bus, re_alert_cooldown_seconds=900.0)
         assert monitor.evaluate(make_sample(disk_free_gb=12.0), now=0.0)
-        # 17 GB free is between the 15 GB trigger and the 20 GB disarm: holds.
-        assert monitor.evaluate(make_sample(disk_free_gb=65.0), now=60.0) is None
+        # 48 GB free is between the 45 GB trigger and the 52 GB disarm: holds.
+        assert monitor.evaluate(make_sample(disk_free_gb=48.0), now=60.0) is None
         assert monitor.evaluate(make_sample(disk_free_gb=12.0), now=120.0) is None
         # Recovery above the disarm clears; the next breach fires immediately.
-        assert monitor.evaluate(make_sample(disk_free_gb=80.0), now=180.0) is None
+        assert monitor.evaluate(make_sample(disk_free_gb=60.0), now=180.0) is None
         assert monitor.evaluate(make_sample(disk_free_gb=12.0), now=240.0)
         assert len(_pressure_events(bus)) == 2
 
@@ -346,16 +366,19 @@ class TestHysteresis:
 
     def test_unbreached_axis_in_band_does_not_hold_episode(self, bus):
         # Guard for the latch design: only axes that actually BREACHED hold the
-        # episode open. Disk hovers in its band (17 GB) throughout but never
-        # crossed its 15 GB trigger, so commit clearing comfortably ends the
+        # episode open. Disk hovers in its band (48 GB) throughout but never
+        # crossed its 45 GB trigger, so commit clearing comfortably ends the
         # episode — disk must not suppress the next fresh commit emergency.
+        # NB: this fixture must stay IN THE BAND. It was scaled to 170.0 on
+        # 2026-08-14, which is comfortably clear rather than in-band, and the
+        # test passed while exercising none of the behaviour it documents.
         monitor = ResourcePressureMonitor(bus, re_alert_cooldown_seconds=900.0)
         assert monitor.evaluate(
-            make_sample(commit_pct=88.0, disk_free_gb=170.0), now=0.0)
+            make_sample(commit_pct=88.0, disk_free_gb=48.0), now=0.0)
         assert monitor.evaluate(
-            make_sample(commit_pct=70.0, disk_free_gb=170.0), now=60.0) is None
+            make_sample(commit_pct=70.0, disk_free_gb=48.0), now=60.0) is None
         assert monitor.evaluate(
-            make_sample(commit_pct=88.0, disk_free_gb=170.0), now=120.0)
+            make_sample(commit_pct=88.0, disk_free_gb=48.0), now=120.0)
         assert len(_pressure_events(bus)) == 2
 
     def test_custom_disarm_levels_are_honored(self, bus):
