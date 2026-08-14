@@ -7821,6 +7821,13 @@ class AIAgent:
                 f"({decision.code}). Continue with the results already collected or "
                 "change strategy."
             )
+        if decision.code == "loop_subagent_cap":
+            return (
+                f"I stopped {tool} after spawning {decision.count} subagents in this turn "
+                "because it reached the per-turn subagent limit "
+                f"({decision.code}). Continue with the results already collected or "
+                "finish the work directly."
+            )
         return (
             f"I stopped retrying {tool} because it hit the tool-call guardrail "
             f"({decision.code}) after {decision.count} repeated non-progressing "
