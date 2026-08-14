@@ -3550,6 +3550,15 @@ class SessionStore:
             # before the DB write so other sessions are not blocked.
             msg = pending[0]
         queue_session_id = session_id
+        # Cap-spooled messages were evicted from the HEAD of this queue, so
+        # they are older than every message still in memory.  Replay them
+        # before writing the live backlog: SessionDB restores by insertion id
+        # (not timestamp), and reversing these two tiers permanently scrambles
+        # the transcript.  A failed replay must also block newer writes or an
+        # orphaned successful tool result can be dropped by alternation repair
+        # while its non-idempotent tool call remains in model history.
+        if not self._drain_spooled_drops(session_id):
+            return
         # DB write outside the retry lock — other sessions can append
         # concurrently. We re-acquire the lock only to update the queue.
         while True:
@@ -3559,8 +3568,7 @@ class SessionStore:
                 from hermes_state import CompressionSessionClosedError
 
                 if isinstance(exc, CompressionSessionClosedError):
-                    child = self._db.find_live_compression_child(session_id)
-                    child_id = str(child["id"]) if child and child.get("id") else ""
+                    child_id = self._find_live_compression_child_id(session_id)
                     if child_id:
                         try:
                             self._append_transcript_message(child_id, msg)
@@ -3653,37 +3661,51 @@ class SessionStore:
                         queue_empty = False
                         msg = pending[0]
                 if queue_empty:
-                    # DB write just succeeded and the in-memory backlog is
-                    # clear: replay any cap-dropped messages spooled to disk
-                    # for this session (#78182).
-                    self._drain_spooled_drops(session_id)
                     return
                 continue
 
-    def _drain_spooled_drops(self, session_id: str) -> None:
-        """Replay cap-dropped spooled transcript messages after DB recovery.
+    def _find_live_compression_child_id(self, session_id: str) -> str:
+        """Return the unique live compression continuation, or an empty id."""
+        child = self._db.find_live_compression_child(session_id)
+        return str(child["id"]) if child and child.get("id") else ""
 
-        Best-effort: replay failures keep the spool files for the next
-        successful flush; nothing here may raise into the caller.
+    def _drain_spooled_drops(self, session_id: str) -> bool:
+        """Replay cap-dropped messages before the newer in-memory queue.
+
+        Returns whether the older tier is fully drained. Replay failures keep
+        both the spool files and the live queue for the next attempt; nothing
+        here may raise into the caller or let newer rows overtake older ones.
         """
         spooled_sessions = getattr(self, "_spooled_drop_sessions", None)
         if not spooled_sessions or session_id not in spooled_sessions:
-            return
+            return True
         try:
             from gateway.shutdown_flush import drain_transcript_spool
+            from hermes_state import CompressionSessionClosedError
+
+            def replay(message: Dict[str, Any]) -> None:
+                try:
+                    self._append_transcript_message(session_id, message)
+                except CompressionSessionClosedError:
+                    child_id = self._find_live_compression_child_id(session_id)
+                    if not child_id:
+                        raise
+                    self._append_transcript_message(child_id, message)
 
             _replayed, remaining = drain_transcript_spool(
                 session_id,
-                lambda message: self._append_transcript_message(
-                    session_id, message
-                ),
+                replay,
             )
-            if not remaining:
+            if remaining is None:
+                return False
+            if remaining == 0:
                 spooled_sessions.discard(session_id)
+            return remaining == 0
         except Exception as exc:
             logger.warning(
                 "Failed to drain transcript spool for %s: %s", session_id, exc
             )
+            return False
 
     def _append_transcript_message(self, session_id: str, message: Dict[str, Any]) -> None:
         """Write one transcript row. Caller handles retry queuing."""
