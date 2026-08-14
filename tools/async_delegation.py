@@ -788,11 +788,15 @@ def _stream_order_blocked_locked(
     a lower sequence remains in the stream, with ONE carve-out: a lower row
     covered by this event's own ``supersedes_before`` watermark is scheduled
     for supersession rather than delivery and does not gate the superseding
-    event — UNLESS that covered row holds a live (unexpired) delivery claim.
-    A live claim means another consumer may already be injecting the older
-    event's user turn; the superseding event must defer until that claim
-    completes (old→terminal order stays honest) or releases (the terminal
-    then retires it), never race past it.
+    event — UNLESS that covered row already CROSSED CUSTODY. Claim history is
+    monotonic and cannot be retracted: a live (unexpired) claim means another
+    consumer may be injecting the older turn right now, and ANY recorded
+    delivery attempt (``delivery_attempts > 0``) means a consumer took the
+    row at least once — it may have injected before an ack was lost, or a
+    TTL-expired leaseholder may still finish. In both cases the superseding
+    event must defer until the covered row RESOLVES (delivered, or terminally
+    dropped by the retry cap); only never-attempted, unclaimed covered rows
+    may be raced past and retired.
     """
     return conn.execute(
         """SELECT 1 FROM async_delegations
@@ -801,6 +805,7 @@ def _stream_order_blocked_locked(
              AND (
                    (? IS NULL OR stream_seq >= ?)
                    OR (delivery_claim IS NOT NULL AND delivery_claimed_at >= ?)
+                   OR delivery_attempts > 0
                  )
            LIMIT 1""",
         (stream_id, delegation_id, stream_seq, supersedes_before,
@@ -848,14 +853,16 @@ def _apply_supersession_watermark_locked(
     the delivered event's ``supersedes_before`` watermark) are touched;
     plain sequenced rows without a watermark never retire siblings.
 
-    A covered row holding a LIVE (unexpired) delivery claim is never
-    rewritten — its consumer may be mid-injection, and yanking the row out
-    from under an in-flight claim would fake a 'superseded' disposition for
-    a turn the user actually received. (The claim gates normally prevent a
-    live covered claim from coexisting with a granted superseding claim;
-    this filter is the transactional backstop for claim-TTL expiry races.)
-    Such a row is retired later, by the delivered-watermark check on its
-    next claim attempt.
+    Custody invariant: only rows that NEVER crossed custody
+    (``delivery_attempts = 0`` and no live claim) may be retired. A row with
+    any recorded delivery attempt has irrevocable claim history — a consumer
+    may have injected its turn before an ack was lost, or a TTL-expired
+    leaseholder may still finish — so rewriting it to 'superseded' would fake
+    a disposition for a turn the user may actually have received. Such rows
+    are left pending to resolve through their own delivery lifecycle
+    (delivered, or terminally dropped by the retry cap); the ordering gate
+    blocks the superseding claim until they do, so this filter is the
+    transactional backstop for claim-TTL expiry races, not the primary gate.
     """
     meta = conn.execute(
         """SELECT stream_id, supersedes_before FROM async_delegations
@@ -870,6 +877,7 @@ def _apply_supersession_watermark_locked(
             """SELECT delegation_id FROM async_delegations
                WHERE stream_id=? AND delegation_id!=? AND stream_seq IS NOT NULL
                  AND stream_seq < ? AND delivery_state='pending'
+                 AND delivery_attempts = 0
                  AND (delivery_claim IS NULL OR delivery_claimed_at < ?)""",
             (stream_id, delegation_id, watermark, now - _DELIVERY_CLAIM_TTL_S),
         ).fetchall()
@@ -907,15 +915,24 @@ def claim_completion_delivery(delegation_id: str, claim_id: str) -> bool:
     granted = False
     with _DB_LOCK, _transaction() as conn:
         row = conn.execute(
-            """SELECT delivery_state, stream_id, stream_seq, supersedes_before
+            """SELECT delivery_state, stream_id, stream_seq, supersedes_before,
+                      delivery_attempts
                FROM async_delegations WHERE delegation_id=?""",
             (delegation_id,),
         ).fetchone()
         if row is None:
             return True  # legacy event created before durable dispatch
-        delivery_state, stream_id, stream_seq, supersedes_before = row
+        (delivery_state, stream_id, stream_seq, supersedes_before,
+         delivery_attempts) = row
         if delivery_state == "pending" and stream_id and stream_seq is not None:
-            if _stream_superseded_locked(conn, delegation_id, stream_id, stream_seq):
+            # Delivered-watermark fallback retires ONLY never-attempted rows.
+            # A covered row with recorded attempts crossed custody — its turn
+            # may already have reached the user before an ack was lost — so
+            # it must resolve through its own delivery lifecycle (deliver, or
+            # drop via the retry cap), never be retroactively 'superseded'.
+            if (delivery_attempts or 0) == 0 and _stream_superseded_locked(
+                conn, delegation_id, stream_id, stream_seq
+            ):
                 conn.execute(
                     """UPDATE async_delegations SET delivery_state='superseded',
                               delivery_claim=NULL, delivery_claimed_at=NULL,

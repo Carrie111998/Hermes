@@ -490,18 +490,112 @@ def test_old_claim_wins_terminal_defers_until_old_completes(_isolated):
     assert _row("a/2")["delivery_attempts"] == 1
 
 
-def test_old_claim_released_lets_terminal_retire_it(_isolated):
+def test_released_old_row_blocks_terminal_until_it_resolves(_isolated):
+    """A covered row with ANY recorded attempt crossed custody: claim history
+    is monotonic and cannot be retracted, so the terminal stays blocked until
+    the old row resolves delivered — never retired mid-lifecycle."""
     _publish("b/1", stream_id="b", sequence=1)
     _publish("b/2", stream_id="b", sequence=2, supersedes_before_sequence=2)
 
+    turn_order = []
     assert ad.claim_completion_delivery("b/1", "c1")
     assert not ad.claim_completion_delivery("b/2", "c2")  # deferred while claimed
     assert ad.release_completion_delivery("b/1", "c1")  # old delivery failed
 
-    assert ad.claim_completion_delivery("b/2", "c2")  # unclaimed covered row: no block
+    # attempts=1: the row crossed custody — terminal remains blocked.
+    assert not ad.claim_completion_delivery("b/2", "c2")
+    assert _row("b/2")["delivery_attempts"] == 0
+
+    # The old row retries through its own lifecycle and delivers...
+    assert ad.claim_completion_delivery("b/1", "c1b")
+    assert ad.complete_completion_delivery("b/1", "c1b")
+    turn_order.append("b/1")
+    # ...and only then may the terminal deliver.
+    assert ad.claim_completion_delivery("b/2", "c2")
     assert ad.complete_completion_delivery("b/2", "c2")
-    assert _row("b/1")["delivery_state"] == "superseded"  # retired, never delivered
-    assert _row("b/1")["delivery_attempts"] == 1  # only its own failed attempt
+    turn_order.append("b/2")
+
+    assert turn_order == ["b/1", "b/2"]
+    assert _row("b/1")["delivery_state"] == "delivered"  # NEVER superseded
+    assert _row("b/1")["delivery_attempts"] == 2
+    assert _row("b/2")["delivery_attempts"] == 1
+
+
+def test_expired_unacked_claim_blocks_terminal_until_old_reclaims(_isolated):
+    """Claim-TTL expiry does not erase custody: the old consumer may have
+    injected before its ack was lost, or may still finish after lease expiry.
+    The terminal must wait for the old row to resolve delivered."""
+    _publish("e/1", stream_id="e", sequence=1)
+    _publish("e/2", stream_id="e", sequence=2, supersedes_before_sequence=2)
+
+    turn_order = []
+    assert ad.claim_completion_delivery("e/1", "c1")
+    # The claim expires without an ack (consumer crashed / ack lost).
+    with ad._DB_LOCK, ad._transaction() as conn:
+        conn.execute(
+            "UPDATE async_delegations SET delivery_claimed_at=? WHERE delegation_id='e/1'",
+            (time.time() - ad._DELIVERY_CLAIM_TTL_S - 10,),
+        )
+    # Terminal remains blocked: attempts>0 is irrevocable custody.
+    assert not ad.claim_completion_delivery("e/2", "c2")
+    assert _row("e/1")["delivery_state"] == "pending"  # never superseded
+    assert _row("e/2")["delivery_attempts"] == 0  # deferral burns no budget
+
+    # The old row re-claims past the expired lease and completes...
+    assert ad.claim_completion_delivery("e/1", "c1b")
+    assert ad.complete_completion_delivery("e/1", "c1b")
+    turn_order.append("e/1")
+    assert ad.claim_completion_delivery("e/2", "c2")
+    assert ad.complete_completion_delivery("e/2", "c2")
+    turn_order.append("e/2")
+
+    assert turn_order == ["e/1", "e/2"]  # old→terminal, always
+    assert _row("e/1")["delivery_attempts"] == 2
+    assert _row("e/2")["delivery_attempts"] == 1
+
+
+def test_attempted_old_row_that_drops_via_retry_cap_unblocks_terminal(_isolated):
+    """The other legal resolution: the old row exhausts its retry budget and
+    terminally drops — only then does the blocked terminal deliver."""
+    _publish("f/1", stream_id="f", sequence=1)
+    _publish("f/2", stream_id="f", sequence=2, supersedes_before_sequence=2)
+
+    for attempt in range(ad._MAX_DELIVERY_ATTEMPTS):
+        assert ad.claim_completion_delivery("f/1", f"c{attempt}")
+        assert not ad.claim_completion_delivery("f/2", "cterm")  # blocked throughout
+        assert ad.release_completion_delivery("f/1", f"c{attempt}")
+
+    assert _row("f/1")["delivery_state"] == "dropped"  # retry cap, honest terminal
+    assert ad.claim_completion_delivery("f/2", "cterm")
+    assert ad.complete_completion_delivery("f/2", "cterm")
+    assert _row("f/2")["delivery_state"] == "delivered"
+    assert _row("f/1")["delivery_state"] == "dropped"  # never rewritten to superseded
+
+
+def test_delivered_watermark_fallback_never_retires_an_attempted_row(_isolated):
+    """Even against an already-delivered watermark, a covered row that
+    crossed custody resolves through its own lifecycle."""
+    _publish("g/1", stream_id="g", sequence=1)
+    _publish("g/2", stream_id="g", sequence=2, supersedes_before_sequence=2)
+
+    # Force the pathological state directly: the terminal is delivered while
+    # the covered row has recorded attempts (e.g. its ack was lost).
+    now = time.time()
+    with ad._DB_LOCK, ad._transaction() as conn:
+        conn.execute(
+            "UPDATE async_delegations SET delivery_attempts=1 WHERE delegation_id='g/1'",
+        )
+        conn.execute(
+            "UPDATE async_delegations SET delivery_state='delivered', delivered_at=?, "
+            "updated_at=? WHERE delegation_id='g/2'",
+            (now, now),
+        )
+    # The fallback must NOT flip g/1 to superseded; its claim proceeds and the
+    # row finishes its own delivery honestly (at-least-once custody).
+    assert ad.claim_completion_delivery("g/1", "c1")
+    assert _row("g/1")["delivery_state"] == "pending"
+    assert ad.complete_completion_delivery("g/1", "c1")
+    assert _row("g/1")["delivery_state"] == "delivered"
 
 
 def test_terminal_claim_wins_old_row_defers_then_supersedes(_isolated):
