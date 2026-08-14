@@ -913,11 +913,10 @@ class GatewayKanbanWatchersMixin:
                                 profile=sub_profile or None,
                                 scope_id=_wake_scope_id(adapter, sub),
                             )
-                            # Graph-safe wake turn (#70752): carry the worker's
-                            # completion handoff into the synthetic turn and
-                            # label it as an automatic notification so the woken
-                            # creator inspects the board instead of
-                            # re-decomposing work that already exists.
+                        # Graph-safe wake turn (#70752): carry the worker's
+                        # completion handoff into every synthetic wake turn,
+                        # including the API-server self-post path.
+                        if _can_wake:
                             if wake_handoff:
                                 _synth += "\n" + t(
                                     "gateway.kanban.wake.handoff",
