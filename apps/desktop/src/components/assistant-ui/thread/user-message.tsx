@@ -89,21 +89,32 @@ const AgentMessageNote: FC<{ text: string }> = ({ text }) => {
   const sender = (match?.[1] || match?.[2] || 'agent').trim()
   const body = (match?.[3] || '').trim()
 
+  // Grok-bots shape: an inter-agent delivery is a timeline EVENT, not a
+  // conversation bubble — a subtle centered notice ("Message from 🤖 X"),
+  // with the delivered text one click away instead of shouting in the
+  // transcript. The recipient's reply below it stays a normal assistant
+  // message, so the exchange still reads in order.
   return (
     <div
-      className="flex w-full min-w-0 max-w-[min(92%,48rem)] flex-col gap-1 self-start rounded-xl border border-(--ui-stroke-tertiary) bg-(--ui-bg-secondary,rgba(255,255,255,0.03)) px-3 py-2"
+      className="flex max-w-[min(86%,44rem)] flex-col gap-0.5 self-center px-2 py-0.5 text-[0.6875rem] leading-5 text-muted-foreground/60"
       data-slot="aui_agent-message-note"
     >
-      <span className="flex items-center gap-1.5 text-[0.6875rem] font-medium uppercase tracking-wider text-(--ui-text-tertiary)">
+      <span className="flex items-center justify-center gap-1.5">
         <span aria-hidden className="text-[0.8125rem] leading-none">
           🤖
         </span>
-        <span className="wrap-anywhere normal-case">{sender}</span>
-        <span className="font-normal normal-case tracking-normal text-(--ui-text-quaternary)">· agent message</span>
+        <span className="wrap-anywhere">Message from {sender}</span>
       </span>
-      <span className="wrap-anywhere text-[length:var(--conversation-text-font-size)] leading-(--dt-line-height) text-foreground/90">
-        <UserMessageText text={body || text} />
-      </span>
+      {body && (
+        <details className="self-center">
+          <summary className="cursor-pointer select-none text-center text-muted-foreground/45 hover:text-muted-foreground/70">
+            show message
+          </summary>
+          <div className="mt-1 max-w-[36rem] rounded-lg border border-(--ui-stroke-tertiary) px-3 py-2 text-left text-[0.75rem] leading-5 text-foreground/85">
+            <UserMessageText text={body} />
+          </div>
+        </details>
+      )}
     </div>
   )
 }
