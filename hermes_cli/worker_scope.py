@@ -37,6 +37,69 @@ def _unit_fragment(value: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]", "-", value)[:48] or "unknown"
 
 
+def _manager_state_is_operational(stdout: str, returncode: int) -> bool:
+    """Accept only an exact systemd state token and its documented result code."""
+    state = stdout[:-1] if stdout.endswith("\n") else stdout
+    if not state or "\n" in state or not state.isascii():
+        return False
+    return (state == "running" and returncode == 0) or (
+        state == "degraded" and returncode in {0, 1}
+    )
+
+
+def _cgroup_output_matches_scope(stdout: str, unit: str) -> bool:
+    """Validate complete /proc/self/cgroup output and exact probe placement."""
+    if not stdout or not stdout.isascii():
+        return False
+    body = stdout[:-1] if stdout.endswith("\n") else stdout
+    if not body or body.endswith("\n"):
+        return False
+
+    expected_component = f"{unit}.scope"
+    hierarchy_ids: set[str] = set()
+    for record in body.split("\n"):
+        if not record or record.count(":") != 2:
+            return False
+        hierarchy_id, controllers, path = record.split(":")
+        if not hierarchy_id.isascii() or not hierarchy_id.isdecimal():
+            return False
+        if len(hierarchy_id) > 1 and hierarchy_id.startswith("0"):
+            return False
+        if hierarchy_id in hierarchy_ids:
+            return False
+        hierarchy_ids.add(hierarchy_id)
+
+        if hierarchy_id == "0":
+            if controllers:
+                return False
+        else:
+            controller_names = controllers.split(",")
+            if not controllers or len(controller_names) != len(set(controller_names)):
+                return False
+            if any(
+                not re.fullmatch(r"(?:name=)?[A-Za-z0-9_.-]+", name)
+                for name in controller_names
+            ):
+                return False
+
+        if not path.startswith("/"):
+            return False
+        components = path[1:].split("/")
+        if not components or any(
+            not component
+            or component in {".", ".."}
+            or any(not 0x21 <= ord(char) <= 0x7E for char in component)
+            for component in components
+        ):
+            return False
+        lowered = [component.lower() for component in components]
+        if any("gateway" in component or "dispatcher" in component for component in lowered):
+            return False
+        if expected_component not in components:
+            return False
+    return bool(hierarchy_ids)
+
+
 def _transient_scope_works(systemd_run: str) -> bool:
     unit = f"hermes-kanban-isolation-probe-{os.getpid()}-{next(_PROBE_SEQUENCE)}"
     try:
@@ -66,14 +129,7 @@ def _transient_scope_works(systemd_run: str) -> bool:
         return False
     if probe.returncode != 0:
         return False
-    expected = f"/{unit}.scope"
-    paths = [line.rsplit(":", 1)[-1].strip() for line in probe.stdout.splitlines() if ":" in line]
-    return any(
-        expected in path
-        and "hermes-gateway" not in path.lower()
-        and "dispatcher" not in path.lower()
-        for path in paths
-    )
+    return _cgroup_output_matches_scope(probe.stdout, unit)
 
 
 def build_scoped_worker_command(
@@ -102,10 +158,7 @@ def build_scoped_worker_command(
         if require_isolation:
             raise WorkerIsolationError("systemd user manager/bus is not healthy") from None
         return list(command)
-    state = probe.stdout.strip()
-    operational_state = (state == "running" and probe.returncode == 0) or (
-        state == "degraded" and probe.returncode in {0, 1}
-    )
+    operational_state = _manager_state_is_operational(probe.stdout, probe.returncode)
     healthy_state = operational_state and _transient_scope_works(systemd_run)
     if not healthy_state:
         if require_isolation:

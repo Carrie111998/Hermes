@@ -158,6 +158,124 @@ def test_degraded_manager_rejects_failed_or_wrong_transient_scope(
         build_scoped_worker_command(["hermes"], env={}, require_isolation=True)
 
 
+def test_cgroup_parser_accepts_exact_scope_component_and_descendants():
+    from hermes_cli.worker_scope import _cgroup_output_matches_scope
+
+    unit = "hermes-kanban-isolation-probe-123-1"
+    assert _cgroup_output_matches_scope(
+        f"0::/user.slice/app.slice/{unit}.scope/child\n",
+        unit,
+    )
+    assert _cgroup_output_matches_scope(
+        f"7:cpu,cpuacct:/user.slice/{unit}.scope\n"
+        f"8:name=systemd:/user.slice/{unit}.scope/child\n",
+        unit,
+    )
+
+
+@pytest.mark.parametrize(
+    "output_factory",
+    [
+        lambda unit: f"0::/user.slice/{unit}.scope-shadow\n",
+        lambda unit: f"0::/user.slice/shadow-{unit}.scope\n",
+        lambda unit: (
+            f"0::/user.slice/{unit}.scope\n"
+            "1:name=systemd:/user.slice/hermes-gateway-athena.service\n"
+        ),
+        lambda unit: (
+            f"0::/user.slice/{unit}.scope\n"
+            "1:name=systemd:/user.slice/hermes-kanban-dispatcher.service\n"
+        ),
+        lambda unit: (
+            f"0::/user.slice/{unit}.scope\n"
+            "1:name=systemd:/user.slice/unrelated.scope\n"
+        ),
+        lambda unit: (
+            f"0::/user.slice/{unit}.scope\n"
+            f"0::/user.slice/{unit}.scope\n"
+        ),
+    ],
+)
+def test_cgroup_parser_rejects_spoofed_duplicate_or_conflicting_records(output_factory):
+    from hermes_cli.worker_scope import _cgroup_output_matches_scope
+
+    unit = "hermes-kanban-isolation-probe-123-1"
+    assert not _cgroup_output_matches_scope(output_factory(unit), unit)
+
+
+@pytest.mark.parametrize(
+    "output_factory",
+    [
+        lambda unit: f"not-a-cgroup-record:/fake/{unit}.scope\n",
+        lambda unit: f"0:/fake/{unit}.scope\n",
+        lambda unit: f"0::extra:/fake/{unit}.scope\n",
+        lambda unit: f"x::/fake/{unit}.scope\n",
+        lambda unit: f"0:cpu:/fake/{unit}.scope\n",
+        lambda unit: f"1::/fake/{unit}.scope\n",
+        lambda unit: f"1:cpu,,memory:/fake/{unit}.scope\n",
+        lambda unit: f"1:cpu=bad:/fake/{unit}.scope\n",
+        lambda unit: f"1:name=:/fake/{unit}.scope\n",
+        lambda unit: f"1:cpu:relative/{unit}.scope\n",
+        lambda unit: f"0::/fake//{unit}.scope\n",
+        lambda unit: f"0::/fake/../{unit}.scope\n",
+        lambda unit: f"0::/fake/{unit}.scope\ninvalid\n",
+        lambda unit: f"0::/fake/{unit}.scope\n\n",
+    ],
+)
+def test_cgroup_parser_rejects_malformed_records(output_factory):
+    from hermes_cli.worker_scope import _cgroup_output_matches_scope
+
+    unit = "hermes-kanban-isolation-probe-123-1"
+    assert not _cgroup_output_matches_scope(output_factory(unit), unit)
+
+
+@pytest.mark.parametrize(
+    "output_factory",
+    [
+        lambda unit: f"0::/fake/{unit}.scope /child\n",
+        lambda unit: f"0::/fake/{unit}.scope\t\n",
+        lambda unit: f"0::/fake/{unit}.scope\x00\n",
+        lambda unit: f"0::/fake/{unit}.scope\u00a0\n",
+        lambda unit: f"0::/fake/{unit}.scope\u2003\n",
+        lambda unit: f"0::/fake/{unit}.scope\u2028",
+        lambda unit: f"0::/fake/{unit}.scope\r\n",
+        lambda unit: f"0::/fake/gateway_alias/{unit}.scope\n",
+        lambda unit: f"0::/fake/HERMES.GATEWAY/{unit}.scope\n",
+        lambda unit: f"0::/fake/dispatcherd/{unit}.scope\n",
+        lambda unit: f"0::/fake/DISPATCHER_ALIAS/{unit}.scope\n",
+    ],
+)
+def test_cgroup_parser_rejects_unicode_control_whitespace_and_aliases(output_factory):
+    from hermes_cli.worker_scope import _cgroup_output_matches_scope
+
+    unit = "hermes-kanban-isolation-probe-123-1"
+    assert not _cgroup_output_matches_scope(output_factory(unit), unit)
+
+
+@pytest.mark.parametrize(
+    ("returncode", "stdout", "expected"),
+    [
+        (0, "running", True),
+        (0, "running\n", True),
+        (0, "degraded", True),
+        (1, "degraded\n", True),
+        (0, " running\n", False),
+        (0, "running \n", False),
+        (0, "running\n\n", False),
+        (0, "running\textra\n", False),
+        (0, "running\u00a0\n", False),
+        (0, "running\u2028", False),
+        (0, "running\x00\n", False),
+        (1, "running\n", False),
+        (2, "degraded\n", False),
+    ],
+)
+def test_manager_state_parser_requires_exact_unambiguous_output(returncode, stdout, expected):
+    from hermes_cli.worker_scope import _manager_state_is_operational
+
+    assert _manager_state_is_operational(stdout, returncode) is expected
+
+
 def test_required_scope_fails_closed_when_backend_missing(monkeypatch):
     from hermes_cli.worker_scope import WorkerIsolationError, build_scoped_worker_command
 
