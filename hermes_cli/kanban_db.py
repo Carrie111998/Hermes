@@ -6176,7 +6176,7 @@ def block_task(
     kind: Optional[str] = None,
     expected_run_id: Optional[int] = None,
 ) -> bool:
-    """Transition ``running``/``ready`` → ``blocked`` (or route elsewhere).
+    """Transition ``running``/``ready``/``review`` → a blocked route.
 
     ``kind`` (one of :data:`VALID_BLOCK_KINDS`, or ``None`` for a legacy
     un-typed block) drives routing instead of every block landing in one
@@ -6218,7 +6218,7 @@ def block_task(
         source_status = (
             _retry_status_for_run(conn, task_id)
             if cur_row["status"] == "running"
-            else "ready"
+            else str(cur_row["status"])
         )
         prev_kind = cur_row["block_kind"] if "block_kind" in cur_row.keys() else None
         prev_recurrences = (
@@ -6242,7 +6242,7 @@ def block_task(
                        worker_pid    = NULL,
                        block_kind    = ?
                  WHERE id = ?
-                   AND status IN ('running', 'ready')
+                   AND status IN ('running', 'ready', 'review')
                 """ + ("" if expected_run_id is None else " AND current_run_id = ?"),
                 (kind, task_id) if expected_run_id is None
                 else (kind, task_id, int(expected_run_id)),
@@ -6280,9 +6280,10 @@ def block_task(
 
         # Truly-blocked kinds. Increment the unblock-loop counter when this is a
         # re-block for the SAME reason after a prior unblock. block_task only
-        # fires from running/ready (i.e. AFTER an unblock returned the task to
-        # the work pool), so a stored block_kind that matches the incoming kind
-        # means: blocked → unblocked → about-to-re-block for the same cause.
+        # usually fires after an unblock returned the task to the work pool, so
+        # a stored block_kind that matches the incoming kind means: blocked →
+        # unblocked → about-to-re-block for the same cause. Review dispatch can
+        # also block before claim when its implementation prerequisites changed.
         # An un-typed (None) block compares as "same" to a prior un-typed block.
         same_cause = prev_kind == kind
         recurrences = prev_recurrences + 1 if same_cause else 1
@@ -6300,7 +6301,7 @@ def block_task(
                        block_kind    = ?,
                        block_recurrences = ?
                  WHERE id = ?
-                   AND status IN ('running', 'ready')
+                   AND status IN ('running', 'ready', 'review')
                 """ + ("" if expected_run_id is None else " AND current_run_id = ?"),
                 (kind, recurrences, task_id) if expected_run_id is None
                 else (kind, recurrences, task_id, int(expected_run_id)),
@@ -6339,7 +6340,7 @@ def block_task(
                            block_kind    = ?,
                            block_recurrences = ?
                      WHERE id = ?
-                       AND status IN ('running', 'ready')
+                       AND status IN ('running', 'ready', 'review')
                     """,
                     (kind, recurrences, task_id),
                 )
@@ -6354,7 +6355,7 @@ def block_task(
                            block_kind    = ?,
                            block_recurrences = ?
                      WHERE id = ?
-                       AND status IN ('running', 'ready')
+                       AND status IN ('running', 'ready', 'review')
                        AND current_run_id = ?
                     """,
                     (kind, recurrences, task_id, int(expected_run_id)),
@@ -9791,6 +9792,37 @@ def _dispatch_once_locked(
             # bucket it as nonspawnable if the profile genuinely isn't
             # there, with the existing diagnostic.
             _default_assignee_resolved = True
+
+    def _preflight_implementation_prerequisites(
+        task_id: str,
+    ) -> tuple[Optional[Path], Optional[str], bool]:
+        candidate = get_task(conn, task_id)
+        if candidate is None or not (candidate.base_ref or candidate.required_paths):
+            return None, None, False
+        try:
+            workspace, branch = _resolve_worktree_workspace(candidate, board=board)
+            prerequisite_error = _check_implementation_prerequisites(
+                candidate, workspace
+            )
+        except Exception as exc:
+            prerequisite_error = str(exc)
+            workspace = None
+            branch = None
+        if not prerequisite_error:
+            return workspace, branch, False
+
+        reason = f"Dispatch prerequisite failed: {prerequisite_error}"
+        if dry_run:
+            result.auto_blocked.append(candidate.id)
+        elif block_task(conn, candidate.id, reason=reason, kind="capability"):
+            with write_txn(conn):
+                conn.execute(
+                    "UPDATE tasks SET last_failure_error = ? WHERE id = ?",
+                    (reason[:2000], candidate.id),
+                )
+            result.auto_blocked.append(candidate.id)
+        return None, None, True
+
     for row in ready_rows:
         if max_spawn is not None and running_count + spawned >= max_spawn:
             break
@@ -9895,6 +9927,11 @@ def _dispatch_once_locked(
                         {"reason": guard_reason},
                     )
             continue
+        prerequisite_workspace, prerequisite_branch, prerequisite_failed = (
+            _preflight_implementation_prerequisites(row["id"])
+        )
+        if prerequisite_failed:
+            continue
         if dry_run:
             result.spawned.append((row["id"], row_assignee, ""))
             spawned += 1
@@ -9907,29 +9944,6 @@ def _dispatch_once_locked(
                     _per_profile_running.get(row_assignee, 0) + 1
                 )
             continue
-        prerequisite_workspace: Optional[Path] = None
-        prerequisite_branch: Optional[str] = None
-        candidate = get_task(conn, row["id"])
-        if candidate is not None and (candidate.base_ref or candidate.required_paths):
-            try:
-                prerequisite_workspace, prerequisite_branch = (
-                    _resolve_worktree_workspace(candidate, board=board)
-                )
-                prerequisite_error = _check_implementation_prerequisites(
-                    candidate, prerequisite_workspace
-                )
-            except Exception as exc:
-                prerequisite_error = str(exc)
-            if prerequisite_error:
-                reason = f"Dispatch prerequisite failed: {prerequisite_error}"
-                if block_task(conn, candidate.id, reason=reason, kind="capability"):
-                    with write_txn(conn):
-                        conn.execute(
-                            "UPDATE tasks SET last_failure_error = ? WHERE id = ?",
-                            (reason[:2000], candidate.id),
-                        )
-                    result.auto_blocked.append(candidate.id)
-                continue
         claimed = claim_task(conn, row["id"], ttl_seconds=ttl_seconds)
         if claimed is None:
             continue
@@ -10052,6 +10066,11 @@ def _dispatch_once_locked(
                         {"reason": guard_reason},
                     )
             continue
+        prerequisite_workspace, prerequisite_branch, prerequisite_failed = (
+            _preflight_implementation_prerequisites(row["id"])
+        )
+        if prerequisite_failed:
+            continue
         if dry_run:
             result.spawned.append((row["id"], row["assignee"], ""))
             spawned += 1
@@ -10065,7 +10084,10 @@ def _dispatch_once_locked(
             continue
         try:
             resolved_branch_name = None
-            if claimed.workspace_kind == "worktree":
+            if prerequisite_workspace is not None:
+                workspace = prerequisite_workspace
+                resolved_branch_name = prerequisite_branch
+            elif claimed.workspace_kind == "worktree":
                 workspace, resolved_branch_name = _resolve_worktree_workspace(claimed, board=board)
             else:
                 workspace = resolve_workspace(claimed, board=board)
