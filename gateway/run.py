@@ -23752,70 +23752,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         means either another same-lifecycle caller owns/delivered the producer
         event or the event has no gateway route. No cross-process exactly-once
         guarantee is claimed.
+
+        Custody protocol (order matters):
+
+        1. The process-local lifecycle reservation is taken FIRST, before any
+           durable claim. A second caller for the same producer identity
+           returns without touching durable state — the old order let a
+           post-TTL duplicate steal the durable claim and then early-return on
+           the inflight check WITHOUT releasing it, stranding the first
+           caller's accepted delivery unable to ack (row pending forever).
+        2. Every exit after the reservation runs through ONE ``finally`` that
+           removes the reservation and releases the claim on non-acceptance.
+        3. While the adapter injection is in flight, the durable claim is
+           HEARTBEAT-renewed at well under the claim TTL, so a genuinely long
+           injection cannot lose its lease to an independent consumer
+           mid-delivery.
+        4. Adapter acceptance is positive delivery truth. If the claim-scoped
+           ack then reports no matching pending+claim row (lease raced away
+           despite the heartbeat), the row is reconciled to 'delivered' via
+           the unconditional acceptance-finalize primitive — accepted truth is
+           never left pending (replay) or dropped.
         """
         identity = self._completion_delivery_identity(evt)
-        durable_claim_id = ""
-        durable_delegation_id = ""
-        if evt.get("type") == "async_delegation":
-            durable_delegation_id = str(evt.get("delegation_id") or "")
-            if durable_delegation_id:
-                try:
-                    from tools.async_delegation import claim_completion_delivery
-
-                    durable_claim_id = f"gateway:{id(self)}:{__import__('uuid').uuid4().hex}"
-                    if not claim_completion_delivery(
-                        durable_delegation_id, durable_claim_id,
-                    ):
-                        return None
-                except Exception as exc:
-                    logger.warning(
-                        "Could not claim durable async completion %s: %s",
-                        durable_delegation_id, exc,
-                    )
-                    return False
-            parent_session_id = str(evt.get("parent_session_id") or "").strip()
-            if parent_session_id:
-                # Pre-flight (#65838-class): adapter acceptance is NOT proof of
-                # delivery — the inner #55578 resolver can still fail closed
-                # inside the message pipeline AFTER the adapter accepted, which
-                # would falsely acknowledge the durable row as delivered.
-                # Verify the target here, before acceptance, and give drops an
-                # honest durable disposition.
-                verdict = await self._classify_completion_target(parent_session_id)
-                if verdict == "terminal":
-                    logger.warning(
-                        "Async delegation %s targets permanently-gone session %s; "
-                        "terminally dropping delivery (result remains in the "
-                        "delegation records).",
-                        durable_delegation_id or "<legacy>", parent_session_id,
-                    )
-                    if durable_claim_id:
-                        try:
-                            from tools.async_delegation import drop_completion_delivery
-
-                            drop_completion_delivery(
-                                durable_delegation_id, durable_claim_id,
-                            )
-                        except Exception:
-                            logger.debug(
-                                "Could not drop durable completion claim",
-                                exc_info=True,
-                            )
-                    return None
-                if verdict == "retry":
-                    if durable_claim_id:
-                        try:
-                            from tools.async_delegation import release_completion_delivery
-
-                            release_completion_delivery(
-                                durable_delegation_id, durable_claim_id,
-                            )
-                        except Exception:
-                            logger.debug(
-                                "Could not release durable completion claim",
-                                exc_info=True,
-                            )
-                    return False
         if identity is not None:
             with self._completion_delivery_lock:
                 if (
@@ -23825,9 +23783,74 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     return None
                 self._completion_deliveries_inflight.add(identity)
 
+        durable_claim_id = ""
+        durable_delegation_id = ""
         accepted = False
         try:
-            injection_result = await self._inject_watch_notification(synth_text, evt)
+            if evt.get("type") == "async_delegation":
+                durable_delegation_id = str(evt.get("delegation_id") or "")
+                if durable_delegation_id:
+                    try:
+                        from tools.async_delegation import claim_completion_delivery
+
+                        durable_claim_id = f"gateway:{id(self)}:{__import__('uuid').uuid4().hex}"
+                        if not claim_completion_delivery(
+                            durable_delegation_id, durable_claim_id,
+                        ):
+                            durable_claim_id = ""
+                            return None
+                    except Exception as exc:
+                        logger.warning(
+                            "Could not claim durable async completion %s: %s",
+                            durable_delegation_id, exc,
+                        )
+                        durable_claim_id = ""
+                        return False
+                parent_session_id = str(evt.get("parent_session_id") or "").strip()
+                if parent_session_id:
+                    # Pre-flight (#65838-class): adapter acceptance is NOT
+                    # proof of delivery — the inner #55578 resolver can still
+                    # fail closed inside the message pipeline AFTER the
+                    # adapter accepted, which would falsely acknowledge the
+                    # durable row as delivered. Verify the target here, before
+                    # acceptance, and give drops an honest durable disposition.
+                    verdict = await self._classify_completion_target(parent_session_id)
+                    if verdict == "terminal":
+                        logger.warning(
+                            "Async delegation %s targets permanently-gone session %s; "
+                            "terminally dropping delivery (result remains in the "
+                            "delegation records).",
+                            durable_delegation_id or "<legacy>", parent_session_id,
+                        )
+                        if durable_claim_id:
+                            try:
+                                from tools.async_delegation import drop_completion_delivery
+
+                                drop_completion_delivery(
+                                    durable_delegation_id, durable_claim_id,
+                                )
+                                durable_claim_id = ""
+                            except Exception:
+                                logger.debug(
+                                    "Could not drop durable completion claim",
+                                    exc_info=True,
+                                )
+                        return None
+                    if verdict == "retry":
+                        return False  # finally releases the claim for retry
+
+            heartbeat_task = None
+            if durable_claim_id:
+                heartbeat_task = asyncio.create_task(
+                    self._renew_completion_claim_while_injecting(
+                        durable_delegation_id, durable_claim_id,
+                    )
+                )
+            try:
+                injection_result = await self._inject_watch_notification(synth_text, evt)
+            finally:
+                if heartbeat_task is not None:
+                    heartbeat_task.cancel()
             if injection_result is not True:
                 return injection_result
             accepted = True
@@ -23847,11 +23870,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # after adapter acceptance; this gateway keeps no parallel ledger.
             if durable_claim_id:
                 try:
-                    from tools.async_delegation import complete_completion_delivery
-
-                    complete_completion_delivery(
-                        durable_delegation_id, durable_claim_id,
+                    from tools.async_delegation import (
+                        complete_completion_delivery,
+                        mark_completion_delivered,
                     )
+
+                    if not complete_completion_delivery(
+                        durable_delegation_id, durable_claim_id,
+                    ):
+                        # Correctness error, not ignorable: the adapter
+                        # ACCEPTED this turn, but the claim-scoped ack found
+                        # no matching pending+claim row (the lease raced away
+                        # despite the heartbeat). Left alone the row would
+                        # stay pending and REPLAY a turn the user already
+                        # received. Acceptance is positive truth — reconcile
+                        # unconditionally (idempotent when a competing
+                        # consumer already delivered it).
+                        logger.error(
+                            "Async completion %s was accepted by the adapter "
+                            "but its claim-scoped ack failed; reconciling the "
+                            "durable row to 'delivered' (acceptance-finalize).",
+                            durable_delegation_id,
+                        )
+                        mark_completion_delivered(durable_delegation_id)
                 except Exception as exc:
                     logger.warning(
                         "Could not acknowledge durable async completion %s: %s",
@@ -23871,6 +23912,42 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
                 except Exception:
                     logger.debug("Could not release durable completion claim", exc_info=True)
+
+    async def _renew_completion_claim_while_injecting(
+        self, delegation_id: str, claim_id: str,
+    ) -> None:
+        """Heartbeat-renew a durable delivery lease during a long injection.
+
+        Runs as a task for the lifetime of one adapter injection and is
+        cancelled in the caller's ``finally``. The renewal period stays well
+        under a third of the claim TTL so an independent consumer can never
+        observe an expired lease while the injection is genuinely in flight.
+        Renewal is claim-scoped (same claim id, still-pending row only); a
+        failed renewal means the row already resolved — stop quietly.
+
+        The timed wait deliberately avoids ``asyncio.sleep``: the watcher's
+        loop cadence is commonly driven in tests by stubbing ``asyncio.sleep``
+        to an instant return, and a stubbed sleep here would turn the
+        heartbeat into a busy-spin that renews thousands of times per
+        injection. ``wait_for`` schedules on the event loop clock directly.
+        """
+        from tools.async_delegation import (
+            _DELIVERY_CLAIM_TTL_S,
+            renew_completion_delivery_claim,
+        )
+
+        interval = max(0.05, _DELIVERY_CLAIM_TTL_S / 4.0)
+        cancelled = asyncio.Event()  # never set; timed wait + task cancellation
+        try:
+            while True:
+                try:
+                    await asyncio.wait_for(cancelled.wait(), timeout=interval)
+                except asyncio.TimeoutError:
+                    pass
+                if not renew_completion_delivery_claim(delegation_id, claim_id):
+                    return
+        except asyncio.CancelledError:
+            pass
 
     def _enrich_async_delegation_routing(self, evt: dict) -> None:
         """Fill platform/chat_id/thread_id/chat_type on an async-delegation event.

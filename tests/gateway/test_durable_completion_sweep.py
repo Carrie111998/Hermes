@@ -195,6 +195,102 @@ def test_reversed_wakes_deliver_ordered_stream_low_to_high(
     assert ad.get_durable_delegation("ride/2")["delivery_state"] == "delivered"
 
 
+def test_duplicate_caller_after_ttl_cannot_steal_the_inflight_claim(
+    monkeypatch, isolated_state,
+):
+    """Reservation-before-claim: a second same-identity caller returns on the
+    lifecycle reservation WITHOUT touching durable state, even after the
+    first caller's original lease TTL has elapsed. The old order let the
+    duplicate steal the claim and strand the first acceptance un-ackable."""
+    monkeypatch.setattr(ad, "_DELIVERY_CLAIM_TTL_S", 0.2)
+    evt = _persist_completion_without_wake("deleg_no_steal")
+
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def _slow(_event):
+        entered.set()
+        await release.wait()
+
+    adapter = SimpleNamespace(handle_message=AsyncMock(side_effect=_slow))
+    runner = _runner(adapter)
+
+    async def _exercise():
+        first = asyncio.create_task(
+            runner._deliver_completion_notification("t", dict(evt))
+        )
+        await asyncio.wait_for(entered.wait(), 5)
+        await asyncio.sleep(0.5)  # far past the compressed original TTL
+        second = await runner._deliver_completion_notification("t", dict(evt))
+        release.set()
+        return await first, second
+
+    first, second = asyncio.run(_exercise())
+    assert first is True
+    assert second is None  # refused at the reservation, before any claim
+    row = ad.get_durable_delegation("deleg_no_steal")
+    assert row["delivery_state"] == "delivered"  # first acceptance acked fine
+    assert row["delivery_attempts"] == 1
+    adapter.handle_message.assert_awaited_once()
+
+
+def test_heartbeat_blocks_independent_consumer_theft_during_long_injection(
+    monkeypatch, isolated_state,
+):
+    """A second INDEPENDENT consumer (direct durable claims, not the runner's
+    lifecycle cache) hammers the row while an injection runs far past the
+    claim TTL: the heartbeat renewal must keep the lease unstealable."""
+    monkeypatch.setattr(ad, "_DELIVERY_CLAIM_TTL_S", 0.3)
+    evt = _persist_completion_without_wake("deleg_hb")
+
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def _slow(_event):
+        entered.set()
+        await release.wait()
+
+    adapter = SimpleNamespace(handle_message=AsyncMock(side_effect=_slow))
+    runner = _runner(adapter)
+    thief_attempts = []
+
+    async def _exercise():
+        task = asyncio.create_task(
+            runner._deliver_completion_notification("t", dict(evt))
+        )
+        await asyncio.wait_for(entered.wait(), 5)
+        for i in range(6):  # spans well over 2x the compressed TTL
+            await asyncio.sleep(0.12)
+            thief_attempts.append(
+                ad.claim_completion_delivery("deleg_hb", f"independent-thief-{i}")
+            )
+        release.set()
+        return await task
+
+    assert asyncio.run(_exercise()) is True
+    assert thief_attempts == [False] * 6  # lease never observably expired
+    row = ad.get_durable_delegation("deleg_hb")
+    assert row["delivery_state"] == "delivered"
+    assert row["delivery_attempts"] == 1  # failed thief claims burned nothing
+
+
+def test_accepted_delivery_reconciles_when_claim_scoped_ack_fails(
+    monkeypatch, isolated_state,
+):
+    """Adapter acceptance is positive delivery truth: if the claim-scoped ack
+    reports no matching row, the durable row is reconciled to 'delivered' via
+    the acceptance-finalize primitive — never left pending to replay."""
+    evt = _persist_completion_without_wake("deleg_ack_lost")
+    monkeypatch.setattr(ad, "complete_completion_delivery", lambda *_a, **_k: False)
+
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner = _runner(adapter)
+
+    assert asyncio.run(runner._deliver_completion_notification("t", dict(evt))) is True
+    row = ad.get_durable_delegation("deleg_ack_lost")
+    assert row["delivery_state"] == "delivered"
+
+
 def test_delivered_terminal_suppresses_stale_recovered_events(
     monkeypatch, isolated_state,
 ):

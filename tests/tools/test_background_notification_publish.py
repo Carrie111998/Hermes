@@ -12,6 +12,7 @@ ProcessRegistry constructor, and the restart then replayed them AFTER their
 stream's terminal event with a formatter claiming "0s ago".
 """
 
+import multiprocessing
 import os
 import queue
 import time
@@ -20,6 +21,32 @@ from types import SimpleNamespace
 import pytest
 
 from tools import async_delegation as ad
+
+
+def _slot_race_worker(hermes_home, notification_id, barrier, results):
+    """Spawn-context worker: publish one stream slot from a FRESH process.
+
+    Module-level and picklable on purpose: ``spawn`` proves independent
+    process initialization (no inherited module locks/registries), which is
+    the point of the cross-process slot-race test — the module's _DB_LOCK is
+    process-local, so only the DB-level unique index can arbitrate.
+    """
+    os.environ["HERMES_HOME"] = hermes_home
+    try:
+        from tools import async_delegation as child_ad
+
+        child_ad._reset_for_tests()
+        barrier.wait(timeout=15)
+        result = child_ad.publish_background_notification(
+            summary="race body",
+            session_key="agent:main:telegram:dm:1:2",
+            notification_id=notification_id,
+            stream_id="race",
+            sequence=7,
+        )
+        results.put((notification_id, result["status"]))
+    except Exception as exc:  # noqa: BLE001 — surfaced to the parent assert
+        results.put((notification_id, f"error:{type(exc).__name__}:{exc}"))
 
 
 @pytest.fixture(autouse=True)
@@ -771,6 +798,166 @@ def test_concurrent_pollers_within_one_interval_trigger_one_db_scan(
     # And a forced call (explicit one-shot recovery / tests) still bypasses.
     assert ad.sweep_undelivered_completions(target, force_scan=True) == 0  # re-arm holds
     assert len(connects) > scans_after_first
+
+
+# ---------------------------------------------------------------------------
+# Cross-process stream-slot identity (DB-enforced unique index)
+# ---------------------------------------------------------------------------
+
+
+def test_cross_process_slot_race_yields_one_row_one_conflict(tmp_path, _isolated):
+    """Two independent processes publish the same (stream_id, sequence):
+    exactly one row persists; the loser gets a deterministic conflict."""
+    try:
+        ctx = multiprocessing.get_context("spawn")
+        barrier = ctx.Barrier(2)
+        results = ctx.Queue()
+    except (ValueError, OSError, ImportError) as exc:
+        pytest.skip(f"multiprocessing spawn primitives unavailable: {exc}")
+
+    hermes_home = os.environ["HERMES_HOME"]
+    procs = [
+        ctx.Process(
+            target=_slot_race_worker,
+            args=(hermes_home, f"racer-{i}", barrier, results),
+        )
+        for i in range(2)
+    ]
+    for p in procs:
+        p.start()
+    outcomes = {}
+    try:
+        for _ in procs:
+            nid, status = results.get(timeout=60)
+            outcomes[nid] = status
+    finally:
+        for p in procs:
+            p.join(timeout=30)
+            if p.is_alive():
+                p.terminate()
+                p.join(timeout=10)
+    assert [p.exitcode for p in procs] == [0, 0]
+
+    assert sorted(outcomes.values()) == ["conflict", "published"]
+    winner = next(nid for nid, status in outcomes.items() if status == "published")
+    with ad._DB_LOCK, ad._transaction() as conn:
+        slot_rows = conn.execute(
+            "SELECT delegation_id FROM async_delegations WHERE stream_id='race' AND stream_seq=7"
+        ).fetchall()
+    assert len(slot_rows) == 1  # the DB index is the cross-process arbiter
+    assert slot_rows[0][0] == winner
+
+
+def test_schema_init_fails_loudly_on_preexisting_duplicate_slots(_isolated):
+    """Legacy duplicates cannot be auto-resolved (independent custody per
+    row); schema init must refuse with a diagnostic, not pick a winner."""
+    _publish("dup/a", stream_id="dup", sequence=1)
+    with ad._DB_LOCK, ad._transaction() as conn:
+        conn.execute("DROP INDEX idx_async_delegations_stream_slot")
+        conn.execute(
+            """INSERT INTO async_delegations
+               (delegation_id, origin_session, state, dispatched_at,
+                updated_at, delivery_state, stream_id, stream_seq)
+               VALUES ('dup/b', '', 'completed', 1, 1, 'pending', 'dup', 1)"""
+        )
+    with pytest.raises(RuntimeError) as excinfo:
+        ad._connect()
+    assert "duplicate stream slots" in str(excinfo.value)
+    assert "dup/a" in str(excinfo.value)
+    assert "dup/b" in str(excinfo.value)
+
+
+# ---------------------------------------------------------------------------
+# Overflow never revokes custody
+# ---------------------------------------------------------------------------
+
+
+def test_pending_overflow_never_revokes_a_live_claim(_isolated, monkeypatch):
+    monkeypatch.setattr(ad, "_MAX_DURABLE_PENDING", 5)
+    _publish("keep0")  # oldest row — and the one holding custody
+    assert ad.claim_completion_delivery("keep0", "c-keep")
+    for i in range(7):
+        _publish(f"fresh/{i}")
+
+    row = _row("keep0")
+    assert row["delivery_state"] == "pending"  # never dropped despite being oldest
+    assert _row("fresh/0")["delivery_state"] == "dropped"  # untouched rows absorbed the cap
+    # The preserved claim remains fully functional: the ack succeeds.
+    assert ad.complete_completion_delivery("keep0", "c-keep")
+
+
+def test_pending_overflow_preserves_attempted_rows_and_exceeds_soft_cap(
+    _isolated, monkeypatch, caplog,
+):
+    for i in range(3):
+        nid = f"cust/{i}"
+        _publish(nid)
+        assert ad.claim_completion_delivery(nid, f"c{i}")
+        assert ad.release_completion_delivery(nid, f"c{i}")  # attempts=1, claim expired/cleared
+    monkeypatch.setattr(ad, "_MAX_DURABLE_PENDING", 2)
+    import logging as _logging
+
+    with caplog.at_level(_logging.WARNING, logger="tools.async_delegation"):
+        ad._prune_durable_records()
+    # Every row crossed custody: the soft cap is EXCEEDED, loudly — nothing
+    # is cleared or revoked.
+    assert all(_row(f"cust/{i}")["delivery_state"] == "pending" for i in range(3))
+    assert any("custody" in rec.message for rec in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# Attempt cap holds without cooperative release (crash / lease-expiry path)
+# ---------------------------------------------------------------------------
+
+
+def test_expired_claims_converge_dropped_at_cap_and_unblock_terminal(_isolated):
+    _publish("h/1", stream_id="h", sequence=1)
+    _publish("h/2", stream_id="h", sequence=2, supersedes_before_sequence=2)
+
+    grants = 0
+    for i in range(ad._MAX_DELIVERY_ATTEMPTS + 4):
+        if not ad.claim_completion_delivery("h/1", f"crash{i}"):
+            break
+        grants += 1
+        # The terminal stays blocked while the old row is unresolved custody.
+        assert not ad.claim_completion_delivery("h/2", "term")
+        # The claim holder crashes; its lease expires with no release call.
+        with ad._DB_LOCK, ad._transaction() as conn:
+            conn.execute(
+                "UPDATE async_delegations SET delivery_claimed_at=? WHERE delegation_id='h/1'",
+                (time.time() - ad._DELIVERY_CLAIM_TTL_S - 5,),
+            )
+    assert grants == ad._MAX_DELIVERY_ATTEMPTS  # no unbounded 9th, 10th... lease
+    assert _row("h/1")["delivery_state"] == "dropped"
+    assert _row("h/1")["delivery_attempts"] == ad._MAX_DELIVERY_ATTEMPTS
+    # A terminally-dropped old row resolves custody: the terminal delivers.
+    assert ad.claim_completion_delivery("h/2", "term")
+    assert ad.complete_completion_delivery("h/2", "term")
+
+
+# ---------------------------------------------------------------------------
+# Tenant routing origin is immutable identity
+# ---------------------------------------------------------------------------
+
+
+def test_tenant_routing_origin_is_immutable_identity(_isolated, monkeypatch):
+    monkeypatch.setattr(
+        ad, "_capture_routing_origin",
+        lambda: {"scope_id": "tenant-a", "user_id": "user-a"},
+    )
+    _publish("shared-id")
+    _drain(_isolated)
+
+    # Tenant B retries the same notification_id: it must conflict — never
+    # 'republished', never a re-wake of tenant A's payload into B's context.
+    monkeypatch.setattr(
+        ad, "_capture_routing_origin",
+        lambda: {"scope_id": "tenant-b", "user_id": "user-b"},
+    )
+    result = _publish("shared-id")
+    assert result["status"] == "conflict"
+    assert "scope_id" in result["error"]
+    assert _drain(_isolated) == []
 
 
 def test_production_recovery_latency_contract():

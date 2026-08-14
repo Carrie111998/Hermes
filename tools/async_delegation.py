@@ -324,6 +324,38 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
     ):
         if name not in columns:
             conn.execute(f"ALTER TABLE async_delegations ADD COLUMN {name} {sql_type}")
+    # A stream slot (stream_id, stream_seq) is a stable IDENTITY, enforced by
+    # the database — the module's _DB_LOCK is process-local, so two processes
+    # sharing this state.db can otherwise both pass the check-then-insert and
+    # persist the same slot under different notification ids. The partial
+    # unique index makes the insert the atomic arbiter across processes.
+    try:
+        conn.execute(
+            """CREATE UNIQUE INDEX IF NOT EXISTS idx_async_delegations_stream_slot
+               ON async_delegations(stream_id, stream_seq)
+               WHERE stream_id IS NOT NULL AND stream_seq IS NOT NULL"""
+        )
+    except sqlite3.IntegrityError as exc:
+        # Pre-existing duplicate slots: custody/identity semantics make an
+        # arbitrary winner unsafe (each row may have independent claim
+        # history). Fail loudly with a diagnostic instead of silently
+        # rewriting either row — resolution requires a human decision.
+        duplicates = conn.execute(
+            """SELECT stream_id, stream_seq, COUNT(*), GROUP_CONCAT(delegation_id)
+               FROM async_delegations
+               WHERE stream_id IS NOT NULL AND stream_seq IS NOT NULL
+               GROUP BY stream_id, stream_seq HAVING COUNT(*) > 1"""
+        ).fetchall()
+        detail = "; ".join(
+            f"stream '{row[0]}' seq {row[1]}: {row[2]} rows ({row[3]})"
+            for row in duplicates
+        )
+        raise RuntimeError(
+            "async_delegations contains duplicate stream slots, which the "
+            "stream identity contract forbids and cannot be auto-resolved "
+            "(each duplicate may carry independent delivery custody). "
+            f"Resolve manually and retry: {detail}"
+        ) from exc
 
 
 @contextmanager
@@ -457,28 +489,46 @@ def _prune_durable_records() -> None:
         ).fetchone()[0]
         overflow = max(0, pending_count - _MAX_DURABLE_PENDING)
         if overflow:
+            # The overflow valve may only drop UNTOUCHED rows: no recorded
+            # delivery attempt and no claim, ever (a claim grant increments
+            # attempts, so attempts=0 implies never claimed; the claim-NULL
+            # predicate is the belt). A row with custody — a live or expired
+            # claim, or any attempt — may already have reached a consumer;
+            # revoking it here would retract irrevocable claim history. If
+            # the backlog exceeds the cap purely on custody rows, EXCEED the
+            # soft cap and say so loudly rather than clear custody.
             overflow_ids = [
                 r[0] for r in conn.execute(
                     """SELECT delegation_id FROM async_delegations
-                       WHERE state NOT IN ('running','finalizing') AND delivery_state='pending'
+                       WHERE state NOT IN ('running','finalizing')
+                         AND delivery_state='pending'
+                         AND delivery_attempts=0 AND delivery_claim IS NULL
                        ORDER BY updated_at ASC LIMIT ?""",
                     (overflow,),
                 ).fetchall()
             ]
-            conn.execute(
-                f"""UPDATE async_delegations SET delivery_state='dropped',
-                           delivery_claim=NULL, delivery_claimed_at=NULL,
-                           updated_at=?
-                    WHERE delegation_id IN ({','.join('?' * len(overflow_ids))})""",
-                (now, *overflow_ids),
-            )
-            logger.warning(
-                "Async delegation pending backlog exceeded %d rows; %d oldest "
-                "undelivered completion(s) transitioned to terminal 'dropped' "
-                "(payloads remain queryable): %s",
-                _MAX_DURABLE_PENDING, len(overflow_ids),
-                ", ".join(overflow_ids[:10]),
-            )
+            if overflow_ids:
+                conn.execute(
+                    f"""UPDATE async_delegations SET delivery_state='dropped',
+                               updated_at=?
+                        WHERE delegation_id IN ({','.join('?' * len(overflow_ids))})""",
+                    (now, *overflow_ids),
+                )
+                logger.warning(
+                    "Async delegation pending backlog exceeded %d rows; %d "
+                    "oldest UNTOUCHED undelivered completion(s) transitioned "
+                    "to terminal 'dropped' (payloads remain queryable): %s",
+                    _MAX_DURABLE_PENDING, len(overflow_ids),
+                    ", ".join(overflow_ids[:10]),
+                )
+            if len(overflow_ids) < overflow:
+                logger.warning(
+                    "Async delegation pending backlog exceeds the %d-row soft "
+                    "cap by %d row(s) that hold delivery custody (claimed or "
+                    "attempted); custody is never revoked — the cap is "
+                    "exceeded until those rows resolve.",
+                    _MAX_DURABLE_PENDING, overflow - len(overflow_ids),
+                )
 
 
 def _persist_completion(event: Dict[str, Any], result: Dict[str, Any]) -> None:
@@ -924,6 +974,35 @@ def claim_completion_delivery(delegation_id: str, claim_id: str) -> bool:
             return True  # legacy event created before durable dispatch
         (delivery_state, stream_id, stream_seq, supersedes_before,
          delivery_attempts) = row
+        if (
+            delivery_state == "pending"
+            and (delivery_attempts or 0) >= _MAX_DELIVERY_ATTEMPTS
+        ):
+            # The retry cap must hold even when consumers never release
+            # cooperatively (crashes, TTL expiry): enforce it at the atomic
+            # claim chokepoint, BEFORE the increment, transitioning the row
+            # terminal instead of granting an unbounded 9th, 10th, ... lease.
+            # An ACTIVE (unexpired) claim is preserved — its holder may still
+            # finish; the guarded UPDATE simply doesn't match and this claim
+            # attempt is refused without burning anything.
+            capped = conn.execute(
+                """UPDATE async_delegations SET delivery_state='dropped',
+                          delivery_claim=NULL, delivery_claimed_at=NULL,
+                          updated_at=?
+                   WHERE delegation_id=? AND delivery_state='pending'
+                     AND (delivery_claim IS NULL OR delivery_claimed_at < ?)""",
+                (now, delegation_id, now - _DELIVERY_CLAIM_TTL_S),
+            )
+            if capped.rowcount == 1:
+                logger.warning(
+                    "Async delegation %s exhausted its %d delivery attempts "
+                    "without a cooperative release (crash/lease-expiry path); "
+                    "marking terminally dropped at the claim chokepoint "
+                    "(result remains queryable).",
+                    delegation_id, _MAX_DELIVERY_ATTEMPTS,
+                )
+                _clear_wake_activity(delegation_id)
+            return False
         if delivery_state == "pending" and stream_id and stream_seq is not None:
             # Delivered-watermark fallback retires ONLY never-attempted rows.
             # A covered row with recorded attempts crossed custody — its turn
@@ -981,6 +1060,28 @@ def claim_event_delivery(evt: Dict[str, Any], consumer: str) -> Optional[str]:
         return ""
     claim_id = f"{consumer}:{__import__('os').getpid()}:{uuid.uuid4().hex}"
     return claim_id if claim_completion_delivery(delegation_id, claim_id) else None
+
+
+def renew_completion_delivery_claim(delegation_id: str, claim_id: str) -> bool:
+    """Extend a live delivery lease while its injection is still in flight.
+
+    A genuinely long adapter injection (slow platform API, large payload) can
+    outlive the claim TTL, at which point an independent consumer may steal
+    the lease mid-delivery and produce a duplicate turn. The delivering
+    consumer heartbeats this renewal (at a period well under the TTL) for as
+    long as the injection runs. Renewal is strictly claim-scoped: it touches
+    only a still-pending row holding the SAME claim id — it can never
+    resurrect a resolved row or extend somebody else's lease.
+    """
+    now = time.time()
+    with _DB_LOCK, _transaction() as conn:
+        cur = conn.execute(
+            """UPDATE async_delegations SET delivery_claimed_at=?, updated_at=?
+               WHERE delegation_id=? AND delivery_state='pending'
+                 AND delivery_claim=?""",
+            (now, now, delegation_id, claim_id),
+        )
+        return cur.rowcount == 1
 
 
 def release_completion_delivery(delegation_id: str, claim_id: str) -> bool:
@@ -1106,11 +1207,15 @@ def get_durable_delegation(delegation_id: str) -> Optional[Dict[str, Any]]:
 
 # The fields an idempotent notification_id binds immutably. Timestamps are
 # excluded on purpose: a producer retry regenerates "now" defaults, and the
-# durable row's first-publish times remain the truth.
+# durable row's first-publish times remain the truth. The captured routing
+# origin (scope_id/user_id/user_name) IS immutable identity: a tenant-B retry
+# of a tenant-A notification_id must conflict, never re-wake tenant A's
+# payload as a "republish".
 _IMMUTABLE_NOTIFICATION_FIELDS = (
     "summary", "goal", "context", "status",
     "session_key", "origin_ui_session_id", "origin_session_id",
     "parent_session_id",
+    "scope_id", "user_id", "user_name",
     "stream_id", "sequence", "supersedes_before_sequence",
 )
 
@@ -1393,21 +1498,55 @@ def publish_background_notification(
                     # watermark covers: persist the durable record for
                     # queryability, but born-terminal — no wake, no delivery.
                     initial_delivery_state = "superseded"
-            conn.execute(
-                """INSERT INTO async_delegations
-                   (delegation_id, origin_session, origin_ui_session_id,
-                    parent_session_id, state, dispatched_at, completed_at,
-                    updated_at, event_json, result_json, delivery_state,
-                    delivery_attempts, owner_pid, owner_started_at, task_json,
-                    origin_session_id, stream_id, stream_seq, supersedes_before)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?)""",
-                (notification_id, session_key or "", origin_ui_session_id or "",
-                 parent_session_id, status, occurred_at, occurred_at, now,
-                 json.dumps(evt), json.dumps(result), initial_delivery_state,
-                 __import__("os").getpid(), owner_started_at,
-                 json.dumps(task_payload), origin_session_id or "",
-                 stream_id or None, sequence, supersedes_before_sequence),
-            )
+            try:
+                conn.execute(
+                    """INSERT INTO async_delegations
+                       (delegation_id, origin_session, origin_ui_session_id,
+                        parent_session_id, state, dispatched_at, completed_at,
+                        updated_at, event_json, result_json, delivery_state,
+                        delivery_attempts, owner_pid, owner_started_at, task_json,
+                        origin_session_id, stream_id, stream_seq, supersedes_before)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?)""",
+                    (notification_id, session_key or "", origin_ui_session_id or "",
+                     parent_session_id, status, occurred_at, occurred_at, now,
+                     json.dumps(evt), json.dumps(result), initial_delivery_state,
+                     __import__("os").getpid(), owner_started_at,
+                     json.dumps(task_payload), origin_session_id or "",
+                     stream_id or None, sequence, supersedes_before_sequence),
+                )
+            except sqlite3.IntegrityError:
+                # _DB_LOCK is process-local; a SIBLING PROCESS won the slot
+                # (or the id) between our checks and this insert. The
+                # DB-level unique constraints are the cross-process arbiter —
+                # resolve deterministically to a conflict, never a second row.
+                incumbent = None
+                if stream_id:
+                    slot = conn.execute(
+                        """SELECT delegation_id FROM async_delegations
+                           WHERE stream_id=? AND stream_seq=?""",
+                        (stream_id, sequence),
+                    ).fetchone()
+                    incumbent = slot[0] if slot else None
+                if incumbent and incumbent != notification_id:
+                    detail = (
+                        f"sequence {sequence} in stream '{stream_id}' was "
+                        f"concurrently bound to notification '{incumbent}' "
+                        "by another process"
+                    )
+                else:
+                    detail = (
+                        f"notification '{notification_id}' was concurrently "
+                        "published by another process"
+                    )
+                logger.warning(
+                    "Background notification %s lost a cross-process publish "
+                    "race: %s", notification_id, detail,
+                )
+                return {
+                    "status": "conflict",
+                    "notification_id": notification_id,
+                    "error": detail,
+                }
             if initial_delivery_state == "superseded":
                 logger.info(
                     "Background notification %s (stream %s seq %s) published "
