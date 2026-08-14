@@ -200,6 +200,38 @@ def maybe_persist_tool_result(
     )
 
 
+def persist_overflow_output(content: str, name_hint: str, env=None) -> str | None:
+    """Write *content* to the sandbox result store, returning its path or None.
+
+    Layer 2 (:func:`maybe_persist_tool_result`) can only preserve what the tool
+    hands it, and it runs after the tool returns. A tool that caps its own
+    output below the layer-2 threshold — ``tool_output_limits.DEFAULT_MAX_BYTES``
+    is 50 000 against ``DEFAULT_RESULT_SIZE_CHARS`` at 100 000 — has already
+    discarded the overflow by then, so layer 2 both never fires and has nothing
+    left to save.
+
+    This is the escape hatch for those tools: call it with the FULL output
+    before capping, then point the truncation notice at the returned path so
+    the discarded bytes stay reachable via ``read_file``. Returns None when no
+    env is available or the write fails, so callers keep their existing
+    truncate-and-continue behaviour instead of failing the tool call.
+    """
+    if env is None or not content:
+        return None
+    storage_dir = _resolve_storage_dir(env)
+    remote_path = f"{storage_dir}/{_safe_result_filename(name_hint)}"
+    try:
+        if _write_to_sandbox(content, remote_path, env):
+            logger.info(
+                "Persisted overflow output before truncation: %s (%d chars -> %s)",
+                name_hint, len(content), remote_path,
+            )
+            return remote_path
+    except Exception as exc:
+        logger.warning("Overflow persist failed for %s: %s", name_hint, exc)
+    return None
+
+
 def enforce_turn_budget(
     tool_messages: list[dict],
     env=None,
