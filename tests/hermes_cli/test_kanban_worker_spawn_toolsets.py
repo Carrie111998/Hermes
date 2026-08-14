@@ -83,6 +83,8 @@ agent:
     assert pid == 4242
     assert captured["env"]["HERMES_HOME"] == str(profile)
     assert captured["env"]["HERMES_KANBAN_TASK"] == "t_spawn_tools"
+    assert "HERMES_KANBAN_WORKER_SCOPE" not in captured["env"]
+    assert "--accept-hooks" in captured["cmd"]
     assert "--toolsets" in captured["cmd"]
     pinned = captured["cmd"][captured["cmd"].index("--toolsets") + 1].split(",")
     for required in ("terminal", "web", "file", "skills", "code_execution", "delegation"):
@@ -166,6 +168,7 @@ toolsets:
 def test_lifecycle_only_worker_surface_excludes_broader_kanban_tools(monkeypatch):
     """A minimal worker profile must not be widened back to the full Kanban API."""
     monkeypatch.setenv("HERMES_KANBAN_TASK", "t_lifecycle_only")
+    monkeypatch.setenv("HERMES_KANBAN_WORKER_SCOPE", "lifecycle-only")
 
     from model_tools import _clear_tool_defs_cache, get_tool_definitions
 
@@ -176,16 +179,27 @@ def test_lifecycle_only_worker_surface_excludes_broader_kanban_tools(monkeypatch
             disabled_toolsets=[],
             quiet_mode=True,
         )
-        names = {
-            item.get("function", {}).get("name")
+        by_name = {
+            item.get("function", {}).get("name"): item.get("function", {})
             for item in definitions
             if item.get("function", {}).get("name")
         }
+        names = set(by_name)
         assert names == {
             "kanban_show",
             "kanban_complete",
             "kanban_block",
             "kanban_heartbeat",
+        }
+        assert set(by_name["kanban_show"]["parameters"]["properties"]) == set()
+        assert set(by_name["kanban_complete"]["parameters"]["properties"]) == {
+            "summary", "metadata", "result",
+        }
+        assert set(by_name["kanban_block"]["parameters"]["properties"]) == {
+            "reason", "kind",
+        }
+        assert set(by_name["kanban_heartbeat"]["parameters"]["properties"]) == {
+            "note",
         }
     finally:
         _clear_tool_defs_cache()
