@@ -20,6 +20,7 @@ import dataclasses
 import hashlib
 import inspect
 import logging
+import math
 import os
 import re
 import shlex
@@ -702,6 +703,31 @@ class GatewaySlashCommandsMixin:
         elif context_used:
             context_line = t("gateway.status.context_used", used=f"{context_used:,}")
 
+        route_line = ""
+        if status_agent is not None and status_agent is not _AGENT_PENDING_SENTINEL:
+            try:
+                from agent.routing_snapshot import RoutingSnapshotAdapter
+
+                route = RoutingSnapshotAdapter.from_agent(
+                    status_agent,
+                    captured_at_monotonic=time.monotonic(),
+                )
+                if (
+                    route.provider or route.model
+                ) and (route.fallback_active or route.cooldown_remaining_s > 0):
+                    identity = f"{route.provider}/{route.model}"
+                    if route.base_url_host:
+                        identity += f"@{route.base_url_host}"
+                    states = []
+                    if route.fallback_active:
+                        states.append("FALLBACK")
+                    if route.cooldown_remaining_s > 0:
+                        states.append(f"T-{max(1, math.ceil(route.cooldown_remaining_s))}s")
+                    route_line = f"**{identity}:** {' · '.join(states)}"
+            except Exception:
+                # Status must remain available for partial/legacy agent objects.
+                route_line = ""
+
         lines = [
             t("gateway.status.header"),
             "",
@@ -717,6 +743,8 @@ class GatewaySlashCommandsMixin:
             lines.append(model_line)
         if context_line:
             lines.append(context_line)
+        if route_line:
+            lines.append(route_line)
         lines.extend([
             t("gateway.status.tokens", tokens=f"{db_total_tokens:,}"),
             t("gateway.status.agent_running", state=t("gateway.status.state_yes") if is_running else t("gateway.status.state_no")),
