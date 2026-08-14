@@ -70,8 +70,17 @@ class CleanupCaptureAdapter(BasePlatformAdapter):
         )
         return SendResult(success=True, message_id=mid)
 
-    async def edit_message(self, chat_id, message_id, content) -> SendResult:
-        self.edits.append({"chat_id": chat_id, "message_id": message_id, "content": content})
+    async def edit_message(
+        self, chat_id, message_id, content, *, finalize: bool = False, metadata=None
+    ) -> SendResult:
+        self.edits.append(
+            {
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "content": content,
+                "metadata": metadata,
+            }
+        )
         return SendResult(success=True, message_id=message_id)
 
     async def delete_message(self, chat_id, message_id) -> bool:
@@ -118,6 +127,15 @@ class ProgressAgent:
             time.sleep(0.2)
             cb("tool.started", "terminal", "ls", {})
             time.sleep(0.2)
+        return {"final_response": "done", "messages": [], "api_calls": 1}
+
+
+class SlowHeartbeatAgent:
+    def __init__(self, **kwargs):
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        time.sleep(0.35)
         return {"final_response": "done", "messages": [], "api_calls": 1}
 
 
@@ -204,6 +222,56 @@ def _install_fakes(
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_discord_heartbeat_edit_keeps_thread_metadata(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_AGENT_NOTIFY_INTERVAL", "0.02")
+    adapter = CleanupCaptureAdapter(platform=Platform.DISCORD)
+    runner = _make_runner(adapter)
+    gateway_run = _install_fakes(
+        monkeypatch,
+        SlowHeartbeatAgent,
+        cleanup_on=False,
+        cleanup_platform=Platform.DISCORD,
+    )
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    _original_float_env = gateway_run._float_env
+    monkeypatch.setattr(
+        gateway_run,
+        "_float_env",
+        lambda name, default: 0.02
+        if name == "HERMES_AGENT_NOTIFY_INTERVAL"
+        else _original_float_env(name, default),
+    )
+    monkeypatch.setattr(
+        runner, "_should_emit_long_running_notification", lambda *args: True
+    )
+
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="parent-1",
+        chat_type="thread",
+        thread_id="thread-9",
+    )
+    result = await runner._run_agent(
+        message="hello",
+        context_prompt="",
+        history=[],
+        source=source,
+        session_id="sess-heartbeat-thread",
+        session_key="agent:main:discord:thread:parent-1:thread-9",
+    )
+
+    assert result["final_response"] == "done"
+    heartbeat_sends = [s for s in adapter.sent if "Working" in s["content"]]
+    heartbeat_edits = [e for e in adapter.edits if "Working" in e["content"]]
+    assert heartbeat_sends
+    assert heartbeat_edits
+    assert all(
+        (e.get("metadata") or {}).get("thread_id") == "thread-9"
+        for e in heartbeat_edits
+    ), heartbeat_edits
 
 
 @pytest.mark.asyncio

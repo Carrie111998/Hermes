@@ -482,6 +482,35 @@ def _non_conversational_metadata(
     return merged
 
 
+async def _edit_message_with_optional_metadata(
+    adapter: Any,
+    *,
+    chat_id: str,
+    message_id: str,
+    content: str,
+    finalize: bool = False,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> Any:
+    """Edit while preserving legacy adapters that do not accept metadata."""
+    kwargs: Dict[str, Any] = {
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "content": content,
+        "finalize": finalize,
+    }
+    if metadata:
+        try:
+            params = inspect.signature(adapter.edit_message).parameters
+            if "metadata" in params or any(
+                param.kind is inspect.Parameter.VAR_KEYWORD
+                for param in params.values()
+            ):
+                kwargs["metadata"] = metadata
+        except (TypeError, ValueError):
+            pass
+    return await adapter.edit_message(**kwargs)
+
+
 def _seed_hygiene_system_prompt(
     agent: Any,
     session_row: Optional[Dict[str, Any]],
@@ -26936,10 +26965,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _notify_res = None
                     if _heartbeat_msg_id:
                         try:
-                            _notify_res = await _notify_adapter.edit_message(
-                                source.chat_id,
-                                _heartbeat_msg_id,
-                                _heartbeat_text,
+                            _notify_res = await _edit_message_with_optional_metadata(
+                                _notify_adapter,
+                                chat_id=source.chat_id,
+                                message_id=_heartbeat_msg_id,
+                                content=_heartbeat_text,
+                                metadata=_non_conversational_metadata(
+                                    _status_thread_metadata,
+                                    platform=source.platform,
+                                ),
                             )
                         except Exception as _ee:
                             logger.debug("Heartbeat edit failed: %s", _ee)
@@ -27837,11 +27871,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
                 elif _sc_msg_id and _sc_msg_id != "__no_edit__" and _sc_adapter is not None:
                     try:
-                        _reconcile_res = await _sc_adapter.edit_message(
+                        _reconcile_res = await _edit_message_with_optional_metadata(
+                            _sc_adapter,
                             chat_id=source.chat_id,
                             message_id=_sc_msg_id,
                             content=_final,
                             finalize=True,
+                            metadata=_status_thread_metadata,
                         )
                         if getattr(_reconcile_res, "success", True):
                             response["already_sent"] = True
@@ -27871,11 +27907,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _sc_msg_id = _sc.message_id
                 if _sc_msg_id:
                     try:
-                        await _sc.adapter.edit_message(
+                        await _edit_message_with_optional_metadata(
+                            _sc.adapter,
                             chat_id=source.chat_id,
                             message_id=_sc_msg_id,
                             content=response["final_response"],
                             finalize=True,
+                            metadata=_status_thread_metadata,
                         )
                         response["already_sent"] = True
                         logger.info(

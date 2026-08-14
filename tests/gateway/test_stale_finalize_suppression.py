@@ -71,6 +71,7 @@ class FinalizeCaptureAdapter(BasePlatformAdapter):
                 "message_id": message_id,
                 "content": content,
                 "finalize": finalize,
+                "metadata": metadata,
             }
         )
         return SendResult(success=True, message_id=message_id)
@@ -158,7 +159,10 @@ def _make_runner(adapter):
     return runner
 
 
-async def _run_streaming_turn(monkeypatch, tmp_path, agent_cls, session_id):
+async def _run_streaming_turn(
+    monkeypatch, tmp_path, agent_cls, session_id, *, platform=Platform.TELEGRAM,
+    chat_id="-1001", chat_type="group", thread_id=None,
+):
     import yaml
 
     (tmp_path / "config.yaml").write_text(
@@ -183,7 +187,7 @@ async def _run_streaming_turn(monkeypatch, tmp_path, agent_cls, session_id):
     fake_run_agent.AIAgent = agent_cls
     monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
 
-    adapter = FinalizeCaptureAdapter()
+    adapter = FinalizeCaptureAdapter(platform=platform)
     runner = _make_runner(adapter)
     gateway_run = importlib.import_module("gateway.run")
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
@@ -192,17 +196,21 @@ async def _run_streaming_turn(monkeypatch, tmp_path, agent_cls, session_id):
     )
 
     source = SessionSource(
-        platform=Platform.TELEGRAM,
-        chat_id="-1001",
-        chat_type="group",
+        platform=platform,
+        chat_id=chat_id,
+        chat_type=chat_type,
+        thread_id=thread_id,
     )
+    session_key = f"agent:main:{platform.value}:{chat_type}:{chat_id}"
+    if thread_id:
+        session_key = f"{session_key}:{thread_id}"
     result = await runner._run_agent(
         message="describe this photo",
         context_prompt="",
         history=[],
         source=source,
         session_id=session_id,
-        session_key="agent:main:telegram:group:-1001",
+        session_key=session_key,
     )
     return adapter, result
 
@@ -238,6 +246,33 @@ async def test_stale_finalize_does_not_suppress_complete_response(
         assert any(
             e["content"] == FULL_RESPONSE and e["finalize"] for e in adapter.edits
         ), "already_sent=True but no edit carried the complete response"
+
+
+@pytest.mark.asyncio
+async def test_stale_finalize_reconciliation_keeps_discord_thread_metadata(
+    monkeypatch, tmp_path
+):
+    adapter, result = await _run_streaming_turn(
+        monkeypatch,
+        tmp_path,
+        StalePrefixAgent,
+        "sess-71643-discord-thread",
+        platform=Platform.DISCORD,
+        chat_id="parent-1",
+        chat_type="thread",
+        thread_id="thread-9",
+    )
+
+    assert result.get("already_sent") is True
+    reconciliation_edits = [
+        e for e in adapter.edits
+        if e["content"] == FULL_RESPONSE and e["finalize"]
+    ]
+    assert reconciliation_edits
+    assert all(
+        (e.get("metadata") or {}).get("thread_id") == "thread-9"
+        for e in reconciliation_edits
+    ), reconciliation_edits
 
 
 @pytest.mark.asyncio

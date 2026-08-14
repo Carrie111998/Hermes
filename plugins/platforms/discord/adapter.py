@@ -3717,9 +3717,14 @@ class DiscordAdapter(BasePlatformAdapter):
         if not self._client:
             return SendResult(success=False, error="Not connected")
         try:
-            channel = self._client.get_channel(int(chat_id))
+            # Match send() routing: edits for messages delivered into a thread
+            # must resolve that thread, not the parent chat. Discord message
+            # snowflakes are channel-scoped for edit endpoints; using the parent
+            # yields 10008 Unknown Message even while the message exists.
+            target_id = str((metadata or {}).get("thread_id") or chat_id)
+            channel = self._client.get_channel(int(target_id))
             if not channel:
-                channel = await self._client.fetch_channel(int(chat_id))
+                channel = await self._client.fetch_channel(int(target_id))
             msg = channel.get_partial_message(int(message_id))
             formatted = self.format_message(content)
 

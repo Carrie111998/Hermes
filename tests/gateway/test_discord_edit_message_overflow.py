@@ -16,6 +16,7 @@ The fix mirrors the proven Telegram contract (and its #48648 lesson):
   in ``message_id`` plus every continuation in ``continuation_message_ids``.
 """
 
+import asyncio
 import sys
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -87,6 +88,38 @@ def _wire_channel(adapter, *, original_msg, send_side_effect=None):
 
 
 class TestEditMessageHappyPath:
+    def test_edit_uses_metadata_thread_target_instead_of_parent_chat(self):
+        adapter = _make_adapter()
+        parent_message = SimpleNamespace(id=42, edit=AsyncMock())
+        thread_message = SimpleNamespace(id=42, edit=AsyncMock())
+        parent = SimpleNamespace(
+            id=555,
+            get_partial_message=MagicMock(return_value=parent_message),
+        )
+        thread = SimpleNamespace(
+            id=777,
+            get_partial_message=MagicMock(return_value=thread_message),
+        )
+        adapter._client = SimpleNamespace(
+            get_channel=lambda cid: {555: parent, 777: thread}.get(cid),
+            fetch_channel=AsyncMock(return_value=None),
+        )
+
+        result = asyncio.run(
+            adapter.edit_message(
+                "555",
+                "42",
+                "thread progress update",
+                metadata={"thread_id": "777"},
+            )
+        )
+
+        assert result.success is True
+        thread.get_partial_message.assert_called_once_with(42)
+        thread_message.edit.assert_awaited_once_with(content="thread progress update")
+        parent.get_partial_message.assert_not_called()
+        parent_message.edit.assert_not_awaited()
+
     @pytest.mark.asyncio
     async def test_short_edit_in_place(self):
         adapter = _make_adapter()

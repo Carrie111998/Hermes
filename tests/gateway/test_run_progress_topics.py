@@ -15,6 +15,80 @@ from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageTyp
 from gateway.session import SessionSource
 
 
+@pytest.mark.asyncio
+async def test_edit_with_optional_metadata_preserves_legacy_adapter_contract():
+    from gateway.run import _edit_message_with_optional_metadata
+
+    class LegacyAdapter:
+        def __init__(self):
+            self.calls = []
+
+        async def edit_message(
+            self, chat_id, message_id, content, *, finalize=False
+        ):
+            self.calls.append(
+                {
+                    "chat_id": chat_id,
+                    "message_id": message_id,
+                    "content": content,
+                    "finalize": finalize,
+                }
+            )
+            return SendResult(success=True, message_id=message_id)
+
+    class MetadataAdapter(LegacyAdapter):
+        async def edit_message(
+            self,
+            chat_id,
+            message_id,
+            content,
+            *,
+            finalize=False,
+            metadata=None,
+        ):
+            self.calls.append(
+                {
+                    "chat_id": chat_id,
+                    "message_id": message_id,
+                    "content": content,
+                    "finalize": finalize,
+                    "metadata": metadata,
+                }
+            )
+            return SendResult(success=True, message_id=message_id)
+
+    metadata = {"thread_id": "thread-1"}
+    legacy = LegacyAdapter()
+    modern = MetadataAdapter()
+
+    await _edit_message_with_optional_metadata(
+        legacy,
+        chat_id="parent-1",
+        message_id="message-1",
+        content="updated",
+        finalize=True,
+        metadata=metadata,
+    )
+    await _edit_message_with_optional_metadata(
+        modern,
+        chat_id="parent-1",
+        message_id="message-1",
+        content="updated",
+        finalize=True,
+        metadata=metadata,
+    )
+
+    assert legacy.calls == [
+        {
+            "chat_id": "parent-1",
+            "message_id": "message-1",
+            "content": "updated",
+            "finalize": True,
+        }
+    ]
+    assert modern.calls[0]["metadata"] == metadata
+
+
 class ProgressCaptureAdapter(BasePlatformAdapter):
     def __init__(self, platform=Platform.TELEGRAM):
         super().__init__(PlatformConfig(enabled=True, token="***"), platform)
@@ -1237,6 +1311,14 @@ async def test_transformed_response_edits_streamed_message_in_place(monkeypatch,
     assert any("[plugin appended this]" in text for text in edited_texts), (
         f"expected transformed text in adapter.edits, got: {edited_texts!r}"
     )
+    transformed_edits = [
+        e for e in adapter.edits if "[plugin appended this]" in e["content"]
+    ]
+    assert transformed_edits
+    assert all(
+        (e.get("metadata") or {}).get("thread_id") == "$thread"
+        for e in transformed_edits
+    ), transformed_edits
 
 
 @pytest.mark.asyncio
