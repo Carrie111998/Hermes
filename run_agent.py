@@ -7490,10 +7490,21 @@ class AIAgent:
             "mimo", (self.provider or "").lower(), self.model, self.base_url
         )
 
-    def _copy_reasoning_content_for_api(self, source_msg: dict, api_msg: dict) -> None:
+    def _copy_reasoning_content_for_api(
+        self,
+        source_msg: dict,
+        api_msg: dict,
+        *,
+        preserve_explicit_reasoning: bool = False,
+    ) -> None:
         """Forwarder — see ``agent.agent_runtime_helpers.copy_reasoning_content_for_api``."""
         from agent.agent_runtime_helpers import copy_reasoning_content_for_api
-        return copy_reasoning_content_for_api(self, source_msg, api_msg)
+        return copy_reasoning_content_for_api(
+            self,
+            source_msg,
+            api_msg,
+            preserve_explicit_reasoning=preserve_explicit_reasoning,
+        )
 
     def _reapply_reasoning_echo_for_provider(self, api_messages: list) -> int:
         """Forwarder — see ``agent.agent_runtime_helpers.reapply_reasoning_echo_for_provider``."""

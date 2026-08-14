@@ -98,3 +98,85 @@ def test_client_exposes_last_aggregator_slot(moa_config, monkeypatch):
     assert slot is not None
     assert slot["model"] == "anthropic/claude-opus-4.8"
     assert slot["provider"] == "openrouter"
+
+
+def test_create_captures_successful_aggregator_fallback_route(moa_config, monkeypatch):
+    from agent.moa_loop import MoAClient
+
+    def fake_call_llm(**kwargs):
+        if kwargs.get("task") == "moa_aggregator":
+            kwargs["route_info"].update(
+                provider="openai",
+                model="fallback-model",
+                base_url="https://fallback.test/v1",
+            )
+            return _response("acted")
+        return _response("advice")
+
+    monkeypatch.setattr("agent.moa_loop.call_llm", fake_call_llm)
+
+    client = MoAClient("closed")
+    client.chat.completions.create(
+        model="closed",
+        messages=[{"role": "user", "content": "clean the db"}],
+    )
+
+    assert client.last_aggregator_runtime == {
+        "provider": "openai",
+        "model": "fallback-model",
+        "base_url": "https://fallback.test/v1",
+    }
+
+
+def test_prepare_preserves_previous_successful_aggregator_route(moa_config, monkeypatch):
+    """Advisor preparation must not erase the route that produced history."""
+    from agent.moa_loop import MoAClient
+
+    def fake_call_llm(**kwargs):
+        assert kwargs.get("task") == "moa_reference"
+        return _response("advice")
+
+    monkeypatch.setattr("agent.moa_loop.call_llm", fake_call_llm)
+    client = MoAClient("closed")
+    previous_route = {
+        "provider": "openrouter",
+        "model": "google/gemma-4-31b-it",
+        "base_url": "https://fallback.test/v1",
+    }
+    client.chat.completions.last_aggregator_runtime = dict(previous_route)
+
+    prepared = client.chat.completions.prepare(
+        [{"role": "user", "content": "continue the tool turn"}]
+    )
+
+    assert prepared["aggregator"]
+    assert client.last_aggregator_runtime == previous_route
+
+
+def test_failed_aggregator_call_preserves_previous_successful_route(
+    moa_config, monkeypatch
+):
+    """A failed replacement attempt cannot invalidate history provenance."""
+    from agent.moa_loop import MoAClient
+
+    def fake_call_llm(**kwargs):
+        if kwargs.get("task") == "moa_reference":
+            return _response("advice")
+        raise RuntimeError("all aggregator routes failed")
+
+    monkeypatch.setattr("agent.moa_loop.call_llm", fake_call_llm)
+    client = MoAClient("closed")
+    previous_route = {
+        "provider": "openrouter",
+        "model": "google/gemma-4-31b-it",
+        "base_url": "https://fallback.test/v1",
+    }
+    client.chat.completions.last_aggregator_runtime = dict(previous_route)
+
+    with pytest.raises(RuntimeError, match="all aggregator routes failed"):
+        client.chat.completions.create(
+            model="closed",
+            messages=[{"role": "user", "content": "continue"}],
+        )
+
+    assert client.last_aggregator_runtime == previous_route

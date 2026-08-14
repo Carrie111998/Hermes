@@ -2536,6 +2536,80 @@ class TestHandleMaxIterations:
         kwargs = agent.client.chat.completions.create.call_args.kwargs
         assert "reasoning" not in kwargs.get("extra_body", {})
 
+    def test_summary_preserves_current_gemma_tool_turn_reasoning(self, agent):
+        agent.provider = "custom"
+        agent.base_url = "https://gemma.test/v1"
+        agent.model = "google/gemma-4-31b-it"
+        agent.client.chat.completions.create.return_value = _mock_response(content="Summary")
+        agent._cached_system_prompt = "You are helpful."
+        messages = [
+            {"role": "user", "content": "do stuff"},
+            {
+                "role": "assistant",
+                "tool_calls": [{"id": "call_1", "function": {"name": "run", "arguments": "{}"}}],
+                "reasoning_content": "provider scratchpad",
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": "result"},
+        ]
+        from agent.agent_runtime_helpers import _reasoning_replay_route
+
+        _, messages[1]["_reasoning_replay_origin"] = _reasoning_replay_route(agent)
+
+        assert agent._handle_max_iterations(messages, 60) == "Summary"
+        sent_messages = agent.client.chat.completions.create.call_args.kwargs["messages"]
+        tool_turn = next(msg for msg in sent_messages if msg.get("tool_calls"))
+        assert tool_turn["reasoning_content"] == "provider scratchpad"
+
+    def test_moa_summary_keeps_origin_until_concrete_route_selection(self, agent):
+        actual_route = {
+            "provider": "openrouter",
+            "base_url": "https://gemma.test/v1",
+            "model": "google/gemma-4-31b-it",
+        }
+        agent.provider = "moa"
+        agent.model = "review"
+        agent.base_url = "moa://local"
+        agent._base_url_lower = agent.base_url
+        summary_client = MagicMock()
+        summary_client.chat.completions.create.return_value = _mock_response(
+            content="Summary"
+        )
+        agent.client = SimpleNamespace(
+            last_aggregator_slot=dict(actual_route),
+            last_aggregator_runtime=dict(actual_route),
+        )
+        agent._cached_system_prompt = "You are helpful."
+        from agent.message_sanitization import reasoning_replay_route_fingerprint
+
+        origin = reasoning_replay_route_fingerprint(**actual_route)
+        messages = [
+            {"role": "user", "content": "do stuff"},
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "function": {"name": "run", "arguments": "{}"},
+                    }
+                ],
+                "reasoning_content": "provider scratchpad",
+                "_reasoning_replay_origin": origin,
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": "result"},
+        ]
+
+        with patch.object(
+            agent, "_ensure_primary_openai_client", return_value=summary_client
+        ):
+            assert agent._handle_max_iterations(messages, 60) == "Summary"
+
+        sent_messages = summary_client.chat.completions.create.call_args.kwargs[
+            "messages"
+        ]
+        tool_turn = next(msg for msg in sent_messages if msg.get("tool_calls"))
+        assert tool_turn["reasoning_content"] == "provider scratchpad"
+        assert tool_turn["_reasoning_replay_origin"] == origin
+
     def test_summary_request_removes_orphan_tool_result(self, agent):
         """Regression: max-iterations summary request must NOT contain
         orphan tool results (tool_call_id with no matching assistant tool_call)."""
@@ -5536,9 +5610,21 @@ class TestAnthropicCredentialRefresh:
 # _streaming_api_call tests
 # ===================================================================
 
-def _make_chunk(content=None, tool_calls=None, finish_reason=None, model="test/model"):
+def _make_chunk(
+    content=None,
+    tool_calls=None,
+    finish_reason=None,
+    model="test/model",
+    reasoning_content=None,
+    reasoning=None,
+):
     """Build a SimpleNamespace mimicking an OpenAI streaming chunk."""
-    delta = SimpleNamespace(content=content, tool_calls=tool_calls)
+    delta = SimpleNamespace(
+        content=content,
+        tool_calls=tool_calls,
+        reasoning_content=reasoning_content,
+        reasoning=reasoning,
+    )
     choice = SimpleNamespace(delta=delta, finish_reason=finish_reason)
     return SimpleNamespace(model=model, choices=[choice])
 
@@ -5591,6 +5677,81 @@ class TestStreamingApiCall:
         assert tc[0].function.name == "web_search"
         assert tc[0].function.arguments == '{"q":"test"}'
         assert tc[0].id == "call_1"
+
+    def test_normalized_reasoning_stream_is_not_marked_provider_native(self, agent):
+        agent.provider = "custom"
+        agent.base_url = "https://gemma.test/v1"
+        agent.model = "google/gemma-4-31b-it"
+        chunks = [
+            _make_chunk(reasoning="normalized thought"),
+            _make_chunk(
+                tool_calls=[_make_tc_delta(0, "call_1", "web_search", "{}")],
+                finish_reason="tool_calls",
+            ),
+        ]
+        agent.client.chat.completions.create.return_value = iter(chunks)
+
+        response = agent._interruptible_streaming_api_call({"messages": []})
+        response = agent._get_transport().normalize_response(response)
+        stored = agent._build_assistant_message(response, "tool_calls")
+
+        assert stored["reasoning_content"] == "normalized thought"
+        assert "_reasoning_replay_origin" not in stored
+
+    @pytest.mark.parametrize(
+        "reasoning_chunks",
+        [
+            [
+                _make_chunk(reasoning="normalized thought"),
+                _make_chunk(reasoning_content="native thought"),
+            ],
+            [
+                _make_chunk(reasoning_content="native thought"),
+                _make_chunk(reasoning="normalized thought"),
+            ],
+        ],
+    )
+    def test_mixed_reasoning_stream_is_not_marked_provider_native(
+        self, agent, reasoning_chunks
+    ):
+        agent.provider = "custom"
+        agent.base_url = "https://gemma.test/v1"
+        agent.model = "google/gemma-4-31b-it"
+        chunks = reasoning_chunks + [
+            _make_chunk(
+                tool_calls=[_make_tc_delta(0, "call_1", "web_search", "{}")],
+                finish_reason="tool_calls",
+            )
+        ]
+        agent.client.chat.completions.create.return_value = iter(chunks)
+
+        response = agent._interruptible_streaming_api_call({"messages": []})
+        response = agent._get_transport().normalize_response(response)
+        stored = agent._build_assistant_message(response, "tool_calls")
+
+        assert "native thought" in stored["reasoning_content"]
+        assert "normalized thought" in stored["reasoning_content"]
+        assert "_reasoning_replay_origin" not in stored
+
+    def test_native_reasoning_stream_is_marked_provider_native(self, agent):
+        agent.provider = "custom"
+        agent.base_url = "https://gemma.test/v1"
+        agent.model = "google/gemma-4-31b-it"
+        chunks = [
+            _make_chunk(reasoning_content="native thought"),
+            _make_chunk(
+                tool_calls=[_make_tc_delta(0, "call_1", "web_search", "{}")],
+                finish_reason="tool_calls",
+            ),
+        ]
+        agent.client.chat.completions.create.return_value = iter(chunks)
+
+        response = agent._interruptible_streaming_api_call({"messages": []})
+        response = agent._get_transport().normalize_response(response)
+        stored = agent._build_assistant_message(response, "tool_calls")
+
+        assert stored["reasoning_content"] == "native thought"
+        assert "_reasoning_replay_origin" in stored
 
     def test_multiple_tool_calls(self, agent):
         chunks = [
@@ -6039,7 +6200,214 @@ class TestReasoningReplayForStrictProviders:
         replayed_assistant = next(msg for msg in sent_messages if msg.get("role") == "assistant")
         assert replayed_assistant["reasoning_content"] == "provider-native scratchpad"
 
+    def test_gemma4_replays_reasoning_only_inside_current_tool_turn(self, agent):
+        self._setup_agent(agent)
+        agent.base_url = "http://localhost:8000/v1"
+        agent._base_url_lower = agent.base_url.lower()
+        agent.provider = "custom"
+        agent.model = "google/gemma-4-31b-it"
+        old_tool = {"id": "old", "type": "function", "function": {"name": "web_search", "arguments": "{}"}}
+        history = [
+            {"role": "user", "content": "old task"},
+            {"role": "assistant", "content": "", "tool_calls": [old_tool], "reasoning_content": "completed thought"},
+            {"role": "tool", "tool_call_id": "old", "content": "old result"},
+            {"role": "assistant", "content": "old answer"},
+        ]
+        # This snapshot remains stale until the new turn is finalized. Replay
+        # must use the live transcript/user boundary instead.
+        agent._session_messages = [dict(msg) for msg in history]
+        current_tool = _mock_tool_call(call_id="current")
+        agent.client.chat.completions.create.side_effect = [
+            _mock_response(content="", finish_reason="tool_calls", tool_calls=[current_tool], reasoning_content="current thought"),
+            _mock_response(content="done", finish_reason="stop"),
+        ]
 
+        with (
+            patch("run_agent.handle_function_call", return_value="current result"),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            agent.run_conversation("current task", conversation_history=history)
+
+        first_sent = agent.client.chat.completions.create.call_args_list[0].kwargs["messages"]
+        first_old = next(msg for msg in first_sent if msg.get("tool_calls"))
+        assert "reasoning_content" not in first_old
+
+        sent = agent.client.chat.completions.create.call_args_list[1].kwargs["messages"]
+        replayed = {m["tool_calls"][0]["id"]: m for m in sent if m.get("tool_calls")}
+        assert "reasoning_content" not in replayed["old"]
+        assert replayed["current"]["reasoning_content"] == "current thought"
+        assert "_reasoning_replay_origin" not in replayed["current"]
+
+    def test_gemma4_reanchors_after_request_repair_rewrites_messages(self, agent):
+        self._setup_agent(agent)
+        agent.base_url = "http://localhost:8000/v1"
+        agent._base_url_lower = agent.base_url.lower()
+        agent.provider = "custom"
+        agent.model = "google/gemma-4-31b-it"
+        history = [
+            {"role": "user", "content": "old task"},
+            {"role": "assistant", "content": "old answer"},
+        ]
+        current_tool = _mock_tool_call(call_id="current")
+        agent.client.chat.completions.create.side_effect = [
+            _mock_response(
+                content="",
+                finish_reason="tool_calls",
+                tool_calls=[current_tool],
+                reasoning_content="current thought",
+            ),
+            _mock_response(content="done", finish_reason="stop"),
+        ]
+        repair_calls = 0
+
+        def rewrite_before_second_request(_agent, messages):
+            nonlocal repair_calls
+            repair_calls += 1
+            if repair_calls == 2:
+                del messages[:2]
+                return 2
+            return 0
+
+        with (
+            patch(
+                "agent.agent_runtime_helpers.repair_message_sequence_with_cursor",
+                side_effect=rewrite_before_second_request,
+            ),
+            patch("run_agent.handle_function_call", return_value="current result"),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            agent.run_conversation("current task", conversation_history=history)
+        sent = agent.client.chat.completions.create.call_args_list[1].kwargs["messages"]
+        replayed = next(msg for msg in sent if msg.get("tool_calls"))
+        assert replayed["reasoning_content"] == "current thought"
+        assert "_reasoning_replay_origin" not in replayed
+
+    def test_gemma4_response_records_producing_route(self, agent):
+        self._setup_agent(agent)
+        agent.provider = "custom"
+        agent.base_url = "https://Example.test/TenantA/v1"
+        agent.model = "google/Gemma-4-Custom"
+        response = _mock_response(
+            content="",
+            finish_reason="tool_calls",
+            tool_calls=[_mock_tool_call(call_id="route")],
+            reasoning_content="native thought",
+        )
+
+        stored = agent._build_assistant_message(
+            response.choices[0].message, "tool_calls"
+        )
+
+        from agent.agent_runtime_helpers import _reasoning_replay_route
+        _, expected_origin = _reasoning_replay_route(agent)
+        assert stored["_reasoning_replay_origin"] == expected_origin
+        assert "Example.test" not in expected_origin
+
+    def test_replay_route_normalizes_only_endpoint_safe_url_components(self, agent):
+        from agent.agent_runtime_helpers import _reasoning_replay_route
+
+        self._setup_agent(agent)
+        agent.provider = "custom"
+        agent.model = "google/gemma-4-31b-it"
+        agent.base_url = "HTTPS://User:Pass@Example.TEST/v1/"
+        _, first = _reasoning_replay_route(agent)
+        agent.base_url = "https://User:Pass@example.test/v1"
+        _, second = _reasoning_replay_route(agent)
+
+        assert first == second
+
+    @pytest.mark.parametrize(
+        ("first_url", "second_url"),
+        [
+            ("https://gw.example/v1?tenant=a/", "https://gw.example/v1?tenant=a"),
+            ("https://gw.example/v1#tenant-a/", "https://gw.example/v1#tenant-a"),
+            ("https://User@gw.example/v1", "https://user@gw.example/v1"),
+            ("https://gw.example/v1", "https://gw.example/v1//"),
+        ],
+    )
+    def test_replay_route_does_not_alias_sensitive_url_components(
+        self, agent, first_url, second_url
+    ):
+        from agent.agent_runtime_helpers import _reasoning_replay_route
+
+        self._setup_agent(agent)
+        agent.provider = "custom"
+        agent.model = "google/gemma-4-31b-it"
+        agent.base_url = first_url
+        _, first = _reasoning_replay_route(agent)
+        agent.base_url = second_url
+        _, second = _reasoning_replay_route(agent)
+
+        assert first != second
+
+    @pytest.mark.parametrize(
+        "synthetic_flag",
+        [
+            "_kanban_stop_synthetic",
+            "_pre_verify_synthetic",
+            "_verification_stop_synthetic",
+        ],
+    )
+    def test_gemma4_reanchor_ignores_synthetic_user_nudges(
+        self, synthetic_flag
+    ):
+        from agent.turn_context import reanchor_current_turn_user_idx
+
+        messages = [
+            {"role": "user", "content": "rewritten current task"},
+            {"role": "assistant", "tool_calls": [{}]},
+            {
+                "role": "user",
+                "content": "internal continuation",
+                synthetic_flag: True,
+            },
+        ]
+
+        assert reanchor_current_turn_user_idx(messages, "original current task") == 0
+
+    def test_repair_keeps_tool_call_reasoning_and_origin_atomic(self, agent):
+        messages = [
+            {
+                "role": "assistant",
+                "content": "thinking prefill",
+                "reasoning_content": "prefill reasoning",
+            },
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"id": "call_1", "function": {"name": "run", "arguments": "{}"}}],
+                "reasoning_content": "tool reasoning",
+                "_reasoning_replay_origin": "tool route",
+            },
+        ]
+
+        assert agent._repair_message_sequence(messages) == 1
+        assert messages[0]["reasoning_content"] == "tool reasoning"
+        assert messages[0]["_reasoning_replay_origin"] == "tool route"
+
+    def test_gemma4_normalized_reasoning_is_not_marked_replayable(self, agent):
+        self._setup_agent(agent)
+        agent.provider = "custom"
+        agent.base_url = "https://example.test/v1"
+        agent.model = "google/gemma-4-31b-it"
+        response = _mock_response(
+            content="",
+            finish_reason="tool_calls",
+            tool_calls=[_mock_tool_call(call_id="normalized")],
+        )
+        response.choices[0].message.reasoning = "normalized only"
+        response.choices[0].message.reasoning_content = None
+
+        stored = agent._build_assistant_message(
+            response.choices[0].message, "tool_calls"
+        )
+
+        assert stored["reasoning_content"] == "normalized only"
+        assert "_reasoning_replay_origin" not in stored
 
 # ---------------------------------------------------------------------------
 # Bugfix: _vprint force=True on error messages during TTS

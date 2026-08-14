@@ -273,7 +273,7 @@ def reanchor_current_turn_user_idx(messages: List[Any], user_message: Any) -> in
     scaffolding, not the active ask. Returns -1 when the list has no
     user-originated message at all.
     """
-    from agent.context_compressor import is_user_originated_turn
+    from agent.conversation_compression import _is_real_user_message
 
     fallback = -1
     for i in range(len(messages) - 1, -1, -1):
@@ -284,7 +284,7 @@ def reanchor_current_turn_user_idx(messages: List[Any], user_message: Any) -> in
             return i
         # Prefer a real human turn over a synthetic handoff / continuation
         # marker when the exact content was rewritten by merge-into-tail.
-        if fallback < 0 and is_user_originated_turn(msg):
+        if fallback < 0 and _is_real_user_message(msg):
             fallback = i
     return fallback
 

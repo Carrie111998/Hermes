@@ -1563,9 +1563,11 @@ class TestCallLlmPaymentFallback:
         primary_client.chat.completions.create.side_effect = rate_err
 
         fallback_client = MagicMock()
+        fallback_client.base_url = "https://fallback.example/v1"
         fallback_client.chat.completions.create.return_value = MagicMock(choices=[
             MagicMock(message=MagicMock(content="fallback response"))
         ])
+        route_info = {}
 
         with patch("agent.auxiliary_client._get_cached_client",
                     return_value=(primary_client, "xiaomi/mimo-v2-pro")), \
@@ -1576,9 +1578,305 @@ class TestCallLlmPaymentFallback:
             result = call_llm(
                 task="session_search",
                 messages=[{"role": "user", "content": "hello"}],
+                route_info=route_info,
             )
         # Fallback client should have been used
         assert fallback_client.chat.completions.create.called
+        assert route_info == {
+            "provider": "openrouter",
+            "model": "fallback-model",
+            "base_url": "https://fallback.example/v1",
+        }
+
+    def test_moa_fallback_reselects_marked_reasoning_for_actual_route(self, monkeypatch):
+        from agent.message_sanitization import reasoning_replay_route_fingerprint
+
+        primary_client = MagicMock()
+        primary_client.base_url = "https://primary.example/v1"
+        primary_client.chat.completions.create.side_effect = (
+            self._make_429_rate_limit_error()
+        )
+
+        fallback_model = "google/gemma-4-31b-it"
+        fallback_client = MagicMock()
+        fallback_client.base_url = "https://fallback.example/v1"
+        fallback_client.chat.completions.create.return_value = MagicMock(
+            choices=[MagicMock(message=MagicMock(content="fallback response"))]
+        )
+        origin = reasoning_replay_route_fingerprint(
+            "openrouter", fallback_client.base_url, fallback_model
+        )
+        messages = [
+            {"role": "user", "content": "continue"},
+            {
+                "role": "assistant",
+                "tool_calls": [{"id": "call_1"}],
+                "reasoning_content": "private scratchpad",
+                "_reasoning_replay_origin": origin,
+            },
+        ]
+
+        with patch(
+            "agent.auxiliary_client._get_cached_client",
+            return_value=(primary_client, "configured-primary"),
+        ), patch(
+            "agent.auxiliary_client._resolve_task_provider_model",
+            return_value=("auto", "configured-primary", None, None, None),
+        ), patch(
+            "agent.auxiliary_client._try_payment_fallback",
+            return_value=(fallback_client, fallback_model, "openrouter"),
+        ):
+            call_llm(task="moa_aggregator", messages=messages)
+
+        primary_wire = primary_client.chat.completions.create.call_args.kwargs[
+            "messages"
+        ][1]
+        fallback_wire = fallback_client.chat.completions.create.call_args.kwargs[
+            "messages"
+        ][1]
+        assert "reasoning_content" not in primary_wire
+        assert fallback_wire["reasoning_content"] == "private scratchpad"
+        assert "_reasoning_replay_origin" not in primary_wire
+        assert "_reasoning_replay_origin" not in fallback_wire
+        assert messages[1]["_reasoning_replay_origin"] == origin
+
+    def test_moa_nous_model_heal_records_and_projects_actual_route(self):
+        from agent.message_sanitization import reasoning_replay_route_fingerprint
+
+        stale_model = "openai/stale-model"
+        healed_model = "google/gemma-4-31b-it"
+        base_url = "https://inference-api.nousresearch.com/v1"
+        stale_error = Exception("requested model does not exist in our configuration")
+        stale_error.status_code = 404
+        client = MagicMock()
+        client.base_url = base_url
+        client.chat.completions.create.side_effect = [
+            stale_error,
+            _DummyResponse("healed response"),
+        ]
+        origin = reasoning_replay_route_fingerprint("nous", base_url, healed_model)
+        messages = [
+            {"role": "user", "content": "continue"},
+            {
+                "role": "assistant",
+                "tool_calls": [{"id": "call_1"}],
+                "reasoning_content": "private scratchpad",
+                "_reasoning_replay_origin": origin,
+            },
+        ]
+        route_info = {}
+
+        with patch(
+            "agent.auxiliary_client._resolve_task_provider_model",
+            return_value=("nous", stale_model, None, None, None),
+        ), patch(
+            "agent.auxiliary_client._get_cached_client",
+            return_value=(client, stale_model),
+        ), patch(
+            "agent.auxiliary_client._refresh_nous_recommended_model",
+            return_value=healed_model,
+        ):
+            result = call_llm(
+                task="moa_aggregator",
+                messages=messages,
+                route_info=route_info,
+            )
+
+        assert result.choices[0].message.content == "healed response"
+        healed_wire = client.chat.completions.create.call_args_list[1].kwargs[
+            "messages"
+        ][1]
+        assert healed_wire["reasoning_content"] == "private scratchpad"
+        assert "_reasoning_replay_origin" not in healed_wire
+        assert route_info == {
+            "provider": "nous",
+            "model": healed_model,
+            "base_url": base_url,
+        }
+
+    @pytest.mark.asyncio
+    async def test_async_moa_nous_model_heal_records_actual_route(self):
+        stale_model = "openai/stale-model"
+        healed_model = "google/gemma-4-31b-it"
+        base_url = "https://inference-api.nousresearch.com/v1"
+        stale_error = Exception("requested model does not exist in our configuration")
+        stale_error.status_code = 404
+        client = MagicMock()
+        client.base_url = base_url
+        client.chat.completions.create = AsyncMock(
+            side_effect=[stale_error, _DummyResponse("healed response")]
+        )
+        route_info = {}
+
+        with patch(
+            "agent.auxiliary_client._resolve_task_provider_model",
+            return_value=("nous", stale_model, None, None, None),
+        ), patch(
+            "agent.auxiliary_client._get_cached_client",
+            return_value=(client, stale_model),
+        ), patch(
+            "agent.auxiliary_client._refresh_nous_recommended_model",
+            return_value=healed_model,
+        ):
+            result = await async_call_llm(
+                task="moa_aggregator",
+                messages=[{"role": "user", "content": "continue"}],
+                route_info=route_info,
+            )
+
+        assert result.choices[0].message.content == "healed response"
+        assert route_info == {
+            "provider": "nous",
+            "model": healed_model,
+            "base_url": base_url,
+        }
+
+    def test_nous_auth_recovery_preserves_rejected_temperature_omission(self):
+        unsupported = Exception("Unsupported parameter: temperature")
+        unsupported.status_code = 400
+        stale_client = MagicMock()
+        stale_client.base_url = "https://inference-api.nousresearch.com/v1"
+        stale_client.chat.completions.create.side_effect = [
+            unsupported,
+            _AuxAuth401("expired after compatibility retry"),
+        ]
+        fresh_client = MagicMock()
+        fresh_client.base_url = stale_client.base_url
+        fresh_client.chat.completions.create.return_value = _DummyResponse("fresh")
+
+        with patch(
+            "agent.auxiliary_client._resolve_task_provider_model",
+            return_value=("nous", "model-a", None, None, None),
+        ), patch(
+            "agent.auxiliary_client._get_cached_client",
+            return_value=(stale_client, "model-a"),
+        ), patch(
+            "agent.auxiliary_client._refresh_nous_auxiliary_client",
+            return_value=(fresh_client, "model-b"),
+        ):
+            result = call_llm(
+                task="moa_aggregator",
+                messages=[{"role": "user", "content": "continue"}],
+                temperature=0.2,
+            )
+
+        assert result.choices[0].message.content == "fresh"
+        assert "temperature" not in fresh_client.chat.completions.create.call_args.kwargs
+        assert fresh_client.chat.completions.create.call_args.kwargs["model"] == "model-b"
+
+    @pytest.mark.asyncio
+    async def test_async_nous_auth_recovery_preserves_rejected_temperature_omission(
+        self,
+    ):
+        unsupported = Exception("Unsupported parameter: temperature")
+        unsupported.status_code = 400
+        stale_client = MagicMock()
+        stale_client.base_url = "https://inference-api.nousresearch.com/v1"
+        stale_client.chat.completions.create = AsyncMock(
+            side_effect=[unsupported, _AuxAuth401("expired after compatibility retry")]
+        )
+        fresh_client = MagicMock()
+        fresh_client.base_url = stale_client.base_url
+        fresh_client.chat.completions.create = AsyncMock(
+            return_value=_DummyResponse("fresh")
+        )
+
+        with patch(
+            "agent.auxiliary_client._resolve_task_provider_model",
+            return_value=("nous", "model-a", None, None, None),
+        ), patch(
+            "agent.auxiliary_client._get_cached_client",
+            return_value=(stale_client, "model-a"),
+        ), patch(
+            "agent.auxiliary_client._refresh_nous_auxiliary_client",
+            return_value=(fresh_client, "model-b"),
+        ):
+            result = await async_call_llm(
+                task="moa_aggregator",
+                messages=[{"role": "user", "content": "continue"}],
+                temperature=0.2,
+            )
+
+        assert result.choices[0].message.content == "fresh"
+        assert "temperature" not in fresh_client.chat.completions.create.call_args.kwargs
+
+    def test_nous_paid_recovery_preserves_rejected_max_tokens_omission(self):
+        unsupported = Exception("Unsupported parameter: max_tokens")
+        unsupported.status_code = 400
+        payment = self._make_402_error()
+        stale_client = MagicMock()
+        stale_client.base_url = "https://inference-api.nousresearch.com/v1"
+        stale_client.chat.completions.create.side_effect = [unsupported, payment]
+        fresh_client = MagicMock()
+        fresh_client.base_url = stale_client.base_url
+        fresh_client.chat.completions.create.return_value = _DummyResponse("fresh")
+
+        with patch(
+            "agent.auxiliary_client._resolve_task_provider_model",
+            return_value=("nous", "model-a", None, None, None),
+        ), patch(
+            "agent.auxiliary_client._get_cached_client",
+            return_value=(stale_client, "model-a"),
+        ), patch(
+            "agent.auxiliary_client._nous_portal_account_has_fresh_paid_access",
+            return_value=True,
+        ), patch(
+            "agent.auxiliary_client._refresh_nous_auxiliary_client",
+            return_value=(fresh_client, "model-b"),
+        ):
+            result = call_llm(
+                task="moa_aggregator",
+                messages=[{"role": "user", "content": "continue"}],
+                max_tokens=128,
+            )
+
+        assert result.choices[0].message.content == "fresh"
+        fresh_kwargs = fresh_client.chat.completions.create.call_args.kwargs
+        assert "max_tokens" not in fresh_kwargs
+        assert "max_completion_tokens" not in fresh_kwargs
+
+    def test_nous_model_heal_retargets_explicit_output_cap_spelling(self):
+        stale_model = "gpt-5.4"
+        healed_model = "google/gemma-4-31b-it"
+        stale_error = Exception("requested model does not exist in our configuration")
+        stale_error.status_code = 404
+        client = MagicMock()
+        client.base_url = "https://inference-api.nousresearch.com/v1"
+        client.chat.completions.create.side_effect = [
+            stale_error,
+            _DummyResponse("healed"),
+        ]
+
+        def _token_param(value, *, model=None):
+            key = "max_completion_tokens" if model == stale_model else "max_tokens"
+            return {key: value}
+
+        with patch(
+            "agent.auxiliary_client._resolve_task_provider_model",
+            return_value=("nous", stale_model, None, None, None),
+        ), patch(
+            "agent.auxiliary_client._get_cached_client",
+            return_value=(client, stale_model),
+        ), patch(
+            "agent.auxiliary_client._refresh_nous_recommended_model",
+            return_value=healed_model,
+        ), patch(
+            "agent.auxiliary_client.auxiliary_max_tokens_param",
+            side_effect=_token_param,
+        ):
+            result = call_llm(
+                task="moa_reference",
+                messages=[{"role": "user", "content": "advise"}],
+                max_tokens=321,
+            )
+
+        assert result.choices[0].message.content == "healed"
+        first_kwargs = client.chat.completions.create.call_args_list[0].kwargs
+        healed_kwargs = client.chat.completions.create.call_args_list[1].kwargs
+        assert first_kwargs["max_completion_tokens"] == 321
+        assert "max_tokens" not in first_kwargs
+        assert healed_kwargs["max_tokens"] == 321
+        assert "max_completion_tokens" not in healed_kwargs
 
     def test_401_auth_error_triggers_fallback_in_auto_mode(self, monkeypatch):
         """401 auth errors should trigger fallback in auto mode (#21165).
@@ -1645,10 +1943,11 @@ class TestStaleFallbackCandidateSkip:
         fresh_fb = MagicMock()
         fresh_fb.base_url = "https://api.anthropic.com"
         fresh_fb.chat.completions.create.return_value = _DummyResponse("fresh-fallback")
+        route_info = {}
 
         def _cached_client(provider, model=None, **kw):
             if provider == "anthropic":
-                return (fresh_fb, "claude-haiku-4-5-20251001")
+                return (fresh_fb, "claude-sonnet-4-6")
             return (primary_client, "gpt-5.5")
 
         with patch("agent.auxiliary_client._resolve_task_provider_model",
@@ -1665,12 +1964,18 @@ class TestStaleFallbackCandidateSkip:
             result = call_llm(
                 task="compression",
                 messages=[{"role": "user", "content": "summarize"}],
+                route_info=route_info,
             )
 
         assert result.choices[0].message.content == "fresh-fallback"
         mock_refresh.assert_called_once_with("anthropic")
         assert stale_fb.chat.completions.create.call_count == 1
         assert fresh_fb.chat.completions.create.call_count == 1
+        assert route_info == {
+            "provider": "anthropic",
+            "model": "claude-sonnet-4-6",
+            "base_url": "https://api.anthropic.com",
+        }
 
     def test_unrefreshable_stale_candidate_is_skipped_to_next(self, monkeypatch):
         """Refresh fails (expired setup token) → candidate quarantined, chain

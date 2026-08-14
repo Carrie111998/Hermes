@@ -72,6 +72,7 @@ from agent.context_engine import (
     sanitize_memory_context,
 )
 from agent.model_metadata import estimate_request_tokens_rough
+from agent.message_sanitization import _MOA_REFERENCE_GUIDANCE_METADATA_KEY
 from agent.session_activity import ActivityProvenance, normalize_activity_provenance
 
 logger = logging.getLogger(__name__)
@@ -1928,10 +1929,43 @@ def _message_text(message: Any) -> str:
 _SYNTHETIC_USER_FLAGS = (
     "_todo_snapshot_synthetic",
     "_empty_recovery_synthetic",
+    "_length_continuation_nudge",
     "_verification_stop_synthetic",
     "_pre_verify_synthetic",
     "_dropped_toolcall_nudge",
+    "_kanban_stop_synthetic",
 )
+
+
+def _without_moa_reference_guidance(message: dict) -> dict:
+    """Return the trailing user turn before MoA merged private guidance.
+
+    MoA must merge its reference block into an existing trailing user row to
+    preserve strict role alternation.  Runtime continuation nudges are
+    recognized by their original exact content after SessionDB projection, so
+    classify that original prefix rather than the private suffix appended for
+    the acting aggregator.
+    """
+    metadata = message.get(_MOA_REFERENCE_GUIDANCE_METADATA_KEY)
+    if not isinstance(metadata, dict):
+        return message
+    candidate = dict(message)
+    candidate.pop(_MOA_REFERENCE_GUIDANCE_METADATA_KEY, None)
+    shape = metadata.get("shape")
+    if shape == "standalone":
+        candidate["content"] = ""
+        return candidate
+    boundary = metadata.get("boundary")
+    if not isinstance(boundary, int) or isinstance(boundary, bool) or boundary < 0:
+        return message
+    content = message.get("content")
+    if shape == "string" and isinstance(content, str) and boundary <= len(content):
+        candidate["content"] = content[:boundary]
+        return candidate
+    if shape == "list" and isinstance(content, list) and boundary <= len(content):
+        candidate["content"] = list(content[:boundary])
+        return candidate
+    return message
 
 
 def _is_real_user_message(message: Any) -> bool:
@@ -1947,14 +1981,20 @@ def _is_real_user_message(message: Any) -> bool:
         return False
     if any(message.get(flag) for flag in _SYNTHETIC_USER_FLAGS):
         return False
-    text = _message_text(message).strip()
+    candidate = _without_moa_reference_guidance(message)
+    text = _message_text(candidate).strip()
     if not text:
-        return False
+        # Image/audio-only human turns have no extractable text but are still
+        # actionable current-turn anchors. The canonical predicate recognizes
+        # supported structured content while rejecting compaction scaffolding.
+        from agent.context_compressor import is_user_originated_turn
+
+        return is_user_originated_turn(candidate)
     if text.startswith(_SYNTHETIC_USER_PREFIXES):
         return False
     from agent.context_compressor import ContextCompressor
 
-    return not ContextCompressor._is_synthetic_compression_user_turn(message)
+    return not ContextCompressor._is_synthetic_compression_user_turn(candidate)
 
 
 def _strip_stale_todo_snapshot(content: Any) -> Any:

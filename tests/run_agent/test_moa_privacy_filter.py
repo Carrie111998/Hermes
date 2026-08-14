@@ -13,7 +13,7 @@ adds conservative email + formatted-phone patterns and wires two modes:
 
 from types import SimpleNamespace
 
-from agent.moa_loop import _redact_reference_text
+from agent.moa_loop import _redact_reference_text, _redact_trace_messages
 
 
 def _response(content="done", *, tool_calls=None):
@@ -59,6 +59,38 @@ def test_non_string_input_passes_through():
     assert _redact_reference_text(None) is None
     assert _redact_reference_text(42) == 42
     assert _redact_reference_text("") == ""
+
+
+def test_trace_redaction_covers_nested_reasoning_carriers():
+    messages = [
+        {
+            "role": "assistant",
+            "content": "visible ceo@example.com",
+            "reasoning": "call (555) 867-5309",
+            "reasoning_content": "email ceo@example.com",
+            "reasoning_details": [
+                {"type": "summary", "text": "contact ceo@example.com"}
+            ],
+            "codex_reasoning_items": [
+                {"type": "reasoning", "summary": ["phone (555) 867-5309"]}
+            ],
+            "codex_message_items": [
+                {"type": "message", "content": "email ceo@example.com"}
+            ],
+            "anthropic_content_blocks": [
+                {"type": "thinking", "thinking": "phone (555) 867-5309"}
+            ],
+        }
+    ]
+
+    redacted = _redact_trace_messages(messages)
+    serialized = str(redacted)
+
+    assert "ceo@example.com" not in serialized
+    assert "(555) 867-5309" not in serialized
+    assert "[redacted email]" in serialized
+    assert "[redacted phone]" in serialized
+    assert messages[0]["reasoning_content"] == "email ceo@example.com"
 
 
 # --- mode wiring ------------------------------------------------------------

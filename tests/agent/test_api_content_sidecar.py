@@ -568,6 +568,31 @@ class TestReanchorCurrentTurnUserIdx:
         messages = ["junk", {"role": "user", "content": "hello"}, None]
         assert reanchor_current_turn_user_idx(messages, "hello") == 1
 
+    def test_image_only_exact_turn_remains_anchorable(self):
+        image_content = [
+            {
+                "type": "image_url",
+                "image_url": {"url": "data:image/png;base64,AAAA"},
+            }
+        ]
+        messages = [
+            {"role": "user", "content": "historical"},
+            {"role": "user", "content": image_content},
+        ]
+
+        assert reanchor_current_turn_user_idx(messages, image_content) == 1
+
+    def test_exact_background_process_turn_beats_prior_human_fallback(self):
+        background_turn = (
+            "[IMPORTANT: Background process 42 completed]\nReview its output."
+        )
+        messages = [
+            {"role": "user", "content": "historical human task"},
+            {"role": "user", "content": background_turn},
+        ]
+
+        assert reanchor_current_turn_user_idx(messages, background_turn) == 1
+
 
 class TestPrologueMoaAndInPlaceBackfill:
     def test_no_stamp_for_moa_turns(self):

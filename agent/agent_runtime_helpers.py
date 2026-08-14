@@ -662,12 +662,25 @@ def repair_message_sequence(agent, messages: List[Dict]) -> int:
                 prev["content"] = joined
             elif not prev_content and new_content is not None:
                 prev["content"] = new_content
-            # Carry reasoning_content from the later turn only if the
-            # earlier turn lacks it (strict thinking providers require a
-            # reasoning_content on the merged tool-call turn; the first
-            # non-empty one suffices).
-            if not prev.get("reasoning_content") and msg.get("reasoning_content"):
+            # Keep replay provenance atomic with the reasoning value. When the
+            # later row contributes tool calls, its pair supersedes any
+            # thinking-prefill reasoning from the earlier row; associating the
+            # earlier scratchpad with the later calls would make it replayable
+            # under the wrong response boundary.
+            replay_origin_key = "_reasoning_replay_origin"
+            if new_calls:
+                prev.pop("reasoning_content", None)
+                prev.pop(replay_origin_key, None)
+                if "reasoning_content" in msg:
+                    prev["reasoning_content"] = msg["reasoning_content"]
+                    if replay_origin_key in msg:
+                        prev[replay_origin_key] = msg[replay_origin_key]
+            elif not prev.get("reasoning_content") and msg.get("reasoning_content"):
                 prev["reasoning_content"] = msg["reasoning_content"]
+                if replay_origin_key in msg:
+                    prev[replay_origin_key] = msg[replay_origin_key]
+            if "reasoning_content" not in prev:
+                prev.pop(replay_origin_key, None)
             repairs += 1
             continue
         collapsed.append(msg)
@@ -3737,7 +3750,42 @@ def intent_ack_continuation_enabled(agent) -> bool:
 
 
 
-def copy_reasoning_content_for_api(agent, source_msg: dict, api_msg: dict) -> None:
+def _reasoning_replay_route(agent) -> tuple[Any, str]:
+    """Return concrete model plus a non-reversible route fingerprint."""
+    model = getattr(agent, "model", None)
+    provider = getattr(agent, "provider", None)
+    base_url = getattr(agent, "base_url", None)
+    if getattr(agent, "provider", None) == "moa":
+        client = getattr(agent, "client", None)
+        runtime = getattr(client, "last_aggregator_runtime", None)
+        slot = getattr(client, "last_aggregator_slot", None)
+        if isinstance(runtime, dict):
+            model = runtime.get("model") or model
+            provider = runtime.get("provider") or provider
+            if "base_url" in runtime:
+                base_url = runtime["base_url"]
+        elif isinstance(slot, dict):
+            try:
+                from agent.moa_loop import _slot_runtime
+
+                runtime = _slot_runtime(slot)
+            except Exception:
+                runtime = slot
+            model = runtime.get("model") or slot.get("model") or model
+            provider = runtime.get("provider") or slot.get("provider") or provider
+            base_url = runtime.get("base_url") or slot.get("base_url") or base_url
+    from agent.message_sanitization import reasoning_replay_route_fingerprint
+
+    return model, reasoning_replay_route_fingerprint(provider, base_url, model)
+
+
+def copy_reasoning_content_for_api(
+    agent,
+    source_msg: dict,
+    api_msg: dict,
+    *,
+    preserve_explicit_reasoning: bool = False,
+) -> None:
     """Copy provider-facing reasoning fields onto an API replay message.
 
     Forwarder — the strip-vs-repad POLICY is owned by
@@ -3746,8 +3794,14 @@ def copy_reasoning_content_for_api(agent, source_msg: dict, api_msg: dict) -> No
     """
     from agent.message_sanitization import apply_reasoning_content_policy
 
+    model, replay_origin = _reasoning_replay_route(agent)
     apply_reasoning_content_policy(
-        source_msg, api_msg, agent._needs_thinking_reasoning_pad()
+        source_msg,
+        api_msg,
+        agent._needs_thinking_reasoning_pad(),
+        model=model,
+        preserve_explicit_reasoning=preserve_explicit_reasoning,
+        replay_origin=replay_origin,
     )
 
 
@@ -3782,8 +3836,12 @@ def reapply_reasoning_echo_for_provider(agent, api_messages: list) -> int:
     """
     from agent.message_sanitization import reapply_reasoning_echo
 
+    model, replay_origin = _reasoning_replay_route(agent)
     return reapply_reasoning_echo(
-        api_messages, agent._needs_thinking_reasoning_pad()
+        api_messages,
+        agent._needs_thinking_reasoning_pad(),
+        model=model,
+        replay_origin=replay_origin,
     )
 
 

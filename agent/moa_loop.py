@@ -19,6 +19,7 @@ from typing import Any
 
 from agent.auxiliary_client import call_llm
 from agent.message_content import flatten_message_text
+from agent.message_sanitization import _MOA_REFERENCE_GUIDANCE_METADATA_KEY
 from agent.transports import get_transport
 
 logger = logging.getLogger(__name__)
@@ -105,28 +106,50 @@ def _redact_trace_messages(messages: Any) -> Any:
     """
     if not isinstance(messages, list):
         return messages
+    def _redact_reasoning_value(value: Any) -> Any:
+        if isinstance(value, str):
+            return _redact_reference_text(value)
+        if isinstance(value, list):
+            return [_redact_reasoning_value(item) for item in value]
+        if isinstance(value, dict):
+            return {
+                key: _redact_reasoning_value(nested)
+                for key, nested in value.items()
+            }
+        return value
+
+    reasoning_keys = {
+        "reasoning",
+        "reasoning_content",
+        "reasoning_details",
+        "codex_reasoning_items",
+        "codex_message_items",
+        "anthropic_content_blocks",
+        "_anthropic_content_blocks",
+    }
     out: list[Any] = []
     for m in messages:
         if not isinstance(m, dict):
             out.append(m)
             continue
+        redacted = {
+            key: _redact_reasoning_value(value) if key in reasoning_keys else value
+            for key, value in m.items()
+        }
         content = m.get("content")
         if isinstance(content, str):
-            out.append({**m, "content": _redact_reference_text(content)})
+            redacted["content"] = _redact_reference_text(content)
+            out.append(redacted)
         elif isinstance(content, list):
-            out.append(
-                {
-                    **m,
-                    "content": [
-                        {**p, "text": _redact_reference_text(p.get("text"))}
-                        if isinstance(p, dict) and isinstance(p.get("text"), str)
-                        else p
-                        for p in content
-                    ],
-                }
-            )
+            redacted["content"] = [
+                {**p, "text": _redact_reference_text(p.get("text"))}
+                if isinstance(p, dict) and isinstance(p.get("text"), str)
+                else p
+                for p in content
+            ]
+            out.append(redacted)
         else:
-            out.append(m)
+            out.append(redacted)
     return out
 
 
@@ -1467,11 +1490,23 @@ def _attach_reference_guidance(agg_messages: list[dict[str, Any]], guidance: str
         last_content = last.get("content")
         if isinstance(last_content, str):
             last["content"] = last_content + "\n\n" + guidance
+            last[_MOA_REFERENCE_GUIDANCE_METADATA_KEY] = {
+                "shape": "string",
+                "boundary": len(last_content),
+            }
             return
         if isinstance(last_content, list):
             last["content"] = [*last_content, {"type": "text", "text": "\n\n" + guidance}]
+            last[_MOA_REFERENCE_GUIDANCE_METADATA_KEY] = {
+                "shape": "list",
+                "boundary": len(last_content),
+            }
             return
-    agg_messages.append({"role": "user", "content": guidance})
+    agg_messages.append({
+        "role": "user",
+        "content": guidance,
+        _MOA_REFERENCE_GUIDANCE_METADATA_KEY: {"shape": "standalone"},
+    })
 
 
 def peel_reference_guidance(
@@ -1507,6 +1542,7 @@ def peel_reference_guidance(
         # Attach shape (a): merged into a trailing string user turn.
         peeled = dict(last)
         peeled["content"] = content[: -len(suffix)]
+        peeled.pop(_MOA_REFERENCE_GUIDANCE_METADATA_KEY, None)
         return [*messages[:-1], peeled]
     if isinstance(content, list) and content:
         last_part = content[-1]
@@ -1516,6 +1552,7 @@ def peel_reference_guidance(
                 # Attach shape (b): guidance rode as its own trailing part.
                 peeled = dict(last)
                 peeled["content"] = list(content[:-1])
+                peeled.pop(_MOA_REFERENCE_GUIDANCE_METADATA_KEY, None)
                 if not peeled["content"]:
                     # The guidance part was the only content — mirror the
                     # string shape (c) and drop the whole message rather
@@ -1527,6 +1564,7 @@ def peel_reference_guidance(
                 new_part["text"] = text[: -len(suffix)]
                 peeled = dict(last)
                 peeled["content"] = [*content[:-1], new_part]
+                peeled.pop(_MOA_REFERENCE_GUIDANCE_METADATA_KEY, None)
                 return [*messages[:-1], peeled]
     return messages
 
@@ -1587,6 +1625,9 @@ class MoAChatCompletions:
         # create(); read by session cost accounting to price the aggregator's
         # acting turn at its real model instead of the virtual preset name.
         self.last_aggregator_slot: Any = None
+        # Concrete provider/model/base_url that actually served the most recent
+        # aggregator response. This follows auxiliary-client fallback routing.
+        self.last_aggregator_runtime: Any = None
         # Full-turn trace parts stashed on a cache-MISS create(), awaiting the
         # caller to stitch in the live session_id + resolved aggregator output
         # and flush to the trace file (only when moa.save_traces is on).
@@ -1859,6 +1900,7 @@ class MoAChatCompletions:
             agg_runtime.pop("extra_body", None),
             extra_body,
         )
+        successful_route: dict[str, str] = {}
         _agg_response = call_llm(
             task="moa_aggregator",
             messages=agg_messages,
@@ -1869,9 +1911,12 @@ class MoAChatCompletions:
             # Prepared requests must retain the acting aggregator's reasoning
             # policy exactly as the direct create() path does (#64187).
             reasoning_config=_aggregator_reasoning_config(aggregator),
+            route_info=successful_route,
             **stream_kwargs,
             **agg_runtime,
         )
+        if successful_route:
+            self.last_aggregator_runtime = dict(successful_route)
         # Non-streaming path (quiet mode / eval / subagents): the aggregator
         # output is available inline, so capture it into the pending trace now.
         # Streaming path: the aggregator's raw token stream is returned to the
@@ -2332,6 +2377,11 @@ class MoAClient:
         aggregator's acting turn at its real model instead of the virtual
         preset name."""
         return getattr(self.chat.completions, "last_aggregator_slot", None)
+
+    @property
+    def last_aggregator_runtime(self) -> Any:
+        """Concrete route that successfully served the latest aggregator call."""
+        return getattr(self.chat.completions, "last_aggregator_runtime", None)
 
     def consume_and_save_trace(
         self, session_id: Any = None, aggregator_output_fallback: Any = None
