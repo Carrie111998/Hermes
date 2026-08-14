@@ -46,7 +46,9 @@ EMBEDDER_PROVIDERS: dict[str, dict[str, Any]] = {
 VECTOR_PROVIDERS: dict[str, dict[str, Any]] = {
     "qdrant": {
         "label": "Qdrant",
-        "default_config": {"path": os.path.expanduser("~/.hermes/mem0_qdrant")},
+        # Path is resolved lazily via resolve_qdrant_path() so HERMES_HOME
+        # redirection works correctly (frozen at import time = ignored).
+        "default_config": {},
         "pip_dep": "qdrant-client",
     },
     "pgvector": {
@@ -55,6 +57,17 @@ VECTOR_PROVIDERS: dict[str, dict[str, Any]] = {
         "pip_dep": "psycopg2-binary",
     },
 }
+
+
+def resolve_qdrant_path() -> str:
+    """Resolve the default qdrant storage path from HERMES_HOME.
+
+    Unlike the import-time expansion in VECTOR_PROVIDERS, this runs at
+    call time so it honors the CLI's HERMES_HOME redirection.
+    """
+    from hermes_constants import get_hermes_home
+
+    return str(get_hermes_home() / "mem0_qdrant")
 
 KNOWN_DIMS: dict[str, int] = {
     "text-embedding-3-small": 1536,

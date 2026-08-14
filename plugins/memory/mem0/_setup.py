@@ -154,11 +154,18 @@ def build_oss_config(flags: dict[str, str]) -> tuple[dict, dict[str, str]]:
     vector_def = VECTOR_PROVIDERS[vector_id]
     vector_config = dict(vector_def["default_config"])
     if vector_id == "qdrant":
+        from ._oss_providers import resolve_qdrant_path
+
         if flags.get("oss_vector_path"):
             vector_config["path"] = flags["oss_vector_path"]
         if flags.get("oss_vector_url"):
             vector_config.pop("path", None)
             vector_config["url"] = flags["oss_vector_url"]
+        # Apply the lazy default path if neither path nor url was provided.
+        # This honors HERMES_HOME redirection (unlike the old import-time
+        # frozen default).
+        if not vector_config.get("path") and not vector_config.get("url"):
+            vector_config["path"] = resolve_qdrant_path()
     elif vector_id == "pgvector":
         if flags.get("oss_vector_host"):
             vector_config["host"] = flags["oss_vector_host"]
