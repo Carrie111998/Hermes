@@ -1,7 +1,9 @@
 """Integration coverage for polling progress against the installed PTB runtime."""
 
 import asyncio
+import json
 import logging
+import os
 
 import pytest
 pytest.importorskip("telegram", reason="python-telegram-bot not installed")
@@ -11,6 +13,11 @@ from telegram.request import BaseRequest
 from gateway.config import PlatformConfig
 from plugins.platforms.telegram import adapter as tg_adapter
 from plugins.platforms.telegram.adapter import TelegramAdapter
+
+
+@pytest.fixture(autouse=True)
+def _isolated_hermes_home(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
 
 
 class _GeneralRequest(BaseRequest):
@@ -212,7 +219,7 @@ async def test_real_base_request_unsuccessful_200_envelope_cannot_record_progres
 
 
 @pytest.mark.asyncio
-async def test_real_base_request_valid_success_envelope_records_progress(caplog):
+async def test_real_base_request_valid_success_envelope_records_progress(caplog, tmp_path):
     caplog.set_level(logging.WARNING, logger=tg_adapter.__name__)
     adapter = TelegramAdapter(PlatformConfig(enabled=True, token="123456:test-token"))
     generation, progress = adapter._begin_polling_generation()
@@ -236,9 +243,19 @@ async def test_real_base_request_valid_success_envelope_records_progress(caplog)
     assert adapter._polling_conflict_count == 0
     assert adapter._send_path_degraded is False
     assert "Telegram polling recovered after successful getUpdates progress" in caplog.text
+    state_path = tmp_path / "runtime" / "telegram_polling_recovery.json"
+    state = json.loads(state_path.read_text())
+    assert state_path.stat().st_mode & 0o777 == 0o600
+    assert state["schema_version"] == 1
+    assert state["platform"] == "Telegram"
+    assert state["pid"] == os.getpid()
+    assert state["process_start_ticks"] == tg_adapter._process_start_ticks(os.getpid())
+    assert isinstance(state["incident_started_at_unix_ns"], int)
+    assert isinstance(state["recovered_at_unix_ns"], int)
+    assert state["incident_started_at_unix_ns"] <= state["recovered_at_unix_ns"]
 
 
-def test_initial_polling_progress_does_not_claim_recovery(caplog):
+def test_initial_polling_progress_does_not_claim_recovery(caplog, tmp_path):
     caplog.set_level(logging.WARNING, logger=tg_adapter.__name__)
     adapter = TelegramAdapter(PlatformConfig(enabled=True, token="123456:test-token"))
     generation, progress = adapter._begin_polling_generation()
@@ -247,6 +264,7 @@ def test_initial_polling_progress_does_not_claim_recovery(caplog):
 
     assert progress.is_set()
     assert "Telegram polling recovered after successful getUpdates progress" not in caplog.text
+    assert not (tmp_path / "runtime" / "telegram_polling_recovery.json").exists()
 
 
 
