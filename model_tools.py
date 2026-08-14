@@ -1590,6 +1590,23 @@ def get_toolset_for_tool(tool_name: str) -> Optional[str]:
     """Return the toolset a tool belongs to."""
     return registry.get_toolset_for_tool(tool_name)
 
+def get_openspec_enforcement_status() -> bool:
+    """Helper to check if OpenSpec enforcement is active."""
+    import sqlite3
+    import hermes_state
+    try:
+        db = hermes_state.SessionDB()
+        with sqlite3.connect(db._db_path) as conn:
+            c = conn.cursor()
+            c.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='openspec_registry'")
+            if not c.fetchone():
+                return False
+            # If table exists, check if any rows exist. For simple active checking.
+            c.execute("SELECT 1 FROM openspec_registry LIMIT 1")
+            return bool(c.fetchone())
+    except Exception:
+        return False
+
 
 def get_available_toolsets() -> Dict[str, dict]:
     """Return toolset availability info for UI display."""

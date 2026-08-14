@@ -114,6 +114,18 @@ def _check_kanban_mode() -> bool:
     """
     if _is_delegated_child_context():
         return False
+        
+    try:
+        from model_tools import get_openspec_enforcement_status
+        if get_openspec_enforcement_status():
+            from hermes_state_common import AUTHORIZED_ACTIVATORS
+            from hermes_cli.profiles import get_active_profile_name
+            profile = get_active_profile_name()
+            if profile not in AUTHORIZED_ACTIVATORS:
+                return False
+    except ImportError:
+        pass
+
     if os.environ.get("HERMES_KANBAN_TASK") and _is_dispatcher_owned_worker():
         return True
     return _profile_has_kanban_toolset()
@@ -130,6 +142,18 @@ def _check_kanban_orchestrator_mode() -> bool:
     """
     if _is_delegated_child_context():
         return False
+        
+    try:
+        from model_tools import get_openspec_enforcement_status
+        if get_openspec_enforcement_status():
+            from hermes_state_common import AUTHORIZED_ACTIVATORS
+            from hermes_cli.profiles import get_active_profile_name
+            profile = get_active_profile_name()
+            if profile not in AUTHORIZED_ACTIVATORS:
+                return False
+    except ImportError:
+        pass
+
     if os.environ.get("HERMES_KANBAN_TASK") and _is_dispatcher_owned_worker():
         return False
     return _profile_has_kanban_toolset()

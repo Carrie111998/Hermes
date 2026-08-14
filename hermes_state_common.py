@@ -570,6 +570,7 @@ def activate_openspec_enforcement(conn, operator: str) -> None:
         raise PermissionError(f"Operator '{operator}' is not authorized to activate OpenSpec enforcement.")
     
     cursor = conn.cursor()
+    cursor.execute("CREATE TABLE IF NOT EXISTS openspec_enforcement_meta (key TEXT PRIMARY KEY, value TEXT)")
     cursor.execute(
         "INSERT INTO openspec_enforcement_meta (key, value) VALUES ('enforcement_status', 'active') "
         "ON CONFLICT(key) DO UPDATE SET value=excluded.value;"
