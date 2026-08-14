@@ -19,8 +19,9 @@ import { navigateToWorkspacePage, NEW_CHAT_ROUTE, SETTINGS_ROUTE } from '../rout
  *
  * It wraps the whole shell, so the guard below is what keeps it a FALLBACK: a
  * right-click that lands inside a surface with its own context menu, on an
- * editable, or on a live selection is stopped before Radix's trigger sees it,
- * leaving that surface's menu — or Electron's native edit menu — in charge.
+ * editable, on a live selection, on an `<a href>`, or on image/media is
+ * stopped before Radix's trigger sees it, leaving that surface's menu — or
+ * Electron's native edit / Open Link / Copy Link / image menu — in charge.
  * `stopPropagation` (never `preventDefault`) is the mechanism, because
  * preventing the default is what would swallow the native menu.
  */
@@ -83,19 +84,46 @@ export function ShellContextMenu({ children }: { children: React.ReactNode }) {
 
 /** Right-clicks that already have an owner keep it: a surface with its own
  *  context menu, an editable, a live selection (Electron's native edit menu),
- *  or an image/media element (Electron's native image menu — Copy Image,
- *  Save Image As...). Never `preventDefault` — that is what would swallow the
+ *  a real link (Open Link / Copy Link), or image/media (Copy Image, Save
+ *  Image As...). Never `preventDefault` — that is what would swallow the
  *  native menu. */
 function guard(event: React.MouseEvent<HTMLDivElement>) {
-  const target = event.target as HTMLElement | null
-  const owner = target?.closest('[data-slot="context-menu-trigger"]')
-
-  if (
-    (owner && !owner.hasAttribute('data-shell-context-menu')) ||
-    target?.closest('img, picture, video, canvas') ||
-    isEditableTarget(target) ||
-    hasTextSelection()
-  ) {
+  if (shouldYieldShellContextMenu(event.target)) {
     event.stopPropagation()
   }
+}
+
+/** True when this right-click already has an owner, so the shell fallback
+ *  must stand down and leave the native Electron menu (or another Radix menu)
+ *  in charge. Exported for tests. */
+export function shouldYieldShellContextMenu(target: EventTarget | null): boolean {
+  // Text nodes / the document are not a menu owner — fall through to the
+  // shell fallback, same as a chrome click.
+  const el = target instanceof Element ? target : null
+  if (!el) {
+    return false
+  }
+
+  const owner = el.closest('[data-slot="context-menu-trigger"]')
+  if (owner && !owner.hasAttribute('data-shell-context-menu')) {
+    return true
+  }
+
+  return (
+    isEditableTarget(el) ||
+    hasTextSelection() ||
+    Boolean(el.closest('img, picture, video, canvas')) ||
+    isNativeLinkTarget(el)
+  )
+}
+
+/** Navigable anchors only. Empty / `#` placeholders have nothing for Electron
+ *  to open or copy, so the shell menu keeps them. */
+function isNativeLinkTarget(el: Element): boolean {
+  const anchor = el.closest('a[href]')
+  if (!(anchor instanceof HTMLAnchorElement)) {
+    return false
+  }
+  const href = anchor.getAttribute('href')
+  return Boolean(href && href !== '#')
 }
