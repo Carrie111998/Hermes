@@ -770,6 +770,14 @@ class GatewayKanbanWatchersMixin:
                             if wake_agent
                             else set()
                         )
+                        completion_event = next(
+                            (
+                                item
+                                for item in d.get("events", [])
+                                if getattr(item, "kind", None) == "completed"
+                            ),
+                            None,
+                        )
                         from gateway.wake import adapter_supports_push as _adapter_push_ok
 
                         _is_push_adapter = _adapter_push_ok(adapter)
@@ -830,11 +838,27 @@ class GatewayKanbanWatchersMixin:
                             from gateway.wake import deliver_wake
 
                             try:
-                                await deliver_wake(
-                                    adapter,
-                                    text=_synth,
-                                    session_id=_session_key,
-                                )
+                                if completion_event is not None:
+                                    complete = await self._deliver_kanban_completed_event(
+                                        adapter=adapter,
+                                        sub=sub,
+                                        event=completion_event,
+                                        task=task,
+                                        text=_synth,
+                                        metadata={},
+                                        board=board_slug,
+                                    )
+                                    if not complete:
+                                        raise RuntimeError(
+                                            "durable non-push completion remains incomplete"
+                                        )
+                                    durable_completion_processed = True
+                                else:
+                                    await deliver_wake(
+                                        adapter,
+                                        text=_synth,
+                                        session_id=_session_key,
+                                    )
                                 logger.info(
                                     "kanban notifier: woke agent for %s on %s/%s profile=%s events=%s",
                                     sub["task_id"], platform_str, sub["chat_id"], sub_profile or "default", _wake_kinds,
@@ -849,7 +873,7 @@ class GatewayKanbanWatchersMixin:
                                     sub["task_id"], fails,
                                     MAX_SEND_FAILURES, _wk_err, exc_info=True,
                                 )
-                                if fails >= MAX_SEND_FAILURES:
+                                if fails >= MAX_SEND_FAILURES and completion_event is None:
                                     logger.warning(
                                         "kanban notifier: dropping subscription "
                                         "%s on %s after %d consecutive wake failures",
@@ -932,14 +956,6 @@ class GatewayKanbanWatchersMixin:
                             # Wake-only completion is still a durable delivery:
                             # materialize a wake child before advancing. Other
                             # terminal events retain the legacy direct wake.
-                            completion_event = next(
-                                (
-                                    item
-                                    for item in d.get("events", [])
-                                    if getattr(item, "kind", None) == "completed"
-                                ),
-                                None,
-                            )
                             try:
                                 if completion_event is not None:
                                     complete = await self._deliver_kanban_completed_event(

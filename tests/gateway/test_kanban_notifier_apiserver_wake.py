@@ -9,6 +9,7 @@ Covers the wrong-session-wake / silent-loss fixes:
 """
 
 import asyncio
+import time
 
 from gateway.config import Platform
 from gateway.platforms.base import SendResult
@@ -100,6 +101,21 @@ def _unseen_terminal_events(tid, platform, chat_id):
         conn.close()
 
 
+def _delivery_state(tid, platform, chat_id):
+    conn = kb.connect()
+    try:
+        subscription_id = f"{tid}:{platform}:{chat_id}:"
+        row = conn.execute(
+            "SELECT p.state, c.kind, c.state FROM kanban_delivery_parents p "
+            "JOIN kanban_delivery_children c ON c.parent_id=p.parent_id "
+            "WHERE p.subscription_id=?",
+            (subscription_id,),
+        ).fetchone()
+        return tuple(row) if row else None
+    finally:
+        conn.close()
+
+
 def test_apiserver_sub_wakes_subscription_destination_via_self_post(tmp_path, monkeypatch):
     """An api_server subscription wakes its chat_id destination, not the
     task's worker-session provenance or a build_session_key()-derived session."""
@@ -137,8 +153,11 @@ def test_apiserver_sub_wakes_subscription_destination_via_self_post(tmp_path, mo
     assert "not a request to decompose" in wake_text.lower()
     assert "do not recreate" in wake_text.lower()
     # The wake self-post IS the delivery on this path (no separate text-ping
-    # fallback is attempted for stateless api_server subs) — cursor advances
-    # once the wake succeeds.
+    # fallback is attempted for stateless api_server subs). It must still be
+    # recorded in the durable completion outbox before the cursor can advance.
+    assert _delivery_state(tid, "api_server", "origin-session") == (
+        "sent", "creator_wake", "sent",
+    )
     assert _unseen_terminal_events(tid, "api_server", "origin-session") == []
 
 
@@ -206,14 +225,56 @@ def test_apiserver_wake_failure_rewinds_then_retries_destination(
         fail_once_then_succeed,
     )
     runner = _make_runner({Platform.API_SERVER: ApiServerLikeAdapter()})
+    first_attempt_at = int(time.time())
 
     asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
     assert _unseen_terminal_events(tid, "api_server", "origin-session")
+    assert _delivery_state(tid, "api_server", "origin-session") == (
+        "pending", "creator_wake", "failed",
+    )
 
+    # Durable outbox retries are intentionally backoff-gated for five seconds.
+    monkeypatch.setattr(time, "time", lambda: first_attempt_at + 6)
     runner._running = True
     asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
 
     assert attempted_sessions == ["origin-session", "origin-session"]
     assert "worker-session" not in attempted_sessions
+    assert _delivery_state(tid, "api_server", "origin-session") == (
+        "sent", "creator_wake", "sent",
+    )
     assert _unseen_terminal_events(tid, "api_server", "origin-session") == []
+
+
+def test_apiserver_completion_retry_ceiling_keeps_durable_subscription(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "apiserver-ceiling.db"))
+    kb.init_db()
+    tid = _create_completed_subscription(
+        "api_server", "origin-session", session_id="worker-session",
+    )
+
+    async def always_fail(adapter, *, text, session_id):
+        raise RuntimeError("simulated persistent wake failure")
+
+    import gateway.wake as wake_mod
+
+    monkeypatch.setattr(wake_mod, "_self_post_chat_completion", always_fail)
+    runner = _make_runner({Platform.API_SERVER: ApiServerLikeAdapter()})
+    sub_key = (tid, "api_server", "origin-session", "")
+    runner._kanban_sub_fail_counts = {sub_key: 11}
+
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    conn = kb.connect()
+    try:
+        assert len(kb.list_notify_subs(conn, tid)) == 1
+    finally:
+        conn.close()
+    assert runner._kanban_sub_fail_counts[sub_key] == 12
+    assert _delivery_state(tid, "api_server", "origin-session") == (
+        "pending", "creator_wake", "failed",
+    )
+    assert _unseen_terminal_events(tid, "api_server", "origin-session")
 
