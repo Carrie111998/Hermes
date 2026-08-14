@@ -83,11 +83,18 @@ def test_non_rate_limit_failover_does_not_record(captured):
 
 
 def test_reason_is_threaded_at_known_sites():
-    """The two sites that know their reason must pass it.
+    """The two sites that know their reason must pass it — as TELEMETRY.
 
     Without this, the eager empty-response fallback (documented in its own
     comment as 'a common rate-limit symptom') and the non-retryable branch
     both fail over invisibly.
+
+    The assertion demands ``telemetry_reason=``, not ``reason=``. ``reason=``
+    reaches a behavioral branch that arms ``agent._rate_limited_until`` for 60s
+    and keeps the agent pinned to its fallback (see
+    test_telemetry_reason_does_not_arm_the_cooldown), which would break Phase
+    1's promise that it cannot change which model answers a call. Do not
+    "restore" reason= here.
     """
     import inspect
     from agent import conversation_loop
@@ -95,8 +102,11 @@ def test_reason_is_threaded_at_known_sites():
     src = inspect.getsource(conversation_loop)
 
     # The eager empty/malformed-response fallback.
-    assert "_try_activate_fallback(reason=FailoverReason.upstream_rate_limit)" in src, \
-        "conversation_loop.py:1605 must pass a reason"
+    assert "_try_activate_fallback(telemetry_reason=FailoverReason.upstream_rate_limit)" in src, \
+        "the eager empty/malformed-response fallback must attribute itself"
+    assert "_try_activate_fallback(reason=FailoverReason.upstream_rate_limit)" not in src, \
+        "that site must attribute via telemetry_reason=, never reason= — " \
+        "reason= arms the 60s fallback-pinning cooldown"
 
     # Verified counts before this task: 8 bare, 2 carrying a reason.
     # This task converts exactly 2, leaving 6 deliberately bare (the sites
@@ -110,6 +120,110 @@ def test_reason_is_threaded_at_known_sites():
         "either a reason-carrying site regressed, or a reason was invented "
         "at a site that cannot know it (which manufactures false alerts)"
     )
+
+
+def test_telemetry_reason_does_not_arm_the_cooldown(captured, monkeypatch):
+    """C1 regression guard: attribution must not change WHICH MODEL ANSWERS.
+
+    ``agent._rate_limited_until`` is read by
+    ``agent_runtime_helpers.restore_primary_runtime()``: while it is in the
+    future, the agent STAYS ON THE FALLBACK instead of restoring the primary.
+    So arming it is not telemetry, it is routing.
+
+    Phase 1 promised to be read-only with respect to model selection. Threading
+    ``reason=`` into a call site purely to attribute it silently broke that
+    promise — the two converted conversation_loop sites went from a 0s cooldown
+    to a 60s one. This test pins both halves of the split: telemetry_reason
+    attributes without arming, reason still arms.
+    """
+    import time
+    from agent.error_classifier import FailoverReason
+    from agent import chat_completion_helpers as cch
+
+    # --- telemetry_reason alone: attributed, but NO behavior change.
+    agent = _agent_with_chain([])
+    assert cch.try_activate_fallback(
+        agent, telemetry_reason=FailoverReason.upstream_rate_limit) is False
+    assert agent._rate_limited_until == 0, (
+        "telemetry_reason armed the fallback-pinning cooldown — this is C1, "
+        "the agent will now stay on its fallback for 60s because of a "
+        "telemetry-only argument"
+    )
+    assert len(captured) == 1, "telemetry_reason must still be attributed"
+
+    # --- reason: the pre-existing BEHAVIORAL contract, unchanged.
+    behavioral = _agent_with_chain([])
+    before = time.monotonic()
+    assert cch.try_activate_fallback(
+        behavioral, reason=FailoverReason.rate_limit) is False
+    assert behavioral._rate_limited_until >= before + 59, (
+        "reason= must still arm the 60s cooldown — the split must not have "
+        "disarmed the real behavioral path"
+    )
+
+
+def test_exhausted_chain_guard_still_reads_reason_only(captured):
+    """C1, second half: telemetry_reason must not skip the #24996 guard.
+
+    When a non-rate-limit failure walks off the end of a NON-EMPTY chain,
+    try_activate_fallback arms a short 5s cooldown so the next turn's
+    restore_primary_runtime does not reset _fallback_index=0 and re-marshal the
+    whole context across every provider again. That guard is skipped for
+    rate-limit-class reasons (they arm their own 60s cooldown instead).
+
+    If telemetry_reason leaked into that condition, an attribution-only caller
+    would silently disable the replay-storm guard.
+    """
+    import time
+    from agent.error_classifier import FailoverReason
+    from agent import chat_completion_helpers as cch
+
+    agent = _agent_with_chain([{"provider": "x", "model": "y"}])
+    agent._fallback_index = 1          # already walked off the end
+    before = time.monotonic()
+
+    assert cch.try_activate_fallback(
+        agent, telemetry_reason=FailoverReason.rate_limit) is False
+
+    assert agent._rate_limited_until >= before, (
+        "the #24996 exhausted-chain cooldown was skipped because "
+        "telemetry_reason reached a behavioral branch"
+    )
+    assert agent._rate_limited_until < before + 30, (
+        "expected the 5s exhausted-chain guard, not the 60s rate-limit "
+        "cooldown — telemetry_reason must not arm the latter"
+    )
+
+
+def test_a1_hook_reports_when_only_telemetry_reason_is_supplied(
+        captured, monkeypatch):
+    """A1 must attribute a site that passes telemetry_reason only.
+
+    ``telemetry_reason or reason`` — a site supplying neither stays invisible,
+    a site supplying either is reported.
+    """
+    from agent.error_classifier import FailoverReason
+    from agent import chat_completion_helpers as cch
+
+    agent = _agent_with_chain([{"provider": "openai-codex",
+                                "model": "gpt-5.6-sol"}])
+    monkeypatch.setattr(
+        "agent.auxiliary_client.resolve_provider_client",
+        lambda *a, **k: (_fake_client(), "gpt-5.6-sol"),
+    )
+    agent._anthropic_prompt_cache_policy.return_value = (True, False)
+    agent.context_compressor = None
+
+    assert cch.try_activate_fallback(
+        agent, telemetry_reason=FailoverReason.upstream_rate_limit) is True
+
+    assert len(captured) == 1, "A1 ignored telemetry_reason"
+    assert captured[0]["outcome"] == "diverted"
+    assert captured[0]["reason"] == FailoverReason.upstream_rate_limit.value
+    assert captured[0]["provider"] == "deepseek"
+    assert captured[0]["fallback_model"] == "gpt-5.6-sol"
+    # ...and it still did not touch routing.
+    assert agent._rate_limited_until == 0
 
 
 def test_nous_rate_limit_records_signal(captured, tmp_path, monkeypatch):
@@ -127,6 +241,36 @@ def test_nous_rate_limit_records_signal(captured, tmp_path, monkeypatch):
     assert captured[0]["provider"] == "nous"
     assert captured[0]["reason"] == "rate_limit"
     assert captured[0]["resets_at"], "reset time must be propagated"
+
+
+def test_nous_signal_fires_even_when_the_state_write_fails(
+        captured, tmp_path, monkeypatch):
+    """M3: A3 must not be coupled to an unrelated disk write.
+
+    The hook sat INSIDE the try that persists the Nous breaker file, so an
+    atomic_replace failure (full disk, the Windows reader race) was swallowed
+    by that handler and the detector never fired — the rate limit went
+    unreported because of a write that has nothing to do with it.
+    """
+    from agent import nous_rate_guard
+    monkeypatch.setattr(nous_rate_guard, "_state_path",
+                        lambda: str(tmp_path / "nous.json"))
+    monkeypatch.setattr(
+        nous_rate_guard, "atomic_replace",
+        lambda *a, **k: (_ for _ in ()).throw(
+            PermissionError(13, "Access is denied")),
+    )
+
+    nous_rate_guard.record_nous_rate_limit(
+        headers={"x-ratelimit-reset-requests-1h": "1800"}
+    )
+
+    assert len(captured) == 1, (
+        "A3 did not fire — the detector is gated on the breaker-file write "
+        "succeeding"
+    )
+    assert captured[0]["detector"] == "nous_guard"
+    assert captured[0]["resets_at"], "reset time must still be propagated"
 
 
 def test_pool_exhaustion_records_signal(captured, monkeypatch, tmp_path):

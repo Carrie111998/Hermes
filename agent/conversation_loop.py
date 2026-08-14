@@ -1614,11 +1614,16 @@ def run_conversation(
                     # rather than retrying with extended backoff.
                     if agent._fallback_index < len(agent._fallback_chain):
                         agent._buffer_status("⚠️ Empty/malformed response — switching to fallback...")
-                    # The comment above states this is a rate-limit symptom;
-                    # pass the reason so the failover is actually attributed
-                    # (and arms the shared cooldown) instead of failing over
-                    # invisibly with reason=None.
-                    if agent._try_activate_fallback(reason=FailoverReason.upstream_rate_limit):
+                    # The comment above states this is a rate-limit symptom, so
+                    # attribute the failover instead of letting it happen
+                    # invisibly. telemetry_reason=, NOT reason=: an empty or
+                    # malformed response is only a SUSPECTED rate limit, and
+                    # reason= would arm agent._rate_limited_until for 60s,
+                    # which restore_primary_runtime() reads to keep the agent
+                    # pinned to the fallback. That would change which model
+                    # answers the next call — a behavior change this phase
+                    # explicitly promised not to make.
+                    if agent._try_activate_fallback(telemetry_reason=FailoverReason.upstream_rate_limit):
                         active_system_prompt = _sync_failover_system_message(
                             agent, api_messages, active_system_prompt)
                         retry_count = 0
@@ -3951,7 +3956,12 @@ def run_conversation(
                             agent._buffer_status("⚠️ TLS certificate verification failed — trying fallback...")
                         else:
                             agent._buffer_status(f"⚠️ Non-retryable error (HTTP {status_code}) — trying fallback...")
-                    if agent._try_activate_fallback(reason=classified.reason):
+                    # telemetry_reason=, NOT reason=: this branch previously
+                    # failed over bare, so passing reason= here would newly arm
+                    # the 60s _rate_limited_until cooldown (and skip the #24996
+                    # 5s exhausted-chain guard) whenever classified.reason is
+                    # rate-limit-class. Attribution only.
+                    if agent._try_activate_fallback(telemetry_reason=classified.reason):
                         active_system_prompt = _sync_failover_system_message(
                             agent, api_messages, active_system_prompt)
                         retry_count = 0
