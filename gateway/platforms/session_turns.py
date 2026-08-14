@@ -1373,7 +1373,9 @@ class SessionTurnService:
         # Stop requests have two distinct pieces of process-local ownership.
         # The handoff survives its HTTP waiter, while an interruption owner
         # prevents concurrent/recovery handoffs from spawning duplicate
-        # watchers for the same durable stopping edge.
+        # interrupts for the same durable stopping edge.  The interruption
+        # owner is a per-turn lifetime marker: completing the synchronous
+        # interrupt call (or its watcher) does not mean the worker has exited.
         self._stop_handoffs: Dict[
             tuple[str, str], asyncio.Task[tuple[Optional[Dict[str, Any]], bool]]
         ] = {}
@@ -1878,15 +1880,24 @@ class SessionTurnService:
                         lambda: store.request_stop(turn_id),
                         propagate_cancellation=False,
                     )
-                    agent = agent_ref[0]
-                    if agent is not None:
-                        try:
-                            agent.interrupt("Session turn coordinator cancellation requested")
-                        except Exception:
-                            pass
-                    else:
-                        watcher = asyncio.create_task(self._interrupt_when_available(turn_id))
-                        self._track_background_task(watcher)
+                    if self._interruption_owners.get(turn_id) is None:
+                        agent = agent_ref[0]
+                        if agent is not None:
+                            current = asyncio.current_task()
+                            assert current is not None
+                            self._interruption_owners[turn_id] = current
+                            try:
+                                agent.interrupt(
+                                    "Session turn coordinator cancellation requested"
+                                )
+                            except Exception:
+                                pass
+                        else:
+                            watcher = asyncio.create_task(
+                                self._interrupt_when_available(turn_id)
+                            )
+                            self._interruption_owners[turn_id] = watcher
+                            self._track_background_task(watcher)
                     # Continue heartbeat and lease ownership until the executor
                     # future itself resolves. Repeated cancellation is handled
                     # by the same bounded, non-abandoning loop.
@@ -2061,6 +2072,12 @@ class SessionTurnService:
                     except asyncio.CancelledError:
                         continue
         finally:
+            # A successful interrupt call is only a request.  Retain its owner
+            # until this authoritative execution/worker cleanup seam so a
+            # repeated stop while the turn is still ``stopping`` cannot issue
+            # another interrupt.  This also covers never-entered coordinators,
+            # and ``finally`` prevents a cleanup failure from leaking ownership.
+            self._interruption_owners.pop(turn_id, None)
             self._agent_refs.pop(turn_id, None)
             self._lifecycle_dispatchers.pop(turn_id, None)
             self._lifecycle_cleanup_owners.discard(turn_id)
@@ -2440,11 +2457,7 @@ class SessionTurnService:
         if public is not None and (
             transitioned or public["status"] == "stopping"
         ):
-            owner = self._interruption_owners.get(turn_id)
-            if owner is not None and owner.done():
-                self._interruption_owners.pop(turn_id, None)
-                owner = None
-            if owner is not None:
+            if self._interruption_owners.get(turn_id) is not None:
                 return public, transitioned
 
             ref = self._agent_refs.get(turn_id)
@@ -2457,16 +2470,20 @@ class SessionTurnService:
                     agent.interrupt("Stop requested via session turn API")
                 except Exception:
                     pass
-                finally:
-                    if self._interruption_owners.get(turn_id) is current:
-                        self._interruption_owners.pop(turn_id, None)
             else:
                 watcher = asyncio.create_task(self._interrupt_when_available(turn_id))
                 self._interruption_owners[turn_id] = watcher
                 self._track_background_task(watcher)
 
                 def watcher_done(done: asyncio.Task[Any]) -> None:
-                    if self._interruption_owners.get(turn_id) is done:
+                    # Normally _finalize_execution owns removal.  A durable
+                    # queued row can also be stopped without ever being admitted
+                    # in this process; no execution finalizer exists in that
+                    # case, so the completed watcher must release its marker.
+                    if (
+                        turn_id not in self._tasks
+                        and self._interruption_owners.get(turn_id) is done
+                    ):
                         self._interruption_owners.pop(turn_id, None)
 
                 watcher.add_done_callback(watcher_done)

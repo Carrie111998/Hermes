@@ -1140,6 +1140,144 @@ async def test_stop_reports_stopping_until_worker_actually_exits(session_db):
 
 
 @pytest.mark.asyncio
+async def test_sequential_repeated_stop_interrupts_once_through_worker_exit(session_db):
+    worker_ready = asyncio.Event()
+    worker_release = asyncio.Event()
+
+    class Agent:
+        interrupts = 0
+
+        def interrupt(self, _reason):
+            self.interrupts += 1
+
+    agent = Agent()
+
+    async def run_agent(**kwargs):
+        kwargs["agent_ref"][0] = agent
+        worker_ready.set()
+        await worker_release.wait()
+        return {"final_response": "discarded", "messages": []}, {}
+
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={}))
+    adapter._session_db = session_db
+    adapter._run_agent = run_agent
+    service = adapter._session_turn_service
+
+    async with TestClient(TestServer(_app(adapter))) as client:
+        submitted = await client.post(
+            "/api/sessions/s1/turns",
+            headers={"Idempotency-Key": "turn-stop-sequential"},
+            json=_payload(),
+        )
+        assert submitted.status == 202
+        await asyncio.wait_for(worker_ready.wait(), 1)
+
+        first = await client.post(
+            "/api/sessions/s1/turns/turn-stop-sequential/stop"
+        )
+        second = await client.post(
+            "/api/sessions/s1/turns/turn-stop-sequential/stop"
+        )
+        assert first.status == second.status == 202
+        assert (await first.json())["turn"]["status"] == "stopping"
+        assert (await second.json())["turn"]["status"] == "stopping"
+        assert agent.interrupts == 1
+        assert "turn-stop-sequential" in service._interruption_owners
+
+        worker_release.set()
+        await service.wait_for_turn("turn-stop-sequential")
+        assert "turn-stop-sequential" not in service._interruption_owners
+
+        later = await client.post(
+            "/api/sessions/s1/turns/turn-stop-sequential/stop"
+        )
+        assert later.status == 200
+        assert (await later.json())["turn"]["status"] == "interrupted"
+        assert agent.interrupts == 1
+
+
+@pytest.mark.asyncio
+async def test_concurrent_repeated_stop_joins_watcher_through_worker_exit(session_db):
+    runner_entered = asyncio.Event()
+    publish_agent = asyncio.Event()
+    worker_release = asyncio.Event()
+    interrupted = asyncio.Event()
+
+    class Agent:
+        interrupts = 0
+
+        def interrupt(self, _reason):
+            self.interrupts += 1
+            interrupted.set()
+
+    agent = Agent()
+
+    async def run_agent(**kwargs):
+        runner_entered.set()
+        await publish_agent.wait()
+        kwargs["agent_ref"][0] = agent
+        await worker_release.wait()
+        return {"final_response": "discarded", "messages": []}, {}
+
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={}))
+    adapter._session_db = session_db
+    adapter._run_agent = run_agent
+    service = adapter._session_turn_service
+
+    async with TestClient(TestServer(_app(adapter))) as client:
+        submitted = await client.post(
+            "/api/sessions/s1/turns",
+            headers={"Idempotency-Key": "turn-stop-watcher-lifetime"},
+            json=_payload(),
+        )
+        assert submitted.status == 202
+        await asyncio.wait_for(runner_entered.wait(), 1)
+
+        first = await client.post(
+            "/api/sessions/s1/turns/turn-stop-watcher-lifetime/stop"
+        )
+        assert first.status == 202
+        publish_agent.set()
+        await asyncio.wait_for(interrupted.wait(), 1)
+
+        # The watcher has synchronously returned, but its per-turn owner must
+        # remain until the still-live worker and central finalizer both exit.
+        repeated = await asyncio.gather(
+            *[
+                client.post(
+                    "/api/sessions/s1/turns/turn-stop-watcher-lifetime/stop"
+                )
+                for _ in range(8)
+            ]
+        )
+        assert all(response.status == 202 for response in repeated)
+        assert agent.interrupts == 1
+        assert "turn-stop-watcher-lifetime" in service._interruption_owners
+
+        worker_release.set()
+        await service.wait_for_turn("turn-stop-watcher-lifetime")
+        assert "turn-stop-watcher-lifetime" not in service._interruption_owners
+
+        later = await asyncio.gather(
+            *[
+                client.post(
+                    "/api/sessions/s1/turns/turn-stop-watcher-lifetime/stop"
+                )
+                for _ in range(3)
+            ]
+        )
+        assert all(response.status == 200 for response in later)
+        later_payloads = await asyncio.gather(
+            *[response.json() for response in later]
+        )
+        assert all(
+            payload["turn"]["status"] == "interrupted"
+            for payload in later_payloads
+        )
+        assert agent.interrupts == 1
+
+
+@pytest.mark.asyncio
 async def test_concurrent_repeated_stop_records_and_watches_once(session_db, monkeypatch):
     gate = asyncio.Event()
 
@@ -1828,6 +1966,32 @@ async def test_forced_cleanup_failure_is_retrieved_and_privacy_safe(
 
 
 @pytest.mark.asyncio
+async def test_central_finalizer_releases_interrupt_owner_on_cleanup_failure(
+    session_db, monkeypatch: pytest.MonkeyPatch
+):
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={}))
+    adapter._session_db = session_db
+    service = adapter._session_turn_service
+    store = SessionTurnStore(session_db)
+    turn_id = "interrupt-owner-cleanup-failure"
+    owner = asyncio.current_task()
+    assert owner is not None
+    service._interruption_owners[turn_id] = owner
+    service._agent_refs[turn_id] = [MagicMock()]
+
+    async def fail_cleanup_store(*_args, **_kwargs):
+        raise RuntimeError("cleanup failed")
+
+    monkeypatch.setattr(service, "_store_operation", fail_cleanup_store)
+    with pytest.raises(RuntimeError, match="cleanup failed"):
+        await service._finalize_execution(store, turn_id)
+
+    assert turn_id not in service._interruption_owners
+    assert turn_id not in service._agent_refs
+    assert turn_id not in service._lifecycle_cleanup_owners
+
+
+@pytest.mark.asyncio
 async def test_blocking_finalize_store_does_not_block_event_loop(
     session_db, monkeypatch: pytest.MonkeyPatch
 ):
@@ -2017,6 +2181,7 @@ async def test_stop_watcher_failure_is_retrieved_and_privacy_safe(
     ]
     assert "session_turn_background_task_failed" in caplog.text
     assert "private watcher secret" not in caplog.text
+    assert service._interruption_owners == {}
 
 
 @pytest.mark.asyncio
