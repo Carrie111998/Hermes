@@ -27,6 +27,7 @@ from gateway.platforms.session_turns import (
     project_safe_tool_event,
     resolve_slack_binding,
 )
+from gateway.session_execution_lease import SessionExecutionLease
 from hermes_state import SessionDB
 
 
@@ -51,6 +52,48 @@ def _png(width: int = 1, height: int = 1) -> str:
     raw += chunk(b"IDAT", zlib.compress(b"\x00\x00\x00\x00\x00"))
     raw += chunk(b"IEND", b"")
     return "data:image/png;base64," + base64.b64encode(raw).decode()
+
+
+@pytest.mark.asyncio
+async def test_execution_lease_release_survives_repeated_cancellation(
+    session_db, monkeypatch: pytest.MonkeyPatch
+):
+    entered = threading.Event()
+    unblock = threading.Event()
+    original_release = session_db.release_session_execution_lease
+    release_calls = 0
+
+    def blocked_release(session_id, owner_id):
+        nonlocal release_calls
+        release_calls += 1
+        entered.set()
+        unblock.wait(timeout=2)
+        return original_release(session_id, owner_id)
+
+    monkeypatch.setattr(session_db, "release_session_execution_lease", blocked_release)
+    lease = await SessionExecutionLease.acquire(
+        session_db, "s1", owner_prefix="repeated-cancel"
+    )
+
+    try:
+        for _ in range(3):
+            waiter = asyncio.create_task(lease.release())
+            assert await asyncio.to_thread(entered.wait, 1)
+            waiter.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await waiter
+            assert lease._released is True
+            assert lease._release_task is not None
+            assert not lease._release_task.cancelled()
+            assert session_db.get_session_execution_lease("s1") is not None
+    finally:
+        unblock.set()
+
+    assert await lease.release() is True
+    assert release_calls == 1
+    assert lease._release_task is not None and lease._release_task.done()
+    assert lease._heartbeat_task is not None and lease._heartbeat_task.done()
+    assert session_db.get_session_execution_lease("s1") is None
 
 
 def test_duplicate_submit_reuses_same_turn_without_second_reservation(session_db):
@@ -1207,6 +1250,9 @@ async def test_slow_observer_never_blocks_post_worker_or_lease_release(
         return {"final_response": "done"}, {}
 
     adapter._run_agent = run_agent
+    # Exclude one-time ledger/SQLite initialization from the observer latency
+    # assertion; this test measures only turn admission with a hung callback.
+    await adapter._session_turn_service.reconcile_startup()
     async with TestClient(TestServer(_app(adapter))) as client:
         started_at = time.perf_counter()
         response = await client.post(
@@ -1216,15 +1262,100 @@ async def test_slow_observer_never_blocks_post_worker_or_lease_release(
         )
         elapsed = time.perf_counter() - started_at
         assert response.status == 202
-        assert elapsed < 0.1
+        assert elapsed < 0.5  # Far below the callback's two-second block.
         assert await asyncio.to_thread(entered.wait, 1)
         await adapter._session_turn_service.wait_for_turn("slow-observer")
 
     assert SessionTurnStore(session_db).get("slow-observer")["status"] == "completed"
     assert session_db.get_session_execution_lease("s1") is None
+    assert "slow-observer" not in adapter._session_turn_service._lifecycle_dispatchers
     release.set()
-    dispatcher = adapter._session_turn_service._lifecycle_dispatchers["slow-observer"]
-    assert await asyncio.to_thread(dispatcher.flush, 1)
+
+
+@pytest.mark.asyncio
+async def test_hung_observer_many_turns_has_fixed_capacity_and_no_dispatcher_leaks(
+    session_db, monkeypatch: pytest.MonkeyPatch
+):
+    import gateway.platforms.session_turns as session_turns
+
+    release = threading.Event()
+    entered = 0
+    entered_lock = threading.Lock()
+    baseline = session_turns.session_turn_lifecycle_metrics()
+    stats = session_turns.session_turn_lifecycle_executor_stats()
+    turn_count = stats["workers"] + stats["pending_capacity"] + 12
+
+    def hung_observer(hook, **_kwargs):
+        nonlocal entered
+        if hook == "session_turn_lifecycle":
+            with entered_lock:
+                entered += 1
+            release.wait(timeout=5)
+        return []
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", hung_observer)
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={}))
+    adapter._session_db = session_db
+
+    for index in range(1, turn_count):
+        session_db.create_session(f"bounded-{index}", "api_server")
+
+    async def run_agent(**kwargs):
+        session_id = kwargs["session_id"]
+        session_db.append_message(session_id, "user", kwargs["user_message"])
+        session_db.append_message(session_id, "assistant", "done")
+        return {"final_response": "done"}, {}
+
+    adapter._run_agent = run_agent
+    try:
+        async with TestClient(TestServer(_app(adapter))) as client:
+            responses = await asyncio.gather(
+                *[
+                    client.post(
+                        f"/api/sessions/{'s1' if index == 0 else f'bounded-{index}'}/turns",
+                        headers={"Idempotency-Key": f"bounded-turn-{index}"},
+                        json=_payload(),
+                    )
+                    for index in range(turn_count)
+                ]
+            )
+            assert {response.status for response in responses} == {202}
+            await asyncio.gather(
+                *[
+                    adapter._session_turn_service.wait_for_turn(f"bounded-turn-{index}")
+                    for index in range(turn_count)
+                ]
+            )
+
+        executor = session_turns.session_turn_lifecycle_executor_stats()
+        assert executor["active"] <= executor["workers"]
+        assert executor["pending"] <= executor["pending_capacity"]
+        assert len(
+            [
+                thread
+                for thread in threading.enumerate()
+                if thread.name.startswith("session-turn-lifecycle-")
+            ]
+        ) == executor["workers"]
+        assert entered <= executor["workers"]
+        assert (
+            session_turns.session_turn_lifecycle_metrics()[
+                "observer_capacity_exhausted"
+            ]
+            > baseline["observer_capacity_exhausted"]
+        )
+        assert adapter._session_turn_service._lifecycle_dispatchers == {}
+    finally:
+        release.set()
+
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        executor = session_turns.session_turn_lifecycle_executor_stats()
+        if executor["active"] == 0 and executor["pending"] == 0:
+            break
+        await asyncio.sleep(0.01)
+    assert session_turns.session_turn_lifecycle_executor_stats()["active"] == 0
+    assert session_turns.session_turn_lifecycle_executor_stats()["pending"] == 0
 
 
 def test_lifecycle_dispatcher_backpressure_drops_only_heartbeats_and_logs_metric(

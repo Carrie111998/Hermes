@@ -33,6 +33,8 @@ logger = logging.getLogger(__name__)
 
 SESSION_TURN_HEARTBEAT_INTERVAL_SECONDS = 15.0
 SESSION_TURN_LIFECYCLE_QUEUE_SIZE = 32
+SESSION_TURN_LIFECYCLE_WORKERS = 4
+SESSION_TURN_LIFECYCLE_PENDING_DISPATCHERS = 32
 SESSION_TURN_LIFECYCLE_SLOW_SECONDS = 0.1
 SESSION_TURN_LIFECYCLE_FLUSH_SECONDS = 0.05
 
@@ -61,6 +63,7 @@ _lifecycle_metrics = {
     "heartbeat_dropped": 0,
     "observer_failed": 0,
     "observer_slow": 0,
+    "observer_capacity_exhausted": 0,
     "terminal_enqueue_failed": 0,
 }
 
@@ -83,10 +86,124 @@ def session_turn_lifecycle_metrics() -> Dict[str, int]:
         return dict(_lifecycle_metrics)
 
 
+class _SessionTurnLifecycleExecutor:
+    """Process-wide fixed observer capacity with a bounded pending queue.
+
+    Python cannot forcibly stop a plugin callback. A hung callback therefore
+    occupies one of a fixed number of daemon workers, while the bounded queue
+    prevents completed turns from accumulating behind it forever. Once both
+    bounds are exhausted, new lifecycle streams explicitly degrade fail-open.
+    """
+
+    def __init__(self, workers: int, pending: int):
+        self.worker_count = max(1, workers)
+        self.pending_capacity = max(1, pending)
+        self._queue: queue.Queue[SessionTurnLifecycleDispatcher] = queue.Queue(
+            maxsize=self.pending_capacity
+        )
+        self._start_lock = threading.Lock()
+        self._stats_lock = threading.Lock()
+        self._started = False
+        self._active = 0
+        self._next_observation = 0
+        self._observations: Dict[int, tuple[str, float, bool]] = {}
+        # Pay the fixed worker startup cost at module initialization, never on
+        # a latency-sensitive turn-admission path.
+        self._start_workers()
+        threading.Thread(
+            target=self._watch_slow_callbacks,
+            name="session-lifecycle-watchdog",
+            daemon=True,
+        ).start()
+
+    def submit(self, dispatcher: "SessionTurnLifecycleDispatcher") -> bool:
+        try:
+            self._queue.put_nowait(dispatcher)
+            return True
+        except queue.Full:
+            return False
+
+    def stats(self) -> Dict[str, int]:
+        with self._stats_lock:
+            active = self._active
+        return {
+            "workers": self.worker_count,
+            "active": active,
+            "pending": self._queue.qsize(),
+            "pending_capacity": self.pending_capacity,
+        }
+
+    def observe_callback_started(self, event: str) -> int:
+        with self._stats_lock:
+            self._next_observation += 1
+            token = self._next_observation
+            self._observations[token] = (event, time.monotonic(), False)
+            return token
+
+    def observe_callback_finished(self, token: int) -> None:
+        with self._stats_lock:
+            self._observations.pop(token, None)
+
+    def _start_workers(self) -> None:
+        if self._started:
+            return
+        with self._start_lock:
+            if self._started:
+                return
+            for index in range(self.worker_count):
+                threading.Thread(
+                    target=self._worker,
+                    name=f"session-turn-lifecycle-{index}",
+                    daemon=True,
+                ).start()
+            self._started = True
+
+    def _worker(self) -> None:
+        while True:
+            dispatcher = self._queue.get()
+            with self._stats_lock:
+                self._active += 1
+            try:
+                dispatcher._run()
+            finally:
+                with self._stats_lock:
+                    self._active -= 1
+                self._queue.task_done()
+
+    def _watch_slow_callbacks(self) -> None:
+        """Report hung callbacks from one fixed watchdog, never per-turn timers."""
+        while True:
+            time.sleep(max(0.01, SESSION_TURN_LIFECYCLE_SLOW_SECONDS / 2))
+            now = time.monotonic()
+            slow_events = []
+            with self._stats_lock:
+                for token, (event, started_at, reported) in list(
+                    self._observations.items()
+                ):
+                    if not reported and now - started_at >= SESSION_TURN_LIFECYCLE_SLOW_SECONDS:
+                        self._observations[token] = (event, started_at, True)
+                        slow_events.append(event)
+            for event in slow_events:
+                _note_lifecycle_degradation(
+                    "observer_slow", event, "callback_slow"
+                )
+
+
+_lifecycle_executor = _SessionTurnLifecycleExecutor(
+    SESSION_TURN_LIFECYCLE_WORKERS,
+    SESSION_TURN_LIFECYCLE_PENDING_DISPATCHERS,
+)
+
+
+def session_turn_lifecycle_executor_stats() -> Dict[str, int]:
+    """Return privacy-safe fixed-capacity observer executor diagnostics."""
+    return _lifecycle_executor.stats()
+
+
 class SessionTurnLifecycleDispatcher:
     """Ordered, bounded, non-blocking observer delivery for one durable turn.
 
-    Plugin code runs only on this dispatcher's daemon thread. Heartbeats are
+    Plugin code runs only on the process-wide fixed daemon pool. Heartbeats are
     lossy under backpressure, while the structural registered/started/terminal
     facts are retained. A slow or permanently hung plugin therefore cannot
     hold aiohttp, the coordinator, or the persistent execution lease.
@@ -100,14 +217,15 @@ class SessionTurnLifecycleDispatcher:
         )
         self._closed = False
         self._drained = threading.Event()
-        self._thread = threading.Thread(
-            target=self._run,
-            name="session-turn-lifecycle",
-            daemon=True,
-        )
         # Registered is admitted before the worker can observe later events.
         self._queue.put_nowait(("registered", {}))
-        self._thread.start()
+        self._admitted = _lifecycle_executor.submit(self)
+        if not self._admitted:
+            self._closed = True
+            self._drained.set()
+            _note_lifecycle_degradation(
+                "observer_capacity_exhausted", "registered", "executor_saturated"
+            )
 
     def emit(self, event: str, **extra: Any) -> bool:
         """Queue an event without waiting; return whether it was retained."""
@@ -155,15 +273,7 @@ class SessionTurnLifecycleDispatcher:
     def _run(self) -> None:
         while True:
             event, extra = self._queue.get()
-            slow = threading.Event()
-
-            def report_slow() -> None:
-                if not slow.is_set():
-                    _note_lifecycle_degradation("observer_slow", event, "callback_slow")
-
-            watchdog = threading.Timer(SESSION_TURN_LIFECYCLE_SLOW_SECONDS, report_slow)
-            watchdog.daemon = True
-            watchdog.start()
+            observation = _lifecycle_executor.observe_callback_started(event)
             try:
                 delivered = _emit_turn_lifecycle(
                     event,
@@ -179,8 +289,7 @@ class SessionTurnLifecycleDispatcher:
                 # Defensive: _emit_turn_lifecycle is already fail-open.
                 _note_lifecycle_degradation("observer_failed", event, "callback_error")
             finally:
-                slow.set()
-                watchdog.cancel()
+                _lifecycle_executor.observe_callback_finished(observation)
             if event == "terminal":
                 self._drained.set()
                 return
@@ -1346,15 +1455,35 @@ class SessionTurnService:
             if outcome is not None:
                 if dispatcher is not None:
                     dispatcher.close(outcome)
-            if execution_lease is not None:
-                await execution_lease.release()
-            # Observer completion is bounded and happens only after lease
-            # release. to_thread keeps even this small grace off aiohttp.
-            if dispatcher is not None and outcome is not None:
-                await asyncio.to_thread(
-                    dispatcher.flush, SESSION_TURN_LIFECYCLE_FLUSH_SECONDS
-                )
-            self._agent_refs.pop(turn_id, None)
+            try:
+                if execution_lease is not None:
+                    # A caller may cancel this coordinator repeatedly during
+                    # unwind. Keep re-awaiting the lease's one shielded release
+                    # operation until durable ownership and heartbeat are gone.
+                    while True:
+                        try:
+                            await execution_lease.release()
+                            break
+                        except asyncio.CancelledError:
+                            continue
+                # Observer completion is bounded and happens only after lease
+                # release. Shield one to_thread call so repeated cancellation
+                # cannot spawn abandoned flush workers.
+                if dispatcher is not None and outcome is not None:
+                    flush_task = asyncio.create_task(
+                        asyncio.to_thread(
+                            dispatcher.flush, SESSION_TURN_LIFECYCLE_FLUSH_SECONDS
+                        )
+                    )
+                    while True:
+                        try:
+                            await asyncio.shield(flush_task)
+                            break
+                        except asyncio.CancelledError:
+                            continue
+            finally:
+                self._agent_refs.pop(turn_id, None)
+                self._lifecycle_dispatchers.pop(turn_id, None)
 
     async def _deliver_slack(self, store: SessionTurnStore, turn_id: str, binding: SlackBinding,
                              slack_adapter: Any, content: str) -> None:
