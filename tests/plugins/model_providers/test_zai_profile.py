@@ -176,3 +176,17 @@ class TestZaiFullKwargsIntegration:
         )
         assert kwargs["reasoning_effort"] == "max"
         assert kwargs["extra_body"]["thinking"] == {"type": "enabled"}
+
+
+class TestZaiGLM53Contract:
+    def test_disabled_thinking_becomes_enabled_low(self, zai_profile):
+        extra_body, top_level = zai_profile.build_api_kwargs_extras(
+            reasoning_config={"enabled": False},
+            model="glm-5.3",
+        )
+
+        assert extra_body == {"thinking": {"type": "enabled"}}
+        assert top_level == {"reasoning_effort": "low"}
+
+    def test_fallback_catalog_leads_with_glm_53(self, zai_profile):
+        assert zai_profile.fallback_models[0] == "glm-5.3"

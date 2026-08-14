@@ -48,6 +48,7 @@ def _run_switch(
     validation=_ACCEPTED,
     current_model="old-model",
     current_base_url="",
+    explicit_provider="",
 ):
     """Drive ``switch_model`` with the resolution chain mocked out.
 
@@ -79,6 +80,7 @@ def _run_switch(
             current_base_url=current_base_url,
             user_providers=user_providers or {},
             custom_providers=custom_providers or [],
+            explicit_provider=explicit_provider,
         )
 
 
@@ -103,6 +105,74 @@ def test_default_model_only_declaration_routes():
     assert result.success is True, result.error_message
     assert result.target_provider == "local-ollama"
     assert result.new_model == "qwen3.5-4b"
+
+
+def test_exact_configured_model_does_not_warn_when_models_listing_lags():
+    """An exact saved declaration is authoritative for model identity.
+
+    Some OpenAI-compatible endpoints accept a newly launched model before
+    exposing it from ``/models``.  A failed discovery probe must not produce a
+    misleading custom-endpoint warning for a model the operator explicitly
+    declared in that provider's configuration.
+    """
+    user_providers = {
+        "zai": {
+            "name": "Z.AI",
+            "base_url": "https://api.z.ai/api/coding/paas/v4",
+            "default_model": "glm-5.3",
+            "key_env": "ZAI_API_KEY",
+            "models": ["glm-5.3"],
+        }
+    }
+    unavailable_listing = {
+        "accepted": True,
+        "persist": True,
+        "recognized": False,
+        "message": "could not reach this custom endpoint's model listing",
+    }
+
+    result = _run_switch(
+        raw_input="glm-5.3",
+        current_provider="custom:zai",
+        current_model="glm-5.2",
+        current_base_url="https://api.z.ai/api/coding/paas/v4",
+        user_providers=user_providers,
+        validation=unavailable_listing,
+    )
+
+    assert result.success is True, result.error_message
+    assert result.target_provider == "zai"
+    assert result.new_model == "glm-5.3"
+    assert result.warning_message == ""
+
+
+def test_explicit_configured_model_does_not_warn_when_models_listing_lags():
+    user_providers = {
+        "zai": {
+            "name": "Z.AI",
+            "base_url": "https://api.z.ai/api/coding/paas/v4",
+            "key_env": "ZAI_API_KEY",
+            "models": ["glm-5.3"],
+        }
+    }
+    unavailable_listing = {
+        "accepted": True,
+        "persist": True,
+        "recognized": False,
+        "message": "could not reach this custom endpoint's model listing",
+    }
+
+    result = _run_switch(
+        raw_input="glm-5.3",
+        current_provider="kimi-coding",
+        user_providers=user_providers,
+        validation=unavailable_listing,
+        explicit_provider="zai",
+    )
+
+    assert result.success is True, result.error_message
+    assert result.target_provider == "zai"
+    assert result.warning_message == ""
 
 
 
