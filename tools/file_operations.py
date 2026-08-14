@@ -2891,26 +2891,34 @@ class ShellFileOperations(FileOperations):
             glob_pattern = pattern
 
         fetch_limit = limit + offset
+        search_root = self._escape_native_tool_arg(path)
         # Try mtime-sorted first (rg 13+); fall back to unsorted if not supported.
         cmd_sorted = (
+            "set -o pipefail; "
             f"rg --files --sortr=modified -g {self._escape_shell_arg(glob_pattern)} "
-            f"{self._escape_native_tool_arg(path)} 2>/dev/null "
+            f"{search_root} "
             f"| head -n {fetch_limit}"
         )
         result = self._exec(cmd_sorted, timeout=60)
         stdout, limit_reason = _search_stdout_and_limit(result)
-        all_files = [f for f in stdout.strip().split('\n') if f]
+        diagnostics, payload = _split_tool_diagnostics(stdout)
+        all_files = [f for f in payload.strip().split('\n') if f]
 
         if not all_files and not limit_reason:
             # --sortr may have failed on older rg; retry without it.
             cmd_plain = (
+                "set -o pipefail; "
                 f"rg --files -g {self._escape_shell_arg(glob_pattern)} "
-                f"{self._escape_native_tool_arg(path)} 2>/dev/null "
+                f"{search_root} "
                 f"| head -n {fetch_limit}"
             )
             result = self._exec(cmd_plain, timeout=60)
             stdout, limit_reason = _search_stdout_and_limit(result)
-            all_files = [f for f in stdout.strip().split('\n') if f]
+            diagnostics, payload = _split_tool_diagnostics(stdout)
+            all_files = [f for f in payload.strip().split('\n') if f]
+            if result.exit_code == 2 and not all_files:
+                error_msg = diagnostics.strip() or result.stdout.strip() or "Search error"
+                return SearchResult(error=f"Search failed: {error_msg}", total_count=0)
 
         page = all_files[offset:offset + limit]
 
