@@ -2284,3 +2284,72 @@ class TestSystemdCgroupIsolation:
         )
 
         assert pr._stop_systemd_unit("hermes-worker-gone.scope") is True
+
+
+def test_format_async_delegation_renders_stop_reason_and_partial_output():
+    """Never-reject contract on the async surface: a failed background child
+    whose summary is empty still reports its stop_reason and preserved
+    partial text in the re-injected parent message."""
+    from tools.process_registry import _format_async_delegation
+
+    text = _format_async_delegation(
+        {
+            "type": "async_delegation",
+            "delegation_id": "deleg_timeout_1",
+            "session_key": "cli",
+            "goal": "research X",
+            "status": "timeout",
+            "summary": None,
+            "error": "Subagent timed out after 60s",
+            "api_calls": 1,
+            "duration_seconds": 60.0,
+            "exit_reason": "timeout",
+            "stop_reason": "error",
+            "partial_output": "partial research before timeout",
+        }
+    )
+    assert "Stop reason: error" in text
+    assert "did not complete successfully (status=timeout)" in text
+    assert "Partial output (before the run ended):" in text
+    assert "partial research before timeout" in text
+
+    # Batch formatter: a child entry with no summary falls back to
+    # partial_output instead of rendering "(no summary)".
+    batch_text = _format_async_delegation(
+        {
+            "type": "async_delegation",
+            "delegation_id": "deleg_batch_1",
+            "is_batch": True,
+            "goals": ["task 1"],
+            "status": "completed",
+            "results": [
+                {
+                    "task_index": 0,
+                    "status": "error",
+                    "summary": None,
+                    "error": "model failed",
+                    "stop_reason": "error",
+                    "partial_output": "half-finished task text",
+                }
+            ],
+        }
+    )
+    assert "Partial output (before the run ended):" in batch_text
+    assert "half-finished task text" in batch_text
+
+    # Completed runs are untouched: summary renders, no partial block.
+    ok_text = _format_async_delegation(
+        {
+            "type": "async_delegation",
+            "delegation_id": "deleg_ok_1",
+            "goal": "task",
+            "status": "completed",
+            "summary": "finished fine",
+            "api_calls": 1,
+            "duration_seconds": 1.0,
+            "exit_reason": "completed",
+            "stop_reason": "completed",
+        }
+    )
+    assert "finished fine" in ok_text
+    assert "Partial output" not in ok_text

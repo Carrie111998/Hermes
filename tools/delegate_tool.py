@@ -59,6 +59,154 @@ DELEGATE_BLOCKED_TOOLS = frozenset(
 
 
 # ---------------------------------------------------------------------------
+# Subagent stop-reason contract (never-reject structured child result)
+#
+# Mirrors the deepseek-harness SubagentResult vocabulary
+# (packages/subagent/subagent/src/types.ts): every child run — success or
+# failure — settles into a structured entry {output, stop_reason} delivered
+# to the parent, instead of surfacing as an exception that can break the
+# parent turn or as a lost failure.  The readable text stays in `summary`
+# (semantics unchanged); `stop_reason` and `partial_output` are ADDITIVE
+# fields, so existing readers of status/summary/error/exit_reason keep
+# working untouched.
+#
+# stop_reason values and the Hermes signals they map from today:
+#   completed  — the child finished its turn normally
+#                (completed=True, non-empty real summary).
+#   aborted    — cancelled: user interrupt, parent interrupt, or the
+#                close-steering race (interrupted=True / fabricated batch
+#                "interrupted" entries).
+#   error      — model/transport failure, child exception, or timeout.
+#                Timeout has no dedicated vocabulary value; the closest is
+#                error and the finer distinction stays in the existing
+#                status="timeout" / timeout_phase fields.
+#   max-tokens — the child hit its iteration/token budget before finishing
+#                (exit_reason="max_iterations", result.partial=True, or a
+#                run_agent.py output-length sentinel in final_response).
+#   refusal    — NOT distinguishable today: a model that declines the task
+#                produces a normal completed turn, so no signal exists.  The
+#                value is reserved for forward compatibility and never
+#                emitted; a refusal currently settles as "completed".
+# ---------------------------------------------------------------------------
+
+STOP_REASON_COMPLETED = "completed"
+STOP_REASON_ABORTED = "aborted"
+STOP_REASON_ERROR = "error"
+STOP_REASON_MAX_TOKENS = "max-tokens"
+STOP_REASON_REFUSAL = "refusal"
+
+# Fixed ceiling for the preserved partial text (auxiliary channel; the full
+# conversation stays available in the child's messages / live transcripts).
+MAX_PARTIAL_OUTPUT_CHARS = 12000
+
+# run_agent.py emits these sentinel strings as final_response when the real
+# content was dropped due to output-length limits (truncated responses,
+# broken mid tool-call streams).  They are error markers, not child text.
+# NOTE: the "(empty)" sentinel (empty-LLM retries — a transport bug) is NOT
+# listed here on purpose: it maps to stop_reason='error', not 'max-tokens'.
+_TRUNCATION_SENTINELS = frozenset(
+    {
+        "Response truncated due to output length limit",
+        "First response truncated due to output length limit",
+        "Stream repeatedly dropped mid tool-call (network); the tool was not executed",
+    }
+)
+
+
+def _looks_like_truncation(text: str) -> bool:
+    """True when a final_response is an output-length/iteration marker."""
+    return bool(text) and text.strip() in _TRUNCATION_SENTINELS
+
+
+def _extract_partial_assistant_text(
+    result: Dict[str, Any],
+    child=None,
+    *,
+    max_chars: int = MAX_PARTIAL_OUTPUT_CHARS,
+) -> str:
+    """Best-effort capture of the child's last real assistant text.
+
+    Failure paths must not lose what the child produced before failing.
+    Selection order:
+      1. result['final_response'] when it is real content (not an error
+         sentinel emitted by run_agent.py);
+      2. the last non-empty assistant message in result['messages'];
+      3. a racy read of the still-running child's ``_session_messages``
+         (timeout/exception path: the worker thread is abandoned, never
+         joined, and no result dict ever arrives).
+
+    Never raises; returns '' when nothing usable exists.  The timeout read is
+    explicitly best-effort — the child thread keeps mutating the list, so a
+    torn snapshot is acceptable: anything captured beats the current behavior
+    of discarding all partial text.
+    """
+    text = ""
+    if isinstance(result, dict):
+        candidate = result.get("final_response")
+        if (
+            isinstance(candidate, str)
+            and candidate.strip()
+            and not _looks_like_truncation(candidate)
+        ):
+            text = candidate.strip()
+        if not text:
+            messages = result.get("messages")
+            if isinstance(messages, list):
+                for msg in reversed(messages):
+                    if not isinstance(msg, dict) or msg.get("role") != "assistant":
+                        continue
+                    if msg.get("tool_calls"):
+                        continue
+                    content = _stringify_tool_content(msg.get("content") or "")
+                    if content.strip():
+                        text = content.strip()
+                        break
+    if not text and child is not None:
+        try:
+            session_messages = getattr(child, "_session_messages", None)
+            for msg in reversed(list(session_messages or [])):
+                if not isinstance(msg, dict) or msg.get("role") != "assistant":
+                    continue
+                if msg.get("tool_calls"):
+                    continue
+                content = _stringify_tool_content(msg.get("content") or "")
+                if content.strip():
+                    text = content.strip()
+                    break
+        except Exception:
+            logger.debug("Partial assistant text capture failed", exc_info=True)
+    if len(text) > max_chars:
+        text = text[:max_chars]
+    return text
+
+
+def _compute_stop_reason(
+    *,
+    interrupted: bool,
+    completed: bool,
+    summary: str,
+    empty_sentinel: bool,
+    partial: bool,
+) -> str:
+    """Map the child run's terminal state onto the stop-reason vocabulary.
+
+    Called only on the normal (non-raising) child path; the timeout/exception
+    and outer-catch paths hard-code STOP_REASON_ERROR (their existing
+    status="timeout" / error fields retain the finer distinction).
+    """
+    if interrupted:
+        return STOP_REASON_ABORTED
+    if completed and summary and not empty_sentinel:
+        return STOP_REASON_COMPLETED
+    if partial or _looks_like_truncation(summary) or (summary and not empty_sentinel):
+        # partial=True, an output-length sentinel, or real text with
+        # completed=False all mean the run ended on its iteration/token
+        # budget before finishing.
+        return STOP_REASON_MAX_TOKENS
+    return STOP_REASON_ERROR
+
+
+# ---------------------------------------------------------------------------
 # Subagent approval callbacks
 # ---------------------------------------------------------------------------
 # Subagents run inside a ThreadPoolExecutor worker. The CLI's interactive
@@ -2691,6 +2839,15 @@ def _run_single_child(
                 "_child_role": getattr(child, "_delegate_role", None),
                 "diagnostic_path": diagnostic_path,
             }
+            # Never-reject contract: a timeout/exception is a structured
+            # `error` result (the finer timeout distinction stays in
+            # status/timeout_phase), and any text the child produced before
+            # the failure is preserved instead of being discarded with the
+            # abandoned worker thread.
+            _error_entry["stop_reason"] = STOP_REASON_ERROR
+            _partial_text = _extract_partial_assistant_text({}, child=child)
+            if _partial_text:
+                _error_entry["partial_output"] = _partial_text
             if _late_pending_steer:
                 _error_entry["missed_steer"] = _late_pending_steer
                 _error_entry["error"] += (
@@ -2857,6 +3014,17 @@ def _run_single_child(
         else:
             exit_reason = "max_iterations"
 
+        # Never-reject contract: map the terminal state onto the structured
+        # stop-reason vocabulary (additive field; the readable text stays in
+        # `summary`).  See the module docstring for the signal mapping.
+        stop_reason = _compute_stop_reason(
+            interrupted=interrupted,
+            completed=completed,
+            summary=summary,
+            empty_sentinel=_empty_sentinel,
+            partial=bool(result.get("partial")),
+        )
+
         # Extract token counts (safe for mock objects)
         _input_tokens = getattr(child, "session_prompt_tokens", 0)
         _output_tokens = getattr(child, "session_completion_tokens", 0)
@@ -2870,6 +3038,7 @@ def _run_single_child(
             "duration_seconds": duration,
             "model": _model if isinstance(_model, str) else None,
             "exit_reason": exit_reason,
+            "stop_reason": stop_reason,
             "tokens": {
                 "input": (
                     _input_tokens if isinstance(_input_tokens, (int, float)) else 0
@@ -2908,6 +3077,15 @@ def _run_single_child(
             _cost_status if isinstance(_cost_status, str) and _cost_status
             else "unknown"
         )
+        # Never-reject contract: on any non-completed run, preserve the
+        # child's last real assistant text when it is not already what the
+        # parent sees in `summary` (e.g. summary is empty, a run_agent.py
+        # sentinel, or was superseded).  Completed runs keep their exact
+        # previous payload shape plus the additive stop_reason field.
+        if stop_reason != STOP_REASON_COMPLETED:
+            _partial_text = _extract_partial_assistant_text(result, child=child)
+            if _partial_text and _partial_text != (summary or "").strip():
+                entry["partial_output"] = _partial_text
         if status == "failed":
             entry["error"] = result.get("error", "Subagent did not produce a response.")
 
@@ -3056,8 +3234,12 @@ def _run_single_child(
             "error": str(exc),
             "api_calls": 0,
             "duration_seconds": duration,
+            "stop_reason": STOP_REASON_ERROR,
             "_child_role": getattr(child, "_delegate_role", None),
         }
+        _partial_text = _extract_partial_assistant_text({}, child=child)
+        if _partial_text:
+            _error_entry["partial_output"] = _partial_text
         if _late_pending_steer:
             _error_entry["missed_steer"] = _late_pending_steer
             _error_entry["error"] += (
@@ -3733,6 +3915,7 @@ def delegate_task(
                                         "error": str(exc),
                                         "api_calls": 0,
                                         "duration_seconds": 0,
+                                        "stop_reason": STOP_REASON_ERROR,
                                         "_child_role": getattr(
                                             _child_by_index.get(idx), "_delegate_role", None
                                         ),
@@ -3745,6 +3928,7 @@ def delegate_task(
                                     "error": "Parent agent interrupted — child did not finish in time",
                                     "api_calls": 0,
                                     "duration_seconds": 0,
+                                    "stop_reason": STOP_REASON_ABORTED,
                                     "_child_role": getattr(
                                         _child_by_index.get(idx), "_delegate_role", None
                                     ),
@@ -3770,6 +3954,7 @@ def delegate_task(
                                 "error": str(exc),
                                 "api_calls": 0,
                                 "duration_seconds": 0,
+                                "stop_reason": STOP_REASON_ERROR,
                                 "_child_role": getattr(
                                     _child_by_index.get(idx), "_delegate_role", None
                                 ),

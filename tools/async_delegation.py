@@ -984,6 +984,11 @@ def _push_completion_event(
         "dispatched_at": dispatched_at,
         "completed_at": completed_at,
         "exit_reason": result.get("exit_reason"),
+        # Never-reject contract (additive): structured stop reason + preserved
+        # partial text so a failed background child still reports why it
+        # stopped and what it produced before that.
+        "stop_reason": result.get("stop_reason"),
+        "partial_output": result.get("partial_output"),
     }
     # Routing origin captured at dispatch (see _capture_routing_origin):
     # additive, lets the gateway reconstruct a full SessionSource (incl.
