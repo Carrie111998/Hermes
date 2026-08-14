@@ -67,6 +67,11 @@ MEMORY_BLOCK_HEADERS = {
 ENTRY_DELIMITER = "\n§\n"
 
 
+def _normalize_line_endings(text: str) -> str:
+    """Return text with CRLF and legacy CR line endings normalized to LF."""
+    return text.replace(chr(13) + chr(10), "\n").replace(chr(13), "\n")
+
+
 # ---------------------------------------------------------------------------
 # Memory content scanning — lightweight check for injection/exfiltration
 # in content that gets injected into the system prompt.
@@ -783,9 +788,13 @@ class MemoryStore:
         """Split raw memory-file text into stripped, non-empty entries."""
         if not raw.strip():
             return []
-        # Use ENTRY_DELIMITER for consistency with _write_file. Splitting by "§"
-        # alone would incorrectly split entries that contain "§" in their content.
-        entries = [e.strip() for e in raw.split(ENTRY_DELIMITER)]
+        # Normalize before splitting so LF, CRLF, and mixed-line-ending files all
+        # recognize the same delimiter. Splitting by "§" alone would incorrectly
+        # split entries that contain it as content.
+        entries = [
+            e.strip()
+            for e in _normalize_line_endings(raw).split(ENTRY_DELIMITER)
+        ]
         return [e for e in entries if e]
 
     @staticmethod
@@ -825,9 +834,9 @@ class MemoryStore:
         The memory file is supposed to be a list of small entries the tool
         wrote, joined by §. Detect drift via two signals:
 
-        1. Round-trip mismatch — re-parsing and re-serializing the file
-           doesn't produce identical bytes (rare; would catch oddly-encoded
-           delimiters).
+        1. Semantic round-trip mismatch — after normalizing line endings,
+           re-parsing and re-serializing the file changes its content. LF and
+           CRLF delimiters are both valid input and are not treated as drift.
         2. Entry-size overflow — any single parsed entry exceeds the
            store's whole-file char limit. The tool budgets the ENTIRE store
            against that limit; no single tool-written entry can exceed it.
@@ -847,13 +856,14 @@ class MemoryStore:
         if not raw.strip():
             return None
 
-        parsed = [e.strip() for e in raw.split(ENTRY_DELIMITER) if e.strip()]
+        parsed = self._parse_entries(raw)
         roundtrip = ENTRY_DELIMITER.join(parsed)
+        normalized_raw = _normalize_line_endings(raw).strip()
 
         char_limit = self._char_limit(target)
         max_entry_len = max((len(e) for e in parsed), default=0)
 
-        drift_detected = (raw.strip() != roundtrip) or (max_entry_len > char_limit)
+        drift_detected = (normalized_raw != roundtrip) or (max_entry_len > char_limit)
         if not drift_detected:
             return None
 
@@ -875,11 +885,13 @@ class MemoryStore:
         Previous implementation used open("w") + flock, but "w" truncates the
         file *before* the lock is acquired, creating a race window where
         concurrent readers see an empty file. Atomic rename avoids this:
-        readers always see either the old complete file or the new one.
+        readers always see either the old complete file or the new one. Memory
+        files use canonical LF delimiters on every platform; the parser accepts
+        legacy CRLF files and normalizes them on the next successful mutation.
         """
         content = ENTRY_DELIMITER.join(entries) if entries else ""
         try:
-            atomic_write_text(path, content, tmp_prefix=".mem_")
+            atomic_write_text(path, content, tmp_prefix=".mem_", newline="\n")
         except (OSError, IOError) as e:
             raise RuntimeError(f"Failed to write memory file {path}: {e}")
 

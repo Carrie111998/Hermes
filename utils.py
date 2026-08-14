@@ -284,6 +284,7 @@ def atomic_write_text(
     tmp_prefix: str = ".tmp_",
     preserve_mode: bool = False,
     create_mode: "int | None" = None,
+    newline: "str | None" = None,
 ) -> None:
     """Write *content* to *path* via temp file + fsync + atomic rename.
 
@@ -307,6 +308,9 @@ def atomic_write_text(
         create_mode: Permission bits to apply when the target does not yet
             exist (otherwise the new file keeps mkstemp's 0600).  Never
             applied to an existing file.
+        newline: Text newline translation policy passed to ``os.fdopen``.
+            The default preserves platform-native behavior; callers with a
+            canonical on-disk format can opt into ``"\n"`` explicitly.
     """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -321,7 +325,7 @@ def atomic_write_text(
         dir=str(path.parent), prefix=tmp_prefix, suffix=".tmp"
     )
     try:
-        with os.fdopen(fd, "w", encoding=encoding) as handle:
+        with os.fdopen(fd, "w", encoding=encoding, newline=newline) as handle:
             if effective_mode is not None and hasattr(os, "fchmod"):
                 # fchmod the temp fd BEFORE the replace so the target never
                 # transits through mkstemp's 0600. fchmod is Unix-only; on
