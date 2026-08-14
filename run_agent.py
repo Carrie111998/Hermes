@@ -4919,10 +4919,12 @@ class AIAgent:
         return create_openai_client(self, client_kwargs, reason=reason, shared=shared)
 
     @staticmethod
-    def _force_close_tcp_sockets(client: Any) -> int:
+    def _force_close_tcp_sockets(
+        client: Any, *, active_only: bool = False
+    ) -> int:
         """Forwarder — see ``agent.agent_runtime_helpers.force_close_tcp_sockets``."""
         from agent.agent_runtime_helpers import force_close_tcp_sockets
-        return force_close_tcp_sockets(client)
+        return force_close_tcp_sockets(client, active_only=active_only)
 
     def _close_openai_client(self, client: Any, *, reason: str, shared: bool) -> None:
         if client is None:
@@ -5216,7 +5218,7 @@ class AIAgent:
             return
         self._close_openai_client(client, reason=reason, shared=False)
 
-    def _abort_request_openai_client(self, client: Any, *, reason: str) -> None:
+    def _abort_request_openai_client(self, client: Any, *, reason: str) -> int:
         """Cross-thread abort: shut sockets down without releasing FDs.
 
         Companion to :meth:`_close_request_openai_client` for stranger-thread
@@ -5231,7 +5233,7 @@ class AIAgent:
         — which is where the FD release belongs.
         """
         if client is None:
-            return
+            return 0
         # A pool whose sockets were shut down from a stranger thread must
         # never be reused: poison the cache slot so the owner-thread close
         # discards it and the next create builds a fresh client.
@@ -5240,7 +5242,9 @@ class AIAgent:
             if cache["client"] is client:
                 cache["poisoned"] = True
         try:
-            shutdown_count = self._force_close_tcp_sockets(client)
+            shutdown_count = self._force_close_tcp_sockets(
+                client, active_only=True
+            )
             # tcp_force_closed=0 means the stranger-thread abort found no
             # sockets to shut down — the worker stays blocked in recv and the
             # provider keeps the slot (#72975). Surface that as WARNING so it
@@ -5259,6 +5263,7 @@ class AIAgent:
                     else ""
                 ),
             )
+            return shutdown_count
         except Exception as exc:
             logger.debug(
                 "OpenAI client abort failed (%s, shared=False) %s error=%s",
@@ -5266,6 +5271,7 @@ class AIAgent:
                 self._client_log_context(),
                 exc,
             )
+            return 0
 
     def _create_request_anthropic_client(self, *, reason: str) -> Any:
         """Build a request-local Anthropic client for one in-flight call.
@@ -5334,7 +5340,7 @@ class AIAgent:
                 exc,
             )
 
-    def _abort_request_anthropic_client(self, client: Any, *, reason: str) -> None:
+    def _abort_request_anthropic_client(self, client: Any, *, reason: str) -> int:
         """Cross-thread abort for request-local Anthropic clients.
 
         Stranger threads (the interrupt-check / stale-stream detector loop)
@@ -5344,9 +5350,11 @@ class AIAgent:
         unblocks and releases the FD from its own thread.
         """
         if client is None:
-            return
+            return 0
         try:
-            shutdown_count = self._force_close_tcp_sockets(client)
+            shutdown_count = self._force_close_tcp_sockets(
+                client, active_only=True
+            )
             # Same visibility contract as the OpenAI abort path (#72975):
             # zero sockets shut down means the abort did not unblock the
             # worker — log WARNING, not a success-shaped INFO.
@@ -5365,6 +5373,7 @@ class AIAgent:
                     else ""
                 ),
             )
+            return shutdown_count
         except Exception as exc:
             logger.debug(
                 "Anthropic client abort failed (%s, shared=False) provider=%s model=%s error=%s",
@@ -5373,6 +5382,7 @@ class AIAgent:
                 getattr(self, "model", None),
                 exc,
             )
+            return 0
 
     def _run_codex_stream(self, api_kwargs: dict, client: Any = None, on_first_delta: callable = None):
         """Forwarder — see ``agent.codex_runtime.run_codex_stream``."""

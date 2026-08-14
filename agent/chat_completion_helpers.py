@@ -27,6 +27,8 @@ import uuid
 from types import SimpleNamespace
 from typing import Any, Dict, Optional
 
+import httpx
+
 from hermes_cli.timeouts import get_provider_request_timeout, get_provider_stale_timeout
 from hermes_constants import PARTIAL_STREAM_STUB_ID, FINISH_REASON_LENGTH
 from agent.error_classifier import FailoverReason
@@ -871,7 +873,11 @@ def interruptible_api_call(agent, api_kwargs: dict):
     if should_use_direct_api_call(agent):
         return direct_api_call(agent, api_kwargs)
 
-    result = {"response": None, "error": None}
+    result = {
+        "response": None,
+        "error": None,
+        "error_monotonic": None,
+    }
 
     # Cross-turn stale-call circuit breaker (#58962) — non-streaming sibling
     # of the guard in interruptible_streaming_api_call.  Quiet-mode /
@@ -880,6 +886,13 @@ def interruptible_api_call(agent, api_kwargs: dict):
     _check_stale_giveup(agent)
 
     request_client_holder = {"client": None, "owner_tid": None}
+    # Request-local terminal marker. Watchdog/interrupt sets this under the
+    # same lock used by client registration, before attempting socket abort.
+    request_state: dict[str, Any] = {
+        "terminal_reason": None,
+        "confirmed_abort_reason": None,
+        "confirmed_abort_started_monotonic": None,
+    }
     # Transport kind of the registered request client ("openai" or
     # "anthropic_messages") so _close_request_client_once routes to the right
     # abort/close helpers (#67142).
@@ -896,6 +909,7 @@ def interruptible_api_call(agent, api_kwargs: dict):
     _request_cancelled = {"value": False}
 
     def _set_request_client(client, *, kind: str = "openai"):
+        late_reason = None
         with request_client_lock:
             request_client_holder["client"] = client
             request_client_kind["value"] = kind
@@ -903,9 +917,39 @@ def interruptible_api_call(agent, api_kwargs: dict):
             # only shuts the connection down rather than racing the worker
             # for FD ownership during ``client.close()``.
             request_client_holder["owner_tid"] = threading.get_ident()
+            late_reason = request_state["terminal_reason"]
+            if late_reason is not None:
+                # The deadline/cancel transition won while client creation was
+                # in flight. Abort under the registration lock so this client
+                # can never be handed to dispatch as an unguarded late request.
+                try:
+                    if kind == "anthropic_messages":
+                        agent._abort_request_anthropic_client(
+                            client, reason=late_reason
+                        )
+                    else:
+                        agent._abort_request_openai_client(
+                            client, reason=late_reason
+                        )
+                except Exception:
+                    logger.debug(
+                        "Abort after late request-client registration failed",
+                        exc_info=True,
+                    )
+        if late_reason is not None:
+            if late_reason == "interrupt_abort":
+                raise InterruptedError(
+                    "Agent interrupted before request dispatch"
+                )
+            raise TimeoutError(
+                "API call timed out before request dispatch "
+                f"[watchdog_abort_reason={late_reason}]"
+            )
         return client
 
-    def _close_request_client_once(reason: str) -> None:
+    def _close_request_client_once(
+        reason: str, *, terminal: bool = False
+    ) -> int:
         # #29507: dispatch on the calling thread.
         #
         # When ``_call`` (the worker) reaches its ``finally`` it owns the
@@ -919,6 +963,10 @@ def interruptible_api_call(agent, api_kwargs: dict):
         # BIO on the worker thread then wrote a 24-byte TLS application-data
         # record into the SQLite header (#29507).
         with request_client_lock:
+            if terminal and request_state["terminal_reason"] is None:
+                # Commit terminal ownership before inspecting/aborting client.
+                # A concurrent late registration must observe this marker.
+                request_state["terminal_reason"] = reason
             request_client = request_client_holder.get("client")
             owner_tid = request_client_holder.get("owner_tid")
             stranger_thread = (
@@ -935,21 +983,55 @@ def interruptible_api_call(agent, api_kwargs: dict):
                 # (socket shutdown + slot poison), so holding the lock across
                 # it only delays the racing pop, never the data path.
                 if request_client_kind.get("value", "openai") == "anthropic_messages":
-                    agent._abort_request_anthropic_client(
+                    shutdown_count = agent._abort_request_anthropic_client(
                         request_client, reason=reason
                     )
                 else:
-                    agent._abort_request_openai_client(request_client, reason=reason)
-                return
+                    shutdown_count = agent._abort_request_openai_client(
+                        request_client, reason=reason
+                    )
+                return max(0, int(shutdown_count or 0))
             # Owning thread (or no recorded owner) → pop and fully close.
             request_client_holder["client"] = None
             request_client_holder["owner_tid"] = None
         if request_client is None:
-            return
+            return 0
         if request_client_kind.get("value", "openai") == "anthropic_messages":
             agent._close_request_anthropic_client(request_client, reason=reason)
         else:
             agent._close_request_openai_client(request_client, reason=reason)
+        return 0
+
+    def _record_confirmed_abort(reason: str) -> None:
+        """Record a bounded abort window only after shutdown is confirmed.
+
+        ``socket.shutdown()`` can wake the worker before the abort helper
+        returns.  Capture the start before entering the helper, then publish it
+        only when the helper confirms that at least one shutdown succeeded.
+        This preserves spontaneous errors that predate the abort attempt while
+        still recognizing the transport error produced during shutdown.
+        """
+        abort_started_monotonic = time.monotonic()
+        shutdown_count = _close_request_client_once(reason, terminal=True)
+        if shutdown_count > 0:
+            request_state["confirmed_abort_reason"] = reason
+            request_state["confirmed_abort_started_monotonic"] = (
+                abort_started_monotonic
+            )
+
+    def _raise_if_interrupted() -> None:
+        """Give a request-local user interrupt priority over other outcomes."""
+        if not agent._interrupt_requested:
+            return
+        _request_cancelled["value"] = True
+        logger.debug(
+            "Force-closing httpx client due to interrupt (not a network error)."
+        )
+        try:
+            _close_request_client_once("interrupt_abort", terminal=True)
+        except Exception:
+            pass
+        raise InterruptedError("Agent interrupted during API call")
 
     def _call():
         try:
@@ -971,6 +1053,7 @@ def interruptible_api_call(agent, api_kwargs: dict):
                 ),
             )
         except Exception as e:
+            result["error_monotonic"] = time.monotonic()
             # If the request was cancelled by the main thread's interrupt
             # handler, the transport error is the expected consequence of our
             # own force-close, NOT a network bug. Swallow it instead of
@@ -1156,6 +1239,10 @@ def interruptible_api_call(agent, api_kwargs: dict):
 
         _elapsed = time.time() - _call_start
 
+        # Interrupt wins if it becomes eligible on the same polling iteration
+        # as any watchdog. This preserves user intent at timeout boundaries.
+        _raise_if_interrupted()
+
         # TTFB detector: the Codex stream has produced no event at all and
         # we're past the first-byte cutoff → the backend opened the
         # connection but isn't responding. Kill it so the retry loop can
@@ -1193,7 +1280,7 @@ def interruptible_api_call(agent, api_kwargs: dict):
                     f"Reconnecting."
                 )
             try:
-                _close_request_client_once("codex_ttfb_kill")
+                _record_confirmed_abort("codex_ttfb_kill")
             except Exception:
                 pass
             agent._emit_wait_notice(
@@ -1243,7 +1330,7 @@ def interruptible_api_call(agent, api_kwargs: dict):
                 f"Reconnecting."
             )
             try:
-                _close_request_client_once("codex_stream_idle_kill")
+                _record_confirmed_abort("codex_stream_idle_kill")
             except Exception:
                 pass
             agent._touch_activity(
@@ -1274,7 +1361,7 @@ def interruptible_api_call(agent, api_kwargs: dict):
                 # #67142: routes by client kind — anthropic now aborts the
                 # request-local client's sockets from this poll (stranger)
                 # thread instead of closing the shared _anthropic_client.
-                _close_request_client_once("stale_call_kill")
+                _record_confirmed_abort("stale_call_kill")
             except Exception:
                 pass
             # Circuit breaker (#58962): count the stale kill.  See the
@@ -1297,28 +1384,31 @@ def interruptible_api_call(agent, api_kwargs: dict):
                     )
             break
 
-        if agent._interrupt_requested:
-            # Mark THIS request cancelled before force-closing so the worker's
-            # exception handler recognizes the forced transport error as a
-            # cancel and exits cleanly instead of surfacing a network error or
-            # (in the streaming path) burning full retry cycles. (#6600)
-            _request_cancelled["value"] = True
-            logger.debug(
-                "Force-closing httpx client due to interrupt (not a network error)."
-            )
-            # Force-close the in-flight worker-local HTTP connection to stop
-            # token generation without poisoning the shared client used to
-            # seed future retries. #67142: for anthropic this aborts the
-            # request-local client's sockets from this poll (stranger) thread
-            # rather than closing the shared _anthropic_client, which could
-            # release a TLS FD mid-SSL-BIO and corrupt an unrelated SQLite DB.
-            try:
-                _close_request_client_once("interrupt_abort")
-            except Exception:
-                pass
-            raise InterruptedError("Agent interrupted during API call")
+    # The worker can finish between the final in-loop interrupt check and the
+    # next ``is_alive()`` condition. Preserve the original post-worker guard so
+    # a /stop arriving in that boundary window still owns the outcome.
+    _raise_if_interrupted()
+
     if result["error"] is not None:
-        raise result["error"]
+        worker_error = result["error"]
+        error_monotonic = result["error_monotonic"]
+        confirmed_abort_reason = request_state["confirmed_abort_reason"]
+        confirmed_abort_started_monotonic = request_state[
+            "confirmed_abort_started_monotonic"
+        ]
+        if (
+            confirmed_abort_reason is not None
+            and confirmed_abort_started_monotonic is not None
+            and error_monotonic is not None
+            and confirmed_abort_started_monotonic <= error_monotonic
+            and type(worker_error) is httpx.ReadError
+            and str(worker_error) == "[Errno 32] Broken pipe"
+        ):
+            raise TimeoutError(
+                "API call was aborted by the local watchdog "
+                f"[watchdog_abort_reason={confirmed_abort_reason}]"
+            ) from worker_error
+        raise worker_error
     # Success — clear the circuit breaker (#58962): the provider proved
     # responsive.  See the canonical comment block above ``_stale_streak()``.
     if result["response"] is not None:
