@@ -288,3 +288,115 @@ def test_write_pool_never_merges_cooldown_onto_reauthed_entry(classic_env):
     assert persisted["access_token"] == "sk-new"
     assert persisted.get("last_status") != "exhausted"
     assert persisted.get("last_error_code") is None
+
+
+# ---------------------------------------------------------------------------
+# Global-root .env fallback for provider keys (named-profile HERMES_HOME)
+# ---------------------------------------------------------------------------
+# Sibling of #18594: auth.json pool entries fall back to the global root, but
+# env-sourced Z.AI rows store only a fingerprint. The live key lives in
+# ~/.hermes/.env. A profile gateway (HERMES_HOME=~/.hermes/profiles/cfo)
+# previously read only the profile .env, sent Bearer no-key-required, and
+# Telegram showed "unexpected error" / "Provider authentication failed"
+# after /model glm-5.3.
+
+
+def test_profile_resolves_zai_key_from_global_root_env(profile_env, monkeypatch):
+    """Provider keys configured only at the global root must resolve in-profile."""
+    (profile_env["global"] / ".env").write_text(
+        "ZAI_API_KEY=sk-global-zai-root\n", encoding="utf-8"
+    )
+    (profile_env["profile"] / ".env").write_text(
+        "KIMI_API_KEY=sk-profile-only\n", encoding="utf-8"
+    )
+    for key in ("ZAI_API_KEY", "GLM_API_KEY", "Z_AI_API_KEY"):
+        monkeypatch.delenv(key, raising=False)
+
+    from hermes_cli.config import get_env_value_prefer_dotenv, invalidate_env_cache
+    from hermes_cli.auth import PROVIDER_REGISTRY, _resolve_api_key_provider_secret
+
+    invalidate_env_cache()
+
+    assert get_env_value_prefer_dotenv("ZAI_API_KEY") == "sk-global-zai-root"
+
+    key, source = _resolve_api_key_provider_secret("zai", PROVIDER_REGISTRY["zai"])
+    assert key == "sk-global-zai-root"
+    assert source == "ZAI_API_KEY"
+
+
+def test_profile_env_wins_over_global_root_provider_key(profile_env, monkeypatch):
+    (profile_env["global"] / ".env").write_text(
+        "ZAI_API_KEY=sk-global-zai\n", encoding="utf-8"
+    )
+    (profile_env["profile"] / ".env").write_text(
+        "ZAI_API_KEY=sk-profile-zai\n", encoding="utf-8"
+    )
+    monkeypatch.delenv("ZAI_API_KEY", raising=False)
+
+    from hermes_cli.config import get_env_value_prefer_dotenv, invalidate_env_cache
+
+    invalidate_env_cache()
+    assert get_env_value_prefer_dotenv("ZAI_API_KEY") == "sk-profile-zai"
+
+
+def test_global_root_env_does_not_inherit_non_provider_keys(profile_env, monkeypatch):
+    """Identity-scoped secrets stay profile-local; only provider API keys fall back."""
+    (profile_env["global"] / ".env").write_text(
+        "ZAI_API_KEY=sk-global-zai\n"
+        "SUPERMEMORY_API_KEY=sm-global\n"
+        "TELEGRAM_BOT_TOKEN=tg-global\n",
+        encoding="utf-8",
+    )
+    (profile_env["profile"] / ".env").write_text(
+        "KIMI_API_KEY=sk-kimi\n", encoding="utf-8"
+    )
+    for key in (
+        "ZAI_API_KEY",
+        "SUPERMEMORY_API_KEY",
+        "TELEGRAM_BOT_TOKEN",
+        "GLM_API_KEY",
+    ):
+        monkeypatch.delenv(key, raising=False)
+
+    from hermes_cli.config import (
+        get_env_value,
+        get_env_value_prefer_dotenv,
+        invalidate_env_cache,
+    )
+
+    invalidate_env_cache()
+    assert get_env_value_prefer_dotenv("ZAI_API_KEY") == "sk-global-zai"
+    assert not get_env_value_prefer_dotenv("SUPERMEMORY_API_KEY")
+    assert not get_env_value("SUPERMEMORY_API_KEY")
+    assert not get_env_value("TELEGRAM_BOT_TOKEN")
+
+
+def test_named_custom_zai_uses_global_root_key(profile_env, monkeypatch):
+    """config.yaml providers.zai (custom:zai) must not 401 with no-key-required."""
+    (profile_env["global"] / ".env").write_text(
+        "ZAI_API_KEY=sk-global-zai-root\n", encoding="utf-8"
+    )
+    (profile_env["profile"] / ".env").write_text(
+        "KIMI_API_KEY=sk-profile-only\n", encoding="utf-8"
+    )
+    (profile_env["profile"] / "config.yaml").write_text(
+        "providers:\n"
+        "  zai:\n"
+        "    api: https://api.z.ai/api/coding/paas/v4\n"
+        "    default_model: glm-5.3\n"
+        "    key_env: ZAI_API_KEY\n"
+        "    models:\n"
+        "      - glm-5.3\n",
+        encoding="utf-8",
+    )
+    for key in ("ZAI_API_KEY", "GLM_API_KEY", "Z_AI_API_KEY"):
+        monkeypatch.delenv(key, raising=False)
+
+    from hermes_cli.config import invalidate_env_cache
+    from hermes_cli.runtime_provider import _get_named_custom_provider
+
+    invalidate_env_cache()
+    entry = _get_named_custom_provider("custom:zai")
+    assert entry is not None
+    assert entry.get("base_url") == "https://api.z.ai/api/coding/paas/v4"
+    assert entry.get("api_key") == "sk-global-zai-root"

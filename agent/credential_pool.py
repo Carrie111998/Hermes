@@ -2861,6 +2861,13 @@ def _seed_from_singletons(provider: str, entries: List[PooledCredential]) -> Tup
 def get_env_prefer_dotenv(key: str) -> str:
     env_file = load_env()
     raw = env_file.get(key, "").strip()
+    if not raw:
+        try:
+            from hermes_cli.config import get_global_root_env_value
+
+            raw = (get_global_root_env_value(key) or "").strip()
+        except Exception:
+            raw = ""
     scoped_value = (_get_secret(key, "") or "").strip()
     # If .env contains an unresolved op:// reference, prefer the
     # already-resolved value supplied by the active secret scope (or by

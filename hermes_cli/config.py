@@ -3832,6 +3832,7 @@ def load_env() -> Dict[str, str]:
 # (set_env_value, save_env, etc.) without relying on filesystem mtime
 # resolution.
 _env_cache: Optional[Tuple[Tuple[str, Optional[float], Optional[int]], Dict[str, str]]] = None
+_global_env_cache: Optional[Tuple[Tuple[str, Optional[float], Optional[int]], Dict[str, str]]] = None
 
 
 def invalidate_env_cache() -> None:
@@ -3842,8 +3843,112 @@ def invalidate_env_cache() -> None:
     filesystems with coarse mtime resolution. Reads invalidate naturally
     via the mtime/size check.
     """
-    global _env_cache
+    global _env_cache, _global_env_cache
     _env_cache = None
+    _global_env_cache = None
+
+
+def _global_root_env_path() -> Optional[Path]:
+    """Return the global-root ``.env`` when HERMES_HOME is a named profile.
+
+    ``None`` in classic mode (profile home == global root) so we do not
+    double-read the same file. Mirrors ``hermes_cli.auth._global_auth_file_path``.
+    """
+    try:
+        from hermes_constants import get_default_hermes_root, get_hermes_home
+
+        global_root = get_default_hermes_root()
+        profile_home = get_hermes_home()
+        if profile_home.resolve(strict=False) == global_root.resolve(strict=False):
+            return None
+        return global_root / ".env"
+    except Exception:
+        return None
+
+
+def _is_provider_api_key_env(key: str) -> bool:
+    """True for env vars that belong to a registered LLM provider.
+
+    Identity-scoped secrets (SUPERMEMORY_*, TELEGRAM_BOT_TOKEN, Discord
+    tokens) must stay profile-local. Only provider API keys fall back to
+    the global-root ``.env`` — the #18594 sibling of auth.json pool
+    fallback.
+    """
+    if not key:
+        return False
+    try:
+        from hermes_cli.auth import PROVIDER_REGISTRY
+
+        for pcfg in PROVIDER_REGISTRY.values():
+            if key in (getattr(pcfg, "api_key_env_vars", None) or ()):
+                return True
+    except Exception:
+        return key in {"GLM_API_KEY", "ZAI_API_KEY", "Z_AI_API_KEY"}
+    return False
+
+
+def load_global_root_env() -> Dict[str, str]:
+    """Read-only parse of the global-root ``.env`` for named-profile processes.
+
+    Under pytest, refuses the real user's ``~/.hermes/.env`` the same way
+    ``_load_global_auth_store`` does, so a mis-isolated test cannot leak
+    live credentials into the suite.
+    """
+    global _global_env_cache
+    path = _global_root_env_path()
+    if path is None:
+        return {}
+    if os.environ.get("PYTEST_CURRENT_TEST"):
+        real_home_env = os.environ.get("HOME", "")
+        if real_home_env:
+            real_env = Path(real_home_env) / ".hermes" / ".env"
+            try:
+                if path.resolve(strict=False) == real_env.resolve(strict=False):
+                    return {}
+            except Exception:
+                pass
+
+    try:
+        mtime = path.stat().st_mtime
+        size = path.stat().st_size
+        cache_key = (str(path), mtime, size)
+    except FileNotFoundError:
+        return {}
+    except Exception:
+        cache_key = None
+
+    if cache_key is not None and _global_env_cache is not None:
+        cached_key, cached_vars = _global_env_cache
+        if cached_key == cache_key:
+            return dict(cached_vars)
+
+    env_vars: Dict[str, str] = {}
+    if path.exists():
+        open_kw = {"encoding": "utf-8-sig", "errors": "replace"}
+        with open(path, **open_kw) as f:
+            raw_lines = f.readlines()
+        for line in _sanitize_env_lines(raw_lines):
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                if line.startswith("export "):
+                    line = line[7:]
+                key, _, value = line.partition("=")
+                env_vars[key.strip()] = _parse_env_value(value)
+
+    if cache_key is not None:
+        _global_env_cache = (cache_key, dict(env_vars))
+    return env_vars
+
+
+def get_global_root_env_value(key: str) -> Optional[str]:
+    """Return a provider API key from the global-root ``.env``, or None.
+
+    Non-provider keys are never inherited. Empty / missing values return None.
+    """
+    if not _is_provider_api_key_env(key):
+        return None
+    val = (load_global_root_env().get(key) or "").strip()
+    return val or None
 
 
 def _sanitize_env_lines(lines: list) -> list:
@@ -4282,11 +4387,23 @@ def get_env_value_prefer_dotenv(key: str) -> Optional[str]:
     that, under an active profile scope (multiplexed gateway turn), this read
     is scope-checked rather than leaking another profile's raw ``os.environ``
     value — matching the credential-pool seeding path's behaviour.
+
+    When ``HERMES_HOME`` is a named profile, provider API keys that are
+    missing from the profile ``.env`` fall back to the global-root
+    ``~/.hermes/.env`` (the #18594 sibling of ``read_credential_pool``).
+    Identity-scoped secrets are not inherited.
     """
     env_vars = load_env()
     val = env_vars.get(key)
     if val:
         return val
+    # Named-profile HERMES_HOME only sees <profile>/.env via load_env().
+    # Provider keys configured at the global root (the live Z.AI / GLM
+    # coding-plan key) must still resolve — otherwise /model glm-5.3
+    # succeeds and the next turn 401s with Bearer no-key-required.
+    global_val = get_global_root_env_value(key)
+    if global_val:
+        return global_val
     try:
         from agent.secret_scope import (
             UnscopedSecretError,

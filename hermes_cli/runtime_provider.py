@@ -723,6 +723,19 @@ def _get_named_custom_provider(requested_provider: str) -> Optional[Dict[str, An
             # Resolve the API key from the env var name stored in key_env
             key_env = str(entry.get("key_env", "") or "").strip()
             resolved_api_key = _getenv(key_env, "").strip() if key_env else ""
+            # Profile-scoped getenv misses keys that live only in the
+            # global-root .env (named-profile HERMES_HOME). Re-read through
+            # the provider-key dotenv chain so custom:zai / providers.zai
+            # does not send Bearer no-key-required.
+            if not resolved_api_key and key_env:
+                try:
+                    from hermes_cli.config import get_env_value_prefer_dotenv
+
+                    resolved_api_key = (
+                        get_env_value_prefer_dotenv(key_env) or ""
+                    ).strip()
+                except Exception:
+                    resolved_api_key = ""
             # Fall back to inline api_key when key_env is absent or unresolvable
             if not resolved_api_key:
                 resolved_api_key = str(entry.get("api_key", "") or "").strip()
@@ -739,6 +752,7 @@ def _get_named_custom_provider(requested_provider: str) -> Optional[Dict[str, An
                         "name": entry.get("name", ep_name),
                         "base_url": base_url.strip(),
                         "api_key": resolved_api_key,
+                        "key_env": key_env,
                         "model": entry.get("default_model", ""),
                     }
                     extra_body = entry.get("extra_body")
@@ -1139,10 +1153,20 @@ def _resolve_named_custom_runtime(
 
     _cp_is_openai_url   = base_url_host_matches(base_url, "openai.com") or base_url_host_matches(base_url, "openai.azure.com")
     _cp_is_openrouter   = base_url_host_matches(base_url, "openrouter.ai")
+    _cp_key_env = str(custom_provider.get("key_env", "") or "").strip()
+    _cp_dotenv_key = ""
+    if _cp_key_env:
+        try:
+            from hermes_cli.config import get_env_value_prefer_dotenv
+
+            _cp_dotenv_key = (get_env_value_prefer_dotenv(_cp_key_env) or "").strip()
+        except Exception:
+            _cp_dotenv_key = ""
     api_key_candidates = [
         (explicit_api_key or "").strip(),
         str(custom_provider.get("api_key", "") or "").strip(),
-        _getenv(str(custom_provider.get("key_env", "") or "").strip(), "").strip(),
+        _getenv(_cp_key_env, "").strip(),
+        _cp_dotenv_key,
         # Gate provider env keys on their authoritative hosts — sending
         # OPENAI_API_KEY to a local-llm endpoint leaks credentials (#28660).
         (_getenv("OPENAI_API_KEY", "").strip()     if _cp_is_openai_url  else ""),

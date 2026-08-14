@@ -6457,6 +6457,15 @@ def resolve_provider_client(
             custom_key_env = (custom_entry.get("key_env") or custom_entry.get("api_key_env") or "").strip()
             if not custom_key and custom_key_env:
                 custom_key = _scoped_key_env(custom_key_env)
+            if not custom_key and custom_key_env:
+                try:
+                    from hermes_cli.config import get_env_value_prefer_dotenv
+
+                    custom_key = (
+                        get_env_value_prefer_dotenv(custom_key_env) or ""
+                    ).strip()
+                except Exception:
+                    custom_key = ""
             custom_key = custom_key or "no-key-required"
             if custom_key == "no-key-required":
                 logger.warning(
