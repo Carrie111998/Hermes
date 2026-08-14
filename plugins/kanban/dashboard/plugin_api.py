@@ -665,6 +665,7 @@ class CreateTaskBody(BaseModel):
     parents: list[str] = Field(default_factory=list)
     triage: bool = False
     idempotency_key: Optional[str] = None
+    initial_status: str = "running"
     max_runtime_seconds: Optional[int] = None
     skills: Optional[list[str]] = None
     goal_mode: bool = False
@@ -697,6 +698,7 @@ def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
             parents=payload.parents,
             triage=payload.triage,
             idempotency_key=payload.idempotency_key,
+            initial_status=payload.initial_status,
             max_runtime_seconds=payload.max_runtime_seconds,
             skills=payload.skills,
             goal_mode=payload.goal_mode,
@@ -886,6 +888,7 @@ def remove_attachment(attachment_id: int, board: Optional[str] = Query(None)):
 
 class UpdateTaskBody(BaseModel):
     status: Optional[str] = None
+    transition_reason: Optional[str] = None
     assignee: Optional[str] = None
     priority: Optional[int] = None
     title: Optional[str] = None
@@ -955,6 +958,7 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
         if payload.status is not None:
             s = payload.status
             ok = True
+            transition_error: Optional[str] = None
             if s == "done":
                 ok = kanban_db.complete_task(
                     conn, task_id,
@@ -999,15 +1003,45 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
                     status_code=400,
                     detail="Cannot set status to 'running' directly; use the dispatcher/claim path",
                 )
-            elif s in ("todo", "triage", "scheduled"):
-                # Only a review task moving to 'todo' needs the reopen
-                # transition; fetch lazily so triage/scheduled skip the query.
-                current = kanban_db.get_task(conn, task_id) if s == "todo" else None
-                reopened = _reopen_if_review(conn, task_id, current)
-                ok = reopened if reopened is not None else _set_status_direct(conn, task_id, s)
+            elif s in ("todo", "triage"):
+                # Only review -> todo uses the dedicated review-reopen path.
+                # Every other todo/triage request goes through the audited
+                # automation transition so active, blocked, scheduled, and
+                # terminal lifecycle rules cannot be bypassed by drag/drop.
+                current = kanban_db.get_task(conn, task_id)
+                reopened = (
+                    _reopen_if_review(conn, task_id, current)
+                    if s == "todo"
+                    else None
+                )
+                if reopened is not None:
+                    ok = reopened
+                elif (
+                    s == "todo"
+                    and current is not None
+                    and current.status in {"done", "archived"}
+                ):
+                    # Preserve the established completed-parent reopen path:
+                    # _set_status_direct owns descendant invalidation and run
+                    # cleanup for this deliberate operator recovery action.
+                    ok = _set_status_direct(conn, task_id, s)
+                else:
+                    transition = kanban_db.transition_task_status(
+                        conn,
+                        task_id,
+                        target_status=s,
+                        # Audit identity is transport-derived, never accepted
+                        # from the request body where it could be spoofed.
+                        actor="dashboard",
+                        reason=payload.transition_reason,
+                    )
+                    ok = transition.ok
+                    transition_error = transition.error
             else:
                 raise HTTPException(status_code=400, detail=f"unknown status: {s}")
             if not ok:
+                if transition_error:
+                    raise HTTPException(status_code=409, detail=transition_error)
                 # For ``ready``, name the blocking parent(s) so the dashboard
                 # can render an actionable toast instead of a silent no-op.
                 # See #26744.
@@ -1235,11 +1269,13 @@ def _set_status_direct(
 
         cur = conn.execute(
             "UPDATE tasks SET status = ?, "
+            "  manual_hold = CASE WHEN ? = 'todo' THEN 1 ELSE 0 END, "
             "  claim_lock = CASE WHEN ? = 'running' THEN claim_lock ELSE NULL END, "
             "  claim_expires = CASE WHEN ? = 'running' THEN claim_expires ELSE NULL END, "
             "  worker_pid = CASE WHEN ? = 'running' THEN worker_pid ELSE NULL END "
             "WHERE id = ?",
             (
+                effective_status,
                 effective_status,
                 effective_status,
                 effective_status,
@@ -1356,6 +1392,7 @@ def delete_link(
 class BulkTaskBody(BaseModel):
     ids: list[str]
     status: Optional[str] = None
+    transition_reason: Optional[str] = None
     assignee: Optional[str] = None  # "" or None = unassign
     priority: Optional[int] = None
     archive: bool = False
@@ -1399,6 +1436,7 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
                         entry.update(ok=False, error="archive refused")
                 if payload.status is not None and not payload.archive:
                     s = payload.status
+                    transition_error: Optional[str] = None
                     if s == "done":
                         ok = kanban_db.complete_task(
                             conn, tid,
@@ -1437,16 +1475,54 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
                     elif s == "scheduled":
                         ok = kanban_db.schedule_task(conn, tid)
                     elif s in {"todo", "triage"}:
-                        # Fetch lazily: only review->todo needs reopen.
-                        cur = kanban_db.get_task(conn, tid) if s == "todo" else None
-                        reopened = _reopen_if_review(conn, tid, cur)
-                        ok = reopened if reopened is not None else _set_status_direct(conn, tid, s)
+                        # Match the single-card path: review -> todo uses the
+                        # review lifecycle; all other todo/triage requests use
+                        # the audited automation transition and fail closed for
+                        # active/blocked/scheduled/terminal cards.
+                        cur = kanban_db.get_task(conn, tid)
+                        reopened = (
+                            _reopen_if_review(conn, tid, cur)
+                            if s == "todo"
+                            else None
+                        )
+                        if reopened is not None:
+                            ok = reopened
+                        elif (
+                            s == "todo"
+                            and cur is not None
+                            and cur.status in {"done", "archived"}
+                        ):
+                            # Deliberate completed-parent reopen; mirrors the
+                            # single-card path and invalidates descendants.
+                            ok = _set_status_direct(conn, tid, s)
+                        else:
+                            transition = kanban_db.transition_task_status(
+                                conn,
+                                tid,
+                                target_status=s,
+                                actor="dashboard",
+                                reason=payload.transition_reason,
+                            )
+                            ok = transition.ok
+                            transition_error = transition.error
                     else:
                         entry.update(ok=False, error=f"unknown status {s!r}")
                         results.append(entry)
                         continue
                     if not ok:
-                        entry.update(ok=False, error=f"transition to {s!r} refused")
+                        entry.update(
+                            ok=False,
+                            error=(
+                                transition_error
+                                or f"transition to {s!r} refused"
+                            ),
+                        )
+                        if transition_error:
+                            # Match single-card PATCH fail-closed semantics:
+                            # do not partially apply unrelated fields after a
+                            # refused lifecycle transition on this card.
+                            results.append(entry)
+                            continue
                 if payload.assignee is not None:
                     try:
                         if payload.reclaim_first:

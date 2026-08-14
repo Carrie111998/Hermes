@@ -122,6 +122,132 @@ def test_create_task_appears_on_board(client):
     assert "researcher" in data["assignees"]
 
 
+def test_api_reuses_held_todo_then_audits_transition_to_triage(client):
+    create_payload = {
+        "title": "LinkedIn M/W/F weekly post",
+        "assignee": "publisher",
+        "initial_status": "todo",
+        "idempotency_key": "linkedin-post:2026-W33",
+    }
+    first = client.post("/api/plugins/kanban/tasks", json=create_payload)
+    assert first.status_code == 200, first.text
+    task = first.json()["task"]
+    assert task["status"] == "todo"
+
+    reused = client.post("/api/plugins/kanban/tasks", json=create_payload)
+    assert reused.status_code == 200, reused.text
+    assert reused.json()["task"]["id"] == task["id"]
+
+    transitioned = client.patch(
+        f"/api/plugins/kanban/tasks/{task['id']}",
+        json={
+            "status": "triage",
+            # Untrusted caller labels must not become audit identity.
+            "transition_actor": "linkedin-analytics-cron",
+            "transition_reason": "Friday analytics started",
+        },
+    )
+    assert transitioned.status_code == 200, transitioned.text
+    assert transitioned.json()["task"]["status"] == "triage"
+
+    detail = client.get(
+        f"/api/plugins/kanban/tasks/{task['id']}"
+    ).json()
+    events = [
+        event for event in detail["events"]
+        if event["kind"] == "status_transitioned"
+    ]
+    assert len(events) == 1
+    assert events[0]["payload"] == {
+        "source_status": "todo",
+        "target_status": "triage",
+        "actor": "dashboard",
+        "reason": "Friday analytics started",
+    }
+
+    with kb.connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 1
+
+
+def test_api_transition_refuses_running_task_instead_of_direct_status_write(client):
+    created = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "active work", "assignee": "publisher"},
+    )
+    assert created.status_code == 200, created.text
+    task_id = created.json()["task"]["id"]
+
+    with kb.connect() as conn:
+        claimed = kb.claim_task(conn, task_id)
+        assert claimed is not None
+
+    response = client.patch(
+        f"/api/plugins/kanban/tasks/{task_id}",
+        json={
+            "status": "triage",
+            "transition_actor": "linkedin-analytics-cron",
+            "transition_reason": "Friday analytics started",
+        },
+    )
+    assert response.status_code == 409, response.text
+
+    with kb.connect() as conn:
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.status == "running"
+        assert not any(
+            event.kind == "status_transitioned"
+            for event in kb.list_events(conn, task_id)
+        )
+
+
+def test_bulk_transition_refusal_does_not_apply_unrelated_fields(client):
+    created = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "active bulk work", "assignee": "publisher"},
+    )
+    assert created.status_code == 200, created.text
+    task_id = created.json()["task"]["id"]
+
+    with kb.connect() as conn:
+        assert kb.claim_task(conn, task_id) is not None
+
+    response = client.post(
+        "/api/plugins/kanban/tasks/bulk",
+        json={
+            "ids": [task_id],
+            "status": "triage",
+            "transition_reason": "Friday analytics started",
+            "priority": 99,
+        },
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["results"] == [
+        {
+            "id": task_id,
+            "ok": False,
+            "error": (
+                f"task {task_id} is 'running'; todo/triage transitions only "
+                "apply to unclaimed 'ready', 'todo', or 'triage' tasks"
+            ),
+        }
+    ]
+
+    with kb.connect() as conn:
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.status == "running"
+        assert task.priority == 0
+
+
+def test_api_rejects_unknown_initial_status(client):
+    response = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "bad lane", "initial_status": "running-now"},
+    )
+    assert response.status_code == 400, response.text
+
+
 def test_patch_board_sets_project_directory(client, tmp_path):
     """Board-level default_workdir must be editable after creation."""
     kb.create_board("late-config")
