@@ -85,6 +85,10 @@ def whatsapp_throttle_path() -> Path:
     return notifications_home() / "whatsapp_throttle.json"
 
 
+def rate_limit_state_path() -> Path:
+    return notifications_home() / "rate_limit_episode_state.json"
+
+
 def cron_stale_thresholds_path() -> Path:
     """Optional per-job stale-threshold overrides (CronStaleMonitor).
 
