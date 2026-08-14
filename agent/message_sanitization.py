@@ -475,6 +475,116 @@ def _sanitize_structure_non_ascii(payload: Any) -> bool:
     return found
 
 
+_MISSING_TOOL_RESULT_CONTENT = "[Result unavailable — see context summary above]"
+
+
+def normalize_tool_transaction_adjacency(
+    messages: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], int, int]:
+    """Make every Chat Completions tool transaction locally complete.
+
+    Strict OpenAI-compatible providers require the ``tool`` messages for an
+    assistant's ``tool_calls`` to appear immediately after that assistant
+    message, before any other role.  A global call-id/result-id set is not
+    sufficient: a result hundreds of messages later cannot satisfy an earlier
+    assistant turn.
+
+    This copy-on-write pass treats each assistant plus its immediately
+    following run of tool messages as one transaction.  It:
+
+    * preserves one matching result per call in its existing order;
+    * inserts a deterministic placeholder for each locally missing result;
+    * drops duplicate, mismatched, and standalone tool results.
+
+    The original list and message dictionaries are returned untouched when
+    the transaction layout is already valid.  The counters are
+    ``(inserted_stubs, dropped_results)``.
+    """
+    repaired: list[dict[str, Any]] = []
+    inserted_stubs = 0
+    dropped_results = 0
+    changed = False
+    index = 0
+
+    while index < len(messages):
+        message = messages[index]
+        role = message.get("role") if isinstance(message, dict) else None
+        tool_calls = (
+            message.get("tool_calls")
+            if isinstance(message, dict) and role == "assistant"
+            else None
+        )
+
+        if not (isinstance(tool_calls, list) and tool_calls):
+            if role == "tool":
+                # A tool result outside the immediately preceding assistant
+                # transaction can never be accepted by strict providers.
+                dropped_results += 1
+                changed = True
+            else:
+                repaired.append(message)
+            index += 1
+            continue
+
+        repaired.append(message)
+        expected: list[tuple[str, str]] = []
+        expected_ids: set[str] = set()
+        for tool_call in tool_calls:
+            call_id = coalesce_tool_call_id(tool_call)
+            if not call_id or call_id in expected_ids:
+                continue
+            expected_ids.add(call_id)
+            if isinstance(tool_call, dict):
+                function = tool_call.get("function")
+                name = function.get("name", "") if isinstance(function, dict) else ""
+            else:
+                function = getattr(tool_call, "function", None)
+                name = getattr(function, "name", "") if function is not None else ""
+            expected.append((call_id, name if isinstance(name, str) else ""))
+
+        result_by_id: dict[str, dict[str, Any]] = {}
+        encountered_results: list[dict[str, Any]] = []
+        cursor = index + 1
+        while cursor < len(messages):
+            candidate = messages[cursor]
+            candidate_role = (
+                candidate.get("role") if isinstance(candidate, dict) else None
+            )
+            if candidate_role != "tool":
+                break
+            result_id = (candidate.get("tool_call_id") or "").strip()
+            if result_id in expected_ids and result_id not in result_by_id:
+                result_by_id[result_id] = candidate
+                encountered_results.append(candidate)
+            else:
+                dropped_results += 1
+                changed = True
+            cursor += 1
+
+        # Existing result order is semantically valid because each message
+        # carries its pairing id.  Preserve it to avoid needless prompt-prefix
+        # churn; only append placeholders for ids absent from this local block.
+        repaired.extend(encountered_results)
+
+        for call_id, name in expected:
+            if call_id in result_by_id:
+                continue
+            repaired.append({
+                "role": "tool",
+                "name": name,
+                "content": _MISSING_TOOL_RESULT_CONTENT,
+                "tool_call_id": call_id,
+            })
+            inserted_stubs += 1
+            changed = True
+
+        index = cursor
+
+    if not changed:
+        return messages, 0, 0
+    return repaired, inserted_stubs, dropped_results
+
+
 __all__ = [
     "_SURROGATE_RE",
     "close_interrupted_tool_sequence",
@@ -488,6 +598,7 @@ __all__ = [
     "_sanitize_tools_non_ascii",
     "_strip_images_from_messages",
     "_sanitize_structure_non_ascii",
+    "normalize_tool_transaction_adjacency",
     # call_id policy owners (F4 consolidation)
     "deterministic_call_id",
     "coalesce_tool_call_id",

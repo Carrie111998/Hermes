@@ -356,6 +356,112 @@ def test_sanitize_drops_empty_tool_calls_array():
     assert assistant["content"] == "answer"
 
 
+def test_sanitize_dedup_does_not_create_empty_tool_calls_array():
+    """A later assistant call whose id is entirely duplicate must not leave
+    ``tool_calls: []`` after the de-duplication pass.
+
+    DeepSeek validates the final serialized request, so an empty array created
+    inside the sanitizer is just as invalid as one loaded from history.
+    """
+    from agent.agent_runtime_helpers import sanitize_api_messages
+
+    duplicate_call = {
+        "id": "call_duplicate",
+        "type": "function",
+        "function": {"name": "terminal", "arguments": "{}"},
+    }
+    messages = [
+        {"role": "assistant", "content": None, "tool_calls": [duplicate_call]},
+        {"role": "tool", "tool_call_id": "call_duplicate", "content": "ok"},
+        {
+            "role": "assistant",
+            "content": "final answer",
+            "tool_calls": [duplicate_call],
+        },
+        {"role": "user", "content": "next"},
+    ]
+
+    out = sanitize_api_messages(messages)
+
+    final_answer = next(m for m in out if m.get("content") == "final answer")
+    assert "tool_calls" not in final_answer
+    assert all(m.get("tool_calls") != [] for m in out)
+
+
+def test_sanitize_repairs_results_that_exist_only_later_in_history():
+    """A global result-id match cannot satisfy a tool call locally.
+
+    Reproduces the long-session DeepSeek failure where de-duplication retained
+    an early call, while its only matching result remained hundreds of turns
+    later.  The outgoing transaction must receive an immediate stub and the
+    late standalone result must be removed.
+    """
+    from agent.agent_runtime_helpers import sanitize_api_messages
+
+    messages = [
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_late",
+                    "type": "function",
+                    "function": {"name": "terminal", "arguments": "{}"},
+                },
+                {
+                    "id": "call_here",
+                    "type": "function",
+                    "function": {"name": "terminal", "arguments": "{}"},
+                },
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_here", "content": "local"},
+        {"role": "assistant", "content": "intervening answer"},
+        {"role": "tool", "tool_call_id": "call_late", "content": "too late"},
+        {"role": "user", "content": "continue"},
+    ]
+
+    out = sanitize_api_messages(messages)
+
+    first_assistant = next(i for i, msg in enumerate(out) if msg.get("tool_calls"))
+    adjacent = out[first_assistant + 1:first_assistant + 3]
+    assert [msg["tool_call_id"] for msg in adjacent] == ["call_here", "call_late"]
+    assert adjacent[0]["content"] == "local"
+    assert adjacent[1]["content"] == "[Result unavailable — see context summary above]"
+    assert not any(msg.get("content") == "too late" for msg in out)
+
+
+def test_sanitize_preserves_complete_adjacent_tool_transaction_by_identity():
+    """Healthy transactions remain byte- and object-identical."""
+    from agent.agent_runtime_helpers import sanitize_api_messages
+
+    messages = [
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_a",
+                    "type": "function",
+                    "function": {"name": "a", "arguments": "{}"},
+                },
+                {
+                    "id": "call_b",
+                    "type": "function",
+                    "function": {"name": "b", "arguments": "{}"},
+                },
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_b", "content": "B"},
+        {"role": "tool", "tool_call_id": "call_a", "content": "A"},
+    ]
+
+    out = sanitize_api_messages(messages)
+
+    assert len(out) == len(messages)
+    assert all(actual is original for actual, original in zip(out, messages))
+
+
 
 
 
@@ -368,9 +474,6 @@ def test_sanitize_drops_empty_tool_calls_array():
 # "all messages must have non-empty content except for the optional final
 # assistant message" (INVALID_REQUEST_BODY). sanitize_api_messages now heals
 # such turns on the per-call copy so the session recovers itself in memory.
-
-
-
 
 
 

@@ -249,6 +249,10 @@ class ChatCompletionsTransport(ProviderTransport):
           gateways (e.g. opencode-go, codex.nekos.me) reject with
           ``Extra inputs are not permitted, field: 'messages[N]._empty_recovery_synthetic'``,
           which then poisons every subsequent request in the session.
+        - Empty or malformed ``tool_calls`` fields on assistant messages.
+          This is the last chat-completions wire boundary, so it defends
+          against any upstream history repair or middleware pass that creates
+          ``tool_calls: []`` after the main sanitizer has already run.
         """
         strip_extra_content = not _model_consumes_thought_signature(
             kwargs.get("model")
@@ -271,6 +275,13 @@ class ChatCompletionsTransport(ProviderTransport):
                 needs_sanitize = True
                 break
             tool_calls = msg.get("tool_calls")
+            if (
+                msg.get("role") == "assistant"
+                and "tool_calls" in msg
+                and not (isinstance(tool_calls, list) and tool_calls)
+            ):
+                needs_sanitize = True
+                break
             if isinstance(tool_calls, list):
                 for tc in tool_calls:
                     if isinstance(tc, dict) and (
@@ -284,7 +295,9 @@ class ChatCompletionsTransport(ProviderTransport):
                     break
 
         if not needs_sanitize:
-            return messages
+            from agent.message_sanitization import normalize_tool_transaction_adjacency
+
+            return normalize_tool_transaction_adjacency(messages)[0]
 
         sanitized = list(messages)
         for msg_idx, msg in enumerate(messages):
@@ -327,6 +340,13 @@ class ChatCompletionsTransport(ProviderTransport):
                     out_msg.pop(key, None)
 
             tool_calls = msg.get("tool_calls")
+            if (
+                msg.get("role") == "assistant"
+                and "tool_calls" in msg
+                and not (isinstance(tool_calls, list) and tool_calls)
+            ):
+                mutable_msg().pop("tool_calls", None)
+                tool_calls = None
             if isinstance(tool_calls, list):
                 copied_tool_calls: list[Any] | None = None
                 for tc_idx, tc in enumerate(tool_calls):
@@ -347,7 +367,12 @@ class ChatCompletionsTransport(ProviderTransport):
                             copied_tool_calls[tc_idx] = copied_tc
                 if copied_tool_calls is not None:
                     mutable_msg()["tool_calls"] = copied_tool_calls
-        return sanitized
+        # Final wire invariant: even if an upstream sanitizer is bypassed or
+        # later middleware reorders history, never emit an assistant tool call
+        # without its complete, immediately adjacent tool-result block.
+        from agent.message_sanitization import normalize_tool_transaction_adjacency
+
+        return normalize_tool_transaction_adjacency(sanitized)[0]
 
     def convert_tools(self, tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Tools are already in OpenAI format — identity."""
