@@ -4563,6 +4563,40 @@ class TestThreadAttachmentContext:
         a._download_slack_file_bytes.assert_not_awaited()
 
     @pytest.mark.asyncio
+    async def test_markerless_third_party_bot_root_requires_authorization(
+        self, adapter_with_session_store
+    ):
+        """Slack may omit bot_id/subtype and expose only a bot user ID. The
+        workspace-scoped users.info identity cache must still put that root on
+        the fail-closed third-party bot path."""
+        a = self._prep(adapter_with_session_store)
+        a.set_authorization_check(None)
+        a._user_is_bot_cache[("T_TEAM", "U_EXTERNAL_BOT")] = True
+        a._user_name_cache[("T_TEAM", "U_EXTERNAL_BOT")] = "Workflow Bot"
+        a._download_slack_file_bytes = AsyncMock(return_value=b"%PDF-1.7\n")
+        a._app.client.conversations_replies = self._replies(
+            root_user="U_EXTERNAL_BOT",
+            root_files=[
+                {
+                    "id": "F_MARKERLESS_BOT",
+                    "name": "markerless.pdf",
+                    "mimetype": "application/pdf",
+                    "size": 1024,
+                    "url_private_download": "https://files.slack.com/T1-FMARKERLESS/file.pdf",
+                }
+            ],
+        )
+
+        await a._handle_slack_message(self._thread_event())
+
+        msg_event = a.handle_message.await_args.args[0]
+        assert msg_event.media_urls == []
+        assert "unverified bot sender" in msg_event.text
+        assert '"uploader_kind": "bot"' in msg_event.channel_context
+        assert '"uploader_trust": "unverified"' in msg_event.channel_context
+        a._download_slack_file_bytes.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_self_bot_root_attachment_remains_trusted(
         self, adapter_with_session_store
     ):

@@ -8200,14 +8200,27 @@ class SlackAdapter(BasePlatformAdapter):
             )
 
         root_user_id = _safe_slack_actor_id(root.get("user"))
-        is_bot_root = bool(root.get("bot_id")) or root.get("subtype") == "bot_message"
-        uploader_kind = "bot" if is_bot_root else "user"
+        declared_bot_root = (
+            bool(root.get("bot_id")) or root.get("subtype") == "bot_message"
+        )
         self_bot_uid = (
             self._team_bot_user_ids.get(team_id) if team_id else None
         ) or self._bot_user_id
         is_self_bot_root = bool(
-            is_bot_root and root_user_id and self_bot_uid and root_user_id == self_bot_uid
+            root_user_id and self_bot_uid and root_user_id == self_bot_uid
         )
+        is_bot_root = declared_bot_root or is_self_bot_root
+        if not is_bot_root and root_user_id:
+            # Some Slack app posts carry only a bot user ID. The thread text
+            # formatter has already populated this workspace-scoped identity
+            # cache in the common path; resolve on cache miss so a missing
+            # bot_id/subtype cannot downgrade a third-party bot to a human.
+            is_bot_root = await self._resolve_user_is_bot(
+                root_user_id,
+                chat_id=channel_id,
+                team_id=team_id,
+            )
+        uploader_kind = "bot" if is_bot_root else "user"
         root_authorized: Optional[bool] = None
         if is_self_bot_root:
             uploader_trust = "self_bot"
