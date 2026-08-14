@@ -1,23 +1,22 @@
-"""Frozen row types for durable Epic-member integration intents.
-
-This module deliberately owns no enqueue, claim, lifecycle, or Git behavior.
-It only turns persisted rows into strict immutable values for later coordinator
-cards to consume.
-"""
+"""Durable Epic-member integration intent state and claim authority."""
 
 from __future__ import annotations
 
 import re
+import secrets
 import sqlite3
 import time
 from dataclasses import dataclass
-from typing import Any, Literal, Mapping, TypeAlias, cast
+from typing import Any, Callable, Literal, Mapping, TypeAlias, cast
 
 from hermes_cli.kanban_product_outcomes import (
     ApprovedCandidate,
     CandidateEligibility,
+    CandidateEligibilityError,
     PassedTest,
+    candidate_eligibility,
 )
+from hermes_cli.kanban_repository import RepositoryContract
 
 
 IntegrationStatus: TypeAlias = Literal[
@@ -153,6 +152,191 @@ def integration_intent_from_row(row: Row) -> IntegrationIntent:
         created_at=_integer(row, "created_at"),
         updated_at=_integer(row, "updated_at"),
     )
+
+
+def claim_next_intent(
+    conn: sqlite3.Connection,
+    owner: str,
+    lease_seconds: int,
+    *,
+    board: str | None = None,
+    repository_check: Callable[
+        [RepositoryContract, ApprovedCandidate, PassedTest], CandidateEligibility
+    ]
+    | None = None,
+) -> IntegrationIntent | None:
+    """Claim one intent and re-derive its authority before repository access.
+
+    An unexpired running row excludes every other intent on the board. Expired
+    work is selected before new work so recovery stays on the same composite
+    intent. Persisted intent fields are comparison inputs, never authority.
+    """
+
+    from hermes_cli import kanban_db as kb
+
+    owner_text = str(owner or "").strip()
+    if not owner_text:
+        raise ValueError("integration claim owner is required")
+    if isinstance(lease_seconds, bool) or int(lease_seconds) <= 0:
+        raise ValueError("integration claim lease must be positive")
+
+    now = int(time.time())
+    claim_lock = f"{owner_text}:{secrets.token_hex(8)}"
+    with kb.authorized_governance_write(), kb.write_txn(conn):
+        active = conn.execute(
+            "SELECT 1 FROM story_integration_intents "
+            "WHERE status='running' "
+            "AND (claim_expires IS NULL OR claim_expires>?) LIMIT 1",
+            (now,),
+        ).fetchone()
+        if active is not None:
+            return None
+        row = conn.execute(
+            "SELECT * FROM story_integration_intents "
+            "WHERE status='pending' "
+            "OR (status='running' AND claim_expires IS NOT NULL AND claim_expires<=?) "
+            "ORDER BY CASE WHEN status='running' THEN 0 ELSE 1 END, created_at, "
+            "epic_id, story_id, source_sha LIMIT 1",
+            (now,),
+        ).fetchone()
+        if row is None:
+            return None
+        updated = conn.execute(
+            "UPDATE story_integration_intents SET status='running', claim_lock=?, "
+            "claim_expires=?, attempt_count=attempt_count+1, updated_at=? "
+            "WHERE epic_id=? AND story_id=? AND source_sha=? "
+            "AND (status='pending' OR (status='running' AND claim_expires IS NOT NULL "
+            "AND claim_expires<=?))",
+            (
+                claim_lock,
+                now + int(lease_seconds),
+                now,
+                row["epic_id"],
+                row["story_id"],
+                row["source_sha"],
+                now,
+            ),
+        )
+        if updated.rowcount != 1:
+            return None
+        claimed_row = conn.execute(
+            "SELECT * FROM story_integration_intents "
+            "WHERE epic_id=? AND story_id=? AND source_sha=?",
+            (row["epic_id"], row["story_id"], row["source_sha"]),
+        ).fetchone()
+        if claimed_row is None:
+            raise RuntimeError("integration claim was not durable")
+        intent = integration_intent_from_row(claimed_row)
+
+    approved: ApprovedCandidate | None = None
+    passed: PassedTest | None = None
+    with kb.authorized_governance_write(), kb.write_txn(conn):
+        current = conn.execute(
+            "SELECT * FROM story_integration_intents "
+            "WHERE epic_id=? AND story_id=? AND source_sha=?",
+            (intent.key.epic_id, intent.key.story_id, intent.key.source_sha),
+        ).fetchone()
+        membership = conn.execute(
+            "SELECT 1 FROM epic_memberships WHERE epic_id=? AND task_id=?",
+            (intent.key.epic_id, intent.key.story_id),
+        ).fetchone()
+        story = conn.execute(
+            "SELECT workflow_template_id, current_step_key, status, assignee, "
+            "running, blocked, current_run_id, branch_name FROM tasks WHERE id=?",
+            (intent.key.story_id,),
+        ).fetchone()
+        epic = conn.execute(
+            "SELECT work_item_kind, workflow_template_id, current_step_key, status, "
+            "running, blocked, current_run_id FROM tasks WHERE id=?",
+            (intent.key.epic_id,),
+        ).fetchone()
+        records = kb._terminal_run_records(conn, intent.key.story_id)
+        approved = kb.latest_review_authority(records)
+        passed = (
+            kb.latest_test_authority(records, intent.key.source_sha)
+            if approved is not None
+            else None
+        )
+        fresh = (
+            current is not None
+            and current["status"] == "running"
+            and current["claim_lock"] == claim_lock
+            and membership is not None
+            and story is not None
+            and story["workflow_template_id"] == "product"
+            and story["current_step_key"] == "integration_pending"
+            and story["status"] == "review"
+            and story["assignee"] is None
+            and not bool(story["running"])
+            and not bool(story["blocked"])
+            and story["current_run_id"] is None
+            and story["branch_name"] == intent.source_branch
+            and epic is not None
+            and epic["work_item_kind"] == "epic"
+            and epic["workflow_template_id"] == "product_epic"
+            and epic["current_step_key"] == "collecting_members"
+            and epic["status"] == "todo"
+            and not bool(epic["running"])
+            and not bool(epic["blocked"])
+            and epic["current_run_id"] is None
+            and approved is not None
+            and passed is not None
+            and approved.run_id == intent.review_run_id
+            and approved.branch == intent.source_branch
+            and approved.base_sha == intent.review_base_sha
+            and approved.source_sha == intent.key.source_sha
+            and passed.branch == intent.source_branch
+            and passed.source_sha == intent.key.source_sha
+            and kb._agent_compare_key(passed.writer_provider)
+            == kb._agent_compare_key(approved.writer_provider)
+            and kb.active_rework_directive(conn, intent.key.story_id) is None
+        )
+        if not fresh:
+            conn.execute(
+                "UPDATE story_integration_intents SET status='superseded', "
+                "claim_lock=NULL, claim_expires=NULL, updated_at=? "
+                "WHERE epic_id=? AND story_id=? AND source_sha=? "
+                "AND status='running' AND claim_lock=?",
+                (
+                    now,
+                    intent.key.epic_id,
+                    intent.key.story_id,
+                    intent.key.source_sha,
+                    claim_lock,
+                ),
+            )
+            return None
+
+    slug = board if board is not None else kb._known_board_slug_for_connection(conn)
+    metadata = kb.product_board_metadata(slug)
+    try:
+        contract = (
+            kb.repository_contract_for_metadata(metadata)
+            if metadata is not None
+            else None
+        )
+    except Exception:
+        contract = None
+    if contract is None or "story_integration" not in contract.verification:
+        return None
+
+    assert approved is not None and passed is not None
+    check = repository_check or (
+        lambda contract, approved, passed: candidate_eligibility(
+            contract.repo_root, approved, passed
+        )
+    )
+    try:
+        eligibility = check(contract, approved, passed)
+    except CandidateEligibilityError:
+        return None
+    if (
+        not isinstance(eligibility, CandidateEligibility)
+        or eligibility.source_sha != intent.key.source_sha
+        or not eligibility.non_empty
+    ):
+        return None
+    return intent
 
 
 def enqueue_approved_story(
