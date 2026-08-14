@@ -5711,7 +5711,9 @@ def test_complete_task_v2_clean_test_evidence_advances_without_commit(kanban_hom
     assert handoff_events[0].payload["sha"] is None
 
 
-def test_complete_task_v2_clean_review_evidence_advances_without_commit(kanban_home, tmp_path, monkeypatch):
+def test_standalone_release_measure_review_evidence_advances_without_commit(
+    kanban_home, tmp_path, monkeypatch
+):
     """A review-step handoff can be evidence-only: independent review should
     move the card to Release / Measure without requiring a new code commit.
     """
@@ -14912,3 +14914,173 @@ def test_configure_task_refuses_active_current_run_without_mutation(kanban_home)
             )
 
         assert _configure_task_row_and_events(conn, task_id) == before
+
+
+def test_engine_owned_integration_pending_refuses_public_lifecycle_paths(
+    kanban_home, monkeypatch
+):
+    board = "engine-owned-guards"
+    _v2_product_board(board)
+    monkeypatch.setattr(
+        kb, "_integration_git",
+        lambda *_args, **_kwargs: pytest.fail("guarded path must not call Git"),
+    )
+    monkeypatch.setattr(
+        kb.subprocess, "run",
+        lambda *_args, **_kwargs: pytest.fail("guarded path must not spawn Git"),
+    )
+    with kb.connect(board=board) as conn:
+        story_id = kb.create_task(
+            conn, title="Story", board=board,
+            workflow_template_id="product", current_step_key="review",
+        )
+        conn.execute(
+            "UPDATE tasks SET current_step_key='integration_pending', status='ready', "
+            "assignee=NULL WHERE id=?", (story_id,),
+        )
+        assert kb.claim_task(conn, story_id, board=board) is None
+        assert kb.complete_task(conn, story_id, board=board) is False
+        assert kb.set_phase(conn, story_id, "development", board=board) is False
+        conn.execute("UPDATE tasks SET status='todo' WHERE id=?", (story_id,))
+        promoted, reason = kb.promote_task(conn, story_id, actor="operator", force=True)
+        assert promoted is False
+        assert reason == "engine-owned integration state cannot be promoted"
+        assert kb.recompute_ready(conn) == 0
+        conn.execute("UPDATE tasks SET status='blocked' WHERE id=?", (story_id,))
+        assert kb.unblock_task(conn, story_id) is False
+        with pytest.raises(kb.ReleaseEvidenceError) as exc:
+            kb.release_product_task(
+                conn, story_id, board,
+                candidate_verify_fn=None, release_adapter=None,
+            )
+        assert exc.value.missing == ["engine_owned_state"]
+        with pytest.raises(ValueError, match="engine-owned"):
+            kb.create_task(
+                conn, title="Fabricated inbox delivery", board=board,
+                workflow_template_id="product", current_step_key="integration_pending",
+            )
+
+
+def test_product_epic_and_legacy_reconcile_are_structurally_refused_without_git(
+    kanban_home, monkeypatch
+):
+    board = "product-epic-guards"
+    _v2_product_board(board)
+    monkeypatch.setattr(
+        kb, "_integration_git",
+        lambda *_args, **_kwargs: pytest.fail("guarded path must not call Git"),
+    )
+    monkeypatch.setattr(
+        kb.subprocess, "run",
+        lambda *_args, **_kwargs: pytest.fail("guarded path must not spawn Git"),
+    )
+    with kb.connect(board=board) as conn:
+        epic_id = kb.create_task(conn, title="Epic", board=board, work_item_kind="epic")
+        story_id = kb.create_task(conn, title="Story", board=board)
+        kb.add_epic_membership(conn, epic_id=epic_id, task_id=story_id)
+        conn.execute(
+            "UPDATE tasks SET workflow_template_id='product_epic', "
+            "current_step_key='collecting_members', status='todo' WHERE id=?", (epic_id,),
+        )
+        conn.execute(
+            "UPDATE tasks SET workflow_template_id='product', current_step_key='done', "
+            "status='done', completed_at=1 WHERE id=?", (story_id,),
+        )
+        assert kb.merge_epic_to_main(conn, epic_id, board=board) == "not_ready"
+        assert kb.complete_task(conn, epic_id, board=board) is False
+        assert kb.promote_task(conn, epic_id, actor="operator", force=True)[0] is False
+        with pytest.raises(kb.ReleaseEvidenceError) as exc:
+            kb.release_product_task(
+                conn, epic_id, board,
+                candidate_verify_fn=lambda _path: True,
+                release_adapter=None,
+                completion_metadata={
+                    "workflow_outcome": {"verdict": "approved"},
+                    "candidate_sha": "f" * 40,
+                },
+            )
+        assert exc.value.missing == ["engine_owned_state"]
+        result = kb.reconcile(conn, board=board, spawn_ready=False)
+        facts = conn.execute(
+            "SELECT COUNT(*) FROM epic_story_integrations WHERE story_id=?", (story_id,),
+        ).fetchone()[0]
+    assert result.integrated == []
+    assert facts == 0
+
+
+def test_integration_enqueued_complete_task_routes_approved_member(
+    kanban_home, tmp_path
+):
+    board = "member-review-enqueue"
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    base_sha = _git_output(repo, "rev-parse", "HEAD")
+    subprocess.run(
+        ["git", "-C", str(repo), "switch", "-c", "story/member"],
+        check=True, capture_output=True, text=True,
+    )
+    source_sha = _commit_file(repo, "member.txt", "member\n", "member")
+    _v2_product_board(board)
+    now = int(time.time())
+    test_metadata = {
+        "workflow_outcome": {"verdict": "passed"},
+        "ai_provenance": {
+            "writer": {"agent": "developer"},
+            "tester": {"agent": "tester", "result": "passed"},
+        },
+        "test_branch": "story/member",
+        "test_head_sha": source_sha,
+    }
+    review_pins = {
+        "review_branch": "story/member",
+        "review_base_sha": base_sha,
+        "review_head_sha": source_sha,
+    }
+    completion_metadata = {
+        "workflow_outcome": {"verdict": "approved"},
+        "ai_provenance": {
+            "writer": {"agent": "developer"},
+            "reviewer": {"agent": "reviewer"},
+        },
+    }
+    with kb.connect(board=board) as conn:
+        epic_id = kb.create_task(conn, title="Epic", board=board, work_item_kind="epic")
+        story_id = kb.create_task(
+            conn, title="Story", board=board, assignee="reviewer",
+            workflow_template_id="product", current_step_key="review",
+            workspace_kind="worktree", workspace_path=str(repo),
+            branch_name="story/member",
+        )
+        kb.add_epic_membership(conn, epic_id=epic_id, task_id=story_id)
+        conn.execute(
+            "INSERT INTO task_runs "
+            "(task_id, step_key, status, outcome, metadata, started_at, ended_at) "
+            "VALUES (?, 'test', 'completed', 'advanced', ?, ?, ?)",
+            (story_id, json.dumps(test_metadata), now - 2, now - 1),
+        )
+        review_run_id = conn.execute(
+            "INSERT INTO task_runs "
+            "(task_id, profile, step_key, status, metadata, started_at) "
+            "VALUES (?, 'reviewer', 'review', 'running', ?, ?)",
+            (story_id, json.dumps(review_pins), now),
+        ).lastrowid
+        conn.execute(
+            "UPDATE tasks SET status='running', running=1, current_run_id=? WHERE id=?",
+            (review_run_id, story_id),
+        )
+
+        assert kb.complete_task(
+            conn, story_id, board=board, expected_run_id=review_run_id,
+            summary="approved", metadata=completion_metadata,
+        ) is True
+        task = kb.get_task(conn, story_id)
+        intents = conn.execute(
+            "SELECT * FROM story_integration_intents WHERE story_id=?", (story_id,),
+        ).fetchall()
+
+    assert task is not None
+    assert task.current_step_key == "integration_pending"
+    assert task.status == "review"
+    assert task.assignee is None
+    assert len(intents) == 1
+    assert intents[0]["source_sha"] == source_sha

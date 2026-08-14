@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from dataclasses import FrozenInstanceError
+import json
 import sqlite3
+import time
 
 import pytest
 
@@ -11,7 +13,13 @@ from hermes_cli import kanban_db as kb
 from hermes_cli.kanban_story_integration import (
     IntegrationIntent,
     IntegrationKey,
+    enqueue_approved_story,
     integration_intent_from_row,
+)
+from hermes_cli.kanban_product_outcomes import (
+    ApprovedCandidate,
+    CandidateEligibility,
+    PassedTest,
 )
 
 
@@ -200,3 +208,158 @@ def test_story_integration_parser_keeps_verification_event_audit_only_nullable()
     }
 
     assert integration_intent_from_row(row).verification_event_id is None
+
+
+def test_integration_enqueued_transaction_is_idempotent_and_uses_zero_git(
+    tmp_path, monkeypatch
+):
+    branch = "story/one"
+    now = int(time.time())
+    approved = ApprovedCandidate(
+        run_id=0,
+        branch=branch,
+        base_sha=BASE_SHA,
+        source_sha=SOURCE_SHA,
+        reviewer_provider="reviewer",
+        writer_provider="developer",
+    )
+    passed = PassedTest(
+        run_id=0,
+        branch=branch,
+        source_sha=SOURCE_SHA,
+        tester_provider="tester",
+        writer_provider="developer",
+    )
+    eligibility = CandidateEligibility(source_sha=SOURCE_SHA, non_empty=True)
+    test_metadata = {
+        "workflow_outcome": {"verdict": "passed"},
+        "ai_provenance": {
+            "writer": {"agent": "developer"},
+            "tester": {"agent": "tester", "result": "passed"},
+        },
+        "test_branch": branch,
+        "test_head_sha": SOURCE_SHA,
+    }
+    review_metadata = {
+        "workflow_outcome": {"verdict": "approved"},
+        "ai_provenance": {
+            "writer": {"agent": "developer"},
+            "reviewer": {"agent": "reviewer"},
+        },
+        "review_branch": branch,
+        "review_base_sha": BASE_SHA,
+        "review_head_sha": SOURCE_SHA,
+    }
+
+    monkeypatch.setattr(
+        kb,
+        "_integration_git",
+        lambda *_args, **_kwargs: pytest.fail("enqueue must not call Git"),
+    )
+    monkeypatch.setattr(
+        kb.subprocess,
+        "run",
+        lambda *_args, **_kwargs: pytest.fail("enqueue must not spawn Git"),
+    )
+    with kb.connect(tmp_path / "enqueue.db") as conn:
+        epic_id = kb.create_task(conn, title="Epic", work_item_kind="epic")
+        story_id = kb.create_task(
+            conn,
+            title="Story",
+            workflow_template_id="product",
+            current_step_key="review",
+        )
+        kb.add_epic_membership(conn, epic_id=epic_id, task_id=story_id)
+        test_run_id = conn.execute(
+            "INSERT INTO task_runs "
+            "(task_id, step_key, status, outcome, metadata, started_at, ended_at) "
+            "VALUES (?, 'test', 'completed', 'advanced', ?, ?, ?)",
+            (story_id, json.dumps(test_metadata), now - 2, now - 1),
+        ).lastrowid
+        review_run_id = conn.execute(
+            "INSERT INTO task_runs "
+            "(task_id, step_key, status, metadata, started_at) "
+            "VALUES (?, 'review', 'running', ?, ?)",
+            (story_id, json.dumps(review_metadata), now),
+        ).lastrowid
+        conn.execute(
+            "UPDATE tasks SET status='running', running=1, assignee='reviewer', "
+            "current_run_id=? WHERE id=?",
+            (review_run_id, story_id),
+        )
+        approved = ApprovedCandidate(
+            run_id=review_run_id,
+            branch=branch,
+            base_sha=BASE_SHA,
+            source_sha=SOURCE_SHA,
+            reviewer_provider="reviewer",
+            writer_provider="developer",
+        )
+        passed = PassedTest(
+            run_id=test_run_id,
+            branch=branch,
+            source_sha=SOURCE_SHA,
+            tester_provider="tester",
+            writer_provider="developer",
+        )
+
+        first = enqueue_approved_story(
+            conn,
+            epic_id=epic_id,
+            story_id=story_id,
+            approved=approved,
+            passed=passed,
+            eligibility=eligibility,
+            expected_run_id=review_run_id,
+            summary="approved",
+            metadata=review_metadata,
+        )
+        replay = enqueue_approved_story(
+            conn,
+            epic_id=epic_id,
+            story_id=story_id,
+            approved=approved,
+            passed=passed,
+            eligibility=eligibility,
+            expected_run_id=review_run_id,
+        )
+        stale_test_metadata = dict(test_metadata)
+        stale_test_metadata["test_head_sha"] = "9" * 40
+        conn.execute(
+            "UPDATE task_runs SET metadata=? WHERE id=?",
+            (json.dumps(stale_test_metadata), test_run_id),
+        )
+        with pytest.raises(ValueError, match="stale"):
+            enqueue_approved_story(
+                conn,
+                epic_id=epic_id,
+                story_id=story_id,
+                approved=approved,
+                passed=passed,
+                eligibility=eligibility,
+                expected_run_id=review_run_id,
+            )
+        story = conn.execute(
+            "SELECT workflow_template_id, current_step_key, status, assignee, "
+            "current_run_id FROM tasks WHERE id=?",
+            (story_id,),
+        ).fetchone()
+        epic = conn.execute(
+            "SELECT workflow_template_id, current_step_key, status, assignee "
+            "FROM tasks WHERE id=?",
+            (epic_id,),
+        ).fetchone()
+        events = [event for event in kb.list_events(conn, story_id)
+                  if event.kind == "story_integration_enqueued"]
+
+    assert replay == first
+    assert first.status == "pending"
+    assert tuple(story) == ("product", "integration_pending", "review", None, None)
+    assert tuple(epic) == ("product_epic", "collecting_members", "todo", None)
+    assert len(events) == 1
+    assert events[0].payload == {
+        "epic_id": epic_id,
+        "story_id": story_id,
+        "source_sha": SOURCE_SHA,
+        "review_run_id": review_run_id,
+    }

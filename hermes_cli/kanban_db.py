@@ -117,6 +117,7 @@ from hermes_cli.kanban_repository import (
 )
 from hermes_cli.kanban_product_outcomes import (
     ApprovedCandidate,
+    CandidateEligibility,
     CandidateEligibilityError,
     OutcomeValidationError,
     PassedTest,
@@ -292,6 +293,17 @@ PRODUCT_WORKFLOW_ROLE_TO_STEP = {
     "tester": "test",
     "reviewer": "review",
 }
+
+
+def _is_engine_owned_integration_state(row: Any) -> bool:
+    """Identify the two lifecycle states owned only by Epic coordinators."""
+
+    if row is None:
+        return False
+    return (
+        row["workflow_template_id"] == "product_epic"
+        or row["current_step_key"] == "integration_pending"
+    )
 
 # Typed block reasons. Distinguishes the two fundamentally different things a
 # worker (or human) means by "blocked", so each can be routed differently
@@ -1739,6 +1751,12 @@ def set_phase(
     """
     meta = product_board_metadata(board)
     if meta is None or not _handoff_v2_enabled(meta):
+        return False
+    scope = conn.execute(
+        "SELECT workflow_template_id, current_step_key FROM tasks WHERE id=?",
+        (task_id,),
+    ).fetchone()
+    if _is_engine_owned_integration_state(scope):
         return False
     _validate_product_workflow_state(PRODUCT_WORKFLOW_TEMPLATE_ID, phase)
     _validate_resolver_cas_fields({"phase": phase})
@@ -8298,6 +8316,11 @@ def create_task(
             workflow_template_id = PRODUCT_WORKFLOW_TEMPLATE_ID
             current_step_key = _inferred_step
 
+    if (
+        workflow_template_id == "product_epic"
+        or current_step_key == "integration_pending"
+    ):
+        raise ValueError("engine-owned integration state cannot be materialized directly")
     _validate_product_workflow_state(workflow_template_id, current_step_key)
 
     parents = tuple(p for p in parents if p)
@@ -10009,11 +10032,12 @@ def _promote_ready_task(
 ) -> bool:
     """Promote one eligible task; caller must hold the write transaction."""
     row = conn.execute(
-        "SELECT id, status, consecutive_failures, max_retries "
+        "SELECT id, status, consecutive_failures, max_retries, "
+        "workflow_template_id, current_step_key "
         "FROM tasks WHERE id = ? AND status IN ('todo', 'blocked')",
         (task_id,),
     ).fetchone()
-    if row is None:
+    if row is None or _is_engine_owned_integration_state(row):
         return False
     cur_status = row["status"]
     if cur_status == "blocked" and _has_sticky_block(conn, task_id):
@@ -10165,7 +10189,13 @@ def claim_task(
             "FROM tasks t LEFT JOIN work_contracts w ON w.id = t.work_contract_id "
             "WHERE t.id = ?", (task_id,)
         ).fetchone()
-        if candidate is not None and candidate["work_item_kind"] == "epic":
+        if (
+            candidate is not None
+            and (
+                candidate["work_item_kind"] == "epic"
+                or _is_engine_owned_integration_state(candidate)
+            )
+        ):
             return None
         # Enforcement preflight: repair a plain/legacy role card missing its
         # product workflow metadata before it claims, so it dispatches on the
@@ -11227,6 +11257,12 @@ def complete_task(
     """
     board = board or _board_slug_for_connection(conn)
     now = int(time.time())
+    lifecycle_scope = conn.execute(
+        "SELECT workflow_template_id, current_step_key FROM tasks WHERE id=?",
+        (task_id,),
+    ).fetchone()
+    if _is_engine_owned_integration_state(lifecycle_scope):
+        return False
     validated_terminal_outcome: Optional[TerminalOutcome] = None
     validated_outcome_phase: Optional[str] = None
     validated_outcome_run_id: Optional[int] = None
@@ -12659,10 +12695,13 @@ def promote_task(
     promotion would succeed without mutating state.
     """
     row = conn.execute(
-        "SELECT status FROM tasks WHERE id = ?", (task_id,)
+        "SELECT status, workflow_template_id, current_step_key FROM tasks WHERE id = ?",
+        (task_id,),
     ).fetchone()
     if row is None:
         return False, f"task {task_id} not found"
+    if _is_engine_owned_integration_state(row):
+        return False, "engine-owned integration state cannot be promoted"
 
     cur_status = row["status"]
     if cur_status not in ("todo", "blocked"):
@@ -12805,6 +12844,12 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
     meta = product_board_metadata(_board_slug_for_connection(conn))
     now = int(time.time())
     with write_txn(conn):
+        lifecycle_scope = conn.execute(
+            "SELECT workflow_template_id, current_step_key FROM tasks WHERE id=?",
+            (task_id,),
+        ).fetchone()
+        if _is_engine_owned_integration_state(lifecycle_scope):
+            return False
         stale = conn.execute(
             "SELECT current_run_id FROM tasks WHERE id = ? AND status IN ('blocked', 'scheduled')",
             (task_id,),
@@ -14821,6 +14866,12 @@ def merge_epic_to_main(
     meta = board_meta if board_meta is not None else product_board_metadata(board)
     if meta is None or not _handoff_v2_enabled(meta):
         return None
+    lifecycle_scope = conn.execute(
+        "SELECT workflow_template_id, current_step_key FROM tasks WHERE id=?",
+        (epic_id,),
+    ).fetchone()
+    if _is_engine_owned_integration_state(lifecycle_scope):
+        return "not_ready"
     _validate_stored_product_workflow_state(conn, epic_id)
 
     # A repository contract owns verification for governed boards.  Do not
@@ -15039,6 +15090,10 @@ def integrate_story_to_epic(
     epic_id = epic_id_for_task(conn, story_id)
     if epic_id is None:
         return None
+    # Epic-member integration is now owned exclusively by a claimed durable
+    # intent.  The legacy/manual merge path remains defined only until E03 can
+    # remove it, but it may no longer act on a current member.
+    return None
 
     epic = get_task(conn, epic_id)
     if epic is None or epic.status in {"done", "archived"}:
@@ -16007,6 +16062,12 @@ def release_product_task(
     task = get_task(conn, task_id)
     meta = product_board_metadata(board)
     is_epic_task = bool(task is not None and task.work_item_kind == "epic")
+    lifecycle_scope = conn.execute(
+        "SELECT workflow_template_id, current_step_key FROM tasks WHERE id=?",
+        (task_id,),
+    ).fetchone()
+    if _is_engine_owned_integration_state(lifecycle_scope):
+        raise ReleaseEvidenceError(task_id, ["engine_owned_state"])
     if (
         task is None
         or meta is None
@@ -17064,6 +17125,60 @@ def handoff(
                     return False
     if sha is None and str(step or "") in _PRODUCT_COMMIT_REQUIRED_STEPS:
         return False
+
+    if str(step or "") == "review":
+        epic_id = epic_id_for_task(conn, task_id)
+        if epic_id is not None:
+            if expected_run_id is None:
+                return False
+            active_run = get_run(conn, expected_run_id)
+            if (
+                active_run is None
+                or active_run.ended_at is not None
+                or not isinstance(active_run.metadata, dict)
+            ):
+                return False
+            final_metadata = dict(metadata or {})
+            for key in ("review_branch", "review_base_sha", "review_head_sha"):
+                pinned = active_run.metadata.get(key)
+                if pinned is not None:
+                    final_metadata[key] = pinned
+            approved = ApprovedCandidate(
+                run_id=expected_run_id,
+                branch=str(final_metadata.get("review_branch") or "").strip(),
+                base_sha=str(final_metadata.get("review_base_sha") or "").strip(),
+                source_sha=str(final_metadata.get("review_head_sha") or "").strip(),
+                reviewer_provider=str(
+                    _reviewer_agent_from_metadata(final_metadata) or ""
+                ).strip(),
+                writer_provider=str(
+                    _writer_agent_from_metadata(final_metadata) or ""
+                ).strip(),
+            )
+            authority_records = _terminal_run_records(conn, task_id)
+            passed = latest_test_authority(authority_records, approved.source_sha)
+            if passed is None or workspace is None:
+                return False
+            try:
+                eligibility: CandidateEligibility = candidate_eligibility(
+                    workspace, approved, passed
+                )
+            except CandidateEligibilityError:
+                return False
+            from hermes_cli.kanban_story_integration import enqueue_approved_story
+
+            enqueue_approved_story(
+                conn,
+                epic_id=epic_id,
+                story_id=task_id,
+                approved=approved,
+                passed=passed,
+                eligibility=eligibility,
+                expected_run_id=expected_run_id,
+                summary=summary,
+                metadata=metadata,
+            )
+            return True
 
     next_step = transition["next_step"]
     next_role = transition.get("assignee_role")

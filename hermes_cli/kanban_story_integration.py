@@ -9,8 +9,15 @@ from __future__ import annotations
 
 import re
 import sqlite3
+import time
 from dataclasses import dataclass
-from typing import Literal, Mapping, TypeAlias, cast
+from typing import Any, Literal, Mapping, TypeAlias, cast
+
+from hermes_cli.kanban_product_outcomes import (
+    ApprovedCandidate,
+    CandidateEligibility,
+    PassedTest,
+)
 
 
 IntegrationStatus: TypeAlias = Literal[
@@ -146,3 +153,186 @@ def integration_intent_from_row(row: Row) -> IntegrationIntent:
         created_at=_integer(row, "created_at"),
         updated_at=_integer(row, "updated_at"),
     )
+
+
+def enqueue_approved_story(
+    conn: sqlite3.Connection,
+    *,
+    epic_id: str,
+    story_id: str,
+    approved: ApprovedCandidate,
+    passed: PassedTest,
+    eligibility: CandidateEligibility,
+    expected_run_id: int,
+    summary: str | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> IntegrationIntent:
+    """Atomically close Review and enqueue one approved Epic-member source.
+
+    The supplied immutable authority values are comparison inputs, not proof:
+    the transaction re-reads membership, task/run ownership, and the complete
+    ended Test/Review history before it writes the intent.  No repository or
+    Git operation belongs in this state-only transition.
+    """
+
+    from hermes_cli import kanban_db as kb
+
+    if not isinstance(approved, ApprovedCandidate):
+        raise ValueError("approved authority must be an ApprovedCandidate")
+    if not isinstance(passed, PassedTest):
+        raise ValueError("test authority must be a PassedTest")
+    if not isinstance(eligibility, CandidateEligibility):
+        raise ValueError("eligibility must be a CandidateEligibility")
+    if (
+        approved.source_sha != passed.source_sha
+        or approved.source_sha != eligibility.source_sha
+        or approved.branch != passed.branch
+        or not eligibility.non_empty
+        or approved.run_id != expected_run_id
+    ):
+        raise ValueError("integration authority does not identify one eligible candidate")
+
+    now = int(time.time())
+    with kb.authorized_governance_write(), kb.write_txn(conn):
+        membership = conn.execute(
+            "SELECT 1 FROM epic_memberships WHERE epic_id=? AND task_id=?",
+            (epic_id, story_id),
+        ).fetchone()
+        if membership is None:
+            raise ValueError("story is not a current member of the Epic")
+
+        epic = conn.execute(
+            "SELECT work_item_kind, workflow_template_id, current_step_key, status "
+            "FROM tasks WHERE id=?",
+            (epic_id,),
+        ).fetchone()
+        if (
+            epic is None
+            or epic["work_item_kind"] != "epic"
+            or epic["status"] in {"done", "archived"}
+        ):
+            raise ValueError("integration parent is not a collecting Epic")
+
+        task = conn.execute(
+            "SELECT workflow_template_id, current_step_key, status, current_run_id "
+            "FROM tasks WHERE id=?",
+            (story_id,),
+        ).fetchone()
+        if task is None:
+            raise ValueError("story does not exist")
+
+        existing = conn.execute(
+            "SELECT * FROM story_integration_intents "
+            "WHERE epic_id=? AND story_id=? AND source_sha=?",
+            (epic_id, story_id, approved.source_sha),
+        ).fetchone()
+        replay = (
+            existing is not None
+            and task["workflow_template_id"] == "product"
+            and task["current_step_key"] == "integration_pending"
+            and task["current_run_id"] is None
+            and epic["workflow_template_id"] == "product_epic"
+            and epic["current_step_key"] == "collecting_members"
+        )
+
+        if replay:
+            records = kb._terminal_run_records(conn, story_id)
+            if (
+                kb.latest_review_authority(records) != approved
+                or kb.latest_test_authority(records, approved.source_sha) != passed
+                or kb.active_rework_directive(conn, story_id) is not None
+            ):
+                raise ValueError("stored integration authority is stale")
+            return integration_intent_from_row(existing)
+
+        if (
+            task["workflow_template_id"] != "product"
+            or task["current_step_key"] != "review"
+            or task["status"] != "running"
+            or task["current_run_id"] != expected_run_id
+        ):
+            raise ValueError("review run ownership changed")
+        run_id = kb._end_run(
+            conn,
+            story_id,
+            outcome="advanced",
+            status="completed",
+            summary=summary,
+            metadata=metadata,
+            expected_run_id=expected_run_id,
+        )
+        if run_id != expected_run_id:
+            raise ValueError("review run ownership changed")
+
+        records = kb._terminal_run_records(conn, story_id)
+        if (
+            kb.latest_review_authority(records) != approved
+            or kb.latest_test_authority(records, approved.source_sha) != passed
+            or kb.active_rework_directive(conn, story_id) is not None
+        ):
+            raise ValueError("latest Test/Review authority is not eligible")
+
+        conn.execute(
+            "UPDATE story_integration_intents SET status='superseded', updated_at=? "
+            "WHERE epic_id=? AND story_id=? AND source_sha<>? "
+            "AND status IN ('pending', 'attention_required')",
+            (now, epic_id, story_id, approved.source_sha),
+        )
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO story_integration_intents (
+                epic_id, story_id, source_sha, source_branch, review_run_id,
+                review_base_sha, status, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+            """,
+            (
+                epic_id,
+                story_id,
+                approved.source_sha,
+                approved.branch,
+                approved.run_id,
+                approved.base_sha,
+                now,
+                now,
+            ),
+        )
+        updated = conn.execute(
+            "UPDATE tasks SET workflow_template_id='product', "
+            "current_step_key='integration_pending', status='review', assignee=NULL, "
+            "running=0, blocked=0, claim_lock=NULL, claim_expires=NULL, "
+            "worker_pid=NULL, result=? "
+            "WHERE id=? AND current_step_key='review' AND current_run_id IS NULL",
+            (summary, story_id),
+        )
+        if updated.rowcount != 1:
+            raise ValueError("story phase changed during integration enqueue")
+        parent_updated = conn.execute(
+            "UPDATE tasks SET workflow_template_id='product_epic', "
+            "current_step_key='collecting_members', status='todo', assignee=NULL, "
+            "running=0, blocked=0, claim_lock=NULL, claim_expires=NULL, worker_pid=NULL "
+            "WHERE id=? AND work_item_kind='epic' "
+            "AND status NOT IN ('done', 'archived')",
+            (epic_id,),
+        )
+        if parent_updated.rowcount != 1:
+            raise ValueError("Epic state changed during integration enqueue")
+        kb._append_event(
+            conn,
+            story_id,
+            "story_integration_enqueued",
+            {
+                "epic_id": epic_id,
+                "story_id": story_id,
+                "source_sha": approved.source_sha,
+                "review_run_id": approved.run_id,
+            },
+            run_id=run_id,
+        )
+        row = conn.execute(
+            "SELECT * FROM story_integration_intents "
+            "WHERE epic_id=? AND story_id=? AND source_sha=?",
+            (epic_id, story_id, approved.source_sha),
+        ).fetchone()
+        if row is None:
+            raise RuntimeError("integration intent insert was not durable")
+        return integration_intent_from_row(row)
