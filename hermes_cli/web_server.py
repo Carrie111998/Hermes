@@ -47,7 +47,7 @@ import zipfile
 
 from hermes_cli._subprocess_compat import windows_detach_flags, windows_hide_flags
 import urllib.request
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Dict, List, Literal, Optional, Tuple
 
 import yaml
@@ -1952,6 +1952,16 @@ def _fs_path(raw_path: str) -> Path:
         raise HTTPException(status_code=400, detail="Invalid path")
 
 
+def _agent_read_path(raw_path: str | Path) -> Path:
+    """Map an agent-visible Docker path to its host bind mount for reads."""
+    raw = str(raw_path)
+    path = PurePosixPath(raw) if raw.startswith("/") else Path(raw).expanduser()
+    from gateway.platforms.base import _translate_docker_container_media_path
+
+    translated = _translate_docker_container_media_path(path)
+    return translated or _fs_path(str(path))
+
+
 def _fs_mime_type(path: Path) -> str:
     suffix = path.suffix.lower()
     if suffix in _FS_MIME_TYPES:
@@ -1969,8 +1979,8 @@ def _fs_looks_binary(data: bytes) -> bool:
     return suspicious / len(data) > 0.12
 
 
-def _fs_regular_file(path: Path) -> tuple[Path, os.stat_result]:
-    target = _fs_path(str(path))
+def _fs_regular_file(path: str | Path) -> tuple[Path, os.stat_result]:
+    target = _agent_read_path(path)
     try:
         st = target.stat()
     except FileNotFoundError:
@@ -2206,10 +2216,16 @@ def _resolve_managed_path(
     request: Request,
     *,
     for_write: bool = False,
+    for_agent_read: bool = False,
 ) -> tuple[ManagedFilesPolicy, Path, str]:
     policy = _managed_files_policy(request)
     text = _path_text(raw_path)
     root = policy.locked_root
+
+    if for_agent_read and text:
+        translated = _agent_read_path(text)
+        if translated != _fs_path(text):
+            text = str(translated)
 
     if root is not None and (not text or text in {".", "/"}):
         candidate = root
@@ -2416,7 +2432,7 @@ async def list_managed_files(request: Request, path: Optional[str] = None):
 
 @app.get("/api/files/read")
 async def read_managed_file(request: Request, path: str):
-    policy, target, display_path = _resolve_managed_path(path, request)
+    policy, target, display_path = _resolve_managed_path(path, request, for_agent_read=True)
     if not target.exists():
         raise HTTPException(status_code=404, detail="File not found")
     if not target.is_file():
@@ -2460,7 +2476,7 @@ async def download_managed_file(request: Request, path: str):
     (which can't set the session header) still authenticates. See ``/api/pty``
     for the same query-token precedent.
     """
-    policy, target, _display_path = _resolve_managed_path(path, request)
+    policy, target, _display_path = _resolve_managed_path(path, request, for_agent_read=True)
     if not target.exists():
         raise HTTPException(status_code=404, detail="File not found")
     if not target.is_file():
@@ -2658,7 +2674,7 @@ async def fs_list(path: str):
 
 @app.get("/api/fs/read-text")
 async def fs_read_text(path: str):
-    target, st = _fs_regular_file(_fs_path(path))
+    target, st = _fs_regular_file(path)
     if st.st_size > _FS_TEXT_SOURCE_MAX_BYTES:
         raise HTTPException(status_code=413, detail="File too large")
     bytes_to_read = min(st.st_size, _FS_TEXT_PREVIEW_MAX_BYTES)
@@ -2729,7 +2745,7 @@ async def fs_write_text(payload: FsWriteText):
 
 @app.get("/api/fs/read-data-url")
 async def fs_read_data_url(path: str):
-    target, st = _fs_regular_file(_fs_path(path))
+    target, st = _fs_regular_file(path)
     if st.st_size > _FS_DATA_URL_MAX_BYTES:
         raise HTTPException(status_code=413, detail="File too large")
     try:

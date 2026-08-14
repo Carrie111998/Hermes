@@ -569,7 +569,7 @@ def is_host_excluded_by_no_proxy(hostname: str, no_proxy_value: str | None = Non
 import dataclasses
 from dataclasses import dataclass, field
 from datetime import datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Dict, List, Optional, Any, Callable, Awaitable, Tuple, Union
 from enum import Enum
 
@@ -1504,8 +1504,10 @@ def _parse_docker_volume_mounts() -> List[Tuple[Path, Path]]:
         spec = entry.strip()
         if not spec:
             continue
-        # Prefer the first ':/' so absolute container paths are unambiguous.
-        sep = spec.find(":/")
+        # The container path is the final absolute-path component.  Use the
+        # last ``:/`` so forward-slash Windows hosts (``C:/...:/workspace``)
+        # do not split at the drive colon.
+        sep = spec.rfind(":/")
         if sep <= 0:
             continue
         host_raw = spec[:sep]
@@ -1522,7 +1524,7 @@ def _parse_docker_volume_mounts() -> List[Tuple[Path, Path]]:
             continue
         try:
             host_path = Path(host_expanded).resolve(strict=False)
-            container_path = Path(container_raw)
+            container_path = PurePosixPath(container_raw)
         except (OSError, RuntimeError, ValueError):
             continue
         if not container_path.is_absolute():
@@ -1613,7 +1615,7 @@ def _cache_dir_container_mounts() -> List[Tuple[Path, Path]]:
         return []
 
 
-def _translate_docker_container_media_path(candidate: Path) -> Optional[Path]:
+def _translate_docker_container_media_path(candidate: Path | PurePosixPath) -> Optional[Path]:
     """Translate a container-absolute path to its host path when possible.
 
     Uses longest-prefix match across configured ``docker_volumes``, the
@@ -1621,7 +1623,8 @@ def _translate_docker_container_media_path(candidate: Path) -> Optional[Path]:
     persistent Docker ``/workspace`` host root, and the persistent ``/root``
     home mount.
     """
-    if not candidate.is_absolute():
+    candidate_posix = candidate.as_posix()
+    if not candidate_posix.startswith("/"):
         return None
 
     # In-process gateways (Desktop backend, `hermes serve`) may not have
@@ -1640,7 +1643,7 @@ def _translate_docker_container_media_path(candidate: Path) -> Optional[Path]:
     # Synthetic /workspace mount for default persistent sandbox / cwd bind.
     default_ws = _default_docker_workspace_host_root()
     if default_ws is not None and not any(c.as_posix() == "/workspace" for _, c in mounts):
-        mounts.append((default_ws, Path("/workspace")))
+        mounts.append((default_ws, PurePosixPath("/workspace")))
     # Synthetic /root mount for the persistent home bind. Cache mounts above
     # are longer prefixes, so /root/.hermes/... still translates to the host
     # cache — this only catches stray home writes like /root/out.png.
@@ -1653,14 +1656,13 @@ def _translate_docker_container_media_path(candidate: Path) -> Optional[Path]:
         # host-side credential denylist prefixes — refuse instead so the
         # normal "container path doesn't exist on host" rejection applies.
         if not candidate.as_posix().startswith("/root/.hermes"):
-            mounts.append((default_home, Path("/root")))
+            mounts.append((default_home, PurePosixPath("/root")))
 
     if not mounts:
         return None
 
     # Longest container-prefix match.
     best: Optional[Tuple[Path, Path, int]] = None
-    candidate_posix = candidate.as_posix()
     for host_root, container_root in mounts:
         container_posix = container_root.as_posix().rstrip("/") or "/"
         if candidate_posix == container_posix or candidate_posix.startswith(container_posix + "/"):
@@ -1672,8 +1674,8 @@ def _translate_docker_container_media_path(candidate: Path) -> Optional[Path]:
 
     host_root, container_root, _ = best
     try:
-        relative = candidate.relative_to(container_root)
-        translated = (host_root / relative).resolve(strict=True)
+        relative = PurePosixPath(candidate_posix).relative_to(PurePosixPath(container_root.as_posix()))
+        translated = (host_root / Path(*relative.parts)).resolve(strict=True)
     except (OSError, RuntimeError, ValueError):
         return None
     if translated != host_root and not _path_is_within(translated, host_root):
@@ -1712,22 +1714,24 @@ def validate_media_delivery_path(path: str) -> Optional[str]:
         return None
 
     try:
-        expanded = Path(os.path.expanduser(candidate))
+        expanded_text = os.path.expanduser(candidate)
+        expanded_path = Path(expanded_text)
+        expanded_container = PurePosixPath(expanded_text) if expanded_text.startswith("/") else expanded_path
     except (OSError, RuntimeError, ValueError):
         # expanduser raises ValueError("embedded null byte") for a ~\x00 path.
         return None
-    if not expanded.is_absolute():
+    if not (expanded_path.is_absolute() or expanded_text.startswith("/")):
         return None
 
     # Docker agents emit MEDIA:/workspace/... (or other configured container
     # mount paths). Resolve those to host paths before the normal host-side
     # existence / denylist checks.
-    translated = _translate_docker_container_media_path(expanded)
+    translated = _translate_docker_container_media_path(expanded_container)
     if translated is not None:
         resolved = translated
     else:
         try:
-            resolved = expanded.resolve(strict=True)
+            resolved = expanded_path.resolve(strict=True)
         except (OSError, RuntimeError, ValueError):
             return None
 

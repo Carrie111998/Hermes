@@ -1,5 +1,6 @@
 """Tests for the dashboard-managed file browser API."""
 
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -111,6 +112,37 @@ def test_download_authenticates_via_query_token(forced_files_client):
     assert client.get(
         "/api/files/download", params={"path": str(file_path)}
     ).status_code == 401
+
+
+def test_download_resolves_configured_docker_mount_inside_managed_root(
+    forced_files_client, monkeypatch
+):
+    client, root = forced_files_client
+    report = root / "report.txt"
+    root.mkdir(parents=True, exist_ok=True)
+    report.write_text("container report", encoding="utf-8")
+    monkeypatch.setenv("TERMINAL_ENV", "docker")
+    monkeypatch.setenv("TERMINAL_DOCKER_VOLUMES", json.dumps([f"{root}:/workspace"]))
+
+    response = client.get("/api/files/download", params={"path": "/workspace/report.txt"})
+
+    assert response.status_code == 200
+    assert response.content == b"container report"
+
+
+def test_download_rejects_translated_docker_mount_outside_managed_root(
+    forced_files_client, monkeypatch, tmp_path
+):
+    client, _root = forced_files_client
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "secret.txt").write_text("not managed", encoding="utf-8")
+    monkeypatch.setenv("TERMINAL_ENV", "docker")
+    monkeypatch.setenv("TERMINAL_DOCKER_VOLUMES", json.dumps([f"{outside}:/workspace"]))
+
+    response = client.get("/api/files/download", params={"path": "/workspace/secret.txt"})
+
+    assert response.status_code == 403
 
 
 def test_query_token_does_not_authenticate_other_endpoints(forced_files_client):
