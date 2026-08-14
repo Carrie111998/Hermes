@@ -206,7 +206,8 @@ export const en: Translations = {
     enterHud: 'HUD mode',
     exitHud: 'Exit HUD mode',
     layoutEditor: 'Layout editor',
-    layoutEditorTitle: 'Layout editor — ⌘-click resets the layout'
+    layoutEditorTitle: 'Layout editor — ⌘-click resets the layout',
+    equalizeConversationPanes: 'Equalize conversation panes'
   },
 
   keybinds: {

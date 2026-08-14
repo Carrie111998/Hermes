@@ -73,6 +73,33 @@ function persist(tree: LayoutNode | null) {
  *  own routed session. */
 export const $layoutTree = atom<LayoutNode | null>(isSecondaryWindow() ? null : loadPersisted())
 
+/** Short renderer-only motion window for the one-shot equalize action. Sash
+ * drags and every other tree mutation remain immediate. */
+export const LAYOUT_EQUALIZE_MOTION_MS = 200
+export const $layoutEqualizeMotion = atom(false)
+let layoutEqualizeMotionTimer: ReturnType<typeof setTimeout> | null = null
+
+export function cancelLayoutEqualizeMotion(): void {
+  if (layoutEqualizeMotionTimer !== null) {
+    clearTimeout(layoutEqualizeMotionTimer)
+    layoutEqualizeMotionTimer = null
+  }
+
+  $layoutEqualizeMotion.set(false)
+}
+
+function beginLayoutEqualizeMotion(): void {
+  if (layoutEqualizeMotionTimer !== null) {
+    clearTimeout(layoutEqualizeMotionTimer)
+  }
+
+  $layoutEqualizeMotion.set(true)
+  layoutEqualizeMotionTimer = setTimeout(() => {
+    layoutEqualizeMotionTimer = null
+    $layoutEqualizeMotion.set(false)
+  }, LAYOUT_EQUALIZE_MOTION_MS)
+}
+
 /**
  * Which layout preset the current tree came from; `'custom'` after the user
  * rearranges anything. Drives the picker's active highlight.
@@ -622,6 +649,79 @@ function shownPanesInGroup(group: { panes: readonly string[] }): string[] {
 
     return true
   })
+}
+
+interface EqualizedSessionSubtree {
+  node: LayoutNode
+  sessionCount: number
+}
+
+/** Equalize visible conversation AREA without disturbing unrelated panes.
+ *
+ * A local 1:1 at every split is wrong for nested layouts: one conversation
+ * beside a subtree of two needs a 1:2 parent split, then 1:1 inside the
+ * subtree. Each split therefore divides the weight ALREADY owned by its
+ * session-bearing children in proportion to their descendant visible-session
+ * counts. Non-session children keep their exact weights, so left/right
+ * sections and contributed tools retain their allocation.
+ *
+ * Visibility mirrors TreeGroup: only the shown active pane counts; a hidden or
+ * unregistered active id falls back to the first shown tab, and a minimized
+ * group has no visible conversation body. */
+function equalizeSessionSubtree(node: LayoutNode): EqualizedSessionSubtree {
+  if (node.type === 'group') {
+    const shown = shownPanesInGroup(node)
+    const active = shown.includes(node.active) ? node.active : shown[0]
+
+    return {
+      node,
+      sessionCount: !node.minimized && active && isSessionStripPane(active) ? 1 : 0
+    }
+  }
+
+  const results = node.children.map(equalizeSessionSubtree)
+  const children = results.map(result => result.node)
+  const sessionCount = results.reduce((sum, result) => sum + result.sessionCount, 0)
+  const sessionChildren = results.flatMap((result, index) => (result.sessionCount > 0 ? [index] : []))
+  let weights = node.weights
+
+  if (sessionChildren.length >= 2) {
+    const sessionWeight = sessionChildren.reduce((sum, index) => sum + node.weights[index], 0)
+    const next = [...node.weights]
+
+    for (const index of sessionChildren) {
+      next[index] = sessionWeight * (results[index].sessionCount / sessionCount)
+    }
+
+    if (next.some((weight, index) => Math.abs(weight - node.weights[index]) > 1e-9)) {
+      weights = next
+    }
+  }
+
+  const childrenChanged = children.some((child, index) => child !== node.children[index])
+
+  return {
+    node: childrenChanged || weights !== node.weights ? { ...node, children, weights } : node,
+    sessionCount
+  }
+}
+
+/** One-shot titlebar action: equalize every visible conversation pane and
+ * persist the resulting tree once. Reference-stable when fewer than two
+ * conversations are visible or the tree is already balanced. */
+export function equalizeVisibleSessionPanes(): void {
+  const tree = $layoutTree.get()
+
+  if (!tree) {
+    return
+  }
+
+  const result = equalizeSessionSubtree(tree)
+
+  if (result.sessionCount >= 2 && result.node !== tree) {
+    beginLayoutEqualizeMotion()
+    commit(result.node, { keepEqualizeMotion: true })
+  }
 }
 
 /** ⌘1…⌘9: activate the Nth *visible* tab of the target zone — the first of
@@ -1197,9 +1297,16 @@ export function watchContributedPanes(): void {
   registry.subscribe(adoptContributedPanes)
 }
 
-function commit(next: LayoutNode | null) {
+function commit(next: LayoutNode | null, { keepEqualizeMotion = false }: { keepEqualizeMotion?: boolean } = {}) {
   if (!next) {
     return
+  }
+
+  // The transition belongs only to the equalize mutation that opened it.
+  // Any subsequent layout intent must paint immediately rather than inheriting
+  // the remainder of that short motion window.
+  if (!keepEqualizeMotion) {
+    cancelLayoutEqualizeMotion()
   }
 
   $layoutTree.set(next)
@@ -1657,6 +1764,7 @@ export function setTreeSplitWeights(splitId: string, weights: number[]) {
 
   if (tree) {
     // Weight drags are high-frequency: update live, persist on the trailing edge.
+    cancelLayoutEqualizeMotion()
     $layoutTree.set(setSplitWeightsOp(tree, splitId, weights))
   }
 }
@@ -1708,6 +1816,7 @@ export function persistTree() {
 }
 
 export function resetLayoutTree() {
+  cancelLayoutEqualizeMotion()
   persist(null)
   clearAllPaneSizeOverrides()
   // Reset restores EVERYTHING — closed panes included — and hands pane
