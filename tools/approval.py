@@ -2165,9 +2165,16 @@ def _is_verification_artifact_cleanup(command: str) -> bool:
         return False
 
     operand = argv[2]
-    temp_dir = os.path.realpath(tempfile.gettempdir())
+    raw_temp_dir = tempfile.gettempdir()
+    temp_dir = os.path.realpath(raw_temp_dir)
     basename = os.path.basename(operand)
-    if operand != os.path.join(temp_dir, basename):
+    # macOS exposes the system temporary directory as /tmp while the kernel
+    # canonicalizes it to /private/tmp. Accept that one OS alias, but do not
+    # generalize the exception to arbitrary symlinked directories.
+    accepted_operands = {os.path.join(temp_dir, basename)}
+    if raw_temp_dir == "/tmp":
+        accepted_operands.add(os.path.join(raw_temp_dir, basename))
+    if operand not in accepted_operands:
         return False
 
     target = os.path.realpath(operand)

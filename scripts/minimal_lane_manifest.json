@@ -1,0 +1,438 @@
+{
+  "manifest_version": "2.0",
+  "lane": "minimal-core-dev",
+  "base_head": "f3d5080c68f034d9bb42f93c39d393633580b5da",
+  "base_tree": "2f2da9514bef80c75646d7944ad26dc5778a4dea",
+  "source_inventory": "/Users/jarvis/harvis-command-release-evidence/hermes-test-baseline-phase1/phase1_inventory.json",
+  "entries": [
+    {
+      "path": "tests/acp/test_entry.py",
+      "lane": "optional_acp",
+      "rationale": "Observed ModuleNotFoundError for package 'acp'; ACP is an explicit optional extra rather than a dev dependency.",
+      "direct_rerun": "tests/acp/test_entry.py",
+      "selectors": [
+        "tests/acp/test_entry.py"
+      ],
+      "phase1_status": "NO_COLLECTION",
+      "selection_level": "file"
+    },
+    {
+      "path": "tests/acp/test_events.py",
+      "lane": "optional_acp",
+      "rationale": "Observed ModuleNotFoundError for package 'acp'; ACP is an explicit optional extra rather than a dev dependency.",
+      "direct_rerun": "tests/acp/test_events.py",
+      "selectors": [
+        "tests/acp/test_events.py"
+      ],
+      "phase1_status": "NO_COLLECTION",
+      "selection_level": "file"
+    },
+    {
+      "path": "tests/acp/test_ping_suppression.py",
+      "lane": "optional_acp",
+      "rationale": "Observed ModuleNotFoundError for package 'acp'; ACP is an explicit optional extra rather than a dev dependency.",
+      "direct_rerun": "tests/acp/test_ping_suppression.py",
+      "selectors": [
+        "tests/acp/test_ping_suppression.py"
+      ],
+      "phase1_status": "NO_COLLECTION",
+      "selection_level": "file"
+    },
+    {
+      "path": "tests/acp/test_mcp_e2e.py",
+      "lane": "optional_acp",
+      "rationale": "Observed ModuleNotFoundError for package 'acp'; ACP is an explicit optional extra rather than a dev dependency.",
+      "direct_rerun": "tests/acp/test_mcp_e2e.py",
+      "selectors": [
+        "tests/acp/test_mcp_e2e.py"
+      ],
+      "phase1_status": "NO_COLLECTION",
+      "selection_level": "file"
+    },
+    {
+      "path": "tests/acp_adapter/test_acp_mcp_discovery.py",
+      "lane": "optional_acp",
+      "rationale": "Observed ModuleNotFoundError for package 'acp'; ACP is an explicit optional extra rather than a dev dependency.",
+      "direct_rerun": "tests/acp_adapter/test_acp_mcp_discovery.py",
+      "selectors": [
+        "tests/acp_adapter/test_acp_mcp_discovery.py"
+      ],
+      "phase1_status": "NO_COLLECTION",
+      "selection_level": "file"
+    },
+    {
+      "path": "tests/acp_adapter/test_acp_images.py",
+      "lane": "optional_acp",
+      "rationale": "Observed ModuleNotFoundError for package 'acp'; ACP is an explicit optional extra rather than a dev dependency.",
+      "direct_rerun": "tests/acp_adapter/test_acp_images.py",
+      "selectors": [
+        "tests/acp_adapter/test_acp_images.py"
+      ],
+      "phase1_status": "NO_COLLECTION",
+      "selection_level": "file"
+    },
+    {
+      "path": "tests/acp/test_server.py",
+      "lane": "optional_acp",
+      "rationale": "Observed ModuleNotFoundError for package 'acp'; ACP is an explicit optional extra rather than a dev dependency.",
+      "direct_rerun": "tests/acp/test_server.py",
+      "selectors": [
+        "tests/acp/test_server.py"
+      ],
+      "phase1_status": "NO_COLLECTION",
+      "selection_level": "file"
+    },
+    {
+      "path": "tests/acp_adapter/test_acp_commands.py",
+      "lane": "optional_acp",
+      "rationale": "Observed ModuleNotFoundError for package 'acp'; ACP is an explicit optional extra rather than a dev dependency.",
+      "direct_rerun": "tests/acp_adapter/test_acp_commands.py",
+      "selectors": [
+        "tests/acp_adapter/test_acp_commands.py"
+      ],
+      "phase1_status": "NO_COLLECTION",
+      "selection_level": "file"
+    },
+    {
+      "path": "tests/acp/test_named_provider_catalogs.py",
+      "lane": "optional_acp",
+      "rationale": "Observed ModuleNotFoundError for package 'acp'; ACP is an explicit optional extra rather than a dev dependency.",
+      "direct_rerun": "tests/acp/test_named_provider_catalogs.py",
+      "selectors": [
+        "tests/acp/test_named_provider_catalogs.py"
+      ],
+      "phase1_status": "NO_COLLECTION",
+      "selection_level": "file"
+    },
+    {
+      "path": "tests/acp/test_tools.py",
+      "lane": "optional_acp",
+      "rationale": "Observed ModuleNotFoundError for package 'acp'; ACP is an explicit optional extra rather than a dev dependency.",
+      "direct_rerun": "tests/acp/test_tools.py",
+      "selectors": [
+        "tests/acp/test_tools.py"
+      ],
+      "phase1_status": "NO_COLLECTION",
+      "selection_level": "file"
+    },
+    {
+      "path": "tests/acp/test_permissions.py",
+      "lane": "optional_acp",
+      "rationale": "Observed ModuleNotFoundError for package 'acp'; ACP is an explicit optional extra rather than a dev dependency.",
+      "direct_rerun": "tests/acp/test_permissions.py",
+      "selectors": [
+        "tests/acp/test_permissions.py"
+      ],
+      "phase1_status": "NO_COLLECTION",
+      "selection_level": "file"
+    },
+    {
+      "path": "tests/acp/test_auth.py",
+      "lane": "optional_acp",
+      "rationale": "Observed ModuleNotFoundError for package 'acp'; ACP is an explicit optional extra rather than a dev dependency.",
+      "direct_rerun": "tests/acp/test_auth.py",
+      "selectors": [
+        "tests/acp/test_auth.py::TestBuildAuthMethods::test_build_auth_methods_returns_provider_and_terminal_when_configured"
+      ],
+      "phase1_status": "FAILED_TESTS",
+      "selection_level": "node"
+    },
+    {
+      "path": "tests/acp/test_edit_approval.py",
+      "lane": "optional_acp",
+      "rationale": "Observed ModuleNotFoundError for package 'acp'; ACP is an explicit optional extra rather than a dev dependency.",
+      "direct_rerun": "tests/acp/test_edit_approval.py",
+      "selectors": [
+        "tests/acp/test_edit_approval.py::test_acp_permission_tool_call_uses_edit_kind_and_diff_content"
+      ],
+      "phase1_status": "FAILED_TESTS",
+      "selection_level": "node"
+    },
+    {
+      "path": "tests/agent/test_auxiliary_transport_autodetect.py",
+      "lane": "optional_anthropic",
+      "rationale": "Failures require Anthropic client construction and report the absent Anthropic SDK or the resulting OpenAI/None fallback.",
+      "direct_rerun": "tests/agent/test_auxiliary_transport_autodetect.py",
+      "selectors": [
+        "tests/agent/test_auxiliary_transport_autodetect.py::test_resolve_provider_client_kimi_coding_wraps_anthropic"
+      ],
+      "phase1_status": "FAILED_TESTS",
+      "selection_level": "node"
+    },
+    {
+      "path": "tests/agent/test_auxiliary_named_custom_providers.py",
+      "lane": "optional_anthropic",
+      "rationale": "Failures require Anthropic client construction and report the absent Anthropic SDK or the resulting OpenAI/None fallback.",
+      "direct_rerun": "tests/agent/test_auxiliary_named_custom_providers.py",
+      "selectors": [
+        "tests/agent/test_auxiliary_named_custom_providers.py::TestProvidersDictApiModeAnthropicMessages::test_resolve_provider_client_returns_anthropic_client"
+      ],
+      "phase1_status": "FAILED_TESTS",
+      "selection_level": "node"
+    },
+    {
+      "path": "tests/agent/test_nous_portal_anthropic_wire.py",
+      "lane": "optional_anthropic",
+      "rationale": "Failures require Anthropic client construction and report the absent Anthropic SDK or the resulting OpenAI/None fallback.",
+      "direct_rerun": "tests/agent/test_nous_portal_anthropic_wire.py",
+      "selectors": [
+        "tests/agent/test_nous_portal_anthropic_wire.py::TestClientShape::test_portal_jwt_authenticates_with_bearer_not_x_api_key",
+        "tests/agent/test_nous_portal_anthropic_wire.py::TestClientShape::test_portal_bearer_does_not_also_send_env_anthropic_api_key"
+      ],
+      "phase1_status": "FAILED_TESTS",
+      "selection_level": "node"
+    },
+    {
+      "path": "tests/agent/test_set_runtime_main_custom_provider.py",
+      "lane": "optional_anthropic",
+      "rationale": "Failures require Anthropic client construction and report the absent Anthropic SDK or the resulting OpenAI/None fallback.",
+      "direct_rerun": "tests/agent/test_set_runtime_main_custom_provider.py",
+      "selectors": [
+        "tests/agent/test_set_runtime_main_custom_provider.py::TestResolveAutoCustomEndToEnd::test_named_custom_anthropic_messages_keeps_full_name_and_url"
+      ],
+      "phase1_status": "FAILED_TESTS",
+      "selection_level": "node"
+    },
+    {
+      "path": "tests/agent/test_vision_routing_31179.py",
+      "lane": "optional_anthropic",
+      "rationale": "Failures require Anthropic client construction and report the absent Anthropic SDK or the resulting OpenAI/None fallback.",
+      "direct_rerun": "tests/agent/test_vision_routing_31179.py",
+      "selectors": [
+        "tests/agent/test_vision_routing_31179.py::TestTextOnlyMainSkippedForVision::test_vision_capable_main_used"
+      ],
+      "phase1_status": "FAILED_TESTS",
+      "selection_level": "node"
+    },
+    {
+      "path": "tests/gateway/test_shutdown_forensics.py",
+      "lane": "linux_systemd_s6",
+      "rationale": "The red paths use GNU timeout/ps/pstree, Linux abstract AF_UNIX sockets, or s6 supervise mode semantics; they fail on Darwin.",
+      "direct_rerun": "tests/gateway/test_shutdown_forensics.py",
+      "selectors": [
+        "tests/gateway/test_shutdown_forensics.py::TestSpawnAsyncDiagnostic::test_spawns_subprocess_and_writes_output"
+      ],
+      "phase1_status": "FAILED_TESTS",
+      "selection_level": "node"
+    },
+    {
+      "path": "tests/gateway/test_systemd_notify.py",
+      "lane": "linux_systemd_s6",
+      "rationale": "The red paths use GNU timeout/ps/pstree, Linux abstract AF_UNIX sockets, or s6 supervise mode semantics; they fail on Darwin.",
+      "direct_rerun": "tests/gateway/test_systemd_notify.py",
+      "selectors": [
+        "tests/gateway/test_systemd_notify.py::test_notify_supports_systemd_abstract_socket"
+      ],
+      "phase1_status": "FAILED_TESTS",
+      "selection_level": "node"
+    },
+    {
+      "path": "tests/gateway/test_wecom_callback.py",
+      "lane": "optional_wecom",
+      "rationale": "The callback parser has ET=None because defusedxml is absent; defusedxml is declared only by the WeCom extra.",
+      "direct_rerun": "tests/gateway/test_wecom_callback.py",
+      "selectors": [
+        "tests/gateway/test_wecom_callback.py::TestWecomCallbackEventConstruction::test_build_event_extracts_text_message",
+        "tests/gateway/test_wecom_callback.py::TestWecomCallbackPollLoop::test_poll_loop_dispatches_handle_message"
+      ],
+      "phase1_status": "FAILED_TESTS",
+      "selection_level": "node"
+    },
+    {
+      "path": "tests/hermes_cli/test_service_manager.py",
+      "lane": "linux_systemd_s6",
+      "rationale": "The red paths use GNU timeout/ps/pstree, Linux abstract AF_UNIX sockets, or s6 supervise mode semantics; they fail on Darwin.",
+      "direct_rerun": "tests/hermes_cli/test_service_manager.py",
+      "selectors": [
+        "tests/hermes_cli/test_service_manager.py::test_seed_supervise_skeleton_creates_expected_layout"
+      ],
+      "phase1_status": "FAILED_TESTS",
+      "selection_level": "node"
+    },
+    {
+      "path": "tests/plugins/memory/test_hindsight_provider.py",
+      "lane": "optional_hindsight",
+      "rationale": "The first error is FeatureUnavailable for missing hindsight-client with lazy installs disabled; follow-on assertions are downstream.",
+      "direct_rerun": "tests/plugins/memory/test_hindsight_provider.py",
+      "selectors": [
+        "tests/plugins/memory/test_hindsight_provider.py"
+      ],
+      "phase1_status": "FAILED_TESTS",
+      "selection_level": "file"
+    },
+    {
+      "path": "tests/plugins/video_gen/test_fal_plugin.py",
+      "lane": "optional_fal",
+      "rationale": "Failures report absent fal_client/FeatureUnavailable for image.fal; these are FAL image/video provider surfaces.",
+      "direct_rerun": "tests/plugins/video_gen/test_fal_plugin.py",
+      "selectors": [
+        "tests/plugins/video_gen/test_fal_plugin.py::TestFamilyRouting::test_text_to_video_routes_to_text_endpoint",
+        "tests/plugins/video_gen/test_fal_plugin.py::TestFamilyRouting::test_image_to_video_routes_to_image_endpoint",
+        "tests/plugins/video_gen/test_fal_plugin.py::TestFamilyRouting::test_default_family_text_routing",
+        "tests/plugins/video_gen/test_fal_plugin.py::TestFamilyRouting::test_unknown_family_falls_back_to_default",
+        "tests/plugins/video_gen/test_fal_plugin.py::TestFamilyRouting::test_premium_seedance_routing"
+      ],
+      "phase1_status": "FAILED_TESTS",
+      "selection_level": "node"
+    },
+    {
+      "path": "tests/run_agent/test_nous_fallback_unavailable.py",
+      "lane": "optional_anthropic",
+      "rationale": "Failures require Anthropic client construction and report the absent Anthropic SDK or the resulting OpenAI/None fallback.",
+      "direct_rerun": "tests/run_agent/test_nous_fallback_unavailable.py",
+      "selectors": [
+        "tests/run_agent/test_nous_fallback_unavailable.py::TestNousFallbackLocalAvailability::test_present_nous_token_allows_activation"
+      ],
+      "phase1_status": "FAILED_TESTS",
+      "selection_level": "node"
+    },
+    {
+      "path": "tests/run_agent/test_switch_model_reasoning_override.py",
+      "lane": "optional_anthropic",
+      "rationale": "Failures require Anthropic client construction and report the absent Anthropic SDK or the resulting OpenAI/None fallback.",
+      "direct_rerun": "tests/run_agent/test_switch_model_reasoning_override.py",
+      "selectors": [
+        "tests/run_agent/test_switch_model_reasoning_override.py::TestSwitchModelReasoningOverride::test_primary_runtime_includes_reasoning_config",
+        "tests/run_agent/test_switch_model_reasoning_override.py::TestSwitchModelReasoningOverride::test_restore_primary_runtime_restores_reasoning"
+      ],
+      "phase1_status": "FAILED_TESTS",
+      "selection_level": "node"
+    },
+    {
+      "path": "tests/run_agent/test_streaming.py",
+      "lane": "optional_anthropic",
+      "rationale": "Failures require Anthropic client construction and report the absent Anthropic SDK or the resulting OpenAI/None fallback.",
+      "direct_rerun": "tests/run_agent/test_streaming.py",
+      "selectors": [
+        "tests/run_agent/test_streaming.py::TestAnthropicStreamCallbacks::test_anthropic_stream_parser_valueerror_retries_before_delivery",
+        "tests/run_agent/test_streaming.py::TestAnthropicStreamCallbacks::test_generic_anthropic_valueerror_still_propagates_without_stream_retry",
+        "tests/run_agent/test_streaming.py::TestAnthropicStreamCallbacks::test_anthropic_eventless_sdk_assertion_normalized_to_empty_stream"
+      ],
+      "phase1_status": "FAILED_TESTS",
+      "selection_level": "node"
+    },
+    {
+      "path": "tests/tools/test_daytona_environment.py",
+      "lane": "optional_daytona",
+      "rationale": "All 15 tests fail at the declared lazy dependency gate for missing daytona.",
+      "direct_rerun": "tests/tools/test_daytona_environment.py",
+      "selectors": [
+        "tests/tools/test_daytona_environment.py"
+      ],
+      "phase1_status": "FAILED_TESTS",
+      "selection_level": "file"
+    },
+    {
+      "path": "tests/tools/test_computer_use.py",
+      "lane": "optional_computer_use_linux",
+      "rationale": "The only red node explicitly exercises Linux default capture/GNOME process selection on a Darwin host.",
+      "direct_rerun": "tests/tools/test_computer_use.py",
+      "selectors": [
+        "tests/tools/test_computer_use.py::TestCaptureAppFilterNoMatch::test_linux_default_capture_skips_gnome_shell_helper"
+      ],
+      "phase1_status": "FAILED_TESTS",
+      "selection_level": "node"
+    },
+    {
+      "path": "tests/tools/test_image_generation.py",
+      "lane": "optional_fal",
+      "rationale": "Failures report absent fal_client/FeatureUnavailable for image.fal; these are FAL image/video provider surfaces.",
+      "direct_rerun": "tests/tools/test_image_generation.py",
+      "selectors": [
+        "tests/tools/test_image_generation.py::TestManagedGatewayErrorTranslation::test_4xx_translates_to_value_error_with_remediation",
+        "tests/tools/test_image_generation.py::TestManagedGatewayErrorTranslation::test_non_http_exception_from_managed_bubbles_up"
+      ],
+      "phase1_status": "FAILED_TESTS",
+      "selection_level": "node"
+    },
+    {
+      "path": "tests/tools/test_managed_media_gateways.py",
+      "lane": "optional_fal",
+      "rationale": "Failures report absent fal_client/FeatureUnavailable for image.fal; these are FAL image/video provider surfaces.",
+      "direct_rerun": "tests/tools/test_managed_media_gateways.py",
+      "selectors": [
+        "tests/tools/test_managed_media_gateways.py::test_managed_fal_submit_uses_gateway_origin_and_nous_token"
+      ],
+      "phase1_status": "FAILED_TESTS",
+      "selection_level": "node"
+    },
+    {
+      "path": "tests/tools/test_modal_snapshot_isolation.py",
+      "lane": "optional_modal",
+      "rationale": "Both tests fail at FeatureUnavailable for missing modal==1.3.4.",
+      "direct_rerun": "tests/tools/test_modal_snapshot_isolation.py",
+      "selectors": [
+        "tests/tools/test_modal_snapshot_isolation.py"
+      ],
+      "phase1_status": "FAILED_TESTS",
+      "selection_level": "file"
+    },
+    {
+      "path": "tests/tools/test_wake_word.py",
+      "lane": "optional_wake_macos",
+      "rationale": "On macOS ARM64 the test reaches the product's explicit tflite-runtime requirement and ai-edge-litert is absent.",
+      "direct_rerun": "tests/tools/test_wake_word.py",
+      "selectors": [
+        "tests/tools/test_wake_word.py::test_openwakeword_ensures_base_models_for_custom_path"
+      ],
+      "phase1_status": "FAILED_TESTS",
+      "selection_level": "node"
+    },
+    {
+      "path": "tests/tools/test_web_tools_config.py",
+      "lane": "optional_parallel_web",
+      "rationale": "Two Parallel client tests fail at FeatureUnavailable for missing parallel-web.",
+      "direct_rerun": "tests/tools/test_web_tools_config.py",
+      "selectors": [
+        "tests/tools/test_web_tools_config.py::TestParallelClientConfig::test_creates_client_with_key",
+        "tests/tools/test_web_tools_config.py::TestParallelClientConfig::test_singleton_returns_same_instance"
+      ],
+      "phase1_status": "FAILED_TESTS",
+      "selection_level": "node"
+    },
+    {
+      "path": "tests/tools/test_video_generation_tool_surface_matrix.py",
+      "lane": "optional_fal",
+      "rationale": "Failures report absent fal_client/FeatureUnavailable for image.fal; these are FAL image/video provider surfaces.",
+      "direct_rerun": "tests/tools/test_video_generation_tool_surface_matrix.py",
+      "selectors": [
+        "tests/tools/test_video_generation_tool_surface_matrix.py::test_fal_text_only_routes_to_text_endpoint[ltx-2.3]",
+        "tests/tools/test_video_generation_tool_surface_matrix.py::test_fal_text_only_routes_to_text_endpoint[pixverse-v6]",
+        "tests/tools/test_video_generation_tool_surface_matrix.py::test_fal_text_only_routes_to_text_endpoint[veo3.1]",
+        "tests/tools/test_video_generation_tool_surface_matrix.py::test_fal_text_only_routes_to_text_endpoint[seedance-2.0]",
+        "tests/tools/test_video_generation_tool_surface_matrix.py::test_fal_text_only_routes_to_text_endpoint[kling-v3-4k]",
+        "tests/tools/test_video_generation_tool_surface_matrix.py::test_fal_text_only_routes_to_text_endpoint[happy-horse]",
+        "tests/tools/test_video_generation_tool_surface_matrix.py::test_tool_model_arg_overrides_config",
+        "tests/tools/test_video_generation_tool_surface_matrix.py::test_tool_model_arg_with_image_url_routes_to_override_image_endpoint"
+      ],
+      "phase1_status": "FAILED_TESTS",
+      "selection_level": "node"
+    },
+    {
+      "path": "tests/tools/test_voice_mode.py",
+      "lane": "wsl_and_audio_host",
+      "rationale": "Two stable reds exercise WSL2 PowerShell fallback from Darwin; the second aggregate also exposed a sounddevice beep node, showing host/optional-audio variance.",
+      "direct_rerun": "tests/tools/test_voice_mode.py",
+      "selectors": [
+        "tests/tools/test_voice_mode.py::TestPlayBeep::test_beep_calls_sounddevice_play",
+        "tests/tools/test_voice_mode.py::TestWSL2PowerShellFallback::test_powershell_pipeline_preserves_real_exit_status",
+        "tests/tools/test_voice_mode.py::TestWSL2PowerShellFallback::test_wsl2_unique_temp_filename"
+      ],
+      "phase1_status": "FAILED_TESTS",
+      "selection_level": "node"
+    },
+    {
+      "path": "tests/tools/test_execution_flag_detection.py",
+      "lane": "gnu_cli_host",
+      "rationale": "Red parameterizations invoke GNU sort options or expect a man binary; Darwin has BSD sort and the observed host lacks the expected execution artifact.",
+      "direct_rerun": "tests/tools/test_execution_flag_detection.py",
+      "selectors": [
+        "tests/tools/test_execution_flag_detection.py::test_real_binaries_execute_leading_dash_program_payload[sort-args2-{bulk}-False]",
+        "tests/tools/test_execution_flag_detection.py::test_real_binaries_execute_leading_dash_program_payload[man-args4-None-True]",
+        "tests/tools/test_execution_flag_detection.py::test_real_binaries_execute_leading_dash_program_payload[man-args5-None-True]"
+      ],
+      "phase1_status": "FAILED_TESTS",
+      "selection_level": "node"
+    }
+  ]
+}

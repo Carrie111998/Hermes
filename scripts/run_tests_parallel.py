@@ -167,7 +167,18 @@ def _discover_files(roots: List[Path]) -> List[Path]:
                 continue
             seen.add(real)
             out.append(path)
-    return sorted(out)
+    discovered = sorted(out)
+    # The default release-facing local lane is deliberately the minimal
+    # core+dev matrix.  Exclusions are versioned and audited; explicit file
+    # arguments remain directly runnable and never get silently subtracted.
+    if (os.environ.get("HERMES_TEST_LANE", "minimal-core-dev") == "minimal-core-dev"
+            and all(root.is_dir() for root in roots)
+            and all(path.resolve().is_relative_to(Path(__file__).resolve().parent.parent) for path in discovered)):
+        from test_selection_audit import select_minimal, audit_file_ownership
+
+        audit_file_ownership(discovered)
+        return select_minimal(discovered)
+    return discovered
 
 
 def _kill_tree(proc: "subprocess.Popen", pgid: int | None = None) -> None:
@@ -906,6 +917,13 @@ def main() -> int:
         print("No test files to run", file=sys.stderr)
         return 1
 
+    selection_args: dict[Path, List[str]] = {}
+    if (os.environ.get("HERMES_TEST_LANE", "minimal-core-dev") == "minimal-core-dev"
+            and roots and all(root.is_dir() for root in roots)
+            and all(path.resolve().is_relative_to(repo_root.resolve()) for path in files)):
+        from test_selection_audit import deselect_args
+        selection_args = {file: deselect_args(file) for file in files}
+
     # --generate-slices: compute LPT distribution and emit JSON, then exit.
     if args.generate_slices is not None:
         durations = _load_durations(repo_root)
@@ -1022,7 +1040,7 @@ def main() -> int:
         for file in files:
             t0 = time.monotonic()
             fut = pool.submit(
-                _run_one_file, file, pytest_passthrough, repo_root,
+                _run_one_file, file, pytest_passthrough + selection_args.get(file, []), repo_root,
                 args.file_timeout, args.file_retries,
             )
             fut.add_done_callback(lambda f, file=file, t0=t0: _on_done(file, t0, f))

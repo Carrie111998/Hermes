@@ -168,11 +168,22 @@ def _inspect_original_collection_environment(
         for name in ("HERMES_HOME", "HOME")
     }
     try:
+        isolated_custom_home = False
+        if snapshot.home is not None:
+            try:
+                import pwd
+
+                isolated_custom_home = (
+                    Path(snapshot.home).resolve()
+                    != Path(pwd.getpwuid(os.getuid()).pw_dir).resolve()
+                )
+            except Exception:
+                isolated_custom_home = False
         if snapshot.hermes_home_was_set:
             if snapshot.hermes_home is None:
                 raise ValueError("missing original HERMES_HOME")
             os.environ["HERMES_HOME"] = snapshot.hermes_home
-        else:
+        elif not isolated_custom_home:
             os.environ.pop("HERMES_HOME", None)
 
         if snapshot.home is None:

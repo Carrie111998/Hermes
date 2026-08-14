@@ -22,6 +22,7 @@ test runner at ``scripts/run_tests.sh``.
 import asyncio
 import atexit
 import os
+import pwd
 import shutil
 import sqlite3
 import sys
@@ -77,21 +78,44 @@ def _hermes_home_points_at_production(value: str) -> bool:
     HERMES_HOME is honored now.
     """
     if not value:
+        # An absent HERMES_HOME is authoritative only when HOME is the real
+        # operator home.  A child may intentionally unset HERMES_HOME while
+        # supplying an isolated HOME/.hermes route; collection must not hide
+        # that route behind a random HERMES_HOME sandbox.
+        try:
+            operator_home = Path(pwd.getpwuid(os.getuid()).pw_dir).resolve()
+            if Path.home().resolve() != operator_home:
+                return False
+        except Exception:
+            return True
         return True
     try:
         resolved = Path(value).expanduser().resolve()
         real_root = (Path.home() / ".hermes").resolve()
     except Exception:
         return True
-    if resolved == real_root:
-        return True
-    # Profile home directly under the production root: <root>/profiles/<name>
-    return resolved.parent.name == "profiles" and resolved.parent.parent == real_root
+    # Named profiles may themselves use a profile-scoped home, such as
+    # <root>/profiles/forge/profiles/forge. Treat every descendant of the
+    # production root as operator state, not as a custom test home.
+    return resolved == real_root or real_root in resolved.parents
 
 
-if _hermes_home_points_at_production(_PRE_SANDBOX_HERMES_HOME):
+if not _PRE_SANDBOX_HERMES_HOME or _hermes_home_points_at_production(
+    _PRE_SANDBOX_HERMES_HOME
+):
+    # Keep HOME/.hermes authoritative when HOME is intentionally isolated,
+    # while still redirecting HERMES_HOME consumers that would otherwise write
+    # ancillary test state into that read-only child fixture estate.
     _SESSION_HERMES_HOME = tempfile.mkdtemp(prefix="hermes-test-home-")
     os.environ["HERMES_HOME"] = _SESSION_HERMES_HOME
+    # A child with an intentionally isolated HOME and no HERMES_HOME must be
+    # inspected against its native HOME/.hermes/config.yaml, while ancillary
+    # imports remain confined to the disposable HERMES_HOME tree.
+    if not _PRE_SANDBOX_HERMES_HOME:
+        native_config = Path.home() / ".hermes" / "config.yaml"
+        sandbox_config = Path(_SESSION_HERMES_HOME) / "config.yaml"
+        if native_config.is_file():
+            sandbox_config.symlink_to(native_config)
     atexit.register(shutil.rmtree, _SESSION_HERMES_HOME, True)
 
 #: HERMES_HOME as it stood when conftest was imported - i.e. before any test

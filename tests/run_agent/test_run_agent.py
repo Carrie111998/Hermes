@@ -20,17 +20,17 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from tests.conftest import ORIGINAL_COLLECTION_ENVIRONMENT
 from tests.run_agent.anthropic_test_gate import (
     GateDecision,
     decide_native_anthropic_test_gate,
 )
 
-# Captured during module collection from the immutable path inputs saved before
-# global conftest sandboxing; environment-provider precedence remains live here,
-# before the per-test autouse fixture clears HERMES_INFERENCE_PROVIDER.
+# Do not inspect the operator's original Hermes home here. That path can be a
+# named profile with native-Anthropic fallback settings, which makes this test
+# depend on whichever profile launched pytest. The collection sandbox is the
+# only supported configuration input for this unit test.
 _NATIVE_ANTHROPIC_INTERRUPT_GATE_DECISION: GateDecision = (
-    decide_native_anthropic_test_gate(ORIGINAL_COLLECTION_ENVIRONMENT)
+    decide_native_anthropic_test_gate(None)
 )
 
 from agent.codex_responses_adapter import _normalize_codex_response

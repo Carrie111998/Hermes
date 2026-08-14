@@ -2221,6 +2221,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     _WRITE_RETRY_SLOW_AFTER_S = 2.0
     _WRITE_RETRY_SLOW_MIN_S = 0.250  # 250ms
     _WRITE_RETRY_SLOW_MAX_S = 1.000  # 1s
+    _SQLITE_BUSY_TIMEOUT_S = 1.0
     # Attempt a WAL checkpoint every N successful writes (PASSIVE mode).
     _CHECKPOINT_EVERY_N_WRITES = 50
     # Retain the existing coarse 1000-write maintenance cadence, but replace
@@ -2986,7 +2987,23 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         while True:
             try:
                 with self._lock:
-                    self._conn.execute("BEGIN IMMEDIATE")
+                    # sqlite3's connection timeout is an engine-level busy
+                    # wait. Cap it to the remaining application budget so a
+                    # single BEGIN IMMEDIATE cannot outlive the total
+                    # patience contract. Restore the normal short timeout
+                    # before leaving the connection critical section.
+                    remaining_s = max(deadline - time.monotonic(), 0.0)
+                    busy_timeout_ms = int(remaining_s * 1000)
+                    self._conn.execute(
+                        f"PRAGMA busy_timeout = {busy_timeout_ms}"
+                    )
+                    try:
+                        self._conn.execute("BEGIN IMMEDIATE")
+                    finally:
+                        self._conn.execute(
+                            f"PRAGMA busy_timeout = "
+                            f"{int(self._SQLITE_BUSY_TIMEOUT_S * 1000)}"
+                        )
                     try:
                         result = fn(self._conn)
                         self._conn.commit()
