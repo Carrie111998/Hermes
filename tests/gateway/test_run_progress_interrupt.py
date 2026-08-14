@@ -219,6 +219,34 @@ async def test_partial_empty_agent_response_is_normalized(monkeypatch, tmp_path)
 
 
 @pytest.mark.asyncio
+async def test_reasoning_budget_exhaustion_is_not_wrapped_as_generic_processing_stopped(
+    monkeypatch, tmp_path,
+):
+    class ReasoningExhaustionAgent(PartialTruncationAgent):
+        def run_conversation(self, message, conversation_history=None, task_id=None):
+            return {
+                "final_response": None,
+                "messages": [],
+                "api_calls": 1,
+                "completed": False,
+                "partial": True,
+                "error": (
+                    "Model used all output tokens on reasoning with none left "
+                    "for the response."
+                ),
+            }
+
+    adapter, result = await _run_once(
+        monkeypatch, tmp_path, ReasoningExhaustionAgent, "sess-reasoning-exhausted"
+    )
+
+    assert result["final_response"].startswith("⚠️ **Thinking Budget Exhausted**")
+    assert "Processing stopped" not in result["final_response"]
+    assert "/thinkon" in result["final_response"]
+    assert adapter.sent == []
+
+
+@pytest.mark.asyncio
 async def test_progress_suppressed_when_agent_is_interrupted(monkeypatch, tmp_path):
     """Post-interrupt tool.started events must not render as bubbles.
 
