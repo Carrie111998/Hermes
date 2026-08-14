@@ -1567,23 +1567,36 @@ def delete_profile(name: str, yes: bool = False) -> Path:
             print("Cancelled.")
             return profile_dir
 
-    # 1. Disable service (prevents auto-restart)
-    _cleanup_gateway_service(canon, profile_dir)
-    # 1b. Phase 4: unregister the s6 service slot (container path).
-    # On host this is a no-op; on container it removes
-    # /run/service/gateway-<profile>/ so s6-supervise drops it.
-    _maybe_unregister_gateway_service(canon)
+    # Refuse before disrupting the service when any board still owns work for
+    # this identity. Keep the authority lock through service shutdown and the
+    # atomic directory tombstone so a new graph cannot land mid-delete.
+    from hermes_cli.profile_lifecycle import (
+        assert_profile_has_no_open_assignments,
+        profile_lifecycle_lock,
+    )
 
-    # 2. Stop running gateway
-    if gw_running:
-        _stop_gateway_process(profile_dir)
+    deleting_dir = profile_dir.parent / f".{canon}.deleting-{os.getpid()}"
+    with profile_lifecycle_lock():
+        assert_profile_has_no_open_assignments(canon)
 
-    # 2b. Stop any other backends bound to this profile (Desktop-spawned
-    # serve/dashboard processes the gateway.pid file never names). They hold
-    # the profile's SQLite connection open and keep writing files, which makes
-    # the rmtree below fail with ENOTEMPTY and — before the ensure_hermes_home
-    # guard — resurrected the deleted tree.
-    _stop_profile_backends(canon, profile_dir)
+        # 1. Disable service (prevents auto-restart)
+        _cleanup_gateway_service(canon, profile_dir)
+        # 1b. Unregister the s6 service slot (container path; host no-op).
+        _maybe_unregister_gateway_service(canon)
+
+        # 2. Stop the gateway and other profile-bound backends before the
+        # tombstone, because they can keep writing into the profile directory.
+        if gw_running:
+            _stop_gateway_process(profile_dir)
+        _stop_profile_backends(canon, profile_dir)
+
+        # Make the identity unavailable atomically. A concurrent graph commit
+        # either landed before the assignment check or observes it missing.
+        if not profile_dir.is_dir():
+            raise FileNotFoundError(f"Profile '{canon}' no longer exists.")
+        if deleting_dir.exists():
+            raise RuntimeError(f"profile deletion tombstone already exists: {deleting_dir}")
+        profile_dir.rename(deleting_dir)
 
     # 3. Remove wrapper script
     if has_wrapper:
@@ -1630,10 +1643,16 @@ def delete_profile(name: str, yes: bool = False) -> Path:
             else:
                 raise
 
-        _rmtree_with_retry(profile_dir, _make_writable)
+        _rmtree_with_retry(deleting_dir, _make_writable)
         print(f"✓ Removed {profile_dir}")
     except Exception as e:
         print(f"⚠ Could not remove {profile_dir}: {e}")
+        # Restore the identity when the tombstone is still recoverable. This
+        # happens under the same lock so no graph can validate a half-restored
+        # profile directory.
+        with profile_lifecycle_lock():
+            if deleting_dir.is_dir() and not profile_dir.exists():
+                deleting_dir.rename(profile_dir)
         remove_error = e
 
     # 5. Clear active_profile if it pointed to this profile
@@ -2319,13 +2338,25 @@ def rename_profile(old_name: str, new_name: str) -> Path:
     if new_dir.exists():
         raise FileExistsError(f"Profile '{new_canon}' already exists.")
 
-    # 1. Stop gateway if running
-    if _check_gateway_running(old_dir):
-        _cleanup_gateway_service(old_canon, old_dir)
-        _stop_gateway_process(old_dir)
+    # Rename directory. Profile identity and Kanban graph commits share one
+    # cross-process authority lock. Open assignments make rename fail closed;
+    # otherwise a graph commit either precedes the check or observes the new
+    # identity after the atomic directory rename.
+    from hermes_cli.profile_lifecycle import (
+        assert_profile_has_no_open_assignments,
+        profile_lifecycle_lock,
+    )
 
-    # 2. Rename directory
-    old_dir.rename(new_dir)
+    with profile_lifecycle_lock():
+        assert_profile_has_no_open_assignments(old_canon)
+        if not old_dir.is_dir():
+            raise FileNotFoundError(f"Profile '{old_canon}' no longer exists.")
+        if new_dir.exists():
+            raise FileExistsError(f"Profile '{new_canon}' already exists.")
+        if _check_gateway_running(old_dir):
+            _cleanup_gateway_service(old_canon, old_dir)
+            _stop_gateway_process(old_dir)
+        old_dir.rename(new_dir)
     print(f"✓ Renamed {old_dir.name} → {new_dir.name}")
 
     # 3. Update profile-scoped Honcho host blocks, preserving aiPeer identity

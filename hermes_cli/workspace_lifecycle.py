@@ -26,6 +26,7 @@ except ImportError:  # pragma: no cover - exercised by the fail-closed branch be
 SCHEMA_VERSION = 1
 _BUSY_TIMEOUT_MS = 2_000
 _MAX_REMOTE_FETCH_AGE_SECONDS = 3_600
+_MAX_RECEIPT_EVIDENCE_AGE_SECONDS = 300
 
 
 def manager_registry_path(home: str | Path | None = None) -> Path:
@@ -693,6 +694,15 @@ class Registry:
                 raise RuntimeError("receipt predicate evidence belongs to another workspace")
             by_hash[evidence_hash] = json.loads(observed_payload)
         current = by_hash[current_hash]
+        observed_at = current.get("observed_at")
+        now = int(time.time())
+        if (
+            not isinstance(observed_at, int)
+            or observed_at <= 0
+            or observed_at > now + 5
+            or now - observed_at > _MAX_RECEIPT_EVIDENCE_AGE_SECONDS
+        ):
+            raise RuntimeError("receipt current evidence is outside the freshness window")
 
         def _canonical(value: str) -> str:
             return str(Path(value).expanduser().resolve(strict=False))
@@ -723,7 +733,15 @@ class Registry:
     def receipt(self, workspace_id: str, operation: str, payload: dict[str, Any], *, receipt_hash: str | None = None) -> str:
         conn = self.open()
         try:
-            return self._receipt_in_conn(conn, workspace_id, operation, payload, receipt_hash=receipt_hash)
+            conn.execute("BEGIN IMMEDIATE")
+            digest = self._receipt_in_conn(
+                conn, workspace_id, operation, payload, receipt_hash=receipt_hash,
+            )
+            conn.execute("COMMIT")
+            return digest
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
         finally:
             conn.close()
 

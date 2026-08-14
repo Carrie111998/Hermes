@@ -273,6 +273,17 @@ class TestDeleteProfile:
         assert profile_dir.is_dir()
         assert get_active_profile() == "default"
 
+    def test_refuses_profile_with_open_kanban_assignment(self, profile_env):
+        from hermes_cli import kanban_db as kb
+
+        profile_dir = create_profile("coder", no_alias=True)
+        with kb.connect_closing() as conn:
+            kb.create_task(conn, title="owned work", assignee="coder", triage=True)
+
+        with pytest.raises(RuntimeError, match="open Kanban assignments"):
+            delete_profile("coder", yes=True)
+        assert profile_dir.is_dir()
+
 
 
     def test_backend_scan_only_matches_this_profile(self, profile_env, monkeypatch):
@@ -540,6 +551,18 @@ class TestRenameProfile:
         assert not old_dir.is_dir()
         assert new_dir.is_dir()
         assert new_dir == tmp_path / ".hermes" / "profiles" / "newname"
+
+    def test_refuses_profile_with_open_kanban_assignment(self, profile_env):
+        from hermes_cli import kanban_db as kb
+
+        old_dir = create_profile("oldname", no_alias=True)
+        with kb.connect_closing() as conn:
+            kb.create_task(conn, title="owned work", assignee="oldname", triage=True)
+
+        with pytest.raises(RuntimeError, match="open Kanban assignments"):
+            rename_profile("oldname", "newname")
+        assert old_dir.is_dir()
+        assert not get_profile_dir("newname").exists()
 
     def test_renames_root_honcho_host_without_changing_ai_peer(self, profile_env):
         tmp_path = profile_env
@@ -935,6 +958,5 @@ class TestProfilesToServe:
 
         assert set(serve) == {"default", "worker"}
         assert serve["worker"] == get_profile_dir("worker")
-
 
 

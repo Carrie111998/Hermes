@@ -3123,9 +3123,10 @@ def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
 def _require_current_profiles(*assignees: Optional[str]) -> None:
     """Revalidate dispatch identities at the authoritative graph write.
 
-    The decomposer roster is necessarily read before the model call. Profiles
-    can be removed or renamed while that call is in flight, so only this check
-    inside the same write transaction as the graph commit is authoritative.
+    The decomposer roster is necessarily read before the model call. The
+    caller holds the shared profile lifecycle lock across this check and the
+    graph commit; delete/rename take the same lock and refuse identities that
+    still have nonterminal cards.
     """
     from hermes_cli.profiles import profile_exists
 
@@ -7183,7 +7184,6 @@ def specify_triage_task(
     author: Optional[str] = None,
     auto_promote: bool = True,
     recover_escalation: bool = False,
-    validate_assignee: bool = False,
 ) -> bool:
     """Flesh out a triage task and promote it to ``todo``.
 
@@ -7209,7 +7209,9 @@ def specify_triage_task(
     if title is not None and not title.strip():
         raise ValueError("title cannot be blank")
     assignee = _canonical_assignee(assignee)
-    with write_txn(conn):
+    from hermes_cli.profile_lifecycle import profile_lifecycle_lock
+
+    with profile_lifecycle_lock(), write_txn(conn):
         existing = conn.execute(
             "SELECT title, body, assignee FROM tasks WHERE id = ? AND status = 'triage'",
             (task_id,),
@@ -7220,8 +7222,7 @@ def specify_triage_task(
             raise ValueError("task already has an open governed child graph")
         if recover_escalation or is_block_loop_escalated(conn, task_id):
             raise ValueError("authenticated owner escalation recovery is unavailable")
-        if validate_assignee:
-            _require_current_profiles(assignee or existing["assignee"])
+        _require_current_profiles(assignee or existing["assignee"])
         sets: list[str] = ["status = 'todo'"]
         params: list[Any] = []
         changed_fields: list[str] = []
@@ -7288,7 +7289,6 @@ def decompose_triage_task(
     author: Optional[str] = None,
     auto_promote: bool = True,
     recover_escalation: bool = False,
-    validate_assignees: bool = False,
 ) -> Optional[list[str]]:
     """Fan a triage task out into child tasks and promote the root to ``todo``.
 
@@ -7380,7 +7380,9 @@ def decompose_triage_task(
     # _append_event calls.
     now = int(time.time())
     child_ids: list[str] = []
-    with write_txn(conn):
+    from hermes_cli.profile_lifecycle import profile_lifecycle_lock
+
+    with profile_lifecycle_lock(), write_txn(conn):
         root_row = conn.execute(
             "SELECT id, status, tenant, workspace_kind, workspace_path, project_id "
             "FROM tasks WHERE id = ?",
@@ -7399,12 +7401,11 @@ def decompose_triage_task(
         canonical_child_assignees = [
             _canonical_assignee(child.get("assignee")) for child in children
         ]
-        if validate_assignees:
-            if root_assignee is None or any(
-                assignee is None for assignee in canonical_child_assignees
-            ):
-                raise ValueError("decomposed graph requires explicit current assignees")
-            _require_current_profiles(root_assignee, *canonical_child_assignees)
+        if root_assignee is None or any(
+            assignee is None for assignee in canonical_child_assignees
+        ):
+            raise ValueError("decomposed graph requires explicit current assignees")
+        _require_current_profiles(root_assignee, *canonical_child_assignees)
 
         needs_repo_anchor = any(
             child.get("workspace_policy", "scratch") == "repo_write"
