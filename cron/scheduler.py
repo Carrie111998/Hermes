@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import re
+import signal
 import shutil
 import subprocess
 import sys
@@ -2504,6 +2505,10 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
 _DEFAULT_SCRIPT_TIMEOUT = 3600  # seconds (1 hour)
 # Backward-compatible module override used by tests and emergency monkeypatches.
 _SCRIPT_TIMEOUT = _DEFAULT_SCRIPT_TIMEOUT
+# Inner script runners may use their TERM handler to close a detached provider
+# group. Keep the scheduler's outer grace longer than those 5s handlers so it
+# does not kill the cleanup owner just before the descendant tree is reaped.
+_SCRIPT_TERMINATE_GRACE_SECONDS = 8.0
 _RUN_CLAIM_HEARTBEAT_SECONDS = 60.0
 
 
@@ -2596,6 +2601,75 @@ def _windows_cron_python_invocation(python_exe: str) -> tuple[str, dict[str, str
             env_overlay["PYTHONPATH"] = os.pathsep.join(pythonpath_entries)
 
     return str(interpreter), env_overlay
+
+
+def _terminate_script_process_tree(process: subprocess.Popen) -> None:
+    """Stop a timed-out cron script and every descendant it started."""
+    if process.poll() is not None:
+        return
+
+    if sys.platform == "win32":
+        # CREATE_NEW_PROCESS_GROUP does not make terminate() recursive on
+        # Windows. taskkill /T is the native process-tree primitive.
+        try:
+            subprocess.run(
+                ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                capture_output=True,
+                timeout=_SCRIPT_TERMINATE_GRACE_SECONDS,
+                creationflags=windows_hide_flags(),
+                check=False,
+            )
+        except Exception:
+            process.kill()
+        try:
+            process.wait(timeout=_SCRIPT_TERMINATE_GRACE_SECONDS)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+        return
+
+    try:
+        process_group = os.getpgid(process.pid)
+    except ProcessLookupError:
+        return
+
+    try:
+        os.killpg(process_group, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+
+    deadline = time.monotonic() + _SCRIPT_TERMINATE_GRACE_SECONDS
+    while time.monotonic() < deadline:
+        process.poll()  # reap the group leader promptly if it has exited
+        try:
+            os.killpg(process_group, 0)
+        except ProcessLookupError:
+            return
+        time.sleep(0.05)
+
+    try:
+        os.killpg(process_group, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    if process.poll() is None:
+        process.wait()
+
+
+def _run_script_process(argv: list[str], *, timeout: int, **kwargs) -> subprocess.CompletedProcess:
+    """Run a cron script in an isolated process tree with bounded cleanup."""
+    process = subprocess.Popen(
+        argv,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        **kwargs,
+    )
+    try:
+        stdout, stderr = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _terminate_script_process_tree(process)
+        process.communicate()
+        raise
+    return subprocess.CompletedProcess(argv, process.returncode, stdout, stderr)
 
 
 def _run_job_script(
@@ -2703,10 +2777,11 @@ def _run_job_script(
     try:
         from tools.environments.local import build_subprocess_env
 
-        popen_kwargs = {}
+        popen_kwargs = {"start_new_session": True}
         if sys.platform == "win32":
             popen_kwargs = {
-                "creationflags": windows_hide_flags(),
+                "creationflags": windows_hide_flags()
+                | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200),
                 "encoding": "utf-8",
                 "errors": "replace",
             }
@@ -2717,9 +2792,8 @@ def _run_job_script(
         # NEVER mutate the Python process cwd — that would leak into
         # concurrent gateway sessions (#69396).
         _script_cwd = workdir or str(path.parent)
-        result = subprocess.run(
+        result = _run_script_process(
             argv,
-            capture_output=True,
             text=True,
             timeout=script_timeout,
             cwd=_script_cwd,

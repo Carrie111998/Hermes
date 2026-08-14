@@ -9,8 +9,10 @@ Tests cover:
 
 import json
 import os
+import signal
 import sys
 import textwrap
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -94,6 +96,110 @@ class TestRunJobScript:
         assert success is True
         assert output == "hello from script"
 
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX process-group contract")
+    @pytest.mark.live_system_guard_bypass
+    def test_timeout_terminates_script_process_group(self, cron_env, monkeypatch):
+        from cron import scheduler as sched_mod
+        from cron.scheduler import _run_job_script
+
+        pid_file = cron_env / "grandchild.pid"
+        script = cron_env / "scripts" / "process_tree.sh"
+        script.write_text(
+            textwrap.dedent(
+                f"""\
+                #!/usr/bin/env bash
+                {sys.executable!r} -c 'import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)' &
+                child=$!
+                printf '%s\\n' "$child" > {str(pid_file)!r}
+                wait "$child"
+                """
+            )
+        )
+        monkeypatch.setattr(sched_mod, "_SCRIPT_TIMEOUT", 1)
+
+        child_pid = None
+        try:
+            started = time.monotonic()
+            success, output = _run_job_script(str(script))
+            elapsed = time.monotonic() - started
+            assert success is False
+            assert "timed out after 1s" in output
+            assert elapsed < 10, f"cron timeout cleanup blocked for {elapsed:.1f}s"
+            child_pid = int(pid_file.read_text().strip())
+
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline:
+                try:
+                    os.kill(child_pid, 0)
+                except ProcessLookupError:
+                    break
+                time.sleep(0.05)
+            else:
+                pytest.fail(f"grandchild process {child_pid} survived cron timeout")
+        finally:
+            if child_pid is not None:
+                try:
+                    os.kill(child_pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX process-group contract")
+    @pytest.mark.live_system_guard_bypass
+    def test_timeout_allows_script_handler_to_clean_detached_child(
+        self, cron_env, monkeypatch
+    ):
+        from cron import scheduler as sched_mod
+        from cron.scheduler import _run_job_script
+
+        pid_file = cron_env / "detached-child.pid"
+        script = cron_env / "scripts" / "nested_cleanup.py"
+        script.write_text(
+            textwrap.dedent(
+                f"""\
+                import os
+                import signal
+                import subprocess
+                import sys
+                import time
+
+                child = subprocess.Popen(
+                    [sys.executable, "-c", "import time; time.sleep(60)"],
+                    start_new_session=True,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                with open({str(pid_file)!r}, "w") as handle:
+                    handle.write(str(child.pid))
+
+                def cleanup(_signum, _frame):
+                    time.sleep(5.5)
+                    os.killpg(child.pid, signal.SIGKILL)
+                    child.wait()
+                    raise SystemExit(143)
+
+                signal.signal(signal.SIGTERM, cleanup)
+                while True:
+                    time.sleep(1)
+                """
+            )
+        )
+        monkeypatch.setattr(sched_mod, "_SCRIPT_TIMEOUT", 1)
+
+        child_pid = None
+        try:
+            success, output = _run_job_script(str(script))
+            assert success is False
+            assert "timed out after 1s" in output
+            child_pid = int(pid_file.read_text().strip())
+            with pytest.raises(ProcessLookupError):
+                os.kill(child_pid, 0)
+        finally:
+            if child_pid is not None:
+                try:
+                    os.killpg(child_pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+
     def test_script_relative_path(self, cron_env):
         from cron.scheduler import _run_job_script
 
@@ -162,14 +268,15 @@ class TestRunJobScript:
             return SimpleNamespace(returncode=0, stdout="ok\n", stderr="")
 
         monkeypatch.setattr(sched_mod.sys, "executable", str(venv_python))
-        monkeypatch.setattr(sched_mod.subprocess, "run", fake_run)
+        monkeypatch.setattr(sched_mod, "windows_hide_flags", lambda: 0x08000000)
+        monkeypatch.setattr(sched_mod, "_run_script_process", fake_run)
 
         success, output = _run_job_script("probe.py")
 
         assert success is True
         assert output == "ok"
         assert captured["argv"] == [str(base_python), str(script.resolve())]
-        assert captured["kwargs"]["creationflags"] == sched_mod.windows_hide_flags()
+        assert captured["kwargs"]["creationflags"] == 0x08000000 | 0x00000200
         env = captured["kwargs"]["env"]
         assert env["VIRTUAL_ENV"] == str(venv)
         assert str(site_packages) in env["PYTHONPATH"]
@@ -190,7 +297,7 @@ class TestRunJobScript:
             captured["kwargs"] = kwargs
             return SimpleNamespace(returncode=0, stdout="ok\n", stderr="")
 
-        monkeypatch.setattr(sched_mod.subprocess, "run", fake_run)
+        monkeypatch.setattr(sched_mod, "_run_script_process", fake_run)
 
         success, output = _run_job_script("probe.py")
 
