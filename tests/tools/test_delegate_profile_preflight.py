@@ -544,6 +544,29 @@ def test_delegation_source_platform_normalizes_only_explicit_private_app_surface
     assert _delegation_source_platform(_parent_agent(platform=source)) == expected
 
 
+@pytest.mark.parametrize(
+    ("origin", "expected"),
+    [
+        ("desktop", "cli"),
+        ("tui", "cli"),
+        ("dashboard", "cli"),
+        ("hermes_browser", "cli"),
+        ("browser", "cli"),
+        ("telegram", "telegram"),
+        ("discord", "discord"),
+        ("cron", "cron"),
+        ("api_server", "api_server"),
+        ("webhook", "webhook"),
+        ("future_private_surface", "future_private_surface"),
+    ],
+)
+def test_nested_subagent_preserves_and_normalizes_explicit_origin(origin, expected):
+    parent = _parent_agent(platform="subagent")
+    parent._delegate_origin_platform = origin
+
+    assert _delegation_source_platform(parent) == expected
+
+
 def test_desktop_named_profile_resolves_cli_terminal_and_file(monkeypatch, tmp_path):
     hermes_home = tmp_path / "hermes-home"
     hermes_home.mkdir()
