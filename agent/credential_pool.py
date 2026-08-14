@@ -738,6 +738,23 @@ class CredentialPool:
         )
         self._replace_entry(entry, updated)
         self._persist()
+
+        # B — a credential burned. The model is unchanged; the KEY is what
+        # ran out. Only report the rate-limit-shaped status codes: a 401 is
+        # an auth problem, not a limit, and must not read as one.
+        if status_code in (402, 429):
+            try:
+                from events.rate_limit_signal import record
+                record(
+                    provider=self.provider,
+                    model=f"{self.provider}:pool",
+                    reason="pool_exhausted",
+                    detector="credential_pool",
+                    outcome="diverted" if self.has_available() else "no_fallback",
+                )
+            except Exception:
+                pass
+
         return updated
 
     def _mark_dead_from_terminal_refresh(

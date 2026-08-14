@@ -129,6 +129,39 @@ def test_nous_rate_limit_records_signal(captured, tmp_path, monkeypatch):
     assert captured[0]["resets_at"], "reset time must be propagated"
 
 
+def test_pool_exhaustion_records_signal(captured, monkeypatch, tmp_path):
+    """B: burning a pool entry on a 429 records pool_exhausted."""
+    from agent.credential_pool import CredentialPool, PooledCredential
+
+    entry = PooledCredential.from_dict("deepseek", {
+        "id": "key-1", "api_key": "sk-test-1",
+    })
+    pool = CredentialPool("deepseek", [entry])
+    monkeypatch.setattr(pool, "_persist", lambda **kw: None)
+
+    pool._mark_exhausted(entry, status_code=429)
+
+    assert len(captured) == 1, "hook did not fire — B is unwired"
+    assert captured[0]["detector"] == "credential_pool"
+    assert captured[0]["provider"] == "deepseek"
+    assert captured[0]["reason"] == "pool_exhausted"
+
+
+def test_auth_failure_is_not_reported_as_a_rate_limit(captured, monkeypatch):
+    """A 401 is an auth problem. Reporting it as a limit would send you
+    hunting a phantom outage."""
+    from agent.credential_pool import CredentialPool, PooledCredential
+
+    entry = PooledCredential.from_dict("deepseek", {
+        "id": "key-1", "api_key": "sk-test-1",
+    })
+    pool = CredentialPool("deepseek", [entry])
+    monkeypatch.setattr(pool, "_persist", lambda **kw: None)
+
+    pool._mark_exhausted(entry, status_code=401)
+    assert captured == []
+
+
 def _fake_client():
     client = MagicMock()
     client.base_url = "https://api.openai.com/v1"
