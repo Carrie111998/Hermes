@@ -814,6 +814,26 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         action="store_true",
         help="Emit machine-readable JSON summary.",
     )
+    p_fanout.add_argument(
+        "--exclude-issues",
+        dest="exclude_issues",
+        default=None,
+        help=(
+            "Comma-separated issue ids to exclude from fan-out, in addition to "
+            "any awareness-only / do-not-file markers parsed from the scout "
+            "body (e.g. '898,899,900'). t_b17ae9d3 GAP 1 follow-up."
+        ),
+    )
+    p_fanout.add_argument(
+        "--repo-map",
+        dest="repo_map",
+        default=None,
+        help=(
+            "Comma-separated repo=owner overrides for bare-ref scouts "
+            "(e.g. 'smilemap=veroscale,aurora=acme'). Merged on top of the "
+            "built-in REPO_OWNER_MAP. t_b17ae9d3 GAP 2 follow-up."
+        ),
+    )
 
     # --- tail ---
     p_tail = sub.add_parser("tail", help="Follow a task's event stream")
@@ -3249,6 +3269,12 @@ def _cmd_issue_triage_fanout(args: argparse.Namespace) -> int:
     keys_db = getattr(args, "keys_db", None)
     if keys_db:
         argv.extend(["--keys-db", keys_db])
+    exclude_issues = getattr(args, "exclude_issues", None)
+    if exclude_issues:
+        argv.extend(["--exclude-issues", exclude_issues])
+    repo_map = getattr(args, "repo_map", None)
+    if repo_map:
+        argv.extend(["--repo-map", repo_map])
 
     return int(itf.main(argv) or 0)
 

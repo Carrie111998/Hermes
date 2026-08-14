@@ -110,6 +110,21 @@ DEFAULT_KEYS_DB = os.path.expanduser(
 # Sentinel title for §3 fallback when ``gh`` is unavailable.
 GH_UNAVAILABLE_TITLE = "<unknown title — re-run with gh available>"
 
+# Built-in repo → owner mapping for bare-ref scouts whose title
+# infers only the repo segment (e.g. "smilemap batch triage"
+# → repo="smilemap", owner needs to be looked up).
+#
+# This is the GAP 2 follow-up from t_b17ae9d3 — without the
+# mapping, ``gh issue view smilemap#N`` is rejected ("invalid
+# issue format") on gh 2.97, and every bare-ref fan-out card
+# lands with the placeholder title. The mapping is intentionally
+# conservative: only repos we know are bare-title-only on the
+# reference scout cards. Callers can extend it via the
+# ``--repo-map`` CLI flag.
+REPO_OWNER_MAP: dict[str, str] = {
+    "smilemap": "veroscale",
+}
+
 
 # ---------------------------------------------------------------------------
 # Parsing
@@ -127,7 +142,11 @@ class IssueRef:
     span: tuple[int, int]  # (start, end) char offsets in the body, for diagnostics
 
 
-def parse_issue_links(body: str, default_repo: Optional[str] = None) -> list[IssueRef]:
+def parse_issue_links(
+    body: str,
+    default_repo: Optional[str] = None,
+    excluded_issue_ids: Optional[Iterable[int]] = None,
+) -> list[IssueRef]:
     """Return the deduplicated, ordered list of issue refs in ``body``.
 
     Ordering: URL matches first in document order, then bare matches
@@ -148,8 +167,17 @@ def parse_issue_links(body: str, default_repo: Optional[str] = None) -> list[Iss
 
     ``default_repo`` is used as the repo for bare-``#NNN`` matches when
     the URL form doesn't supply one.
+
+    ``excluded_issue_ids`` is an optional iterable of ``int`` issue
+    numbers that the parser will drop from the output. Used to
+    honor scout-body awareness-only / do-not-file markers (spec
+    §11 follow-up) and the ``--exclude-issues`` CLI override.
+    Excluded refs are silently filtered here; the caller tracks
+    them in ``FanoutResult.excluded`` for the JSON summary so the
+    operator can audit what was dropped.
     """
     scoped_body = _scope_to_triage_section(body)
+    excluded = {int(x) for x in (excluded_issue_ids or [])}
     seen: dict[int, IssueRef] = {}
     order: list[int] = []
 
@@ -157,6 +185,8 @@ def parse_issue_links(body: str, default_repo: Optional[str] = None) -> list[Iss
     # authoritative when present.
     for m in _URL_RE.finditer(scoped_body):
         iid = int(m.group("issue_id"))
+        if iid in excluded:
+            continue
         ref = IssueRef(
             issue_id=iid,
             owner=m.group("owner"),
@@ -173,7 +203,7 @@ def parse_issue_links(body: str, default_repo: Optional[str] = None) -> list[Iss
     # because the §3 title needs a repo segment.
     for m in _BARE_RE.finditer(scoped_body):
         iid = int(m.group(1))
-        if iid in seen:
+        if iid in excluded or iid in seen:
             continue
         if not default_repo:
             continue
@@ -208,14 +238,68 @@ _TRIAGE_ANCHOR_RE = re.compile(
     r")"
 )
 
+# Awareness-only / do-not-file marker pattern (spec §11 follow-up).
+#
+# A scout card may explicitly mark a cluster of refs as "for
+# awareness only — do not file cards" so the fan-out CLI doesn't
+# produce cards for them. The convention seen on the reference
+# scout card (t_12cc81c6) is:
+#
+#     Adjacent P3 (#898, #899, #900) is for awareness only — do
+#     not file cards for it unless explicitly reassigned.
+#
+# The shape we match is:
+#
+#     <optional label> ( <#NNN list> ) ... <marker phrase>
+#
+# where <marker phrase> contains "awareness only" or "do not
+# file" (or "don't file"). We capture the label (for diagnostics),
+# the issue ids in the parens, and the full matched text (so we
+# can classify the reason — "awareness_only" vs "do_not_file" —
+# when surfacing in the JSON summary).
+#
+# This is intentionally permissive on the label (it can be
+# anything) and restrictive on the marker phrase so a stray
+# parenthesized list without the marker is NOT excluded.
+_AWARENESS_LIST_RE = re.compile(
+    r"(?ims)"
+    # Optional label, e.g. "Adjacent P3 " or "Path B " or "Stay-grouped ".
+    # Label may contain internal spaces. We use a lazy quantifier on
+    # the trailing whitespace so the regex engine prefers "label + one
+    # whitespace" before \(, not "label extending to consume the
+    # whitespace that should anchor (\s* would over-consume). The
+    # outer `?` makes the whole label optional.
+    r"(?:(?P<label>[A-Za-z][A-Za-z0-9 _-]{0,40}?)\s+)?"
+    # Parenthesized comma-separated #NNN list (bare refs only —
+    # URL form would imply "fan this out" intent)
+    r"\(\s*"
+    r"(?P<ids>"
+    r"#\d{3,5}"                 # at least one #NNN
+    r"(?:\s*,\s*#\d{3,5})*"     # optional comma-separated more
+    r")"
+    r"\s*\)"
+    # Up to ~160 chars of prose containing the marker phrase.
+    # The marker phrase check is done separately so we can
+    # report which phrase matched.
+    r"(?P<trailer>[^.;\n]{0,160}?)"
+    r"[.;\n]"
+)
+_AWARENESS_PHRASE_RE = re.compile(
+    r"(?ims)\b("
+    r"awareness[\s-]+only"
+    r"|do(?:n't|\s+not)\s+file"
+    r"|not\s+(?:to\s+be\s+)?filed"
+    r")\b"
+)
+
 
 def _scope_to_triage_section(body: str) -> str:
     """Return the slice of ``body`` that contains the triage list.
 
     The slice starts at the first triage-section anchor
-    (``Issues in scope:``, ``Adjacent P3 (…)``, etc.) and ends at the
-    next paragraph break — either a blank line, a ``Step N`` marker,
-    or a markdown heading.
+    (``Issues in scope:``, ``Adjacent P3 (…)``, etc.) and ends at
+    the next paragraph break — either a blank line, a ``Step N``
+    marker, or a markdown heading.
 
     If no triage section is detected, the whole body is returned
     (the conservative fallback matches what the spec §2 strict regex
@@ -235,7 +319,7 @@ def _scope_to_triage_section(body: str) -> str:
         "\nStep ",         # "Step 1", "Step 2" ...
         "\nstep ",         # lowercase variant
         "\n#",             # markdown heading
-        "\n---",           # horizontal rule
+        "\n---\n",           # horizontal rule (require trailing newline so we don't cut in the middle of a word)
     )
     end = len(tail)
     for term in terminators:
@@ -243,6 +327,87 @@ def _scope_to_triage_section(body: str) -> str:
         if 0 < idx < end:
             end = idx
     return tail[:end]
+
+
+@dataclass(frozen=True)
+class ExcludedRef:
+    """One issue id the parser dropped because the scout body
+    explicitly excluded it via an awareness-only / do-not-file marker.
+
+    Fields:
+        issue_id: the issue number that was excluded.
+        reason: ``"awareness_only"`` or ``"do_not_file"`` — which
+            phrase matched. Useful for the JSON summary so operators
+            can audit exactly which marker fired.
+        label: the leading label captured before the parenthesized
+            list, if any (e.g. ``"Adjacent P3"``). May be empty when
+            the body has no label (e.g. ``(#123) is for awareness
+            only``).
+        excerpt: a short snippet of the matched text, trimmed to
+            ~120 chars, so operators can see the original directive
+            without re-reading the scout body.
+    """
+
+    issue_id: int
+    reason: str
+    label: str
+    excerpt: str
+
+
+def parse_excluded_refs(body: str) -> list[ExcludedRef]:
+    """Return the issue ids the scout body explicitly marked as
+    ``for awareness only`` / ``do not file``.
+
+    The convention seen on the reference scout card (t_12cc81c6) is:
+
+        Adjacent P3 (#898, #899, #900) is for awareness only — do
+        not file cards for it unless explicitly reassigned.
+
+    The detector matches an optional label, a parenthesized
+    comma-separated ``#NNN`` list, and a trailing clause that
+    contains the marker phrase. We DO NOT match parenthesized
+    lists that lack the marker phrase — a stray ``(#NNN)`` is
+    not sufficient evidence to drop an issue.
+
+    Output ordering: in document order; duplicates (same issue_id
+    mentioned in two markers) collapse to the first match.
+    """
+    if not body:
+        return []
+    out: dict[int, ExcludedRef] = {}
+    order: list[int] = []
+    for m in _AWARENESS_LIST_RE.finditer(body):
+        trailer = m.group("trailer") or ""
+        phrase_match = _AWARENESS_PHRASE_RE.search(trailer)
+        if not phrase_match:
+            continue
+        phrase = phrase_match.group(1).lower().strip()
+        reason = (
+            "do_not_file"
+            if ("do not file" in phrase or "don't file" in phrase or "not filed" in phrase or "not to be filed" in phrase)
+            else "awareness_only"
+        )
+        # Extract the #NNN ids from the captured ids group.
+        ids_blob = m.group("ids") or ""
+        iids = [int(x) for x in _BARE_RE.findall(ids_blob)]
+        label = (m.group("label") or "").strip()
+        # Build a short excerpt around the match for diagnostics.
+        start = max(0, m.start())
+        end = min(len(body), m.end())
+        excerpt = " ".join(body[start:end].split())
+        if len(excerpt) > 160:
+            excerpt = excerpt[:157].rstrip() + "…"
+        for iid in iids:
+            if iid in out:
+                continue
+            out[iid] = ExcludedRef(
+                issue_id=iid,
+                reason=reason,
+                label=label,
+                excerpt=excerpt,
+            )
+            order.append(iid)
+    return [out[iid] for iid in order]
 
 
 def infer_default_repo(title: str) -> Optional[str]:
@@ -462,6 +627,28 @@ class GhFetchResult:
     error: Optional[str] = None
 
 
+def resolve_repo_owner(
+    owner: str,
+    repo: str,
+    extra_map: Optional[dict[str, str]] = None,
+) -> tuple[str, str]:
+    """Resolve the ``(owner, repo)`` pair for a ``gh issue view`` call.
+
+    When ``owner`` is empty (a bare-ref scout where the parser only
+    inferred the repo segment from the card title), look it up in
+    ``REPO_OWNER_MAP`` (built-in) + ``extra_map`` (CLI-supplied
+    overrides). Returns the canonical ``(owner, repo)`` pair, with
+    ``owner`` empty when nothing maps.
+
+    ``extra_map`` takes precedence over the built-in map so a CLI
+    override always wins.
+    """
+    if owner:
+        return (owner, repo)
+    merged = {**REPO_OWNER_MAP, **(extra_map or {})}
+    return (merged.get(repo, ""), repo)
+
+
 def fetch_gh_issue(
     owner: str,
     repo: str,
@@ -469,23 +656,52 @@ def fetch_gh_issue(
     *,
     timeout_seconds: float = 5.0,
     gh_path: str = "gh",
+    repo_owner_map: Optional[dict[str, str]] = None,
 ) -> GhFetchResult:
     """Fetch the live issue title (and body excerpt) via ``gh``.
 
     Spec §3 fallback: if ``gh`` is unavailable, returns the placeholder
     title and an ``error`` string the caller can put in a card comment.
+
+    GitHub CLI invocation (gh 2.97):
+
+        gh issue view <issue_id> --repo <owner>/<repo> --json title,body
+
+    Earlier versions accepted ``gh issue view <owner>/<repo>#<N>`` but
+    gh 2.97 rejects that form ("invalid issue format: <X>#<N>"); we
+    use ``--repo <owner>/<repo>`` so the same code works on both.
+
+    When ``owner`` is empty we consult the built-in
+    ``REPO_OWNER_MAP`` (plus the optional ``repo_owner_map``
+    override) to fill it in. If the repo isn't mapped, we fall
+    back to the placeholder title with an explanatory error so
+    the operator can add the mapping via ``--repo-map``.
     """
-    # We need both title and body; fetch them in one call. ``gh issue
-    # view`` supports ``--json title,body``.
-    spec = "owner/repo"
-    if owner:
-        spec = f"{owner}/{repo}"
-    else:
-        spec = repo
-    ref = f"{spec}#{issue_id}"
+    resolved_owner, repo = resolve_repo_owner(owner, repo, repo_owner_map)
+    if not resolved_owner:
+        return GhFetchResult(
+            title=GH_UNAVAILABLE_TITLE,
+            body=None,
+            error=(
+                f"gh issue view: bare repo '{repo}' has no owner mapping "
+                f"(add via --repo-map {repo}=<owner> or extend "
+                f"REPO_OWNER_MAP)"
+            ),
+        )
+    repo_spec = f"{resolved_owner}/{repo}"
+    issue_arg = str(issue_id)
     try:
         proc = subprocess.run(
-            [gh_path, "issue", "view", ref, "--json", "title,body"],
+            [
+                gh_path,
+                "issue",
+                "view",
+                issue_arg,
+                "--repo",
+                repo_spec,
+                "--json",
+                "title,body",
+            ],
             capture_output=True,
             text=True,
             timeout=timeout_seconds,
@@ -508,7 +724,8 @@ def fetch_gh_issue(
             title=GH_UNAVAILABLE_TITLE,
             body=None,
             error=(
-                f"gh issue view {ref} exited {proc.returncode}: "
+                f"gh issue view {issue_arg} --repo {repo_spec} "
+                f"exited {proc.returncode}: "
                 f"{(proc.stderr or proc.stdout or '').strip()[:200]}"
             ),
         )
@@ -674,6 +891,7 @@ class FanoutResult:
     created: list[dict[str, Any]] = field(default_factory=list)
     would_create: list[dict[str, Any]] = field(default_factory=list)
     skipped_duplicates: list[dict[str, Any]] = field(default_factory=list)
+    excluded: list[dict[str, Any]] = field(default_factory=list)
     errors: list[dict[str, Any]] = field(default_factory=list)
     dry_run: bool = False
     duration_ms: int = 0
@@ -685,6 +903,7 @@ class FanoutResult:
             "detected": self.detected,
             "scanned": self.scanned,
             "skipped_duplicates": list(self.skipped_duplicates),
+            "excluded": list(self.excluded),
             "errors": list(self.errors),
             "dry_run": self.dry_run,
             "duration_ms": self.duration_ms,
@@ -696,7 +915,13 @@ class FanoutResult:
         return d
 
     def exit_code(self) -> int:
-        """Spec §7: 0 success/all-skip, 2 partial, 1 total failure."""
+        """Spec §7: 0 success/all-skip, 2 partial, 1 total failure.
+
+        Excluded refs (awareness-only / do-not-file) are NOT errors
+        — they're an expected outcome when the scout body says
+        "do not file cards for these". They don't trigger non-zero
+        exit codes.
+        """
         if self.errors and not (self.created or self.would_create):
             return 1
         if self.errors and (self.created or self.would_create):
@@ -718,6 +943,11 @@ class FanoutDeps:
     signal_emit: Any = None  # callable (kind, tag, summary) -> signal_id or None
     parent_link_scan: Any = None  # callable (scout_id) -> set[int] of existing child issue_ids
     gh_path: str = "gh"
+    # Repo → owner mapping overrides for bare-ref scouts (spec §11
+    # follow-up / GAP 2). Merged on top of the built-in
+    # ``REPO_OWNER_MAP`` inside ``fetch_gh_issue``. Keys are repo
+    # segments (``"smilemap"``), values are owners (``"veroscale"``).
+    repo_owner_map: Optional[dict[str, str]] = None
 
     def __post_init__(self) -> None:
         if self.fetch_gh_issue is None:
@@ -738,11 +968,19 @@ def run_fanout(
     max_issues: Optional[int] = None,
     skip_existing: bool = True,
     dry_run: bool = False,
+    exclude_issues: Optional[Iterable[int]] = None,
 ) -> FanoutResult:
     """Execute the full fan-out pipeline for one scout card.
 
     ``scout`` is the minimal shape the implementation needs:
     ``{"id", "title", "body", "comments" (optional list[str])}``.
+
+    ``exclude_issues`` is an optional iterable of issue ids that
+    the parser will drop from the fan-out. The drop list is the
+    union of (a) issue ids extracted from awareness-only /
+    do-not-file markers in the scout body and (b) issue ids
+    supplied via the ``--exclude-issues`` CLI flag (the
+    ``exclude_issues`` argument).
     """
     started = time.monotonic()
     result = FanoutResult(scout_card_id=scout_card_id, board=board, dry_run=dry_run)
@@ -751,8 +989,45 @@ def run_fanout(
     title = scout.get("title") or ""
     comments = scout.get("comments") or []
 
+    # GAP 1 (spec §11 follow-up): parse the scout body for
+    # awareness-only / do-not-file markers. Any issue id listed
+    # in such a marker is excluded from fan-out and surfaced in
+    # ``result.excluded`` so the operator can audit exactly which
+    # refs were dropped and why.
+    excluded_from_body = parse_excluded_refs(body)
+    excluded_id_to_meta: dict[int, ExcludedRef] = {
+        e.issue_id: e for e in excluded_from_body
+    }
+    # Manual ``--exclude-issues`` overrides — recorded under a
+    # different reason so the JSON summary distinguishes "scout
+    # body said don't file" from "operator said don't file".
+    manual_excluded_ids = {int(x) for x in (exclude_issues or [])}
+    combined_excluded_ids = set(excluded_id_to_meta) | manual_excluded_ids
+    for iid in sorted(manual_excluded_ids - set(excluded_id_to_meta)):
+        result.excluded.append(
+            {
+                "issue_id": iid,
+                "reason": "manual_override",
+                "label": "",
+                "excerpt": "",
+            }
+        )
+    for ref in excluded_from_body:
+        result.excluded.append(
+            {
+                "issue_id": ref.issue_id,
+                "reason": ref.reason,
+                "label": ref.label,
+                "excerpt": ref.excerpt,
+            }
+        )
+
     default_repo = infer_default_repo(title)
-    refs = parse_issue_links(body, default_repo=default_repo)
+    refs = parse_issue_links(
+        body,
+        default_repo=default_repo,
+        excluded_issue_ids=combined_excluded_ids,
+    )
     if max_issues is not None:
         refs = refs[:max_issues]
     result.detected = len(refs)
@@ -809,14 +1084,31 @@ def run_fanout(
                 continue
 
         # Fetch live title/body (spec §3 fallback on gh failure).
+        # GAP 2 (t_b17ae9d3): pass repo_owner_map so bare-ref scouts
+        # like t_12cc81c6 (repo=smilemap, owner="") resolve to
+        # veroscale/smilemap and ``gh issue view`` succeeds.
         fetch = deps.fetch_gh_issue(
-            ref.owner, ref.repo, ref.issue_id, gh_path=deps.gh_path
+            ref.owner,
+            ref.repo,
+            ref.issue_id,
+            gh_path=deps.gh_path,
+            repo_owner_map=deps.repo_owner_map,
         )
 
         child_title = build_child_title(ref.repo, ref.issue_id, fetch.title)
-        owner = ref.owner or "unknown-owner"
+        # If we successfully resolved an owner (either from the URL
+        # form or via the mapping), use it for the issue url;
+        # otherwise leave the url with an "unknown-owner" prefix
+        # but the card body will still record the placeholder so a
+        # worker can fix it. The mapping means this should only
+        # fire when the operator forgot to add a mapping.
+        owner_for_url, _ = resolve_repo_owner(
+            ref.owner, ref.repo, deps.repo_owner_map
+        )
+        if not owner_for_url:
+            owner_for_url = "unknown-owner"
         issue_url = (
-            f"https://github.com/{owner}/{ref.repo}/issues/{ref.issue_id}"
+            f"https://github.com/{owner_for_url}/{ref.repo}/issues/{ref.issue_id}"
         )
 
         # §4 done-when.
@@ -902,9 +1194,11 @@ def run_fanout(
                 "repo": ref.repo,
                 "child_card_id": new_id,
                 "title": child_title,
+                "issue_url": issue_url,
                 "idempotency_key": idempotency_key,
                 "inherited_signal": scout_signal_id,
                 "source": ref.source,
+                **({"gh_error": fetch.error} if fetch.error else {}),
             }
         )
 
@@ -928,7 +1222,20 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("board", help="Board slug")
     parser.add_argument(
         "scout_card_id",
-        help="Scout card id (e.g. t_12cc81c6)",
+        nargs="?",
+        help=(
+            "Scout card id (e.g. t_12cc81c6). Omit only with "
+            "--scan-all-scouts (cron entry point)."
+        ),
+    )
+    parser.add_argument(
+        "--scan-all-scouts", action="store_true",
+        dest="scan_all_scouts",
+        help=(
+            "Scan every done scout card on the board (dry-run only). "
+            "Mirrors `hermes kanban issue-triage-fanout ... --scan-all-scouts` "
+            "for the cron entry point. Spec: t_9bbc7ec3 §9."
+        ),
     )
     parser.add_argument(
         "--dry-run", action="store_true",
@@ -948,16 +1255,136 @@ def build_argparser() -> argparse.ArgumentParser:
                         help="Path to gh CLI (default: gh).")
     parser.add_argument("--keys-db", default=DEFAULT_KEYS_DB,
                         help=f"Idempotency key DB (default: {DEFAULT_KEYS_DB})")
+    parser.add_argument(
+        "--exclude-issues",
+        dest="exclude_issues",
+        default=None,
+        help=(
+            "Comma-separated issue ids to exclude from fan-out, "
+            "in addition to any awareness-only / do-not-file markers "
+            "parsed from the scout body (e.g. '898,899,900'). "
+            "GAP 1 follow-up: lets operators hand-override what to skip."
+        ),
+    )
+    parser.add_argument(
+        "--repo-map",
+        dest="repo_map",
+        default=None,
+        help=(
+            "Comma-separated repo=owner overrides for bare-ref scouts "
+            "(e.g. 'smilemap=veroscale,aurora=veroscale'). Merged on top "
+            "of the built-in REPO_OWNER_MAP. GAP 2 follow-up: lets "
+            "operators add new repo→owner mappings without editing the "
+            "module."
+        ),
+    )
     return parser
 
 
+def _parse_csv_ints(value: Optional[str]) -> list[int]:
+    """Parse a comma-separated int list from a CLI string.
+
+    Empty / None yields []. Negative numbers and zero are rejected
+    (GitHub issue ids are positive). Non-numeric tokens raise
+    ``argparse.ArgumentTypeError`` so the CLI exits with a clean
+    usage error rather than a stack trace.
+    """
+    if not value:
+        return []
+    out: list[int] = []
+    for tok in value.split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        try:
+            n = int(tok)
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError(
+                f"--exclude-issues: expected comma-separated ints, "
+                f"got {tok!r}: {exc}"
+            )
+        if n <= 0:
+            raise argparse.ArgumentTypeError(
+                f"--exclude-issues: issue ids must be positive, got {n}"
+            )
+        out.append(n)
+    return out
+
+
+def _parse_repo_map(value: Optional[str]) -> dict[str, str]:
+    """Parse a ``--repo-map`` value like ``smilemap=veroscale,aurora=acme``.
+
+    Empty / None yields {}. Tokens without ``=`` raise so the CLI
+    exits with a clean usage error. Values are lowercased; keys are
+    lowercased (matches how ``infer_default_repo`` returns lowercase
+    repo segments).
+    """
+    if not value:
+        return {}
+    out: dict[str, str] = {}
+    for tok in value.split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        if "=" not in tok:
+            raise argparse.ArgumentTypeError(
+                f"--repo-map: expected repo=owner pairs, got {tok!r}"
+            )
+        k, v = tok.split("=", 1)
+        k = k.strip().lower()
+        v = v.strip()
+        if not k or not v:
+            raise argparse.ArgumentTypeError(
+                f"--repo-map: empty key or value in {tok!r}"
+            )
+        out[k] = v
+    return out
+
+
 def main(argv: Optional[list[str]] = None) -> int:
-    args = build_argparser().parse_args(argv)
+    # Parse the basic args first so we can validate the new
+    # comma-separated flags up front (better error messages than
+    # ``run_fanout`` raising deep in the loop).
+    parser = build_argparser()
+    args = parser.parse_args(argv)
+    # Augment with parsed/typed versions of the CSV flags.
+    try:
+        args.exclude_issues_list = _parse_csv_ints(args.exclude_issues)
+    except argparse.ArgumentTypeError as exc:
+        print(f"issue-triage-fanout: {exc}", file=sys.stderr)
+        return 2
+    try:
+        args.repo_map_dict = _parse_repo_map(args.repo_map)
+    except argparse.ArgumentTypeError as exc:
+        print(f"issue-triage-fanout: {exc}", file=sys.stderr)
+        return 2
 
     # Resolve the scout card via the real kanban DB. We avoid importing
     # kanban_db at module import time so unit tests can import this
     # file without a DB.
     from hermes_cli import kanban_db as kb
+
+    # --scan-all-scouts is the cron entry point (spec §9). It is
+    # intentionally dry-run only — the cron never creates cards.
+    # Reject the flag if the operator forgot `--dry-run` so we never
+    # fan out the whole board from a cron tick.
+    if getattr(args, "scan_all_scouts", False):
+        if not args.dry_run:
+            print(
+                "issue-triage-fanout: --scan-all-scouts requires --dry-run "
+                "(cron is report-only; per spec §9, no fan-out from the nightly cron).",
+                file=sys.stderr,
+            )
+            return 2
+        return _run_scan_all_scouts(args)
+
+    if not args.scout_card_id:
+        print(
+            "issue-triage-fanout: <scout_card_id> is required "
+            "(or pass --scan-all-scouts).",
+            file=sys.stderr,
+        )
+        return 2
 
     kb.init_db()
     with kb.connect_closing() as conn:
@@ -979,7 +1406,10 @@ def main(argv: Optional[list[str]] = None) -> int:
         existing_issue_ids = _child_issue_ids_from_titles(conn, child_ids)
 
         comments = kb.list_comments(conn, args.scout_card_id) or []
-        comment_bodies = [c.get("body") or "" for c in comments]
+        # kb.list_comments returns dataclass `Comment` objects (not dicts),
+        # so use attribute access — `c.get` would AttributeError when the
+        # scout has any comments. Caught by the scan-all path in t_28fd3b11.
+        comment_bodies = [c.body or "" for c in comments]
 
         # Scout signal id lookup is best-effort; absent here.
         scout_signal_id = None
@@ -1026,6 +1456,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             signal_emit=_signal_emit,
             parent_link_scan=_parent_link_scan,
             gh_path=args.gh_path,
+            repo_owner_map=getattr(args, "repo_map_dict", None) or None,
         )
 
         result = run_fanout(
@@ -1041,6 +1472,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             max_issues=args.max_issues,
             skip_existing=args.skip_existing,
             dry_run=args.dry_run,
+            exclude_issues=getattr(args, "exclude_issues_list", None) or None,
         )
 
     if args.json or args.dry_run:
@@ -1050,6 +1482,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             f"scout={result.scout_card_id} board={result.board} "
             f"detected={result.detected} created={len(result.created)} "
             f"skipped={len(result.skipped_duplicates)} "
+            f"excluded={len(result.excluded)} "
             f"errors={len(result.errors)} duration_ms={result.duration_ms}"
         )
     return result.exit_code()
@@ -1072,6 +1505,131 @@ def _child_issue_ids_from_titles(conn: sqlite3.Connection, child_ids: list[str])
         if m:
             out.add(int(m.group(1)))
     return out
+
+
+def _run_scan_all_scouts(args) -> int:
+    """Cron entry point: scan every done scout on the board in dry-run.
+
+    Implements spec §9 — lists every ``status='done'`` task on the board,
+    filters to those whose body matches the §2 heuristic (≥3 GitHub issue
+    links), and runs each through the single-scout dry-run path. The
+    aggregated JSON is emitted as the cron run's stdout.
+
+    Side effects: NONE. No ``kanban create``, no dedupe table writes, no
+    signals. The cron is intentionally a report-only diff checker.
+    """
+    import time as _time
+
+    from hermes_cli import kanban_db as kb
+
+    kb.init_db()
+    started = _time.monotonic()
+    per_scout: list[dict] = []
+    grand_detected = 0
+    grand_would_create = 0
+    grand_skipped = 0
+    grand_errors = 0
+
+    with kb.connect_closing() as conn:
+        all_done = kb.list_tasks(conn, status="done", include_archived=False)
+        candidates = []
+        for t in all_done:
+            body = (t.body or "") + "\n"
+            # Cheap pre-filter: ≥3 issue links per the §2 URL regex. The
+            # single-card path does the full heuristic + section scoping
+            # because that's where repo inference lives; this pre-filter
+            # just avoids calling it 200 times for unrelated done tasks.
+            url_count = len(_URL_RE.findall(body))
+            if url_count >= 3:
+                candidates.append((t.id, t.title, url_count))
+
+    for scout_id, scout_title, url_count in candidates:
+        argv = [args.board, scout_id]
+        if getattr(args, "max_issues", None) is not None:
+            argv.extend(["--max-issues", str(args.max_issues)])
+        if getattr(args, "skip_existing", True) is False:
+            argv.append("--no-skip-existing")
+        if args.json:
+            argv.append("--json")
+        if getattr(args, "gh_path", None) and args.gh_path != "gh":
+            argv.extend(["--gh-path", args.gh_path])
+        if getattr(args, "keys_db", None):
+            argv.extend(["--keys-db", args.keys_db])
+        # GAP 1: propagate --exclude-issues through to each scout.
+        # The cron sets this via the operator's flags; the
+        # single-card path picks them up unchanged.
+        if getattr(args, "exclude_issues", None):
+            argv.extend(["--exclude-issues", args.exclude_issues])
+        # GAP 2: same for --repo-map.
+        if getattr(args, "repo_map", None):
+            argv.extend(["--repo-map", args.repo_map])
+
+        proc = subprocess.run(
+            [sys.executable, "-m", "hermes_cli.issue_triage_fanout", *argv],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+        if proc.returncode not in (0, 2):
+            per_scout.append(
+                {
+                    "scout_card_id": scout_id,
+                    "title": scout_title,
+                    "url_count": url_count,
+                    "error": (
+                        f"single-card dry-run failed: rc={proc.returncode} "
+                        f"stderr={(proc.stderr or '').strip()[-400:]}"
+                    ),
+                }
+            )
+            grand_errors += 1
+            continue
+
+        try:
+            summary = json.loads(proc.stdout) if proc.stdout.strip() else {}
+        except json.JSONDecodeError:
+            summary = {}
+
+        detected = int(summary.get("detected", 0))
+        would_create = len(summary.get("would_create", []))
+        skipped = len(summary.get("skipped_duplicates", []))
+        errors = len(summary.get("errors", []))
+        grand_detected += detected
+        grand_would_create += would_create
+        grand_skipped += skipped
+        grand_errors += errors
+
+        per_scout.append(
+            {
+                "scout_card_id": scout_id,
+                "title": scout_title,
+                "url_count": url_count,
+                "detected": detected,
+                "would_create": would_create,
+                "skipped_duplicates": skipped,
+                "errors": errors,
+                "duration_ms": summary.get("duration_ms"),
+            }
+        )
+
+    duration_ms = int((_time.monotonic() - started) * 1000)
+    envelope = {
+        "board": args.board,
+        "mode": "scan-all-scouts",
+        "dry_run": True,
+        "scanned_candidates": len(candidates),
+        "totals": {
+            "detected": grand_detected,
+            "would_create": grand_would_create,
+            "skipped_duplicates": grand_skipped,
+            "errors": grand_errors,
+        },
+        "scouts": per_scout,
+        "duration_ms": duration_ms,
+    }
+    print(json.dumps(envelope, indent=2, ensure_ascii=False))
+    return 0
 
 
 if __name__ == "__main__":  # pragma: no cover
