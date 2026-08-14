@@ -161,6 +161,8 @@ def _get_scoped_secret(name, default=None):
 
 logger = logging.getLogger(__name__)
 
+_FEISHU_THREAD_FALLBACK_CODES = frozenset({99992402})
+
 # ---------------------------------------------------------------------------
 # Regex patterns
 # ---------------------------------------------------------------------------
@@ -4846,22 +4848,34 @@ class FeishuAdapter(BasePlatformAdapter):
                 uuid_value=str(uuid.uuid4()),
             )
             request = self._build_create_message_request("thread_id", body)
-        else:
-            receive_id = chat_id
-            receive_id_type = "chat_id"
-            if chat_id.startswith("feishu_user_id:"):
-                receive_id = chat_id.split(":", 1)[1]
-                receive_id_type = "user_id"
-            elif chat_id.startswith("ou_"):
-                receive_id_type = "open_id"
-
-            body = self._build_create_message_body(
-                receive_id=receive_id,
-                msg_type=msg_type,
-                content=payload,
-                uuid_value=str(uuid.uuid4()),
+            response = await self._run_blocking(self._client.im.v1.message.create, request)
+            if (
+                self._response_succeeded(response)
+                or getattr(response, "code", None) not in _FEISHU_THREAD_FALLBACK_CODES
+            ):
+                return response
+            logger.warning(
+                "[Feishu] Thread %s is unavailable (code=%s); retrying in parent chat %s",
+                _thread_id,
+                getattr(response, "code", None),
+                chat_id,
             )
-            request = self._build_create_message_request(receive_id_type, body)
+
+        receive_id = chat_id
+        receive_id_type = "chat_id"
+        if chat_id.startswith("feishu_user_id:"):
+            receive_id = chat_id.split(":", 1)[1]
+            receive_id_type = "user_id"
+        elif chat_id.startswith("ou_"):
+            receive_id_type = "open_id"
+
+        body = self._build_create_message_body(
+            receive_id=receive_id,
+            msg_type=msg_type,
+            content=payload,
+            uuid_value=str(uuid.uuid4()),
+        )
+        request = self._build_create_message_request(receive_id_type, body)
         return await self._run_blocking(self._client.im.v1.message.create, request)
 
     @staticmethod

@@ -1248,6 +1248,56 @@ class TestAdapterBehavior(unittest.TestCase):
 
 
     @patch.dict(os.environ, {}, clear=True)
+    def test_send_raw_message_falls_back_to_parent_chat_when_thread_is_invalid(self):
+        """A stale Feishu topic must not make a normal outbound message disappear."""
+        from gateway.config import PlatformConfig
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        captured = []
+
+        class _MessageAPI:
+            def create(self, request):
+                captured.append(request)
+                if len(captured) == 1:
+                    return SimpleNamespace(success=lambda: False, code=99992402)
+                return SimpleNamespace(
+                    success=lambda: True,
+                    code=0,
+                    data=SimpleNamespace(message_id="om_parent_fallback"),
+                )
+
+        adapter._client = SimpleNamespace(
+            im=SimpleNamespace(
+                v1=SimpleNamespace(
+                    message=_MessageAPI(),
+                )
+            )
+        )
+
+        async def _direct(func, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        with patch("plugins.platforms.feishu.adapter.asyncio.to_thread", side_effect=_direct):
+            response = asyncio.run(
+                adapter._send_raw_message(
+                    chat_id="oc_parent",
+                    msg_type="text",
+                    payload=json.dumps({"text": "hello"}),
+                    reply_to=None,
+                    metadata={"thread_id": "omt_stale"},
+                )
+            )
+
+        self.assertTrue(response.success())
+        self.assertEqual(len(captured), 2)
+        self.assertEqual(captured[0].receive_id_type, "thread_id")
+        self.assertEqual(captured[0].request_body.receive_id, "omt_stale")
+        self.assertEqual(captured[1].receive_id_type, "chat_id")
+        self.assertEqual(captured[1].request_body.receive_id, "oc_parent")
+
+
+    @patch.dict(os.environ, {}, clear=True)
     def test_send_uses_post_for_every_chunk_of_multi_chunk_markdown(self):
         """Regression for #26841: when a long Markdown message is split
         across multiple chunks, every chunk must go out as
@@ -2465,5 +2515,4 @@ class TestChatLockEviction(unittest.TestCase):
 
         adapter = self._make_adapter()
         self.assertIsInstance(adapter._chat_locks, _collections.OrderedDict)
-
 
