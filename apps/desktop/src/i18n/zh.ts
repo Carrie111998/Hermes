@@ -1776,6 +1776,7 @@ export const zh: Translations = {
     title: '配置档案',
     count: count => `${count} 个配置档案`,
     search: '搜索配置档案…',
+    noSearchResults: '未找到匹配的配置档案。',
     loading: '正在加载配置档案…',
     newProfile: '新建配置档案',
     importProfile: '导入配置档案…',

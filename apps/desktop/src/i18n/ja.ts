@@ -1405,6 +1405,7 @@ export const ja = defineLocale({
     title: 'プロファイル',
     count: count => `${count} プロファイル`,
     search: 'プロファイルを検索...',
+    noSearchResults: '一致するプロファイルが見つかりません。',
     loading: 'プロファイルを読み込み中...',
     newProfile: '新しいプロファイル',
     importProfile: 'プロファイルをインポート…',

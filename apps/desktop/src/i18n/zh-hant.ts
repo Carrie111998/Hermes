@@ -1354,6 +1354,7 @@ export const zhHant = defineLocale({
     title: '設定檔',
     count: count => `${count} 個設定檔`,
     search: '搜尋設定檔…',
+    noSearchResults: '找不到相符的設定檔。',
     loading: '正在載入設定檔…',
     newProfile: '新增設定檔',
     importProfile: '匯入設定檔…',

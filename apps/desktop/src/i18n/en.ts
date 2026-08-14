@@ -1584,6 +1584,7 @@ export const en: Translations = {
     title: 'Profiles',
     count: count => `${count} ${count === 1 ? 'profile' : 'profiles'}`,
     search: 'Search profiles...',
+    noSearchResults: 'No profiles found.',
     loading: 'Loading profiles...',
     newProfile: 'New profile',
     importProfile: 'Import profile…',

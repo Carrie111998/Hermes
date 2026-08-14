@@ -26,11 +26,12 @@ import { CodeEditor } from '@/components/chat/code-editor'
 import { Button } from '@/components/ui/button'
 import { Codicon } from '@/components/ui/codicon'
 import { ColorSwatches } from '@/components/ui/color-swatches'
+import { Command, CommandEmpty, CommandGroup, CommandInput, CommandItem, CommandList } from '@/components/ui/command'
 import { ContextMenu, ContextMenuContent, ContextMenuItem, ContextMenuTrigger } from '@/components/ui/context-menu'
+import { controlVariants } from '@/components/ui/control'
 import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog'
-import { Popover, PopoverAnchor, PopoverContent } from '@/components/ui/popover'
+import { Popover, PopoverAnchor, PopoverContent, PopoverTrigger } from '@/components/ui/popover'
 import { ProfileGlyph } from '@/components/ui/profile-glyph'
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { Tip, Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
 import { getProfileSoul, updateProfileSoul } from '@/hermes'
 import { useI18n } from '@/i18n'
@@ -460,7 +461,7 @@ function ImportProfileButton({ label }: { label: string }) {
 // The condensed rail: every named profile in one compact select. The trigger
 // shows the active profile (tinted initial + name); on default/all scope it
 // falls back to the placeholder since the left toggle pill carries that state.
-function ProfileDropdown({
+export function ProfileDropdown({
   activeKey,
   colors,
   onSelect,
@@ -473,39 +474,115 @@ function ProfileDropdown({
 }) {
   const { t } = useI18n()
   const p = t.profiles
+  const [open, setOpen] = useState(false)
+  const [search, setSearch] = useState('')
 
-  const value = activeKey ? (profiles.find(profile => normalizeProfileKey(profile.name) === activeKey)?.name ?? '') : ''
+  const activeProfile = activeKey
+    ? profiles.find(profile => normalizeProfileKey(profile.name) === activeKey)
+    : undefined
+
+  const query = search.trim().toLocaleLowerCase()
+  const filtered = query ? profiles.filter(profile => profile.name.toLocaleLowerCase().includes(query)) : profiles
+
+  const handleOpenChange = (next: boolean) => {
+    setOpen(next)
+
+    if (!next) {
+      setSearch('')
+    }
+  }
+
+  const handleSelect = (name: string) => {
+    onSelect(name)
+    handleOpenChange(false)
+  }
 
   return (
-    <Select onValueChange={name => name && onSelect(name)} value={value}>
-      <SelectTrigger aria-label={p.title} className="min-w-0 flex-1" size="xs">
-        <SelectValue placeholder={p.title} />
-      </SelectTrigger>
-      <SelectContent collisionPadding={{ bottom: 44, left: 8, right: 8, top: 8 }} side="top">
-        {profiles.map(profile => (
-          <ProfileDropdownItem
-            color={resolveProfileColor(profile.name, colors)}
-            key={profile.name}
-            name={profile.name}
-          />
-        ))}
-      </SelectContent>
-    </Select>
+    <Popover onOpenChange={handleOpenChange} open={open}>
+      <PopoverTrigger asChild>
+        <button
+          aria-expanded={open}
+          aria-haspopup="listbox"
+          aria-label={p.title}
+          className={cn(
+            controlVariants({ size: 'xs' }),
+            'flex min-w-0 flex-1 cursor-pointer items-center justify-between gap-2 whitespace-nowrap',
+            !activeProfile && 'text-muted-foreground'
+          )}
+          data-slot="profile-dropdown-trigger"
+          role="combobox"
+          type="button"
+        >
+          {activeProfile ? (
+            <span className="flex min-w-0 items-center gap-1.5">
+              <ProfileGlyph
+                aria-hidden="true"
+                color={resolveProfileColor(activeProfile.name, colors)}
+                isDefault={false}
+                name={activeProfile.name}
+              />
+              <span className="truncate">{activeProfile.name}</span>
+            </span>
+          ) : (
+            <span className="truncate">{p.title}</span>
+          )}
+          <Codicon className="shrink-0 opacity-60" name={open ? 'chevron-up' : 'chevron-down'} size="1rem" />
+        </button>
+      </PopoverTrigger>
+      <PopoverContent
+        align="start"
+        className="w-72 p-0"
+        collisionPadding={{ bottom: 44, left: 8, right: 8, top: 8 }}
+        side="top"
+      >
+        <Command className="bg-transparent" shouldFilter={false}>
+          <CommandInput autoFocus onValueChange={setSearch} placeholder={p.search} value={search} />
+          <CommandList className="max-h-72 p-1">
+            {filtered.length === 0 ? (
+              <CommandEmpty>{p.noSearchResults}</CommandEmpty>
+            ) : (
+              <CommandGroup>
+                {filtered.map(profile => (
+                  <ProfileDropdownItem
+                    active={profile === activeProfile}
+                    color={resolveProfileColor(profile.name, colors)}
+                    key={profile.name}
+                    name={profile.name}
+                    onSelect={() => handleSelect(profile.name)}
+                  />
+                ))}
+              </CommandGroup>
+            )}
+          </CommandList>
+        </Command>
+      </PopoverContent>
+    </Popover>
   )
 }
 
 // One dropdown row per profile — its own component so each row can own a
 // hover-intent prewarm timer (see useProfilePrewarm).
-function ProfileDropdownItem({ color, name }: { color: null | string; name: string }) {
+function ProfileDropdownItem({
+  active,
+  color,
+  name,
+  onSelect
+}: {
+  active: boolean
+  color: null | string
+  name: string
+  onSelect: () => void
+}) {
   const { cancelPrewarm, startPrewarm } = useProfilePrewarm(name)
 
   return (
-    <SelectItem onPointerEnter={startPrewarm} onPointerLeave={cancelPrewarm} value={name}>
-      <span className="flex min-w-0 items-center gap-1.5">
+    <CommandItem onPointerEnter={startPrewarm} onPointerLeave={cancelPrewarm} onSelect={onSelect} value={name}>
+      <span className="flex min-w-0 flex-1 items-center gap-1.5">
         <ProfileGlyph aria-hidden="true" color={color} isDefault={false} name={name} />
         <span className="truncate">{name}</span>
       </span>
-    </SelectItem>
+      <Codicon className={cn('shrink-0', active ? 'opacity-100' : 'opacity-0')} name="check" size="1rem" />
+    </CommandItem>
   )
 }
 
