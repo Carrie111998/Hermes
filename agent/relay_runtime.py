@@ -948,6 +948,63 @@ class RelaySessionCoordinator:
         _CURRENT_TURN.set(turn)
         return turn
 
+    @staticmethod
+    def _attempt_stack_recovery(relay, target_handle) -> None:
+        """Recover from a scope stack that is out of sync.
+
+        When scopes are popped in a different order than they were pushed,
+        _native_pop_scope raises RuntimeError('scope handle is not at the
+        top of the stack'). This function attempts to clear the stack down
+        to (and including) the target handle so future sessions can start
+        cleanly.
+
+        Args:
+            relay: The nemo_relay instance from the lease.host.
+            target_handle: The scope handle that end_turn was trying to pop.
+        """
+        try:
+            stack = relay.scope._get_scope_stack()
+        except Exception:
+            return  # No stack to recover
+
+        # Find the target handle in the stack (search from top).
+        handle_index = None
+        for i in range(len(stack) - 1, -1, -1):
+            if stack[i].get('handle') == target_handle:
+                handle_index = i
+                break
+
+        if handle_index is None:
+            # Target not in stack — just clear the whole stack.
+            stack.clear()
+            return
+
+        # Pop everything above the target handle.
+        while len(stack) > handle_index:
+            try:
+                top = stack.pop()
+                relay.scope._native_pop_scope(
+                    top.get('handle'),
+                    output=None,
+                    metadata=None,
+                    timestamp=None,
+                )
+            except Exception:
+                # Best-effort: skip broken scopes, just clear the list.
+                stack.pop()
+
+        # Now pop the target handle itself.
+        try:
+            relay.scope._native_pop_scope(
+                target_handle,
+                output=None,
+                metadata=None,
+                timestamp=None,
+            )
+        except Exception:
+            # If even the target can't be popped, clear the stack.
+            stack.clear()
+
     def end_turn(
         self,
         turn: RelayTurnContext,
@@ -976,6 +1033,25 @@ class RelaySessionCoordinator:
                                 },
                                 timeout=_SCOPE_OP_TIMEOUT,
                             )
+                        except RuntimeError as e:
+                            # Scope stack out of sync (handle not at top).
+                            # This happens when a session closes with errors
+                            # and scopes were popped in a different order.
+                            logger.warning(
+                                "Hermes Relay turn finalization failed: scope stack "
+                                "out of sync, attempting recovery",
+                                exc_info=True,
+                            )
+                            try:
+                                RelaySessionCoordinator._attempt_stack_recovery(
+                                    lease.host.relay, turn.handle
+                                )
+                            except Exception:
+                                logger.debug(
+                                    "Scope stack recovery also failed, "
+                                    "leaving stale handle",
+                                    exc_info=True,
+                                )
                         except Exception:
                             logger.warning(
                                 "Hermes Relay turn finalization failed", exc_info=True
