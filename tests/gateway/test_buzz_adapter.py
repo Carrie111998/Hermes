@@ -2,6 +2,8 @@
 
 import asyncio
 import json
+import sys
+import types
 
 import pytest
 from unittest.mock import AsyncMock, MagicMock
@@ -38,6 +40,7 @@ DM_CHANNEL = "6468cc16-a114-4f23-8b8c-02c1655cbf6b"
 _ENV_VARS = (
     "BUZZ_RELAY_URL",
     "BUZZ_PRIVATE_KEY",
+    "BUZZ_AUTH_TAG",
     "BUZZ_CHANNELS",
     "BUZZ_HOME_CHANNEL",
     "BUZZ_ALLOWED_USERS",
@@ -101,6 +104,33 @@ class _ScriptedCli:
         return 0, "[]", ""
 
 
+class _FakeWebSocket:
+    def __init__(self, *, fail_with=None, entered_event=None, hold_event=None):
+        self._fail_with = fail_with
+        self._entered_event = entered_event
+        self._hold_event = hold_event
+
+    async def __aenter__(self):
+        if self._entered_event is not None:
+            self._entered_event.set()
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        if self._fail_with is not None:
+            exc = self._fail_with
+            self._fail_with = None
+            raise exc
+        if self._hold_event is not None:
+            await self._hold_event.wait()
+        raise StopAsyncIteration
+
+
 # ── bech32 / identity helpers ─────────────────────────────────────────────
 
 
@@ -128,6 +158,7 @@ class TestBuzzAdapterInit:
                 "channels": ["ccc"],
                 "poll_interval": 2,
                 "home_channel": "ccc",
+                "auth_tag": '["delegation","owner","app","sig"]',
             },
         )
         adapter = BuzzAdapter(cfg)
@@ -135,12 +166,20 @@ class TestBuzzAdapterInit:
         assert adapter.channels == ["ccc"]
         assert adapter.poll_interval == 2.0
         assert adapter.home_channel == "ccc"
+        assert adapter._auth_tag == '["delegation","owner","app","sig"]'
 
     def test_env_overrides_config(self, monkeypatch):
         monkeypatch.setenv("BUZZ_RELAY_URL", "https://env.relay")
+        monkeypatch.setenv("BUZZ_AUTH_TAG", '["delegation","env-owner","app","sig"]')
         from gateway.config import PlatformConfig
-        adapter = BuzzAdapter(PlatformConfig(enabled=True, extra={"relay_url": "https://cfg.relay"}))
+        adapter = BuzzAdapter(
+            PlatformConfig(
+                enabled=True,
+                extra={"relay_url": "https://cfg.relay", "auth_tag": '["delegation","cfg-owner","app","sig"]'},
+            )
+        )
         assert adapter.relay_url == "https://env.relay"
+        assert adapter._auth_tag == '["delegation","env-owner","app","sig"]'
 
 
 # ── CLI error contract ────────────────────────────────────────────────────
@@ -151,6 +190,66 @@ class TestCliErrorContract:
     def test_parses_json_error(self):
         msg = _cli_error_message('{"error":"relay_error","message":"boom","retryable":false}', 2)
         assert "relay_error" in msg and "boom" in msg and "exit 2" in msg
+
+
+class TestBuzzCliPlumbing:
+
+    @pytest.mark.asyncio
+    async def test_run_cli_passes_auth_tag_to_subprocess(self, monkeypatch):
+        adapter = _make_adapter({"auth_tag": '["delegation","owner","app","sig"]'})
+        captured = {}
+
+        async def fake_exec(cli_path, args, *, relay_url, private_key, auth_tag="", input_text=None, timeout=30.0):
+            captured.update(
+                cli_path=cli_path,
+                args=args,
+                relay_url=relay_url,
+                private_key=private_key,
+                auth_tag=auth_tag,
+                input_text=input_text,
+                timeout=timeout,
+            )
+            return 0, "[]", ""
+
+        monkeypatch.setattr(_buzz_mod, "_exec_buzz", fake_exec)
+        await adapter._run_cli(["users", "get"])
+        assert captured["auth_tag"] == '["delegation","owner","app","sig"]'
+
+    @pytest.mark.asyncio
+    async def test_websocket_auth_uses_configured_auth_tag(self, monkeypatch):
+        adapter = _make_adapter({"auth_tag": '["delegation","owner","app","sig"]'})
+
+        build_calls = {}
+
+        def fake_build_auth_event(*, private_key, challenge, relay_url, auth_tag_json=""):
+            build_calls.update(
+                private_key=private_key,
+                challenge=challenge,
+                relay_url=relay_url,
+                auth_tag_json=auth_tag_json,
+            )
+            return {"id": "evt-1", "kind": 22242}
+
+        monkeypatch.setattr(_buzz_mod, "_load_nostr_auth", lambda: types.SimpleNamespace(build_auth_event=fake_build_auth_event))
+
+        class _AuthSocket:
+            def __init__(self):
+                self.sent = []
+                self._recv = iter([
+                    json.dumps(["AUTH", "challenge-1"]),
+                    json.dumps(["OK", "evt-1", True, ""]),
+                ])
+
+            async def recv(self):
+                return next(self._recv)
+
+            async def send(self, payload):
+                self.sent.append(payload)
+
+        ws = _AuthSocket()
+        await adapter._authenticate_websocket(ws)
+        assert build_calls["auth_tag_json"] == '["delegation","owner","app","sig"]'
+        assert ws.sent
 
 
 # ── Seeding / high-water mark / de-dupe ───────────────────────────────────
@@ -261,9 +360,11 @@ class TestMentionGating:
 
 
 def _tagged_event(event_id, channel, *, content, pubkey=OTHER_PUBKEY,
-                  created_at=1000, kind=9, p=None, reply_to=None):
+                  created_at=1000, kind=9, p=None, root=None, reply_to=None):
     """Event with the tag shapes observed on a live relay (h/p/e tags)."""
     tags = [["h", channel]]
+    if root:
+        tags.append(["e", root, "", "root"])
     if reply_to:
         tags.append(["e", reply_to, "", "reply"])
     if p:
@@ -335,6 +436,7 @@ class TestDmClassification:
         assert adapter._channel_state[CHANNEL]["chat_type"] == "group"
         # It carried a mention, so it dispatches — but as a group message.
         assert [d["chat_type"] for d in adapter._dispatched] == ["group"]
+        assert adapter._dispatched[0]["thread_id"] == "root-event"
 
         # And once the mention is absent, the channel gate drops the message
         # even though the earlier reply p-tagged us.
@@ -344,6 +446,20 @@ class TestDmClassification:
         )
         assert len(adapter._dispatched) == 1
 
+    @pytest.mark.asyncio
+    async def test_nested_channel_reply_preserves_canonical_root(self, adapter):
+        await self._poll_with(
+            adapter, CHANNEL,
+            _tagged_event(
+                "e1",
+                CHANNEL,
+                content="@chip nested reply",
+                root="thread-root",
+                reply_to="immediate-parent",
+            ),
+        )
+
+        assert adapter._dispatched[0]["thread_id"] == "thread-root"
 
     @pytest.mark.asyncio
     async def test_channel_like_metadata_blocks_latch_even_without_mention(self, adapter):
@@ -379,6 +495,26 @@ class TestDmClassification:
         assert a._may_reclassify_as_dm(DM_CHANNEL) is True
         assert CHANNEL not in a._channel_state
         assert a._may_reclassify_as_dm(CHANNEL) is False
+
+
+class TestThreadAnchorExtraction:
+
+    def test_prefers_root_over_reply_regardless_of_tag_order(self):
+        event = {
+            "tags": [
+                ["e", "immediate-parent", "", "reply"],
+                ["e", "thread-root", "", "root"],
+            ]
+        }
+        assert BuzzAdapter._thread_id_from_event(event) == "thread-root"
+
+    def test_falls_back_to_reply_then_first_unmarked_event(self):
+        assert BuzzAdapter._thread_id_from_event(
+            {"tags": [["e", "reply-anchor", "", "reply"]]}
+        ) == "reply-anchor"
+        assert BuzzAdapter._thread_id_from_event(
+            {"tags": [["e", "legacy-anchor"]]}
+        ) == "legacy-anchor"
 
 
 # ── Sending ───────────────────────────────────────────────────────────────
@@ -524,8 +660,14 @@ class TestStandaloneSend:
 
         captured = {}
 
-        async def fake_exec(cli_path, args, *, relay_url, private_key, input_text=None, timeout=30.0):
-            captured.update(cli_path=cli_path, args=args, relay_url=relay_url, input_text=input_text)
+        async def fake_exec(cli_path, args, *, relay_url, private_key, auth_tag="", input_text=None, timeout=30.0):
+            captured.update(
+                cli_path=cli_path,
+                args=args,
+                relay_url=relay_url,
+                auth_tag=auth_tag,
+                input_text=input_text,
+            )
             return 0, json.dumps({"accepted": True, "event_id": "evt-cron", "message": ""}), ""
 
         monkeypatch.setattr(_buzz_mod, "_exec_buzz", fake_exec)
@@ -534,7 +676,31 @@ class TestStandaloneSend:
         assert result == {"success": True, "message_id": "evt-cron"}
         assert captured["args"][:2] == ["messages", "send"]
         assert captured["input_text"] == "cron says hi"
+        assert captured["auth_tag"] == ""
         # The private key must never be part of argv
         assert all("nsec1x" not in str(a) for a in captured["args"])
+    @pytest.mark.asyncio
+    async def test_standalone_send_uses_config_auth_tag(self, monkeypatch, tmp_path):
+        from gateway.config import PlatformConfig
 
+        fake_cli = tmp_path / "buzz"
+        fake_cli.write_text("#!/bin/sh\n", encoding="utf-8")
+        monkeypatch.setenv("BUZZ_RELAY_URL", "https://r")
+        monkeypatch.setenv("BUZZ_PRIVATE_KEY", "nsec1x")
+        monkeypatch.setenv("BUZZ_CLI_PATH", str(fake_cli))
 
+        captured = {}
+
+        async def fake_exec(cli_path, args, *, relay_url, private_key, auth_tag="", input_text=None, timeout=30.0):
+            captured.update(auth_tag=auth_tag, args=args, input_text=input_text)
+            return 0, json.dumps({"accepted": True, "event_id": "evt-cron", "message": ""}), ""
+
+        monkeypatch.setattr(_buzz_mod, "_exec_buzz", fake_exec)
+
+        result = await _standalone_send(
+            PlatformConfig(enabled=True, extra={"auth_tag": '["delegation","owner","app","sig"]'}),
+            CHANNEL,
+            "cron says hi",
+        )
+        assert result == {"success": True, "message_id": "evt-cron"}
+        assert captured["auth_tag"] == '["delegation","owner","app","sig"]'
