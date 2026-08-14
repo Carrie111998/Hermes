@@ -5145,6 +5145,19 @@ def complete_task(
     metadata = _merge_completion_prose_artifacts(
         conn, task_id, metadata, summary=summary, result=result,
     )
+
+    import hermes_state
+    try:
+        row_h = conn.execute("SELECT openspec_contract_hash FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        if row_h and row_h["openspec_contract_hash"]:
+            st = hermes_state.SessionDB()
+            st.enforce_openspec_transaction(task_id, 'done', row_h["openspec_contract_hash"])
+    except ValueError as e:
+        if "hash mismatch" in str(e).lower() or "not found" in str(e).lower() or "invariant" in str(e).lower():
+            return False
+    except Exception:
+        pass
+
     with write_txn(conn):
         # Parent completion is a hard invariant even for direct human review
         # approval. A parent may have been reopened after this task entered
@@ -5919,6 +5932,20 @@ def block_task(
             f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None"
         )
     recurrences = 0
+
+    import hermes_state
+    try:
+        row_h = conn.execute("SELECT openspec_contract_hash FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        if row_h and row_h["openspec_contract_hash"]:
+            st = hermes_state.SessionDB()
+            # block_task maps 'dependency' blocks to 'todo', and all others to 'blocked'/'triage'
+            st.enforce_openspec_transaction(task_id, 'todo' if kind == 'dependency' else 'blocked', row_h["openspec_contract_hash"])
+    except ValueError as e:
+        if "hash mismatch" in str(e).lower() or "not found" in str(e).lower() or "invariant" in str(e).lower():
+            return False
+    except Exception:
+        pass
+
     with write_txn(conn):
         cur_row = conn.execute(
             "SELECT status, block_kind, block_recurrences FROM tasks WHERE id = ?",
@@ -6159,6 +6186,20 @@ def request_review(
 
     summary = redact_review_value(summary)
     metadata = redact_review_value(metadata)
+
+    
+    import hermes_state
+    try:
+        row_h = conn.execute("SELECT openspec_contract_hash FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        if row_h and row_h["openspec_contract_hash"]:
+            st = hermes_state.SessionDB()
+            st.enforce_openspec_transaction(task_id, 'review', row_h["openspec_contract_hash"])
+    except ValueError as e:
+        if "hash mismatch" in str(e).lower() or "not found" in str(e).lower() or "invariant" in str(e).lower():
+            return _ret(False, str(e))
+    except Exception:
+        pass
+
     with write_txn(conn):
         if not _parents_satisfied(conn, task_id):
             return _ret(False, "parent dependencies are not satisfied")
@@ -6303,6 +6344,19 @@ def request_changes(
     reason = str(redact_review_value(reason or "")).strip()
     if not reason:
         return False, "reason is required"
+
+    
+    import hermes_state
+    try:
+        row_h = conn.execute("SELECT openspec_contract_hash FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        if row_h and row_h["openspec_contract_hash"]:
+            st = hermes_state.SessionDB()
+            st.enforce_openspec_transaction(task_id, 'todo', row_h["openspec_contract_hash"])
+    except ValueError as e:
+        if "hash mismatch" in str(e).lower() or "not found" in str(e).lower() or "invariant" in str(e).lower():
+            return False, str(e)
+    except Exception:
+        pass
 
     with write_txn(conn):
         task_row = conn.execute(
@@ -6456,6 +6510,18 @@ def promote_task(
     if dry_run:
         return True, None
 
+    import hermes_state
+    try:
+        row_h = conn.execute("SELECT openspec_contract_hash FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        if row_h and row_h["openspec_contract_hash"]:
+            st = hermes_state.SessionDB()
+            st.enforce_openspec_transaction(task_id, 'ready', row_h["openspec_contract_hash"])
+    except ValueError as e:
+        if "hash mismatch" in str(e).lower() or "not found" in str(e).lower() or "invariant" in str(e).lower():
+            return False, str(e)
+    except Exception:
+        pass
+
     with write_txn(conn):
         upd = conn.execute(
             "UPDATE tasks SET status = 'ready' "
@@ -6533,7 +6599,20 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
     runs invariant (``current_run_id IS NULL`` ⇔ run row in terminal
     state) holds for the rest of this function's lifetime.
     """
-    now = int(time.time())
+
+    
+    import hermes_state
+    try:
+        row_h = conn.execute("SELECT openspec_contract_hash FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        if row_h and row_h["openspec_contract_hash"]:
+            st = hermes_state.SessionDB()
+            st.enforce_openspec_transaction(task_id, 'todo', row_h["openspec_contract_hash"])
+    except ValueError as e:
+        if "hash mismatch" in str(e).lower() or "not found" in str(e).lower() or "invariant" in str(e).lower():
+            return False
+    except Exception:
+        pass
+
     with write_txn(conn):
         current = conn.execute(
             "SELECT status FROM tasks WHERE id = ?",
@@ -6598,7 +6677,20 @@ def reopen_review_task(conn: sqlite3.Connection, task_id: str) -> bool:
     genuine block *before* review is left intact — only :func:`complete_task`
     clears it.) Returns False when the task is missing or not in ``review``.
     """
-    now = int(time.time())
+
+    
+    import hermes_state
+    try:
+        row_h = conn.execute("SELECT openspec_contract_hash FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        if row_h and row_h["openspec_contract_hash"]:
+            st = hermes_state.SessionDB()
+            st.enforce_openspec_transaction(task_id, 'todo', row_h["openspec_contract_hash"])
+    except ValueError as e:
+        if "hash mismatch" in str(e).lower() or "not found" in str(e).lower() or "invariant" in str(e).lower():
+            return False
+    except Exception:
+        pass
+
     with write_txn(conn):
         _reclaim_dangling_run(
             conn, task_id, statuses=("review",), now=now,
@@ -7147,6 +7239,20 @@ def decompose_triage_task(
 
 
 def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
+    
+    
+    import hermes_state
+    try:
+        row_h = conn.execute("SELECT openspec_contract_hash FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        if row_h and row_h["openspec_contract_hash"]:
+            st = hermes_state.SessionDB()
+            st.enforce_openspec_transaction(task_id, 'archived', row_h["openspec_contract_hash"])
+    except ValueError as e:
+        if "hash mismatch" in str(e).lower() or "not found" in str(e).lower() or "invariant" in str(e).lower():
+            return False
+    except Exception:
+        pass
+
     with write_txn(conn):
         cur = conn.execute(
             "UPDATE tasks SET status = 'archived', "
