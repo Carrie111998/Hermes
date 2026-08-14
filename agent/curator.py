@@ -1494,9 +1494,11 @@ def _render_candidate_list() -> str:
 
     Each row gains an outcome-quality tail when the signal exists: ``fr=``
     (recent-window failure rate, only when there are enough samples),
-    ``review=yes`` (the skill is flagged needs-review), and ``reason=`` (the
-    latest verifier/eval failure reason). Rows with no outcome signal stay
-    compact — the tail is purely additive to the activity stats.
+    ``review=yes`` (the skill is flagged needs-review), ``no_signal=`` (how
+    many recent outcomes were neutral — the skill ran unverified, no per-skill
+    evidence either way), and ``reason=`` (the latest verifier/eval failure
+    reason). Rows with no outcome signal stay compact — the tail is purely
+    additive to the activity stats.
     """
     rows = skill_usage.curated_report()
     if not rows:
@@ -1510,6 +1512,9 @@ def _render_candidate_list() -> str:
             tail.append(f"fr={fr:.2f}")
         if r.get("needs_review"):
             tail.append("review=yes")
+        unk = r.get("recent_unknown_count") or 0
+        if unk:
+            tail.append(f"no_signal={unk}")
         reason = r.get("recent_failure_reason") or ""
         if reason:
             tail.append(f'reason="{_clip(reason)}"')

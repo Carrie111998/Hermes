@@ -14,13 +14,19 @@ Mechanism:
      when a used skill had no verifier (unverified residue — the common case),
      or when configured ``run: always``. The aux prompt is seeded with the
      verdict report so it can't ignore a mechanical fail line.
-  3. Attribution is dumb-recorder: mechanical FAILs always land on their
-     skill; the eval's extra failure points merge in (union). Down-only
+  3. Attribution is dumb-recorder: mechanical FAILs always land on their skill;
+     the eval's extra failure points merge in (union). Down-only
      governs attribution too: once a mechanical FAIL is on the table, the
      eval's ``failure_points`` are ignored so a low-context judge can't pin
-     extra blame on an unrelated skill that merely ran unverified.
-     Environmental reads live in the reason string, never in the verdict —
-     the curator review is the arbiter, not this recorder.
+     extra blame on an unrelated skill that merely ran unverified, and a
+     mechanically-confirmed PASS protects that skill from the judge's contrary
+     blame. Symmetrically, a per-skill PASS requires per-skill evidence (a
+     mechanical verifier PASS); on a confident eval success a skill that ran
+     unverified records a NEUTRAL outcome — a sample that keeps the recovery
+     window sliding but never claims success, so incidentally-loaded skills
+     can't bank fake passes and wash out their failure history. Environmental
+     reads live in the reason string, never in the verdict — the curator
+     review is the arbiter, not this recorder.
   4. Best-effort everywhere: any failure here must never break the turn.
 
 Known limitation (future work, not fixed here): the aux judge sees only the
@@ -58,9 +64,12 @@ _AUX_TASK = "outcome"
 # but a valid object embedded anywhere in the text survives.
 _JSON_OBJECT_RE = re.compile(r"\{.*\}", re.DOTALL)
 
-# A pass is only recorded (and only eligible to clear `needs_review`) when the
-# eval declares success at or above this confidence. A weak pass — no verifier,
-# low-confidence eval success — must not clear a needs-review flag on its own.
+# The eval-success gate for NEUTRAL outcomes. A neutral (a sample that claims
+# neither success nor failure) is only recorded when the eval declares success
+# at or above this confidence — a weak eval must not add samples that could
+# dilute a genuinely-flagged skill's failure rate into recovery. Real passes
+# are never gated here: they require a mechanical verifier PASS, which is
+# strong per-skill evidence regardless of the eval.
 _PASS_CONFIDENCE_THRESHOLD = 0.6
 
 
@@ -216,9 +225,16 @@ def _default_aux_eval(prompt: str) -> Optional[Dict[str, Any]]:
 
 
 def _record(
-    skill_name: str, success: bool, reason: str = "", skill_dir: Optional[Path] = None
+    skill_name: str,
+    success: Optional[bool],
+    reason: str = "",
+    skill_dir: Optional[Path] = None,
 ) -> None:
     """Best-effort write to the usage sidecar. Never raises into the turn.
+
+    ``success`` is three-state: True (mechanical PASS), False (mechanical FAIL
+    or eval-attributed blame), None (neutral — the turn succeeded but this
+    skill ran unverified). See ``tools.skill_usage.bump_outcome``.
 
     Gated on curation eligibility, mirroring the mechanical verifier path
     (``tools.skill_verify.run_verification`` refuses non-eligible skills before
@@ -313,7 +329,10 @@ def evaluate_turn_outcome(
             name: _run_skill_verifier(name, d, cwd) for name, d in skill_dirs
         }
         fail_verdicts = [(n, r) for n, (v, r) in verdicts.items() if v == "fail"]
+        pass_names = [n for n, (v, r) in verdicts.items() if v == "pass"]
         skip_names = {n for n, (v, r) in verdicts.items() if v == "skip"}
+
+        dir_by_name = dict(skill_dirs)
 
         fm = file_mutation_state or {}
         has_mechanical_fail = bool(fail_verdicts) or bool(fm)
@@ -322,7 +341,12 @@ def evaluate_turn_outcome(
         should_eval = run_mode == "always" or has_mechanical_fail or has_residue
         if not should_eval:
             # All used skills verified clean and nothing failed — no residue to
-            # judge, nothing to record.
+            # judge, so no global verdict is produced. Still record the clean
+            # verifier passes: a mechanical PASS is per-skill evidence and must
+            # not be lost just because nothing else triggered the judge
+            # (previously these passes were discarded entirely).
+            for n in pass_names:
+                _record(n, True, skill_dir=dir_by_name.get(n))
             return None
 
         # ── Signal-gated aux judgment ───────────────────────────────────────
@@ -391,10 +415,19 @@ def evaluate_turn_outcome(
         # recorder must not pin blame (or flip needs_review) on a skill the turn
         # never touched. Mechanical points are already used-skills-only.
         used_names = {name for name, _d in skill_dirs}
-        failure_points = list(
-            dict.fromkeys(mechanical_points + [p for p in eval_points if p in used_names])
-        )
-        dir_by_name = dict(skill_dirs)
+        eval_blamed = [p for p in eval_points if p in used_names]
+        failure_points = list(dict.fromkeys(mechanical_points + eval_blamed))
+        _blamed_set = set(failure_points)
+
+        # An eval-blamed skill that ALSO mechanically PASSed gets the fail, not
+        # the pass: a verifier checks one narrow thing (e.g. a commit-message
+        # prefix), and the judge's semantic read (e.g. "the wrong change was
+        # committed") can be right even when the narrow check passed. Never
+        # double-record one skill twice in the same turn.
+        _suppressed_pass = set(eval_blamed)
+        effective_pass = [n for n in pass_names if n not in _suppressed_pass]
+        _pass_set = set(effective_pass)
+
         for s in failure_points:
             # Mechanical fails carry their verifier's reason; eval-attributed
             # points carry the eval's merged reason text. Pass the skill dir so
@@ -405,9 +438,23 @@ def evaluate_turn_outcome(
                 fail_reasons.get(s) or eval_reason,
                 skill_dir=dir_by_name.get(s),
             )
-        if task_succeeded and confidence >= _PASS_CONFIDENCE_THRESHOLD:
-            for name, d in skill_dirs:
-                _record(name, True, skill_dir=d)
+        # A per-skill PASS requires per-skill evidence: only mechanical verifier
+        # PASSes get one (recorded here so an eval blame on the same skill can
+        # suppress them). Previously the eval's global success minted a pass for
+        # every used skill — fake success that let incidentally-loaded skills
+        # wash out their failure history.
+        for n in effective_pass:
+            _record(n, True, skill_dir=dir_by_name.get(n))
+
+        # On a confident eval success, skills that merely ran unverified get a
+        # NEUTRAL outcome: a sample that keeps the recovery window sliding but
+        # never claims success (see tools.skill_usage.bump_outcome). Skills that
+        # mechanically passed or were blamed already have an outcome this turn.
+        if task_succeeded and eval_succeeded is True:
+            if confidence >= _PASS_CONFIDENCE_THRESHOLD:
+                for name in used_names:
+                    if name not in _pass_set and name not in _blamed_set:
+                        _record(name, None, skill_dir=dir_by_name.get(name))
 
         # ── Reason corpus ───────────────────────────────────────────────────
         parts = []

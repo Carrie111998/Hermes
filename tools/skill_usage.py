@@ -61,6 +61,30 @@ def arm_turn_skill_accumulator(used_skills: Set[str]) -> Token:
     return _turn_skill_accumulator.set(used_skills)
 
 
+def disarm_turn_skill_accumulator(token: Optional[Token]) -> None:
+    """Restore the per-turn accumulator to its unarmed state at turn end.
+
+    Called from ``finalize_turn`` so ``bump_use`` calls that happen OUTSIDE a
+    turn — CLI skill preloads, cron jobs loading skills between turns, gateway
+    sessions sharing a thread — stop writing into the finished turn's set
+    (already read by finalize and about to be discarded). The next turn re-arms
+    with a fresh set, so this is about not mutating a dead set, not about the
+    next turn's attribution.
+    """
+    if token is not None:
+        try:
+            _turn_skill_accumulator.reset(token)
+            return
+        except (ValueError, TypeError):
+            # The token belongs to a different context (a copy_context boundary
+            # between arm and disarm) — fall through to a current-context clear.
+            pass
+    try:
+        _turn_skill_accumulator.set(None)
+    except Exception:
+        logger.debug("turn_skill_accumulator.clear failed", exc_info=True)
+
+
 # fcntl is Unix-only; on Windows use msvcrt for file locking.
 msvcrt = None
 try:
@@ -683,7 +707,9 @@ def _empty_record() -> Dict[str, Any]:
         # Outcome telemetry. Distinct from use_count: use_count answers "was
         # this touched", these answer "did touching it work". A bounded
         # recent-outcomes window lets a skill recover after a fix instead of
-        # being haunted by lifetime failures.
+        # being haunted by lifetime failures. Each entry is three-state:
+        # True (mechanical PASS), False (mechanical FAIL / eval-blamed), or
+        # None (neutral — ran unverified, no per-skill evidence).
         "recent_outcomes": [],
         # Parallel to recent_outcomes (same window, appended in lockstep):
         # the reason behind each outcome, so the curator review has something
@@ -1034,13 +1060,26 @@ def record_installed(skill_name: str) -> None:
         _emit_skill_lifecycle(skill_name, "installed", record=facts)
 
 
-def bump_outcome(skill_name: str, success: bool, reason: Optional[str] = None) -> None:
-    """Record whether a use of *skill_name* succeeded or failed.
+def bump_outcome(
+    skill_name: str, success: Optional[bool], reason: Optional[str] = None
+) -> None:
+    """Record whether a use of *skill_name* held up.
 
-    "Failed" means the use could not show that the work held up. Appends to a
-    capped recent-outcomes window and re-derives needs_review from it.
-    ``reason`` is the human/verifier text explaining the outcome (mechanical
-    fail reason, eval reason, ...); it is kept alongside the boolean in a
+    ``success`` is THREE-state, so the sidecar never claims success without
+    per-skill evidence:
+
+      - True — per-skill evidence it held up (a mechanical verifier PASS).
+      - False — per-skill evidence it failed (mechanical FAIL or
+        eval-attributed blame).
+      - None — NEUTRAL: the turn succeeded but this skill has no per-skill
+        evidence either way (it ran unverified). Counted as a sample so the
+        window still slides and recovery works, but explicitly NOT a pass —
+        incidentally-loaded skills can't bank fake success and wash out their
+        failure history.
+
+    Appends to a capped recent-outcomes window and re-derives needs_review from
+    it. ``reason`` is the human/verifier text explaining the outcome (mechanical
+    fail reason, eval reason, ...); it is kept alongside the outcome in a
     parallel capped list so the curator review pass can read *why* a skill
     failed without having to parse trajectories.
     """
@@ -1048,7 +1087,9 @@ def bump_outcome(skill_name: str, success: bool, reason: Optional[str] = None) -
         outcomes = rec.get("recent_outcomes")
         if not isinstance(outcomes, list):
             outcomes = []
-        outcomes.append(bool(success))
+        # Preserve the three states exactly (bool(True)=True, bool(False)=False,
+        # but bool(None)=False would erase the neutral marker — store raw).
+        outcomes.append(success)
         if len(outcomes) > _OUTCOME_WINDOW:
             outcomes = outcomes[-_OUTCOME_WINDOW:]
 
@@ -1063,7 +1104,9 @@ def bump_outcome(skill_name: str, success: bool, reason: Optional[str] = None) -
 
         was_needs_review = bool(rec.get("needs_review"))
         samples = len(outcomes)
-        failures = sum(1 for o in outcomes if not o)
+        # Only an explicit False is a failure — a None (neutral) counts toward
+        # the sample floor but must never be read as a pass OR a failure.
+        failures = sum(1 for o in outcomes if o is False)
         should_flag = (
             samples >= _OUTCOME_MIN_SAMPLES
             and (failures / samples) >= _OUTCOME_FAILURE_THRESHOLD
@@ -1084,7 +1127,7 @@ def failure_rate(skill_name: str) -> Optional[float]:
     outcomes = rec.get("recent_outcomes")
     if not isinstance(outcomes, list) or len(outcomes) < _OUTCOME_MIN_SAMPLES:
         return None
-    return sum(1 for o in outcomes if not o) / len(outcomes)
+    return sum(1 for o in outcomes if o is False) / len(outcomes)
 
 
 def recent_failure_reason(rec: Dict[str, Any]) -> str:
@@ -1092,15 +1135,16 @@ def recent_failure_reason(rec: Dict[str, Any]) -> str:
 
     ``rec`` is a usage record (or backfilled row). ``recent_outcomes`` and
     ``recent_outcome_reasons`` are parallel capped lists; walk from the newest
-    entry back to the newest *failure* with a reason attached. Returns "" when
-    there isn't one.
+    entry back to the newest *failure* (an explicit ``False`` — a neutral
+    ``None`` is not a failure) with a reason attached. Returns "" when there
+    isn't one.
     """
     outcomes = rec.get("recent_outcomes")
     reasons = rec.get("recent_outcome_reasons")
     if not isinstance(outcomes, list) or not isinstance(reasons, list):
         return ""
     for i, ok in reversed(list(enumerate(outcomes))):
-        if not ok and i < len(reasons):
+        if ok is False and i < len(reasons):
             r = reasons[i]
             if isinstance(r, str) and r:
                 return r
@@ -1423,9 +1467,14 @@ def curated_report() -> List[Dict[str, Any]]:
         row["activity_count"] = activity_count(row)
         outcomes = row.get("recent_outcomes")
         if isinstance(outcomes, list) and len(outcomes) >= _OUTCOME_MIN_SAMPLES:
-            row["failure_rate"] = sum(1 for o in outcomes if not o) / len(outcomes)
+            row["failure_rate"] = sum(1 for o in outcomes if o is False) / len(outcomes)
         else:
             row["failure_rate"] = None
+        row["recent_unknown_count"] = (
+            sum(1 for o in outcomes if o is None)
+            if isinstance(outcomes, list)
+            else 0
+        )
         row["recent_failure_reason"] = recent_failure_reason(row)
         row["provenance"] = provenance(name)
         rows.append(row)

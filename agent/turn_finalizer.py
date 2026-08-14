@@ -298,6 +298,20 @@ def finalize_turn(
     except Exception as _oc_err:
         logger.debug("turn outcome evaluation failed: %s", _oc_err)
 
+    # Disarm the per-turn skill accumulator so out-of-turn ``bump_use`` calls
+    # (CLI skill preloads, cron jobs loading skills between turns, gateway
+    # sessions sharing a thread) stop writing into this finished turn's set.
+    # Runs regardless of how the turn ended — interrupted turns armed it too
+    # at turn start.
+    try:
+        from tools.skill_usage import disarm_turn_skill_accumulator
+
+        disarm_turn_skill_accumulator(
+            getattr(agent, "_turn_skill_accumulator_token", None)
+        )
+    except Exception as _disarm_err:
+        logger.debug("turn skill accumulator disarm failed: %s", _disarm_err)
+
     # Save trajectory if enabled.  ``user_message`` may be a multimodal
     # list of parts; the trajectory format wants a plain string.
     try:

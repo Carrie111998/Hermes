@@ -326,6 +326,27 @@ def test_candidate_list_carries_outcome_quality_signal(curator_env):
     assert "reason=" not in clean_line
 
 
+def test_candidate_list_shows_neutral_signal_count(curator_env):
+    """Skills whose recent outcomes were neutral (ran unverified, no per-skill
+    evidence) must surface a ``no_signal=`` count so the review can distinguish
+    'confirmed clean' from 'no signal either way'."""
+    c = curator_env["curator"]
+    u = curator_env["usage"]
+    skills_dir = curator_env["home"] / "skills"
+    _write_skill(skills_dir, "quiet")
+    u.mark_agent_created("quiet")
+    for _ in range(3):
+        u.bump_outcome("quiet", False, reason="boom")
+    for _ in range(2):
+        u.bump_outcome("quiet", None, reason="")
+
+    listing = c._render_candidate_list()
+    quiet_line = next(l for l in listing.splitlines() if l.startswith("- quiet"))
+    assert "no_signal=2" in quiet_line
+    assert "fr=0.60" in quiet_line  # 3 failures / 5 samples
+    assert "review=yes" in quiet_line
+
+
 def test_review_prompt_embeds_needs_review_reason(curator_env, monkeypatch):
     """The prompt handed to the LLM fork must contain the needs-review rule AND
     the flagged skill's failure reason — otherwise the review pass can't act on

@@ -3,11 +3,16 @@
 Pins the Layer 0 decisions from patch.md to behavior:
 
   - signal-gated trigger: no signal (all used skills verified clean, no
-    residue, no ``run: always``) ⇒ no aux call, nothing recorded
+    residue, no ``run: always``) ⇒ no aux call, no global verdict; a clean
+    verifier PASS is still recorded as per-skill evidence
   - down-only override: a mechanical verifier FAIL wins over an eval that
     claims success
   - pass-is-not-success: a verifier PASS never confirms success; the eval's
-    semantic failure is still recorded
+    semantic failure is still recorded, and an eval-blamed skill gets the fail,
+    not the pass (never double-recorded)
+  - pass needs per-skill evidence: only a mechanical verifier PASS banks a
+    success; an unverified skill on a confident eval success records a NEUTRAL
+    (None) outcome — a sample, never a pass
   - weak pass: eval success at low confidence over unverified residue is not
     recorded (must not clear ``needs_review`` on its own)
   - dumb-recorder attribution: mechanical FAILs always land on their skill;
@@ -90,8 +95,14 @@ def _eval(**kwargs):
     return lambda _prompt: kwargs
 
 
-def test_no_signal_skips_aux_and_writes_nothing(turn_env):
-    """All used skills verified clean, no residue, run=auto ⇒ no aux, no write."""
+def test_no_signal_skips_aux_but_records_verifier_pass(turn_env):
+    """All used skills verified clean, no residue, run=auto ⇒ no aux call.
+
+    The signal gate stays: without a failure or residue the judge does not run.
+    But the mechanical PASS is still recorded — it is per-skill evidence, and
+    skipping it would leave a flagged skill unable to recover on its own
+    verifier's testimony (previously these passes were discarded entirely).
+    """
     from agent.turn_outcome import evaluate_turn_outcome
     from tools.skill_usage import get_record, set_verify_enabled
 
@@ -110,7 +121,7 @@ def test_no_signal_skips_aux_and_writes_nothing(turn_env):
     )
     assert outcome is None
     assert called == []
-    assert get_record("golden").get("recent_outcomes") == []
+    assert get_record("golden")["recent_outcomes"] == [True]
 
 
 def test_down_only_verifier_fail_wins_over_llm_success(turn_env):
@@ -355,6 +366,87 @@ def test_high_confidence_eval_success_records_pass(turn_env):
     assert outcome is not None
     assert outcome.task_succeeded is True
     assert get_record("golden")["recent_outcomes"][-1] is True
+
+
+def test_unverified_skill_on_confident_eval_success_records_neutral(turn_env):
+    """A skill that ran unverified on a confident eval success gets a NEUTRAL
+    outcome, never a pass — the core of the pass-inflation fix. The eval's
+    global success must not mint per-skill wins for skills the turn never
+    mechanically checked."""
+    from agent.turn_outcome import evaluate_turn_outcome
+    from tools.skill_usage import get_record
+
+    d = _write_plain_skill(turn_env / "skills", "open")
+
+    outcome = evaluate_turn_outcome(
+        skills_used_this_turn={"open": d},
+        outcome_config={"enabled": True},
+        _aux_eval=_eval(
+            task_succeeded=True, confidence=0.9, failure_points=[], reason="held up"
+        ),
+    )
+    assert outcome is not None
+    assert outcome.task_succeeded is True
+    # Stored raw — None, not a coerced False, and definitely not a pass.
+    assert get_record("open")["recent_outcomes"] == [None]
+    assert get_record("open")["needs_review"] is False
+
+
+def test_verifier_pass_survives_eval_success_alongside_unverified_neutral(turn_env):
+    """On the same eval success: the verifier-backed skill gets the pass, the
+    unverified sibling gets a neutral — per-skill evidence decides, not the
+    judge's global verdict."""
+    from agent.turn_outcome import evaluate_turn_outcome
+    from tools.skill_usage import get_record, set_verify_enabled
+
+    d_golden = _write_skill_with_verify(
+        turn_env / "skills", "golden", _verify_script(True, "ok")
+    )
+    d_open = _write_plain_skill(turn_env / "skills", "open")
+    set_verify_enabled("golden", True)
+
+    outcome = evaluate_turn_outcome(
+        skills_used_this_turn={"golden": d_golden, "open": d_open},
+        outcome_config={"enabled": True, "run": "always"},
+        _aux_eval=_eval(
+            task_succeeded=True, confidence=0.9, failure_points=[], reason="fine"
+        ),
+    )
+    assert outcome is not None
+    assert outcome.task_succeeded is True
+    assert get_record("golden")["recent_outcomes"] == [True]
+    assert get_record("open")["recent_outcomes"] == [None]
+
+
+def test_mechanical_pass_recovers_a_flagged_skill_without_eval(turn_env):
+    """A needs-review skill whose verifier keeps passing must recover on its own
+    evidence — clean turns (no eval) still bank the passes, so the flag clears
+    instead of being stuck until a judge happens to fire."""
+    from agent.turn_outcome import evaluate_turn_outcome
+    from tools.skill_usage import bump_outcome, get_record, set_verify_enabled
+
+    d = _write_skill_with_verify(
+        turn_env / "skills", "recover", _verify_script(True, "ok")
+    )
+    set_verify_enabled("recover", True)
+    for _ in range(4):
+        bump_outcome("recover", False)
+    assert get_record("recover")["needs_review"] is True
+
+    # Five clean verifier-pass turns — each recorded even though no eval runs.
+    # 4 fails + 5 passes = 4/9 ≈ 0.44 < 0.5 threshold → flag clears.
+    for _ in range(5):
+        evaluate_turn_outcome(
+            skills_used_this_turn={"recover": d},
+            outcome_config={"enabled": True, "run": "auto"},
+            _aux_eval=lambda p: _eval(
+                task_succeeded=True, confidence=0.9, failure_points=[], reason="ok"
+            ),
+        )
+    rec = get_record("recover")
+    assert rec["recent_outcomes"][-5:] == [True, True, True, True, True]
+    assert rec["needs_review"] is False
+    assert rec["needs_review_since"] is None
 
 
 def test_interrupted_turn_is_not_a_work_failure(turn_env):

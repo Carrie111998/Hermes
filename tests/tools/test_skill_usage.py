@@ -423,6 +423,92 @@ def test_bump_outcome_empty_reason_stored_as_blank_not_dropped(skills_home):
     assert recent_failure_reason(rec) == "boom"
 
 
+def test_bump_outcome_neutral_none_is_not_a_pass_or_failure(skills_home):
+    """A neutral (None) outcome must count as a window sample but never as a
+    pass or a failure: it stores raw, never clears the needs-review flag on its
+    own, keeps the failure math honest, and still lets the window slide toward
+    recovery."""
+    from tools.skill_usage import bump_outcome, failure_rate, get_record, recent_failure_reason
+
+    for _ in range(4):
+        bump_outcome("neutral", False, reason="f")
+    assert get_record("neutral")["needs_review"] is True
+
+    for _ in range(3):
+        bump_outcome("neutral", None, reason="")
+    rec = get_record("neutral")
+    # Stored raw — bool(None) would have collapsed the neutral marker.
+    assert rec["recent_outcomes"] == [False, False, False, False, None, None, None]
+    assert rec["needs_review"] is True             # neutrals don't clear on their own
+    assert failure_rate("neutral") == pytest.approx(4 / 7)  # failures / all samples
+    assert recent_failure_reason(rec) == "f"        # newest failure reason, neutrals skipped
+
+    bump_outcome("neutral", True, reason="recovered")
+    bump_outcome("neutral", True, reason="recovered")
+    assert get_record("neutral")["needs_review"] is False  # 4/9 slides below threshold
+    assert get_record("neutral")["recent_outcomes"][-1] is True
+
+
+def test_bump_outcome_neutrals_never_flag_a_skill_alone(skills_home):
+    """Neutrals in isolation must never flip needs_review — only explicit
+    failures can flag, so incidentally-loaded skills stay unmarked."""
+    from tools.skill_usage import bump_outcome, get_record
+
+    for _ in range(4):
+        bump_outcome("ghost", None, reason="no signal")
+    rec = get_record("ghost")
+    assert rec["recent_outcomes"] == [None, None, None, None]
+    assert rec["needs_review"] is False
+    assert rec["needs_review_since"] is None
+
+
+def test_curated_report_exposes_neutral_count(skills_home):
+    """curated_report must surface how many recent outcomes were neutral so the
+    candidate list can say a skill has no per-skill signal either way."""
+    from tools.skill_usage import bump_outcome, curated_report, mark_agent_created
+
+    skills_dir = skills_home / "skills"
+    _write_skill(skills_dir, "mixed")
+    mark_agent_created("mixed")
+    bump_outcome("mixed", False, reason="boom")
+    bump_outcome("mixed", None)
+    bump_outcome("mixed", None)
+
+    row = next(r for r in curated_report() if r["name"] == "mixed")
+    assert row["recent_unknown_count"] == 2
+    assert row["failure_rate"] is None  # 3 samples < minimum floor of 4
+
+
+def test_disarm_turn_skill_accumulator_clears_and_resets(skills_home):
+    """disarm restores the prior context (token path) and also clears a stale
+    arm when the token no longer applies (cross-context fallback)."""
+    import contextvars as _cv
+
+    from tools.skill_usage import (
+        _turn_skill_accumulator,
+        arm_turn_skill_accumulator,
+        disarm_turn_skill_accumulator,
+    )
+
+    assert _turn_skill_accumulator.get() is None
+    armed = set()
+    token = arm_turn_skill_accumulator(armed)
+    assert _turn_skill_accumulator.get() is armed
+    disarm_turn_skill_accumulator(token)
+    assert _turn_skill_accumulator.get() is None
+
+    # A token minted in a different context must still clear the current
+    # context rather than raising — the fallback path.
+    ctx = _cv.copy_context()
+    foreign_token = ctx.run(lambda: arm_turn_skill_accumulator(set()))
+    disarm_turn_skill_accumulator(foreign_token)
+    assert _turn_skill_accumulator.get() is None
+
+    # None token — the unarmed/no-acc-at-finalize case — is a safe no-op.
+    disarm_turn_skill_accumulator(None)
+    assert _turn_skill_accumulator.get() is None
+
+
 def test_concurrent_bump_view_preserves_all_updates(skills_home):
     from tools.skill_usage import get_record
 
