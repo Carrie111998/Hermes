@@ -8541,6 +8541,14 @@ def _run_install_with_heartbeat(
     Some resolvers/build backends (especially when compiling Rust/C extensions)
     can stay quiet for minutes. Emit a simple elapsed-time heartbeat so users
     know ``hermes update`` is still progressing even if pip/uv itself is silent.
+
+    Captures stderr so that on failure the ``CalledProcessError`` carries the
+    installer's actual error output (``e.stderr``).  Without capture, the
+    error handler in ``_cmd_update_impl`` can only print a bare exit code and
+    the real cause — a locked ``.pyd``, a resolver conflict, a build failure
+    — is invisible in ``update.log`` (#85840).  Stdout is not captured: the
+    heartbeat thread already provides progress feedback, and unbuffered stdout
+    passthrough avoids breaking installers that use ANSI cursor tricks.
     """
     done = threading.Event()
     start = _time.time()
@@ -8563,6 +8571,10 @@ def _run_install_with_heartbeat(
             cwd=PROJECT_ROOT,
             check=True,
             env=env,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
         )
     finally:
         done.set()
