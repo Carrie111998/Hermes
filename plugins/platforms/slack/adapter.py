@@ -1007,7 +1007,11 @@ class SlackAdapter(BasePlatformAdapter):
         # (team_id, user_id) → Slack bot identity, same workspace scoping as
         # the name cache. Used to catch peer-agent posts that arrive as plain
         # user messages without bot_id/subtype=bot_message markers.
-        self._user_is_bot_cache: Dict[Tuple[str, str], bool] = {}
+        # ``None`` means Slack identity lookup failed or returned no user.
+        # Keeping that distinct from a verified human (False) lets security-
+        # sensitive context hydration fail closed without changing the legacy
+        # boolean behavior of _resolve_user_is_bot callers.
+        self._user_is_bot_cache: Dict[Tuple[str, str], Optional[bool]] = {}
         self._socket_mode_task: Optional[asyncio.Task] = None
         # Multi-workspace support
         self._team_clients: Dict[str, Any] = {}  # team_id → WebClient
@@ -4366,7 +4370,7 @@ class SlackAdapter(BasePlatformAdapter):
             result = await client.users_info(user=user_id)
             payload = _slack_response_payload(result)
             if not payload:
-                self._user_is_bot_cache[cache_key] = False
+                self._user_is_bot_cache[cache_key] = None
                 self._user_name_cache[cache_key] = user_id
                 return user_id
             user = payload.get("user", {})
@@ -4524,20 +4528,34 @@ class SlackAdapter(BasePlatformAdapter):
     async def _resolve_user_is_bot(
         self, user_id: str, chat_id: str = "", team_id: str = ""
     ) -> bool:
+        """Return bot status, preserving legacy unknown-as-human behavior."""
+        return bool(
+            await self._resolve_user_bot_status(
+                user_id,
+                chat_id=chat_id,
+                team_id=team_id,
+            )
+        )
+
+    async def _resolve_user_bot_status(
+        self, user_id: str, chat_id: str = "", team_id: str = ""
+    ) -> Optional[bool]:
         """Resolve whether a Slack user ID is a bot account, with caching.
 
         Workspace-scoped like :meth:`_resolve_user_name` — Slack user IDs are
-        team-local, so the cache key includes the team.
+        team-local, so the cache key includes the team. Returns ``None`` when
+        Slack identity lookup is unavailable, allowing security-sensitive
+        callers to distinguish unknown identity from a verified human.
         """
         if not user_id:
-            return False
+            return None
         team_id = str(team_id or self._channel_team.get(chat_id, ""))
         cache_key = (team_id, str(user_id))
         if cache_key in self._user_is_bot_cache:
             return self._user_is_bot_cache[cache_key]
         if not self._app:
-            self._user_is_bot_cache[cache_key] = False
-            return False
+            self._user_is_bot_cache[cache_key] = None
+            return None
 
         try:
             client = (
@@ -4548,9 +4566,9 @@ class SlackAdapter(BasePlatformAdapter):
             result = await client.users_info(user=user_id)
             payload = _slack_response_payload(result)
             if not payload:
-                self._user_is_bot_cache[cache_key] = False
+                self._user_is_bot_cache[cache_key] = None
                 self._user_name_cache.setdefault(cache_key, user_id)
-                return False
+                return None
             user = payload.get("user", {})
             profile = user.get("profile", {}) if isinstance(user, dict) else {}
             is_bot = bool(
@@ -4575,8 +4593,8 @@ class SlackAdapter(BasePlatformAdapter):
             return is_bot
         except Exception as e:
             logger.debug("[Slack] users.info bot check failed for %s: %s", user_id, e)
-            self._user_is_bot_cache[cache_key] = False
-            return False
+            self._user_is_bot_cache[cache_key] = None
+            return None
 
     async def send_image_file(
         self,
@@ -8210,17 +8228,24 @@ class SlackAdapter(BasePlatformAdapter):
             root_user_id and self_bot_uid and root_user_id == self_bot_uid
         )
         is_bot_root = declared_bot_root or is_self_bot_root
+        bot_identity_unknown = not root_user_id and not is_bot_root
         if not is_bot_root and root_user_id:
             # Some Slack app posts carry only a bot user ID. The thread text
             # formatter has already populated this workspace-scoped identity
             # cache in the common path; resolve on cache miss so a missing
             # bot_id/subtype cannot downgrade a third-party bot to a human.
-            is_bot_root = await self._resolve_user_is_bot(
+            bot_status = await self._resolve_user_bot_status(
                 root_user_id,
                 chat_id=channel_id,
                 team_id=team_id,
             )
-        uploader_kind = "bot" if is_bot_root else "user"
+            if bot_status is None:
+                bot_identity_unknown = True
+            else:
+                is_bot_root = bot_status
+        uploader_kind = (
+            "unknown" if bot_identity_unknown else "bot" if is_bot_root else "user"
+        )
         root_authorized: Optional[bool] = None
         if is_self_bot_root:
             uploader_trust = "self_bot"
@@ -8238,16 +8263,23 @@ class SlackAdapter(BasePlatformAdapter):
             should_block = (
                 is_bot_root and root_authorized is not True
             ) or (
+                bot_identity_unknown and root_authorized is not True
+            ) or (
                 not is_bot_root and root_authorized is False
             )
             if should_block:
-                sender_label = "unverified bot sender" if is_bot_root else "unverified sender"
+                if bot_identity_unknown:
+                    sender_description = "a root sender with unresolved sender identity"
+                elif is_bot_root:
+                    sender_description = "an unverified bot sender"
+                else:
+                    sender_description = "an unverified sender"
                 result = _SlackAttachmentResolution(
                     file_ids=seen_file_ids if seen_file_ids is not None else set(),
                     sha256s=seen_sha256s if seen_sha256s is not None else set(),
                 )
                 result.notices.append(
-                    f"Thread-root attachments from an {sender_label} were not downloaded and are not available to this turn. Treat their file markers as background only."
+                    f"Thread-root attachments from {sender_description} were not downloaded and are not available to this turn. Treat their file markers as background only."
                 )
                 result.provenance.append(
                     "- "
