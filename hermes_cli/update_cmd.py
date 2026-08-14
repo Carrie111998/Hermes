@@ -5780,13 +5780,28 @@ def _cmd_update_impl(args, gateway_mode: bool):
             sys.exit(1)
 
     except subprocess.CalledProcessError as e:
+        # Surface the actual command and its stderr — the old "Git update
+        # failed" message misattributed Python-deps failures to the git stage
+        # and hid the real error (#85840).
+        _cmd = e.cmd if isinstance(e.cmd, str) else " ".join(str(c) for c in e.cmd)
+        _stderr = e.stderr.strip() if e.stderr else ""
+        _stage = "Git" if "git" in _cmd else "Python dependency install"
         if sys.platform == "win32":
-            print(f"⚠ Git update failed: {e}")
+            print(f"⚠ {_stage} failed: {e}")
+            if _stderr:
+                # Show last few lines of stderr for diagnosis
+                _lines = _stderr.splitlines()
+                for line in _lines[-5:]:
+                    print(f"    {line}")
             print("→ Falling back to ZIP download...")
             print()
             _update_via_zip(args)
         else:
-            print(f"✗ Update failed: {e}")
+            print(f"✗ {_stage} failed: {e}")
+            if _stderr:
+                _lines = _stderr.splitlines()
+                for line in _lines[-5:]:
+                    print(f"    {line}")
             sys.exit(1)
 
 # --- Hoisted from the body of _cmd_update_impl (self-contained, no closure state) ---
