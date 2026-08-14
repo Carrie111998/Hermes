@@ -2,6 +2,7 @@
 
 import json
 import pytest
+from unittest.mock import patch
 
 
 def _write_config(tmp_path, config: dict) -> None:
@@ -50,6 +51,46 @@ def test_ambient_pool_source_does_not_count_as_explicit(tmp_path, monkeypatch):
 
     from hermes_cli.auth import is_provider_explicitly_configured
     assert is_provider_explicitly_configured("copilot") is False
+
+
+def test_vertex_adc_counts_as_explicit_when_config_present(tmp_path, monkeypatch):
+    """A keyless Vertex provider (ADC / service account) is explicitly
+    configured when its non-secret routing settings live in config.yaml, even
+    when it is NOT the current provider — otherwise it silently vanishes from
+    explicit-only pickers (desktop chat model menu) unless already selected."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    _write_config(tmp_path, {"model": {"provider": "anthropic", "default": "claude-opus-4-8"}})
+    _write_auth_store(tmp_path, {"version": 1, "providers": {}, "active_provider": None})
+
+    from hermes_cli.auth import is_provider_explicitly_configured
+
+    # has_vertex_credentials() is the single source of truth for "the user set
+    # up Vertex" (resolvable ADC / service-account path / project override).
+    with patch("agent.vertex_adapter.has_vertex_credentials", return_value=True):
+        assert is_provider_explicitly_configured("vertex") is True
+    with patch("agent.vertex_adapter.has_vertex_credentials", return_value=False):
+        assert is_provider_explicitly_configured("vertex") is False
+
+
+def test_bedrock_region_counts_as_explicit(tmp_path, monkeypatch):
+    """Bedrock (AWS SDK auth, no API key) is explicitly configured once the
+    user pins a region in config.yaml, mirroring the Vertex keyless case."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    _write_auth_store(tmp_path, {"version": 1, "providers": {}, "active_provider": None})
+
+    from hermes_cli.auth import is_provider_explicitly_configured
+
+    _write_config(tmp_path, {
+        "model": {"provider": "anthropic", "default": "claude-opus-4-8"},
+        "bedrock": {"region": "us-east-1"},
+    })
+    assert is_provider_explicitly_configured("bedrock") is True
+
+    _write_config(tmp_path, {
+        "model": {"provider": "anthropic", "default": "claude-opus-4-8"},
+        "bedrock": {"region": ""},
+    })
+    assert is_provider_explicitly_configured("bedrock") is False
 
 
 def test_returns_true_when_moa_reference_slot_uses_provider(tmp_path, monkeypatch):
