@@ -21,10 +21,8 @@ from __future__ import annotations
 import json
 import logging
 import os
-import queue
 import subprocess
 import sys
-import threading
 import time
 from html.parser import HTMLParser
 from typing import Any, Dict, Optional
@@ -164,7 +162,6 @@ _test_hook: Optional[str] = None
 
 # Last worker Popen started by ``_run_ddgs_search_bounded`` (test reap checks).
 _last_worker_proc: Optional[subprocess.Popen] = None
-_last_worker_thread: Optional[threading.Thread] = None
 
 
 def _plugins_path_entry() -> str:
@@ -233,7 +230,7 @@ def _run_ddgs_search_bounded(query: str, safe_limit: int) -> list[dict[str, Any]
     # Imported lazily so plugin import stays light for ``hermes tools`` probes.
     from tools.interrupt import is_interrupted
 
-    global _last_worker_proc, _last_worker_thread
+    global _last_worker_proc
 
     request: dict[str, Any] = {"query": query, "safe_limit": safe_limit}
     if _test_hook:
@@ -282,29 +279,10 @@ def _run_ddgs_search_bounded(query: str, safe_limit: int) -> list[dict[str, Any]
     )
     _last_worker_proc = proc
 
-    # ``communicate`` runs in a daemon thread so the parent can poll interrupt /
-    # deadline without blocking. A daemon avoids trapping interpreter shutdown
-    # if a native worker dies while an inherited pipe remains open.
-    completed: queue.Queue[tuple[Optional[str], Optional[BaseException]]] = queue.Queue(maxsize=1)
-
-    def _communicate() -> None:
-        try:
-            out, _err = proc.communicate(json.dumps(request))
-            completed.put((out or "", None))
-        except BaseException as exc:  # noqa: BLE001 — forward into caller thread
-            completed.put((None, exc))
-
-    communicator = threading.Thread(
-        target=_communicate,
-        name=f"ddgs-worker-{proc.pid}",
-        daemon=True,
-    )
-    communicator.start()
-    _last_worker_thread = communicator
     timed_out = False
     interrupted = False
     raw = ""
-    communicate_error: Optional[BaseException] = None
+    input_payload: Optional[str] = json.dumps(request)
     try:
         deadline = time.monotonic() + _SEARCH_TIMEOUT_SECS
         while True:
@@ -316,22 +294,25 @@ def _run_ddgs_search_bounded(query: str, safe_limit: int) -> list[dict[str, Any]
                 timed_out = True
                 break
             try:
-                out, communicate_error = completed.get(
-                    timeout=min(_POLL_INTERVAL_SECS, remaining)
+                out, _err = proc.communicate(
+                    input_payload,
+                    timeout=min(_POLL_INTERVAL_SECS, remaining),
                 )
+                input_payload = None
                 raw = out or ""
                 break
-            except queue.Empty:
+            except subprocess.TimeoutExpired:
+                # communicate() retains its input after a timeout; subsequent
+                # calls must pass None and continue draining the same pipes.
+                input_payload = None
                 continue
     finally:
         _terminate_and_reap(proc)
-        communicator.join(timeout=_TERMINATE_GRACE_SECS)
-        if not communicator.is_alive() and completed.qsize():
+        if not raw:
             try:
-                out, communicate_error = completed.get_nowait()
-                if not raw:
-                    raw = out or ""
-            except queue.Empty:
+                out, _err = proc.communicate(timeout=_TERMINATE_GRACE_SECS)
+                raw = out or ""
+            except (subprocess.TimeoutExpired, ValueError):
                 pass
 
     if interrupted:
@@ -340,9 +321,6 @@ def _run_ddgs_search_bounded(query: str, safe_limit: int) -> list[dict[str, Any]
         raise TimeoutError(
             f"DuckDuckGo search timed out after {_SEARCH_TIMEOUT_SECS}s"
         )
-    if communicate_error is not None:
-        raise RuntimeError(f"DDGS worker communication failed: {communicate_error}")
-
     raw = raw.strip()
     if not raw:
         raise RuntimeError(
