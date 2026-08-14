@@ -304,8 +304,10 @@ from plugins.platforms.telegram.telegram_ids import (
 )
 from plugins.platforms.telegram.telegram_network import (
     TelegramFallbackTransport,
+    cap_fallback_ips,
     discover_fallback_ips,
     parse_fallback_ip_env,
+    safe_fallback_pool_limits,
 )
 from utils import atomic_replace, env_float, env_int
 
@@ -4121,6 +4123,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     self.name,
                     ", ".join(fallback_ips),
                 )
+            fallback_ips = cap_fallback_ips(fallback_ips)
 
             proxy_targets = ["api.telegram.org", *fallback_ips]
             proxy_url = resolve_proxy_url("TELEGRAM_PROXY", target_hosts=proxy_targets)
@@ -4139,9 +4142,16 @@ class TelegramAdapter(BasePlatformAdapter):
                 # directly into TelegramFallbackTransport so its inner
                 # AsyncHTTPTransport instances honour keepalive_expiry — do not
                 # route this through `_with_limits`, httpx would discard it.
+                # TelegramFallbackTransport forwards this same `limits` object
+                # to its primary pool AND every lazily-built fallback pool, so
+                # passing `_pool_limits` unmodified would let the configured
+                # per-pool budget multiply by the pool count instead of
+                # bounding it (#82678) — derate it first.
                 _transport_kwargs: dict = {}
                 if _pool_limits is not None:
-                    _transport_kwargs["limits"] = _pool_limits
+                    _transport_kwargs["limits"] = safe_fallback_pool_limits(
+                        _pool_limits, len(fallback_ips)
+                    )
                 request = HTTPXRequest(
                     **request_kwargs,
                     httpx_kwargs={

@@ -42,6 +42,11 @@ _DOH_PROVIDERS: list[dict] = [
 # endpoints in the 149.154.160.0/20 block (same seed used by OpenClaw).
 _SEED_FALLBACK_IPS: list[str] = ["149.154.166.110", "149.154.167.220"]
 
+# DoH discovery returns every unique A record with no upper bound, and each
+# fallback IP gets its own httpx connection pool. Cap the count so the number
+# of pools a gateway can materialize has a finite worst case (#82678).
+DEFAULT_MAX_FALLBACK_IPS = 3
+
 
 def _resolve_proxy_url(target_hosts=None) -> str | None:
     # Delegate to shared implementation (env vars + macOS system proxy detection)
@@ -209,6 +214,49 @@ def parse_fallback_ip_env(value: str | None) -> list[str]:
         return []
     parts = [part.strip() for part in value.split(",")]
     return _normalize_fallback_ips(parts)
+
+
+def cap_fallback_ips(
+    ips: list[str], max_ips: int = DEFAULT_MAX_FALLBACK_IPS
+) -> list[str]:
+    """Bound the fallback-IP list so pool fan-out has a finite worst case.
+
+    Both configured (``HERMES_TELEGRAM_FALLBACK_IPS``) and DoH-discovered lists
+    are otherwise unbounded, and every fallback IP gets its own connection
+    pool (#82678).
+    """
+    if len(ips) <= max_ips:
+        return ips
+    logger.warning(
+        "Telegram fallback IP count %d exceeds the safety cap of %d; using only the first %d",
+        len(ips), max_ips, max_ips,
+    )
+    return ips[:max_ips]
+
+
+def safe_fallback_pool_limits(
+    base_limits: httpx.Limits, fallback_ip_count: int, num_ptb_clients: int = 2
+) -> httpx.Limits:
+    """Derate a per-client connection limit for the fallback-IP transport.
+
+    ``TelegramFallbackTransport`` forwards whatever ``limits`` it is given to
+    its primary pool and to every lazily-built fallback pool unchanged (that
+    "caller wins" contract is itself load-bearing, see
+    ``test_caller_limits_win_over_pool_default``). Passing the same
+    ``base_limits`` used for a single pool means the *effective* connection
+    budget scales with ``num_ptb_clients * (1 + fallback_ip_count)`` instead
+    of staying at what the operator configured (#82678). Divide the budget
+    across every pool that will actually be constructed so the total stays
+    bounded.
+    """
+    num_pools = num_ptb_clients * (1 + fallback_ip_count)
+    max_connections = max(1, base_limits.max_connections // num_pools)
+    max_keepalive = max(1, min(base_limits.max_keepalive_connections, max_connections))
+    return httpx.Limits(
+        max_connections=max_connections,
+        max_keepalive_connections=max_keepalive,
+        keepalive_expiry=base_limits.keepalive_expiry,
+    )
 
 
 def _resolve_system_dns() -> set[str]:
