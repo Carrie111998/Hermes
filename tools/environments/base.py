@@ -925,6 +925,7 @@ class BaseEnvironment(ABC):
         # that later expands the ``mv`` operand, keeping both consistent.
         if self._snapshot_ready:
             parts.append(
+                f"__hermes_snap_tmp=$(mktemp {_snap_tmp_template}) && "
                 f"{{ {_export_dump_excluding_session_vars(_snap_tmp, passthrough_names)} "
                 f"&& mv -f {_snap_tmp} {_quoted_snap}; }} "
                 f"2>/dev/null || rm -f {_snap_tmp} 2>/dev/null || true"
