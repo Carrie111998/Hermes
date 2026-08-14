@@ -5,6 +5,7 @@ import { useCallback } from 'react'
 import type { HermesGateway } from '@/hermes'
 import { sessionTitle } from '@/lib/chat-runtime'
 import {
+  canonicalDesktopSlashCommand,
   type CommandsCatalogLike,
   desktopSkinSlashCompletions,
   desktopSlashDescription,
@@ -195,7 +196,21 @@ export function useSlashCompletions(options: {
         const isArgCompletion = replaceFrom > 1
         const prefix = isArgCompletion ? text.slice(0, replaceFrom) : ''
 
-        const decorated = (result.items ?? [])
+        const completionItems = isArgCompletion
+          ? (result.items ?? [])
+          : [
+              ...new Map(
+                (result.items ?? []).map(item => {
+                  const command = commandText(item.text)
+                  const canonical = canonicalDesktopSlashCommand(command)
+                  const canonicalItem = canonical === command ? item : { ...item, text: canonical, display: canonical }
+
+                  return [canonical, canonicalItem] as const
+                })
+              ).values()
+            ]
+
+        const decorated = completionItems
           .map(item => {
             if (!isArgCompletion) {
               return item
@@ -215,7 +230,9 @@ export function useSlashCompletions(options: {
             // blurb). Only command rows get the registry description — looking
             // one up for `/personality none` would clobber it with the parent
             // command's text.
-            meta: isArgCompletion ? textValue(item.meta) : desktopSlashDescription(item.text, textValue(item.meta))
+            meta: isArgCompletion
+              ? textValue(item.meta)
+              : desktopSlashDescription(item.text, textValue(item.meta), true)
           }))
 
         // Keep each group contiguous so headers render once: Commands before

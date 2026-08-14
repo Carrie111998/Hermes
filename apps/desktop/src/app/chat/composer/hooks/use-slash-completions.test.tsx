@@ -130,6 +130,34 @@ describe('useSlashCompletions', () => {
     expect(skills).toEqual(['/work', '/research', '/docx'])
   })
 
+  it('surfaces the canonical command when a typed query matches an alias', async () => {
+    const request = vi.fn().mockResolvedValue({
+      items: [{ text: '/btw', display: '/btw', meta: 'Alias for /background' }]
+    })
+
+    const api = harness({ request } as unknown as HermesGateway)
+
+    const items = await completions(api, 'bt')
+
+    expect(commandsOf(items)).toEqual(['/background'])
+    expect(items[0]?.label).toBe('background')
+    expect(items[0]?.description).toContain('aliases: /bg, /btw')
+  })
+
+  it('deduplicates canonical and alias matches into one command row', async () => {
+    const request = vi.fn().mockResolvedValue({
+      items: [
+        { text: '/background', display: '/background', meta: 'Run a prompt in the background' },
+        { text: '/bg', display: '/bg', meta: 'Alias for /background' },
+        { text: '/btw', display: '/btw', meta: 'Alias for /background' }
+      ]
+    })
+
+    const api = harness({ request } as unknown as HermesGateway)
+
+    expect(commandsOf(await completions(api, 'b'))).toEqual(['/background'])
+  })
+
   // Typing is a search, and a search that hides a match is broken — the
   // never-used built-in still shows, just below the one she actually uses.
   it('ranks a typed query by use without hiding anything', async () => {
