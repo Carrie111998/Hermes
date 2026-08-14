@@ -1182,6 +1182,109 @@ async def test_concurrent_repeated_stop_records_and_watches_once(session_db, mon
         await service.wait_for_turn("turn-stop-concurrent")
 
 
+@pytest.mark.asyncio
+async def test_cancelled_http_stops_finish_commit_handoff_and_interrupt_once(
+    session_db, monkeypatch: pytest.MonkeyPatch
+):
+    """Cancellation after the stopping commit cannot orphan interruption."""
+
+    worker_released = asyncio.Event()
+    agent_ready = asyncio.Event()
+
+    class Agent:
+        interrupts = 0
+
+        def interrupt(self, _reason):
+            self.interrupts += 1
+            worker_released.set()
+
+    agent = Agent()
+
+    async def run_agent(**kwargs):
+        kwargs["agent_ref"][0] = agent
+        agent_ready.set()
+        await worker_released.wait()
+        return {"final_response": "must be discarded", "messages": []}, {}
+
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={}))
+    adapter._session_db = session_db
+    adapter._run_agent = run_agent
+    service = adapter._session_turn_service
+    await service.reconcile_startup()
+    store = await service._store()
+    assert store is not None
+    turn_id = "cancel-stop-after-commit"
+    store.reserve("s1", turn_id, _payload())
+    service._admit_execution(store, turn_id, "s1", _payload(), None, None)
+    await asyncio.wait_for(agent_ready.wait(), 1)
+
+    commit_finished = threading.Event()
+    return_from_store = threading.Event()
+    original_stop = store.request_stop
+
+    def commit_then_block(*args, **kwargs):
+        result = original_stop(*args, **kwargs)
+        commit_finished.set()
+        return_from_store.wait(timeout=2)
+        return result
+
+    monkeypatch.setattr(store, "request_stop", commit_then_block)
+    watcher_calls = 0
+    original_watcher = service._interrupt_when_available
+
+    async def counted_watcher(requested_turn_id):
+        nonlocal watcher_calls
+        watcher_calls += 1
+        await original_watcher(requested_turn_id)
+
+    monkeypatch.setattr(service, "_interrupt_when_available", counted_watcher)
+
+    def stop_request():
+        request = MagicMock()
+        request.match_info = {"session_id": "s1", "turn_id": turn_id}
+        return request
+
+    # Every HTTP handler joins the same tracked handoff. Cancel all waiters at
+    # the exact seam where SQLite has committed stopping but the worker thread
+    # has not returned the transition result to the event loop.
+    requests = [asyncio.create_task(service.stop(stop_request())) for _ in range(12)]
+    assert await asyncio.to_thread(commit_finished.wait, 1)
+    assert store.get(turn_id)["status"] == "stopping"
+    for request in requests:
+        request.cancel()
+    cancelled = await asyncio.gather(*requests, return_exceptions=True)
+    assert all(isinstance(result, asyncio.CancelledError) for result in cancelled)
+
+    return_from_store.set()
+    await asyncio.wait_for(worker_released.wait(), 1)
+    await service.wait_for_turn(turn_id)
+    for _ in range(20):
+        if not service._stop_handoffs and not service._interruption_owners:
+            break
+        await asyncio.sleep(0)
+
+    events = store.events_after(turn_id, 0)
+    assert store.get(turn_id)["status"] == "interrupted"
+    assert agent.interrupts == 1
+    assert watcher_calls == 0
+    assert [event["event"] for event in events].count("turn.stopping") == 1
+    assert service._stop_handoffs == {}
+    assert service._interruption_owners == {}
+
+    # A later idempotent stop observes terminal truth and cannot create a
+    # second edge, interruption, watcher, or leaked owner.
+    later = await service.stop(stop_request())
+    assert later.status == 200
+    assert json.loads(later.text)["turn"]["status"] == "interrupted"
+    assert agent.interrupts == 1
+    assert watcher_calls == 0
+    assert [
+        event["event"] for event in store.events_after(turn_id, 0)
+    ].count("turn.stopping") == 1
+    assert service._stop_handoffs == {}
+    assert service._interruption_owners == {}
+
+
 def test_no_transcript_duplication_store_has_no_content_columns(session_db):
     store = SessionTurnStore(session_db)
     store.reserve("s1", "turn-1", _payload("body must not be here"))

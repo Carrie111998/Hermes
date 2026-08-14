@@ -1370,6 +1370,14 @@ class SessionTurnService:
         self._store_operation_lock = asyncio.Lock()
         self._tasks: Dict[str, asyncio.Task[Any]] = {}
         self._agent_refs: Dict[str, list[Any]] = {}
+        # Stop requests have two distinct pieces of process-local ownership.
+        # The handoff survives its HTTP waiter, while an interruption owner
+        # prevents concurrent/recovery handoffs from spawning duplicate
+        # watchers for the same durable stopping edge.
+        self._stop_handoffs: Dict[
+            tuple[str, str], asyncio.Task[tuple[Optional[Dict[str, Any]], bool]]
+        ] = {}
+        self._interruption_owners: Dict[str, asyncio.Task[Any]] = {}
         self._lifecycle_dispatchers: Dict[str, SessionTurnLifecycleDispatcher] = {}
         self._lifecycle_cleanup_owners: set[str] = set()
         # Assistant text deltas are intentionally process-local. Canonical
@@ -2360,16 +2368,49 @@ class SessionTurnService:
         if store is None:
             return _error("Session database unavailable", "session_db_unavailable", 503)
         turn_id = request.match_info["turn_id"]
-        turn = await self._store_operation(lambda: store.get(turn_id))
-        if not turn or turn["session_id"] != request.match_info["session_id"]:
+        session_id = request.match_info["session_id"]
+        public, _transitioned = await self._join_stop_handoff(
+            store, session_id, turn_id
+        )
+        if public is None:
             return _error("Turn not found", "turn_not_found", 404)
-        if turn["status"] in TERMINAL_STATUSES:
-            public = await self._store_operation(
-                lambda: store.public_turn(turn_id)
-            )
+        if public["status"] in TERMINAL_STATUSES:
             return web.json_response(
                 {"object": "hermes.session.turn.stop", "turn": public}
             )
+        return web.json_response(
+            {"object": "hermes.session.turn.stop", "turn": public}, status=202
+        )
+
+    async def _join_stop_handoff(
+        self, store: SessionTurnStore, session_id: str, turn_id: str
+    ) -> tuple[Optional[Dict[str, Any]], bool]:
+        """Join one cancellation-resistant durable-stop/interruption handoff."""
+
+        key = (session_id, turn_id)
+        handoff = self._stop_handoffs.get(key)
+        if handoff is None:
+            handoff = asyncio.create_task(
+                self._perform_stop_handoff(store, session_id, turn_id)
+            )
+            self._stop_handoffs[key] = handoff
+            self._track_background_task(handoff)
+
+            def handoff_done(done: asyncio.Task[Any]) -> None:
+                if self._stop_handoffs.get(key) is done:
+                    self._stop_handoffs.pop(key, None)
+
+            handoff.add_done_callback(handoff_done)
+
+        # Client disconnect/request cancellation only abandons this waiter. The
+        # tracked handoff keeps ownership through durable commit and interrupt.
+        return await asyncio.shield(handoff)
+
+    async def _perform_stop_handoff(
+        self, store: SessionTurnStore, session_id: str, turn_id: str
+    ) -> tuple[Optional[Dict[str, Any]], bool]:
+        """Commit/read stop truth, then recover or claim interruption ownership."""
+
         # Let a just-admitted task finish durable lease/history admission so a
         # stop does not race it into a false "stopped before start" result.
         # Bounded and event-loop friendly; genuinely queued work still stops.
@@ -2379,27 +2420,57 @@ class SessionTurnService:
                 break
             await asyncio.sleep(0.01)
         def stop_and_read() -> tuple[Optional[Dict[str, Any]], bool]:
+            existing = store.get(turn_id)
+            if existing is None or existing["session_id"] != session_id:
+                return None, False
+            if existing["status"] in TERMINAL_STATUSES:
+                return store.public_turn(turn_id), False
             result = store.request_stop(turn_id)
             if result is None:
                 return None, False
             _row, transitioned = result
             return store.public_turn(turn_id), transitioned
 
-        public, transitioned = await self._store_operation(stop_and_read)
-        if transitioned:
+        # This task, rather than an HTTP request task, owns the ordered store
+        # operation. shield() in the caller ensures a disconnected request can
+        # neither cancel the commit nor strand its interruption handoff.
+        public, transitioned = await self._store_operation(
+            stop_and_read, propagate_cancellation=False
+        )
+        if public is not None and (
+            transitioned or public["status"] == "stopping"
+        ):
+            owner = self._interruption_owners.get(turn_id)
+            if owner is not None and owner.done():
+                self._interruption_owners.pop(turn_id, None)
+                owner = None
+            if owner is not None:
+                return public, transitioned
+
             ref = self._agent_refs.get(turn_id)
             agent = ref[0] if ref else None
             if agent is not None:
+                current = asyncio.current_task()
+                assert current is not None
+                self._interruption_owners[turn_id] = current
                 try:
                     agent.interrupt("Stop requested via session turn API")
                 except Exception:
                     pass
+                finally:
+                    if self._interruption_owners.get(turn_id) is current:
+                        self._interruption_owners.pop(turn_id, None)
             else:
                 watcher = asyncio.create_task(self._interrupt_when_available(turn_id))
+                self._interruption_owners[turn_id] = watcher
                 self._track_background_task(watcher)
-        return web.json_response(
-            {"object": "hermes.session.turn.stop", "turn": public}, status=202
-        )
+
+                def watcher_done(done: asyncio.Task[Any]) -> None:
+                    if self._interruption_owners.get(turn_id) is done:
+                        self._interruption_owners.pop(turn_id, None)
+
+                watcher.add_done_callback(watcher_done)
+        return public, transitioned
 
     async def _interrupt_when_available(self, turn_id: str) -> None:
         """Close the small race between stop admission and agent construction."""
