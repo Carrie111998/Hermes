@@ -2284,20 +2284,67 @@ class AIAgent:
             # re-writes the whole tail (same recovery contract as before,
             # minus the partial-prefix case that could double-pay counters).
             if _batch_rows:
-                self._session_db.append_messages_batch(
-                    session_id=self.session_id,
-                    messages=_batch_rows,
-                    compression_lock_holder=getattr(
-                        self, "_active_compression_lock_holder", None
-                    ),
-                    turn_lease_holder=getattr(
-                        self, "_active_session_turn_lease_holder", None
-                    ),
-                    turn_lease_ttl_seconds=getattr(
-                        self, "_active_session_turn_lease_ttl_seconds", 300.0
+                def _append_batch(_sid: str) -> None:
+                    self._session_db.append_messages_batch(
+                        session_id=_sid,
+                        messages=_batch_rows,
+                        compression_lock_holder=getattr(
+                            self, "_active_compression_lock_holder", None
+                        ),
+                        turn_lease_holder=getattr(
+                            self, "_active_session_turn_lease_holder", None
+                        ),
+                        turn_lease_ttl_seconds=getattr(
+                            self, "_active_session_turn_lease_ttl_seconds", 300.0
+                        )
+                        or 300.0,
                     )
-                    or 300.0,
-                )
+
+                try:
+                    _append_batch(self.session_id)
+                except Exception as _closed_exc:
+                    from hermes_state import CompressionSessionClosedError
+
+                    if not isinstance(_closed_exc, CompressionSessionClosedError):
+                        raise
+                    # #82001: our session id points at a parent another
+                    # process already closed via compression (WebUI/streaming
+                    # clients keep sending the pre-compression id every
+                    # turn). The store publishes exactly one live
+                    # continuation for a healthy rotation — adopt it and
+                    # replay this batch once. Bounded to a single probe:
+                    # 0 children (orphan window), >1 children (ambiguous
+                    # lineage), or a second Closed error on the child all
+                    # fail closed exactly as before, but with an honest
+                    # "compression rotated this session" explanation instead
+                    # of the misleading full-disk advice.
+                    _child = self._session_db.find_live_compression_child(
+                        self.session_id
+                    )
+                    _child_id = str((_child or {}).get("id") or "")
+                    if not _child_id:
+                        raise
+                    _parent_id = self.session_id
+                    logger.info(
+                        "Adopted live compression continuation %s for closed "
+                        "session %s during transcript flush",
+                        _child_id,
+                        _parent_id,
+                    )
+                    # Shared with turn-start adoption so side-state (session
+                    # ContextVar/env, logging context, flush session guard,
+                    # compressor/memory-manager boundaries) can't drift
+                    # between the two adoption paths. Does NOT touch the
+                    # message list or flush counters — this flush continues
+                    # with its already-built batch.
+                    from agent.conversation_compression import (
+                        rebind_agent_compression_side_state,
+                    )
+
+                    rebind_agent_compression_side_state(
+                        self, self._session_db, _child_id, _parent_id
+                    )
+                    _append_batch(self.session_id)
                 for _written in _batch_msgs:
                     _written[_DB_PERSISTED_MARKER] = True
             # The intrinsic markers are now the sole source of truth. Reset the

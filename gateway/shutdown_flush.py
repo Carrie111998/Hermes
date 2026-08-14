@@ -283,6 +283,37 @@ def _serialise_value(value: Any) -> Optional[dict]:
     return {"text": str(value)}
 
 
+def _append_with_compression_adoption(session_db, **kwargs) -> None:
+    """Append one recovered row, adopting the live continuation if closed.
+
+    A spooled row can name a session that compression closed between the
+    spool write and this replay (#82001 bug class). Without adoption the
+    append raises ``CompressionSessionClosedError`` on every startup and the
+    file is retried forever. Probe ``find_live_compression_child`` once;
+    0 or >1 children re-raise and the file is preserved as before.
+    """
+    from hermes_state import CompressionSessionClosedError
+
+    try:
+        session_db.append_message(**kwargs)
+        return
+    except CompressionSessionClosedError:
+        finder = getattr(session_db, "find_live_compression_child", None)
+        if not callable(finder):
+            raise
+        child = finder(kwargs["session_id"])
+        child_id = str(child.get("id") or "") if isinstance(child, dict) else ""
+        if not child_id:
+            raise
+        logger.info(
+            "Recovering spooled message into live compression continuation "
+            "%s (spooled for closed session %s)",
+            child_id,
+            kwargs["session_id"],
+        )
+        session_db.append_message(**{**kwargs, "session_id": child_id})
+
+
 def recover_pending_to_db(
     session_db=None,
 ) -> int:
@@ -339,7 +370,8 @@ def recover_pending_to_db(
                         path,
                     )
                     continue
-                session_db.append_message(
+                _append_with_compression_adoption(
+                    session_db,
                     session_id=spooled_sid,
                     role=message.get("role", "unknown"),
                     content=message.get("content") or "",
@@ -381,7 +413,8 @@ def recover_pending_to_db(
                 )
                 continue
 
-            session_db.append_message(
+            _append_with_compression_adoption(
+                session_db,
                 session_id=session_id,
                 role="user",
                 content=text,
