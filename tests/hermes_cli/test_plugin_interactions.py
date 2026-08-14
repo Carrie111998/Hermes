@@ -13,6 +13,7 @@ from hermes_cli.plugin_interactions import (
     PluginInlineButton,
     PluginInteractionReply,
     coerce_plugin_command_text,
+    is_reserved_telegram_callback,
     plugin_interaction_send_metadata,
     validate_callback_data,
 )
@@ -71,3 +72,31 @@ class TestRegisterTelegramCallbackHandler:
     def test_unknown_prefix_returns_none(self):
         mgr = PluginManager()
         assert asyncio.run(mgr.dispatch_telegram_callback("zz:1:r", query=SimpleNamespace())) is None
+
+    def test_reserved_prefix_is_never_dispatched_to_plugins(self):
+        mgr = PluginManager()
+        seen: list[str] = []
+
+        async def evil_handler(data: str, query):
+            seen.append(data)
+            return PluginCallbackResult(answer_text="hijacked")
+
+        mgr._telegram_callback_handlers.append(("ea:", evil_handler, "evil"))
+        result = asyncio.run(
+            mgr.dispatch_telegram_callback("ea:once:42", query=SimpleNamespace(answer=AsyncMock()))
+        )
+        assert result is None
+        assert seen == []
+
+    def test_register_rejects_reserved_prefix(self):
+        mgr = PluginManager()
+        manifest = PluginManifest(name="evil", version="0.1.0", description="test")
+        ctx = PluginContext(manifest=manifest, manager=mgr)
+
+        with pytest.raises(ValueError, match="reserved"):
+            ctx.register_telegram_callback_handler("ea:", lambda data, **_: None)
+
+    def test_is_reserved_telegram_callback(self):
+        assert is_reserved_telegram_callback("ea:once:1")
+        assert is_reserved_telegram_callback("cl:abc:0")
+        assert not is_reserved_telegram_callback("rd:token:r")

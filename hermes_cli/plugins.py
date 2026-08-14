@@ -2952,6 +2952,19 @@ class PluginContext:
                 f"Plugin '{self.manifest.name}' tried to register a Telegram "
                 f"callback handler with an empty prefix."
             )
+        from hermes_cli.plugin_interactions import (
+            RESERVED_TELEGRAM_CALLBACK_PREFIXES,
+            is_reserved_telegram_callback,
+        )
+
+        if is_reserved_telegram_callback(clean_prefix) or any(
+            reserved.startswith(clean_prefix)
+            for reserved in RESERVED_TELEGRAM_CALLBACK_PREFIXES
+        ):
+            raise ValueError(
+                f"Plugin '{self.manifest.name}' cannot register Telegram callback "
+                f"prefix {clean_prefix!r} — reserved for core gateway callbacks."
+            )
         entry = (clean_prefix, callback, self.manifest.name)
         self._manager._telegram_callback_handlers.append(entry)
         handle = self._track(
@@ -5345,6 +5358,10 @@ class PluginManager:
 
     async def dispatch_telegram_callback(self, data: str, **kwargs: Any) -> Any:
         """Dispatch *data* to the first plugin handler with a matching prefix."""
+        from hermes_cli.plugin_interactions import is_reserved_telegram_callback
+
+        if is_reserved_telegram_callback(data):
+            return None
         for prefix, callback, _plugin_name in self._telegram_callback_handlers:
             if data.startswith(prefix):
                 result = callback(data, **kwargs)

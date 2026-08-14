@@ -9,10 +9,38 @@ __all__ = [
     "PluginCallbackResult",
     "PluginInlineButton",
     "PluginInteractionReply",
+    "RESERVED_TELEGRAM_CALLBACK_PREFIXES",
     "coerce_plugin_command_text",
+    "is_reserved_telegram_callback",
     "plugin_interaction_send_metadata",
     "validate_callback_data",
 ]
+
+# Core Telegram inline callbacks — plugins must never register or intercept these.
+RESERVED_TELEGRAM_CALLBACK_PREFIXES = (
+    "mp:",
+    "mpg:",
+    "mpv:",
+    "mm:",
+    "mc:",
+    "mb",
+    "mx:",
+    "mg:",
+    "cp:",
+    "gt:",
+    "ea:",
+    "sc:",
+    "cl:",
+    "update_prompt:",
+)
+
+
+def is_reserved_telegram_callback(data: str) -> bool:
+    value = (data or "").strip()
+    return any(
+        value.startswith(prefix) or (prefix.endswith(":") and value == prefix[:-1])
+        for prefix in RESERVED_TELEGRAM_CALLBACK_PREFIXES
+    )
 
 
 @dataclass(frozen=True)

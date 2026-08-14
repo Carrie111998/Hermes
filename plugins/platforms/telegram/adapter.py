@@ -4840,7 +4840,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     reply_to_message_id=reply_to_id,
                     reply_to_mode=self._reply_to_mode,
                 )
-                msg = await self._bot.send_message(
+                msg = await self._send_message_with_thread_fallback(
                     chat_id=normalize_telegram_chat_id(chat_id),
                     text=content,
                     parse_mode=parse_mode,
@@ -6757,10 +6757,6 @@ class TelegramAdapter(BasePlatformAdapter):
                 await self._handle_choice_picker_callback(query, data, chat_id)
             return
 
-        # --- Plugin-registered inline callbacks (prefix match) ---
-        if await self._handle_plugin_callback_query(query, data):
-            return
-
         # --- Gmail-triage callbacks (gt:verb:arg) ---
         if data.startswith("gt:"):
             await self._handle_gmail_triage_callback(
@@ -7075,42 +7071,46 @@ class TelegramAdapter(BasePlatformAdapter):
             return
 
         # --- Update prompt callbacks ---
-        if not data.startswith("update_prompt:"):
+        if data.startswith("update_prompt:"):
+            answer = data.split(":", 1)[1]  # "y" or "n"
+            caller_id = str(getattr(query.from_user, "id", ""))
+            if not self._is_callback_user_authorized(
+                caller_id,
+                chat_id=query_chat_id,
+                chat_type=str(query_chat_type) if query_chat_type is not None else None,
+                thread_id=str(query_thread_id) if query_thread_id is not None else None,
+                user_name=query_user_name,
+            ):
+                await query.answer(text="⛔ You are not authorized to answer update prompts.")
+                return
+            await query.answer(text=f"Sent '{answer}' to the update process.")
+            # Edit the message to show the choice and remove buttons
+            label = "Yes" if answer == "y" else "No"
+            try:
+                await query.edit_message_text(
+                    text=self.format_message(f"⚕ Update prompt answered: *{label}*"),
+                    parse_mode=ParseMode.MARKDOWN_V2,
+                    reply_markup=None,
+                )
+            except Exception:
+                pass  # non-fatal if edit fails
+            # Write the response file
+            try:
+                from hermes_constants import get_hermes_home
+                home = get_hermes_home()
+                response_path = home / ".update_response"
+                tmp = response_path.with_suffix(".tmp")
+                tmp.write_text(answer, encoding="utf-8")
+                tmp.replace(response_path)
+                logger.info("Telegram update prompt answered '%s' by user %s",
+                            answer, getattr(query.from_user, "id", "unknown"))
+            except Exception as exc:
+                logger.error("Failed to write update response from callback: %s", exc)
             return
-        answer = data.split(":", 1)[1]  # "y" or "n"
-        caller_id = str(getattr(query.from_user, "id", ""))
-        if not self._is_callback_user_authorized(
-            caller_id,
-            chat_id=query_chat_id,
-            chat_type=str(query_chat_type) if query_chat_type is not None else None,
-            thread_id=str(query_thread_id) if query_thread_id is not None else None,
-            user_name=query_user_name,
-        ):
-            await query.answer(text="⛔ You are not authorized to answer update prompts.")
+
+        # --- Plugin-registered inline callbacks (prefix match) ---
+        if await self._handle_plugin_callback_query(query, data):
             return
-        await query.answer(text=f"Sent '{answer}' to the update process.")
-        # Edit the message to show the choice and remove buttons
-        label = "Yes" if answer == "y" else "No"
-        try:
-            await query.edit_message_text(
-                text=self.format_message(f"⚕ Update prompt answered: *{label}*"),
-                parse_mode=ParseMode.MARKDOWN_V2,
-                reply_markup=None,
-            )
-        except Exception:
-            pass  # non-fatal if edit fails
-        # Write the response file
-        try:
-            from hermes_constants import get_hermes_home
-            home = get_hermes_home()
-            response_path = home / ".update_response"
-            tmp = response_path.with_suffix(".tmp")
-            tmp.write_text(answer, encoding="utf-8")
-            tmp.replace(response_path)
-            logger.info("Telegram update prompt answered '%s' by user %s",
-                        answer, getattr(query.from_user, "id", "unknown"))
-        except Exception as exc:
-            logger.error("Failed to write update response from callback: %s", exc)
 
     async def _handle_plugin_callback_query(self, query, data: str) -> bool:
         """Dispatch callback data to plugin-registered prefix handlers."""
