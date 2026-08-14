@@ -1196,6 +1196,7 @@ def interruptible_api_call(agent, api_kwargs: dict):
     if _codex_watchdog_enabled:
         # Reset before the worker starts so a marker left over from a previous
         # call on this agent can't be misread as first-byte for this one.
+        agent._codex_stream_event_lock = threading.RLock()
         agent._codex_stream_last_event_ts = None
         agent._codex_stream_last_progress_ts = None
 
@@ -1344,9 +1345,29 @@ def interruptible_api_call(agent, api_kwargs: dict):
                 )
             break
 
-        # Stale-call detector: kill the connection if no response
-        # arrives within the configured timeout.
+        # After an OpenAI Codex request receives its first SSE event, activity
+        # is governed by the stream-idle watchdog instead. Serialize the final
+        # marker check with event publication so first-SSE cannot race a
+        # generic stale abort at the deadline. The Codex hard ceiling remains
+        # an absolute backstop and intentionally bypasses this suppression.
+        _codex_hard_ceiling_reached = (
+            _codex_hard_timeout > 0 and _elapsed > _codex_hard_timeout
+        )
         if _elapsed > _stale_timeout:
+            _stale_abort_serialized = False
+            if (
+                _codex_watchdog_enabled
+                and _openai_codex_backend
+                and not _codex_hard_ceiling_reached
+            ):
+                with agent._codex_stream_event_lock:
+                    if getattr(agent, "_codex_stream_last_event_ts", None) is not None:
+                        continue
+                    try:
+                        _record_confirmed_abort("stale_call_kill")
+                    except Exception:
+                        pass
+                    _stale_abort_serialized = True
             _silent_hint: Optional[str] = None
             _hint_fn = getattr(agent, "_codex_silent_hang_hint", None)
             if callable(_hint_fn):
@@ -1357,13 +1378,14 @@ def interruptible_api_call(agent, api_kwargs: dict):
             _report_stale_nonstream_kill(
                 agent, api_kwargs, _elapsed, _stale_timeout, hint=_silent_hint
             )
-            try:
-                # #67142: routes by client kind — anthropic now aborts the
-                # request-local client's sockets from this poll (stranger)
-                # thread instead of closing the shared _anthropic_client.
-                _record_confirmed_abort("stale_call_kill")
-            except Exception:
-                pass
+            if not _stale_abort_serialized:
+                try:
+                    # #67142: routes by client kind — anthropic now aborts the
+                    # request-local client's sockets from this poll (stranger)
+                    # thread instead of closing the shared _anthropic_client.
+                    _record_confirmed_abort("stale_call_kill")
+                except Exception:
+                    pass
             # Circuit breaker (#58962): count the stale kill.  See the
             # canonical comment block above ``_stale_streak()``.
             _bump_stale_streak(agent)
