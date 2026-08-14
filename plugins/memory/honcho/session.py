@@ -1110,7 +1110,16 @@ class HonchoSessionManager:
         # under the NON-OWNER's peer, and Honcho's deriver attributes the
         # owner's facts to that person. SOUL.md describes the agent, not a
         # human, but skipping it here too keeps the migration owner-scoped.
-        if session.user_peer_id != self._sanitize_id(self._config.peer_name):
+        #
+        # Compare against the full explicit-owner set (peer_name + aliases) and
+        # only skip when we can actually identify an owner. peer_name is
+        # optional (default None), and the owner's sessions may resolve via a
+        # configured alias rather than the raw peer_name — in both cases the
+        # old check either crashed (TypeError in _sanitize_id, swallowed by
+        # the caller) or skipped the owner's own migration. With no owner
+        # configured at all, preserve the pre-guard behaviour and migrate.
+        owner_peer_ids = self._explicit_user_peer_ids()
+        if owner_peer_ids and session.user_peer_id not in owner_peer_ids:
             logger.info(
                 "Skipping memory-file migration for non-owner session (user=%s)",
                 session.user_peer_id,

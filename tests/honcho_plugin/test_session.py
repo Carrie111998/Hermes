@@ -389,6 +389,137 @@ class TestPerSessionMigrateGuard:
         mock_manager.migrate_memory_files.assert_not_called()
 
 
+class TestMigrateMemoryFilesOwnerGuard:
+    """Regression tests for the owner guard in migrate_memory_files.
+
+    The guard must skip migration only when an owner is configured AND the
+    session's user peer is not that owner. Three failure modes covered:
+
+    1. peer_name=None (the default): the old guard called
+       _sanitize_id(None) → TypeError, swallowed by callers → migration
+       silently disabled for every single-user install.
+    2. Owner session resolving via alias: user_peer_id equals an alias,
+       not the raw peer_name — must NOT be skipped.
+    3. Non-owner session in a shared channel: must be skipped.
+    """
+
+    def _make_manager(self, tmp_path, peer_name=None, aliases=None):
+        """Build a HonchoSessionManager with a cached session ready to migrate."""
+        from plugins.memory.honcho.client import HonchoClientConfig
+
+        cfg = HonchoClientConfig(
+            api_key="test-key",
+            enabled=True,
+            recall_mode="tools",
+            peer_name=peer_name,
+            user_peer_aliases=aliases or {},
+        )
+        manager = HonchoSessionManager(honcho=MagicMock(), config=cfg)
+        return manager
+
+    def _seed_session(self, manager, user_peer_id, key="slack:C123"):
+        """Insert a cached session + fake Honcho session so the guard is reached."""
+        session = HonchoSession(
+            key=key,
+            user_peer_id=user_peer_id,
+            assistant_peer_id="hermes-assistant",
+            honcho_session_id="hs-123",
+        )
+        manager._cache[key] = session
+        manager._sessions_cache["hs-123"] = MagicMock()
+        return session
+
+    def _write_memory_files(self, tmp_path):
+        for name in ("MEMORY.md", "USER.md", "SOUL.md"):
+            (tmp_path / name).write_text(f"# {name} content", encoding="utf-8")
+
+    def test_peer_name_none_does_not_crash_and_migrates(self, tmp_path):
+        """peer_name=None (default) must not TypeError; migration proceeds."""
+        manager = self._make_manager(tmp_path, peer_name=None)
+        session = self._seed_session(manager, user_peer_id="user-slack-U999")
+        self._write_memory_files(tmp_path)
+
+        # Mock the upload path so we don't hit the network
+        uploaded = []
+        def fake_upload(**kwargs):
+            uploaded.append(kwargs)
+        manager._sdk_session = MagicMock(return_value=MagicMock(upload_file=fake_upload))
+        manager._get_or_create_peer = MagicMock(side_effect=lambda peer_id: MagicMock())
+
+        result = manager.migrate_memory_files("slack:C123", str(tmp_path))
+        assert result is True
+        assert len(uploaded) == 3  # MEMORY, USER, SOUL all uploaded
+
+    def test_owner_via_alias_is_not_skipped(self, tmp_path):
+        """Owner whose session resolves via alias must NOT be skipped."""
+        manager = self._make_manager(
+            tmp_path, peer_name="Minh", aliases={"U123": "minh-alias"}
+        )
+        # Session's user peer is the alias, NOT the raw peer_name
+        session = self._seed_session(manager, user_peer_id="minh-alias")
+        self._write_memory_files(tmp_path)
+
+        uploaded = []
+        def fake_upload(**kwargs):
+            uploaded.append(kwargs)
+        manager._sdk_session = MagicMock(return_value=MagicMock(upload_file=fake_upload))
+        manager._get_or_create_peer = MagicMock(side_effect=lambda peer_id: MagicMock())
+
+        result = manager.migrate_memory_files("slack:C123", str(tmp_path))
+        assert result is True
+        assert len(uploaded) == 3
+
+    def test_owner_via_peer_name_is_not_skipped(self, tmp_path):
+        """Owner whose session resolves via peer_name directly is not skipped."""
+        manager = self._make_manager(tmp_path, peer_name="Minh")
+        session = self._seed_session(manager, user_peer_id="Minh")
+        self._write_memory_files(tmp_path)
+
+        uploaded = []
+        def fake_upload(**kwargs):
+            uploaded.append(kwargs)
+        manager._sdk_session = MagicMock(return_value=MagicMock(upload_file=fake_upload))
+        manager._get_or_create_peer = MagicMock(side_effect=lambda peer_id: MagicMock())
+
+        result = manager.migrate_memory_files("slack:C123", str(tmp_path))
+        assert result is True
+        assert len(uploaded) == 3
+
+    def test_non_owner_is_skipped(self, tmp_path):
+        """Non-owner session in a shared channel must be skipped."""
+        manager = self._make_manager(tmp_path, peer_name="Minh")
+        session = self._seed_session(manager, user_peer_id="user-slack-U999")
+        self._write_memory_files(tmp_path)
+
+        uploaded = []
+        def fake_upload(**kwargs):
+            uploaded.append(kwargs)
+        manager._sdk_session = MagicMock(return_value=MagicMock(upload_file=fake_upload))
+        manager._get_or_create_peer = MagicMock(side_effect=lambda peer_id: MagicMock())
+
+        result = manager.migrate_memory_files("slack:C123", str(tmp_path))
+        assert result is False
+        assert len(uploaded) == 0
+
+    def test_non_owner_alias_mismatch_is_skipped(self, tmp_path):
+        """Session peer matching neither peer_name nor any alias is skipped."""
+        manager = self._make_manager(
+            tmp_path, peer_name="Minh", aliases={"U123": "minh-alias"}
+        )
+        session = self._seed_session(manager, user_peer_id="user-slack-U999")
+        self._write_memory_files(tmp_path)
+
+        uploaded = []
+        def fake_upload(**kwargs):
+            uploaded.append(kwargs)
+        manager._sdk_session = MagicMock(return_value=MagicMock(upload_file=fake_upload))
+        manager._get_or_create_peer = MagicMock(side_effect=lambda peer_id: MagicMock())
+
+        result = manager.migrate_memory_files("slack:C123", str(tmp_path))
+        assert result is False
+        assert len(uploaded) == 0
+
+
 class TestChunkMessage:
     def test_short_message_single_chunk(self):
         result = HonchoMemoryProvider._chunk_message("hello world", 100)
