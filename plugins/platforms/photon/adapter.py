@@ -596,6 +596,12 @@ def _markdown_enabled() -> bool:
     }
 
 
+def _plain_text(content: str) -> str:
+    """Normalize Markdown-shaped replies for conversational iMessage text."""
+    stripped = strip_markdown(content)
+    return re.sub(r"(?m)^\s*(?:[-*+] |\d+[.)] )", "", stripped)
+
+
 def _url_only_candidate(text: str) -> Optional[str]:
     candidate = (text or "").strip()
     if not re.fullmatch(r"https?://\S+", candidate, flags=re.IGNORECASE):
@@ -2384,7 +2390,7 @@ class PhotonAdapter(BasePlatformAdapter):
         # as the PHOTON_MARKDOWN=false kill-switch.
         if _markdown_enabled():
             return content
-        return strip_markdown(content)
+        return _plain_text(content)
 
     @staticmethod
     def _is_retryable_error(error: Optional[str]) -> bool:
@@ -2849,7 +2855,7 @@ async def _standalone_send(
                         rich_url = None
                 if not rich_url:
                     outbound_text = (
-                        message if _markdown_enabled() else strip_markdown(message)
+                        message if _markdown_enabled() else _plain_text(message)
                     )
                     send_body: Dict[str, Any] = {
                         "spaceId": chat_id,

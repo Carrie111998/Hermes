@@ -138,7 +138,7 @@ async def test_markdown_plus_raw_url_delivers_plain_builder_payload(
     assert path == "/send"
     assert body == {
         "spaceId": "+15551234567",
-        "text": "Update\n\n- Read the docs: https://example.com/docs",
+        "text": "Update\nRead the docs: https://example.com/docs",
     }
-    for marker in ("##", "- **", "**", "[the docs]("):
+    for marker in ("##", "\n- ", "- **", "**", "[the docs]("):
         assert marker not in body["text"]
