@@ -33,7 +33,8 @@ function validOutboundReceiptKey(key) {
   return key?.fromMe === true
     && typeof key.id === 'string'
     && /^[A-Za-z0-9_-]{1,191}$/.test(key.id)
-    && !(typeof key.remoteJid === 'string' && key.remoteJid.endsWith('@g.us'));
+    && !(typeof key.remoteJid === 'string'
+      && (key.remoteJid.endsWith('@g.us') || key.remoteJid.endsWith('@broadcast')));
 }
 
 function timestampIso(value) {

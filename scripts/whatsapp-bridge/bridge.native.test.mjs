@@ -63,6 +63,22 @@ import {
     null,
   );
   assert.equal(
+    deliveryReceiptFromMessageUpdate({
+      key: { ...key, remoteJid: 'status@broadcast' },
+      update: { status: 4 },
+      now,
+    }),
+    null,
+  );
+  assert.equal(
+    deliveryReceiptFromUserReceiptUpdate({
+      key: { ...key, remoteJid: 'status@broadcast' },
+      receipt: { readTimestamp: 1_723_636_900 },
+      now,
+    }),
+    null,
+  );
+  assert.equal(
     deliveryReceiptFromMessageUpdate({ key: { ...key, id: '' }, update: { status: 4 }, now }),
     null,
   );
