@@ -14,7 +14,7 @@ import { cloneAttachments, type QueueEditState } from '../composer-utils'
 import { onComposerSubmitRequest } from '../focus'
 import { pathifyRefs } from '../path-refs'
 import { composerPlainText } from '../rich-editor'
-import { useComposerScope } from '../scope'
+import { useComposerScope, useComposerSurfaceId } from '../scope'
 import type { ChatBarProps } from '../types'
 
 interface UseComposerSubmitArgs {
@@ -79,6 +79,7 @@ export function useComposerSubmit({
 }: UseComposerSubmitArgs) {
   const paneVisible = usePaneVisible()
   const scope = useComposerScope()
+  const surfaceId = useComposerSurfaceId()
 
   // Shared send primitive: fire onSubmit, and if the gateway rejects (accepted
   // === false) or throws, re-load + re-stash the draft so the words survive.
@@ -112,12 +113,18 @@ export function useComposerSubmit({
 
   useLayoutEffect(
     () =>
-      onComposerSubmitRequest(({ target, text }) => {
-        if (target === scope.target && paneVisible && !inputDisabled) {
+      onComposerSubmitRequest(({ surfaceId: requestedSurfaceId, target, text }) => {
+        if (
+          target === scope.target &&
+          surfaceId !== null &&
+          requestedSurfaceId === surfaceId &&
+          paneVisible &&
+          !inputDisabled
+        ) {
           dispatchSubmitRef.current(text)
         }
       }),
-    [inputDisabled, paneVisible, scope.target]
+    [inputDisabled, paneVisible, scope.target, surfaceId]
   )
 
   const submitDraft = () => {

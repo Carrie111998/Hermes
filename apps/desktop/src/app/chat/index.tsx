@@ -3,7 +3,7 @@ import { useStore } from '@nanostores/react'
 import { useQuery } from '@tanstack/react-query'
 import type { ReadableAtom } from 'nanostores'
 import type * as React from 'react'
-import { memo, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { memo, Suspense, useCallback, useEffect, useId, useMemo, useRef, useState } from 'react'
 import { useLocation } from 'react-router'
 
 import type { SubmitTextOptions } from '@/app/session/hooks/use-prompt-actions/utils'
@@ -54,7 +54,7 @@ import { ChatSwapOverlay } from './chat-swap-overlay'
 import { ChatBar, ChatBarFallback } from './composer'
 import { requestComposerInsert } from './composer/focus'
 import { droppedFileInlineRefs } from './composer/inline-refs'
-import { useComposerScope } from './composer/scope'
+import { ComposerSurfaceProvider, useComposerScope } from './composer/scope'
 import type { ChatBarState } from './composer/types'
 import { type DroppedFile, partitionDroppedFiles } from './hooks/use-composer-actions'
 import { type DragKind, useFileDropZone } from './hooks/use-file-drop-zone'
@@ -308,6 +308,7 @@ export const ChatView = memo(function ChatView({
   onTranscribeAudio,
   onDismissError
 }: ChatViewProps) {
+  const composerSurfaceId = useId()
   const location = useLocation()
   const { t } = useI18n()
   // The view this surface renders: the primary route-driven session (global
@@ -511,15 +512,17 @@ export const ChatView = memo(function ChatView({
   const overlayKind: DragKind = dragKind === 'files' ? 'files' : sessionDragging && !sessionEdgeHover ? 'session' : null
 
   return (
-    <div
-      className={cn(
-        'relative isolate flex h-full min-w-0 flex-col overflow-hidden bg-(--ui-chat-surface-background)',
-        className
-      )}
-      data-chat-surface=""
-      data-composer-target={composerScope.target}
-      data-session-anchor={sessionAnchor}
-    >
+    <ComposerSurfaceProvider value={composerSurfaceId}>
+      <div
+        className={cn(
+          'relative isolate flex h-full min-w-0 flex-col overflow-hidden bg-(--ui-chat-surface-background)',
+          className
+        )}
+        data-chat-surface=""
+        data-composer-surface-id={composerSurfaceId}
+        data-composer-target={composerScope.target}
+        data-session-anchor={sessionAnchor}
+      >
       <Backdrop />
       {/* Tiles get their chrome from the layout zone (chip strip); the modal
           prompt overlays stay active-session-scoped in the primary surface. */}
@@ -635,6 +638,7 @@ export const ChatView = memo(function ChatView({
           </Suspense>
         )}
       </ChatRuntimeBoundary>
-    </div>
+      </div>
+    </ComposerSurfaceProvider>
   )
 })

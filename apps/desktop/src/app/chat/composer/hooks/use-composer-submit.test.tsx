@@ -21,7 +21,7 @@ import {
 } from '@/store/prompts'
 
 import { type ComposerTarget, requestComposerSubmit } from '../focus'
-import { ComposerScopeProvider, MAIN_COMPOSER_SCOPE } from '../scope'
+import { ComposerScopeProvider, ComposerSurfaceProvider, MAIN_COMPOSER_SCOPE } from '../scope'
 
 import { useComposerSubmit } from './use-composer-submit'
 
@@ -29,21 +29,30 @@ interface SubmitHarnessOptions {
   attachments?: ComposerAttachment[]
   busy?: boolean
   compacting?: boolean
+  inputDisabled?: boolean
+  sessionKey?: string | null
+  surfaceId?: string | null
   submitOnHide?: boolean
   target?: ComposerTarget
   text?: string
   visible?: boolean
 }
 
+let surfaceSequence = 0
+
 function renderSubmitHook({
   attachments = [],
   busy = false,
   compacting = false,
+  inputDisabled = false,
+  sessionKey = 'stored-session',
+  surfaceId,
   submitOnHide = false,
   target = 'main',
   text = '',
   visible = true
 }: SubmitHarnessOptions = {}) {
+  const resolvedSurfaceId = surfaceId === undefined ? `test-surface-${++surfaceSequence}` : surfaceId
   const draftRef = { current: text }
   const editor = window.document.createElement('div')
   editor.dataset.slot = 'composer-rich-input'
@@ -72,7 +81,17 @@ function renderSubmitHook({
 
     return (
       <ComposerScopeProvider value={{ ...MAIN_COMPOSER_SCOPE, target }}>
-        <PaneVisibleContext.Provider value={paneVisible}>{children}</PaneVisibleContext.Provider>
+        <ComposerSurfaceProvider value={resolvedSurfaceId}>
+          <PaneVisibleContext.Provider value={paneVisible}>
+            <div
+              data-composer-surface-id={resolvedSurfaceId ?? undefined}
+              data-composer-target={target}
+              data-pane-hidden={paneVisible ? undefined : ''}
+            >
+              {children}
+            </div>
+          </PaneVisibleContext.Provider>
+        </ComposerSurfaceProvider>
       </ComposerScopeProvider>
     )
   }
@@ -80,8 +99,8 @@ function renderSubmitHook({
   const hook = renderHook(
     () =>
       useComposerSubmit({
-        activeQueueSessionKey: 'stored-session',
-        activeQueueSessionKeyRef: { current: 'stored-session' },
+        activeQueueSessionKey: sessionKey,
+        activeQueueSessionKeyRef: { current: sessionKey },
         attachments,
         busy,
         compacting,
@@ -92,7 +111,7 @@ function renderSubmitHook({
         editorRef,
         exitQueuedEdit: vi.fn(() => false),
         focusInput: vi.fn(),
-        inputDisabled: false,
+        inputDisabled,
         loadIntoComposer: vi.fn(),
         onCancel,
         onSteer,
@@ -160,6 +179,64 @@ describe('useComposerSubmit external request routing', () => {
     act(() => main.setPaneVisible(false))
 
     expect(main.onSubmit).not.toHaveBeenCalled()
+  })
+
+  it('submits to the session visible at click time even when the same click switches tabs', async () => {
+    const hiddenA = renderSubmitHook({ sessionKey: 'session-a', visible: false })
+    const visibleB = renderSubmitHook({ sessionKey: 'session-b' })
+
+    act(() => {
+      requestComposerSubmit('ship session B', { target: 'main' })
+      visibleB.setPaneVisible(false)
+      hiddenA.setPaneVisible(true)
+    })
+
+    await waitFor(() =>
+      expect(visibleB.onSubmit).toHaveBeenCalledWith('ship session B', { composerScope: 'session-b' })
+    )
+    expect(hiddenA.onSubmit).not.toHaveBeenCalled()
+  })
+
+  it('uses the captured surface id when two main composers both report visible', async () => {
+    const firstMain = renderSubmitHook({ sessionKey: 'session-first' })
+    const secondMain = renderSubmitHook({ sessionKey: 'session-second' })
+
+    requestComposerSubmit('ship exactly one session', { target: 'main' })
+
+    await waitFor(() =>
+      expect(firstMain.onSubmit).toHaveBeenCalledWith('ship exactly one session', {
+        composerScope: 'session-first'
+      })
+    )
+    expect(secondMain.onSubmit).not.toHaveBeenCalled()
+  })
+
+  it('does not fan out when visible composers do not have queue session keys yet', async () => {
+    const firstNewSession = renderSubmitHook({ sessionKey: null })
+    const secondNewSession = renderSubmitHook({ sessionKey: null })
+
+    act(() => {
+      requestComposerSubmit('ship the visible new session', { target: 'main' })
+    })
+
+    await waitFor(() => expect(firstNewSession.onSubmit).toHaveBeenCalledTimes(1))
+    expect(secondNewSession.onSubmit).not.toHaveBeenCalled()
+  })
+
+  it('fails closed when the visible composer has no surface id', () => {
+    const unidentifiedMain = renderSubmitHook({ surfaceId: null })
+
+    requestComposerSubmit('do not broadcast this', { target: 'main' })
+
+    expect(unidentifiedMain.onSubmit).not.toHaveBeenCalled()
+  })
+
+  it('does not submit through a composer whose input is disabled', () => {
+    const disabledMain = renderSubmitHook({ inputDisabled: true })
+
+    requestComposerSubmit('do not send this', { target: 'main' })
+
+    expect(disabledMain.onSubmit).not.toHaveBeenCalled()
   })
 })
 
