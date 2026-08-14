@@ -11,10 +11,17 @@ from tools.process_registry import process_registry
 
 
 class _IdleAgent:
-    def __init__(self, idle_seconds=60.0, current_tool=None, activity_observed=None):
+    def __init__(
+        self,
+        idle_seconds=60.0,
+        current_tool=None,
+        activity_observed=None,
+        tool_started_at=None,
+    ):
         self.idle_seconds = idle_seconds
         self.current_tool = current_tool
         self.activity_observed = activity_observed
+        self.tool_started_at = tool_started_at
         self.interrupts = []
 
     def get_activity_summary(self):
@@ -23,6 +30,7 @@ class _IdleAgent:
         return {
             "seconds_since_activity": self.idle_seconds,
             "current_tool": self.current_tool,
+            "tool_started_at": self.tool_started_at,
         }
 
     def interrupt(self, reason):
@@ -110,6 +118,42 @@ def test_thread_watchdog_does_not_abandon_silent_in_flight_tool(monkeypatch):
 
     assert not timeout_fired.is_set()
     assert agent.interrupts == []
+
+
+def test_thread_watchdog_abandons_hung_in_flight_tool(monkeypatch):
+    agent = _IdleAgent(current_tool="hung_tool", tool_started_at=0.0)
+    worker_done, timeout_fired, cleanup_lock = _state()
+    calls = []
+    monkeypatch.setattr(
+        process_registry,
+        "kill_started_since",
+        lambda task_id, baseline, *, source: calls.append(
+            (task_id, baseline, source)
+        )
+        or 1,
+    )
+
+    watchdog = threading.Thread(
+        target=_watch_gateway_turn_inactivity,
+        kwargs={
+            "agent_holder": [agent],
+            "task_id": "session-a",
+            "process_baseline": frozenset(),
+            "timeout": 30.0,
+            "in_flight_tool_timeout": 0.01,
+            "worker_done": worker_done,
+            "timeout_fired": timeout_fired,
+            "cleanup_lock": cleanup_lock,
+            "poll_interval": 0.01,
+        },
+    )
+    watchdog.start()
+    watchdog.join(timeout=1)
+
+    assert not watchdog.is_alive()
+    assert timeout_fired.is_set()
+    assert agent.interrupts == ["Execution timed out (inactivity)"]
+    assert calls == [("session-a", frozenset(), "gateway_turn_timeout")]
 
 
 def test_completed_worker_wins_race_and_preserves_background_process(monkeypatch):

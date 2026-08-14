@@ -179,6 +179,7 @@ def _clear_current_tool_if_idle_locked(agent) -> None:
     """Clear the marker when called with the worker lock already held."""
     if not agent._tool_worker_threads:
         agent._current_tool = None
+        agent._current_tool_started_at = None
 
 
 def _clear_current_tool_if_idle(agent) -> None:
@@ -714,7 +715,17 @@ def _begin_tool_execution(
                 f"{args_preview}"
             )
 
-    agent._current_tool = function_name
+    tool_started_at = time.monotonic()
+    worker_lock = getattr(agent, "_tool_worker_threads_lock", None)
+    if worker_lock is None:
+        agent._current_tool = function_name
+        agent._current_tool_started_at = tool_started_at
+    else:
+        with worker_lock:
+            agent._current_tool = function_name
+            current_started_at = getattr(agent, "_current_tool_started_at", None)
+            if current_started_at is None or tool_started_at < current_started_at:
+                agent._current_tool_started_at = tool_started_at
     agent._touch_activity(f"executing tool: {function_name}")
     try:
         from tools.environments.base import set_activity_callback
