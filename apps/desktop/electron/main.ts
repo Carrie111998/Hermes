@@ -104,6 +104,7 @@ import {
   tuiResumeArgs
 } from './external-terminal'
 import { findGitBash as _findGitBash } from './find-git-bash'
+import { resolveGitBinary as _resolveGitBinary } from './git-binary'
 import { installFoundInPageForwarder, performFind, stopFind } from './find-in-page'
 import { createFirstRunSetupGate } from './first-run-setup-gate'
 import { readDirForIpc } from './fs-read-dir'
@@ -2308,33 +2309,21 @@ function makeDashboardReadyFile() {
 // standard Git-for-Windows locations, then PATH. Cached after first probe.
 let _gitBinaryCache = null
 
+// Delegates to ./git-binary (extracted, unit-tested). That module prefers a
+// space-free git path on Windows so simple-git stops emitting the noisy
+// "Invalid value supplied for custom binary" warning when git lives under
+// "Program Files". Cached after first probe to match the prior behavior.
 function resolveGitBinary() {
   if (_gitBinaryCache) {
     return _gitBinaryCache
   }
 
-  if (!IS_WINDOWS) {
-    _gitBinaryCache = findOnPath('git') || 'git'
-
-    return _gitBinaryCache
-  }
-
-  const localAppData = process.env.LOCALAPPDATA || ''
-  const candidates = []
-
-  if (localAppData) {
-    candidates.push(path.join(localAppData, 'hermes', 'git', 'cmd', 'git.exe'))
-    candidates.push(path.join(localAppData, 'hermes', 'git', 'bin', 'git.exe'))
-  }
-
-  candidates.push(path.join(process.env['ProgramFiles'] || 'C:\\Program Files', 'Git', 'cmd', 'git.exe'))
-  candidates.push(path.join(process.env['ProgramFiles(x86)'] || 'C:\\Program Files (x86)', 'Git', 'cmd', 'git.exe'))
-
-  if (localAppData) {
-    candidates.push(path.join(localAppData, 'Programs', 'Git', 'cmd', 'git.exe'))
-  }
-
-  _gitBinaryCache = candidates.find(fileExists) || findOnPath('git') || 'git'
+  _gitBinaryCache = _resolveGitBinary({
+    isWindows: IS_WINDOWS,
+    env: process.env,
+    fileExists,
+    findOnPath
+  })
 
   return _gitBinaryCache
 }
