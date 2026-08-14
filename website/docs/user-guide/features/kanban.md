@@ -620,8 +620,8 @@ Workflow policy keys:
 
 | Key | Default | Purpose |
 |---|---|---|
-| `human_comment_wake` | `true` | Wake a worker blocked on `needs_input` when a human comments. This fixes human replies remaining unread. |
-| `human_comment_wake_overrides_mute` | `false` | Also wake the worker when the subscriber has muted ordinary notifications. |
+| `human_comment_wake` | `true` | Wake a worker blocked on `needs_input` when a human comments through a wake-enabled subscription. This fixes human replies remaining unread. |
+| `human_comment_wake_overrides_mute` | `false` | Also wake the worker for a passive `notify` subscription, which normally mutes agent wakes while keeping ordinary notifications. |
 | `safe_checkpoint.enabled` | `false` | Enable fenced safe checkpoints, including the worker tool, prompt guidance, and persistent-dispatcher capability advertisement. |
 | `safe_checkpoint.prompt_hint` | `""` | Optional extra guidance on when workers should checkpoint. Empty uses the built-in generic context-pressure guidance. |
 | `workspace_conflict` | `"allow"` | Workspace collision policy: `allow` preserves current behavior; `warn` dispatches and logs; `serialize` skips candidates sharing a running task's workspace. |

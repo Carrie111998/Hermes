@@ -1197,7 +1197,9 @@ Isolation model:
   same task (default: 2), the dispatcher auto-blocks it to prevent spin
   loops.
 - **Workflow policy:** `kanban.human_comment_wake` defaults on to wake a
-  `needs_input` worker after a human reply. Safe checkpoints, workspace
+  `needs_input` worker after a human reply when its subscription permits
+  wakes. `kanban.human_comment_wake_overrides_mute` makes human replies wake
+  even passive `notify` subscriptions. Safe checkpoints, workspace
   collision handling, creation validation/default subscriptions, and runtime
   deadline nudges are separately configured under `kanban.*`; their defaults
   preserve existing dispatch behavior.
