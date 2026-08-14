@@ -11,9 +11,76 @@ import {
   isInlineMediaSrc,
   isRemoteGateway,
   mediaExternalUrl,
+  mediaName,
   resolveMediaDisplaySrc,
   resolveMediaPlaybackSrc
 } from './media'
+
+describe('mediaName', () => {
+  it('returns the decoded basename for a Windows path with non-ASCII characters', () => {
+    expect(
+      mediaName(
+        String.raw`C:\Users\user\Documents\張耀祖論文_送印前稽核報告.md`
+      )
+    ).toBe('張耀祖論文_送印前稽核報告.md')
+  })
+
+  it('decodes a percent-encoded non-ASCII basename from a file URL', () => {
+    expect(
+      mediaName(
+        'file:///C:/Users/user/Documents/%E5%BC%B5%E8%80%80%E7%A5%96%E8%AB%96%E6%96%87_%E9%80%81%E5%8D%B0%E5%89%8D%E7%A8%BD%E6%A0%B8%E5%A0%B1%E5%91%8A.md'
+      )
+    ).toBe('張耀祖論文_送印前稽核報告.md')
+  })
+
+  it('preserves a basename containing a malformed percent escape', () => {
+    expect(mediaName('file:///C:/Users/user/Documents/report%ZZ.md')).toBe('report%ZZ.md')
+  })
+
+  it('keeps non-ASCII characters in Windows drive-letter paths with forward slashes', () => {
+    expect(mediaName('D:/pb/Hermes_Agency/码上编码对照统计/候选总部推荐_v2.xlsx')).toBe(
+      '候选总部推荐_v2.xlsx'
+    )
+  })
+
+  it('handles Windows paths with spaces without URL-parsing them', () => {
+    expect(mediaName(String.raw`C:\Users\qxp\My Documents\报告 2026.xlsx`)).toBe('报告 2026.xlsx')
+  })
+
+  it('keeps non-ASCII characters in UNC paths', () => {
+    expect(mediaName(String.raw`\\tsclient\F\workspace\数据分析.xlsx`)).toBe('数据分析.xlsx')
+  })
+
+  it('keeps non-ASCII characters in home-relative paths', () => {
+    expect(mediaName('~/Documents/报告.md')).toBe('报告.md')
+  })
+
+  it('keeps non-ASCII characters in POSIX absolute paths', () => {
+    expect(mediaName('/home/user/报告.md')).toBe('报告.md')
+  })
+
+  it('decodes a percent-encoded basename from an https URL', () => {
+    expect(mediaName('https://example.com/files/%E6%8A%A5%E5%91%8A.xlsx')).toBe('报告.xlsx')
+  })
+
+  it('does not decode literal percent sequences in real on-disk filenames', () => {
+    // `a%20b.txt` is the genuine filename on disk — decoding would corrupt it.
+    expect(mediaName(String.raw`D:\dir\a%20b.txt`)).toBe('a%20b.txt')
+    expect(mediaName('a%20b.txt')).toBe('a%20b.txt')
+  })
+
+  it('returns the basename for a plain URL', () => {
+    expect(mediaName('https://example.com/foo/bar.txt')).toBe('bar.txt')
+  })
+
+  it('returns the basename for a relative path', () => {
+    expect(mediaName('foo/bar.txt')).toBe('bar.txt')
+  })
+
+  it('returns the input unchanged for a URL without path segments', () => {
+    expect(mediaName('https://example.com')).toBe('https://example.com')
+  })
+})
 
 describe('isRemoteGateway', () => {
   afterEach(() => {
