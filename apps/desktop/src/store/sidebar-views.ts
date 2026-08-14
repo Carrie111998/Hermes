@@ -267,6 +267,10 @@ export const $activeSavedSidebarViewId: ReadableAtom<string | null> = computed(
   }
 )
 
+export function savedSidebarViewRequiresProfileSwitch(view: SavedSidebarView): boolean {
+  return view.state.profileScope !== ALL_PROFILES && view.state.profileScope !== $profileScope.get()
+}
+
 interface SaveSidebarViewOptions {
   id?: string
   now?: number

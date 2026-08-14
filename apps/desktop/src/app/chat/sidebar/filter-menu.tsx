@@ -67,7 +67,8 @@ import {
   $activeSavedSidebarViewId,
   $savedSidebarViews,
   applySavedSidebarView,
-  type SavedSidebarView
+  type SavedSidebarView,
+  savedSidebarViewRequiresProfileSwitch
 } from '@/store/sidebar-views'
 
 import { SidebarViewDialog, type SidebarViewDialogState } from './sidebar-view-dialog'
@@ -246,6 +247,14 @@ export function SidebarFilterMenu({ className }: { className?: string }) {
 
   const editView = (kind: 'delete' | 'rename' | 'update', view: SavedSidebarView) => setDialog({ kind, view })
 
+  const selectView = (view: SavedSidebarView) => {
+    if (savedSidebarViewRequiresProfileSwitch(view)) {
+      setDialog({ kind: 'apply', view })
+    } else {
+      applySavedSidebarView(view.id)
+    }
+  }
+
   return (
     <>
       <DropdownMenu>
@@ -289,7 +298,7 @@ export function SidebarFilterMenu({ className }: { className?: string }) {
                         <span className="max-w-48 truncate">{view.name}</span>
                       </DropdownMenuSubTrigger>
                       <DropdownMenuSubContent>
-                        <DropdownMenuItem onSelect={() => applySavedSidebarView(view.id)}>
+                        <DropdownMenuItem onSelect={() => selectView(view)}>
                           {copy.useView}
                         </DropdownMenuItem>
                         <DropdownMenuItem onSelect={() => editView('update', view)}>{copy.updateCurrent}</DropdownMenuItem>

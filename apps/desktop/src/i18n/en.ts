@@ -1990,6 +1990,7 @@ export const en: Translations = {
       filters: 'Filters',
       savedViews: 'Saved views',
       useView: 'Use view',
+      apply: 'Switch and use view',
       saveCurrent: 'Save current view…',
       updateCurrent: 'Update with current settings',
       update: 'Update',
@@ -1999,6 +2000,9 @@ export const en: Translations = {
       saveDescription: 'Save the current grouping, ordering, filters, profile scope, metadata, and display mode.',
       renameTitle: 'Rename sidebar view',
       renameDescription: 'Give this saved view a new name.',
+      applyTitle: 'Switch profile and use view?',
+      applyDescription: (name, profile) =>
+        `“${name}” switches to the “${profile}” profile and starts a fresh chat before applying the view.`,
       updateTitle: 'Update saved view?',
       updateDescription: name => `Replace “${name}” with the current sidebar settings?`,
       deleteTitle: 'Delete sidebar view?',

@@ -1673,6 +1673,7 @@ export interface Translations {
       filters: string
       savedViews: string
       useView: string
+      apply: string
       saveCurrent: string
       updateCurrent: string
       update: string
@@ -1682,6 +1683,8 @@ export interface Translations {
       saveDescription: string
       renameTitle: string
       renameDescription: string
+      applyTitle: string
+      applyDescription: (name: string, profile: string) => string
       updateTitle: string
       updateDescription: (name: string) => string
       deleteTitle: string

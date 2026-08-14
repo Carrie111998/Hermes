@@ -1759,6 +1759,7 @@ export const ja = defineLocale({
       filters: 'フィルター',
       savedViews: '保存済みビュー',
       useView: 'ビューを使用',
+      apply: '切り替えてビューを使用',
       saveCurrent: '現在のビューを保存…',
       updateCurrent: '現在の設定で更新',
       update: '更新',
@@ -1768,6 +1769,9 @@ export const ja = defineLocale({
       saveDescription: '現在のグループ化、並び順、フィルター、プロファイル範囲、メタデータ、表示モードを保存します。',
       renameTitle: 'サイドバービューの名前を変更',
       renameDescription: 'この保存済みビューに新しい名前を付けます。',
+      applyTitle: 'プロフィールを切り替えてビューを使用しますか？',
+      applyDescription: (name, profile) =>
+        `「${name}」を使用すると、プロフィールが「${profile}」に切り替わり、新しいチャットが開始されます。`,
       updateTitle: '保存済みビューを更新しますか？',
       updateDescription: name => `「${name}」を現在のサイドバー設定で置き換えますか？`,
       deleteTitle: 'サイドバービューを削除しますか？',

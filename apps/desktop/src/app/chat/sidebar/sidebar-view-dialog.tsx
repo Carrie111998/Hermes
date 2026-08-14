@@ -13,6 +13,7 @@ import {
 import { Input } from '@/components/ui/input'
 import { useI18n } from '@/i18n'
 import {
+  applySavedSidebarView,
   deleteSavedSidebarView,
   renameSavedSidebarView,
   saveCurrentSidebarView,
@@ -21,6 +22,7 @@ import {
 } from '@/store/sidebar-views'
 
 export type SidebarViewDialogState =
+  | { kind: 'apply'; view: SavedSidebarView }
   | { kind: 'delete'; view: SavedSidebarView }
   | { kind: 'rename'; view: SavedSidebarView }
   | { kind: 'save' }
@@ -44,24 +46,33 @@ export function SidebarViewDialog({ dialog, onClose }: SidebarViewDialogProps) {
     return null
   }
 
-  if (dialog.kind === 'delete' || dialog.kind === 'update') {
+  if (dialog.kind === 'apply' || dialog.kind === 'delete' || dialog.kind === 'update') {
+    const applying = dialog.kind === 'apply'
     const deleting = dialog.kind === 'delete'
 
     return (
       <ConfirmDialog
-        confirmLabel={deleting ? t.common.delete : copy.update}
-        description={deleting ? copy.deleteDescription(dialog.view.name) : copy.updateDescription(dialog.view.name)}
+        confirmLabel={applying ? copy.apply : deleting ? t.common.delete : copy.update}
+        description={
+          applying
+            ? copy.applyDescription(dialog.view.name, dialog.view.state.profileScope)
+            : deleting
+              ? copy.deleteDescription(dialog.view.name)
+              : copy.updateDescription(dialog.view.name)
+        }
         destructive={deleting}
         onClose={onClose}
         onConfirm={() => {
-          if (deleting) {
+          if (applying) {
+            applySavedSidebarView(dialog.view.id)
+          } else if (deleting) {
             deleteSavedSidebarView(dialog.view.id)
           } else {
             updateSavedSidebarView(dialog.view.id)
           }
         }}
         open
-        title={deleting ? copy.deleteTitle : copy.updateTitle}
+        title={applying ? copy.applyTitle : deleting ? copy.deleteTitle : copy.updateTitle}
       />
     )
   }

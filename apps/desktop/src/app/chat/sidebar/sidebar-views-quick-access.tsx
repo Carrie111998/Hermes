@@ -3,10 +3,24 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 
 import { Button } from '@/components/ui/button'
 import { Codicon } from '@/components/ui/codicon'
-import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover'
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuTrigger
+} from '@/components/ui/dropdown-menu'
 import { useI18n } from '@/i18n'
 import { cn } from '@/lib/utils'
-import { $activeSavedSidebarViewId, $savedSidebarViews, applySavedSidebarView } from '@/store/sidebar-views'
+import {
+  $activeSavedSidebarViewId,
+  $savedSidebarViews,
+  applySavedSidebarView,
+  type SavedSidebarView,
+  savedSidebarViewRequiresProfileSwitch
+} from '@/store/sidebar-views'
+
+import { SidebarViewDialog, type SidebarViewDialogState } from './sidebar-view-dialog'
 
 const HOVER_CLOSE_DELAY_MS = 180
 
@@ -15,7 +29,10 @@ export function SidebarSavedViewsQuickAccess({ className }: { className?: string
   const savedViews = useStore($savedSidebarViews).views
   const activeViewId = useStore($activeSavedSidebarViewId)
   const [open, setOpen] = useState(false)
+  const [dialog, setDialog] = useState<SidebarViewDialogState | null>(null)
   const closeTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const openedByPointer = useRef(false)
+  const pointerFocus = useRef<HTMLElement | null>(null)
 
   const cancelClose = useCallback(() => {
     if (closeTimer.current) {
@@ -26,7 +43,12 @@ export function SidebarSavedViewsQuickAccess({ className }: { className?: string
 
   const openNow = () => {
     cancelClose()
+    openedByPointer.current = true
+    pointerFocus.current = globalThis.document?.activeElement as HTMLElement | null
     setOpen(true)
+    globalThis.requestAnimationFrame(() => {
+      globalThis.requestAnimationFrame(() => pointerFocus.current?.focus())
+    })
   }
 
   const scheduleClose = () => {
@@ -42,57 +64,70 @@ export function SidebarSavedViewsQuickAccess({ className }: { className?: string
 
   const label = t.sidebar.viewMenu.savedViews
 
-  return (
-    <div className="grid size-6 place-items-center">
-      <Popover onOpenChange={setOpen} open={open}>
-        <PopoverTrigger asChild>
-          <Button
-            aria-expanded={open}
-            aria-haspopup="dialog"
-            aria-label={label}
-            className={cn(className, open && 'bg-(--ui-control-active-background) text-foreground opacity-100')}
-            onClick={event => event.stopPropagation()}
-            onFocus={openNow}
-            onPointerEnter={openNow}
-            onPointerLeave={scheduleClose}
-            size="icon-xs"
-            type="button"
-            variant="ghost"
-          >
-            <Codicon name="eye" size="0.75rem" />
-          </Button>
-        </PopoverTrigger>
+  const selectView = (view: SavedSidebarView) => {
+    setOpen(false)
 
-        <PopoverContent
-          align="start"
-          aria-label={label}
-          className="w-52 p-1"
-          onFocusCapture={cancelClose}
-          onPointerEnter={cancelClose}
-          onPointerLeave={scheduleClose}
-        >
-          <div className="px-2 py-1 text-[0.6875rem] font-medium text-(--ui-text-tertiary)">{label}</div>
-          {savedViews.map(view => (
+    if (savedSidebarViewRequiresProfileSwitch(view)) {
+      setDialog({ kind: 'apply', view })
+    } else {
+      applySavedSidebarView(view.id)
+    }
+  }
+
+  return (
+    <>
+      <div className="grid size-6 place-items-center">
+        <DropdownMenu modal={false} onOpenChange={setOpen} open={open}>
+          <DropdownMenuTrigger asChild>
             <Button
-              aria-label={view.name}
-              className="h-7 w-full justify-start gap-2 px-2 font-normal"
-              key={view.id}
-              onClick={event => {
-                event.stopPropagation()
-                applySavedSidebarView(view.id)
-                setOpen(false)
+              aria-label={label}
+              className={cn(className, open && 'bg-(--ui-control-active-background) text-foreground opacity-100')}
+              onKeyDown={() => {
+                openedByPointer.current = false
               }}
+              onPointerEnter={openNow}
+              onPointerLeave={scheduleClose}
+              size="icon-xs"
               type="button"
               variant="ghost"
             >
-              <span className="flex w-3 shrink-0 items-center justify-center">
-                {activeViewId === view.id && <Codicon name="check" size="0.75rem" />}
-              </span>
-              <span className="truncate">{view.name}</span>
+              <Codicon name="eye" size="0.75rem" />
             </Button>
-          ))}
-        </PopoverContent>
-      </Popover>
-    </div>
+          </DropdownMenuTrigger>
+
+          <DropdownMenuContent
+            align="start"
+            aria-label={label}
+            className="w-52"
+            onCloseAutoFocus={event => {
+              if (openedByPointer.current) {
+                event.preventDefault()
+              }
+
+              openedByPointer.current = false
+              pointerFocus.current = null
+            }}
+            onFocusOutside={event => {
+              if (openedByPointer.current) {
+                event.preventDefault()
+              }
+            }}
+            onPointerEnter={cancelClose}
+            onPointerLeave={scheduleClose}
+          >
+            <DropdownMenuLabel>{label}</DropdownMenuLabel>
+            {savedViews.map(view => (
+              <DropdownMenuItem aria-label={view.name} key={view.id} onSelect={() => selectView(view)}>
+                <span className="flex w-3 shrink-0 items-center justify-center">
+                  {activeViewId === view.id && <Codicon name="check" size="0.75rem" />}
+                </span>
+                <span className="truncate">{view.name}</span>
+              </DropdownMenuItem>
+            ))}
+          </DropdownMenuContent>
+        </DropdownMenu>
+      </div>
+      <SidebarViewDialog dialog={dialog} onClose={() => setDialog(null)} />
+    </>
   )
 }
