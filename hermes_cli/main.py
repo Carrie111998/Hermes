@@ -7388,6 +7388,26 @@ def cmd_gui(args: argparse.Namespace):
         else:
             sys.exit(1)
 
+    # Wayland: Electron 40+ auto-selects --ozone-platform=wayland when
+    # WAYLAND_DISPLAY is set, but Chromium's Vulkan backend is incompatible
+    # with the Wayland ozone platform — the GPU process crashes repeatedly
+    # (electron/electron#50455). appendSwitch() in main.ts is too late: the
+    # browser process picks the ozone platform from argv before our JS runs.
+    # Pass --ozone-platform=x11 and --disable-gpu on the actual command line
+    # when XWayland is available so the window is created as an X11 surface.
+    if sys.platform == "linux":
+        is_wayland = (
+            os.environ.get("XDG_SESSION_TYPE") == "wayland"
+            and bool(os.environ.get("WAYLAND_DISPLAY"))
+        )
+        has_xwayland = bool(os.environ.get("DISPLAY"))
+        if is_wayland and has_xwayland:
+            launch_command.extend(["--ozone-platform=x11", "--disable-gpu", "--no-zygote"])
+            print("⚠ Wayland session detected with XWayland; using --ozone-platform=x11 --disable-gpu --no-zygote to avoid Vulkan/Wayland GPU crash (electron/electron#50455)")
+        elif is_wayland and not has_xwayland:
+            launch_command.extend(["--disable-gpu", "--no-zygote"])
+            print("⚠ Wayland-only session (no XWayland); using --disable-gpu --no-zygote to avoid GPU crash (electron/electron#50455)")
+
     launch_command.extend(config_electron_flags)
     print(f"→ Launching packaged Hermes Desktop: {' '.join(launch_command)}")
     launch_result = subprocess.run(launch_command, cwd=desktop_dir, env=env, check=False)

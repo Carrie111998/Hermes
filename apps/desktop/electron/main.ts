@@ -333,16 +333,21 @@ if (DEV_CDP.port) {
   }
 }
 
-// Linux/Wayland: Electron's zygote process pool doesn't propagate
-// --ozone-platform=wayland or GPU acceleration flags to the GPU child
-// process (electron/electron#50455). The GPU process falls back to software
-// compositing (5-9x CPU overhead). --no-zygote forces each child to be spawned
-// fresh via posix_spawn with the full command line, fixing GPU flag
-// propagation so hardware acceleration works.
+// Linux/Wayland: Electron 40+ auto-selects --ozone-platform=wayland when
+// WAYLAND_DISPLAY is set, but Chromium's Vulkan backend is incompatible with
+// the Wayland ozone platform — the GPU process crashes repeatedly
+// (electron/electron#50455). The zygote process pool also doesn't propagate
+// GPU flags to child processes.
 //
-// The "'--ozone-platform=wayland' is not compatible with Vulkan" error
-// message still appears at startup but is cosmetic — GPU acceleration works
-// correctly with --no-zygote (confirmed by electron/electron#50455).
+// The primary fix is in the Python launcher (hermes_cli/main.py), which passes
+// --ozone-platform=x11 and --disable-gpu on the actual command line before the
+// process starts — appendSwitch() here is too late because the browser process
+// picks the ozone platform from argv before our JS runs.
+//
+// This block adds --no-zygote as a belt-and-suspenders fix for GPU flag
+// propagation to child processes (electron/electron#50455). The zygote forks
+// children before ozone/GPU flags are applied; --no-zygote forces fresh
+// posix_spawn with the full command line.
 //
 // Trade-off: ~100ms slower child process spawning — irrelevant for a
 // long-running desktop app.
@@ -353,7 +358,15 @@ const IS_WAYLAND_NATIVE =
 
 if (IS_WAYLAND_NATIVE && !REMOTE_DISPLAY_REASON) {
   app.commandLine.appendSwitch('no-zygote')
-  console.log('[hermes] Wayland native session detected; using --no-zygote for GPU flag propagation (electron/electron#50455)')
+  if (process.env.DISPLAY) {
+    app.commandLine.appendSwitch('ozone-platform', 'x11')
+    app.disableHardwareAcceleration()
+    console.log('[hermes] Wayland session with XWayland; using --no-zygote + ozone-platform=x11 + software rendering to avoid Vulkan/Wayland GPU crash (electron/electron#50455)')
+  } else {
+    app.disableHardwareAcceleration()
+    app.commandLine.appendSwitch('disable-gpu-compositing')
+    console.log('[hermes] Wayland-only session (no XWayland); disabling GPU to avoid Vulkan/Wayland crash (electron/electron#50455)')
+  }
 }
 
 // WSLg: Chromium blocklists the Mesa vGPU → software compositing → typing lag.
