@@ -3317,6 +3317,19 @@ TERMINAL_CONFIG_ENV_MAP = {
     "persistent_shell": "TERMINAL_PERSISTENT_SHELL",
 }
 
+# A local CLI/TUI owns its launch directory for the lifetime of the process.
+# This provenance cannot live in TERMINAL_CWD itself because dotenv/config
+# reloads use the same variable as their carrier. The pin is intentionally
+# process-local so gateway, cron, and child entrypoints resolve independently.
+_LOCAL_CLI_LAUNCH_CWD: Optional[str] = None
+
+
+def pin_local_cli_launch_cwd(cwd: str | os.PathLike[str]) -> None:
+    """Make a local CLI/TUI launch directory authoritative in this process."""
+    global _LOCAL_CLI_LAUNCH_CWD
+    _LOCAL_CLI_LAUNCH_CWD = os.fspath(cwd)
+    os.environ["TERMINAL_CWD"] = _LOCAL_CLI_LAUNCH_CWD
+
 
 def _terminal_env_value(value: Any) -> str:
     if isinstance(value, (list, dict)):
@@ -3358,8 +3371,10 @@ def apply_terminal_config_to_env(
     CLI without importing ``cli.py`` and paying for its startup side effects.
 
     Explicit keys in the user config's ``terminal`` section are authoritative
-    and override their matching env values.  Merged defaults only backfill
-    missing env vars; they never replace unrelated exported/.env values.
+    and override their matching env values. Merged defaults only backfill
+    missing env vars; they never replace unrelated exported/.env values. A
+    process-local CLI launch-directory pin is more specific than config.yaml
+    and remains authoritative across every bridge call in that process.
     """
     target = os.environ if env is None else env
 
@@ -3392,6 +3407,13 @@ def apply_terminal_config_to_env(
 
     for cfg_key, env_var in TERMINAL_CONFIG_ENV_MAP.items():
         if cfg_key not in terminal_cfg:
+            continue
+        if (
+            env_var == "TERMINAL_CWD"
+            and _LOCAL_CLI_LAUNCH_CWD is not None
+            and (env is None or target.get(env_var) == _LOCAL_CLI_LAUNCH_CWD)
+        ):
+            target[env_var] = _LOCAL_CLI_LAUNCH_CWD
             continue
         value = terminal_cfg[cfg_key]
         if cfg_key == "cwd":
