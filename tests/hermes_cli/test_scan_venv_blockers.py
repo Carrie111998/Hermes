@@ -199,6 +199,45 @@ def test_main_exempts_gateway_chain_but_keeps_other_holders(monkeypatch, capsys)
     assert data["pausable_gateways"] == 2
 
 
+def test_main_rehydrates_truncated_runtime_gateway_cmdline(monkeypatch, capsys):
+    """A long managed-runtime path can consume the detector's 120-char
+    diagnostic prefix before ``gateway run`` appears. Classification must use
+    the live argv, otherwise a pausable gateway blocks every Desktop update."""
+    pid = 35140
+    runtime_prefix = (
+        r"C:\Users\Jose\AppData\Local\hermes\hermes-agent\.hermes-runtime\python"
+        r"\generation-1785951912-33788-b5f7a5d0\cpython-3.11-windows-x86_64-none\python.exe"
+    )
+    truncated = runtime_prefix[:120]
+    live_argv = [
+        runtime_prefix,
+        "-m",
+        "hermes_cli.main",
+        "gateway",
+        "run",
+        "--replace",
+    ]
+    fake_process = types.SimpleNamespace(cmdline=lambda: live_argv)
+    fake_psutil = types.SimpleNamespace(Process=lambda requested_pid: fake_process)
+    monkeypatch.setitem(sys.modules, "psutil", fake_psutil)
+
+    import hermes_cli.main as cli_main
+
+    monkeypatch.setattr(
+        cli_main,
+        "_detect_venv_python_processes",
+        lambda: [(pid, "python.exe", truncated)],
+    )
+    with pytest.raises(SystemExit) as excinfo:
+        main()
+
+    data = json.loads(capsys.readouterr().out)
+    assert excinfo.value.code == 0
+    assert data["blocked"] is False
+    assert data["processes"] == []
+    assert data["pausable_gateways"] == 1
+
+
 def test_main_desktop_serve_backend_still_blocks(monkeypatch, capsys):
     """The desktop's own `serve` backend has no downstream pause — it must
     keep blocking exactly as before the exemption."""

@@ -126,6 +126,24 @@ def _is_pausable_gateway(cmdline: str) -> bool:
     return looks_like_gateway_command_line(cmdline)
 
 
+def _live_cmdline_for_classification(pid: int, fallback: str) -> str:
+    """Return the process's full live argv for blocker classification.
+
+    ``_detect_venv_python_processes`` intentionally limits its diagnostic
+    cmdline to 120 characters. Managed-runtime executable paths can exceed that
+    by themselves, cutting off the trailing ``gateway run`` tokens and making a
+    pausable gateway look like an opaque Python blocker. Re-read argv only for
+    classification; reporting still uses the bounded, redacted fallback.
+    """
+    try:
+        import psutil  # noqa: PLC0415
+
+        live = " ".join(psutil.Process(int(pid)).cmdline())
+    except Exception:
+        return fallback
+    return live or fallback
+
+
 def main() -> None:
     """Entry point.  Prints one JSON doc to stdout.  Exits 0 for valid scan."""
     try:
@@ -140,6 +158,10 @@ def main() -> None:
     except Exception as exc:
         _emit_probe_fail(f"scan aborted: {exc}")
 
+    classified = [
+        (pid, name, cmdline, _live_cmdline_for_classification(pid, cmdline))
+        for pid, name, cmdline in matches
+    ]
     processes = [
         {
             "pid": pid,
@@ -149,10 +171,14 @@ def main() -> None:
             # otherwise swallow the `gateway run` argv).
             "cmdline": _redact_sensitive_cmdline(cmdline)[:120],
         }
-        for pid, name, cmdline in matches
-        if not _is_pausable_gateway(cmdline)
+        for pid, name, cmdline, classification_cmdline in classified
+        if not _is_pausable_gateway(classification_cmdline)
     ]
-    exempted = sum(1 for _pid, _name, cmdline in matches if _is_pausable_gateway(cmdline))
+    exempted = sum(
+        1
+        for _pid, _name, _cmdline, classification_cmdline in classified
+        if _is_pausable_gateway(classification_cmdline)
+    )
     data = {
         "ok": True,
         "blocked": bool(processes),
