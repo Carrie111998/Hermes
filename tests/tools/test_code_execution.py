@@ -249,6 +249,64 @@ print(result.get("output", ""))
         self.assertIn("mock output for: echo hello", result["output"])
         self.assertEqual(result["tool_calls_made"], 1)
 
+    def test_tool_result_with_trailing_hint_is_parseable(self):
+        """Truncated tool payloads may append a UI hint after valid JSON."""
+        code = """
+from hermes_tools import search_files
+result = search_files("needle", path=".")
+print(result["total_count"])
+print(result["_hermes_hint"])
+"""
+
+        def hinted_mock(function_name, function_args, task_id=None, user_task=None):
+            if function_name == "search_files":
+                return (
+                    json.dumps({"total_count": 12, "matches": [], "truncated": True})
+                    + "\n\n[Hint: Results truncated. Use offset=5 to see more.]"
+                )
+            return _mock_handle_function_call(
+                function_name, function_args, task_id=task_id, user_task=user_task
+            )
+
+        with patch("model_tools.handle_function_call", side_effect=hinted_mock):
+            raw = execute_code(
+                code=code,
+                task_id="test-trailing-hint",
+                enabled_tools=list(SANDBOX_ALLOWED_TOOLS),
+            )
+
+        result = json.loads(raw)
+        self.assertEqual(result["status"], "success", msg=result)
+        self.assertIn("12", result["output"])
+        self.assertIn("[Hint: Results truncated.", result["output"])
+        self.assertEqual(result["tool_calls_made"], 1)
+
+    def test_unexpected_trailing_tool_bytes_still_fail(self):
+        """Only the recognized UI-hint envelope may follow the JSON payload."""
+        code = """
+from hermes_tools import search_files
+search_files("needle", path=".")
+"""
+
+        def corrupted_mock(function_name, function_args, task_id=None, user_task=None):
+            if function_name == "search_files":
+                return json.dumps({"total_count": 1}) + "\nunexpected trailing bytes"
+            return _mock_handle_function_call(
+                function_name, function_args, task_id=task_id, user_task=user_task
+            )
+
+        with patch("model_tools.handle_function_call", side_effect=corrupted_mock):
+            raw = execute_code(
+                code=code,
+                task_id="test-corrupt-trailing-result",
+                enabled_tools=list(SANDBOX_ALLOWED_TOOLS),
+            )
+
+        result = json.loads(raw)
+        self.assertEqual(result["status"], "error", msg=result)
+        self.assertIn("JSONDecodeError", result.get("error", "") + result["output"])
+        self.assertEqual(result["tool_calls_made"], 1)
+
 
     def test_concurrent_tool_calls_match_responses(self):
         """Regression for the UDS RPC race: multiple threads inside the

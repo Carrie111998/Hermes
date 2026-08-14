@@ -502,6 +502,37 @@ def retry(fn, max_attempts=3, delay=2):
                 time.sleep(delay * (2 ** attempt))
     raise last_err
 
+
+def _parse_rpc_result(raw):
+    """Parse a tool result and preserve a recognized trailing UI hint.
+
+    Some tools intentionally return a JSON payload followed by a human-facing
+    ``[Hint: ...]`` line (for example, truncated ``search_files`` results).
+    The normal agent loop accepts that envelope, so programmatic tool calling
+    must accept it too instead of failing with ``JSONDecodeError: Extra data``.
+    Unexpected trailing bytes still fail closed as protocol corruption.
+    """
+    def _loads(value):
+        try:
+            return json.loads(value)
+        except json.JSONDecodeError:
+            stripped = value.lstrip()
+            result, end = json.JSONDecoder().raw_decode(stripped)
+            trailing = stripped[end:].strip()
+            if not trailing.startswith("[Hint:"):
+                raise
+            if isinstance(result, dict):
+                result.setdefault("_hermes_hint", trailing)
+            return result
+
+    result = _loads(raw)
+    if isinstance(result, str):
+        try:
+            return _loads(result)
+        except (json.JSONDecodeError, TypeError):
+            return result
+    return result
+
 '''
 
 # ---- UDS transport (local backend) ---------------------------------------
@@ -562,13 +593,7 @@ def _call(tool_name, args):
             if buf.endswith(b"\\n"):
                 break
     raw = buf.decode().strip()
-    result = json.loads(raw)
-    if isinstance(result, str):
-        try:
-            return json.loads(result)
-        except (json.JSONDecodeError, TypeError):
-            return result
-    return result
+    return _parse_rpc_result(raw)
 
 '''
 
@@ -628,13 +653,7 @@ def _call(tool_name, args):
     except OSError:
         pass
 
-    result = json.loads(raw)
-    if isinstance(result, str):
-        try:
-            return json.loads(result)
-        except (json.JSONDecodeError, TypeError):
-            return result
-    return result
+    return _parse_rpc_result(raw)
 
 '''
 
