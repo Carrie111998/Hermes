@@ -65,6 +65,34 @@ logger = logging.getLogger(__name__)
 _OWNER_REPLY_PREFIX = "[owner reply] "
 
 
+def _set_owner_message_secret_permissions(descriptor: int, secret_path: Path) -> None:
+    """Restrict a secret file using the safest chmod available on this platform."""
+    descriptor_stat = os.fstat(descriptor)
+    if not stat.S_ISREG(descriptor_stat.st_mode):
+        raise ValueError("owner message secret must be a regular file")
+
+    fchmod = getattr(os, "fchmod", None)
+    if callable(fchmod):
+        fchmod(descriptor, 0o600)
+        return
+
+    # Windows Python 3.11/3.12 does not expose os.fchmod. Before falling back
+    # to path-based chmod, reject symlinks and prove the path still identifies
+    # the open regular file. Recheck afterward so a concurrent replacement is
+    # detected rather than accepted as the protected secret.
+    path_stat = os.stat(secret_path, follow_symlinks=False)
+    if not stat.S_ISREG(path_stat.st_mode) or not os.path.samestat(
+        descriptor_stat, path_stat
+    ):
+        raise ValueError("owner message secret must be a regular file")
+    os.chmod(secret_path, 0o600)
+    protected_stat = os.stat(secret_path, follow_symlinks=False)
+    if not stat.S_ISREG(protected_stat.st_mode) or not os.path.samestat(
+        descriptor_stat, protected_stat
+    ):
+        raise ValueError("owner message secret changed while securing permissions")
+
+
 def _load_or_create_owner_message_secret(
     secret_path: Path, allowed_parent: Optional[Path] = None
 ) -> str:
@@ -87,15 +115,13 @@ def _load_or_create_owner_message_secret(
         )
         try:
             os.write(descriptor, (secret + "\n").encode("utf-8"))
-            os.fchmod(descriptor, 0o600)
+            _set_owner_message_secret_permissions(descriptor, secret_path)
         finally:
             os.close(descriptor)
         return secret
     try:
-        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
-            raise ValueError("owner message secret must be a regular file")
+        _set_owner_message_secret_permissions(descriptor, secret_path)
         secret = os.read(descriptor, 4096).decode("utf-8").strip()
-        os.fchmod(descriptor, 0o600)
     finally:
         os.close(descriptor)
     if len(secret.encode("utf-8")) < 32:

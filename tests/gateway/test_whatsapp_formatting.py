@@ -172,12 +172,14 @@ class TestSendChunking:
         adapter = _make_adapter()
         adapter._owner_messages_external_consumer = True
         resp = MagicMock(status=400)
-        resp.json = AsyncMock(return_value={"error": "expectedOwnerFenceSequence required"})
+        resp.text = AsyncMock(return_value="expectedOwnerFenceSequence required")
         adapter._http_session.post = MagicMock(return_value=_AsyncCM(resp))
 
         result = await adapter.send("chat1", "unfenced automatic reply")
 
         assert not result.success
+        assert result.error == "expectedOwnerFenceSequence required"
+        resp.text.assert_awaited_once_with()
         payload = adapter._http_session.post.call_args.kwargs["json"]
         assert payload["sendIntent"] == "automatic"
         assert "expectedOwnerFenceSequence" not in payload

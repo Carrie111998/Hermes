@@ -100,22 +100,61 @@ export function acknowledgeDeliveryReceipts(queue, acknowledgements) {
   return removed;
 }
 
-export function createDeliveryReceiptQueue({ capacity = 1000, pageSize = 100 } = {}) {
+const DELIVERY_STATUS_RANK = new Map([
+  ['sent', 1],
+  ['delivered', 2],
+  ['read', 3],
+]);
+
+export function createDeliveryReceiptQueue({
+  capacity = 1000,
+  pageSize = 100,
+  tombstoneRetentionMs = 30 * 24 * 60 * 60 * 1000,
+  now = Date.now,
+} = {}) {
   if (!Number.isInteger(capacity) || capacity < 1) throw new RangeError('capacity must be positive');
   if (!Number.isInteger(pageSize) || pageSize < 1 || pageSize > capacity) {
     throw new RangeError('pageSize must be within capacity');
   }
+  if (!Number.isFinite(tombstoneRetentionMs) || tombstoneRetentionMs <= 0) {
+    throw new RangeError('tombstoneRetentionMs must be positive');
+  }
+  if (typeof now !== 'function') throw new TypeError('now must be a function');
   const queue = [];
   const seen = new Set();
+  const tombstones = new Map();
+
+  function pruneExpiredTombstones(referenceTime = now()) {
+    const cutoff = referenceTime - tombstoneRetentionMs;
+    for (const [messageId, tombstone] of tombstones) {
+      if (!Number.isFinite(tombstone?.acknowledgedAt) || tombstone.acknowledgedAt <= cutoff) {
+        tombstones.delete(messageId);
+      }
+    }
+  }
+
+  function highestKnownRank(messageId) {
+    let rank = 0;
+    for (const receipt of queue) {
+      if (receipt.messageId === messageId) {
+        rank = Math.max(rank, DELIVERY_STATUS_RANK.get(receipt.status));
+      }
+    }
+    rank = Math.max(rank, tombstones.get(messageId)?.rank || 0);
+    return rank;
+  }
+
   return {
     add(receipt) {
       const messageId = receipt?.messageId;
       const status = receipt?.status;
       if (typeof messageId !== 'string' || !/^[A-Za-z0-9_-]{1,191}$/.test(messageId)) return false;
-      if (!['sent', 'delivered', 'read'].includes(status)) return false;
+      if (!DELIVERY_STATUS_RANK.has(status)) return false;
       if (typeof receipt.occurredAt !== 'string' || !receipt.occurredAt) return false;
+      pruneExpiredTombstones();
       const key = `${messageId}:${status}`;
       if (seen.has(key)) return false;
+      if (highestKnownRank(messageId) >= DELIVERY_STATUS_RANK.get(status)) return false;
       seen.add(key);
       queue.push(receipt);
       if (queue.length > capacity) {
@@ -128,11 +167,41 @@ export function createDeliveryReceiptQueue({ capacity = 1000, pageSize = 100 } =
       return queue.slice(0, pageSize);
     },
     acknowledge(acknowledgements) {
-      const removed = acknowledgeDeliveryReceipts(queue, acknowledgements);
+      const acknowledgedKeys = new Set();
       for (const acknowledgement of acknowledgements || []) {
-        seen.delete(`${acknowledgement?.messageId}:${acknowledgement?.status}`);
+        const messageId = acknowledgement?.messageId;
+        const status = acknowledgement?.status;
+        if (typeof messageId === 'string' && DELIVERY_STATUS_RANK.has(status)) {
+          const key = `${messageId}:${status}`;
+          if (seen.has(key)) acknowledgedKeys.add(key);
+        }
       }
-      return removed;
+      const removedExact = acknowledgeDeliveryReceipts(queue, acknowledgements);
+      const removedKeys = new Set(acknowledgedKeys);
+      if (removedExact) {
+        const acknowledgedRanks = new Map();
+        for (const key of acknowledgedKeys) {
+          const separator = key.lastIndexOf(':');
+          const messageId = key.slice(0, separator);
+          const rank = DELIVERY_STATUS_RANK.get(key.slice(separator + 1));
+          acknowledgedRanks.set(messageId, Math.max(acknowledgedRanks.get(messageId) || 0, rank));
+        }
+        for (let index = queue.length - 1; index >= 0; index -= 1) {
+          const receipt = queue[index];
+          const acknowledgedRank = acknowledgedRanks.get(receipt.messageId) || 0;
+          if (DELIVERY_STATUS_RANK.get(receipt.status) <= acknowledgedRank) {
+            queue.splice(index, 1);
+            removedKeys.add(`${receipt.messageId}:${receipt.status}`);
+          }
+        }
+        const acknowledgedAt = now();
+        for (const key of removedKeys) seen.delete(key);
+        for (const [messageId, rank] of acknowledgedRanks) {
+          const previousRank = tombstones.get(messageId)?.rank || 0;
+          tombstones.set(messageId, { rank: Math.max(previousRank, rank), acknowledgedAt });
+        }
+      }
+      return removedKeys.size;
     },
     size() {
       return queue.length;
@@ -267,6 +336,72 @@ export function createSerializedSendQueue({ now = Date.now } = {}) {
   return { enqueueSend };
 }
 
+function isPlainObject(value) {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function validSequenceMap(value, keyPattern) {
+  return isPlainObject(value) && Object.entries(value).every(([key, sequence]) => (
+    keyPattern.test(key) && Number.isSafeInteger(sequence) && sequence > 0
+  ));
+}
+
+function validateOwnerMessageState(parsed) {
+  const invalid = () => { throw new Error('Invalid owner message queue state'); };
+  if (!isPlainObject(parsed) || !Number.isSafeInteger(parsed.nextSequence)
+    || parsed.nextSequence < 1 || !Array.isArray(parsed.entries)) invalid();
+
+  const lastSequenceByChat = parsed.lastSequenceByChat ?? {};
+  const unresolvedLidFences = parsed.unresolvedLidFences ?? {};
+  const tombstones = parsed.tombstones ?? {};
+  if (!validSequenceMap(lastSequenceByChat, /^\d{7,20}@(s\.whatsapp\.net|lid)$/)
+    || !validSequenceMap(unresolvedLidFences, /^\d{7,20}@lid$/)
+    || !isPlainObject(tombstones)) invalid();
+
+  const messageIds = new Set();
+  const sequences = new Set();
+  let maximumSequence = 0;
+  for (const entry of parsed.entries) {
+    const event = entry?.event;
+    const valid = isPlainObject(entry)
+      && Number.isSafeInteger(entry.sequence) && entry.sequence > 0
+      && isPlainObject(event)
+      && typeof event.messageId === 'string' && /^[A-Za-z0-9_-]{1,191}$/.test(event.messageId)
+      && typeof event.chatId === 'string' && /^\d{7,20}@(s\.whatsapp\.net|lid)$/.test(event.chatId)
+      && typeof event.senderId === 'string' && event.senderId.length > 0
+      && event.fromOwner === true
+      && typeof event.type === 'string' && event.type.length > 0
+      && typeof event.body === 'string'
+      && Number.isFinite(event.timestamp) && event.timestamp > 0
+      && event.ownerFenceSequence === entry.sequence
+      && !messageIds.has(event.messageId)
+      && !sequences.has(entry.sequence);
+    if (!valid) invalid();
+    messageIds.add(event.messageId);
+    sequences.add(entry.sequence);
+    maximumSequence = Math.max(maximumSequence, entry.sequence);
+  }
+  for (const [messageId, tombstone] of Object.entries(tombstones)) {
+    const valid = /^[A-Za-z0-9_-]{1,191}$/.test(messageId)
+      && !messageIds.has(messageId)
+      && isPlainObject(tombstone)
+      && Number.isSafeInteger(tombstone.sequence) && tombstone.sequence > 0
+      && Number.isFinite(tombstone.acknowledgedAt) && tombstone.acknowledgedAt > 0;
+    if (!valid) invalid();
+    messageIds.add(messageId);
+    maximumSequence = Math.max(maximumSequence, tombstone.sequence);
+  }
+  for (const sequence of Object.values(lastSequenceByChat)) {
+    maximumSequence = Math.max(maximumSequence, sequence);
+  }
+  for (const sequence of Object.values(unresolvedLidFences)) {
+    maximumSequence = Math.max(maximumSequence, sequence);
+  }
+  if (parsed.nextSequence <= maximumSequence) invalid();
+
+  return { ...parsed, lastSequenceByChat, unresolvedLidFences, tombstones };
+}
+
 export function createOwnerMessageQueue({
   directory,
   pageSize = 100,
@@ -292,26 +427,12 @@ export function createOwnerMessageQueue({
   };
   try {
     const parsed = JSON.parse(readFileSync(statePath, 'utf8'));
-    if (Number.isSafeInteger(parsed?.nextSequence) && Array.isArray(parsed?.entries)) {
-      state = {
-        nextSequence: parsed.nextSequence,
-        entries: parsed.entries,
-        lastSequenceByChat: parsed.lastSequenceByChat && typeof parsed.lastSequenceByChat === 'object'
-          ? parsed.lastSequenceByChat : {},
-        unresolvedLidFences:
-          parsed.unresolvedLidFences && typeof parsed.unresolvedLidFences === 'object'
-            ? parsed.unresolvedLidFences : {},
-        tombstones: parsed.tombstones && typeof parsed.tombstones === 'object'
-          ? parsed.tombstones : {},
-      };
-      for (const entry of state.entries) {
-        const chat = entry?.event?.chatId;
-        if (typeof chat === 'string' && Number.isSafeInteger(entry?.sequence)) {
-          state.lastSequenceByChat[chat] = Math.max(
-            Number(state.lastSequenceByChat[chat] || 0), entry.sequence,
-          );
-        }
-      }
+    state = validateOwnerMessageState(parsed);
+    for (const entry of state.entries) {
+      const chat = entry.event.chatId;
+      state.lastSequenceByChat[chat] = Math.max(
+        Number(state.lastSequenceByChat[chat] || 0), entry.sequence,
+      );
     }
   } catch (error) {
     if (error?.code !== 'ENOENT') throw error;

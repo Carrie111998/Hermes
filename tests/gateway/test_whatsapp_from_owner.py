@@ -19,6 +19,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from gateway.config import Platform, PlatformConfig
+from plugins.platforms.whatsapp import adapter as whatsapp_adapter
 from plugins.platforms.whatsapp.adapter import (
     WhatsAppAdapter,
     _load_or_create_owner_message_secret,
@@ -94,6 +95,20 @@ def test_yaml_owner_forwarding_setting_overrides_internal_environment(monkeypatc
 
 def test_owner_message_secret_is_strong_private_and_stable_per_session(tmp_path):
     secret_path = tmp_path / "consumer.secret"
+
+    first = _load_or_create_owner_message_secret(secret_path)
+    second = _load_or_create_owner_message_secret(secret_path)
+
+    assert first == second
+    assert len(first) >= 43
+    assert stat.S_IMODE(secret_path.stat().st_mode) == 0o600
+
+
+def test_owner_message_secret_uses_path_chmod_when_fchmod_is_unavailable(
+    tmp_path, monkeypatch
+):
+    secret_path = tmp_path / "consumer.secret"
+    monkeypatch.delattr(whatsapp_adapter.os, "fchmod")
 
     first = _load_or_create_owner_message_secret(secret_path)
     second = _load_or_create_owner_message_secret(secret_path)

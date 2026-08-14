@@ -127,6 +127,42 @@ import {
 }
 
 {
+  const malformedJsonDir = mkdtempSync(path.join(tmpdir(), 'hermes-owner-malformed-json-'));
+  writeFileSync(path.join(malformedJsonDir, 'owner-messages.json'), '{not-json');
+  assert.throws(
+    () => createOwnerMessageQueue({ directory: malformedJsonDir }),
+    SyntaxError,
+  );
+
+  const invalidSchemaDir = mkdtempSync(path.join(tmpdir(), 'hermes-owner-invalid-schema-'));
+  writeFileSync(path.join(invalidSchemaDir, 'owner-messages.json'), JSON.stringify({
+    nextSequence: 2,
+    entries: [{ sequence: 1, event: { messageId: 'owner-lost' } }],
+    lastSequenceByChat: {},
+    unresolvedLidFences: {},
+    tombstones: {},
+  }));
+  assert.throws(
+    () => createOwnerMessageQueue({ directory: invalidSchemaDir }),
+    /Invalid owner message queue state/,
+  );
+
+  const invalidNestedMapDir = mkdtempSync(path.join(tmpdir(), 'hermes-owner-invalid-map-'));
+  writeFileSync(path.join(invalidNestedMapDir, 'owner-messages.json'), JSON.stringify({
+    nextSequence: 1,
+    entries: [],
+    lastSequenceByChat: { '15551234567@s.whatsapp.net': '1' },
+    unresolvedLidFences: {},
+    tombstones: {},
+  }));
+  assert.throws(
+    () => createOwnerMessageQueue({ directory: invalidNestedMapDir }),
+    /Invalid owner message queue state/,
+  );
+  console.log('  ✓ readable corrupt owner queue state fails closed instead of resetting');
+}
+
+{
   const queueDir = mkdtempSync(path.join(tmpdir(), 'hermes-owner-tombstone-'));
   let currentTime = 1_723_636_800_000;
   const retentionMs = 30 * 24 * 60 * 60 * 1000;
@@ -389,7 +425,14 @@ import {
 }
 
 {
-  const receipts = createDeliveryReceiptQueue({ capacity: 2, pageSize: 1 });
+  let currentTime = 1_723_636_800_000;
+  const retentionMs = 30 * 24 * 60 * 60 * 1000;
+  const receipts = createDeliveryReceiptQueue({
+    capacity: 2,
+    pageSize: 1,
+    tombstoneRetentionMs: retentionMs,
+    now: () => currentTime,
+  });
   const delivered = {
     messageId: 'outbound-queue-1', status: 'delivered', occurredAt: '2026-08-14T12:00:00Z',
   };
@@ -407,9 +450,46 @@ import {
   assert.deepEqual(receipts.snapshot(), [read]);
   assert.equal(receipts.acknowledge([{ messageId: read.messageId, status: read.status }]), 1);
   assert.deepEqual(receipts.snapshot(), [other]);
-  assert.equal(receipts.add(delivered), true);
+  assert.equal(receipts.add(read), false);
+  assert.equal(receipts.add(delivered), false);
+
+  const monotonic = {
+    messageId: 'outbound-monotonic', status: 'delivered', occurredAt: '2026-08-14T12:02:30Z',
+  };
+  assert.equal(receipts.add(monotonic), true);
+  assert.equal(receipts.acknowledge([
+    { messageId: monotonic.messageId, status: monotonic.status },
+  ]), 1);
+  assert.equal(receipts.add({
+    ...monotonic, status: 'read', occurredAt: '2026-08-14T12:02:45Z',
+  }), true);
+
+  const unmatched = {
+    messageId: 'outbound-unmatched-ack', status: 'sent', occurredAt: '2026-08-14T12:03:00Z',
+  };
+  assert.equal(receipts.acknowledge([
+    { messageId: unmatched.messageId, status: unmatched.status },
+  ]), 0);
+  assert.equal(receipts.add(unmatched), true);
+
+  const outOfOrder = createDeliveryReceiptQueue({ capacity: 4, pageSize: 4 });
+  const lower = {
+    messageId: 'outbound-out-of-order', status: 'sent', occurredAt: '2026-08-14T12:03:10Z',
+  };
+  const higher = {
+    messageId: lower.messageId, status: 'read', occurredAt: '2026-08-14T12:03:20Z',
+  };
+  assert.equal(outOfOrder.add(lower), true);
+  assert.equal(outOfOrder.add(higher), true);
+  assert.equal(outOfOrder.acknowledge([
+    { messageId: higher.messageId, status: higher.status },
+  ]), 2);
+  assert.deepEqual(outOfOrder.snapshot(), []);
+
+  currentTime += retentionMs + 1;
+  assert.equal(receipts.add(read), true);
   assert.equal(receipts.size(), 2);
-  console.log('  ✓ receipt queue bounds, deduplicates, paginates, and acknowledges exact states');
+  console.log('  ✓ receipt ACK tombstones suppress replay/regression, expire by age, and ignore unmatched ACKs');
 }
 
 // -- inbound read receipts ------------------------------------------------

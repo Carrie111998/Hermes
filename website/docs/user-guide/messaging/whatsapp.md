@@ -205,6 +205,16 @@ The option is disabled by default so owner-device sends cannot accidentally ente
 
 WhatsApp supports **streaming (progressive) responses** — the bot edits its message in real-time as the AI generates text, just like Discord and Telegram. Internally, WhatsApp is classified as a TIER_MEDIUM platform for delivery capabilities.
 
+### Delivery Receipt Consumer Contract
+
+The Baileys bridge exposes outbound `sent`, `delivered`, and `read` updates through a separate non-destructive receipt queue:
+
+- `GET /receipts` returns the oldest page as a JSON array of `{ "messageId", "status", "occurredAt" }` objects. A page contains at most **100** receipts.
+- `POST /receipts/ack` accepts `{ "receipts": [{ "messageId": "...", "status": "..." }] }`. Each ACK is exact on both message ID and status, and a request may acknowledge at most **100** receipts. The response reports the exact `acknowledged` count.
+- The bridge queue holds at most **1,000** unacknowledged receipts. Consumers must therefore poll promptly and ACK each bounded page rather than accumulating an oversized batch.
+- **Persist every receipt durably before ACKing it.** `GET` is a peek, so a crash before persistence leaves the receipt available; a crash after persistence but before ACK must be absorbed by the consumer's `(messageId, status)` deduplication.
+- ACKed states are replay-suppressed in the running bridge while a later monotonic state (for example `delivered` → `read`) remains eligible. An unmatched ACK does not suppress a future real receipt.
+
 ### Chunking
 
 Long responses are automatically split into multiple messages at **4,096 characters** per chunk (WhatsApp's practical display limit). You don't need to configure anything — the gateway handles splitting and sends chunks sequentially.
