@@ -6,6 +6,7 @@ Config + Server + asyncio.run to capture kwargs without starting an event loop.
 
 import asyncio
 import contextlib
+import sys
 
 import pytest
 import uvicorn
@@ -295,9 +296,6 @@ def test_start_server_treats_windows_keyboardinterrupt_as_clean_shutdown(monkeyp
     monkeypatch.setattr(
         "uvicorn._compat.asyncio_run", _raise_keyboard_interrupt, raising=False
     )
-    # Cover the pre-0.36 fallback runner with the same contract, in case the
-    # installed uvicorn predates the loop-factory API on this lane.
-    monkeypatch.setattr(asyncio, "run", _raise_keyboard_interrupt)
 
     try:
         web_server.start_server(host="127.0.0.1", port=0, open_browser=False)
@@ -305,4 +303,38 @@ def test_start_server_treats_windows_keyboardinterrupt_as_clean_shutdown(monkeyp
         pytest.fail(
             "start_server must treat serve-time KeyboardInterrupt as a clean "
             "shutdown on the Windows branch, not propagate it"
+        )
+
+
+@pytest.mark.windows_only
+def test_start_server_treats_windows_fallback_keyboardinterrupt_as_clean_shutdown(
+    monkeypatch,
+):
+    """The pre-0.36 fallback runner shares the clean Ctrl+C contract.
+
+    When ``uvicorn._compat.asyncio_run`` is unavailable (uvicorn predates the
+    loop-factory API), the Windows branch falls back to bare ``asyncio.run``
+    under a hand-installed selector policy — still inside the same
+    ``capture_signals()`` re-raise, so its ``KeyboardInterrupt`` must be
+    swallowed identically. Forcing the ``_compat`` import to fail (None in
+    ``sys.modules`` halts the import) is what actually selects the fallback:
+    merely patching ``asyncio.run`` alongside a successful import would leave
+    this path untested.
+    """
+    _stub_uvicorn(monkeypatch)
+
+    monkeypatch.setitem(sys.modules, "uvicorn._compat", None)
+
+    def _raise_keyboard_interrupt(coro):
+        coro.close()
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(asyncio, "run", _raise_keyboard_interrupt)
+
+    try:
+        web_server.start_server(host="127.0.0.1", port=0, open_browser=False)
+    except KeyboardInterrupt:
+        pytest.fail(
+            "start_server must treat serve-time KeyboardInterrupt as a clean "
+            "shutdown on the Windows pre-0.36 fallback, not propagate it"
         )
