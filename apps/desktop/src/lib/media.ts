@@ -52,18 +52,30 @@ function decodeMediaName(value: string): string {
   }
 }
 
+// Filesystem paths are NOT URLs. A Windows drive letter like `D:` parses as a
+// URL *scheme* under WHATWG rules, so `new URL()` never throws for them and
+// the catch branch is dead code for exactly the paths Desktop produces most
+// (MEDIA: artifact deliveries). Routing a real filename through the URL parser
+// also percent-encodes non-ASCII characters, and decoding such a path would
+// corrupt genuine on-disk names containing literal '%' sequences (e.g.
+// `a%20b.txt`). Split filesystem paths directly instead.
+const FILESYSTEM_PATH_RE = /^(?:[a-zA-Z]:[\\/]|\\\\|~(?=$|[\\/])|\/)/
+
 export function mediaName(path: string): string {
-  let name: string | undefined
+  if (FILESYSTEM_PATH_RE.test(path)) {
+    return path.split(/[\\/]/).filter(Boolean).pop() || path
+  }
 
   try {
     const url = new URL(path)
+    // Non-special-scheme URLs (incl. drive-letter-shaped strings) keep
+    // backslashes in the pathname, so split on both separators.
+    const name = url.pathname.split(/[\\/]/).filter(Boolean).pop()
 
-    name = url.pathname.split(/[\\/]/).filter(Boolean).pop()
+    return decodeMediaName(name || path)
   } catch {
-    name = path.split(/[\\/]/).filter(Boolean).pop()
+    return path.split(/[\\/]/).filter(Boolean).pop() || path
   }
-
-  return decodeMediaName(name || path)
 }
 
 export function mediaMarkdownHref(path: string): string {
