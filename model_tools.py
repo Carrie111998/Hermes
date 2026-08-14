@@ -211,7 +211,10 @@ def _run_async(coro):
 # Tool Discovery  (importing each module triggers its registry.register calls)
 # =============================================================================
 
-discover_builtin_tools()
+from hermes_cli.bootstrap_policy import is_isolated_oneshot as _bootstrap_isolated
+
+if not _bootstrap_isolated():
+    discover_builtin_tools()
 
 # MCP tool discovery (external MCP servers from config) used to run here as
 # a module-level side effect.  It was removed because discover_mcp_tools()

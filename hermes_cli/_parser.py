@@ -37,6 +37,27 @@ def _inherited_flag(parser, *args, **kwargs):
     return action
 
 
+ISOLATED_REQUIRES_ONESHOT_ERROR = (
+    "hermes: --isolated requires -z/--oneshot. Isolated mode is a one-shot-only "
+    "runtime (no session, no memory, no tools); there is no interactive form of "
+    "it. Re-run as: hermes -z \"<prompt>\" --isolated"
+)
+
+
+def isolated_oneshot_active(args) -> bool:
+    """Return whether this is an explicitly requested valid isolated one-shot."""
+    return bool(
+        getattr(args, "isolated_oneshot", False) and getattr(args, "oneshot", None)
+    )
+
+
+def validate_isolated_oneshot(args) -> str | None:
+    """Fail closed when isolation is requested outside one-shot mode."""
+    if getattr(args, "isolated_oneshot", False) and not getattr(args, "oneshot", None):
+        return ISOLATED_REQUIRES_ONESHOT_ERROR
+    return None
+
+
 _EPILOGUE = """
 Examples:
     hermes                        Start interactive chat
@@ -124,6 +145,22 @@ def build_top_level_parser():
             "The report is written even when the run fails, so pipelines "
             "can always account for spend. No effect outside -z/--oneshot."
         ),
+    )
+    parser.add_argument(
+        "--isolated",
+        dest="isolated_oneshot",
+        action="store_true",
+        default=False,
+        help=(
+            "One-shot mode only: disable sessions, memory, context, tools, MCP, "
+            "delegation, fallback and retries, and permit one provider attempt."
+        ),
+    )
+    parser.add_argument(
+        "--show-response-metadata",
+        action="store_true",
+        default=False,
+        help="With isolated one-shot, print safe response identifiers to stderr.",
     )
     # --model / --provider are accepted at the top level so they can pair
     # with -z without needing the `chat` subcommand.  If neither -z nor a
