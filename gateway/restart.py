@@ -39,8 +39,23 @@ def is_gateway_supervisor_process(
 ) -> bool:
     """Return whether this gateway process is owned by a supervisor."""
     env = os.environ if environ is None else environ
-    if env.get("INVOCATION_ID"):
-        return True
+    # ⛔ INVOCATION_ID 不是充分条件 (2026-08-14 实锤回归):
+    #    GNOME/ptyxis 桌面会话的每个进程都带 INVOCATION_ID (gnome-session /
+    #    ptyxis-spawn-*.scope 都是 systemd 单元), 导致终端里跑的 CLI 会话被
+    #    误判为 "gateway supervisor" → spawn_local 走 systemd scope 路径
+    #    (start_new_session=False) → bash -lic 继承用户终端的进程组/会话/tty
+    #    → 交互式 bash 初始化 job control 抢终端前台 (tcsetpgrp) → 用户 shell
+    #    的其他 hermes job 全部被 SIGTSTP。v2026.8.3 #70716 引入。
+    # ✅ 精确判定: 自己的 systemd cgroup 单元名是否就是 hermes-gateway.service
+    #    (真正的 gateway 一定在该单元内; CLI/桌面会话在 ptyxis-spawn-*.scope
+    #    或其它单元, 返回 False → 走旧的 start_new_session=True 安全路径)
+    try:
+        with open("/proc/self/cgroup") as _f:
+            _unit = _f.read().rstrip().split("/")[-1]
+        if "hermes-gateway" in _unit:
+            return True
+    except Exception:
+        pass
     if env.get("HERMES_S6_SUPERVISED_CHILD"):
         return True
     xpc_service = env.get("XPC_SERVICE_NAME", "")
