@@ -16149,6 +16149,30 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Check for commands
         command = event.get_command()
 
+        # Matrix-only, explicit project selection. Matrix adapters normalize
+        # only registered bang commands, so this unregistered command arrives
+        # here as ``!project`` rather than ``/project``.
+        _matrix_project_args = None
+        if source.platform == Platform.MATRIX:
+            _matrix_text = (event.text or "").lstrip()
+            if command == "project":
+                _matrix_project_args = event.get_command_args()
+            elif _matrix_text.startswith("!"):
+                _matrix_parts = _matrix_text[1:].split(maxsplit=1)
+                if _matrix_parts and _matrix_parts[0].lower() == "project":
+                    _matrix_project_args = _matrix_parts[1] if len(_matrix_parts) > 1 else ""
+        if _matrix_project_args is not None:
+            arg = _matrix_project_args.strip().lower()
+            if arg == "newmoon":
+                from gateway.project_router import select_project
+                session_key = self._session_key_for_source(source)
+                try:
+                    path = select_project(self._session_db._db, session_key, arg)
+                except ValueError as exc:
+                    return f"Project selection failed: {exc}"
+                self._evict_cached_agent(session_key)
+                return f"Active project: newmoon ({path})"
+
         from hermes_cli.commands import (
             GATEWAY_KNOWN_COMMANDS,
             is_gateway_known_command,
@@ -23028,6 +23052,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _adapters = getattr(self, "adapters", None) or {}
         _adapter = _adapters.get(context.source.platform)
         _async_delivery = getattr(_adapter, "supports_async_delivery", True)
+        _project_cwd = ""
+        _session_db = getattr(self, "_session_db", None)
+        if context.source.platform == Platform.MATRIX and _session_db is not None:
+            from gateway.project_router import active_project_path
+
+            _project_path = active_project_path(_session_db._db, context.session_key)
+            if _project_path is not None:
+                _project_cwd = str(_project_path)
         return set_session_vars(
             platform=context.source.platform.value,
             chat_id=context.source.chat_id,
@@ -23045,6 +23077,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             profile=getattr(context.source, "profile", "") or "",
             async_delivery=_async_delivery,
             cron_session="",
+            cwd=_project_cwd,
         )
 
     def _clear_session_env(self, tokens: list) -> None:
