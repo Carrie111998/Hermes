@@ -127,6 +127,7 @@ class TestDDGSProviderSearch:
             '<b>Example</b> &amp; result</a>'
             '<a class="result__snippet">A <b>useful</b> description.</a></div>'
             '<a class="result__a" href="https://ignored.example">Ignored</a>'
+            '<a class="result__snippet">Discarded description.</a>'
         )
 
         assert parser.results == [{

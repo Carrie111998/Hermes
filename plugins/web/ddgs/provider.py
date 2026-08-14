@@ -79,7 +79,14 @@ class _DDGHTMLParser(HTMLParser):
     def handle_starttag(self, tag: str, attrs: list[tuple[str, Optional[str]]]) -> None:
         attributes = dict(attrs)
         classes = set((attributes.get("class") or "").split())
-        if tag == "a" and "result__a" in classes and len(self.results) < self.limit:
+        if tag == "a" and "result__a" in classes:
+            if len(self.results) >= self.limit:
+                # A skipped result must also sever the previous result's
+                # snippet target; otherwise its snippet is appended there.
+                self._current = None
+                self._field = None
+                self._depth = 0
+                return
             href = attributes.get("href") or ""
             self._current = {
                 "title": "",
