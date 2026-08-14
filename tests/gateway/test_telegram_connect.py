@@ -6,6 +6,7 @@ background reconnection (#31049).
 """
 
 import sys
+from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
@@ -40,6 +41,19 @@ import plugins.platforms.telegram.adapter as telegram_mod  # noqa: E402
 from plugins.platforms.telegram.adapter import TelegramAdapter  # noqa: E402
 
 
+def test_lazy_install_rebinds_type_handler(monkeypatch):
+    """A same-process lazy install must replace every Any placeholder."""
+    import tools.lazy_deps
+
+    expected_type_handler = sys.modules["telegram.ext"].TypeHandler
+    monkeypatch.setattr(telegram_mod, "TELEGRAM_AVAILABLE", False)
+    monkeypatch.setattr(telegram_mod, "TypeHandler", Any)
+    monkeypatch.setattr(tools.lazy_deps, "ensure", lambda *_args, **_kwargs: True)
+
+    assert telegram_mod.check_telegram_requirements() is True
+    assert telegram_mod.TypeHandler is expected_type_handler
+
+
 class TestTelegramUnconfiguredNonRetryable:
     """Verify that missing dependency/token sets a non-retryable fatal error."""
 
@@ -53,4 +67,3 @@ class TestTelegramUnconfiguredNonRetryable:
         assert adapter.has_fatal_error is True
         assert adapter.fatal_error_retryable is False
         assert adapter.fatal_error_code == "missing_dependency"
-
