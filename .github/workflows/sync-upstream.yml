@@ -14,25 +14,28 @@ name: sync-upstream
 # So: merge into a branch, open a pull request, and let a human merge it. main
 # moves only on review. Nothing this workflow does is destructive on its own.
 #
-# WHY --allow-unrelated-histories IS REQUIRED
-# -------------------------------------------
-# Measured 2026-08-14: `git merge-tree upstream/main origin/main` fails with
-# "refusing to merge unrelated histories". The fork is a GitHub fork by
-# metadata (parent = NousResearch/hermes-agent) but its git lineage was
-# rewritten, so there is no merge base. Without the flag every run fails; with
-# it, git treats the trees as siblings and merges by content.
+# A CORRECTION, KEPT BECAUSE IT NEARLY SHIPPED
+# --------------------------------------------
+# The first version of this file passed --allow-unrelated-histories and claimed
+# the fork had no merge base with upstream. That was wrong. Every number behind
+# it came from /root/hermes-src, a SHALLOW clone with one commit of history,
+# where git cannot find a merge base and therefore reports "refusing to merge
+# unrelated histories", "20386 commits behind" and "121 files differ" - all
+# artifacts of the clone, none of them facts about this repo.
 #
-# WHAT THE FIRST RUN WILL LOOK LIKE
-# ---------------------------------
-# At install time the fork was behind by every upstream commit (no shared
-# ancestry to count against) with 121 files differing: 85 modified, 35 present
-# only upstream, and exactly ONE present only here — .github/CODEOWNERS. The
-# 85 are the fork being an older snapshot, not local customisation; sampled
-# diffs carry no QENEX-specific content. Expect a large first PR and review it
-# as a whole rather than merging blind.
+# Measured from a full clone (22,389 commits): merge base 4d6f4a6fe7 exists,
+# git merge-tree is clean with NO flag, and the real divergence is 16 ahead /
+# 5 behind over 19 files - exactly what GitHub's fork banner reports. Never
+# measure divergence in a shallow clone; check
+# `git rev-parse --is-shallow-repository` first.
 #
-# CODEOWNERS is the one thing a naive sync would delete. The verify step below
-# fails the run if it disappears, so that cannot happen silently.
+# WHAT THE FORK ACTUALLY OWNS
+# ---------------------------
+# Two files upstream does not have: .github/CODEOWNERS and this workflow. Of
+# the 16 commits ahead, 14 are prior "Merge branch NousResearch:main" syncs
+# carrying no unique content. The verify step below fails the run if either
+# owned file disappears - this one included, since it is what a future sync
+# would have to remove to disable the safety net.
 
 on:
   schedule:
@@ -84,12 +87,11 @@ jobs:
         run: |
           set -euo pipefail
           git checkout -B sync/upstream origin/main
-          # --no-ff so the PR always shows a reviewable merge commit, and
-          # --allow-unrelated-histories because this fork has no merge base
-          # (see the header). A conflict must STOP here: resolving it
+          # --no-ff so the PR always shows a reviewable merge commit.
+          # A conflict must STOP here: resolving it
           # automatically in favour of either side is how local work gets
           # thrown away without anyone reading the diff.
-          if ! git merge --no-ff --allow-unrelated-histories --no-edit upstream/main; then
+          if ! git merge --no-ff --no-edit upstream/main; then
             git merge --abort || true
             echo "CONFLICTED=1" >> "$GITHUB_ENV"
             exit 0
@@ -100,11 +102,11 @@ jobs:
         if: env.ALREADY_IN_SYNC != '1' && env.CONFLICTED != '1'
         run: |
           set -euo pipefail
-          # CODEOWNERS is the only file this fork has that upstream does not.
-          # If a merge ever removes it, that is the signature of the sync
-          # having become a reset, and the run must fail rather than push.
-          test -f .github/CODEOWNERS \
-            || { echo "::error::CODEOWNERS disappeared in the merge — refusing to proceed"; exit 1; }
+          # The two files this fork has that upstream does not. If a merge
+          # removes either, the sync has become a reset and the run must fail.
+          for owned in .github/CODEOWNERS .github/workflows/sync-upstream.yml; do
+            test -f "$owned" || { echo "::error::$owned disappeared - refusing to proceed"; exit 1; }
+          done
 
       - name: Open or update the sync PR
         if: env.ALREADY_IN_SYNC != '1' && env.CONFLICTED != '1'
@@ -117,7 +119,7 @@ jobs:
           else
             gh pr create --base main --head sync/upstream \
               --title "sync: merge upstream NousResearch/hermes-agent" \
-              --body "Automated upstream sync. Merged with --allow-unrelated-histories because this fork has no merge base with upstream. Review as a whole; the fork's only unique file is .github/CODEOWNERS and a step in this workflow fails the run if it disappears."
+              --body "Automated upstream sync. A plain merge of upstream/main into a branch off origin/main; main is never reset or force-pushed. The fork owns .github/CODEOWNERS and this workflow, and a verify step fails the run if a merge removes either."
           fi
 
       - name: Fail loudly on conflict
