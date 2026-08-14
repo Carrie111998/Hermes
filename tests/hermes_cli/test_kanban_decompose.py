@@ -252,6 +252,88 @@ def test_manual_decompose_of_escalated_triage_recovers_and_proceeds(kanban_home)
         assert any(e.kind == "triage_escalation_recovered" for e in events)
 
 
+def test_manual_decompose_failure_keeps_escalation(kanban_home):
+    """A FAILED manual decompose must not clear the escalation: the card
+    stays escalated and out of the auto-decompose feed, and the recovery
+    event is only written when an attempt actually succeeds (#81353)."""
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="needs capability")
+        _escalate_via_block_loop(conn, tid, kind="capability")
+        assert kb.is_block_loop_escalated(conn, tid) is True
+
+    # Manual decompose fails at the LLM call (API error).
+    patches = _patch_list_profiles(["orchestrator", "fallback"])
+    for p in patches:
+        p.start()
+    try:
+        with patch(
+            "hermes_cli.kanban_decompose._load_config",
+            return_value={"kanban": {"default_assignee": "fallback"}},
+        ), patch(
+            "agent.auxiliary_client.call_llm",
+            side_effect=RuntimeError("api down"),
+        ):
+            outcome = decomp.decompose_task(tid, author="me")
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert outcome.ok is False
+    with kb.connect_closing() as conn:
+        task = kb.get_task(conn, tid)
+        assert task.status == "triage"
+        assert task.title == "needs capability"  # spec must not be rewritten
+        # Escalation survives the failed attempt...
+        assert kb.is_block_loop_escalated(conn, tid) is True
+        assert tid not in decomp.list_triage_ids()
+        events = kb.list_events(conn, tid)
+        assert not any(e.kind == "triage_escalation_recovered" for e in events)
+    # ...and the auto-decomposer still refuses the card.
+    with patch("agent.auxiliary_client.call_llm") as call_llm:
+        outcome = decomp.decompose_task(tid, author=decomp.AUTO_DECOMPOSER_AUTHOR)
+        assert outcome.ok is False
+        call_llm.assert_not_called()
+
+
+def test_manual_decompose_fanout_recovers_on_success(kanban_home):
+    """The fanout=true success path also acknowledges the escalation
+    (audited) after the children are created."""
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="needs capability")
+        _escalate_via_block_loop(conn, tid, kind="capability")
+        assert kb.is_block_loop_escalated(conn, tid) is True
+
+    llm_payload = jsonlib.dumps({
+        "fanout": True,
+        "rationale": "operator split",
+        "tasks": [
+            {"title": "research", "body": "look it up", "assignee": "researcher", "parents": []},
+            {"title": "build", "body": "code it", "assignee": "engineer", "parents": [0]},
+        ],
+    })
+    patches = _patch_list_profiles(["orchestrator", "researcher", "engineer"])
+    for p in patches:
+        p.start()
+    try:
+        with _patch_aux_client(llm_payload), _patch_extra_body():
+            outcome = decomp.decompose_task(tid, author="me")
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert outcome.ok, outcome.reason
+    assert outcome.fanout is True
+    assert outcome.child_ids and len(outcome.child_ids) == 2
+    with kb.connect_closing() as conn:
+        root = kb.get_task(conn, tid)
+        assert root.status == "todo"
+        assert root.block_kind is None
+        assert root.block_recurrences == 0
+        assert kb.is_block_loop_escalated(conn, tid) is False
+        events = kb.list_events(conn, tid)
+        assert any(e.kind == "triage_escalation_recovered" for e in events)
+
+
 def test_decompose_returns_false_when_task_not_triage(kanban_home):
     with kb.connect() as conn:
         tid = kb.create_task(conn, title="x")  # ready, not triage

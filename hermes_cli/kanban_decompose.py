@@ -287,6 +287,7 @@ def decompose_task(
     configured, API error, malformed response, decomposer returned
     fanout=true with empty task list) — those surface via ``ok=False``.
     """
+    recover_after = False
     with kb.connect_closing() as conn:
         task = kb.get_task(conn, task_id)
         if task is None:
@@ -307,9 +308,11 @@ def decompose_task(
                     "waiting on human input — refusing to re-specify",
                 )
             # Explicit manual decomposition IS the operator's human-in-the-loop
-            # decision: acknowledge the escalation (audited) and proceed, so
-            # `hermes kanban decompose <id>` stays seamless (#79728).
-            kb.recover_escalated_triage_task(conn, task_id)
+            # decision, but the escalation is acknowledged (audited) only when
+            # the decomposition actually succeeds. A failed attempt must leave
+            # the card escalated and out of the auto-decompose feed, otherwise
+            # the next dispatcher tick would re-specify it (#81353 review).
+            recover_after = True
 
     cfg = _load_config()
     orchestrator = _resolve_orchestrator_profile(cfg)
@@ -395,6 +398,9 @@ def decompose_task(
             return DecomposeOutcome(
                 task_id, False, "task moved out of triage before promotion",
             )
+        if recover_after:
+            with kb.connect_closing() as conn:
+                kb.recover_escalated_triage_task(conn, task_id)
         return DecomposeOutcome(
             task_id, True, "single task (no fanout)",
             fanout=False, new_title=title_val,
@@ -470,6 +476,9 @@ def decompose_task(
         return DecomposeOutcome(
             task_id, False, "task moved out of triage before decomposition",
         )
+    if recover_after:
+        with kb.connect_closing() as conn:
+            kb.recover_escalated_triage_task(conn, task_id)
 
     return DecomposeOutcome(
         task_id, True, f"decomposed into {len(child_ids)} children",

@@ -6798,7 +6798,7 @@ def is_block_loop_escalated(conn: sqlite3.Connection, task_id: str) -> bool:
 
 
 def recover_escalated_triage_task(conn: sqlite3.Connection, task_id: str) -> bool:
-    """Audited operator acknowledgment for a block-loop-escalated triage card.
+    """Audited operator acknowledgment for a block-loop-escalated card.
 
     Clears ``block_kind`` and resets ``block_recurrences`` so the card is
     auto-decomposable again with a fresh loop budget, and appends a
@@ -6806,13 +6806,17 @@ def recover_escalated_triage_task(conn: sqlite3.Connection, task_id: str) -> boo
     recurrence reset is essential: without it, one re-block would instantly
     re-hit ``BLOCK_RECURRENCE_LIMIT`` and re-escalate the card.
 
-    Returns False when the task is not an escalated triage card.
+    Deliberately not restricted to ``status='triage'``: a successful manual
+    ``decompose_task`` transitions the card out of triage (todo/ready)
+    BEFORE calling this to record the acknowledgment, and the escalation
+    event predicate is the semantic gate in every path. Returns False when
+    the card is not escalated (or was already recovered).
     """
     with write_txn(conn):
         cur = conn.execute(
             "UPDATE tasks "
             "SET block_kind = NULL, block_recurrences = 0 "
-            "WHERE id = ? AND status = 'triage' AND " + _BLOCK_LOOP_ESCALATED_SQL,
+            "WHERE id = ? AND " + _BLOCK_LOOP_ESCALATED_SQL,
             (task_id,),
         )
         if cur.rowcount != 1:
