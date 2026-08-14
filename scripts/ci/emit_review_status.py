@@ -99,7 +99,7 @@ def build_results(
                 "summary": (
                     "This PR changes CI-sensitive files (eslint config, "
                     "workflow YAMLs, or composite actions). These influence "
-                    "what the js-autofix job executes and pushes to main."
+                    "what the autofix job executes and pushes to main."
                 ),
                 "how_to_fix": (
                     "Add the `ci-reviewed` label after verifying:\n"

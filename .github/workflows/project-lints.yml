@@ -1,0 +1,50 @@
+name: Project lints
+
+# Project-wide lints registered under scripts/lints/ — see the registry
+# docstring (scripts/lints/__init__.py) for the severity/autofix policy.
+#
+# Deliberately NOT gated by the change classifier, and deliberately NOT a
+# job inside lint.yml: ci.yml only calls lint.yml when python files
+# changed, and lints' inputs span the whole tree (.npmrc, package.json,
+# workflows, ...). Every registered lint is a static file check measured
+# in seconds; always-on is what closes the classifier-gap class where a
+# lint's input files don't match the lane that runs it.
+#
+# Blocking unfixable findings exit 1 and block merge via all-checks-pass;
+# fixable/advisory findings surface as warnings in the PR review comment
+# via the review-status artifact. Autofixable findings are resolved by
+# the autofix bot on push to main.
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  project-lints:
+    name: Project lints (blocking)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      # No uv / python setup: the runner and all registered lints are
+      # stdlib-only by design (see the registry docstring), so the
+      # runner-image python3 suffices.
+      - name: Run lints
+        run: |
+          python3 scripts/lints/run.py --format github \
+            --review-status-out review-status.json
+
+      - name: Upload review status
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: review-status-project-lints
+          path: review-status.json
+          retention-days: 1
+          overwrite: true
+          if-no-files-found: ignore

@@ -1,64 +1,73 @@
 name: auto-fix lint issues & formatting
 
-# On push to main (or manual trigger), run `npm run fix` on each workspace
-# package and apply any changes via a PR.
+# On push to main (or manual trigger), run every registered auto-fixer —
+# `npm run fix` on each workspace package plus the project lint fixers
+# (`scripts/lints/run.py --fix`) — and apply any changes via a PR.
 #
-# Fixable lint issues (import sorting, unused imports, curly braces, etc.) are
-# auto-corrected on merge so PRs aren't blocked by them. The PR-time eslint
-# check in typecheck.yml fails only when un-fixable errors remain.
+# Fixable lint issues (import sorting, unused imports, curly braces, stale
+# .npmrc entries, etc.) are auto-corrected on merge so PRs aren't blocked by
+# them. PR-time checks fail only when un-fixable errors remain — that split
+# is the project-wide severity policy (see scripts/lints/__init__.py).
+#
+# No schedule trigger, on purpose: merges to main are frequent enough to be
+# the clock. No paths filter either — lint inputs span the whole tree
+# (.npmrc, lockfiles, workflows, ...), the run is cheap, and it exits with
+# an empty patch when there is nothing to fix.
 #
 # NOTE: App token pushes DO trigger further workflow runs (unlike
-# secrets.GITHUB_TOKEN). The concurrency group (ts-autofix-${{ github.ref }})
+# secrets.GITHUB_TOKEN). The concurrency group (autofix-${{ github.ref }})
 # with cancel-in-progress: true prevents an infinite loop — a re-triggered
 # run cancels the in-flight one, and since the second run finds no new fixes
 # (the first run already applied them), it exits with an empty patch.
 #
 # ── Security model: two-job split ───────────────────────────────────────────
 #
-# The eslint process executes repo code (eslint.config.mjs, package.json
-# scripts, installed plugins). To prevent a malicious PR from getting arbitrary
-# code execution on a runner with push access, the work is split:
+# The fixers execute repo code (eslint.config.mjs, package.json scripts,
+# installed plugins, scripts/lints/*.py). To prevent a malicious PR from
+# getting arbitrary code execution on a runner with push access, the work is
+# split:
 #
 #   1. generate-patch (unprivileged, contents: read only)
-#      Checks out, installs deps, runs eslint --fix, produces a .patch artifact.
+#      Checks out, installs deps, runs the fixers, produces a .patch artifact.
 #      Worst case: malicious code runs here on an ephemeral runner with zero
 #      push permissions.
 #
 #   2. apply-patch (privileged, contents: write + pull-requests: write)
 #      Checks out, downloads the patch artifact, applies it, pushes to the
-#      bot/js-autofix branch, creates/updates a PR, and enables auto-merge.
+#      bot/autofix branch, creates/updates a PR, and enables auto-merge.
 #      This job never runs npm, never installs anything, never executes any
 #      repo code. The only input it trusts is the patch artifact.
 #      Skipped entirely when generate-patch reports no fixes (has-fixes != true).
 #      The PR auto-merges (squash) once CI passes. If CI fails or main moves,
 #      the PR is auto-closed and the branch deleted — the next run re-applies
 #      on the current state.
+#
+# ── Patch guard ─────────────────────────────────────────────────────────────
+#
+# The patch is rejected unless every touched file matches an allowed
+# pattern: the JS/TS/JSON sources `npm run fix` owns, plus each lint's
+# declared fix_touches globs (queried via `run.py --print-fix-globs`).
+# Per-lint attribution — a fixer writing a file that only ANOTHER lint's
+# globs allow — is enforced inside run.py --fix itself, which exits
+# non-zero and fails this job before the patch is produced.
 
 on:
   push:
     branches: [main]
-    paths:
-      - '**/*.js'
-      - '**/*.cjs'
-      - '**/*.mjs'
-      - '**/*.ts'
-      - '**/*.tsx'
-      - 'package.json'
-      - 'package-lock.json'
   workflow_dispatch:
 
 permissions:
   contents: read # default; apply-patch job overrides to write
 
 concurrency:
-  group: ts-autofix-${{ github.ref }}
+  group: autofix-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
   generate-patch:
-    name: Generate eslint --fix patch
+    name: Generate auto-fix patch
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
     outputs:
       has-fixes: ${{ steps.produce-patch.outputs.has-fixes }}
     # No permissions override → inherits workflow-level contents: read.
@@ -81,10 +90,28 @@ jobs:
 
       - name: npm run fix in all workspaces
         # continue-on-error: if un-fixable errors exist on main, we still want
-        # to commit whatever fixes were applied. The PR-time check in
-        # typecheck.yml is what blocks un-fixable errors from landing.
+        # to commit whatever fixes were applied. The PR-time eslint check is
+        # what blocks un-fixable errors from landing.
         continue-on-error: true
         run: npm run fix
+
+      - name: Install uv + ruff
+        uses: ./.github/actions/retry
+        with:
+          command: curl -LsSf https://astral.sh/uv/0.9.28/install.sh | sh && ~/.local/bin/uv tool install ruff
+
+      - name: ruff check --fix
+        # Same deal as npm run fix: apply what's fixable, let the PR-time
+        # ruff-blocking job be the gate for what isn't.
+        continue-on-error: true
+        run: ~/.local/bin/uv tool run ruff check --fix .
+
+      - name: Run project lint fixers
+        # NOT continue-on-error: a non-zero exit here means a fixer crashed
+        # or wrote outside its own declared fix_touches globs (per-lint
+        # attribution lives in run.py). Either way the diff is not
+        # trustworthy and must not become a patch.
+        run: python3 scripts/lints/run.py --fix
 
       - name: Produce patch
         id: produce-patch
@@ -106,28 +133,55 @@ jobs:
             echo "No fixes needed."
             echo "has-fixes=false" >> "$GITHUB_OUTPUT"
             # Empty patch signals "nothing to do" to apply-patch.
-            : > js-fix.patch
+            : > autofix.patch
           else
-            git diff -- . "${EXCLUDES[@]}" > js-fix.patch
+            git diff -- . "${EXCLUDES[@]}" > autofix.patch
             echo "has-fixes=true" >> "$GITHUB_OUTPUT"
-            echo "Patch size: $(wc -c < js-fix.patch) bytes"
+            echo "Patch size: $(wc -c < autofix.patch) bytes"
 
-            # Reject patches that touch anything outside JS/TS/JSON sources.
-            # `npm run fix` should only ever modify those; anything else means
-            # eslint/prettier or a plugin went rogue and we refuse to ship it.
-            BAD=$(git diff --name-only -- . "${EXCLUDES[@]}" | grep -vE '\.(js|cjs|mjs|ts|tsx|json)$' || true)
-            if [ -n "$BAD" ]; then
-              echo "::error::Refusing to upload patch — touches disallowed files:"
-              echo "$BAD"
-              exit 1
-            fi
+            # Reject patches that touch anything outside the allowed set:
+            # JS/TS/JSON sources (npm run fix), .py (ruff check --fix), plus
+            # the union of registered lint fix_touches globs. Anything else
+            # means a fixer or plugin went rogue and we refuse to ship it.
+            # (Per-lint glob attribution already ran inside run.py --fix
+            # above; the EXCLUDES pathspec keeps review-gated files out of
+            # the patch entirely.)
+            git diff --name-only -- . "${EXCLUDES[@]}" | python3 -c '
+          import fnmatch, os, subprocess, sys
+
+          js_exts = (".js", ".cjs", ".mjs", ".ts", ".tsx", ".json")
+          # .py: ruff check --fix output. The .json allowance is for
+          # sources npm run fix formats — NOT lockfiles. A bot-authored,
+          # auto-merged lockfile rewrite is exactly the shape of a
+          # supply-chain attack, so lockfiles fall through to the default
+          # rejection like any other unallowed path.
+          fixer_exts = js_exts + (".py",)
+          not_js_sources = {"package-lock.json", "npm-shrinkwrap.json"}
+          lint_globs = subprocess.run(
+              [sys.executable, "scripts/lints/run.py", "--print-fix-globs"],
+              capture_output=True, text=True, encoding="utf-8", check=True,
+          ).stdout.split()
+
+          bad = []
+          for path in (p.strip() for p in sys.stdin if p.strip()):
+              if path.endswith(fixer_exts) and os.path.basename(path) not in not_js_sources:
+                  continue
+              if any(fnmatch.fnmatch(path, g) for g in lint_globs):
+                  continue
+              bad.append(path)
+
+          if bad:
+              print("::error::Refusing to upload patch — touches disallowed files:")
+              print("\n".join(bad))
+              sys.exit(1)
+          '
           fi
 
       - name: Upload patch artifact
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: js-fix-patch
-          path: js-fix.patch
+          name: autofix-patch
+          path: autofix.patch
           retention-days: 1
           include-hidden-files: true
 
@@ -141,7 +195,7 @@ jobs:
     timeout-minutes: 15
     environment: trusted-automation
     permissions:
-      contents: write # needed to push to bot/js-autofix
+      contents: write # needed to push to bot/autofix
       pull-requests: write # needed for PR creation + auto-merge
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -156,39 +210,39 @@ jobs:
       - name: Download patch
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          name: js-fix-patch
+          name: autofix-patch
           # ${{ runner.temp }} expands in with: params (shell-style $VAR does not).
-          # download-artifact's path is a *directory* — the artifact's js-fix.patch
-          # file lands inside it, so $RUNNER_TEMP/js-fix.patch resolves correctly
+          # download-artifact's path is a *directory* — the artifact's autofix.patch
+          # file lands inside it, so $RUNNER_TEMP/autofix.patch resolves correctly
           # in the run step below.
           path: ${{ runner.temp }}
 
       - name: Apply patch and push to bot branch
         env:
-          BOT_BRANCH: bot/js-autofix
+          BOT_BRANCH: bot/autofix
         run: |
           set -euo pipefail
 
           # Empty patch = nothing to do.
-          if [ ! -s "$RUNNER_TEMP/js-fix.patch" ]; then
+          if [ ! -s "$RUNNER_TEMP/autofix.patch" ]; then
             echo "Patch is empty. No fixes to apply."
             exit 0
           fi
 
           # Apply the patch produced by the unprivileged job.
-          git apply --check "$RUNNER_TEMP/js-fix.patch" || {
+          git apply --check "$RUNNER_TEMP/autofix.patch" || {
             echo "::error::Patch does not apply cleanly. Branch may have moved."
             exit 1
           }
-          git apply "$RUNNER_TEMP/js-fix.patch"
+          git apply "$RUNNER_TEMP/autofix.patch"
 
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add -A
-          git commit -m "fmt(js): \`npm run fix\` on merge"
+          git commit -m "fix: auto-fix lints & formatting on merge"
 
           # Push to the dedicated bot branch. Force-push is safe here:
-          # bot/js-autofix is a bot-only branch that gets rewritten each run.
+          # bot/autofix is a bot-only branch that gets rewritten each run.
           # If the branch was deleted after a previous PR merge, this
           # recreates it.
           git push --force origin HEAD:"$BOT_BRANCH"
@@ -196,7 +250,7 @@ jobs:
       - name: Create/update PR and enable auto-merge
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
-          BOT_BRANCH: bot/js-autofix
+          BOT_BRANCH: bot/autofix
         run: |
           set -euo pipefail
 
@@ -208,8 +262,8 @@ jobs:
             # (https://github.com/<org>/<repo>/pull/<number>).
             PR_URL=$(gh pr create \
               --head "$BOT_BRANCH" --base main \
-              --title 'fmt(js): `npm run fix` auto-fix' \
-              --body 'Auto-generated by the `auto-fix lint issues & formatting` workflow. Auto-merges (squash) once CI passes. If CI fails or `main` moves, the PR is auto-closed and the branch deleted — the next run re-applies on the current state.')
+              --title 'fix: auto-fix lints & formatting' \
+              --body 'Auto-generated by the `auto-fix lint issues & formatting` workflow (`npm run fix` + `scripts/lints/run.py --fix`). Auto-merges (squash) once CI passes. If CI fails or `main` moves, the PR is auto-closed and the branch deleted — the next run re-applies on the current state.')
             PR_NUM=$(echo "$PR_URL" | grep -oE '[0-9]+$')
           fi
 
@@ -223,7 +277,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          PR_NUM=$(gh pr list --head bot/js-autofix --state open --json number --jq '.[0].number' 2>/dev/null || true)
+          PR_NUM=$(gh pr list --head bot/autofix --state open --json number --jq '.[0].number' 2>/dev/null || true)
           if [ -z "$PR_NUM" ]; then
             echo "No open PR. Nothing to wait for."
             exit 0

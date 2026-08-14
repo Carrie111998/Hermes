@@ -234,20 +234,11 @@ def _lazy_deps_pinned_specs():
     return specs
 
 
-def test_pyproject_pins_are_internally_consistent():
-    """No package may be exact-pinned to two different versions in pyproject.
-
-    A package legitimately appearing in several extras (e.g. aiohttp in
-    messaging/slack/homeassistant/sms) must use the SAME version everywhere.
-    """
-    pins = _pins_from_specs(_pyproject_pinned_specs())
-    conflicts = {name: sorted(v) for name, v in pins.items() if len(v) > 1}
-    assert not conflicts, (
-        "pyproject.toml exact-pins the same package to different versions "
-        "across [project.dependencies] / extras: " + str(conflicts)
-    )
-
-
+# The "no package exact-pinned to two different versions across pyproject
+# sections" invariant migrated to scripts/lints/pyproject_dep_bounds.py
+# (always-on lints job). The lazy_deps consistency tests below stay here:
+# they parse tools/lazy_deps.py and the coverage contract is coupled to
+# product code layout.
 
 
 def _lazy_deps_by_feature():

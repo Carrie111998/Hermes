@@ -152,10 +152,13 @@ jobs:
     if: needs.detect.outputs.uv_lock == 'true'
     uses: ./.github/workflows/uv-lockfile-check.yml
 
-  infographic-check:
-    name: Check no committed infographics
+  project-lints:
+    name: Project lints
     needs: detect
-    uses: ./.github/workflows/infographic-check.yml
+    # Ungated on purpose — lint inputs span the whole tree (.npmrc,
+    # package.json, workflows, python, ...), so no classifier lane can
+    # soundly gate them. The job is static file checks, seconds cheap.
+    uses: ./.github/workflows/project-lints.yml
 
   lockfile-diff:
     name: package-lock.json diff
@@ -218,6 +221,7 @@ jobs:
       - history-check
       - contributor-check
       - uv-lockfile
+      - project-lints
       - lockfile-diff
       - docker-lint
       - supply-chain

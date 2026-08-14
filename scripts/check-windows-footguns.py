@@ -110,6 +110,7 @@ EXCLUDED_SUFFIXES = {
 # patterns it detects — and the CONTRIBUTING docs that list them).
 EXCLUDED_FILES = {
     "scripts/check-windows-footguns.py",
+    "scripts/lints/windows_footguns.py",  # registry wrapper — quotes the patterns
     "CONTRIBUTING.md",
 }
 
