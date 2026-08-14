@@ -76,8 +76,30 @@ def _fts5_safe_query(text: str) -> str:
     operator, at the cost of losing FTS5's own phrase/prefix operators in
     user-supplied queries (an acceptable tradeoff — those operators were
     never intentionally exposed to callers anyway).
+
+    Stopwords are dropped (Aug 14 2026): the OR of every token including
+    "what", "and", "am", "I" barely filters and lets bm25 rank carry all
+    discrimination, which buried gold chunks at rank 60-470 on bench
+    queries. Dropping them keeps the MATCH set tighter and the ranks
+    meaningful. Token count floor: a query reduced to zero tokens returns
+    empty (caller treats as no-match), and a query with 1-2 tokens still
+    works as a plain OR of those.
     """
+    STOPWORDS = {
+        "the", "and", "are", "for", "you", "your", "that", "this", "with",
+        "what", "how", "why", "does", "did", "was", "were", "have", "has",
+        "had", "not", "but", "can", "from", "they", "them", "will", "would",
+        "could", "should", "there", "their", "about", "into", "over", "after",
+        "before", "between", "out", "off", "all", "any", "who", "whom",
+        "whose", "which", "when", "where", "am", "is", "be", "been", "being",
+        "to", "of", "in", "on", "at", "by", "it", "its", "i", "a", "an", "or",
+    }
     tokens = re.findall(r"[A-Za-z0-9]+", text)
+    filtered = [t for t in tokens if t.lower() not in STOPWORDS]
+    # Degenerate-query guard: if stopword filtering empties the query
+    # (e.g. "how are you"), fall back to the unfiltered tokens rather than
+    # returning no match at all — recall("how are you") should still work.
+    tokens = filtered if filtered else tokens
     if not tokens:
         return ""
     return " OR ".join(f'"{t}"' for t in tokens)
@@ -426,6 +448,7 @@ class MemoryIndex:
         ).fetchall()
 
         results = [_row_to_dict(r, self.conn) for r in obs_rows]
+        wiki_dicts = []
         for r in wiki_rows:
             d = {
                 "id": r[0], "profile": r[1], "type": r[2], "epistemic": r[3],
@@ -434,9 +457,24 @@ class MemoryIndex:
                 "evidence": r[10], "created_at": r[11], "last_confirmed": r[12],
                 "last_retrieved": r[13], "source": r[14], "path": r[15],
             }
-            results.append(d)
+            wiki_dicts.append(d)
 
-        return results[:limit]
+        # Fair-share interleave (fix Aug 14 2026): previously observations were
+        # appended first and results[:limit] truncated, so wiki rows were
+        # silently discarded whenever observations saturated the limit
+        # (verified: wiki FTS survivors = 0 on 20/20 bench queries). Both
+        # sources now get comparable RRF rank footing and neither can starve.
+        merged: List[Dict[str, Any]] = []
+        oi, wi = 0, 0
+        while len(merged) < limit and (oi < len(results) or wi < len(wiki_dicts)):
+            if oi < len(results):
+                merged.append(results[oi])
+                oi += 1
+            if len(merged) < limit and wi < len(wiki_dicts):
+                merged.append(wiki_dicts[wi])
+                wi += 1
+
+        return merged
 
     def search_hybrid(
         self, query: str, query_embedding: Optional[List[float]], profile: str = "agent:main", k: int = 6
@@ -447,12 +485,19 @@ class MemoryIndex:
         Recency: recent observations get a weighted boost via exponential decay
         (half-life from config, default 7 days/168h, 15% weight).
         """
+        # Candidate pool (Aug 14 2026): k*3 was starving deep golds — FTS gold
+        # chunks measured at rank 13-474 on bench queries were never fetched at
+        # all, and the wiki-vector path already uncapped for the same reason
+        # (see _vector_search comment). Grid-tested Aug 14: pool 40/60/100/300
+        # all score recall 0.641 (vs 0.558 at k*3); 60 chosen as headroom
+        # without paying for 300-candidate RRF every call.
+        pool = max(k * 3, 60)
         if query_embedding is None:
-            return self.search_fts(query, profile, limit=k * 3)[:k]
+            return self.search_fts(query, profile, limit=pool)[:k]
 
         # Vector search — cosine similarity via dot product on normalized vectors
-        vec_results = self._vector_search(query_embedding, profile, limit=k * 3)
-        fts_results = self.search_fts(query, profile, limit=k * 3)
+        vec_results = self._vector_search(query_embedding, profile, limit=pool)
+        fts_results = self.search_fts(query, profile, limit=pool)
 
         # RRF: score = 1/(rank + 60) per result set, sum across both
         scores: Dict[str, float] = {}
