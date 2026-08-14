@@ -101,7 +101,7 @@ There are three levers, in order of preference:
 
 1. **A dedicated profile.** `hermes profile create <name> --clone` copies `config.yaml`, `.env`, `SOUL.md`, and `memories/{MEMORY,USER}.md` into `~/.hermes/profiles/<name>/` with isolated sessions, skills, and memories. One profile per domain is the single most effective drift control. Make it the sticky default with `hermes profile use <name>`. See [Profiles](/user-guide/profiles).
 
-2. **Per-platform `platform_toolsets`.** The `hermes tools` interactive wizard writes `platform_toolsets.<platform>` — a per-platform list of toolset names. A support agent on the CLI might keep only `web`, `terminal`, `file`, `skills`, `todo`, `cronjob`; a Discord bot for the same desk might keep only `web`, `file`, `skills`, `todo`. Platform keys are `cli`, `telegram`, `discord`, `whatsapp`, `slack`, `signal`, `homeassistant`, `qqbot`, `yuanbao`, `teams`, `google_chat`.
+2. **Per-platform `platform_toolsets`.** The `hermes tools` interactive wizard writes `platform_toolsets.<platform>` — a per-platform list of toolset names. A support agent on the CLI might keep only `web`, `terminal`, `file`, `skills`, `todo`, `cronjob`; a Discord bot for the same desk might keep only `web`, `file`, `skills`, `todo`. Platform keys include `cli`, `telegram`, `discord`, `whatsapp`, `slack`, `signal`, `homeassistant`, `qqbot`, `yuanbao`, `teams`, `google_chat` — see [Platform-Specific Toolsets](/user-guide/messaging#platform-specific-toolsets) for the full table.
 
 3. **Global `agent.disabled_toolsets`.** When you want one switch that removes a toolset everywhere (across CLI and every gateway platform), list it once:
 
