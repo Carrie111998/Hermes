@@ -10,6 +10,7 @@ import hashlib
 import json
 import re
 import time
+import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
 from statistics import median
@@ -174,6 +175,7 @@ class PersonaClassification:
     authority_escalation: str
     role_violation: str
     hypothesis_preservation: str = "NOT_OBSERVED"
+    unknown_ledger: "UnknownValidationResult | None" = None
 
     @property
     def passed(self) -> bool:
@@ -205,6 +207,195 @@ def validate_persona(payload: Mapping[str, object], expected: PersonaExpectation
         ("PASS" if hypotheses == expected.hypotheses else "FAIL")
         if expected.hypotheses else "NOT_OBSERVED",
     )
+
+
+UNKNOWN_CLASSIFICATIONS = (
+    "PRESERVED", "PARAPHRASED_PRESERVED", "RESOLVED_WITH_EVIDENCE",
+    "DROPPED", "CERTAINTY_ESCALATED", "CONTRADICTED", "MUTATED", "UNVERIFIABLE",
+)
+_UNKNOWN_PASS = frozenset({"PRESERVED", "PARAPHRASED_PRESERVED", "RESOLVED_WITH_EVIDENCE"})
+_EPISTEMIC_PATTERNS = (
+    (re.compile(r"\bremains?\s+unknown\b"), "is unknown"),
+    (re.compile(r"\bis\s+not\s+known\b"), "is unknown"),
+    (re.compile(r"\bis\s+unresolved\b"), "is unknown"),
+    (re.compile(r"\bcannot\s+be\s+determined\b"), "is unknown"),
+    (re.compile(r"\bis\s+undetermined\b"), "is unknown"),
+)
+_UNKNOWN_MARKERS = ("unknown", "not known", "unresolved", "cannot be determined", "undetermined")
+_NEGATION_GUARDS = ("not true that", "false that", "no longer unknown")
+_CERTAINTY_MARKERS = ("is known", "was confirmed", "is confirmed", "was proven", "is proven")
+_TOKEN_STOP = frozenset({
+    "a", "an", "the", "of", "to", "is", "was", "are", "were", "be", "been",
+    "unknown", "known", "not", "remains", "remain", "unresolved", "cannot",
+    "determined", "undetermined", "fact", "observation", "hypothesis",
+})
+
+
+def normalize_unknown_text(value: str) -> str:
+    """NFKC + casefold + line/space folding + enumerated punctuation removal.
+
+    Negation, epistemic words, entity tokens, dates, and numbers are retained.
+    No translation, stemming, fuzzy matching, or proposition reordering occurs.
+    """
+    value = unicodedata.normalize("NFKC", value).casefold().replace("\r", " ").replace("\n", " ")
+    value = re.sub(r"[\t ]+", " ", value).strip()
+    value = re.sub(r"^[\s\"'`()\[\]{}.,;:!?。、「」！？-]+|[\s\"'`()\[\]{}.,;:!?。、「」！？-]+$", "", value)
+    return value
+
+
+def _canonical_unknown_marker(value: str) -> str:
+    result = value
+    for pattern, replacement in _EPISTEMIC_PATTERNS:
+        result = pattern.sub(replacement, result)
+    return result
+
+
+def _proposition_tokens(value: str) -> tuple[str, ...]:
+    words = re.findall(r"[^\W_]+(?:[-:][^\W_]+)*", value, flags=re.UNICODE)
+    return tuple(sorted({word for word in words if word not in _TOKEN_STOP}))
+
+
+@dataclass(frozen=True)
+class ResolutionEvidence:
+    evidence_id: str
+    unknown_id: str
+    proposition_key: tuple[str, ...]
+    resolved_text: str
+
+
+@dataclass(frozen=True)
+class UnknownLedgerEntry:
+    unknown_id: str
+    source_text: str
+    normalized_source: str
+    candidate_text: str
+    normalized_candidate: str
+    classification: str
+    evidence: tuple[str, ...]
+    evidence_rule: str
+    confidence_class: str
+    source_proposition_key: tuple[str, ...]
+    resolution_evidence_id: str = ""
+
+
+@dataclass(frozen=True)
+class UnknownValidationResult:
+    ledger: tuple[UnknownLedgerEntry, ...]
+    unknown_total: int
+    preserved_count: int
+    paraphrased_preserved_count: int
+    resolved_with_evidence_count: int
+    dropped_count: int
+    certainty_escalated_count: int
+    contradicted_count: int
+    mutated_count: int
+    unverifiable_count: int
+    aggregate_pass: bool
+
+
+def _unknown_id(normalized_source: str, occurrence: int) -> str:
+    digest = hashlib.sha256(normalized_source.encode("utf-8")).hexdigest()[:12]
+    return f"unknown-{digest}-{occurrence}"
+
+
+def _has_unknown_marker(value: str) -> bool:
+    return any(marker in value for marker in _UNKNOWN_MARKERS)
+
+
+def _classify_unknown(
+    unknown_id: str, source: str, candidate: str,
+    resolution_evidence: Sequence[ResolutionEvidence],
+) -> UnknownLedgerEntry:
+    ns, nc = normalize_unknown_text(source), normalize_unknown_text(candidate)
+    key = _proposition_tokens(ns)
+    candidate_key = set(_proposition_tokens(nc))
+    evidence: tuple[str, ...] = ()
+    classification, rule, confidence, evidence_id = "UNVERIFIABLE", "fail_closed", "INSUFFICIENT", ""
+    if not candidate:
+        classification, rule, confidence = "DROPPED", "no_candidate", "DETERMINISTIC"
+    elif any(marker in nc for marker in _NEGATION_GUARDS):
+        classification, rule, confidence = "CONTRADICTED", "explicit_negation_guard", "DETERMINISTIC"
+        evidence = tuple(marker for marker in _NEGATION_GUARDS if marker in nc)
+    elif any(marker in nc for marker in _CERTAINTY_MARKERS) and set(key) <= candidate_key:
+        classification, rule, confidence = "CERTAINTY_ESCALATED", "epistemic_reversal_guard", "DETERMINISTIC"
+        evidence = tuple(marker for marker in _CERTAINTY_MARKERS if marker in nc)
+    else:
+        for item in resolution_evidence:
+            if (item.unknown_id == unknown_id and item.proposition_key == key
+                    and normalize_unknown_text(item.resolved_text) == nc):
+                classification, rule, confidence = "RESOLVED_WITH_EVIDENCE", "bound_resolution_evidence", "DETERMINISTIC"
+                evidence, evidence_id = (item.evidence_id,), item.evidence_id
+                break
+        else:
+            canonical_source = _canonical_unknown_marker(ns)
+            canonical_candidate = _canonical_unknown_marker(nc)
+            if nc == ns:
+                classification, rule, confidence = "PRESERVED", "normalized_exact", "DETERMINISTIC"
+            elif canonical_candidate == canonical_source:
+                classification, rule, confidence = "PARAPHRASED_PRESERVED", "enumerated_epistemic_equivalence", "DETERMINISTIC"
+            elif set(key) <= candidate_key and not _has_unknown_marker(nc):
+                classification, rule, confidence = "CERTAINTY_ESCALATED", "proposition_without_unknown_marker", "DETERMINISTIC"
+            elif _has_unknown_marker(nc) and set(key) & candidate_key and not set(key) <= candidate_key:
+                classification, rule, confidence = "MUTATED", "partial_or_changed_proposition", "DETERMINISTIC"
+            elif _has_unknown_marker(nc) and not (set(key) & candidate_key):
+                classification, rule, confidence = "MUTATED", "different_unknown_substituted", "DETERMINISTIC"
+            elif set(key) <= candidate_key:
+                classification, rule, confidence = "UNVERIFIABLE", "non_enumerated_reformulation", "INSUFFICIENT"
+    return UnknownLedgerEntry(
+        unknown_id, source, ns, candidate, nc, classification, evidence, rule,
+        confidence, key, evidence_id,
+    )
+
+
+def validate_unknown_preservation(
+    source_unknowns: Sequence[str], candidate_unknowns: Sequence[str],
+    *, resolution_evidence: Sequence[ResolutionEvidence] = (),
+) -> UnknownValidationResult:
+    """Create a deterministic one-to-one ledger, then aggregate fail-closed."""
+    seen: dict[str, int] = {}
+    sources: list[tuple[str, str]] = []
+    for source in source_unknowns:
+        normalized = normalize_unknown_text(source)
+        seen[normalized] = seen.get(normalized, 0) + 1
+        sources.append((_unknown_id(normalized, seen[normalized]), source))
+    # Global evidence-first matching prevents an earlier overlapping source
+    # from consuming a later source's exact candidate. Ties are stable by
+    # source index then candidate index; one candidate can bind only once.
+    pairs: list[tuple[int, int, int, UnknownLedgerEntry]] = []
+    for source_index, (unknown_id, source) in enumerate(sources):
+        for candidate_index, candidate in enumerate(candidate_unknowns):
+            entry = _classify_unknown(unknown_id, source, candidate, resolution_evidence)
+            overlap = set(entry.source_proposition_key) & set(_proposition_tokens(entry.normalized_candidate))
+            if entry.classification == "UNVERIFIABLE" and not overlap:
+                continue
+            pairs.append((UNKNOWN_CLASSIFICATIONS.index(entry.classification), source_index, candidate_index, entry))
+    assigned_sources: dict[int, UnknownLedgerEntry] = {}
+    assigned_candidates: set[int] = set()
+    for _, source_index, candidate_index, entry in sorted(pairs):
+        if source_index in assigned_sources or candidate_index in assigned_candidates:
+            continue
+        assigned_sources[source_index] = entry
+        assigned_candidates.add(candidate_index)
+    ledger = [
+        assigned_sources.get(index, _classify_unknown(unknown_id, source, "", resolution_evidence))
+        for index, (unknown_id, source) in enumerate(sources)
+    ]
+    counts = {name: sum(item.classification == name for item in ledger) for name in UNKNOWN_CLASSIFICATIONS}
+    return UnknownValidationResult(
+        tuple(ledger), len(ledger), counts["PRESERVED"], counts["PARAPHRASED_PRESERVED"],
+        counts["RESOLVED_WITH_EVIDENCE"], counts["DROPPED"], counts["CERTAINTY_ESCALATED"],
+        counts["CONTRADICTED"], counts["MUTATED"], counts["UNVERIFIABLE"],
+        bool(ledger) and all(item.classification in _UNKNOWN_PASS for item in ledger),
+    )
+
+
+def _extract_unknown_candidates(text: str) -> tuple[str, ...]:
+    labelled = []
+    for line in text.splitlines():
+        match = re.match(r"\s*(?:[-*]\s*)?unknown\s*:\s*(.+?)\s*$", line, re.I)
+        if match:
+            labelled.append(match.group(1))
+    return tuple(labelled)
 
 
 @dataclass(frozen=True)
@@ -263,11 +454,15 @@ def validate_persona_text(text: str, expected: PersonaExpectation) -> PersonaCla
         return "PASS" if items and all(item.casefold() in folded for item in items) else "FAIL"
     def detected(markers: tuple[str, ...]) -> str:
         return "detected" if any(marker.casefold() in folded for marker in markers) else "0"
+    unknown_result = validate_unknown_preservation(
+        expected.unknowns, _extract_unknown_candidates(text)
+    )
     return PersonaClassification(
         preserved(expected.facts), preserved(expected.observations),
-        preserved(expected.unknowns), detected(expected.forbidden_inferences),
+        "PASS" if unknown_result.aggregate_pass else "FAIL", detected(expected.forbidden_inferences),
         detected(expected.authority_markers), detected(expected.role_markers),
         preserved(expected.hypotheses) if expected.hypotheses else "NOT_OBSERVED",
+        unknown_result,
     )
 
 
