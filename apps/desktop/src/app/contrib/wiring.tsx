@@ -513,7 +513,11 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     void refreshCurrentModel(true)
     void refreshHermesConfig(true)
     void refreshActiveProfile()
-  }, [activeGatewayProfile, refreshCurrentModel, refreshHermesConfig])
+    // Session rows are profile-scoped; a soft rail switch does not reopen the
+    // gateway, so the on-connect refresh never reruns — repull now.
+    void refreshSessions()
+    void refreshCronJobs()
+  }, [activeGatewayProfile, refreshCronJobs, refreshCurrentModel, refreshHermesConfig, refreshSessions])
 
   // New session anchored to a workspace. Seeds cwd + branch from the clicked
   // workspace; an explicit worktree path also drills the sidebar into that

@@ -248,12 +248,11 @@ function createSecondary(profile: string): Secondary {
 }
 
 // True when `profile`'s backend route resolves to the SHARED primary backend
-// (global-remote case 3 in resolveProfileBackendRoute): the descriptor comes
-// back as the primary connection tagged with `profile`. Own-remote-override
-// and local pooled descriptors are never tagged. Dialing a second socket at
-// that descriptor is wrong — over SSH the second dial fails (tunnel/token are
-// per-backend) and the closed socket poisons the active gateway with
-// "not connected" even though the primary is open right next to it.
+// (global-remote case 3 in resolveProfileBackendRoute): ensureBackend tags the
+// primary descriptor with `sharedPrimary: true`. Pooled backends (local serve
+// or per-profile remote override) also carry a `profile` name for REST routing
+// but must still dial their own socket — checking `.profile` alone misclassified
+// them and left profile tab switches stuck on the primary gateway (#85745).
 async function sharedPrimaryRoute(profile: string): Promise<boolean> {
   const desktop = window.hermesDesktop
 
@@ -264,7 +263,9 @@ async function sharedPrimaryRoute(profile: string): Promise<boolean> {
   try {
     const conn = await desktop.getConnection(profile)
 
-    return Boolean(conn && typeof conn === 'object' && (conn as { profile?: string }).profile)
+    return Boolean(
+      conn && typeof conn === 'object' && (conn as { sharedPrimary?: boolean }).sharedPrimary === true
+    )
   } catch {
     return false
   }
