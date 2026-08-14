@@ -19,6 +19,50 @@ from unittest.mock import MagicMock
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _restore_purged_modules():
+    """Put ``sys.modules`` back the way ``_fresh_run_agent`` found it.
+
+    ``_fresh_run_agent`` drops every ``run_agent`` / ``agent.*`` / ``tools.*``
+    / ``hermes_*`` module and re-imports, which is the right way to pick up a
+    changed ``HERMES_HOME``. What it never did is put them back, so every test
+    collected after this file ran against freshly-imported duplicates while
+    already-imported test modules still held references to the originals.
+
+    Two live copies of a module means two distinct class objects with the same
+    name, so ``except SomeError`` and ``isinstance`` stop matching across the
+    boundary. That is why the damage landed almost entirely on error-path
+    assertions: this file was responsible for all 7 failures in
+    ``transports/test_codex_app_server_session.py`` (``*_failure_returns_error``,
+    ``oauth_*_failure``, ``*_raises``), confirmed by running the two files
+    together — 7 failed — and by the innocent-verdict control on
+    ``test_vision_routing_31179.py``, which purges too but happened to hit
+    nothing the victim depends on.
+
+    Restoring ``sys.modules`` alone is NOT enough, and this is the part that is
+    easy to get wrong: ``import a.b as x`` reads ``sys.modules``, while
+    ``from a.b import y`` reads the attribute ``b`` on the parent package. Fix
+    only the first and half the imports still resolve to the stale copy. The
+    same two-step was needed in
+    ``tests/agent/test_empty_tool_name_loop_dampening.py``.
+    """
+    snapshot = dict(sys.modules)
+    yield
+    purged = {
+        name: module for name, module in snapshot.items()
+        if sys.modules.get(name) is not module
+    }
+    for name, module in purged.items():
+        sys.modules[name] = module
+    for name, module in purged.items():
+        parent_name, _, child = name.rpartition(".")
+        if not parent_name:
+            continue
+        parent = sys.modules.get(parent_name)
+        if parent is not None and getattr(parent, child, None) is not module:
+            setattr(parent, child, module)
+
+
 def _fresh_run_agent(hermes_home):
     for mod in list(sys.modules):
         if mod == "run_agent" or mod.startswith("agent.") or mod.startswith("tools.") or mod.startswith("hermes_"):
