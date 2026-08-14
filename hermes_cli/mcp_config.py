@@ -40,6 +40,11 @@ def _redact_url(url: Any) -> str:
     return redact_credential_url(str(url))
 
 
+def _redact_diagnostic(text: Any) -> str:
+    """Mask credential-bearing URL values inside a diagnostic message."""
+    return redact_credential_url(text)
+
+
 _MCP_PRESETS: Dict[str, Dict[str, Any]] = {
     "codex": {
         "command": "codex",
@@ -507,7 +512,7 @@ def cmd_mcp_add(args):
             else:
                 _warning("OAuth setup failed — MCP SDK auth module not available")
         except Exception as exc:
-            _warning(f"OAuth error: {exc}")
+            _warning(f"OAuth error: {_redact_diagnostic(exc)}")
 
         if not oauth_ok:
             _info("This server may not support OAuth.")
@@ -521,7 +526,7 @@ def cmd_mcp_add(args):
     elif url:
         # Prompt for API key / Bearer token for HTTP servers
         print()
-        _info(f"Connecting to {url}")
+        _info(f"Connecting to {_redact_url(url)}")
         needs_auth = _confirm("Does this server require authentication?", default=True)
         if needs_auth:
             if auth_type == "header" or not auth_type:
@@ -549,7 +554,7 @@ def cmd_mcp_add(args):
     try:
         tools = _probe_single_server(name, server_config)
     except Exception as exc:
-        _error(f"Failed to connect: {exc}")
+        _error(f"Failed to connect: {_redact_diagnostic(exc)}")
         if _confirm("Save config anyway (you can test later)?", default=False):
             server_config["enabled"] = False
             if _save_mcp_server(name, server_config):
@@ -776,7 +781,7 @@ def cmd_mcp_test(args):
         elapsed_ms = (time.monotonic() - start) * 1000
     except Exception as exc:
         elapsed_ms = (time.monotonic() - start) * 1000
-        _error(f"Connection failed ({elapsed_ms:.0f}ms): {exc}")
+        _error(f"Connection failed ({elapsed_ms:.0f}ms): {_redact_diagnostic(exc)}")
         return
 
     _success(f"Connected ({elapsed_ms:.0f}ms)")
@@ -888,7 +893,7 @@ def _reauth_oauth_server(name: str, server_config: dict) -> bool:
             )
         except Exception:
             humanized = None
-        _error(f"Authentication failed: {humanized or exc}")
+        _error(f"Authentication failed: {_redact_diagnostic(humanized or exc)}")
         return False
 
 
@@ -994,7 +999,7 @@ def cmd_mcp_configure(args):
     try:
         all_tools = _probe_single_server(name, cfg)
     except Exception as exc:
-        _error(f"Failed to connect: {exc}")
+        _error(f"Failed to connect: {_redact_diagnostic(exc)}")
         return
 
     if not all_tools:
