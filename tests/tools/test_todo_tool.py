@@ -65,6 +65,21 @@ class TestFormatForInjection:
         assert "Working" in text
         assert "context compression" in text.lower()
 
+    def test_injection_reframes_preserved_plan_as_context_not_instruction(self):
+        store = TodoStore()
+        store.write([
+            {"id": "remove", "content": "Remove the checkout route", "status": "pending"},
+        ])
+
+        text = store.format_for_injection()
+
+        assert "not a new user request" in text.lower()
+        assert "or autonomous instruction" in text.lower()
+        assert "reconcile" in text.lower()
+        assert "key decisions" in text.lower()
+        assert "completed actions" in text.lower()
+        assert "cancel or rewrite" in text.lower()
+
 
 class TestMergeMode:
     def test_update_existing_by_id(self):
@@ -126,12 +141,21 @@ class TestTodoStoreBounds:
         assert item["content"].endswith("… [truncated]")
 
     def test_injection_block_is_bounded(self):
-        from tools.todo_tool import MAX_TODO_CONTENT_CHARS
+        from tools.todo_tool import (
+            MAX_TODO_CONTENT_CHARS,
+            TODO_INJECTION_HEADER,
+            TODO_INJECTION_RECONCILIATION_GUIDANCE,
+        )
         store = TodoStore()
         store.write([{"id": "1", "content": "A" * 50001, "status": "pending"}])
         inj = store.format_for_injection()
         # Before the fix this was ~50085 chars; now it tracks the cap.
-        assert len(inj) < MAX_TODO_CONTENT_CHARS + 200
+        assert len(inj) <= (
+            MAX_TODO_CONTENT_CHARS
+            + len(TODO_INJECTION_HEADER)
+            + len(TODO_INJECTION_RECONCILIATION_GUIDANCE)
+            + 100
+        )
 
 
     def test_item_count_is_bounded(self):

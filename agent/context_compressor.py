@@ -41,7 +41,7 @@ from agent.model_metadata import (
 )
 from agent.redact import redact_sensitive_text
 from agent.turn_context import drop_stale_api_content
-from tools.todo_tool import TODO_INJECTION_HEADER
+from tools.todo_tool import TODO_INJECTION_HEADERS
 
 logger = logging.getLogger(__name__)
 
@@ -4621,8 +4621,8 @@ This compaction should PRIORITISE preserving all information related to the focu
             _LENGTH_CONTINUATION_OUTPUT_LIMIT,
         } or text.startswith(
             _BACKGROUND_PROCESS_NOTIFICATION_PREFIX
-        ) or text.startswith(
-            TODO_INJECTION_HEADER + "\n"
+        ) or any(
+            text.startswith(header + "\n") for header in TODO_INJECTION_HEADERS
         ) or text.startswith(
             _LENGTH_CONTINUATION_DROPPED_TOOLS_PREFIX
         )

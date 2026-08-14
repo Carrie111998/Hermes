@@ -1903,11 +1903,14 @@ def conversation_history_after_compression(
     return None
 
 
+from tools.todo_tool import TODO_INJECTION_HEADERS
+
+
 _SYNTHETIC_USER_PREFIXES = (
     "[System: Your previous response was truncated",
     "[System: The previous response was cut off",
     "[System: Your previous tool call",
-    "[Your active task list was preserved across context compression]",
+    *TODO_INJECTION_HEADERS,
     "[IMPORTANT: Background process ",
 )
 
@@ -1966,13 +1969,14 @@ def _strip_stale_todo_snapshot(content: Any) -> Any:
     Stripping before re-injection keeps repeated boundaries from
     accumulating outdated snapshots (#26981).
     """
-    from tools.todo_tool import TODO_INJECTION_HEADER
+    from tools.todo_tool import TODO_INJECTION_HEADERS
 
     if isinstance(content, str):
-        idx = content.find(TODO_INJECTION_HEADER)
-        if idx == -1:
+        indices = [content.find(header) for header in TODO_INJECTION_HEADERS]
+        indices = [idx for idx in indices if idx >= 0]
+        if not indices:
             return content
-        return content[:idx].rstrip()
+        return content[:min(indices)].rstrip()
     if isinstance(content, list):
         return [
             part
@@ -1982,7 +1986,7 @@ def _strip_stale_todo_snapshot(content: Any) -> Any:
                 and part.get("type") == "text"
                 and str(part.get("text") or "")
                 .lstrip()
-                .startswith(TODO_INJECTION_HEADER)
+                .startswith(TODO_INJECTION_HEADERS)
             )
         ]
     return content

@@ -38,8 +38,21 @@ MAX_TODO_RESULT_CHARS = 512_000
 _TRUNCATION_MARKER = "… [truncated]"
 # Persisted as ordinary message content. ContextCompressor uses this stable
 # header to distinguish the synthetic post-compaction row from a real user.
+# The framing is deliberately explicit: active todos carry useful continuity,
+# but are not a replacement for a current user instruction after compaction.
 TODO_INJECTION_HEADER = (
-    "[Your active task list was preserved across context compression]"
+    "[Planning state preserved across context compression — not a new user "
+    "request or autonomous instruction]"
+)
+LEGACY_TODO_INJECTION_HEADERS = (
+    "[Your active task list was preserved across context compression]",
+)
+TODO_INJECTION_HEADERS = (TODO_INJECTION_HEADER, *LEGACY_TODO_INJECTION_HEADERS)
+TODO_INJECTION_RECONCILIATION_GUIDANCE = (
+    "Reconcile these candidates with the preserved ## Key Decisions and ## "
+    "Completed Actions before continuing. If preserved findings or the latest "
+    "user message invalidate an item, cancel or rewrite it rather than acting "
+    "on the stale wording."
 )
 
 
@@ -140,7 +153,7 @@ class TodoStore:
         if not active_items:
             return None
 
-        lines = [TODO_INJECTION_HEADER]
+        lines = [TODO_INJECTION_HEADER, TODO_INJECTION_RECONCILIATION_GUIDANCE]
         for item in active_items:
             marker = markers.get(item["status"], "[?]")
             lines.append(f"- {marker} {item['id']}. {item['content']} ({item['status']})")
