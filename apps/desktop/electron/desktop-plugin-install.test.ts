@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url'
 import { afterEach, describe, expect, it } from 'vitest'
 
 import {
+  desktopPluginFolderName,
   detectPluginComponents,
   findDesktopEntry,
   repoNameFromUrl,
@@ -45,6 +46,18 @@ describe('resolvePluginGitUrl', () => {
 describe('repoNameFromUrl', () => {
   it('strips .git suffix', () => {
     expect(repoNameFromUrl('https://github.com/o/my-plugin.git')).toBe('my-plugin')
+  })
+})
+
+describe('desktopPluginFolderName', () => {
+  it('uses the repo name for a root-level plugin, not the clone path', () => {
+    expect(desktopPluginFolderName('https://github.com/o/my-plugin.git', null)).toBe('my-plugin')
+  })
+
+  it('uses the last meaningful subdir, not a generic desktop folder', () => {
+    expect(desktopPluginFolderName('https://github.com/o/monorepo.git', 'plugins/alerts/desktop')).toBe(
+      'alerts'
+    )
   })
 })
 

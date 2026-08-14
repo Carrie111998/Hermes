@@ -120,6 +120,22 @@ export function repoNameFromUrl(url: string): string {
   return name
 }
 
+/** Stable on-disk folder for a desktop plugin. Never the clone temp dir or a generic `desktop/` folder. */
+export function desktopPluginFolderName(gitUrl: string, subdir: string | null): string {
+  if (subdir) {
+    const last = subdir
+      .split(/[/\\]/)
+      .filter(part => part && part !== '.' && part !== 'desktop')
+      .pop()
+
+    if (last) {
+      return last
+    }
+  }
+
+  return repoNameFromUrl(gitUrl)
+}
+
 export function resolveSubdirWithin(cloneRoot: string, subdir: string): string {
   const root = path.resolve(cloneRoot)
   const candidate = path.resolve(root, subdir)
@@ -350,10 +366,7 @@ export async function probePluginRepo(
         agent: detected.agent,
         desktop: detected.desktop,
         agentName: detected.agentName ?? (detected.agent ? repoFallback : null),
-        desktopName:
-          detected.desktopSourceSubdir === '.'
-            ? repoFallback
-            : (detected.desktopName ?? (detected.desktop ? repoFallback : null)),
+        desktopName: detected.desktop ? desktopPluginFolderName(gitUrl, subdir) : null,
         warnings,
         insecure
       }
@@ -399,7 +412,7 @@ export async function installDesktopPluginFromGit(
         detected.desktopSourceSubdir === '.'
           ? pluginRoot
           : path.join(pluginRoot, detected.desktopSourceSubdir)
-      const pluginName = detected.desktopName || repoNameFromUrl(gitUrl)
+      const pluginName = desktopPluginFolderName(gitUrl, subdir)
       const targetDir = path.join(desktopPluginsRoot, pluginName)
       const targetPlugin = path.join(targetDir, 'plugin.js')
 
