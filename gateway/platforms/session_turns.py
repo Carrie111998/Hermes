@@ -15,7 +15,9 @@ import hashlib
 import io
 import json
 import logging
+import queue
 import re
+import threading
 import time
 import uuid
 import warnings
@@ -30,24 +32,158 @@ from gateway.session_execution_lease import SessionExecutionConflict
 logger = logging.getLogger(__name__)
 
 SESSION_TURN_HEARTBEAT_INTERVAL_SECONDS = 15.0
+SESSION_TURN_LIFECYCLE_QUEUE_SIZE = 32
+SESSION_TURN_LIFECYCLE_SLOW_SECONDS = 0.1
+SESSION_TURN_LIFECYCLE_FLUSH_SECONDS = 0.05
 
 
-def _emit_turn_lifecycle(event: str, session_id: str, turn_id: str, **extra: Any) -> None:
-    """Emit an observer-only fact without allowing observers to affect execution."""
+def _emit_turn_lifecycle(event: str, session_id: str, turn_id: str, **extra: Any) -> bool:
+    """Invoke the provider boundary. Call only from an observer worker thread."""
     try:
         from agent.lifecycle_hooks import emit_session_turn_lifecycle
 
-        emit_session_turn_lifecycle(
+        return emit_session_turn_lifecycle(
             event,
             session_id=session_id,
             turn_id=turn_id,
             **extra,
         )
     except Exception:
-        logger.debug(
+        logger.warning(
             "session_turn_lifecycle_failed event=%s reason=invalid_or_callback_error",
             event,
         )
+        return False
+
+
+_lifecycle_metric_lock = threading.Lock()
+_lifecycle_metrics = {
+    "heartbeat_dropped": 0,
+    "observer_failed": 0,
+    "observer_slow": 0,
+    "terminal_enqueue_failed": 0,
+}
+
+
+def _note_lifecycle_degradation(metric: str, event: str, reason: str) -> None:
+    """Record a privacy-safe provider degradation without touching execution."""
+    with _lifecycle_metric_lock:
+        _lifecycle_metrics[metric] = _lifecycle_metrics.get(metric, 0) + 1
+    logger.warning(
+        "session_turn_lifecycle_degraded event=%s reason=%s metric=%s",
+        event,
+        reason,
+        metric,
+    )
+
+
+def session_turn_lifecycle_metrics() -> Dict[str, int]:
+    """Return process-local safe counters for monitoring/tests."""
+    with _lifecycle_metric_lock:
+        return dict(_lifecycle_metrics)
+
+
+class SessionTurnLifecycleDispatcher:
+    """Ordered, bounded, non-blocking observer delivery for one durable turn.
+
+    Plugin code runs only on this dispatcher's daemon thread. Heartbeats are
+    lossy under backpressure, while the structural registered/started/terminal
+    facts are retained. A slow or permanently hung plugin therefore cannot
+    hold aiohttp, the coordinator, or the persistent execution lease.
+    """
+
+    def __init__(self, session_id: str, turn_id: str):
+        self.session_id = session_id
+        self.turn_id = turn_id
+        self._queue: queue.Queue[tuple[str, Dict[str, Any]]] = queue.Queue(
+            maxsize=max(4, SESSION_TURN_LIFECYCLE_QUEUE_SIZE)
+        )
+        self._closed = False
+        self._drained = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run,
+            name="session-turn-lifecycle",
+            daemon=True,
+        )
+        # Registered is admitted before the worker can observe later events.
+        self._queue.put_nowait(("registered", {}))
+        self._thread.start()
+
+    def emit(self, event: str, **extra: Any) -> bool:
+        """Queue an event without waiting; return whether it was retained."""
+        if self._closed:
+            _note_lifecycle_degradation("observer_failed", event, "dispatcher_closed")
+            return False
+        try:
+            self._queue.put_nowait((event, dict(extra)))
+            return True
+        except queue.Full:
+            if event == "heartbeat":
+                _note_lifecycle_degradation("heartbeat_dropped", event, "queue_full")
+                return False
+            # Structural events must not be displaced by observer latency.
+            # At capacity after registered/started, at least one queued item is
+            # a heartbeat; evict the oldest heartbeat without blocking.
+            with self._queue.mutex:
+                for index, item in enumerate(self._queue.queue):
+                    if item[0] == "heartbeat":
+                        del self._queue.queue[index]
+                        self._queue.not_full.notify()
+                        break
+                else:
+                    _note_lifecycle_degradation(
+                        "terminal_enqueue_failed" if event == "terminal" else "observer_failed",
+                        event,
+                        "structural_queue_full",
+                    )
+                    return False
+            self._queue.put_nowait((event, dict(extra)))
+            return True
+
+    def close(self, terminal_outcome: str) -> bool:
+        """Queue exactly one terminal and reject all later events."""
+        if self._closed:
+            return False
+        accepted = self.emit("terminal", terminal_outcome=terminal_outcome)
+        self._closed = True
+        return accepted
+
+    def flush(self, timeout: Optional[float] = None) -> bool:
+        """Wait for terminal delivery. Never call directly on the event loop."""
+        return self._drained.wait(timeout)
+
+    def _run(self) -> None:
+        while True:
+            event, extra = self._queue.get()
+            slow = threading.Event()
+
+            def report_slow() -> None:
+                if not slow.is_set():
+                    _note_lifecycle_degradation("observer_slow", event, "callback_slow")
+
+            watchdog = threading.Timer(SESSION_TURN_LIFECYCLE_SLOW_SECONDS, report_slow)
+            watchdog.daemon = True
+            watchdog.start()
+            try:
+                delivered = _emit_turn_lifecycle(
+                    event,
+                    self.session_id,
+                    self.turn_id,
+                    **extra,
+                )
+                if not delivered:
+                    _note_lifecycle_degradation(
+                        "observer_failed", event, "callback_error"
+                    )
+            except Exception:
+                # Defensive: _emit_turn_lifecycle is already fail-open.
+                _note_lifecycle_degradation("observer_failed", event, "callback_error")
+            finally:
+                slow.set()
+                watchdog.cancel()
+            if event == "terminal":
+                self._drained.set()
+                return
 
 
 DELIVERY_MODES = frozenset({"occ_only", "slack_only", "both"})
@@ -850,6 +986,7 @@ class SessionTurnService:
         self._store_lock = asyncio.Lock()
         self._tasks: Dict[str, asyncio.Task[Any]] = {}
         self._agent_refs: Dict[str, list[Any]] = {}
+        self._lifecycle_dispatchers: Dict[str, SessionTurnLifecycleDispatcher] = {}
         # Assistant text deltas are intentionally process-local. Canonical
         # SessionDB messages are the only durable transcript authority.
         self._volatile_events: Dict[str, Dict[int, Dict[str, Any]]] = {}
@@ -952,8 +1089,11 @@ class SessionTurnService:
 
         if created:
             # reserve() committed the runnable identity before this observation.
-            # Emit before scheduling so registered always precedes started.
-            _emit_turn_lifecycle("registered", session_id, turn_id)
+            # Construct before scheduling: its bounded FIFO already contains
+            # registered, so started can never overtake it.
+            self._lifecycle_dispatchers[turn_id] = SessionTurnLifecycleDispatcher(
+                session_id, turn_id
+            )
             task = asyncio.create_task(
                 self._execute(store, turn_id, session_id, payload, binding, slack_adapter)
             )
@@ -975,6 +1115,8 @@ class SessionTurnService:
         agent_ref: list[Any] = [None]
         execution_lease = None
         heartbeat_task: Optional[asyncio.Task[Any]] = None
+        agent_task: Optional[asyncio.Task[Any]] = None
+        dispatcher = self._lifecycle_dispatchers.get(turn_id)
         self._agent_refs[turn_id] = agent_ref
         try:
             def interrupt_on_lease_loss() -> None:
@@ -999,12 +1141,14 @@ class SessionTurnService:
             if not store.set_running(turn_id):
                 return
             store.append_event(turn_id, "turn.started", {"status": "running"})
-            _emit_turn_lifecycle("started", session_id, turn_id)
+            if dispatcher is not None:
+                dispatcher.emit("started")
 
             async def emit_heartbeats() -> None:
                 while True:
                     await asyncio.sleep(SESSION_TURN_HEARTBEAT_INTERVAL_SECONDS)
-                    _emit_turn_lifecycle("heartbeat", session_id, turn_id)
+                    if dispatcher is not None:
+                        dispatcher.emit("heartbeat")
 
             heartbeat_task = asyncio.create_task(emit_heartbeats())
             try:
@@ -1061,16 +1205,47 @@ class SessionTurnService:
                 )
                 append(projected["event"], projected["data"])
 
-            result, _usage = await self.adapter._run_agent(
-                user_message=_agent_input(payload),
-                conversation_history=history,
-                session_id=session_id,
-                stream_delta_callback=on_delta,
-                tool_start_callback=on_tool_start,
-                tool_complete_callback=on_tool_complete,
-                agent_ref=agent_ref,
-                authoritative_turn_id=turn_id,
+            agent_task = asyncio.create_task(
+                self.adapter._run_agent(
+                    user_message=_agent_input(payload),
+                    conversation_history=history,
+                    session_id=session_id,
+                    stream_delta_callback=on_delta,
+                    tool_start_callback=on_tool_start,
+                    tool_complete_callback=on_tool_complete,
+                    agent_ref=agent_ref,
+                    authoritative_turn_id=turn_id,
+                )
             )
+            while True:
+                try:
+                    # Cancelling a Task waiting directly on run_in_executor
+                    # abandons the still-live thread. Shield the child and keep
+                    # this coordinator as monitoring owner until real exit.
+                    result, _usage = await asyncio.shield(agent_task)
+                    break
+                except asyncio.CancelledError:
+                    if agent_task.done():
+                        # A child cancellation is a real execution outcome, not
+                        # a request to abandon coordinator ownership.
+                        await agent_task
+                    await asyncio.to_thread(store.request_stop, turn_id)
+                    agent = agent_ref[0]
+                    if agent is not None:
+                        try:
+                            agent.interrupt("Session turn coordinator cancellation requested")
+                        except Exception:
+                            pass
+                    else:
+                        watcher = asyncio.create_task(self._interrupt_when_available(turn_id))
+                        try:
+                            self.adapter._background_tasks.add(watcher)
+                            watcher.add_done_callback(self.adapter._background_tasks.discard)
+                        except (AttributeError, TypeError):
+                            pass
+                    # Continue heartbeat and lease ownership until the executor
+                    # future itself resolves. Repeated cancellation is handled
+                    # by the same bounded, non-abandoning loop.
             effective_id = result.get("session_id", session_id) if isinstance(result, dict) else session_id
             if execution_lease is None or not await execution_lease.still_owned():
                 store.finish(
@@ -1135,12 +1310,15 @@ class SessionTurnService:
             store.finish(turn_id, "completed", effective_session_id=effective_id)
             store.append_event(turn_id, "turn.completed", {"status": "completed"})
         except asyncio.CancelledError:
-            # An asyncio cancellation does not kill run_in_executor work.  Only
-            # mark interrupted here when no agent was ever created; otherwise a
-            # still-running worker must remain truthfully stopping.
-            if agent_ref[0] is None:
-                store.finish(turn_id, "interrupted", safe_error_code="cancelled_before_execution")
-            raise
+            # Cancellation before an executor exists is mechanically terminal.
+            # Once agent_task exists, the shielded loop above retains ownership
+            # and this branch is unreachable until that worker has really quit.
+            store.finish(turn_id, "interrupted", safe_error_code="cancelled_before_execution")
+            store.append_event(
+                turn_id,
+                "turn.interrupted",
+                {"status": "interrupted", "error_code": "cancelled_before_execution"},
+            )
         except Exception:
             store.finish(turn_id, "failed", safe_error_code="run_failed")
             store.append_event(turn_id, "turn.failed", {"status": "failed", "error_code": "run_failed"})
@@ -1166,14 +1344,16 @@ class SessionTurnService:
                 else None
             )
             if outcome is not None:
-                _emit_turn_lifecycle(
-                    "terminal",
-                    session_id,
-                    turn_id,
-                    terminal_outcome=outcome,
-                )
+                if dispatcher is not None:
+                    dispatcher.close(outcome)
             if execution_lease is not None:
                 await execution_lease.release()
+            # Observer completion is bounded and happens only after lease
+            # release. to_thread keeps even this small grace off aiohttp.
+            if dispatcher is not None and outcome is not None:
+                await asyncio.to_thread(
+                    dispatcher.flush, SESSION_TURN_LIFECYCLE_FLUSH_SECONDS
+                )
             self._agent_refs.pop(turn_id, None)
 
     async def _deliver_slack(self, store: SessionTurnStore, turn_id: str, binding: SlackBinding,

@@ -1108,3 +1108,371 @@ async def test_native_lifecycle_maps_terminal_outcome_without_error_text(
         "terminal_outcome",
     }
     assert "secret" not in repr(terminal)
+
+
+@pytest.mark.asyncio
+async def test_coordinator_cancellation_retains_worker_heartbeat_lease_and_terminal_truth(
+    session_db, monkeypatch: pytest.MonkeyPatch
+):
+    """Cancelling asyncio ownership must not abandon a live executor worker."""
+    import gateway.platforms.session_turns as session_turns
+
+    lifecycle = []
+    worker_started = threading.Event()
+    worker_release = threading.Event()
+    worker_exited = threading.Event()
+    agent = MagicMock()
+
+    def capture(hook, **kwargs):
+        if hook == "session_turn_lifecycle":
+            lifecycle.append(dict(kwargs["dto"]))
+        return []
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", capture)
+    monkeypatch.setattr(session_turns, "SESSION_TURN_HEARTBEAT_INTERVAL_SECONDS", 0.01)
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={}))
+    adapter._session_db = session_db
+
+    async def run_agent(**kwargs):
+        def worker():
+            kwargs["agent_ref"][0] = agent
+            worker_started.set()
+            worker_release.wait(timeout=2)
+            session_db.append_message("s1", "user", kwargs["user_message"])
+            session_db.append_message("s1", "assistant", "late result")
+            worker_exited.set()
+            return {
+                "final_response": "late result",
+                "messages": session_db.get_messages_as_conversation("s1"),
+            }, {}
+
+        return await asyncio.to_thread(worker)
+
+    adapter._run_agent = run_agent
+    async with TestClient(TestServer(_app(adapter))) as client:
+        response = await client.post(
+            "/api/sessions/s1/turns",
+            headers={"Idempotency-Key": "cancel-live-worker"},
+            json=_payload(),
+        )
+        assert response.status == 202
+        assert await asyncio.to_thread(worker_started.wait, 1)
+        coordinator = adapter._session_turn_service._tasks["cancel-live-worker"]
+        coordinator.cancel()
+        await asyncio.sleep(0.04)
+
+        row = SessionTurnStore(session_db).get("cancel-live-worker")
+        assert row["status"] == "stopping"
+        assert not worker_exited.is_set()
+        assert session_db.get_session_execution_lease("s1") is not None
+        before = sum(item["event"] == "heartbeat" for item in lifecycle)
+        await asyncio.sleep(0.03)
+        after = sum(item["event"] == "heartbeat" for item in lifecycle)
+        assert after > before
+        assert not [item for item in lifecycle if item["event"] == "terminal"]
+
+        worker_release.set()
+        await adapter._session_turn_service.wait_for_turn("cancel-live-worker")
+
+    assert worker_exited.is_set()
+    assert session_db.get_session_execution_lease("s1") is None
+    row = SessionTurnStore(session_db).get("cancel-live-worker")
+    assert row["status"] == "interrupted"
+    terminal = [item for item in lifecycle if item["event"] == "terminal"]
+    assert len(terminal) == 1
+    assert terminal[0]["terminal_outcome"] == "cancelled"
+    assert agent.interrupt.call_count >= 1
+
+
+@pytest.mark.asyncio
+async def test_slow_observer_never_blocks_post_worker_or_lease_release(
+    session_db, monkeypatch: pytest.MonkeyPatch
+):
+    entered = threading.Event()
+    release = threading.Event()
+
+    def slow_observer(hook, **_kwargs):
+        if hook == "session_turn_lifecycle" and not entered.is_set():
+            entered.set()
+            release.wait(timeout=2)
+        return []
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", slow_observer)
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={}))
+    adapter._session_db = session_db
+
+    async def run_agent(**kwargs):
+        session_db.append_message("s1", "user", kwargs["user_message"])
+        session_db.append_message("s1", "assistant", "done")
+        return {"final_response": "done"}, {}
+
+    adapter._run_agent = run_agent
+    async with TestClient(TestServer(_app(adapter))) as client:
+        started_at = time.perf_counter()
+        response = await client.post(
+            "/api/sessions/s1/turns",
+            headers={"Idempotency-Key": "slow-observer"},
+            json=_payload(),
+        )
+        elapsed = time.perf_counter() - started_at
+        assert response.status == 202
+        assert elapsed < 0.1
+        assert await asyncio.to_thread(entered.wait, 1)
+        await adapter._session_turn_service.wait_for_turn("slow-observer")
+
+    assert SessionTurnStore(session_db).get("slow-observer")["status"] == "completed"
+    assert session_db.get_session_execution_lease("s1") is None
+    release.set()
+    dispatcher = adapter._session_turn_service._lifecycle_dispatchers["slow-observer"]
+    assert await asyncio.to_thread(dispatcher.flush, 1)
+
+
+def test_lifecycle_dispatcher_backpressure_drops_only_heartbeats_and_logs_metric(
+    monkeypatch: pytest.MonkeyPatch
+):
+    import gateway.platforms.session_turns as session_turns
+
+    entered = threading.Event()
+    release = threading.Event()
+    lifecycle = []
+    baseline = session_turns.session_turn_lifecycle_metrics()
+
+    def blocked(hook, **kwargs):
+        if hook == "session_turn_lifecycle":
+            lifecycle.append(dict(kwargs["dto"]))
+            if kwargs["dto"]["event"] == "registered":
+                entered.set()
+                release.wait(timeout=2)
+        return []
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", blocked)
+    monkeypatch.setattr(session_turns, "SESSION_TURN_LIFECYCLE_QUEUE_SIZE", 4)
+    dispatcher = session_turns.SessionTurnLifecycleDispatcher("safe-session", "safe-turn")
+    assert entered.wait(timeout=1)
+    assert dispatcher.emit("started")
+    for _ in range(20):
+        dispatcher.emit("heartbeat")
+    assert dispatcher.close("succeeded")
+
+    metrics = session_turns.session_turn_lifecycle_metrics()
+    assert metrics["heartbeat_dropped"] > baseline["heartbeat_dropped"]
+    release.set()
+    assert dispatcher.flush(timeout=1)
+    names = [item["event"] for item in lifecycle]
+    assert names[0:2] == ["registered", "started"]
+    assert names[-1] == "terminal"
+    assert names.count("terminal") == 1
+
+
+@pytest.mark.asyncio
+async def test_lease_loss_emits_one_cancelled_terminal_after_worker_exit(
+    session_db, monkeypatch: pytest.MonkeyPatch
+):
+    lifecycle = []
+    fake_lease = MagicMock()
+    fake_lease.still_owned = AsyncMock(return_value=False)
+    fake_lease.release = AsyncMock(return_value=False)
+
+    def capture(hook, **kwargs):
+        if hook == "session_turn_lifecycle":
+            lifecycle.append(dict(kwargs["dto"]))
+        return []
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", capture)
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={}))
+    adapter._session_db = session_db
+    adapter._acquire_session_execution_lease = AsyncMock(return_value=fake_lease)
+
+    async def run_agent(**kwargs):
+        session_db.append_message("s1", "user", kwargs["user_message"])
+        session_db.append_message("s1", "assistant", "untrusted after lease loss")
+        return {"final_response": "untrusted after lease loss"}, {}
+
+    adapter._run_agent = run_agent
+    async with TestClient(TestServer(_app(adapter))) as client:
+        await client.post(
+            "/api/sessions/s1/turns",
+            headers={"Idempotency-Key": "lease-loss-once"},
+            json=_payload(),
+        )
+        await adapter._session_turn_service.wait_for_turn("lease-loss-once")
+
+    row = SessionTurnStore(session_db).get("lease-loss-once")
+    assert row["status"] == "interrupted"
+    assert row["safe_error_code"] == "execution_lease_lost"
+    terminal = [item for item in lifecycle if item["event"] == "terminal"]
+    assert len(terminal) == 1
+    assert terminal[0]["terminal_outcome"] == "cancelled"
+    fake_lease.release.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_history_read_failure_lifecycle_is_registered_started_terminal(
+    session_db, monkeypatch: pytest.MonkeyPatch
+):
+    lifecycle = []
+
+    def capture(hook, **kwargs):
+        if hook == "session_turn_lifecycle":
+            lifecycle.append(dict(kwargs["dto"]))
+        return []
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", capture)
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={}))
+    adapter._session_db = session_db
+    adapter._conversation_history_for_session = AsyncMock(
+        side_effect=RuntimeError("private history failure")
+    )
+    async with TestClient(TestServer(_app(adapter))) as client:
+        await client.post(
+            "/api/sessions/s1/turns",
+            headers={"Idempotency-Key": "history-lifecycle"},
+            json=_payload(),
+        )
+        await adapter._session_turn_service.wait_for_turn("history-lifecycle")
+
+    assert [item["event"] for item in lifecycle] == ["registered", "started", "terminal"]
+    assert lifecycle[-1]["terminal_outcome"] == "failed"
+    assert "private" not in repr(lifecycle)
+
+
+@pytest.mark.asyncio
+async def test_simultaneous_duplicate_posts_register_and_execute_once(
+    session_db, monkeypatch: pytest.MonkeyPatch
+):
+    lifecycle = []
+    calls = 0
+    release = asyncio.Event()
+
+    def capture(hook, **kwargs):
+        if hook == "session_turn_lifecycle":
+            lifecycle.append(dict(kwargs["dto"]))
+        return []
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", capture)
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={}))
+    adapter._session_db = session_db
+
+    async def run_agent(**kwargs):
+        nonlocal calls
+        calls += 1
+        await release.wait()
+        session_db.append_message("s1", "user", kwargs["user_message"])
+        session_db.append_message("s1", "assistant", "once")
+        return {"final_response": "once"}, {}
+
+    adapter._run_agent = run_agent
+    async with TestClient(TestServer(_app(adapter))) as client:
+        responses = await asyncio.gather(*[
+            client.post(
+                "/api/sessions/s1/turns",
+                headers={"Idempotency-Key": "duplicate-race"},
+                json=_payload(),
+            )
+            for _ in range(2)
+        ])
+        release.set()
+        await adapter._session_turn_service.wait_for_turn("duplicate-race")
+
+    assert sorted(response.status for response in responses) == [200, 202]
+    assert calls == 1
+    assert sum(item["event"] == "registered" for item in lifecycle) == 1
+    assert sum(item["event"] == "terminal" for item in lifecycle) == 1
+
+
+@pytest.mark.asyncio
+async def test_startup_preserves_live_owner_without_adoption_or_lifecycle(
+    session_db, monkeypatch: pytest.MonkeyPatch
+):
+    store = SessionTurnStore(session_db)
+    store.reserve("s1", "foreign-live", _payload())
+    store.set_running("foreign-live")
+    assert session_db.acquire_session_execution_lease("s1", "foreign-owner", ttl_seconds=30)
+    lifecycle = []
+    monkeypatch.setattr(
+        "hermes_cli.plugins.invoke_hook",
+        lambda hook, **kwargs: lifecycle.append((hook, kwargs)),
+    )
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={}))
+    adapter._session_db = session_db
+
+    await adapter._session_turn_service.reconcile_startup()
+
+    assert store.get("foreign-live")["status"] == "running"
+    assert adapter._session_turn_service._tasks == {}
+    assert lifecycle == []
+
+
+@pytest.mark.asyncio
+async def test_api_root_turn_identity_reaches_child_parent_turn_id_end_to_end(
+    session_db, monkeypatch: pytest.MonkeyPatch
+):
+    """The admitted API identity, not a synthesized task id, parents children."""
+    from tools import delegate_tool
+
+    lifecycle = []
+    parent = MagicMock()
+    parent.session_id = "s1"
+    parent._delegate_depth = 0
+    parent.base_url = "https://example.invalid/v1"
+    parent.api_key = "key"
+    parent.model = "model"
+    parent.provider = "openai"
+    parent.api_mode = "chat_completions"
+    parent.reasoning_config = {"enabled": False}
+    parent.enabled_toolsets = []
+    parent.disabled_toolsets = []
+    parent.prefill_messages = None
+    parent._fallback_chain = []
+    parent.request_overrides = {}
+    parent.openrouter_min_coding_score = None
+    child = MagicMock()
+    child.session_id = "child-session"
+
+    def capture(hook, **kwargs):
+        if hook in {"session_turn_lifecycle", "subagent_lifecycle"}:
+            lifecycle.append((hook, dict(kwargs["dto"])))
+        return []
+
+    def run_conversation(*, user_message, **_kwargs):
+        # This assignment is the real turn-prologue contract in
+        # build_turn_context; its focused test covers consumption/reset.
+        parent._current_turn_id = parent._authoritative_turn_id
+        delegate_tool._build_child_agent(
+            task_index=0,
+            goal="private child goal",
+            context=None,
+            toolsets=None,
+            model=None,
+            max_iterations=2,
+            parent_agent=parent,
+            task_count=1,
+        )
+        session_db.append_message("s1", "user", user_message)
+        session_db.append_message("s1", "assistant", "done")
+        return {"final_response": "done"}
+
+    parent.run_conversation.side_effect = run_conversation
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", capture)
+    monkeypatch.setattr("run_agent.AIAgent", MagicMock(return_value=child))
+    monkeypatch.setattr(delegate_tool, "_resolve_child_credential_pool", lambda *_args: None)
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={}))
+    adapter._session_db = session_db
+    monkeypatch.setattr(adapter, "_create_agent", MagicMock(return_value=parent))
+
+    async with TestClient(TestServer(_app(adapter))) as client:
+        response = await client.post(
+            "/api/sessions/s1/turns",
+            headers={"Idempotency-Key": "root-authoritative-turn"},
+            json=_payload(),
+        )
+        assert response.status == 202
+        await adapter._session_turn_service.wait_for_turn("root-authoritative-turn")
+
+    registered_children = [
+        dto for hook, dto in lifecycle
+        if hook == "subagent_lifecycle" and dto["event"] == "registered"
+    ]
+    assert len(registered_children) == 1
+    assert registered_children[0]["parent_turn_id"] == "root-authoritative-turn"
+    assert "private child goal" not in repr(registered_children)

@@ -240,6 +240,17 @@ coordination; `terminal` maps the durable coordinator result. The same native
 turn ID is installed on the root agent, so delegated children created during
 that turn report the same `parent_turn_id`.
 
+Callbacks run on a per-turn ordered daemon dispatcher, never on aiohttp or the
+execution coordinator. Its queue is bounded: observer backpressure may drop
+heartbeats, but cannot reorder or displace registered, started, or terminal.
+Drops, callback failures, and callbacks exceeding the latency threshold produce
+privacy-safe warning logs and process-local counters. Close queues terminal
+exactly once; bounded flush occurs only after the execution lease is released,
+so a slow or hung observer cannot delay requests, heartbeats, or lease release.
+Coordinator cancellation is cooperative: it requests child interruption but
+retains lease and heartbeat ownership until the executor actually exits, then
+maps the durable terminal result.
+
 Startup adoption is intentionally not emitted. Although the durable lease can
 prove that another process still owns a turn, this provider process cannot
 observe that owner's eventual completion or continue its per-turn sequence.

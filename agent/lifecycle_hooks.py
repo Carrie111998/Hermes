@@ -85,15 +85,17 @@ def _envelope(kind: str, source_id: Optional[str], event: str) -> dict[str, Any]
     }
 
 
-def _emit(hook_name: str, payload: dict[str, Any]) -> None:
+def _emit(hook_name: str, payload: dict[str, Any]) -> bool:
     try:
         from hermes_cli.plugins import invoke_hook
 
         # A single DTO keyword makes the privacy boundary explicit and prevents
         # future helper locals from accidentally becoming hook kwargs.
         invoke_hook(hook_name, dto=payload)
+        return True
     except Exception:
-        logger.debug("lifecycle_hook_failed hook=%s reason=callback_error", hook_name)
+        logger.warning("lifecycle_hook_failed hook=%s reason=callback_error", hook_name)
+        return False
 
 
 def emit_session_turn_lifecycle(
@@ -102,7 +104,7 @@ def emit_session_turn_lifecycle(
     session_id: Any,
     turn_id: Any,
     terminal_outcome: Any = None,
-) -> None:
+) -> bool:
     """Emit one versioned, turn-scoped gateway execution observation."""
     if event not in SESSION_TURN_EVENTS:
         raise ValueError(f"invalid session turn lifecycle event: {event}")
@@ -130,7 +132,7 @@ def emit_session_turn_lifecycle(
         raise ValueError(
             "terminal_outcome is only valid for terminal session-turn events"
         )
-    _emit("session_turn_lifecycle", payload)
+    return _emit("session_turn_lifecycle", payload)
 
 
 def emit_subagent_lifecycle(
