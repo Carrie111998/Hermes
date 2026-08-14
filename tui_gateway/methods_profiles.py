@@ -206,7 +206,7 @@ def _(rid, params: dict) -> dict:
     # .env (only over the seeded comment-only stub — never clobber real
     # secrets a clone brought along) and auth.json (only when absent), then
     # inherit model.provider/model.default unless the caller pinned a model.
-    mirrored = {"env": False, "auth": False, "model_inherited": False}
+    mirrored = {"env": False, "auth": False, "model_inherited": False, "voice": False}
     if is_truthy_value(params.get("mirror_credentials", True)):
         import shutil
 
@@ -241,6 +241,51 @@ def _(rid, params: dict) -> dict:
     model = str(params.get("model") or "").strip()
     provider = str(params.get("provider") or "").strip()
     model_set = False
+
+    def _mirror_voice_sections() -> bool:
+        """Copy voice config (stt/tts/voice) from the launch profile.
+
+        Desktop dictation and TTS are profile-scoped: /api/audio/transcribe
+        resolves the ``stt`` section inside the TARGET profile's home. A
+        freshly created profile has only a ``model`` section, so voice fell
+        back to defaults (local whisper, often not installed) and dictation
+        "didn't work in bot mode" while working on the primary profile.
+        """
+        try:
+            import yaml as _yaml
+
+            from hermes_cli.config import load_config_readonly
+
+            src_cfg = load_config_readonly() or {}
+            sections = {
+                k: src_cfg[k] for k in ("stt", "tts", "voice") if src_cfg.get(k)
+            }
+            if not sections:
+                return False
+
+            cfg_path = path / "config.yaml"
+            dst_cfg = {}
+            if cfg_path.exists():
+                dst_cfg = _yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
+            changed = False
+            for key, value in sections.items():
+                if key not in dst_cfg:
+                    dst_cfg[key] = value
+                    changed = True
+            if changed:
+                tmp = cfg_path.with_suffix(".yaml.tmp")
+                tmp.write_text(
+                    _yaml.safe_dump(dst_cfg, sort_keys=False, allow_unicode=True),
+                    encoding="utf-8",
+                )
+                tmp.replace(cfg_path)
+            return changed
+        except Exception:
+            return False
+
+    if is_truthy_value(params.get("mirror_credentials", True)):
+        mirrored["voice"] = _mirror_voice_sections()
+
     if model and provider:
         try:
             from hermes_cli.web_routers.profiles import _write_profile_model
