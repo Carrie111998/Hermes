@@ -4910,6 +4910,7 @@ class SessionBridgeCoordinator:
         indexed = 0
         locally_owned = 0
         deferred = 0
+        vanished = 0
         for native_id in selected_ids:
             try:
                 summary = summaries_by_native_id.get(native_id)
@@ -4921,7 +4922,29 @@ class SessionBridgeCoordinator:
                         native_id,
                     )
                 if summary is None:
-                    raise RuntimeError("staged Codex thread is unavailable")
+                    # 2026-08-14: a staged id the source can no longer resolve. This
+                    # used to `raise RuntimeError`, which the generic handler below
+                    # turns into failed=1 -- that aborts the rest of the batch AND
+                    # leaves the id staged, so the same vanished thread was retried
+                    # every cycle forever. Measured: 88 identical diagnostics for
+                    # task:92a4c43cd63cdbff, ScanSummary(discovered=52, indexed=30,
+                    # failed=1) on repeat, codex pinned at scan_failed with the tail of
+                    # the backfill stuck behind it.
+                    #
+                    # A thread that no longer exists in Codex is not a scan failure and
+                    # can never resolve: deleted, archived out of scope, or pruned since
+                    # it was staged. Count it, log it, and fall through so
+                    # _commit_scan_batch drains it from the staged set instead of
+                    # re-staging it. Same reasoning as the LocalSessionOwnsCanonicalId /
+                    # StaleExternalProjection / TimeoutError branches below.
+                    vanished += 1
+                    self._record_codex_scan_diagnostic(
+                        stage="persistent_project",
+                        native_id=native_id,
+                        exc=RuntimeError("staged Codex thread is unavailable"),
+                        adapter=adapter,
+                    )
+                    continue
                 projection = await self._provider_call(
                     _call,
                     adapter,
@@ -4980,6 +5003,18 @@ class SessionBridgeCoordinator:
                     duration_ms=0,
                 )
             indexed += 1
+        if vanished:
+            # Counted, never silent. Unlike the timeout branch these ids are DROPPED
+            # from staged rather than retried: the source cannot resolve them at all.
+            try:
+                _LOG.warning(
+                    "codex_scan_diagnostic stage=persistent_project "
+                    "code=staged_thread_vanished dropped=%d indexed=%d",
+                    vanished,
+                    indexed,
+                )
+            except Exception:
+                pass
         if locally_owned:
             # Counted, never silent: these threads stay outside the catalog.
             try:
