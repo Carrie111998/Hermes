@@ -11,6 +11,7 @@ Also works when ``hermes`` is not on PATH (e.g. ``nix run`` or ``python -m``).
 import os
 import shutil
 import sys
+from pathlib import Path
 from typing import Optional, Sequence
 
 from hermes_cli._parser import (
@@ -101,13 +102,28 @@ def resolve_hermes_bin() -> Optional[str]:
     def _is_python_script(p: str) -> bool:
         return p.lower().endswith((".py", ".pyc"))
 
+    # The repository's top-level ``hermes`` is a source launcher whose shebang
+    # selects ``python3`` from PATH. It is often invoked *through* a venv
+    # interpreter (for example by the Desktop backend); relaunching that source
+    # file directly would drop the venv and can select a system Python instead.
+    source_launcher = (Path(__file__).resolve().parent.parent / "hermes").resolve()
+    try:
+        argv0_is_source_launcher = Path(argv0).resolve() == source_launcher
+    except OSError:
+        argv0_is_source_launcher = False
+
     # Absolute path to an executable (covers nix store, venv wrappers, etc.)
-    if os.path.isabs(argv0) and os.path.isfile(argv0) and os.access(argv0, os.X_OK):
+    if (
+        not argv0_is_source_launcher
+        and os.path.isabs(argv0)
+        and os.path.isfile(argv0)
+        and os.access(argv0, os.X_OK)
+    ):
         if not (_is_windows and _is_python_script(argv0)):
             return argv0
 
     # Relative path — resolve against CWD
-    if not argv0.startswith("-") and os.path.isfile(argv0):
+    if not argv0_is_source_launcher and not argv0.startswith("-") and os.path.isfile(argv0):
         abs_path = os.path.abspath(argv0)
         if os.access(abs_path, os.X_OK):
             if not (_is_windows and _is_python_script(abs_path)):

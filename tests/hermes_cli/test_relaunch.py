@@ -1,6 +1,8 @@
 """Tests for hermes_cli.relaunch — unified self-relaunch utility."""
 
+import os
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -31,6 +33,20 @@ class TestResolveHermesBin:
             relaunch_mod.shutil, "which", lambda name: "/usr/bin/hermes" if name == "hermes" else None
         )
         assert relaunch_mod.resolve_hermes_bin() == "/usr/bin/hermes"
+
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX source launcher only")
+    def test_rejects_checked_in_source_launcher_without_path_entry(self, monkeypatch):
+        """A direct source launcher would re-run via its PATH-selected shebang.
+
+        When a Desktop backend starts ``venv/bin/python <repo>/hermes``,
+        ``sys.argv[0]`` names this executable source file.  Reusing it during
+        ``/update`` loses the active venv and can select a system Python.
+        """
+        source_launcher = Path(relaunch_mod.__file__).resolve().parent.parent / "hermes"
+        monkeypatch.setattr(sys, "argv", [str(source_launcher), "update"])
+        monkeypatch.setattr(relaunch_mod.shutil, "which", lambda _name: None)
+
+        assert relaunch_mod.resolve_hermes_bin() is None
 
 
 class TestExtractInheritedFlags:
