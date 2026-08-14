@@ -6109,6 +6109,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return False
         return bool(raw.get("yolo_mode"))
 
+    # Billing-bucket classes that aren't a routable provider identity on
+    # their own — mirrors tui_gateway.server._BARE_BILLING_PROVIDERS. A
+    # session that persisted only one of these (never ran /model) must fall
+    # back to the ambient config default rather than restore a bare bucket.
+    _BARE_BILLING_PROVIDERS = ("auto", "custom")
+
     @staticmethod
     def session_gateway_runtime(session_meta: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         """Read the persisted runtime route off a session row dict.
@@ -6118,9 +6124,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         ``gateway_runtime`` key (written by the gateway's
         ``_sync_session_model_from_agent`` and the CLI ``/model`` persist),
         falling back to the top-level ``provider``/``base_url``/``api_mode``
-        keys the TUI gateway's ``_runtime_model_config`` writes. Returns an
-        empty dict on any parse failure — resume falls back to ambient
-        config resolution.
+        keys the TUI gateway's ``_runtime_model_config`` writes, and finally
+        to the ``billing_provider`` column — set independently of ``/model``
+        on every session's first accounted API call — for a session that
+        never explicitly switched models. Returns an empty dict on any parse
+        failure — resume falls back to ambient config resolution.
         """
         raw = (session_meta or {}).get("model_config")
         if isinstance(raw, str):
@@ -6129,7 +6137,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             except Exception:
                 return {}
         if not isinstance(raw, dict):
-            return {}
+            raw = {}
         runtime = raw.get("gateway_runtime")
         if isinstance(runtime, dict) and runtime.get("provider"):
             return dict(runtime)
@@ -6140,7 +6148,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         }
         if top_level:
             return top_level
-        return dict(runtime) if isinstance(runtime, dict) else {}
+        if isinstance(runtime, dict) and runtime:
+            return dict(runtime)
+        billing_provider = str((session_meta or {}).get("billing_provider") or "").strip()
+        if billing_provider and billing_provider.lower() not in SessionDB._BARE_BILLING_PROVIDERS:
+            return {"provider": billing_provider}
+        return {}
 
     def update_session_billing_route(
         self,

@@ -30,10 +30,11 @@ def _make_stub(**overrides):
     return stub
 
 
-def _row(model="glm-4.7", model_config=None):
+def _row(model="glm-4.7", model_config=None, billing_provider=None):
     return {
         "model": model,
         "model_config": json.dumps(model_config) if model_config else None,
+        "billing_provider": billing_provider,
     }
 
 
@@ -62,6 +63,33 @@ def test_session_gateway_runtime_tolerates_garbage():
     assert SessionDB.session_gateway_runtime({}) == {}
     assert SessionDB.session_gateway_runtime({"model_config": "{not json"}) == {}
     assert SessionDB.session_gateway_runtime({"model_config": json.dumps([1, 2])}) == {}
+
+
+def test_session_gateway_runtime_falls_back_to_billing_provider():
+    """A plain session that never ran /model has no gateway_runtime or
+    top-level provider keys in model_config — only billing_provider, set
+    independently on the session's first accounted API call."""
+    meta = _row(model_config={"max_iterations": 60}, billing_provider="minimax")
+    runtime = SessionDB.session_gateway_runtime(meta)
+    assert runtime == {"provider": "minimax"}
+
+
+def test_session_gateway_runtime_billing_provider_bare_bucket_ignored():
+    """A bare billing bucket ('custom'/'auto') isn't a routable identity —
+    must fall back to the ambient default, not restore the bucket verbatim."""
+    meta = _row(model_config=None, billing_provider="custom")
+    assert SessionDB.session_gateway_runtime(meta) == {}
+    meta = _row(model_config=None, billing_provider="auto")
+    assert SessionDB.session_gateway_runtime(meta) == {}
+
+
+def test_session_gateway_runtime_explicit_provider_wins_over_billing_provider():
+    meta = _row(
+        model_config={"provider": "nous"},
+        billing_provider="openrouter",
+    )
+    runtime = SessionDB.session_gateway_runtime(meta)
+    assert runtime == {"provider": "nous"}
 
 
 # ── _restore_session_model ──────────────────────────────────────────
@@ -93,6 +121,21 @@ def test_restore_session_model_no_stored_model_is_noop():
     stub = _make_stub()
     stub._restore_session_model(_row(model=None))
     assert stub.model == "ambient-model"
+
+
+def test_restore_session_model_restores_billing_provider_fallback():
+    """A session that never ran /model still recorded billing_provider on its
+    first accounted API call — resume must route to that provider, not the
+    ambient default the user may have changed since."""
+    stub = _make_stub()
+    stub._restore_session_model(_row(
+        model="glm-4.7",
+        model_config={"max_iterations": 60},
+        billing_provider="minimax",
+    ))
+    assert stub.model == "glm-4.7"
+    assert stub.provider == "minimax"
+    assert stub.requested_provider == "minimax"
 
 
 def test_restore_session_model_matching_state_is_silent_noop():
