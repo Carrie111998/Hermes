@@ -100,8 +100,8 @@ export function useComposerDrop({
         triggerHaptic('selection')
       }
 
-      if (osDrops.length) {
-        void Promise.resolve(onAttachDroppedItems!(osDrops)).then(attached => {
+      if (osDrops.length && onAttachDroppedItems) {
+        void Promise.resolve(onAttachDroppedItems(osDrops)).then(attached => {
           if (attached) {
             triggerHaptic('selection')
             requestMainFocus()
