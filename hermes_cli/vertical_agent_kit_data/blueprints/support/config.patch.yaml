@@ -1,0 +1,16 @@
+profile:
+  description: Hermes support specialist
+
+skills:
+  required:
+    - article-retrieval
+    - ticket-triage
+    - escalation-routing
+
+platform_toolset:
+  helpers:
+    - help_center_lookup
+    - ticket_lookup
+    - account_lookup
+  generic_tools:
+    - execute_code: disabled_by_default

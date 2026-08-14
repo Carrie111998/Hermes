@@ -1,0 +1,16 @@
+profile:
+  description: Hermes research specialist
+
+skills:
+  required:
+    - source-collection
+    - evidence-synthesis
+    - citation-briefing
+
+platform_toolset:
+  helpers:
+    - web_search
+    - document_fetch
+    - citation_helper
+  generic_tools:
+    - execute_code: disabled_by_default
