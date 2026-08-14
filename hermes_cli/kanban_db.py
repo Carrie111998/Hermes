@@ -8654,6 +8654,241 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
         return True
 
 
+CONFIGURE_TASK_SNAPSHOT_FIELDS = TASK_SNAPSHOT_FIELDS + (
+    "source_policy",
+    "max_retries",
+    "max_runtime_seconds",
+    "goal_mode",
+)
+CONFIGURE_TASK_ELIGIBLE_STATUSES = frozenset(
+    {"triage", "todo", "scheduled", "ready", "blocked", "review"}
+)
+UNLINK_TASK_ELIGIBLE_STATUSES = CONFIGURE_TASK_ELIGIBLE_STATUSES
+
+
+def _execution_source_policy(row: Mapping[str, Any]) -> str:
+    required = bool(row["source_commit_required"])
+    forbidden = bool(row["source_commit_forbidden"])
+    if required and forbidden:
+        raise RuntimeError(
+            "task has conflicting source commit policy flags; repair the task "
+            "before changing its execution contract"
+        )
+    if required:
+        return "required"
+    if forbidden:
+        return "forbidden"
+    return "none"
+
+
+def execution_contract_from_row(row: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "source_policy": _execution_source_policy(row),
+        "max_retries": row["max_retries"],
+        "max_runtime_seconds": row["max_runtime_seconds"],
+        "goal_mode": bool(row["goal_mode"]),
+    }
+
+
+def task_execution_contract(task: Task) -> dict[str, Any]:
+    if task.source_commit_required and task.source_commit_forbidden:
+        raise RuntimeError("task has conflicting source commit policy flags")
+    source_policy = "none"
+    if task.source_commit_required:
+        source_policy = "required"
+    elif task.source_commit_forbidden:
+        source_policy = "forbidden"
+    return {
+        "source_policy": source_policy,
+        "max_retries": task.max_retries,
+        "max_runtime_seconds": task.max_runtime_seconds,
+        "goal_mode": bool(task.goal_mode),
+    }
+
+
+def configure_task_snapshot_from_row(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        **task_snapshot_from_row(row),
+        **execution_contract_from_row(row),
+    }
+
+
+def _validate_optional_positive_int(value: Any, field_name: str) -> None:
+    if value is not None and (type(value) is not int or value < 1):
+        raise ValueError(f"{field_name} must be a positive integer or null")
+
+
+def _validate_execution_contract_values(
+    *,
+    source_policy: Any,
+    max_retries: Any,
+    max_runtime_seconds: Any,
+    goal_mode: Any,
+) -> None:
+    if source_policy not in {"none", "required", "forbidden"}:
+        raise ValueError(
+            "source_policy must be one of 'none', 'required', or 'forbidden'"
+        )
+    _validate_optional_positive_int(max_retries, "max_retries")
+    _validate_optional_positive_int(max_runtime_seconds, "max_runtime_seconds")
+    if type(goal_mode) is not bool:
+        raise ValueError("goal_mode must be a boolean")
+
+
+def _validate_configure_task_expected(expected: Mapping[str, Any]) -> None:
+    if not isinstance(expected, Mapping):
+        raise ValueError("expected must be the complete task snapshot object")
+    fields = set(CONFIGURE_TASK_SNAPSHOT_FIELDS)
+    missing = sorted(fields - set(expected))
+    extra = sorted(set(expected) - fields)
+    if missing:
+        raise ValueError(
+            f"expected is missing task snapshot field(s): {', '.join(missing)}"
+        )
+    if extra:
+        raise ValueError(
+            f"expected has unsupported task snapshot field(s): {', '.join(extra)}"
+        )
+    if not isinstance(expected["status"], str):
+        raise ValueError("expected.status must be a string")
+    if not isinstance(expected["title"], str):
+        raise ValueError("expected.title must be a string")
+    for field_name in ("assignee", "current_step_key"):
+        if expected[field_name] is not None and not isinstance(
+            expected[field_name], str
+        ):
+            raise ValueError(f"expected.{field_name} must be a string or null")
+    current_run_id = expected["current_run_id"]
+    if current_run_id is not None and type(current_run_id) is not int:
+        raise ValueError("expected.current_run_id must be an integer or null")
+    _validate_execution_contract_values(
+        source_policy=expected["source_policy"],
+        max_retries=expected["max_retries"],
+        max_runtime_seconds=expected["max_runtime_seconds"],
+        goal_mode=expected["goal_mode"],
+    )
+
+
+def _validate_unlink_task_expected(expected: Mapping[str, Any]) -> None:
+    if not isinstance(expected, Mapping):
+        raise ValueError("expected must be the complete child task snapshot object")
+    fields = set(TASK_SNAPSHOT_FIELDS)
+    missing = sorted(fields - set(expected))
+    extra = sorted(set(expected) - fields)
+    if missing:
+        raise ValueError(
+            f"expected is missing child task snapshot field(s): {', '.join(missing)}"
+        )
+    if extra:
+        raise ValueError(
+            f"expected has unsupported child task snapshot field(s): {', '.join(extra)}"
+        )
+    if not isinstance(expected["status"], str):
+        raise ValueError("expected.status must be a string")
+    if not isinstance(expected["title"], str):
+        raise ValueError("expected.title must be a string")
+    for field_name in ("assignee", "current_step_key"):
+        if expected[field_name] is not None and not isinstance(
+            expected[field_name], str
+        ):
+            raise ValueError(f"expected.{field_name} must be a string or null")
+    current_run_id = expected["current_run_id"]
+    if current_run_id is not None and type(current_run_id) is not int:
+        raise ValueError("expected.current_run_id must be an integer or null")
+
+
+def _task_has_active_execution(
+    conn: sqlite3.Connection, row: sqlite3.Row
+) -> bool:
+    keys = set(row.keys())
+    if "running" in keys and bool(row["running"]):
+        return True
+    if "current_run_id" in keys and row["current_run_id"] is not None:
+        return True
+    if "claim_lock" in keys and row["claim_lock"] is not None:
+        return True
+    return conn.execute(
+        "SELECT 1 FROM task_runs WHERE task_id = ? AND status = 'running' LIMIT 1",
+        (row["id"],),
+    ).fetchone() is not None
+
+
+def configure_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    expected: Mapping[str, Any],
+    source_policy: str,
+    max_retries: Optional[int],
+    max_runtime_seconds: Optional[int],
+    goal_mode: bool,
+) -> bool:
+    """CAS-replace an idle Default-board card's execution contract atomically."""
+    _validate_configure_task_expected(expected)
+    _validate_execution_contract_values(
+        source_policy=source_policy,
+        max_retries=max_retries,
+        max_runtime_seconds=max_runtime_seconds,
+        goal_mode=goal_mode,
+    )
+
+    with write_txn(conn):
+        row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        if row is None:
+            return False
+        current = configure_task_snapshot_from_row(row)
+        normalized_expected = dict(expected)
+        normalized_expected["assignee"] = _canonical_assignee(
+            normalized_expected["assignee"]
+        )
+        if current != normalized_expected:
+            raise TaskSnapshotConflict("configure task", current)
+        if _task_has_active_execution(conn, row):
+            raise RuntimeError(
+                f"cannot configure task {task_id}: it has an active/current run"
+            )
+        if row["status"] not in CONFIGURE_TASK_ELIGIBLE_STATUSES:
+            raise RuntimeError(
+                f"cannot configure task {task_id}: status {row['status']!r} is not eligible"
+            )
+
+        before = execution_contract_from_row(row)
+        conn.execute(
+            """
+            UPDATE tasks
+               SET source_commit_required = ?,
+                   source_commit_forbidden = ?,
+                   max_retries = ?,
+                   max_runtime_seconds = ?,
+                   goal_mode = ?
+             WHERE id = ?
+            """,
+            (
+                1 if source_policy == "required" else 0,
+                1 if source_policy == "forbidden" else 0,
+                max_retries,
+                max_runtime_seconds,
+                1 if goal_mode else 0,
+                task_id,
+            ),
+        )
+        after_row = conn.execute(
+            "SELECT * FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if after_row is None:
+            raise RuntimeError(f"task disappeared while configuring {task_id}")
+        _append_event(
+            conn,
+            task_id,
+            "execution_contract_configured",
+            {
+                "before": before,
+                "after": execution_contract_from_row(after_row),
+            },
+        )
+        return True
+
+
 def set_model_override(
     conn: sqlite3.Connection,
     task_id: str,
@@ -8795,25 +9030,71 @@ def _would_cycle(conn: sqlite3.Connection, parent_id: str, child_id: str) -> boo
     return False
 
 
-def unlink_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> bool:
+def unlink_tasks(
+    conn: sqlite3.Connection,
+    parent_id: str,
+    child_id: str,
+    *,
+    expected: Optional[Mapping[str, Any]] = None,
+    failure_limit: Optional[int] = None,
+) -> bool:
+    """Remove one exact edge and reconsider only its idle child for readiness."""
+    if not isinstance(parent_id, str) or not parent_id.strip():
+        raise ValueError("parent_id must be a non-empty string")
+    if not isinstance(child_id, str) or not child_id.strip():
+        raise ValueError("child_id must be a non-empty string")
+    if expected is not None:
+        _validate_unlink_task_expected(expected)
+    if failure_limit is None:
+        failure_limit = DEFAULT_FAILURE_LIMIT
+    board_meta = product_board_metadata(_board_slug_for_connection(conn))
+    release_measure_unblocks = _product_release_measure_unblocks_dependents(board_meta)
     with write_txn(conn):
+        child = conn.execute(
+            "SELECT * FROM tasks WHERE id = ?", (child_id,)
+        ).fetchone()
+        if child is None:
+            return False
+        if expected is not None:
+            current = task_snapshot_from_row(child)
+            normalized_expected = dict(expected)
+            normalized_expected["assignee"] = _canonical_assignee(
+                normalized_expected["assignee"]
+            )
+            if current != normalized_expected:
+                raise TaskSnapshotConflict("unlink task", current)
+        if _task_has_active_execution(conn, child):
+            raise RuntimeError(
+                f"cannot unlink task {child_id}: it has an active/current run"
+            )
+        if child["status"] not in UNLINK_TASK_ELIGIBLE_STATUSES:
+            raise RuntimeError(
+                f"cannot unlink task {child_id}: status {child['status']!r} is not eligible"
+            )
+        if not conn.execute(
+            "SELECT 1 FROM task_links WHERE parent_id = ? AND child_id = ?",
+            (parent_id, child_id),
+        ).fetchone():
+            return False
         cur = conn.execute(
             "DELETE FROM task_links WHERE parent_id = ? AND child_id = ?",
             (parent_id, child_id),
         )
-        if cur.rowcount:
-            _append_event(
-                conn, child_id, "unlinked",
-                {"parent": parent_id, "child": child_id},
+        if cur.rowcount != 1:
+            raise RuntimeError(
+                f"task link disappeared while unlinking {parent_id} -> {child_id}"
             )
-        removed = cur.rowcount > 0
-    if removed:
-        # Dependency edge removed — re-evaluate promotion eligibility for the
-        # child immediately.  Matches the contract of complete_task and
-        # unblock_task; without this the child stays stuck in todo until the
-        # next dispatcher tick or a manual `hermes kanban recompute` (issue #22459).
-        recompute_ready(conn)
-    return removed
+        _append_event(
+            conn, child_id, "unlinked",
+            {"parent": parent_id, "child": child_id},
+        )
+        _promote_ready_task(
+            conn,
+            child_id,
+            failure_limit=int(failure_limit),
+            release_measure_unblocks=release_measure_unblocks,
+        )
+        return True
 
 
 def parent_ids(conn: sqlite3.Connection, task_id: str) -> list[str]:
@@ -9661,6 +9942,55 @@ def handle_development_budget_exhaustion(
     return True
 
 
+def _promote_ready_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    failure_limit: int,
+    release_measure_unblocks: bool,
+) -> bool:
+    """Promote one eligible task; caller must hold the write transaction."""
+    row = conn.execute(
+        "SELECT id, status, consecutive_failures, max_retries "
+        "FROM tasks WHERE id = ? AND status IN ('todo', 'blocked')",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return False
+    cur_status = row["status"]
+    if cur_status == "blocked" and _has_sticky_block(conn, task_id):
+        return False
+    parents = conn.execute(
+        "SELECT t.status, t.workflow_template_id, t.current_step_key FROM tasks t "
+        "JOIN task_links l ON l.parent_id = t.id "
+        "WHERE l.child_id = ?",
+        (task_id,),
+    ).fetchall()
+    if not all(
+        _dependency_parent_satisfied(
+            parent, release_measure_unblocks=release_measure_unblocks
+        )
+        for parent in parents
+    ):
+        return False
+    if cur_status == "blocked":
+        failures = int(row["consecutive_failures"] or 0)
+        task_limit = row["max_retries"]
+        effective_limit = (
+            int(task_limit) if task_limit is not None else int(failure_limit)
+        )
+        if failures >= effective_limit:
+            return False
+    cur = conn.execute(
+        "UPDATE tasks SET status = 'ready' WHERE id = ? AND status = ?",
+        (task_id, cur_status),
+    )
+    if cur.rowcount != 1:
+        return False
+    _append_event(conn, task_id, "promoted", None)
+    return True
+
+
 def recompute_ready(
     conn: sqlite3.Connection, failure_limit: int = None,
 ) -> int:
@@ -9704,53 +10034,16 @@ def recompute_ready(
     promoted = 0
     with write_txn(conn):
         todo_rows = conn.execute(
-            "SELECT id, status, consecutive_failures, max_retries "
+            "SELECT id "
             "FROM tasks WHERE status IN ('todo', 'blocked')"
         ).fetchall()
         for row in todo_rows:
-            task_id = row["id"]
-            cur_status = row["status"]
-            if cur_status == "blocked" and _has_sticky_block(conn, task_id):
-                # Worker / operator asked for human review — do not
-                # silently auto-recover.  ``unblock_task`` is the only
-                # legitimate exit (it emits ``"unblocked"`` which flips
-                # this predicate back).
-                continue
-            parents = conn.execute(
-                "SELECT t.status, t.workflow_template_id, t.current_step_key FROM tasks t "
-                "JOIN task_links l ON l.parent_id = t.id "
-                "WHERE l.child_id = ?",
-                (task_id,),
-            ).fetchall()
-            if all(_dependency_parent_satisfied(p, release_measure_unblocks=release_measure_unblocks) for p in parents):
-                if cur_status == "blocked":
-                    # Don't auto-recover tasks that have hit the
-                    # circuit-breaker failure limit.  Without this
-                    # guard, a task that repeatedly exhausts its
-                    # iteration budget would cycle forever:
-                    # block → auto-recover → respawn → budget
-                    # exhausted → block → …  The counter must also
-                    # be preserved so the breaker can accumulate
-                    # across recovery cycles.
-                    failures = int(row["consecutive_failures"] or 0)
-                    task_limit = row["max_retries"]
-                    effective_limit = (
-                        int(task_limit) if task_limit is not None
-                        else int(failure_limit)
-                    )
-                    if failures >= effective_limit:
-                        continue
-                    conn.execute(
-                        "UPDATE tasks SET status = 'ready' "
-                        "WHERE id = ? AND status = 'blocked'",
-                        (task_id,),
-                    )
-                else:
-                    conn.execute(
-                        "UPDATE tasks SET status = 'ready' WHERE id = ? AND status = 'todo'",
-                        (task_id,),
-                    )
-                _append_event(conn, task_id, "promoted", None)
+            if _promote_ready_task(
+                conn,
+                row["id"],
+                failure_limit=int(failure_limit),
+                release_measure_unblocks=release_measure_unblocks,
+            ):
                 promoted += 1
     return promoted
 

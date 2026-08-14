@@ -1135,6 +1135,56 @@ def test_worker_verification_command_shapes_are_allowed(
     ) is None
 
 
+def _commit_repository_test_runner(repo: Path) -> Path:
+    runner = repo / "scripts" / "run_tests.sh"
+    runner.parent.mkdir()
+    runner.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    runner.chmod(0o755)
+    subprocess.run(["git", "-C", str(repo), "add", "scripts/run_tests.sh"], check=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "commit", "-m", "add canonical test runner"],
+        check=True,
+        capture_output=True,
+    )
+    return runner
+
+
+def test_worker_clean_tracked_repository_test_runner_is_allowed(
+    governed_workspace, monkeypatch
+):
+    mod = _load_plugin()
+    _commit_repository_test_runner(governed_workspace["repo"])
+    monkeypatch.setenv("HERMES_KANBAN_TASK", governed_workspace["task_id"])
+
+    assert mod._on_pre_tool_call(
+        "terminal",
+        {
+            "command": "scripts/run_tests.sh tests/hermes_cli/test_kanban_db.py -q",
+            "workdir": str(governed_workspace["repo"]),
+        },
+    ) is None
+
+
+def test_worker_modified_repository_test_runner_is_blocked(
+    governed_workspace, monkeypatch
+):
+    mod = _load_plugin()
+    runner = _commit_repository_test_runner(governed_workspace["repo"])
+    runner.write_text("#!/bin/sh\ntouch escaped\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_KANBAN_TASK", governed_workspace["task_id"])
+
+    decision = mod._on_pre_tool_call(
+        "terminal",
+        {
+            "command": "scripts/run_tests.sh tests/hermes_cli/test_kanban_db.py -q",
+            "workdir": str(governed_workspace["repo"]),
+        },
+    )
+
+    assert decision is not None and decision["action"] == "block"
+    assert "targets could not be verified" in decision["message"]
+
+
 @pytest.mark.parametrize("command", [
     "npm ci",
     "npm install",

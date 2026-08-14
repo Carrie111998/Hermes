@@ -253,9 +253,11 @@ def test_worker_with_kanban_toolset_still_hides_board_routing(monkeypatch, tmp_p
     assert {
         "kanban_list",
         "kanban_unblock",
+        "kanban_configure",
+        "kanban_unlink",
     }.isdisjoint(kanban), (
         f"Board-routing tools leaked into worker schema: "
-        f"{kanban & {'kanban_list', 'kanban_unblock'}}"
+        f"{kanban & {'kanban_list', 'kanban_unblock', 'kanban_configure', 'kanban_unlink'}}"
     )
 
 
@@ -4003,3 +4005,648 @@ def test_attach_url_happy_path_public_host(worker_env, default_url_guard, monkey
         assert Path(atts[0].stored_path).read_bytes() == payload
     finally:
         conn.close()
+
+
+def _kanban_configure_env(monkeypatch, tmp_path, *, configured=True):
+    from pathlib import Path
+
+    home = tmp_path / ".hermes"
+    home.mkdir(exist_ok=True)
+    if configured:
+        (home / "config.yaml").write_text(
+            "toolsets:\n  - kanban\n", encoding="utf-8"
+        )
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    if configured:
+        monkeypatch.setenv("HERMES_PROFILE", "orchestrator")
+    else:
+        monkeypatch.delenv("HERMES_PROFILE", raising=False)
+
+    from hermes_cli import kanban_db as kb
+    from model_tools import _clear_tool_defs_cache
+    from tools.registry import invalidate_check_fn_cache
+
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+    invalidate_check_fn_cache()
+    _clear_tool_defs_cache()
+    return kb
+
+
+def _kanban_configure_expected(task):
+    if task.source_commit_required:
+        source_policy = "required"
+    elif task.source_commit_forbidden:
+        source_policy = "forbidden"
+    else:
+        source_policy = "none"
+    return {
+        "status": task.status,
+        "title": task.title,
+        "assignee": task.assignee,
+        "current_step_key": task.current_step_key,
+        "current_run_id": task.current_run_id,
+        "source_policy": source_policy,
+        "max_retries": task.max_retries,
+        "max_runtime_seconds": task.max_runtime_seconds,
+        "goal_mode": task.goal_mode,
+    }
+
+
+def _kanban_configure_args(task, **overrides):
+    args = {
+        "task_id": task.id,
+        "source_policy": "required",
+        "max_retries": 1,
+        "max_runtime_seconds": 300,
+        "goal_mode": True,
+        "expected": _kanban_configure_expected(task),
+    }
+    args.update(overrides)
+    return args
+
+
+def _kanban_configure_public(args, **kwargs):
+    from model_tools import handle_function_call
+
+    return json.loads(
+        handle_function_call(
+            "kanban_configure",
+            args,
+            enabled_toolsets=["kanban"],
+            **kwargs,
+        )
+    )
+
+
+def _kanban_configure_state(kb, task_id, *, board=None):
+    with kb.connect(board=board) as conn:
+        row = dict(
+            conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        )
+        events = [(event.kind, event.payload) for event in kb.list_events(conn, task_id)]
+    return row, events
+
+
+def test_kanban_configure_public_schema_call_and_show_readback(monkeypatch, tmp_path):
+    kb = _kanban_configure_env(monkeypatch, tmp_path)
+    import tools.kanban_tools  # ensure registration
+    from model_tools import get_tool_definitions, handle_function_call
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="public configure", assignee="developer")
+
+    schemas = get_tool_definitions(
+        enabled_toolsets=["kanban"],
+        quiet_mode=True,
+        skip_tool_search_assembly=True,
+    )
+    names = {schema["function"]["name"] for schema in schemas}
+    assert "kanban_configure" in names
+
+    shown_before = json.loads(
+        handle_function_call(
+            "kanban_show", {"task_id": task_id}, enabled_toolsets=["kanban"]
+        )
+    )
+    expected = {
+        key: shown_before["task"][key]
+        for key in (
+            "status",
+            "title",
+            "assignee",
+            "current_step_key",
+            "current_run_id",
+            "source_policy",
+            "max_retries",
+            "max_runtime_seconds",
+            "goal_mode",
+        )
+    }
+    result = _kanban_configure_public(
+        {
+            "task_id": task_id,
+            "source_policy": "required",
+            "max_retries": 1,
+            "max_runtime_seconds": 300,
+            "goal_mode": True,
+            "expected": expected,
+        }
+    )
+    shown_after = json.loads(
+        handle_function_call(
+            "kanban_show", {"task_id": task_id}, enabled_toolsets=["kanban"]
+        )
+    )
+
+    assert result == {
+        "ok": True,
+        "task_id": task_id,
+        "source_policy": "required",
+        "max_retries": 1,
+        "max_runtime_seconds": 300,
+        "goal_mode": True,
+    }
+    assert {
+        key: shown_after["task"][key]
+        for key in ("source_policy", "max_retries", "max_runtime_seconds", "goal_mode")
+    } == {
+        "source_policy": "required",
+        "max_retries": 1,
+        "max_runtime_seconds": 300,
+        "goal_mode": True,
+    }
+    assert shown_after["events"][-1]["kind"] == "execution_contract_configured"
+    assert shown_after["events"][-1]["payload"] == {
+        "before": {
+            "source_policy": "none",
+            "max_retries": None,
+            "max_runtime_seconds": None,
+            "goal_mode": False,
+        },
+        "after": {
+            "source_policy": "required",
+            "max_retries": 1,
+            "max_runtime_seconds": 300,
+            "goal_mode": True,
+        },
+    }
+
+
+@pytest.mark.parametrize(
+    ("changed_field", "changed_value"),
+    [("title", "changed title"), ("max_retries", 4)],
+    ids=["stale_lifecycle", "stale_execution"],
+)
+def test_kanban_configure_public_cas_refuses_stale_state_without_mutation(
+    monkeypatch, tmp_path, changed_field, changed_value
+):
+    kb = _kanban_configure_env(monkeypatch, tmp_path)
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="stale public configure")
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        conn.execute(
+            f"UPDATE tasks SET {changed_field} = ? WHERE id = ?",
+            (changed_value, task_id),
+        )
+        conn.commit()
+    before = _kanban_configure_state(kb, task_id)
+
+    result = _kanban_configure_public(_kanban_configure_args(task))
+
+    assert "refresh with kanban_show" in result.get("error", "")
+    assert _kanban_configure_state(kb, task_id) == before
+
+
+def test_kanban_configure_public_refuses_second_same_expectation_write(
+    monkeypatch, tmp_path
+):
+    kb = _kanban_configure_env(monkeypatch, tmp_path)
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="single public write")
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+    args = _kanban_configure_args(task)
+    assert _kanban_configure_public(args)["ok"] is True
+    before_replay = _kanban_configure_state(kb, task_id)
+
+    replay = _kanban_configure_public(args)
+
+    assert "refresh with kanban_show" in replay.get("error", "")
+    assert _kanban_configure_state(kb, task_id) == before_replay
+
+
+def test_kanban_configure_public_refuses_unconfigured_direct_dispatch_with_empty_tools(
+    monkeypatch, tmp_path
+):
+    kb = _kanban_configure_env(monkeypatch, tmp_path, configured=False)
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="not an orchestrator")
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+    before = _kanban_configure_state(kb, task_id)
+
+    result = _kanban_configure_public(
+        _kanban_configure_args(task), enabled_tools=[]
+    )
+
+    assert "configured Kanban orchestrator" in result.get("error", "")
+    assert _kanban_configure_state(kb, task_id) == before
+
+
+@pytest.mark.parametrize("context", ["worker", "delegated_child"])
+def test_kanban_configure_public_refuses_worker_and_delegated_contexts(
+    monkeypatch, tmp_path, context
+):
+    kb = _kanban_configure_env(monkeypatch, tmp_path)
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title=f"refuse {context}")
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+    before = _kanban_configure_state(kb, task_id)
+
+    if context == "worker":
+        monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+        monkeypatch.setenv("HERMES_PROFILE", "developer")
+        result = _kanban_configure_public(_kanban_configure_args(task))
+    else:
+        from agent.delegation_context import delegated_child_context
+
+        with delegated_child_context("configure-child"):
+            result = _kanban_configure_public(_kanban_configure_args(task))
+
+    assert result.get("ok") is not True
+    assert _kanban_configure_state(kb, task_id) == before
+
+
+def test_kanban_configure_public_refuses_strict_board_without_mutation(
+    monkeypatch, tmp_path
+):
+    kb = _kanban_configure_env(monkeypatch, tmp_path)
+    board = "strict-configure"
+    kb.create_board(board, name="Strict configure", preset="product")
+    with kb.connect(board=board) as conn:
+        task_id = kb.create_task(conn, title="strict card")
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+    metadata = kb.read_board_metadata(board)
+    metadata.setdefault("qualification", {})["required"] = True
+    metadata.pop("db_path", None)
+    kb.board_metadata_path(board).write_text(json.dumps(metadata), encoding="utf-8")
+    before = _kanban_configure_state(kb, task_id, board=board)
+
+    result = _kanban_configure_public(
+        _kanban_configure_args(task, board=board)
+    )
+
+    assert "strict-board" in result.get("error", "")
+    assert _kanban_configure_state(kb, task_id, board=board) == before
+
+
+def test_kanban_configure_public_refuses_active_current_run_without_mutation(
+    monkeypatch, tmp_path
+):
+    kb = _kanban_configure_env(monkeypatch, tmp_path)
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="active public card")
+        task = kb.claim_task(conn, task_id)
+        assert task is not None and task.current_run_id is not None
+    before = _kanban_configure_state(kb, task_id)
+
+    result = _kanban_configure_public(_kanban_configure_args(task))
+
+    assert "active/current run" in result.get("error", "")
+    assert _kanban_configure_state(kb, task_id) == before
+
+
+def test_kanban_configure_public_refuses_non_default_board_without_mutation(
+    monkeypatch, tmp_path
+):
+    kb = _kanban_configure_env(monkeypatch, tmp_path)
+    board = "legacy-other"
+    kb.create_board(board, name="Other board")
+    with kb.connect(board=board) as conn:
+        task_id = kb.create_task(conn, title="other board card")
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+    before = _kanban_configure_state(kb, task_id, board=board)
+
+    result = _kanban_configure_public(
+        _kanban_configure_args(task, board=board)
+    )
+
+    assert "Default board" in result.get("error", "")
+    assert _kanban_configure_state(kb, task_id, board=board) == before
+
+
+@pytest.mark.parametrize("status", ["running", "done", "archived"])
+def test_kanban_configure_public_refuses_terminal_status_without_mutation(
+    monkeypatch, tmp_path, status
+):
+    kb = _kanban_configure_env(monkeypatch, tmp_path)
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title=f"public {status}")
+        conn.execute("UPDATE tasks SET status = ? WHERE id = ?", (status, task_id))
+        conn.commit()
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+    before = _kanban_configure_state(kb, task_id)
+
+    result = _kanban_configure_public(_kanban_configure_args(task))
+
+    assert "status" in result.get("error", "")
+    assert _kanban_configure_state(kb, task_id) == before
+
+
+@pytest.mark.parametrize(
+    ("case", "override"),
+    [
+        ("missing_top_level", {"remove": "max_retries"}),
+        ("missing_expected", {"remove_expected": "goal_mode"}),
+        ("invalid_source", {"source_policy": "sometimes"}),
+        ("invalid_retries", {"max_retries": 0}),
+        ("invalid_runtime", {"max_runtime_seconds": 0}),
+        ("invalid_goal", {"goal_mode": None}),
+    ],
+)
+def test_kanban_configure_public_refuses_invalid_and_incomplete_input_without_mutation(
+    monkeypatch, tmp_path, case, override
+):
+    kb = _kanban_configure_env(monkeypatch, tmp_path)
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title=f"invalid {case}")
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+    args = _kanban_configure_args(task)
+    if "remove" in override:
+        args.pop(override["remove"])
+    elif "remove_expected" in override:
+        args["expected"].pop(override["remove_expected"])
+    else:
+        args.update(override)
+    before = _kanban_configure_state(kb, task_id)
+
+    result = _kanban_configure_public(args)
+
+    assert result.get("ok") is not True
+    assert _kanban_configure_state(kb, task_id) == before
+
+
+def _kanban_unlink_public(args, **kwargs):
+    from model_tools import handle_function_call
+
+    return json.loads(
+        handle_function_call(
+            "kanban_unlink",
+            args,
+            enabled_toolsets=["kanban"],
+            **kwargs,
+        )
+    )
+
+
+def _kanban_unlink_expected(task):
+    return {
+        "status": task.status,
+        "title": task.title,
+        "assignee": task.assignee,
+        "current_step_key": task.current_step_key,
+        "current_run_id": task.current_run_id,
+    }
+
+
+def _kanban_unlink_args(task, parent_id, child_id, **overrides):
+    args = {
+        "parent_id": parent_id,
+        "child_id": child_id,
+        "expected": _kanban_unlink_expected(task),
+    }
+    args.update(overrides)
+    return args
+
+
+def _kanban_unlink_state(kb, *, board=None):
+    with kb.connect(board=board) as conn:
+        tasks = [
+            dict(row)
+            for row in conn.execute("SELECT * FROM tasks ORDER BY id").fetchall()
+        ]
+        links = [
+            tuple(row)
+            for row in conn.execute(
+                "SELECT parent_id, child_id FROM task_links ORDER BY parent_id, child_id"
+            ).fetchall()
+        ]
+        events = [
+            dict(row)
+            for row in conn.execute("SELECT * FROM task_events ORDER BY id").fetchall()
+        ]
+        runs = [
+            dict(row)
+            for row in conn.execute("SELECT * FROM task_runs ORDER BY id").fetchall()
+        ]
+    return tasks, links, events, runs
+
+
+def test_kanban_unlink_public_schema_call_and_show_readback(monkeypatch, tmp_path):
+    kb = _kanban_configure_env(monkeypatch, tmp_path)
+    import tools.kanban_tools  # ensure registration
+    from model_tools import get_tool_definitions, handle_function_call
+
+    with kb.connect() as conn:
+        parent_id = kb.create_task(conn, title="blocking parent")
+        child_id = kb.create_task(conn, title="public unlink", parents=[parent_id])
+
+    schemas = get_tool_definitions(
+        enabled_toolsets=["kanban"],
+        quiet_mode=True,
+        skip_tool_search_assembly=True,
+    )
+    names = {schema["function"]["name"] for schema in schemas}
+    assert {"kanban_configure", "kanban_unlink"} <= names
+    from toolsets import _HERMES_CORE_TOOLS
+
+    assert "kanban_unlink" not in _HERMES_CORE_TOOLS
+
+    shown_before = json.loads(
+        handle_function_call(
+            "kanban_show", {"task_id": child_id}, enabled_toolsets=["kanban"]
+        )
+    )
+    expected = {
+        key: shown_before["task"][key]
+        for key in (
+            "status",
+            "title",
+            "assignee",
+            "current_step_key",
+            "current_run_id",
+        )
+    }
+
+    result = _kanban_unlink_public(
+        {
+            "parent_id": parent_id,
+            "child_id": child_id,
+            "expected": expected,
+            "board": "Default",
+        }
+    )
+    shown_after = json.loads(
+        handle_function_call(
+            "kanban_show", {"task_id": child_id}, enabled_toolsets=["kanban"]
+        )
+    )
+
+    assert result == {
+        "ok": True,
+        "parent_id": parent_id,
+        "child_id": child_id,
+        "removed": True,
+        "status": "ready",
+    }
+    assert shown_after["parents"] == []
+    assert shown_after["task"]["status"] == "ready"
+    assert [event["kind"] for event in shown_after["events"]][-2:] == [
+        "unlinked",
+        "promoted",
+    ]
+
+
+def test_kanban_unlink_public_repeat_missing_edge_is_mutation_free(
+    monkeypatch, tmp_path
+):
+    kb = _kanban_configure_env(monkeypatch, tmp_path)
+    with kb.connect() as conn:
+        parent_id = kb.create_task(conn, title="repeat parent")
+        child_id = kb.create_task(conn, title="repeat child", parents=[parent_id])
+        child = kb.get_task(conn, child_id)
+        assert child is not None
+    first = _kanban_unlink_public(
+        _kanban_unlink_args(child, parent_id, child_id)
+    )
+    assert first["ok"] is True
+    with kb.connect() as conn:
+        current = kb.get_task(conn, child_id)
+        assert current is not None
+    before = _kanban_unlink_state(kb)
+
+    repeat = _kanban_unlink_public(
+        _kanban_unlink_args(current, parent_id, child_id)
+    )
+
+    assert "not found" in repeat.get("error", "")
+    assert _kanban_unlink_state(kb) == before
+
+
+@pytest.mark.parametrize("expected_case", ["stale", "missing_field", "extra_field"])
+def test_kanban_unlink_public_refuses_bad_snapshot_without_mutation(
+    monkeypatch, tmp_path, expected_case
+):
+    kb = _kanban_configure_env(monkeypatch, tmp_path)
+    with kb.connect() as conn:
+        parent_id = kb.create_task(conn, title=f"{expected_case} parent")
+        child_id = kb.create_task(
+            conn, title=f"{expected_case} child", parents=[parent_id]
+        )
+        child = kb.get_task(conn, child_id)
+        assert child is not None
+        args = _kanban_unlink_args(child, parent_id, child_id)
+        if expected_case == "stale":
+            conn.execute(
+                "UPDATE tasks SET title = 'changed after show' WHERE id = ?",
+                (child_id,),
+            )
+            conn.commit()
+        elif expected_case == "missing_field":
+            args["expected"].pop("title")
+        else:
+            args["expected"]["unexpected"] = "value"
+    before = _kanban_unlink_state(kb)
+
+    result = _kanban_unlink_public(args)
+
+    if expected_case == "stale":
+        assert "refresh with kanban_show" in result.get("error", "")
+    else:
+        assert "expected" in result.get("error", "")
+    assert _kanban_unlink_state(kb) == before
+
+
+@pytest.mark.parametrize("child_case", ["active_run", "running", "done", "archived"])
+def test_kanban_unlink_public_refuses_active_and_terminal_child_without_mutation(
+    monkeypatch, tmp_path, child_case
+):
+    kb = _kanban_configure_env(monkeypatch, tmp_path)
+    with kb.connect() as conn:
+        parent_id = kb.create_task(conn, title=f"{child_case} parent")
+        child_id = kb.create_task(conn, title=f"{child_case} child")
+        if child_case == "active_run":
+            child = kb.claim_task(conn, child_id)
+            assert child is not None and child.current_run_id is not None
+            kb.link_tasks(conn, parent_id, child_id)
+        else:
+            kb.link_tasks(conn, parent_id, child_id)
+            conn.execute(
+                "UPDATE tasks SET status = ? WHERE id = ?",
+                (child_case, child_id),
+            )
+            conn.commit()
+            child = kb.get_task(conn, child_id)
+            assert child is not None
+    before = _kanban_unlink_state(kb)
+
+    result = _kanban_unlink_public(
+        _kanban_unlink_args(child, parent_id, child_id)
+    )
+
+    assert result.get("ok") is not True
+    assert _kanban_unlink_state(kb) == before
+
+
+@pytest.mark.parametrize("context", ["unconfigured", "worker", "delegated_child"])
+def test_kanban_unlink_public_refuses_unauthorized_context_without_mutation(
+    monkeypatch, tmp_path, context
+):
+    kb = _kanban_configure_env(
+        monkeypatch, tmp_path, configured=context != "unconfigured"
+    )
+    with kb.connect() as conn:
+        parent_id = kb.create_task(conn, title=f"{context} parent")
+        child_id = kb.create_task(conn, title=f"{context} child", parents=[parent_id])
+        child = kb.get_task(conn, child_id)
+        assert child is not None
+    before = _kanban_unlink_state(kb)
+    args = _kanban_unlink_args(child, parent_id, child_id)
+
+    if context == "unconfigured":
+        result = _kanban_unlink_public(args, enabled_tools=[])
+    elif context == "worker":
+        monkeypatch.setenv("HERMES_KANBAN_TASK", child_id)
+        monkeypatch.setenv("HERMES_PROFILE", "developer")
+        result = _kanban_unlink_public(args)
+    else:
+        from agent.delegation_context import delegated_child_context
+
+        with delegated_child_context("unlink-child"):
+            result = _kanban_unlink_public(args)
+
+    assert result.get("ok") is not True
+    assert _kanban_unlink_state(kb) == before
+
+
+@pytest.mark.parametrize("board_case", ["strict", "non_default"])
+def test_kanban_unlink_public_refuses_non_default_boards_without_mutation(
+    monkeypatch, tmp_path, board_case
+):
+    kb = _kanban_configure_env(monkeypatch, tmp_path)
+    board = f"{board_case}-unlink"
+    kb.create_board(
+        board,
+        name=f"{board_case} unlink",
+        preset="product" if board_case == "strict" else None,
+    )
+    with kb.connect(board=board) as conn:
+        parent_id = kb.create_task(conn, title=f"{board_case} parent")
+        child_id = kb.create_task(
+            conn, title=f"{board_case} child", parents=[parent_id]
+        )
+        child = kb.get_task(conn, child_id)
+        assert child is not None
+    if board_case == "strict":
+        metadata = kb.read_board_metadata(board)
+        metadata.setdefault("qualification", {})["required"] = True
+        metadata.pop("db_path", None)
+        kb.board_metadata_path(board).write_text(json.dumps(metadata), encoding="utf-8")
+    before = _kanban_unlink_state(kb, board=board)
+
+    result = _kanban_unlink_public(
+        _kanban_unlink_args(child, parent_id, child_id, board=board)
+    )
+
+    expected_error = "strict-board" if board_case == "strict" else "Default board"
+    assert expected_error in result.get("error", "")
+    assert _kanban_unlink_state(kb, board=board) == before
