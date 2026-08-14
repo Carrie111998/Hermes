@@ -328,6 +328,7 @@ def _(rid, params: dict) -> dict:
 
 
 @method("complete.slash")
+@_profile_scoped
 def _(rid, params: dict) -> dict:
     text = params.get("text", "")
     if not text.startswith("/"):
