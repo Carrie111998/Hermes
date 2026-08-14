@@ -2282,13 +2282,46 @@ class AIAgent:
             # re-writes the whole tail (same recovery contract as before,
             # minus the partial-prefix case that could double-pay counters).
             if _batch_rows:
-                self._session_db.append_messages_batch(
-                    session_id=self.session_id,
-                    messages=_batch_rows,
-                    compression_lock_holder=getattr(
-                        self, "_active_compression_lock_holder", None
-                    ),
-                )
+                try:
+                    self._session_db.append_messages_batch(
+                        session_id=self.session_id,
+                        messages=_batch_rows,
+                        compression_lock_holder=getattr(
+                            self, "_active_compression_lock_holder", None
+                        ),
+                    )
+                except Exception as append_exc:
+                    # A long-running turn can publish its compression child and
+                    # still reach this final flush through a stale Agent path.
+                    # The batch writer rejects the ended parent before inserting
+                    # any rows. Adopt only the unique durable continuation, then
+                    # retry the same all-or-nothing batch exactly once.
+                    from hermes_state import CompressionSessionClosedError
+
+                    if not isinstance(append_exc, CompressionSessionClosedError):
+                        raise
+                    stale_session_id = self.session_id
+                    from agent.conversation_compression import (
+                        recover_rotated_compression_session,
+                    )
+
+                    recovered = recover_rotated_compression_session(self)
+                    if recovered is None or self.session_id == stale_session_id:
+                        raise
+                    logger.info(
+                        "Final session flush adopted compression continuation "
+                        "%s -> %s",
+                        stale_session_id,
+                        self.session_id,
+                    )
+                    self._session_db.append_messages_batch(
+                        session_id=self.session_id,
+                        messages=_batch_rows,
+                        compression_lock_holder=getattr(
+                            self, "_active_compression_lock_holder", None
+                        ),
+                    )
+                self._flushed_db_message_session_id = self.session_id
                 for _written in _batch_msgs:
                     _written[_DB_PERSISTED_MARKER] = True
             # The intrinsic markers are now the sole source of truth. Reset the

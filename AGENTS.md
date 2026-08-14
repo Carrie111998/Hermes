@@ -1198,6 +1198,16 @@ invalidation. See `/skills install --now` for the canonical pattern.
   `LoadState=loaded`; otherwise a synthetic user-manager `TimeoutStopUSec=90s`
   can shadow the real system unit. Pin this in `test_shutdown_forensics.py`.
 
+### Compression-final persistence
+
+- A long-running turn can publish a compression child before its final durable
+  flush completes. If the atomic message batch then raises
+  `CompressionSessionClosedError`, adopt only the unique live continuation via
+  `recover_rotated_compression_session()` and retry that same batch once. Do not
+  reroute other persistence errors, guess among ambiguous children, or stamp
+  `_db_persisted` before the retry succeeds. Keep the real-`SessionDB`
+  regression in `tests/run_agent/test_flush_compression_child_adoption.py`.
+
 ### Background Process Notifications (Gateway)
 
 When `terminal(background=true, notify_on_complete=true)` is used, the gateway runs a watcher that
