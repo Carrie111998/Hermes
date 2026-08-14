@@ -227,6 +227,7 @@ class TestResolveWorkerExecutor:
             "kanban.claude_cli_bin",
             "kanban.claude_cli_model",
             "kanban.claude_cli_permission_mode",
+            "kanban.claude_cli_effort",
             "kanban.claude_cli_extra_args",
             "kanban.claude_cli_spawn_stagger_seconds",
         ):
@@ -236,6 +237,269 @@ class TestResolveWorkerExecutor:
         from hermes_cli.config_defaults import DEFAULT_CONFIG
 
         assert DEFAULT_CONFIG["kanban"]["worker_executor"] == "claude_cli"
+
+
+# ---------------------------------------------------------------------------
+# Thinking depth (--effort)
+# ---------------------------------------------------------------------------
+
+def _effort_of(cmd):
+    """Return the ``--effort`` value in ``cmd``, or None if the flag is absent."""
+    assert cmd.count("--effort") <= 1, f"--effort passed twice: {cmd}"
+    if "--effort" not in cmd:
+        return None
+    return cmd[cmd.index("--effort") + 1]
+
+
+class TestWorkerEffort:
+    """Every direct-lane worker runs at an explicit, validated effort.
+
+    The house requirement is that a kanban worker/reviewer runs at *medium*
+    unless its card says otherwise, and that this is provable after the fact
+    rather than inherited from whatever default the host CLI happens to ship.
+    Two failure modes are guarded specifically:
+
+    * a card pinning a Hermes-only level (``minimal``/``ultra``/``none``) must
+      not have that word forwarded — ``claude --effort minimal`` is argv the
+      CLI rejects, so the worker would die at startup and the card would show
+      an unexplained ``spawn_failed``;
+    * the level must never be silently translated *upward* into more thinking
+      than the card asked for.
+    """
+
+    def test_default_worker_runs_at_medium(self, spawn_env, monkeypatch):
+        kb = spawn_env["kb"]
+        _select(monkeypatch, kb)
+
+        kb._default_spawn(_make_task(kb), str(spawn_env["workspace"]))
+
+        assert _effort_of(spawn_env["captured"]["cmd"]) == "medium"
+
+    def test_config_default_is_medium(self):
+        from hermes_cli.config_defaults import DEFAULT_CONFIG
+
+        assert DEFAULT_CONFIG["kanban"]["claude_cli_effort"] == "medium"
+
+    @pytest.mark.parametrize("level", ["low", "medium", "high", "xhigh", "max"])
+    def test_cli_supported_levels_are_forwarded_verbatim(
+        self, spawn_env, monkeypatch, level
+    ):
+        kb = spawn_env["kb"]
+        _select(monkeypatch, kb)
+
+        kb._default_spawn(
+            _make_task(kb, reasoning_effort=level), str(spawn_env["workspace"])
+        )
+
+        assert _effort_of(spawn_env["captured"]["cmd"]) == level
+
+    @pytest.mark.parametrize(
+        "pinned,expected",
+        [("minimal", "low"), ("ultra", "max"), ("none", "low")],
+    )
+    def test_hermes_only_levels_are_translated_not_forwarded(
+        self, spawn_env, monkeypatch, caplog, pinned, expected
+    ):
+        kb = spawn_env["kb"]
+        _select(monkeypatch, kb)
+
+        with caplog.at_level("WARNING"):
+            kb._default_spawn(
+                _make_task(kb, reasoning_effort=pinned),
+                str(spawn_env["workspace"]),
+            )
+
+        cmd = spawn_env["captured"]["cmd"]
+        assert _effort_of(cmd) == expected
+        # The untranslated word must not survive anywhere in argv.
+        assert pinned not in cmd
+        # A translation is a real behavior change; it stays visible.
+        assert pinned in caplog.text
+
+    def test_translation_never_increases_thinking(self, spawn_env, monkeypatch):
+        """`minimal` and `none` must land at the floor, never at the default.
+
+        Falling back to the lane default here would be the quiet bug: a card
+        that explicitly asked for the least thinking would get medium, and
+        nothing in argv or the log would say so.
+        """
+        kb = spawn_env["kb"]
+        _select(monkeypatch, kb)
+
+        for pinned in ("minimal", "none"):
+            kb._default_spawn(
+                _make_task(kb, reasoning_effort=pinned),
+                str(spawn_env["workspace"]),
+            )
+            assert _effort_of(spawn_env["captured"]["cmd"]) == "low"
+
+    def test_every_hermes_effort_level_maps_to_something_the_cli_accepts(self):
+        """No Hermes level may reach the CLI untranslated.
+
+        Pinned as a test because the two vocabularies are maintained in
+        different files: a new level added to VALID_REASONING_EFFORTS with no
+        entry here would ship a card status that kills its own worker.
+        """
+        from hermes_cli import kanban_db as kb
+        from hermes_constants import VALID_REASONING_EFFORTS
+
+        for level in (*VALID_REASONING_EFFORTS, "none"):
+            mapped = kb._CLAUDE_CLI_EFFORT_ALIASES.get(level, level)
+            assert mapped in kb.CLAUDE_CLI_SUPPORTED_EFFORTS, level
+
+    def test_supported_levels_match_the_host_cli(self):
+        """Verified against `claude --help` (2.1.x): low|medium|high|xhigh|max."""
+        from hermes_cli import kanban_db as kb
+
+        assert kb.CLAUDE_CLI_SUPPORTED_EFFORTS == (
+            "low", "medium", "high", "xhigh", "max",
+        )
+
+    def test_configured_lane_default_applies_when_the_card_pins_nothing(
+        self, spawn_env, monkeypatch
+    ):
+        kb = spawn_env["kb"]
+        _select(monkeypatch, kb, claude_cli_effort="high")
+
+        kb._default_spawn(_make_task(kb), str(spawn_env["workspace"]))
+
+        assert _effort_of(spawn_env["captured"]["cmd"]) == "high"
+
+    def test_card_pin_beats_the_configured_lane_default(
+        self, spawn_env, monkeypatch
+    ):
+        kb = spawn_env["kb"]
+        _select(monkeypatch, kb, claude_cli_effort="low")
+
+        kb._default_spawn(
+            _make_task(kb, reasoning_effort="high"), str(spawn_env["workspace"])
+        )
+
+        assert _effort_of(spawn_env["captured"]["cmd"]) == "high"
+
+    def test_empty_config_value_adds_no_flag(self, spawn_env, monkeypatch):
+        """An explicit "" is the operator opt-out: let the host CLI choose."""
+        kb = spawn_env["kb"]
+        _select(monkeypatch, kb, claude_cli_effort="")
+
+        kb._default_spawn(_make_task(kb), str(spawn_env["workspace"]))
+
+        assert _effort_of(spawn_env["captured"]["cmd"]) is None
+
+    def test_unrecognized_config_value_falls_forward_to_medium(
+        self, spawn_env, monkeypatch, caplog
+    ):
+        kb = spawn_env["kb"]
+        _select(monkeypatch, kb, claude_cli_effort="bogus")
+
+        with caplog.at_level("WARNING"):
+            kb._default_spawn(_make_task(kb), str(spawn_env["workspace"]))
+
+        assert _effort_of(spawn_env["captured"]["cmd"]) == "medium"
+        assert "bogus" not in spawn_env["captured"]["cmd"]
+        assert "claude_cli_effort" in caplog.text
+
+    def test_unrecognized_card_pin_falls_back_to_the_lane_default(
+        self, spawn_env, monkeypatch, caplog
+    ):
+        """A typo'd card level must not become argv the CLI rejects."""
+        kb = spawn_env["kb"]
+        _select(monkeypatch, kb, claude_cli_effort="high")
+
+        with caplog.at_level("WARNING"):
+            kb._default_spawn(
+                _make_task(kb, reasoning_effort="medum"),
+                str(spawn_env["workspace"]),
+            )
+
+        cmd = spawn_env["captured"]["cmd"]
+        assert _effort_of(cmd) == "high"
+        assert "medum" not in cmd
+        assert "medum" in caplog.text
+
+    def test_operator_effort_flag_is_not_overridden(self, spawn_env, monkeypatch):
+        """Passing --effort twice would leave the winner up to the host CLI."""
+        kb = spawn_env["kb"]
+        _select(
+            monkeypatch, kb,
+            claude_cli_effort="medium",
+            claude_cli_extra_args=["--effort", "max"],
+        )
+
+        kb._default_spawn(_make_task(kb), str(spawn_env["workspace"]))
+
+        cmd = spawn_env["captured"]["cmd"]
+        assert cmd.count("--effort") == 1
+        assert _effort_of(cmd) == "max"
+
+    def test_native_lane_still_uses_hermes_reasoning_flag(
+        self, spawn_env, monkeypatch
+    ):
+        """The opt-out lane is untouched: --reasoning, not --effort."""
+        kb = spawn_env["kb"]
+        _select(monkeypatch, kb, worker_executor="native")
+
+        kb._default_spawn(
+            _make_task(kb, reasoning_effort="medium"),
+            str(spawn_env["workspace"]),
+        )
+
+        cmd = spawn_env["captured"]["cmd"]
+        assert "--effort" not in cmd
+        assert cmd[cmd.index("--reasoning") + 1] == "medium"
+
+    def test_log_header_records_the_resolved_effort(self, spawn_env, monkeypatch):
+        kb = spawn_env["kb"]
+        _select(monkeypatch, kb)
+
+        kb._default_spawn(
+            _make_task(kb, reasoning_effort="high"), str(spawn_env["workspace"])
+        )
+
+        text = (kb.worker_logs_dir() / "t_exec1.log").read_text(encoding="utf-8")
+        assert "effort=high" in text
+
+    def test_log_header_withholds_an_operator_supplied_effort_value(
+        self, spawn_env, monkeypatch
+    ):
+        """Only allowlisted values are printed; operator argv is arbitrary text.
+
+        The header's whole safety property is "flag names, never values". The
+        resolved effort is the one exception and it is safe because it comes
+        from a closed set — an operator's own value is not, so it is reported
+        as `operator` rather than quoted.
+        """
+        kb = spawn_env["kb"]
+        _select(
+            monkeypatch, kb,
+            claude_cli_extra_args=["--effort", "sk-not-really-an-effort"],
+        )
+
+        kb._default_spawn(_make_task(kb), str(spawn_env["workspace"]))
+
+        text = (kb.worker_logs_dir() / "t_exec1.log").read_text(encoding="utf-8")
+        assert "effort=operator" in text
+        assert "sk-not-really-an-effort" not in text
+
+    def test_log_header_marks_the_no_flag_case(self, spawn_env, monkeypatch):
+        kb = spawn_env["kb"]
+        _select(monkeypatch, kb, claude_cli_effort="")
+
+        kb._default_spawn(_make_task(kb), str(spawn_env["workspace"]))
+
+        text = (kb.worker_logs_dir() / "t_exec1.log").read_text(encoding="utf-8")
+        assert "effort=-" in text
+
+    def test_effort_flag_precedes_the_trailing_prompt(self, spawn_env, monkeypatch):
+        """`-p <prompt>` stays last — --allowedTools is variadic (see argv order)."""
+        kb = spawn_env["kb"]
+        _select(monkeypatch, kb)
+
+        kb._default_spawn(_make_task(kb), str(spawn_env["workspace"]))
+
+        cmd = spawn_env["captured"]["cmd"]
+        assert cmd[-2] == "-p"
+        assert cmd.index("--effort") < cmd.index("-p")
 
 
 # ---------------------------------------------------------------------------

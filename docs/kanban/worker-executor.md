@@ -48,6 +48,10 @@ kanban:
   # model override of its own.
   claude_cli_model: claude-opus-5
 
+  # `--effort` for the direct lane when a card pins no reasoning_effort of
+  # its own. Default `medium`. Set to "" to add no flag at all.
+  claude_cli_effort: medium
+
   # Optional. Minimum seconds between two direct-lane `claude` process
   # startups on this Hermes root. Default 2.0; clamped to [0, 60].
   claude_cli_spawn_stagger_seconds: 2.0
@@ -167,6 +171,58 @@ accept both, which is exactly how this hides in local testing.
 through the real `hermes kanban` parser so an invented or misordered flag
 cannot ship.
 
+### Thinking depth
+
+Every direct-lane worker runs with an explicit `--effort`. The level is
+resolved once per spawn, in this order:
+
+1. the card's own `reasoning_effort`, if it pins one;
+2. `kanban.claude_cli_effort`;
+3. `medium` — the built-in default.
+
+Medium is stated in argv rather than left to the CLI's own default on purpose.
+"Which depth did this worker run at" is a question an operator has to be able
+to answer from evidence after the fact, and an implicit default is not
+evidence. The resolved level is written to the worker log header as
+`effort=<level>`, next to `executor=` and `bin=`:
+
+```
+[kanban] executor=claude_cli bin=/usr/local/bin/claude board=reefmind \
+  profile=integrator flags=--model,--effort,--permission-mode,--allowedTools,-p \
+  effort=medium stripped_env=-
+```
+
+Effort is the only flag whose *value* appears in that header. That is
+deliberate and it is bounded: the value is written only when it came from the
+closed allowlist below, so the header cannot become a place a secret leaks.
+An `--effort` the operator supplied themselves in `claude_cli_extra_args` is
+arbitrary text, so it is reported as `effort=operator` and its value is
+withheld like every other flag value.
+
+The host CLI accepts `low`, `medium`, `high`, `xhigh`, `max`. Hermes'
+`reasoning_effort` vocabulary is wider, so the extra levels are translated to
+the nearest level in the same direction — never upward into more thinking than
+the card asked for:
+
+| Card `reasoning_effort` | `--effort` | Note |
+|---|---|---|
+| `low` / `medium` / `high` / `xhigh` / `max` | same | forwarded as-is |
+| `minimal` | `low` | floor of what the CLI offers; logged |
+| `ultra` | `max` | ceiling of what the CLI offers; logged |
+| `none` | `low` | **`--effort` cannot disable thinking.** Logged. Omitting the flag would inherit a session default that may be *more* thinking than `none` asked for, and refusing the card would strand it, so the floor is the least-wrong option. Run the card on `native` if disabled reasoning is a hard requirement. |
+| unrecognized | lane default | logged; see below |
+
+An unrecognized level — on the card or in `claude_cli_effort` — falls forward
+to the lane default instead of reaching the CLI. This is not conservatism:
+`claude --effort bogus` is argv the CLI rejects outright, so the worker would
+die at startup and the card would show an unexplained `spawn_failed` with
+nothing pointing at the typo.
+
+Setting `claude_cli_effort: ""` adds no flag at all and lets the host CLI pick;
+the header then reads `effort=-`. An `--effort` in `claude_cli_extra_args`
+takes precedence over all of the above and suppresses the resolved flag
+entirely, so the run never carries `--effort` twice.
+
 ## Claim and heartbeat behavior
 
 A direct-lane worker keeps its claim the same way a native one does. The
@@ -259,8 +315,9 @@ header in the task's worker log.
   rather than complete on a partial result. `goal_max_turns` is passed through
   as a soft round budget. This is weaker than the native judge loop — run
   goal-critical cards on `native` if you need the real thing.
-- **Per-task `--toolsets` and `--reasoning` pins do not apply** — they are
-  Hermes CLI flags. Use `claude_cli_extra_args` for the CLI's own equivalents.
+- **Per-task `--toolsets` pins do not apply** — that is a Hermes CLI flag. Use
+  `claude_cli_extra_args` for the CLI's own equivalent. (Per-task
+  `reasoning_effort` *does* apply on this lane — see "Thinking depth" above.)
 - **Per-task `skills` are named in the prompt, not injected.** The native lane
   passes `--skills X` and Hermes resolves each into the worker's system prompt
   before its first turn. The host CLI has no equivalent flag, so this lane

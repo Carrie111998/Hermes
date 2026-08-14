@@ -2502,6 +2502,16 @@ DEFAULT_CONFIG = {
         # lifecycle protocol needs shell access to run `hermes kanban
         # complete` / `block`, which is granted separately via --allowedTools.
         "claude_cli_permission_mode": "bypassPermissions",
+        # --effort for the run: the thinking depth every worker and reviewer
+        # on this lane runs at unless its card pins reasoning_effort of its
+        # own. One of low|medium|high|xhigh|max — the levels the host Claude
+        # CLI accepts. Hermes-only levels (minimal, ultra, none) are
+        # translated to the nearest of those; an unrecognized value falls
+        # forward to medium rather than being passed to the CLI, which would
+        # reject its own argv and kill the worker at startup. Set to an empty
+        # string to add no flag and let the host CLI choose. The resolved
+        # level is recorded in the worker log header as `effort=<level>`.
+        "claude_cli_effort": "medium",
         # Extra argv appended before the prompt. YAML list, or a shell-quoted
         # string. For operator escape hatches (--add-dir, --settings, ...).
         "claude_cli_extra_args": [],

@@ -10415,6 +10415,49 @@ _CLAUDE_CLI_PERMISSION_FLAGS = (
 #: empty value restores the old warn-only behavior.
 CLAUDE_CLI_DEFAULT_PERMISSION_MODE = "bypassPermissions"
 
+#: Effort levels the host Claude Code CLI's ``--effort`` accepts. Verified
+#: against ``claude --help`` (2.1.x): "Effort level for the current session
+#: (low, medium, high, xhigh, max)". Hermes' own
+#: :data:`hermes_constants.VALID_REASONING_EFFORTS` is a superset, so a card
+#: pinned to a Hermes-only level has to be translated rather than forwarded —
+#: passing ``minimal`` straight through makes the CLI reject its own argv and
+#: the worker dies at startup with nothing on the board to explain why.
+CLAUDE_CLI_SUPPORTED_EFFORTS = ("low", "medium", "high", "xhigh", "max")
+
+#: Translation for the Hermes levels the CLI has no exact word for. Each maps
+#: to the nearest level in the *same direction* — never silently upward into
+#: more thinking than the card asked for.
+#:
+#: ``none`` (thinking disabled) has no CLI equivalent at all: ``--effort``
+#: cannot turn reasoning off. It maps to the floor and warns, because the
+#: honest alternatives are both worse — omitting the flag would inherit
+#: whatever the session default is (possibly *more* thinking than "none"
+#: requested), and refusing the card would strand it.
+_CLAUDE_CLI_EFFORT_ALIASES = {
+    "minimal": "low",
+    "ultra": "max",
+    "none": "low",
+}
+
+#: ``--effort`` applied when a card pins no ``reasoning_effort`` of its own.
+#:
+#: Medium is the deliberate house default, not an inherited one. Every kanban
+#: worker and reviewer on this lane runs Opus at medium unless a card says
+#: otherwise, and stating it explicitly in argv is what makes that verifiable
+#: from the worker log instead of an assumption about the CLI's own default.
+#: Operators set ``kanban.claude_cli_effort`` to change it, or to the empty
+#: string to add no flag at all and let the host CLI choose.
+CLAUDE_CLI_DEFAULT_EFFORT = "medium"
+
+#: Argv flags that already pin the run's effort. If the operator passed one in
+#: ``claude_cli_extra_args`` we add none of our own — same precedence rule the
+#: permission-mode flags follow.
+_CLAUDE_CLI_EFFORT_FLAGS = ("--effort",)
+
+#: Sentinel for :func:`_build_claude_cli_worker_command`'s ``effort`` kwarg.
+#: Distinct from ``None``, which is a real value meaning "add no flag".
+_EFFORT_UNSET = "\x00<unset>"
+
 #: Minimum seconds between two direct-lane ``claude`` process *startups* on
 #: this Hermes root. See :func:`_claude_cli_spawn_gate`.
 CLAUDE_CLI_DEFAULT_SPAWN_STAGGER_SECONDS = 2.0
@@ -10619,6 +10662,62 @@ def _claude_cli_permission_mode(kanban_cfg: Optional[dict] = None) -> str:
     return str(raw).strip()
 
 
+def _claude_cli_effort_arg(
+    task: Task, kanban_cfg: Optional[dict] = None
+) -> Optional[str]:
+    """Return the ``--effort`` level for a direct-CLI worker, or ``None``.
+
+    Precedence: the card's own ``reasoning_effort`` first, then
+    ``kanban.claude_cli_effort``, then :data:`CLAUDE_CLI_DEFAULT_EFFORT`.
+    ``None`` means "add no flag" and is reachable only by an operator setting
+    the config key to an explicit empty string.
+
+    Both sources are validated against what the host CLI actually accepts.
+    Hermes-only levels are translated via :data:`_CLAUDE_CLI_EFFORT_ALIASES`;
+    anything else falls forward to the default with a warning rather than
+    being handed to the CLI, because an unknown ``--effort`` value is not a
+    degraded run — it is argv the CLI rejects outright, so the worker never
+    starts and the card looks like an unexplained crash.
+    """
+    pinned = str(task.reasoning_effort or "").strip().lower()
+    if pinned:
+        mapped = _CLAUDE_CLI_EFFORT_ALIASES.get(pinned, pinned)
+        if mapped in CLAUDE_CLI_SUPPORTED_EFFORTS:
+            if mapped != pinned:
+                _log.warning(
+                    "kanban worker %s: reasoning_effort=%r has no %s equivalent "
+                    "— running at --effort %s (the nearest level the host CLI "
+                    "accepts).",
+                    task.id, pinned, WORKER_EXECUTOR_CLAUDE_CLI, mapped,
+                )
+            return mapped
+        _log.warning(
+            "kanban worker %s: reasoning_effort=%r is not a level the host "
+            "Claude CLI accepts (%s) — falling back to the configured lane "
+            "default instead of passing argv the CLI would reject.",
+            task.id, pinned, ", ".join(CLAUDE_CLI_SUPPORTED_EFFORTS),
+        )
+
+    if kanban_cfg is None:
+        kanban_cfg = _load_kanban_config()
+    raw = (kanban_cfg or {}).get("claude_cli_effort")
+    if raw is None:
+        return CLAUDE_CLI_DEFAULT_EFFORT
+    configured = str(raw).strip().lower()
+    if not configured:
+        # Explicit operator opt-out: let the host CLI pick its own effort.
+        return None
+    mapped = _CLAUDE_CLI_EFFORT_ALIASES.get(configured, configured)
+    if mapped in CLAUDE_CLI_SUPPORTED_EFFORTS:
+        return mapped
+    _log.warning(
+        "kanban worker: kanban.claude_cli_effort=%r is not one of %s — using "
+        "%r.", raw, ", ".join(CLAUDE_CLI_SUPPORTED_EFFORTS),
+        CLAUDE_CLI_DEFAULT_EFFORT,
+    )
+    return CLAUDE_CLI_DEFAULT_EFFORT
+
+
 def _claude_cli_goal_mode_prompt(task: Task) -> str:
     """Return the self-judge section for a goal-mode card, or ``""``.
 
@@ -10761,13 +10860,30 @@ def _build_claude_cli_worker_command(
     task: Task,
     workspace: str,
     kanban_cfg: Optional[dict] = None,
+    *,
+    effort: Optional[str] = _EFFORT_UNSET,
 ) -> list[str]:
-    """Build the full ``claude -p ...`` argv for a direct-CLI worker."""
+    """Build the full ``claude -p ...`` argv for a direct-CLI worker.
+
+    ``effort`` lets the caller resolve the level once and reuse it (the spawn
+    path also writes it to the worker log header). Left unset, the level is
+    resolved here; ``None`` means "add no ``--effort`` flag".
+    """
     cmd = _resolve_claude_cli_argv(kanban_cfg)
     model = _claude_cli_model_arg(task, kanban_cfg)
     if model:
         cmd.extend(["--model", model])
     extra = _claude_cli_extra_args(kanban_cfg)
+    # Per-task / lane thinking depth. Skipped entirely when the operator
+    # already pinned effort themselves in claude_cli_extra_args — passing
+    # --effort twice would leave which one wins up to the host CLI.
+    if not any(
+        arg.split("=", 1)[0] in _CLAUDE_CLI_EFFORT_FLAGS for arg in extra
+    ):
+        if effort is _EFFORT_UNSET:
+            effort = _claude_cli_effort_arg(task, kanban_cfg)
+        if effort:
+            cmd.extend(["--effort", effort])
     if not any(
         arg.split("=", 1)[0] in _CLAUDE_CLI_PERMISSION_FLAGS for arg in extra
     ):
@@ -11186,11 +11302,18 @@ def _default_spawn(
     kanban_cfg = _load_kanban_config()
     executor = resolve_worker_executor(kanban_cfg)
     stripped_env_vars: list[str] = []
+    resolved_effort: Optional[str] = None
     if executor == WORKER_EXECUTOR_CLAUDE_CLI:
+        # Resolved here rather than inside the builder so the same level that
+        # went into argv is the one the log header reports — no second call,
+        # no chance of the two disagreeing or the warnings firing twice.
+        resolved_effort = _claude_cli_effort_arg(task, kanban_cfg)
         # Build first: every unsupported-configuration error raises out of
         # here, and it must do so before `env` is mutated or a log file is
         # opened, so a rejected spawn leaves nothing half-applied behind.
-        cmd = _build_claude_cli_worker_command(task, workspace, kanban_cfg)
+        cmd = _build_claude_cli_worker_command(
+            task, workspace, kanban_cfg, effort=resolved_effort
+        )
         stripped_env_vars = _apply_claude_cli_env(env)
     else:
         cmd = _build_hermes_worker_command(task, env, prompt)
@@ -11216,15 +11339,32 @@ def _default_spawn(
             arg.split("=", 1)[0] for arg in cmd[1:] if arg.startswith("-")
         ) or "-"
         stripped_names = ",".join(stripped_env_vars) or "-"
+        # Effort is the one flag whose *value* is recorded, because "which
+        # depth did this worker actually run at" is unanswerable from names
+        # alone and is exactly what an operator audits this lane for. It is
+        # safe to record only because it came out of a closed allowlist
+        # (CLAUDE_CLI_SUPPORTED_EFFORTS) — an operator's own --effort in
+        # claude_cli_extra_args is arbitrary text, so that case is reported as
+        # `operator` and its value stays out of the log like every other one.
+        if "--effort" not in cmd:
+            effort_note = "-"
+        elif resolved_effort and cmd.count("--effort") == 1 and (
+            cmd[cmd.index("--effort") + 1] == resolved_effort
+        ):
+            effort_note = resolved_effort
+        else:
+            effort_note = "operator"
         _log.info(
-            "kanban worker %s: executor=%s bin=%s flags=%s stripped_env=%s",
-            task.id, executor, cmd[0], flag_names, stripped_names,
+            "kanban worker %s: executor=%s bin=%s flags=%s effort=%s "
+            "stripped_env=%s",
+            task.id, executor, cmd[0], flag_names, effort_note, stripped_names,
         )
         try:
             log_f.write(
                 f"[kanban] executor={executor} bin={cmd[0]} "
                 f"board={resolved_board} profile={profile_arg} "
-                f"flags={flag_names} stripped_env={stripped_names}\n".encode()
+                f"flags={flag_names} effort={effort_note} "
+                f"stripped_env={stripped_names}\n".encode()
             )
             log_f.flush()
         except OSError as exc:  # pragma: no cover - log write is best-effort
