@@ -2652,6 +2652,18 @@ DEFAULT_CONFIG = {
         "claude_bin": "claude",
         "codex_sandbox": "workspace-write",
         "claude_permission_mode": "acceptEdits",
+        # Opt-in recovery for an already configured Windows/WSL Claude
+        # Remote Control Scheduled Task. Empty names are intentional: never
+        # reuse a KLIB-scoped task for Hermes by default.
+        "remote_control_recovery": {
+            "enabled": False,
+            "task_name": "",
+            "remote_name": "",
+            "wsl_distro": "Ubuntu",
+            "claude_bin": "claude",
+            "probe_timeout_seconds": 10,
+            "repair_wait_seconds": 0,
+        },
     },
 
     # Web access gate -- fail-closed URL-access decision layer for

@@ -282,6 +282,7 @@ from typing import Optional
 
 from hermes_cli.subcommands._shared import add_accept_hooks_flag as _add_accept_hooks_flag
 from hermes_cli.subcommands.cron import build_cron_parser
+from hermes_cli.subcommands.claude_recovery import build_claude_recovery_parser
 from hermes_cli.subcommands.gateway import build_gateway_parser
 from hermes_cli.subcommands.profile import build_profile_parser
 from hermes_cli.subcommands.model import build_model_parser
@@ -4266,6 +4267,13 @@ def cmd_cron(args):
     from hermes_cli.cron import cron_command
 
     cron_command(args)
+
+
+def cmd_claude_recovery(args):
+    """Inspect or safely trigger an existing Claude Remote Control task."""
+    from hermes_cli.claude_recovery import claude_recovery_command
+
+    return claude_recovery_command(args)
 
 
 def cmd_webhook(args):
@@ -13177,6 +13185,13 @@ def main():
     # cron command  (parser built in hermes_cli/subcommands/cron.py)
     # =========================================================================
     build_cron_parser(subparsers, cmd_cron=cmd_cron)
+
+    # =======================================================================
+    # Claude Remote Control recovery (opt-in, host-local, no core tool)
+    # =======================================================================
+    build_claude_recovery_parser(
+        subparsers, cmd_claude_recovery=cmd_claude_recovery
+    )
 
     # =========================================================================
     # webhook command  (parser built in hermes_cli/subcommands/webhook.py)
