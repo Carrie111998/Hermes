@@ -4814,6 +4814,46 @@ class TelegramAdapter(BasePlatformAdapter):
         # Skip whitespace-only text to prevent Telegram 400 empty-text errors.
         if not content or not content.strip():
             return SendResult(success=True, message_id=None)
+
+        plugin_parse_mode = (metadata or {}).get("plugin_parse_mode")
+        plugin_keyboard = (metadata or {}).get("plugin_inline_keyboard")
+        if plugin_parse_mode or plugin_keyboard:
+            try:
+                from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+
+                rows = [
+                    [InlineKeyboardButton(text=btn["text"], callback_data=btn["callback_data"]) for btn in row]
+                    for row in (plugin_keyboard or [])
+                ]
+                reply_markup = InlineKeyboardMarkup(rows) if rows else None
+                parse_mode = ParseMode.HTML if plugin_parse_mode == "html" else None
+                reply_to_id = None
+                if reply_to:
+                    try:
+                        reply_to_id = int(reply_to)
+                    except (TypeError, ValueError):
+                        reply_to_id = None
+                thread_kwargs = self._thread_kwargs_for_send(
+                    chat_id,
+                    self._metadata_thread_id(metadata),
+                    metadata,
+                    reply_to_message_id=reply_to_id,
+                    reply_to_mode=self._reply_to_mode,
+                )
+                msg = await self._bot.send_message(
+                    chat_id=normalize_telegram_chat_id(chat_id),
+                    text=content,
+                    parse_mode=parse_mode,
+                    reply_markup=reply_markup,
+                    reply_to_message_id=reply_to_id,
+                    **thread_kwargs,
+                    **self._link_preview_kwargs(),
+                    **self._notification_kwargs(metadata),
+                )
+                return SendResult(success=True, message_id=str(msg.message_id))
+            except Exception as exc:
+                logger.warning("[%s] Plugin interaction send failed: %s", self.name, exc)
+                return SendResult(success=False, error=str(exc))
         
         try:
             # Bot API 10.1 rich fast-path: send the raw agent markdown via
@@ -6717,6 +6757,10 @@ class TelegramAdapter(BasePlatformAdapter):
                 await self._handle_choice_picker_callback(query, data, chat_id)
             return
 
+        # --- Plugin-registered inline callbacks (prefix match) ---
+        if await self._handle_plugin_callback_query(query, data):
+            return
+
         # --- Gmail-triage callbacks (gt:verb:arg) ---
         if data.startswith("gt:"):
             await self._handle_gmail_triage_callback(
@@ -7067,6 +7111,53 @@ class TelegramAdapter(BasePlatformAdapter):
                         answer, getattr(query.from_user, "id", "unknown"))
         except Exception as exc:
             logger.error("Failed to write update response from callback: %s", exc)
+
+    async def _handle_plugin_callback_query(self, query, data: str) -> bool:
+        """Dispatch callback data to plugin-registered prefix handlers."""
+        try:
+            from hermes_cli.plugin_interactions import PluginCallbackResult
+            from hermes_cli.plugins import get_plugin_manager
+
+            result = await get_plugin_manager().dispatch_telegram_callback(
+                data,
+                query=query,
+                adapter=self,
+            )
+        except Exception as exc:
+            logger.error("[%s] Plugin callback dispatch failed: %s", self.name, exc, exc_info=True)
+            await query.answer(text="Could not handle that action.")
+            return True
+
+        if result is None:
+            return False
+
+        answer_text = ""
+        delete_message = False
+        edit_text = None
+        if isinstance(result, PluginCallbackResult):
+            answer_text = result.answer_text
+            delete_message = result.delete_message
+            edit_text = result.edit_text
+        elif result:
+            answer_text = str(result)
+
+        if answer_text:
+            await query.answer(text=answer_text)
+        else:
+            await query.answer()
+
+        message = getattr(query, "message", None)
+        chat_id = str(getattr(message, "chat_id", "")) if message else ""
+        message_id = str(getattr(message, "message_id", "")) if message else ""
+        if delete_message and chat_id and message_id:
+            if await self.delete_message(chat_id, message_id):
+                return True
+        if edit_text is not None and message is not None:
+            try:
+                await query.edit_message_text(text=edit_text, reply_markup=None)
+            except Exception:
+                pass
+        return True
 
     # Maps `gt:<verb>` -> (script-name, extra-args, success-label, is_state).
     # Scripts live in ~/.hermes/scripts/gmail-triage/. `arg` from the callback

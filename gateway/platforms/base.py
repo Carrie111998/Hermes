@@ -6249,6 +6249,18 @@ class BasePlatformAdapter(ABC):
 
             # Call the handler (this can take a while with tool calls)
             response = await self._message_handler(event)
+            plugin_send_metadata: Dict[str, Any] = {}
+            try:
+                from hermes_cli.plugin_interactions import (
+                    PluginInteractionReply,
+                    plugin_interaction_send_metadata,
+                )
+
+                if isinstance(response, PluginInteractionReply):
+                    plugin_send_metadata = dict(plugin_interaction_send_metadata(response))
+                    response = response.text
+            except Exception:
+                logger.debug("plugin interaction unwrap failed", exc_info=True)
             is_ephemeral_response = isinstance(response, EphemeralReply)
 
             # Slash-command handlers may return an EphemeralReply sentinel to
@@ -6477,6 +6489,11 @@ class BasePlatformAdapter(ABC):
                         event.source.chat_id,
                     )
                     _reply_anchor = _reply_anchor_for_event(event)
+                    if plugin_send_metadata:
+                        _final_thread_metadata = {
+                            **_final_thread_metadata,
+                            **plugin_send_metadata,
+                        }
                     # Delivery-obligation ledger: durably record the final
                     # response BEFORE the send attempt so a gateway crash
                     # between finalize and platform ACK can redeliver it on
