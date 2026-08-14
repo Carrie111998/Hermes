@@ -217,7 +217,7 @@ export function useSlashCompletions(options: {
                   const canonicalItem = {
                     ...item,
                     text: canonical,
-                    display: matchedAlias ? `${canonical} (${matchedAlias.slice(1)})` : canonical
+                    display: matchedAlias ? `${canonical} (${matchedAlias.trim().slice(1)})` : canonical
                   }
 
                   // Prefer the alias-labelled row when an alias — rather than

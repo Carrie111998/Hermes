@@ -132,7 +132,7 @@ describe('useSlashCompletions', () => {
 
   it('shows the matched alias beside its canonical command', async () => {
     const request = vi.fn().mockResolvedValue({
-      items: [{ text: '/btw', display: '/btw', meta: 'Alias for /background' }]
+      items: [{ text: '/btw ', display: '/btw', meta: 'Alias for /background' }]
     })
 
     const api = harness({ request } as unknown as HermesGateway)
