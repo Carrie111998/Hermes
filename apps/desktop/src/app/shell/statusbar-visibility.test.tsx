@@ -103,7 +103,7 @@ describe('statusbar item visibility', () => {
     expect(screen.getByText('Plugin thing')).toBeTruthy()
   })
 
-  it('starts the per-turn session readouts hidden and restores them from the menu', async () => {
+  it('keeps coding-plan usage visible and hides only per-turn timers by default', () => {
     const statusbar = bar([
       item('running-timer', 'Turn timer', { variant: 'text' }),
       item('context-usage', 'Context meter', { variant: 'menu' }),
@@ -111,9 +111,22 @@ describe('statusbar item visibility', () => {
       item('gateway-health', 'Gateway')
     ])
 
-    for (const label of ['Turn timer', 'Context meter', 'Session timer']) {
+    for (const label of ['Turn timer', 'Session timer']) {
       expect(screen.queryByText(label)).toBeNull()
     }
+    expect(within(statusbar).getByText('Context meter')).toBeTruthy()
+    expect($statusbarHiddenIds.get()).not.toContain('context-usage')
+  })
+
+  it('restores a hidden per-turn item from the menu', async () => {
+    const statusbar = bar([
+      item('running-timer', 'Turn timer', { variant: 'text' }),
+      item('context-usage', 'Context meter', { variant: 'menu' }),
+      item('session-timer', 'Session timer', { variant: 'text' }),
+      item('gateway-health', 'Gateway')
+    ])
+
+    expect(screen.queryByText('Session timer')).toBeNull()
 
     openContextMenu(statusbar)
 

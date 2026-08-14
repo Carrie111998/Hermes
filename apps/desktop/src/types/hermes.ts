@@ -718,6 +718,78 @@ export interface ContextBreakdown {
   model?: string
 }
 
+export type AccountUsageState = 'available' | 'error' | 'unavailable' | 'unsupported'
+export type CredentialHealthState = 'cooldown' | 'error' | 'expired' | 'ready' | 'unavailable'
+
+export interface AccountUsageWindow {
+  detail?: null | string
+  label: string
+  reset_at?: null | string
+  used_percent?: null | number
+}
+
+export interface AccountUsageQuota {
+  details?: string[]
+  fetched_at?: string
+  plan?: null | string
+  reason?: string
+  source?: 'provider_reported'
+  stale?: boolean
+  status: AccountUsageState
+  windows: AccountUsageWindow[]
+}
+
+export interface UsageAccount {
+  account_id: string
+  display_name?: string
+  health: {
+    auth_type: string
+    expires_at?: string
+    retry_at?: string
+    status: CredentialHealthState
+  }
+  quota: AccountUsageQuota
+  routing: {
+    priority: number
+    request_count: number
+  }
+}
+
+export interface UsageProvider {
+  accounts: UsageAccount[]
+  provider: string
+  routing: Record<CredentialHealthState, number>
+  usage_capability: 'supported' | 'unsupported'
+}
+
+export interface UsageAccountsContract {
+  capabilities: {
+    credential_pool_health: boolean
+    local_session_analytics: boolean
+    provider_usage: {
+      per_account: boolean
+      providers: string[]
+    }
+  }
+  contract: {
+    name: 'usage.accounts'
+    version: number
+  }
+  generated_at: string
+  local: {
+    calls?: number
+    model?: null | string
+    provider?: null | string
+    status: 'available' | 'unavailable'
+    tokens?: {
+      input: number
+      output: number
+      total: number
+    }
+  }
+  providers: UsageProvider[]
+}
+
 export interface AnalyticsDailyEntry {
   actual_cost: number
   api_calls: number
@@ -739,8 +811,30 @@ export interface AnalyticsModelEntry {
   sessions: number
 }
 
+export interface AnalyticsProviderEntry {
+  api_calls: number
+  estimated_cost: number
+  input_tokens: number
+  output_tokens: number
+  provider: string
+  sessions: number
+}
+
+export interface AnalyticsTaskEntry {
+  api_calls: number
+  estimated_cost: number
+  input_tokens: number
+  models: string[]
+  output_tokens: number
+  task: string
+}
+
 export interface AnalyticsResponse {
   by_model: AnalyticsModelEntry[]
+  /** Real per-provider accounting (sessions + aux, add-only). Absent on older backends. */
+  by_provider?: AnalyticsProviderEntry[]
+  /** Aux usage per task (vision, compression, ...). Absent on older backends. */
+  by_task?: AnalyticsTaskEntry[]
   daily: AnalyticsDailyEntry[]
   period_days: number
   skills: {

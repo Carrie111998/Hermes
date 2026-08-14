@@ -14578,6 +14578,117 @@ def _aux_task_summary(aux_rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return result
 
 
+def _provider_summary(db, cutoff: float) -> List[Dict[str, Any]]:
+    """Aggregate real usage per billing provider.
+
+    Per-call deltas live in ``session_model_usage`` keyed by the model/provider
+    active at call time, so a mid-session provider switch attributes tokens to
+    the provider that actually served them. The aggregate ``sessions`` row keeps
+    only one (model, billing_provider) pair; any positive residual (absolute
+    cumulative writes, history predating the table) is reconciled against that
+    session's recorded provider. Rows with no recorded provider land in an
+    explicit ``unknown`` bucket — never guessed from model names. DBs predating
+    the per-call table fall back to session-level grouping.
+    """
+    zero = {"input_tokens": 0, "output_tokens": 0, "estimated_cost": 0, "api_calls": 0}
+
+    def _bucket(store: Dict[str, Dict[str, Any]], provider: str) -> Dict[str, Any]:
+        return store.setdefault(provider, {"provider": provider, "sessions": 0, **dict(zero)})
+
+    try:
+        cur = db._conn.execute("""
+            SELECT u.session_id as session_id,
+                   COALESCE(NULLIF(u.billing_provider, ''), 'unknown') as provider,
+                   SUM(u.input_tokens) as input_tokens,
+                   SUM(u.output_tokens) as output_tokens,
+                   COALESCE(SUM(u.estimated_cost_usd), 0) as estimated_cost,
+                   SUM(COALESCE(u.api_call_count, 0)) as api_calls
+            FROM session_model_usage u
+            JOIN sessions s ON s.id = u.session_id
+            WHERE s.started_at > ?
+            GROUP BY u.session_id, provider
+        """, (cutoff,))
+        per_call = [dict(r) for r in cur.fetchall()]
+    except Exception:
+        per_call = None  # table/column predates this build — legacy fallback below
+
+    # Session counts are informational; the sessions row's single recorded
+    # provider is the only honest attribution available for them.
+    sessions_by_provider: Dict[str, int] = {}
+    try:
+        cur = db._conn.execute("""
+            SELECT COALESCE(NULLIF(billing_provider, ''), 'unknown') as provider,
+                   COUNT(*) as sessions
+            FROM sessions WHERE started_at > ?
+            GROUP BY provider
+        """, (cutoff,))
+        sessions_by_provider = {r["provider"]: r["sessions"] for r in cur.fetchall()}
+    except Exception:
+        sessions_by_provider = {}
+
+    if per_call is None:
+        # Legacy: no per-call attribution exists at all — group the aggregate
+        # session rows directly (accurate only when no mid-session switch).
+        by_provider: Dict[str, Dict[str, Any]] = {}
+        try:
+            cur = db._conn.execute("""
+                SELECT COALESCE(NULLIF(billing_provider, ''), 'unknown') as provider,
+                       SUM(input_tokens) as input_tokens,
+                       SUM(output_tokens) as output_tokens,
+                       COALESCE(SUM(estimated_cost_usd), 0) as estimated_cost,
+                       SUM(COALESCE(api_call_count, 0)) as api_calls
+                FROM sessions WHERE started_at > ?
+                GROUP BY provider
+            """, (cutoff,))
+            for r in cur.fetchall():
+                row = dict(r)
+                bucket = _bucket(by_provider, row["provider"])
+                for key in zero:
+                    bucket[key] += row.get(key) or 0
+        except Exception:
+            by_provider = {}
+    else:
+        by_provider = {}
+        covered: Dict[str, Dict[str, Any]] = {}
+        for row in per_call:
+            bucket = _bucket(by_provider, row["provider"])
+            session_cov = covered.setdefault(row["session_id"], dict(zero))
+            for key in zero:
+                value = row.get(key) or 0
+                bucket[key] += value
+                session_cov[key] += value
+        # Reconcile positive residuals (absolute cumulative writes and pre-table
+        # history) against the session's recorded provider.
+        try:
+            cur = db._conn.execute("""
+                SELECT id, COALESCE(NULLIF(billing_provider, ''), 'unknown') as provider,
+                       input_tokens, output_tokens,
+                       COALESCE(estimated_cost_usd, 0) as estimated_cost,
+                       COALESCE(api_call_count, 0) as api_calls
+                FROM sessions WHERE started_at > ?
+            """, (cutoff,))
+            for r in cur.fetchall():
+                cov = covered.get(r["id"])
+                if cov is None:
+                    cov = dict(zero)
+                residual = {key: (r[key] or 0) - cov[key] for key in zero}
+                if not any(value > 0 for value in residual.values()):
+                    continue
+                bucket = _bucket(by_provider, r["provider"])
+                for key in zero:
+                    bucket[key] += max(0, residual[key])
+        except Exception:
+            pass
+
+    for provider, sessions in sessions_by_provider.items():
+        _bucket(by_provider, provider)["sessions"] = sessions
+    result = list(by_provider.values())
+    result.sort(
+        key=lambda r: (r.get("input_tokens") or 0) + (r.get("output_tokens") or 0),
+        reverse=True,
+    )
+    return result
+
 def _get_usage_analytics(days: int = 30, profile: Optional[str] = None):
     from agent.insights import InsightsEngine
 
@@ -14639,6 +14750,8 @@ def _get_usage_analytics(days: int = 30, profile: Optional[str] = None):
             # Aux-task summary across models (vision, compression, ...). Lets
             # the dashboard answer "what is compression costing me" directly.
             "by_task": _aux_task_summary(aux_rows),
+            # Per-provider real accounting (sessions + aux, add-only merge).
+            "by_provider": _provider_summary(db, cutoff),
             "totals": totals,
             "period_days": days,
             "skills": usage["skills"],

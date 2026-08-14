@@ -1,0 +1,68 @@
+{
+  "generated_at": "2026-08-10T04:49:49.512Z",
+  "viewport_narrow": "360px",
+  "total": 12,
+  "passed": 12,
+  "checks": [
+    {
+      "name": "narrow popover: scrollWidth == clientWidth",
+      "ok": true,
+      "detail": "{\"popScroll\":342,\"popClient\":342,\"docScroll\":360,\"innerWidth\":360,\"bodyScroll\":360}"
+    },
+    {
+      "name": "narrow popover: no page horizontal overflow",
+      "ok": true,
+      "detail": "docScroll=360"
+    },
+    {
+      "name": "popover: all visible actions are tabbable",
+      "ok": true,
+      "detail": "[]"
+    },
+    {
+      "name": "popover: has real link/button actions",
+      "ok": true,
+      "detail": "count=2"
+    },
+    {
+      "name": "popover: role=status present for stale line",
+      "ok": true,
+      "detail": "count=1"
+    },
+    {
+      "name": "popover: role=alert present for auth error",
+      "ok": true,
+      "detail": "count=1"
+    },
+    {
+      "name": "popover: user-facing source copy",
+      "ok": true,
+      "detail": "{\"roleStatus\":1,\"roleAlert\":1,\"officialCopy\":true,\"leakedSource\":false}"
+    },
+    {
+      "name": "popover: every account-limit bar fill equals its \"% left\" text",
+      "ok": true,
+      "detail": "[{\"text\":\"68\",\"fill\":\"68\",\"match\":true},{\"text\":\"68\",\"fill\":\"68\",\"match\":true},{\"text\":\"77\",\"fill\":\"77\",\"match\":true},{\"text\":\"77\",\"fill\":\"77\",\"match\":true},{\"text\":\"73\",\"fill\":\"73\",\"match\":true},{\"text\":\"73\",\"fill\":\"73\",\"match\":true}]"
+    },
+    {
+      "name": "narrow command-center: no horizontal overflow",
+      "ok": true,
+      "detail": "{\"overlayScroll\":331,\"overlayClient\":331,\"docScroll\":360,\"hasTask\":true,\"hasCoding\":true}"
+    },
+    {
+      "name": "command-center: Task dimension present",
+      "ok": true,
+      "detail": "{\"hasTask\":true,\"hasCoding\":true}"
+    },
+    {
+      "name": "palette: rows are real focusable buttons in a listbox",
+      "ok": true,
+      "detail": "{\"count\":3,\"allButtons\":true,\"allTabbable\":true,\"listbox\":true}"
+    },
+    {
+      "name": "popover: Escape closes and returns focus to trigger",
+      "ok": true,
+      "detail": "{\"before\":true,\"afterHidden\":true,\"ariaExpanded\":\"false\",\"focusReturned\":true}"
+    }
+  ]
+}

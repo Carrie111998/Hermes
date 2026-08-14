@@ -25,6 +25,7 @@ from __future__ import annotations
 import copy
 import json
 import logging
+import random
 import re
 import threading
 import time
@@ -51,6 +52,106 @@ logger = logging.getLogger(__name__)
 # even when the upstream keeps rejecting it, so without this cap the retry loop
 # spins forever and never reaches ``_try_activate_fallback``. See #26080.
 _MAX_AUTH_REFRESH_ATTEMPTS = 2
+
+# Rate-limit rotation backoff. Pool rotation on 429 succeeds whenever another
+# entry exists, so the caller retries the request IMMEDIATELY — a full-context
+# resend every couple of seconds. When the whole pool is being throttled
+# (short-window rate limit hitting every entry), that resend storm itself
+# burns the provider's rate window and turns one 429 into a sustained loop
+# (observed: 12 rotations in 25s against an OpenAI Codex pool whose first
+# entry was already weekly-limited). Back off exponentially between
+# consecutive 429 rotations and, after a small budget, stop rotating so the
+# fallback chain engages instead of hammering the pool.
+#
+# The first rotation is NOT delayed — a single-entry 429 with a healthy
+# sibling is a normal failover and should stay fast. The counter lives on the
+# agent and decays after a quiet window so recovered sessions start fresh.
+_RATE_LIMIT_ROTATION_BACKOFF_BASE_SECONDS = 5.0
+_RATE_LIMIT_ROTATION_BACKOFF_MAX_SECONDS = 60.0
+_RATE_LIMIT_ROTATION_BACKOFF_WINDOW_SECONDS = 15 * 60
+_RATE_LIMIT_ROTATION_MAX_CONSECUTIVE = 4
+
+
+def _rate_limit_rotation_delay(
+    agent,
+    error_context: Optional[Dict[str, Any]],
+    *,
+    now: Optional[float] = None,
+) -> Optional[float]:
+    """Return the backoff delay before the next 429 rotation retry.
+
+    Returns None when the consecutive-429 budget is exhausted — the caller
+    should stop rotating and let the fallback chain take over. A delay of 0.0
+    means "rotate immediately" (the first rotation of a streak).
+
+    A provider-supplied reset hint (``error_context["reset_at"]``, normalized
+    by ``credential_pool._normalize_error_context`` from bodies like Codex's
+    ``resets_in_seconds``) raises the delay when it lands inside the backoff
+    cap; longer resets are handled by pool exhaustion, not by parking the turn.
+    """
+    current = time.time() if now is None else now
+    state = getattr(agent, "_pool_rate_limit_backoff", None)
+    if (
+        not isinstance(state, dict)
+        or current - float(state.get("last_at", 0) or 0)
+        > _RATE_LIMIT_ROTATION_BACKOFF_WINDOW_SECONDS
+    ):
+        state = {"count": 0, "last_at": current}
+    state["count"] = int(state.get("count", 0)) + 1
+    state["last_at"] = current
+    agent._pool_rate_limit_backoff = state
+
+    count = state["count"]
+    if count > _RATE_LIMIT_ROTATION_MAX_CONSECUTIVE:
+        return None
+    if count <= 1:
+        return 0.0
+
+    delay = min(
+        _RATE_LIMIT_ROTATION_BACKOFF_MAX_SECONDS,
+        _RATE_LIMIT_ROTATION_BACKOFF_BASE_SECONDS * (2 ** (count - 2)),
+    )
+    if isinstance(error_context, dict):
+        reset_at = error_context.get("reset_at")
+        if isinstance(reset_at, (int, float)):
+            reset_delay = float(reset_at) - current
+            if 0 < reset_delay <= _RATE_LIMIT_ROTATION_BACKOFF_MAX_SECONDS:
+                delay = max(delay, reset_delay)
+    # ±20% jitter so concurrent processes don't resynchronize on the window.
+    return delay * random.uniform(0.8, 1.2)
+
+
+def _sleep_before_rate_limit_rotation(agent, delay: float) -> None:
+    """Sleep in short slices so Ctrl+C / steer interrupts stay responsive."""
+    if delay <= 0:
+        return
+    logger.info("Rate-limit rotation backoff: waiting %.1fs before retry", delay)
+    deadline = time.time() + delay
+    while True:
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            return
+        if getattr(agent, "_interrupt_requested", False):
+            return
+        time.sleep(min(1.0, remaining))
+
+
+def _apply_rate_limit_rotation_backoff(agent, error_context) -> bool:
+    """Account for one 429 rotation; sleep unless the streak budget is spent.
+
+    Returns True when the caller may proceed with the retried request, False
+    when it should stop rotating and defer to the fallback chain.
+    """
+    delay = _rate_limit_rotation_delay(agent, error_context)
+    if delay is None:
+        logger.info(
+            "Rate-limit rotation backoff budget exhausted (%d consecutive 429s) "
+            "— deferring to fallback chain instead of resending immediately",
+            _RATE_LIMIT_ROTATION_MAX_CONSECUTIVE,
+        )
+        return False
+    _sleep_before_rate_limit_rotation(agent, delay)
+    return True
 
 
 _REASONING_TAG_NAMES = ("think", "thinking", "reasoning", "REASONING_SCRATCHPAD", "thought")
@@ -1112,6 +1213,8 @@ def recover_with_credential_pool(
             rotate_status = status_code if status_code is not None else 429
             next_entry = _rotate_failed_credential(rotate_status)
             if next_entry is not None:
+                if not _apply_rate_limit_rotation_backoff(agent, error_context):
+                    return False, has_retried_429
                 _ra().logger.info(
                     "Credential %s (rate limit, pre-exhausted) — rotated to pool entry %s",
                     rotate_status,
@@ -1136,6 +1239,8 @@ def recover_with_credential_pool(
         rotate_status = status_code if status_code is not None else 429
         next_entry = _rotate_failed_credential(rotate_status)
         if next_entry is not None:
+            if not _apply_rate_limit_rotation_backoff(agent, error_context):
+                return False, True
             _ra().logger.info(
                 "Credential %s (rate limit) — rotated to pool entry %s",
                 rotate_status,

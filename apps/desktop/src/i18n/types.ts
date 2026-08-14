@@ -1146,6 +1146,11 @@ export interface Translations {
     noDailyActivity: string
     topModels: string
     noModelUsage: string
+    accountLimits: string
+    topProviders: string
+    noProviderUsage: string
+    topTasks: string
+    noTaskUsage: string
     topSkills: string
     noSkillActivity: string
     actions: (count: string) => string
@@ -2178,6 +2183,7 @@ export interface Translations {
       turnRunning: string
       contextUsage: string
       contextUsagePanel: {
+        accountName: (suffix: string) => string
         categories: {
           conversation: string
           mcp: string
@@ -2188,11 +2194,43 @@ export interface Translations {
           system_prompt: string
           tool_definitions: string
         }
+        accountEmpty: string
+        accountError: string
+        accountLoading: string
+        accountTitle: string
+        accountUnsupported: string
+        allNoUsage: (count: number) => string
+        callsAndTokens: (calls: number, tokens: string) => string
+        categoryDetails: string
+        currentBadge: string
         empty: string
+        health: {
+          cooldown: string
+          error: string
+          expired: string
+          ready: string
+          unavailable: string
+        }
+        localTitle: string
+        localUnavailable: string
         loading: string
+        modelSummary: (provider: string, model: string) => string
+        openInCommandCenter: string
         percentFull: (percent: number) => string
+        quota: {
+          error: string
+          unavailable: string
+          unsupported: string
+        }
+        refresh: string
+        refreshing: string
+        remaining: (percent: number) => string
+        resetsAt: (time: string) => string
+        sourceOfficial: string
+        staleData: string
         title: string
         tokenSummary: (used: string, max: string) => string
+        updatedAt: (time: string) => string
       }
       session: string
       yoloOn: string

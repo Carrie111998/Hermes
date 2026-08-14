@@ -526,15 +526,17 @@ export function useStatusbarItems({
       },
       {
         detail: contextBar || undefined,
-        hidden: !contextUsage,
+        hidden: gatewayState !== 'open',
         id: 'context-usage',
-        label: contextUsage,
+        label: contextUsage || copy.contextUsage,
         menuAlign: 'end',
         menuClassName: 'w-auto border-(--ui-stroke-secondary) p-0',
         menuContent: (
           <ContextUsagePanel
             currentUsage={currentUsage}
+            onOpenCommandCenter={() => openCommandCenterSection('usage')}
             onUsageSnapshot={publishContextUsage}
+            profile={activeGatewayProfile}
             requestGateway={requestGateway}
             sessionId={activeSessionId}
           />
@@ -571,6 +573,7 @@ export function useStatusbarItems({
     ],
     [
       activeSessionId,
+      activeGatewayProfile,
       approvalModeItem,
       backendVersionItem,
       busy,

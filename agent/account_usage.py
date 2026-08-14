@@ -507,6 +507,12 @@ def _resolve_codex_usage_credentials(
     return entry.runtime_api_key, str(entry.runtime_base_url or base_url or "").strip(), None
 
 
+# Advisory UI data: every provider read on the contract path must stay under
+# the usage contract's global deadline (usage_contract._FETCH_DEADLINE_SECONDS,
+# 6.5s) so a degraded provider edge cannot stall the panel.
+USAGE_FETCH_TIMEOUT_SECONDS = 6.0
+
+
 def _fetch_codex_account_usage(
     base_url: Optional[str] = None,
     api_key: Optional[str] = None,
@@ -519,7 +525,7 @@ def _fetch_codex_account_usage(
     }
     if account_id:
         headers["ChatGPT-Account-Id"] = account_id
-    with httpx.Client(timeout=15.0) as client:
+    with httpx.Client(timeout=USAGE_FETCH_TIMEOUT_SECONDS) as client:
         response = client.get(_resolve_codex_usage_url(resolved_base_url), headers=headers)
         response.raise_for_status()
     payload = response.json() or {}
@@ -748,8 +754,10 @@ def redeem_codex_reset_credit(
     )
 
 
-def _fetch_anthropic_account_usage() -> Optional[AccountUsageSnapshot]:
-    token = (resolve_anthropic_token() or "").strip()
+def _fetch_anthropic_account_usage(
+    api_key: Optional[str] = None,
+) -> Optional[AccountUsageSnapshot]:
+    token = (api_key or resolve_anthropic_token() or "").strip()
     if not token:
         return None
     if not _is_oauth_token(token):
@@ -766,7 +774,7 @@ def _fetch_anthropic_account_usage() -> Optional[AccountUsageSnapshot]:
         "anthropic-beta": "oauth-2025-04-20",
         "User-Agent": "claude-code/2.1.0",
     }
-    with httpx.Client(timeout=15.0) as client:
+    with httpx.Client(timeout=USAGE_FETCH_TIMEOUT_SECONDS) as client:
         response = client.get("https://api.anthropic.com/api/oauth/usage", headers=headers)
         response.raise_for_status()
     payload = response.json() or {}
@@ -825,7 +833,9 @@ def _fetch_openrouter_account_usage(base_url: Optional[str], api_key: Optional[s
         "Authorization": f"Bearer {token}",
         "Accept": "application/json",
     }
-    with httpx.Client(timeout=10.0) as client:
+    # Two sequential reads share one client; halve the per-request budget so
+    # the pair still fits the contract's global deadline.
+    with httpx.Client(timeout=USAGE_FETCH_TIMEOUT_SECONDS / 2) as client:
         credits_resp = client.get(credits_url, headers=headers)
         credits_resp.raise_for_status()
         credits = (credits_resp.json() or {}).get("data") or {}
@@ -881,6 +891,158 @@ def _fetch_openrouter_account_usage(base_url: Optional[str], api_key: Optional[s
     )
 
 
+_KIMI_DEFAULT_BASE_URL = "https://api.kimi.com/coding"
+
+
+def _kimi_plan_label(payload: Any) -> Optional[str]:
+    level = str(
+        (((payload.get("user") or {}).get("membership") or {}).get("level")) or ""
+    ).strip()
+    if not level:
+        return None
+    return _title_case_slug(level.removeprefix("LEVEL_"))
+
+
+def _kimi_window_label(duration: Any, time_unit: Any) -> str:
+    """Map a Kimi limit window's real duration onto a human label."""
+    try:
+        value = float(duration)
+    except (TypeError, ValueError):
+        return "Window"
+    unit = str(time_unit or "").strip().upper()
+    if "MINUTE" in unit:
+        seconds = value * 60
+    elif "HOUR" in unit:
+        seconds = value * 3600
+    elif "DAY" in unit:
+        seconds = value * 86400
+    elif "WEEK" in unit:
+        seconds = value * 604800
+    elif "MONTH" in unit:
+        seconds = value * 2629800
+    else:
+        seconds = value
+    if seconds >= 604800:
+        weeks = round(seconds / 604800)
+        return "Weekly" if weeks == 1 else f"{weeks} week"
+    if seconds >= 86400:
+        days = round(seconds / 86400)
+        return "Weekly" if days == 7 else f"{days} day"
+    if seconds >= 3600:
+        return f"{seconds / 3600:g} hour"
+    minutes = max(1, round(seconds / 60))
+    return f"{minutes} min"
+
+
+def _kimi_quota_window(detail: Any, label: str) -> Optional[AccountUsageWindow]:
+    if not isinstance(detail, dict):
+        return None
+    try:
+        limit = float(detail.get("limit"))
+        used = float(detail.get("used"))
+    except (TypeError, ValueError):
+        return None
+    if limit <= 0:
+        return None
+    detail_text = None
+    try:
+        remaining = detail.get("remaining")
+        if remaining is not None:
+            detail_text = f"{float(remaining):g} of {limit:g} remaining"
+    except (TypeError, ValueError):
+        detail_text = None
+    return AccountUsageWindow(
+        label=label,
+        used_percent=round((used / limit) * 100, 2),
+        reset_at=_parse_dt(detail.get("resetTime")),
+        detail=detail_text,
+    )
+
+
+def _fetch_kimi_account_usage(
+    base_url: Optional[str] = None,
+    api_key: Optional[str] = None,
+) -> Optional[AccountUsageSnapshot]:
+    """Fetch the Kimi Code Plan quota from ``GET {base}/v1/usages``.
+
+    The top-level ``usage`` object is the plan's primary (weekly) quota; each
+    entry in ``limits`` carries an explicit window duration that is mapped to
+    its real length (e.g. 300 minutes -> "5 hour").
+    """
+    token = str(api_key or "").strip()
+    if not token:
+        return None
+    normalized = str(base_url or "").strip().rstrip("/") or _KIMI_DEFAULT_BASE_URL
+    if normalized.endswith("/usages"):
+        url = normalized
+    elif normalized.endswith("/v1"):
+        url = f"{normalized}/usages"
+    else:
+        url = f"{normalized}/v1/usages"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/json",
+        # Kimi's coding edge expects the same UA family as the inference path.
+        "User-Agent": "claude-code/0.1.0",
+    }
+    with httpx.Client(timeout=USAGE_FETCH_TIMEOUT_SECONDS) as client:
+        response = client.get(url, headers=headers)
+        response.raise_for_status()
+    payload = response.json() or {}
+    windows: list[AccountUsageWindow] = []
+    primary = _kimi_quota_window(payload.get("usage"), "Weekly")
+    if primary is not None:
+        windows.append(primary)
+    for extra in payload.get("limits") or []:
+        if not isinstance(extra, dict):
+            continue
+        window_info = extra.get("window") or {}
+        label = _kimi_window_label(window_info.get("duration"), window_info.get("timeUnit"))
+        window = _kimi_quota_window(extra.get("detail"), label)
+        if window is not None:
+            windows.append(window)
+    details: list[str] = []
+    parallel = (payload.get("parallel") or {}).get("limit")
+    if isinstance(parallel, (int, float)) and float(parallel) > 0:
+        details.append(f"Parallel limit: {int(parallel)}")
+    return AccountUsageSnapshot(
+        provider="kimi-coding",
+        source="usage_api",
+        fetched_at=_utc_now(),
+        plan=_kimi_plan_label(payload),
+        windows=tuple(windows),
+        details=tuple(details),
+    )
+
+
+ACCOUNT_USAGE_PROVIDERS = frozenset({"anthropic", "kimi-coding", "openai-codex", "openrouter"})
+
+
+def fetch_account_usage_for_credential(
+    provider: str,
+    *,
+    api_key: Optional[str],
+    base_url: Optional[str] = None,
+) -> Optional[AccountUsageSnapshot]:
+    """Fetch usage for one exact credential without selecting from a pool.
+
+    Unlike :func:`fetch_account_usage`, provider errors intentionally propagate
+    so a structured consumer can distinguish an unavailable capability from a
+    failed provider request. The credential is accepted only as an argument and
+    is never copied into the returned snapshot.
+    """
+    normalized = str(provider or "").strip().lower()
+    if normalized == "openai-codex":
+        return _fetch_codex_account_usage(base_url=base_url, api_key=api_key)
+    if normalized == "anthropic":
+        return _fetch_anthropic_account_usage(api_key=api_key)
+    if normalized == "openrouter":
+        return _fetch_openrouter_account_usage(base_url, api_key)
+    if normalized == "kimi-coding":
+        return _fetch_kimi_account_usage(base_url=base_url, api_key=api_key)
+    return None
+
+
 def fetch_account_usage(
     provider: Optional[str],
     *,
@@ -897,6 +1059,8 @@ def fetch_account_usage(
             return _fetch_anthropic_account_usage()
         if normalized == "openrouter":
             return _fetch_openrouter_account_usage(base_url, api_key)
+        if normalized == "kimi-coding":
+            return _fetch_kimi_account_usage(base_url=base_url, api_key=api_key)
     except Exception:
         return None
     return None

@@ -1,0 +1,806 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Usage Bar M1/M2 Mockup</title>
+<style>
+/* ===== REAL TOKENS from apps/desktop/src/styles.css (2026-08-10) ===== */
+:root {
+    color-scheme: light;
+
+    --theme-foreground: #17171a;
+    --theme-primary: #0053fd;
+    --theme-secondary: color-mix(in srgb, #0053fd 7%, #ffffff);
+    --theme-accent-soft: color-mix(in srgb, #0053fd 10%, #ffffff);
+    --theme-midground: #0053fd;
+    --theme-warm: #cf806d;
+    --theme-background-seed: #f8faff;
+    --theme-sidebar-seed: #f3f7ff;
+    --theme-card-seed: #ffffff;
+    --theme-elevated-seed: #ffffff;
+    --theme-bubble-seed: color-mix(in srgb, #0053fd 6%, #ffffff);
+    --theme-neutral-chrome: #f3f3f3;
+    --theme-neutral-sidebar: #f3f3f3;
+    --theme-neutral-card: #fcfcfc;
+    --theme-mix-chrome: 92%;
+    --theme-mix-sidebar: 100%;
+    --theme-mix-card: 22%;
+    --theme-mix-elevated: 28%;
+    --theme-mix-bubble: 0%;
+    --theme-fill-primary-accent-mix: 16%;
+    --theme-fill-secondary-accent-mix: 11%;
+    --theme-fill-tertiary-accent-mix: 8%;
+    --theme-fill-quaternary-accent-mix: 5%;
+    --theme-fill-quinary-accent-mix: 3%;
+    --theme-stroke-primary-accent-mix: 24%;
+    --theme-stroke-secondary-accent-mix: 16%;
+    --theme-stroke-tertiary-accent-mix: 10%;
+    --theme-stroke-quaternary-accent-mix: 6%;
+    --theme-row-hover-accent-mix: 4%;
+    --theme-row-active-accent-mix: 8%;
+    --theme-control-hover-accent-mix: 6%;
+    --theme-control-active-accent-mix: 8%;
+
+    --ui-base: var(--theme-foreground);
+    --ui-accent: var(--theme-midground);
+    --ui-accent-secondary: var(--theme-primary);
+    --ui-warm: var(--theme-warm);
+    --ui-red: #cf2d56;
+    --ui-orange: #db704b;
+    --ui-yellow: #c08532;
+    --ui-green: #1f8a65;
+    --ui-cyan: #4c7f8c;
+    --ui-blue: #0053fd;
+    --ui-purple: #9e94d5;
+    --context-usage-system: color-mix(in srgb, var(--ui-base) 55%, transparent);
+    --context-usage-tools: var(--ui-purple);
+    --context-usage-rules: var(--ui-green);
+    --context-usage-skills: var(--ui-yellow);
+    --context-usage-mcp: color-mix(in srgb, var(--ui-red) 72%, var(--ui-purple));
+    --context-usage-subagents: color-mix(in srgb, var(--ui-blue) 70%, var(--ui-cyan));
+    --context-usage-memory: color-mix(in srgb, var(--ui-orange) 80%, var(--ui-yellow));
+    --context-usage-conversation: var(--ui-cyan);
+    /* Landed memory-write tool row — gold → purple, never amber warning. */
+    --tool-memory-legendary-from: color-mix(in srgb, var(--ui-yellow) 72%, #f5d08a);
+    --tool-memory-legendary-mid: color-mix(in srgb, var(--ui-orange) 55%, var(--ui-purple));
+    --tool-memory-legendary-to: color-mix(in srgb, var(--ui-purple) 82%, #c4b5fd);
+    --tool-memory-legendary-icon: color-mix(in srgb, var(--ui-yellow) 55%, var(--ui-purple));
+    --tool-memory-legendary-meta: color-mix(in srgb, var(--ui-purple) 58%, var(--ui-text-tertiary));
+    --tool-memory-legendary-glow: color-mix(in srgb, var(--ui-purple) 38%, transparent);
+    /* Diff add/remove, derived from the semantic palette so every diff surface
+       (tool cards, preview, review pane) tracks the theme's green/red. Only the
+       foregrounds need a dark override — they mix toward the page instead of
+       away from it. */
+    --ui-diff-add-border: var(--ui-green);
+    --ui-diff-add-background: color-mix(in srgb, var(--ui-green) 12%, transparent);
+    --ui-diff-add-foreground: color-mix(in srgb, var(--ui-green) 70%, #000);
+    --ui-diff-remove-border: var(--ui-red);
+    --ui-diff-remove-background: color-mix(in srgb, var(--ui-red) 12%, transparent);
+    --ui-diff-remove-foreground: color-mix(in srgb, var(--ui-red) 70%, #000);
+
+    /* Overlay ladder. DESIGN.md: app-wide surfaces must not compete through
+       ad-hoc z-index literals — pick the rung that describes the surface.
+       Values are deliberately sparse so a one-off can slot between two rungs
+       without a renumber. Local stacking inside a component (a sticky header
+       over its own scroll area) stays on plain `z-10`/`z-20`; these rungs are
+       only for surfaces that float over the app. */
+    --z-modal-backdrop: 120;
+    --z-modal: 130;
+    /* A select/dropdown/popover opened from inside a modal, portaled to body. */
+    --z-modal-popover: 140;
+    /* Must clear any open modal: toasts, tooltips, command-surface backdrops. */
+    --z-over-modal: 200;
+    --z-over-modal-content: 210;
+    --z-switcher-backdrop: 219;
+    --z-switcher: 220;
+    /* Boot and blocking states, in the order they can stack. */
+    --z-connecting: 1200;
+    --z-onboarding: 1300;
+    --z-onboarding-popover: 1310;
+    --z-setup: 1400;
+    --z-crash: 1500;
+    --ui-bg-chrome: color-mix(
+      in srgb,
+      var(--theme-background-seed) var(--theme-mix-chrome),
+      var(--theme-neutral-chrome)
+    );
+    --ui-bg-sidebar: color-mix(
+      in srgb,
+      var(--theme-sidebar-seed) var(--theme-mix-sidebar),
+      var(--theme-neutral-sidebar)
+    );
+    --ui-bg-editor: color-mix(in srgb, var(--theme-card-seed) var(--theme-mix-card), var(--theme-neutral-card));
+    --ui-bg-elevated: color-mix(
+      in srgb,
+      var(--theme-elevated-seed) var(--theme-mix-elevated),
+      var(--theme-neutral-card)
+    );
+    --ui-bg-card: color-mix(in srgb, var(--ui-accent) 4%, color-mix(in srgb, var(--ui-base) 4%, transparent));
+    --ui-bg-input: #fcfcfc;
+    --ui-bg-primary: color-mix(
+      in srgb,
+      var(--ui-accent) var(--theme-fill-primary-accent-mix),
+      color-mix(in srgb, var(--ui-base) 10%, transparent)
+    );
+    --ui-bg-secondary: color-mix(
+      in srgb,
+      var(--ui-accent) var(--theme-fill-secondary-accent-mix),
+      color-mix(in srgb, var(--ui-base) 7%, transparent)
+    );
+    --ui-bg-tertiary: color-mix(
+      in srgb,
+      var(--ui-accent) var(--theme-fill-tertiary-accent-mix),
+      color-mix(in srgb, var(--ui-base) 5%, transparent)
+    );
+    --ui-bg-quaternary: color-mix(
+      in srgb,
+      var(--ui-accent) var(--theme-fill-quaternary-accent-mix),
+      color-mix(in srgb, var(--ui-base) 4%, transparent)
+    );
+    --ui-bg-quinary: color-mix(
+      in srgb,
+      var(--ui-accent) var(--theme-fill-quinary-accent-mix),
+      color-mix(in srgb, var(--ui-base) 3%, transparent)
+    );
+    --ui-row-hover-background: color-mix(
+      in srgb,
+      var(--ui-accent) var(--theme-row-hover-accent-mix),
+      color-mix(in srgb, var(--ui-base) 3%, transparent)
+    );
+    --ui-row-active-background: color-mix(
+      in srgb,
+      var(--ui-accent) var(--theme-row-active-accent-mix),
+      color-mix(in srgb, var(--ui-base) 5%, transparent)
+    );
+    --ui-control-hover-background: color-mix(
+      in srgb,
+      var(--ui-accent) var(--theme-control-hover-accent-mix),
+      color-mix(in srgb, var(--ui-base) 4%, transparent)
+    );
+    --ui-control-active-background: color-mix(
+      in srgb,
+      var(--ui-accent) var(--theme-control-active-accent-mix),
+      color-mix(in srgb, var(--ui-base) 5%, transparent)
+    );
+    --ui-text-primary: color-mix(in srgb, var(--ui-base) 94%, transparent);
+    --ui-text-secondary: color-mix(in srgb, var(--ui-base) 74%, transparent);
+    --ui-text-tertiary: color-mix(in srgb, var(--ui-base) 54%, transparent);
+    --ui-text-quaternary: color-mix(in srgb, var(--ui-base) 36%, transparent);
+    /* Transcript scaffolding — thinking headers, settled tool runs, the live
+       activity ticker. One colour for all of them (see `ScaffoldRow`), pitched
+       between the secondary and tertiary greys those lines used to pick
+       individually, and dimmed once more by the fade rule below so the prose
+       reading column stays primary. */
+    --conversation-scaffold-text: color-mix(in srgb, var(--ui-base) 64%, transparent);
+    --conversation-scaffold-meta: color-mix(in srgb, var(--ui-base) 44%, transparent);
+    --ui-stroke-primary: color-mix(
+      in srgb,
+      var(--ui-accent) var(--theme-stroke-primary-accent-mix),
+      color-mix(in srgb, var(--ui-base) 10%, transparent)
+    );
+    --ui-stroke-secondary: color-mix(
+      in srgb,
+      var(--ui-accent) var(--theme-stroke-secondary-accent-mix),
+      color-mix(in srgb, var(--ui-base) 7%, transparent)
+    );
+    --ui-stroke-tertiary: color-mix(
+      in srgb,
+      var(--ui-accent) var(--theme-stroke-tertiary-accent-mix),
+      color-mix(in srgb, var(--ui-base) 5%, transparent)
+    );
+    --ui-stroke-quaternary: color-mix(
+      in srgb,
+      var(--ui-accent) var(--theme-stroke-quaternary-accent-mix),
+      color-mix(in srgb, var(--ui-base) 3%, transparent)
+    );
+    --ui-sash-hover-border: color-mix(in srgb, var(--ui-accent) 18%, var(--ui-stroke-tertiary));
+    --ui-sash-hover-background: color-mix(in srgb, var(--ui-accent) 6%, transparent);
+    --ui-surface-background: var(--ui-bg-editor);
+    --ui-sidebar-surface-background: var(--ui-bg-sidebar);
+    --ui-chat-surface-background: var(--ui-bg-chrome);
+    --ui-editor-surface-background: var(--ui-bg-chrome);
+    /* The integrated terminal wears the transcript's background, not the
+       editor's — it reads as part of the conversation surface. Its own token so
+       the two can diverge without dragging the terminal along, and so a skin
+       gets one knob for it. xterm's canvas can't use a var, so the probe in
+       terminal/selection.ts resolves this same name to a concrete rgb. */
+    --ui-terminal-surface-background: var(--ui-chat-surface-background);
+    /* Inline chat widgets (clarify, artifact card) — the card fill in light
+       mode, nudged down in dark so a widget settles into the transcript
+       instead of glowing above it (see the `.dark` override). */
+    --ui-widget-surface-background: var(--ui-bg-editor);
+    --ui-chat-bubble-background: color-mix(
+      in srgb,
+      var(--theme-bubble-seed) var(--theme-mix-bubble),
+      var(--theme-neutral-card)
+    );
+    --ui-chat-bubble-opaque-background: var(--ui-bg-editor);
+    --ui-inline-code-background: color-mix(in srgb, #141414 5%, transparent);
+    --ui-inline-code-foreground: color-mix(in srgb, #141414 88%, transparent);
+    --ui-selection-background: color-mix(in srgb, #ffd24a 55%, transparent);
+
+    --dt-background: var(--ui-bg-chrome);
+    --dt-foreground: var(--ui-text-primary);
+    --dt-card: var(--ui-bg-editor);
+    --dt-card-foreground: var(--ui-text-primary);
+    --dt-muted: var(--ui-bg-tertiary);
+    --dt-muted-foreground: var(--ui-text-tertiary);
+    --dt-popover: color-mix(in srgb, var(--ui-bg-elevated) 96%, transparent);
+    --dt-popover-foreground: var(--ui-text-primary);
+    --dt-primary: var(--theme-primary);
+    --dt-primary-foreground: #fcfcfc;
+    --dt-secondary: var(--theme-secondary);
+    --dt-secondary-foreground: var(--ui-text-secondary);
+    --dt-accent: var(--theme-accent-soft);
+    --dt-accent-foreground: var(--ui-text-primary);
+    --dt-border: var(--ui-stroke-secondary);
+    --dt-input: var(--ui-stroke-primary);
+    /* THE single knob for input-field borders: the resting alpha (% of the ring
+       color). Hover doubles it; focus/open go full. 0% = invisible at rest. */
+    --dt-input-border: 7%;
+    /* Knob for input-field background fill: alpha (% of --dt-card) across all
+       states. 100% = fully opaque, lower = translucent over the blurred chrome. */
+    --dt-input-bg: 0%;
+    /* Classic recessed "inset" — a crisp 1px inner shadow at the TOP edge.
+       :root.dark bumps the alpha since a dark card swallows shadow. Removed on
+       focus (the focus border carries the state). */
+    --dt-input-inset: inset 0 1px 1px color-mix(in srgb, #000 10%, transparent);
+    /* Hovered inactive tab: deepen it AWAY from the lighter active surface, so
+       hover can never be mistaken for selected. Dark mode needs more — black
+       over a dark gutter shows less. */
+    --ui-tab-hover-darken: 2.5%;
+    --dt-ring: var(--ui-stroke-primary);
+    --dt-midground: var(--theme-midground);
+    --dt-composer-ring: var(--ui-base);
+    --dt-destructive: #cf2d56;
+    --dt-destructive-foreground: #ffffff;
+    --dt-sidebar-bg: var(--ui-bg-sidebar);
+    --dt-sidebar-border: var(--ui-stroke-secondary);
+    --dt-user-bubble: var(--ui-chat-bubble-background);
+    --dt-user-bubble-border: var(--ui-stroke-tertiary);
+
+    --dt-font-sans:
+      'Segoe WPC', 'Segoe UI', -apple-system, BlinkMacSystemFont, 'SF Pro Text', system-ui, sans-serif,
+      'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol', 'Noto Color Emoji', emoji;
+    /* Key caps always use the native UI face — never theme typography overrides. */
+    --dt-font-kbd: -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', system-ui, sans-serif;
+    /* Menlo/Monaco first — Apple's native monospace faces — so code/diff read
+       in the system mono on macOS, with SF Mono and bundled Courier Prime as
+       fallbacks. */
+    --dt-font-mono:
+      Menlo, Monaco, 'SF Mono', 'Courier Prime', monospace, 'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol',
+      'Noto Color Emoji', emoji;
+    --dt-base-size: 1rem;
+    --dt-line-height: 1.5;
+    --dt-letter-spacing: 0;
+    --dt-spacing-mul: 1;
+
+    --radius: 0.75rem;
+    /* Effective value everywhere: the chat backdrop used to force 0.2 onto the
+       root element at runtime (an ungated leva slider default), so this 0.6
+       only ever applied to the windows that don't mount the backdrop. Pinned
+       to the value the app actually renders at. */
+    --radius-scalar: 0.2;
+
+    /* Space under last message vs overlay composer — driven by the measured composer DOCK height (see
+       composer/index.tsx), which covers the micro-action strip, the status stack, the composer, and the
+       underside strip in one number.
+       This is the default; each chat surface re-declares the calc against its own measurement (see below). */
+    --thread-last-message-clearance: calc(var(--composer-measured-height) + 2rem);
+
+    --composer-shell-pad-block-end: 0.625rem;
+    --message-text-indent: 0.75rem;
+    --conversation-text-font-size: 0.8125rem;
+    --conversation-tool-font-size: 0.6875rem;
+    --conversation-caption-font-size: 0.75rem;
+    --conversation-line-height: 1.125rem;
+    --conversation-caption-line-height: 1rem;
+    --conversation-turn-gap: 0.375rem;
+    /* Gap between top-level turn blocks (prose ↔ tools ↔ thinking) — enough air
+       that scaffolding reads as separate from the reply, not crammed into it. */
+    --turn-block-gap: 0.75rem;
+    /* Between adjacent scaffolding, though: a back-to-back run of thinking
+       headers and tool rows is one sequence, not blocks to hold apart. Derived
+       so retuning the block gap carries it along. */
+    --scaffold-block-gap: calc(var(--turn-block-gap) / 3);
+    /* Tight gap between tool rows inside a single action group, so a back-to-back
+       run still reads as one cohesive sequence. */
+    --tool-row-gap: 0.375rem;
+    /* Resting opacity of a disclosure caret — invisible until hover, except
+       where a surface opts into a faint hint of the affordance. */
+    --disclosure-caret-rest: 0;
+    /* Paragraph spacing — vertical gap between prose paragraphs, both inside a
+       markdown block and between consecutive prose parts. Single knob; tweak
+       freely. */
+    --paragraph-gap: 0.7rem;
+    --sticky-human-top: 0.23rem;
+    --file-tree-row-height: 1.375rem;
+
+    --composer-width: 48.75rem;
+    --composer-control-size: 1.5rem;
+    --composer-control-primary-size: 1.625rem;
+    --composer-control-gap: 0.25rem;
+    --composer-row-gap: 0.25rem;
+    --composer-ring-strength: 1;
+    --composer-surface-pad-x: 0.5rem;
+    --composer-surface-pad-y: 0.3125rem;
+    --composer-input-min-height: 1.625rem;
+    --composer-input-max-height: 9.375rem;
+    --composer-input-inline-min-width: 8rem;
+    --composer-fallback-height: 2.75rem;
+    --composer-measured-height: calc(0.5rem + var(--composer-shell-pad-block-end) + var(--composer-fallback-height));
+    --composer-surface-measured-height: var(--composer-fallback-height);
+    --thread-viewport-height: max(
+      0rem,
+      calc(100% - var(--composer-measured-height) + var(--composer-surface-measured-height))
+    );
+    --vsq: min(0.5vh, 0.5vw);
+    --image-preview-max-width: 34rem;
+    --image-preview-height: clamp(16.25rem, calc(var(--vsq) * 100), 26.25rem);
+
+    --sidebar-width: 14.8125rem;
+    --chat-min-width: 28rem;
+    --titlebar-control-size: 1.25rem;
+    --titlebar-control-height: 1.375rem;
+    --sidebar-content-inline-padding: 1rem;
+
+    --sidebar: var(--dt-sidebar-bg);
+    --sidebar-foreground: var(--dt-foreground);
+    --sidebar-primary: var(--dt-primary);
+    --sidebar-primary-foreground: var(--dt-primary-foreground);
+    --sidebar-accent: var(--ui-control-active-background);
+    --sidebar-accent-foreground: var(--dt-accent-foreground);
+    --sidebar-border: var(--dt-sidebar-border);
+    --sidebar-ring: var(--dt-ring);
+    --sidebar-edge-border: color-mix(in srgb, var(--ui-base) 7.5%, transparent);
+    --chrome-action-hover: var(--ui-control-hover-background);
+
+    --midground: var(--dt-midground);
+    --background: var(--dt-background);
+    --foreground: var(--dt-foreground);
+
+    --warm-glow: color-mix(in srgb, var(--ui-warm) 32%, color-mix(in srgb, var(--ui-accent) 6%, transparent));
+    /* `--noise-opacity-mul` is set per-mode by `applyTheme()`. */
+    --noise-opacity-mul: 1;
+    --backdrop-invert-mul: 1;
+  }
+:root {
+  --dock-glow-scale: 0.55;
+}
+:root {
+  /* Fallback for drawers outside the main composer (e.g. edit-message). */
+  --composer-fill: color-mix(in srgb, var(--dt-card) 90%, var(--dt-background));
+}
+:root.dark {
+    /* Per-mode mix knobs — overridden inline by `applyTheme()` per skin. */
+    --theme-mix-chrome: 74%;
+    --theme-mix-card: 38%;
+    --theme-mix-elevated: 46%;
+    --theme-mix-bubble: 46%;
+    --theme-neutral-chrome: #0d0d0e;
+    --theme-neutral-sidebar: #0a0a0b;
+    --theme-neutral-card: #161618;
+
+    /* Dark-only accent palette overrides. */
+    --ui-red: #e75e78;
+    --ui-green: #55a583;
+    --ui-cyan: #6f9ba6;
+    --ui-diff-add-foreground: color-mix(in srgb, var(--ui-green) 62%, #fff);
+    --ui-diff-remove-foreground: color-mix(in srgb, var(--ui-red) 62%, #fff);
+
+    --sidebar-edge-border: color-mix(in srgb, var(--ui-base) 12%, transparent);
+    --composer-ring-strength: 1.3;
+    --backdrop-invert-mul: 0;
+    /* Dark mode: a dark card needs a stronger black inset to show the recess. */
+    --dt-input-inset: inset 0 1px 1px color-mix(in srgb, #000 38%, transparent);
+    --ui-tab-hover-darken: 6%;
+    /* Dark needs a lighter resting border than light mode. */
+    --dt-input-border: 4%;
+
+    --ui-inline-code-background: color-mix(in srgb, #ffffff 7%, transparent);
+    --ui-inline-code-foreground: color-mix(in srgb, #ffffff 88%, transparent);
+    --ui-selection-background: color-mix(in srgb, #ffd24a 38%, transparent);
+    /* A dark card sits ABOVE the chrome (#161618 over #0d0d0e), so an inline
+       widget wearing the raw card fill reads as a lit panel. Take it down a
+       touch — still clearly a surface, no longer the brightest thing in the
+       transcript. Derived from the card so every skin follows its own seed. */
+    --ui-widget-surface-background: color-mix(in srgb, var(--ui-bg-editor) 88%, #000);
+  }
+/* ===== applyTheme() inline seeds — default Nous skin, dark mode =====
+   (styles.css :root.dark only holds mix knobs; the real app injects these
+   per-skin values inline. Source: apps/desktop/src/themes/presets.ts
+   nousTheme.darkColors + themes/context.tsx applyTheme.) */
+:root.dark {
+  --theme-foreground: #FFE6CB;
+  --theme-primary: #FFE6CB;
+  --theme-secondary: #1B45A4;
+  --theme-accent-soft: #1540B1;
+  --theme-midground: #0053FD;
+  --theme-warm: #FFE6CB;
+  --theme-background-seed: #0D2F86;
+  --theme-sidebar-seed: #09286F;
+  --theme-card-seed: #12378F;
+  --theme-elevated-seed: #123A96;
+  --theme-bubble-seed: #143B91;
+  --dt-primary-foreground: #0D2F86;
+  --dt-muted: #183F9A;
+  --dt-border: #3158AD;
+  --dt-ring: #FFE6CB;
+  --dt-destructive: #C0473A;
+}
+/* ===== semantic aliases mirroring @theme inline mapping ===== */
+:root {
+  --color-background: var(--dt-background);
+  --color-foreground: var(--dt-foreground);
+  --color-card: var(--dt-card);
+  --color-muted: var(--dt-muted);
+  --color-muted-foreground: var(--dt-muted-foreground);
+  --color-primary: var(--dt-primary, var(--theme-primary));
+  --color-destructive: var(--dt-destructive, var(--ui-red));
+  --color-border: var(--dt-border, var(--ui-stroke-secondary));
+}
+/* ===== mockup frame ===== */
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html, body { height: 100%; }
+body {
+  background: var(--color-background);
+  color: var(--color-foreground);
+  font: 400 0.8125rem/1.45 -apple-system, "Segoe UI", system-ui, sans-serif;
+  display: flex; flex-direction: column;
+}
+.app { flex: 1; display: flex; flex-direction: column; justify-content: flex-end; position: relative; min-height: 100vh; }
+.stage { flex: 1; display: flex; align-items: center; justify-content: center; color: var(--color-muted-foreground); font-size: 0.75rem; }
+/* ===== statusbar (compact quick layer) ===== */
+.statusbar {
+  display: flex; align-items: center; gap: 0.75rem;
+  height: 1.75rem; padding: 0 0.625rem;
+  border-top: 1px solid var(--ui-stroke-tertiary);
+  background: var(--color-background);
+  font-size: 0.6875rem; color: var(--color-muted-foreground);
+  white-space: nowrap; overflow: hidden;
+}
+.sb-item { display: inline-flex; align-items: center; gap: 0.375rem; }
+.sb-btn {
+  display: inline-flex; align-items: center; gap: 0.375rem;
+  border: 0; background: none; color: inherit; font: inherit;
+  padding: 0.125rem 0.375rem; border-radius: 4px; cursor: pointer;
+}
+.sb-btn:hover { background: var(--chrome-action-hover); }
+.sb-btn:focus-visible { outline: 2px solid var(--theme-primary); outline-offset: 1px; }
+.sb-spacer { flex: 1; }
+.dot { width: 6px; height: 6px; border-radius: 50%; background: var(--ui-green); }
+.meter-mini { display: inline-flex; align-items: center; gap: 0.25rem; }
+.meter-mini .track { width: 42px; height: 4px; border-radius: 999px; background: var(--color-muted); overflow: hidden; }
+.meter-mini .fill { height: 100%; border-radius: 999px; background: var(--color-primary); }
+.tabular { font-variant-numeric: tabular-nums; }
+/* ===== popover (account limits) — mirrors ContextUsagePanel ===== */
+.popover {
+  position: absolute; right: 0.5rem; bottom: 2.25rem;
+  width: 20rem; max-height: min(34rem, 80vh); overflow-y: auto;
+  display: flex; flex-direction: column; gap: 1rem;
+  padding: 0.75rem; font-size: 0.75rem;
+  background: var(--color-card);
+  border: 1px solid var(--ui-stroke-secondary);
+  border-radius: 10px;
+  box-shadow: var(--shadow-nous);
+}
+.vp-narrow .popover { width: calc(100vw - 1rem); right: 0.5rem; }
+.row { display: flex; align-items: baseline; justify-content: space-between; gap: 0.5rem; }
+.row-center { display: flex; align-items: center; justify-content: space-between; gap: 0.5rem; }
+.title { font-weight: 500; color: var(--color-foreground); }
+.small { font-size: 0.6875rem; }
+.muted { color: var(--color-muted-foreground); }
+.fg { color: var(--color-foreground); }
+.truncate { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.section { display: flex; flex-direction: column; gap: 0.75rem; border-top: 1px solid var(--ui-stroke-tertiary); padding-top: 0.75rem; }
+.stack { display: flex; flex-direction: column; gap: 0.375rem; }
+.stack-lg { display: flex; flex-direction: column; gap: 0.625rem; }
+.progress { position: relative; width: 100%; height: 4px; overflow: hidden; border-radius: 999px; background: var(--color-muted); }
+.progress > i { display: block; height: 100%; border-radius: 999px; background: var(--color-primary); }
+.progress.warn > i { background: var(--ui-warm); }
+.progress.crit > i { background: var(--color-destructive); }
+.ctxbar { display: flex; height: 6px; overflow: hidden; border-radius: 999px; background: var(--ui-stroke-tertiary); }
+.ctxbar > span { height: 100%; min-width: 1px; }
+.badge {
+  display: inline-flex; align-items: center; gap: 0.25rem;
+  font-size: 0.625rem; line-height: 1; padding: 0.1875rem 0.375rem;
+  border-radius: 999px; font-weight: 500;
+}
+.badge-current { color: var(--color-primary); background: var(--theme-accent-soft); }
+.badge-stale { color: var(--ui-warm); background: color-mix(in srgb, var(--ui-warm) 12%, transparent); }
+.badge-err { color: var(--color-destructive); background: color-mix(in srgb, var(--color-destructive) 10%, transparent); }
+.badge-plan { color: var(--color-muted-foreground); border: 1px solid var(--ui-stroke-tertiary); }
+.alert { display: flex; align-items: flex-start; gap: 0.5rem; color: var(--color-destructive); }
+.vp-narrow .alert { flex-direction: column; gap: 0.25rem; }
+.alert .muted { color: var(--color-muted-foreground); }
+.link { color: var(--color-primary); text-decoration: none; cursor: pointer; background: none; border: 0; font: inherit; padding: 0; }
+.link:hover { text-decoration: underline; }
+.link:focus-visible { outline: 2px solid var(--theme-primary); outline-offset: 1px; border-radius: 2px; }
+/* ===== command center overlay (M2) ===== */
+.overlay-backdrop { position: absolute; inset: 0; background: color-mix(in srgb, #000 18%, transparent); display: flex; align-items: center; justify-content: center; }
+.overlay {
+  width: min(44rem, 92vw); max-height: 84vh; overflow-y: auto;
+  background: var(--color-card);
+  border: 1px solid var(--stroke-nous);
+  border-radius: 14px; box-shadow: var(--shadow-nous);
+  padding: 1.25rem 1.5rem; display: flex; flex-direction: column; gap: 1.25rem;
+}
+.cc-head { display: flex; align-items: center; justify-content: space-between; }
+.cc-title { font-size: 1rem; font-weight: 600; }
+.cc-close { border: 0; background: none; color: var(--color-muted-foreground); cursor: pointer; font-size: 0.875rem; padding: 0.25rem 0.5rem; border-radius: 6px; }
+.cc-close:hover { background: var(--chrome-action-hover); }
+.cc-close:focus-visible { outline: 2px solid var(--theme-primary); outline-offset: 1px; }
+.cc-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem 1.5rem; }
+.vp-narrow .cc-grid { grid-template-columns: 1fr; }
+.dim-note { font-size: 0.625rem; letter-spacing: 0.02em; text-transform: uppercase; color: var(--color-muted-foreground); }
+/* ===== command palette ===== */
+.palette {
+  width: min(30rem, 92vw); background: var(--color-card);
+  border: 1px solid var(--stroke-nous); border-radius: 12px;
+  box-shadow: var(--shadow-nous); overflow: hidden;
+}
+.palette input {
+  width: 100%; border: 0; outline: none; background: none; color: var(--color-foreground);
+  font: inherit; padding: 0.75rem 1rem; border-bottom: 1px solid var(--ui-stroke-tertiary);
+}
+.palette-item { display: flex; align-items: center; gap: 0.625rem; padding: 0.5rem 1rem; font-size: 0.75rem; cursor: pointer; width: 100%; background: none; border: 0; color: var(--color-foreground); font-family: inherit; text-align: left; }
+.palette-item.active { background: var(--theme-accent-soft); }
+.palette-item:hover { background: var(--chrome-action-hover); }
+.palette-item:focus-visible { outline: 2px solid var(--theme-primary); outline-offset: -2px; }
+.palette-item .kbd { margin-left: auto; font-size: 0.625rem; color: var(--color-muted-foreground); }
+/* ===== annotations ===== */
+.note { position: absolute; top: 0.75rem; left: 0.75rem; max-width: 22rem; font-size: 0.6875rem; color: var(--color-muted-foreground); background: var(--color-card); border: 1px dashed var(--ui-stroke-secondary); border-radius: 8px; padding: 0.5rem 0.75rem; }
+.note b { color: var(--color-foreground); }
+@media (prefers-reduced-motion: reduce) {
+  * { transition: none !important; animation: none !important; }
+}
+</style>
+</head>
+<body>
+<script>
+const q = new URLSearchParams(location.search);
+const scene = q.get('scene') || 'index';
+const theme = q.get('theme') || 'light';
+const vp = q.get('vp') || 'wide';
+if (theme === 'dark') document.documentElement.classList.add('dark');
+if (vp === 'narrow') document.body.classList.add('vp-narrow');
+if (q.get('full') === '1') {
+  // Screenshot aid only: the real component keeps max-h min(34rem,80vh) + scroll.
+  const st = document.createElement('style');
+  st.textContent = '.popover{max-height:none !important; overflow:visible !important}';
+  document.head.appendChild(st);
+}
+</script>
+
+<!-- ================= INDEX / 说明 ================= -->
+<div class="app" data-scene="index" style="justify-content:flex-start; padding:2rem; gap:1rem; overflow-y:auto">
+  <h1 style="font-size:1.125rem">Usage Bar 内建化 — M1/M2 高保真 Mockup</h1>
+  <p class="muted small">token 直接内联自 <code>apps/desktop/src/styles.css</code> 的 <code>:root</code> / <code>:root.dark</code>（2026-08-10 提取），light/dark 为生产真实值。所有账号名为稳定哈希派生展示名，不含任何凭证/邮箱/内部 label。</p>
+  <ul class="small" style="display:flex; flex-direction:column; gap:0.375rem; list-style:none">
+    <li>① 状态栏快捷摘要：<a class="link" href="?scene=statusbar&amp;theme=light">light</a> · <a class="link" href="?scene=statusbar&amp;theme=dark">dark</a></li>
+    <li>② Account Limits popover：<a class="link" href="?scene=popover&amp;theme=light">light</a> · <a class="link" href="?scene=popover&amp;theme=dark">dark</a> · <a class="link" href="?scene=popover&amp;theme=light&amp;vp=narrow">窄视口 360px</a></li>
+    <li>③ Command Center → Usage（M2）：<a class="link" href="?scene=command-center&amp;theme=light">light</a> · <a class="link" href="?scene=command-center&amp;theme=dark">dark</a> · <a class="link" href="?scene=command-center&amp;theme=light&amp;vp=narrow">窄视口</a></li>
+    <li>④ 状态栏整体关闭时的到达路径（Command Palette）：<a class="link" href="?scene=palette&amp;theme=light">light</a> · <a class="link" href="?scene=palette&amp;theme=dark">dark</a></li>
+  </ul>
+  <div class="stack small" style="border-top:1px solid var(--ui-stroke-tertiary); padding-top:0.75rem; max-width:40rem">
+    <p><b>进度条语义</b>：Account limits 的 bar fill = remaining，与 <code>xx% left</code> 文字同值（父验收 B1 统一）；By provider/model/task 的 bar = 占比份额，aria-label 各自说明。</p>
+    <p><b>键盘（mockup 内真实实现的最小路径）</b>：状态栏触发器为真实 <code>&lt;button&gt;</code>，Tab 可达、<code>:focus-visible</code> 主题色环；popover 场景的 Esc 真实关闭面板并返还焦点给触发器（可现场验证）；面板内 "Open in Command Center" 为真实 <code>&lt;a href&gt;</code>（跳转本 mockup 的 CC 场景）、CC 的 "Refresh" 为真实 <code>&lt;button&gt;</code>；palette rows 为真实 <code>&lt;button role="option"&gt;</code>。</p>
+    <p><b>Production implementation acceptance targets（mockup 未实现，不声称已实现）</b>：focus trap、roving tabindex（方向键在窗口行间移动）、打开后焦点自动进入面板、live region 对 stale/error 状态变化的动态播报。这些在 M1/M2 生产实现时验收。</p>
+    <p><b>reduced-motion</b>：全部过渡包在 <code>@media (prefers-reduced-motion: reduce)</code> 下禁用（本页底部媒体查询演示）；reduced 下进度条宽度即时生效、popover 无位移。</p>
+    <p><b>live region</b>：stale 状态行带稳定 <code>role="status"</code>（polite）；provider error 用 <code>role="alert"</code>。</p>
+    <p><b>真相来源分离</b>：provider quota（官方接口，用户文案 "Official provider data"）/ credential health（本地凭证池状态）/ local analytics（本地计量）三区独立渲染、独立 loading/error，不混算、不跨窗口平均。</p>
+    <p><b>stale 语义</b>：仅可重试故障（timeout/network/remote-protocol/proxy/5xx）回退 stale 并标注 "Cached · 时间"；401/403/429 与本地配置错误（UnsupportedProtocol/LocalProtocolError）直接表面化，绝不用 stale 掩盖。</p>
+  </div>
+</div>
+
+<!-- ================= ① 状态栏快捷摘要 ================= -->
+<div class="app" data-scene="statusbar">
+  <div class="note"><b>① 状态栏快捷摘要</b> — 单行紧凑层。context-usage 默认可见（M0 已固化）；点击打开 Account Limits popover（场景②）。完整分析入口在 Command Center（场景③）。</div>
+  <div class="stage">— transcript / composer 区域 —</div>
+  <div class="statusbar">
+    <span class="sb-item"><span class="dot"></span>Gateway</span>
+    <span class="sb-item truncate">aichat_group · main</span>
+    <span class="sb-spacer"></span>
+    <button class="sb-btn" aria-label="Context and account usage">
+      <span class="meter-mini"><span class="track"><span class="fill" style="width:38%"></span></span></span>
+      <span class="tabular">Ctx 38%</span>
+      <span class="muted">·</span>
+      <span class="tabular fg">Codex 41% wk</span>
+    </button>
+    <span class="sb-item muted">k3 · kimi-coding</span>
+  </div>
+</div>
+
+<!-- ================= ② Account Limits popover ================= -->
+<div class="app" data-scene="popover">
+  <div class="note"><b>② Account Limits popover</b> — 触发器带焦点环（演示）。覆盖：稳定账号名 Codex 1/2、当前 badge、plan、reset countdown、window detail、source、freshness、stale、provider-specific error（401 不用 stale 掩盖）。</div>
+  <div class="stage">— transcript / composer 区域 —</div>
+  <div class="popover" role="dialog" aria-label="Context and account usage">
+    <div class="row"><p class="title">Context usage</p><span class="small muted">~76k / 200k tokens</span></div>
+    <p class="small fg tabular">38% full</p>
+    <div class="ctxbar"><span style="background:var(--theme-primary);width:22%"></span><span style="background:var(--ui-warm);width:9%"></span><span style="background:var(--ui-green);width:7%"></span></div>
+    <div class="section" aria-label="Account limits">
+      <div class="row"><p class="title">Account limits</p><span class="small muted">Official provider data</span></div>
+
+      <!-- openai-codex -->
+      <div class="stack-lg">
+        <div class="row"><span class="title truncate">openai-codex</span><span class="small muted">2/2 ready</span></div>
+        <div class="stack">
+          <div class="row">
+            <span class="fg truncate">Codex 1 <span class="badge badge-current">current</span> <span class="badge badge-plan">Plus</span></span>
+            <span class="small muted">ready</span>
+          </div>
+          <div class="stack">
+            <div class="row-center small"><span class="muted truncate">5 hour</span><span class="fg tabular">68% left · resets in 2h 14m</span></div>
+            <div class="progress" role="progressbar" aria-valuenow="68" aria-valuemin="0" aria-valuemax="100" aria-label="5 hour: 68% left"><i style="width:68%"></i></div>
+            <div class="row-center small"><span class="muted truncate">Weekly</span><span class="fg tabular">41% left · resets in 3d 4h</span></div>
+            <div class="progress warn" role="progressbar" aria-valuenow="41" aria-valuemin="0" aria-valuemax="100" aria-label="Weekly: 41% left"><i style="width:41%"></i></div>
+            <p class="small muted">updated 12s ago</p>
+          </div>
+        </div>
+        <div class="stack">
+          <div class="row">
+            <span class="fg truncate">Codex 2 <span class="badge badge-plan">Plus</span> <span class="badge badge-stale">stale</span></span>
+            <span class="small muted">ready</span>
+          </div>
+          <div class="stack">
+            <div class="row-center small"><span class="muted truncate">Weekly</span><span class="fg tabular">77% left · resets in 5d 1h</span></div>
+            <div class="progress" role="progressbar" aria-valuenow="77" aria-valuemin="0" aria-valuemax="100" aria-label="Weekly: 77% left"><i style="width:77%"></i></div>
+            <p class="small muted" role="status">Cached · 11:42:03 — request timed out, showing last good read</p>
+          </div>
+        </div>
+      </div>
+
+      <!-- kimi-coding -->
+      <div class="stack-lg">
+        <div class="row"><span class="title truncate">kimi-coding</span><span class="small muted">1/1 ready</span></div>
+        <div class="stack">
+          <div class="row">
+            <span class="fg truncate">Kimi 1 <span class="badge badge-plan">Level 2</span></span>
+            <span class="small muted">ready</span>
+          </div>
+          <div class="stack">
+            <div class="row-center small"><span class="muted truncate">Weekly</span><span class="fg tabular">73% left · resets in 4d 6h</span></div>
+            <div class="progress" role="progressbar" aria-valuenow="73" aria-valuemin="0" aria-valuemax="100" aria-label="Weekly: 73% left"><i style="width:73%"></i></div>
+            <div class="row-center small"><span class="muted truncate">5 hour</span><span class="fg tabular">90% left · resets in 47m</span></div>
+            <div class="progress" role="progressbar" aria-valuenow="90" aria-valuemin="0" aria-valuemax="100" aria-label="5 hour: 90% left"><i style="width:90%"></i></div>
+            <p class="small muted">Parallel limit: 5 · updated 12s ago</p>
+          </div>
+        </div>
+      </div>
+
+      <!-- anthropic: provider-specific error（认证失效，非 stale） -->
+      <div class="stack-lg">
+        <div class="row"><span class="title truncate">anthropic</span><span class="small muted">0/1 ready</span></div>
+        <div class="stack">
+          <div class="row"><span class="fg truncate">Claude 1</span><span class="small muted">cooldown</span></div>
+          <div class="alert small" role="alert">
+            <span>⚠ Credential token expired — re-authenticate.</span>
+            <span class="muted">401 responses are never masked by stale cache.</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="row"><span class="small muted">Local analytics · this session</span><a class="link small" href="?scene=command-center">Open in Command Center</a></div>
+    </div>
+  </div>
+  <div class="statusbar">
+    <span class="sb-item"><span class="dot"></span>Gateway</span>
+    <span class="sb-item truncate">aichat_group · main</span>
+    <span class="sb-spacer"></span>
+    <button class="sb-btn" data-popover-trigger style="outline:2px solid var(--theme-primary); outline-offset:1px" aria-expanded="true" aria-haspopup="dialog" aria-label="Context and account usage">
+      <span class="meter-mini"><span class="track"><span class="fill" style="width:38%"></span></span></span>
+      <span class="tabular">Ctx 38%</span><span class="muted">·</span><span class="tabular fg">Codex 41% wk</span>
+    </button>
+    <span class="sb-item muted">k3 · kimi-coding</span>
+  </div>
+</div>
+
+<!-- ================= ③ Command Center → Usage (M2) ================= -->
+<div class="app" data-scene="command-center">
+  <div class="overlay-backdrop">
+    <div class="overlay" role="dialog" aria-label="Command Center — Usage">
+      <div class="cc-head"><span class="cc-title">Command Center · Usage</span><button class="cc-close" aria-label="Close">✕</button></div>
+      <div class="stack-lg">
+        <div class="row"><p class="title">Account limits</p><span class="small muted">Official provider data · refreshed 12s ago · <button class="link small" type="button">Refresh</button></span></div>
+        <div class="cc-grid">
+          <div class="stack">
+            <div class="row"><span class="fg">Codex 1 <span class="badge badge-current">current</span> <span class="badge badge-plan">Plus</span></span><span class="small muted">openai-codex</span></div>
+            <div class="row-center small"><span class="muted">5 hour</span><span class="fg tabular">68% left · resets in 2h 14m</span></div>
+            <div class="progress" role="progressbar" aria-valuenow="68" aria-valuemin="0" aria-valuemax="100" aria-label="5 hour: 68% left"><i style="width:68%"></i></div>
+            <div class="row-center small"><span class="muted">Weekly</span><span class="fg tabular">41% left · resets in 3d 4h</span></div>
+            <div class="progress warn" role="progressbar" aria-valuenow="41" aria-valuemin="0" aria-valuemax="100" aria-label="Weekly: 41% left"><i style="width:41%"></i></div>
+          </div>
+          <div class="stack">
+            <div class="row"><span class="fg">Codex 2 <span class="badge badge-plan">Plus</span> <span class="badge badge-stale">stale</span></span><span class="small muted">openai-codex</span></div>
+            <div class="row-center small"><span class="muted">Weekly</span><span class="fg tabular">77% left · resets in 5d 1h</span></div>
+            <div class="progress" role="progressbar" aria-valuenow="77" aria-valuemin="0" aria-valuemax="100" aria-label="Weekly: 77% left"><i style="width:77%"></i></div>
+            <p class="small muted" role="status">Cached · 11:42:03 — transient upstream timeout</p>
+          </div>
+          <div class="stack">
+            <div class="row"><span class="fg">Kimi 1 <span class="badge badge-plan">Level 2</span></span><span class="small muted">kimi-coding</span></div>
+            <div class="row-center small"><span class="muted">Weekly</span><span class="fg tabular">73% left · resets in 4d 6h</span></div>
+            <div class="progress" role="progressbar" aria-valuenow="73" aria-valuemin="0" aria-valuemax="100" aria-label="Weekly: 73% left"><i style="width:73%"></i></div>
+            <p class="small muted">Parallel limit: 5</p>
+          </div>
+          <div class="stack">
+            <div class="row"><span class="fg">Claude 1</span><span class="small muted">anthropic</span></div>
+            <div class="alert small" role="alert"><span>⚠ Credential token expired — re-authenticate</span></div>
+          </div>
+        </div>
+      </div>
+      <div class="section">
+        <div class="row"><p class="title">Provider / Model / Task</p><span class="dim-note">Local analytics — 与 provider quota 分离，不混算</span></div>
+        <div class="cc-grid">
+          <div class="stack">
+            <span class="dim-note">By provider (7d, local)</span>
+            <div class="row-center small"><span class="muted">kimi-coding</span><span class="fg tabular">1.2M tok · 214 calls</span></div>
+            <div class="progress" role="progressbar" aria-valuenow="64" aria-valuemin="0" aria-valuemax="100" aria-label="kimi-coding: 64% of local tokens"><i style="width:64%"></i></div>
+            <div class="row-center small"><span class="muted">openai-codex</span><span class="fg tabular">0.6M tok · 88 calls</span></div>
+            <div class="progress" role="progressbar" aria-valuenow="32" aria-valuemin="0" aria-valuemax="100" aria-label="openai-codex: 32% of local tokens"><i style="width:32%"></i></div>
+          </div>
+          <div class="stack">
+            <span class="dim-note">By model (7d, local)</span>
+            <div class="row-center small"><span class="muted">k3</span><span class="fg tabular">0.9M tok</span></div>
+            <div class="progress" role="progressbar" aria-valuenow="48" aria-valuemin="0" aria-valuemax="100" aria-label="k3: 48% of local tokens"><i style="width:48%"></i></div>
+            <div class="row-center small"><span class="muted">gpt-5.3-codex</span><span class="fg tabular">0.6M tok</span></div>
+            <div class="progress" role="progressbar" aria-valuenow="32" aria-valuemin="0" aria-valuemax="100" aria-label="gpt-5.3-codex: 32% of local tokens"><i style="width:32%"></i></div>
+          </div>
+          <div class="stack">
+            <span class="dim-note">By task (7d, local)</span>
+            <div class="row-center small"><span class="muted">coding</span><span class="fg tabular">1.1M tok · 61%</span></div>
+            <div class="progress" role="progressbar" aria-valuenow="61" aria-valuemin="0" aria-valuemax="100" aria-label="coding: 61% of local tokens"><i style="width:61%"></i></div>
+            <div class="row-center small"><span class="muted">tool ops</span><span class="fg tabular">0.4M tok · 22%</span></div>
+            <div class="progress" role="progressbar" aria-valuenow="22" aria-valuemin="0" aria-valuemax="100" aria-label="tool ops: 22% of local tokens"><i style="width:22%"></i></div>
+            <div class="row-center small"><span class="muted">research</span><span class="fg tabular">0.3M tok · 17%</span></div>
+            <div class="progress" role="progressbar" aria-valuenow="17" aria-valuemin="0" aria-valuemax="100" aria-label="research: 17% of local tokens"><i style="width:17%"></i></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ================= ④ Command Palette 到达路径 ================= -->
+<div class="app" data-scene="palette">
+  <div class="note"><b>④ 状态栏整体关闭时</b>：Command Palette 输入 "usage" 直达 Command Center → Usage；同一 action，同一状态（one action, one home）。</div>
+  <div class="stage" style="align-items:flex-start; padding-top:12vh">
+    <div class="palette" role="dialog" aria-label="Command palette">
+      <input value="usage" aria-label="Command search" readonly>
+      <div role="listbox" aria-label="Commands">
+        <button class="palette-item active" type="button" role="option" aria-selected="true">▸ Open Usage — Command Center<span class="kbd">Enter</span></button>
+        <button class="palette-item" type="button" role="option" aria-selected="false">▸ Refresh account limits<span class="kbd">usage.accounts</span></button>
+        <button class="palette-item" type="button" role="option" aria-selected="false">▸ Toggle statusbar visibility<span class="kbd">Settings</span></button>
+      </div>
+    </div>
+  </div>
+  <div class="statusbar" style="opacity:0.35"><span class="sb-item muted">（statusbar 已整体关闭 — 仅为演示占位）</span></div>
+</div>
+
+<script>
+// scene router
+const scenes = document.querySelectorAll('[data-scene]');
+scenes.forEach(s => { s.style.display = (s.dataset.scene === scene) ? '' : 'none'; });
+if (scene === 'index') document.querySelector('[data-scene="index"]').style.display = '';
+
+// Minimal real keyboard path (mockup scope): the statusbar trigger toggles the
+// popover; Escape closes it and returns focus to the trigger. Focus trap /
+// roving tabindex remain production acceptance targets (see index notes).
+if (scene === 'popover') {
+  const root = document.querySelector('[data-scene="popover"]');
+  const trigger = root.querySelector('[data-popover-trigger]');
+  const pop = root.querySelector('.popover');
+  const setOpen = (open) => {
+    pop.style.display = open ? '' : 'none';
+    trigger.setAttribute('aria-expanded', String(open));
+    if (!open) trigger.focus();
+  };
+  trigger.addEventListener('click', () => setOpen(pop.style.display === 'none'));
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && pop.style.display !== 'none') setOpen(false);
+  });
+}
+</script>
+</body>
+</html>

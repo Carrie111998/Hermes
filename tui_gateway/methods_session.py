@@ -1410,6 +1410,36 @@ def _(rid, params: dict) -> dict:
     return _ok(rid, payload)
 
 
+@method("usage.accounts")
+@_profile_scoped
+def _(rid, params: dict) -> dict:
+    """Return the v1 sanitized multi-provider usage/account contract."""
+    session = None
+    session_id = str(params.get("session_id") or "").strip()
+    if session_id:
+        session, _err_response = _sess_nowait(params, rid)
+
+    usage = _session_usage_snapshot(session) if session else None
+    agent = session.get("agent") if session else None
+    mirror = _metadata_mirror(session)
+    provider = getattr(agent, "provider", None) or mirror.get("provider")
+    model = getattr(agent, "model", None) or mirror.get("model")
+
+    try:
+        from agent.usage_contract import build_usage_contract
+
+        payload = build_usage_contract(
+            session_usage=usage,
+            session_provider=provider,
+            session_model=model,
+            fetch_provider_usage=bool(params.get("refresh", True)),
+        )
+        return _ok(rid, payload)
+    except Exception:
+        logger.exception("usage.accounts failed")
+        return _err(rid, 5000, "Could not load account usage")
+
+
 @method("pet.info")
 @_profile_scoped
 def _(rid, params: dict) -> dict:

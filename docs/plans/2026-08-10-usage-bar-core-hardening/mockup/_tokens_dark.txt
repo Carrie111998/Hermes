@@ -1,0 +1,35 @@
+:root.dark {
+    /* Per-mode mix knobs — overridden inline by `applyTheme()` per skin. */
+    --theme-mix-chrome: 74%;
+    --theme-mix-card: 38%;
+    --theme-mix-elevated: 46%;
+    --theme-mix-bubble: 46%;
+    --theme-neutral-chrome: #0d0d0e;
+    --theme-neutral-sidebar: #0a0a0b;
+    --theme-neutral-card: #161618;
+
+    /* Dark-only accent palette overrides. */
+    --ui-red: #e75e78;
+    --ui-green: #55a583;
+    --ui-cyan: #6f9ba6;
+    --ui-diff-add-foreground: color-mix(in srgb, var(--ui-green) 62%, #fff);
+    --ui-diff-remove-foreground: color-mix(in srgb, var(--ui-red) 62%, #fff);
+
+    --sidebar-edge-border: color-mix(in srgb, var(--ui-base) 12%, transparent);
+    --composer-ring-strength: 1.3;
+    --backdrop-invert-mul: 0;
+    /* Dark mode: a dark card needs a stronger black inset to show the recess. */
+    --dt-input-inset: inset 0 1px 1px color-mix(in srgb, #000 38%, transparent);
+    --ui-tab-hover-darken: 6%;
+    /* Dark needs a lighter resting border than light mode. */
+    --dt-input-border: 4%;
+
+    --ui-inline-code-background: color-mix(in srgb, #ffffff 7%, transparent);
+    --ui-inline-code-foreground: color-mix(in srgb, #ffffff 88%, transparent);
+    --ui-selection-background: color-mix(in srgb, #ffd24a 38%, transparent);
+    /* A dark card sits ABOVE the chrome (#161618 over #0d0d0e), so an inline
+       widget wearing the raw card fill reads as a lit panel. Take it down a
+       touch — still clearly a surface, no longer the brightest thing in the
+       transcript. Derived from the card so every skin follows its own seed. */
+    --ui-widget-surface-background: color-mix(in srgb, var(--ui-bg-editor) 88%, #000);
+  }

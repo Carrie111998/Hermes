@@ -1,0 +1,51 @@
+{
+  "task": "usage-bar-core-hardening",
+  "phase": "CLOSEOUT",
+  "status": "M0_M1_M2_M3_E2E_DONE",
+  "writer_final": "parent session (kimi-k3, direct implementation per user decision 2026-08-10)",
+  "updated_at": "2026-08-10T06:05:00Z",
+  "git": {
+    "branch": "codex/hermes-custom-migrate-v020",
+    "commits_m2_closeout": [
+      "9ca0182c1 docs: M1 parent-accepted; writer switch; M3 rescoped to E2E-only",
+      "6ca605c80 feat(analytics): add real by_provider usage aggregation",
+      "0111f67a4 feat(desktop): shared account limits with refresh + command-center usage integration",
+      "654b4065e fix(usage): per-call provider attribution, focus-visible actions, alert roles, real race tests"
+    ],
+    "worktree": "clean",
+    "upstream_sync": "PROBE_CLEAN_DEFERRED (merge-tree 零冲突已证实; live-checkout guard 需停 Hermes 后外部执行)"
+  },
+  "tests_final": {
+    "backend": "182 passed, 5 skipped (usage_contract 32 + usage_accounts 1 + account_usage 7 + web_server 含 by_provider 4 项; 唯一失败 test_serve_index_injects_bootstrap_for_user_theme 经 232532eb8 旧版复现证实为既有环境失败, 与本任务无关)",
+    "desktop": "32 passed (account-limits 8 + usage-panel 5 + context-usage-panel 5 + statusbar-visibility 8 + statusbar-prefs 6)",
+    "typecheck": "tsc x3 exit 0",
+    "build": "vite + electron main/preload + assert-dist-built exit 0",
+    "e2e_smoke": "真实凭证池 build_usage_contract: 7 providers / 8 accounts, 稳定 display_name (Codex 1, Kimi 1...), 状态诚实 (available/error/unsupported/cooldown), 无 secret 泄露",
+    "git_diff_check": "clean"
+  },
+  "milestones": {
+    "M0": "DONE",
+    "M1_backend": "DONE (singleflight/negative cache/Retry-After/display_name, 40/40)",
+    "M1_deferred": "is_current 无权威只读信号源, 未实现 (诚实省略, 非 blocker)",
+    "M2": "DONE (共享 AccountLimits + popover 修复 fill=remaining + Refresh/OpenCC + CC Provider/Model/Task + palette 关键词)",
+    "M3": "DONE_E2E_ONLY (provider 估值按用户拍板砍掉; E2E=jsdom 行为测试 + 真实 contract smoke + build)"
+  },
+  "review": {
+    "m2_codex_round1": "4 findings (provider 归因 blocker + focus/alert/假竞态) → 654b4065e 全部修复并补真竞态/切换/residual 回归测试",
+    "codex_rereview": "WAIVED by user 2026-08-10 (以后无需 Codex 复验)"
+  },
+  "not_claimed": "不宣称 release ready: 发布门禁 (回滚包 MANIFEST/恢复演练/双向兼容 smoke/上游 merge) 仍未执行, 维持文档记录的发布前阻塞条件",
+  "release_promotion": {
+    "status": "PENDING_ONE_RESTART",
+    "new_build": "apps/desktop/release-new/win-unpacked (electron-builder --dir, 含 hide-unused/relative-time/threshold 全部改动)",
+    "user_confirmed": "2026-08-10 用户在新包上确认无误",
+    "watcher": "C:\\Users\\Admin\\AppData\\Local\\hermes\\cache\\usage-bar-release-promote.ps1 — 用户退出后自动 release→release-old, release-new→release, 并从 release\\ 重启",
+    "rollback": "release-old\\win-unpacked\\Hermes.exe 或 cache\\release-backups\\release-backup-usage-20260810-114009"
+  },
+  "ux_compaction": {
+    "commit": "bacaa4e07",
+    "changes": "上下文用量分类默认折叠(disclosure); 提供商按使用排序(当前会话置顶+当前徽标→有真实额度→需注意); unsupported 合并为单行折叠组(note 仅一次); 健康状态图标化(CheckCircle2/Clock/AlertCircle); 额度行内联(label+bar+% left)",
+    "tests": "desktop 36 passed, typecheck x3, build exit 0",
+    "note": "排序 currentProvider 取自 contract.local.provider (会话事实), 非路由 is_current"
+  }
+}

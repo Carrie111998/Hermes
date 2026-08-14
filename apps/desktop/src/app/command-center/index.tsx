@@ -7,6 +7,7 @@ import { SearchField } from '@/components/ui/search-field'
 import { SegmentedControl } from '@/components/ui/segmented-control'
 import { ResponsiveTabs } from '@/components/ui/tab-dropdown'
 import { Tip } from '@/components/ui/tooltip'
+import { AccountLimitsStateNotice, AccountLimitsView, useUsageAccounts } from '@/app/usage/account-limits'
 import { getActionStatus, getLogs, getStatus, getUsageAnalytics, restartGateway, updateHermes } from '@/hermes'
 import type { ActionStatusResponse, AnalyticsResponse, StatusResponse } from '@/hermes'
 import { useI18n } from '@/i18n'
@@ -61,6 +62,12 @@ interface CommandCenterViewProps {
   // Accepted for call-site parity; navigation lives in the global Cmd+K palette.
   onNavigateRoute?: (path: string) => void
   onOpenSession: (sessionId: string) => void
+  /** Active gateway profile — scopes the account limits contract request. */
+  profile?: null | string
+  /** Gateway requester for the canonical usage.accounts contract. */
+  requestGateway?: <T = unknown>(method: string, params?: Record<string, unknown>) => Promise<T>
+  /** Active runtime session id — binds local analytics to the focused session. */
+  sessionId?: null | string
 }
 
 function formatTimestamp(value?: number | null): string {
@@ -132,7 +139,15 @@ function EmptyPanel({ action, description, title }: { action?: ReactNode; descri
   )
 }
 
-export function CommandCenterView({ initialSection, onClose, onDeleteSession, onOpenSession }: CommandCenterViewProps) {
+export function CommandCenterView({
+  initialSection,
+  onClose,
+  onDeleteSession,
+  onOpenSession,
+  profile,
+  requestGateway,
+  sessionId
+}: CommandCenterViewProps) {
   const { t } = useI18n()
   const cc = t.commandCenter
   // $sessions ticks on every streaming token (title updates, new sessions),
@@ -413,6 +428,9 @@ export function CommandCenterView({ initialSection, onClose, onDeleteSession, on
               loading={usageLoading}
               onRefresh={() => void refreshUsage(usagePeriod)}
               period={usagePeriod}
+              profile={profile}
+              requestGateway={requestGateway}
+              sessionId={sessionId}
               usage={usage}
             />
           ) : section === 'maintenance' ? (
@@ -518,15 +536,29 @@ interface UsagePanelProps {
   loading: boolean
   onRefresh: () => void
   period: UsagePeriod
+  profile?: null | string
+  requestGateway?: <T = unknown>(method: string, params?: Record<string, unknown>) => Promise<T>
+  sessionId?: null | string
   usage: AnalyticsResponse | null
 }
 
-function UsagePanel({ error, loading, onRefresh, period, usage }: UsagePanelProps) {
+export function UsagePanel({
+  error,
+  loading,
+  onRefresh,
+  period,
+  profile,
+  requestGateway,
+  sessionId,
+  usage
+}: UsagePanelProps) {
   const { t } = useI18n()
   const cc = t.commandCenter
   const daily = useMemo(() => usage?.daily ?? [], [usage])
   const totals = usage?.totals
   const byModel = usage?.by_model ?? []
+  const byProvider = usage?.by_provider ?? []
+  const byTask = usage?.by_task ?? []
   const topSkills = usage?.skills?.top_skills ?? []
 
   const maxTokens = useMemo(() => {
@@ -537,10 +569,24 @@ function UsagePanel({ error, loading, onRefresh, period, usage }: UsagePanelProp
     return daily.reduce((acc, entry) => Math.max(acc, (entry.input_tokens || 0) + (entry.output_tokens || 0)), 1)
   }, [daily])
 
-  if (!totals) {
-    return (
-      <div className="min-h-0 flex-1">
-        {loading ? (
+  return (
+    <div className="flex min-h-0 flex-1 flex-col gap-5 overflow-y-auto pb-2">
+      {requestGateway && (
+        <AccountLimitsSection profile={profile} requestGateway={requestGateway} sessionId={sessionId ?? null} />
+      )}
+
+      {error && (
+        <span
+          className="inline-flex items-center gap-1 text-[length:var(--conversation-caption-font-size)] text-destructive"
+          role="alert"
+        >
+          <AlertCircle className="size-3.5" />
+          {error}
+        </span>
+      )}
+
+      {!totals ? (
+        loading ? (
           <PageLoader className="min-h-48" label={cc.loadingUsage} />
         ) : (
           <EmptyPanel
@@ -551,20 +597,9 @@ function UsagePanel({ error, loading, onRefresh, period, usage }: UsagePanelProp
             }
             description={cc.noUsage(period)}
           />
-        )}
-      </div>
-    )
-  }
-
-  return (
-    <div className="flex min-h-0 flex-1 flex-col gap-5 overflow-y-auto pb-2">
-      {error && (
-        <span className="inline-flex items-center gap-1 text-[length:var(--conversation-caption-font-size)] text-destructive">
-          <AlertCircle className="size-3.5" />
-          {error}
-        </span>
-      )}
-
+        )
+      ) : (
+        <>
       <div className="grid grid-cols-2 gap-x-4 gap-y-4 py-2 sm:grid-cols-3">
         <UsageStat label={cc.statSessions} value={compactNumber(totals.total_sessions)} />
         <UsageStat label={cc.statApiCalls} value={compactNumber(totals.total_api_calls)} />
@@ -627,6 +662,15 @@ function UsagePanel({ error, loading, onRefresh, period, usage }: UsagePanelProp
 
       <div className="grid min-h-0 gap-x-8 gap-y-5 pt-1 sm:grid-cols-2">
         <UsageList
+          emptyLabel={cc.noProviderUsage}
+          rows={byProvider.slice(0, 6).map(entry => ({
+            key: entry.provider,
+            label: entry.provider,
+            value: `${compactNumber((entry.input_tokens || 0) + (entry.output_tokens || 0))}`
+          }))}
+          title={cc.topProviders}
+        />
+        <UsageList
           emptyLabel={cc.noModelUsage}
           rows={byModel.slice(0, 6).map(entry => ({
             key: entry.model,
@@ -634,6 +678,15 @@ function UsagePanel({ error, loading, onRefresh, period, usage }: UsagePanelProp
             value: `${compactNumber((entry.input_tokens || 0) + (entry.output_tokens || 0))}`
           }))}
           title={cc.topModels}
+        />
+        <UsageList
+          emptyLabel={cc.noTaskUsage}
+          rows={byTask.slice(0, 6).map(entry => ({
+            key: entry.task,
+            label: entry.task,
+            value: `${compactNumber((entry.input_tokens || 0) + (entry.output_tokens || 0))}`
+          }))}
+          title={cc.topTasks}
         />
         <UsageList
           emptyLabel={cc.noSkillActivity}
@@ -645,7 +698,33 @@ function UsagePanel({ error, loading, onRefresh, period, usage }: UsagePanelProp
           title={cc.topSkills}
         />
       </div>
+        </>
+      )}
     </div>
+  )
+}
+
+function AccountLimitsSection({
+  profile,
+  requestGateway,
+  sessionId
+}: {
+  profile?: null | string
+  requestGateway: <T = unknown>(method: string, params?: Record<string, unknown>) => Promise<T>
+  sessionId: null | string
+}) {
+  const { t } = useI18n()
+  const cc = t.commandCenter
+  const { contract, refresh, refreshing, state } = useUsageAccounts({ profile, requestGateway, sessionId })
+
+  return (
+    <section className="flex flex-col gap-2 border-b border-(--ui-stroke-tertiary) pb-4">
+      <span className="text-[0.625rem] font-medium uppercase tracking-[0.08em] text-(--ui-text-tertiary)">
+        {cc.accountLimits}
+      </span>
+      <AccountLimitsStateNotice state={state} />
+      {contract && <AccountLimitsView contract={contract} onRefresh={refresh} refreshing={refreshing} />}
+    </section>
   )
 }
 

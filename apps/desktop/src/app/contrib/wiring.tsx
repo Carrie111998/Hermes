@@ -1097,6 +1097,9 @@ export function ContribWiring({ children }: { children: ReactNode }) {
             onDeleteSession={removeSession}
             onNavigateRoute={path => navigateToWorkspacePage(navigate, path)}
             onOpenSession={sessionId => openSession(sessionId, navigate)}
+            profile={activeGatewayProfile}
+            requestGateway={requestGateway}
+            sessionId={activeSessionId}
           />
         </Suspense>
       )}

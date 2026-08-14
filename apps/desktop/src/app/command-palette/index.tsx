@@ -860,7 +860,7 @@ function CommandPaletteBody({ onExited }: { onExited: () => void }) {
           {
             icon: BarChart3,
             id: 'cc-usage',
-            keywords: ['command center', 'usage', 'tokens', 'cost'],
+            keywords: ['command center', 'usage', 'tokens', 'cost', 'account limits', 'quota', 'provider', 'model', 'task', 'rate limit'],
             label: cc.sections.usage,
             run: go(`${COMMAND_CENTER_ROUTE}?section=usage`)
           },
