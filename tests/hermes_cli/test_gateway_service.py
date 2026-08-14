@@ -262,6 +262,81 @@ class TestGeneratedSystemdUnits:
         assert "SoftResourceLimits" not in plist
 
 
+class TestLaunchdPlistXmlEscaping:
+    """launchd plist values must be XML-safe for user-controlled paths.
+
+    Regression: a HERMES_HOME (or venv/PATH entry) containing ``&`` or ``<``
+    — e.g. an AD username like ``/Users/foo & bar`` — produced a plist that
+    ``launchctl bootstrap`` rejects as malformed XML, so the gateway could
+    never register as a service for those users.
+    """
+
+    def _gen_plist_with_home(self, home: str, monkeypatch, tmp_path) -> str:
+        import xml.etree.ElementTree as ET
+
+        # Use a real temp dir as the fake HERMES_HOME so _stable_service_working_dir
+        # resolves it (it requires Path(home).is_dir()).
+        fake_home = tmp_path / home.strip("/").replace("/", "_")
+        fake_home.mkdir(parents=True, exist_ok=True)
+        monkeypatch.setattr(gateway_cli, "get_hermes_home", lambda: fake_home)
+        monkeypatch.setattr(gateway_cli.Path, "mkdir", lambda *a, **k: None)
+        monkeypatch.setattr(gateway_cli.Path, "resolve", lambda self: self)
+        plist = gateway_cli.generate_launchd_plist()
+        # Must be well-formed XML — this is what launchctl's plist parser
+        # enforces; ET.fromstring failing means bootstrap would fail too.
+        ET.fromstring(plist)
+        return plist
+
+    def test_ampersand_home_escaped(self, monkeypatch, tmp_path):
+        import plistlib
+
+        fake_home = tmp_path / "Users_foo & bar"
+        fake_home.mkdir(parents=True, exist_ok=True)
+        monkeypatch.setattr(gateway_cli, "get_hermes_home", lambda: fake_home)
+        monkeypatch.setattr(gateway_cli.Path, "mkdir", lambda *a, **k: None)
+        monkeypatch.setattr(gateway_cli.Path, "resolve", lambda self: self)
+        plist = gateway_cli.generate_launchd_plist()
+        # Raw & must never appear in XML text — it is escaped to &amp;.
+        assert "foo &amp; bar" in plist
+        assert "foo & bar" not in plist
+        # Round-trip through plistlib returns the original path.
+        parsed = plistlib.loads(plist.encode("utf-8"))
+        assert parsed["WorkingDirectory"] == str(fake_home)
+
+    def test_angle_bracket_home_escaped(self, monkeypatch, tmp_path):
+        import plistlib
+
+        fake_home = tmp_path / "foo<bar>"
+        fake_home.mkdir(parents=True, exist_ok=True)
+        monkeypatch.setattr(gateway_cli, "get_hermes_home", lambda: fake_home)
+        monkeypatch.setattr(gateway_cli.Path, "mkdir", lambda *a, **k: None)
+        monkeypatch.setattr(gateway_cli.Path, "resolve", lambda self: self)
+        plist = gateway_cli.generate_launchd_plist()
+        # Raw < > must never appear in XML text — they are escaped.
+        assert "&lt;" in plist and "&gt;" in plist
+        assert "foo<bar>" not in plist
+        parsed = plistlib.loads(plist.encode("utf-8"))
+        assert parsed["WorkingDirectory"] == str(fake_home)
+
+    def test_unescaped_plist_is_malformed_without_fix(self, monkeypatch, tmp_path):
+        # Sanity check that the test itself is sensitive: the old f-string
+        # output for a `<`-containing home is NOT parseable XML.
+        import xml.etree.ElementTree as ET
+        import plistlib
+
+        fake_home = tmp_path / "foo<bar>"
+        fake_home.mkdir(parents=True, exist_ok=True)
+        monkeypatch.setattr(gateway_cli, "get_hermes_home", lambda: fake_home)
+        monkeypatch.setattr(gateway_cli.Path, "mkdir", lambda *a, **k: None)
+        monkeypatch.setattr(gateway_cli.Path, "resolve", lambda self: self)
+        plist = gateway_cli.generate_launchd_plist()
+        # Fixed output escapes the < > in the HERMES_HOME value and round-trips
+        # through plistlib back to the original value.
+        assert "&lt;" in plist and "&gt;" in plist
+        parsed = plistlib.loads(plist.encode("utf-8"))
+        assert parsed["WorkingDirectory"] == str(fake_home)
+
+
 
 class TestGatewayStopCleanup:
     @pytest.mark.linux_only

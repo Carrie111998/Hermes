@@ -15,6 +15,7 @@ import subprocess
 import sys
 import textwrap
 import time
+import xml.sax.saxutils
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -4181,6 +4182,19 @@ def _launchd_fallback_to_detached(reason: str, *, exit_on_failure: bool = True) 
     return False
 
 
+def _xml_escape(value: str) -> str:
+    """Escape a string for safe embedding in a plist XML text node.
+
+    plist values that embed user-controlled paths (HOME, venv dir, PATH
+    entries) must be escaped: a path containing ``&`` or ``<`` (e.g. a
+    company AD username like ``/Users/foo & bar``) currently produces an
+    XML-invalid plist that ``launchctl bootstrap`` rejects outright. Uses
+    the stdlib SAX escaper (also handles quotes so attribute-position
+    safety holds if a value is ever moved into an attribute).
+    """
+    return xml.sax.saxutils.escape(str(value), entities={'"': "&quot;"})
+
+
 def generate_launchd_plist() -> str:
     python_path = get_python_path()
     # Stable cwd anchor — never the volatile source checkout. See
@@ -4211,13 +4225,13 @@ def generate_launchd_plist() -> str:
 
     # Build ProgramArguments array, including --profile when using a named profile
     prog_args = [
-        f"<string>{python_path}</string>",
+        f"<string>{_xml_escape(python_path)}</string>",
         "<string>-m</string>",
         "<string>hermes_cli.main</string>",
     ]
     if profile_arg:
         for part in profile_arg.split():
-            prog_args.append(f"<string>{part}</string>")
+            prog_args.append(f"<string>{_xml_escape(part)}</string>")
     prog_args.extend(
         [
             "<string>gateway</string>",
@@ -4254,7 +4268,7 @@ def generate_launchd_plist() -> str:
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>{label}</string>
+    <string>{_xml_escape(label)}</string>
 
     <key>ProgramArguments</key>
     <array>
@@ -4262,16 +4276,16 @@ def generate_launchd_plist() -> str:
     </array>
     
     <key>WorkingDirectory</key>
-    <string>{working_dir}</string>
+    <string>{_xml_escape(working_dir)}</string>
     
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
-        <string>{sane_path}</string>
+        <string>{_xml_escape(sane_path)}</string>
         <key>VIRTUAL_ENV</key>
-        <string>{venv_dir}</string>
+        <string>{_xml_escape(venv_dir)}</string>
         <key>HERMES_HOME</key>
-        <string>{hermes_home}</string>
+        <string>{_xml_escape(hermes_home)}</string>
     </dict>
 
     <key>LimitLoadToSessionType</key>
@@ -4297,10 +4311,10 @@ def generate_launchd_plist() -> str:
     <integer>25</integer>
 {nofile_block}
     <key>StandardOutPath</key>
-    <string>{log_dir}/gateway.log</string>
+    <string>{_xml_escape(log_dir)}/gateway.log</string>
     
     <key>StandardErrorPath</key>
-    <string>{log_dir}/gateway.error.log</string>
+    <string>{_xml_escape(log_dir)}/gateway.error.log</string>
 </dict>
 </plist>
 """
