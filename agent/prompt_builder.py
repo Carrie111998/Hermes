@@ -26,9 +26,11 @@ from agent.skill_utils import (
     extract_skill_conditions,
     extract_skill_description,
     get_all_skills_dirs,
+    get_central_private_skill_roots,
     get_disabled_skill_names,
     iter_skill_index_files,
     org_id_of_path,
+    path_is_within_roots,
     parse_frontmatter,
     read_active_org_id,
     skill_matches_environment,
@@ -1480,9 +1482,10 @@ def drain_truncation_warnings() -> list:
 _SKILLS_PROMPT_CACHE_MAX = 8
 _SKILLS_PROMPT_CACHE: OrderedDict[tuple, str] = OrderedDict()
 _SKILLS_PROMPT_CACHE_LOCK = threading.Lock()
-# v2: entries gained org provenance fields (org_id/org_author/rel_dir) for M2
+# v3: snapshots bind to the configured MCP-authority boundary. Entries gained
+# org provenance fields (org_id/org_author/rel_dir) for M2 in v2.
 # org-shared skills; older snapshots are discarded and rebuilt.
-_SKILLS_SNAPSHOT_VERSION = 2
+_SKILLS_SNAPSHOT_VERSION = 3
 
 
 def _skills_prompt_snapshot_path() -> Path:
@@ -1500,7 +1503,10 @@ def clear_skills_system_prompt_cache(*, clear_snapshot: bool = False) -> None:
             logger.debug("Could not remove skills prompt snapshot: %s", e)
 
 
-def _build_skills_manifest(skills_dir: Path) -> dict[str, list[int]]:
+def _build_skills_manifest(
+    skills_dir: Path,
+    authority_roots: tuple[Path, ...],
+) -> dict[str, list[int]]:
     """Build an mtime/size manifest of all SKILL.md and DESCRIPTION.md files.
 
     Org mirrors (M2): only the ACTIVE org's mirror participates, and the
@@ -1508,6 +1514,8 @@ def _build_skills_manifest(skills_dir: Path) -> dict[str, list[int]]:
     invalidates the snapshot even when no SKILL.md changed.
     """
     manifest: dict[str, list[int]] = {}
+    if path_is_within_roots(skills_dir, authority_roots):
+        return manifest
     skills_dir_str = str(skills_dir)
     base = os.path.join(skills_dir_str, "")
     prefix_len = len(base)
@@ -1522,6 +1530,10 @@ def _build_skills_manifest(skills_dir: Path) -> dict[str, list[int]]:
     except OSError:
         pass
     for root, dirs, files in os.walk(skills_dir_str, followlinks=True):
+        root_path = Path(root)
+        if path_is_within_roots(root_path, authority_roots):
+            dirs[:] = []
+            continue
         has_skill_md = "SKILL.md" in files
         if root == skills_dir_str and ORG_MIRROR_DIR_NAME in dirs and active_org is None:
             dirs.remove(ORG_MIRROR_DIR_NAME)
@@ -1532,6 +1544,7 @@ def _build_skills_manifest(skills_dir: Path) -> dict[str, list[int]]:
             for d in dirs
             if d not in EXCLUDED_SKILL_DIRS
             and not (has_skill_md and d in SKILL_SUPPORT_DIRS)
+            and not path_is_within_roots(root_path / d, authority_roots)
         ]
         for filename in ("SKILL.md", "DESCRIPTION.md"):
             if filename not in files:
@@ -1545,7 +1558,7 @@ def _build_skills_manifest(skills_dir: Path) -> dict[str, list[int]]:
     return manifest
 
 
-def _load_skills_snapshot(skills_dir: Path) -> Optional[dict]:
+def _load_skills_snapshot(skills_dir: Path, authority_boundary) -> Optional[dict]:
     """Load the disk snapshot if it exists and its manifest still matches."""
     snapshot_path = _skills_prompt_snapshot_path()
     if not snapshot_path.exists():
@@ -1558,7 +1571,11 @@ def _load_skills_snapshot(skills_dir: Path) -> Optional[dict]:
         return None
     if snapshot.get("version") != _SKILLS_SNAPSHOT_VERSION:
         return None
-    if snapshot.get("manifest") != _build_skills_manifest(skills_dir):
+    if snapshot.get("authority_signature") != list(authority_boundary.signature[1:]):
+        return None
+    if snapshot.get("manifest") != _build_skills_manifest(
+        skills_dir, authority_boundary.roots
+    ):
         return None
     return snapshot
 
@@ -1568,11 +1585,13 @@ def _write_skills_snapshot(
     manifest: dict[str, list[int]],
     skill_entries: list[dict],
     category_descriptions: dict[str, str],
+    authority_boundary,
 ) -> None:
     """Persist skill metadata to disk for fast cold-start reuse."""
     payload = {
         "version": _SKILLS_SNAPSHOT_VERSION,
         "manifest": manifest,
+        "authority_signature": list(authority_boundary.signature[1:]),
         "skills": skill_entries,
         "category_descriptions": category_descriptions,
     }
@@ -1741,6 +1760,7 @@ def build_skills_system_prompt(
     """
     skills_dir = get_skills_dir()
     external_dirs = get_all_skills_dirs()[1:]  # skip local (index 0)
+    authority_boundary = get_central_private_skill_roots()
 
     if not skills_dir.exists() and not external_dirs:
         return ""
@@ -1753,6 +1773,8 @@ def build_skills_system_prompt(
     cache_key = (
         str(skills_dir),
         tuple(str(d) for d in external_dirs),
+        authority_boundary.signature,
+        tuple(str(root) for root in authority_boundary.roots),
         tuple(sorted(str(t) for t in (available_tools or set()))),
         tuple(sorted(str(ts) for ts in (available_toolsets or set()))),
         _platform_hint,
@@ -1766,7 +1788,7 @@ def build_skills_system_prompt(
             return cached
 
     # ── Layer 2: disk snapshot ────────────────────────────────────────
-    snapshot = _load_skills_snapshot(skills_dir)
+    snapshot = _load_skills_snapshot(skills_dir, authority_boundary)
 
     skills_by_category: dict[str, list[tuple[str, str]]] = {}
     category_descriptions: dict[str, str] = {}
@@ -1863,9 +1885,10 @@ def build_skills_system_prompt(
 
         _write_skills_snapshot(
             skills_dir,
-            _build_skills_manifest(skills_dir),
+            _build_skills_manifest(skills_dir, authority_boundary.roots),
             skill_entries,
             category_descriptions,
+            authority_boundary,
         )
 
     # ── External skill directories ─────────────────────────────────────

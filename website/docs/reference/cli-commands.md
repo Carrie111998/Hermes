@@ -1136,6 +1136,8 @@ Subcommands:
 |------------|-------------|
 | `browse` | Paginated browser for skill registries. |
 | `search` | Search skill registries. |
+| `route <query>` | Plan a deterministic, budgeted route through eligible local skills. |
+| `topology` | Audit local topology coverage, lifecycle values, references, cycles, and conflicts. |
 | `install` | Install a skill. |
 | `inspect` | Preview a skill without installing it. |
 | `list` | List installed skills. |
@@ -1158,6 +1160,9 @@ hermes skills browse
 hermes skills browse --source official
 hermes skills search react --source skills-sh
 hermes skills search https://mintlify.com/docs --source well-known
+hermes skills route "review this change" --limit 4 --budget-chars 24000
+hermes skills route "debug failing tests" --json
+hermes skills topology --json
 hermes skills inspect official/security/1password
 hermes skills inspect skills-sh/vercel-labs/json-render/json-render-react
 hermes skills install official/migration/openclaw-migration
@@ -1175,6 +1180,10 @@ hermes skills opt-in --sync            # undo: remove marker and re-seed now
 ```
 
 Notes:
+- `route` is local and read-only; unlike `search`, it never queries remote registries. `--limit` counts required skills and `--budget-chars` uses actual complete SKILL.md character counts, including registered plugin skills.
+- Route JSON contains neither a raw query nor a query fingerprint. It never includes local paths or skill bodies; selected skill metadata may naturally repeat query terms. V1 returns the artifact without persisting a route event.
+- `route` and `topology` use the installed Hermes inventory: local skills, configured external directories, and registered plugins. A central private MCP skill library belongs behind one installed thin adapter skill; Hermes does not ingest that library's catalog directly.
+- `topology` is a graph/manifest audit and is distinct from the security-focused `skills audit` command.
 - `--force` can override non-dangerous policy blocks for third-party/community skills.
 - `--force` does not override a `dangerous` scan verdict.
 - `--source skills-sh` searches the public `skills.sh` directory.

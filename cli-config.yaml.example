@@ -847,6 +847,13 @@ skills:
   #   - ~/.agents/skills
   #   - /home/shared/team-skills
 
+  # MCP-authoritative skill corpus roots. These must be exact absolute,
+  # non-symlink directories. Hermes excludes them from all native discovery,
+  # listing, routing, topology, and loading. Keep a thin local adapter skill
+  # outside the roots; it should direct the model to the configured MCP tools.
+  # central_private_roots:
+  #   - /absolute/path/to/mcp-authority-root
+
 # =============================================================================
 # Agent Behavior
 # =============================================================================

@@ -5,6 +5,7 @@ the create-job bridge, and the export round-trip without touching the real
 cron store.
 """
 
+import os
 import sys
 from pathlib import Path
 from unittest.mock import patch
@@ -63,6 +64,39 @@ metadata:
 """
 
 
+def _write_blueprint(
+    root: Path,
+    directory: str,
+    *,
+    name: str,
+    schedule: str,
+    body: str = "body",
+) -> Path:
+    skill_dir = root / directory
+    skill_dir.mkdir(parents=True, exist_ok=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\n"
+        f"name: {name}\n"
+        "metadata:\n"
+        "  hermes:\n"
+        "    blueprint:\n"
+        f'      schedule: "{schedule}"\n'
+        "---\n\n"
+        f"{body}\n",
+        encoding="utf-8",
+    )
+    return skill_dir
+
+
+def _write_authority_config(home: Path, roots: tuple[Path, ...]) -> None:
+    home.mkdir(parents=True, exist_ok=True)
+    lines = ["skills:"]
+    if roots:
+        lines.append("  central_private_roots:")
+        lines.extend(f"    - {root}" for root in roots)
+    (home / "config.yaml").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
 class TestParseBlueprint:
     def test_parses_full_blueprint(self):
         spec = parse_blueprint(BLUEPRINT_SKILL)
@@ -103,6 +137,96 @@ class TestBlueprintSpecForInstalled:
         (d / "SKILL.md").write_text(PLAIN_SKILL, encoding="utf-8")
         with patch("tools.skills_hub.SKILLS_DIR", skills_dir):
             assert blueprint_spec_for_installed("not-a-blueprint") is None
+
+
+    @pytest.mark.parametrize("boundary", ["equal", "nested", "containing", "symlink_alias"])
+    def test_mcp_authority_boundary_blocks_guessed_blueprint_names(
+        self, tmp_path, monkeypatch, caplog, boundary
+    ):
+        from agent import skill_utils
+
+        home = tmp_path / "home"
+        skills_dir = home / "skills"
+        private_body = "PRIVATE BLUEPRINT BODY 8675309"
+        private = _write_blueprint(
+            skills_dir,
+            "private/canonical-private-workflow-8675309",
+            name="canonical-private-workflow-8675309",
+            schedule="0 1 * * *",
+            body=private_body,
+        )
+        _write_blueprint(
+            skills_dir,
+            "adapter",
+            name="adapter",
+            schedule="0 2 * * *",
+        )
+        if boundary == "equal":
+            authority = private
+        elif boundary == "nested":
+            authority = private.parent
+        elif boundary == "containing":
+            authority = skills_dir
+        else:
+            authority = tmp_path / "authority-alias"
+            authority.symlink_to(private, target_is_directory=True)
+        _write_authority_config(home, (authority,))
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        skill_utils._external_dirs_cache_clear()
+
+        with patch("tools.skills_hub.SKILLS_DIR", skills_dir):
+            assert blueprint_spec_for_installed("canonical-private-workflow-8675309") is None
+            if boundary != "containing":
+                adapter = blueprint_spec_for_installed("adapter")
+                assert adapter is not None
+                assert adapter.schedule == "0 2 * * *"
+
+        assert "canonical-private-workflow-8675309" not in caplog.text
+        assert private_body not in caplog.text
+        assert str(private) not in caplog.text
+
+
+    def test_colliding_blueprint_directories_use_sorted_native_index_order(self, tmp_path):
+        skills_dir = tmp_path / "skills"
+        _write_blueprint(skills_dir, "z-last/collision", name="collision", schedule="0 9 * * *")
+        _write_blueprint(skills_dir, "a-first/collision", name="collision", schedule="0 7 * * *")
+
+        with patch("tools.skills_hub.SKILLS_DIR", skills_dir):
+            spec = blueprint_spec_for_installed("collision")
+
+        assert spec is not None
+        assert spec.schedule == "0 7 * * *"
+
+
+    def test_authority_config_cache_tracks_edits_and_profile_switches(self, tmp_path, monkeypatch):
+        from agent import skill_utils
+
+        first_home = tmp_path / "first-home"
+        skills_dir = first_home / "skills"
+        private = _write_blueprint(
+            skills_dir,
+            "private/profile-private",
+            name="profile-private",
+            schedule="0 1 * * *",
+        )
+        _write_authority_config(first_home, (private,))
+        monkeypatch.setenv("HERMES_HOME", str(first_home))
+        skill_utils._external_dirs_cache_clear()
+
+        with patch("tools.skills_hub.SKILLS_DIR", skills_dir):
+            assert blueprint_spec_for_installed("profile-private") is None
+
+            _write_authority_config(first_home, ())
+            config = first_home / "config.yaml"
+            stat = config.stat()
+            os.utime(config, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1))
+            visible = blueprint_spec_for_installed("profile-private")
+            assert visible is not None
+
+            second_home = tmp_path / "second-home"
+            _write_authority_config(second_home, (private,))
+            monkeypatch.setenv("HERMES_HOME", str(second_home))
+            assert blueprint_spec_for_installed("profile-private") is None
 
 
 class TestCreateBlueprintJob:

@@ -16,7 +16,11 @@ from pathlib import Path
 from hermes_cli.config import get_hermes_home, get_env_path, get_project_root, load_config
 from hermes_cli.env_loader import load_hermes_dotenv
 from hermes_constants import display_hermes_home
-from agent.skill_utils import is_excluded_skill_path
+from agent.skill_utils import (
+    get_central_private_skill_roots,
+    is_excluded_skill_path,
+    iter_skill_index_files,
+)
 
 
 def _dotenv_key_names() -> set[str]:
@@ -146,8 +150,13 @@ def _count_skills(hermes_home: Path) -> int:
     skills_dir = hermes_home / "skills"
     if not skills_dir.is_dir():
         return 0
+    authority_boundary = get_central_private_skill_roots(hermes_home / "config.yaml")
     count = 0
-    for item in skills_dir.rglob("SKILL.md"):
+    for item in iter_skill_index_files(
+        skills_dir,
+        "SKILL.md",
+        excluded_roots=authority_boundary.roots,
+    ):
         if is_excluded_skill_path(item):
             continue
         count += 1

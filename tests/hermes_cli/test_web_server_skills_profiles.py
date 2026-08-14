@@ -64,6 +64,30 @@ def _load_cfg(home):
 
 class TestProfileScopedSkills:
 
+    def test_profile_builder_does_not_write_authority_skill_to_disabled_state(
+        self, isolated_profiles
+    ):
+        """The profile setup path only disables skills it is allowed to enumerate."""
+        pytest.importorskip("fastapi")
+        from hermes_cli.web_server import _disable_unselected_skills
+
+        worker_home = isolated_profiles["worker_alpha"]
+        skills_root = worker_home / "skills"
+        _write_skill(skills_root, "public-skill")
+        private = skills_root / "private" / "canonical-private-workflow-8675309"
+        _write_skill(private.parent, private.name)
+        (worker_home / "config.yaml").write_text(
+            yaml.safe_dump(
+                {"skills": {"central_private_roots": [str(private)]}}
+            ),
+            encoding="utf-8",
+        )
+
+        assert _disable_unselected_skills(worker_home, keep=[]) == 2
+        disabled = _load_cfg(worker_home)["skills"]["disabled"]
+        assert set(disabled) == {"worker-skill", "public-skill"}
+        assert "canonical-private-workflow-8675309" not in disabled
+
 
     def test_toggle_writes_into_target_profile_only(self, client, isolated_profiles):
         resp = client.put(

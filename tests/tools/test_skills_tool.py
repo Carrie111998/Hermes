@@ -8,7 +8,9 @@ from unittest.mock import patch
 import pytest
 
 import tools.skills_tool as skills_tool_module
+from agent.skill_topology import audit_topology
 from tools.skills_tool import (
+    SKILLS_LIST_SCHEMA,
     _get_required_environment_variables,
     _parse_frontmatter,
     _parse_tags,
@@ -258,6 +260,261 @@ class TestFindAllSkills:
 
 
 class TestSkillsList:
+    def test_unqueried_listing_does_not_discover_plugin_skills(self, tmp_path, monkeypatch):
+        """The legacy no-query index must remain local/external only."""
+        from hermes_cli import plugins
+
+        calls = []
+        monkeypatch.setattr(plugins, "discover_plugins", lambda: calls.append(True))
+
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(tmp_path, "local")
+            result = json.loads(skills_list())
+
+        assert [item["name"] for item in result["skills"]] == ["local"]
+        assert calls == []
+
+    def test_query_plugin_uses_complete_skill_content_cost_and_environment_gate(
+        self, tmp_path, monkeypatch
+    ):
+        """Plugin candidates use their registered SKILL.md, never a short description."""
+        from hermes_cli import plugins
+
+        plugin_skill = tmp_path / "plugin" / "SKILL.md"
+        plugin_skill.parent.mkdir()
+        plugin_skill.write_bytes(
+            b"\xef\xbb\xbf---\nname: review\ndescription: tiny\n---\n\n" + b"x" * 200
+        )
+        metadata = {
+            "name": "demo:review",
+            "description": "tiny",
+            "category": "plugin",
+            "path": plugin_skill,
+            "frontmatter": {"environments": ["not-a-real-environment"]},
+        }
+        monkeypatch.setattr(plugins, "discover_plugins", lambda: None)
+        monkeypatch.setattr(
+            plugins,
+            "get_plugin_manager",
+            lambda: type("Manager", (), {"list_plugin_skill_metadata": lambda self: [metadata]})(),
+        )
+
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path / "skills"):
+            result = json.loads(skills_list(query="review", limit=1, budget_chars=100))
+
+        # Unknown environment tags intentionally fail open; the full 200-char
+        # body must therefore exceed the budget rather than being charged as
+        # the five-character description.
+        assert result["status"] == "blocked"
+        assert [item["code"] for item in result["diagnostics"]] == ["budget_omission"]
+
+    def test_query_plugin_ineligible_environment_is_not_routable(self, tmp_path, monkeypatch):
+        from hermes_cli import plugins
+
+        plugin_skill = tmp_path / "plugin" / "SKILL.md"
+        plugin_skill.parent.mkdir()
+        plugin_skill.write_text("---\nname: review\n---\n\nReview", encoding="utf-8")
+        metadata = {
+            "name": "demo:review",
+            "description": "review",
+            "category": "plugin",
+            "path": plugin_skill,
+            "frontmatter": {"environments": ["docker"]},
+        }
+        monkeypatch.setattr(plugins, "discover_plugins", lambda: None)
+        monkeypatch.setattr(
+            plugins,
+            "get_plugin_manager",
+            lambda: type("Manager", (), {"list_plugin_skill_metadata": lambda self: [metadata]})(),
+        )
+        monkeypatch.setattr(skills_tool_module, "skill_matches_environment", lambda _: False)
+
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path / "skills"):
+            result = json.loads(skills_list(query="review"))
+
+        assert result["status"] == "no_match"
+
+    def test_query_plugin_uses_registered_file_frontmatter_over_stale_metadata(
+        self, tmp_path, monkeypatch
+    ):
+        """Eligibility cannot be bypassed by stale registration metadata."""
+        from hermes_cli import plugins
+
+        plugin_skill = tmp_path / "plugin" / "SKILL.md"
+        plugin_skill.parent.mkdir()
+        plugin_skill.write_text(
+            "---\nname: review\nplatforms: [windows]\nenvironments: [docker]\nmetadata:\n"
+            "  hermes:\n    tags: [review]\n---\n\nReview",
+            encoding="utf-8",
+        )
+        metadata = {
+            "name": "demo:worker",
+            "description": "unrelated",
+            "category": "plugin",
+            "path": plugin_skill,
+            # This stale registration data would make the old route path
+            # consider the plugin a review candidate on every environment.
+            "frontmatter": {"metadata": {"hermes": {"tags": ["review"]}}},
+        }
+        monkeypatch.setattr(plugins, "discover_plugins", lambda: None)
+        monkeypatch.setattr(
+            plugins,
+            "get_plugin_manager",
+            lambda: type("Manager", (), {"list_plugin_skill_metadata": lambda self: [metadata]})(),
+        )
+        monkeypatch.setattr(
+            skills_tool_module,
+            "skill_matches_environment",
+            lambda frontmatter: "docker" not in frontmatter.get("environments", []),
+        )
+        monkeypatch.setattr(
+            skills_tool_module,
+            "skill_matches_platform",
+            lambda frontmatter: "windows" not in frontmatter.get("platforms", []),
+        )
+
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path / "skills"):
+            result = json.loads(skills_list(query="review"))
+
+        assert result["status"] == "no_match"
+
+    def test_query_plugin_with_unreadable_registered_skill_fails_closed(
+        self, tmp_path, monkeypatch
+    ):
+        from hermes_cli import plugins
+
+        metadata = {
+            "name": "demo:review",
+            "description": "review",
+            "category": "plugin",
+            "path": tmp_path / "missing" / "SKILL.md",
+            "frontmatter": {},
+        }
+        monkeypatch.setattr(plugins, "discover_plugins", lambda: None)
+        monkeypatch.setattr(
+            plugins,
+            "get_plugin_manager",
+            lambda: type("Manager", (), {"list_plugin_skill_metadata": lambda self: [metadata]})(),
+        )
+
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path / "skills"):
+            result = json.loads(skills_list(query="review"))
+
+        assert result["status"] == "blocked"
+        assert [item["code"] for item in result["diagnostics"]] == [
+            "skill_content_unavailable"
+        ]
+
+    def test_mixed_local_external_and_plugin_route_shares_costs_and_dependencies(
+        self, tmp_path, monkeypatch
+    ):
+        from hermes_cli import plugins
+
+        local_dir = tmp_path / "local"
+        external_dir = tmp_path / "external"
+        _make_skill(local_dir, "local-helper", body="local")
+        external_plan = _make_skill(external_dir, "plan", body="external-plan")
+        plugin_skill = tmp_path / "plugin" / "SKILL.md"
+        plugin_skill.parent.mkdir()
+        plugin_skill.write_text(
+            "---\nname: review\nmetadata:\n  hermes:\n    tags: [review]\n"
+            "    topology:\n      requires: [plan]\n---\n\nplugin-review-body",
+            encoding="utf-8",
+        )
+        metadata = {
+            "name": "demo:review",
+            "description": "short",
+            "category": "plugin",
+            "path": plugin_skill,
+            "frontmatter": {
+                "metadata": {
+                    "hermes": {"tags": ["review"], "topology": {"requires": ["plan"]}}
+                }
+            },
+        }
+        monkeypatch.setattr(plugins, "discover_plugins", lambda: None)
+        monkeypatch.setattr(
+            plugins,
+            "get_plugin_manager",
+            lambda: type("Manager", (), {"list_plugin_skill_metadata": lambda self: [metadata]})(),
+        )
+
+        with (
+            patch("tools.skills_tool.SKILLS_DIR", local_dir),
+            patch("agent.skill_utils.get_external_skills_dirs", return_value=[external_dir]),
+        ):
+            skills_tool_module._SKILLS_CACHE.clear()
+            result = json.loads(skills_list(query="review", limit=2, budget_chars=10_000))
+
+        assert [item["name"] for item in result["route"]] == ["plan", "demo:review"]
+        assert result["total_cost_chars"] == (
+            len((external_plan / "SKILL.md").read_text(encoding="utf-8"))
+            + len(plugin_skill.read_text(encoding="utf-8-sig"))
+        )
+        assert result["route"][1]["graph_role"] == "root"
+
+    def test_mixed_plugin_collision_blocks_route_without_paths(self, tmp_path, monkeypatch):
+        from hermes_cli import plugins
+
+        local_dir = tmp_path / "local"
+        external_dir = tmp_path / "external"
+        _make_skill(external_dir, "plugin-copy", body="external")
+        external_md = external_dir / "plugin-copy" / "SKILL.md"
+        external_md.write_text(
+            external_md.read_text(encoding="utf-8").replace(
+                "name: plugin-copy", "name: demo:review"
+            ),
+            encoding="utf-8",
+        )
+        plugin_skill = tmp_path / "plugin" / "SKILL.md"
+        plugin_skill.parent.mkdir()
+        plugin_skill.write_text("---\nname: review\n---\n\nplugin", encoding="utf-8")
+        metadata = {
+            "name": "demo:review",
+            "description": "review",
+            "category": "plugin",
+            "path": plugin_skill,
+            "frontmatter": {},
+        }
+        monkeypatch.setattr(plugins, "discover_plugins", lambda: None)
+        monkeypatch.setattr(
+            plugins,
+            "get_plugin_manager",
+            lambda: type("Manager", (), {"list_plugin_skill_metadata": lambda self: [metadata]})(),
+        )
+
+        with (
+            patch("tools.skills_tool.SKILLS_DIR", local_dir),
+            patch("agent.skill_utils.get_external_skills_dirs", return_value=[external_dir]),
+        ):
+            skills_tool_module._SKILLS_CACHE.clear()
+            result = json.loads(skills_list(query="review"))
+
+        assert result["status"] == "blocked"
+        assert [item["code"] for item in result["diagnostics"]] == [
+            "canonical_name_collision"
+        ]
+        assert str(external_dir) not in json.dumps(result)
+        assert str(plugin_skill) not in json.dumps(result)
+
+    def test_rich_inventory_cache_does_not_cross_live_profile_skill_directories(
+        self, tmp_path, monkeypatch
+    ):
+        alpha_home = tmp_path / "alpha"
+        beta_home = tmp_path / "beta"
+        _make_skill(alpha_home / "skills", "alpha")
+        _make_skill(beta_home / "skills", "beta")
+        active_home = [alpha_home]
+        monkeypatch.setattr(skills_tool_module, "get_hermes_home", lambda: active_home[0])
+        skills_tool_module._SKILLS_CACHE.clear()
+
+        alpha = _find_all_skills(include_topology=True)
+        active_home[0] = beta_home
+        beta = _find_all_skills(include_topology=True)
+
+        assert [record["name"] for record in alpha] == ["alpha"]
+        assert [record["name"] for record in beta] == ["beta"]
+
     def test_empty_creates_directory(self, tmp_path):
         skills_dir = tmp_path / "skills"
         with patch("tools.skills_tool.SKILLS_DIR", skills_dir):
@@ -294,6 +551,244 @@ class TestSkillsList:
         assert result["count"] == 1
         assert result["categories"] == ["linked"]
         assert result["skills"][0]["name"] == "knowledge-brain"
+
+    def test_unqueried_payload_keeps_minimal_skill_shape(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(
+                tmp_path,
+                "skill-a",
+                frontmatter_extra=(
+                    "metadata:\n"
+                    "  hermes:\n"
+                    "    tags: [testing]\n"
+                    "    topology:\n"
+                    "      domains: [quality]\n"
+                ),
+            )
+            result = json.loads(skills_list())
+
+        assert result["skills"] == [
+            {
+                "name": "skill-a",
+                "description": "Description for skill-a.",
+                "category": None,
+            }
+        ]
+
+    def test_exact_duplicate_rich_discovery_blocks_route_and_audit(
+        self, tmp_path
+    ):
+        local_dir = tmp_path / "local"
+        external_dir = tmp_path / "external"
+        local_dir.mkdir()
+        external_dir.mkdir()
+        _make_skill(local_dir, "review")
+        _make_skill(external_dir, "review")
+        _make_skill(external_dir, "deploy")
+
+        with (
+            patch("tools.skills_tool.SKILLS_DIR", local_dir),
+            patch(
+                "agent.skill_utils.get_external_skills_dirs",
+                return_value=[external_dir],
+            ),
+        ):
+            skills_tool_module._SKILLS_CACHE.clear()
+            legacy_raw = skills_list()
+            route_raw = skills_list(
+                query="review", limit=5, budget_chars=10_000
+            )
+            unique_raw = skills_list(
+                query="deploy", limit=5, budget_chars=10_000
+            )
+            installed = _find_all_skills(
+                skip_disabled=True,
+                include_topology=True,
+                include_ineligible=True,
+            )
+
+        legacy = json.loads(legacy_raw)
+        route = json.loads(route_raw)
+        unique_route = json.loads(unique_raw)
+        audit = audit_topology(installed)
+
+        assert legacy["skills"] == [
+            {
+                "name": "deploy",
+                "description": "Description for deploy.",
+                "category": None,
+            },
+            {
+                "name": "review",
+                "description": "Description for review.",
+                "category": None,
+            },
+        ]
+        assert [record["name"] for record in installed].count("review") == 2
+        assert route["status"] == "blocked"
+        assert route["route"] == []
+        assert route["total_cost_chars"] == 0
+        assert route["total_cost_bytes"] == 0
+        assert [item["code"] for item in route["diagnostics"]] == [
+            "canonical_name_collision"
+        ]
+        assert audit["status"] == "issues"
+        assert [item["code"] for item in audit["diagnostics"]] == [
+            "canonical_name_collision"
+        ]
+        assert unique_route["status"] == "ok"
+        assert [item["name"] for item in unique_route["route"]] == ["deploy"]
+        for raw in (route_raw, json.dumps(audit, sort_keys=True)):
+            assert str(local_dir) not in raw
+            assert str(external_dir) not in raw
+
+    def test_case_variant_scanner_collision_blocks_queried_tool(self, tmp_path):
+        local_dir = tmp_path / "local"
+        external_dir = tmp_path / "external"
+        local_dir.mkdir()
+        external_dir.mkdir()
+        _make_skill(local_dir, "review")
+        external_skill = _make_skill(external_dir, "external-review")
+        skill_md = external_skill / "SKILL.md"
+        skill_md.write_text(
+            skill_md.read_text(encoding="utf-8").replace(
+                "name: external-review", "name: Review"
+            ),
+            encoding="utf-8",
+        )
+        _make_skill(external_dir, "github-code-review")
+        _make_skill(external_dir, "requesting-code-review")
+        _make_skill(external_dir, "deploy")
+
+        with (
+            patch("tools.skills_tool.SKILLS_DIR", local_dir),
+            patch(
+                "agent.skill_utils.get_external_skills_dirs",
+                return_value=[external_dir],
+            ),
+        ):
+            skills_tool_module._SKILLS_CACHE.clear()
+            raw = skills_list(query="review", limit=5, budget_chars=10_000)
+            deploy_raw = skills_list(
+                query="deploy", limit=5, budget_chars=10_000
+            )
+
+        route = json.loads(raw)
+        deploy_route = json.loads(deploy_raw)
+        assert route["status"] == "blocked"
+        assert route["route"] == []
+        assert route["total_cost_chars"] == 0
+        assert route["total_cost_bytes"] == 0
+        assert [item["code"] for item in route["diagnostics"]] == [
+            "canonical_name_collision"
+        ]
+        assert deploy_route["status"] == "ok"
+        assert [item["name"] for item in deploy_route["route"]] == ["deploy"]
+        for payload in (raw, deploy_raw):
+            assert str(local_dir) not in payload
+            assert str(external_dir) not in payload
+
+    def test_unqueried_empty_category_keeps_legacy_listing_shape(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(tmp_path, "skill-a", category="devops")
+            result = json.loads(skills_list(category="missing"))
+
+        assert result == {
+            "success": True,
+            "skills": [],
+            "categories": [],
+            "count": 0,
+            "hint": "Use skill_view(name) to see full content, tags, and linked files",
+        }
+
+    def test_rich_discovery_computes_actual_character_and_byte_costs(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            skill_dir = _make_skill(
+                tmp_path,
+                "review",
+                frontmatter_extra=(
+                    "metadata:\n"
+                    "  hermes:\n"
+                    "    tags: [quality]\n"
+                    "    topology:\n"
+                    "      domains: [code-review]\n"
+                    "      lifecycle: stable\n"
+                ),
+                body="Review the change. 🧪",
+            )
+            record = _find_all_skills(include_topology=True)[0]
+
+        content = (skill_dir / "SKILL.md").read_text(encoding="utf-8")
+        assert record["cost_chars"] == len(content)
+        assert record["cost_bytes"] == len(content.encode("utf-8"))
+        assert record["cost_bytes"] > record["cost_chars"]
+        assert record["tags"] == ["quality"]
+        assert record["topology"].domains == ("code-review",)
+
+    def test_topology_audit_discovery_can_include_runtime_ineligible_skills(
+        self, tmp_path
+    ):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(
+                tmp_path,
+                "windows-only",
+                frontmatter_extra=(
+                    "platforms: [windows]\n"
+                    "metadata:\n"
+                    "  hermes:\n"
+                    "    topology:\n"
+                    "      lifecycle: stable\n"
+                ),
+            )
+            eligible = _find_all_skills(include_topology=True)
+            installed = _find_all_skills(
+                skip_disabled=True,
+                include_topology=True,
+                include_ineligible=True,
+            )
+
+        assert eligible == []
+        assert [record["name"] for record in installed] == ["windows-only"]
+
+    def test_query_mode_returns_route_without_raw_query(self, tmp_path):
+        query = "review private-8675309"
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(
+                tmp_path,
+                "review-private-8675309",
+                frontmatter_extra=(
+                    "metadata:\n"
+                    "  hermes:\n"
+                    "    topology:\n"
+                    "      lifecycle: stable\n"
+                ),
+            )
+            raw = skills_list(query=query, limit=1, budget_chars=10000)
+
+        result = json.loads(raw)
+        assert result["success"] is True
+        assert result["mode"] == "route"
+        assert result["status"] == "ok"
+        assert result["route"][0]["name"] == "review-private-8675309"
+        assert query not in raw
+
+    def test_query_mode_does_not_create_a_missing_skills_directory(self, tmp_path):
+        skills_dir = tmp_path / "skills"
+
+        with patch("tools.skills_tool.SKILLS_DIR", skills_dir):
+            result = json.loads(skills_list(query="testing"))
+
+        assert result["status"] == "no_match"
+        assert not skills_dir.exists()
+
+    def test_schema_adds_only_optional_route_parameters(self):
+        properties = SKILLS_LIST_SCHEMA["parameters"]["properties"]
+
+        assert SKILLS_LIST_SCHEMA["parameters"]["required"] == []
+        assert "query" in SKILLS_LIST_SCHEMA["description"]
+        assert properties["query"]["type"] == "string"
+        assert properties["limit"]["minimum"] == 1
+        assert properties["budget_chars"]["minimum"] == 1
 
 
 # ---------------------------------------------------------------------------

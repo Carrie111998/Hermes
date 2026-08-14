@@ -104,7 +104,7 @@ _SKILLS_CACHE_KEY_DISABLED = "with_disabled"
 _SKILLS_CACHE_KEY_FILTERED = "filtered"
 
 
-def _skills_scan_signature(dirs_to_scan, disabled) -> tuple:
+def _skills_scan_signature(dirs_to_scan, disabled, authority_boundary) -> tuple:
     """Cheap change-signature for the skill scan inputs.
 
     O(#dirs + #categories) stat calls, not a recursive walk. Includes the
@@ -134,7 +134,13 @@ def _skills_scan_signature(dirs_to_scan, disabled) -> tuple:
         except OSError:
             pass
         sig.append((str(d), m))
-    return (tuple(sig), frozenset(disabled), platform)
+    return (
+        tuple(sig),
+        frozenset(disabled),
+        platform,
+        authority_boundary.signature,
+        tuple(str(root) for root in authority_boundary.roots),
+    )
 
 
 # All skills live in ~/.hermes/skills/ (seeded from bundled skills/ on install).
@@ -670,13 +676,25 @@ def _is_skill_disabled(name: str, platform: str = None) -> bool:
         return False
 
 
-def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
+def _find_all_skills(
+    *,
+    skip_disabled: bool = False,
+    include_topology: bool = False,
+    include_ineligible: bool = False,
+) -> List[Dict[str, Any]]:
     """Recursively find all skills in ~/.hermes/skills/ and external dirs.
 
     Args:
         skip_disabled: If True, return ALL skills regardless of disabled
             state (used by ``hermes skills`` config UI). Default False
             filters out disabled skills.
+        include_topology: If True, include normalized topology, tags, actual
+            SKILL.md character/byte costs, and every physical record needed
+            for collision-safe local route planning. Default False preserves
+            exact-name precedence and the minimal metadata shape.
+        include_ineligible: If True, include skills gated from the current
+            platform/environment. Used only by the read-only installed-graph
+            topology audit; routes keep the gates enforced.
 
     Returns:
         List of skill metadata dicts (name, description, category).
@@ -685,9 +703,17 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
     signature changes (dir/category mtimes or the disabled-set) and expires
     after a short TTL to bound staleness from in-place SKILL.md edits.
     """
-    from agent.skill_utils import get_external_skills_dirs, iter_skill_index_files
+    from agent.skill_utils import (
+        get_central_private_skill_roots,
+        get_external_skills_dirs,
+        path_is_within_roots,
+        iter_skill_index_files,
+    )
 
-    cache_key = _SKILLS_CACHE_KEY_DISABLED if skip_disabled else _SKILLS_CACHE_KEY_FILTERED
+    base_cache_key = (
+        _SKILLS_CACHE_KEY_DISABLED if skip_disabled else _SKILLS_CACHE_KEY_FILTERED
+    )
+    cache_key = (base_cache_key, include_topology, include_ineligible)
 
     # Load disabled set once (not per-skill). Part of the cache signature:
     # disabling a skill is a config change with no filesystem mtime bump.
@@ -701,8 +727,9 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
     if active_skills_dir.exists():
         dirs_to_scan.append(active_skills_dir)
     dirs_to_scan.extend(get_external_skills_dirs())
+    authority_boundary = get_central_private_skill_roots()
 
-    signature = _skills_scan_signature(dirs_to_scan, disabled)
+    signature = _skills_scan_signature(dirs_to_scan, disabled, authority_boundary)
     now = time.monotonic()
 
     cached = _SKILLS_CACHE.get(cache_key)
@@ -722,24 +749,37 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
     # Scan local dir first, then external dirs (local takes precedence) —
     # dirs_to_scan already resolved above for the signature.
     for scan_dir in dirs_to_scan:
-        for skill_md in iter_skill_index_files(scan_dir, "SKILL.md"):
+        if path_is_within_roots(scan_dir, authority_boundary.roots):
+            continue
+        for skill_md in iter_skill_index_files(
+            scan_dir,
+            "SKILL.md",
+            excluded_roots=authority_boundary.roots,
+        ):
             if any(part in _EXCLUDED_SKILL_DIRS for part in skill_md.parts):
                 continue
 
             skill_dir = skill_md.parent
 
             try:
-                content = skill_md.read_text(encoding="utf-8-sig", errors="replace")[:4000]
+                if include_topology:
+                    raw_content = skill_md.read_bytes()
+                    content = raw_content.decode("utf-8-sig")
+                else:
+                    raw_content = b""
+                    content = skill_md.read_text(
+                        encoding="utf-8-sig", errors="replace"
+                    )[:4000]
                 frontmatter, body = _parse_frontmatter(content)
 
-                if not skill_matches_platform(frontmatter):
+                if not include_ineligible and not skill_matches_platform(frontmatter):
                     continue
 
-                if not skill_matches_environment(frontmatter):
+                if not include_ineligible and not skill_matches_environment(frontmatter):
                     continue
 
                 name = frontmatter.get("name", skill_dir.name)[:MAX_NAME_LENGTH]
-                if name in seen_names:
+                if name in seen_names and not include_topology:
                     continue
                 if name in disabled:
                     continue
@@ -758,11 +798,33 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
                 category = _get_category_from_path(skill_md)
 
                 seen_names.add(name)
-                skills.append({
+                skill_record = {
                     "name": name,
                     "description": description,
                     "category": category,
-                })
+                }
+                if include_topology:
+                    from agent.skill_topology import parse_topology
+
+                    metadata = frontmatter.get("metadata")
+                    hermes_meta = (
+                        metadata.get("hermes", {})
+                        if isinstance(metadata, dict)
+                        and isinstance(metadata.get("hermes"), dict)
+                        else {}
+                    )
+                    skill_record.update(
+                        {
+                            "tags": _parse_tags(
+                                hermes_meta.get("tags")
+                                or frontmatter.get("tags", "")
+                            ),
+                            "topology": parse_topology(hermes_meta.get("topology")),
+                            "cost_chars": len(content),
+                            "cost_bytes": len(raw_content),
+                        }
+                    )
+                skills.append(skill_record)
 
             except (UnicodeDecodeError, PermissionError) as e:
                 logger.debug("Failed to read skill file %s: %s", skill_md, e)
@@ -786,7 +848,117 @@ def _sort_skills(skills: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return sorted(skills, key=lambda s: (s.get("category") or "", s["name"]))
 
 
-def skills_list(category: str = None, task_id: str = None) -> str:
+def _plugin_topology_records(*, include_ineligible: bool) -> List[Dict[str, Any]]:
+    """Return rich records for registered plugin skills without exposing paths.
+
+    Plugin skills are registered outside the local/external scan tree.  Route
+    planning must nevertheless account for exactly the same complete
+    ``SKILL.md`` representation as a rich local scan.  A registered file that
+    cannot be decoded is retained as a matching fail-closed sentinel; the
+    planner reports only its qualified name, never the path or file content.
+    """
+    from agent.skill_topology import parse_topology
+    from agent.skill_utils import is_central_private_skill_path
+    from hermes_cli.plugins import discover_plugins, get_plugin_manager
+
+    records: List[Dict[str, Any]] = []
+    try:
+        discover_plugins()
+        manager = get_plugin_manager()
+        plugin_skills = manager.list_plugin_skill_metadata()
+    except Exception:
+        logger.debug("Plugin skill discovery failed", exc_info=True)
+        return records
+
+    for metadata in plugin_skills:
+        plugin_skill = dict(metadata)
+        registered_frontmatter = plugin_skill.pop("frontmatter", {})
+        if not isinstance(registered_frontmatter, dict):
+            registered_frontmatter = {}
+        name = str(plugin_skill.get("name") or "")
+        if not name:
+            continue
+        inventory_error = None
+        raw_content = b""
+        content = ""
+        try:
+            registered_path = plugin_skill.get("path") or manager.find_plugin_skill(name)
+            path = Path(registered_path)
+            if is_central_private_skill_path(path):
+                continue
+            raw_content = path.read_bytes()
+            content = raw_content.decode("utf-8-sig")
+            parsed_frontmatter, _ = _parse_frontmatter(content)
+            # The registered file is authoritative.  Keep registration-time
+            # metadata only for older plugins whose file has no parseable
+            # frontmatter at all.
+            frontmatter = parsed_frontmatter or registered_frontmatter
+        except (KeyError, OSError, UnicodeDecodeError, TypeError, ValueError):
+            # Do not propagate exception strings: they can contain private
+            # local paths.  The route planner treats this matching candidate
+            # as blocked rather than undercharging it from its description.
+            inventory_error = "skill_content_unavailable"
+            frontmatter = registered_frontmatter
+        if not include_ineligible:
+            if not skill_matches_platform(frontmatter):
+                continue
+            if not skill_matches_environment(frontmatter):
+                continue
+            if _is_skill_disabled(name):
+                continue
+
+        metadata_block = frontmatter.get("metadata")
+        hermes_meta = (
+            metadata_block.get("hermes", {})
+            if isinstance(metadata_block, dict)
+            and isinstance(metadata_block.get("hermes"), dict)
+            else {}
+        )
+        record = {
+            "name": name,
+            "description": str(
+                frontmatter.get("description") or plugin_skill.get("description", "")
+            ),
+            "category": str(plugin_skill.get("category") or "plugin"),
+            "tags": _parse_tags(
+                hermes_meta.get("tags") or frontmatter.get("tags", "")
+            ),
+            "topology": parse_topology(hermes_meta.get("topology")),
+        }
+        if inventory_error:
+            record["inventory_error"] = inventory_error
+        else:
+            record["cost_chars"] = len(content)
+            record["cost_bytes"] = len(raw_content)
+        records.append(record)
+    return records
+
+
+def build_installed_skill_inventory(
+    *, skip_disabled: bool = False, include_ineligible: bool = False
+) -> List[Dict[str, Any]]:
+    """Build the one rich installed inventory used by route and audit paths.
+
+    Ordinary ``skills_list()`` listings deliberately do not use this builder:
+    preserving their legacy local/external-only shape also avoids plugin
+    discovery unless callers explicitly request topology-aware work.
+    """
+    records = _find_all_skills(
+        skip_disabled=skip_disabled,
+        include_topology=True,
+        include_ineligible=include_ineligible,
+    )
+    records.extend(_plugin_topology_records(include_ineligible=include_ineligible))
+    return records
+
+
+def skills_list(
+    category: str = None,
+    task_id: str = None,
+    query: str = None,
+    limit: int = None,
+    budget_chars: int = None,
+) -> str:
     """
     List all available skills (progressive disclosure tier 1 - minimal metadata).
 
@@ -796,30 +968,55 @@ def skills_list(category: str = None, task_id: str = None) -> str:
     Args:
         category: Optional category filter (e.g., "mlops")
         task_id: Optional task identifier used to probe the active backend
+        query: Optional local route query. Omit for the legacy minimal listing.
+        limit: Maximum skills in query mode (including requirements).
+        budget_chars: Maximum cumulative SKILL.md characters in query mode.
 
     Returns:
-        JSON string with minimal skill info: name, description, category
+        JSON string with minimal skill info, or a route artifact in query mode.
     """
     try:
         active_skills_dir = _skills_dir()
         if not active_skills_dir.exists():
-            active_skills_dir.mkdir(parents=True, exist_ok=True)
+            # A topology query may still route a registered plugin skill even
+            # when this profile has no local skills directory yet.  Keep the
+            # legacy no-query side effect (creating the directory) unchanged.
+            if query is None:
+                active_skills_dir.mkdir(parents=True, exist_ok=True)
 
-        # Find all skills
-        all_skills = _find_all_skills()
-        try:
-            from hermes_cli.plugins import discover_plugins, get_plugin_manager
+        # Topology query mode uses the shared rich inventory.  The ordinary
+        # listing must preserve its historical local/external-only behavior.
+        all_skills = (
+            build_installed_skill_inventory()
+            if query is not None
+            else _find_all_skills()
+        )
 
-            discover_plugins()
-            for plugin_skill in get_plugin_manager().list_plugin_skill_metadata():
-                frontmatter = plugin_skill.pop("frontmatter", {})
-                if not skill_matches_platform(frontmatter):
-                    continue
-                if _is_skill_disabled(plugin_skill["name"]):
-                    continue
-                all_skills.append(plugin_skill)
-        except Exception:
-            logger.debug("Plugin skill listing failed", exc_info=True)
+        if query is not None:
+            from agent.skill_topology import (
+                DEFAULT_ROUTE_BUDGET_CHARS,
+                DEFAULT_ROUTE_LIMIT,
+                plan_skill_route,
+            )
+
+            if category:
+                all_skills = [
+                    s for s in all_skills if s.get("category") == category
+                ]
+            artifact = plan_skill_route(
+                all_skills,
+                query,
+                max_skills=(DEFAULT_ROUTE_LIMIT if limit is None else limit),
+                budget_chars=(
+                    DEFAULT_ROUTE_BUDGET_CHARS
+                    if budget_chars is None
+                    else budget_chars
+                ),
+            )
+            return json.dumps(
+                {"success": True, "mode": "route", **artifact},
+                ensure_ascii=False,
+            )
 
         if not all_skills:
             return json.dumps(
@@ -832,7 +1029,9 @@ def skills_list(category: str = None, task_id: str = None) -> str:
                 ensure_ascii=False,
             )
 
-        # Filter by category if specified
+        # Filter by category if specified. Keep this after the all-skills
+        # emptiness check: legacy callers receive a normal empty filtered
+        # listing, not the "no skills installed" message.
         if category:
             all_skills = [s for s in all_skills if s.get("category") == category]
 
@@ -1091,6 +1290,13 @@ def skill_view(
                 ensure_ascii=False,
             )
 
+        from agent.skill_utils import (
+            get_central_private_skill_roots,
+            get_external_skills_dirs,
+            path_is_within_roots,
+        )
+        authority_boundary = get_central_private_skill_roots()
+
         local_category_name: str | None = None
         # ── Qualified name dispatch (plugin skills) ──────────────────
         # Names containing ':' are routed to the plugin skill registry.
@@ -1151,6 +1357,14 @@ def skill_view(
                     )
 
             if plugin_skill_md is not None:
+                if path_is_within_roots(plugin_skill_md, authority_boundary.roots):
+                    return json.dumps(
+                        {
+                            "success": False,
+                            "error": "This skill is available only through its configured MCP authority.",
+                        },
+                        ensure_ascii=False,
+                    )
                 if not plugin_skill_md.exists():
                     # Stale registry entry — file deleted out of band
                     pm.remove_plugin_skill(name)
@@ -1178,6 +1392,17 @@ def skill_view(
             # Plugin exists but this specific skill is missing?
             available = pm.list_plugin_skills(namespace)
             if available:
+                # A plugin registry can retain candidates that are physically
+                # under an MCP-authority root. Do not turn a qualified miss
+                # into an enumeration of that private corpus.
+                if authority_boundary.roots:
+                    return json.dumps(
+                        {
+                            "success": False,
+                            "error": "This skill is available only through its configured MCP authority.",
+                        },
+                        ensure_ascii=False,
+                    )
                 return json.dumps(
                     {
                         "success": False,
@@ -1193,8 +1418,6 @@ def skill_view(
             # on-disk `category/skill` path during the local scan below.
             if bare:
                 local_category_name = f"{namespace}/{bare}"
-
-        from agent.skill_utils import get_external_skills_dirs
 
         # The categorized fall-through form (namespace/bare) joins onto each
         # search dir too; re-validate it since `bare` is not namespace-checked.
@@ -1251,10 +1474,14 @@ def skill_view(
             candidates.append((sd, smd))
 
         for search_dir in all_dirs:
+            if path_is_within_roots(search_dir, authority_boundary.roots):
+                continue
             # Strategy 1: direct path (e.g., "mlops/axolotl" or bare "axolotl"
             # at the top of the dir).
             direct_path = search_dir / name
             if (
+                not path_is_within_roots(direct_path, authority_boundary.roots)
+                and
                 not _is_skill_support_path(direct_path)
                 and direct_path.is_dir()
                 and (direct_path / "SKILL.md").exists()
@@ -1271,6 +1498,8 @@ def skill_view(
             if local_category_name:
                 categorized_path = search_dir / local_category_name
                 if (
+                    not path_is_within_roots(categorized_path, authority_boundary.roots)
+                    and
                     not _is_skill_support_path(categorized_path)
                     and categorized_path.is_dir()
                     and (categorized_path / "SKILL.md").exists()
@@ -1288,7 +1517,11 @@ def skill_view(
             # plus frontmatter `name:` lookup. `skills_list()` exposes the
             # frontmatter name, so `skill_view(name)` must accept it too even
             # when the on-disk directory is a shorter category/alias.
-            for found_skill_md in iter_skill_index_files(search_dir, "SKILL.md"):
+            for found_skill_md in iter_skill_index_files(
+                search_dir,
+                "SKILL.md",
+                excluded_roots=authority_boundary.roots,
+            ):
                 if found_skill_md.parent.name == name:
                     _record(found_skill_md.parent, found_skill_md)
                     continue
@@ -1304,7 +1537,11 @@ def skill_view(
             # Exclude skill support docs: references/templates/assets/scripts
             # are loaded through skill_view(skill, file_path=...) and must not
             # shadow or collide with real skills that share the same basename.
-            for found_md in search_dir.rglob(f"{name}.md"):
+            for found_md in iter_skill_index_files(
+                search_dir,
+                f"{name}.md",
+                excluded_roots=authority_boundary.roots,
+            ):
                 if found_md.name != "SKILL.md" and not _is_skill_support_path(
                     found_md
                 ):
@@ -1339,6 +1576,14 @@ def skill_view(
 
         if not skill_md or not skill_md.exists():
             available = [s["name"] for s in _sort_skills(_find_all_skills())[:20]]
+            if authority_boundary.roots:
+                return json.dumps(
+                    {
+                        "success": False,
+                        "error": "This skill is available only through its configured MCP authority.",
+                    },
+                    ensure_ascii=False,
+                )
             return json.dumps(
                 {
                     "success": False,
@@ -1888,14 +2133,32 @@ if __name__ == "__main__":
 
 SKILLS_LIST_SCHEMA = {
     "name": "skills_list",
-    "description": "List available skills (name + description). Use skill_view(name) to load full content.",
+    "description": (
+        "List available skills (name + description). Optionally pass query for "
+        "a small local route with reasons and topology. Use skill_view(name) "
+        "to load full content."
+    ),
     "parameters": {
         "type": "object",
         "properties": {
             "category": {
                 "type": "string",
                 "description": "Optional category filter to narrow results",
-            }
+            },
+            "query": {
+                "type": "string",
+                "description": "Optional query for a small deterministic local skill route",
+            },
+            "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Maximum skills in query mode, including required skills",
+            },
+            "budget_chars": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Maximum cumulative SKILL.md characters in query mode",
+            },
         },
         "required": [],
     },
@@ -1925,7 +2188,11 @@ registry.register(
     toolset="skills",
     schema=SKILLS_LIST_SCHEMA,
     handler=lambda args, **kw: skills_list(
-        category=args.get("category"), task_id=kw.get("task_id")
+        category=args.get("category"),
+        task_id=kw.get("task_id"),
+        query=args.get("query"),
+        limit=args.get("limit"),
+        budget_chars=args.get("budget_chars"),
     ),
     check_fn=check_skills_requirements,
     emoji="📚",

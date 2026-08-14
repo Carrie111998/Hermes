@@ -33,7 +33,11 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Dict, List, Optional, Tuple
 
-from agent.skill_utils import is_excluded_skill_path
+from agent.skill_utils import (
+    get_central_private_skill_roots,
+    is_excluded_skill_path,
+    iter_skill_index_files,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -745,7 +749,7 @@ def _check_gateway_running(profile_dir: Path) -> bool:
 # renders "全部智能体 0". We cache the count keyed by the skills dir, invalidated
 # when the dir tree's signature (skills_dir + immediate category dirs mtimes)
 # changes (catches skill add/remove) or after a short TTL (catches deep edits).
-_SKILL_COUNT_CACHE: dict[str, tuple[float, float, int]] = {}
+_SKILL_COUNT_CACHE: dict[str, tuple[object, float, int]] = {}
 _SKILL_COUNT_TTL_SECONDS = 30.0
 
 
@@ -783,7 +787,8 @@ def _count_skills(profile_dir: Path) -> int:
         return 0
 
     key = str(skills_dir)
-    signature = _skills_dir_signature(skills_dir)
+    authority_boundary = get_central_private_skill_roots(profile_dir / "config.yaml")
+    signature = (_skills_dir_signature(skills_dir), authority_boundary.signature)
     now = time.time()
     cached = _SKILL_COUNT_CACHE.get(key)
     if (
@@ -794,7 +799,11 @@ def _count_skills(profile_dir: Path) -> int:
         return cached[2]
 
     count = 0
-    for md in skills_dir.rglob("SKILL.md"):
+    for md in iter_skill_index_files(
+        skills_dir,
+        "SKILL.md",
+        excluded_roots=authority_boundary.roots,
+    ):
         if is_excluded_skill_path(md):
             continue
         count += 1

@@ -34,7 +34,11 @@ from pathlib import Path
 from typing import Optional
 
 from hermes_cli import profiles as profiles_mod
-from agent.skill_utils import is_excluded_skill_path
+from agent.skill_utils import (
+    get_central_private_skill_roots,
+    is_excluded_skill_path,
+    iter_skill_index_files,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -107,8 +111,13 @@ def _collect_skills(profile_dir: Path) -> list[str]:
     skills_dir = profile_dir / "skills"
     if not skills_dir.is_dir():
         return []
+    authority_boundary = get_central_private_skill_roots(profile_dir / "config.yaml")
     names: list[str] = []
-    for md in skills_dir.rglob("SKILL.md"):
+    for md in iter_skill_index_files(
+        skills_dir,
+        "SKILL.md",
+        excluded_roots=authority_boundary.roots,
+    ):
         if is_excluded_skill_path(md):
             continue
         try:
@@ -198,10 +207,17 @@ def describe_profile(
 
     skill_names = _collect_skills(profile_dir)
     skill_list = "\n".join(f"  - {n}" for n in skill_names) or "  (no skills installed)"
+    skills_dir = profile_dir / "skills"
+    authority_boundary = get_central_private_skill_roots(profile_dir / "config.yaml")
     skill_count = sum(
-        1 for _ in (profile_dir / "skills").rglob("SKILL.md")
-        if not is_excluded_skill_path(_)
-    ) if (profile_dir / "skills").is_dir() else 0
+        1
+        for skill_md in iter_skill_index_files(
+            skills_dir,
+            "SKILL.md",
+            excluded_roots=authority_boundary.roots,
+        )
+        if not is_excluded_skill_path(skill_md)
+    ) if skills_dir.is_dir() else 0
 
     # Read model + provider from the profile's config.
     try:
