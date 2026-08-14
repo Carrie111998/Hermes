@@ -588,7 +588,7 @@ class ChatCompletionsTransport(ProviderTransport):
         # Never clobbers an existing top_p, and request_overrides below can
         # still replace it — an intentional override always wins.
         _fixed_top_p = params.get("fixed_top_p")
-        if _fixed_top_p is not None and "top_p" not in api_kwargs:
+        if _fixed_top_p is not None:
             api_kwargs["top_p"] = _fixed_top_p
 
         # Request overrides last (service_tier etc.)
