@@ -90,6 +90,8 @@ class _FakeAgent:
         self._persist_calls = 0
         self._session_messages = []
         self._pending_cli_user_message = None
+        self._authoritative_turn_id: str | None = None
+        self._current_turn_id = ""
         self._session_persist_lock = threading.RLock()
         # Records _cached_system_prompt at the moment _ensure_db_session()
         # is called (regression guard for #45499 turn-setup ordering).
@@ -228,6 +230,20 @@ def test_task_id_passthrough():
     ctx = _build(agent, task_id="fixed-task")
     assert ctx.effective_task_id == "fixed-task"
     assert agent._current_task_id == "fixed-task"
+
+
+def test_authoritative_provider_turn_id_is_shared_and_consumed_once():
+    agent = _FakeAgent()
+    agent._authoritative_turn_id = "native-turn-1"
+
+    first = _build(agent, task_id="first-task")
+    child_parent_ids = [agent._current_turn_id, agent._current_turn_id]
+    second = _build(agent, task_id="second-task")
+
+    assert first.turn_id == "native-turn-1"
+    assert child_parent_ids == ["native-turn-1", "native-turn-1"]
+    assert second.turn_id != first.turn_id
+    assert second.turn_id.startswith("sess-1:second-task:")
 
 
 def test_persist_user_message_becomes_original():

@@ -14,6 +14,7 @@ import binascii
 import hashlib
 import io
 import json
+import logging
 import re
 import time
 import uuid
@@ -24,6 +25,29 @@ from typing import Any, Dict, Optional
 from aiohttp import web
 
 from gateway.session_execution_lease import SessionExecutionConflict
+
+
+logger = logging.getLogger(__name__)
+
+SESSION_TURN_HEARTBEAT_INTERVAL_SECONDS = 15.0
+
+
+def _emit_turn_lifecycle(event: str, session_id: str, turn_id: str, **extra: Any) -> None:
+    """Emit an observer-only fact without allowing observers to affect execution."""
+    try:
+        from agent.lifecycle_hooks import emit_session_turn_lifecycle
+
+        emit_session_turn_lifecycle(
+            event,
+            session_id=session_id,
+            turn_id=turn_id,
+            **extra,
+        )
+    except Exception:
+        logger.debug(
+            "session_turn_lifecycle_failed event=%s reason=invalid_or_callback_error",
+            event,
+        )
 
 
 DELIVERY_MODES = frozenset({"occ_only", "slack_only", "both"})
@@ -927,6 +951,9 @@ class SessionTurnService:
             return _error(str(exc), "invalid_turn", 400)
 
         if created:
+            # reserve() committed the runnable identity before this observation.
+            # Emit before scheduling so registered always precedes started.
+            _emit_turn_lifecycle("registered", session_id, turn_id)
             task = asyncio.create_task(
                 self._execute(store, turn_id, session_id, payload, binding, slack_adapter)
             )
@@ -947,6 +974,7 @@ class SessionTurnService:
                        payload: Dict[str, Any], binding: Optional[SlackBinding], slack_adapter: Any) -> None:
         agent_ref: list[Any] = [None]
         execution_lease = None
+        heartbeat_task: Optional[asyncio.Task[Any]] = None
         self._agent_refs[turn_id] = agent_ref
         try:
             def interrupt_on_lease_loss() -> None:
@@ -971,6 +999,14 @@ class SessionTurnService:
             if not store.set_running(turn_id):
                 return
             store.append_event(turn_id, "turn.started", {"status": "running"})
+            _emit_turn_lifecycle("started", session_id, turn_id)
+
+            async def emit_heartbeats() -> None:
+                while True:
+                    await asyncio.sleep(SESSION_TURN_HEARTBEAT_INTERVAL_SECONDS)
+                    _emit_turn_lifecycle("heartbeat", session_id, turn_id)
+
+            heartbeat_task = asyncio.create_task(emit_heartbeats())
             try:
                 history = await self.adapter._conversation_history_for_session(session_id)
             except Exception:
@@ -1033,6 +1069,7 @@ class SessionTurnService:
                 tool_start_callback=on_tool_start,
                 tool_complete_callback=on_tool_complete,
                 agent_ref=agent_ref,
+                authoritative_turn_id=turn_id,
             )
             effective_id = result.get("session_id", session_id) if isinstance(result, dict) else session_id
             if execution_lease is None or not await execution_lease.still_owned():
@@ -1108,6 +1145,33 @@ class SessionTurnService:
             store.finish(turn_id, "failed", safe_error_code="run_failed")
             store.append_event(turn_id, "turn.failed", {"status": "failed", "error_code": "run_failed"})
         finally:
+            if heartbeat_task is not None:
+                heartbeat_task.cancel()
+                try:
+                    await heartbeat_task
+                except asyncio.CancelledError:
+                    pass
+            # The durable ledger is the outcome authority. This single epilogue
+            # maps every coordinator exit without leaking safe_error_code or raw
+            # exception text, and emits nothing while execution remains live.
+            row = store.get(turn_id)
+            status = row.get("status") if row else None
+            outcome = (
+                {
+                    "completed": "succeeded",
+                    "failed": "failed",
+                    "interrupted": "cancelled",
+                }.get(status)
+                if isinstance(status, str)
+                else None
+            )
+            if outcome is not None:
+                _emit_turn_lifecycle(
+                    "terminal",
+                    session_id,
+                    turn_id,
+                    terminal_outcome=outcome,
+                )
             if execution_lease is not None:
                 await execution_lease.release()
             self._agent_refs.pop(turn_id, None)

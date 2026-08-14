@@ -1,7 +1,8 @@
 """Versioned, privacy-bounded lifecycle hook payloads.
 
-These helpers are the provider boundary for delegated children and managed
-background processes.  Payloads intentionally contain only stable identities,
+These helpers are the provider boundary for session turns, delegated children,
+and managed background processes. Payloads intentionally contain only stable
+identities,
 small integers, and allowlisted enum values.  Runtime text (prompts, commands,
 paths, output, exceptions, model/tool metadata) must never cross this seam.
 """
@@ -21,12 +22,17 @@ _sequences: dict[tuple[str, str], int] = {}
 SUBAGENT_LIFECYCLE_VERSION = 2
 DELEGATION_WRAPPER_LIFECYCLE_VERSION = 1
 MANAGED_PROCESS_LIFECYCLE_VERSION = 2
+SESSION_TURN_LIFECYCLE_VERSION = 1
 
 _LIFECYCLE_VERSIONS = {
     "subagent": SUBAGENT_LIFECYCLE_VERSION,
     "delegation_wrapper": DELEGATION_WRAPPER_LIFECYCLE_VERSION,
     "managed_process": MANAGED_PROCESS_LIFECYCLE_VERSION,
+    "session_turn": SESSION_TURN_LIFECYCLE_VERSION,
 }
+
+SESSION_TURN_EVENTS = frozenset({"registered", "started", "heartbeat", "terminal"})
+SESSION_TURN_TERMINAL_OUTCOMES = frozenset({"succeeded", "failed", "cancelled"})
 
 SUBAGENT_EVENTS = frozenset(
     {"registered", "queued", "started", "heartbeat", "cancel_requested", "terminal"}
@@ -88,6 +94,43 @@ def _emit(hook_name: str, payload: dict[str, Any]) -> None:
         invoke_hook(hook_name, dto=payload)
     except Exception:
         logger.debug("lifecycle_hook_failed hook=%s reason=callback_error", hook_name)
+
+
+def emit_session_turn_lifecycle(
+    event: str,
+    *,
+    session_id: Any,
+    turn_id: Any,
+    terminal_outcome: Any = None,
+) -> None:
+    """Emit one versioned, turn-scoped gateway execution observation."""
+    if event not in SESSION_TURN_EVENTS:
+        raise ValueError(f"invalid session turn lifecycle event: {event}")
+    session = _identity(session_id)
+    turn = _identity(turn_id)
+    if session is None or turn is None:
+        raise ValueError(
+            "session-turn lifecycle event requires stable session and turn identities"
+        )
+    payload = {
+        **_envelope("session_turn", turn, event),
+        "session_id": session,
+        "turn_id": turn,
+    }
+    if event == "terminal":
+        outcome = (
+            terminal_outcome
+            if terminal_outcome in SESSION_TURN_TERMINAL_OUTCOMES
+            else None
+        )
+        if outcome is None:
+            raise ValueError("terminal session-turn event requires terminal_outcome")
+        payload["terminal_outcome"] = outcome
+    elif terminal_outcome is not None:
+        raise ValueError(
+            "terminal_outcome is only valid for terminal session-turn events"
+        )
+    _emit("session_turn_lifecycle", payload)
 
 
 def emit_subagent_lifecycle(

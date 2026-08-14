@@ -955,3 +955,156 @@ async def test_slack_only_turn_never_exposes_assistant_deltas_to_occ(session_db)
 
     assert "assistant.delta" not in wire
     assert "must not reach OCC" not in wire
+
+
+@pytest.mark.asyncio
+async def test_native_lifecycle_orders_heartbeats_and_distinguishes_sequential_turns(
+    session_db, monkeypatch: pytest.MonkeyPatch
+):
+    import gateway.platforms.session_turns as session_turns
+
+    lifecycle = []
+
+    def capture(hook, **kwargs):
+        if hook == "session_turn_lifecycle":
+            lifecycle.append(dict(kwargs["dto"]))
+        return []
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", capture)
+    monkeypatch.setattr(session_turns, "SESSION_TURN_HEARTBEAT_INTERVAL_SECONDS", 0.01)
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={}))
+    adapter._session_db = session_db
+
+    async def run_agent(**kwargs):
+        native_id = kwargs["authoritative_turn_id"]
+        await asyncio.sleep(0.035)
+        session_db.append_message("s1", "user", kwargs["user_message"])
+        session_db.append_message("s1", "assistant", native_id)
+        return {
+            "final_response": native_id,
+            "messages": session_db.get_messages_as_conversation("s1"),
+        }, {}
+
+    adapter._run_agent = run_agent
+    async with TestClient(TestServer(_app(adapter))) as client:
+        for turn_id in ("native-turn-a", "native-turn-b"):
+            response = await client.post(
+                "/api/sessions/s1/turns",
+                headers={"Idempotency-Key": turn_id},
+                json=_payload(turn_id),
+            )
+            assert response.status == 202
+            await adapter._session_turn_service.wait_for_turn(turn_id)
+
+    assert {dto["turn_id"] for dto in lifecycle} == {
+        "native-turn-a",
+        "native-turn-b",
+    }
+    for turn_id in ("native-turn-a", "native-turn-b"):
+        events = [dto for dto in lifecycle if dto["turn_id"] == turn_id]
+        assert events[0]["event"] == "registered"
+        assert events[1]["event"] == "started"
+        assert "heartbeat" in [dto["event"] for dto in events[2:-1]]
+        assert events[-1]["event"] == "terminal"
+        assert events[-1]["terminal_outcome"] == "succeeded"
+        assert sum(dto["event"] == "terminal" for dto in events) == 1
+        assert [dto["sequence"] for dto in events] == sorted(
+            dto["sequence"] for dto in events
+        )
+        assert len({dto["sequence"] for dto in events}) == len(events)
+        assert {dto["session_id"] for dto in events} == {"s1"}
+
+
+@pytest.mark.asyncio
+async def test_native_lifecycle_observer_failure_is_fail_open(session_db, monkeypatch):
+    def broken_observer(hook, **kwargs):
+        if hook == "session_turn_lifecycle":
+            raise RuntimeError("observer secret must not affect the turn")
+        return []
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", broken_observer)
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={}))
+    adapter._session_db = session_db
+
+    async def run_agent(**kwargs):
+        session_db.append_message("s1", "user", kwargs["user_message"])
+        session_db.append_message("s1", "assistant", "done")
+        return {
+            "final_response": "done",
+            "messages": session_db.get_messages_as_conversation("s1"),
+        }, {}
+
+    adapter._run_agent = run_agent
+    async with TestClient(TestServer(_app(adapter))) as client:
+        response = await client.post(
+            "/api/sessions/s1/turns",
+            headers={"Idempotency-Key": "observer-fail-open"},
+            json=_payload(),
+        )
+        await adapter._session_turn_service.wait_for_turn("observer-fail-open")
+        status = await client.get("/api/sessions/s1/turns/observer-fail-open")
+        turn = (await status.json())["turn"]
+
+    assert response.status == 202
+    assert turn["status"] == "completed"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("stop", "expected_outcome"),
+    [(False, "failed"), (True, "cancelled")],
+)
+async def test_native_lifecycle_maps_terminal_outcome_without_error_text(
+    session_db, monkeypatch: pytest.MonkeyPatch, stop, expected_outcome
+):
+    lifecycle = []
+
+    def capture(hook, **kwargs):
+        if hook == "session_turn_lifecycle":
+            lifecycle.append(dict(kwargs["dto"]))
+        return []
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", capture)
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={}))
+    adapter._session_db = session_db
+    lease_gate = asyncio.Event()
+    if stop:
+        adapter._run_agent = AsyncMock()
+        acquire_lease = adapter._acquire_session_execution_lease
+
+        async def delayed_acquire(*args, **kwargs):
+            await lease_gate.wait()
+            return await acquire_lease(*args, **kwargs)
+
+        monkeypatch.setattr(adapter, "_acquire_session_execution_lease", delayed_acquire)
+    else:
+        adapter._run_agent = AsyncMock(side_effect=RuntimeError("raw provider secret"))
+
+    turn_id = f"terminal-{expected_outcome}"
+    async with TestClient(TestServer(_app(adapter))) as client:
+        response = await client.post(
+            "/api/sessions/s1/turns",
+            headers={"Idempotency-Key": turn_id},
+            json=_payload(),
+        )
+        assert response.status == 202
+        if stop:
+            # request_stop before the scheduled worker starts is an authoritative
+            # cancelled-before-start result.
+            await client.post(f"/api/sessions/s1/turns/{turn_id}/stop")
+            lease_gate.set()
+        await adapter._session_turn_service.wait_for_turn(turn_id)
+
+    terminal = [dto for dto in lifecycle if dto["event"] == "terminal"]
+    assert len(terminal) == 1
+    assert terminal[0]["terminal_outcome"] == expected_outcome
+    assert set(terminal[0]) == {
+        "contract_version",
+        "event",
+        "occurred_at",
+        "sequence",
+        "session_id",
+        "turn_id",
+        "terminal_outcome",
+    }
+    assert "secret" not in repr(terminal)

@@ -222,6 +222,31 @@ and `child_goal`.
 Observers can use these hooks to model nested trajectories while keeping child
 agent execution linked to the parent turn that spawned it.
 
+### Native Session-Turn Lifecycle
+
+The versioned `session_turn_lifecycle` hook observes durable API session turns
+at the gateway coordinator's authoritative boundaries. Its single `dto`
+keyword has contract version 1 and contains only `contract_version`, `event`,
+`occurred_at`, `sequence`, `session_id`, and `turn_id`. A `terminal` DTO also
+contains `terminal_outcome`, one of `succeeded`, `failed`, or `cancelled`.
+Events are `registered`, `started`, periodic `heartbeat`, and exactly one
+`terminal` for a coordinator execution that reaches durable terminal state.
+Sequence is strictly increasing within each turn. Runtime input, output, tool
+data, and error text never cross this hook.
+
+`registered` follows durable turn reservation; `started` follows the durable
+transition to running; heartbeats cover agent execution and delivery
+coordination; `terminal` maps the durable coordinator result. The same native
+turn ID is installed on the root agent, so delegated children created during
+that turn report the same `parent_turn_id`.
+
+Startup adoption is intentionally not emitted. Although the durable lease can
+prove that another process still owns a turn, this provider process cannot
+observe that owner's eventual completion or continue its per-turn sequence.
+Treating that proof as local adoption would therefore invent ownership and
+could produce conflicting sequences. Startup reconciliation preserves a live
+owner or interrupts work whose owner is not mechanically live.
+
 ## Payload Safety
 
 Observer payloads are designed for telemetry consumers, not raw object access.

@@ -5,6 +5,8 @@ import time
 from concurrent.futures import Future
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from agent import lifecycle_hooks as lh
 from tools import delegate_tool as dt
 
@@ -114,6 +116,51 @@ def test_identity_enum_dtos_drop_runtime_text(monkeypatch):
     assert emitted[2][1]["exit_code"] is None
 
 
+def test_session_turn_lifecycle_v1_exact_shape_sequence_and_validation(monkeypatch):
+    emitted = []
+    monkeypatch.setattr(lh, "_emit", lambda hook, payload: emitted.append((hook, payload)))
+
+    lh.emit_session_turn_lifecycle(
+        "registered", session_id="session-native", turn_id="turn-native"
+    )
+    lh.emit_session_turn_lifecycle(
+        "terminal",
+        session_id="session-native",
+        turn_id="turn-native",
+        terminal_outcome="failed",
+    )
+
+    assert [hook for hook, _dto in emitted] == [
+        "session_turn_lifecycle",
+        "session_turn_lifecycle",
+    ]
+    registered, terminal = [dto for _hook, dto in emitted]
+    assert set(registered) == {
+        "contract_version",
+        "event",
+        "occurred_at",
+        "sequence",
+        "session_id",
+        "turn_id",
+    }
+    assert set(terminal) == set(registered) | {"terminal_outcome"}
+    assert registered["contract_version"] == terminal["contract_version"] == 1
+    assert registered["session_id"] == terminal["session_id"] == "session-native"
+    assert registered["turn_id"] == terminal["turn_id"] == "turn-native"
+    assert registered["sequence"] < terminal["sequence"]
+    assert terminal["terminal_outcome"] == "failed"
+    assert registered["occurred_at"].endswith("Z")
+
+    with pytest.raises(ValueError):
+        lh.emit_session_turn_lifecycle("adopted", session_id="s", turn_id="t")
+    with pytest.raises(ValueError):
+        lh.emit_session_turn_lifecycle("started", session_id="s", turn_id="t", terminal_outcome="failed")
+    with pytest.raises(ValueError):
+        lh.emit_session_turn_lifecycle(
+            "terminal", session_id="s", turn_id="t", terminal_outcome="raw exception"
+        )
+
+
 def test_emitted_dto_versions_match_advertised_hook_contracts(monkeypatch):
     from hermes_cli.plugins import HOOK_CONTRACT_VERSIONS
 
@@ -142,6 +189,9 @@ def test_emitted_dto_versions_match_advertised_hook_contracts(monkeypatch):
         pid_scope="host",
         backend="local",
     )
+    lh.emit_session_turn_lifecycle(
+        "started", session_id="session-version", turn_id="turn-version"
+    )
 
     assert set(emitted) == set(HOOK_CONTRACT_VERSIONS)
     assert {
@@ -164,8 +214,9 @@ def test_registered_after_stable_ids_and_legacy_start_is_preserved(monkeypatch):
     parent._fallback_chain = []
     parent.request_overrides = {}
     parent.openrouter_min_coding_score = None
-    child = MagicMock()
-    child.session_id = "stable-child-session"
+    children = [MagicMock(), MagicMock()]
+    children[0].session_id = "stable-child-session-0"
+    children[1].session_id = "stable-child-session-1"
     calls = []
 
     monkeypatch.setattr(
@@ -173,31 +224,41 @@ def test_registered_after_stable_ids_and_legacy_start_is_preserved(monkeypatch):
         lambda hook, **payload: calls.append((hook, dict(payload))),
     )
     monkeypatch.setattr(dt, "_resolve_child_credential_pool", lambda *_args: None)
-    with patch("run_agent.AIAgent", return_value=child):
-        built = dt._build_child_agent(
-            task_index=0,
-            goal="goal prompt must not leak from v1",
-            context=None,
-            toolsets=None,
-            model=None,
-            max_iterations=5,
-            parent_agent=parent,
-            task_count=1,
-        )
+    with patch("run_agent.AIAgent", side_effect=children):
+        built = [
+            dt._build_child_agent(
+                task_index=index,
+                goal="goal prompt must not leak from v1",
+                context=None,
+                toolsets=None,
+                model=None,
+                max_iterations=5,
+                parent_agent=parent,
+                task_count=2,
+            )
+            for index in range(2)
+        ]
 
-    assert built is child
+    assert built == children
     lifecycle = [
         payload["dto"] for hook, payload in calls if hook == "subagent_lifecycle"
     ]
-    assert len(lifecycle) == 1
-    assert lifecycle[0]["event"] == "registered"
-    assert lifecycle[0]["child_session_id"] == "stable-child-session"
-    assert lifecycle[0]["child_subagent_id"]
+    assert len(lifecycle) == 2
+    assert all(dto["event"] == "registered" for dto in lifecycle)
+    assert {dto["child_session_id"] for dto in lifecycle} == {
+        "stable-child-session-0",
+        "stable-child-session-1",
+    }
+    assert len({dto["child_subagent_id"] for dto in lifecycle}) == 2
+    assert {dto["parent_turn_id"] for dto in lifecycle} == {"turn-1"}
     assert "goal prompt must not leak" not in repr(lifecycle)
     # Existing plugins retain their historical callback and payload.
     legacy = [payload for hook, payload in calls if hook == "subagent_start"]
-    assert len(legacy) == 1
-    assert legacy[0]["child_goal"] == "goal prompt must not leak from v1"
+    assert len(legacy) == 2
+    assert all(
+        payload["child_goal"] == "goal prompt must not leak from v1"
+        for payload in legacy
+    )
 
 
 def test_provider_invokes_native_hook_with_one_bounded_dto(monkeypatch):

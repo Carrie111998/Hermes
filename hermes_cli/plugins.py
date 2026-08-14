@@ -168,6 +168,7 @@ VALID_HOOKS: Set[str] = {
     "subagent_lifecycle",
     "delegation_wrapper_lifecycle",
     "managed_process_lifecycle",
+    "session_turn_lifecycle",
     # Gateway pre-dispatch hook. Fired once per incoming MessageEvent
     # after the internal-event guard but BEFORE auth/pairing and agent
     # dispatch. Plugins may return a dict to influence flow:
@@ -220,11 +221,12 @@ VALID_HOOKS: Set[str] = {
 }
 
 # Explicit per-hook payload contract versions. Hooks omitted here retain their
-# historical unversioned callback kwargs; adding the two entries is additive.
+# historical unversioned callback kwargs; adding entries here is additive.
 HOOK_CONTRACT_VERSIONS: Dict[str, int] = {
     "subagent_lifecycle": 2,
     "delegation_wrapper_lifecycle": 1,
     "managed_process_lifecycle": 2,
+    "session_turn_lifecycle": 1,
 }
 
 ENTRY_POINTS_GROUP = "hermes_agent.plugins"
