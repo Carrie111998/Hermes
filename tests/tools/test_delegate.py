@@ -1747,6 +1747,79 @@ class TestFallbackModelInheritance(unittest.TestCase):
         _, kwargs = MockAgent.call_args
         self.assertIsNone(kwargs["fallback_model"])
 
+    def test_child_uses_delegation_fallback_chain_override(self):
+        """delegation.fallback_providers replaces the parent chain for children."""
+        parent = _make_mock_parent(depth=0)
+        parent._fallback_chain = [{"provider": "openrouter", "model": "glm-5.2"}]
+        override = [
+            {
+                "provider": "ascent-dspark",
+                "model": "deepseek-v4-flash-0731",
+                "base_url": "http://100.126.67.14:8888/v1",
+            }
+        ]
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            MockAgent.return_value = MagicMock()
+            _build_child_agent(
+                task_index=0,
+                goal="test delegation fallback override",
+                context=None,
+                toolsets=None,
+                model=None,
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+                override_fallback_providers=override,
+            )
+
+        _, kwargs = MockAgent.call_args
+        self.assertEqual(kwargs["fallback_model"], override)
+
+    def test_child_inherits_parent_chain_when_override_empty(self):
+        """An empty delegation.fallback_providers list keeps parent inheritance."""
+        parent = _make_mock_parent(depth=0)
+        parent._fallback_chain = [{"provider": "openrouter", "model": "glm-5.2"}]
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            MockAgent.return_value = MagicMock()
+            _build_child_agent(
+                task_index=0,
+                goal="test empty delegation fallback override",
+                context=None,
+                toolsets=None,
+                model=None,
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+                override_fallback_providers=[],
+            )
+
+        _, kwargs = MockAgent.call_args
+        self.assertEqual(kwargs["fallback_model"], parent._fallback_chain)
+
+    def test_resolve_credentials_carries_delegation_fallback_chain(self):
+        """_resolve_delegation_credentials forwards a normalized chain."""
+        parent = _make_mock_parent(depth=0)
+        cfg = {
+            "model": "",
+            "provider": "",
+            "base_url": "",
+            "api_key": "",
+            "api_mode": "",
+            "fallback_providers": [
+                {"provider": "ascent-dspark", "model": "deepseek-v4-flash-0731"},
+                {"provider": "", "model": "broken"},
+                {"provider": "openrouter"},
+                "not-a-dict",
+            ],
+        }
+        creds = _resolve_delegation_credentials(cfg, parent)
+        self.assertEqual(
+            creds["fallback_providers"],
+            [{"provider": "ascent-dspark", "model": "deepseek-v4-flash-0731"}],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

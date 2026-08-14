@@ -1486,6 +1486,10 @@ def _build_child_agent(
     # 'leaf' (default) cannot; 'orchestrator' retains the delegation
     # toolset subject to depth/kill-switch bounds applied below.
     role: str = "leaf",
+    # Independent fallback chain from delegation.fallback_providers. When
+    # set, the child uses this chain instead of inheriting the parent's
+    # top-level fallback_providers.
+    override_fallback_providers: Optional[List[Dict[str, Any]]] = None,
 ):
     """
     Build a child AIAgent on the main thread (thread-safe construction).
@@ -1730,9 +1734,12 @@ def _build_child_agent(
 
     # Inherit the parent's fallback provider chain so subagents can recover
     # from rate-limits and credential exhaustion exactly like the top-level
-    # agent does.  _fallback_chain is a list accepted by AIAgent's
-    # fallback_model parameter (which handles both list and dict forms).
+    # agent does, unless the delegation config pins its own chain
+    # (delegation.fallback_providers).  _fallback_chain is a list accepted
+    # by AIAgent's fallback_model parameter (which handles both list and
+    # dict forms).
     parent_fallback = getattr(parent_agent, "_fallback_chain", None) or None
+    child_fallback = override_fallback_providers or parent_fallback
 
     # Inherit the parent's OpenRouter provider-preference filters by default
     # (so subagents routed to the same provider honour the same routing
@@ -1787,7 +1794,7 @@ def _build_child_agent(
 
             reasoning_config=child_reasoning,
             prefill_messages=getattr(parent_agent, "prefill_messages", None),
-            fallback_model=parent_fallback,
+            fallback_model=child_fallback,
             enabled_toolsets=child_toolsets,
             disabled_toolsets=child_disabled_toolsets,
             quiet_mode=True,
@@ -3631,6 +3638,7 @@ def delegate_task(
             override_max_tokens=creds.get("max_output_tokens"),
             override_acp_command=creds.get("command"),
             override_acp_args=creds.get("args"),
+            override_fallback_providers=creds.get("fallback_providers") or None,
             role=effective_role,
         )
         # Attach the validated schema for the completion-side validation
@@ -4180,6 +4188,32 @@ def _resolve_child_credential_pool(
     return None
 
 
+def _normalize_delegation_fallback_chain(raw: Any) -> List[Dict[str, Any]]:
+    """Normalize ``delegation.fallback_providers`` into fallback chain entries.
+
+    Mirrors the top-level fallback_providers contract (see
+    hermes_cli.fallback_config._iter_fallback_entries): each entry must
+    carry a non-empty provider and model; anything else is dropped so a
+    malformed entry can never wedge child construction. An empty result
+    means the child inherits the parent's chain.
+    """
+    if not isinstance(raw, list):
+        return []
+    chain: List[Dict[str, Any]] = []
+    for entry in raw:
+        if not isinstance(entry, dict):
+            continue
+        provider = str(entry.get("provider") or "").strip()
+        model = str(entry.get("model") or "").strip()
+        if not provider or not model:
+            continue
+        normalized = dict(entry)
+        normalized["provider"] = provider
+        normalized["model"] = model
+        chain.append(normalized)
+    return chain
+
+
 def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
     """Resolve credentials for subagent delegation.
 
@@ -4206,6 +4240,10 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
     configured_base_url = str(cfg.get("base_url") or "").strip() or None
     configured_api_key = str(cfg.get("api_key") or "").strip() or None
     configured_api_mode = str(cfg.get("api_mode") or "").strip().lower() or None
+
+    fallback_chain = _normalize_delegation_fallback_chain(
+        cfg.get("fallback_providers")
+    )
 
     # Native-SDK providers (Bedrock, Vertex, Google GenAI) speak their own
     # wire protocol — they cannot be reached via OpenAI chat_completions against
@@ -4261,6 +4299,7 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
             "base_url": configured_base_url,
             "api_key": api_key,
             "api_mode": api_mode,
+            "fallback_providers": fallback_chain,
         }
 
     if not configured_provider:
@@ -4273,6 +4312,7 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
             "api_mode": None,
             "request_overrides": None,
             "max_output_tokens": None,
+            "fallback_providers": fallback_chain,
         }
 
     # Provider is configured — resolve full credentials
@@ -4305,6 +4345,7 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
         "max_output_tokens": runtime.get("max_output_tokens"),
         "command": runtime.get("command"),
         "args": list(runtime.get("args") or []),
+        "fallback_providers": fallback_chain,
     }
 
 
@@ -4400,7 +4441,9 @@ def _build_top_level_description() -> str:
         "memory, send_message, or cronjob; orchestrators regain only "
         "delegate_task.\n"
         "- Children inherit the parent model and fallback chain unless pinned "
-        "globally via delegation.provider / delegation.model in config.yaml. "
+        "globally via delegation.provider / delegation.model (or given an "
+        "independent fallback chain via delegation.fallback_providers) in "
+        "config.yaml. "
         "Results are returned as an array, one entry per task."
     )
 

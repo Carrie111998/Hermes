@@ -1767,6 +1767,12 @@ DEFAULT_CONFIG = {
                            # "codex_responses", or "anthropic_messages". Empty = auto-detect
                            # from URL (e.g. /anthropic suffix → anthropic_messages). Set this
                            # explicitly for non-standard endpoints the heuristic can't detect.
+        # Independent fallback chain for subagents. When set, children use
+        # this list instead of inheriting the parent's top-level
+        # fallback_providers chain. Same entry shape as the top-level list
+        # (provider + model + optional base_url/api_key). Empty = inherit
+        # the parent chain.
+        "fallback_providers": [],
         # When delegate_task narrows child toolsets explicitly, preserve any
         # MCP toolsets the parent already has enabled. On by default so
         # narrowing (e.g. toolsets=["web","browser"]) expresses "I want these
