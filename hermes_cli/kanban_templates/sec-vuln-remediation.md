@@ -515,8 +515,13 @@ hermes kanban workflow <template> <card-ref> [--dry-run] [--force]
   Resolution: `$HERMES_KANBAN_TEMPLATES_DIR` (tests use this) →
   packaged `hermes_cli/kanban_templates/<template>.md`; filename must
   equal the frontmatter `template_id`.
-- `<card-ref>` = card id (`t_…`) or VULN-id (resolved by searching title
-  + body, then children of any card whose title carries the VULN-id).
+- `<card-ref>` = card id (`t_…`) or VULN-id. VULN-id resolution (in
+  order, over non-archived tasks): (1) tasks whose TITLE contains the
+  VULN-id — among those, prefer `created_by=scout`/`[gh]`-titled cards;
+  (2) if exactly one candidate remains, use it; (3) if multiple remain,
+  error listing candidate ids (a VULN-id alone is ambiguous once a chain
+  exists — children carry it in their bodies). A card whose title carries
+  the VULN-id but fails the §3.1 scout predicate is a validation error.
 - `--dry-run`: full validation + assignee resolution, prints the would-be
   children (title, assignee, parents, gate state) without writing. Exit 0
   on success, 2 on validation failure.
