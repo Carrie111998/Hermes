@@ -310,6 +310,61 @@ class TestEmptyAssistantShellsStillDrop:
         assert [m["role"] for m in agent_history] == ["assistant"]
 
 
+class TestEmptyStringReasoningContentSentinelSurvivesReload:
+    """``reasoning_content == ""`` is a meaningful sentinel, not an empty
+    value, and the rebuild must not collapse it.
+
+    ``_build_replay_entry`` singles this field out: every other replay field
+    is dropped when falsy, but an empty-string ``reasoning_content`` is kept
+    because thinking-mode replay upgrades it to a single space. If the row
+    is dropped on reload instead, the next request carries no
+    ``reasoning_content`` at all, which strict thinking providers reject
+    with HTTP 400.
+
+    This is also the case a plain truthiness test gets wrong, so it pins the
+    ``None``-vs-``""`` distinction rather than just the round-trip.
+    """
+
+    def test_empty_string_sentinel_row_is_preserved(self):
+        assistant = _assistant_rows([
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "", "reasoning_content": ""},
+        ])
+        assert len(assistant) == 1
+        assert assistant[0]["reasoning_content"] == ""
+
+    def test_sentinel_is_distinguished_from_absent_reasoning_content(self):
+        """An empty-string sentinel is payload; an absent key is not."""
+        with_sentinel = _assistant_rows([
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "", "reasoning_content": ""},
+        ])
+        without_key = _assistant_rows([
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": ""},
+        ])
+        assert len(with_sentinel) == 1
+        assert without_key == []
+
+    def test_explicit_none_reasoning_content_is_not_payload(self):
+        """``None`` is the genuine no-value case and must not resurrect the
+        row -- matching `_build_replay_entry`, which skips it on ``None``."""
+        assert _assistant_rows([
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "", "reasoning_content": None},
+        ]) == []
+
+    def test_sentinel_survives_alongside_a_later_user_turn(self):
+        """The sentinel must still be there when it is no longer the tail."""
+        agent_history, _observed = _build_gateway_agent_history([
+            {"role": "user", "content": "first"},
+            {"role": "assistant", "content": "", "reasoning_content": ""},
+            {"role": "user", "content": "second"},
+        ])
+        assert [m["role"] for m in agent_history] == ["user", "assistant", "user"]
+        assert agent_history[1]["reasoning_content"] == ""
+
+
 class TestGatewayHistoryBuildForwardsSidecar:
     def test_end_to_end_history_build_keeps_sidecar(self):
         history = [
