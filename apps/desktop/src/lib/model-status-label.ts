@@ -53,20 +53,52 @@ const VARIANT_TAGS: ReadonlyArray<readonly [RegExp, string]> = [
 
 const titleCase = (text: string): string => text.replace(/\b\w/g, char => char.toUpperCase()).trim()
 
+// Vendor-specific token corrections applied after titleCase to restore the
+// casing vendors use for their own model names. Without this, GLM renders
+// as "Glm", DeepSeek as "Deepseek", MiniMax as "MiniMax", etc.
+const VENDOR_TOKENS: ReadonlyArray<readonly [RegExp, string]> = [
+  [/\bGlm\b/g, 'GLM'],
+  [/\bDeepseek\b/g, 'DeepSeek'],
+  [/\bOpenai\b/g, 'OpenAI'],
+  [/\bMinimax\b/g, 'MiniMax'],
+  [/\bErnie\b/g, 'ERNIE'],
+  [/\bMimo\b/g, 'MiMo'],
+  [/\bBge\b/g, 'BGE'],
+  [/\bVl\b/g, 'VL'],
+  [/\bIt\b/g, 'IT'],
+  [/\bFp8\b/g, 'FP8'],
+  [/\bAi\b/g, 'AI']
+]
+
+// Parameter counts like "8b", "30b", "70b", "a3b", "a22b" should use
+// a capital B (vendors always write them that way).
+const PARAM_COUNT = /(\d+[a-z])(?=\s|$)/gi
+
+function applyVendorTokens(text: string): string {
+  let result = text
+  for (const [pattern, replacement] of VENDOR_TOKENS) {
+    result = result.replace(pattern, replacement)
+  }
+  return result
+}
+
 function prettifyBase(base: string): string {
   if (/^claude-/i.test(base)) {
-    return titleCase(base.replace(/^claude-/i, '').replace(/-/g, ' '))
+    return applyVendorTokens(titleCase(base.replace(/^claude-/i, '').replace(/-/g, ' ')))
   }
 
   if (/^gpt-/i.test(base)) {
-    return base.replace(/^gpt-/i, 'GPT-')
+    return applyVendorTokens(base.replace(/^gpt-/i, 'GPT-'))
   }
 
   if (/^gemini-/i.test(base)) {
-    return base.replace(/^gemini-/i, 'Gemini ').replace(/-/g, ' ')
+    return applyVendorTokens(titleCase(base.replace(/^gemini-/i, '').replace(/-/g, ' ')))
   }
 
-  return titleCase(base.replace(/-/g, ' '))
+  const titleCased = titleCase(base.replace(/-/g, ' '))
+  const withVendorTokens = applyVendorTokens(titleCased)
+  // Fix parameter counts: "8b" -> "8B", "a3b" -> "A3B"
+  return withVendorTokens.replace(PARAM_COUNT, (match) => match.slice(0, -1) + match.slice(-1).toUpperCase())
 }
 
 /** Split a model id into a clean display name plus an optional grayed variant
