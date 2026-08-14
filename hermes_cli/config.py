@@ -2146,9 +2146,35 @@ def warn_deprecated_cwd_env_vars(config: Optional[Dict[str, Any]] = None) -> Non
 
     These env vars are deprecated — the canonical setting is terminal.cwd
     in config.yaml.  Prints a migration hint to stderr.
+
+    Only warns when the variable is actually *defined in the profile's .env*.
+    ``TERMINAL_CWD`` legitimately reaches ``os.environ`` through several
+    non-.env paths: the CLI's config bridge exports it for the local backend,
+    the desktop app injects it into child processes, and any ``hermes``
+    process exports it for its own children (browser daemons, LSP servers,
+    shells) — a nested ``hermes`` then inherits it.  Warning on the bare env
+    presence produced false "found in .env" positives for those inherited /
+    bridged values.
     """
-    messaging_cwd = os.environ.get("MESSAGING_CWD")
-    terminal_cwd_env = os.environ.get("TERMINAL_CWD")
+    from hermes_cli.env_loader import _env_keys_defined_in_dotenv
+
+    try:
+        from hermes_constants import get_hermes_home
+
+        dotenv_keys = _env_keys_defined_in_dotenv(get_hermes_home() / ".env")
+    except Exception:
+        dotenv_keys = None  # early bootstrap — fall back to env-presence check
+
+    messaging_cwd = (
+        os.environ.get("MESSAGING_CWD")
+        if dotenv_keys is None or "MESSAGING_CWD" in dotenv_keys
+        else None
+    )
+    terminal_cwd_env = (
+        os.environ.get("TERMINAL_CWD")
+        if dotenv_keys is None or "TERMINAL_CWD" in dotenv_keys
+        else None
+    )
 
     if config is None:
         try:
