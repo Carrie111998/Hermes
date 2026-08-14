@@ -8747,6 +8747,62 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             )
             return cursor.fetchone() is not None
 
+    def _carry_forward_row_ids(
+        self, conn, session_id: str, compacted_messages: List[Dict[str, Any]]
+    ) -> List[int]:
+        """Row ids of active messages that *compacted_messages* keeps verbatim.
+
+        The compressor emits ``[summary] + [recent tail]`` where the tail is a
+        byte-identical copy of the newest active rows, so those rows are about
+        to be re-inserted rather than replaced.
+
+        Matched as a longest common suffix, not by content alone: an older turn
+        that happens to repeat the tail's text — a re-run command, a re-read
+        file — was genuinely summarized away and has to stay discoverable as
+        ``compacted = 1``. Anchoring to the suffix is what keeps the two cases
+        apart.
+
+        Keys mirror what :meth:`_insert_message_rows` will store, so the
+        comparison is against the encoded form actually on disk.
+        """
+        active = list(
+            conn.execute(
+                "SELECT id, role, content, tool_call_id, tool_calls FROM messages"
+                " WHERE session_id = ? AND active = 1 ORDER BY id",
+                (session_id,),
+            )
+        )
+        if not active or not compacted_messages:
+            return []
+
+        def _incoming_key(msg: Dict[str, Any]):
+            tool_calls = msg.get("tool_calls")
+            # Mirrors _insert_message_rows: a JSON string must be parsed before
+            # re-dumping, or the stored form double-encodes and never matches.
+            if isinstance(tool_calls, str):
+                try:
+                    tool_calls = json.loads(tool_calls)
+                except (json.JSONDecodeError, TypeError):
+                    tool_calls = []
+            return (
+                msg.get("role", "unknown"),
+                self._encode_content(msg.get("content")),
+                msg.get("tool_call_id"),
+                json.dumps(tool_calls) if tool_calls else None,
+            )
+
+        carried: List[int] = []
+        i = len(active) - 1
+        j = len(compacted_messages) - 1
+        while i >= 0 and j >= 0:
+            row = active[i]
+            if (row[1], row[2], row[3], row[4]) != _incoming_key(compacted_messages[j]):
+                break
+            carried.append(row[0])
+            i -= 1
+            j -= 1
+        return carried
+
     def archive_and_compact(
         self,
         session_id: str,
@@ -8796,6 +8852,24 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             # back"). search_messages includes compacted=1 rows by default so
             # the pre-compaction transcript stays discoverable; live-context
             # loads (active=1 only) still exclude them.
+            #
+            # The recent tail is NOT summarized away — it is re-inserted below,
+            # verbatim, as fresh active rows. Stamping compacted=1 on its
+            # originals would publish a second copy of still-live content to
+            # recall (search_messages matches active=1 OR compacted=1) and label
+            # live turns "summarized away", once more per compaction. Those
+            # originals are superseded duplicates, so they take the rewind state
+            # instead: still on disk and reachable via include_inactive=True,
+            # hidden from recall. Only turns the summary actually replaced keep
+            # compacted=1.
+            carried = self._carry_forward_row_ids(conn, session_id, compacted_messages)
+            if carried:
+                placeholders = ",".join("?" * len(carried))
+                conn.execute(
+                    "UPDATE messages SET active = 0, compacted = 0 "
+                    f"WHERE session_id = ? AND active = 1 AND id IN ({placeholders})",
+                    (session_id, *carried),
+                )
             conn.execute(
                 "UPDATE messages SET active = 0, compacted = 1 "
                 "WHERE session_id = ? AND active = 1",
