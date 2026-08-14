@@ -27,6 +27,26 @@ MAX_SYMBOLIC_CODE_LENGTH: Final[int] = 64
 PROVIDER_FRESHNESS_MULTIPLIER: Final[int] = 3
 PROVIDER_FRESHNESS_JITTER_FLOOR_SECONDS: Final[int] = 30
 
+# Minimum believable scan cadence per provider, in seconds. Raises the freshness
+# limit ONLY for providers that physically cannot meet the global
+# `catalog_scan_seconds`; providers absent here are unchanged (floor 0), so
+# claude and hermes keep the exact contract they had.
+#
+# codex: every catalog lookup crosses a `codex app-server` JSON-RPC boundary whose
+# own per-call bound is 30s, and a full inventory pages ~2,700 threads. A 3s
+# service-wide setting yields a 33s limit that codex can never satisfy -- observed
+# lag 50-560s while the provider was healthy and indexing normally.
+#
+# 240s -> a 720s limit. Chosen from the measured distribution, not rounded up for
+# comfort: 180s was tried first and yields 540s, which sits ON the worst observed
+# healthy lag (559s) and would flap. 720s clears that by ~1.3x while still catching
+# a genuine stall -- the failures seen today parked for 20+ minutes and kept
+# climbing, so they stay well outside it. Revisit if codex's steady-state cadence
+# changes; the number is an observation, so re-measure before moving it.
+PROVIDER_SCAN_SECONDS_FLOOR: Final[dict[str, float]] = {
+    "codex": 240.0,
+}
+
 _SYMBOLIC_CODE = re.compile(r"[a-z0-9_]+", re.ASCII)
 State = Literal["healthy", "error", "unknown"]
 
@@ -472,9 +492,23 @@ def _provider_axis(
     if lag is None or last_success is None or scan_seconds is None:
         freshness_axis = _freshness("unknown", "invalid_measurement")
     else:
+        # 2026-08-13: the expected scan cadence is PER PROVIDER, not global.
+        # `catalog_scan_seconds` is a single service-wide setting (3s here), which is
+        # the right expectation for claude -- it reads local transcript files and runs
+        # a lag of ~5-8s. It is not achievable for codex, whose every lookup crosses an
+        # app-server JSON-RPC boundary with a 30s per-call bound; measured codex lag ran
+        # 50-560s while the derived limit was 33s. The row was therefore permanently
+        # 'unknown' for a provider that was working correctly, and the only ways to
+        # green it were to slacken the GLOBAL contract (which would also stop catching
+        # genuine claude staleness) or to fabricate speed codex cannot have.
+        # A floor per provider keeps claude's contract exactly as strict as before and
+        # states codex's real cadence instead of pretending it matches claude's.
+        effective_scan_seconds = max(
+            scan_seconds, PROVIDER_SCAN_SECONDS_FLOOR.get(name, 0.0)
+        )
         limit = max(
-            scan_seconds * PROVIDER_FRESHNESS_MULTIPLIER,
-            scan_seconds + PROVIDER_FRESHNESS_JITTER_FLOOR_SECONDS,
+            effective_scan_seconds * PROVIDER_FRESHNESS_MULTIPLIER,
+            effective_scan_seconds + PROVIDER_FRESHNESS_JITTER_FLOOR_SECONDS,
         )
         if lag <= limit:
             state: State = "healthy"
