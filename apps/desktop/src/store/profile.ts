@@ -15,6 +15,8 @@ import { invalidateCronModelImpactScopeState } from '@/store/cron-model-impact-s
 import { $gateway, ensureGatewayForProfile, openGatewayForProfile } from '@/store/gateway'
 import { setConnection } from '@/store/session'
 import { resetStarmapGraph } from '@/store/starmap'
+import { invalidateMcpSuggestionIndex } from '@/store/suggestion-providers/mcp'
+import { invalidateSkillSuggestionIndex } from '@/store/suggestion-providers/skill'
 import type { ProfileInfo } from '@/types/hermes'
 
 // Canonical key for a profile: trimmed, empty → "default". Used everywhere we
@@ -183,6 +185,13 @@ $activeGatewayProfile.subscribe(value => {
     // every profile switch.
     invalidateProfileScopedQueries()
     resetStarmapGraph()
+    // Composer suggestion-provider caches (configured-MCP-servers list,
+    // skill index) are profile-scoped REST reads with their own TTL cache,
+    // outside invalidateProfileScopedQueries' React Query cache — a stale
+    // hit here can re-offer "Add <server>" for one already configured on
+    // the new profile, or point a skill pill at the wrong profile's skill.
+    invalidateMcpSuggestionIndex()
+    invalidateSkillSuggestionIndex()
   }
 
   _lastRoutedProfile = key
