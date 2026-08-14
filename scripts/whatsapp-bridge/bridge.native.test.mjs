@@ -54,6 +54,14 @@ import {
     null,
   );
   assert.equal(
+    deliveryReceiptFromMessageUpdate({
+      key: { ...key, remoteJid: '120363001234567890@g.us' },
+      update: { status: 4 },
+      now,
+    }),
+    null,
+  );
+  assert.equal(
     deliveryReceiptFromMessageUpdate({ key: { ...key, id: '' }, update: { status: 4 }, now }),
     null,
   );
@@ -81,6 +89,14 @@ import {
   );
   assert.equal(
     deliveryReceiptFromUserReceiptUpdate({ key, receipt: {}, now }),
+    null,
+  );
+  assert.equal(
+    deliveryReceiptFromUserReceiptUpdate({
+      key: { ...key, remoteJid: '120363001234567890@g.us' },
+      receipt: { readTimestamp: 1_723_636_900 },
+      now,
+    }),
     null,
   );
   console.log('  ✓ outbound delivery receipts are normalized without recipient identifiers');

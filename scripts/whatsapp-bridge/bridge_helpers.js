@@ -32,7 +32,8 @@ const DELIVERY_STATUS = new Map([
 function validOutboundReceiptKey(key) {
   return key?.fromMe === true
     && typeof key.id === 'string'
-    && /^[A-Za-z0-9_-]{1,191}$/.test(key.id);
+    && /^[A-Za-z0-9_-]{1,191}$/.test(key.id)
+    && !(typeof key.remoteJid === 'string' && key.remoteJid.endsWith('@g.us'));
 }
 
 function timestampIso(value) {
