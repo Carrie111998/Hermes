@@ -108,6 +108,39 @@ class TestResolveClientIdentity:
         monkeypatch.setenv("A2A_TRUSTED_PROXIES", "10.0.0.1")
         assert security.resolve_client_identity(_hdr(" , 203.0.113.9"), "10.0.0.1") == "203.0.113.9"
 
+    @pytest.mark.parametrize("xff", [
+        "not-an-ip",                            # single malformed hop
+        "10.0.0.1, not-an-ip",                  # malformed rightmost (direct upstream)
+        "10.0.0.1, garbage, 203.0.113.9, not-an-ip",  # malformed rightmost in a longer chain
+    ])
+    def test_malformed_xff_hop_at_boundary_rejected_falls_back_to_socket(
+        self, monkeypatch, xff
+    ):
+        """P1 hardening: an unvalidated X-Forwarded-For value at the walk
+        boundary (the first non-trusted hop from the right) must never become
+        the identity. The direct upstream of a trusted proxy is an IP by
+        construction; anything else was forged by the caller, so the header
+        is rejected and the socket peer is used."""
+        monkeypatch.setenv("A2A_TRUSTED_PROXIES", "10.0.0.1")
+        assert security.resolve_client_identity(_hdr(xff), "10.0.0.1") == "10.0.0.1"
+
+    @pytest.mark.parametrize("xff", [
+        "not-an-ip, 203.0.113.9",               # malformed leftmost, valid rightmost
+        "10.0.0.1, garbage, 203.0.113.9",       # malformed middle hop
+    ])
+    def test_malformed_xff_hop_beyond_valid_client_ignored(self, monkeypatch, xff):
+        """A malformed hop further LEFT than the first valid untrusted hop is
+        never reached by the right-to-left walk — the proxy-appended real
+        client wins, so forged garbage cannot displace it either way."""
+        monkeypatch.setenv("A2A_TRUSTED_PROXIES", "10.0.0.1")
+        assert security.resolve_client_identity(_hdr(xff), "10.0.0.1") == "203.0.113.9"
+
+    def test_spoofed_bare_string_hop_cannot_match_allowlist_entry(self, monkeypatch):
+        """A bare-string hop like ``ip:alice`` (or any non-IP) must not be
+        usable to impersonate a configured trusted-peer identity."""
+        monkeypatch.setenv("A2A_TRUSTED_PROXIES", "10.0.0.1")
+        assert security.resolve_client_identity(_hdr("ip:alice"), "10.0.0.1") == "10.0.0.1"
+
     def test_end_to_end_identity_through_authenticate(self, monkeypatch):
         """authenticate() builds the final identity string from the resolved IP.
         With a shared token + trusted proxy, two distinct real clients get two

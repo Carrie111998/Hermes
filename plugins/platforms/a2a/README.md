@@ -90,7 +90,7 @@ Only when the immediate socket peer matches a trusted proxy does the adapter
 consult `X-Forwarded-For`, **walking validated hops right-to-left**: the
 rightmost hop (appended by the trusted proxy itself) is trusted, and each
 further hop to the left is only trusted when it is itself a listed trusted
-proxy; the first hop that is not a listed proxy is the real client. Taking
+proxy; the first hop that is not a listed proxy is the real client; a malformed or non-IP hop at that boundary is rejected outright (the header is forged) and identity falls back to the socket peer. Taking
 the leftmost hop blindly would let a caller prepend an allow-listed address
 before the proxy appends the real one (spoofing identity), so hops are never
 trusted beyond the configured proxy chain. The identity becomes

@@ -227,6 +227,17 @@ def _peer_in_proxies(peer_ip: str, proxies: set[str]) -> bool:
     return False
 
 
+def _is_valid_ip(value: str) -> bool:
+    """True when ``value`` parses as an IP address (v4 or v6)."""
+    if not value or "/" in value:
+        return False
+    try:
+        ipaddress.ip_address(value)
+        return True
+    except ValueError:
+        return False
+
+
 def resolve_client_identity(headers, client_ip: str = "") -> str:
     """Resolve the real client IP for identity, honoring trusted proxies only.
 
@@ -265,6 +276,13 @@ def resolve_client_identity(headers, client_ip: str = "") -> str:
                 for hop in reversed(hops):
                     if _peer_in_proxies(hop, proxies):
                         continue
+                    # The direct upstream of a trusted proxy must be an IP
+                    # address — anything else was forged by the caller, so
+                    # reject the header and fall back to the socket peer
+                    # rather than deriving identity from an unvalidated
+                    # value (#80534 P1).
+                    if not _is_valid_ip(hop):
+                        return client_ip
                     return hop
                 return hops[0]
     return client_ip
