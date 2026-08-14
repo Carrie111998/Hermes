@@ -550,8 +550,12 @@ def detect_hardline_command(command: str) -> tuple:
     """
     if _command_parser_limit_exceeded(command):
         return (True, _PARSER_LIMIT_DESCRIPTION)
-    normalized = _normalize_command_for_detection(command)
-    _, malformed_grep = _grep_safe_detection_variant(normalized)
+    # Grep syntax must be validated against faithful shell quote state:
+    # normalization strips escapes such as \" before the grep parser sees
+    # them. Quoted newlines are data, so mask those without altering quoting.
+    _, malformed_grep = _grep_safe_detection_variant(
+        _mask_quoted_newlines(command)
+    )
     if malformed_grep:
         return (True, _MALFORMED_EXEC_DESCRIPTION)
     for command_variant in _command_detection_variants(command):

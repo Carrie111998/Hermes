@@ -235,6 +235,30 @@ def test_grep_pcre_pattern_with_grouped_root_delete_text_stays_safe():
     assert detect_hardline_command(command) == (False, None)
 
 
+@pytest.mark.parametrize(
+    "command",
+    [
+        r'cd ~/.hermes/hermes-agent && grep -n "^from\|^__all__\|^    \"" tools/environments/__init__.py | head -15',
+        r'egrep -n "alpha\"beta|gamma" input.txt',
+    ],
+)
+def test_quoted_grep_patterns_with_escaped_double_quotes_stay_safe(command):
+    assert detect_hardline_command(command) == (False, None)
+    assert detect_dangerous_command(command) == (False, None, None)
+
+
+def test_unterminated_quoted_grep_pattern_fails_closed():
+    assert detect_hardline_command('grep -n "unterminated file') == (
+        True,
+        "command parser limit or malformed executable payload",
+    )
+
+
+def test_escaped_quotes_in_grep_pattern_do_not_hide_following_hardline_command():
+    command = r'grep -n "prefix \"quoted\" suffix" input.txt; reboot'
+    assert detect_hardline_command(command) == (True, "system shutdown/reboot")
+
+
 def test_interpreter_heredoc_keeps_legacy_approval_key_compatibility():
     from tools.approval import _approval_key_aliases
 
