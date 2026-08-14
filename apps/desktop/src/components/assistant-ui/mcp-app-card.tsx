@@ -333,10 +333,30 @@ export function McpAppCard({ result, toolCallId }: ToolCallMessagePartProps) {
             // Requests (tools/call, resources/*) proxy to the MCP server session.
             void (async () => {
                 try {
+                    // Inject session_id into tools/call arguments when the card
+                    // omitted it. UTP (and similar servers) require session_id
+                    // on every call, but cards built from older SDKs don't
+                    // forward the sessionId received in ui/initialize. The host
+                    // has it on the original tool result's structuredContent.
+                    let outgoingMsg = msg
+                    if (method === 'tools/call') {
+                        const params = (msg.params ?? {}) as Record<string, unknown>
+                        const args = (params.arguments ?? {}) as Record<string, unknown>
+                        if (args.session_id === undefined) {
+                            const sid = readSessionId(resultRef.current)
+                            if (sid) {
+                                outgoingMsg = {
+                                    ...msg,
+                                    params: { ...params, arguments: { ...args, session_id: sid } },
+                                }
+                            }
+                        }
+                    }
+
                     const res = await requestGateway<{ response?: JsonRpcFrame }>('mcp.app.request', {
                         server,
                         toolCallId,
-                        message: msg
+                        message: outgoingMsg
                     })
 
                     const response = res?.response

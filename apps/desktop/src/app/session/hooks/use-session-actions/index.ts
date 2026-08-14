@@ -1042,7 +1042,7 @@ export function useSessionActions({
           state => ({
             ...state,
             ...(runtimeInfo ?? {}),
-            messages: messagesForView,
+            messages: preserveMcpUiCards(messagesForView, currentMessages, storedSessionId),
             busy: resumedRunning,
             awaitingResponse: resumedRunning && !recoveredInFlightTail,
             adoptedRunningTurn: state.adoptedRunningTurn || resumedRunning,

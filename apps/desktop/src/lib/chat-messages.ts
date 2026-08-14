@@ -1144,15 +1144,15 @@ export function toChatMessages(messages: SessionMessage[]): ChatMessage[] {
 // tool.complete handler stashes ui here, and hydration consults it when
 // state.messages has already been replaced by another session.
 //
-// The cache is mirrored to sessionStorage so it survives HMR reloads (which
-// wipe the in-memory Map). sessionStorage is scoped to the tab and cleared on
-// app restart — acceptable since MCP server connections reset too.
+// The cache is mirrored to localStorage so it survives HMR reloads AND app
+// restarts (both wipe the in-memory Map). localStorage persists across restarts
+// so cards remain visible even after closing and reopening the app.
 const _mcpUiBySession = new Map<string, Map<string, unknown>>()
 const _SS_PREFIX = 'mcp-ui:'
 
 function _loadSessionFromStorage(sessionId: string): Map<string, unknown> | undefined {
   try {
-    const raw = sessionStorage.getItem(_SS_PREFIX + sessionId)
+    const raw = localStorage.getItem(_SS_PREFIX + sessionId)
     if (!raw) return undefined
     const obj = JSON.parse(raw) as Record<string, unknown>
     const m = new Map(Object.entries(obj))
@@ -1168,7 +1168,7 @@ function _persistSessionToStorage(sessionId: string, m: Map<string, unknown>): v
   try {
     const obj: Record<string, unknown> = {}
     for (const [k, v] of m) obj[k] = v
-    sessionStorage.setItem(_SS_PREFIX + sessionId, JSON.stringify(obj))
+    localStorage.setItem(_SS_PREFIX + sessionId, JSON.stringify(obj))
   } catch {
     // QuotaExceeded — drop silently; the in-memory cache still works.
   }
@@ -1188,7 +1188,7 @@ export function cacheMcpUi(sessionId: string, toolCallId: string, ui: unknown): 
 export function clearCachedMcpUi(sessionId: string): void {
   _mcpUiBySession.delete(sessionId)
   try {
-    sessionStorage.removeItem(_SS_PREFIX + sessionId)
+    localStorage.removeItem(_SS_PREFIX + sessionId)
   } catch {
     // ignore
   }
@@ -1217,7 +1217,7 @@ export function preserveMcpUiCards(
 
   // Fall back to the per-session cache when $messages was already replaced
   // by another session (state.messages no longer has our ui).  Check both
-  // the in-memory Map and sessionStorage (survives HMR reload).
+  // the in-memory Map and localStorage (survives HMR reload + app restart).
   if (sessionId) {
     let cached = _mcpUiBySession.get(sessionId)
     if (!cached) {
@@ -1231,6 +1231,33 @@ export function preserveMcpUiCards(
       }
     }
   }
+
+  // Fallback: cacheMcpUi keys by the event's session_id (stored session
+  // ID), but resume/preserveMcpUiCards may receive a runtime session ID
+  // from the route. Scan all mcp-ui:* entries for matching tool-call IDs
+  // when the precise lookup came up empty.
+  if (!uiByToolCallId.size) {
+    const nextToolCallIds = new Set(
+      nextMessages
+        .flatMap(m => m.parts)
+        .filter(p => p.type === 'tool-call')
+        .map(p => (p as { toolCallId?: string }).toolCallId)
+        .filter(Boolean) as Set<string>
+    )
+    if (nextToolCallIds.size) {
+      for (const key of Object.keys(localStorage)) {
+        if (!key.startsWith(_SS_PREFIX)) continue
+        const entry = _loadSessionFromStorage(key.slice(_SS_PREFIX.length))
+        if (!entry) continue
+        for (const [id, ui] of entry) {
+          if (nextToolCallIds.has(id) && !uiByToolCallId.has(id)) {
+            uiByToolCallId.set(id, ui)
+          }
+        }
+      }
+    }
+  }
+
 
   if (!uiByToolCallId.size) {
     return nextMessages
