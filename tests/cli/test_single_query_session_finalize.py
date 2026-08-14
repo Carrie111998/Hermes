@@ -156,10 +156,11 @@ def test_human_single_query_main_propagates_failed_turn_exit_code(monkeypatch):
 
         def chat(self, query, images=None):
             self._last_turn_result = {
-                "final_response": "",
-                "messages": [],
+                "final_response": "Billing or credits exhausted: HTTP 402",
+                "messages": [
+                    {"role": "user", "content": "Return exactly OK"},
+                ],
                 "error": "HTTP 402 payment required",
-                "failed": True,
             }
             return "Error: HTTP 402 payment required"
 

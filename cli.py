@@ -19661,18 +19661,20 @@ def main(
                 )
                 cli._print_exit_summary(clear_screen=False)
                 _single_query_result = getattr(cli, "_last_turn_result", None)
-                _raw_final_response = (
-                    _single_query_result.get("final_response", "")
+                _single_query_messages = (
+                    _single_query_result.get("messages", [])
                     if isinstance(_single_query_result, dict)
-                    else ""
+                    else []
+                )
+                _has_assistant_result = any(
+                    isinstance(message, dict)
+                    and message.get("role") == "assistant"
+                    and (message.get("content") or message.get("tool_calls"))
+                    for message in _single_query_messages
                 )
                 if not (_single_query_response or "").strip() or (
                     isinstance(_single_query_result, dict)
-                    and (
-                        _single_query_result.get("failed")
-                        or _single_query_result.get("partial")
-                    )
-                    and not (_raw_final_response or "").strip()
+                    and not _has_assistant_result
                 ):
                     sys.exit(1)
         finally:
