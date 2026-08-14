@@ -1,7 +1,8 @@
 import { ActionBarPrimitive, BranchPickerPrimitive, MessagePrimitive, useAuiState } from '@assistant-ui/react'
-import { type FC, type ReactNode, useCallback, useRef, useState } from 'react'
+import { type FC, type ReactNode, useCallback, useEffect, useRef, useState } from 'react'
 
 import { DirectiveContent } from '@/components/assistant-ui/directive-text'
+import { $gateway } from '@/store/gateway'
 import { messageAttachmentRefs, messageContentText } from '@/components/assistant-ui/thread/content'
 import { ReactionBadge, ReactionPicker } from '@/components/assistant-ui/thread/message-reactions'
 import { type RestoreMessageTarget } from '@/components/assistant-ui/thread/types'
@@ -78,16 +79,103 @@ export const StopGlyph = <StopFilled aria-hidden className="size-3.5 -translate-
 const PROCESS_NOTIFICATION_RE = /^\[IMPORTANT: Background process [\s\S]*\]$/
 
 // Agent-to-agent deliveries ("Message from 🤖 <sender>: …", the Bot Mode /
-// multi-profile convention; legacy "[Message from agent '<sender>'] …" too).
-// They arrive on the user role because the recipient's turn runs on it, but
-// they are NOT the human speaking — render them as an attributed inter-agent
-// card instead of a user bubble.
-export const AGENT_MESSAGE_RE = /^(?:Message from (?:🤖\s*)?([^:\n]{1,64}):\s*|\[Message from agent '([^']{1,64})'\]\s*)([\s\S]*)$/u
+// multi-profile convention; optional "(@<handle>)" carries the sender's
+// profile name for avatar resolution; legacy "[Message from agent
+// '<sender>'] …" too). They arrive on the user role because the recipient's
+// turn runs on it, but they are NOT the human speaking — render them as a
+// compact attributed timeline notice instead of a user bubble.
+export const AGENT_MESSAGE_RE =
+  /^(?:Message from (?:🤖\s*)?([^:\n(]{1,64}?)(?:\s*\(@([a-z0-9][a-z0-9_-]{0,63})\))?:\s*|\[Message from agent '([^']{1,64})'\]\s*)([\s\S]*)$/u
+
+// sender handle -> avatar data URL (null = known absent). Module-level so a
+// chat full of notices from one bot resolves once. Profiles change rarely;
+// stale entries only persist for the window's lifetime.
+const agentAvatarCache = new Map<string, null | string>()
+const agentAvatarInflight = new Map<string, Promise<null | string>>()
+
+async function resolveAgentAvatar(handle: string): Promise<null | string> {
+  const key = handle.trim().toLowerCase()
+
+  if (!key) {
+    return null
+  }
+
+  if (agentAvatarCache.has(key)) {
+    return agentAvatarCache.get(key) ?? null
+  }
+
+  const inflight = agentAvatarInflight.get(key)
+
+  if (inflight) {
+    return inflight
+  }
+
+  const run = (async (): Promise<null | string> => {
+    try {
+      const gateway = $gateway.get()
+
+      if (!gateway) {
+        return null
+      }
+
+      const res = await gateway.request<{ profiles?: Array<{ has_avatar?: boolean; name: string }> }>(
+        'profiles.list',
+        { include_sessions: false }
+      )
+      const profiles = res?.profiles ?? []
+      let profile = profiles.find(p => p.name.toLowerCase() === key)
+
+      // 'hermes' is the conventional alias for the primary profile.
+      if (!profile && key === 'hermes') {
+        profile = profiles.find(p => p.name === 'default')
+      }
+
+      if (!profile?.has_avatar) {
+        return null
+      }
+
+      const asset = await gateway.request<{ data?: string; found?: boolean }>('profiles.get_asset', {
+        asset: 'avatar',
+        name: profile.name
+      })
+
+      return asset?.found && asset.data ? asset.data : null
+    } catch {
+      // Older gateway (no profiles.* RPCs) or transient failure — the 🤖
+      // glyph fallback is always correct.
+      return null
+    } finally {
+      agentAvatarInflight.delete(key)
+    }
+  })()
+
+  agentAvatarInflight.set(key, run)
+  const out = await run
+  agentAvatarCache.set(key, out)
+
+  return out
+}
 
 const AgentMessageNote: FC<{ text: string }> = ({ text }) => {
   const match = AGENT_MESSAGE_RE.exec(text)
-  const sender = (match?.[1] || match?.[2] || 'agent').trim()
-  const body = (match?.[3] || '').trim()
+  const sender = (match?.[1] || match?.[3] || 'agent').trim()
+  const handle = (match?.[2] || match?.[3] || sender).trim()
+  const body = (match?.[4] || '').trim()
+  const [avatar, setAvatar] = useState<null | string>(() => agentAvatarCache.get(handle.toLowerCase()) ?? null)
+
+  useEffect(() => {
+    let live = true
+
+    void resolveAgentAvatar(handle).then(url => {
+      if (live && url) {
+        setAvatar(url)
+      }
+    })
+
+    return () => {
+      live = false
+    }
+  }, [handle])
 
   // Grok-bots shape: an inter-agent delivery is a timeline EVENT, not a
   // conversation bubble — a subtle centered notice ("Message from 🤖 X"),
@@ -100,9 +188,13 @@ const AgentMessageNote: FC<{ text: string }> = ({ text }) => {
       data-slot="aui_agent-message-note"
     >
       <span className="flex items-center justify-center gap-1.5">
-        <span aria-hidden className="text-[0.8125rem] leading-none">
-          🤖
-        </span>
+        {avatar ? (
+          <img alt="" aria-hidden className="size-4 shrink-0 rounded-full object-cover" src={avatar} />
+        ) : (
+          <span aria-hidden className="text-[0.8125rem] leading-none">
+            🤖
+          </span>
+        )}
         <span className="wrap-anywhere">Message from {sender}</span>
       </span>
       {body && (
