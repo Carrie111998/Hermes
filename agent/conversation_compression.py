@@ -1204,6 +1204,73 @@ def compression_skipped_due_to_lock(agent: Any) -> bool:
     return _sig is True or isinstance(_sig, str)
 
 
+def rebind_agent_compression_side_state(
+    agent: Any,
+    session_db: Any,
+    child_session_id: str,
+    parent_session_id: str,
+) -> None:
+    """Rebind per-process side-state onto an adopted compression child.
+
+    Shared by turn-start adoption (:func:`_adopt_live_compression_child`) and
+    the flush-time adoption in ``run_agent._flush_messages_to_session_db``
+    so the two paths cannot drift: session ContextVar/env, logging context,
+    the flush session guard, and the compressor/memory-manager boundary
+    notifications all move together. Load-specific state
+    (``_last_flushed_db_idx``, ``_flushed_db_message_ids``,
+    ``_cached_system_prompt``) is intentionally NOT set here — only the
+    turn-start path reloads messages.
+    """
+    agent.session_id = child_session_id
+    try:
+        from gateway.session_context import set_current_session_id
+
+        set_current_session_id(child_session_id)
+    except Exception:
+        os.environ["HERMES_SESSION_ID"] = child_session_id
+    try:
+        from hermes_logging import set_session_context
+
+        set_session_context(child_session_id)
+    except Exception:
+        pass
+
+    agent._session_db_created = True
+    agent._flushed_db_message_session_id = child_session_id
+
+    compressor = getattr(agent, "context_compressor", None)
+    on_session_start = getattr(compressor, "on_session_start", None)
+    if callable(on_session_start):
+        try:
+            on_session_start(
+                child_session_id,
+                boundary_reason="compression",
+                old_session_id=parent_session_id,
+                session_db=session_db,
+                platform=getattr(agent, "platform", None) or "cli",
+                conversation_id=getattr(agent, "_gateway_session_key", None),
+            )
+        except Exception as exc:
+            logger.debug("context engine compression-child adoption failed: %s", exc)
+    else:
+        bind_state = getattr(compressor, "bind_session_state", None)
+        if callable(bind_state):
+            try:
+                bind_state(session_db=session_db, session_id=child_session_id)
+            except Exception:
+                pass
+    try:
+        if getattr(agent, "_memory_manager", None):
+            agent._memory_manager.on_session_switch(
+                child_session_id,
+                parent_session_id=parent_session_id,
+                reset=False,
+                reason="compression",
+            )
+    except Exception as exc:
+        logger.debug("memory manager compression-child adoption failed: %s", exc)
+
+
 def _adopt_live_compression_child(
     agent: Any,
     session_db: Any,
@@ -1232,59 +1299,15 @@ def _adopt_live_compression_child(
     if not confirmed or str(confirmed.get("id") or "") != child_session_id:
         return None
 
-    agent.session_id = child_session_id
-    try:
-        from gateway.session_context import set_current_session_id
-
-        set_current_session_id(child_session_id)
-    except Exception:
-        os.environ["HERMES_SESSION_ID"] = child_session_id
-    try:
-        from hermes_logging import set_session_context
-
-        set_session_context(child_session_id)
-    except Exception:
-        pass
-
-    agent._session_db_created = True
+    rebind_agent_compression_side_state(
+        agent, session_db, child_session_id, parent_session_id
+    )
     if child.get("system_prompt"):
         agent._cached_system_prompt = child["system_prompt"]
     agent._last_flushed_db_idx = len(recovered)
-    agent._flushed_db_message_session_id = child_session_id
     agent._flushed_db_message_ids = {
         id(message) for message in recovered if isinstance(message, dict)
     }
-
-    on_session_start = getattr(agent.context_compressor, "on_session_start", None)
-    if callable(on_session_start):
-        try:
-            on_session_start(
-                child_session_id,
-                boundary_reason="compression",
-                old_session_id=parent_session_id,
-                session_db=session_db,
-                platform=getattr(agent, "platform", None) or "cli",
-                conversation_id=getattr(agent, "_gateway_session_key", None),
-            )
-        except Exception as exc:
-            logger.debug("context engine compression-child adoption failed: %s", exc)
-    else:
-        bind_state = getattr(agent.context_compressor, "bind_session_state", None)
-        if callable(bind_state):
-            try:
-                bind_state(session_db=session_db, session_id=child_session_id)
-            except Exception:
-                pass
-    try:
-        if agent._memory_manager:
-            agent._memory_manager.on_session_switch(
-                child_session_id,
-                parent_session_id=parent_session_id,
-                reset=False,
-                reason="compression",
-            )
-    except Exception as exc:
-        logger.debug("memory manager compression-child adoption failed: %s", exc)
 
     return recovered
 
