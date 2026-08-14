@@ -276,6 +276,21 @@ def atomic_replace(tmp_path: Union[str, Path], target: Union[str, Path]) -> str:
     return real_path
 
 
+def normalize_newlines(text: str, target: str = "\n") -> str:
+    """Convert all line endings in ``text`` to ``target`` (``\\n`` or ``\\r\\n``).
+
+    Idempotent, and homogenizes mixed-ending content in a single pass.
+    Order matters: CRLF must collapse before lone CR, otherwise a CRLF would
+    double-convert to LFLF.
+    """
+    lf_normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+    if target == "\n":
+        return lf_normalized
+    if target == "\r\n":
+        return lf_normalized.replace("\n", "\r\n")
+    return text
+
+
 def atomic_write_text(
     path: Union[str, Path],
     content: str,

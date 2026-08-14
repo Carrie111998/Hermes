@@ -251,9 +251,9 @@ class TestMemoryStorePersistence:
         [
             pytest.param(ENTRY_DELIMITER, id="lf"),
             pytest.param(
-                chr(13) + chr(10) + "§" + chr(13) + chr(10), id="crlf"
+                "\r\n§\r\n", id="crlf"
             ),
-            pytest.param("\n§" + chr(13) + chr(10), id="mixed"),
+            pytest.param("\n§\r\n", id="mixed"),
         ],
     )
     @pytest.mark.parametrize("action", ["replace", "remove"])
@@ -283,7 +283,7 @@ class TestMemoryStorePersistence:
 
         assert result["success"] is True
         persisted = path.read_bytes()
-        assert bytes((13, 10)) not in persisted
+        assert b"\r\n" not in persisted
         assert persisted.decode("utf-8") == ENTRY_DELIMITER.join(expected)
         assert MemoryStore._parse_entries(persisted.decode("utf-8")) == expected
 

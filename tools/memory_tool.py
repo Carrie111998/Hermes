@@ -31,7 +31,7 @@ from pathlib import Path
 from hermes_constants import get_hermes_home
 from typing import Dict, Any, List, Optional, Tuple
 
-from utils import atomic_write_text
+from utils import atomic_write_text, normalize_newlines
 
 # fcntl is Unix-only; on Windows use msvcrt for file locking
 msvcrt = None
@@ -65,11 +65,6 @@ MEMORY_BLOCK_HEADERS = {
 }
 
 ENTRY_DELIMITER = "\n§\n"
-
-
-def _normalize_line_endings(text: str) -> str:
-    """Return text with CRLF and legacy CR line endings normalized to LF."""
-    return text.replace(chr(13) + chr(10), "\n").replace(chr(13), "\n")
 
 
 # ---------------------------------------------------------------------------
@@ -788,12 +783,14 @@ class MemoryStore:
         """Split raw memory-file text into stripped, non-empty entries."""
         if not raw.strip():
             return []
-        # Normalize before splitting so LF, CRLF, and mixed-line-ending files all
-        # recognize the same delimiter. Splitting by "§" alone would incorrectly
-        # split entries that contain it as content.
+        # Defensive normalization: production reads decode via Path.read_text
+        # (universal newlines), so `raw` never contains \r on that path — but
+        # callers handing over raw decoded bytes (tests, future byte-level
+        # readers) still split on the canonical LF delimiter. Splitting by "§"
+        # alone would incorrectly split entries that contain it as content.
         entries = [
             e.strip()
-            for e in _normalize_line_endings(raw).split(ENTRY_DELIMITER)
+            for e in normalize_newlines(raw).split(ENTRY_DELIMITER)
         ]
         return [e for e in entries if e]
 
@@ -856,9 +853,12 @@ class MemoryStore:
         if not raw.strip():
             return None
 
-        parsed = self._parse_entries(raw)
+        # Normalize once and derive both the parse and the drift comparison
+        # from the same normalized snapshot (parse re-normalizing is an
+        # idempotent no-op).
+        normalized_raw = normalize_newlines(raw).strip()
+        parsed = self._parse_entries(normalized_raw)
         roundtrip = ENTRY_DELIMITER.join(parsed)
-        normalized_raw = _normalize_line_endings(raw).strip()
 
         char_limit = self._char_limit(target)
         max_entry_len = max((len(e) for e in parsed), default=0)
@@ -872,8 +872,11 @@ class MemoryStore:
         # the caller can refuse the mutation.
         ts = int(time.time())
         bak_path = path.with_suffix(path.suffix + f".bak.{ts}")
+        # Keep the snapshot on the same canonical-LF policy as the store
+        # itself so a restored .bak is byte-identical to what the parser
+        # round-trips (raw is already universal-newline decoded).
         try:
-            bak_path.write_text(raw, encoding="utf-8")
+            bak_path.write_text(raw, encoding="utf-8", newline="\n")
         except (OSError, IOError):
             return str(bak_path) + " (BACKUP FAILED — file unchanged on disk)"
         return str(bak_path)
@@ -886,8 +889,10 @@ class MemoryStore:
         file *before* the lock is acquired, creating a race window where
         concurrent readers see an empty file. Atomic rename avoids this:
         readers always see either the old complete file or the new one. Memory
-        files use canonical LF delimiters on every platform; the parser accepts
-        legacy CRLF files and normalizes them on the next successful mutation.
+        files use canonical LF delimiters on every platform (newline="\\n"
+        disables the text-mode translation that previously produced CRLF
+        bytes on Windows); reads normalize defensively, so a pre-existing
+        CRLF file is rewritten canonical on its next successful mutation.
         """
         content = ENTRY_DELIMITER.join(entries) if entries else ""
         try:
