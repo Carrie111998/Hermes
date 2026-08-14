@@ -102,6 +102,16 @@ DEFAULT_CONFIG = {
         # on flaky primaries; raise it if you prefer to tolerate longer
         # provider hiccups on a single provider.
         "api_max_retries": 3,
+        # Wall-clock budget for one non-interactive tool on the sequential
+        # executor. A single tool call otherwise owns the conversation thread
+        # forever when its transport or plugin never returns (#84719).
+        # Human-response tools (clarify/setup_mcp) keep their own lifecycle
+        # timeouts and are not charged to this budget. 0 = unlimited.
+        "sequential_tool_timeout": 420,
+        # A timed-out Python thread cannot be killed safely. Bound the number
+        # of detached sequential workers per agent so repeated hangs cannot
+        # grow threads without limit; completed workers are pruned lazily.
+        "max_abandoned_tool_workers": 2,
         "service_tier": "",
         # Tool-use enforcement: injects system prompt guidance that tells the
         # model to actually call tools instead of describing intended actions.

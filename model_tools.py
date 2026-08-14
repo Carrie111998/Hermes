@@ -24,6 +24,7 @@ import os
 import json
 import re
 import asyncio
+import contextvars
 import logging
 import threading
 import time
@@ -39,6 +40,32 @@ from tools.registry import (
 from toolsets import resolve_toolset, validate_toolset
 
 logger = logging.getLogger(__name__)
+
+_POST_TOOL_CALL_DISPATCHER: contextvars.ContextVar = contextvars.ContextVar(
+    "post_tool_call_dispatcher",
+    default=None,
+)
+_TOOL_HANDLER_TERMINAL_CALLBACK: contextvars.ContextVar = contextvars.ContextVar(
+    "tool_handler_terminal_callback",
+    default=None,
+)
+
+
+def _set_post_tool_call_dispatcher(dispatcher):
+    """Bind a supervisor-owned observer dispatcher into this context."""
+    return _POST_TOOL_CALL_DISPATCHER.set(dispatcher)
+
+
+def _reset_post_tool_call_dispatcher(token) -> None:
+    _POST_TOOL_CALL_DISPATCHER.reset(token)
+
+
+def _set_tool_handler_terminal_callback(callback):
+    return _TOOL_HANDLER_TERMINAL_CALLBACK.set(callback)
+
+
+def _reset_tool_handler_terminal_callback(token) -> None:
+    _TOOL_HANDLER_TERMINAL_CALLBACK.reset(token)
 
 # Tracks platform-bundle names already flagged in disabled_toolsets so the
 # advisory (#33924) is logged once per name, not on every tool recompute.
@@ -1131,39 +1158,56 @@ def _emit_post_tool_call_hook(
 ) -> None:
     """Emit the ``post_tool_call`` observer hook.
 
-    No-ops cheaply when no plugin has registered for ``post_tool_call`` —
-    the ``has_hook`` gate skips both the result-field derivation and the
-    payload dispatch so the no-listener path costs one dict lookup.  When
-    ``status`` is not supplied, the ok/error fields are derived from the
-    result *after* the gate (parsing the result is only worth it when a
-    listener will actually consume it).
+    No-ops cheaply when no plugin has registered for ``post_tool_call``.
+    Sequential supervision may provide a bounded dispatcher so a stuck
+    observer cannot own the conversation thread. When ``status`` is omitted,
+    fields are derived only after the listener check.
     """
+    terminal_callback = _TOOL_HANDLER_TERMINAL_CALLBACK.get()
+
+    def _mark_terminal() -> None:
+        if terminal_callback is not None:
+            try:
+                terminal_callback()
+            except Exception:
+                pass
+
     try:
         from hermes_cli.lifecycle import has_hook, invoke_hook
         if not has_hook("post_tool_call"):
+            _mark_terminal()
             return
         if status is None:
             status, error_type, error_message = _tool_result_observer_fields(
                 function_name,
                 result,
             )
-        invoke_hook(
-            "post_tool_call",
-            tool_name=function_name,
-            args=function_args,
-            result=result,
-            task_id=task_id or "",
-            session_id=session_id or "",
-            tool_call_id=tool_call_id or "",
-            turn_id=turn_id or "",
-            api_request_id=api_request_id or "",
-            duration_ms=duration_ms,
-            status=status,
-            error_type=error_type,
-            error_message=error_message,
-            middleware_trace=list(middleware_trace or []),
-        )
+        def _invoke() -> None:
+            invoke_hook(
+                "post_tool_call",
+                tool_name=function_name,
+                args=function_args,
+                result=result,
+                task_id=task_id or "",
+                session_id=session_id or "",
+                tool_call_id=tool_call_id or "",
+                turn_id=turn_id or "",
+                api_request_id=api_request_id or "",
+                duration_ms=duration_ms,
+                status=status,
+                error_type=error_type,
+                error_message=error_message,
+                middleware_trace=list(middleware_trace or []),
+            )
+
+        dispatcher = _POST_TOOL_CALL_DISPATCHER.get()
+        if dispatcher is None:
+            _mark_terminal()
+            _invoke()
+        else:
+            dispatcher(_invoke)
     except Exception as _hook_err:
+        _mark_terminal()
         logger.debug("post_tool_call hook error: %s", _hook_err)
 
 
@@ -1213,6 +1257,7 @@ def handle_function_call(
     if not isinstance(function_args, dict):
         function_args = {}
     _tool_middleware_trace = list(tool_request_middleware_trace or [])
+
 
     # ── Tool Search bridge dispatch ──────────────────────────────────
     # tool_search and tool_describe are pure catalog reads — handle them

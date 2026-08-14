@@ -20,6 +20,7 @@ preserved.
 from __future__ import annotations
 
 import logging
+import math
 import os
 import re
 import sys
@@ -1690,6 +1691,38 @@ def init_agent(
         _agent_cfg = _load_agent_config()
     except Exception:
         _agent_cfg = {}
+
+    _agent_section = (
+        _agent_cfg.get("agent", {}) if isinstance(_agent_cfg, dict) else {}
+    )
+    if not isinstance(_agent_section, dict):
+        _agent_section = {}
+    try:
+        _sequential_timeout = float(
+            _agent_section.get("sequential_tool_timeout", 420)
+        )
+    except (TypeError, ValueError):
+        _sequential_timeout = 420.0
+    if not math.isfinite(_sequential_timeout):
+        _sequential_timeout = 420.0
+    agent.sequential_tool_timeout_s = (
+        _sequential_timeout if _sequential_timeout > 0 else None
+    )
+    try:
+        _abandoned_worker_cap = int(
+            _agent_section.get("max_abandoned_tool_workers", 2)
+        )
+    except (TypeError, ValueError, OverflowError):
+        _abandoned_worker_cap = 2
+    agent.max_abandoned_tool_workers = max(1, min(_abandoned_worker_cap, 16))
+    # Event -> may-have-side-effect. Effectful abandoned workers quarantine
+    # later mutations across model rounds until they actually exit.
+    # ``None`` marks an atomically reserved slot for an in-flight supervised
+    # call; a bool marks a timed-out worker and whether it may have side effects.
+    agent._abandoned_tool_workers: dict[threading.Event, bool | None] = {}
+    agent._abandoned_tool_workers_lock = threading.Lock()
+    agent._detached_post_hook_events: set[threading.Event] = set()
+    agent._detached_post_hook_events_lock = threading.Lock()
 
     # Codex commentary visibility (display.show_commentary, default true).
     # When true, completed Codex phase=commentary messages are delivered as

@@ -1008,11 +1008,32 @@ Instead, when the budget is actually exhausted (500/500), Hermes injects one mes
 agent:
   max_turns: 500               # Max iterations per conversation turn (default: 500)
   api_max_retries: 3           # Retries per provider before fallback engages (default: 3)
+  sequential_tool_timeout: 420 # Max seconds for one non-interactive sequential tool (0 = unlimited)
+  max_abandoned_tool_workers: 2 # Per-agent cap for timed-out workers that have not exited
 ```
 
 When the iteration budget is fully exhausted, the CLI shows a notification to the user: `⚠ Iteration budget reached (500/500) — response may be incomplete`.
 
 `agent.api_max_retries` controls how many times Hermes retries a provider API call on transient errors (rate limits, connection drops, 5xx) **before** fallback-provider switching engages. The default is `3` — four attempts total. If you have [fallback providers](/user-guide/features/fallback-providers) configured and want to fail over faster, drop this to `0` so the first transient error on your primary immediately hands off to the fallback instead of churning retries against the flaky endpoint.
+
+`agent.sequential_tool_timeout` prevents one stalled tool handler, transport, or
+plugin middleware from owning the conversation thread indefinitely. The default
+is 420 seconds. Approval time is excluded from this budget, and tools that wait
+for a direct human response (`clarify` and the Desktop `setup_mcp` card) retain
+their own lifecycle timeouts. When a dispatched call exceeds the deadline,
+Hermes records an `unknown` effect disposition and skips later calls from the
+same model batch so a late side effect cannot be reordered behind them.
+
+Python cannot forcibly terminate an arbitrary running thread safely. Hermes
+signals timed-out workers cooperatively and detaches those that do not stop;
+`agent.max_abandoned_tool_workers` bounds those detached workers per agent
+(default `2`, clamped to `1`–`16`). Once the cap is reached, subsequent
+non-interactive sequential calls fail without starting until an abandoned
+worker exits. When the abandoned tool may have side effects, later effectful
+tools are quarantined even below the cap; read-only diagnostics remain
+available. This prevents cross-round mutation reordering and protects
+long-running gateway processes from unbounded thread growth while preserving
+the conversation's ability to return a result.
 
 ## Verify-on-Stop (coding verification)
 

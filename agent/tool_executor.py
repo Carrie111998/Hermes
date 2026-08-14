@@ -109,6 +109,9 @@ _START_ORDER_GATE_TIMEOUT_S = 120.0
 # answering an approval prompt, which self-terminates at approvals.timeout —
 # so a holder that overstays it is wedged and must not starve the batch.
 _AUTHORIZATION_GATE_LOCK_TIMEOUT_S = 360.0
+_SEQUENTIAL_WAIT_POLL_S = 0.05
+_SYNTHETIC_POST_HOOK_GRACE_S = 0.25
+_HUMAN_RESPONSE_TOOLS = frozenset({"clarify", "setup_mcp"})
 
 
 def _authorization_gate_lock_timeout() -> float:
@@ -136,6 +139,32 @@ class _BatchAbandoned(BaseException):
     Derives from BaseException so intermediate ``except Exception`` handlers in
     the middleware chain cannot swallow it and dispatch the tool anyway.
     """
+
+
+class _SequentialCallAbandoned(BaseException):
+    """Stop a worker that reaches dispatch after its owner has moved on."""
+
+
+class _SequentialTerminalResult(str):
+    """Synthetic terminal result plus the metadata needed by the owner."""
+
+    def __new__(
+        cls,
+        value: str,
+        *,
+        status: str,
+        error_type: str,
+        effect_disposition: str,
+        dispatched: bool,
+        duration_s: float,
+    ):
+        instance = super().__new__(cls, value)
+        instance.status = status
+        instance.error_type = error_type
+        instance.effect_disposition = effect_disposition
+        instance.dispatched = dispatched
+        instance.duration_s = duration_s
+        return instance
 
 
 def _parse_tool_arguments(raw_arguments: Any) -> tuple[dict, Optional[str]]:
@@ -289,6 +318,66 @@ def _emit_terminal_post_tool_call(
         )
     except Exception:
         pass
+
+
+def _run_bounded_post_tool_hook(agent, callback, *, function_name: str) -> None:
+    """Run one observer with bounded waiting and bounded detached threads."""
+    lock = getattr(agent, "_detached_post_hook_events_lock", None)
+    events = getattr(agent, "_detached_post_hook_events", None)
+    if lock is None or events is None:
+        lock = threading.Lock()
+        events = set()
+        agent._detached_post_hook_events_lock = lock
+        agent._detached_post_hook_events = events
+
+    done = threading.Event()
+    with lock:
+        events.difference_update(event for event in events if event.is_set())
+        if events:
+            logger.warning(
+                "Skipping post_tool_call for %s: prior hook is still running",
+                function_name,
+            )
+            return
+        events.add(done)
+
+    def _run() -> None:
+        try:
+            callback()
+        except Exception as exc:
+            logger.debug("post_tool_call hook error: %s", exc)
+        finally:
+            done.set()
+            with lock:
+                events.discard(done)
+
+    worker = threading.Thread(
+        target=propagate_context_to_thread(_run),
+        name="hermes-post-tool-hook",
+        daemon=True,
+    )
+    worker.start()
+    if not done.wait(_SYNTHETIC_POST_HOOK_GRACE_S):
+        logger.warning(
+            "Detached a slow post_tool_call hook for %s",
+            function_name,
+        )
+
+
+def _emit_bounded_post_tool_call(agent, **kwargs) -> None:
+    """Emit an owner-generated terminal hook without re-wedging the turn."""
+    try:
+        from hermes_cli.lifecycle import has_hook
+
+        if not has_hook("post_tool_call"):
+            return
+    except Exception:
+        return
+    _run_bounded_post_tool_hook(
+        agent,
+        lambda: _emit_terminal_post_tool_call(agent, **kwargs),
+        function_name=kwargs.get("function_name", "unknown"),
+    )
 
 
 def _cancelled_tool_result(reason: str = "user interrupt") -> str:
@@ -480,6 +569,331 @@ def _managed_values(
     )
 
 
+def _has_abandoned_effect_worker(agent) -> bool:
+    """Prune completed workers and report a still-live unknown effect."""
+    lock = getattr(agent, "_abandoned_tool_workers_lock", None)
+    workers = getattr(agent, "_abandoned_tool_workers", None)
+    if lock is None or workers is None:
+        return False
+    with lock:
+        if isinstance(workers, set):
+            workers = {event: True for event in workers}
+            agent._abandoned_tool_workers = workers
+        for event in [event for event in workers if event.is_set()]:
+            workers.pop(event, None)
+        return any(workers.values())
+
+
+class _SequentialToolSupervisor:
+    """Own one sequential call without letting it own the conversation thread.
+
+    Python cannot safely kill a running thread. Containment therefore has three
+    layers: a pre-dispatch fence, cooperative interrupt fan-out after dispatch,
+    and a per-agent budget for workers that still do not return. Human approval
+    time is measured at its source and excluded from the deadline, matching the
+    concurrent executor's contract.
+    """
+
+    def __init__(
+        self,
+        agent,
+        *,
+        function_name: str,
+        authorization_gate: _ConcurrentToolAuthorizationGate,
+        suspend_deadline_after_dispatch: bool = False,
+    ) -> None:
+        self.agent = agent
+        self.function_name = function_name
+        self.authorization_gate = authorization_gate
+        self.suspend_deadline_after_dispatch = suspend_deadline_after_dispatch
+        self.timeout_s = getattr(agent, "sequential_tool_timeout_s", 420.0)
+        self._state_lock = threading.Lock()
+        self._abandoned = False
+        self._dispatched = False
+        self._execution_terminal = False
+        self._human_wait_started: float | None = None
+        self._human_excluded_s = 0.0
+        self._observer_wait_started: float | None = None
+        self._observer_excluded_s = 0.0
+        self._worker_tid: int | None = None
+        self._done = threading.Event()
+        self._reservation_error_type = "abandoned_worker_capacity"
+
+    def begin_execution(self, callback=None) -> None:
+        """Atomically fence dispatch once the owner synthesized a result."""
+        with self._state_lock:
+            if self._abandoned:
+                raise _SequentialCallAbandoned(self.function_name)
+            self._dispatched = True
+            if self.suspend_deadline_after_dispatch:
+                self._human_wait_started = time.monotonic()
+        if callback is not None:
+            callback()
+
+    def mark_execution_terminal(self) -> None:
+        """Resume a human tool's deadline once its handler has returned."""
+        with self._state_lock:
+            if self._execution_terminal:
+                return
+            self._execution_terminal = True
+            if self._human_wait_started is not None:
+                self._human_excluded_s += max(
+                    0.0, time.monotonic() - self._human_wait_started
+                )
+                self._human_wait_started = None
+
+    def dispatch_post_hook(self, callback) -> None:
+        """Preserve fast-hook ordering but detach a hook that could wedge."""
+        started = time.monotonic()
+        with self._state_lock:
+            if self._abandoned:
+                return
+            if not self._execution_terminal:
+                self._execution_terminal = True
+                if self._human_wait_started is not None:
+                    self._human_excluded_s += max(
+                        0.0, started - self._human_wait_started
+                    )
+                    self._human_wait_started = None
+            self._observer_wait_started = started
+        try:
+            _run_bounded_post_tool_hook(
+                self.agent,
+                callback,
+                function_name=self.function_name,
+            )
+        finally:
+            finished = time.monotonic()
+            with self._state_lock:
+                if self._observer_wait_started is not None:
+                    self._observer_excluded_s += max(
+                        0.0, finished - self._observer_wait_started
+                    )
+                    self._observer_wait_started = None
+
+    def _worker(self, callback):
+        worker_tid = threading.current_thread().ident
+        with self._state_lock:
+            self._worker_tid = worker_tid
+            abandoned = self._abandoned
+        with self.agent._tool_worker_threads_lock:
+            self.agent._tool_worker_threads.add(worker_tid)
+        if abandoned or self.agent._interrupt_requested:
+            try:
+                _ra()._set_interrupt(True, worker_tid)
+            except Exception:
+                pass
+        try:
+            return callback()
+        finally:
+            self._done.set()
+            with self.agent._tool_worker_threads_lock:
+                self.agent._tool_worker_threads.discard(worker_tid)
+            try:
+                _ra()._set_interrupt(False, worker_tid)
+            except Exception:
+                pass
+
+    def _try_reserve_worker(self) -> bool:
+        from agent.tool_result_classification import tool_may_have_side_effect
+
+        lock = getattr(self.agent, "_abandoned_tool_workers_lock", None)
+        workers = getattr(self.agent, "_abandoned_tool_workers", None)
+        if lock is None or workers is None:
+            self.agent._abandoned_tool_workers_lock = threading.Lock()
+            self.agent._abandoned_tool_workers = {}
+            lock = self.agent._abandoned_tool_workers_lock
+            workers = self.agent._abandoned_tool_workers
+        with lock:
+            if isinstance(workers, set):
+                # Compatibility for test doubles and in-process agents created
+                # before this field became effect-aware.
+                workers = {event: True for event in workers}
+                self.agent._abandoned_tool_workers = workers
+            for event in [event for event in workers if event.is_set()]:
+                workers.pop(event, None)
+            if tool_may_have_side_effect(self.function_name) and any(workers.values()):
+                self._reservation_error_type = "abandoned_effect_quarantine"
+                return False
+            cap = max(1, int(getattr(self.agent, "max_abandoned_tool_workers", 2)))
+            if len(workers) >= cap:
+                self._reservation_error_type = "abandoned_worker_capacity"
+                return False
+            # Reserve before submission while holding the same lock used by
+            # competing owners. ``None`` is active but not quarantined; on a
+            # timeout it is atomically promoted to an abandoned-worker record.
+            workers[self._done] = None
+            return True
+
+    def _release_worker_reservation(self) -> None:
+        lock = getattr(self.agent, "_abandoned_tool_workers_lock", None)
+        workers = getattr(self.agent, "_abandoned_tool_workers", None)
+        if lock is None or workers is None:
+            return
+        with lock:
+            workers.pop(self._done, None)
+
+    def _remember_abandoned_worker(self) -> None:
+        from agent.tool_result_classification import tool_may_have_side_effect
+
+        with self.agent._abandoned_tool_workers_lock:
+            if self._done.is_set():
+                self.agent._abandoned_tool_workers.pop(self._done, None)
+                return
+            self.agent._abandoned_tool_workers[self._done] = tool_may_have_side_effect(
+                self.function_name
+            )
+
+    def _synthetic(
+        self,
+        message: str,
+        *,
+        status: str,
+        error_type: str,
+        started_at: float,
+    ) -> _ManagedToolResult:
+        with self._state_lock:
+            dispatched = self._dispatched
+        result = _SequentialTerminalResult(
+            message,
+            status=status,
+            error_type=error_type,
+            effect_disposition="unknown" if dispatched else "none",
+            dispatched=dispatched,
+            duration_s=max(0.0, time.monotonic() - started_at),
+        )
+        return _ManagedToolResult(
+            result=result,
+            args={},
+            middleware_trace=[],
+            blocked=False,
+            dispatched=dispatched,
+        )
+
+    def run(self, callback) -> _ManagedToolResult:
+        if self.timeout_s is None:
+            return callback()
+        if not self._try_reserve_worker():
+            detail = (
+                "an earlier effectful tool is still running after timeout; "
+                "tool was not started"
+                if self._reservation_error_type == "abandoned_effect_quarantine"
+                else "abandoned worker capacity reached; tool was not started"
+            )
+            return self._synthetic(
+                f"Error executing tool '{self.function_name}': {detail}",
+                status="error",
+                error_type=self._reservation_error_type,
+                started_at=time.monotonic(),
+            )
+
+        from tools.daemon_pool import DaemonThreadPoolExecutor
+
+        started_at = time.monotonic()
+        deadline = started_at + float(self.timeout_s)
+        executor = DaemonThreadPoolExecutor(max_workers=1)
+        from model_tools import (
+            _reset_post_tool_call_dispatcher,
+            _reset_tool_handler_terminal_callback,
+            _set_post_tool_call_dispatcher,
+            _set_tool_handler_terminal_callback,
+        )
+
+        dispatcher_token = _set_post_tool_call_dispatcher(self.dispatch_post_hook)
+        terminal_token = _set_tool_handler_terminal_callback(
+            self.mark_execution_terminal
+        )
+        try:
+            worker = propagate_context_to_thread(self._worker)
+        finally:
+            _reset_tool_handler_terminal_callback(terminal_token)
+            _reset_post_tool_call_dispatcher(dispatcher_token)
+        try:
+            future = executor.submit(worker, callback)
+        except BaseException:
+            self._release_worker_reservation()
+            executor.shutdown(wait=False, cancel_futures=True)
+            raise
+        abandon = False
+        try:
+            while True:
+                with self._state_lock:
+                    waiting_for_human = (
+                        self.suspend_deadline_after_dispatch
+                        and self._dispatched
+                        and not self._execution_terminal
+                    )
+                    human_excluded = self._human_excluded_s
+                    if self._human_wait_started is not None:
+                        human_excluded += max(
+                            0.0, time.monotonic() - self._human_wait_started
+                        )
+                    observer_excluded = self._observer_excluded_s
+                    if self._observer_wait_started is not None:
+                        observer_excluded += max(
+                            0.0, time.monotonic() - self._observer_wait_started
+                        )
+                if waiting_for_human:
+                    remaining = _SEQUENTIAL_WAIT_POLL_S
+                else:
+                    effective_deadline = (
+                        deadline
+                        + self.authorization_gate.excluded_seconds()
+                        + human_excluded
+                        + observer_excluded
+                    )
+                    remaining = effective_deadline - time.monotonic()
+                    if remaining <= 0:
+                        if future.done():
+                            return future.result()
+                        with self._state_lock:
+                            self._abandoned = True
+                        abandon = True
+                        reason = "timeout"
+                        break
+                try:
+                    return future.result(
+                        timeout=min(_SEQUENTIAL_WAIT_POLL_S, remaining)
+                    )
+                except concurrent.futures.TimeoutError:
+                    if self.agent._interrupt_requested:
+                        with self._state_lock:
+                            self._abandoned = True
+                        abandon = True
+                        reason = "interrupt"
+                        break
+        finally:
+            if not abandon:
+                self._release_worker_reservation()
+                executor.shutdown(wait=True, cancel_futures=False)
+
+        with self._state_lock:
+            self._abandoned = True
+            worker_tid = self._worker_tid
+        future.cancel()
+        if worker_tid is not None:
+            try:
+                _ra()._set_interrupt(True, worker_tid)
+            except Exception:
+                pass
+        self._remember_abandoned_worker()
+        executor.shutdown(wait=False, cancel_futures=True)
+
+        if reason == "interrupt":
+            return self._synthetic(
+                f"[Tool execution cancelled — {self.function_name} was interrupted by the user]",
+                status="cancelled",
+                error_type="user_interrupt",
+                started_at=started_at,
+            )
+        return self._synthetic(
+            f"Error executing tool '{self.function_name}': timed out after {float(self.timeout_s):.1f}s",
+            status="timeout",
+            error_type="tool_timeout",
+            started_at=started_at,
+        )
+
+
 def _run_agent_tool_execution_middleware(
     agent,
     *,
@@ -492,6 +906,7 @@ def _run_agent_tool_execution_middleware(
     display_index: int | None = None,
     middleware_trace: list[dict[str, Any]] | None = None,
     begin_execution=None,
+    execution_completed=None,
     authorization_gate: _ConcurrentToolAuthorizationGate | None = None,
 ) -> _ManagedToolResult:
     """Run Relay rewrites before Hermes policy and dispatch exactly once."""
@@ -608,7 +1023,11 @@ def _run_agent_tool_execution_middleware(
             agent._iters_since_skill = 0
 
         _advance_start_order(_begin)
-        return execute(final_args)
+        try:
+            return execute(final_args)
+        finally:
+            if execution_completed is not None:
+                execution_completed()
 
     def _hermes_pipeline(relay_args: dict[str, Any]) -> Any:
         request_result = apply_tool_request_middleware(
@@ -661,6 +1080,33 @@ def _run_agent_tool_execution_middleware(
         blocked=bool(state["blocked"]),
         dispatched=bool(state["dispatched"]),
     )
+
+
+def _run_sequential_tool_execution_middleware(
+    agent,
+    **kwargs,
+) -> _ManagedToolResult:
+    """Apply one deadline to the complete sequential middleware/dispatch path."""
+    function_name = kwargs["function_name"]
+    authorization_gate = _ConcurrentToolAuthorizationGate(
+        session_key=getattr(agent, "session_id", None)
+    )
+    supervisor = _SequentialToolSupervisor(
+        agent,
+        function_name=function_name,
+        authorization_gate=authorization_gate,
+        suspend_deadline_after_dispatch=function_name in _HUMAN_RESPONSE_TOOLS,
+    )
+    kwargs["begin_execution"] = supervisor.begin_execution
+    kwargs["authorization_gate"] = authorization_gate
+    kwargs["execution_completed"] = supervisor.mark_execution_terminal
+    outcome = supervisor.run(
+        lambda: _run_agent_tool_execution_middleware(agent, **kwargs)
+    )
+    if isinstance(outcome.result, _SequentialTerminalResult):
+        outcome.args = kwargs["function_args"]
+        outcome.middleware_trace = list(kwargs.get("middleware_trace") or [])
+    return outcome
 
 
 def _begin_tool_execution(
@@ -1610,6 +2056,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
     """
     # Resolve the context-scaled tool-output budget once per turn.
     _tool_budget = _budget_for_agent(agent)
+    batch_abandoned = False
     for i, tool_call in enumerate(assistant_message.tool_calls, 1):
         if getattr(agent, "_incremental_persistence_failed", False):
             return
@@ -1632,7 +2079,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     skipped_tc.id,
                     effect_disposition="none",
                 ))
-                _emit_terminal_post_tool_call(
+                _emit_bounded_post_tool_call(
                     agent,
                     function_name=skipped_name,
                     function_args={},
@@ -1657,7 +2104,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             tool_call.function.arguments
         )
         if malformed_args_result is not None:
-            _emit_terminal_post_tool_call(
+            _emit_bounded_post_tool_call(
                 agent,
                 function_name=function_name,
                 function_args=function_args,
@@ -1734,7 +2181,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     merge=next_args.get("merge", False),
                     store=agent._todo_store,
                 )
-            function_result, function_args, middleware_trace, _execution_blocked, _execution_dispatched = _managed_values(_run_agent_tool_execution_middleware(
+            function_result, function_args, middleware_trace, _execution_blocked, _execution_dispatched = _managed_values(_run_sequential_tool_execution_middleware(
                 agent,
                 function_name=function_name,
                 function_args=function_args,
@@ -1765,7 +2212,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     db=session_db,
                     current_session_id=agent.session_id,
                 )
-            function_result, function_args, middleware_trace, _execution_blocked, _execution_dispatched = _managed_values(_run_agent_tool_execution_middleware(
+            function_result, function_args, middleware_trace, _execution_blocked, _execution_dispatched = _managed_values(_run_sequential_tool_execution_middleware(
                 agent,
                 function_name=function_name,
                 function_args=function_args,
@@ -1804,7 +2251,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                         ),
                     )
                 return result
-            function_result, function_args, middleware_trace, _execution_blocked, _execution_dispatched = _managed_values(_run_agent_tool_execution_middleware(
+            function_result, function_args, middleware_trace, _execution_blocked, _execution_dispatched = _managed_values(_run_sequential_tool_execution_middleware(
                 agent,
                 function_name=function_name,
                 function_args=function_args,
@@ -1826,7 +2273,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     multi_select=next_args.get("multi_select", False),
                     callback=agent.clarify_callback,
                 )
-            function_result, function_args, middleware_trace, _execution_blocked, _execution_dispatched = _managed_values(_run_agent_tool_execution_middleware(
+            function_result, function_args, middleware_trace, _execution_blocked, _execution_dispatched = _managed_values(_run_sequential_tool_execution_middleware(
                 agent,
                 function_name=function_name,
                 function_args=function_args,
@@ -1847,7 +2294,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     count=next_args.get("count"),
                     callback=getattr(agent, "read_terminal_callback", None),
                 )
-            function_result, function_args, middleware_trace, _execution_blocked, _execution_dispatched = _managed_values(_run_agent_tool_execution_middleware(
+            function_result, function_args, middleware_trace, _execution_blocked, _execution_dispatched = _managed_values(_run_sequential_tool_execution_middleware(
                 agent,
                 function_name=function_name,
                 function_args=function_args,
@@ -1868,7 +2315,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     count=next_args.get("count"),
                     callback=getattr(agent, "read_preview_callback", None),
                 )
-            function_result, function_args, middleware_trace, _execution_blocked, _execution_dispatched = _managed_values(_run_agent_tool_execution_middleware(
+            function_result, function_args, middleware_trace, _execution_blocked, _execution_dispatched = _managed_values(_run_sequential_tool_execution_middleware(
                 agent,
                 function_name=function_name,
                 function_args=function_args,
@@ -1887,7 +2334,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 return _read_window_below_tool(
                     callback=getattr(agent, "read_window_below_callback", None),
                 )
-            function_result, function_args, middleware_trace, _execution_blocked, _execution_dispatched = _managed_values(_run_agent_tool_execution_middleware(
+            function_result, function_args, middleware_trace, _execution_blocked, _execution_dispatched = _managed_values(_run_sequential_tool_execution_middleware(
                 agent,
                 function_name=function_name,
                 function_args=function_args,
@@ -1909,7 +2356,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     reason=next_args.get("reason", ""),
                     callback=getattr(agent, "setup_mcp_callback", None),
                 )
-            function_result, function_args, middleware_trace, _execution_blocked, _execution_dispatched = _managed_values(_run_agent_tool_execution_middleware(
+            function_result, function_args, middleware_trace, _execution_blocked, _execution_dispatched = _managed_values(_run_sequential_tool_execution_middleware(
                 agent,
                 function_name=function_name,
                 function_args=function_args,
@@ -1946,7 +2393,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             try:
                 def _execute(next_args: dict) -> Any:
                     return agent._dispatch_delegate_task(next_args)
-                function_result, function_args, middleware_trace, _execution_blocked, _execution_dispatched = _managed_values(_run_agent_tool_execution_middleware(
+                function_result, function_args, middleware_trace, _execution_blocked, _execution_dispatched = _managed_values(_run_sequential_tool_execution_middleware(
                     agent,
                     function_name=function_name,
                     function_args=function_args,
@@ -1979,7 +2426,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             try:
                 def _execute(next_args: dict) -> Any:
                     return agent.context_compressor.handle_tool_call(function_name, next_args, messages=messages)
-                function_result, function_args, middleware_trace, _execution_blocked, _execution_dispatched = _managed_values(_run_agent_tool_execution_middleware(
+                function_result, function_args, middleware_trace, _execution_blocked, _execution_dispatched = _managed_values(_run_sequential_tool_execution_middleware(
                     agent,
                     function_name=function_name,
                     function_args=function_args,
@@ -2015,7 +2462,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             try:
                 def _execute(next_args: dict) -> Any:
                     return agent._memory_manager.handle_tool_call(function_name, next_args)
-                function_result, function_args, middleware_trace, _execution_blocked, _execution_dispatched = _managed_values(_run_agent_tool_execution_middleware(
+                function_result, function_args, middleware_trace, _execution_blocked, _execution_dispatched = _managed_values(_run_sequential_tool_execution_middleware(
                     agent,
                     function_name=function_name,
                     function_args=function_args,
@@ -2077,7 +2524,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     _execution_blocked,
                     _execution_dispatched,
                 ) = _managed_values(
-                    _run_agent_tool_execution_middleware(
+                    _run_sequential_tool_execution_middleware(
                         agent,
                         function_name=function_name,
                         function_args=function_args,
@@ -2156,7 +2603,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     _execution_blocked,
                     _execution_dispatched,
                 ) = _managed_values(
-                    _run_agent_tool_execution_middleware(
+                    _run_sequential_tool_execution_middleware(
                         agent,
                         function_name=function_name,
                         function_args=function_args,
@@ -2208,22 +2655,18 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         # Log tool errors to the persistent error log so [error] tags
         # in the UI always have a corresponding detailed entry on disk.
         _is_error_result, _ = _detect_tool_failure(function_name, function_result)
-        # The agent-runtime tools above (todo, session_search, memory,
-        # context-engine, memory-manager, clarify, delegate_task) are
-        # dispatched inline — they never reach handle_function_call, so the
-        # executor is the one that has to fire post_tool_call. For
-        # registry-dispatched tools the else-branch above invoked
-        # handle_function_call, which already fires the hook.
-        from agent.agent_runtime_helpers import agent_runtime_owns_post_tool_hook
-        _executor_must_emit_post_hook = (
-            not _execution_blocked
-            and (
-                not _execution_dispatched
-                or agent_runtime_owns_post_tool_hook(agent, function_name)
-            )
+        _synthetic_terminal = isinstance(
+            function_result, _SequentialTerminalResult
         )
-        if _executor_must_emit_post_hook:
-            _emit_terminal_post_tool_call(
+        _synthetic_effect_disposition = (
+            function_result.effect_disposition if _synthetic_terminal else None
+        )
+        _synthetic_dispatched = (
+            function_result.dispatched if _synthetic_terminal else False
+        )
+        if _synthetic_terminal:
+            tool_duration = function_result.duration_s
+            _emit_bounded_post_tool_call(
                 agent,
                 function_name=function_name,
                 function_args=function_args,
@@ -2231,9 +2674,33 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 effective_task_id=effective_task_id,
                 tool_call_id=getattr(tool_call, "id", "") or "",
                 duration_ms=int(tool_duration * 1000),
+                status=function_result.status,
+                error_type=function_result.error_type,
+                error_message=str(function_result),
                 middleware_trace=list(middleware_trace),
             )
-        if not _execution_blocked:
+        else:
+            from agent.agent_runtime_helpers import agent_runtime_owns_post_tool_hook
+
+            _executor_must_emit_post_hook = (
+                not _execution_blocked
+                and (
+                    not _execution_dispatched
+                    or agent_runtime_owns_post_tool_hook(agent, function_name)
+                )
+            )
+            if _executor_must_emit_post_hook:
+                _emit_bounded_post_tool_call(
+                    agent,
+                    function_name=function_name,
+                    function_args=function_args,
+                    result=function_result,
+                    effective_task_id=effective_task_id,
+                    tool_call_id=getattr(tool_call, "id", "") or "",
+                    duration_ms=int(tool_duration * 1000),
+                    middleware_trace=list(middleware_trace),
+                )
+        if not _execution_blocked and not _synthetic_terminal:
             function_result = agent._append_guardrail_observation(
                 function_name,
                 function_args,
@@ -2252,7 +2719,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         # the concurrent path for the rationale; both paths must feed
         # the same state so the footer reflects every tool call in the
         # turn, not just the parallel ones.
-        if not _execution_blocked:
+        if not _execution_blocked and not _synthetic_terminal:
             try:
                 agent._record_file_mutation_result(
                     function_name, function_args, function_result, _is_error_result,
@@ -2289,7 +2756,12 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         # Unwrap _multimodal dicts to an OpenAI-style content list
         # (see parallel path for rationale). String results pass through.
         _tool_content = agent._tool_result_content_for_active_model(function_name, function_result)
-        tool_message = make_tool_result_message(function_name, _tool_content, tool_call.id)
+        tool_message = make_tool_result_message(
+            function_name,
+            _tool_content,
+            tool_call.id,
+            effect_disposition=_synthetic_effect_disposition,
+        )
         messages.append(tool_message)
         risk_metadata = tool_message.get("_tool_output_risk")
         if not _flush_session_db_after_tool_progress(
@@ -2352,17 +2824,52 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 response_preview = _fr_str[:agent.log_prefix_chars] + "..." if len(_fr_str) > agent.log_prefix_chars else _fr_str
                 print(f"  ✅ Tool {i} completed in {tool_duration:.2f}s - {response_preview}")
 
-        if agent._interrupt_requested and i < len(assistant_message.tool_calls):
+        if _synthetic_terminal and _synthetic_dispatched:
+            # The worker may still apply an effect. Preserve the sequential
+            # ordering contract by refusing to start later calls in this batch.
+            batch_abandoned = True
+
+        if (
+            (agent._interrupt_requested or batch_abandoned)
+            and i < len(assistant_message.tool_calls)
+        ):
             remaining = len(assistant_message.tool_calls) - i
-            agent._vprint(f"{agent.log_prefix}⚡ Interrupt: skipping {remaining} remaining tool call(s)", force=True)
+            reason = (
+                "an earlier tool timed out with an unknown effect"
+                if batch_abandoned
+                else "user interrupt"
+            )
+            agent._vprint(
+                f"{agent.log_prefix}⚡ Skipping {remaining} remaining tool call(s): {reason}",
+                force=True,
+            )
             for skipped_tc in assistant_message.tool_calls[i:]:
                 skipped_name = skipped_tc.function.name
+                skipped_result = (
+                    f"[Tool execution skipped — {skipped_name} was not started "
+                    f"due to {reason}]"
+                )
                 messages.append(make_tool_result_message(
                     skipped_name,
-                    f"[Tool execution skipped — {skipped_name} was not started. User sent a new message]",
+                    skipped_result,
                     skipped_tc.id,
                     effect_disposition="none",
                 ))
+                _emit_bounded_post_tool_call(
+                    agent,
+                    function_name=skipped_name,
+                    function_args={},
+                    result=skipped_result,
+                    effective_task_id=effective_task_id,
+                    tool_call_id=getattr(skipped_tc, "id", "") or "",
+                    status="cancelled",
+                    error_type=(
+                        "prior_tool_unknown_effect"
+                        if batch_abandoned
+                        else "user_interrupt"
+                    ),
+                    error_message=reason,
+                )
                 if not _flush_session_db_after_tool_progress(
                     agent,
                     messages,
@@ -2384,6 +2891,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
     # applied to sequential execution as well.
     if finalize and num_tools_seq > 0:
         agent._apply_pending_steer_to_tool_results(messages, num_tools_seq)
+    return batch_abandoned
 
 
 
@@ -2418,7 +2926,13 @@ def execute_tool_calls_segmented(agent, assistant_message, messages: list, effec
         _exec_cwd = Path(_active_env.cwd) if _active_env is not None and _active_env.cwd else None
         segments = _plan_tool_batch_segments(assistant_message.tool_calls, execution_cwd=_exec_cwd)
 
-    for kind, calls in segments:
+    # A detached effectful worker can finish in a later model round. Route the
+    # whole batch through the sequential supervisor while that quarantine is
+    # active so even tools that are normally parallel-safe cannot bypass it.
+    if _has_abandoned_effect_worker(agent):
+        segments = [("sequential", list(assistant_message.tool_calls))]
+
+    for segment_index, (kind, calls) in enumerate(segments):
         if getattr(agent, "_incremental_persistence_failed", False):
             return
         segment_message = SimpleNamespace(tool_calls=list(calls))
@@ -2428,10 +2942,47 @@ def execute_tool_calls_segmented(agent, assistant_message, messages: list, effec
                 finalize=False,
             )
         else:
-            execute_tool_calls_sequential(
+            batch_abandoned = execute_tool_calls_sequential(
                 agent, segment_message, messages, effective_task_id, api_call_count,
                 finalize=False,
             )
+            if batch_abandoned:
+                future_calls = [
+                    call
+                    for _future_kind, future_segment in segments[segment_index + 1:]
+                    for call in future_segment
+                ]
+                _append_cancelled_tool_results(
+                    messages,
+                    future_calls,
+                    reason="an earlier tool timed out with an unknown effect",
+                )
+                for skipped_tc in future_calls:
+                    skipped_name = skipped_tc.function.name
+                    _emit_bounded_post_tool_call(
+                        agent,
+                        function_name=skipped_name,
+                        function_args={},
+                        result=(
+                            f"[Tool execution cancelled — {skipped_name} was "
+                            "skipped due to an earlier tool timed out with an "
+                            "unknown effect]"
+                        ),
+                        effective_task_id=effective_task_id,
+                        tool_call_id=getattr(skipped_tc, "id", "") or "",
+                        status="cancelled",
+                        error_type="prior_tool_unknown_effect",
+                        error_message=(
+                            "An earlier tool timed out with an unknown effect"
+                        ),
+                    )
+                if future_calls:
+                    _flush_session_db_after_tool_progress(
+                        agent,
+                        messages,
+                        stage="skipped post-timeout tool results",
+                    )
+                break
 
         if getattr(agent, "_incremental_persistence_failed", False):
             return
