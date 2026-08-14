@@ -269,6 +269,7 @@ def _emit_terminal_post_tool_call(
     error_type: str | None = None,
     error_message: str | None = None,
     middleware_trace: Optional[list[dict[str, Any]]] = None,
+    transcript_path: str = "",
 ) -> None:
     try:
         from model_tools import _emit_post_tool_call_hook
@@ -286,6 +287,7 @@ def _emit_terminal_post_tool_call(
             error_type=error_type,
             error_message=error_message,
             middleware_trace=list(middleware_trace or []),
+            transcript_path=transcript_path,
         )
     except Exception:
         pass
@@ -312,6 +314,7 @@ def _emit_cancelled_terminal_post_tool_call(
     reason: str = "user interrupt",
     error_type: str = "keyboard_interrupt",
     middleware_trace: Optional[list[dict[str, Any]]] = None,
+    transcript_path: str = "",
 ) -> str:
     result = _cancelled_tool_result(reason)
     _emit_terminal_post_tool_call(
@@ -326,6 +329,7 @@ def _emit_cancelled_terminal_post_tool_call(
         error_type=error_type,
         error_message=f"Tool execution cancelled by {reason}",
         middleware_trace=list(middleware_trace or []),
+        transcript_path=transcript_path,
     )
     return result
 
@@ -493,6 +497,7 @@ def _run_agent_tool_execution_middleware(
     middleware_trace: list[dict[str, Any]] | None = None,
     begin_execution=None,
     authorization_gate: _ConcurrentToolAuthorizationGate | None = None,
+    transcript_path: str = "",
 ) -> _ManagedToolResult:
     """Run Relay rewrites before Hermes policy and dispatch exactly once."""
     from agent import relay_tools
@@ -556,6 +561,7 @@ def _run_agent_tool_execution_middleware(
                         api_request_id=getattr(agent, "_current_api_request_id", "")
                         or "",
                         middleware_trace=list(state["middleware_trace"]),
+                        transcript_path=transcript_path,
                     )
                 except Exception:
                     return None
@@ -599,6 +605,7 @@ def _run_agent_tool_execution_middleware(
                 error_type=error_type,
                 error_message=error_message,
                 middleware_trace=list(state["middleware_trace"]),
+                transcript_path=transcript_path,
             )
             return result
 
@@ -768,6 +775,9 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
     """
     tool_calls = assistant_message.tool_calls
     num_tools = len(tool_calls)
+    from agent.agent_runtime_helpers import tool_hook_transcript_path
+
+    transcript_path = tool_hook_transcript_path(agent, messages)
 
     # Resolve the context-scaled tool-output budget once per turn (cheap, but
     # avoids rebuilding it per result inside the loop below).
@@ -1052,6 +1062,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                     middleware_trace=middleware_trace,
                     begin_execution=_advance_start,
                     authorization_gate=authorization_gate,
+                    transcript_path=transcript_path,
                 )
                 result = managed.result
                 function_args = managed.args
@@ -1082,6 +1093,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                     tool_call_id=getattr(tool_call, "id", "") or "",
                     start_time=start,
                     middleware_trace=list(middleware_trace),
+                    transcript_path=transcript_path,
                 )
                 duration = time.time() - start
                 logger.info("tool %s cancelled (%.2fs)", function_name, duration)
@@ -1381,6 +1393,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 error_type="tool_timeout",
                 error_message=function_result,
                 middleware_trace=list(middleware_trace),
+                transcript_path=transcript_path,
             )
             tool_duration = float(timeout_s or 0.0)
         elif r is None:
@@ -1398,6 +1411,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                     error_type="keyboard_interrupt",
                     error_message="Tool execution cancelled by user interrupt",
                     middleware_trace=list(middleware_trace),
+                    transcript_path=transcript_path,
                 )
             else:
                 function_result = f"Error executing tool '{name}': thread did not return a result"
@@ -1412,6 +1426,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                     error_type="thread_missing_result",
                     error_message=function_result,
                     middleware_trace=list(middleware_trace),
+                    transcript_path=transcript_path,
                 )
             tool_duration = 0.0
         else:
@@ -1608,6 +1623,8 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
     and /steer injection — used when this call is one segment of a larger
     mixed batch and the segmented dispatcher owns the turn-end work.
     """
+    from agent.agent_runtime_helpers import tool_hook_transcript_path
+
     # Resolve the context-scaled tool-output budget once per turn.
     _tool_budget = _budget_for_agent(agent)
     for i, tool_call in enumerate(assistant_message.tool_calls, 1):
@@ -1720,6 +1737,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         except Exception:
             pass
 
+        transcript_path = tool_hook_transcript_path(agent, messages)
         middleware_trace: list[dict[str, Any]] = []
         _execution_blocked = False
         _execution_dispatched = False
@@ -1743,6 +1761,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 execute=_execute,
                 scope_block=_ts_scope_block,
                 display_index=i,
+                transcript_path=transcript_path,
             ))
             tool_duration = time.time() - tool_start_time
             if agent._should_emit_quiet_tool_messages():
@@ -1774,6 +1793,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 execute=_execute,
                 scope_block=_ts_scope_block,
                 display_index=i,
+                transcript_path=transcript_path,
             ))
             tool_duration = time.time() - tool_start_time
             if agent._should_emit_quiet_tool_messages():
@@ -1813,6 +1833,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 execute=_execute,
                 scope_block=_ts_scope_block,
                 display_index=i,
+                transcript_path=transcript_path,
             ))
             tool_duration = time.time() - tool_start_time
             if agent._should_emit_quiet_tool_messages():
@@ -1835,6 +1856,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 execute=_execute,
                 scope_block=_ts_scope_block,
                 display_index=i,
+                transcript_path=transcript_path,
             ))
             tool_duration = time.time() - tool_start_time
             if agent._should_emit_quiet_tool_messages():
@@ -1856,6 +1878,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 execute=_execute,
                 scope_block=_ts_scope_block,
                 display_index=i,
+                transcript_path=transcript_path,
             ))
             tool_duration = time.time() - tool_start_time
             if agent._should_emit_quiet_tool_messages():
@@ -1955,6 +1978,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     execute=_execute,
                     scope_block=_ts_scope_block,
                     display_index=i,
+                    transcript_path=transcript_path,
                 ))
                 _delegate_result = function_result
             finally:
@@ -1988,6 +2012,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     execute=_execute,
                     scope_block=_ts_scope_block,
                     display_index=i,
+                    transcript_path=transcript_path,
                 ))
                 _ce_result = function_result
             except Exception as tool_error:
@@ -2024,6 +2049,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     execute=_execute,
                     scope_block=_ts_scope_block,
                     display_index=i,
+                    transcript_path=transcript_path,
                 ))
                 _mem_result = function_result
             except Exception as tool_error:
@@ -2068,6 +2094,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                         tool_request_middleware_trace=list(middleware_trace),
                         enabled_toolsets=getattr(agent, "enabled_toolsets", None),
                         disabled_toolsets=getattr(agent, "disabled_toolsets", None),
+                        transcript_path=transcript_path,
                     )
 
                 (
@@ -2087,6 +2114,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                         scope_block=_ts_scope_block,
                         display_index=i,
                         middleware_trace=middleware_trace,
+                        transcript_path=transcript_path,
                     )
                 )
                 _spinner_result = function_result
@@ -2099,6 +2127,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     tool_call_id=getattr(tool_call, "id", "") or "",
                     start_time=tool_start_time,
                     middleware_trace=list(middleware_trace),
+                    transcript_path=transcript_path,
                 )
                 _spinner_result = function_result
                 try:
@@ -2147,6 +2176,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                         tool_request_middleware_trace=list(middleware_trace),
                         enabled_toolsets=getattr(agent, "enabled_toolsets", None),
                         disabled_toolsets=getattr(agent, "disabled_toolsets", None),
+                        transcript_path=transcript_path,
                     )
 
                 (
@@ -2166,6 +2196,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                         scope_block=_ts_scope_block,
                         display_index=i,
                         middleware_trace=middleware_trace,
+                        transcript_path=transcript_path,
                     )
                 )
             except KeyboardInterrupt:
@@ -2177,6 +2208,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     tool_call_id=getattr(tool_call, "id", "") or "",
                     start_time=tool_start_time,
                     middleware_trace=list(middleware_trace),
+                    transcript_path=transcript_path,
                 )
                 try:
                     agent.interrupt("keyboard interrupt")
@@ -2232,6 +2264,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 tool_call_id=getattr(tool_call, "id", "") or "",
                 duration_ms=int(tool_duration * 1000),
                 middleware_trace=list(middleware_trace),
+                transcript_path=transcript_path,
             )
         if not _execution_blocked:
             function_result = agent._append_guardrail_observation(
