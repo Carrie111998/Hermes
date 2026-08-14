@@ -1102,6 +1102,7 @@ class DiscordAdapter(BasePlatformAdapter):
         self._voice_fx_cfg: Dict[str, Any] = self._load_voice_fx_config()
         # Post-STT keyword gate for voice-channel utterances. Empty = disabled.
         self._voice_keywords = self._load_voice_keywords()
+        self._voice_keyword_similarity = self._load_voice_keyword_similarity()
         # Track threads where the bot has participated so follow-up messages
         # in those threads don't require @mention.  Persisted to disk so the
         # set survives gateway restarts.
@@ -4326,28 +4327,91 @@ class DiscordAdapter(BasePlatformAdapter):
             logger.debug("Could not load discord.voice_keywords config: %s", e)
             return []
 
+    @staticmethod
+    def _fold_case_accents(text: str) -> str:
+        """Lowercase and strip diacritics (é→e, à→a, …) for tolerant matching.
+
+        Applied to both the transcript and the configured keywords so accent
+        variants ("Hé Hermès", "hermès") match their plain spelling.
+        """
+        import unicodedata
+        s = unicodedata.normalize("NFD", text.lower())
+        return "".join(c for c in s if not unicodedata.combining(c))
+
+    def _load_voice_keyword_similarity(self) -> float:
+        """Read ``discord.voice_keyword_similarity`` (0.0–1.0) from config.yaml.
+
+        0 disables fuzzy matching (exact, case/accent-insensitive only).
+        Clamped to [0, 1]; defaults to 0.5.
+        """
+        default = 0.5
+        try:
+            from hermes_cli.config import read_raw_config
+            cfg = read_raw_config() or {}
+            raw = (cfg.get("discord") or {}).get("voice_keyword_similarity")
+            if raw is None:
+                return default
+            return max(0.0, min(1.0, float(raw)))
+        except Exception as e:
+            logger.debug("Could not load discord.voice_keyword_similarity: %s", e)
+            return default
+
     def _matches_voice_keyword(self, transcript: str) -> Optional[str]:
         """If *transcript* starts with a configured keyword, return the strip of
         the keyword; otherwise return None (utterance is filtered out).
 
-        Matching is case-insensitive and requires a word boundary after the
-        keyword (whitespace, punctuation, or end of text) so a stray prefix
-        like "hey hermesphone" does not trigger. An empty config returns the
-        original transcript (gate disabled).
+        Matching is case- and accent-insensitive. A direct prefix match must be
+        followed by a word boundary (whitespace, punctuation, or end of text) so
+        a stray prefix like "hey hermesphone" does not trigger. When
+        ``voice_keyword_similarity`` > 0, a leading keyword the STT only
+        approximated (e.g. Whisper hears "hey hermes" as "l'hermesse") is also
+        accepted if it is similar enough to the keyword — the same word-boundary
+        rule still applies after stripping, so longer real words do not slip
+        through. An empty config returns the original transcript (gate disabled).
         """
         if not self._voice_keywords:
             return transcript
         text = transcript.strip()
-        low = text.lower()
+        low = self._fold_case_accents(text)
         for kw in self._voice_keywords:
-            if low == kw:
+            kn = self._fold_case_accents(kw)
+            # 1) exact, case/accent-insensitive prefix at a word boundary
+            if low == kn:
                 return ""  # user said only the keyword, nothing follows
-            if low.startswith(kw):
+            if low.startswith(kn):
                 rest = text[len(kw):]
-                # boundary check: next char must be a separator or end-of-text
                 if not rest or rest[0].isspace() or rest[0] in ",;:!?.":
                     return rest.lstrip(" \t,;:!?.")
+            # 2) fuzzy: tolerate STT mangling of the keyword, anchored on a
+            #    contiguous run so scattered letters don't false-trigger
+            sim = self._voice_keyword_similarity
+            if sim > 0 and kn:
+                lead = low[:len(kn) + 2]  # a little slack for dropped/extra chars
+                if self._keyword_block_coverage(kn, lead) >= sim:
+                    rest = text[len(kw):]
+                    if not rest or rest[0].isspace() or rest[0] in ",;:!?.":
+                        return rest.lstrip(" \t,;:!?.")
         return None
+
+    @staticmethod
+    def _keyword_block_coverage(a: str, b: str) -> float:
+        """Fraction of *a* covered by its longest contiguous run inside *b*.
+
+        ``a`` is the (normalized) keyword and ``b`` is the leading slice of the
+        (normalized) transcript.  Anchoring on the longest matching block
+        instead of total character overlap means a phrase like "quelle heure
+        est-il" (letters scattered) scores low and won't trigger, while an STT
+        mangling like "l'hermesse" keeps the contiguous "hermes" run and
+        matches. Returns 0.0 for an empty keyword.
+        """
+        if not a or not b:
+            return 0.0
+        from difflib import SequenceMatcher
+        longest = 0
+        for blk in SequenceMatcher(None, a, b).get_matching_blocks():
+            if blk.size > longest:
+                longest = blk.size
+        return longest / len(a)
 
     def _load_discord_int_config(self, key: str, default: int, *, minimum: int = 0) -> int:
         """Read a non-secret integer from the top-level ``discord`` config."""
