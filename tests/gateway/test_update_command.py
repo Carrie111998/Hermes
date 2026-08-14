@@ -171,16 +171,30 @@ class TestHandleUpdateCommand:
 
     @pytest.mark.asyncio
     async def test_resolve_hermes_bin_fallback(self):
-        """_resolve_hermes_bin falls back to sys.executable argv when which fails."""
-        import sys
+        """_resolve_hermes_bin falls back to real_executable() argv when which fails.
+
+        Deliberately NOT ``sys.executable``. On a Microsoft-Store CPython host
+        that value is an MSIX app-execution alias — a 0-byte reparse point
+        under ``%LOCALAPPDATA%\\Microsoft\\WindowsApps`` — and AppX starts the
+        packaged child SUSPENDED, resuming it only once the activation handoff
+        completes. If the launching parent dies first, nothing ever resumes it
+        and the process survives indefinitely having never executed an
+        instruction. ``hermes_constants.real_executable()`` resolves past the
+        alias for exactly that reason, so asserting ``sys.executable`` here
+        would pressure the production code back into spawning orphans.
+
+        The two paths are identical off Windows-Store hosts, which is why this
+        assertion went stale without failing anywhere else.
+        """
         from gateway.run import _resolve_hermes_bin
+        from hermes_constants import real_executable
 
         fake_spec = MagicMock()
         with patch("shutil.which", return_value=None), \
              patch("importlib.util.find_spec", return_value=fake_spec):
             result = _resolve_hermes_bin()
 
-        assert result == [sys.executable, "-m", "hermes_cli.main"]
+        assert result == [real_executable(), "-m", "hermes_cli.main"]
 
     @pytest.mark.asyncio
     async def test_resolve_hermes_bin_returns_none_when_both_fail(self):
