@@ -1700,6 +1700,21 @@ def _get_env_config() -> Dict[str, Any]:
         ).lower() in {"true", "1", "yes"},
     }
 
+    # Guard against TERMINAL_TIMEOUT=0 (or negative), which silently makes
+    # every command instantly time out with "timed out after 0s". Users often
+    # set 0 expecting "infinite", but it means instant timeout. Fall back to
+    # the documented default (180s) with a warning (see issue #85809).
+    raw_timeout = config["timeout"]
+    if isinstance(raw_timeout, int) and raw_timeout <= 0:
+        logger.warning(
+            "TERMINAL_TIMEOUT=%s is invalid (must be > 0); falling back to the "
+            "default 180s. Note: 0 does NOT mean 'no timeout' — it means "
+            "'instant timeout'. If you want no timeout, set a very large value "
+            "(e.g. 86400) or unset TERMINAL_TIMEOUT to use the default.",
+            raw_timeout,
+        )
+        config["timeout"] = 180
+
 
 def _get_modal_backend_state(modal_mode: object | None) -> Dict[str, Any]:
     """Resolve direct vs managed Modal backend selection."""
