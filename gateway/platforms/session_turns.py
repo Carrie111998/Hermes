@@ -1380,6 +1380,7 @@ class SessionTurnService:
             tuple[str, str], asyncio.Task[tuple[Optional[Dict[str, Any]], bool]]
         ] = {}
         self._interruption_owners: Dict[str, asyncio.Task[Any]] = {}
+        self._interruption_watcher_owners: Dict[str, asyncio.Task[Any]] = {}
         self._lifecycle_dispatchers: Dict[str, SessionTurnLifecycleDispatcher] = {}
         self._lifecycle_cleanup_owners: set[str] = set()
         # Assistant text deltas are intentionally process-local. Canonical
@@ -1897,7 +1898,13 @@ class SessionTurnService:
                                 self._interrupt_when_available(turn_id)
                             )
                             self._interruption_owners[turn_id] = watcher
+                            self._interruption_watcher_owners[turn_id] = watcher
                             self._track_background_task(watcher)
+                            watcher.add_done_callback(
+                                lambda done: self._interruption_watcher_done(
+                                    turn_id, done
+                                )
+                            )
                     # Continue heartbeat and lease ownership until the executor
                     # future itself resolves. Repeated cancellation is handled
                     # by the same bounded, non-abandoning loop.
@@ -2078,6 +2085,7 @@ class SessionTurnService:
             # another interrupt.  This also covers never-entered coordinators,
             # and ``finally`` prevents a cleanup failure from leaking ownership.
             self._interruption_owners.pop(turn_id, None)
+            self._interruption_watcher_owners.pop(turn_id, None)
             self._agent_refs.pop(turn_id, None)
             self._lifecycle_dispatchers.pop(turn_id, None)
             self._lifecycle_cleanup_owners.discard(turn_id)
@@ -2406,6 +2414,13 @@ class SessionTurnService:
 
         key = (session_id, turn_id)
         handoff = self._stop_handoffs.get(key)
+        if handoff is not None and handoff.done():
+            # A retry may arrive before the completed handoff's done callback.
+            # Retire that exact generation synchronously so one caller creates
+            # the recovery handoff below and concurrent callers join it.
+            if self._stop_handoffs.get(key) is handoff:
+                self._stop_handoffs.pop(key, None)
+            handoff = None
         if handoff is None:
             handoff = asyncio.create_task(
                 self._perform_stop_handoff(store, session_id, turn_id)
@@ -2457,6 +2472,13 @@ class SessionTurnService:
         if public is not None and (
             transitioned or public["status"] == "stopping"
         ):
+            owner = self._interruption_owners.get(turn_id)
+            if owner is not None:
+                # A retry can enter after the watcher task has completed but
+                # before its call_soon() done callback has run.  Inspect and
+                # conditionally release the exact failed generation here, with
+                # no await before a replacement owner is installed below.
+                self._release_failed_interruption_watcher(turn_id, owner)
             if self._interruption_owners.get(turn_id) is not None:
                 return public, transitioned
 
@@ -2473,21 +2495,59 @@ class SessionTurnService:
             else:
                 watcher = asyncio.create_task(self._interrupt_when_available(turn_id))
                 self._interruption_owners[turn_id] = watcher
+                self._interruption_watcher_owners[turn_id] = watcher
                 self._track_background_task(watcher)
-
-                def watcher_done(done: asyncio.Task[Any]) -> None:
-                    # Normally _finalize_execution owns removal.  A durable
-                    # queued row can also be stopped without ever being admitted
-                    # in this process; no execution finalizer exists in that
-                    # case, so the completed watcher must release its marker.
-                    if (
-                        turn_id not in self._tasks
-                        and self._interruption_owners.get(turn_id) is done
-                    ):
-                        self._interruption_owners.pop(turn_id, None)
-
-                watcher.add_done_callback(watcher_done)
+                watcher.add_done_callback(
+                    lambda done: self._interruption_watcher_done(turn_id, done)
+                )
         return public, transitioned
+
+    def _interruption_watcher_done(
+        self, turn_id: str, watcher: asyncio.Task[Any]
+    ) -> None:
+        """Preserve successful ownership; release failed watcher generations."""
+        # A successful interrupt request remains owned until the worker
+        # finalizer. Failure/cancellation did not deliver that request, so
+        # release the exact generation even while a local execution exists.
+        if self._release_failed_interruption_watcher(turn_id, watcher):
+            return
+        # A durable queued row can be stopped without ever being admitted in
+        # this process; no execution finalizer exists in that case.
+        if (
+            turn_id not in self._tasks
+            and self._interruption_owners.get(turn_id) is watcher
+        ):
+            self._interruption_owners.pop(turn_id, None)
+            self._interruption_watcher_owners.pop(turn_id, None)
+
+    def _release_failed_interruption_watcher(
+        self, turn_id: str, watcher: asyncio.Task[Any]
+    ) -> bool:
+        """Release only the current failed watcher generation, if completed."""
+        if self._interruption_watcher_owners.get(turn_id) is not watcher:
+            return False
+        if not watcher.done():
+            return False
+        if watcher.cancelled():
+            reason = "cancelled"
+        else:
+            try:
+                failure = watcher.exception()
+            except asyncio.CancelledError:
+                reason = "cancelled"
+            else:
+                if failure is None:
+                    return False
+                reason = "internal_error"
+        if self._interruption_owners.get(turn_id) is not watcher:
+            return False
+        self._interruption_owners.pop(turn_id, None)
+        self._interruption_watcher_owners.pop(turn_id, None)
+        # Never log turn identity or exception text: either can contain
+        # tenant/provider data.  The stable classification is operationally
+        # sufficient and safe for shared logs.
+        logger.error("session_turn_interrupt_watcher_failed reason=%s", reason)
+        return True
 
     async def _interrupt_when_available(self, turn_id: str) -> None:
         """Close the small race between stop admission and agent construction."""

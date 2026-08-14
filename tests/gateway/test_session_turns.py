@@ -1278,6 +1278,111 @@ async def test_concurrent_repeated_stop_joins_watcher_through_worker_exit(sessio
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("failure_kind", "expected_reason"),
+    [("exception", "internal_error"), ("cancelled", "cancelled")],
+)
+async def test_failed_stop_watcher_releases_owner_and_concurrent_retry_runs_once(
+    session_db,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    failure_kind: str,
+    expected_reason: str,
+):
+    runner_entered = asyncio.Event()
+    publish_agent = asyncio.Event()
+    worker_release = asyncio.Event()
+    interrupted = asyncio.Event()
+    first_watcher_finished = asyncio.Event()
+    retry_watcher_started = asyncio.Event()
+
+    class Agent:
+        interrupts = 0
+
+        def interrupt(self, _reason):
+            self.interrupts += 1
+            interrupted.set()
+
+    agent = Agent()
+
+    async def run_agent(**kwargs):
+        runner_entered.set()
+        await publish_agent.wait()
+        kwargs["agent_ref"][0] = agent
+        await worker_release.wait()
+        return {"final_response": "discarded", "messages": []}, {}
+
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={}))
+    adapter._session_db = session_db
+    adapter._run_agent = run_agent
+    service = adapter._session_turn_service
+    original_watcher = service._interrupt_when_available
+    watcher_calls = 0
+
+    async def fail_once_then_interrupt(turn_id):
+        nonlocal watcher_calls
+        watcher_calls += 1
+        if watcher_calls == 1:
+            first_watcher_finished.set()
+            if failure_kind == "exception":
+                raise RuntimeError("private watcher retry secret")
+            raise asyncio.CancelledError
+        retry_watcher_started.set()
+        await original_watcher(turn_id)
+
+    monkeypatch.setattr(service, "_interrupt_when_available", fail_once_then_interrupt)
+    turn_id = f"turn-stop-watcher-{failure_kind}-retry"
+
+    async with TestClient(TestServer(_app(adapter))) as client:
+        submitted = await client.post(
+            "/api/sessions/s1/turns",
+            headers={"Idempotency-Key": turn_id},
+            json=_payload(),
+        )
+        assert submitted.status == 202
+        await asyncio.wait_for(runner_entered.wait(), 1)
+
+        first = await client.post(f"/api/sessions/s1/turns/{turn_id}/stop")
+        assert first.status == 202
+        await asyncio.wait_for(first_watcher_finished.wait(), 1)
+        for _ in range(10):
+            if turn_id not in service._interruption_owners:
+                break
+            await asyncio.sleep(0)
+        assert turn_id not in service._interruption_owners
+        assert turn_id not in service._interruption_watcher_owners
+
+        retries = await asyncio.gather(
+            *[
+                client.post(f"/api/sessions/s1/turns/{turn_id}/stop")
+                for _ in range(8)
+            ]
+        )
+        assert all(response.status == 202 for response in retries)
+        await asyncio.wait_for(retry_watcher_started.wait(), 1)
+        assert watcher_calls == 2
+
+        publish_agent.set()
+        await asyncio.wait_for(interrupted.wait(), 1)
+        assert agent.interrupts == 1
+        assert turn_id in service._interruption_owners
+
+        worker_release.set()
+        await service.wait_for_turn(turn_id)
+        terminal = await client.get(f"/api/sessions/s1/turns/{turn_id}")
+        assert terminal.status == 200
+        assert (await terminal.json())["turn"]["status"] == "interrupted"
+
+    assert watcher_calls == 2
+    assert agent.interrupts == 1
+    assert turn_id not in service._interruption_owners
+    assert turn_id not in service._interruption_watcher_owners
+    assert "session_turn_interrupt_watcher_failed" in caplog.text
+    assert f"reason={expected_reason}" in caplog.text
+    assert "private watcher retry secret" not in caplog.text
+
+
+@pytest.mark.asyncio
 async def test_concurrent_repeated_stop_records_and_watches_once(session_db, monkeypatch):
     gate = asyncio.Event()
 
