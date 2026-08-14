@@ -201,6 +201,59 @@ class TestWeComNativeStream:
         assert bodies[3]["markdown"]["content"] == "查询完成。"
 
     @pytest.mark.asyncio
+    async def test_pairing_reply_does_not_open_a_native_stream(self):
+        adapter = self._adapter()
+        adapter._last_chat_req_ids["chat-1"] = "req-1"
+        event = MessageEvent(
+            text="1",
+            message_id="msg-1",
+            source=adapter.build_source(
+                chat_id="chat-1",
+                user_id="unpaired-user",
+                message_id="msg-1",
+            ),
+        )
+
+        async def pairing_handler(_event):
+            await adapter.send("chat-1", "Here's your pairing code: `ABC12345`")
+            return None
+
+        adapter._message_handler = pairing_handler
+        adapter._active_sessions["session-1"] = asyncio.Event()
+
+        await adapter._process_message_background(event, "session-1")
+
+        bodies = [call.args[1] for call in adapter._send_reply_request.await_args_list]
+        assert bodies == [
+            {
+                "msgtype": "markdown",
+                "markdown": {"content": "Here's your pairing code: `ABC12345`"},
+            }
+        ]
+        assert adapter._native_streams == {}
+
+    @pytest.mark.asyncio
+    async def test_agent_turn_start_opens_native_stream(self):
+        adapter = self._adapter()
+        event = MessageEvent(
+            text="开始调查",
+            message_id="msg-1",
+            source=adapter.build_source(
+                chat_id="chat-1",
+                user_id="paired-user",
+                message_id="msg-1",
+            ),
+        )
+
+        await adapter.on_agent_turn_start(event, "session-1")
+
+        body = adapter._send_reply_request.await_args.args[1]
+        assert body["msgtype"] == "stream"
+        assert body["stream"]["finish"] is False
+        assert body["stream"]["content"] == "正在思考中…"
+        assert adapter._native_streams["msg-1"].session_key == "session-1"
+
+    @pytest.mark.asyncio
     async def test_native_stream_frames_are_serialized_for_shared_req_id(self):
         adapter = self._adapter()
         metadata = {"wecom_reply_to_message_id": "msg-1"}

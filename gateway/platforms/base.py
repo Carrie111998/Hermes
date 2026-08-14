@@ -2949,6 +2949,13 @@ class BasePlatformAdapter(ABC):
     # set this to False to stay correct-by-default.
     supports_async_delivery: bool = True
 
+    # Most platform typing indicators are ephemeral status signals and can
+    # safely start as soon as background dispatch begins.  A platform whose
+    # indicator creates a persistent user-visible message can opt into the
+    # later agent boundary instead, so auth, pairing, commands, and other
+    # pre-agent short-circuits never leave behind a fake model turn.
+    typing_starts_at_agent_boundary: bool = False
+
     # Whether this adapter's ``send()`` splits long content into multiple
     # messages via ``truncate_message()``.  When True, the delivery router
     # (gateway/delivery.py) skips gateway-level truncation and lets the
@@ -5332,6 +5339,13 @@ class BasePlatformAdapter(ABC):
     async def on_processing_start(self, event: MessageEvent) -> None:
         """Hook called when background processing begins."""
 
+    async def on_agent_turn_start(
+        self,
+        event: MessageEvent,
+        session_key: str,
+    ) -> None:
+        """Hook called after pre-agent gates and immediately before Agent work."""
+
     async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
         """Hook called when background processing completes.
 
@@ -6230,7 +6244,10 @@ class BasePlatformAdapter(ABC):
             _thread_metadata = dict(_thread_metadata or {})
             _thread_metadata["wecom_session_key"] = session_key
         typing_task: Optional[asyncio.Task] = None
-        if getattr(self.config, "typing_indicator", True):
+        if (
+            getattr(self.config, "typing_indicator", True)
+            and not getattr(self, "typing_starts_at_agent_boundary", False)
+        ):
             _keep_typing_kwargs: Dict[str, Any] = {"metadata": _thread_metadata}
             try:
                 _keep_typing_sig = inspect.signature(self._keep_typing)

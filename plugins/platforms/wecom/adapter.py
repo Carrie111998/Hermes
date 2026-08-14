@@ -189,6 +189,11 @@ class _NativeStreamState:
 class WeComAdapter(BasePlatformAdapter):
     """WeCom AI Bot adapter backed by a persistent WebSocket connection."""
 
+    # Native stream frames are persistent chat cards, not an ephemeral typing
+    # signal. Start them only at the real Agent boundary so pairing and other
+    # Hermes-owned short-circuit replies do not create a false thinking card.
+    typing_starts_at_agent_boundary = True
+
     MAX_MESSAGE_LENGTH = MAX_MESSAGE_LENGTH
     # WeCom streams can only update the reply bound to one inbound req_id;
     # they are not arbitrary message edits and must not enter the generic
@@ -1789,6 +1794,36 @@ class WeComAdapter(BasePlatformAdapter):
         # request so a slow ACK cannot leave a late response racing a retry
         # that reuses the same inbound req_id.
         await asyncio.shield(state.start_task)
+
+    async def on_agent_turn_start(
+        self,
+        event: MessageEvent,
+        session_key: str,
+    ) -> None:
+        """Open the native placeholder only after dispatch reaches the Agent."""
+        if not getattr(self.config, "typing_indicator", True):
+            return
+
+        source = event.source
+        message_id = getattr(event, "message_id", None) or getattr(
+            source,
+            "message_id",
+            None,
+        )
+        metadata = {
+            "wecom_reply_to_message_id": str(message_id or ""),
+            "wecom_session_key": str(session_key or ""),
+        }
+        try:
+            # Match the base refresh loop's bounded typing call. send_typing
+            # shields the underlying request, so a slow WeCom ACK can finish
+            # in the background without delaying the model invocation.
+            await asyncio.wait_for(
+                self.send_typing(source.chat_id, metadata=metadata),
+                timeout=1.5,
+            )
+        except asyncio.TimeoutError:
+            pass
 
     async def finish_pending_stream_for_busy_input(self, session_key: str) -> None:
         """Finish this turn's placeholder before acknowledging a successful steer."""

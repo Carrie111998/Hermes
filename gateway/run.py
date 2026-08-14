@@ -18985,6 +18985,31 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
 
         try:
+            # Persistent, user-visible working indicators must begin only once
+            # this message has survived auth, pairing, command, and preprocessing
+            # gates. Ephemeral platform typing continues to start in the base
+            # adapter at dispatch time; adapters opt into this later boundary.
+            _agent_adapter = self._adapter_for_source(source)
+            _agent_hook_runner = getattr(
+                _agent_adapter,
+                "_run_processing_hook",
+                None,
+            )
+            if (
+                _agent_adapter is not None
+                and getattr(
+                    _agent_adapter,
+                    "typing_starts_at_agent_boundary",
+                    False,
+                )
+                and callable(_agent_hook_runner)
+            ):
+                await _agent_hook_runner(
+                    "on_agent_turn_start",
+                    event,
+                    session_key,
+                )
+
             # Emit agent:start hook
             hook_ctx = {
                 "platform": source.platform.value if source.platform else "",
