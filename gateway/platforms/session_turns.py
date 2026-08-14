@@ -1143,8 +1143,12 @@ class SessionTurnService:
             return self._stores[key]
         async with self._store_lock:
             if key not in self._stores:
-                store = await asyncio.to_thread(SessionTurnStore, db)
-                await asyncio.to_thread(store.reconcile_uncertain)
+                def initialize_store() -> SessionTurnStore:
+                    store = SessionTurnStore(db)
+                    store.reconcile_uncertain()
+                    return store
+
+                store = await self._store_operation(initialize_store)
                 self._stores[key] = store
         return self._stores[key]
 
@@ -1241,11 +1245,11 @@ class SessionTurnService:
 
         # An accepted idempotency key is durable truth. Browser retries must
         # reuse it even if the Slack adapter's current connectivity changed.
-        existing = await asyncio.to_thread(store.get, turn_id)
+        existing = await self._store_operation(lambda: store.get(turn_id))
         if existing is not None:
             try:
-                _turn, _created = await asyncio.to_thread(
-                    store.reserve, session_id, turn_id, payload
+                _turn, _created = await self._store_operation(
+                    lambda: store.reserve(session_id, turn_id, payload)
                 )
             except ConflictingTurn:
                 return _error(
@@ -1269,8 +1273,8 @@ class SessionTurnService:
         slack_adapter = None
         if payload["delivery_mode"] in {"slack_only", "both"}:
             try:
-                binding = await asyncio.to_thread(
-                    resolve_slack_binding, store.db, session_id
+                binding = await self._store_operation(
+                    lambda: resolve_slack_binding(store.db, session_id)
                 )
             except SlackBindingError as exc:
                 return _error("Session has no unique Slack binding", exc.code, 409)
@@ -1279,7 +1283,9 @@ class SessionTurnService:
                 return _error("Slack adapter is not connected", "slack_unavailable", 503)
 
         try:
-            turn, created = await asyncio.to_thread(store.reserve, session_id, turn_id, payload)
+            turn, created = await self._store_operation(
+                lambda: store.reserve(session_id, turn_id, payload)
+            )
         except ConflictingTurn:
             return _error("turn_id was already used for a different request", "idempotency_conflict", 409)
         except TurnConflict:
@@ -1394,6 +1400,8 @@ class SessionTurnService:
         execution_lease = None
         heartbeat_task: Optional[asyncio.Task[Any]] = None
         agent_task: Optional[asyncio.Task[Any]] = None
+        callback_event_task: Optional[asyncio.Task[Any]] = None
+        callback_events_done = threading.Event()
         dispatcher = self._lifecycle_dispatchers.get(turn_id)
         self._agent_refs[turn_id] = agent_ref
         try:
@@ -1455,13 +1463,52 @@ class SessionTurnService:
                 return
             message_high_water = await self._store_operation(store.message_high_water)
 
+            callback_events: queue.Queue[tuple[str, Dict[str, Any]]] = queue.Queue()
+
+            async def persist_callback_events() -> None:
+                while True:
+                    try:
+                        event_type, data = callback_events.get_nowait()
+                    except queue.Empty:
+                        if callback_events_done.is_set():
+                            return
+                        await asyncio.sleep(0.01)
+                        continue
+                    durable = await self._store_operation(
+                        lambda event_type=event_type, data=data: store.append_event(
+                            turn_id, event_type, data
+                        )
+                    )
+                    if (
+                        event_type == "assistant.delta"
+                        and payload["delivery_mode"] != "slack_only"
+                    ):
+                        self._volatile_events.setdefault(turn_id, {})[
+                            durable["seq"]
+                        ] = {**durable, "data": dict(data)}
+
+            callback_event_task = asyncio.create_task(persist_callback_events())
+
+            async def drain_callback_events() -> bool:
+                callback_events_done.set()
+                assert callback_event_task is not None
+                results = await asyncio.gather(
+                    callback_event_task, return_exceptions=True
+                )
+                if isinstance(results[0], BaseException):
+                    logger.error(
+                        "session_turn_background_task_failed "
+                        "reason=callback_event_store_error"
+                    )
+                    return False
+                return True
+
             def append(event_type: str, data: Dict[str, Any]) -> None:
-                durable = store.append_event(turn_id, event_type, data)
-                if event_type == "assistant.delta" and payload["delivery_mode"] != "slack_only":
-                    self._volatile_events.setdefault(turn_id, {})[durable["seq"]] = {
-                        **durable,
-                        "data": dict(data),
-                    }
+                # Agent callbacks may originate on the aiohttp loop or on an
+                # executor thread. Queue only safe projections here; the one
+                # loop-owned pump routes every SQLite call through the ordered
+                # off-loop helper without blocking either caller.
+                callback_events.put_nowait((event_type, dict(data)))
 
             def on_delta(delta: Any) -> None:
                 if (
@@ -1518,7 +1565,10 @@ class SessionTurnService:
                         # A child cancellation is a real execution outcome, not
                         # a request to abandon coordinator ownership.
                         await agent_task
-                    await asyncio.to_thread(store.request_stop, turn_id)
+                    await self._store_operation(
+                        lambda: store.request_stop(turn_id),
+                        propagate_cancellation=False,
+                    )
                     agent = agent_ref[0]
                     if agent is not None:
                         try:
@@ -1531,6 +1581,11 @@ class SessionTurnService:
                     # Continue heartbeat and lease ownership until the executor
                     # future itself resolves. Repeated cancellation is handled
                     # by the same bounded, non-abandoning loop.
+            if not await drain_callback_events():
+                await self._finish_turn(
+                    store, turn_id, "failed", "turn.failed", "event_store_failed"
+                )
+                return
             effective_id = result.get("session_id", session_id) if isinstance(result, dict) else session_id
             if execution_lease is None or not await execution_lease.still_owned():
                 await self._finish_turn(
@@ -1591,11 +1646,17 @@ class SessionTurnService:
             # so cancellation can never contradict a persisted turn.started.
             if agent_task is not None and agent_task.done():
                 phase.execution_done = True
+            if callback_event_task is not None and not callback_events_done.is_set():
+                callback_events_done.set()
+                await asyncio.gather(callback_event_task, return_exceptions=True)
             await self._finish_turn(
                 store, turn_id, "interrupted", "turn.interrupted",
                 phase.cancellation_code,
             )
         except Exception:
+            if callback_event_task is not None and not callback_events_done.is_set():
+                callback_events_done.set()
+                await asyncio.gather(callback_event_task, return_exceptions=True)
             await self._finish_turn(
                 store, turn_id, "failed", "turn.failed", "run_failed"
             )
@@ -1694,12 +1755,41 @@ class SessionTurnService:
 
     async def _deliver_slack(self, store: SessionTurnStore, turn_id: str, binding: SlackBinding,
                              slack_adapter: Any, content: str) -> None:
-        if not store.begin_delivery(turn_id, "slack"):
+        def begin_and_read_delivery() -> Optional[Dict[str, Any]]:
+            if not store.begin_delivery(turn_id, "slack"):
+                return None
+            return store.get_delivery(turn_id, "slack") or {}
+
+        delivery = await self._store_operation(begin_and_read_delivery)
+        if delivery is None:
             return
-        delivery = store.get_delivery(turn_id, "slack") or {}
+
+        async def record_outcome(
+            state: str,
+            event_type: str,
+            error_code: Optional[str] = None,
+            *,
+            provider_message_id: Optional[str] = None,
+        ) -> None:
+            def finish_and_append() -> None:
+                store.finish_delivery(
+                    turn_id,
+                    "slack",
+                    state,
+                    error_code,
+                    provider_message_id=provider_message_id,
+                )
+                data = {"destination": "slack", "status": state}
+                if error_code is not None:
+                    data["error_code"] = error_code
+                store.append_event(turn_id, event_type, data)
+
+            await self._store_operation(finish_and_append)
+
         if len(content) > MAX_SLACK_ROUTED_CHARS:
-            store.finish_delivery(turn_id, "slack", "rejected", "delivery_too_large")
-            store.append_event(turn_id, "delivery.failed", {"destination": "slack", "status": "rejected", "error_code": "delivery_too_large"})
+            await record_outcome(
+                "rejected", "delivery.failed", "delivery_too_large"
+            )
             return
         metadata = dict(binding.metadata)
         # The durable delivery id is also Slack's idempotency key. The bounded
@@ -1710,40 +1800,34 @@ class SessionTurnService:
                 binding.chat_id, content, reply_to=binding.thread_id, metadata=metadata
             )
         except Exception:
-            store.finish_delivery(turn_id, "slack", "needs_manual_retry", "delivery_outcome_unknown")
-            store.append_event(turn_id, "delivery.failed", {"destination": "slack", "status": "needs_manual_retry", "error_code": "delivery_outcome_unknown"})
+            await record_outcome(
+                "needs_manual_retry",
+                "delivery.failed",
+                "delivery_outcome_unknown",
+            )
             return
         if getattr(result, "success", False):
             provider_message_id = getattr(result, "message_id", None)
             if not isinstance(provider_message_id, str) or not provider_message_id:
-                store.finish_delivery(
-                    turn_id,
-                    "slack",
+                await record_outcome(
                     "needs_manual_retry",
+                    "delivery.failed",
                     "provider_receipt_missing",
                 )
-                store.append_event(
-                    turn_id,
-                    "delivery.failed",
-                    {
-                        "destination": "slack",
-                        "status": "needs_manual_retry",
-                        "error_code": "provider_receipt_missing",
-                    },
-                )
                 return
-            store.finish_delivery(
-                turn_id,
-                "slack",
+            await record_outcome(
                 "delivered",
+                "delivery.completed",
                 provider_message_id=provider_message_id,
             )
-            store.append_event(turn_id, "delivery.completed", {"destination": "slack", "status": "delivered"})
         else:
             # Once chat.postMessage was attempted, a timeout/error can be
             # ambiguous.  Never retry automatically.
-            store.finish_delivery(turn_id, "slack", "needs_manual_retry", "delivery_outcome_unknown")
-            store.append_event(turn_id, "delivery.failed", {"destination": "slack", "status": "needs_manual_retry", "error_code": "delivery_outcome_unknown"})
+            await record_outcome(
+                "needs_manual_retry",
+                "delivery.failed",
+                "delivery_outcome_unknown",
+            )
 
     async def status(self, request: web.Request) -> web.Response:
         auth_err = self.adapter._check_auth(request)
@@ -1752,7 +1836,9 @@ class SessionTurnService:
         store = await self._store()
         if store is None:
             return _error("Session database unavailable", "session_db_unavailable", 503)
-        turn = await asyncio.to_thread(store.public_turn, request.match_info["turn_id"])
+        turn = await self._store_operation(
+            lambda: store.public_turn(request.match_info["turn_id"])
+        )
         if not turn or turn["session_id"] != request.match_info["session_id"]:
             return _error("Turn not found", "turn_not_found", 404)
         return web.json_response({"object": "hermes.session.turn.status", "turn": turn})
@@ -1765,7 +1851,7 @@ class SessionTurnService:
         if store is None:
             return _error("Session database unavailable", "session_db_unavailable", 503)
         turn_id = request.match_info["turn_id"]
-        turn = await asyncio.to_thread(store.get, turn_id)
+        turn = await self._store_operation(lambda: store.get(turn_id))
         if not turn or turn["session_id"] != request.match_info["session_id"]:
             return _error("Turn not found", "turn_not_found", 404)
         raw_sequence = request.headers.get("Last-Event-ID") or request.query.get("after") or "0"
@@ -1775,7 +1861,9 @@ class SessionTurnService:
                 raise ValueError
         except (TypeError, ValueError):
             return _error("Last-Event-ID must be a non-negative integer", "invalid_last_event_id", 400)
-        low_water, high_water, event_count = await asyncio.to_thread(store.event_bounds, turn_id)
+        low_water, high_water, event_count = await self._store_operation(
+            lambda: store.event_bounds(turn_id)
+        )
         if sequence > high_water:
             return _resync_error(
                 "Last-Event-ID is ahead of the durable event high-water mark",
@@ -1788,7 +1876,9 @@ class SessionTurnService:
                 "event_gap",
                 high_water=high_water,
             )
-        initial_rows = await asyncio.to_thread(store.events_after, turn_id, sequence)
+        initial_rows = await self._store_operation(
+            lambda: store.events_after(turn_id, sequence)
+        )
         volatile = self._volatile_events.get(turn_id, {})
         missing_volatile = any(
             row["event"] == "assistant.delta" and row["seq"] not in volatile
@@ -1808,8 +1898,12 @@ class SessionTurnService:
         await response.prepare(request)
         try:
             while True:
-                rows = await asyncio.to_thread(store.events_after, turn_id, sequence)
-                current = await asyncio.to_thread(store.get, turn_id)
+                def read_stream_state() -> tuple[
+                    list[Dict[str, Any]], Optional[Dict[str, Any]]
+                ]:
+                    return store.events_after(turn_id, sequence), store.get(turn_id)
+
+                rows, current = await self._store_operation(read_stream_state)
                 missing_volatile = any(
                     row["event"] == "assistant.delta"
                     and row["seq"] not in self._volatile_events.get(turn_id, {})
@@ -1862,12 +1956,14 @@ class SessionTurnService:
             return _error("Session database unavailable", "session_db_unavailable", 503)
         session_id = request.match_info["session_id"]
         turn_id = request.match_info["turn_id"]
-        turn = await asyncio.to_thread(store.get, turn_id)
+        turn = await self._store_operation(lambda: store.get(turn_id))
         if not turn or turn["session_id"] != session_id:
             return _error("Turn not found", "turn_not_found", 404)
         if turn["status"] != "completed":
             return _error("Turn is not completed", "turn_not_completed", 409)
-        existing = await asyncio.to_thread(store.get_delivery, turn_id, "slack")
+        existing = await self._store_operation(
+            lambda: store.get_delivery(turn_id, "slack")
+        )
         if existing:
             if existing["state"] == "delivered":
                 return web.json_response({"object": "hermes.session.turn.delivery", "delivery": existing})
@@ -1877,14 +1973,18 @@ class SessionTurnService:
                 409,
             )
         try:
-            binding = await asyncio.to_thread(resolve_slack_binding, store.db, session_id)
+            binding = await self._store_operation(
+                lambda: resolve_slack_binding(store.db, session_id)
+            )
         except SlackBindingError as exc:
             return _error("Session has no unique Slack binding", exc.code, 409)
         slack_adapter = self.adapter._get_platform_callback_adapter(request, "slack")
         if slack_adapter is None:
             return _error("Slack adapter is not connected", "slack_unavailable", 503)
         try:
-            content = await asyncio.to_thread(store.anchored_assistant_content, turn_id)
+            content = await self._store_operation(
+                lambda: store.anchored_assistant_content(turn_id)
+            )
         except Exception:
             return _error("Session history unavailable", "session_history_unavailable", 503)
         if not isinstance(content, str):
@@ -1896,7 +1996,9 @@ class SessionTurnService:
         await self._deliver_slack(
             store, turn_id, binding, slack_adapter, content
         )
-        delivery = await asyncio.to_thread(store.get_delivery, turn_id, "slack")
+        delivery = await self._store_operation(
+            lambda: store.get_delivery(turn_id, "slack")
+        )
         status = 200 if delivery and delivery["state"] == "delivered" else 409
         return web.json_response(
             {"object": "hermes.session.turn.delivery", "delivery": delivery}, status=status
@@ -1910,11 +2012,16 @@ class SessionTurnService:
         if store is None:
             return _error("Session database unavailable", "session_db_unavailable", 503)
         turn_id = request.match_info["turn_id"]
-        turn = await asyncio.to_thread(store.get, turn_id)
+        turn = await self._store_operation(lambda: store.get(turn_id))
         if not turn or turn["session_id"] != request.match_info["session_id"]:
             return _error("Turn not found", "turn_not_found", 404)
         if turn["status"] in TERMINAL_STATUSES:
-            return web.json_response({"object": "hermes.session.turn.stop", "turn": store.public_turn(turn_id)})
+            public = await self._store_operation(
+                lambda: store.public_turn(turn_id)
+            )
+            return web.json_response(
+                {"object": "hermes.session.turn.stop", "turn": public}
+            )
         # Let a just-admitted task finish durable lease/history admission so a
         # stop does not race it into a false "stopped before start" result.
         # Bounded and event-loop friendly; genuinely queued work still stops.
@@ -1923,7 +2030,15 @@ class SessionTurnService:
             if (ref and ref[0] is not None) or turn_id not in self._tasks:
                 break
             await asyncio.sleep(0.01)
-        stopped = await asyncio.to_thread(store.request_stop, turn_id)
+        def stop_and_record() -> Optional[Dict[str, Any]]:
+            stopped = store.request_stop(turn_id)
+            if stopped is not None and stopped["status"] == "stopping":
+                store.append_event(
+                    turn_id, "turn.stopping", {"status": "stopping"}
+                )
+            return store.public_turn(turn_id)
+
+        public = await self._store_operation(stop_and_record)
         ref = self._agent_refs.get(turn_id)
         agent = ref[0] if ref else None
         if agent is not None:
@@ -1933,14 +2048,9 @@ class SessionTurnService:
                 pass
         else:
             watcher = asyncio.create_task(self._interrupt_when_available(turn_id))
-            try:
-                self.adapter._background_tasks.add(watcher)
-                watcher.add_done_callback(self.adapter._background_tasks.discard)
-            except (AttributeError, TypeError):
-                pass
-        store.append_event(turn_id, "turn.stopping", {"status": "stopping"})
+            self._track_background_task(watcher)
         return web.json_response(
-            {"object": "hermes.session.turn.stop", "turn": store.public_turn(turn_id)}, status=202
+            {"object": "hermes.session.turn.stop", "turn": public}, status=202
         )
 
     async def _interrupt_when_available(self, turn_id: str) -> None:

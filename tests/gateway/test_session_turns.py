@@ -21,6 +21,7 @@ from gateway.platforms.api_server import APIServerAdapter
 from gateway.platforms.base import SendResult
 from gateway.platforms.session_turns import (
     ConflictingTurn,
+    SlackBinding,
     SessionTurnStore,
     TurnConflict,
     TurnInputError,
@@ -1359,6 +1360,159 @@ async def test_blocking_finalize_store_does_not_block_event_loop(
     await service.wait_for_turn(turn_id)
 
     assert store.get(turn_id)["status"] == "interrupted"
+
+
+@pytest.mark.asyncio
+async def test_blocking_delivery_store_does_not_block_loop_and_keeps_state_event_order(
+    session_db, monkeypatch: pytest.MonkeyPatch
+):
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={}))
+    adapter._session_db = session_db
+    service = adapter._session_turn_service
+    store = SessionTurnStore(session_db)
+    store.reserve("s1", "blocking-delivery", _payload(mode="both"))
+    entered = threading.Event()
+    release = threading.Event()
+    original_begin = store.begin_delivery
+
+    def blocking_begin(*args, **kwargs):
+        entered.set()
+        release.wait(timeout=2)
+        return original_begin(*args, **kwargs)
+
+    monkeypatch.setattr(store, "begin_delivery", blocking_begin)
+    binding = SlackBinding(chat_id="safe", thread_id=None, metadata={})
+    delivery = asyncio.create_task(
+        service._deliver_slack(
+            store,
+            "blocking-delivery",
+            binding,
+            AsyncMock(),
+            "x" * 3_001,
+        )
+    )
+    assert await asyncio.to_thread(entered.wait, 1)
+
+    ticked = asyncio.Event()
+    asyncio.get_running_loop().call_later(0.02, ticked.set)
+    await asyncio.wait_for(ticked.wait(), 0.1)
+    release.set()
+    await delivery
+
+    persisted = store.get_delivery("blocking-delivery", "slack")
+    events = store.events_after("blocking-delivery", 0)
+    assert persisted is not None and persisted["state"] == "rejected"
+    assert [event["event"] for event in events] == ["delivery.failed"]
+    assert events[0]["data"]["status"] == persisted["state"]
+
+
+@pytest.mark.asyncio
+async def test_blocking_stop_store_does_not_block_aiohttp_loop(
+    session_db, monkeypatch: pytest.MonkeyPatch
+):
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={}))
+    adapter._session_db = session_db
+    service = adapter._session_turn_service
+    await service.reconcile_startup()
+    store = await service._store()
+    assert store is not None
+    store.reserve("s1", "blocking-stop", _payload())
+    entered = threading.Event()
+    release = threading.Event()
+    original_stop = store.request_stop
+
+    def blocking_stop(*args, **kwargs):
+        entered.set()
+        release.wait(timeout=2)
+        return original_stop(*args, **kwargs)
+
+    monkeypatch.setattr(store, "request_stop", blocking_stop)
+    async with TestClient(TestServer(_app(adapter))) as client:
+        stop_task = asyncio.create_task(
+            client.post("/api/sessions/s1/turns/blocking-stop/stop")
+        )
+        assert await asyncio.to_thread(entered.wait, 1)
+        capability = await asyncio.wait_for(client.get("/v1/capabilities"), 0.2)
+        assert capability.status == 200
+        release.set()
+        response = await stop_task
+        body = await response.json()
+
+    assert response.status == 202
+    assert body["turn"]["status"] == "stopping"
+    assert [event["event"] for event in store.events_after("blocking-stop", 0)] == [
+        "turn.stopping"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_concurrent_store_operations_preserve_submission_order(session_db):
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={}))
+    service = adapter._session_turn_service
+    first_entered = threading.Event()
+    first_release = threading.Event()
+    observed = []
+
+    def first():
+        observed.append("first-start")
+        first_entered.set()
+        first_release.wait(timeout=2)
+        observed.append("first-end")
+
+    def second():
+        observed.append("second")
+
+    first_task = asyncio.create_task(service._store_operation(first))
+    assert await asyncio.to_thread(first_entered.wait, 1)
+    second_task = asyncio.create_task(service._store_operation(second))
+    await asyncio.sleep(0.02)
+    assert observed == ["first-start"]
+    first_release.set()
+    await asyncio.gather(first_task, second_task)
+
+    assert observed == ["first-start", "first-end", "second"]
+
+
+@pytest.mark.asyncio
+async def test_stop_watcher_failure_is_retrieved_and_privacy_safe(
+    session_db,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+):
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={}))
+    adapter._session_db = session_db
+    service = adapter._session_turn_service
+    await service.reconcile_startup()
+    store = await service._store()
+    assert store is not None
+    store.reserve("s1", "broken-stop-watcher", _payload())
+    monkeypatch.setattr(
+        service,
+        "_interrupt_when_available",
+        AsyncMock(side_effect=RuntimeError("private watcher secret")),
+    )
+    loop_contexts = []
+    loop = asyncio.get_running_loop()
+    previous_handler = loop.get_exception_handler()
+    loop.set_exception_handler(lambda _loop, context: loop_contexts.append(context))
+    try:
+        async with TestClient(TestServer(_app(adapter))) as client:
+            response = await client.post(
+                "/api/sessions/s1/turns/broken-stop-watcher/stop"
+            )
+            assert response.status == 202
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+    finally:
+        loop.set_exception_handler(previous_handler)
+
+    assert not [
+        context
+        for context in loop_contexts
+        if context.get("message") == "Task exception was never retrieved"
+    ]
+    assert "session_turn_background_task_failed" in caplog.text
+    assert "private watcher secret" not in caplog.text
 
 
 @pytest.mark.asyncio
