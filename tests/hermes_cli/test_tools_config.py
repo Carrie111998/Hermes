@@ -802,38 +802,29 @@ def test_get_effective_configurable_toolsets_dedupes_bundled_plugins():
 
 
 
-
-# ── Checklist diff scope: non-configurable toolsets (kanban) must not be
-#    reported as added/removed by `hermes tools` ──────────────────────────
+# ── Kanban is an explicit per-platform orchestration capability ─────────────
 
 
+def test_kanban_is_configurable_and_default_off_for_discord():
+    universe = _checklist_toolset_keys("discord")
+    assert "kanban" in universe
+
+    defaults = _get_platform_tools(
+        {}, "discord", include_default_mcp_servers=False
+    )
+    assert "kanban" not in defaults
 
 
-def test_kanban_not_reported_as_removed_in_diff():
-    """Reproduces the false-signal bug: `hermes tools` printed ``- kanban``
-    when saving a platform that resolves kanban as enabled, even though the
-    checklist never offered kanban as a toggle.
-
-    The printed diff must be scoped to ``_checklist_toolset_keys`` so a tool
-    the user could not deselect is never reported as removed. The persisted
-    config still keeps kanban (verified separately by _save_platform_tools).
-    """
-    config = {"platform_toolsets": {"telegram": ["kanban", "web", "terminal"]}}
-    current = _get_platform_tools(config, "telegram", include_default_mcp_servers=False)
-    assert "kanban" in current  # resolved as enabled at read time
-
-    # The checklist can only return configurable keys it was shown; kanban
-    # is never one of them.
-    universe = _checklist_toolset_keys("telegram")
-    new_enabled = {t for t in current if t != "kanban"}
-
-    # Unscoped (old, buggy) diff would surface kanban.
-    assert (current - new_enabled) == {"kanban"}
-    # Scoped (fixed) diff drops it.
-    assert ((current - new_enabled) & universe) == set()
-
-
-
+def test_explicit_discord_kanban_opt_in_survives_resolution():
+    config = {
+        "platform_toolsets": {
+            "discord": ["web", "terminal", "kanban"],
+        },
+    }
+    current = _get_platform_tools(
+        config, "discord", include_default_mcp_servers=False
+    )
+    assert "kanban" in current
 
 
 

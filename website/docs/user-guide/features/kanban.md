@@ -19,6 +19,12 @@ The board has two front doors, both backed by the same `~/.hermes/kanban.db`:
 
 Both surfaces route through the same `kanban_db` layer, so reads see a consistent view and writes can't drift. The rest of this page shows CLI examples because they're easy to copy-paste, but every CLI verb has a tool-call equivalent the model uses.
 
+To let an ordinary Discord conversation orchestrate the board through natural
+language, enable **Kanban Orchestration** for Discord with `hermes tools`, then
+start a new Discord session. This writes an explicit `kanban` entry under
+`platform_toolsets.discord`; Kanban remains off by default for ordinary chat
+profiles. Direct `/kanban …` commands do not require model-tool exposure.
+
 This is the shape that covers the workloads `delegate_task` can't:
 
 - **Research triage** — parallel researchers + analyst + writer, human-in-the-loop.

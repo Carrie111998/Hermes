@@ -1134,3 +1134,44 @@ def test_attach_url_happy_path_public_host(worker_env, default_url_guard, monkey
         assert Path(atts[0].stored_path).read_bytes() == payload
     finally:
         conn.close()
+
+
+def test_kanban_profile_gate_accepts_matching_platform_opt_in(monkeypatch):
+    from tools import kanban_tools as kt
+
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"platform_toolsets": {"discord": ["web", "kanban"]}},
+    )
+    monkeypatch.setattr(
+        "gateway.session_context.get_session_env",
+        lambda name, default="": "discord" if name == "HERMES_SESSION_PLATFORM" else default,
+    )
+
+    assert kt._profile_has_kanban_toolset() is True
+
+
+def test_kanban_profile_gate_rejects_other_platform_opt_in(monkeypatch):
+    from tools import kanban_tools as kt
+
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"platform_toolsets": {"telegram": ["kanban"]}},
+    )
+    monkeypatch.setattr(
+        "gateway.session_context.get_session_env",
+        lambda name, default="": "discord" if name == "HERMES_SESSION_PLATFORM" else default,
+    )
+
+    assert kt._profile_has_kanban_toolset() is False
+
+
+def test_kanban_profile_gate_preserves_global_opt_in(monkeypatch):
+    from tools import kanban_tools as kt
+
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"toolsets": ["web", "kanban"]},
+    )
+
+    assert kt._profile_has_kanban_toolset() is True
