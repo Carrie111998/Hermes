@@ -13364,6 +13364,84 @@ def main():
         help="Maximum sessions to examine (default: 200)",
     )
 
+    sessions_repair_chains = sessions_subparsers.add_parser(
+        "repair-chains",
+        help="Detect and relink orphaned compression chains",
+        description=(
+            "Finds root sessions that look like orphaned compression "
+            "continuations (old builds wrote them as independent roots, no "
+            "parent_session_id link) and, with --apply, relinks them under "
+            "the oldest root of each group. Relinking only happens for "
+            "strong-signal groups where a root's first message is a "
+            "compaction handoff; same-title-only groups are reported but "
+            "never auto-relinked (repeated kanban tasks legitimately share "
+            "titles). Detection only by default; delegate/branch/tool "
+            "children are always excluded."
+        ),
+    )
+    sessions_repair_chains.add_argument(
+        "--apply",
+        action="store_true",
+        help="Write the relinks (default: dry run, detection reported only)",
+    )
+
+    sessions_retitle_missing = sessions_subparsers.add_parser(
+        "retitle-missing",
+        help="Regenerate missing/truncated session titles",
+        description=(
+            "Scans for rows whose title is missing or a bare first-message "
+            "truncation, regenerates root titles with the LLM generator, and "
+            "inherits titles down compression chains (deduped with #N). "
+            "Never overwrites a title the user typed (title_source='user'). "
+            "Lists what it would change unless --apply is passed."
+        ),
+    )
+    sessions_retitle_missing.add_argument(
+        "--apply",
+        action="store_true",
+        help="Write the changes (default: dry run)",
+    )
+    sessions_retitle_missing.add_argument(
+        "--no-chain-inherit",
+        action="store_true",
+        help="Skip chain-segment title inheritance (only LLM-regenerate broken roots)",
+    )
+    sessions_retitle_missing.add_argument(
+        "--include-legacy-truncated",
+        action="store_true",
+        help=(
+            "Also repair pre-provenance rows (title_source IS NULL) whose "
+            "title is a bare first-message truncation. Off by default: "
+            "official provenance treats those as user-titled. "
+            "Writes at user level — explicit opt-in."
+        ),
+    )
+    sessions_retitle_missing.add_argument(
+        "--limit",
+        type=int,
+        default=500,
+        help="Maximum sessions to examine (default: 500)",
+    )
+
+    sessions_merge_chains = sessions_subparsers.add_parser(
+        "merge-chains",
+        help="Flatten fork compression chains into single in-place sessions",
+        description=(
+            "For each fork compression chain (parent end_reason='compression' "
+            "with a linked child), moves every segment message into the chain "
+            "head and deletes the segment rows, leaving one in-place session "
+            "per conversation (like in-place compression). A timestamped "
+            "state.db snapshot is taken (pre-merge-chains-<timestamp>) before "
+            "any write, and message totals are verified after. Dry run lists "
+            "candidate chains without writing."
+        ),
+    )
+    sessions_merge_chains.add_argument(
+        "--apply",
+        action="store_true",
+        help="Write the changes (default: dry run; automatic backup taken first)",
+    )
+
     sessions_browse = sessions_subparsers.add_parser(
         "browse",
         help="Interactive session picker — browse, search, and resume sessions",

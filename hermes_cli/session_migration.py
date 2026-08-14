@@ -1,0 +1,961 @@
+"""``hermes sessions`` legacy-session maintenance commands.
+
+Hermes has evolved its session storage over many versions (``schema_version``
+0..25, ``title_source`` provenance, FTS layout v0→v1→v23). Older installs
+leave several classes of legacy data in ``state.db``:
+
+1. **Orphaned compression segments** — when a long conversation hit context
+   compression in an old version, the continuation segment was written as an
+   *independent root* (no ``parent_session_id`` link, parent not marked
+   ``end_reason='compression'``). The sidebar renders these as many separate
+   same-titled entries that are really one conversation.
+   → ``hermes sessions repair-chains``
+2. **Missing/truncated titles** — rows with no ``title_source`` provenance
+   (pre-5566379f5) whose title is a bare first-message truncation, and empty
+   chain segments that never inherited a title.
+   → ``hermes sessions retitle-missing``
+3. **Fork compression chains** — sessions split into a head + linked
+   segments (parent ``end_reason='compression'``). Flattening them back into
+   one in-place session matches modern in-place compression.
+   → ``hermes sessions merge-chains``
+
+This module implements all three, honoring the official provenance and
+compression-chain semantics in ``hermes_state``.
+
+Safety
+------
+* Dry-run by default; pass ``--apply`` to write.
+* Never touches ``title_source == 'user'`` rows.
+* Chain-relink candidates are reported but **not** auto-written without
+  ``--apply``; delegate/branch/tool children are always excluded.
+* ``merge-chains`` takes an automatic timestamped state.db snapshot before
+  writing and verifies message totals after.
+* Uses official provenance API (``set_auto_title`` / ``set_session_title``),
+  never raw SQL UPDATEs for titles.
+"""
+
+from __future__ import annotations
+
+import os
+import re
+import sys
+import time
+from pathlib import Path
+from typing import Callable, Iterable, Optional
+
+
+# ---------------------------------------------------------------------------
+# Chain-relink detection
+# ---------------------------------------------------------------------------
+
+# Children that must never be treated as compression continuations.
+_DELEGATE_EXPR = (
+    "json_extract(COALESCE(s.model_config, '{}'), '$._delegate_from') IS NULL"
+)
+_BRANCH_EXPR = (
+    "json_extract(COALESCE(s.model_config, '{}'), '$._branched_from') IS NULL"
+)
+
+
+def _title_key(title: Optional[str]) -> Optional[str]:
+    """Normalize a title for orphan-grouping.
+
+    Strips the `` #N`` dedupe suffix so ``"Plan review"`` and
+    ``"Plan review #2"`` group together (they are segments of one
+    conversation relinked with lineage dedupe).
+    """
+    if not title or not title.strip():
+        return None
+    return re.sub(r" #\d+$", "", title.strip())
+
+
+def _first_message_content(db, session_id: str) -> Optional[str]:
+    """Return the first message's content for a session, if any."""
+    row = db._conn.execute(
+        """
+        SELECT content FROM messages
+        WHERE session_id = ? AND content IS NOT NULL AND content != ''
+        ORDER BY id LIMIT 1
+        """,
+        (session_id,),
+    ).fetchone()
+    return row[0] if row else None
+
+
+def _starts_with_compaction_summary(db, session_id: str) -> bool:
+    """True if the session's first message is a context-compaction handoff.
+
+    The authoritative signal for \"this root is really the continuation of an
+    older conversation\": old Hermes builds wrote compression continuations
+    as independent roots whose first persisted message is the compaction
+    handoff (``SUMMARY_PREFIX`` / ``LEGACY_SUMMARY_PREFIX`` / any
+    ``_HISTORICAL_SUMMARY_PREFIXES`` entry — the frozen set of every wire
+    prefix a shipped build persisted, maintained in
+    ``agent.context_compressor``).
+
+    This is far more reliable than grouping by same title: a Kanban task
+    repeated under one title is NOT a continuation, but a root whose first
+    message begins with the handoff prefix IS one, regardless of what title
+    it carries.
+    """
+    content = _first_message_content(db, session_id)
+    if not content:
+        return False
+    try:
+        from agent.context_compressor import (
+            ContextCompressor,
+            LEGACY_SUMMARY_PREFIX,
+            SUMMARY_PREFIX,
+            _HISTORICAL_SUMMARY_PREFIXES,
+        )
+    except Exception:  # noqa: BLE001 — optional import; fall back to prefixes
+        # ContextCompressor is not importable in a minimal environment;
+        # match the current/legacy prefixes directly.
+        LEGACY_SUMMARY_PREFIX = "[CONTEXT SUMMARY]:"
+        _HISTORICAL_SUMMARY_PREFIXES = ()
+        try:
+            from agent.context_compressor import SUMMARY_PREFIX
+        except Exception:  # noqa: BLE001
+            SUMMARY_PREFIX = (
+                "[CONTEXT COMPACTION — REFERENCE ONLY] Earlier turns "
+                "were compacted into the summary below."
+            )
+    text = content.lstrip()
+    if text.startswith(SUMMARY_PREFIX) or text.startswith(LEGACY_SUMMARY_PREFIX):
+        return True
+    return any(text.startswith(p) for p in _HISTORICAL_SUMMARY_PREFIXES)
+
+
+def find_orphaned_chain_candidates(db, *, min_group: int = 2) -> list[dict]:
+    """Find root sessions that look like orphaned compression continuations.
+
+    The hard signal is the compaction-handoff first message: an older build
+    persisted a compression continuation as a NEW ROOT whose first message
+    is the summary handoff (``[CONTEXT COMPACTION — REFERENCE ONLY]...`` /
+    ``[CONTEXT SUMMARY]:...`` / any historical prefix), because at that time
+    continuations were not linked via ``parent_session_id``.
+
+    We also group roots sharing a normalized title as a secondary, weaker
+    signal, but a root whose first message is a compaction handoff is
+    reported even when it has no same-titled sibling (the strongest single
+    indication it is a continuation of an earlier conversation).
+
+    Children that are explicit delegates/branches/tools are always excluded
+    — those are legitimate separate sessions.
+
+    Returns a list of dicts:
+    ``{"title": str, "sessions": [{id, started_at, message_count, title}],
+      "signal": "handoff"|"same-title"|"both"}`` ordered oldest-first.
+    This is *detection only* — relinking is destructive and requires human
+    confirmation.
+    """
+    roots = db._conn.execute(
+        f"""
+        SELECT s.id, s.title, s.started_at, s.message_count, s.source,
+               s.model_config
+        FROM sessions s
+        WHERE s.parent_session_id IS NULL
+          AND COALESCE(s.title_source, '') != 'user'
+          AND {_DELEGATE_EXPR}
+          AND {_BRANCH_EXPR}
+          AND COALESCE(s.source, '') != 'tool'
+        ORDER BY s.started_at ASC
+        """
+    ).fetchall()
+
+    by_key: dict[str, list[dict]] = {}
+    handoff_ids: set[str] = set()
+    for r in roots:
+        key = _title_key(r["title"])
+        sess = {
+            "id": r["id"],
+            "title": r["title"],
+            "started_at": r["started_at"],
+            "message_count": r["message_count"],
+        }
+        if key is not None:
+            by_key.setdefault(key, []).append(sess)
+        if _starts_with_compaction_summary(db, r["id"]):
+            handoff_ids.add(r["id"])
+
+    # Build candidates: handoff-signal roots always; same-title groups
+    # (>= min_group) as the secondary signal.
+    candidates: list[dict] = []
+    seen_ids: set[str] = set()
+
+    for title, sess in by_key.items():
+        if len(sess) >= min_group:
+            has_handoff = any(s["id"] in handoff_ids for s in sess)
+            signal = "both" if has_handoff else "same-title"
+            candidates.append(
+                {"title": title, "sessions": sess, "signal": signal}
+            )
+            seen_ids.update(s["id"] for s in sess)
+
+    for sid in sorted(handoff_ids):
+        if sid in seen_ids:
+            continue
+        row = next(r for r in roots if r["id"] == sid)
+        candidates.append(
+            {
+                "title": row["title"] or "(untitled)",
+                "sessions": [
+                    {
+                        "id": row["id"],
+                        "title": row["title"],
+                        "started_at": row["started_at"],
+                        "message_count": row["message_count"],
+                    }
+                ],
+                "signal": "handoff",
+            }
+        )
+
+    return sorted(
+        candidates, key=lambda g: g["sessions"][0]["started_at"]
+    )
+
+
+# ---------------------------------------------------------------------------
+# Title repair
+# ---------------------------------------------------------------------------
+
+
+def _first_user_message(db, session_id: str) -> Optional[str]:
+    """Return the first user message of a session, if any."""
+    row = db._conn.execute(
+        """
+        SELECT content FROM messages
+        WHERE session_id = ? AND role = 'user'
+          AND content IS NOT NULL AND content != ''
+        ORDER BY id LIMIT 1
+        """,
+        (session_id,),
+    ).fetchone()
+    return row[0] if row else None
+
+
+def _looks_truncated(title: Optional[str], first_user: Optional[str]) -> bool:
+    """A title that is literally the first message truncated (old behavior).
+
+    Old installs titled sessions with ``first_user_message[:~40]``, so the
+    sidebar shows a mid-sentence slice. Those are regeneration candidates.
+    """
+    if not title or not title.strip():
+        return True
+    if not first_user:
+        return False
+    t = title.strip()
+    fmc = first_user.strip()[:80]
+    # Title starts like the message (>=12 chars so a short word is not a
+    # false positive), or is a verbatim prefix of it.
+    if len(t) >= 12 and (fmc.startswith(t[:25]) or t in fmc[:80]):
+        return True
+    return False
+
+
+def _title_is_placeholder(title: Optional[str]) -> bool:
+    """Chain segments often carry an empty or whitespace title."""
+    return not title or not title.strip()
+
+
+def _chain_ancestor_title(db, session_id: str, max_depth: int = 10) -> tuple[Optional[str], Optional[str]]:
+    """Walk ``parent_session_id`` up the compression chain.
+
+    Returns ``(ancestor_session_id, ancestor_title)`` for the nearest
+    ancestor that has a title, or ``(None, None)`` if none exists.
+    """
+    seen = set()
+    sid = session_id
+    for _ in range(max_depth):
+        if sid in seen or not sid:
+            return None, None
+        seen.add(sid)
+        row = db._conn.execute(
+            "SELECT parent_session_id, title FROM sessions WHERE id = ?", (sid,)
+        ).fetchone()
+        if row is None:
+            return None, None
+        if row[1]:
+            return sid, row[1]
+        sid = row[0]
+    return None, None
+
+
+def iter_missing_title_candidates(
+    db,
+    *,
+    include_chain_segments: bool = True,
+    include_legacy_truncated: bool = False,
+    limit: int = 500,
+) -> Iterable[dict]:
+    """Yield candidate rows needing a title.
+
+    * Chain segments (``parent_session_id`` set) with empty titles → inherit
+      the nearest ancestor title (with ``#N`` dedupe).
+    * Roots and stray sessions whose title is missing or truncated to the
+      first message → regenerate via the LLM generator.
+    * Pre-provenance rows (``title_source IS NULL``): official provenance
+      treats NULL as ``user`` (a manual /title from that era is
+      indistinguishable), so a non-empty legacy title is only repaired with
+      ``include_legacy_truncated`` (explicit opt-in).
+    """
+    rows = db._conn.execute(
+        """
+        SELECT id, parent_session_id, title, title_source,
+               started_at, message_count
+        FROM sessions
+        ORDER BY COALESCE(started_at, 0) ASC
+        """
+    ).fetchall()
+
+    for row in rows:
+        sid = row["id"]
+        parent = row["parent_session_id"]
+        title = row["title"]
+        source = row["title_source"]
+
+        if source == "user":
+            continue
+
+        # Chain segment with empty title → inheritance candidate.
+        if parent and _title_is_placeholder(title):
+            if include_chain_segments:
+                yield {
+                    "id": sid,
+                    "kind": "inherit",
+                    "title": title,
+                    "title_source": source,
+                }
+            continue
+
+        # Empty title (root or stray) → LLM candidate.
+        if _title_is_placeholder(title):
+            yield {
+                "id": sid,
+                "kind": "generate",
+                "title": title,
+                "title_source": source,
+            }
+            continue
+
+        # Pre-provenance rows (title_source IS NULL from old installs):
+        # official provenance treats NULL as ``user``. Refuse to overwrite a
+        # non-empty legacy title unless the user explicitly opts in with
+        # include_legacy_truncated.
+        if source is None:
+            if include_legacy_truncated:
+                fm = _first_user_message(db, sid)
+                if _looks_truncated(title, fm):
+                    yield {
+                        "id": sid,
+                        "kind": "generate",
+                        "title": title,
+                        "title_source": source,
+                        "legacy": True,
+                    }
+            continue
+
+        # Provenance rows with a known source: derived/llm are repairable,
+        # but only when the title itself is broken (truncated).
+        if source in ("derived", "llm"):
+            fm = _first_user_message(db, sid)
+            if _looks_truncated(title, fm):
+                yield {
+                    "id": sid,
+                    "kind": "generate",
+                    "title": title,
+                    "title_source": source,
+                }
+            continue
+
+
+# ---------------------------------------------------------------------------
+# Runner
+# ---------------------------------------------------------------------------
+
+
+def repair_chains(
+    db,
+    *,
+    apply_changes: bool = False,
+    progress: Optional[Callable[[str], None]] = None,
+) -> dict:
+    """Detect and repair orphaned compression chains. Returns a stats dict.
+
+    Legacy builds wrote compression continuations as independent roots (no
+    ``parent_session_id`` link). This reports groups of roots that look like
+    orphaned segments; with ``apply_changes`` it relinks them under the
+    oldest root (the head).
+
+    Relinking is only performed for **strong-signal** groups — those where
+    at least one root's first message is a compaction handoff (signal
+    ``both``). Same-title-only groups (signal ``same-title``) are reported
+    but never auto-relinked: identical titles also arise from legitimate
+    repeated tasks (e.g. kanban subtasks), so without a handoff there is no
+    evidence the roots are one conversation. Delegate/branch/tool children
+    are always excluded.
+    """
+    stats = {
+        "orphaned_chain_groups": 0,
+        "relinked": 0,
+        "skipped": 0,
+    }
+    log = progress or (lambda msg: None)
+
+    orphan_groups = find_orphaned_chain_candidates(db)
+    stats["orphaned_chain_groups"] = len(orphan_groups)
+    if apply_changes and any(
+        g["signal"] == "both" for g in orphan_groups
+    ):
+        # Batch the relinks in one transaction (SessionDB is autocommit;
+        # without BEGIN each UPDATE would be durable independently).
+        db._conn.execute("BEGIN IMMEDIATE")
+    try:
+        for g in orphan_groups:
+            ids = ", ".join(s["id"][:10] for s in g["sessions"])
+            log(
+                f"⚠ {len(g['sessions'])} roots share title {g['title']!r} "
+                f"(orphaned compression segments?): {ids}"
+            )
+            if not apply_changes:
+                continue
+            if g["signal"] != "both":
+                # Same-title-only (or single-handoff) group: no hard evidence
+                # these are one conversation — report, do not relink.
+                stats["skipped"] += 1
+                continue
+            head_id = g["sessions"][0]["id"]
+            # A relinked child is only surfaced by the official list/chain
+            # readers when the parent carries end_reason='compression' (the
+            # compression-lineage edge). Without it the child becomes a
+            # non-root, non-branch, non-reset row — invisible in the sidebar.
+            # Mark the parent so the chain renders like a normal compression
+            # continuation (one logical conversation, tip-projected).
+            db._conn.execute(
+                "UPDATE sessions SET end_reason='compression' WHERE id=?",
+                (head_id,),
+            )
+            for s in g["sessions"][1:]:
+                db._conn.execute(
+                    "UPDATE sessions SET parent_session_id=? WHERE id=?",
+                    (head_id, s["id"]),
+                )
+                stats["relinked"] += 1
+        if apply_changes:
+            db._conn.commit()
+    except Exception:
+        if apply_changes:
+            db._conn.execute("ROLLBACK")
+        raise
+    return stats
+
+
+def retitle_missing(
+    db,
+    *,
+    generate: Callable[[str], Optional[str]],
+    apply_changes: bool = False,
+    include_chain_segments: bool = True,
+    include_legacy_truncated: bool = False,
+    limit: int = 500,
+    progress: Optional[Callable[[str], None]] = None,
+) -> dict:
+    """Regenerate missing/truncated session titles. Returns a stats dict.
+
+    ``generate`` receives a first-user-message string and returns a title or
+    None. The live command wires ``agent.title_generator.generate_title``
+    here; tests inject a stub. Roots get LLM-generated titles; empty chain
+    segments inherit the nearest ancestor title (deduped with #N via
+    ``get_next_title_in_lineage``). Never overwrites a user-titled row.
+    """
+    stats = {
+        "scanned": 0,
+        "generated": 0,
+        "inherited": 0,
+        "skipped_untouchable": 0,
+        "failed": 0,
+        "up_to_date": 0,
+    }
+    log = progress or (lambda msg: None)
+
+    # --- Title repair ---
+    candidates = list(iter_missing_title_candidates(
+        db,
+        include_chain_segments=include_chain_segments,
+        include_legacy_truncated=include_legacy_truncated,
+    ))
+    if limit:
+        candidates = candidates[:limit]
+    stats["scanned"] = len(candidates)
+
+    for i, cand in enumerate(candidates, 1):
+        sid = cand["id"]
+        kind = cand["kind"]
+
+        if kind == "inherit":
+            anc_id, anc_title = _chain_ancestor_title(db, sid)
+            if not anc_title:
+                stats["skipped_untouchable"] += 1
+                continue
+            try:
+                deduped = db.get_next_title_in_lineage(anc_title)
+                log(f"[{i}/{len(candidates)}] {sid[:8]} ← inherit {anc_title!r} → {deduped!r}")
+                if apply_changes:
+                    ok = db.set_auto_title(sid, deduped, source="derived")
+                    if ok:
+                        stats["inherited"] += 1
+                    else:
+                        stats["skipped_untouchable"] += 1
+                else:
+                    stats["inherited"] += 1
+            except Exception as e:  # noqa: BLE001 — repair should never crash
+                log(f"  ✗ {sid[:8]} inherit failed: {e}")
+                stats["failed"] += 1
+            continue
+
+        # kind == "generate"
+        fm = _first_user_message(db, sid)
+        if not fm:
+            stats["skipped_untouchable"] += 1
+            continue
+        log(f"[{i}/{len(candidates)}] {sid[:8]} generating…")
+        try:
+            new_title = generate(fm)
+        except Exception as e:  # noqa: BLE001
+            log(f"  ✗ {sid[:8]} generation error: {e}")
+            stats["failed"] += 1
+            continue
+        if not new_title:
+            stats["failed"] += 1
+            continue
+        if new_title == cand["title"]:
+            stats["up_to_date"] += 1
+            continue
+        log(f"  {cand['title']!r} → {new_title!r}")
+        if apply_changes:
+            try:
+                if cand.get("legacy"):
+                    # Pre-provenance row: official auto-title refuses to
+                    # overwrite (NULL treated as user). The user opted in
+                    # with --include-legacy-truncated, so write at user
+                    # level — an explicit repair, not an auto-titler
+                    # overwrite.
+                    ok = db.set_session_title(sid, new_title)
+                else:
+                    ok = db.set_auto_title(sid, new_title, source="llm")
+                if ok:
+                    stats["generated"] += 1
+                else:
+                    stats["skipped_untouchable"] += 1
+            except Exception as e:  # noqa: BLE001
+                log(f"  ✗ {sid[:8]} write failed: {e}")
+                stats["failed"] += 1
+        else:
+            stats["generated"] += 1
+
+    return stats
+
+
+# ---------------------------------------------------------------------------
+# fork compression-chain flattening (hermes sessions merge-chains)
+# ---------------------------------------------------------------------------
+
+# Children that are legitimate continuations of a compression-ended parent.
+# Mirrors get_compression_tip's exclusion set (branch/delegate/tool).
+_MERGE_CHILD_SQL = (
+    "json_extract(COALESCE(child.model_config, '{}'), '$._branched_from') IS NULL"
+    " AND json_extract(COALESCE(child.model_config, '{}'), '$._delegate_from') IS NULL"
+    " AND COALESCE(child.source, '') != 'tool'"
+)
+
+
+def _is_compression_child(db, session_id: str) -> bool:
+    """True if this session is a child of a compression-ended parent
+    (the authoritative fork-chain edge, mirroring get_compression_tip)."""
+    row = db._conn.execute(
+        f"""
+        SELECT 1 FROM sessions parent
+        JOIN sessions child ON child.parent_session_id = parent.id
+        WHERE child.id = ?
+          AND parent.end_reason = 'compression'
+          AND {_MERGE_CHILD_SQL}
+        """,
+        (session_id,),
+    ).fetchone()
+    return row is not None
+
+
+def _walk_compression_chain(db, head: str) -> list[str]:
+    """Walk the compression-continuation chain forward from ``head``.
+
+    Returns ``[head, seg2, seg3, ...]`` — every session in the fork chain
+    (only compression edges; branch/delegate/tool children are skipped).
+    """
+    chain = [head]
+    seen = {head}
+    current = head
+    for _ in range(100):  # defensive bound — pathological chains shouldn't happen
+        row = db._conn.execute(
+            f"""
+            SELECT child.id FROM sessions parent
+            JOIN sessions child ON child.parent_session_id = parent.id
+            WHERE parent.id = ?
+              AND parent.end_reason = 'compression'
+              AND {_MERGE_CHILD_SQL}
+            ORDER BY
+              CASE WHEN child.end_reason = 'compression' THEN 0
+                   WHEN child.ended_at IS NULL THEN 1
+                   ELSE 2 END,
+              child.started_at DESC, child.id DESC
+            LIMIT 1
+            """,
+            (current,),
+        ).fetchone()
+        if not row:
+            break
+        child_id = row["id"]
+        if child_id in seen:
+            break
+        seen.add(child_id)
+        chain.append(child_id)
+        current = child_id
+    return chain
+
+
+def find_merge_chain_candidates(db) -> list[dict]:
+    """Find fork compression chains (compression-ended parent + linked child).
+
+    Returns a list of dicts (oldest head first):
+    ``{"head": str, "segments": [str, ...], "message_count": int,
+      "head_title": str|None}`` for chains with at least one segment.
+    This is *detection only* — flattening is destructive and requires
+    ``--apply`` plus the automatic pre-write backup.
+    """
+    rows = db._conn.execute(
+        f"""
+        SELECT DISTINCT parent.id AS head
+        FROM sessions parent
+        JOIN sessions child ON child.parent_session_id = parent.id
+        WHERE parent.end_reason = 'compression'
+          AND {_MERGE_CHILD_SQL}
+        ORDER BY parent.started_at ASC
+        """
+    ).fetchall()
+
+    candidates = []
+    seen_heads = set()
+    for r in rows:
+        head = r["head"]
+        if head in seen_heads:
+            continue
+        # A chain head must not itself be a compression child (else it is a
+        # middle segment of a longer chain — that longer chain's head owns it).
+        if _is_compression_child(db, head):
+            seen_heads.add(head)
+            continue
+        seen_heads.add(head)
+        chain = _walk_compression_chain(db, head)
+        if len(chain) <= 1:
+            continue
+        msg_count = 0
+        for sid in chain:
+            row = db._conn.execute(
+                "SELECT COUNT(*) c FROM messages WHERE session_id = ?", (sid,)
+            ).fetchone()
+            msg_count += row["c"]
+        title_row = db._conn.execute(
+            "SELECT title FROM sessions WHERE id = ?", (head,)
+        ).fetchone()
+        candidates.append(
+            {
+                "head": head,
+                "segments": chain[1:],
+                "message_count": msg_count,
+                "head_title": title_row["title"] if title_row else None,
+            }
+        )
+    return candidates
+
+
+def _merge_chain_stats(db, chain: list[str]) -> dict:
+    """Aggregate token/cost counters for a chain's segments (excludes head)."""
+    placeholders = ",".join("?" * len(chain[1:]))
+    row = db._conn.execute(
+        f"""
+        SELECT
+          COALESCE(SUM(input_tokens),0) it, COALESCE(SUM(output_tokens),0) ot,
+          COALESCE(SUM(cache_read_tokens),0) cr, COALESCE(SUM(cache_write_tokens),0) cw,
+          COALESCE(SUM(reasoning_tokens),0) rt,
+          COALESCE(SUM(estimated_cost_usd),0) ec, COALESCE(SUM(actual_cost_usd),0) ac,
+          COALESCE(SUM(tool_call_count),0) tc
+        FROM sessions WHERE id IN ({placeholders})
+        """,
+        tuple(chain[1:]),
+    ).fetchone()
+    return {
+        "input_tokens": row["it"],
+        "output_tokens": row["ot"],
+        "cache_read_tokens": row["cr"],
+        "cache_write_tokens": row["cw"],
+        "reasoning_tokens": row["rt"],
+        "estimated_cost_usd": row["ec"],
+        "actual_cost_usd": row["ac"],
+        "tool_call_count": row["tc"],
+    }
+
+
+def _backup_before_merge(db) -> Optional[Path]:
+    """Timestamped full snapshot via VACUUM INTO (safe against a live
+    connection, mirroring the clean-markers backup convention)."""
+    import datetime
+
+    stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    dest = db.db_path.with_name(f"{db.db_path.name}.pre-merge-chains-{stamp}")
+    db._conn.execute("VACUUM INTO ?", (str(dest),))
+    return dest
+
+
+def merge_compression_chains(
+    db,
+    *,
+    apply_changes: bool = False,
+    backup: bool = True,
+    progress: Optional[Callable[[str], None]] = None,
+) -> dict:
+    """Flatten fork compression chains into single in-place sessions.
+
+    For each chain (head + compression-linked segments), moves every segment
+    message into the head session (message ids unchanged — FTS rowids stay
+    valid, no index rebuild), merges ``session_model_usage`` counters,
+    redirects orphaned children (reset/branch sessions whose parent was a
+    removed segment) to the head, accumulates token/cost counters and gateway
+    origin columns onto the head, then deletes the segment rows.
+
+    Returns a stats dict:
+    ``{"chains": int, "segments": int, "messages_moved": int,
+      "orphans_redirected": int, "usage_merged": int, "backup_path": str|None}``
+    """
+    log = progress or (lambda msg: None)
+    candidates = find_merge_chain_candidates(db)
+    stats = {
+        "chains": len(candidates),
+        "segments": sum(len(c["segments"]) for c in candidates),
+        "messages_moved": 0,
+        "orphans_redirected": 0,
+        "usage_merged": 0,
+        "backup_path": None,
+        "verified": False,
+        "verify_report": None,
+    }
+
+    if not candidates:
+        return stats
+
+    # Report (always)
+    for c in candidates:
+        ids = ", ".join(s[:10] for s in c["segments"])
+        log(
+            f"⚠ chain {c['head'][:10]} «{c['head_title'] or '(untitled)'}»: "
+            f"{len(c['segments'])} segment(s), {c['message_count']} messages — {ids}"
+        )
+
+    if not apply_changes:
+        return stats
+
+    # Automatic backup before any write.
+    if backup:
+        try:
+            backup_path = _backup_before_merge(db)
+            stats["backup_path"] = str(backup_path)
+            log(f"✓ backup: {backup_path}")
+        except Exception as exc:  # noqa: BLE001 — backup refusal is a HARD STOP
+            log(f"✗ automatic backup failed: {exc}")
+            raise RuntimeError(
+                f"automatic backup failed ({exc}); refusing to merge without a backup"
+            ) from exc
+
+    # One transaction for the whole merge: SessionDB connects in autocommit
+    # (isolation_level=None), so without an explicit BEGIN every UPDATE/DELETE
+    # below would be durable independently and a crash mid-loop would leave a
+    # partially merged database. BEGIN IMMEDIATE takes the write lock up front
+    # (mirrors the official write path) so the batch is all-or-nothing.
+    db._conn.execute("BEGIN IMMEDIATE")
+    try:
+        for c in candidates:
+            head = c["head"]
+            segs = c["segments"]
+            placeholders = ",".join("?" * len(segs))
+            segs_tuple = tuple(segs)
+
+            # 1. Move segment messages into the head (ids unchanged).
+            cur = db._conn.execute(
+                f"UPDATE messages SET session_id=? WHERE session_id IN ({placeholders})",
+                (head,) + segs_tuple,
+            )
+            stats["messages_moved"] += cur.rowcount
+
+            # 2. Merge session_model_usage (UPSERT; prevents ON DELETE CASCADE loss).
+            usage_rows = db._conn.execute(
+                f"SELECT * FROM session_model_usage WHERE session_id IN ({placeholders})",
+                segs_tuple,
+            ).fetchall()
+            for u in usage_rows:
+                db._conn.execute(
+                    """
+                    INSERT INTO session_model_usage
+                      (session_id, model, billing_provider, billing_base_url, billing_mode, task,
+                       api_call_count, input_tokens, output_tokens, cache_read_tokens,
+                       cache_write_tokens, reasoning_tokens, estimated_cost_usd,
+                       actual_cost_usd, cost_status, cost_source, first_seen, last_seen)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    ON CONFLICT(session_id, model, billing_provider, billing_base_url,
+                                billing_mode, task)
+                    DO UPDATE SET
+                      api_call_count = session_model_usage.api_call_count + excluded.api_call_count,
+                      input_tokens = session_model_usage.input_tokens + excluded.input_tokens,
+                      output_tokens = session_model_usage.output_tokens + excluded.output_tokens,
+                      cache_read_tokens = session_model_usage.cache_read_tokens + excluded.cache_read_tokens,
+                      cache_write_tokens = session_model_usage.cache_write_tokens + excluded.cache_write_tokens,
+                      reasoning_tokens = session_model_usage.reasoning_tokens + excluded.reasoning_tokens,
+                      estimated_cost_usd = session_model_usage.estimated_cost_usd + excluded.estimated_cost_usd,
+                      actual_cost_usd = session_model_usage.actual_cost_usd + excluded.actual_cost_usd,
+                      last_seen = MAX(session_model_usage.last_seen, excluded.last_seen)
+                    """,
+                    (
+                        head, u["model"], u["billing_provider"], u["billing_base_url"],
+                        u["billing_mode"], u["task"], u["api_call_count"],
+                        u["input_tokens"], u["output_tokens"], u["cache_read_tokens"],
+                        u["cache_write_tokens"], u["reasoning_tokens"],
+                        u["estimated_cost_usd"], u["actual_cost_usd"], u["cost_status"],
+                        u["cost_source"], u["first_seen"], u["last_seen"],
+                    ),
+                )
+                stats["usage_merged"] += 1
+            db._conn.execute(
+                f"DELETE FROM session_model_usage WHERE session_id IN ({placeholders})",
+                segs_tuple,
+            )
+
+            # 3. Redirect orphaned children of removed segments to the head.
+            cur = db._conn.execute(
+                f"""
+                UPDATE sessions SET parent_session_id=?
+                WHERE parent_session_id IN ({placeholders})
+                  AND id NOT IN ({placeholders})
+                  AND id != ?
+                """,
+                (head,) + segs_tuple + segs_tuple + (head,),
+            )
+            stats["orphans_redirected"] += cur.rowcount
+
+            # 4. Accumulate counters onto the head; inherit terminal end state.
+            agg = _merge_chain_stats(db, [head] + segs)
+            total_msgs = db._conn.execute(
+                "SELECT COUNT(*) c FROM messages WHERE session_id=? AND active=1",
+                (head,),
+            ).fetchone()["c"]
+            last_row = db._conn.execute(
+                "SELECT * FROM sessions WHERE id=?",
+                (chain_tip := segs[-1],),
+            ).fetchone()
+            head_row = db._conn.execute(
+                "SELECT * FROM sessions WHERE id=?", (head,)
+            ).fetchone()
+
+            # Gateway origin inheritance: fill head's empty routing columns from the tip.
+            origin_cols = [
+                "user_id", "session_key", "chat_id", "chat_type", "thread_id",
+                "display_name", "origin_json", "handoff_platform",
+            ]
+            origin_updates = [
+                f"{col} = ?"
+                for col in origin_cols
+                if head_row[col] in (None, "") and last_row[col] not in (None, "")
+            ]
+            if origin_updates:
+                origin_params = tuple(
+                    last_row[c]
+                    for c in origin_cols
+                    if head_row[c] in (None, "") and last_row[c] not in (None, "")
+                )
+                db._conn.execute(
+                    f"UPDATE sessions SET {', '.join(origin_updates)} WHERE id=?",
+                    origin_params + (head,),
+                )
+
+            db._conn.execute(
+                """
+                UPDATE sessions SET
+                  message_count=?,
+                  input_tokens = COALESCE(input_tokens,0) + ?,
+                  output_tokens = COALESCE(output_tokens,0) + ?,
+                  cache_read_tokens = COALESCE(cache_read_tokens,0) + ?,
+                  cache_write_tokens = COALESCE(cache_write_tokens,0) + ?,
+                  reasoning_tokens = COALESCE(reasoning_tokens,0) + ?,
+                  estimated_cost_usd = COALESCE(estimated_cost_usd,0) + ?,
+                  actual_cost_usd = COALESCE(actual_cost_usd,0) + ?,
+                  tool_call_count = COALESCE(tool_call_count,0) + ?,
+                  ended_at = ?,
+                  end_reason = ?
+                WHERE id=?
+                """,
+                (
+                    total_msgs, agg["input_tokens"], agg["output_tokens"],
+                    agg["cache_read_tokens"], agg["cache_write_tokens"],
+                    agg["reasoning_tokens"], agg["estimated_cost_usd"],
+                    agg["actual_cost_usd"], agg["tool_call_count"],
+                    last_row["ended_at"], last_row["end_reason"], head,
+                ),
+            )
+
+            # 5. Delete segment rows (usage already merged — no cascade loss).
+            db._conn.execute(
+                f"DELETE FROM sessions WHERE id IN ({placeholders})", segs_tuple
+            )
+            log(
+                f"  ✓ {head[:10]} ← merged {len(segs)} segment(s), "
+                f"moved {stats['messages_moved']} messages so far"
+            )
+        db._conn.commit()
+    except Exception:
+        db._conn.execute("ROLLBACK")
+        raise
+
+    # --- Post-write file-level verification ---
+    # Compare message/session/usage counts before vs after. The only
+    # legitimate delta is the number of deleted segment rows and (because a
+    # live gateway may append messages mid-merge) any concurrent writes.
+    before_msgs = sum(c["message_count"] for c in candidates)
+    after_msgs = 0
+    for c in candidates:
+        row = db._conn.execute(
+            "SELECT COUNT(*) c FROM messages WHERE session_id = ?",
+            (c["head"],),
+        ).fetchone()
+        after_msgs += row["c"]
+    orphan_rows = db._conn.execute(
+        "SELECT COUNT(*) c FROM session_model_usage "
+        "WHERE session_id NOT IN (SELECT id FROM sessions)"
+    ).fetchone()["c"]
+    verify = {
+        "messages_before": before_msgs,
+        "messages_after": after_msgs,
+        "delta": after_msgs - before_msgs,
+        "segments_deleted": stats["segments"],
+        "usage_orphans": orphan_rows,
+    }
+    # Messages are only re-homed (session_id changed), never copied or
+    # deleted, so the total count must not shrink. A live gateway may append
+    # messages mid-merge, so after >= before is the invariant. usage orphans
+    # must be 0 (session_model_usage is ON DELETE CASCADE).
+    stats["verified"] = verify["delta"] >= 0 and verify["usage_orphans"] == 0
+    stats["verify_report"] = verify
+    log(
+        f"✓ verify: messages {verify['messages_before']} → "
+        f"{verify['messages_after']} (Δ{verify['delta']:+d}, "
+        f"deleted {verify['segments_deleted']} segment rows), "
+        f"usage orphans={verify['usage_orphans']} "
+        f"{'✅ OK' if stats['verified'] else '❌ MISMATCH'}"
+    )
+    return stats

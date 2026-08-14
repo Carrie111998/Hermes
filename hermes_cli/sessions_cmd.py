@@ -124,6 +124,9 @@ def _prune_never_active_keyed(db, args):
 def cmd_sessions(args, sessions_parser=None):
     import json as _json
 
+    def _log(msg):
+        print(msg)
+
     action = args.sessions_action
 
     # 'repair' and 'recover' must run BEFORE opening SessionDB(): a
@@ -1145,6 +1148,95 @@ def cmd_sessions(args, sessions_parser=None):
             print("  every title already reflects the user's request.")
         elif apply_changes:
             print(f"✓ Re-titled {changed} session(s).")
+
+    elif action == "repair-chains":
+        from hermes_cli.session_migration import repair_chains
+
+        apply_changes = bool(getattr(args, "apply", False))
+
+        if not apply_changes:
+            print("Dry run — pass --apply to write. Rows the user titled are never touched.")
+        stats = repair_chains(db, apply_changes=apply_changes, progress=_log)
+        print()
+        print(
+            f"✓ orphaned_chain_groups={stats['orphaned_chain_groups']} "
+            f"relinked={stats['relinked']} "
+            f"skipped={stats['skipped']}"
+        )
+        if not apply_changes:
+            print("Dry run — nothing written.")
+
+    elif action == "retitle-missing":
+        from hermes_cli.session_migration import retitle_missing
+
+        apply_changes = bool(getattr(args, "apply", False))
+        include_chain = not bool(getattr(args, "no_chain_inherit", False))
+        include_legacy = bool(getattr(args, "include_legacy_truncated", False))
+        limit = max(1, int(getattr(args, "limit", 500) or 500))
+
+        def _generate(fm):
+            from agent.title_generator import generate_title
+
+            return generate_title(fm, timeout=120)
+
+        if not apply_changes:
+            print("Dry run — pass --apply to write. Rows the user titled are never touched.")
+        stats = retitle_missing(
+            db,
+            generate=_generate,
+            apply_changes=apply_changes,
+            include_chain_segments=include_chain,
+            include_legacy_truncated=include_legacy,
+            limit=limit,
+            progress=_log,
+        )
+        print()
+        print(
+            f"✓ scanned={stats['scanned']} "
+            f"generated={stats['generated']} "
+            f"inherited={stats['inherited']} "
+            f"skipped={stats['skipped_untouchable']} "
+            f"failed={stats['failed']} "
+            f"up_to_date={stats['up_to_date']}"
+        )
+        if not apply_changes:
+            print("Dry run — nothing written.")
+
+    elif action == "merge-chains":
+        from hermes_cli.session_migration import merge_compression_chains
+
+        apply_changes = bool(getattr(args, "apply", False))
+
+        print(
+            "fork compression-chain flattening "
+            f"({'dry run — pass --apply to write' if not apply_changes else 'writing'})"
+        )
+        merge_stats = merge_compression_chains(
+            db,
+            apply_changes=apply_changes,
+            backup=apply_changes,
+            progress=_log,
+        )
+        print()
+        print(
+            f"✓ chains={merge_stats['chains']} "
+            f"segments={merge_stats['segments']} "
+            f"messages_moved={merge_stats['messages_moved']} "
+            f"orphans_redirected={merge_stats['orphans_redirected']} "
+            f"usage_merged={merge_stats['usage_merged']}"
+        )
+        if merge_stats.get("verify_report"):
+            v = merge_stats["verify_report"]
+            print(
+                f"  verify: messages {v['messages_before']} → "
+                f"{v['messages_after']} (Δ{v['delta']:+d}), "
+                f"usage orphans={v['usage_orphans']} "
+                f"{'✅ OK' if merge_stats['verified'] else '❌ MISMATCH'}"
+            )
+        if merge_stats["backup_path"]:
+            print(f"  backup: {merge_stats['backup_path']}")
+        if not apply_changes:
+            print("Dry run — nothing written.")
 
     elif action == "browse":
         limit = getattr(args, "limit", 500) or 500
