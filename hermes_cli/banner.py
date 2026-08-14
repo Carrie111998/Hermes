@@ -633,7 +633,20 @@ def _defer_update_notice(console: "Console", max_wait: float = 30.0) -> None:
             behind = _update_result
             if behind is None or behind == 0:
                 return
-            console.print(_format_update_notice(behind))
+            # Render rich markup to ANSI in memory, then print through
+            # prompt_toolkit's renderer. console.print() writes raw escapes
+            # to stdout, which patch_stdout's StdoutProxy mangles into
+            # visible "[1;33m..." artifacts (see #2262 / #2448; this
+            # callsite was missed by both fixes). Lazy imports keep this
+            # module off the gateway startup path (see module docstring).
+            from io import StringIO
+            from rich.console import Console as _RichConsole
+            buf = StringIO()
+            _RichConsole(
+                file=buf, force_terminal=True, color_system="truecolor", highlight=False
+            ).print(_format_update_notice(behind))
+            for line in buf.getvalue().rstrip("\n").split("\n"):
+                cprint(line)
         except Exception:
             pass  # never break the session over an update notice
 

@@ -83,3 +83,36 @@ def test_build_welcome_banner_non_moa_unchanged(tmp_path, monkeypatch):
     out = console.export_text()
     assert "claude-opus-4.8" in out
     assert "MoA:" not in out
+
+
+def test_defer_update_notice_routes_through_cprint_not_raw_console():
+    """Deferred update notice must render via prompt_toolkit (cprint), never
+    console.print — raw ANSI to stdout gets mangled by patch_stdout's
+    StdoutProxy into visible "[1;33m..." artifacts (#83969, cf. #2262/#2448)."""
+    import threading
+    import time
+    from unittest.mock import Mock, patch
+
+    import hermes_cli.banner as banner
+
+    console = Mock()
+    done = threading.Event()
+    done.set()
+
+    with (
+        patch.object(banner, "_update_check_done", done),
+        patch.object(banner, "_update_result", 5),
+        patch.object(banner, "_deferred_update_notice_started", False),
+        patch.object(banner, "cprint") as mock_cprint,
+    ):
+        banner._defer_update_notice(console, max_wait=1.0)
+        deadline = time.time() + 2.0
+        while time.time() < deadline and mock_cprint.call_count == 0:
+            time.sleep(0.01)
+
+    console.print.assert_not_called()
+    assert mock_cprint.call_count >= 1, "deferred notice never printed via cprint"
+    for call in mock_cprint.call_args_list:
+        line = call.args[0]
+        assert "\x1b[" in line, f"expected ANSI-rendered line, got: {line!r}"
+        assert "[bold yellow]" not in line, f"rich markup leaked through: {line!r}"
