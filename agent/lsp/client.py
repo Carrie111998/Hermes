@@ -355,20 +355,23 @@ class LSPClient:
         proc = self._proc
         if proc is None or os.name == "nt":
             return
+        pid = getattr(proc, "pid", None)
+        if pid is None:
+            return
         try:
-            pgid = os.getpgid(proc.pid)
+            pgid = os.getpgid(pid)
         except ProcessLookupError:
             # ``start_new_session`` makes the child PID its group ID.  If
             # the parent exited before getpgid(), retaining that ID still
-            # lets cleanup reap a descendant that outlived its parent.
-            pgid = proc.pid
+            # lets cleanup reap a descendant that outlived the parent.
+            pgid = pid
         except OSError:
             return
         try:
             # ``start_new_session`` owns the group whose id is the child PID.
             # Refuse to signal a group the child joined later because it may
             # contain unrelated processes.
-            if pgid == proc.pid and pgid != os.getpgrp():
+            if pgid == pid and pgid != os.getpgrp():
                 self._pgid = pgid
         except OSError:
             return
