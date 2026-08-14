@@ -10,7 +10,6 @@ reasoning configuration, temperature handling, and extra_body assembly.
 """
 
 import json
-from collections.abc import Mapping
 from typing import Any, Dict
 
 from agent.lmstudio_reasoning import resolve_lmstudio_effort
@@ -878,34 +877,18 @@ class ChatCompletionsTransport(ProviderTransport):
         return True
 
     def extract_cache_stats(self, response: Any) -> dict[str, int] | None:
-        """Extract cache stats from all supported OpenAI-wire usage shapes.
-
-        Anthropic-compatible relays may keep ``cache_creation_input_tokens``
-        at the usage top level or nest it in ``prompt_tokens_details``.
-        """
+        """Extract cache stats from prompt_tokens_details (OpenRouter/OpenAI)
+        or DeepSeek's native top-level prompt_cache_hit_tokens field."""
         usage = getattr(response, "usage", None)
-        if isinstance(response, Mapping):
-            usage = response.get("usage")
         if usage is None:
             return None
-        def _field(value: Any, name: str, default: Any = 0) -> Any:
-            if isinstance(value, Mapping):
-                return value.get(name, default)
-            return getattr(value, name, default)
-
-        details = _field(usage, "prompt_tokens_details", None)
-        cached = _field(details, "cached_tokens", 0) or 0 if details else 0
-        written = (
-            (_field(details, "cache_write_tokens", 0) or 0 if details else 0)
-            or (_field(details, "cache_creation_input_tokens", 0) or 0 if details else 0)
-            or _field(usage, "cache_creation_input_tokens", 0)
-            or _field(usage, "cache_write_tokens", 0)
-            or 0
-        )
+        details = getattr(usage, "prompt_tokens_details", None)
+        cached = getattr(details, "cached_tokens", 0) or 0 if details else 0
+        written = getattr(details, "cache_write_tokens", 0) or 0 if details else 0
         if not cached:
             # DeepSeek native API shape (api.deepseek.com): top-level
             # prompt_cache_hit_tokens / prompt_cache_miss_tokens (#61871).
-            cached = _field(usage, "prompt_cache_hit_tokens", 0) or 0
+            cached = getattr(usage, "prompt_cache_hit_tokens", 0) or 0
         if cached or written:
             return {"cached_tokens": cached, "creation_tokens": written}
         return None

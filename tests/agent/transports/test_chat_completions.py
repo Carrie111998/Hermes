@@ -504,38 +504,6 @@ class TestChatCompletionsCacheStats:
         result = transport.extract_cache_stats(r)
         assert result == {"cached_tokens": 1500, "creation_tokens": 0}
 
-    @pytest.mark.parametrize(
-        ("details", "top_level", "expected"),
-        [
-            (SimpleNamespace(cache_creation_input_tokens=320), None, 320),
-            (SimpleNamespace(cache_creation_input_tokens=0), 640, 640),
-            (SimpleNamespace(cache_write_tokens=0, cache_creation_input_tokens=320), 640, 320),
-        ],
-    )
-    def test_anthropic_cache_creation_tokens_from_openai_wire_shapes(
-        self, transport, details, top_level, expected
-    ):
-        usage = SimpleNamespace(
-            prompt_tokens_details=details,
-            cache_creation_input_tokens=top_level,
-        )
-
-        result = transport.extract_cache_stats(SimpleNamespace(usage=usage))
-
-        assert result == {"cached_tokens": 0, "creation_tokens": expected}
-
-    def test_anthropic_cache_creation_tokens_from_mapping_wire_shape(self, transport):
-        response = {
-            "usage": {
-                "prompt_tokens_details": {"cache_creation_input_tokens": 512},
-            }
-        }
-
-        assert transport.extract_cache_stats(response) == {
-            "cached_tokens": 0,
-            "creation_tokens": 512,
-        }
-
 
 
 class TestChatCompletionsGeminiNativeExtraBodyStrip:
