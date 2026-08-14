@@ -63,3 +63,21 @@ def test_workspace_subcommand_requires_json_and_dry_run_for_import(tmp_path, cap
         assert exc.code == 2
     else:
         raise AssertionError("import without --dry-run must be rejected")
+
+
+def test_manifest_binds_exact_observation_but_remains_read_only(tmp_path, capsys):
+    parser = argparse.ArgumentParser()
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    build_workspace_parser(subparsers, cmd_workspace=cmd_workspace)
+    repo = _repo(tmp_path)
+    before = sorted(item.name for item in repo.iterdir())
+
+    args = parser.parse_args(["workspace", "manifest", "--repo", str(repo), "--json"])
+    assert args.func(args) == 0
+    report = json.loads(capsys.readouterr().out)
+
+    assert report["operation"] == "closeout_manifest"
+    assert len(report["manifest_hash"]) == 64
+    assert report["apply_available"] is False
+    assert report["entries"][0]["canonical_path"] == str(repo.resolve())
+    assert sorted(item.name for item in repo.iterdir()) == before

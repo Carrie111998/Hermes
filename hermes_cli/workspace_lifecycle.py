@@ -15,7 +15,7 @@ from pathlib import Path
 import sqlite3
 import subprocess
 import time
-from typing import Any, Iterable, Iterator
+from typing import Any, Iterator
 import uuid
 
 try:  # The lifecycle manager is host-local; Windows is retain-only until it has a lease backend.
@@ -254,127 +254,43 @@ def import_dry_run(repo: str | Path) -> dict[str, Any]:
     return report
 
 
-def _load_post_cleanup_baseline(path: str | Path) -> dict[str, dict[str, Any]]:
-    """Read the owner-provided post-cleanup baseline as data, never as authority.
+def build_closeout_manifest(repo: str | Path) -> dict[str, Any]:
+    """Bind an owner-review packet to the exact observed paths and evidence.
 
-    The baseline syntax is deliberately narrow: only ``- `<HEAD>` `<path>``` rows
-    are accepted.  Unknown prose is ignored, so a malformed or future document
-    cannot manufacture a removable registration.
+    This remains a read-only report.  Its hash is a review identity, not removal
+    authority; a later apply phase must re-observe every predicate and require an
+    exact hash match before it can even consider a mutation.
     """
-    import re
-
-    rows: dict[str, dict[str, Any]] = {}
-    line_re = re.compile(r"^- `([0-9a-f]{40})` `([^`]+)`")
-    category_re = re.compile(r"^## `([a-z_]+)` \(\d+\)$")
-    manifest_path_re = re.compile(r"^- `([^`]+)`$")
-    try:
-        lines = Path(path).read_text(encoding="utf-8").splitlines()
-    except (OSError, UnicodeError) as exc:
-        raise RuntimeError("baseline unreadable; comparison blocked") from exc
-    active_category: str | None = None
-    categories: dict[str, str] = {}
-    for line in lines:
-        match = line_re.match(line)
-        if match:
-            head, raw_path = match.groups()
-            canonical = str(Path(raw_path).resolve(strict=False))
-            if canonical in rows and rows[canonical]["head"] != head:
-                raise RuntimeError("baseline has conflicting canonical paths")
-            rows[canonical] = {"head": head, "category": None, "classification": "retain"}
-            continue
-        heading = category_re.match(line)
-        if heading:
-            active_category = heading.group(1)
-            continue
-        manifest_path = manifest_path_re.match(line)
-        if active_category and manifest_path:
-            canonical = str(Path(manifest_path.group(1)).resolve(strict=False))
-            if canonical in categories and categories[canonical] != active_category:
-                raise RuntimeError("baseline assigns conflicting retention categories")
-            categories[canonical] = active_category
-    if len(rows) != 54:
-        raise RuntimeError(f"baseline must contain exactly 54 retained registrations; found {len(rows)}")
-    if set(rows) != set(categories):
-        raise RuntimeError("baseline category manifest does not exactly cover retained registrations")
-    for canonical, row in rows.items():
-        row["category"] = categories[canonical]
-    return rows
-
-
-def _legacy_observed_category(row: dict[str, Any]) -> str:
-    """Map only proven observations; do not infer a historical retention reason."""
-    evidence = row["evidence"]
-    if evidence.get("lock") == "locked":
-        return "locked"
-    if evidence.get("status") in {"dirty", "untracked", "tracked_dirty", "unreadable", "timeout"}:
-        return "dirty_or_unreadable"
-    return "unclassified_legacy"
-
-
-def compare_post_cleanup_baseline(repo: str | Path, baseline_path: str | Path) -> dict[str, Any]:
-    """Emit path-by-path drift evidence without importing, writing, or reclassifying.
-
-    A legacy ``retain`` is never upgraded by this report.  Every mismatch remains
-    owner-review evidence and the dedicated implementation worktree is reported
-    as a post-baseline addition rather than a historical drift.
-    """
-    baseline = _load_post_cleanup_baseline(baseline_path)
     inventory = collect_inventory(repo)
-    observed = {
-        row["evidence"]["canonical_path"]: row
+    entries = [
+        {
+            "canonical_path": row["evidence"]["canonical_path"],
+            "repo_common_dir": row["evidence"]["repo_common_dir"],
+            "head": row["evidence"]["head"],
+            "branch": row["evidence"]["branch"],
+            "evidence_hash": row["evidence_hash"],
+            "disposition": row["disposition"],
+            "state": row["state"],
+            "reasons": row["reasons"],
+        }
         for row in inventory.get("workspaces", [])
-    }
-    comparisons: list[dict[str, Any]] = []
-    for canonical_path in sorted(baseline):
-        expected = baseline[canonical_path]
-        row = observed.pop(canonical_path, None)
-        differences: list[str] = []
-        if row is None:
-            differences.append("missing_registration")
-            actual: dict[str, Any] | None = None
-        else:
-            actual = row
-            evidence = row["evidence"]
-            actual_category = _legacy_observed_category(row)
-            category_verification = "observed" if expected["category"] in {
-                "dirty_or_unreadable", "locked",
-            } else "unavailable_without_authoritative_adapter"
-            if evidence.get("head") != expected["head"]:
-                differences.append("head")
-            if category_verification == "observed" and actual_category != expected["category"]:
-                differences.append("category")
-            # The manifest records known exceptional observations.  It does not
-            # invent a clean/unlocked fact for the other legacy rows.
-            if expected["category"] == "dirty_or_unreadable" and evidence.get("status") not in {
-                "dirty", "untracked", "tracked_dirty", "unreadable", "timeout",
-            }:
-                differences.append("status")
-            if expected["category"] == "locked" and evidence.get("lock") != "locked":
-                differences.append("lock")
-            actual = {
-                **row,
-                "observed_category": actual_category,
-                "category_verification": category_verification,
-            }
-        comparisons.append({
-            "canonical_path": canonical_path,
-            "expected": expected,
-            "actual": actual,
-            "differences": differences,
-            "owner_review": bool(differences),
-        })
-    additions = sorted(observed)
-    return {
+    ]
+    entries.sort(key=lambda item: item["canonical_path"])
+    payload = {
         "schema_version": SCHEMA_VERSION,
-        "operation": "baseline_compare",
+        "repo": inventory["repo"],
+        "entries": entries,
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return {
+        **payload,
+        "operation": "closeout_manifest",
         "dry_run": True,
-        "expected_registrations": len(baseline),
-        "observed_registrations": len(inventory.get("workspaces", [])),
-        "comparisons": comparisons,
-        "post_baseline_additions": additions,
+        "manifest_hash": hashlib.sha256(encoded.encode("utf-8")).hexdigest(),
+        "apply_available": False,
         "disposition": Disposition.BLOCKED_REVIEW.value,
         "state": WorkspaceState.BLOCKED_REVIEW.value,
-        "reasons": ["baseline_observation_only", "legacy_rows_never_auto_removable"],
+        "reasons": ["report_only", "owner_review_required", "apply_path_unavailable"],
     }
 
 
@@ -584,17 +500,20 @@ class Registry:
                     raise RuntimeError("idempotency conflict: key maps to different workspace identity")
                 conn.execute("COMMIT")
                 return prior
+            canonical_path = Path(evidence.canonical_path).resolve(strict=False)
+            if canonical_path.exists():
+                raise RuntimeError("unmanaged pre-existing workspace collision; retain-only")
             record = json.dumps({"schema_version": SCHEMA_VERSION, "evidence": json.loads(evidence.canonical_json()),
                                  "reservation": {"pid": os.getpid(), "process_started_at": process_start_identity(), "reserved_at": int(time.time()),
                                                  "recovery_statement": "interrupted reservation blocks review; no Git mutation resumed"}},
                                 sort_keys=True, separators=(",", ":"))
             conn.execute("INSERT INTO workspaces VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                         (workspace_id, idempotency_key, str(Path(evidence.canonical_path).resolve(strict=False)),
+                         (workspace_id, idempotency_key, str(canonical_path),
                           evidence.repo_common_dir, WorkspaceState.PREPARING.value,
                           Disposition.BLOCKED_REVIEW.value, json.dumps(["preparing"]), evidence.observation_hash, record))
             self._append_observation(conn, workspace_id, evidence)
             conn.execute("COMMIT")
-            return {"id": workspace_id, "canonical_path": str(Path(evidence.canonical_path).resolve(strict=False)),
+            return {"id": workspace_id, "canonical_path": str(canonical_path),
                     "state": WorkspaceState.PREPARING.value, "disposition": Disposition.BLOCKED_REVIEW.value,
                     "reasons": ["preparing"], "evidence_hash": evidence.observation_hash}
         except Exception:

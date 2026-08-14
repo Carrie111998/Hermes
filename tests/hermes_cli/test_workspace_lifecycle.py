@@ -12,8 +12,8 @@ from hermes_cli.workspace_lifecycle import (
     Evidence,
     Registry,
     WorkspaceState,
+    build_closeout_manifest,
     classify,
-    compare_post_cleanup_baseline,
     collect_inventory,
     import_dry_run,
     manager_registry_path,
@@ -130,6 +130,25 @@ def test_idempotency_key_refuses_different_workspace_identity(tmp_path):
         )
 
 
+def test_reservation_refuses_unmanaged_pre_existing_path(tmp_path):
+    occupied = tmp_path / "occupied"
+    occupied.mkdir()
+    registry = Registry(tmp_path / "registry.sqlite3")
+
+    with pytest.raises(RuntimeError, match="unmanaged pre-existing workspace collision"):
+        registry.reserve(
+            workspace_id="one",
+            idempotency_key="one",
+            evidence=_evidence(tmp_path, canonical_path=str(occupied)),
+        )
+
+    conn = registry.open()
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM workspaces").fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
 def test_interrupted_preparing_is_reconciled_to_blocked_review(tmp_path):
     registry = Registry(tmp_path / "registry.sqlite3")
     conn = registry.open()
@@ -187,20 +206,15 @@ def test_dirty_nested_or_unmanaged_is_never_labeled_preserved(tmp_path):
         assert classify(_evidence(tmp_path, **overrides)).state is not WorkspaceState.PRESERVED
 
 
-def test_baseline_comparison_is_observation_only_and_reports_each_missing_row(tmp_path):
-    baseline = tmp_path / "baseline.md"
-    rows = [f"- `{'a' * 40}` `{tmp_path / f'legacy-{i}'}`" for i in range(54)]
-    manifest = [f"- `{tmp_path / f'legacy-{i}'}`" for i in range(54)]
-    baseline.write_text("\n".join(rows + ["", "## `evidence_update_pr_or_nonterminal` (54)", ""] + manifest) + "\n", encoding="utf-8")
-    before = baseline.read_bytes()
+def test_closeout_manifest_is_generic_hashed_and_never_authorizes_apply(tmp_path):
+    report = build_closeout_manifest(tmp_path / "missing-repo")
 
-    report = compare_post_cleanup_baseline(tmp_path / "missing-repo", baseline)
-
+    assert report["operation"] == "closeout_manifest"
     assert report["dry_run"] is True
-    assert report["expected_registrations"] == 54
-    assert len(report["comparisons"]) == 54
-    assert all(item["differences"] == ["missing_registration"] for item in report["comparisons"])
-    assert baseline.read_bytes() == before
+    assert report["entries"] == []
+    assert len(report["manifest_hash"]) == 64
+    assert report["apply_available"] is False
+    assert report["disposition"] == "blocked_review"
 
 
 def _race_reservation(registry_path: str, root: str, queue) -> None:

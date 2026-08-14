@@ -652,6 +652,24 @@ All actions are also available as a slash command in the gateway (`/kanban …`)
 
 For the full design — comparison with Cline Kanban / Paperclip / NanoClaw / Gemini Enterprise, eight collaboration patterns, four user stories, concurrency correctness proof — see `docs/hermes-kanban-v1-spec.pdf` in the repository or the [Kanban user guide](/user-guide/features/kanban).
 
+## `hermes workspace`
+
+Read-only, fail-closed workspace lifecycle reports. These commands inspect Git
+worktree registrations but do not create a registry entry, mutate a repository,
+or authorize removal.
+
+```bash
+hermes workspace inventory --repo /path/to/repo --json
+hermes workspace classify --repo /path/to/repo --json
+hermes workspace import --repo /path/to/repo --dry-run --json
+hermes workspace manifest --repo /path/to/repo --json
+```
+
+`manifest` binds the exact observed paths, heads, branches, and evidence hashes
+to a single manifest hash for owner review. The manifest is not permission to
+remove anything: V1 has no apply path, and all legacy or unverified work remains
+`blocked_review` or retained.
+
 ## `hermes egress`
 
 Outbound credential-injection firewall for remote terminal sandboxes. Wraps the [iron-proxy](https://github.com/ironsh/iron-proxy) daemon — a TLS-intercepting proxy that swaps opaque proxy tokens for real upstream API credentials at the network boundary, so sandboxes never hold real keys. Disabled by default; see the full [Egress proxy](../user-guide/egress/iron-proxy.md) page for setup + architecture.
