@@ -380,6 +380,38 @@ def test_custom_endpoint_uses_provider_currency_override(monkeypatch):
     assert entry.output_cost_per_million == Decimal("0.221463")
 
 
+def test_named_custom_provider_selects_its_own_same_url_override(monkeypatch):
+    monkeypatch.setattr(
+        "agent.usage_pricing.fetch_endpoint_model_metadata",
+        lambda *_args, **_kwargs: {
+            "model": {"pricing": {"prompt": "0.000001", "completion": "0.000002"}}
+        },
+    )
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config_readonly",
+        lambda: {
+            "providers": {
+                "first": {
+                    "api": "https://router.example/v1",
+                    "pricing": {"currency": "RUB", "rate": "0.01"},
+                },
+                "second": {
+                    "api": "https://router.example/v1",
+                    "pricing": {"currency": "RUB", "rate": "0.02"},
+                },
+            }
+        },
+    )
+
+    entry = get_pricing_entry(
+        "model", provider="second", base_url="https://router.example/v1"
+    )
+
+    assert entry is not None
+    assert entry.input_cost_per_million == Decimal("0.02")
+    assert entry.output_cost_per_million == Decimal("0.04")
+
+
 def test_custom_endpoint_rejects_non_usd_pricing_without_rate(monkeypatch):
     """Never relabel a declared foreign-currency amount as USD by guessing."""
     monkeypatch.setattr(

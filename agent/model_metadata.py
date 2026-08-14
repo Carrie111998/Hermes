@@ -1142,9 +1142,22 @@ def _extract_pricing(payload: Dict[str, Any]) -> Dict[str, Any]:
                 if alias in normalized and normalized[alias] not in {None, ""}:
                     pricing[target] = normalized[alias]
                     break
+        for field in ("currency", "rate"):
+            if field in normalized and normalized[field] not in {None, ""}:
+                pricing[field] = normalized[field]
         if pricing:
             return pricing
     return {}
+
+
+def _copy_currency_metadata(
+    entry: Dict[str, Any],
+    payload: Dict[str, Any],
+) -> None:
+    if payload.get("currency") not in {None, ""}:
+        entry["currency"] = payload["currency"]
+        if payload.get("rate") not in {None, ""}:
+            entry["rate"] = payload["rate"]
 
 
 def _add_model_aliases(cache: Dict[str, Dict[str, Any]], model_id: str, entry: Dict[str, Any]) -> None:
@@ -1273,6 +1286,7 @@ def fetch_endpoint_model_metadata(
                     if not model_id:
                         continue
                     entry: Dict[str, Any] = {"name": model.get("name", model_id)}
+                    _copy_currency_metadata(entry, model)
 
                     context_length = None
                     for inst in model.get("loaded_instances", []) or []:
@@ -1344,6 +1358,7 @@ def fetch_endpoint_model_metadata(
                 if not model_id:
                     continue
                 entry: Dict[str, Any] = {"name": model.get("name", model_id)}
+                _copy_currency_metadata(entry, model)
                 context_length = _extract_context_length(model)
                 if context_length is not None:
                     entry["context_length"] = context_length

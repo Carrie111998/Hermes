@@ -1195,7 +1195,10 @@ def _openrouter_pricing_entry(route: BillingRoute) -> Optional[PricingEntry]:
     )
 
 
-def _custom_provider_pricing_override(base_url: str) -> Dict[str, Any]:
+def _custom_provider_pricing_override(
+    base_url: str,
+    provider: str = "",
+) -> Dict[str, Any]:
     """Return explicit pricing semantics for the custom provider at *base_url*."""
     if not base_url:
         return {}
@@ -1207,11 +1210,17 @@ def _custom_provider_pricing_override(base_url: str) -> Dict[str, Any]:
         )
 
         target = normalize_route_base_url(base_url)
+        provider_key = provider.strip().lower()
+        matches = []
         for entry in get_compatible_custom_providers(load_config_readonly()):
             candidate = normalize_route_base_url(entry.get("base_url"))
             pricing = entry.get("pricing")
             if candidate == target and isinstance(pricing, dict):
-                return pricing
+                matches.append(entry)
+                if str(entry.get("provider_key") or "").strip().lower() == provider_key:
+                    return pricing
+        if len(matches) == 1:
+            return matches[0]["pricing"]
     except Exception:
         logger.debug("custom-provider pricing override resolution failed", exc_info=True)
     return {}
@@ -1312,7 +1321,10 @@ def get_pricing_entry(
             route.model,
             source_url=f"{route.base_url.rstrip('/')}/models",
             pricing_version="openai-compatible-models-api",
-            pricing_override=_custom_provider_pricing_override(route.base_url),
+            pricing_override=_custom_provider_pricing_override(
+                route.base_url,
+                route.provider,
+            ),
         )
         if entry:
             return entry
