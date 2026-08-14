@@ -95,6 +95,54 @@ _EXCLUDED_NAMES = {
     "cron.pid",
 }
 
+# ---------------------------------------------------------------------------
+# Chrome-debug transient state
+# ---------------------------------------------------------------------------
+# The Hermes-managed debug Chrome profile (``chrome-debug/`` at the top level
+# of HERMES_HOME -- see ``chrome_debug_data_dir()`` in
+# ``hermes_cli/browser_connect.py``) is continuously rewritten by Chrome
+# itself while a debug session is active: UMA metrics buffers, per-tab
+# session-restore state, and LevelDB WAL segments are swapped/rotated/deleted
+# with no advance notice. None of this data has restore value -- it's
+# regenerated from scratch on the next Chrome launch -- and the constant
+# churn means a scan-then-archive backup can observe a file that existed at
+# scan time vanish before the archive-write phase reaches it, raising a
+# harmless ``FileNotFoundError`` (see
+# docs/rca-chrome-debug-transient-files-backup.md).
+#
+# Excluding these subpaths up front eliminates the race in the common case
+# *and* lets ``os.walk`` skip descending into them entirely (faster scans).
+# Both are scoped to fire only when rooted under the top-level
+# ``chrome-debug/`` directory so a same-named directory elsewhere under
+# HERMES_HOME (e.g. a skill's own ``Sessions`` folder) is never affected.
+_CHROME_DEBUG_ROOT_DIR = "chrome-debug"
+
+_CHROME_DEBUG_TRANSIENT_DIRS = {
+    "Sessions",         # Default/Sessions/Session_<id>, Tabs_<id> -- tab/session
+                         # restore state, rewritten under a new timestamped
+                         # filename on every navigation/tab event.
+    "shared_proto_db",  # Default/shared_proto_db/*.log, *.ldb -- LevelDB WAL,
+                         # rotated away during compaction.
+    "BrowserMetrics",   # BrowserMetrics/*.pma -- UMA metrics recording buffer.
+}
+
+_CHROME_DEBUG_TRANSIENT_FILES = {
+    # Pre-allocated "spare" metrics buffer Chrome swaps in/out as it rotates
+    # the active BrowserMetrics file.
+    "BrowserMetrics-spare.pma",
+}
+
+
+def _is_chrome_debug_transient_dir(rel_dir: Path, dirname: str) -> bool:
+    """True if *dirname* directly under *rel_dir* is known-transient,
+    regenerable Chrome-internal state that ``os.walk`` should prune before
+    descending (see ``_CHROME_DEBUG_TRANSIENT_DIRS`` above)."""
+    if dirname not in _CHROME_DEBUG_TRANSIENT_DIRS:
+        return False
+    parts = rel_dir.parts
+    return bool(parts) and parts[0] == _CHROME_DEBUG_ROOT_DIR
+
+
 # File names that ``hermes import`` must never overwrite, matched by basename so
 # they're caught for the root profile (``gateway_state.json``) and for named
 # profiles alike (``profiles/<name>/gateway_state.json``).
@@ -308,6 +356,15 @@ def _should_exclude(rel_path: Path) -> bool:
             continue
         return True
 
+    # Chrome-debug transient state (see ``_CHROME_DEBUG_TRANSIENT_DIRS``
+    # above): scoped to fire only under the top-level ``chrome-debug/`` dir so
+    # a same-named directory elsewhere under HERMES_HOME is never affected.
+    if parts and parts[0] == _CHROME_DEBUG_ROOT_DIR:
+        if any(part in _CHROME_DEBUG_TRANSIENT_DIRS for part in parts[1:]):
+            return True
+        if rel_path.name in _CHROME_DEBUG_TRANSIENT_FILES:
+            return True
+
     name = rel_path.name
 
     if name in _EXCLUDED_NAMES:
@@ -339,27 +396,167 @@ def _should_skip_backup_file(abs_path: Path, rel_path: Path, out_path: Path) -> 
 # SQLite safe copy
 # ---------------------------------------------------------------------------
 
+# ``sqlite3.Connection.backup()`` retries SQLITE_BUSY/SQLITE_LOCKED with
+# ``time.sleep()`` inside CPython's C implementation
+# (Modules/_sqlite/connection.c: a ``do { sqlite3_backup_step(); if (BUSY or
+# LOCKED) sqlite3_sleep(); } while (OK or BUSY or LOCKED)`` loop) with NO
+# overall deadline. The ``timeout=`` a connection is opened with only bounds
+# the *initial* lock acquisition for ordinary statements -- it has no effect
+# on this loop at all, confirmed empirically: opening both sides with
+# timeout=2 and holding an external BEGIN EXCLUSIVE for 8s still blocks
+# backup() for the full 8s. Left unbounded, a source `.db` that stays
+# SQLITE_BUSY (observed in the wild against Chrome's own
+# ``first_party_sets.db`` under ``chrome-debug/``, including a live 61s
+# in-situ hang against a real lock, and even against the user's separate
+# personal Chrome profile's copy of the same file -- so this is a Chrome/
+# SQLite locking characteristic, not specific to the Hermes-managed
+# profile) can stall the entire ``hermes backup`` run for as long as the
+# lock is held.
+#
+# Bounded via the ``progress=`` callback, which CPython invokes after
+# *every* ``sqlite3_backup_step()`` call including ones that returned BUSY/
+# LOCKED, and which can raise to abort the backup cleanly (CPython's own
+# comment: "Callback failed: abort backup and bail" -- it still calls
+# ``sqlite3_backup_finish()`` internally, so no handle is leaked). The
+# deadline check is gated on ``status in (SQLITE_BUSY, SQLITE_LOCKED)``,
+# NOT on raw elapsed time: with the default ``pages=-1`` a healthy,
+# uncontended copy -- however large -- completes in a single
+# ``sqlite3_backup_step()`` call, and the progress callback only fires
+# *after* that (possibly slow, for a many-GB state.db) step finishes. A
+# time-only check would wrongly discard an already-successful large,
+# non-busy copy; gating on status keeps the deadline meaningful only for
+# genuine lock contention. Confirmed both properties experimentally: a
+# genuinely-busy source is aborted well before an 8-10s external lock would
+# clear, while an 87 MB non-busy source completes normally even against a
+# 1ms deadline.
+#
+# See the ``timeout=0`` comment inside ``_safe_copy_db`` below for a
+# second, easy-to-miss piece this fix depends on: the connections used in
+# the bounded path must NOT use ``sqlite3.connect()``'s default 5s
+# ``timeout=``, or SQLite's own internal busy-handler silently absorbs the
+# wait *inside* a single backup_step() call before our callback ever runs.
+_SAFE_COPY_BUSY_DEADLINE_SECONDS = 30.0
+_SQLITE_BUSY_STATUSES = (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED)
+
+
+class _SafeCopyBusyTimeout(Exception):
+    """Raised from the backup() progress callback past the busy deadline.
+
+    Plain ``Exception`` subclass so it's caught by the existing
+    ``except Exception as exc:`` in :func:`_safe_copy_db` with no change to
+    that function's control flow or return contract -- a busy-timeout abort
+    degrades to the same "safe copy failed" warning + ``False`` return as
+    any other backup() failure.
+    """
+
+
+def _resolve_safe_copy_busy_deadline_seconds() -> float:
+    """Busy/locked retry deadline for :func:`_safe_copy_db`, in seconds.
+
+    Override via ``HERMES_BACKUP_SQLITE_BUSY_DEADLINE_SECONDS`` (e.g. for
+    tests, or to disable bounding entirely with a non-positive value).
+    """
+    raw = os.environ.get("HERMES_BACKUP_SQLITE_BUSY_DEADLINE_SECONDS", "").strip()
+    if raw:
+        try:
+            return float(raw)
+        except ValueError:
+            pass
+    return _SAFE_COPY_BUSY_DEADLINE_SECONDS
+
+
 def _safe_copy_db(src: Path, dst: Path) -> bool:
     """Copy a SQLite database safely using the backup() API.
 
     Handles WAL mode — produces a consistent snapshot even while
     the DB is being written to. Fail closed if a consistent snapshot cannot
     be created: copying only the live main file can omit committed WAL data.
+
+    Bounded against a sustained SQLITE_BUSY/SQLITE_LOCKED source (see
+    ``_SAFE_COPY_BUSY_DEADLINE_SECONDS`` above) so one persistently-locked
+    file degrades to a skipped-with-warning outcome instead of stalling the
+    whole backup indefinitely. A non-positive deadline disables bounding
+    (retries indefinitely, the pre-fix behavior) for anyone who wants it.
+
+    Thin wrapper over :func:`_safe_copy_db_ex` that keeps this function's
+    long-standing plain-``bool`` contract for existing callers (e.g.
+    :func:`copy_db_and_verify`) that don't need to distinguish *why* a copy
+    failed.
+    """
+    return _safe_copy_db_ex(src, dst)[0]
+
+
+def _safe_copy_db_ex(src: Path, dst: Path) -> "tuple[bool, bool]":
+    """Like :func:`_safe_copy_db` but also reports *why* a copy failed.
+
+    Returns ``(success, was_busy_timeout)``. ``was_busy_timeout`` is True
+    only when the copy failed because the source stayed SQLITE_BUSY/LOCKED
+    past the bounded deadline (see ``_SAFE_COPY_BUSY_DEADLINE_SECONDS``
+    above) -- i.e. the source file itself is fine, just transiently locked
+    by another process. Observed in the wild against Chrome's own small
+    housekeeping databases (``first_party_sets.db``,
+    ``declarative_performance_observer.db``) under a live ``chrome-debug/``
+    profile: with the busy-retry now bounded (instead of hanging
+    indefinitely), an abort past the deadline was still being classified as
+    a hard failure identically to genuine corruption, which flipped
+    ``hermes backup``'s summary to "Backup incomplete" again -- just via a
+    different file than the original ENOENT-based report. Callers that
+    distinguish "benign, skip with a warning" from "genuine failure"
+    (corrupt file, permissions, disk error) should treat a busy-timeout the
+    same as a vanished-file skip, not as a hard error. See
+    docs/rca-chrome-debug-transient-files-backup.md and
+    docs/rca-backup-sqlite-busy-retry-unbounded.md.
     """
     conn = None
     backup_conn = None
+    deadline_seconds = _resolve_safe_copy_busy_deadline_seconds()
     try:
-        conn = sqlite3.connect(f"file:{src}?mode=ro", uri=True)
-        backup_conn = sqlite3.connect(str(dst))
-        conn.backup(backup_conn)
-        return True
+        if deadline_seconds > 0:
+            # timeout=0 on BOTH sides is load-bearing here, not cosmetic:
+            # the connect()-level default (5.0) installs SQLite's own
+            # internal busy-handler, which silently retries *inside a
+            # single* sqlite3_backup_step() call for up to that many
+            # seconds before ever returning SQLITE_BUSY back to Python --
+            # i.e. before our progress callback below gets a chance to run
+            # at all. Measured directly: with the default timeout, an 8s
+            # external lock produced exactly ONE progress callback (after
+            # ~8s, because SQLite's own retries absorbed almost the whole
+            # wait), so a 2s deadline was checked too late to matter. With
+            # timeout=0, each step call fails fast on contention and
+            # control returns to the progress callback roughly every
+            # backup()'s own sleep= cadence (default 250ms), so the
+            # deadline below is enforced with the intended granularity.
+            conn = sqlite3.connect(f"file:{src}?mode=ro", uri=True, timeout=0)
+            backup_conn = sqlite3.connect(str(dst), timeout=0)
+            deadline = time.monotonic() + deadline_seconds
+
+            def _abort_past_deadline(status: int, remaining: int, total: int) -> None:
+                if status in _SQLITE_BUSY_STATUSES and time.monotonic() > deadline:
+                    raise _SafeCopyBusyTimeout(
+                        f"source stayed SQLITE_BUSY/SQLITE_LOCKED for over "
+                        f"{deadline_seconds:.0f}s (remaining={remaining}, total={total})"
+                    )
+
+            conn.backup(backup_conn, progress=_abort_past_deadline)
+        else:
+            conn = sqlite3.connect(f"file:{src}?mode=ro", uri=True)
+            backup_conn = sqlite3.connect(str(dst))
+            conn.backup(backup_conn)
+        return True, False
+    except _SafeCopyBusyTimeout as exc:
+        logger.warning("SQLite safe copy skipped for %s (busy/locked): %s", src, exc)
+        try:
+            dst.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return False, True
     except Exception as exc:
         logger.warning("SQLite safe copy failed for %s: %s", src, exc)
         try:
             dst.unlink(missing_ok=True)
         except OSError:
             pass
-        return False
+        return False, False
     finally:
         for connection in (backup_conn, conn):
             if connection is not None:
@@ -633,7 +830,8 @@ def _run_backup_locked(args, hermes_root: Path) -> None:
         orig_dirnames = dirnames[:]
         dirnames[:] = [
             d for d in dirnames
-            if d not in _EXCLUDED_DIRS or (d == "hermes-agent" and not is_root)
+            if (d not in _EXCLUDED_DIRS or (d == "hermes-agent" and not is_root))
+            and not _is_chrome_debug_transient_dir(rel_dir, d)
         ]
         for removed in set(orig_dirnames) - set(dirnames):
             skipped_dirs.add(str(rel_dir / removed))
@@ -691,6 +889,16 @@ def _run_backup_locked(args, hermes_root: Path) -> None:
 
     total_bytes = 0
     errors = []
+    # Files that existed at scan time but vanished (ENOENT) before the slow
+    # archive-write phase reached them -- typically a live process (most
+    # commonly the Hermes-managed chrome-debug profile) rewriting its own
+    # transient state concurrently with the backup. Tracked separately from
+    # ``errors``: these are logged as warnings but must never flip the
+    # summary to "incomplete" or suppress the restore hint, because the
+    # archive itself is still complete and valid for every file that still
+    # existed when we got to it. See
+    # docs/rca-chrome-debug-transient-files-backup.md.
+    transient_skipped = []
     t0 = time.monotonic()
 
     with _atomic_output_path(out_path) as archive_path, zipfile.ZipFile(
@@ -708,17 +916,50 @@ def _run_backup_locked(args, hermes_root: Path) -> None:
                         suffix=".db", delete=False, dir=str(out_path.parent)
                     ) as tmp:
                         tmp_db = Path(tmp.name)
-                    if _safe_copy_db(abs_path, tmp_db):
+                    copy_ok, was_busy_timeout = _safe_copy_db_ex(abs_path, tmp_db)
+                    if copy_ok:
                         zf.write(tmp_db, arcname=str(rel_path))
                         total_bytes += tmp_db.stat().st_size
                         tmp_db.unlink(missing_ok=True)
                     else:
                         tmp_db.unlink(missing_ok=True)
-                        errors.append(f"  {rel_path}: SQLite safe copy failed")
+                        # sqlite3.connect() raises a generic OperationalError
+                        # for a missing source file (not FileNotFoundError),
+                        # so _safe_copy_db can't tell us "vanished" directly.
+                        # A post-hoc existence check is a good enough proxy:
+                        # if the source is gone right after the failed copy,
+                        # it almost certainly vanished mid-copy rather than
+                        # being genuinely corrupt.
+                        #
+                        # A busy-timeout abort (was_busy_timeout=True) is the
+                        # same "benign, not a real failure" story: the file
+                        # is present and healthy, just transiently locked by
+                        # another process (observed against Chrome's own
+                        # first_party_sets.db / declarative_performance_
+                        # observer.db under chrome-debug/). Treat it like a
+                        # vanished-file skip, not a hard error -- otherwise
+                        # the now-bounded busy-retry (previously an
+                        # indefinite hang) just trades one "Backup
+                        # incomplete" cause for another. See
+                        # docs/rca-backup-sqlite-busy-retry-unbounded.md.
+                        if was_busy_timeout:
+                            transient_skipped.append(
+                                f"  {rel_path}: temporarily locked by another process, skipped"
+                            )
+                        elif abs_path.exists():
+                            errors.append(f"  {rel_path}: SQLite safe copy failed")
+                        else:
+                            transient_skipped.append(
+                                f"  {rel_path}: vanished before it could be safely copied"
+                            )
                         continue
                 else:
                     zf.write(abs_path, arcname=str(rel_path))
                     total_bytes += abs_path.stat().st_size
+            except FileNotFoundError as exc:
+                # Benign scan-then-archive race, not a real failure.
+                transient_skipped.append(f"  {rel_path}: {exc}")
+                continue
             except (PermissionError, OSError, ValueError) as exc:
                 errors.append(f"  {rel_path}: {exc}")
                 continue
@@ -739,6 +980,9 @@ def _run_backup_locked(args, hermes_root: Path) -> None:
             try:
                 zf.write(abs_path, arcname=arcname)
                 total_bytes += abs_path.stat().st_size
+            except FileNotFoundError as exc:
+                transient_skipped.append(f"  {arcname}: {exc}")
+                continue
             except (PermissionError, OSError, ValueError) as exc:
                 errors.append(f"  {arcname}: {exc}")
                 continue
@@ -746,10 +990,11 @@ def _run_backup_locked(args, hermes_root: Path) -> None:
     elapsed = time.monotonic() - t0
     zip_size = out_path.stat().st_size
     logger.info(
-        "backup phase=archive status=complete duration_ms=%.1f files=%d errors=%d bytes=%d",
+        "backup phase=archive status=complete duration_ms=%.1f files=%d errors=%d transient_skipped=%d bytes=%d",
         elapsed * 1000,
         file_count,
         len(errors),
+        len(transient_skipped),
         zip_size,
     )
 
@@ -782,6 +1027,16 @@ def _run_backup_locked(args, hermes_root: Path) -> None:
         print("\n  Excluded directories:")
         for d in sorted(skipped_dirs):
             print(f"    {d}/")
+
+    if transient_skipped:
+        print(
+            f"\n  Note ({len(transient_skipped)} file(s) changed during backup, "
+            "harmless -- nothing to restore there):"
+        )
+        for w in transient_skipped[:10]:
+            print(w)
+        if len(transient_skipped) > 10:
+            print(f"  ... and {len(transient_skipped) - 10} more")
 
     if errors:
         print(f"\n  Warnings ({len(errors)} files skipped):")
@@ -1670,8 +1925,15 @@ def _write_full_zip_backup_locked(out_path: Path, hermes_root: Path) -> Optional
     try:
         for dirpath, dirnames, filenames in os.walk(hermes_root, followlinks=False):
             dp = Path(dirpath)
+            try:
+                rel_dir = dp.relative_to(hermes_root)
+            except ValueError:
+                rel_dir = Path(".")
             # Prune excluded directories in-place so os.walk doesn't descend
-            dirnames[:] = [d for d in dirnames if d not in _EXCLUDED_DIRS]
+            dirnames[:] = [
+                d for d in dirnames
+                if d not in _EXCLUDED_DIRS and not _is_chrome_debug_transient_dir(rel_dir, d)
+            ]
 
             for fname in filenames:
                 fpath = dp / fname
@@ -1698,6 +1960,7 @@ def _write_full_zip_backup_locked(out_path: Path, hermes_root: Path) -> Optional
     )
 
     archive_started = time.monotonic()
+    transient_skipped = 0
     try:
         with _atomic_output_path(out_path) as archive_path, zipfile.ZipFile(
             archive_path, "w", zipfile.ZIP_DEFLATED, compresslevel=6
@@ -1714,7 +1977,44 @@ def _write_full_zip_backup_locked(out_path: Path, hermes_root: Path) -> Optional
                         ) as tmp:
                             tmp_db = Path(tmp.name)
                         try:
-                            if not _safe_copy_db(abs_path, tmp_db):
+                            copy_ok, was_busy_timeout = _safe_copy_db_ex(abs_path, tmp_db)
+                            if not copy_ok:
+                                # A source file that has vanished since the scan
+                                # phase (most commonly a chrome-debug/*.db file
+                                # rewritten by a live Chrome process racing this
+                                # backup -- see
+                                # docs/rca-chrome-debug-transient-files-backup.md)
+                                # is a benign, already-logged skip, not a real
+                                # failure: only abort the whole archive when the
+                                # file still exists but genuinely couldn't be
+                                # snapshotted (locked, corrupt, permissions).
+                                #
+                                # A busy-timeout abort (was_busy_timeout=True)
+                                # is the same "benign" story: the file is
+                                # present and healthy, just transiently locked
+                                # by another process (observed against
+                                # Chrome's own first_party_sets.db under
+                                # chrome-debug/ once the busy-retry was bounded
+                                # instead of hanging indefinitely -- see
+                                # docs/rca-backup-sqlite-busy-retry-unbounded.md).
+                                # Skip just this file instead of aborting the
+                                # entire archive.
+                                if was_busy_timeout:
+                                    logger.warning(
+                                        "Full-zip backup: %s temporarily locked by "
+                                        "another process, skipping (transient)",
+                                        rel_path,
+                                    )
+                                    transient_skipped += 1
+                                    continue
+                                if not abs_path.exists():
+                                    logger.warning(
+                                        "Full-zip backup: %s vanished before it "
+                                        "could be safely copied, skipping (transient)",
+                                        rel_path,
+                                    )
+                                    transient_skipped += 1
+                                    continue
                                 logger.warning(
                                     "Full-zip backup aborted: SQLite snapshot failed for %s",
                                     rel_path,
@@ -1725,6 +2025,15 @@ def _write_full_zip_backup_locked(out_path: Path, hermes_root: Path) -> Optional
                             tmp_db.unlink(missing_ok=True)
                     else:
                         zf.write(abs_path, arcname=str(rel_path))
+                except FileNotFoundError as exc:
+                    # Benign scan-then-archive race, not a real failure.
+                    logger.warning(
+                        "Full-zip backup: %s vanished during archiving, skipping (transient): %s",
+                        rel_path,
+                        exc,
+                    )
+                    transient_skipped += 1
+                    continue
                 except (PermissionError, OSError, ValueError) as exc:
                     logger.debug("Skipping %s in zip backup: %s", rel_path, exc)
                     continue
@@ -1742,9 +2051,10 @@ def _write_full_zip_backup_locked(out_path: Path, hermes_root: Path) -> Optional
         return None
 
     logger.info(
-        "automatic backup phase=archive status=complete duration_ms=%.1f files=%d bytes=%d",
+        "automatic backup phase=archive status=complete duration_ms=%.1f files=%d transient_skipped=%d bytes=%d",
         (time.monotonic() - archive_started) * 1000,
         len(files_to_add),
+        transient_skipped,
         out_path.stat().st_size,
     )
 

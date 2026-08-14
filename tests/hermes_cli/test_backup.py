@@ -3,6 +3,7 @@
 import json
 import os
 import sqlite3
+import time
 import zipfile
 from argparse import Namespace
 from pathlib import Path
@@ -143,6 +144,280 @@ class TestShouldExclude:
         assert _should_exclude(Path("memory_store.db-wal"))
         # The .db itself is still included (and safe-copied separately)
         assert not _should_exclude(Path("state.db"))
+
+    def test_excludes_chrome_debug_transient_subpaths(self):
+        """Chrome's own transient profile churn (metrics buffer, per-tab
+        session-restore state, LevelDB WAL segments) is excluded outright so
+        the scan-then-archive race that produces spurious ENOENT warnings
+        (see docs/rca-chrome-debug-transient-files-backup.md) never fires in
+        the common case."""
+        from hermes_cli.backup import _should_exclude
+        assert _should_exclude(Path("chrome-debug/BrowserMetrics-spare.pma"))
+        assert _should_exclude(
+            Path("chrome-debug/Default/Sessions/Session_13430660839007907")
+        )
+        assert _should_exclude(
+            Path("chrome-debug/Default/Sessions/Tabs_13430660850173240")
+        )
+        assert _should_exclude(
+            Path("chrome-debug/Default/shared_proto_db/000003.log")
+        )
+        assert _should_exclude(
+            Path("chrome-debug/BrowserMetrics/BrowserMetrics-6A771AF3-8DD9.pma")
+        )
+
+    def test_chrome_debug_exclusion_is_scoped_to_top_level_dir(self):
+        """The exclusion must not blanket-match ``Sessions``/``shared_proto_db``
+        directories that happen to live somewhere else under HERMES_HOME —
+        only paths actually rooted under the top-level ``chrome-debug/``
+        profile are transient Chrome state."""
+        from hermes_cli.backup import _should_exclude
+        assert not _should_exclude(Path("skills/my-skill/Sessions/keep.txt"))
+        assert not _should_exclude(Path("Sessions/keep.txt"))
+        assert not _should_exclude(
+            Path("profiles/other/chrome-debug/BrowserMetrics-spare.pma")
+        )
+        # A regular, non-transient file inside chrome-debug/ is unaffected.
+        assert not _should_exclude(Path("chrome-debug/Default/Cookies"))
+
+
+# ---------------------------------------------------------------------------
+# Chrome-debug transient-file race: archive loop must warn, not fail
+# ---------------------------------------------------------------------------
+
+class TestChromeDebugTransientRace:
+    """Regression coverage for the backup-failure investigation: a file that
+    existed at scan time but is deleted by a live process (typically the
+    Hermes-managed chrome-debug Chrome) before the archive-write phase
+    reaches it must be logged as a warning and MUST NOT flip the summary to
+    "Backup incomplete" or suppress the restore hint."""
+
+    def test_vanished_file_is_warning_not_fatal(self, tmp_path, monkeypatch, capsys):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        _make_hermes_tree(hermes_home)
+
+        # A file that exists at scan time but is deleted before zf.write()
+        # reaches it, simulating the chrome-debug scan-then-archive race.
+        vanishing = hermes_home / "chrome-debug-sim" / "will-vanish.txt"
+        vanishing.parent.mkdir(parents=True, exist_ok=True)
+        vanishing.write_text("ephemeral")
+
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+        import hermes_cli.backup as backup_mod
+        real_write = zipfile.ZipFile.write
+
+        def flaky_write(self, filename, arcname=None, *a, **kw):
+            if str(filename) == str(vanishing):
+                vanishing.unlink()
+            return real_write(self, filename, arcname, *a, **kw)
+
+        monkeypatch.setattr(zipfile.ZipFile, "write", flaky_write)
+
+        out_zip = tmp_path / "backup.zip"
+        backup_mod.run_backup(Namespace(output=str(out_zip)))
+
+        out = capsys.readouterr().out
+        assert "Backup complete:" in out
+        assert "Backup incomplete" not in out
+        assert "Restore with:" in out
+        assert "changed during backup" in out
+        assert "will-vanish.txt" in out
+
+        # The archive itself must still be valid.
+        assert out_zip.exists()
+        with zipfile.ZipFile(out_zip) as zf:
+            assert zf.testzip() is None
+            assert "chrome-debug-sim/will-vanish.txt" not in zf.namelist()
+
+    def test_genuine_permission_error_still_reported_as_warning_error(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """A real (non-ENOENT) failure must still land in the ``errors``
+        bucket and flip the summary to incomplete -- only transient
+        vanished-file races are downgraded."""
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        _make_hermes_tree(hermes_home)
+
+        target = hermes_home / "unreadable.txt"
+        target.write_text("secret")
+
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+        import hermes_cli.backup as backup_mod
+        real_write = zipfile.ZipFile.write
+
+        def boom(self, filename, arcname=None, *a, **kw):
+            if str(filename) == str(target):
+                raise PermissionError(13, "Permission denied", str(filename))
+            return real_write(self, filename, arcname, *a, **kw)
+
+        monkeypatch.setattr(zipfile.ZipFile, "write", boom)
+
+        out_zip = tmp_path / "backup.zip"
+        backup_mod.run_backup(Namespace(output=str(out_zip)))
+
+        out = capsys.readouterr().out
+        assert "Backup incomplete:" in out
+        assert "Restore with:" not in out
+        assert "Warnings (1 files skipped)" in out
+        assert "unreadable.txt" in out
+
+    def test_vanished_db_file_skipped_not_fatal(self, tmp_path, monkeypatch, capsys):
+        """A .db file that vanishes between scan and the safe-copy attempt
+        (chrome-debug/*.db under a live Chrome process) must be skipped as
+        transient, not reported as a SQLite copy failure."""
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        _make_hermes_tree(hermes_home)
+
+        db_path = hermes_home / "vanishing.db"
+        db_path.write_bytes(b"not-actually-sqlite")
+
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+        import hermes_cli.backup as backup_mod
+
+        def vanish_then_fail(src, dst):
+            Path(src).unlink(missing_ok=True)
+            return False, False
+
+        monkeypatch.setattr(backup_mod, "_safe_copy_db_ex", vanish_then_fail)
+
+        out_zip = tmp_path / "backup.zip"
+        backup_mod.run_backup(Namespace(output=str(out_zip)))
+
+        out = capsys.readouterr().out
+        assert "Backup complete:" in out
+        assert "Backup incomplete" not in out
+        assert "vanished before it could be safely copied" in out
+
+    def test_still_existing_db_copy_failure_is_fatal_warning(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """A .db file that is present but genuinely fails to safe-copy
+        (locked, corrupt) must still surface as an error, distinguishing it
+        from the vanished-mid-copy case above."""
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        _make_hermes_tree(hermes_home)
+
+        db_path = hermes_home / "locked.db"
+        db_path.write_bytes(b"not-actually-sqlite")
+
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+        import hermes_cli.backup as backup_mod
+        monkeypatch.setattr(backup_mod, "_safe_copy_db", lambda src, dst: False)
+
+        out_zip = tmp_path / "backup.zip"
+        backup_mod.run_backup(Namespace(output=str(out_zip)))
+
+        out = capsys.readouterr().out
+        assert "Backup incomplete:" in out
+        assert "SQLite safe copy failed" in out
+        assert "locked.db" in out
+
+    def test_automatic_backup_skips_vanished_file_instead_of_failing(
+        self, tmp_path, monkeypatch
+    ):
+        """The shared pre-update/pre-migration path (_write_full_zip_backup)
+        must tolerate the same scan-then-archive race: a vanished plain file
+        should be skipped, and the archive should still be produced."""
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        _make_hermes_tree(hermes_home)
+
+        vanishing = hermes_home / "chrome-debug-sim" / "will-vanish.txt"
+        vanishing.parent.mkdir(parents=True, exist_ok=True)
+        vanishing.write_text("ephemeral")
+
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+        import hermes_cli.backup as backup_mod
+        real_write = zipfile.ZipFile.write
+
+        def flaky_write(self, filename, arcname=None, *a, **kw):
+            if str(filename) == str(vanishing):
+                vanishing.unlink()
+            return real_write(self, filename, arcname, *a, **kw)
+
+        monkeypatch.setattr(zipfile.ZipFile, "write", flaky_write)
+
+        out_zip = tmp_path / "automatic.zip"
+        result = backup_mod._write_full_zip_backup(out_zip, hermes_home)
+
+        assert result == out_zip
+        assert out_zip.exists()
+        with zipfile.ZipFile(out_zip) as zf:
+            assert zf.testzip() is None
+            assert "chrome-debug-sim/will-vanish.txt" not in zf.namelist()
+            # Other, non-vanishing files from the tree still made it in.
+            assert "config.yaml" in zf.namelist()
+
+    def test_automatic_backup_skips_vanished_db_instead_of_aborting(
+        self, tmp_path, monkeypatch
+    ):
+        """A vanished .db file in the automatic backup path must be skipped,
+        not raise _SQLiteSnapshotError and abort the whole archive -- that
+        would silently drop every other file behind it in the walk order."""
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        _make_hermes_tree(hermes_home)
+
+        db_path = hermes_home / "vanishing.db"
+        db_path.write_bytes(b"not-actually-sqlite")
+
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+        import hermes_cli.backup as backup_mod
+
+        def vanish_then_fail(src, dst):
+            Path(src).unlink(missing_ok=True)
+            return False, False
+
+        monkeypatch.setattr(backup_mod, "_safe_copy_db_ex", vanish_then_fail)
+
+        out_zip = tmp_path / "automatic.zip"
+        result = backup_mod._write_full_zip_backup(out_zip, hermes_home)
+
+        # Must still succeed and produce a complete archive of everything
+        # else, rather than returning None (the old abort-on-vanish behavior).
+        assert result == out_zip
+        assert out_zip.exists()
+        with zipfile.ZipFile(out_zip) as zf:
+            assert zf.testzip() is None
+            assert "vanishing.db" not in zf.namelist()
+            assert "config.yaml" in zf.namelist()
+
+    def test_automatic_backup_still_aborts_on_genuine_db_failure(
+        self, tmp_path, monkeypatch
+    ):
+        """A .db file that is present but genuinely fails to safe-copy must
+        still abort the automatic backup and preserve the previous archive
+        -- this is the existing #68474-adjacent protection and must not
+        regress just because vanished files are now tolerated."""
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        (hermes_home / "state.db").write_bytes(b"not-a-database")
+        archive = tmp_path / "automatic.zip"
+        archive.write_bytes(b"previous-valid-backup")
+
+        monkeypatch.setattr(
+            "hermes_cli.backup._safe_copy_db", lambda _src, _dst: False
+        )
+
+        from hermes_cli.backup import _write_full_zip_backup
+        assert _write_full_zip_backup(archive, hermes_home) is None
+        assert archive.read_bytes() == b"previous-valid-backup"
 
 
 # ---------------------------------------------------------------------------
@@ -720,6 +995,321 @@ class TestSafeCopyDb:
         p = tmp_path / "state.db"
         p.write_bytes(bytes(4096))  # all NULs
         assert is_zeroed_sqlite_file(p) is True
+
+
+class TestSafeCopyDbBusyBounding:
+    """Regression tests for the unbounded SQLITE_BUSY retry in
+    ``_safe_copy_db``: ``sqlite3.Connection.backup()`` retries a busy/locked
+    source with ``time.sleep()`` inside CPython's C implementation with no
+    overall deadline, independent of any connection-level ``timeout=``. A
+    source that stays locked (observed in the wild against Chrome's own
+    ``first_party_sets.db`` under a live ``chrome-debug/`` profile) could
+    previously stall the entire backup for as long as the lock was held.
+    """
+
+    @staticmethod
+    def _make_source_db(path, nrows: int = 50) -> None:
+        conn = sqlite3.connect(str(path))
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+        conn.executemany(
+            "INSERT INTO t (v) VALUES (?)", [(f"row{i}",) for i in range(nrows)]
+        )
+        conn.commit()
+        conn.close()
+
+    @staticmethod
+    def _hold_exclusive_lock(path, hold_seconds: float, ready_evt) -> None:
+        """Runs in a background thread: holds BEGIN EXCLUSIVE on *path*
+        for *hold_seconds*, then releases. Mirrors the task's suggested
+        deterministic repro (a separate connection holding an exclusive
+        write transaction while ``_safe_copy_db`` runs against it)."""
+        conn = sqlite3.connect(str(path), timeout=0)
+        conn.execute("BEGIN EXCLUSIVE")
+        conn.execute("INSERT INTO t (v) VALUES ('locker')")
+        ready_evt.set()
+        time.sleep(hold_seconds)
+        conn.rollback()
+        conn.close()
+
+    def test_busy_source_is_bounded_not_indefinite(self, tmp_path, monkeypatch):
+        """A source locked LONGER than the deadline must return False in
+        roughly the deadline window, not block until the lock clears."""
+        import threading
+
+        from hermes_cli.backup import _safe_copy_db
+
+        monkeypatch.setenv("HERMES_BACKUP_SQLITE_BUSY_DEADLINE_SECONDS", "1")
+
+        src = tmp_path / "locked.db"
+        dst = tmp_path / "copy.db"
+        self._make_source_db(src)
+
+        ready_evt = threading.Event()
+        holder = threading.Thread(
+            target=self._hold_exclusive_lock, args=(src, 5.0, ready_evt), daemon=True
+        )
+        holder.start()
+        assert ready_evt.wait(timeout=5), "background thread failed to acquire lock"
+
+        t0 = time.monotonic()
+        result = _safe_copy_db(src, dst)
+        elapsed = time.monotonic() - t0
+        holder.join(timeout=10)
+
+        assert result is False, "busy copy should fail closed, not hang until unlocked"
+        assert elapsed < 3.0, (
+            f"_safe_copy_db took {elapsed:.2f}s against a 1s deadline and a 5s "
+            "lock hold -- the busy-retry loop is not bounded"
+        )
+        assert not dst.exists(), "failed copy must not leave a partial destination file"
+
+    def test_short_busy_window_still_succeeds(self, tmp_path, monkeypatch):
+        """A lock that clears BEFORE the deadline must not be penalized --
+        the bounding must not make normal WAL-mode contention fail."""
+        import threading
+
+        from hermes_cli.backup import _safe_copy_db
+
+        monkeypatch.setenv("HERMES_BACKUP_SQLITE_BUSY_DEADLINE_SECONDS", "5")
+
+        src = tmp_path / "locked.db"
+        dst = tmp_path / "copy.db"
+        self._make_source_db(src)
+
+        ready_evt = threading.Event()
+        holder = threading.Thread(
+            target=self._hold_exclusive_lock, args=(src, 0.5, ready_evt), daemon=True
+        )
+        holder.start()
+        assert ready_evt.wait(timeout=5)
+
+        result = _safe_copy_db(src, dst)
+        holder.join(timeout=10)
+
+        assert result is True
+        conn = sqlite3.connect(str(dst))
+        count = conn.execute("SELECT COUNT(*) FROM t").fetchone()[0]
+        conn.close()
+        # The locker thread rolls back its own INSERT on release (it only
+        # needs the exclusive lock, not a durable write), so the copy
+        # reflects just the original seed rows.
+        assert count == 50
+
+    def test_connection_timeout_parameter_does_not_bound_backup_loop(self, tmp_path):
+        """Documents *why* the fix can't just be 'pass timeout= to connect()':
+        a connection's timeout= only bounds the initial lock acquisition for
+        ordinary statements, not backup()'s own internal busy-retry loop."""
+        import threading
+
+        monkeypatch_env_backup = os.environ.pop(
+            "HERMES_BACKUP_SQLITE_BUSY_DEADLINE_SECONDS", None
+        )
+        try:
+            src = tmp_path / "locked.db"
+            dst = tmp_path / "copy.db"
+            self._make_source_db(src)
+
+            ready_evt = threading.Event()
+            holder = threading.Thread(
+                target=self._hold_exclusive_lock, args=(src, 2.0, ready_evt), daemon=True
+            )
+            holder.start()
+            assert ready_evt.wait(timeout=5)
+
+            t0 = time.monotonic()
+            # A short connection timeout does NOT bound Connection.backup().
+            conn = sqlite3.connect(f"file:{src}?mode=ro", uri=True, timeout=0.2)
+            backup_conn = sqlite3.connect(str(dst), timeout=0.2)
+            try:
+                conn.backup(backup_conn)
+            finally:
+                backup_conn.close()
+                conn.close()
+            elapsed = time.monotonic() - t0
+            holder.join(timeout=10)
+
+            assert elapsed >= 1.5, (
+                f"backup() returned after only {elapsed:.2f}s despite a 0.2s "
+                "connection timeout -- if this now fails, sqlite3's behavior "
+                "changed and the bounding fix in _safe_copy_db may need "
+                "revisiting"
+            )
+        finally:
+            if monkeypatch_env_backup is not None:
+                os.environ["HERMES_BACKUP_SQLITE_BUSY_DEADLINE_SECONDS"] = (
+                    monkeypatch_env_backup
+                )
+
+    def test_large_non_busy_copy_is_unaffected_by_bounding(self, tmp_path, monkeypatch):
+        """The deadline must be gated on BUSY/LOCKED status, not raw elapsed
+        time: a large, uncontended copy must never be aborted just because
+        it took a while (see DEFAULT_INTEGRITY_CHECK_MAX_BYTES's own comment
+        on multi-GB state.db files being a normal, supported case)."""
+        from hermes_cli.backup import _safe_copy_db
+
+        # Deliberately absurd deadline: if bounding were time-based instead
+        # of status-gated, this would abort a perfectly healthy copy.
+        monkeypatch.setenv("HERMES_BACKUP_SQLITE_BUSY_DEADLINE_SECONDS", "0.001")
+
+        src = tmp_path / "big.db"
+        dst = tmp_path / "copy.db"
+        self._make_source_db(src, nrows=20_000)
+
+        result = _safe_copy_db(src, dst)
+
+        assert result is True
+        conn = sqlite3.connect(str(dst))
+        count = conn.execute("SELECT COUNT(*) FROM t").fetchone()[0]
+        conn.close()
+        assert count == 20_000
+
+    def test_negative_deadline_disables_bounding(self, tmp_path, monkeypatch):
+        """A non-positive deadline is an explicit escape hatch back to the
+        pre-fix behavior (retry indefinitely until the lock clears)."""
+        import threading
+
+        from hermes_cli.backup import _safe_copy_db
+
+        monkeypatch.setenv("HERMES_BACKUP_SQLITE_BUSY_DEADLINE_SECONDS", "0")
+
+        src = tmp_path / "locked.db"
+        dst = tmp_path / "copy.db"
+        self._make_source_db(src)
+
+        ready_evt = threading.Event()
+        holder = threading.Thread(
+            target=self._hold_exclusive_lock, args=(src, 1.5, ready_evt), daemon=True
+        )
+        holder.start()
+        assert ready_evt.wait(timeout=5)
+
+        t0 = time.monotonic()
+        result = _safe_copy_db(src, dst)
+        elapsed = time.monotonic() - t0
+        holder.join(timeout=10)
+
+        assert result is True
+        assert elapsed >= 1.2, "disabled bounding should still wait out the lock"
+
+    def test_safe_copy_db_ex_reports_busy_timeout(self, tmp_path, monkeypatch):
+        """``_safe_copy_db_ex`` must flag a busy-deadline abort distinctly
+        from other failures, so callers can treat it as benign (skip with a
+        warning) instead of a hard error. Regression guard for the "Backup
+        incomplete" summary reappearing via a different file (Chrome's own
+        first_party_sets.db / declarative_performance_observer.db) once the
+        busy-retry itself was bounded instead of hanging indefinitely."""
+        import threading
+
+        from hermes_cli.backup import _safe_copy_db_ex
+
+        monkeypatch.setenv("HERMES_BACKUP_SQLITE_BUSY_DEADLINE_SECONDS", "0.5")
+
+        src = tmp_path / "locked.db"
+        dst = tmp_path / "copy.db"
+        self._make_source_db(src)
+
+        ready_evt = threading.Event()
+        holder = threading.Thread(
+            target=self._hold_exclusive_lock, args=(src, 3.0, ready_evt), daemon=True
+        )
+        holder.start()
+        assert ready_evt.wait(timeout=5)
+
+        success, was_busy_timeout = _safe_copy_db_ex(src, dst)
+        holder.join(timeout=10)
+
+        assert success is False
+        assert was_busy_timeout is True
+        assert not dst.exists()
+
+    def test_safe_copy_db_ex_genuine_corruption_not_flagged_as_busy(self, tmp_path):
+        """A source that's simply not a valid SQLite file (genuine failure,
+        not a lock) must NOT be misreported as a busy-timeout -- that would
+        wrongly downgrade a real corruption/failure into a silently-skipped
+        warning."""
+        from hermes_cli.backup import _safe_copy_db_ex
+
+        src = tmp_path / "corrupt.db"
+        src.write_bytes(b"not-actually-sqlite")
+        dst = tmp_path / "copy.db"
+
+        success, was_busy_timeout = _safe_copy_db_ex(src, dst)
+
+        assert success is False
+        assert was_busy_timeout is False
+
+    def test_backup_treats_busy_timeout_as_transient_not_incomplete(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """End-to-end: when ``_safe_copy_db_ex`` reports a busy-timeout for
+        a .db file, ``hermes backup`` must print "Backup complete" (with
+        the restore hint) and list the file under the harmless transient
+        note, not under "Warnings" / "Backup incomplete". This is the exact
+        symptom from the bug report reappearing via a different file once
+        the busy-retry itself got bounded."""
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        _make_hermes_tree(hermes_home)
+
+        db_path = hermes_home / "chrome-debug" / "first_party_sets.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        db_path.write_bytes(b"not-actually-sqlite")
+
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+        import hermes_cli.backup as backup_mod
+
+        def busy_timeout(src, dst):
+            return False, True
+
+        monkeypatch.setattr(backup_mod, "_safe_copy_db_ex", busy_timeout)
+
+        out_zip = tmp_path / "backup.zip"
+        backup_mod.run_backup(Namespace(output=str(out_zip)))
+
+        out = capsys.readouterr().out
+        assert "Backup complete:" in out
+        assert "Backup incomplete" not in out
+        assert "Restore with:" in out
+        assert "Warnings" not in out
+        assert "first_party_sets.db" in out
+        assert "temporarily locked" in out
+
+    def test_automatic_backup_treats_busy_timeout_as_transient_not_aborted(
+        self, tmp_path, monkeypatch
+    ):
+        """Same busy-timeout scenario in the automatic backup path
+        (``_write_full_zip_backup``, used by ``hermes update`` / ``claw
+        migrate``): must skip just that file, not abort the entire
+        archive."""
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        _make_hermes_tree(hermes_home)
+
+        db_path = hermes_home / "chrome-debug" / "first_party_sets.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        db_path.write_bytes(b"not-actually-sqlite")
+
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+        import hermes_cli.backup as backup_mod
+
+        def busy_timeout(src, dst):
+            return False, True
+
+        monkeypatch.setattr(backup_mod, "_safe_copy_db_ex", busy_timeout)
+
+        out_zip = tmp_path / "automatic.zip"
+        result = backup_mod._write_full_zip_backup(out_zip, hermes_home)
+
+        assert result == out_zip
+        assert out_zip.exists()
+        with zipfile.ZipFile(out_zip) as zf:
+            assert zf.testzip() is None
+            assert "chrome-debug/first_party_sets.db" not in zf.namelist()
+            assert "config.yaml" in zf.namelist()
 
 
 # ---------------------------------------------------------------------------
