@@ -1344,6 +1344,47 @@ def _finalize_single_query(cli) -> None:
         cli._release_active_session()
 
 
+def _emit_session_end_before_hard_exit() -> None:
+    """Best-effort memory session-end flush for the kanban hard-exit paths.
+
+    The single-query signal handler (``_signal_handler_q``) and the exit
+    watchdog both terminate the process with ``os._exit(0)``, which bypasses
+    the ``finally:`` / ``atexit`` machinery that would otherwise run
+    ``_finalize_single_query`` → ``_run_cleanup`` → ``shutdown_memory_provider``
+    → memory providers' ``on_session_end``. When the process is a kanban worker,
+    this flushes the memory provider so it can ingest the worker's last turns
+    before the hard exit — the SAME flush ```_run_cleanup`` delivers, not a
+    parallel implementation.
+
+    Exactly-once relies on the existing ``_cleanup_done`` flag: if ``_run_cleanup``
+    already ran (or is wedged mid-run with the flag set), this is a no-op, so a
+    normal ``finally:`` exit can never double-emit. A raising provider is
+    swallowed, so it can never prevent the process exit. Never raises — safe to
+    call from a signal handler or the watchdog thread.
+
+    Non-blocking note: ``shutdown_memory_provider`` may join a provider's writer
+    thread (e.g. memori joins its daemon ``sync_writer``). On the signal-handler
+    path that is bounded by the pre-existing SIGALRM deadman; in the watchdog
+    it is a no-op whenever cleanup was reached (``_cleanup_done`` set — the
+    common arming case), so it cannot block the last-resort backstop in practice.
+    """
+    global _cleanup_done
+    if _cleanup_done:
+        return
+    agent = _active_agent_ref
+    if agent is None or not hasattr(agent, "shutdown_memory_provider"):
+        return
+    _cleanup_done = True
+    try:
+        _session_msgs = getattr(agent, "_session_messages", None)
+        if isinstance(_session_msgs, list):
+            agent.shutdown_memory_provider(_session_msgs)
+        else:
+            agent.shutdown_memory_provider()
+    except Exception:
+        pass
+
+
 def _reset_terminal_input_modes_on_exit() -> None:
     """Best-effort: disable focus reporting + mouse tracking on TUI exit so they
     don't leak into the next shell session sharing the tab.
@@ -18925,6 +18966,15 @@ def main(
                         # 5-hour quota window can't trip the circuit breaker and
                         # permanently block the card. Non-kanban runs keep the
                         # plain 0/1 contract automation wrappers expect.
+                        #
+                        # The memory session-end flush is NOT emitted here: the
+                        # enclosing ``finally`` (below) already delivers it via
+                        # ``_finalize_single_query`` → ``_run_cleanup`` →
+                        # ``shutdown_memory_provider`` on this normal ``-Q`` exit
+                        # path, exactly once (``_run_cleanup``'s ``_cleanup_done``
+                        # guard). The hard ``os._exit(0)`` paths (signal handler,
+                        # exit watchdog) that genuinely skip that machinery get
+                        # the flush from ``_emit_session_end_before_hard_exit``.
                         _exit_code = 0
                         if isinstance(result, dict) and result.get("failed"):
                             _exit_code = 1
@@ -18939,29 +18989,6 @@ def main(
                                 except Exception:
                                     _exit_code = 1
 
-                        # Emit the session-end lifecycle event deterministically
-                        # at the worker session boundary, on BOTH the success and
-                        # failure paths. The non-goal ``-q`` branch above reaches
-                        # ``_finalize_single_query`` (→ ``_run_cleanup`` →
-                        # ``shutdown_memory_provider`` → memory providers'
-                        # ``on_session_end``) from its ``finally``.  The fully-quiet
-                        # ``-Q`` goal-mode path used to rely SOLELY on ``atexit``
-                        # firing after ``sys.exit`` below to deliver that flush.
-                        # Atexit is silently bypassed by the kanban ``os._exit(0)``
-                        # signal handler, the exit watchdog, and hard kills — each
-                        # dropping the worker's last turns before memori's
-                        # ``on_session_end`` (which joins its sync writer thread)
-                        # could ingest them. Calling the same helper here makes the
-                        # flush deterministic and exactly-once (``_run_cleanup``
-                        # dedupes via ``_cleanup_done``); ``sys.exit`` then triggers
-                        # a no-op ``atexit`` ``_run_cleanup``.
-                        try:
-                            _finalize_single_query(cli)
-                        except Exception as _fq_exc:
-                            logger.warning(
-                                "kanban worker session finalize failed (best-effort): %s",
-                                _fq_exc,
-                            )
                         sys.exit(_exit_code)
 
                 # Exit with error code if credentials or agent init fails
