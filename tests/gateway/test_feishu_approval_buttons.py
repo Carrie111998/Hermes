@@ -304,6 +304,31 @@ class TestNonApprovalCardAction:
         event = mock_handle.call_args[0][0]
         assert event.message_id == "om_original_card_msg"
 
+    @pytest.mark.asyncio
+    async def test_synthetic_event_falls_back_to_token_without_open_message_id(self):
+        """Fall back to the token when the payload omits open_message_id."""
+        adapter = _make_adapter()
+
+        data = _make_card_action_data(
+            action_value={"custom_action": "something_else"},
+            token="tok_fallback_123",
+            open_message_id="",
+        )
+
+        with (
+            patch.object(
+                adapter, "_resolve_sender_profile", new_callable=AsyncMock,
+                return_value={"user_id": "ou_u", "user_name": "Dave", "user_id_alt": None},
+            ),
+            patch.object(adapter, "get_chat_info", new_callable=AsyncMock, return_value={"name": "Test Chat"}),
+            patch.object(adapter, "_handle_message_with_guards", new_callable=AsyncMock) as mock_handle,
+        ):
+            await adapter._handle_card_action_event(data)
+
+        mock_handle.assert_called_once()
+        event = mock_handle.call_args[0][0]
+        assert event.message_id == "tok_fallback_123"
+
 
 # ===========================================================================
 # _on_card_action_trigger — inline card response for approval actions
