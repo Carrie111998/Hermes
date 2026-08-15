@@ -8713,7 +8713,32 @@ def _run_package_only_install(
     ``pip install --upgrade pip`` and ``--force-reinstall <pkg>`` do not
     rewrite ``hermes.exe``. The editable-install quarantine path would rename
     shims without uv recreating them on Windows (#57828).
+
+    Wheels-only, for the same reason as the sibling injection in
+    ``hermes_cli/_install_repair.py::_run_install_cmd`` — see that docstring for
+    the full argument. Briefly: a source distribution runs its PEP 517 backend
+    at install time, and ``hermes update`` runs unattended and as root, so an
+    sdist from the registry is arbitrary code execution from a maintainer
+    account we do not control. Pinning does not help; it constrains which
+    artifact is fetched, not whether that artifact's build hooks run.
+
+    This is a SECOND chokepoint, deliberately hardened separately. The two
+    Python install call sites in ``update_cmd.py`` (the pip self-upgrade, and
+    the Hermes Tools dependency restore loop) route through here and NOT
+    through ``_run_install_cmd``, so hardening only the repair path would have
+    left the normal update route installing registry sdists as root — while
+    the finding read as closed.
+
+    Not applied to ``_run_install_with_heartbeat`` itself: its other caller is
+    the Termux psutil path, which deliberately builds a patched LOCAL sdist.
+    That would in fact still work (``--only-binary`` exempts local paths), but
+    narrowing the injection to the registry-install wrapper keeps the exemption
+    obvious rather than incidental.
     """
+    if "install" in cmd and "--only-binary=:all:" not in cmd:
+        at = cmd.index("install") + 1
+        cmd = [*cmd[:at], "--only-binary=:all:", *cmd[at:]]
+
     _run_install_with_heartbeat(cmd, env=env)
 
 
