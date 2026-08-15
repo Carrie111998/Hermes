@@ -7207,73 +7207,102 @@ async def get_env_vars(profile: Optional[str] = None):
 
 
 def _get_env_vars_sync(profile: Optional[str] = None):
-    with _profile_scope(profile):
-        env_on_disk = load_env()
     channel_keys = _channel_managed_env_keys()
     catalog_meta = _catalog_provider_env_metadata()
-    onepassword_keys = onepassword_managed_env_keys()
+    # Both load_env() and onepassword_managed_env_keys() resolve
+    # get_hermes_home() at call time (the latter via load_config_readonly()),
+    # so BOTH must run inside the same _profile_scope(profile) block — else a
+    # non-default ?profile= request reports 1Password mapping/managed_by from
+    # the WRONG profile's config.yaml (final-review finding #1). _row() (and
+    # its os.environ fallback for values the 1Password source resolved into
+    # this process's environment) is defined and fully evaluated inside the
+    # block too, so nothing profile-sensitive leaks past the scope's exit.
+    with _profile_scope(profile):
+        env_on_disk = load_env()
+        onepassword_keys = onepassword_managed_env_keys()
 
-    def _row(var_name: str, info: dict, *, custom: bool = False) -> dict:
-        value = env_on_disk.get(var_name)
-        managed_by_onepassword = var_name in onepassword_keys
-        if not value and managed_by_onepassword:
-            # Resolved into this process's os.environ at startup by the
-            # onepassword secret source — intentionally never written to
-            # .env (docs/rfcs/2026-08-onepassword-provider-keys.md).
-            value = os.environ.get(var_name)
-        cat_meta = catalog_meta.get(var_name) or {}
-        # Hand OPTIONAL_ENV_VARS prose wins where present; the catalog fills any
-        # gaps (description/url) and always supplies provider grouping hints.
-        return {
-            "is_set": bool(value),
-            "redacted_value": redact_key(value) if value else None,
-            "description": info.get("description") or cat_meta.get("description", ""),
-            "url": info.get("url") if info.get("url") is not None else cat_meta.get("url"),
-            "category": info.get("category") or cat_meta.get("category", ""),
-            "is_password": info.get("password", cat_meta.get("is_password", False)),
-            "tools": info.get("tools", []),
-            "advanced": info.get("advanced", cat_meta.get("advanced", False)),
-            # True when this var is a messaging-platform credential owned by a
-            # Channels page card. The Keys/Env page uses this to hide it and
-            # avoid duplicating the (richer) Channels configuration UI.
-            "channel_managed": var_name in channel_keys,
-            # Provider grouping hints derived from the unified provider catalog
-            # so the desktop Keys tab groups by the SAME provider identity the
-            # CLI `hermes model` picker uses (not desktop-only prefix guesses).
-            "provider": cat_meta.get("provider", ""),
-            "provider_label": cat_meta.get("provider_label", ""),
-            # True when this key exists in the user's .env but is NOT in any
-            # catalog (OPTIONAL_ENV_VARS or the provider catalog) — an
-            # arbitrary/custom env var the user added directly. Surfaced so the
-            # Keys page can list (and let the user manage) them instead of
-            # hiding everything it doesn't recognise.
-            "custom": custom,
-            "managed_by": "onepassword" if managed_by_onepassword else None,
-        }
+        def _row(var_name: str, info: dict, *, custom: bool = False) -> dict:
+            value = env_on_disk.get(var_name)
+            # Only treat this row as 1Password-managed when there is NOT
+            # already a real plaintext value in .env for it. `hermes secrets
+            # onepassword set` maps a key without deleting any stale .env
+            # copy, so if one is still on disk the row must behave like a
+            # normal editable key (final-review finding #2) — otherwise the
+            # locked "Managed via 1Password" badge hides the only UI control
+            # that could remove the stale plaintext secret.
+            managed_by_onepassword = var_name in onepassword_keys and not value
+            if managed_by_onepassword:
+                # Resolved into this process's os.environ at startup by the
+                # onepassword secret source — intentionally never written to
+                # .env (docs/rfcs/2026-08-onepassword-provider-keys.md).
+                value = os.environ.get(var_name)
+            cat_meta = catalog_meta.get(var_name) or {}
+            # Hand OPTIONAL_ENV_VARS prose wins where present; the catalog fills any
+            # gaps (description/url) and always supplies provider grouping hints.
+            return {
+                "is_set": bool(value),
+                "redacted_value": redact_key(value) if value else None,
+                "description": info.get("description") or cat_meta.get("description", ""),
+                "url": info.get("url") if info.get("url") is not None else cat_meta.get("url"),
+                "category": info.get("category") or cat_meta.get("category", ""),
+                "is_password": info.get("password", cat_meta.get("is_password", False)),
+                "tools": info.get("tools", []),
+                "advanced": info.get("advanced", cat_meta.get("advanced", False)),
+                # True when this var is a messaging-platform credential owned by a
+                # Channels page card. The Keys/Env page uses this to hide it and
+                # avoid duplicating the (richer) Channels configuration UI.
+                "channel_managed": var_name in channel_keys,
+                # Provider grouping hints derived from the unified provider catalog
+                # so the desktop Keys tab groups by the SAME provider identity the
+                # CLI `hermes model` picker uses (not desktop-only prefix guesses).
+                "provider": cat_meta.get("provider", ""),
+                "provider_label": cat_meta.get("provider_label", ""),
+                # True when this key exists in the user's .env but is NOT in any
+                # catalog (OPTIONAL_ENV_VARS or the provider catalog) — an
+                # arbitrary/custom env var the user added directly. Surfaced so the
+                # Keys page can list (and let the user manage) them instead of
+                # hiding everything it doesn't recognise.
+                "custom": custom,
+                "managed_by": "onepassword" if managed_by_onepassword else None,
+            }
 
-    result = {}
-    for var_name, info in OPTIONAL_ENV_VARS.items():
-        result[var_name] = _row(var_name, info)
-    # Synthesize rows for catalog provider env vars that have no hand entry in
-    # OPTIONAL_ENV_VARS — these are the providers that were CLI-configurable but
-    # invisible in the desktop app until now.
-    for var_name in catalog_meta:
-        if var_name not in result:
-            result[var_name] = _row(var_name, {})
-    # Surface arbitrary/custom keys the user set in .env that aren't in any
-    # catalog. These are always "set" (they're on disk). Treated as secrets by
-    # default (is_password=True → redacted, reveal-gated) since an unrecognised
-    # key could hold anything. Channel-managed credentials are excluded — those
-    # belong to the Channels page. This makes the "add a custom key" surface
-    # round-trip: a key added there reappears here under its own section.
-    for var_name in env_on_disk:
-        if var_name in result or var_name in channel_keys:
-            continue
-        row = _row(var_name, {}, custom=True)
-        row["category"] = "custom"
-        row["is_password"] = True
-        result[var_name] = row
-    return result
+        result = {}
+        for var_name, info in OPTIONAL_ENV_VARS.items():
+            result[var_name] = _row(var_name, info)
+        # Synthesize rows for catalog provider env vars that have no hand entry in
+        # OPTIONAL_ENV_VARS — these are the providers that were CLI-configurable but
+        # invisible in the desktop app until now.
+        for var_name in catalog_meta:
+            if var_name not in result:
+                result[var_name] = _row(var_name, {})
+        # Surface arbitrary/custom keys the user set in .env that aren't in any
+        # catalog. These are always "set" (they're on disk). Treated as secrets by
+        # default (is_password=True → redacted, reveal-gated) since an unrecognised
+        # key could hold anything. Channel-managed credentials are excluded — those
+        # belong to the Channels page. This makes the "add a custom key" surface
+        # round-trip: a key added there reappears here under its own section.
+        for var_name in env_on_disk:
+            if var_name in result or var_name in channel_keys:
+                continue
+            row = _row(var_name, {}, custom=True)
+            row["category"] = "custom"
+            row["is_password"] = True
+            result[var_name] = row
+        # Surface keys that are ONLY mapped via 1Password — never in .env
+        # (that's the point of 1Password-managing them), never in
+        # OPTIONAL_ENV_VARS, and never in the provider catalog (e.g. a custom
+        # endpoint's HERMES_CUSTOM_<slug>_API_KEY). Without this loop such a
+        # key falls into none of the three loops above and never appears in
+        # the response — invisible on the desktop Keys page (final-review
+        # finding #3).
+        for var_name in onepassword_keys:
+            if var_name in result or var_name in channel_keys:
+                continue
+            row = _row(var_name, {}, custom=True)
+            row["category"] = "custom"
+            row["is_password"] = True
+            result[var_name] = row
+        return result
 
 
 @app.put("/api/env")
