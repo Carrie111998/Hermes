@@ -477,6 +477,7 @@ class TestReapUnsupervisedGatewayOrphansMacOS:
         # Pretend we're on macOS — supports_systemd_services() returns False
         # so the function does NOT short-circuit and proceeds to the scan.
         monkeypatch.setattr(gateway, "is_macos", lambda: True)
+        monkeypatch.setattr(gateway, "is_windows", lambda: False)
         monkeypatch.setattr(gateway, "supports_systemd_services", lambda: False)
 
         # _get_service_pids returns the launchd-managed gateway PID.
@@ -494,11 +495,21 @@ class TestReapUnsupervisedGatewayOrphansMacOS:
         )
 
         killed_pids = []
-        monkeypatch.setattr(gateway.os, "kill", lambda pid, sig: killed_pids.append((pid, sig)))
+        monkeypatch.setattr(
+            gateway,
+            "os",
+            SimpleNamespace(
+                getpid=os.getpid,
+                kill=lambda pid, sig: killed_pids.append((pid, sig)),
+            ),
+        )
         monkeypatch.setattr("gateway.status._pid_exists", lambda pid: False)
         monkeypatch.setattr("gateway.status.write_planned_stop_marker", lambda pid: None)
-        monkeypatch.setattr("time.sleep", lambda _: None)
-        monkeypatch.setattr("time.monotonic", lambda: 1.0)
+        monkeypatch.setattr(
+            gateway,
+            "time",
+            SimpleNamespace(sleep=lambda _: None, monotonic=lambda: 1.0),
+        )
 
         result = gateway._reap_unsupervised_gateway_orphans()
 
@@ -512,6 +523,7 @@ class TestReapUnsupervisedGatewayOrphansMacOS:
         launchd_pid = 52615
 
         monkeypatch.setattr(gateway, "is_macos", lambda: True)
+        monkeypatch.setattr(gateway, "is_windows", lambda: False)
         monkeypatch.setattr(gateway, "supports_systemd_services", lambda: False)
         monkeypatch.setattr(gateway, "_get_service_pids", lambda: {launchd_pid})
         monkeypatch.setattr("gateway.status.get_running_pid", lambda: None)
@@ -524,7 +536,14 @@ class TestReapUnsupervisedGatewayOrphansMacOS:
         )
 
         killed_pids = []
-        monkeypatch.setattr(gateway.os, "kill", lambda pid, sig: killed_pids.append((pid, sig)))
+        monkeypatch.setattr(
+            gateway,
+            "os",
+            SimpleNamespace(
+                getpid=os.getpid,
+                kill=lambda pid, sig: killed_pids.append((pid, sig)),
+            ),
+        )
 
         result = gateway._reap_unsupervised_gateway_orphans()
 
