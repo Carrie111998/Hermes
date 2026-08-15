@@ -2453,6 +2453,39 @@ class ContextCompressor(ContextEngine):
             if _effective_cap < self.threshold_tokens:
                 self.threshold_tokens = _effective_cap
 
+    def _replays_all_turn_thinking(self) -> bool:
+        """True when the active provider replays EVERY turn's thinking text.
+
+        The tail-budget walks (#73624) exempt stale ``reasoning`` /
+        ``reasoning_content`` from the charge on the assumption those bytes
+        are stripped at send time.  That assumption is per-transport: for
+        require-side echo families (DeepSeek/Kimi/MiMo) and soft-replay
+        loopback endpoints (local llama.cpp et al.), every assistant turn's
+        thinking ships on every request.  Exempting bytes that DO reach the
+        wire makes compression ineffective — the compacted context stays
+        larger than the budget walk believed (K3 incident #83247; the same
+        correction now covers the soft-replay family).
+        """
+        cached = getattr(self, "_replay_all_cache", None)
+        key = (self.provider, self.model, self.base_url)
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        result = False
+        try:
+            from agent.message_sanitization import (
+                needs_reasoning_echo,
+                replays_reasoning_content,
+            )
+            result = bool(
+                needs_reasoning_echo(self.provider, self.model, self.base_url)
+                or replays_reasoning_content(
+                    self.provider, self.model, self.base_url)
+            )
+        except Exception:
+            result = False
+        self._replay_all_cache = (key, result)
+        return result
+
     @staticmethod
     def _effective_threshold_percent(
         context_length: int, threshold_percent: float,
@@ -3167,10 +3200,12 @@ class ContextCompressor(ContextEngine):
             # (#73624) — this boundary decides which tool results stay
             # prunable, and overcharging stale thinking shrinks that window.
             _newest_asst_idx = _last_assistant_index(result)
+            _replay_all_thinking = self._replays_all_turn_thinking()
             for i in range(len(result) - 1, -1, -1):
                 msg = result[i]
                 msg_tokens = _estimate_msg_budget_tokens(
-                    msg, charge_stale_thinking=(i == _newest_asst_idx)
+                    msg, charge_stale_thinking=(
+                        _replay_all_thinking or i == _newest_asst_idx)
                 )
                 if accumulated + msg_tokens > protect_tail_tokens and (len(result) - i) >= min_protect:
                     boundary = i
@@ -5551,12 +5586,17 @@ This compaction should PRIORITISE preserving all information related to the focu
         # fields any transport still replays (#73624) — every older turn's
         # reasoning/reasoning_content is stripped or padded at send time,
         # so charging it here spends tail budget on bytes that never ship.
+        # Exception: replay-all providers (require-side echo families and
+        # soft-replay loopback endpoints) ship every turn's thinking, so
+        # those bytes DO reach the wire and must stay charged (K3 #83247).
         _newest_asst_idx = _last_assistant_index(messages)
+        _replay_all_thinking = self._replays_all_turn_thinking()
 
         for i in range(n - 1, head_end - 1, -1):
             msg = messages[i]
             msg_tokens = _estimate_msg_budget_tokens(
-                msg, charge_stale_thinking=(i == _newest_asst_idx)
+                msg, charge_stale_thinking=(
+                    _replay_all_thinking or i == _newest_asst_idx)
             )
             # Stop once we exceed the soft ceiling (unless we haven't hit min_tail yet)
             if accumulated + msg_tokens > soft_ceiling and (n - i) >= min_tail:
@@ -5584,7 +5624,8 @@ This compaction should PRIORITISE preserving all information related to the focu
             for j in range(n - 1, head_end - 1, -1):
                 raw_msg = messages[j]
                 raw_tok = _estimate_msg_budget_tokens(
-                    raw_msg, charge_stale_thinking=(j == _newest_asst_idx)
+                    raw_msg, charge_stale_thinking=(
+                        _replay_all_thinking or j == _newest_asst_idx)
                 )
                 if raw_accumulated + raw_tok > raw_budget and (n - j) >= min_tail:
                     cut_idx = j
