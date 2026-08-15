@@ -4375,7 +4375,9 @@ class TestValidateProviderCredential:
                 captured["headers"] = headers
                 return _Resp()
 
-        monkeypatch.setattr("httpx.AsyncClient", _Client)
+        monkeypatch.setattr(
+            "tools.url_safety.create_ssrf_safe_async_client", lambda **k: _Client(**k)
+        )
 
         resp = self.client.post(
             "/api/providers/validate",
@@ -4416,7 +4418,9 @@ class TestValidateProviderCredential:
                 captured["headers"] = headers
                 return _Resp()
 
-        monkeypatch.setattr("httpx.AsyncClient", _Client)
+        monkeypatch.setattr(
+            "tools.url_safety.create_ssrf_safe_async_client", lambda **k: _Client(**k)
+        )
 
         self.client.post(
             "/api/providers/validate",
@@ -4450,7 +4454,10 @@ class TestValidateProviderCredential:
                 captured["headers"] = headers
                 return _Resp()
 
-        monkeypatch.setattr("httpx.AsyncClient", _Client)
+        monkeypatch.setattr(
+            "tools.url_safety.create_ssrf_safe_async_client",
+            lambda **k: _Client(**k),
+        )
 
         response = self.client.post(
             "/api/providers/custom-endpoints/validate",
@@ -4475,6 +4482,281 @@ class TestValidateProviderCredential:
                 "Authorization": "Bearer local-secret",
             },
         }
+
+    @pytest.mark.parametrize(
+        "base_url",
+        [
+            "http://169.254.169.254",
+            "http://169.254.169.254/latest/meta-data",
+            "http://metadata.google.internal/computeMetadata/v1/",
+            "file:///etc/passwd",
+            "gopher://127.0.0.1:70/x",
+        ],
+    )
+    def test_openai_base_url_blocks_ssrf_targets(self, monkeypatch, base_url):
+        """Server-side OPENAI_BASE_URL probes must not fetch metadata / non-http."""
+        called = []
+
+        class _Client:
+            def __init__(self, *a, **k):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *a):
+                return False
+
+            async def get(self, *a, **k):
+                called.append((a, k))
+                raise AssertionError("SSRF target must not be fetched")
+
+        monkeypatch.setattr(
+            "tools.url_safety.create_ssrf_safe_async_client", lambda **k: _Client(**k)
+        )
+        data = self._post("OPENAI_BASE_URL", base_url).json()
+        assert data["ok"] is False
+        assert data["reachable"] is False
+        assert data["message"]
+        assert called == []
+
+    def test_openai_base_url_still_allows_loopback(self, monkeypatch):
+        """Local LLM endpoints remain probeable (feature must not be killed)."""
+        called = []
+        client_kwargs = {}
+
+        class _Resp:
+            status_code = 200
+            is_success = True
+
+            def json(self):
+                return {"data": [{"id": "local-model"}]}
+
+        class _Client:
+            def __init__(self, *a, **k):
+                client_kwargs.update(k)
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *a):
+                return False
+
+            async def get(self, url, *a, **k):
+                called.append(url)
+                return _Resp()
+
+        monkeypatch.setattr(
+            "tools.url_safety.create_ssrf_safe_async_client", lambda **k: _Client(**k)
+        )
+        data = self._post("OPENAI_BASE_URL", "http://127.0.0.1:11434/v1").json()
+        assert data["ok"] is True
+        assert data["models"] == ["local-model"]
+        assert called == ["http://127.0.0.1:11434/v1/models"]
+        assert client_kwargs.get("follow_redirects") is False
+        assert client_kwargs.get("allow_private_urls") is True
+
+    def test_openai_base_url_blocks_dns_rebinding_to_metadata(self, monkeypatch):
+        """Connect-time floor must catch hosts that flip to metadata after preflight."""
+        import socket
+        from unittest.mock import patch
+
+        monkeypatch.setattr(
+            "tools.url_safety.is_always_blocked_url",
+            lambda url: False,
+        )
+        metadata_answers = [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("169.254.169.254", 80))
+        ]
+        with patch("socket.getaddrinfo", return_value=metadata_answers):
+            data = self._post("OPENAI_BASE_URL", "http://evil.example.com/v1").json()
+        assert data["ok"] is False
+        assert data["reachable"] is False
+        assert "blocked" in data["message"].lower()
+
+    def test_openai_base_url_blocks_scoped_ipv6_link_local(self, monkeypatch):
+        called = []
+
+        class _Client:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+            async def get(self, *args, **kwargs):
+                called.append(True)
+                raise AssertionError("IPv6 link-local target must not be fetched")
+
+        monkeypatch.setattr(
+            "tools.url_safety.create_ssrf_safe_async_client",
+            lambda **kwargs: _Client(**kwargs),
+        )
+        data = self._post(
+            "OPENAI_BASE_URL", "http://[fe80::1%25eth0]/v1"
+        ).json()
+        assert data["ok"] is False
+        assert data["reachable"] is False
+        assert called == []
+
+
+class TestValidateCustomEndpointSsrf:
+    """SSRF floor for POST /api/providers/custom-endpoints/validate."""
+
+    @pytest.fixture(autouse=True)
+    def _setup_test_client(self, monkeypatch, _isolate_hermes_home):
+        try:
+            from starlette.testclient import TestClient
+        except ImportError:
+            pytest.skip("fastapi/starlette not installed")
+
+        from hermes_cli.web_server import app, _SESSION_HEADER_NAME, _SESSION_TOKEN
+
+        self.client = TestClient(app)
+        self.client.headers[_SESSION_HEADER_NAME] = _SESSION_TOKEN
+
+    def _post(self, base_url: str):
+        return self.client.post(
+            "/api/providers/custom-endpoints/validate",
+            json={"name": "probe", "base_url": base_url, "model": "m"},
+        )
+
+    @pytest.mark.asyncio
+    async def test_dns_preflight_runs_off_event_loop(self, monkeypatch):
+        import threading
+
+        from hermes_cli import web_server
+
+        event_loop_thread = threading.get_ident()
+        resolver_threads = []
+
+        def _check(_url):
+            resolver_threads.append(threading.get_ident())
+            return True
+
+        monkeypatch.setattr("tools.url_safety.is_always_blocked_url", _check)
+        result = await web_server.validate_custom_endpoint(
+            web_server.CustomEndpointUpdate(
+                name="probe", base_url="https://example.com/v1", model="m"
+            )
+        )
+
+        assert result["ok"] is False
+        assert resolver_threads
+        assert resolver_threads[0] != event_loop_thread
+
+    @pytest.mark.asyncio
+    async def test_dns_preflight_timeout_fails_closed(self, monkeypatch):
+        from hermes_cli import web_server
+
+        original_wait_for = asyncio.wait_for
+
+        async def _timeout(awaitable, *, timeout):
+            awaitable.close()
+            raise TimeoutError
+
+        monkeypatch.setattr(web_server.asyncio, "wait_for", _timeout)
+        try:
+            result = await web_server.validate_custom_endpoint(
+                web_server.CustomEndpointUpdate(
+                    name="probe", base_url="https://example.com/v1", model="m"
+                )
+            )
+        finally:
+            monkeypatch.setattr(web_server.asyncio, "wait_for", original_wait_for)
+
+        assert result["ok"] is False
+        assert result["reachable"] is False
+        assert "safely resolve" in result["message"].lower()
+
+    @pytest.mark.parametrize(
+        "base_url",
+        [
+            "http://169.254.169.254",
+            "http://[::ffff:169.254.169.254]",
+            "file:///etc/passwd",
+        ],
+    )
+    def test_blocks_ssrf_targets_without_fetch(self, monkeypatch, base_url):
+        called = []
+
+        class _Client:
+            def __init__(self, *a, **k):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *a):
+                return False
+
+            async def get(self, *a, **k):
+                called.append(True)
+                raise AssertionError("SSRF target must not be fetched")
+
+        monkeypatch.setattr(
+            "tools.url_safety.create_ssrf_safe_async_client", lambda **k: _Client(**k)
+        )
+        data = self._post(base_url).json()
+        assert data["ok"] is False
+        assert data["reachable"] is False
+        assert data["models"] == []
+        assert called == []
+
+    def test_allows_public_https_endpoint(self, monkeypatch):
+        client_kwargs = {}
+
+        class _Resp:
+            status_code = 200
+            is_success = True
+
+            def json(self):
+                return {"data": [{"id": "gpt-test"}]}
+
+        class _Client:
+            def __init__(self, *a, **k):
+                client_kwargs.update(k)
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *a):
+                return False
+
+            async def get(self, url, *a, **k):
+                assert url == "https://api.example.com/v1/models"
+                return _Resp()
+
+        monkeypatch.setattr(
+            "tools.url_safety.create_ssrf_safe_async_client", lambda **k: _Client(**k)
+        )
+        data = self._post("https://api.example.com/v1").json()
+        assert data["ok"] is True
+        assert data["models"] == ["gpt-test"]
+        assert client_kwargs.get("follow_redirects") is False
+        assert client_kwargs.get("allow_private_urls") is True
+
+    def test_blocks_dns_rebinding_to_metadata(self, monkeypatch):
+        """Connect-time always-blocked floor closes DNS-rebinding TOCTOU."""
+        import socket
+        from unittest.mock import patch
+
+        monkeypatch.setattr(
+            "tools.url_safety.is_always_blocked_url",
+            lambda url: False,
+        )
+        metadata_answers = [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("169.254.169.254", 80))
+        ]
+        with patch("socket.getaddrinfo", return_value=metadata_answers):
+            data = self._post("http://evil.example.com/v1").json()
+        assert data["ok"] is False
+        assert data["reachable"] is False
+        assert data["models"] == []
+        assert "blocked" in data["message"].lower()
 
 
 class TestDesktopCronTicker:

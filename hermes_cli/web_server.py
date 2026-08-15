@@ -7522,6 +7522,50 @@ def _parse_model_ids(resp: "Any") -> List[str]:
     return ids
 
 
+_ENDPOINT_PROBE_BLOCKED_MSG = "That URL targets a blocked internal address."
+_ENDPOINT_PROBE_DNS_TIMEOUT_SECONDS = 2.0
+
+
+async def _endpoint_probe_blocked_reason(url: str) -> Optional[str]:
+    """Return a user-facing reason when *url* must not be fetched server-side.
+
+    Custom-endpoint / ``OPENAI_BASE_URL`` validation intentionally allows
+    loopback and private LAN targets (local Ollama, vLLM, llama.cpp). The
+    security floor is http(s) only plus the shared always-blocked cloud
+    metadata policy from ``tools.url_safety`` (CWE-918). DNS preflight runs
+    off the event loop with a bounded timeout; callers must also probe via
+    ``create_ssrf_safe_async_client(allow_private_urls=True)`` so DNS rebinding
+    cannot flip a hostname to metadata at connect time.
+    """
+    from tools.url_safety import is_always_blocked_url
+
+    parsed = urllib.parse.urlparse(url)
+    scheme = (parsed.scheme or "").strip().lower()
+    if scheme not in {"http", "https"}:
+        return "Only http:// and https:// endpoint URLs are allowed."
+    if not (parsed.hostname or "").strip():
+        return "Enter a valid endpoint URL with a hostname."
+    try:
+        blocked = await asyncio.wait_for(
+            asyncio.to_thread(is_always_blocked_url, url),
+            timeout=_ENDPOINT_PROBE_DNS_TIMEOUT_SECONDS,
+        )
+    except Exception:
+        return "Could not safely resolve that endpoint URL."
+    if blocked:
+        return _ENDPOINT_PROBE_BLOCKED_MSG
+    return None
+
+
+def _endpoint_probe_client(**kwargs):
+    """Async httpx client for dashboard endpoint probes (LAN ok, metadata blocked)."""
+    from tools.url_safety import create_ssrf_safe_async_client
+
+    kwargs.setdefault("follow_redirects", False)
+    kwargs.setdefault("allow_private_urls", True)
+    return create_ssrf_safe_async_client(**kwargs)
+
+
 def _custom_endpoint_id(raw: str, fallback: str = "custom") -> str:
     slug = re.sub(r"[^A-Za-z0-9_-]+", "-", (raw or "").strip()).strip("-_").lower()
     return slug or fallback
@@ -7851,19 +7895,35 @@ def delete_custom_endpoint(endpoint_id: str, profile: Optional[str] = None):
 async def validate_custom_endpoint(body: CustomEndpointUpdate):
     """Probe a custom endpoint by calling its OpenAI-compatible /models URL."""
     import httpx
+    from tools.url_safety import SSRFConnectionBlocked
 
     base_url = (body.base_url or "").strip().rstrip("/")
     if not base_url:
         return {"ok": False, "reachable": True, "message": "Enter an endpoint URL first.", "models": []}
 
     url = base_url + "/models"
+    blocked = await _endpoint_probe_blocked_reason(url)
+    if blocked:
+        return {"ok": False, "reachable": False, "message": blocked, "models": []}
+
     headers = {"Accept": "application/json"}
     if body.api_key and body.api_key.strip():
         headers["Authorization"] = f"Bearer {body.api_key.strip()}"
 
     try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(8.0)) as client:
+        # follow_redirects=False: a public URL must not bounce into metadata.
+        # allow_private_urls=True keeps local Ollama/vLLM probes working while
+        # create_ssrf_safe_async_client still enforces the metadata floor at connect.
+        # Async client preserves main's non-blocking dashboard event-loop path.
+        async with _endpoint_probe_client(timeout=httpx.Timeout(8.0)) as client:
             resp = await client.get(url, headers=headers)
+    except SSRFConnectionBlocked:
+        return {
+            "ok": False,
+            "reachable": False,
+            "message": _ENDPOINT_PROBE_BLOCKED_MSG,
+            "models": [],
+        }
     except Exception:
         return {"ok": False, "reachable": False, "message": f"Could not reach {url}.", "models": []}
 
@@ -7897,16 +7957,28 @@ async def validate_provider_credential(body: EnvVarUpdate, request: Request):
     # ids the endpoint advertises (OpenAI ``/v1/models`` shape) so the GUI can
     # auto-pick a default without asking the user to type a model name.
     if key == "OPENAI_BASE_URL":
+        from tools.url_safety import SSRFConnectionBlocked
+
         url = value.rstrip("/") + "/models"
+        blocked = await _endpoint_probe_blocked_reason(url)
+        if blocked:
+            return {"ok": False, "reachable": False, "message": blocked, "models": []}
         # Send the optional API key so endpoints that require auth on
         # ``/v1/models`` (many hosted OpenAI-compatible servers) still enumerate
         # their models instead of returning an empty list behind a 401.
         api_key = (body.api_key or "").strip()
         headers = {"Authorization": f"Bearer {api_key}"} if api_key else None
         try:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(8.0)) as client:
+            async with _endpoint_probe_client(timeout=httpx.Timeout(8.0)) as client:
                 resp = await client.get(url, headers=headers)
             return {"ok": True, "reachable": True, "message": "", "models": _parse_model_ids(resp)}
+        except SSRFConnectionBlocked:
+            return {
+                "ok": False,
+                "reachable": False,
+                "message": _ENDPOINT_PROBE_BLOCKED_MSG,
+                "models": [],
+            }
         except Exception:
             return {"ok": False, "reachable": False, "message": f"Could not reach {url}."}
 

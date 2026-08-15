@@ -185,6 +185,28 @@ class TestSSRFGuardedHttpxClient:
             with pytest.raises(SSRFConnectionBlocked, match="metadata"):
                 _resolved_http_connect_ips("example.com", 80, "http")
 
+    def test_allow_private_urls_still_blocks_metadata_at_connect(self):
+        """Endpoint-probe mode may dial LAN, but never cloud metadata."""
+        with _resolves_to("169.254.169.254"):
+            with pytest.raises(SSRFConnectionBlocked, match="metadata"):
+                _resolved_http_connect_ips(
+                    "evil.example.com", 80, "http", allow_private_urls=True
+                )
+
+    @pytest.mark.parametrize("ip", ["fe80::1", "fe80::1%eth0"])
+    def test_allow_private_urls_still_blocks_ipv6_link_local_at_connect(self, ip):
+        with _resolves_to(ip):
+            with pytest.raises(SSRFConnectionBlocked, match="metadata"):
+                _resolved_http_connect_ips(
+                    "evil.example.com", 80, "http", allow_private_urls=True
+                )
+
+    def test_allow_private_urls_permits_loopback_at_connect(self):
+        with _resolves_to("127.0.0.1"):
+            assert _resolved_http_connect_ips(
+                "127.0.0.1", 11434, "http", allow_private_urls=True
+            ) == ["127.0.0.1"]
+
 
     @pytest.mark.asyncio
     async def test_async_backend_blocks_unix_socket_connects(self):
@@ -405,6 +427,14 @@ class TestIsAlwaysBlockedUrl:
         not skipped as unparseable."""
         with _resolves_to("::ffff:169.254.169.254%eth0"):
             assert is_always_blocked_url("http://attacker-controlled.example.com/") is True
+
+    @pytest.mark.parametrize("ip", ["fe80::1", "fe80::1%eth0"])
+    def test_ipv6_link_local_resolution_always_blocked(self, ip):
+        with _resolves_to(ip):
+            assert is_always_blocked_url("http://attacker-controlled.example.com/") is True
+
+    def test_scoped_ipv6_link_local_literal_always_blocked(self):
+        assert is_always_blocked_url("http://[fe80::1%25eth0]/") is True
 
     # -- Things the floor must NOT block ----------------------------------------
 
