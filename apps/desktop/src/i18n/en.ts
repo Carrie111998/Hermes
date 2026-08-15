@@ -607,7 +607,8 @@ export const en: Translations = {
       couldNotSave: 'Could not save credential.',
       remove: 'Remove',
       getKey: 'Get a key',
-      saving: 'Saving'
+      saving: 'Saving',
+      managedByOnePassword: 'Managed via 1Password'
     },
     envActions: {
       actions: 'Actions',

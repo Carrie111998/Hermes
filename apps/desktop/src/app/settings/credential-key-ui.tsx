@@ -82,6 +82,23 @@ export function KeyField({
 
   const editType = info.is_password ? 'password' : 'text'
 
+  if (info.managed_by === 'onepassword') {
+    return (
+      <div
+        className={cn(
+          CREDENTIAL_CONTROL_CLASS,
+          bare && CRED_BARE,
+          'flex items-center gap-1.5 text-muted-foreground'
+        )}
+      >
+        <span className="truncate">{masked}</span>
+        <span className="shrink-0 text-[length:var(--conversation-caption-font-size)] text-(--ui-text-tertiary)">
+          {t.settings.credentials.managedByOnePassword}
+        </span>
+      </div>
+    )
+  }
+
   if (info.is_set && !editing) {
     return (
       <Input

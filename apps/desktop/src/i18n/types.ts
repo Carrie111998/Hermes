@@ -502,6 +502,7 @@ export interface Translations {
       remove: string
       getKey: string
       saving: string
+      managedByOnePassword: string
     }
     envActions: {
       actions: string

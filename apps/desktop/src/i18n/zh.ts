@@ -814,7 +814,8 @@ export const zh: Translations = {
       couldNotSave: '无法保存凭据。',
       remove: '移除',
       getKey: '获取密钥',
-      saving: '保存中'
+      saving: '保存中',
+      managedByOnePassword: 'Managed via 1Password'
     },
     envActions: {
       actions: '操作',

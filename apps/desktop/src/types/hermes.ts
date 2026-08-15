@@ -115,6 +115,11 @@ export interface EnvVarInfo {
   description: string
   is_password: boolean
   is_set: boolean
+  // 'onepassword' when this key is resolved via the 1Password secret source
+  // (secrets.onepassword.env in config.yaml) rather than stored in .env.
+  // The Keys UI shows it as a locked, non-editable "Managed via 1Password"
+  // row — manage it via the 1Password app + `hermes secrets onepassword`.
+  managed_by?: null | string
   // Backend-derived provider grouping hints (from the unified provider catalog
   // in hermes_cli/provider_catalog.py). When present, the Keys tab groups by
   // this provider identity — the SAME one `hermes model` uses — instead of
