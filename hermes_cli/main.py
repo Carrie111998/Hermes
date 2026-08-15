@@ -1955,7 +1955,12 @@ def _tui_cache_fd_is_private(fd: int) -> bool:
         return True
     try:
         metadata = os.fstat(fd)
-        return metadata.st_uid == os.geteuid() and not (metadata.st_mode & 0o022)
+        get_effective_uid = getattr(os, "geteuid", None)
+        return (
+            get_effective_uid is not None
+            and metadata.st_uid == get_effective_uid()
+            and not (metadata.st_mode & 0o022)
+        )
     except (AttributeError, OSError):
         return False
 
