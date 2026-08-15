@@ -612,6 +612,91 @@ def test_complete_task_persists_scratch_artifacts_before_cleanup(kanban_home):
     ]
 
 
+@pytest.mark.parametrize("via_workspace_symlink", [False, True])
+def test_complete_task_rejects_artifacts_outside_scratch_workspace(
+    kanban_home,
+    tmp_path,
+    via_workspace_symlink,
+):
+    """A completion artifact cannot turn the notifier into a host-file reader."""
+    outside = tmp_path / "outside-secret.txt"
+    outside.write_text("host secret\n", encoding="utf-8")
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="bounded artifact")
+        task = kb.get_task(conn, task_id)
+        workspace = kb.resolve_workspace(task)
+        kb.set_workspace_path(conn, task_id, workspace)
+        declared = outside
+        if via_workspace_symlink:
+            declared = workspace / "artifact.txt"
+            declared.symlink_to(outside)
+
+        with pytest.raises(
+            kb.ArtifactPreservationError,
+            match="outside its task workspace",
+        ):
+            kb.complete_task(
+                conn,
+                task_id,
+                result="done",
+                metadata={"artifacts": [str(declared)]},
+            )
+
+        assert kb.get_task(conn, task_id).status == "ready"
+        assert kb.list_attachments(conn, task_id) == []
+        assert all(event.kind != "completed" for event in kb.list_events(conn, task_id))
+
+    assert workspace.exists(), "rejected completion must preserve the workspace"
+    assert outside.read_text(encoding="utf-8") == "host secret\n"
+
+
+@pytest.mark.skipif(
+    not hasattr(os, "O_NOFOLLOW"),
+    reason="platform has no O_NOFOLLOW support",
+)
+def test_complete_task_rejects_artifact_swapped_to_symlink_before_open(
+    kanban_home,
+    tmp_path,
+    monkeypatch,
+):
+    """Opening the source must not follow a symlink installed after validation."""
+    outside = tmp_path / "outside-secret.txt"
+    outside.write_text("host secret\n", encoding="utf-8")
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="race-safe artifact")
+        task = kb.get_task(conn, task_id)
+        workspace = kb.resolve_workspace(task)
+        kb.set_workspace_path(conn, task_id, workspace)
+        artifact = workspace / "artifact.txt"
+        artifact.write_text("expected output\n", encoding="utf-8")
+
+        original_unique_path = kb._unique_attachment_path
+
+        def swap_before_open(directory, filename, used):
+            artifact.unlink()
+            artifact.symlink_to(outside)
+            return original_unique_path(directory, filename, used)
+
+        monkeypatch.setattr(kb, "_unique_attachment_path", swap_before_open)
+
+        with pytest.raises(kb.ArtifactPreservationError):
+            kb.complete_task(
+                conn,
+                task_id,
+                result="done",
+                metadata={"artifacts": [str(artifact)]},
+            )
+
+        assert kb.get_task(conn, task_id).status == "ready"
+        assert kb.list_attachments(conn, task_id) == []
+        assert all(event.kind != "completed" for event in kb.list_events(conn, task_id))
+
+    assert workspace.exists(), "rejected completion must preserve the workspace"
+    assert outside.read_text(encoding="utf-8") == "host secret\n"
+
+
 
 
 # ---------------------------------------------------------------------------

@@ -79,6 +79,7 @@ import random
 import secrets
 import shutil
 import sqlite3
+import stat
 import subprocess
 import sys
 import threading
@@ -5346,7 +5347,71 @@ class HallucinatedCardsError(ValueError):
 
 
 class ArtifactPreservationError(RuntimeError):
-    """Raised when a declared scratch deliverable cannot be preserved."""
+    """Raised when a declared completion artifact cannot be preserved."""
+
+
+def _scope_completion_artifacts(
+    conn: sqlite3.Connection,
+    task_id: str,
+    metadata: Optional[dict],
+) -> Optional[dict]:
+    """Canonicalize declared artifacts below the task's workspace."""
+    if not isinstance(metadata, dict) or "artifacts" not in metadata:
+        return metadata
+    raw_artifacts = metadata.get("artifacts")
+    if not isinstance(raw_artifacts, (list, tuple)):
+        raise ArtifactPreservationError("metadata.artifacts must be a list")
+    if not raw_artifacts:
+        return metadata
+
+    row = conn.execute(
+        "SELECT workspace_path FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if not row or not row["workspace_path"]:
+        raise ArtifactPreservationError(
+            "completion artifacts require an available task workspace"
+        )
+    try:
+        workspace_root = Path(row["workspace_path"]).expanduser().resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise ArtifactPreservationError(
+            "completion artifacts require an available task workspace"
+        ) from exc
+    if not workspace_root.is_dir():
+        raise ArtifactPreservationError(
+            "completion artifacts require an available task workspace"
+        )
+
+    canonical: list[str] = []
+    seen: set[str] = set()
+    for item in raw_artifacts:
+        if not isinstance(item, str) or not item.strip():
+            raise ArtifactPreservationError(
+                "every completion artifact must be a non-empty path string"
+            )
+        candidate = Path(item).expanduser()
+        if not candidate.is_absolute():
+            candidate = workspace_root / candidate
+        try:
+            resolved = candidate.resolve(strict=True)
+            resolved.relative_to(workspace_root)
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise ArtifactPreservationError(
+                f"declared artifact is outside its task workspace: {item}"
+            ) from exc
+        if not resolved.is_file():
+            raise ArtifactPreservationError(
+                f"declared artifact is not a regular file: {item}"
+            )
+        normalized = str(resolved)
+        if normalized not in seen:
+            seen.add(normalized)
+            canonical.append(normalized)
+
+    updated = dict(metadata)
+    updated["artifacts"] = canonical
+    return updated
 
 
 def complete_task(
@@ -5428,6 +5493,7 @@ def complete_task(
     metadata = _merge_completion_prose_artifacts(
         conn, task_id, metadata, summary=summary, result=result,
     )
+    metadata = _scope_completion_artifacts(conn, task_id, metadata)
     with write_txn(conn):
         # Parent completion is a hard invariant even for direct human review
         # approval. A parent may have been reopened after this task entered
@@ -5693,23 +5759,32 @@ def _persist_scratch_completion_artifacts(
             continue
         src = Path(artifact).expanduser()
         try:
-            resolved_src = src.resolve()
-        except OSError:
-            persisted.append(artifact)
-            continue
+            resolved_src = src.resolve(strict=True)
+        except OSError as exc:
+            _discard_copies()
+            raise ArtifactPreservationError(
+                f"declared scratch artifact is unavailable: {artifact}"
+            ) from exc
 
         if not resolved_src.is_relative_to(workspace_root):
-            persisted.append(artifact)
-            continue
+            _discard_copies()
+            raise ArtifactPreservationError(
+                f"declared artifact is outside its task workspace: {artifact}"
+            )
 
-        if not src.is_file():
+        try:
+            expected_stat = os.stat(resolved_src, follow_symlinks=False)
+        except OSError as exc:
+            _discard_copies()
+            raise ArtifactPreservationError(
+                f"declared scratch artifact is unavailable or not a regular file: {artifact}"
+            ) from exc
+        if not stat.S_ISREG(expected_stat.st_mode):
             _discard_copies()
             raise ArtifactPreservationError(
                 f"declared scratch artifact is unavailable or not a regular file: {artifact}"
             )
-
-        size = resolved_src.stat().st_size
-        if size > KANBAN_ATTACHMENT_MAX_BYTES:
+        if expected_stat.st_size > KANBAN_ATTACHMENT_MAX_BYTES:
             _discard_copies()
             raise ArtifactPreservationError(
                 f"declared scratch artifact exceeds the "
@@ -5720,7 +5795,33 @@ def _persist_scratch_completion_artifacts(
         try:
             attachment_dir.mkdir(parents=True, exist_ok=True)
             dest = _unique_attachment_path(attachment_dir, resolved_src.name, used_destinations)
-            with resolved_src.open("rb") as source_file, dest.open("xb") as destination_file:
+            source_flags = (
+                os.O_RDONLY
+                | getattr(os, "O_BINARY", 0)
+                | getattr(os, "O_NOFOLLOW", 0)
+            )
+            source_fd = os.open(resolved_src, source_flags)
+            with (
+                os.fdopen(source_fd, "rb") as source_file,
+                dest.open("xb") as destination_file,
+            ):
+                opened_stat = os.fstat(source_file.fileno())
+                if not stat.S_ISREG(opened_stat.st_mode):
+                    raise ArtifactPreservationError(
+                        f"declared scratch artifact is not a regular file: {artifact}"
+                    )
+                if (
+                    opened_stat.st_dev != expected_stat.st_dev
+                    or opened_stat.st_ino != expected_stat.st_ino
+                ):
+                    raise ArtifactPreservationError(
+                        f"declared scratch artifact changed before it could be copied: {artifact}"
+                    )
+                if opened_stat.st_size > KANBAN_ATTACHMENT_MAX_BYTES:
+                    raise ArtifactPreservationError(
+                        f"declared scratch artifact exceeds the "
+                        f"{KANBAN_ATTACHMENT_MAX_BYTES}-byte limit: {artifact}"
+                    )
                 copied = 0
                 while chunk := source_file.read(1024 * 1024):
                     copied += len(chunk)
