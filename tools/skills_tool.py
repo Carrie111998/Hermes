@@ -959,6 +959,42 @@ def _serve_plugin_skill(
     )
 
 
+def _iter_contained_skill_files(
+    directory: Path, skill_dir: Path, *, recursive: bool
+):
+    """Yield files without following a directory path outside *skill_dir*."""
+
+    def _walk(current: Path, resolved_ancestors: frozenset[Path]):
+        if validate_within_dir(current, skill_dir):
+            return
+        try:
+            resolved = current.resolve()
+        except OSError:
+            return
+        if resolved in resolved_ancestors:
+            return
+
+        try:
+            entries = list(current.iterdir())
+        except OSError:
+            return
+
+        ancestors = resolved_ancestors | {resolved}
+        for entry in entries:
+            if validate_within_dir(entry, skill_dir):
+                continue
+            try:
+                if entry.is_file():
+                    yield entry
+                elif recursive and entry.is_dir():
+                    yield from _walk(entry, ancestors)
+            except OSError:
+                continue
+
+    if directory.exists():
+        yield from _walk(directory, frozenset())
+
+
 def skill_view(
     name: str,
     file_path: str = None,
@@ -1326,9 +1362,11 @@ def skill_view(
                     "other": [],
                 }
 
-                # Scan for all readable files
-                for f in skill_dir.rglob("*"):
-                    if f.is_file() and f.name != "SKILL.md":
+                # Scan for all readable files that remain inside the skill root.
+                for f in _iter_contained_skill_files(
+                    skill_dir, skill_dir, recursive=True
+                ):
+                    if f.name != "SKILL.md":
                         rel = str(f.relative_to(skill_dir))
                         if rel.startswith("references/"):
                             available_files["references"].append(rel)
@@ -1411,57 +1449,54 @@ def skill_view(
 
         if skill_dir:
             references_dir = skill_dir / "references"
-            if references_dir.exists() and not validate_within_dir(
-                references_dir, skill_dir
-            ):
+            if not validate_within_dir(references_dir, skill_dir):
                 reference_files = [
                     str(f.relative_to(skill_dir))
-                    for f in references_dir.glob("*.md")
-                    if f.is_file() and not validate_within_dir(f, skill_dir)
+                    for f in _iter_contained_skill_files(
+                        references_dir, skill_dir, recursive=False
+                    )
+                    if f.suffix == ".md"
                 ]
 
             templates_dir = skill_dir / "templates"
-            if templates_dir.exists() and not validate_within_dir(
-                templates_dir, skill_dir
-            ):
-                for ext in [
-                    "*.md",
-                    "*.py",
-                    "*.yaml",
-                    "*.yml",
-                    "*.json",
-                    "*.tex",
-                    "*.sh",
-                ]:
-                    template_files.extend(
-                        [
-                            str(f.relative_to(skill_dir))
-                            for f in templates_dir.rglob(ext)
-                            if f.is_file() and not validate_within_dir(f, skill_dir)
-                        ]
+            if not validate_within_dir(templates_dir, skill_dir):
+                template_suffixes = {
+                    ".md",
+                    ".py",
+                    ".yaml",
+                    ".yml",
+                    ".json",
+                    ".tex",
+                    ".sh",
+                }
+                template_files = [
+                    str(f.relative_to(skill_dir))
+                    for f in _iter_contained_skill_files(
+                        templates_dir, skill_dir, recursive=True
                     )
+                    if f.suffix in template_suffixes
+                ]
 
             # assets/ — agentskills.io standard directory for supplementary files
             assets_dir = skill_dir / "assets"
-            if assets_dir.exists() and not validate_within_dir(
-                assets_dir, skill_dir
-            ):
-                for f in assets_dir.rglob("*"):
-                    if f.is_file() and not validate_within_dir(f, skill_dir):
-                        asset_files.append(str(f.relative_to(skill_dir)))
+            if not validate_within_dir(assets_dir, skill_dir):
+                asset_files = [
+                    str(f.relative_to(skill_dir))
+                    for f in _iter_contained_skill_files(
+                        assets_dir, skill_dir, recursive=True
+                    )
+                ]
 
             scripts_dir = skill_dir / "scripts"
-            if scripts_dir.exists() and not validate_within_dir(
-                scripts_dir, skill_dir
-            ):
-                for ext in ["*.py", "*.sh", "*.bash", "*.js", "*.ts", "*.rb"]:
-                    script_files.extend(
-                        [
-                            str(f.relative_to(skill_dir))
-                            for f in scripts_dir.glob(ext)
-                            if f.is_file() and not validate_within_dir(f, skill_dir)
-                        ]
+            if not validate_within_dir(scripts_dir, skill_dir):
+                script_suffixes = {".py", ".sh", ".bash", ".js", ".ts", ".rb"}
+                script_files = [
+                    str(f.relative_to(skill_dir))
+                    for f in _iter_contained_skill_files(
+                        scripts_dir, skill_dir, recursive=False
                     )
+                    if f.suffix in script_suffixes
+                ]
 
         # Read tags/related_skills with backward compat:
         # Check metadata.hermes.* first (agentskills.io convention), fall back to top-level

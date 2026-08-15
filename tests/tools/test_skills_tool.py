@@ -383,6 +383,41 @@ class TestSkillView:
         assert "payload.py" not in json.dumps(result["linked_files"])
         assert "secret.md" not in json.dumps(result["linked_files"])
 
+    def test_missing_file_inventory_stays_within_skill_root(self, tmp_path):
+        external_scripts = tmp_path / "external" / "scripts"
+        external_scripts.mkdir(parents=True)
+        (external_scripts / "payload.py").write_text("PRIVATE_KEY = 'MATERIAL'")
+
+        skills_root = tmp_path / "skills"
+        skills_root.mkdir()
+        skill_dir = _make_skill(skills_root, "redirected")
+        internal_templates = skill_dir / "internal-templates"
+        internal_templates.mkdir()
+        (internal_templates / "safe.md").write_text("safe")
+        try:
+            (skill_dir / "scripts").symlink_to(
+                external_scripts, target_is_directory=True
+            )
+            (skill_dir / "templates").symlink_to(
+                internal_templates, target_is_directory=True
+            )
+        except (OSError, NotImplementedError) as exc:
+            pytest.skip(f"symlinks unavailable in test environment: {exc}")
+
+        with patch("tools.skills_tool.SKILLS_DIR", skills_root):
+            raw = skill_view("redirected", file_path="references/missing.md")
+
+        result = json.loads(raw)
+        assert result["success"] is False
+        inventory = json.dumps(result["available_files"])
+        assert "payload.py" not in inventory
+        listed_paths = {
+            Path(path).as_posix()
+            for paths in result["available_files"].values()
+            for path in paths
+        }
+        assert "templates/safe.md" in listed_paths
+
     def test_disabled_skill_blocked_enabled_allowed(self, tmp_path):
         with (
             patch("tools.skills_tool.SKILLS_DIR", tmp_path),
