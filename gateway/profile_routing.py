@@ -106,6 +106,25 @@ class ProfileRoute:
         return True
 
 
+def _coerce_route_id(key: str, value: Any, name: str) -> Optional[str]:
+    """Coerce a route discriminator to ``str``, warning on non-string input.
+
+    YAML parses unquoted numeric IDs (e.g. Discord snowflakes) as ``int``,
+    but the ``SessionSource`` fields they are matched against are always
+    ``str`` — an ``int`` route would silently never match and messages
+    would fall through to the default profile. Normalize here so the
+    comparison is type-consistent, and surface the misconfiguration.
+    """
+    if value is None or isinstance(value, str):
+        return value
+    logger.warning(
+        "Profile route %r: %s=%r is not a string — coercing to %r. "
+        "Quote the value in config.yaml (e.g. `%s: \"%s\"`) to be explicit.",
+        name, key, value, str(value), key, value,
+    )
+    return str(value)
+
+
 def parse_profile_routes(raw: Optional[List[Dict[str, Any]]]) -> List[ProfileRoute]:
     """Parse profile_routes from config.yaml into ProfileRoute objects.
 
@@ -143,9 +162,9 @@ def parse_profile_routes(raw: Optional[List[Dict[str, Any]]]) -> List[ProfileRou
                 name=name,
                 platform=platform,
                 profile=profile,
-                guild_id=entry.get("guild_id"),
-                chat_id=entry.get("chat_id"),
-                thread_id=entry.get("thread_id"),
+                guild_id=_coerce_route_id("guild_id", entry.get("guild_id"), name),
+                chat_id=_coerce_route_id("chat_id", entry.get("chat_id"), name),
+                thread_id=_coerce_route_id("thread_id", entry.get("thread_id"), name),
                 enabled=entry.get("enabled", True),
             )
         )
