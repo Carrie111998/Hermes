@@ -5130,8 +5130,12 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 find_gateway_pids,
                 find_profile_gateway_processes,
                 _prepare_profile_gateway_update_restart,
+                _prepare_unmapped_gateway_update_restart,
+                _is_pid_ancestor_of_current_process,
                 _get_service_pids,
-                _graceful_restart_via_sigusr1,
+                _restart_gateway_for_update,
+                _restart_watcher_wait_timeout,
+                launch_detached_systemd_restart_after_exit,
                 _wait_for_gateway_exit,
             )
             import signal as _signal
@@ -5292,9 +5296,11 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 _drain_budget = 45.0
 
             restarted_services = []
+            deferred_restart_services = []
             failed_or_stale_units = []
             killed_pids = set()
             relaunched_profiles = []
+            relaunched_unmapped_pids = []
             externally_supervised_profiles = []
 
             # --- Systemd services (Linux) ---
@@ -5383,17 +5389,36 @@ def _cmd_update_impl(args, gateway_mode: bool):
                         ):
                             _main_pid = 0
 
-                        _graceful_ok = False
+                        _restart_outcome = "failed"
                         if _main_pid > 0:
                             print(
                                 f"  → {svc_name}: draining (up to {int(_drain_budget)}s)..."
                             )
-                            _graceful_ok = _graceful_restart_via_sigusr1(
+                            _restart_outcome = _restart_gateway_for_update(
                                 _main_pid,
-                                drain_timeout=_drain_budget,
+                                _drain_budget,
                             )
+                            if _restart_outcome == "deferred":
+                                if _manage_cmd is not None and not (
+                                    launch_detached_systemd_restart_after_exit(
+                                        _main_pid,
+                                        _manage_cmd,
+                                        svc_name,
+                                        wait_timeout=_restart_watcher_wait_timeout(
+                                            _main_pid, _drain_budget
+                                        ),
+                                    )
+                                ):
+                                    failed_or_stale_units.append(svc_name)
+                                    print(
+                                        f"  WARNING: Could not schedule post-exit "
+                                        f"recovery for {svc_name}; verify it restarts "
+                                        "after the current gateway job"
+                                    )
+                                deferred_restart_services.append(svc_name)
+                                return
 
-                        if _graceful_ok:
+                        if _restart_outcome == "exited":
                             # Gateway exited after a planned restart.
                             # ``Restart=always`` means systemd WILL respawn
                             # the unit — but only after
@@ -5639,7 +5664,9 @@ def _cmd_update_impl(args, gateway_mode: bool):
             }
             for pid, proc in profile_processes.items():
                 restart_mode = _prepare_profile_gateway_update_restart(
-                    proc.profile, pid
+                    proc.profile,
+                    pid,
+                    wait_timeout=_restart_watcher_wait_timeout(pid, _drain_budget),
                 )
                 if restart_mode is None:
                     continue
@@ -5656,11 +5683,11 @@ def _cmd_update_impl(args, gateway_mode: bool):
                     f"  → {proc.profile}: draining gateway PID {pid} "
                     f"(up to {int(_drain_budget)}s)..."
                 )
-                drained = _graceful_restart_via_sigusr1(
-                    pid,
-                    drain_timeout=_drain_budget,
-                )
-                if not drained:
+                restart_outcome = _restart_gateway_for_update(pid, _drain_budget)
+                if restart_outcome == "deferred":
+                    deferred_restart_services.append(proc.profile)
+                    continue
+                if restart_outcome == "failed":
                     try:
                         os.kill(pid, _signal.SIGTERM)
                     except (ProcessLookupError, PermissionError):
@@ -5689,19 +5716,60 @@ def _cmd_update_impl(args, gateway_mode: bool):
             for pid in manual_pids:
                 if pid in profile_processes:
                     continue
+                restart_mode = _prepare_unmapped_gateway_update_restart(
+                    pid,
+                    wait_timeout=_restart_watcher_wait_timeout(pid, _drain_budget),
+                )
+                if restart_mode is not None:
+                    print(
+                        f"  -> manual gateway PID {pid}: draining "
+                        f"(up to {int(_drain_budget)}s)..."
+                    )
+                    restart_outcome = _restart_gateway_for_update(
+                        pid,
+                        _drain_budget,
+                    )
+                    if restart_outcome == "deferred":
+                        deferred_restart_services.append(f"PID {pid}")
+                        continue
+                    if restart_outcome == "failed":
+                        try:
+                            os.kill(pid, _signal.SIGTERM)
+                        except (ProcessLookupError, PermissionError):
+                            pass
+                    _wait_for_gateway_exit(timeout=5.0, force_after=None)
+                    killed_pids.add(pid)
+                    if restart_mode == "external-supervisor":
+                        externally_supervised_profiles.append(f"PID {pid}")
+                    else:
+                        relaunched_unmapped_pids.append(pid)
+                    continue
+                if _is_pid_ancestor_of_current_process(pid):
+                    failed_or_stale_units.append(f"manual gateway PID {pid}")
+                    print(
+                        f"  WARNING: Cannot safely restart gateway PID {pid}: "
+                        "its command line could not be captured. Leaving it "
+                        "running so the current gateway job can finish."
+                    )
+                    continue
                 try:
                     os.kill(pid, _signal.SIGTERM)
                     killed_pids.add(pid)
                 except (ProcessLookupError, PermissionError):
                     pass
 
-            if restarted_services or killed_pids:
+            if restarted_services or deferred_restart_services or killed_pids:
                 print()
                 for svc in restarted_services:
                     print(f"  ✓ Restarted {svc}")
+                for target in deferred_restart_services:
+                    print(f"  ✓ Restart scheduled after current gateway job: {target}")
                 if relaunched_profiles:
                     names = ", ".join(relaunched_profiles)
                     print(f"  ✓ Restarting manual gateway profile(s): {names}")
+                if relaunched_unmapped_pids:
+                    pids = ", ".join(str(pid) for pid in relaunched_unmapped_pids)
+                    print(f"  -> Restarting manual gateway PID(s): {pids}")
                 if externally_supervised_profiles:
                     names = ", ".join(externally_supervised_profiles)
                     print(
@@ -5711,6 +5779,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 unmapped_count = (
                     len(killed_pids)
                     - len(relaunched_profiles)
+                    - len(relaunched_unmapped_pids)
                     - len(externally_supervised_profiles)
                 )
                 if unmapped_count:
