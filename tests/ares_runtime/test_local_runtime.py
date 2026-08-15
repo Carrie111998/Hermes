@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import tomllib
 
 from ares_runtime.local_runtime import AresLocalPaths, AresLocalRuntime
 
@@ -88,3 +89,10 @@ def test_systemd_environment_preserves_an_existing_session_bus(monkeypatch) -> N
     assert environment["XDG_RUNTIME_DIR"] == "/existing/runtime"
     assert environment["DBUS_SESSION_BUS_ADDRESS"] == "unix:path=/existing/runtime/bus"
     assert environment["PATH"] == os.environ["PATH"]
+
+
+def test_ares_runtime_is_included_in_the_noneditable_distribution() -> None:
+    project = Path(__file__).parents[2] / "pyproject.toml"
+    data = tomllib.loads(project.read_text(encoding="utf-8"))
+
+    assert "ares_runtime" in data["tool"]["setuptools"]["packages"]["find"]["include"]
