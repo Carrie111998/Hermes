@@ -1029,6 +1029,7 @@ def test_frame_id_navigate_redirect_to_private_is_blanked(monkeypatch):
         url="https://public.example/widget",
         origin="https://public.example",
         session_id="child-session",
+        loaderId="public-loader",
     )
 
     class _NavSupervisor(_FakeSupervisor):
@@ -1054,9 +1055,12 @@ def test_frame_id_navigate_redirect_to_private_is_blanked(monkeypatch):
             self.cdp_calls.append(
                 {"method": method, "params": params or {}, "session_id": session_id}
             )
+            if method == "Page.enable":
+                return {"result": {}}
             if method == "Page.navigate" and (params or {}).get("url") != "about:blank":
                 public_frame._data["url"] = PRIVATE_URL
                 public_frame._data["origin"] = "http://169.254.169.254"
+                public_frame._data["loaderId"] = "private-loader"
                 return {
                     "result": {
                         "frameId": "oopif-public",
@@ -1070,6 +1074,7 @@ def test_frame_id_navigate_redirect_to_private_is_blanked(monkeypatch):
                             "frame": {
                                 "id": "oopif-public",
                                 "url": public_frame._data["url"],
+                                "loaderId": public_frame._data.get("loaderId", ""),
                             }
                         }
                     }
@@ -1077,6 +1082,7 @@ def test_frame_id_navigate_redirect_to_private_is_blanked(monkeypatch):
             if method == "Page.navigate" and (params or {}).get("url") == "about:blank":
                 public_frame._data["url"] = "about:blank"
                 public_frame._data["origin"] = "null"
+                public_frame._data["loaderId"] = "blank-loader"
                 return {"result": {"frameId": "oopif-public", "loaderId": "blank-loader"}}
             return {"result": {}}
 
@@ -1107,12 +1113,175 @@ def test_frame_id_navigate_redirect_to_private_is_blanked(monkeypatch):
     assert "landed on a private or internal address" in result["error"]
     assert "frame reset to about:blank" in result["error"]
     assert [call["method"] for call in supervisor.cdp_calls] == [
+        "Page.enable",
+        "Page.getFrameTree",
         "Page.navigate",
         "Page.getFrameTree",
         "Page.navigate",
+        "Page.getFrameTree",
     ]
-    assert supervisor.cdp_calls[-1]["params"] == {"url": "about:blank"}
+    assert supervisor.cdp_calls[2]["params"] == {"url": "https://public.example/redirect"}
+    assert supervisor.cdp_calls[4]["params"] == {"url": "about:blank"}
     assert public_frame._data["url"] == "about:blank"
+
+
+def test_frame_id_navigate_waits_for_delayed_private_commit(monkeypatch):
+    """frame_id navigate must not trust a still-public tree before redirect commit."""
+    import tools.browser_tool as bt
+    import tools.browser_supervisor as bs
+
+    monkeypatch.setattr(bt, "_eval_ssrf_guard_active", lambda task_id: True)
+    monkeypatch.setattr(bt, "_current_page_private_url", lambda task_id: None)
+    monkeypatch.setattr(bt, "_is_always_blocked_url", lambda url: False)
+    monkeypatch.setattr(bt, "_is_safe_url", lambda url: url != PRIVATE_URL)
+
+    public_frame = _FakeFrame(
+        frame_id="oopif-public",
+        url="https://public.example/widget",
+        origin="https://public.example",
+        session_id="child-session",
+        loaderId="public-loader",
+    )
+    post_nav_tree_reads = {"count": 0}
+    navigated = {"done": False}
+
+    class _DelayedCommitSupervisor(_FakeSupervisor):
+        def __init__(self):
+            super().__init__(
+                frame_tree={
+                    "top": {
+                        "frame_id": "top-1",
+                        "url": "https://example.com/",
+                        "origin": "https://example.com",
+                    },
+                    "children": [public_frame.to_dict()],
+                },
+                frames={"oopif-public": public_frame},
+            )
+            self._loop = type(
+                "Loop",
+                (),
+                {"is_running": staticmethod(lambda: True)},
+            )()
+
+        async def _cdp(self, method, params=None, *, session_id=None, timeout=10.0):
+            self.cdp_calls.append(
+                {"method": method, "params": params or {}, "session_id": session_id}
+            )
+            if method == "Page.enable":
+                return {"result": {}}
+            if method == "Page.navigate" and (params or {}).get("url") == "about:blank":
+                public_frame._data["url"] = "about:blank"
+                public_frame._data["origin"] = "null"
+                public_frame._data["loaderId"] = "blank-loader"
+                return {"result": {"frameId": "oopif-public", "loaderId": "blank-loader"}}
+            if method == "Page.navigate":
+                # Navigate returns the new loaderId while the frame is still on
+                # the public URL — mirrors CDP returning before redirect commit.
+                navigated["done"] = True
+                return {
+                    "result": {
+                        "frameId": "oopif-public",
+                        "loaderId": "private-loader",
+                    }
+                }
+            if method == "Page.getFrameTree":
+                if public_frame._data.get("loaderId") == "blank-loader":
+                    return {
+                        "result": {
+                            "frameTree": {
+                                "frame": {
+                                    "id": "oopif-public",
+                                    "url": "about:blank",
+                                    "loaderId": "blank-loader",
+                                }
+                            }
+                        }
+                    }
+                if not navigated["done"]:
+                    return {
+                        "result": {
+                            "frameTree": {
+                                "frame": {
+                                    "id": "oopif-public",
+                                    "url": public_frame._data["url"],
+                                    "loaderId": public_frame._data.get(
+                                        "loaderId", "public-loader"
+                                    ),
+                                }
+                            }
+                        }
+                    }
+                post_nav_tree_reads["count"] += 1
+                if post_nav_tree_reads["count"] < 3:
+                    # Still the old public commit — early revalidate would pass.
+                    return {
+                        "result": {
+                            "frameTree": {
+                                "frame": {
+                                    "id": "oopif-public",
+                                    "url": "https://public.example/widget",
+                                    "loaderId": "public-loader",
+                                }
+                            }
+                        }
+                    }
+                public_frame._data["url"] = PRIVATE_URL
+                public_frame._data["origin"] = "http://169.254.169.254"
+                public_frame._data["loaderId"] = "private-loader"
+                return {
+                    "result": {
+                        "frameTree": {
+                            "frame": {
+                                "id": "oopif-public",
+                                "url": PRIVATE_URL,
+                                "loaderId": "private-loader",
+                            }
+                        }
+                    }
+                }
+            return {"result": {}}
+
+    supervisor = _DelayedCommitSupervisor()
+    monkeypatch.setattr(bs.SUPERVISOR_REGISTRY, "get", lambda task_id: supervisor)
+
+    def fake_schedule(coro, loop):
+        class _Fut:
+            def result(self, timeout=None):
+                return asyncio.run(coro)
+
+        return _Fut()
+
+    monkeypatch.setattr(
+        "agent.async_utils.safe_schedule_threadsafe", fake_schedule
+    )
+
+    result = json.loads(
+        browser_cdp_tool.browser_cdp(
+            method="Page.navigate",
+            params={"url": "https://public.example/redirect"},
+            frame_id="oopif-public",
+            task_id="task-1",
+        )
+    )
+
+    assert "error" in result
+    assert "landed on a private or internal address" in result["error"]
+    assert "frame reset to about:blank" in result["error"]
+    assert post_nav_tree_reads["count"] >= 3
+    assert public_frame._data["url"] == "about:blank"
+    blank_calls = [
+        call
+        for call in supervisor.cdp_calls
+        if call["method"] == "Page.navigate"
+        and call["params"].get("url") == "about:blank"
+    ]
+    assert len(blank_calls) == 1
+    assert [call["method"] for call in supervisor.cdp_calls[:3]] == [
+        "Page.enable",
+        "Page.getFrameTree",
+        "Page.navigate",
+    ]
 
 
 def test_target_reload_blocked_when_selected_target_is_private(cdp_server, monkeypatch):

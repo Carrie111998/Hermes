@@ -270,6 +270,213 @@ def _live_selected_frame_info(supervisor: Any, frame_id: str) -> Optional[Dict[s
         return raw.to_dict()
 
 
+def _selected_frame_from_tree(
+    frame_tree: Dict[str, Any], frame_id: str
+) -> Dict[str, Any]:
+    selected = _find_frame_in_tree(frame_tree, frame_id)
+    if selected is None:
+        # OOPIF child sessions often expose only the selected frame as root.
+        selected = frame_tree.get("frame", {})
+    return selected if isinstance(selected, dict) else {}
+
+
+async def _supervisor_selected_frame_tree_entry(
+    *,
+    supervisor: Any,
+    frame_id: str,
+    session_id: str,
+    timeout: float,
+) -> Dict[str, Any]:
+    tree_msg = await supervisor._cdp(  # type: ignore[attr-defined]
+        "Page.getFrameTree",
+        {},
+        session_id=session_id,
+        timeout=timeout,
+    )
+    frame_tree = tree_msg.get("result", {}).get("frameTree", {})
+    if not isinstance(frame_tree, dict):
+        return {}
+    return _selected_frame_from_tree(frame_tree, frame_id)
+
+
+async def _prepare_supervisor_frame_navigation(
+    *,
+    supervisor: Any,
+    frame_id: str,
+    session_id: str,
+    method: str,
+    timeout: float,
+) -> str:
+    """Enable page events and capture the pre-dispatch loaderId for commit waits."""
+    try:
+        await supervisor._cdp(  # type: ignore[attr-defined]
+            "Page.enable",
+            {},
+            session_id=session_id,
+            timeout=timeout,
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise _BrowserCdpFrameGuardBlocked(
+            tool_error(
+                f"Blocked: Page.enable failed before {method}: {exc}",
+                method=method,
+                cdp_docs=CDP_DOCS_URL,
+            )
+        ) from exc
+
+    try:
+        selected = await _supervisor_selected_frame_tree_entry(
+            supervisor=supervisor,
+            frame_id=frame_id,
+            session_id=session_id,
+            timeout=timeout,
+        )
+    except _BrowserCdpFrameGuardBlocked:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise _BrowserCdpFrameGuardBlocked(
+            tool_error(
+                f"Blocked: Page.getFrameTree failed before {method}: {exc}",
+                method=method,
+                cdp_docs=CDP_DOCS_URL,
+            )
+        ) from exc
+
+    if not selected:
+        raise _BrowserCdpFrameGuardBlocked(
+            tool_error(
+                f"Blocked: selected frame is missing before {method}",
+                method=method,
+                cdp_docs=CDP_DOCS_URL,
+            )
+        )
+    return str(selected.get("loaderId") or "").strip()
+
+
+def _supervisor_frame_commit_matched(
+    *,
+    frame: Dict[str, Any],
+    expected_frame_id: str,
+    expected_loader_id: str,
+    initial_loader_id: str,
+) -> bool:
+    frame_entry_id = str(frame.get("id") or frame.get("frame_id") or "").strip()
+    if expected_frame_id and frame_entry_id and frame_entry_id != expected_frame_id:
+        return False
+    loader_id = str(frame.get("loaderId") or "").strip()
+    if expected_loader_id:
+        return loader_id == expected_loader_id
+    return bool(loader_id and loader_id != initial_loader_id)
+
+
+async def _wait_supervisor_frame_commit(
+    *,
+    supervisor: Any,
+    frame_id: str,
+    session_id: str,
+    method: str,
+    expected_frame_id: str,
+    expected_loader_id: str,
+    initial_loader_id: str,
+    timeout: float,
+) -> Dict[str, Any]:
+    """Poll ``Page.getFrameTree`` until the navigate/reload loader commits.
+
+    ``Page.navigate`` can return before a redirect lands. Matching the
+    target-scoped path, wait for the new ``loaderId`` (or a changed loader on
+    reload) before treating the landing URL as authoritative.
+    """
+    deadline = asyncio.get_running_loop().time() + timeout
+    while True:
+        remaining = deadline - asyncio.get_running_loop().time()
+        if remaining <= 0:
+            raise _BrowserCdpFrameGuardBlocked(
+                tool_error(
+                    f"Blocked: timed out waiting for frame commit after {method}",
+                    method=method,
+                    cdp_docs=CDP_DOCS_URL,
+                )
+            )
+        try:
+            selected = await _supervisor_selected_frame_tree_entry(
+                supervisor=supervisor,
+                frame_id=frame_id,
+                session_id=session_id,
+                timeout=max(0.05, remaining),
+            )
+        except _BrowserCdpFrameGuardBlocked:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(
+                "browser_cdp: Page.getFrameTree while waiting for frame %s commit: %s",
+                method,
+                exc,
+            )
+            await asyncio.sleep(0.05)
+            continue
+
+        if _supervisor_frame_commit_matched(
+            frame=selected,
+            expected_frame_id=expected_frame_id,
+            expected_loader_id=expected_loader_id,
+            initial_loader_id=initial_loader_id,
+        ):
+            return selected
+        await asyncio.sleep(0.05)
+
+
+async def _reset_supervisor_frame_to_blank(
+    *,
+    supervisor: Any,
+    frame_id: str,
+    session_id: str,
+    timeout: float,
+) -> Optional[str]:
+    """Navigate the child session to about:blank and wait for that commit."""
+    try:
+        blank_msg = await supervisor._cdp(  # type: ignore[attr-defined]
+            "Page.navigate",
+            {"url": "about:blank"},
+            session_id=session_id,
+            timeout=timeout,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return f"failed to reset frame to about:blank: {exc}"
+
+    blank_result = blank_msg.get("result", {}) if isinstance(blank_msg, dict) else {}
+    blank_frame_id = str(
+        (blank_result or {}).get("frameId") or frame_id
+    ).strip() or frame_id
+    blank_loader_id = str((blank_result or {}).get("loaderId") or "").strip()
+    deadline = asyncio.get_running_loop().time() + timeout
+    while True:
+        remaining = deadline - asyncio.get_running_loop().time()
+        if remaining <= 0:
+            return "timed out waiting for about:blank reset to commit"
+        try:
+            selected = await _supervisor_selected_frame_tree_entry(
+                supervisor=supervisor,
+                frame_id=blank_frame_id,
+                session_id=session_id,
+                timeout=max(0.05, remaining),
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(
+                "browser_cdp: Page.getFrameTree while waiting for about:blank: %s",
+                exc,
+            )
+            await asyncio.sleep(0.05)
+            continue
+
+        url = str(selected.get("url") or "").strip()
+        loader_id = str(selected.get("loaderId") or "").strip()
+        if url == "about:blank" and (
+            not blank_loader_id or loader_id == blank_loader_id
+        ):
+            return None
+        await asyncio.sleep(0.05)
+
+
 async def _revalidate_supervisor_frame_navigation(
     *,
     supervisor: Any,
@@ -278,14 +485,16 @@ async def _revalidate_supervisor_frame_navigation(
     session_id: str,
     method: str,
     timeout: float,
+    nav_result: Optional[Dict[str, Any]] = None,
+    initial_loader_id: str = "",
 ) -> None:
     """Fail closed when frame_id navigate/reload lands on a private address.
 
     ``Page.navigate`` remains allowlisted so a private OOPIF can be left, but
     public-to-private redirects (and reload of a page that becomes private)
     must not keep the child session on an internal URL. Mirror the target-scoped
-    post-check: inspect live frame metadata + ``Page.getFrameTree``, then reset
-    to ``about:blank`` when blocked.
+    post-check: wait for the navigation commit, inspect live frame metadata +
+    ``Page.getFrameTree``, then reset to ``about:blank`` when blocked.
     """
     try:
         from tools import browser_tool as bt  # type: ignore[import-not-found]
@@ -307,36 +516,59 @@ async def _revalidate_supervisor_frame_navigation(
             )
         ) from exc
 
+    nav_payload = nav_result if isinstance(nav_result, dict) else {}
+    expected_frame_id = str(nav_payload.get("frameId") or frame_id).strip() or frame_id
+    expected_loader_id = str(nav_payload.get("loaderId") or "").strip()
+    # Cross-document Page.navigate returns a loaderId. Page.reload has no
+    # result payload, so compare against the pre-dispatch loader. Same-document
+    # Page.navigate has no loaderId and is already committed on return.
+    commit_required = method == "Page.reload" or bool(expected_loader_id)
+
+    commit_url = ""
+    if commit_required:
+        committed = await _wait_supervisor_frame_commit(
+            supervisor=supervisor,
+            frame_id=frame_id,
+            session_id=session_id,
+            method=method,
+            expected_frame_id=expected_frame_id,
+            expected_loader_id=expected_loader_id,
+            initial_loader_id=initial_loader_id,
+            timeout=timeout,
+        )
+        commit_url = str(committed.get("url") or "").strip()
+        if not commit_url:
+            raise _BrowserCdpFrameGuardBlocked(
+                tool_error(
+                    f"Blocked: committed frame has no URL metadata after {method}",
+                    method=method,
+                    cdp_docs=CDP_DOCS_URL,
+                )
+            )
+    else:
+        try:
+            selected = await _supervisor_selected_frame_tree_entry(
+                supervisor=supervisor,
+                frame_id=frame_id,
+                session_id=session_id,
+                timeout=timeout,
+            )
+            commit_url = str(selected.get("url") or "").strip()
+        except _BrowserCdpFrameGuardBlocked:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(
+                "browser_cdp: Page.getFrameTree after frame %s failed: %s",
+                method,
+                exc,
+            )
+
     live_info = _live_selected_frame_info(supervisor, frame_id)
     live_url = str((live_info or {}).get("url") or "").strip()
     live_origin = str((live_info or {}).get("origin") or "").strip()
 
-    tree_url = ""
     try:
-        tree_msg = await supervisor._cdp(  # type: ignore[attr-defined]
-            "Page.getFrameTree",
-            {},
-            session_id=session_id,
-            timeout=timeout,
-        )
-        frame_tree = tree_msg.get("result", {}).get("frameTree", {})
-        selected = _find_frame_in_tree(frame_tree, frame_id)
-        if selected is None:
-            # OOPIF child sessions often expose only the selected frame as root.
-            selected = frame_tree.get("frame", {})
-        tree_url = str((selected or {}).get("url") or "").strip()
-    except _BrowserCdpFrameGuardBlocked:
-        raise
-    except Exception as exc:  # noqa: BLE001
-        logger.debug(
-            "browser_cdp: Page.getFrameTree after frame %s failed: %s",
-            method,
-            exc,
-        )
-        # Fall through to live supervisor metadata; empty sources fail closed below.
-
-    try:
-        blocked = _private_address_from_candidates(live_url, live_origin, tree_url)
+        blocked = _private_address_from_candidates(live_url, live_origin, commit_url)
     except Exception as exc:  # noqa: BLE001
         raise _BrowserCdpFrameGuardBlocked(
             tool_error(
@@ -348,7 +580,7 @@ async def _revalidate_supervisor_frame_navigation(
             )
         ) from exc
 
-    if not live_url and not live_origin and not tree_url:
+    if not live_url and not live_origin and not commit_url:
         raise _BrowserCdpFrameGuardBlocked(
             tool_error(
                 "Blocked: selected OOPIF frame has no URL/origin metadata after "
@@ -362,17 +594,12 @@ async def _revalidate_supervisor_frame_navigation(
     if not blocked:
         return
 
-    blank_error: Optional[str] = None
-    try:
-        await supervisor._cdp(  # type: ignore[attr-defined]
-            "Page.navigate",
-            {"url": "about:blank"},
-            session_id=session_id,
-            timeout=timeout,
-        )
-    except Exception as exc:  # noqa: BLE001
-        blank_error = f"failed to reset frame to about:blank: {exc}"
-
+    blank_error = await _reset_supervisor_frame_to_blank(
+        supervisor=supervisor,
+        frame_id=expected_frame_id,
+        session_id=session_id,
+        timeout=timeout,
+    )
     reset_status = (
         f"; {blank_error}" if blank_error else "; frame reset to about:blank"
     )
@@ -1033,6 +1260,15 @@ def _browser_cdp_via_supervisor(
                     f"at the top-level page instead."
                 )
             )
+        initial_loader_id = ""
+        if method in _CDP_TARGET_NAVIGATION_METHODS:
+            initial_loader_id = await _prepare_supervisor_frame_navigation(
+                supervisor=supervisor,
+                frame_id=frame_id,
+                session_id=live_sid,
+                method=method,
+                timeout=timeout,
+            )
         result_msg = await supervisor._cdp(  # type: ignore[attr-defined]
             method,
             params or {},
@@ -1047,6 +1283,8 @@ def _browser_cdp_via_supervisor(
                 session_id=live_sid,
                 method=method,
                 timeout=timeout,
+                nav_result=result_msg.get("result", {}),
+                initial_loader_id=initial_loader_id,
             )
         return result_msg, live_sid
 
