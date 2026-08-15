@@ -2188,6 +2188,33 @@ class SlackAdapter(BasePlatformAdapter):
             # them at dispatch time.
             def _make_wrapper(cb, plugin_name):
                 async def _wrapped(ack, body, action):
+                    # Plugin callbacks are an interactive ingress just like
+                    # the built-in Block Kit handlers.  Authorize the Slack
+                    # user before invoking plugin code so a plugin cannot
+                    # perform side effects through this registration surface.
+                    body = body or {}
+                    user = body.get("user") or {}
+                    channel = body.get("channel") or {}
+                    user_id = str(user.get("id") or "").strip()
+                    channel_id = str(channel.get("id") or body.get("channel_id") or "")
+                    user_name = user.get("name") or user.get("username")
+                    team_id = self._event_team_id({}, body)
+                    if not await self._authorize_interactive_user(
+                        user_id,
+                        channel_id=channel_id,
+                        user_name=user_name,
+                        team_id=team_id,
+                    ):
+                        logger.warning(
+                            "[Slack] Unauthorized plugin action click by %s (%s) - ignoring",
+                            user_name or "unknown", user_id,
+                        )
+                        # Ack denied clicks without allowing plugin code to run.
+                        try:
+                            await ack()
+                        except Exception:
+                            pass
+                        return
                     try:
                         await cb(ack, body, action)
                     except Exception as exc:  # pragma: no cover - defensive
@@ -7253,6 +7280,7 @@ class SlackAdapter(BasePlatformAdapter):
         channel_id: str = "",
         user_name: Optional[str] = None,
         team_id: str = "",
+        source: Any = None,
     ) -> bool:
         """Check the ordinary synchronous Slack/gateway authorization policy."""
         normalized_user_id = str(user_id or "").strip()
@@ -7264,14 +7292,15 @@ class SlackAdapter(BasePlatformAdapter):
             try:
                 from gateway.session import SessionSource
 
-                return bool(auth_fn(SessionSource(
+                auth_source = source or SessionSource(
                     platform=Platform.SLACK,
                     chat_id=str(channel_id or normalized_user_id),
                     chat_type="dm" if str(channel_id or "").startswith("D") else "group",
                     user_id=normalized_user_id,
                     user_name=str(user_name).strip() if user_name else None,
                     scope_id=str(team_id) if team_id else None,
-                )))
+                )
+                return bool(auth_fn(auth_source))
             except Exception:
                 logger.debug("[Slack] Gateway interactive auth failed", exc_info=True)
                 return False
@@ -7338,6 +7367,7 @@ class SlackAdapter(BasePlatformAdapter):
             channel_id=channel_id,
             user_name=user_name,
             team_id=team_id,
+            source=source,
         )
 
     async def _handle_slash_confirm_action(self, ack, body, action) -> None:

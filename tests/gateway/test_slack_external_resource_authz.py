@@ -106,25 +106,25 @@ async def test_expired_allow_is_not_used(adapter):
 
 @pytest.mark.asyncio
 async def test_interactive_path_requires_external_membership_before_gateway_auth(adapter):
+    seen = {}
+
     class Runner:
         def _is_user_authorized(self, source):
+            seen["marker"] = source.external_resource_authorized
             return True
 
     adapter._message_handler = Runner()._is_user_authorized
-    external = AsyncMock(return_value=False)
-    with patch.object(adapter, "_authorize_external_resource", external):
-        assert not await adapter._authorize_interactive_user(
-            "U1", channel_id="D1", team_id="T1"
-        )
-    external.assert_awaited_once()
+    async def external(_user_id, *, source, **_kwargs):
+        source.external_resource_authorized = True
+        return True
 
-    external.reset_mock()
-    external.return_value = True
+    external = AsyncMock(side_effect=external)
     with patch.object(adapter, "_authorize_external_resource", external):
         assert await adapter._authorize_interactive_user(
             "U1", channel_id="D1", team_id="T1"
         )
     external.assert_awaited_once()
+    assert seen["marker"] is True
 
 
 def test_disabled_behavior_and_wire_marker_fail_closed():
