@@ -4962,7 +4962,7 @@ def _fetch_ai_gateway_models(timeout: float = 5.0) -> Optional[list[str]]:
     }
     req = urllib.request.Request(url, headers=headers)
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with _urlopen_model_catalog_request(req, timeout=timeout) as resp:
             data = json.loads(resp.read().decode())
             return [
                 m["id"]
