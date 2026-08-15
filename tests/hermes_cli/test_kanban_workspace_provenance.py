@@ -12,6 +12,7 @@ import pytest
 
 from hermes_cli import kanban
 from hermes_cli import kanban_db as kb
+from hermes_cli import projects_db as pdb
 
 
 @pytest.fixture
@@ -197,6 +198,86 @@ def test_claim_heals_legacy_worktree_path_and_records_resolution(
     assert event_kinds.index("claimed") < event_kinds.index("workspace_resolved")
     claimed = next(event for event in events if event.kind == "claimed")
     assert resolved_events[0].run_id == claimed.run_id
+
+
+def test_project_normalization_and_claim_resolution_keep_all_provenance_stages(
+    kanban_home: Path,
+) -> None:
+    repo = kanban_home / "project-repo"
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "config", "user.email", "test@example.com"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "config", "user.name", "Test User"],
+        check=True,
+    )
+    (repo / "README.md").write_text("fixture\n")
+    subprocess.run(["git", "-C", str(repo), "add", "README.md"], check=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "commit", "-qm", "fixture"], check=True
+    )
+    with pdb.connect_closing() as project_conn:
+        project_id = pdb.create_project(
+            project_conn, name="Provenance Fixture", folders=[str(repo)]
+        )
+        project = pdb.get_project(project_conn, project_id)
+    assert project is not None
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="prove workspace provenance",
+            assignee="coding",
+            project_id=project.id,
+            workspace_kind="scratch",
+            requested_workspace="scratch",
+        )
+        created_before_claim = _event(conn, task_id, "created")[0]
+        created_payload = created_before_claim.payload
+        normalized_path = repo / ".worktrees" / task_id
+
+        assert created_payload is not None
+        assert created_payload["requested_workspace"] == "scratch"
+        assert created_payload["workspace_kind"] == "worktree"
+        assert created_payload["workspace_path"] == str(normalized_path)
+
+        # Reproduce a legacy pre-resolution row while leaving the immutable
+        # creation record intact. Claim-time healing must append provenance,
+        # not overwrite either the request or normalized creation state.
+        conn.execute(
+            "UPDATE tasks SET workspace_path = ? WHERE id = ?", (str(repo), task_id)
+        )
+        conn.commit()
+
+    assert kanban._cmd_claim(Namespace(task_id=task_id, ttl=60)) == 0
+
+    with kb.connect() as conn:
+        task = kb.get_task(conn, task_id)
+        events = kb.list_events(conn, task_id)
+        created_after_claim = _event(conn, task_id, "created")[0]
+        resolved = _event(conn, task_id, "workspace_resolved")
+
+    assert task is not None
+    assert task.workspace_path == str(normalized_path)
+    created_events = [event for event in events if event.kind == "created"]
+    claimed_events = [event for event in events if event.kind == "claimed"]
+    assert created_events == [created_after_claim]
+    assert len(claimed_events) == 1
+    assert created_after_claim.id == created_before_claim.id
+    assert created_after_claim.payload == created_before_claim.payload
+    assert [event.payload for event in resolved] == [
+        {
+            "previous_path": str(repo),
+            "resolved_path": str(normalized_path),
+            "branch_name": created_payload["branch_name"],
+        }
+    ]
+    assert resolved[0].run_id == claimed_events[0].run_id
+    event_kinds = [event.kind for event in events]
+    assert event_kinds.index("created") < event_kinds.index("claimed")
+    assert event_kinds.index("claimed") < event_kinds.index("workspace_resolved")
 
 
 def test_repeated_resolution_does_not_duplicate_event(kanban_home: Path) -> None:
