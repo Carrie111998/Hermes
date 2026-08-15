@@ -455,7 +455,8 @@ class AresLocalRuntime:
         if legacy_active:
             self._systemctl("disable", "--now", "hermes-gateway.service")
         try:
-            self._systemctl("enable", "--now", "ares-gateway.service")
+            self._systemctl("enable", "ares-gateway.service")
+            self._systemctl("restart", "ares-gateway.service")
             time.sleep(1)
             if not self._systemctl("is-active", "--quiet", "ares-gateway.service", required=False):
                 raise AresLocalRuntimeError("Ares gateway did not remain active after startup")
