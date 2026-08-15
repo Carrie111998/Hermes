@@ -629,3 +629,119 @@ class TestRunJobEnvVarCleanup:
         assert os.environ.get("HERMES_SESSION_PLATFORM") is None
         assert os.environ.get("HERMES_SESSION_CHAT_ID") is None
         assert os.environ.get("HERMES_SESSION_CHAT_NAME") is None
+
+
+class TestScriptTimeoutTreeKill:
+    """Phase 4a (#85125): a script timeout must leave zero living descendants."""
+
+    def test_unified_tree_kill_failure_falls_back(self, monkeypatch, caplog):
+        from agent import deadline
+        from cron import scheduler as sched
+
+        proc = SimpleNamespace(pid=12345)
+        fallback_calls = []
+        monkeypatch.setattr(deadline, "kill_process_tree", lambda _pid: False)
+        monkeypatch.setattr(
+            sched,
+            "_terminate_cron_script_process",
+            lambda candidate: fallback_calls.append(candidate),
+        )
+
+        with caplog.at_level("WARNING", logger=sched.__name__):
+            sched._terminate_cron_script_tree(proc)
+
+        assert fallback_calls == [proc]
+        assert "falling back to process-group termination" in caplog.text
+
+    def test_invalid_pid_never_reaches_unified_tree_kill(self, monkeypatch, caplog):
+        from agent import deadline
+        from cron import scheduler as sched
+
+        proc = SimpleNamespace(pid=0)
+        tree_kill_calls = []
+        fallback_calls = []
+        monkeypatch.setattr(
+            deadline,
+            "kill_process_tree",
+            lambda pid: tree_kill_calls.append(pid),
+        )
+        monkeypatch.setattr(
+            sched,
+            "_terminate_cron_script_process",
+            lambda candidate: fallback_calls.append(candidate),
+        )
+
+        with caplog.at_level("WARNING", logger=sched.__name__):
+            sched._terminate_cron_script_tree(proc)
+
+        assert tree_kill_calls == []
+        assert fallback_calls == [proc]
+        assert "invalid pid 0" in caplog.text
+
+    @pytest.mark.live_system_guard_bypass
+    def test_timeout_leaves_no_setsid_grandchild(self, cron_env, monkeypatch):
+        """The script spawns a grandchild in its OWN session (start_new_session).
+        killpg alone cannot reach it; agent.deadline.kill_process_tree must —
+        after the timeout the grandchild must no longer be running."""
+        import time
+
+        psutil = pytest.importorskip(
+            "psutil",
+            reason="kill_process_tree needs psutil to reach own-session descendants",
+        )
+
+        from cron import scheduler as sched
+
+        def is_live(pid):
+            try:
+                process = psutil.Process(pid)
+                return process.is_running() and process.status() != psutil.STATUS_ZOMBIE
+            except (psutil.NoSuchProcess, psutil.ZombieProcess):
+                return False
+
+        scripts_dir = cron_env / "scripts"
+        pid_file = cron_env / "grandchild.pid"
+        (scripts_dir / "spawner.py").write_text(
+            "import subprocess, sys, time\n"
+            "p = subprocess.Popen(\n"
+            "    [sys.executable, '-c', 'import time; time.sleep(30)'],\n"
+            "    start_new_session=True,\n"
+            "    stdin=subprocess.DEVNULL,\n"
+            "    stdout=subprocess.DEVNULL,\n"
+            "    stderr=subprocess.DEVNULL,\n"
+            ")\n"
+            f"open({str(pid_file)!r}, 'w').write(str(p.pid))\n"
+            "time.sleep(30)\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_CRON_SCRIPT_TIMEOUT", "1")
+        monkeypatch.setattr(sched, "_SCRIPT_TIMEOUT", sched._DEFAULT_SCRIPT_TIMEOUT)
+
+        ok, out = sched._run_job_script(
+            str(scripts_dir / "spawner.py"), workdir=str(cron_env)
+        )
+        assert not ok, f"script should have timed out, got {out!r}"
+
+        deadline = time.monotonic() + 5
+        gpid = None
+        while time.monotonic() < deadline and gpid is None:
+            try:
+                gpid = int(pid_file.read_text().strip())
+            except (FileNotFoundError, ValueError):
+                time.sleep(0.05)
+        assert gpid is not None, "spawner never wrote the grandchild pid"
+
+        try:
+            deadline = time.monotonic() + 5
+            while is_live(gpid) and time.monotonic() < deadline:
+                time.sleep(0.05)
+            assert not is_live(gpid), (
+                f"grandchild pid {gpid} survived the script timeout — the "
+                "timeout path orphaned an own-session descendant"
+            )
+        finally:
+            if is_live(gpid):
+                try:
+                    psutil.Process(gpid).kill()
+                except psutil.NoSuchProcess:
+                    pass
