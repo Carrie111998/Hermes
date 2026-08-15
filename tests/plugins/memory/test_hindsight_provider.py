@@ -682,6 +682,26 @@ class TestPrefetch:
         )
         assert p.prefetch("next query", session_id="test-session") == ""
 
+    def test_recall_async_repeated_query_prefers_current_turn(self, provider_with_config):
+        p = provider_with_config(recall_async=True)
+
+        async def _recall(**kwargs):
+            turn = p._client.arecall.await_count
+            return SimpleNamespace(
+                results=[SimpleNamespace(text=f"memory from turn {turn}")]
+            )
+
+        p._client.arecall = AsyncMock(side_effect=_recall)
+        p.start_prefetch("same query", session_id="test-session", turn_number=1)
+        p._prefetch_thread.join(timeout=2.0)
+        p.start_prefetch("same query", session_id="test-session", turn_number=2)
+        p._prefetch_thread.join(timeout=2.0)
+
+        result = p.prefetch("same query", session_id="test-session")
+        assert "memory from turn 2" in result
+        assert "memory from turn 1" not in result
+        assert p.prefetch("next query", session_id="test-session") == ""
+
     def test_async_default_ignores_current_query_and_reads_buffer(self, provider):
         # Default (recall_sync off): prefetch returns the buffered result and
         # does NOT issue a live recall for the current query.

@@ -1944,8 +1944,9 @@ class HindsightMemoryProvider(MemoryProvider):
                 current_idx = next(
                     (
                         idx
-                        for idx, ready in enumerate(self._opportunistic_ready)
-                        if ready.session_id == active_session and ready.query == query
+                        for idx in range(len(self._opportunistic_ready) - 1, -1, -1)
+                        if self._opportunistic_ready[idx].session_id == active_session
+                        and self._opportunistic_ready[idx].query == query
                     ),
                     None,
                 )

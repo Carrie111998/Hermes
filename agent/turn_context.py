@@ -704,6 +704,7 @@ def build_turn_context(
     # against the current query. This hook must return immediately; providers
     # collect only already-ready results at the existing prefetch boundary
     # below, before api_content is finalized and persisted.
+    _early_prefetch_session_id = agent.session_id or ""
     if agent._memory_manager:
         try:
             _early_query = (
@@ -712,7 +713,7 @@ def build_turn_context(
             if not is_trivial_prompt(_early_query):
                 agent._memory_manager.start_prefetch_all(
                     _early_query,
-                    session_id=agent.session_id or "",
+                    session_id=_early_prefetch_session_id,
                     turn_number=agent._user_turn_count,
                 )
         except Exception:
@@ -1299,7 +1300,24 @@ def build_turn_context(
         try:
             _query = original_user_message if isinstance(original_user_message, str) else ""
             if not is_trivial_prompt(_query):
-                ext_prefetch_cache = agent._memory_manager.prefetch_all(_query) or ""
+                _prefetch_session_id = agent.session_id or ""
+                # Compression may rotate the session after the early launch.
+                # Hindsight correctly invalidates the old generation at that
+                # boundary, so give the new session its own launch before the
+                # zero-wait collection point.
+                if _prefetch_session_id != _early_prefetch_session_id:
+                    agent._memory_manager.start_prefetch_all(
+                        _query,
+                        session_id=_prefetch_session_id,
+                        turn_number=agent._user_turn_count,
+                    )
+                ext_prefetch_cache = (
+                    agent._memory_manager.prefetch_all(
+                        _query,
+                        session_id=_prefetch_session_id,
+                    )
+                    or ""
+                )
         except Exception:
             pass
         # Deterministic, model-independent recall indicator: when memory was
