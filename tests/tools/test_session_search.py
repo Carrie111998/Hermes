@@ -20,6 +20,7 @@ from tools.session_search_tool import (
     _is_compression_ended,
     _resolve_to_parent,
     _session_link,
+    _session_route_key,
     session_search,
 )
 
@@ -157,6 +158,121 @@ class TestDiscoveryShape:
         result = json.loads(session_search(query="modpack", db=db, current_session_id="s_newest"))
         sids = [r["session_id"] for r in result["results"]]
         assert "s_newest" not in sids
+
+
+class TestDiscoveryScopeRelation:
+    """Discovery results identify their route relationship without exposing keys."""
+
+    CURRENT_ROUTE = "route:telegram:group-a:topic-1"
+    OTHER_ROUTE = "route:telegram:group-a:topic-2"
+
+    def _seed_duplicate_topic_hits(self, db):
+        db.create_session(
+            "s_current",
+            source="telegram",
+            session_key=self.CURRENT_ROUTE,
+        )
+        db.create_session(
+            "s_same_topic_history",
+            source="telegram",
+            session_key=self.CURRENT_ROUTE,
+        )
+        db.create_session(
+            "s_other_topic_history",
+            source="telegram",
+            session_key=self.OTHER_ROUTE,
+        )
+        for sid in ("s_same_topic_history", "s_other_topic_history"):
+            db.append_message(
+                sid,
+                role="user",
+                content="identical closeout prompt",
+            )
+        db._conn.commit()
+
+    def test_duplicate_topic_hits_are_bound_to_the_current_route(self, db):
+        self._seed_duplicate_topic_hits(db)
+
+        result = json.loads(session_search(
+            query="identical closeout prompt",
+            limit=5,
+            db=db,
+            current_session_id="s_current",
+        ))
+
+        relations = {
+            entry["session_id"]: entry["scope_relation"]
+            for entry in result["results"]
+        }
+        assert relations == {
+            "s_same_topic_history": "current_route",
+            "s_other_topic_history": "other_route",
+        }
+
+    def test_missing_current_route_key_fails_closed_to_unknown(self, db):
+        self._seed_duplicate_topic_hits(db)
+        db.create_session("s_current_without_key", source="telegram")
+
+        result = json.loads(session_search(
+            query="identical closeout prompt",
+            limit=5,
+            db=db,
+            current_session_id="s_current_without_key",
+        ))
+
+        assert result["results"]
+        assert {entry["scope_relation"] for entry in result["results"]} == {"unknown"}
+
+    def test_missing_result_route_key_fails_closed_to_unknown(self, db):
+        db.create_session(
+            "s_current",
+            source="telegram",
+            session_key=self.CURRENT_ROUTE,
+        )
+        db.create_session("s_history_without_key", source="telegram")
+        db.append_message(
+            "s_history_without_key",
+            role="user",
+            content="unbound closeout prompt",
+        )
+        db._conn.commit()
+
+        result = json.loads(session_search(
+            query="unbound closeout prompt",
+            db=db,
+            current_session_id="s_current",
+        ))
+
+        assert result["results"][0]["scope_relation"] == "unknown"
+
+    def test_keyless_child_does_not_borrow_parent_route(self, db):
+        route = "route:telegram:group-a:topic-1"
+        db.create_session("s_parent", source="telegram", session_key=route)
+        db.create_session(
+            "s_delegate", source="delegate", parent_session_id="s_parent"
+        )
+
+        assert _session_route_key(db, "s_delegate") is None
+
+    def test_route_lookup_error_is_unknown(self):
+        class BrokenSessionLookup:
+            def get_session(self, session_id):
+                raise RuntimeError("synthetic lookup failure")
+
+        assert _session_route_key(BrokenSessionLookup(), "s_result") is None
+
+    def test_scope_relation_does_not_expose_route_keys(self, db):
+        self._seed_duplicate_topic_hits(db)
+
+        rendered = session_search(
+            query="identical closeout prompt",
+            limit=5,
+            db=db,
+            current_session_id="s_current",
+        )
+
+        assert self.CURRENT_ROUTE not in rendered
+        assert self.OTHER_ROUTE not in rendered
 
 
 class TestDiscoverySort:
@@ -379,6 +495,33 @@ class TestCrossProfileRead:
         assert result["success"] is True
         assert result["mode"] == "read"
         assert result["profile"] == "asdf"
+
+    def test_cross_profile_discovery_scope_is_unknown(
+        self, db, tmp_path, monkeypatch
+    ):
+        other_home = tmp_path / "asdf_home"
+        other_home.mkdir()
+        other = SessionDB(other_home / "state.db")
+        route = "route:telegram:group-a:topic-1"
+        # Deliberately collide with the caller's current_session_id. A named
+        # profile read must still discard current-profile route authority.
+        other.create_session("s_current", source="telegram", session_key=route)
+        other.append_message(
+            "s_current", role="user", content="cross profile scope evidence"
+        )
+        assert other._conn is not None
+        other._conn.commit()
+        other.close()
+
+        self._patch_profiles(monkeypatch, other_home)
+        result = json.loads(session_search(
+            query="cross profile scope evidence",
+            profile="asdf",
+            db=db,
+            current_session_id="s_current",
+        ))
+
+        assert result["results"][0]["scope_relation"] == "unknown"
 
 
     def test_combined_value_autosplits(self, db, tmp_path, monkeypatch):
