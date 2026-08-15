@@ -1335,6 +1335,8 @@ def _kill_processes(holders: list[int], log: Callable[[str], None]) -> tuple[lis
 
     import signal as _signal
 
+    import psutil
+
     for pid in holders:
         try:
             os.kill(pid, _signal.SIGTERM)
@@ -1349,13 +1351,13 @@ def _kill_processes(holders: list[int], log: Callable[[str], None]) -> tuple[lis
         time.sleep(0.1)
         still: list[int] = []
         for pid in pending:
-            try:
-                os.kill(pid, 0)
+            # psutil.pid_exists is the official recommendation: os.kill(pid, 0)
+            # is NOT a no-op on Windows (CTRL_C_EVENT broadcast). psutil is a
+            # core dependency (we already import it in _find_state_db_holders).
+            if psutil.pid_exists(pid):
                 still.append(pid)
-            except ProcessLookupError:
+            else:
                 killed.append(pid)
-            except (PermissionError, OSError):
-                still.append(pid)
         pending = still
 
     for pid in pending:
