@@ -256,6 +256,7 @@ def test_persist_connection_configures_direct_mcp_and_one_secret_source(tmp_path
                 "command": "old-proxy",
                 "args": ["--old"],
                 "transport": "sse",
+                "enabled": False,
                 "timeout": 45,
                 "headers": {
                     "authorization": "Bearer old-key",
@@ -306,7 +307,7 @@ def test_persist_connection_configures_direct_mcp_and_one_secret_source(tmp_path
             "X-API-Key": "${OPENVIKING_API_KEY}",
             "X-OpenViking-Actor-Peer": "hermes-work",
         },
-        "enabled": True,
+        "enabled": False,
         "strict_redirect_headers": True,
         "timeout": 45,
     }
@@ -331,6 +332,7 @@ def test_direct_mcp_uses_default_local_identity_without_api_key():
 
     entry = config["mcp_servers"]["openviking"]
     assert entry["url"] == "http://localhost:1933/mcp"
+    assert entry["enabled"] is True
     assert entry["headers"]["X-OpenViking-Account"] == "default"
     assert entry["headers"]["X-OpenViking-User"] == "default"
     assert entry["headers"]["X-OpenViking-Actor-Peer"] == "hermes"
@@ -422,7 +424,12 @@ def test_dashboard_save_migrates_linked_profile_and_keeps_mcp_in_sync(tmp_path, 
                 "ovcli_config_path": str(ovcli_path),
                 "recall_limit": 7,
             },
-        }
+        },
+        "mcp_servers": {
+            "openviking": {
+                "enabled": False,
+            },
+        },
     }
     saved = []
 
@@ -453,10 +460,50 @@ def test_dashboard_save_migrates_linked_profile_and_keeps_mcp_in_sync(tmp_path, 
     assert config["mcp_servers"]["openviking"]["url"] == (
         "https://new.example/openviking/mcp"
     )
+    assert config["mcp_servers"]["openviking"]["enabled"] is False
     assert "linked-key" not in json.dumps(config)
     assert (hermes_home / ".env").read_text(encoding="utf-8") == (
         "OPENVIKING_API_KEY=linked-key\n"
     )
+
+
+def test_dashboard_save_preserves_disabled_mcp_in_real_profile_config(tmp_path, monkeypatch):
+    _clear_openviking_env(monkeypatch)
+    hermes_home = tmp_path / "hermes"
+    hermes_home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setenv("OPENVIKING_API_KEY", "profile-key")
+
+    from hermes_cli import config as config_module
+
+    config_module.save_config({
+        "memory": {
+            "provider": "honcho",
+            "openviking": {
+                "endpoint": "https://openviking.example",
+                "agent": "hermes",
+            },
+        },
+        "mcp_servers": {
+            "openviking": {
+                "url": "https://openviking.example/mcp",
+                "enabled": False,
+            },
+        },
+    })
+
+    OpenVikingMemoryProvider().save_config(
+        {"recall_limit": 9},
+        str(hermes_home),
+    )
+
+    saved = config_module.load_config_readonly()
+    assert saved["memory"]["provider"] == "honcho"
+    assert saved["memory"]["openviking"]["recall_limit"] == 9
+    assert saved["mcp_servers"]["openviking"]["url"] == (
+        "https://openviking.example/mcp"
+    )
+    assert saved["mcp_servers"]["openviking"]["enabled"] is False
 
 
 def test_local_setup_recommends_user_api_key_before_unauthenticated_mode(monkeypatch):
@@ -780,6 +827,84 @@ def test_initialize_autostarts_local_openviking_in_background_when_runtime_healt
     assert len(waiter_calls) == 1
     assert waiter_calls[0]["status_callback"] == statuses.append
     assert any("starting in the background" in message for message in statuses)
+
+
+@pytest.mark.parametrize(
+    ("config", "expected"),
+    [
+        ({}, "missing"),
+        ({"mcp_servers": {"openviking": {"enabled": False}}}, "disabled"),
+        ({"mcp_servers": {"openviking": {"url": ""}}}, "missing"),
+        ({"mcp_servers": {"openviking": {"command": "openviking-mcp"}}}, "configured"),
+        (
+            {"mcp_servers": {"openviking": {"url": "http://127.0.0.1:1933/mcp"}}},
+            "configured",
+        ),
+    ],
+)
+def test_openviking_mcp_tools_state_distinguishes_user_policy(monkeypatch, config, expected):
+    import hermes_cli.config as config_mod
+
+    monkeypatch.setattr(config_mod, "load_config_readonly", lambda: config)
+
+    assert openviking_module._openviking_mcp_tools_state() == expected
+
+
+@pytest.mark.parametrize(
+    ("mcp_state", "expected_warnings"),
+    [
+        (
+            "missing",
+            [
+                "OpenViking automatic memory is active, but explicit OpenViking MCP "
+                "tools are not configured. Run `hermes memory setup` with OpenViking "
+                "0.4.1 or newer to enable them."
+            ],
+        ),
+        ("disabled", []),
+        ("configured", []),
+        ("unknown", []),
+    ],
+)
+def test_initialize_mcp_migration_warning_respects_config_state(
+    monkeypatch,
+    tmp_path,
+    mcp_state,
+    expected_warnings,
+):
+    settings = {
+        "endpoint": "http://127.0.0.1:1933",
+        "api_key": "",
+        "account": "default",
+        "user": "default",
+        "agent": "hermes",
+    }
+    monkeypatch.setattr(
+        openviking_module,
+        "_resolve_connection_settings",
+        lambda provider_config=None: settings,
+    )
+    monkeypatch.setattr(openviking_module, "_VikingClient", lambda *args, **kwargs: MagicMock())
+    monkeypatch.setattr(
+        openviking_module,
+        "_classify_runtime_openviking_health",
+        lambda client, endpoint: ("healthy", ""),
+    )
+    monkeypatch.setattr(openviking_module, "_openviking_mcp_tools_state", lambda: mcp_state)
+    monkeypatch.setattr(openviking_module, "_MCP_MIGRATION_WARNING_EMITTED", False)
+    monkeypatch.setattr(OpenVikingMemoryProvider, "_acquire_run_lock", lambda self: None)
+    monkeypatch.setattr(OpenVikingMemoryProvider, "_recover_pending_sessions", lambda self: None)
+
+    warnings = []
+    for session_id in ("session-1", "session-2"):
+        OpenVikingMemoryProvider().initialize(
+            session_id,
+            hermes_home=str(tmp_path),
+            platform="cli",
+            warning_callback=warnings.append,
+        )
+
+    assert warnings == expected_warnings
 
 
 def test_provider_exposes_no_native_tools():

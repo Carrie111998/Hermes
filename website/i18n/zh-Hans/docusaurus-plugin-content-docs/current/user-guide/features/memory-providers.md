@@ -283,7 +283,7 @@ openviking-server
 hermes memory setup    # 选择 "openviking"
 ```
 
-Hermes 使用的 MCP 工具和 actor-peer 契约要求 OpenViking 0.4.1 或更高版本。
+Hermes 使用的 MCP 工具和 actor-peer 契约要求 OpenViking 0.4.1 或更高版本。迁移期间，现有配置仍可在部分旧版服务器上继续运行基于 REST 的自动内存生命周期；新设置或重新运行设置则要求 OpenViking 0.4.1 或更高版本。
 
 `hermes memory setup` 可以导入现有 `ovcli.conf` 配置，也可以创建新连接。设置过程会配置基于 REST 的自动召回和捕获，并配置 `<endpoint>/mcp` 上的直接 HTTP MCP 工具。非机密连接设置保存在当前 Hermes 配置的 `config.yaml` 中，只有 `OPENVIKING_API_KEY` 保存在该配置的 `.env` 中。两个连接使用同一个密钥，不需要 MCP 代理或单独安装 OpenViking Agent Plugin。
 

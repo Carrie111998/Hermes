@@ -307,7 +307,9 @@ hermes memory setup    # select "openviking"
 ```
 
 OpenViking 0.4.1 or newer is required for the MCP tool and actor-peer contract
-used by Hermes.
+used by Hermes. Existing profiles can continue automatic REST lifecycle work
+against some older servers during migration, but new setup, or rerunning
+setup, requires OpenViking 0.4.1 or newer.
 
 `hermes memory setup` can import connection values from an existing
 `ovcli.conf` profile or create a new connection. Setup configures automatic

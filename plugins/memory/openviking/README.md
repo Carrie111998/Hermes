@@ -11,8 +11,9 @@ Context database by Volcengine (ByteDance) with filesystem-style knowledge hiera
 
 OpenViking 0.4.1 or newer is required for the MCP tool and actor-peer contract
 used by Hermes.
-Hermes can still run automatic memory lifecycle hooks against some older
-servers, but explicit OpenViking tools will not be available.
+Existing Hermes profiles can still run automatic memory lifecycle hooks
+against some older servers, but explicit OpenViking tools will not be
+available. New setup, or rerunning setup, requires OpenViking 0.4.1 or newer.
 
 ## Setup
 

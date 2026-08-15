@@ -141,6 +141,8 @@ _LOCK_BUSY_ERRNOS = {errno.EWOULDBLOCK, errno.EACCES, errno.EAGAIN}
 _SETUP_CANCELLED = object()
 _INVALID_SETTING_WARNINGS: Set[tuple[str, str]] = set()
 _INVALID_SETTING_WARNINGS_LOCK = threading.Lock()
+_MCP_MIGRATION_WARNING_EMITTED = False
+_MCP_MIGRATION_WARNING_LOCK = threading.Lock()
 
 
 @dataclass(frozen=True)
@@ -815,21 +817,30 @@ def _load_hermes_openviking_config() -> dict:
         return {}
 
 
-def _openviking_mcp_tools_configured() -> bool:
-    """Return whether the canonical OpenViking MCP server is enabled."""
+def _openviking_mcp_tools_state() -> str:
+    """Return ``configured``, ``disabled``, ``missing``, or ``unknown``."""
     try:
         from hermes_cli.config import load_config_readonly
 
         config = load_config_readonly()
         servers = config.get("mcp_servers") if isinstance(config, dict) else None
         entry = servers.get(_OPENVIKING_MCP_SERVER_NAME) if isinstance(servers, dict) else None
-        return bool(
-            isinstance(entry, dict)
-            and entry.get("enabled", True) is not False
-            and _clean_config_value(entry.get("url"))
+        if not isinstance(entry, dict):
+            return "missing"
+        if entry.get("enabled", True) is False:
+            return "disabled"
+        has_transport = bool(
+            _clean_config_value(entry.get("url"))
+            or _clean_config_value(entry.get("command"))
         )
+        return "configured" if has_transport else "missing"
     except Exception:
-        return False
+        return "unknown"
+
+
+def _openviking_mcp_tools_configured() -> bool:
+    """Return whether the canonical OpenViking MCP server is enabled."""
+    return _openviking_mcp_tools_state() == "configured"
 
 
 def _env_value(name: str) -> Optional[str]:
@@ -1360,6 +1371,21 @@ def _emit_runtime_warning(message: str, warning_callback=None) -> None:
             logger.debug("OpenViking runtime warning callback failed", exc_info=True)
 
 
+def _warn_missing_openviking_mcp_once(warning_callback=None) -> None:
+    """Tell legacy profiles how to restore explicit tools, once per process."""
+    global _MCP_MIGRATION_WARNING_EMITTED
+    with _MCP_MIGRATION_WARNING_LOCK:
+        if _MCP_MIGRATION_WARNING_EMITTED:
+            return
+        _MCP_MIGRATION_WARNING_EMITTED = True
+    _emit_runtime_warning(
+        "OpenViking automatic memory is active, but explicit OpenViking MCP "
+        "tools are not configured. Run `hermes memory setup` with OpenViking "
+        "0.4.1 or newer to enable them.",
+        warning_callback,
+    )
+
+
 def _emit_runtime_status(message: str, status_callback=None) -> None:
     logger.info("%s", message)
     if status_callback:
@@ -1763,10 +1789,10 @@ def _configure_openviking_mcp(config: dict, values: dict) -> None:
     if user:
         headers["X-OpenViking-User"] = user
 
+    entry["enabled"] = entry.get("enabled", True) is not False
     entry.update({
         "url": f"{endpoint.rstrip('/')}/mcp",
         "headers": headers,
-        "enabled": True,
         # Never forward API credentials if an endpoint redirects to a
         # different origin.
         "strict_redirect_headers": True,
@@ -2637,6 +2663,8 @@ class OpenVikingMemoryProvider(MemoryProvider):
             self._conn_snapshot = (
                 self._endpoint, self._api_key, self._account, self._user, self._agent,
             )
+            if _openviking_mcp_tools_state() == "missing":
+                _warn_missing_openviking_mcp_once(warning_callback)
             self._recover_pending_sessions()
 
         # Register as the last active provider for atexit safety net
