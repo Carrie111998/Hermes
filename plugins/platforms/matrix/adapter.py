@@ -3625,15 +3625,19 @@ class MatrixAdapter(BasePlatformAdapter):
                         "Schau in deinem Element-Client nach — es sollte eine "
                         "Verifizierungsanfrage erscheinen. Wähle **Emoji-Vergleich** "
                         "und bestätige, wenn die Emojis übereinstimmen.",
+                        "m.notice",
                     )
                 else:
                     await self._send_simple_message(
                         room_id,
                         "Verifikation konnte nicht gestartet werden (kein DM-Raum gefunden).",
+                        "m.notice",
                     )
             except Exception as exc:
                 logger.warning("Matrix: !verify failed: %s", exc)
-                await self._send_simple_message(room_id, f"Verifikation fehlgeschlagen: {exc}")
+                await self._send_simple_message(
+                    room_id, f"Verifikation fehlgeschlagen: {exc}", "m.notice"
+                )
             return
 
         # Reply-to detection.

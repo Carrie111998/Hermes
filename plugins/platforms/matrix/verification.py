@@ -318,6 +318,7 @@ class SasVerificationHandler:
             # so _on_ready/_on_accept/... find it via _txid_from().
             self._sessions.pop(txid, None)
             session.transaction_id = str(event_id)
+            session.anchor_event_id = str(event_id)
             session.last_event_id = str(event_id)
             self._sessions[str(event_id)] = session
             logger.info(
@@ -995,10 +996,17 @@ class SasVerificationHandler:
         payload.pop("transaction_id", None)
         # Every in-room verification event references the ANCHOR (the
         # original request event id), exactly like matrix-rust-sdk's
-        # Reference::new(anchor).  In in-room flows transaction_id IS the
-        # anchor (resolved by _txid_from); last_event_id is a legacy
-        # fallback for sessions created before the anchor was known.
-        anchor = session.anchor_event_id or session.transaction_id or session.last_event_id
+        # Reference::new(anchor).  The request itself IS the anchor and has
+        # no relation yet — a fresh uuid4() transaction_id (initiator path,
+        # before the request event exists) is NOT an event id, so only
+        # reference real event ids (Matrix event ids start with '$').
+        anchor = session.anchor_event_id
+        if not anchor:
+            txid = str(session.transaction_id or "")
+            if txid.startswith("$"):
+                anchor = txid
+        if not anchor:
+            anchor = session.last_event_id
         if anchor:
             payload["m.relates_to"] = {"rel_type": "m.reference", "event_id": anchor}
         try:
