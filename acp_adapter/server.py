@@ -2002,7 +2002,12 @@ class HermesACPAgent(acp.Agent):
                     exc_info=True,
                 )
 
-        final_response = result.get("final_response", "")
+        # ``result.get("final_response", "")`` is NOT enough: an interrupted
+        # turn returns the key present with an explicit None value (finalize
+        # synthesizes no response when interrupted), so the default never
+        # applies and the later .startswith() would crash on None (#86798).
+        # Normalize with `or ""` so the truthiness guard below still decides.
+        final_response = result.get("final_response") or ""
         cancelled = bool(state.cancel_event and state.cancel_event.is_set())
         interrupted = bool(result.get("interrupted")) or cancelled
         # Hermes' local "waiting for model response" interrupt status is metadata,
