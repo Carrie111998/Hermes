@@ -2309,6 +2309,7 @@ export const ar = defineLocale({
       yesterday: time => `أمس ${time}`,
       copy: 'نسخ',
       refresh: 'تحديث',
+      reply: 'رد',
       moreActions: 'إجراءات إضافية',
       branchNewChat: 'تفريع إلى محادثة جديدة',
       react: 'تفاعل',

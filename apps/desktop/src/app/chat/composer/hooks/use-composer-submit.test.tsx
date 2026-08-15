@@ -1,8 +1,10 @@
 import { act, cleanup, renderHook, waitFor } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
+import { encodeComposerQuote } from '@/lib/composer-quote'
 import { $clarifyRequests } from '@/store/clarify'
-import type { ComposerAttachment } from '@/store/composer'
+import { type ComposerAttachment } from '@/store/composer'
+import { clearQueuedPrompts, getQueuedPrompts } from '@/store/composer-queue'
 import { $gateway } from '@/store/gateway'
 import {
   clearAllPrompts,
@@ -12,19 +14,29 @@ import {
   setSudoRequest
 } from '@/store/prompts'
 
+import type { ChatBarProps } from '../types'
+
 import { useComposerSubmit } from './use-composer-submit'
 
 interface SubmitHarnessOptions {
+  accepted?: boolean
+  activeQueueSessionKey?: string | null
   attachments?: ComposerAttachment[]
   busy?: boolean
   compacting?: boolean
+  steer?: () => Promise<boolean>
+  submit?: ChatBarProps['onSubmit']
   text?: string
 }
 
 function renderSubmitHook({
+  accepted = true,
+  activeQueueSessionKey = 'stored-session',
   attachments = [],
   busy = false,
   compacting = false,
+  steer = async () => true,
+  submit,
   text = ''
 }: SubmitHarnessOptions = {}) {
   const draftRef = { current: text }
@@ -33,9 +45,11 @@ function renderSubmitHook({
   editor.textContent = text
   const editorRef = { current: editor }
   const onCancel = vi.fn()
-  const onSteer = vi.fn(async () => true)
-  const onSubmit = vi.fn(async () => true)
+  const onSteer = vi.fn(steer)
+  const onSubmit = vi.fn(submit ?? (async () => accepted))
   const queueCurrentDraft = vi.fn(() => true)
+  const loadIntoComposer = vi.fn()
+  const stashAt = vi.fn()
 
   const clearDraft = vi.fn(() => {
     draftRef.current = ''
@@ -44,8 +58,8 @@ function renderSubmitHook({
 
   const hook = renderHook(() =>
     useComposerSubmit({
-      activeQueueSessionKey: 'stored-session',
-      activeQueueSessionKeyRef: { current: 'stored-session' },
+      activeQueueSessionKey,
+      activeQueueSessionKeyRef: { current: activeQueueSessionKey },
       attachments,
       busy,
       compacting,
@@ -57,7 +71,7 @@ function renderSubmitHook({
       exitQueuedEdit: vi.fn(() => false),
       focusInput: vi.fn(),
       inputDisabled: false,
-      loadIntoComposer: vi.fn(),
+      loadIntoComposer,
       onCancel,
       onSteer,
       onSubmit,
@@ -66,16 +80,17 @@ function renderSubmitHook({
       queuedPrompts: [],
       sessionId: 'runtime-session',
       setComposerText: vi.fn(),
-      stashAt: vi.fn()
+      stashAt
     })
   )
 
-  return { clearDraft, hook, onCancel, onSteer, onSubmit, queueCurrentDraft }
+  return { clearDraft, hook, loadIntoComposer, onCancel, onSteer, onSubmit, queueCurrentDraft, stashAt }
 }
 
 describe('useComposerSubmit busy-turn routing', () => {
   afterEach(() => {
     cleanup()
+    clearQueuedPrompts('stored-session')
     vi.restoreAllMocks()
   })
 
@@ -179,6 +194,103 @@ describe('useComposerSubmit busy-turn routing', () => {
     expect(onSteer).not.toHaveBeenCalled()
     expect(queueCurrentDraft).not.toHaveBeenCalled()
     expect(onCancel).not.toHaveBeenCalled()
+  })
+
+  it('expands a quote chip before the prompt leaves the composer', async () => {
+    const ref = '@quote:`' + encodeComposerQuote({ body: '> First line\n> Second line', label: 'earlier reply' }) + '`'
+    const { hook, onSubmit } = renderSubmitHook({ text: ref + 'My response' })
+
+    act(() => {
+      hook.result.current.submitDraft()
+    })
+
+    await waitFor(() =>
+      expect(onSubmit).toHaveBeenCalledWith('> First line\n> Second line\n\nMy response', {
+        attachments: [],
+        composerScope: 'stored-session'
+      })
+    )
+  })
+
+  it('restores the compact chip and keeps its body when submit is rejected', async () => {
+    const rawDraft =
+      '@quote:`' + encodeComposerQuote({ body: '> Earlier reply', label: 'earlier reply' }) + '`Correction'
+
+    const { hook, loadIntoComposer, onSubmit, stashAt } = renderSubmitHook({ accepted: false, text: rawDraft })
+
+    act(() => {
+      hook.result.current.submitDraft()
+    })
+
+    await waitFor(() => expect(onSubmit).toHaveBeenCalledWith('> Earlier reply\n\nCorrection', expect.anything()))
+    await waitFor(() => expect(loadIntoComposer).toHaveBeenCalledWith(rawDraft, []))
+    expect(stashAt).toHaveBeenCalledWith('stored-session', rawDraft, [])
+  })
+
+  it('restores the compact chip and keeps its body when submit throws', async () => {
+    const rawDraft =
+      '@quote:`' + encodeComposerQuote({ body: '> Earlier reply', label: 'earlier reply' }) + '`Correction'
+
+    const { hook, loadIntoComposer, onSubmit, stashAt } = renderSubmitHook({
+      submit: async () => Promise.reject(new Error('offline')),
+      text: rawDraft
+    })
+
+    act(() => {
+      hook.result.current.submitDraft()
+    })
+
+    await waitFor(() => expect(onSubmit).toHaveBeenCalledWith('> Earlier reply\n\nCorrection', expect.anything()))
+    await waitFor(() => expect(loadIntoComposer).toHaveBeenCalledWith(rawDraft, []))
+    expect(stashAt).toHaveBeenCalledWith('stored-session', rawDraft, [])
+  })
+
+  it('expands a quote chip before steering a busy turn', async () => {
+    const ref = '@quote:`' + encodeComposerQuote({ body: '> Earlier answer', label: 'earlier reply' }) + '`'
+    const { hook, onSteer } = renderSubmitHook({ busy: true, text: ref + 'Correction' })
+
+    act(() => {
+      hook.result.current.submitDraft()
+    })
+
+    await waitFor(() => expect(onSteer).toHaveBeenCalledWith('> Earlier answer\n\nCorrection'))
+  })
+
+  it('queues self-contained expanded text when steering rejects', async () => {
+    const rawDraft =
+      '@quote:`' + encodeComposerQuote({ body: '> Earlier answer?', label: 'Earlier answer?' }) + '`Correction'
+
+    const { hook } = renderSubmitHook({
+      busy: true,
+      steer: async () => Promise.reject(new Error('offline')),
+      text: rawDraft
+    })
+
+    act(() => {
+      hook.result.current.submitDraft()
+    })
+
+    await waitFor(() => expect(getQueuedPrompts('stored-session')).toHaveLength(1))
+    expect(getQueuedPrompts('stored-session')[0]?.text).toBe('> Earlier answer?\n\nCorrection')
+  })
+
+  it('restores the compact draft when a refused steer cannot be queued', async () => {
+    const rawDraft =
+      '@quote:`' + encodeComposerQuote({ body: '> Earlier answer?', label: 'Earlier answer?' }) + '`Correction'
+
+    const { hook, loadIntoComposer, stashAt } = renderSubmitHook({
+      activeQueueSessionKey: null,
+      busy: true,
+      steer: async () => false,
+      text: rawDraft
+    })
+
+    act(() => {
+      hook.result.current.submitDraft()
+    })
+
+    await waitFor(() => expect(loadIntoComposer).toHaveBeenCalledWith(rawDraft, []))
+    expect(stashAt).toHaveBeenCalledWith(null, rawDraft, [])
   })
 
   it('threads the loaded composer scope through onSubmit for the #59305 submit-time guard', async () => {

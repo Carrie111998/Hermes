@@ -1,17 +1,20 @@
 import { ActionBarPrimitive, BranchPickerPrimitive, MessagePrimitive, useAuiState } from '@assistant-ui/react'
 import { type FC, type ReactNode, useCallback, useEffect, useRef, useState } from 'react'
 
+import { insertMessageReply } from '@/app/chat/composer/message-reply'
+import { useComposerScope } from '@/app/chat/composer/scope'
 import { DirectiveContent } from '@/components/assistant-ui/directive-text'
 import { messageAttachmentRefs, messageContentText } from '@/components/assistant-ui/thread/content'
 import { ReactionBadge, ReactionPicker } from '@/components/assistant-ui/thread/message-reactions'
 import { type RestoreMessageTarget } from '@/components/assistant-ui/thread/types'
 import { useMessageReactions } from '@/components/assistant-ui/thread/use-message-reactions'
 import { UserMessageText } from '@/components/assistant-ui/thread/user-message-text'
+import { TooltipIconButton } from '@/components/assistant-ui/tooltip-icon-button'
 import { Codicon } from '@/components/ui/codicon'
 import { useResizeObserver } from '@/hooks/use-resize-observer'
 import { useI18n } from '@/i18n'
 import { triggerHaptic } from '@/lib/haptics'
-import { StopFilled } from '@/lib/icons'
+import { MessageReplyIcon, StopFilled } from '@/lib/icons'
 import { cn } from '@/lib/utils'
 import { $gateway } from '@/store/gateway'
 import { notifyThreadEditOpen } from '@/store/thread-scroll'
@@ -265,6 +268,7 @@ export const UserMessage: FC<{
 }> = ({ onCancel, onRequestRestoreConfirm }) => {
   const { t } = useI18n()
   const copy = t.assistant.thread
+  const { target } = useComposerScope()
   const messageId = useAuiState(s => s.message.id)
   const content = useAuiState(s => s.message.content)
   const messageText = messageContentText(content)
@@ -403,9 +407,16 @@ export const UserMessage: FC<{
   // the live turn before rewinding.
   const showRestore = !readOnly && !showStop && Boolean(onRequestRestoreConfirm) && hasBody
 
+  const reply = () => {
+    if (insertMessageReply(messageText, { target })) {
+      triggerHaptic('selection')
+    }
+  }
+
   const bubbleClassName = cn(
     USER_BUBBLE_BASE_CLASS,
-    'cursor-pointer pr-9 text-[length:var(--conversation-text-font-size)] leading-(--dt-line-height) text-foreground/95 transition-colors',
+    'cursor-pointer text-[length:var(--conversation-text-font-size)] leading-(--dt-line-height) text-foreground/95 transition-colors',
+    showStop || showRestore ? 'pr-16' : 'pr-9',
     'border-(--ui-stroke-tertiary) hover:border-(--ui-stroke-secondary)'
   )
 
@@ -520,8 +531,23 @@ export const UserMessage: FC<{
                     </button>
                   </ActionBarPrimitive.Edit>
                 )}
-                {(showStop || showRestore) && (
+                {!readOnly && hasBody && (
                   <div className="pointer-events-none absolute right-2 bottom-2 z-10 flex items-center justify-center opacity-0 transition-opacity group-hover/user-message:opacity-100 group-focus-within/user-message:opacity-100">
+                    <TooltipIconButton
+                      className="pointer-events-auto"
+                      onClick={event => {
+                        event.preventDefault()
+                        event.stopPropagation()
+                        reply()
+                      }}
+                      onPointerDown={event => {
+                        event.preventDefault()
+                        event.stopPropagation()
+                      }}
+                      tooltip={copy.reply}
+                    >
+                      <MessageReplyIcon />
+                    </TooltipIconButton>
                     {showStop ? (
                       <button
                         aria-label={copy.stop}
@@ -536,7 +562,7 @@ export const UserMessage: FC<{
                       >
                         {StopGlyph}
                       </button>
-                    ) : (
+                    ) : showRestore ? (
                       <button
                         aria-label={copy.restoreCheckpoint}
                         className={cn('pointer-events-auto size-6', USER_ACTION_ICON_BUTTON_CLASS)}
@@ -558,7 +584,7 @@ export const UserMessage: FC<{
                       >
                         <Codicon name="discard" size="0.875rem" />
                       </button>
-                    )}
+                    ) : null}
                   </div>
                 )}
               </div>

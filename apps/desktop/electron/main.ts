@@ -54,6 +54,7 @@ import {
 } from './bootstrap-platform'
 import { decideBootstrapRepair } from './bootstrap-repair-guard'
 import { runBootstrap } from './bootstrap-runner'
+import { createComposerSelectionMenuItem } from './composer-selection'
 import { applyConnectionChange, resolveTerminalConnection } from './connection-apply'
 import {
   authModeFromStatus,
@@ -6041,7 +6042,7 @@ function installZoomShortcuts(window) {
   })
 }
 
-function installContextMenu(window) {
+function installContextMenu(window, { composerEnabled = true }: { composerEnabled?: boolean } = {}) {
   window.webContents.on('context-menu', (_event, params) => {
     const template = []
     const hasSelection = Boolean(params.selectionText?.trim())
@@ -6103,6 +6104,22 @@ function installContextMenu(window) {
     if (hasSelection || isEditable) {
       if (template.length) {
         template.push({ type: 'separator' })
+      }
+
+      const composerSelectionItem = createComposerSelectionMenuItem(
+        {
+          canCompose: composerEnabled,
+          isEditable,
+          selectionText: params.selectionText,
+          x: params.x,
+          y: params.y
+        },
+        payload => window.webContents.send('hermes:composer:append-selection', payload),
+        message => rememberLog(`composer append-selection send failed: ${message}`)
+      )
+
+      if (composerSelectionItem) {
+        template.push(composerSelectionItem, { type: 'separator' })
       }
 
       if (isEditable) {
@@ -9829,8 +9846,13 @@ async function startHermes() {
 // `zoom` is opt-out for the pet overlay: it sizes its own OS window to fit the
 // sprite in unzoomed CSS px (overlayWindowSize -> setBounds) and has its own
 // Alt+wheel scale, so inheriting the global UI zoom would render the mascot
-// larger than its window and crop it. Chat windows keep zoom on.
-function wireCommonWindowHandlers(win, { zoom = true }: { zoom?: boolean } = {}) {
+// larger than its window and crop it. `composerEnabled` is disabled for
+// spectator/watch windows and the pet overlay, where no chat composer is
+// mounted to receive the selection IPC event.
+function wireCommonWindowHandlers(
+  win,
+  { composerEnabled = true, zoom = true }: { composerEnabled?: boolean; zoom?: boolean } = {}
+) {
   installPreviewShortcut(win)
   installDevToolsShortcut(win)
 
@@ -9846,7 +9868,7 @@ function wireCommonWindowHandlers(win, { zoom = true }: { zoom?: boolean } = {})
     win.webContents.on('did-finish-load', () => restorePersistedZoomLevel(win))
   }
 
-  installContextMenu(win)
+  installContextMenu(win, { composerEnabled })
   win.webContents.setWindowOpenHandler(details => {
     openExternalUrl(details.url)
 
@@ -9946,7 +9968,10 @@ function spawnSecondaryWindow({ sessionId, watch }: { sessionId?: string; watch?
   win.on('leave-full-screen', () => sendWindowStateChanged(false))
 
   streamThrottle.register(win)
-  wireCommonWindowHandlers(win, zoomWiringForWindowKind('chat'))
+  wireCommonWindowHandlers(win, {
+    ...zoomWiringForWindowKind('chat'),
+    composerEnabled: !watch
+  })
   attachRendererConsoleCapture(win, 'session-window', rememberLog)
 
   // Renderer lifecycle diagnostics + recovery (#81290): a dead session-window
@@ -10081,7 +10106,11 @@ const wakeIndicatorController = createWakeIndicatorWindowController({
   log: rememberLog,
   preloadPath: PRELOAD_PATH,
   rendererIndex: resolveRendererIndex,
-  wireWindow: window => wireCommonWindowHandlers(window, zoomWiringForWindowKind('wakeIndicator'))
+  wireWindow: window =>
+    wireCommonWindowHandlers(window, {
+      ...zoomWiringForWindowKind('wakeIndicator'),
+      composerEnabled: false
+    })
 })
 
 // The pet overlay: a single transparent, frameless, always-on-top window that
@@ -10170,7 +10199,10 @@ function spawnPetOverlayWindow(bounds) {
 
   // Pet overlay opts out of global UI zoom (see zoomWiringForWindowKind): it
   // owns its window-fit + scale, and inheriting zoom would crop the sprite.
-  wireCommonWindowHandlers(win, zoomWiringForWindowKind('petOverlay'))
+  wireCommonWindowHandlers(win, {
+    ...zoomWiringForWindowKind('petOverlay'),
+    composerEnabled: false
+  })
 
   wireWindowReveal(win, { show: () => win.showInactive() })
 
@@ -10739,7 +10771,10 @@ function spawnQuickEntryWindow() {
 
   // Opts out of global UI zoom for the same reason as the pet overlay: it sizes
   // its own OS window and a zoomed composer would overflow it.
-  wireCommonWindowHandlers(win, zoomWiringForWindowKind('quickEntry'))
+  wireCommonWindowHandlers(win, {
+    ...zoomWiringForWindowKind('quickEntry'),
+    composerEnabled: false
+  })
 
   // Log-only renderer lifecycle (#81290): a dead quick-entry window must never
   // resurrect itself over the app, but its loss belongs in desktop.log.
