@@ -67,6 +67,13 @@ def _setup_update_mocks(monkeypatch, tmp_path):
     monkeypatch.setattr(hermes_config, "migrate_config", lambda **kw: {"env_added": [], "config_added": []})
     monkeypatch.setattr(hermes_main, "_upgrade_pip_before_lazy_refresh", lambda *a, **kw: None)
     monkeypatch.setattr(hermes_main, "_refresh_active_lazy_features", lambda *a, **kw: True)
+    # cmd_update always pauses/resumes installed gateways in a finally path.
+    # On Windows, leaving these unmocked lets a failure-path unit test rewrite
+    # the real launcher scripts and cold-start an audit-venv gateway.
+    monkeypatch.setattr(hermes_main, "_pause_windows_gateways_for_update", lambda: None)
+    monkeypatch.setattr(
+        hermes_main, "_resume_windows_gateways_after_update", lambda token: None
+    )
 
 
 

@@ -88,13 +88,14 @@ def test_mirror_refresh_updates_changed_files_and_keeps_node_modules(
     assert (mirror / "node_modules" / "installed.txt").exists()
 
 
+@pytest.mark.skipif(os.name == "nt", reason="chmod is a no-op on Windows")
 def test_dir_writable_probe(tmp_path) -> None:
     assert sidecar_paths.dir_writable(tmp_path) is True
     ro = tmp_path / "ro"
     ro.mkdir()
     ro.chmod(0o555)
     try:
-        if os.geteuid() == 0:  # pragma: no cover - root ignores perms
+        if getattr(os, "geteuid", lambda: -1)() == 0:  # pragma: no cover - root ignores perms
             pytest.skip("root bypasses directory permissions")
         assert sidecar_paths.dir_writable(ro) is False
     finally:
