@@ -20,6 +20,7 @@ preserved.
 from __future__ import annotations
 
 import logging
+import math
 import os
 import re
 import sys
@@ -106,6 +107,11 @@ def _external_prefetch_timeout_from_config(mem_config: Any) -> float | None:
     raw = mem_config.get("external_prefetch_timeout")
     if raw is None:
         return None
+    if isinstance(raw, bool):
+        logger.warning(
+            "Ignoring boolean memory.external_prefetch_timeout=%r; using default", raw
+        )
+        return None
     try:
         value = float(raw)
     except (TypeError, ValueError):
@@ -113,9 +119,10 @@ def _external_prefetch_timeout_from_config(mem_config: Any) -> float | None:
             "Ignoring invalid memory.external_prefetch_timeout=%r; using default", raw
         )
         return None
-    if value <= 0:
+    if not math.isfinite(value) or value <= 0:
         logger.warning(
-            "Ignoring non-positive memory.external_prefetch_timeout=%r; using default", raw
+            "Ignoring non-finite or non-positive memory.external_prefetch_timeout=%r; using default",
+            raw,
         )
         return None
     return value
