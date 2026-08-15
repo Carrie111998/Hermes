@@ -128,11 +128,22 @@ def wait_for_response(clarify_id: str, timeout: float) -> Optional[str]:
     except Exception:  # pragma: no cover - optional
         touch_activity_if_due = None
 
+    # Per-thread interrupt flag: /stop and interrupt-mode messages set it on
+    # the agent thread (tools.interrupt), and the wait loop below must observe
+    # it or the agent stays blocked until the full clarify timeout even though
+    # the run has been cancelled (#83889).
+    try:
+        from tools.interrupt import is_interrupted
+    except Exception:  # pragma: no cover - optional
+        is_interrupted = lambda: False
+
     # 0 / negative → unlimited: no deadline, poll forever in 1s slices.
     unlimited = timeout is None or float(timeout) <= 0.0
     deadline = None if unlimited else time.monotonic() + float(timeout)
     activity_state = {"last_touch": time.monotonic(), "start": time.monotonic()}
     while True:
+        if is_interrupted():
+            break
         if deadline is None:
             slice_s = 1.0
         else:

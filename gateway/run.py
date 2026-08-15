@@ -5692,6 +5692,17 @@ class TurnRunner:
 
             timeout = _clarify_mod.get_clarify_timeout()
             response = _clarify_mod.wait_for_response(clarify_id, timeout=float(timeout))
+            # A /stop or interrupt-mode message unblocks wait_for_response
+            # via the per-thread interrupt flag (#83889). Surface that as an
+            # explicit interrupt sentinel rather than a misleading timeout
+            # message — the agent is already in the interrupted state and
+            # will wind the turn down accordingly.
+            try:
+                from tools.interrupt import is_interrupted as _clarify_is_interrupted
+            except Exception:  # pragma: no cover - optional
+                _clarify_is_interrupted = lambda: False
+            if _clarify_is_interrupted():
+                return "[interrupted by user]"
             if response is None or response == "":
                 # Timeout or session-boundary cancellation
                 return f"[user did not respond within {int(timeout / 60)}m]"
