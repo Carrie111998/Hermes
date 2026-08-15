@@ -71,21 +71,30 @@ def _enabled_in_config(cfg: dict[str, Any]) -> bool:
 def self_improvement_authorized() -> bool:
     """Hard authorization check for autonomous skill/memory mutation.
 
-    Returns True only when an explicit opt-in is present (env override or
-    profile config ``self_improvement.enabled: true``). For non-governed
-    profiles it returns True (normal Hermes autonomous evolution continues);
-    for governed profiles it defaults to False (nothing autonomous mutates the
-    skill/memory store) unless explicitly enabled.
+    Returns True only when an explicit opt-in is present. For governed profiles
+    a bare process env var is NOT sufficient: the operator-mandated contract
+    requires the versioned, code-reviewable profile config
+    ``self_improvement.enabled: true`` (or an env opt-in explicitly combined
+    with the governed config marker). The env-only bypass was the governance gap
+    identified in the Claude review — if the operator wants to authorize a
+    governed run they must set the config, not just an env var in a child
+    process. For non-governed profiles the built-in autonomous behaviour (and
+    the env override) is preserved.
     """
-    # Explicit per-process opt-in always wins (operator-authorised).
+    cfg = _profile_config()
+
+    if _governed(cfg):
+        # Governed: NO silent env-only override. The operator must set the
+        # versioned, auditable config flag. An env var alone cannot flip a
+        # governed run green — otherwise any child process could authorise
+        # SKILL.md/reference/memory mutation without operator knowledge.
+        return _enabled_in_config(cfg)
+
+    # Non-governed profile: preserve the built-in autonomous review behaviour,
+    # including the explicit per-process env opt-in.
     env = os.environ.get(_AUTH_ENV_VAR, "").strip().lower()
     if env in {"1", "true", "yes", "on"}:
         return True
-
-    cfg = _profile_config()
-    if _governed(cfg):
-        return _enabled_in_config(cfg)
-    # Non-governed profile: preserve the built-in autonomous review behaviour.
     return True
 
 
