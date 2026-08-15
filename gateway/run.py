@@ -47,7 +47,7 @@ from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from typing import Awaitable, Callable, Dict, Optional, Any, List, Tuple, Union, cast
 
-from agent.async_utils import consume_detached_task_result, safe_schedule_threadsafe
+from agent.async_utils import safe_schedule_threadsafe
 from agent.conversation_compression import (
     COMPACTION_STATUS,
     COMPRESSION_RETRY_CONTEXT_REDUCED_STATUS_TEMPLATE,
@@ -80,12 +80,6 @@ from hermes_cli.fallback_config import get_fallback_chain
 # (see gateway/agent_cache_pressure.py).
 _AGENT_CACHE_MAX_SIZE = 128
 _AGENT_CACHE_IDLE_TTL_SECS = 3600.0  # evict agents idle for >1h
-_PLATFORM_CONNECT_TIMEOUT_SECS_DEFAULT = 30.0
-# Telegram cold polling now proves one real getUpdates round trip before connect
-# returns. Leave enough outer budget for initialize/deleteWebhook/start_polling
-# wall deadlines plus readiness; other platforms retain the 30s isolation bound.
-_TELEGRAM_CONNECT_TIMEOUT_SECS_DEFAULT = 180.0
-_ADAPTER_DISCONNECT_TIMEOUT_SECS_DEFAULT = 5.0
 # End reasons that mean the USER deliberately closed this thread of work
 # (/new -> session_reset / new_session, an explicit exit, or a /switch).
 # Shared by _classify_completion_target (pre-flight verdict) and
@@ -2467,6 +2461,7 @@ from gateway.session_state import (
     legacy_dict_property,
     legacy_lease_token_property,
 )
+from gateway.adapter_lifecycle_mixin import GatewayAdapterLifecycleMixin
 from gateway.authz_mixin import GatewayAuthorizationMixin
 from gateway.kanban_watchers import GatewayKanbanWatchersMixin
 from gateway.slash_commands import GatewaySlashCommandsMixin
@@ -6341,7 +6336,12 @@ class TurnRunner:
 
 
 
-class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, GatewaySlashCommandsMixin):
+class GatewayRunner(
+    GatewayAdapterLifecycleMixin,
+    GatewayAuthorizationMixin,
+    GatewayKanbanWatchersMixin,
+    GatewaySlashCommandsMixin,
+):
     """
     Main gateway controller.
 
@@ -7062,185 +7062,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if mode in {"voice_only", "all"} and key.startswith(prefix)
             )
 
-    async def _await_adapter_cleanup_with_timeout(
-        self, awaitable: Awaitable[Any], timeout: float
-    ) -> bool:
-        """Wait for adapter cleanup without letting cancellation swallowing hang us.
-
-        ``asyncio.wait_for`` cancels an overdue child but then waits for it to
-        exit. An adapter close path that catches ``CancelledError`` can therefore
-        block recovery forever. Keep ownership of the old task through its done
-        callback, but release the runner at the deadline.
-        """
-        if timeout <= 0:
-            await awaitable
-            return True
-
-        task = asyncio.ensure_future(awaitable)
-        try:
-            done, _pending = await asyncio.wait({task}, timeout=timeout)
-        except asyncio.CancelledError:
-            task.cancel()
-            task.add_done_callback(consume_detached_task_result)
-            raise
-        if task in done:
-            await task
-            return True
-
-        task.cancel()
-        task.add_done_callback(consume_detached_task_result)
-        return False
-
-    async def _safe_adapter_disconnect(self, adapter, platform) -> None:
-        """Call adapter.disconnect() defensively, swallowing any error.
-
-        Used when adapter.connect() failed or raised — the adapter may
-        have allocated partial resources (aiohttp.ClientSession, poll
-        tasks, child subprocesses) that would otherwise leak and surface
-        as "Unclosed client session" warnings at process exit.
-
-        Must tolerate partial-init state and never raise, since callers
-        use it inside error-handling blocks.
-        """
-        timeout = self._adapter_disconnect_timeout_secs()
-        try:
-            completed = await self._await_adapter_cleanup_with_timeout(
-                adapter.disconnect(), timeout
-            )
-            if not completed:
-                logger.warning(
-                    "Timed out after %.1fs while disconnecting %s adapter; continuing shutdown",
-                    timeout,
-                    platform.value if platform is not None else "adapter",
-                )
-        except Exception as e:
-            logger.debug(
-                "Defensive %s disconnect after failed connect raised: %s",
-                platform.value if platform is not None else "adapter",
-                e,
-            )
-
-    async def _bounded_adapter_teardown(
-        self, adapter, platform, *, profile: Optional[str] = None
-    ) -> None:
-        """Tear down one adapter on the shutdown path with bounded awaits.
-
-        Both ``cancel_background_tasks()`` and ``disconnect()`` can block
-        indefinitely when a platform's network state is half-dead (e.g. a
-        wedged Feishu/Lark WebSocket thread waiting on I/O). An unbounded
-        await here stalls the entire shutdown sequence past systemd's
-        ``TimeoutStopSec``; the resulting SIGKILL skips ``atexit`` PID-file
-        cleanup, so the next start dies with "PID file race lost" (#14128).
-
-        Each await uses the existing per-adapter timeout budget
-        (``HERMES_GATEWAY_ADAPTER_DISCONNECT_TIMEOUT``). On timeout the old
-        task is cancelled and detached, then teardown forces forward progress;
-        the loop never hangs even if an adapter swallows cancellation. Never
-        raises.
-        """
-        timeout = self._adapter_disconnect_timeout_secs()
-        suffix = f" (profile: {profile})" if profile else ""
-        started_at = time.monotonic()
-        try:
-            cancelled = await self._await_adapter_cleanup_with_timeout(
-                adapter.cancel_background_tasks(), timeout
-            )
-            if not cancelled:
-                logger.warning(
-                    "✗ %s background-task cancel timed out after %.1fs - forcing continue%s",
-                    platform.value, timeout, suffix,
-                )
-        except Exception as e:
-            logger.debug("✗ %s background-task cancel error%s: %s", platform.value, suffix, e)
-        try:
-            disconnected = await self._await_adapter_cleanup_with_timeout(
-                adapter.disconnect(), timeout
-            )
-            if disconnected:
-                logger.info(
-                    "✓ %s disconnected (%.2fs)%s",
-                    platform.value, time.monotonic() - started_at, suffix,
-                )
-            else:
-                logger.warning(
-                    "✗ %s disconnect timed out after %.1fs - forcing continue%s",
-                    platform.value, timeout, suffix,
-                )
-        except Exception as e:
-            logger.error(
-                "✗ %s disconnect error after %.2fs%s: %s",
-                platform.value, time.monotonic() - started_at, suffix, e,
-            )
-
-    def _adapter_disconnect_timeout_secs(self) -> float:
-        """Return the per-adapter disconnect timeout used during shutdown."""
-        raw = os.getenv("HERMES_GATEWAY_ADAPTER_DISCONNECT_TIMEOUT", "").strip()
-        if raw:
-            try:
-                timeout = float(raw)
-            except ValueError:
-                logger.warning(
-                    "Ignoring invalid HERMES_GATEWAY_ADAPTER_DISCONNECT_TIMEOUT=%r",
-                    raw,
-                )
-            else:
-                return max(0.0, timeout)
-        return _ADAPTER_DISCONNECT_TIMEOUT_SECS_DEFAULT
-
-    def _platform_connect_timeout_secs(self, platform=None) -> float:
-        """Return the per-platform connect timeout used during startup/retry."""
-        raw = os.getenv("HERMES_GATEWAY_PLATFORM_CONNECT_TIMEOUT", "").strip()
-        if raw:
-            try:
-                timeout = float(raw)
-            except ValueError:
-                logger.warning(
-                    "Ignoring invalid HERMES_GATEWAY_PLATFORM_CONNECT_TIMEOUT=%r",
-                    raw,
-                )
-            else:
-                return max(0.0, timeout)
-        if platform == Platform.TELEGRAM:
-            return _TELEGRAM_CONNECT_TIMEOUT_SECS_DEFAULT
-        return _PLATFORM_CONNECT_TIMEOUT_SECS_DEFAULT
-
-    async def _connect_adapter_with_timeout(
-        self, adapter, platform, *, is_reconnect: bool = False
-    ) -> bool:
-        """Connect an adapter without allowing one platform to block others.
-
-        ``is_reconnect`` is forwarded to ``adapter.connect()`` so platform
-        adapters can distinguish a cold first boot (drop any stale
-        server-side queue) from a watcher reconnect after a prolonged outage
-        (preserve the queue so messages sent during the outage are delivered
-        rather than silently dropped — #46621).
-        """
-        timeout = self._platform_connect_timeout_secs(platform)
-        if timeout <= 0:
-            return await adapter.connect(is_reconnect=is_reconnect)
-        # Use the detach-on-timeout pattern instead of plain asyncio.wait_for:
-        # asyncio.wait_for cancels the overdue task but then waits for it to
-        # exit. An adapter connect() that catches CancelledError can therefore
-        # block recovery forever (the watcher never reaches the next retry).
-        # Keep ownership of the old task through its done callback, but
-        # release the runner at the deadline (#70344).
-        task = asyncio.ensure_future(
-            adapter.connect(is_reconnect=is_reconnect)
-        )
-        try:
-            done, _pending = await asyncio.wait({task}, timeout=timeout)
-        except asyncio.CancelledError:
-            task.cancel()
-            task.add_done_callback(consume_detached_task_result)
-            raise
-        if task in done:
-            result = await task
-            return bool(result)
-        task.cancel()
-        task.add_done_callback(consume_detached_task_result)
-        raise TimeoutError(
-            f"{platform.value} connect timed out after {timeout:g}s"
-        )
+    # Adapter lifecycle helpers live in GatewayAdapterLifecycleMixin.  The
+    # mixin is the leftmost base of GatewayRunner, so existing call sites
+    # continue to resolve them through the MRO without changes.
 
     async def _connect_initial_adapter_with_timeout(self, adapter, platform) -> bool:
         """Connect one cold-start adapter with tightly scoped replace intent.

@@ -86,10 +86,10 @@ def _disconnect_drain_grace_s(budget_s: Optional[float] = None) -> float:
 
 def _env_disconnect_budget_s() -> float:
     """The runner's adapter-disconnect budget, read the same way
-    gateway/run.py:_adapter_disconnect_timeout_secs reads it (same env
+    GatewayAdapterLifecycleMixin._adapter_disconnect_timeout_secs reads it (same env
     variable, same default). Callers above the transport use this to
     apportion the budget across go_idle / monitor teardown / drain."""
-    budget = 5.0  # _ADAPTER_DISCONNECT_TIMEOUT_SECS_DEFAULT in gateway/run.py
+    budget = 5.0  # _ADAPTER_DISCONNECT_TIMEOUT_SECS_DEFAULT in the lifecycle mixin
     raw = os.getenv("HERMES_GATEWAY_ADAPTER_DISCONNECT_TIMEOUT", "").strip()
     if raw:
         try:
