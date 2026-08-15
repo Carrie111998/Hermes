@@ -151,13 +151,15 @@ BOARD_COLUMNS: list[str] = [
     "triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done",
 ]
 
-# Cross-column swim lane for the L3x assignee profile. The dashboard renders
-# tasks assigned to ``L3X_SWIM_LANE_ASSIGNEE`` in a dedicated horizontal row
-# spanning every lifecycle column; all other assignees (including unassigned)
-# land in the companion "Other" row.
+# Cross-column swim lanes for profile-scoped rows. The dashboard renders tasks
+# assigned to ``L3X_SWIM_LANE_ASSIGNEE`` and ``W3BB_SWIM_LANE_ASSIGNEE`` in
+# dedicated horizontal rows spanning every lifecycle column; all other assignees
+# (including unassigned) land in the companion "Org" row, which is listed first.
 L3X_SWIM_LANE_ASSIGNEE = "l3x"
+W3BB_SWIM_LANE_ASSIGNEE = "w3bb"
+W3BB_SWIM_LANE_LABEL = "W3bb"
 L3X_SWIM_LANE_OTHER_ID = "__other__"
-L3X_SWIM_LANE_OTHER_LABEL = "Other"
+L3X_SWIM_LANE_OTHER_LABEL = "Org"
 
 
 _CARD_SUMMARY_PREVIEW_CHARS = 200
@@ -167,28 +169,33 @@ def partition_swim_lanes(
     columns: list[dict[str, Any]],
     *,
     l3x_assignee: str = L3X_SWIM_LANE_ASSIGNEE,
+    w3bb_assignee: str = W3BB_SWIM_LANE_ASSIGNEE,
+    w3bb_swim_lane: bool = True,
 ) -> list[dict[str, Any]]:
-    """Split board columns into L3x vs non-L3x cross-column swim lanes.
+    """Split board columns into Org, optional W3bb, and L3x cross-column swim lanes.
 
     Each lane carries the full status column set so the UI can render a
     status grid per row without duplicating cards across lanes.
     """
     l3x_cols: list[dict[str, Any]] = []
+    w3bb_cols: list[dict[str, Any]] = []
     other_cols: list[dict[str, Any]] = []
     for col in columns:
         tasks = col.get("tasks") or []
         l3x_tasks = [t for t in tasks if t.get("assignee") == l3x_assignee]
-        other_tasks = [t for t in tasks if t.get("assignee") != l3x_assignee]
+        w3bb_tasks = (
+            [t for t in tasks if t.get("assignee") == w3bb_assignee]
+            if w3bb_swim_lane
+            else []
+        )
+        dedicated = {l3x_assignee}
+        if w3bb_swim_lane:
+            dedicated.add(w3bb_assignee)
+        other_tasks = [t for t in tasks if t.get("assignee") not in dedicated]
         l3x_cols.append({"name": col["name"], "tasks": l3x_tasks})
+        w3bb_cols.append({"name": col["name"], "tasks": w3bb_tasks})
         other_cols.append({"name": col["name"], "tasks": other_tasks})
-    return [
-        {
-            "id": l3x_assignee,
-            "label": l3x_assignee,
-            "assignee": l3x_assignee,
-            "task_count": sum(len(c["tasks"]) for c in l3x_cols),
-            "columns": l3x_cols,
-        },
+    lanes: list[dict[str, Any]] = [
         {
             "id": L3X_SWIM_LANE_OTHER_ID,
             "label": L3X_SWIM_LANE_OTHER_LABEL,
@@ -197,6 +204,26 @@ def partition_swim_lanes(
             "columns": other_cols,
         },
     ]
+    if w3bb_swim_lane:
+        lanes.append(
+            {
+                "id": w3bb_assignee,
+                "label": W3BB_SWIM_LANE_LABEL,
+                "assignee": w3bb_assignee,
+                "task_count": sum(len(c["tasks"]) for c in w3bb_cols),
+                "columns": w3bb_cols,
+            }
+        )
+    lanes.append(
+        {
+            "id": l3x_assignee,
+            "label": l3x_assignee,
+            "assignee": l3x_assignee,
+            "task_count": sum(len(c["tasks"]) for c in l3x_cols),
+            "columns": l3x_cols,
+        }
+    )
+    return lanes
 
 
 def _task_dict(
@@ -554,11 +581,18 @@ def get_board(
         k_cfg = ((cfg.get("dashboard") or {}).get("kanban") or {})
         l3x_swim_lane = bool(k_cfg.get("l3x_swim_lane", True))
         l3x_assignee = str(k_cfg.get("l3x_swim_lane_assignee") or L3X_SWIM_LANE_ASSIGNEE)
+        w3bb_swim_lane = bool(k_cfg.get("w3bb_swim_lane", True))
+        w3bb_assignee = str(k_cfg.get("w3bb_swim_lane_assignee") or W3BB_SWIM_LANE_ASSIGNEE)
 
         return {
             "columns": column_payload,
             "swim_lanes": (
-                partition_swim_lanes(column_payload, l3x_assignee=l3x_assignee)
+                partition_swim_lanes(
+                    column_payload,
+                    l3x_assignee=l3x_assignee,
+                    w3bb_assignee=w3bb_assignee,
+                    w3bb_swim_lane=w3bb_swim_lane,
+                )
                 if l3x_swim_lane
                 else None
             ),
@@ -2171,6 +2205,10 @@ def get_config():
         "l3x_swim_lane": bool(k_cfg.get("l3x_swim_lane", True)),
         "l3x_swim_lane_assignee": str(
             k_cfg.get("l3x_swim_lane_assignee") or L3X_SWIM_LANE_ASSIGNEE
+        ),
+        "w3bb_swim_lane": bool(k_cfg.get("w3bb_swim_lane", True)),
+        "w3bb_swim_lane_assignee": str(
+            k_cfg.get("w3bb_swim_lane_assignee") or W3BB_SWIM_LANE_ASSIGNEE
         ),
         "include_archived_by_default": bool(k_cfg.get("include_archived_by_default", False)),
         "render_markdown": bool(k_cfg.get("render_markdown", True)),

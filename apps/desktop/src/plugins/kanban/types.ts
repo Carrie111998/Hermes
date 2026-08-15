@@ -52,6 +52,8 @@ export interface KanbanBoardConfig {
   lane_by_profile: boolean
   l3x_swim_lane: boolean
   l3x_swim_lane_assignee: string
+  w3bb_swim_lane: boolean
+  w3bb_swim_lane_assignee: string
   include_archived_by_default: boolean
   render_markdown: boolean
 }

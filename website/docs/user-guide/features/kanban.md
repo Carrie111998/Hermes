@@ -740,7 +740,7 @@ All routes are mounted under `/api/plugins/kanban/` and protected by the dashboa
 | `POST` | `/links` | Add a dependency (`parent_id` → `child_id`) |
 | `DELETE` | `/links?parent_id=…&child_id=…` | Remove a dependency |
 | `POST` | `/dispatch?max=…&dry_run=…` | Nudge the dispatcher — skip the 60 s wait |
-| `GET` | `/config` | Read `dashboard.kanban` preferences from `config.yaml` — `default_tenant`, `lane_by_profile`, `l3x_swim_lane`, `l3x_swim_lane_assignee`, `include_archived_by_default`, `render_markdown` |
+| `GET` | `/config` | Read `dashboard.kanban` preferences from `config.yaml` — `default_tenant`, `lane_by_profile`, `l3x_swim_lane`, `l3x_swim_lane_assignee`, `w3bb_swim_lane`, `w3bb_swim_lane_assignee`, `include_archived_by_default`, `render_markdown` |
 | `WS` | `/events?since=<event_id>` | Live stream of `task_events` rows |
 
 Every handler is a thin wrapper — the plugin is ~700 lines of Python (router + WebSocket tail + bulk batcher + config reader) and adds no new business logic. A tiny `_conn()` helper auto-initializes `kanban.db` on every read and write, so a fresh install works whether the user opened the dashboard first, hit the REST API directly, or ran `hermes kanban init`.
@@ -754,13 +754,15 @@ dashboard:
   kanban:
     default_tenant: acme              # preselects the tenant filter
     lane_by_profile: true             # default for the "lanes by profile" toggle
-    l3x_swim_lane: true               # cross-column rows for L3x vs other assignees
-    l3x_swim_lane_assignee: l3x       # assignee profile for the dedicated swim row
+    l3x_swim_lane: true               # cross-column swim rows (Org / W3bb / L3x)
+    l3x_swim_lane_assignee: l3x       # assignee profile for the engineering swim row
+    w3bb_swim_lane: true              # dedicated W3bb marketing swim row
+    w3bb_swim_lane_assignee: w3bb    # assignee profile for the W3bb swim row
     include_archived_by_default: false
     render_markdown: true             # set false for plain <pre> rendering
 ```
 
-When `l3x_swim_lane` is enabled (default), the board renders two horizontal swim rows spanning every lifecycle column: one for tasks assigned to `l3x_swim_lane_assignee` and one labeled **Other** for all remaining assignees (including unassigned). The flat `columns` payload is unchanged so filters, search, and drag/drop continue to operate on the full board; assignee filters collapse to a single visible row when narrowed to L3x or a non-L3x profile.
+When `l3x_swim_lane` is enabled (default), the board renders three horizontal swim rows spanning every lifecycle column: **Org** first (all assignees except the dedicated profile rows, including unassigned), **W3bb** for tasks assigned to `w3bb_swim_lane_assignee` when `w3bb_swim_lane` is true (default), then **L3x** for tasks assigned to `l3x_swim_lane_assignee`. The flat `columns` payload is unchanged so filters, search, and drag/drop continue to operate on the full board; assignee filters collapse to a single visible row when narrowed to W3bb, L3x, or another profile.
 
 Each key is optional and falls back to the shown default.
 

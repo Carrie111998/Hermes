@@ -83,7 +83,8 @@ import { BoardSwitcher } from './board-switcher'
 import { TaskDrawer } from './drawer'
 import { EMPTY_OVERRIDE, ModelOverrideField, overrideCreateFields, type TaskModelOverride } from './model-override'
 import { OrchestrationPanel } from './orchestration'
-import { columnMeta, type KanbanBoard, type KanbanColumn, type KanbanSwimLane, type KanbanTask, type TaskEstimate } from './types'
+import { partitionSwimLanes, SWIM_LANE_ORG_ID } from './swim-lanes'
+import { columnMeta, type KanbanBoard, type KanbanTask, type TaskEstimate } from './types'
 import {
   $newTaskLane,
   ago,
@@ -133,39 +134,6 @@ function moveCard(board: KanbanBoard, id: string, toStatus: string): KanbanBoard
 
 function removeCard(board: KanbanBoard, id: string): KanbanBoard {
   return { ...board, columns: board.columns.map(col => ({ ...col, tasks: col.tasks.filter(t => t.id !== id) })) }
-}
-
-const L3X_SWIM_LANE_OTHER_ID = '__other__'
-
-function partitionSwimLanes(columns: KanbanColumn[], l3xAssignee: string): KanbanSwimLane[] {
-  const l3xCols: KanbanColumn[] = []
-  const otherCols: KanbanColumn[] = []
-
-  for (const col of columns) {
-    const l3xTasks = col.tasks.filter(task => task.assignee === l3xAssignee)
-    const otherTasks = col.tasks.filter(task => task.assignee !== l3xAssignee)
-    l3xCols.push({ name: col.name, tasks: l3xTasks })
-    otherCols.push({ name: col.name, tasks: otherTasks })
-  }
-
-  const count = (cols: KanbanColumn[]) => cols.reduce((sum, col) => sum + col.tasks.length, 0)
-
-  return [
-    {
-      id: l3xAssignee,
-      label: l3xAssignee,
-      assignee: l3xAssignee,
-      task_count: count(l3xCols),
-      columns: l3xCols
-    },
-    {
-      id: L3X_SWIM_LANE_OTHER_ID,
-      label: 'Other',
-      assignee: null,
-      task_count: count(otherCols),
-      columns: otherCols
-    }
-  ]
 }
 
 // ── card ─────────────────────────────────────────────────────────────────────
@@ -1136,6 +1104,8 @@ export function KanbanBoardPage() {
 
   const l3xSwimLane = kanbanConfig?.l3x_swim_lane ?? true
   const l3xSwimLaneAssignee = kanbanConfig?.l3x_swim_lane_assignee ?? 'l3x'
+  const w3bbSwimLane = kanbanConfig?.w3bb_swim_lane ?? true
+  const w3bbSwimLaneAssignee = kanbanConfig?.w3bb_swim_lane_assignee ?? 'w3bb'
 
   const [openId, setOpenId] = useState<null | string>(null)
   const [addStatus, setAddStatus] = useState<null | string>(null)
@@ -1234,18 +1204,27 @@ export function KanbanBoardPage() {
       return null
     }
 
-    const lanes = partitionSwimLanes(filtered.columns, l3xSwimLaneAssignee)
+    const lanes = partitionSwimLanes(
+      filtered.columns,
+      l3xSwimLaneAssignee,
+      w3bbSwimLaneAssignee,
+      w3bbSwimLane
+    )
 
     if (assignee === l3xSwimLaneAssignee) {
       return lanes.filter(lane => lane.id === l3xSwimLaneAssignee)
     }
 
-    if (assignee && assignee !== l3xSwimLaneAssignee) {
-      return lanes.filter(lane => lane.id === L3X_SWIM_LANE_OTHER_ID)
+    if (assignee === w3bbSwimLaneAssignee) {
+      return lanes.filter(lane => lane.id === w3bbSwimLaneAssignee)
+    }
+
+    if (assignee && assignee !== l3xSwimLaneAssignee && assignee !== w3bbSwimLaneAssignee) {
+      return lanes.filter(lane => lane.id === SWIM_LANE_ORG_ID)
     }
 
     return lanes
-  }, [filtered, l3xSwimLane, l3xSwimLaneAssignee, assignee])
+  }, [filtered, l3xSwimLane, l3xSwimLaneAssignee, w3bbSwimLane, w3bbSwimLaneAssignee, assignee])
 
   const moveMut = useMutation({
     mutationFn: ({ id, status }: { id: string; status: string }) => patchTask(id, { status }),

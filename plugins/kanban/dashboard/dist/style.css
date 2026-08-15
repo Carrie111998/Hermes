@@ -197,7 +197,7 @@
   color: var(--color-foreground);
 }
 
-/* ---- Cross-column swim lanes (L3x vs other assignees) --------------- */
+/* ---- Cross-column swim lanes (Org / W3bb / L3x assignees) ------------ */
 
 .hermes-kanban-swim-board {
   display: flex;
