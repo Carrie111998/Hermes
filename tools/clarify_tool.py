@@ -150,6 +150,32 @@ def _parse_multi_select_response(raw_response) -> List[str]:
     return [s.strip() for s in raw.split(",") if s.strip()]
 
 
+# WEBHOOK_REVOLUTION_TASK12_CLARIFY_POLICY_V2
+def _webhook_clarification_error(callback) -> str | None:
+    """Return a fail-closed error for unattended webhook clarification."""
+    try:
+        from gateway.platforms.webhook_policy import get_webhook_interaction_context
+
+        context = get_webhook_interaction_context()
+    except Exception:
+        return None
+    if context is None:
+        return None
+    mode = str(context.clarification_mode or "fail")
+    if mode == "fail":
+        return (
+            "Clarification is disabled for this unattended webhook route. "
+            "Use the event payload and route contract to decide deterministically."
+        )
+    if mode == "delivery_target":
+        if callback is None or context.clarification_delivery is None:
+            return (
+                "Webhook clarification target is unavailable; no authenticated "
+                "same-profile reply path exists."
+            )
+        return None
+    return f"Unsupported webhook clarification mode: {mode}"
+
 def clarify_tool(
     question: str,
     choices: Optional[List[str]] = None,
@@ -181,6 +207,10 @@ def clarify_tool(
         return tool_error("Question text is required.")
 
     question = question.strip()
+
+    webhook_policy_error = _webhook_clarification_error(callback)
+    if webhook_policy_error is not None:
+        return tool_error(webhook_policy_error)
 
     # Validate and trim choices
     if choices is not None:

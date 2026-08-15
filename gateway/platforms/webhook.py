@@ -30,6 +30,21 @@ Security:
   - Set secret to "INSECURE_NO_AUTH" to skip validation (testing only)
 """
 
+from gateway.platforms.webhook_policy import (
+    WebhookPolicyError,
+    get_webhook_interaction_context,
+    interaction_context,
+    resolve_webhook_interaction_delivery,
+    resolve_webhook_session_key,
+    session_is_one_shot,
+    set_webhook_interaction_context,
+    reset_webhook_interaction_context,
+    validate_webhook_route_policy,
+    validate_webhook_route_runtime,
+)
+
+import inspect
+
 import asyncio
 import base64
 import binascii
@@ -251,6 +266,11 @@ class WebhookAdapter(BasePlatformAdapter):
 
         # Validate routes at startup — secret is required per route
         for name, route in self._routes.items():
+            validate_webhook_route_policy(name, route)
+            validate_webhook_route_runtime(
+                name, route, self.gateway_runner,
+                profile=str(route.get("profile") or "default"),
+            )
             secret = route.get("secret", self._global_secret)
             if not secret:
                 raise ValueError(
@@ -909,7 +929,19 @@ class WebhookAdapter(BasePlatformAdapter):
 
         # Use delivery_id in session key so concurrent webhooks on the
         # same route get independent agent runs (not queued/interrupted).
-        session_chat_id = f"webhook:{route_name}:{delivery_id}"
+        session_chat_id = resolve_webhook_session_key(
+            profile=profile or "default",
+            route_name=route_name,
+            route=route_config,
+            payload=payload,
+            delivery_id=delivery_id,
+        )
+        _interaction = interaction_context(
+            profile=profile or "default",
+            route_name=route_name,
+            session_key=session_chat_id,
+            route=route_config,
+        )
 
         # Store delivery info for send().  Read by every send() invocation
         # for this chat_id (interim status messages and the final response),
@@ -957,7 +989,11 @@ class WebhookAdapter(BasePlatformAdapter):
         # once the agent run actually finishes (``handle_message`` itself is
         # fire-and-forget: it spawns ``_process_message_background`` and
         # returns before the run starts, so nothing can be closed here).
-        task = asyncio.create_task(self.handle_message(event))
+        _interaction_token = set_webhook_interaction_context(_interaction)
+        try:
+            task = asyncio.create_task(self.handle_message(event))
+        finally:
+            reset_webhook_interaction_context(_interaction_token)
         self._background_tasks.add(task)
         task.add_done_callback(self._background_tasks.discard)
 
@@ -995,6 +1031,96 @@ class WebhookAdapter(BasePlatformAdapter):
         """
         await self._end_webhook_session(event, event.source.chat_id)
 
+    # WEBHOOK_REVOLUTION_TASK12_INTERACTION_ROUTER_V2
+    @staticmethod
+    def _interaction_kwargs(callable_obj, values: dict) -> dict:
+        """Pass only keywords admitted by the target adapter signature."""
+        try:
+            params = inspect.signature(callable_obj).parameters
+        except (TypeError, ValueError):
+            return values
+        if any(item.kind is inspect.Parameter.VAR_KEYWORD for item in params.values()):
+            return values
+        return {key: value for key, value in values.items() if key in params}
+
+    async def send_exec_approval(
+        self,
+        chat_id: str,
+        command: str,
+        session_key: str,
+        description: str = "dangerous command",
+        metadata: Optional[Dict[str, Any]] = None,
+        allow_permanent: bool = True,
+        allow_session: bool = True,
+        smart_denied: bool = False,
+    ) -> SendResult:
+        context = get_webhook_interaction_context()
+        if context is None or context.approval_mode != "delivery_target":
+            return SendResult(
+                success=False,
+                error="Webhook approval denied by unattended route policy",
+            )
+        try:
+            adapter, target_chat_id, target_metadata = resolve_webhook_interaction_delivery(
+                self.gateway_runner, context, purpose="approval"
+            )
+            sender = adapter.send_exec_approval
+            kwargs = self._interaction_kwargs(
+                sender,
+                {
+                    "chat_id": target_chat_id,
+                    "command": command,
+                    "session_key": session_key,
+                    "description": description,
+                    "metadata": target_metadata,
+                    # Route-scoped consent must never become a process-global
+                    # permanent allowlist entry. Event sessions are one-shot,
+                    # so even session approval is meaningless there.
+                    "allow_permanent": False,
+                    "allow_session": allow_session and context.session_mode != "event",
+                    "smart_denied": smart_denied,
+                },
+            )
+            return await sender(**kwargs)
+        except WebhookPolicyError as exc:
+            return SendResult(success=False, error=str(exc))
+        except Exception as exc:
+            logger.error("[webhook] approval delivery failed: %s", exc, exc_info=True)
+            return SendResult(success=False, error="Webhook approval delivery failed")
+
+    async def send_clarify(
+        self,
+        chat_id: str,
+        question: str,
+        choices: Optional[list],
+        clarify_id: str,
+        session_key: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        context = get_webhook_interaction_context()
+        if context is None or context.clarification_mode != "delivery_target":
+            return SendResult(
+                success=False,
+                error="Webhook clarification is disabled for this unattended route",
+            )
+        try:
+            adapter, target_chat_id, target_metadata = resolve_webhook_interaction_delivery(
+                self.gateway_runner, context, purpose="clarification"
+            )
+            return await adapter.send_clarify(
+                chat_id=target_chat_id,
+                question=question,
+                choices=choices,
+                clarify_id=clarify_id,
+                session_key=session_key,
+                metadata=target_metadata,
+            )
+        except WebhookPolicyError as exc:
+            return SendResult(success=False, error=str(exc))
+        except Exception as exc:
+            logger.error("[webhook] clarification delivery failed: %s", exc, exc_info=True)
+            return SendResult(success=False, error="Webhook clarification delivery failed")
+
     async def _end_webhook_session(
         self, event: "MessageEvent", session_chat_id: str
     ) -> None:
@@ -1005,6 +1131,12 @@ class WebhookAdapter(BasePlatformAdapter):
         and key construction match exactly), then closes it via the existing
         ``SessionDB.end_session`` API — never a hand-written UPDATE.
         """
+        parts = session_chat_id.split(":", 5)
+        route_name = parts[2] if len(parts) > 2 else ""
+        route = self._routes.get(route_name, {})
+        if not session_is_one_shot(route):
+            return
+
         runner = self.gateway_runner
         if runner is None:
             return

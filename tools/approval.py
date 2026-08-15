@@ -3305,6 +3305,30 @@ def _smart_approve(command: str, description: str) -> str:
         return "escalate"
 
 
+# WEBHOOK_REVOLUTION_TASK12_APPROVAL_POLICY_V2
+def _webhook_approval_mode() -> str | None:
+    """Return route-scoped webhook approval mode, or None off-webhook."""
+    try:
+        from gateway.platforms.webhook_policy import get_webhook_interaction_context
+
+        context = get_webhook_interaction_context()
+    except Exception:
+        return None
+    if context is None:
+        return None
+    return str(context.approval_mode or "deny")
+
+
+def _webhook_approval_block(pattern_key: str, description: str, message: str) -> dict:
+    return {
+        "approved": False,
+        "message": message,
+        "pattern_key": pattern_key,
+        "description": description,
+        "outcome": "webhook_policy_denied",
+        "user_consent": False,
+    }
+
 def _run_approval_gate(
     *,
     pattern_key: str,
@@ -3356,10 +3380,27 @@ def _run_approval_gate(
         ``{"approved": bool, "message": str|None, ...}`` — shape shared with
         ``check_dangerous_command`` so all callers handle it uniformly.
     """
-    # --yolo bypasses all approval prompts (session- or process-scoped).
-    # Hardline blocks are handled by the caller BEFORE this gate, so yolo
-    # here only skips the recoverable approval layer.
-    if _YOLO_MODE_FROZEN or is_current_session_yolo_enabled():
+    webhook_approval_mode = _webhook_approval_mode()
+    if webhook_approval_mode == "deny":
+        return _webhook_approval_block(
+            pattern_key,
+            description,
+            "BLOCKED: Webhook routes deny interactive approvals by default. "
+            "Configure approval_mode='delivery_target' with a verified "
+            "same-profile bidirectional target to request consent.",
+        )
+    if webhook_approval_mode not in {None, "delivery_target"}:
+        return _webhook_approval_block(
+            pattern_key,
+            description,
+            f"BLOCKED: unsupported webhook approval mode {webhook_approval_mode!r}.",
+        )
+
+    # Process/session yolo never bypasses an explicit webhook interaction
+    # policy. The route either denies, or it requires a real user round-trip.
+    if webhook_approval_mode is None and (
+        _YOLO_MODE_FROZEN or is_current_session_yolo_enabled()
+    ):
         return {"approved": True, "message": None}
 
     session_key = get_current_session_key()
@@ -3427,7 +3468,7 @@ def _run_approval_gate(
                 "pattern_key": pattern_key,
                 "pattern_keys": [pattern_key],
                 "description": redact_sensitive_text(description),
-                "allow_permanent": True,
+                "allow_permanent": webhook_approval_mode is None,
                 "allow_session": True,
             }
             decision = _await_gateway_decision(
@@ -3471,8 +3512,9 @@ def _run_approval_gate(
                 approve_session(session_key, pattern_key)
             elif choice == "always":
                 approve_session(session_key, pattern_key)
-                approve_permanent(pattern_key)
-                save_permanent_allowlist(_permanent_approved)
+                if webhook_approval_mode is None:
+                    approve_permanent(pattern_key)
+                    save_permanent_allowlist(_permanent_approved)
             return {"approved": True, "message": None}
 
         # No notify callback: interactive CLI with a panel callback should
@@ -3483,6 +3525,14 @@ def _run_approval_gate(
             approval_callback=approval_callback,
             notify_cb=notify_cb,
         ):
+            if webhook_approval_mode == "delivery_target":
+                return _webhook_approval_block(
+                    pattern_key,
+                    description,
+                    "BLOCKED: webhook approval target could not be reached. "
+                    "No pending approval was queued because no authenticated "
+                    "reply path exists for this route.",
+                )
             # No notify callback (e.g. API server without an attached chat):
             # queue for /approve /deny review, agent sees approval_required.
             submit_pending(session_key, {
