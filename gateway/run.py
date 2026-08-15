@@ -16167,12 +16167,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             action = action.lower()
             from gateway.project_router import (
                 active_project,
+                add_project_alias,
                 analyze_project_setup,
                 apply_project_setup,
                 clear_project,
                 project_keys,
                 project_path,
                 register_project,
+                remove_project_alias,
                 render_project_setup_apply_result,
                 render_project_setup_plan,
                 select_project,
@@ -16199,6 +16201,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     f"- {key} → {project_path(self._session_db._db, key)}" for key in projects
                 )
                 return "\n".join(lines)
+            if action == "alias":
+                alias_args = remainder.strip().split(maxsplit=2)
+                if len(alias_args) != 3 or alias_args[0] not in {"add", "remove"}:
+                    return "Project alias failed: usage: !project alias add|remove <key> <alias>"
+                operation, key, alias = alias_args
+                try:
+                    normalized_alias = (
+                        add_project_alias(self._session_db._db, key, alias)
+                        if operation == "add"
+                        else remove_project_alias(self._session_db._db, key, alias)
+                    )
+                except ValueError as exc:
+                    return f"Project alias failed: {exc}"
+                verb = "added" if operation == "add" else "removed"
+                return f"Project alias {verb}: {key} → {normalized_alias}"
             if action == "setup":
                 setup_args = remainder.split()
                 if len(setup_args) == 1:
@@ -16237,6 +16254,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return f"Project selection failed: {exc}"
             self._evict_cached_agent(session_key)
             return f"Active project: {action} ({path})"
+
+        # Explicit !project commands above always win. Ordinary Matrix messages
+        # get only deterministic registry evidence: key, display name, or alias.
+        # A generic follow-up leaves an existing binding unchanged; no classifier
+        # or speculative switch is attempted.
+        if source.platform == Platform.MATRIX:
+            from gateway.project_router import active_project, resolve_project_reference, select_project
+
+            session_key = self._session_key_for_source(source)
+            matches = resolve_project_reference(self._session_db._db, event.text or "")
+            if len(matches) > 1:
+                lines = ["I found multiple possible projects:", *(f"- {key}" for key in matches)]
+                lines.append("Which one do you want to use?")
+                return "\n".join(lines)
+            if len(matches) == 1:
+                matched_key = matches[0]
+                current = active_project(self._session_db._db, session_key)
+                if current is None or current[0] != matched_key:
+                    select_project(self._session_db._db, session_key, matched_key)
+                    self._evict_cached_agent(session_key)
+                    await self._adapter_for_source(source).send(
+                        chat_id=source.chat_id, content=f"Using project: {matched_key}"
+                    )
 
         from hermes_cli.commands import (
             GATEWAY_KNOWN_COMMANDS,

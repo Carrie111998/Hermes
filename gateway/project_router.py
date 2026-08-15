@@ -9,12 +9,24 @@ from pathlib import Path
 
 # One-time legacy seed. Runtime lookups use the persisted registry exclusively.
 _BOOTSTRAP_PROJECTS = {
-    "newmoon": "/home/rle/projects/NewMoonNailsAndSpa",
-    "fivehours": "/home/rle/projects/savefivehours",
+    "newmoon": {
+        "path": "/home/rle/projects/NewMoonNailsAndSpa",
+        "metadata": {
+            "display_name": "New Moon Nails",
+            "aliases": ["new moon", "new moon nails", "nail site", "nails site"],
+        },
+    },
+    "fivehours": {
+        "path": "/home/rle/projects/savefivehours",
+        "metadata": {
+            "display_name": "Five Hours",
+            "aliases": ["five hours", "save five hours"],
+        },
+    },
 }
 _META_PREFIX = "matrix_project_router:"
 _REGISTRY_META_KEY = "matrix_project_router:registry"
-_REGISTRY_VERSION = 1
+_REGISTRY_VERSION = 2
 # Relative `!project add` references are resolved only beneath this root.
 # Keep this in one place so a future gateway configuration can override it.
 DEFAULT_PROJECTS_ROOT = Path("/home/rle/projects")
@@ -99,34 +111,98 @@ def normalize_project_key(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", (value or "").casefold())
 
 
+def _normalize_routing_phrase(value: str) -> str:
+    """Normalize routing evidence into a boundary-aware, comparable phrase."""
+    return re.sub(r"[^a-z0-9]+", " ", (value or "").casefold()).strip()
+
+
+def _default_display_name(value: str) -> str:
+    words = _normalize_routing_phrase(value).split()
+    return " ".join(word.capitalize() for word in words)
+
+
+def _validated_metadata(metadata: object) -> dict:
+    if metadata is None:
+        metadata = {}
+    if not isinstance(metadata, dict):
+        raise ValueError("project registry state is invalid")
+    result = dict(metadata)
+    display_name = result.get("display_name")
+    if display_name is not None:
+        if not isinstance(display_name, str) or not _normalize_routing_phrase(display_name):
+            raise ValueError("project registry state is invalid")
+        result["display_name"] = " ".join(display_name.split())
+    aliases = result.get("aliases", [])
+    if not isinstance(aliases, list) or not all(isinstance(alias, str) for alias in aliases):
+        raise ValueError("project registry state is invalid")
+    normalized_aliases = sorted({_normalize_routing_phrase(alias) for alias in aliases})
+    if any(not alias for alias in normalized_aliases):
+        raise ValueError("project registry state is invalid")
+    result["aliases"] = normalized_aliases
+    return result
+
+
 def _bootstrap_registry_value() -> dict:
     return {
         "version": _REGISTRY_VERSION,
         "projects": {
-            key: {"path": path, "metadata": {}}
-            for key, path in sorted(_BOOTSTRAP_PROJECTS.items())
+            key: {
+                "path": project["path"],
+                "metadata": {
+                    "display_name": project["metadata"]["display_name"],
+                    "aliases": list(project["metadata"]["aliases"]),
+                },
+            }
+            for key, project in sorted(_BOOTSTRAP_PROJECTS.items())
         },
     }
+
+
+def _migrate_registry(registry: dict) -> tuple[dict, bool]:
+    if registry.get("version") not in {1, _REGISTRY_VERSION} or not isinstance(
+        registry.get("projects"), dict
+    ):
+        raise ValueError("project registry state is invalid")
+    migrated = dict(registry)
+    if not all(isinstance(key, str) and isinstance(entry, dict) for key, entry in registry["projects"].items()):
+        raise ValueError("project registry state is invalid")
+    projects = {key: dict(entry) for key, entry in registry["projects"].items()}
+    changed = registry.get("version") != _REGISTRY_VERSION
+    for key, entry in projects.items():
+        if not isinstance(key, str) or key != normalize_project_key(key):
+            raise ValueError("project registry state is invalid")
+        if not isinstance(entry.get("path"), str):
+            raise ValueError("project registry state is invalid")
+        original_metadata = entry.get("metadata")
+        raw_metadata = original_metadata if isinstance(original_metadata, dict) else {}
+        metadata = _validated_metadata(original_metadata)
+        bootstrap = _BOOTSTRAP_PROJECTS.get(key, {}).get("metadata", {})
+        for field, value in bootstrap.items():
+            if field not in raw_metadata:
+                metadata[field] = list(value) if isinstance(value, list) else value
+        if "display_name" not in raw_metadata and "display_name" not in bootstrap:
+            metadata["display_name"] = _default_display_name(Path(entry["path"]).name) or key
+        if original_metadata != metadata:
+            changed = True
+        entry["metadata"] = metadata
+    migrated["version"] = _REGISTRY_VERSION
+    migrated["projects"] = projects
+    return migrated, changed
 
 
 def _load_registry(db) -> dict:
     raw = db.get_meta(_REGISTRY_META_KEY)
     if raw is None:
         registry = _bootstrap_registry_value()
-        db.set_meta(_REGISTRY_META_KEY, json.dumps(registry, sort_keys=True))
+        _save_registry(db, registry)
         return registry
     try:
         registry = json.loads(raw)
-        projects = registry["projects"]
-    except (json.JSONDecodeError, KeyError, TypeError) as exc:
+    except (json.JSONDecodeError, TypeError) as exc:
         raise ValueError("project registry state is invalid") from exc
-    if registry.get("version") != _REGISTRY_VERSION or not isinstance(projects, dict):
-        raise ValueError("project registry state is invalid")
-    for key, entry in projects.items():
-        if not isinstance(key, str) or key != normalize_project_key(key):
-            raise ValueError("project registry state is invalid")
-        if not isinstance(entry, dict) or not isinstance(entry.get("path"), str):
-            raise ValueError("project registry state is invalid")
+    registry, migrated = _migrate_registry(registry)
+    if migrated:
+        _save_registry(db, registry)
     return registry
 
 
@@ -135,7 +211,7 @@ def _save_registry(db, registry: dict) -> None:
 
 
 def bootstrap_registry(db) -> None:
-    """Create the legacy registry only when no persisted registry exists."""
+    """Create or migrate the registry without overwriting saved metadata."""
     _load_registry(db)
 
 
@@ -150,6 +226,79 @@ def project_keys(db) -> tuple[str, ...]:
 def project_path(db, key: str) -> Path | None:
     entry = _registry_projects(db).get(normalize_project_key(key))
     return Path(entry["path"]) if entry else None
+
+
+def _routing_phrases(key: str, metadata: dict) -> tuple[str, ...]:
+    phrases = {_normalize_routing_phrase(key)}
+    display_name = metadata.get("display_name")
+    if isinstance(display_name, str):
+        phrases.add(_normalize_routing_phrase(display_name))
+    phrases.update(metadata.get("aliases", []))
+    return tuple(sorted(phrase for phrase in phrases if phrase))
+
+
+def _contains_routing_phrase(text: str, phrase: str) -> bool:
+    words = phrase.split()
+    pattern = r"(?<!\w)" + r"[^a-z0-9]+".join(map(re.escape, words)) + r"(?!\w)"
+    return re.search(pattern, text.casefold()) is not None
+
+
+def resolve_project_reference(db, text: str) -> tuple[str, ...]:
+    """Return every registered project with exact key/name/alias evidence."""
+    if not isinstance(text, str) or not text.strip():
+        return ()
+    return tuple(
+        key
+        for key, entry in sorted(_registry_projects(db).items())
+        if any(
+            _contains_routing_phrase(text, phrase)
+            for phrase in _routing_phrases(key, entry["metadata"])
+        )
+    )
+
+
+def add_project_alias(db, key: str, alias: str) -> str:
+    """Persist an alias only when it cannot route to another registered project."""
+    normalized_key = normalize_project_key(key)
+    normalized_alias = _normalize_routing_phrase(alias)
+    if not normalized_alias:
+        raise ValueError("project alias must contain at least one ASCII letter or number")
+    registry = _load_registry(db)
+    projects = registry["projects"]
+    entry = projects.get(normalized_key)
+    if entry is None:
+        raise ValueError(
+            f"unknown project '{normalized_key}'. Valid projects: {', '.join(sorted(projects))}"
+        )
+    for other_key, other_entry in sorted(projects.items()):
+        if other_key != normalized_key and normalized_alias in _routing_phrases(
+            other_key, other_entry["metadata"]
+        ):
+            raise ValueError(f"project alias '{normalized_alias}' conflicts with project '{other_key}'")
+    aliases = entry["metadata"]["aliases"]
+    if normalized_alias not in aliases:
+        aliases.append(normalized_alias)
+        aliases.sort()
+        _save_registry(db, registry)
+    return normalized_alias
+
+
+def remove_project_alias(db, key: str, alias: str) -> str:
+    """Remove one normalized alias without changing any other project metadata."""
+    normalized_key = normalize_project_key(key)
+    normalized_alias = _normalize_routing_phrase(alias)
+    registry = _load_registry(db)
+    entry = registry["projects"].get(normalized_key)
+    if entry is None:
+        raise ValueError(
+            f"unknown project '{normalized_key}'. Valid projects: {', '.join(project_keys(db))}"
+        )
+    aliases = entry["metadata"]["aliases"]
+    if normalized_alias not in aliases:
+        raise ValueError(f"project alias '{normalized_alias}' is not registered for '{normalized_key}'")
+    aliases.remove(normalized_alias)
+    _save_registry(db, registry)
+    return normalized_alias
 
 
 def inspect_project_context(path: Path) -> tuple[tuple[str, bool], ...]:
@@ -547,7 +696,10 @@ def register_project(
             raise ValueError(f"project path is already registered as '{existing_key}'")
 
     context = inspect_project_context(path)
-    projects[normalized_key] = {"path": str(path), "metadata": {}}
+    projects[normalized_key] = {
+        "path": str(path),
+        "metadata": {"display_name": _default_display_name(path.name) or normalized_key, "aliases": []},
+    }
     _save_registry(db, registry)
     return RegisteredProject(normalized_key, path, context)
 

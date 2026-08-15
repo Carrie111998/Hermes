@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+import json
 from pathlib import Path
 import subprocess
 from types import SimpleNamespace
@@ -17,6 +18,7 @@ from gateway.platforms.base import MessageEvent, MessageType
 from gateway.project_router import (
     ProjectSetupPlan,
     SetupRecommendation,
+    add_project_alias,
     active_project_path,
     analyze_project_setup,
     apply_project_setup,
@@ -24,6 +26,7 @@ from gateway.project_router import (
     project_keys,
     project_path,
     register_project,
+    resolve_project_reference,
 )
 from gateway.session import SessionContext, SessionEntry, SessionSource, build_session_key
 from hermes_state import SessionDB
@@ -323,6 +326,60 @@ async def test_unbound_matrix_session_dispatches_normally(tmp_path):
     runner._handle_message_with_agent.assert_awaited_once()
 
 
+@pytest.mark.asyncio
+async def test_natural_project_reference_switches_and_continues_same_message(tmp_path):
+    runner = _runner(tmp_path)
+    session_key = build_session_key(_source())
+    expected = {"final_response": "ordinary dispatch", "messages": []}
+    runner._handle_message_with_agent = AsyncMock(return_value=expected)
+
+    result = await runner._handle_message(_event("For Five Hours, update the homepage."))
+
+    assert result == expected
+    assert active_project_path(runner._session_db._db, session_key) == FIVEHOURS_PATH
+    runner._evict_cached_agent.assert_called_once_with(session_key)
+    runner._handle_message_with_agent.assert_awaited_once()
+    runner.adapters[Platform.MATRIX].send.assert_awaited_once_with(
+        chat_id="matrix-room", content="Using project: fivehours"
+    )
+
+
+@pytest.mark.asyncio
+async def test_active_project_stays_bound_for_generic_follow_up_and_switches_for_other_reference(tmp_path):
+    runner = _runner(tmp_path)
+    session_key = build_session_key(_source())
+    runner._handle_message_with_agent = AsyncMock(return_value={"final_response": "ok", "messages": []})
+
+    await runner._handle_message(_event("!project newmoon"))
+    runner._evict_cached_agent.reset_mock()
+    await runner._handle_message(_event("Change the CTA to Get Started."))
+    assert active_project_path(runner._session_db._db, session_key) == NEWMOON_PATH
+    runner._evict_cached_agent.assert_not_called()
+
+    await runner._handle_message(_event("Let's go back to Five Hours and change pricing."))
+    assert active_project_path(runner._session_db._db, session_key) == FIVEHOURS_PATH
+    runner._evict_cached_agent.assert_called_once_with(session_key)
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_natural_project_reference_asks_without_dispatch(tmp_path):
+    runner = _runner(tmp_path)
+    runner._handle_message_with_agent = AsyncMock()
+    db = runner._session_db._db
+    project = _make_project(tmp_path, "Other Project")
+    register_project(db, str(project))
+    registry = json.loads(db.get_meta("matrix_project_router:registry"))
+    registry["projects"]["newmoon"]["metadata"]["aliases"] = ["website"]
+    registry["projects"]["otherproject"]["metadata"]["aliases"] = ["website"]
+    db.set_meta("matrix_project_router:registry", json.dumps(registry))
+
+    result = await runner._handle_message(_event("I want to work on the website."))
+
+    assert result == "I found multiple possible projects:\n- newmoon\n- otherproject\nWhich one do you want to use?"
+    runner._handle_message_with_agent.assert_not_awaited()
+    runner._evict_cached_agent.assert_not_called()
+
+
 def test_registry_bootstraps_legacy_projects_once_without_overwriting_additions(tmp_path):
     db = SessionDB(db_path=tmp_path / "state.db")
 
@@ -335,6 +392,77 @@ def test_registry_bootstraps_legacy_projects_once_without_overwriting_additions(
 
     bootstrap_registry(db)
     assert project_keys(db) == ("customproject", "fivehours", "newmoon")
+
+
+def test_registry_migration_adds_default_metadata_without_overwriting_custom_metadata(tmp_path):
+    db = SessionDB(db_path=tmp_path / "state.db")
+    db.set_meta(
+        "matrix_project_router:registry",
+        json.dumps(
+            {
+                "version": 1,
+                "projects": {
+                    "fivehours": {
+                        "path": str(FIVEHOURS_PATH),
+                        "metadata": {"display_name": "Custom Hours", "aliases": ["custom hours"]},
+                    }
+                },
+            }
+        ),
+    )
+
+    bootstrap_registry(db)
+
+    assert resolve_project_reference(db, "CUSTOM HOURS") == ("fivehours",)
+    assert resolve_project_reference(db, "five hours") == ()
+    registry = json.loads(db.get_meta("matrix_project_router:registry"))
+    assert registry["version"] == 2
+    assert registry["projects"]["fivehours"]["metadata"] == {
+        "aliases": ["custom hours"],
+        "display_name": "Custom Hours",
+    }
+
+
+def test_resolve_project_reference_matches_key_display_name_and_aliases_with_boundaries(tmp_path):
+    db = SessionDB(db_path=tmp_path / "state.db")
+    trinity = _make_project(tmp_path, "trinity-water")
+    register_project(db, str(trinity))
+
+    assert resolve_project_reference(db, "Let's work on Five Hours.") == ("fivehours",)
+    assert resolve_project_reference(db, "Go back to New Moon Nails") == ("newmoon",)
+    assert resolve_project_reference(db, "I want to change something on the nail site.") == ("newmoon",)
+    assert resolve_project_reference(db, "For Trinity Water, change the homepage") == ("trinitywater",)
+    assert resolve_project_reference(db, "FIVE HOURS should work") == ("fivehours",)
+    assert resolve_project_reference(db, "fivehoursly is not a project reference") == ()
+
+
+def test_project_aliases_persist_and_conflicts_never_reassign(tmp_path):
+    db_path = tmp_path / "state.db"
+    db = SessionDB(db_path=db_path)
+
+    assert add_project_alias(db, "newmoon", "Nail Website") == "nail website"
+    assert resolve_project_reference(db, "Let's work on the nail website.") == ("newmoon",)
+    with pytest.raises(ValueError, match="conflicts with project 'newmoon'"):
+        add_project_alias(db, "fivehours", "nail website")
+
+    reopened = SessionDB(db_path=db_path)
+    assert resolve_project_reference(reopened, "NAIL WEBSITE") == ("newmoon",)
+    fresh = SessionDB(db_path=tmp_path / "fresh-state.db")
+    assert resolve_project_reference(fresh, "nail website") == ()
+
+
+@pytest.mark.asyncio
+async def test_project_alias_commands_mutate_registry_without_agent_dispatch(tmp_path):
+    runner = _runner(tmp_path)
+    runner._handle_message_with_agent = AsyncMock()
+
+    added = await runner._handle_message(_event("!project alias add newmoon nail website"))
+    removed = await runner._handle_message(_event("!project alias remove newmoon nail website"))
+
+    assert added == "Project alias added: newmoon → nail website"
+    assert removed == "Project alias removed: newmoon → nail website"
+    assert resolve_project_reference(runner._session_db._db, "nail website") == ()
+    runner._handle_message_with_agent.assert_not_awaited()
 
 
 def test_registered_project_uses_canonical_path_and_survives_reopening_state(tmp_path):
