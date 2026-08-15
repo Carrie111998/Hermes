@@ -99,7 +99,7 @@ class TestSchema:
             "sort",
             "profile",
         ]
-        assert parameters == [*historical_prefix, "detail"]
+        assert parameters == [*historical_prefix, "detail", "group"]
 
 
 class TestFormatTimestamp:
@@ -171,12 +171,39 @@ class TestBrowseShape:
         sids = [r["session_id"] for r in result["results"]]
         assert "s_newest" not in sids
 
+    def test_browse_can_be_scoped_to_a_session_group(self, db):
+        _seed_modpack_sessions(db)
+        db.create_session_group("Active Project")
+        db.assign_sessions_to_group("Active Project", ["s_middle"])
+
+        result = json.loads(session_search(db=db, group="active project"))
+
+        assert [row["session_id"] for row in result["results"]] == ["s_middle"]
+
 
 # =========================================================================
 # Discovery shape (with query)
 # =========================================================================
 
 class TestDiscoveryShape:
+    def test_discovery_can_be_scoped_to_a_session_group(self, db):
+        _seed_modpack_sessions(db)
+        db.create_session_group("Quest Work")
+        db.assign_sessions_to_group("Quest Work", ["s_middle"])
+
+        result = json.loads(
+            session_search(query="modpack", limit=3, db=db, group="Quest Work")
+        )
+
+        assert result["success"] is True
+        assert [row["session_id"] for row in result["results"]] == ["s_middle"]
+
+    def test_unknown_group_is_an_error(self, db):
+        result = json.loads(session_search(query="anything", db=db, group="missing"))
+
+        assert result["success"] is False
+        assert "session group not found" in result["error"]
+
     def test_discovery_field_plan_preserves_full_default_result(self, db, monkeypatch):
         _seed_modpack_sessions(db)
         original = db.search_messages
