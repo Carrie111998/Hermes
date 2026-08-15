@@ -654,7 +654,7 @@ class FactRetriever:
     @classmethod
     def _is_short_cjk_query(cls, query: str) -> bool:
         """True when the query's only meaningful tokens are short (<3 char)
-        CJK runs — e.g. a bare Chinese name like "王坤". Such queries can
+        CJK runs — e.g. a bare Chinese name like "张伟". Such queries can
         never match a trigram index, so the caller must fall back to LIKE.
         """
         import re as _re
