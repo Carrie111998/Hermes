@@ -20,6 +20,7 @@ from engineering.domain import (
 from .base import (
     EngineeringStoreCorruption,
     EngineeringStoreError,
+    EvidenceAlreadyExists,
     EvidenceNotFound,
     InvalidWorkflowIdentifier,
     ReviewAlreadyExists,
@@ -97,6 +98,14 @@ class FileEngineeringStore:
 
     def append_evidence(self, evidence: Evidence) -> None:
         self._require_workflow(evidence.workflow_run_id)
+        try:
+            self.get_evidence(evidence.evidence_id)
+        except EvidenceNotFound:
+            pass
+        else:
+            raise EvidenceAlreadyExists(
+                f"evidence already exists: {evidence.evidence_id}"
+            )
         evidence_path = self._safe_run_path(
             evidence.workflow_run_id, "evidence.jsonl"
         )

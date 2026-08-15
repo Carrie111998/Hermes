@@ -4,7 +4,9 @@ import inspect
 
 from engineering.store.base import (
     EngineeringStore,
+    EngineeringStoreConflict,
     EngineeringStoreError,
+    EvidenceAlreadyExists,
     EvidenceNotFound,
     WorkflowAlreadyExists,
     WorkflowNotFound,
@@ -48,6 +50,7 @@ def test_store_errors_distinguish_missing_and_duplicate_facts() -> None:
     assert issubclass(WorkflowAlreadyExists, EngineeringStoreError)
     assert issubclass(WorkflowNotFound, EngineeringStoreError)
     assert issubclass(EvidenceNotFound, EngineeringStoreError)
+    assert issubclass(EvidenceAlreadyExists, EngineeringStoreConflict)
     assert WorkflowAlreadyExists is not WorkflowNotFound
     assert WorkflowNotFound is not EvidenceNotFound
 

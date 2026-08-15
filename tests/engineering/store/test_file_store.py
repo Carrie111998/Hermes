@@ -28,6 +28,8 @@ from engineering.domain import (
 )
 from engineering.store import (
     EngineeringStoreCorruption,
+    EngineeringStoreError,
+    EvidenceAlreadyExists,
     EvidenceNotFound,
     FileEngineeringStore,
     InvalidWorkflowIdentifier,
@@ -227,6 +229,38 @@ def test_multiple_evidence_records_preserve_append_order(tmp_path: Path) -> None
     ]
 
 
+def test_duplicate_evidence_id_in_same_workflow_is_rejected(
+    tmp_path: Path,
+) -> None:
+    store, _ = create_store(tmp_path)
+    workflow = create_workflow(store)
+    original = make_evidence(workflow, evidence_id="unique-evidence")
+    store.append_evidence(original)
+
+    with pytest.raises(EvidenceAlreadyExists):
+        store.append_evidence(original)
+
+    assert store.list_evidence(workflow.workflow_run_id) == (original,)
+
+
+def test_duplicate_evidence_id_across_workflows_is_rejected(
+    tmp_path: Path,
+) -> None:
+    store, _ = create_store(tmp_path)
+    first_workflow = create_workflow(store)
+    second_workflow = create_workflow(store)
+    store.append_evidence(
+        make_evidence(first_workflow, evidence_id="root-unique-evidence")
+    )
+
+    with pytest.raises(EvidenceAlreadyExists):
+        store.append_evidence(
+            make_evidence(second_workflow, evidence_id="root-unique-evidence")
+        )
+
+    assert store.list_evidence(second_workflow.workflow_run_id) == ()
+
+
 def test_list_evidence_returns_all_records(tmp_path: Path) -> None:
     store, _ = create_store(tmp_path)
     workflow = create_workflow(store)
@@ -301,10 +335,14 @@ def test_save_and_get_verification(tmp_path: Path) -> None:
 def test_duplicate_verification_attempt_is_rejected(tmp_path: Path) -> None:
     store, _ = create_store(tmp_path)
     workflow = create_workflow(store)
-    store.save_verification(make_verification(workflow.workflow_run_id))
+    original = make_verification(workflow.workflow_run_id)
+    store.save_verification(original)
 
     with pytest.raises(VerificationAlreadyExists):
         store.save_verification(make_verification(workflow.workflow_run_id))
+
+    restored = store.get_verification(workflow.workflow_run_id, 1)
+    assert restored.verification_id == original.verification_id
 
 
 def test_verification_for_missing_workflow_is_rejected(tmp_path: Path) -> None:
@@ -347,10 +385,14 @@ def test_save_and_get_review(tmp_path: Path) -> None:
 def test_duplicate_review_attempt_is_rejected(tmp_path: Path) -> None:
     store, _ = create_store(tmp_path)
     workflow = create_workflow(store)
-    store.save_review(make_review(workflow.workflow_run_id))
+    original = make_review(workflow.workflow_run_id)
+    store.save_review(original)
 
     with pytest.raises(ReviewAlreadyExists):
         store.save_review(make_review(workflow.workflow_run_id))
+
+    restored = store.get_review(workflow.workflow_run_id, 1)
+    assert restored.review_id == original.review_id
 
 
 def test_review_for_missing_workflow_is_rejected(tmp_path: Path) -> None:
@@ -387,6 +429,34 @@ def test_corrupt_workflow_json_raises_corruption(tmp_path: Path) -> None:
 
     with pytest.raises(EngineeringStoreCorruption):
         store.get_workflow(workflow.workflow_run_id)
+
+
+def test_failed_workflow_write_before_replace_preserves_previous_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, root = create_store(tmp_path)
+    workflow = create_workflow(store)
+    workflow.transition_to(WorkflowState.UNDERSTANDING)
+
+    def fail_during_dump(
+        record: object,
+        stream: object,
+        **kwargs: object,
+    ) -> None:
+        del record, kwargs
+        stream.write('{"partial":')  # type: ignore[attr-defined]
+        raise OSError("injected write failure")
+
+    monkeypatch.setattr(file_store_module.json, "dump", fail_during_dump)
+
+    with pytest.raises(EngineeringStoreError) as captured:
+        store.save_workflow(workflow)
+
+    assert isinstance(captured.value.__cause__, OSError)
+    restored = store.get_workflow(workflow.workflow_run_id)
+    assert restored.state is WorkflowState.CREATED
+    assert list(run_dir(root, workflow).glob(".*.tmp")) == []
 
 
 def test_unsupported_schema_is_wrapped_as_corruption(tmp_path: Path) -> None:

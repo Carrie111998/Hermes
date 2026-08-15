@@ -48,6 +48,10 @@ class ReviewAlreadyExists(EngineeringStoreConflict):
     """Raised when a review already exists for an attempt."""
 
 
+class EvidenceAlreadyExists(EngineeringStoreConflict):
+    """Raised when an evidence identity already exists in the store."""
+
+
 class EngineeringStoreCorruption(EngineeringStoreError):
     """Raised when persisted Engineering data cannot be reconstructed."""
 
@@ -65,7 +69,9 @@ class EngineeringStore(Protocol):
 
     def save_workflow(self, workflow: WorkflowRun) -> None: ...
 
-    def append_evidence(self, evidence: Evidence) -> None: ...
+    def append_evidence(self, evidence: Evidence) -> None:
+        """Append evidence, rejecting an ID already present in this store."""
+        ...
 
     def list_evidence(
         self,
