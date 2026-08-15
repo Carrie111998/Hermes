@@ -7,6 +7,7 @@ launching profile preselected. `--isolated` opts out.
 """
 import sys
 import types
+
 import pytest
 
 
@@ -31,21 +32,34 @@ class TestUnifiedDashboardRouting:
 
     def test_profile_launch_reexecs_machine_dashboard(self, main_mod, monkeypatch):
         monkeypatch.delenv("HERMES_HOME", raising=False)
+        monkeypatch.delenv("HERMES_DESKTOP", raising=False)
         monkeypatch.setattr(
             "hermes_cli.profiles.get_active_profile_name", lambda: "worker_x"
         )
         monkeypatch.setattr(main_mod, "_dashboard_listening", lambda host, port: False)
         execs = []
 
-        def fake_exec(exe, argv, env):
+        def record_exec(exe, argv, env):
             execs.append((exe, argv, env))
             raise SystemExit(0)  # execvpe never returns
 
-        monkeypatch.setattr(main_mod.os, "execvpe", fake_exec)
+        if sys.platform == "win32":
+            class _CompletedReexec:
+                def wait(self):
+                    return 0
 
-        with pytest.raises(SystemExit):
+            def record_popen(argv, env):
+                execs.append((argv[0], argv, env))
+                return _CompletedReexec()
+
+            monkeypatch.setattr(main_mod.subprocess, "Popen", record_popen)
+        else:
+            monkeypatch.setattr(main_mod.os, "execvpe", record_exec)
+
+        with pytest.raises(SystemExit) as exc:
             main_mod.cmd_dashboard(_args())
 
+        assert exc.value.code == 0
         assert len(execs) == 1
         exe, argv, env = execs[0]
         assert exe == sys.executable
@@ -61,7 +75,9 @@ class TestUnifiedDashboardRouting:
         assert env.get("HERMES_HOME") == str(get_default_hermes_root())
 
 
-    def test_desktop_profile_backend_skips_machine_dashboard_reroute(self, main_mod, monkeypatch):
+    def test_desktop_profile_backend_skips_machine_dashboard_reroute(
+        self, main_mod, monkeypatch, tmp_path
+    ):
         """A desktop-spawned named-profile backend (HERMES_DESKTOP=1) must NOT
         reroute into the machine dashboard. The reroute re-execs as the default
         profile and exits, so the desktop never sees a ready backend → boot
@@ -77,12 +93,71 @@ class TestUnifiedDashboardRouting:
         )
         execs = []
         monkeypatch.setattr(main_mod.os, "execvpe", lambda *a, **k: execs.append(a))
-        monkeypatch.setitem(sys.modules, "fastapi", None)
+        monkeypatch.setattr(
+            main_mod.subprocess,
+            "Popen",
+            lambda *a, **k: pytest.fail("desktop backend must not re-exec"),
+        )
 
-        with pytest.raises((SystemExit, AttributeError, ImportError, TypeError)):
+        # Keep the assertion on routing only. Every downstream startup seam is
+        # replaced so this test cannot build the UI, discover plugins, start
+        # MCP, or bind a real dashboard server on the developer's machine.
+        web_dist = tmp_path / "web-dist"
+        web_dist.mkdir()
+        (web_dist / "index.html").write_text("test", encoding="utf-8")
+        monkeypatch.setenv("HERMES_WEB_DIST", str(web_dist))
+        monkeypatch.setattr(main_mod, "_sync_bundled_skills_quietly", lambda: None)
+        monkeypatch.setattr(
+            main_mod, "_maybe_setup_dashboard_auth_interactively", lambda _args: None
+        )
+        monkeypatch.setitem(
+            sys.modules,
+            "hermes_logging",
+            types.SimpleNamespace(setup_logging=lambda **_kwargs: None),
+        )
+        monkeypatch.setitem(
+            sys.modules,
+            "hermes_cli.resource_limits",
+            types.SimpleNamespace(apply_nofile_soft_limit=lambda: None),
+        )
+        monkeypatch.setitem(
+            sys.modules,
+            "hermes_cli.config",
+            types.SimpleNamespace(apply_terminal_config_to_env=lambda: None),
+        )
+        monkeypatch.setitem(
+            sys.modules,
+            "hermes_cli.plugins",
+            types.SimpleNamespace(discover_plugins=lambda: None),
+        )
+        monkeypatch.setitem(
+            sys.modules,
+            "hermes_cli.mcp_startup",
+            types.SimpleNamespace(start_background_mcp_discovery=lambda **_kwargs: None),
+        )
+
+        starts = []
+
+        class _ServerReached(Exception):
+            pass
+
+        def fake_start_server(**kwargs):
+            starts.append(kwargs)
+            raise _ServerReached
+
+        monkeypatch.setitem(
+            sys.modules,
+            "hermes_cli.web_server",
+            types.SimpleNamespace(start_server=fake_start_server),
+        )
+
+        with pytest.raises(_ServerReached):
             main_mod.cmd_dashboard(_args())
         assert listening_calls == []
         assert execs == []
+        assert len(starts) == 1
+        assert starts[0]["host"] == "127.0.0.1"
+        assert starts[0]["port"] == 9119
 
 
 
