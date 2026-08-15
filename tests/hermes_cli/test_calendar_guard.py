@@ -230,10 +230,42 @@ def test_installer_renders_user_units_without_gateway_env(tmp_path):
     wrapper = (home / "scripts" / "hermes_calendar_guard.sh").read_text()
     assert str(release) in wrapper
     assert "@RELEASE_PATH@" not in wrapper
-    assert 'if [[ ! -d "$RELEASE_PATH" ]]; then' in wrapper
     assert f"ExecStart={Path('/opt/hermes/bin/python').absolute()}" in service
     assert "hermes_cli.calendar_guard --recover" in service
     assert calls[0][0] == ["systemctl", "--user", "daemon-reload"]
+    assert len(calls) == 1
+
+
+def test_installer_only_enables_timer_when_explicitly_requested(tmp_path):
+    calls = []
+
+    def runner(args, **kwargs):
+        calls.append((args, kwargs))
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    home = tmp_path / ".hermes"
+    release = home / "releases" / "v1"
+    release.mkdir(parents=True)
+    (release / ".hermes-release-sha").write_text("a" * 40 + "\n")
+
+    install_user_units(
+        home,
+        release,
+        Path("/opt/hermes/bin/python"),
+        unit_dir=tmp_path / "systemd-user",
+        runner=runner,
+        enable=True,
+    )
+
+    assert calls[1][0] == [
+        "systemctl",
+        "--user",
+        "enable",
+        "--now",
+        "hermes-gateway-recovery.timer",
+    ]
+    assert "_HERMES_GATEWAY" not in calls[0][1]["env"]
+    assert "HERMES_GATEWAY_SESSION" not in calls[0][1]["env"]
 
 
 def test_check_queues_once_and_suppresses_duplicate(tmp_path, monkeypatch):

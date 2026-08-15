@@ -32,7 +32,7 @@ def install_user_units(
     *,
     unit_dir: Path | None = None,
     runner=subprocess.run,
-    enable: bool = True,
+    enable: bool = False,
 ) -> list[Path]:
     hermes_home = hermes_home.resolve()
     release_path = release_path.resolve()
@@ -78,6 +78,7 @@ def install_user_units(
     )
     clean_env = os.environ.copy()
     clean_env.pop("_HERMES_GATEWAY", None)
+    clean_env.pop("HERMES_GATEWAY_SESSION", None)
     runner(["systemctl", "--user", "daemon-reload"], check=True, env=clean_env)
     if enable:
         runner(
@@ -94,13 +95,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--release-path", type=Path, required=True)
     parser.add_argument("--python", dest="python_path", type=Path, required=True)
     parser.add_argument(
-        "--no-enable",
+        "--enable",
         action="store_true",
-        help="render and reload units without enabling or starting the timer",
+        help="enable and start the timer after rendering and reloading units",
     )
     args = parser.parse_args(argv)
     for path in install_user_units(
-        args.hermes_home, args.release_path, args.python_path, enable=not args.no_enable
+        args.hermes_home, args.release_path, args.python_path, enable=args.enable
     ):
         print(path)
     return 0
