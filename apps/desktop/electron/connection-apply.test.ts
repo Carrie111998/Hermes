@@ -64,6 +64,61 @@ describe('applyConnectionChange', () => {
     })
     expect(events).toEqual(['cancel:worker', 'ssh:worker', 'pool:worker'])
   })
+
+  it('dedupes two concurrent primary-scope calls into one teardown + apply', async () => {
+    // Reproduces the Settings "Apply" button and the cloud-agent "Connect"
+    // button firing back-to-back: each is an independent UI trigger with its
+    // own pending-state guard, so nothing stops both calling
+    // applyConnectionChange for the primary scope close together. Without
+    // dedup, a second call starts its own teardownPrimary() while the first
+    // is still waiting on the real process exit.
+    const gate = deferred()
+    const teardownPrimary = vi.fn(async () => {
+      await gate.promise
+    })
+    const sendApplied = vi.fn()
+
+    const first = applyConnectionChange({
+      cancelAndWait: vi.fn(async () => undefined),
+      isPrimary: true,
+      scope: '',
+      sendApplied,
+      stopPool: vi.fn(),
+      teardownPrimary,
+      teardownSsh: vi.fn(async () => undefined)
+    })
+
+    // Flush enough microtasks for `first` to reach the in-flight teardown
+    // and suspend on the still-open gate, without resolving it.
+    for (let i = 0; i < 10; i++) {
+      await Promise.resolve()
+    }
+    expect(teardownPrimary).toHaveBeenCalledOnce()
+
+    const second = applyConnectionChange({
+      cancelAndWait: vi.fn(async () => undefined),
+      isPrimary: true,
+      scope: '',
+      sendApplied,
+      stopPool: vi.fn(),
+      teardownPrimary,
+      teardownSsh: vi.fn(async () => undefined)
+    })
+
+    for (let i = 0; i < 10; i++) {
+      await Promise.resolve()
+    }
+    // The second call joined the first's in-flight re-home instead of
+    // starting its own teardown.
+    expect(teardownPrimary).toHaveBeenCalledOnce()
+    expect(sendApplied).not.toHaveBeenCalled()
+
+    gate.resolve()
+    await Promise.all([first, second])
+
+    expect(teardownPrimary).toHaveBeenCalledOnce()
+    expect(sendApplied).toHaveBeenCalledOnce()
+  })
 })
 
 describe('resolveTerminalConnection', () => {
