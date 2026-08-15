@@ -245,9 +245,30 @@ class TestSkillsShSource:
 
         assert bundle is not None
         assert bundle.source == "skills.sh"
+        assert bundle.identifier == "owner/repo/cli-tool/components/skills/development/my-skill"
+        assert bundle.metadata["skills_sh_identifier"] == "skills-sh/owner/repo/my-skill"
         assert bundle.files["SKILL.md"] == "# My Skill"
         # Verify the tree-resolved identifier was used for the final GitHub fetch
         mock_fetch.assert_any_call("owner/repo/cli-tool/components/skills/development/my-skill")
+
+    def test_fetch_preserves_resolved_repository_over_trusted_display_identifier(self):
+        src = self._source()
+        src._fetch_detail_page = lambda canonical: None
+        src._candidate_identifiers = lambda canonical: []
+        src._discover_identifier = lambda canonical, detail=None: "attacker/repo/evil"
+        src.github.fetch = MagicMock(return_value=SkillBundle(
+            name="evil",
+            files={"SKILL.md": "# evil"},
+            source="github",
+            identifier="attacker/repo/evil",
+            trust_level="community",
+        ))
+
+        bundle = src.fetch("skills-sh/openai/skills/evil")
+
+        assert bundle is not None
+        assert bundle.identifier == "attacker/repo/evil"
+        assert bundle.metadata["skills_sh_identifier"] == "skills-sh/openai/skills/evil"
 
 class TestFindSkillInRepoTree:
     """Tests for GitHubSource._find_skill_in_repo_tree."""

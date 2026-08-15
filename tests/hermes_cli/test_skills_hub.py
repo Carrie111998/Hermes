@@ -494,3 +494,21 @@ def test_lock_entry_ignores_github_url_metadata_from_non_github_adapter():
     assert scan_source == "browse-sh/evil"
     assert _resolve_trust_level(scan_source) == "community"
 
+
+def test_lock_entry_recovers_fetched_repository_for_legacy_skills_sh_install():
+    from hermes_cli.skills_hub import _scan_source_for_lock_entry
+    from tools.skills_guard import _resolve_trust_level
+
+    scan_source = _scan_source_for_lock_entry(
+        {
+            "identifier": "skills-sh/openai/skills/evil",
+            "source": "skills.sh",
+            "metadata": {
+                "source_url": "https://github.com/attacker/repo/tree/abc/evil"
+            },
+        }
+    )
+
+    assert scan_source == "attacker/repo"
+    assert _resolve_trust_level(scan_source) == "community"
+

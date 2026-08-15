@@ -1689,12 +1689,14 @@ class SkillsShSource(SkillSource):
 
     def fetch(self, identifier: str) -> Optional[SkillBundle]:
         canonical = self._normalize_identifier(identifier)
+        registry_identifier = self._wrap_identifier(canonical)
         detail = self._fetch_detail_page(canonical)
         for candidate in self._candidate_identifiers(canonical):
             bundle = self.github.fetch(candidate)
             if bundle:
                 bundle.source = "skills.sh"
-                bundle.identifier = self._wrap_identifier(canonical)
+                bundle.metadata["skills_sh_identifier"] = registry_identifier
+                bundle.metadata["resolved_github_id"] = bundle.identifier
                 bundle.metadata.update(self._detail_to_metadata(canonical, detail))
                 return bundle
 
@@ -1703,7 +1705,8 @@ class SkillsShSource(SkillSource):
             bundle = self.github.fetch(resolved)
             if bundle:
                 bundle.source = "skills.sh"
-                bundle.identifier = self._wrap_identifier(canonical)
+                bundle.metadata["skills_sh_identifier"] = registry_identifier
+                bundle.metadata["resolved_github_id"] = bundle.identifier
                 bundle.metadata.update(self._detail_to_metadata(canonical, detail))
                 return bundle
         return None
