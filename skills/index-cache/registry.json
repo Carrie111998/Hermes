@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-08-14T23:49:17.872788Z",
+  "generated_at": "2026-08-15T01:17:21.372610Z",
   "skills": [
     {
       "name": "computer-use",
@@ -370,6 +370,36 @@
       "version": "1.0.0",
       "path": "social-media/runway",
       "updated_at": "2026-08-15T07:48:12.358178",
+      "category": "social-media"
+    },
+    {
+      "name": "x-post-writer",
+      "description": "Use when drafting, rewriting, or repurposing short-form X content, including single posts, quote posts, replies, threads, launches, and personal stories, with source fidelity and claim verification built in.",
+      "version": "1.0.0",
+      "author": "Tony Simons",
+      "license": "Apache-2.0",
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "metadata": {
+        "hermes": {
+          "category": "content",
+          "tags": [
+            "x",
+            "twitter",
+            "posts",
+            "threads",
+            "quote-posts",
+            "replies",
+            "social-writing"
+          ],
+          "related_skills": []
+        }
+      },
+      "path": "social-media/x-post-writer",
+      "updated_at": "2026-08-15T09:16:15.182501",
       "category": "social-media"
     },
     {
@@ -1168,6 +1198,137 @@
       "category": "social-media"
     },
     {
+      "name": "hermes-gateway-doctor",
+      "description": "Use when Hermes messaging gateway failures must be diagnosed across process state, adapters, credential posture, logs, delivery evidence, polling conflicts, and service persistence without automatic repair.",
+      "version": "1.0.0",
+      "author": "Tony Simons",
+      "license": "Apache-2.0",
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "metadata": {
+        "hermes": {
+          "category": "operations",
+          "tags": [
+            "hermes",
+            "gateway",
+            "doctor",
+            "telegram",
+            "discord",
+            "whatsapp",
+            "diagnosis"
+          ],
+          "related_skills": [
+            "hermes-stack-doctor"
+          ]
+        }
+      },
+      "path": "devops/hermes-gateway-doctor",
+      "updated_at": "2026-08-15T09:16:15.170753",
+      "category": "devops"
+    },
+    {
+      "name": "hermes-stack-doctor",
+      "description": "Use when a top-level, read-only Hermes health audit is needed across installation, updates, gateways, cron, profiles, skills, repositories, credential posture, persistence, and cost signals.",
+      "version": "1.0.0",
+      "author": "Tony Simons",
+      "license": "Apache-2.0",
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "metadata": {
+        "hermes": {
+          "category": "operations",
+          "tags": [
+            "hermes",
+            "doctor",
+            "health",
+            "gateway",
+            "cron",
+            "profiles",
+            "skills"
+          ],
+          "related_skills": [
+            "hermes-update-doctor",
+            "hermes-gateway-doctor",
+            "hermes-skill-audit",
+            "hermes-profile-audit",
+            "hermes-token-audit",
+            "repo-readiness-audit"
+          ]
+        }
+      },
+      "path": "devops/hermes-stack-doctor",
+      "updated_at": "2026-08-15T09:16:15.174497",
+      "category": "devops"
+    },
+    {
+      "name": "hermes-update-doctor",
+      "description": "Use when stuck, contradictory, blocked, or incomplete Hermes updates must be diagnosed across Git state, remotes, running processes, caches, and installed versions before recovery.",
+      "version": "1.0.0",
+      "author": "Tony Simons",
+      "license": "Apache-2.0",
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "metadata": {
+        "hermes": {
+          "category": "operations",
+          "tags": [
+            "hermes",
+            "update",
+            "doctor",
+            "git",
+            "windows",
+            "recovery"
+          ],
+          "related_skills": [
+            "hermes-stack-doctor"
+          ]
+        }
+      },
+      "path": "devops/hermes-update-doctor",
+      "updated_at": "2026-08-15T09:16:15.175947",
+      "category": "devops"
+    },
+    {
+      "name": "hermes-environment-migration",
+      "description": "Use when a Hermes environment must be safely migrated between machines with staged exports, integrity manifests, secret separation, selective imports, verification, and rollback.",
+      "version": "1.0.0",
+      "author": "Tony Simons",
+      "license": "Apache-2.0",
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "metadata": {
+        "hermes": {
+          "category": "operations",
+          "tags": [
+            "hermes",
+            "migration",
+            "backup",
+            "manifest",
+            "secrets",
+            "rollback"
+          ],
+          "related_skills": [
+            "hermes-stack-doctor"
+          ]
+        }
+      },
+      "path": "devops/hermes-environment-migration",
+      "updated_at": "2026-08-15T09:16:15.169615",
+      "category": "devops"
+    },
+    {
       "name": "sdlc-review",
       "description": "Review Kanban handoffs and route verified outcomes.",
       "version": "1.1.0",
@@ -1674,6 +1835,35 @@
       "category": "productivity"
     },
     {
+      "name": "interview-me",
+      "description": "Use when the user says Interview me before you start as a standalone command, explicitly asks to be questioned before work begins, or needs an adaptive, consent-based interview because goals, constraints, preferences, tradeoffs, or success criteria are genuinely unclear.",
+      "version": "0.2.0",
+      "author": "Tony Simons",
+      "license": "Apache-2.0",
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "metadata": {
+        "hermes": {
+          "category": "productivity",
+          "tags": [
+            "interview",
+            "clarification",
+            "discovery",
+            "briefing",
+            "decisions",
+            "consent"
+          ],
+          "related_skills": []
+        }
+      },
+      "path": "productivity/interview-me",
+      "updated_at": "2026-08-15T09:16:15.176674",
+      "category": "productivity"
+    },
+    {
       "name": "product-price-monitor",
       "description": "Watch product, flight, or listing prices; alert on target.",
       "version": "0.1.0",
@@ -1949,6 +2139,35 @@
       "updated_at": "2026-08-15T07:29:03.347061"
     },
     {
+      "name": "x-analytics-import",
+      "description": "Use when X Analytics CSV exports must be inspected, validated, normalized, imported, or compared through a repeatable private-by-default workflow.",
+      "version": "1.0.0",
+      "author": "Tony Simons",
+      "license": "Apache-2.0",
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "metadata": {
+        "hermes": {
+          "category": "data-analysis",
+          "tags": [
+            "x",
+            "analytics",
+            "csv",
+            "validation",
+            "statistics",
+            "privacy"
+          ],
+          "related_skills": []
+        }
+      },
+      "path": "data-engineering/x-analytics-import",
+      "updated_at": "2026-08-15T09:16:15.180884",
+      "category": "data-engineering"
+    },
+    {
       "name": "huggingface-hub",
       "description": "HuggingFace hf CLI: search/download/upload models, datasets.",
       "version": "1.0.1",
@@ -2211,6 +2430,37 @@
       "category": "research"
     },
     {
+      "name": "hermes-skill-audit",
+      "description": "Use when installed Hermes skills must be audited for overlap, staleness, broken references, usage-integrity problems, and dead weight without changing the installation.",
+      "version": "1.0.0",
+      "author": "Tony Simons",
+      "license": "Apache-2.0",
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "metadata": {
+        "hermes": {
+          "category": "software-development",
+          "tags": [
+            "hermes",
+            "skills",
+            "audit",
+            "overlap",
+            "staleness",
+            "integrity"
+          ],
+          "related_skills": [
+            "repo-readiness-audit"
+          ]
+        }
+      },
+      "path": "software-development/hermes-skill-audit",
+      "updated_at": "2026-08-15T09:16:15.172461",
+      "category": "software-development"
+    },
+    {
       "name": "dogfood",
       "description": "Exploratory QA of web apps: find bugs, evidence, reports.",
       "version": "1.0.0",
@@ -2270,6 +2520,36 @@
       "category": "software-development"
     },
     {
+      "name": "dont-lie-to-me",
+      "description": "Use when the user explicitly wants evidence-disciplined answers that separate observed facts, sourced claims, user reports, inference, unknowns, and contradictions before making strong factual or completion claims.",
+      "version": "0.1.0",
+      "author": "Tony Simons",
+      "license": "Apache-2.0",
+      "platforms": [
+        "platform-agnostic"
+      ],
+      "metadata": {
+        "hermes": {
+          "category": "productivity",
+          "tags": [
+            "evidence",
+            "verification",
+            "hallucination",
+            "claims",
+            "uncertainty",
+            "trust"
+          ],
+          "related_skills": [
+            "x-post-writer",
+            "oss-tool-trust-audit"
+          ]
+        }
+      },
+      "path": "software-development/dont-lie-to-me",
+      "updated_at": "2026-08-15T09:16:15.168869",
+      "category": "software-development"
+    },
+    {
       "name": "simplify-code",
       "description": "Parallel 4-agent cleanup of recent code changes.",
       "version": "1.1.0",
@@ -2300,6 +2580,69 @@
       },
       "path": "software-development/simplify-code",
       "updated_at": "2026-07-26T20:08:42.242827",
+      "category": "software-development"
+    },
+    {
+      "name": "hermes-skill-consolidate",
+      "description": "Use when installed Hermes skills must be safely consolidated, restructured, deprecated, split, or given shared references after overlap has been established, with a read-only plan, explicit approval, rollback snapshot, staged writes, and post-change verification.",
+      "version": "0.1.0",
+      "author": "Tony Simons",
+      "license": "Apache-2.0",
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "metadata": {
+        "hermes": {
+          "category": "software-development",
+          "tags": [
+            "hermes",
+            "skills",
+            "consolidation",
+            "refactor",
+            "rollback",
+            "safety"
+          ],
+          "related_skills": [
+            "hermes-skill-audit"
+          ]
+        }
+      },
+      "path": "software-development/hermes-skill-consolidate",
+      "updated_at": "2026-08-15T09:16:15.173211",
+      "category": "software-development"
+    },
+    {
+      "name": "hermes-profile-audit",
+      "description": "Use when a Hermes profile must be audited for role clarity, authority boundaries, configuration fit, skills, memory posture, credential scope, handoffs, and recurring operational failures.",
+      "version": "1.0.0",
+      "author": "Tony Simons",
+      "license": "Apache-2.0",
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "metadata": {
+        "hermes": {
+          "category": "operations",
+          "tags": [
+            "hermes",
+            "profile",
+            "audit",
+            "configuration",
+            "skills",
+            "permissions"
+          ],
+          "related_skills": [
+            "hermes-skill-audit",
+            "hermes-stack-doctor"
+          ]
+        }
+      },
+      "path": "software-development/hermes-profile-audit",
+      "updated_at": "2026-08-15T09:16:15.171610",
       "category": "software-development"
     },
     {
@@ -2555,6 +2898,68 @@
       },
       "path": "software-development/node-inspect-debugger",
       "updated_at": "2026-08-11T22:01:39.795729",
+      "category": "software-development"
+    },
+    {
+      "name": "pre-build-feature-audit",
+      "description": "Use when a proposed open-source feature must be checked across source, history, branches, issues, pull requests, roadmaps, and contributor guidance before implementation begins.",
+      "version": "1.1.0",
+      "author": "Tony Simons",
+      "license": "Apache-2.0",
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "metadata": {
+        "hermes": {
+          "category": "software-development",
+          "tags": [
+            "contribution",
+            "feature-audit",
+            "gap-analysis",
+            "open-source",
+            "duplicate-check"
+          ],
+          "related_skills": [
+            "repo-readiness-audit",
+            "oss-tool-trust-audit"
+          ]
+        }
+      },
+      "path": "software-development/pre-build-feature-audit",
+      "updated_at": "2026-08-15T09:16:15.178282",
+      "category": "software-development"
+    },
+    {
+      "name": "repo-readiness-audit",
+      "description": "Use when a user asks whether an identified repository is ready for further development, release work, a new feature, handoff, or a new contributor, requiring a disciplined read-only audit before an evidence-backed verdict.",
+      "version": "0.1.0",
+      "author": "Tony Simons",
+      "license": "Apache-2.0",
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "metadata": {
+        "hermes": {
+          "category": "software-development",
+          "tags": [
+            "repository",
+            "readiness",
+            "audit",
+            "git",
+            "github",
+            "ci",
+            "tests",
+            "handoff"
+          ],
+          "related_skills": []
+        }
+      },
+      "path": "software-development/repo-readiness-audit",
+      "updated_at": "2026-08-15T09:16:15.179417",
       "category": "software-development"
     },
     {
@@ -3589,6 +3994,68 @@
       "category": "creative"
     },
     {
+      "name": "hermes-token-audit",
+      "description": "Use when Hermes token usage, cost attribution, runaway sessions, cron consumption, or billing discrepancies must be investigated using privacy-preserving, schema-aware evidence.",
+      "version": "1.0.0",
+      "author": "Tony Simons",
+      "license": "Apache-2.0",
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "metadata": {
+        "hermes": {
+          "category": "operations",
+          "tags": [
+            "hermes",
+            "tokens",
+            "cost",
+            "billing",
+            "sqlite",
+            "privacy"
+          ],
+          "related_skills": [
+            "hermes-stack-doctor"
+          ]
+        }
+      },
+      "path": "security/hermes-token-audit",
+      "updated_at": "2026-08-15T09:16:15.175280",
+      "category": "security"
+    },
+    {
+      "name": "oss-tool-trust-audit",
+      "description": "Use when an open-source developer tool, package, CLI, agent, or MCP server must be evaluated for legitimacy, supply-chain risk, telemetry, dangerous capabilities, claim accuracy, and adoption fit.",
+      "version": "1.0.0",
+      "author": "Tony Simons",
+      "license": "Apache-2.0",
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "metadata": {
+        "hermes": {
+          "category": "security",
+          "tags": [
+            "security",
+            "open-source",
+            "supply-chain",
+            "telemetry",
+            "trust",
+            "build-vs-buy"
+          ],
+          "related_skills": [
+            "repo-readiness-audit"
+          ]
+        }
+      },
+      "path": "security/oss-tool-trust-audit",
+      "updated_at": "2026-08-15T09:16:15.177434",
+      "category": "security"
+    },
+    {
       "name": "openhue",
       "description": "Control Philips Hue lights, scenes, rooms via OpenHue CLI.",
       "version": "1.0.1",
@@ -3652,6 +4119,7 @@
       "infographic-and-data-viz",
       "seasonal-and-moment-marketing",
       "runway",
+      "x-post-writer",
       "ugc-and-influencer",
       "nano-banana",
       "youtube-long-form",
@@ -3740,6 +4208,10 @@
       "heygen"
     ],
     "devops": [
+      "hermes-gateway-doctor",
+      "hermes-stack-doctor",
+      "hermes-update-doctor",
+      "hermes-environment-migration",
       "sdlc-review"
     ],
     "note-taking": [
@@ -3759,6 +4231,7 @@
       "meeting-action-items",
       "google-workspace",
       "box",
+      "interview-me",
       "product-price-monitor",
       "session-librarian",
       "teams-meeting-pipeline",
@@ -3768,7 +4241,8 @@
       "db-schema-introspect",
       "sql-query-executor",
       "redis-cli-wrapper",
-      "vector-db-ops"
+      "vector-db-ops",
+      "x-analytics-import"
     ],
     "mlops": [
       "huggingface-hub"
@@ -3783,9 +4257,13 @@
       "blogwatcher"
     ],
     "software-development": [
+      "hermes-skill-audit",
       "dogfood",
       "inspecting-hermes-desktop-dom",
+      "dont-lie-to-me",
       "simplify-code",
+      "hermes-skill-consolidate",
+      "hermes-profile-audit",
       "plan",
       "hermes-agent-skill-authoring",
       "spike",
@@ -3793,7 +4271,9 @@
       "python-debugpy",
       "test-driven-development",
       "systematic-debugging",
-      "node-inspect-debugger"
+      "node-inspect-debugger",
+      "pre-build-feature-audit",
+      "repo-readiness-audit"
     ],
     "email": [
       "himalaya",
@@ -3836,6 +4316,10 @@
       "humanizer",
       "p5js",
       "baoyu-infographic"
+    ],
+    "security": [
+      "hermes-token-audit",
+      "oss-tool-trust-audit"
     ],
     "smart-home": [
       "openhue"
