@@ -280,35 +280,49 @@ class AresLocalRuntime:
 
         source_home = source_home.expanduser().resolve()
         marker = self.paths.agent_home / "ares-migration.json"
-        if marker.exists():
-            return False
+        existing_marker: dict[str, object] = {}
+        if marker.is_file():
+            try:
+                raw_marker = json.loads(marker.read_text(encoding="utf-8"))
+                if isinstance(raw_marker, dict):
+                    existing_marker = raw_marker
+            except json.JSONDecodeError:
+                raise AresLocalRuntimeError("Ares migration record is invalid") from None
         if self.paths.agent_home.exists():
             managed_entries = {"runtime", "runtime-state"}
-            if any(entry.name not in managed_entries for entry in self.paths.agent_home.iterdir()):
+            if not existing_marker and any(
+                entry.name not in managed_entries for entry in self.paths.agent_home.iterdir()
+            ):
                 return False
         else:
             self.paths.agent_home.mkdir(parents=True, exist_ok=False)
         copied: list[str] = []
-        for name in ("config.yaml", ".env", "active_profile"):
+        for name in ("config.yaml", ".env", "auth.json", "active_profile"):
             candidate = source_home / name
-            if candidate.is_file():
-                shutil.copy2(candidate, self.paths.agent_home / name)
+            destination = self.paths.agent_home / name
+            if candidate.is_file() and not destination.exists():
+                shutil.copy2(candidate, destination)
                 copied.append(name)
         for name in ("profiles", "skills", "plugins"):
             candidate = source_home / name
-            if candidate.is_dir():
+            if candidate.is_dir() and not (self.paths.agent_home / name).exists():
                 shutil.copytree(candidate, self.paths.agent_home / name, symlinks=True)
                 copied.append(name)
+        previous_copied = existing_marker.get("copied", [])
+        if not isinstance(previous_copied, list) or not all(
+            isinstance(value, str) for value in previous_copied
+        ):
+            previous_copied = []
         self._atomic_json(
             self.paths.agent_home / "ares-migration.json",
             {
                 "schema_version": 1,
                 "source_home": str(source_home),
-                "copied": copied,
+                "copied": sorted(set(previous_copied) | set(copied)),
                 "migrated_at": int(time.time()),
             },
         )
-        return True
+        return bool(copied)
 
     def _build_runtime(self, source: Path, *, desktop: bool) -> None:
         uv = shutil.which("uv")

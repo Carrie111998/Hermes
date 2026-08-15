@@ -100,6 +100,23 @@ def test_systemd_environment_preserves_an_existing_session_bus(monkeypatch) -> N
     assert environment["PATH"] == os.environ["PATH"]
 
 
+def test_seed_adds_missing_auth_without_overwriting_an_ares_home(tmp_path: Path) -> None:
+    runtime = _runtime(tmp_path)
+    source_home = tmp_path / "hermes-home"
+    source_home.mkdir()
+    (source_home / "auth.json").write_text('{"provider":"codex"}', encoding="utf-8")
+    runtime.paths.agent_home.mkdir()
+    (runtime.paths.agent_home / "config.yaml").write_text("provider: preserved\n", encoding="utf-8")
+    runtime._atomic_json(
+        runtime.paths.agent_home / "ares-migration.json",
+        {"schema_version": 1, "source_home": str(source_home), "copied": [], "migrated_at": 0},
+    )
+
+    assert runtime._seed_agent_home(source_home) is True
+    assert (runtime.paths.agent_home / "auth.json").read_text(encoding="utf-8") == '{"provider":"codex"}'
+    assert (runtime.paths.agent_home / "config.yaml").read_text(encoding="utf-8") == "provider: preserved\n"
+
+
 def test_ares_runtime_is_included_in_the_noneditable_distribution() -> None:
     project = Path(__file__).parents[2] / "pyproject.toml"
     data = tomllib.loads(project.read_text(encoding="utf-8"))
