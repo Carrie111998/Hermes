@@ -60,7 +60,7 @@ def test_two_processes_each_complete_local_mcp_discovery(tmp_path):
             output = Path(output_arg)
 
             mcp_tool._MCP_AVAILABLE = True
-            mcp_tool._MCP_DISCOVERY_LOCK_PATH = None
+            mcp_tool._reset_mcp_runtimes_for_tests()
             mcp_tool._MCP_DISCOVERY_LOCK_MAX_RETRIES = 200
             mcp_tool._MCP_DISCOVERY_LOCK_RETRY_DELAY_S = 0.01
             mcp_tool._servers.clear()

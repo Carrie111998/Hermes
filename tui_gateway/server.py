@@ -12667,19 +12667,10 @@ def _session_processes(session: dict) -> list:
 # server can't freeze the reader thread. Serialize reloads: overlapping
 # shutdown+discover pairs from stacked config-change polls would interleave
 # and leave the registry half-built.
-_mcp_reload_lock = threading.Lock()
-# Bumped once per SUCCESSFUL shutdown+discover. A follower that waited on the
-# lock only skips the redundant reload if this advanced while it waited — i.e.
-# the leader actually completed. If the leader threw (flapping server), the
-# follower sees no advance and re-runs the full reload itself.
-_mcp_reload_gen = 0
-# The mcp_rev hash that the last successful reload actually LOADED (config
-# re-hashed after discovery, so it reflects what discover_mcp_tools read —
-# not what the caller hoped for). A follower coalesces only when the
-# revision it was asked to load matches this; otherwise the config changed
-# under the leader (rev A loaded, rev B requested) and the follower must
-# re-run the full reload itself instead of acking B against A's registry.
-_mcp_reload_loaded_rev = ""
+# Reload coalescing is profile-local: one profile's completed reload must not
+# satisfy or suppress another profile's request.
+_mcp_reload_states_lock = threading.Lock()
+_mcp_reload_states = {}
 # Bounded convergence for a config edit racing a slow reload: the leader
 # re-hashes after discovery and repeats until the hash is stable.
 _MCP_RELOAD_MAX_PASSES = 3
@@ -12708,7 +12699,13 @@ def _compute_mcp_rev() -> str:
         return ""
 
 
-def _finish_reload(rid, params: dict, *, coalesced: bool) -> dict:
+def _finish_reload(
+    rid,
+    params: dict,
+    *,
+    coalesced: bool,
+    loaded_rev: str,
+) -> dict:
     """Shared tail for both reload paths: honor ``always`` (persist the
     confirm opt-out) and return the ok payload."""
     if bool(params.get("always", False)):
@@ -12719,7 +12716,7 @@ def _finish_reload(rid, params: dict, *, coalesced: bool) -> dict:
         except Exception as _exc:
             logger.warning("Failed to persist mcp_reload_confirm=false: %s", _exc)
 
-    payload = {"status": "reloaded", "loaded_rev": _mcp_reload_loaded_rev}
+    payload = {"status": "reloaded", "loaded_rev": loaded_rev}
     if coalesced:
         payload["coalesced"] = True
 

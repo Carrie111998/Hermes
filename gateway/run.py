@@ -5419,6 +5419,23 @@ class TurnRunner:
                     pass
 
         if agent is None:
+            # Discovery is profile-owned. In a multiplexed gateway the
+            # process-start discovery only covers the launch profile, so each
+            # routed profile must get its own bounded discovery before AIAgent
+            # snapshots the scoped registry.
+            try:
+                from hermes_cli.mcp_startup import ensure_mcp_discovery_before_agent_build
+
+                ensure_mcp_discovery_before_agent_build(
+                    logger=logger,
+                    thread_name="gateway-profile-mcp-discovery",
+                )
+            except Exception:
+                logger.debug(
+                    "Profile-scoped MCP discovery before agent build failed",
+                    exc_info=True,
+                )
+
             # Config changed or first message — create fresh agent
             agent = ctx.AIAgent(
                 model=turn_route["model"],
@@ -5458,6 +5475,9 @@ class TurnRunner:
                 # a single small file, not part of the expensive walk.
                 load_soul_identity=True,
             )
+            from tools.mcp_tool import current_mcp_scope
+
+            agent._mcp_profile_scope = current_mcp_scope(require=True)
             if _cache_lock and _cache is not None:
                 with _cache_lock:
                     # Record the session_id the snapshot was taken for
@@ -22655,18 +22675,39 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         loop = asyncio.get_running_loop()
         try:
-            from tools.mcp_tool import shutdown_mcp_servers, discover_mcp_tools, _servers, _lock
+            from tools.mcp_tool import (
+                shutdown_mcp_servers,
+                discover_mcp_tools,
+                current_mcp_scope,
+                _servers,
+                _lock,
+            )
+            import contextvars
+
+            reload_scope = current_mcp_scope(require=True)
 
             # Capture old server names before shutdown
             with _lock:
                 old_servers = set(_servers.keys())
 
-            # Read new config before shutting down, so we know what will be added/removed
-            # Shutdown existing connections
-            await loop.run_in_executor(None, shutdown_mcp_servers)
+            # Shutdown only the routed profile. Copy the trusted profile
+            # context into executor workers; bare run_in_executor does not
+            # propagate ContextVars and would otherwise fall back to the
+            # gateway launch profile.
+            shutdown_ctx = contextvars.copy_context()
+            await loop.run_in_executor(
+                None,
+                shutdown_ctx.run,
+                lambda: shutdown_mcp_servers(scope=reload_scope),
+            )
 
-            # Reconnect by discovering tools (reads config.yaml fresh)
-            new_tools = await loop.run_in_executor(None, discover_mcp_tools)
+            # Reconnect by discovering tools (reads this profile's config fresh).
+            discovery_ctx = contextvars.copy_context()
+            new_tools = await loop.run_in_executor(
+                None,
+                discovery_ctx.run,
+                discover_mcp_tools,
+            )
 
             # Compute what changed
             with _lock:
@@ -22706,6 +22747,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             except Exception:
                                 continue
                             if _agent is None:
+                                continue
+                            _agent_scope = getattr(
+                                _agent,
+                                "_mcp_profile_scope",
+                                None,
+                            )
+                            if _agent_scope is None:
+                                from agent.secret_scope import is_multiplex_active
+
+                                if not is_multiplex_active():
+                                    _agent_scope = reload_scope
+                            if _agent_scope != reload_scope:
+                                # Never rebuild another profile's cached agent
+                                # from the requesting profile's registry overlay.
                                 continue
                             # Preserve each cached agent's build-time toolset
                             # selection EXACTLY: a gateway session built with a
@@ -29872,9 +29927,21 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     # heartbeats (Discord shard, Telegram polling) until it returned.
     # See #16856.
     try:
+        import contextvars
+        from hermes_constants import get_hermes_home
         from tools.mcp_tool import discover_mcp_tools
+
         _loop = asyncio.get_running_loop()
-        await _loop.run_in_executor(None, discover_mcp_tools)
+        # Multiplex mode rejects unscoped MCP access. Bootstrap discovery is
+        # explicitly owned by the launch profile rather than implicitly
+        # falling back to it.
+        with _profile_runtime_scope(Path(get_hermes_home())):
+            _discovery_ctx = contextvars.copy_context()
+            await _loop.run_in_executor(
+                None,
+                _discovery_ctx.run,
+                discover_mcp_tools,
+            )
     except Exception as e:
         logger.debug("MCP tool discovery failed: %s", e)
 

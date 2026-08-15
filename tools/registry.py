@@ -463,7 +463,26 @@ class ToolRegistry:
         """Return global tools overlaid with one profile's plugin tools."""
         active_scope = scope or self.current_scope_key()
         merged = dict(self._tools)
-        merged.update(self._scoped_tools.get(active_scope, {}))
+        include_overlay = True
+        try:
+            from agent.secret_scope import is_multiplex_active
+            from hermes_constants import get_hermes_home_override
+
+            if is_multiplex_active():
+                if scope is None and get_hermes_home_override() is None:
+                    include_overlay = False
+                merged = {
+                    name: entry
+                    for name, entry in merged.items()
+                    if not (
+                        name.startswith("mcp__")
+                        or entry.toolset.startswith("mcp-")
+                    )
+                }
+        except Exception:
+            pass
+        if include_overlay:
+            merged.update(self._scoped_tools.get(active_scope, {}))
         return merged
 
     def _snapshot_state(
@@ -513,9 +532,19 @@ class ToolRegistry:
         *,
         scope: Optional[str] = None,
     ) -> Optional[ToolEntry]:
-        """Return the active profile's entry by name, falling back to global."""
+        """Return the active profile's entry by name.
+
+        Built-ins normally fall back to the process-global registry. MCP is a
+        credential boundary: in multiplex mode, a missing profile-local MCP
+        entry must never execute a legacy/global handler.
+        """
         with self._lock:
             return self._merged_tools(scope).get(name)
+
+    def get_global_entry(self, name: str) -> Optional[ToolEntry]:
+        """Return a process-global entry without profile fallback filtering."""
+        with self._lock:
+            return self._tools.get(name)
 
     def snapshot_registration(
         self,
@@ -855,12 +884,17 @@ class ToolRegistry:
                 self._toolset_checks[toolset] = check_fn
             self._generation += 1
 
-    def deregister(self, name: str) -> None:
+    def deregister(self, name: str, *, scope: Optional[str] = None) -> None:
         """Remove a tool from the registry.
 
         Also cleans up the toolset check if no other tools remain in the
         same toolset.  Used by MCP dynamic tool discovery to nuke-and-repave
         when a server sends ``notifications/tools/list_changed``.
+
+        ``scope`` removes the entry from one profile's overlay instead of the
+        caller-derived slot. MCP passes the owning profile's canonical home so
+        one profile's reconnect/shutdown never strips another profile's
+        identically-named tool.
 
         Gated by the same operator opt-in policy ``register(override=True)``
         enforces. Without this, a plugin could bypass that gate entirely by
@@ -874,7 +908,8 @@ class ToolRegistry:
         with self._lock:
             caller_mod = self._caller_module()
             caller_owner = self._plugin_namespace_of_module(caller_mod)
-            caller_scope = (
+            explicit_scope = scope is not None
+            caller_scope = scope if explicit_scope else (
                 self._plugin_scope_of(caller_owner)
                 if caller_owner is not None
                 else None
@@ -886,7 +921,7 @@ class ToolRegistry:
             )
             entry = target.get(name)
             if entry is None and caller_scope is not None:
-                if name in self._tools:
+                if not explicit_scope and name in self._tools:
                     raise PermissionError(
                         f"Scoped plugin module {caller_mod!r} cannot deregister "
                         f"process-global tool {name!r}; register a scoped "
@@ -928,11 +963,14 @@ class ToolRegistry:
             del target[name]
             if caller_scope is not None and not target:
                 self._scoped_tools.pop(caller_scope, None)
-            # Drop the toolset check and aliases if this was the last tool in
-            # that toolset.
+            # Drop the process-global toolset check/aliases only when no
+            # global or profile overlay still owns a tool in this toolset.
             toolset_still_exists = any(
-                e.toolset == entry.toolset
-                for e in self._merged_tools(caller_scope).values()
+                e.toolset == entry.toolset for e in self._tools.values()
+            ) or any(
+                scoped_entry.toolset == entry.toolset
+                for scoped_entries in self._scoped_tools.values()
+                for scoped_entry in scoped_entries.values()
             )
             if not toolset_still_exists:
                 self._toolset_checks.pop(entry.toolset, None)
@@ -1168,9 +1206,20 @@ class ToolRegistry:
         entry = self.get_entry(name)
         return entry.schema if entry else None
 
-    def get_toolset_for_tool(self, name: str) -> Optional[str]:
-        """Return the toolset a tool belongs to, or None."""
-        entry = self.get_entry(name)
+    def get_toolset_for_tool(
+        self,
+        name: str,
+        *,
+        scope: Optional[str] = None,
+    ) -> Optional[str]:
+        """Return the toolset a tool belongs to, or None.
+
+        ``scope`` resolves ownership inside one profile's overlay instead of
+        the active profile's. MCP discovery uses it so a server connecting on
+        behalf of profile A never sees profile B's identically-named tool as
+        a colliding owner.
+        """
+        entry = self.get_entry(name, scope=scope)
         return entry.toolset if entry else None
 
     def get_emoji(self, name: str, default: str = "⚡") -> str:

@@ -12908,7 +12908,13 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         sees the updated tools on the next turn.
         """
         try:
-            from tools.mcp_tool import shutdown_mcp_servers, discover_mcp_tools, _servers, _lock
+            from tools.mcp_tool import (
+                shutdown_mcp_servers,
+                discover_mcp_tools,
+                current_mcp_scope,
+                _servers,
+                _lock,
+            )
 
             # Capture old server names
             with _lock:
@@ -12917,8 +12923,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             if not self._command_running:
                 print("🔄 Reloading MCP servers...")
 
-            # Shutdown existing connections
-            shutdown_mcp_servers()
+            # Shutdown only this profile's connections. In a multiplexed
+            # process, other profiles may have an identically-named server.
+            shutdown_mcp_servers(scope=current_mcp_scope(require=True))
 
             # Reconnect (reads config.yaml fresh)
             new_tools = discover_mcp_tools()

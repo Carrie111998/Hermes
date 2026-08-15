@@ -285,7 +285,9 @@ class TestLazyFirstUseConnect:
              patch.object(registry, "deregister") as mock_dereg:
             assert mcp._ensure_lazy_server_connected("playwright") is True
 
-        mock_dereg.assert_called_once_with("mcp_playwright_tool_x")
+        mock_dereg.assert_called_once()
+        assert mock_dereg.call_args.args == ("mcp_playwright_tool_x",)
+        assert mock_dereg.call_args.kwargs["scope"] == mcp.current_mcp_scope()
 
     def test_lazy_connect_failure_records_cooldown(self):
         mcp._lazy_server_configs["playwright"] = {"command": "npx", "lazy": True}

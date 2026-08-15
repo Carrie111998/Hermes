@@ -162,7 +162,15 @@ def _(rid, params: dict) -> dict:
                 )
             _emit("session.info", params.get("session_id", ""), _session_info(agent, session))
 
-        global _mcp_reload_gen, _mcp_reload_loaded_rev
+        from tools.mcp_tool import current_mcp_scope
+
+        reload_scope = current_mcp_scope(require=True)
+        with _mcp_reload_states_lock:
+            reload_state = _mcp_reload_states.setdefault(
+                reload_scope,
+                {"lock": threading.Lock(), "gen": 0, "loaded_rev": ""},
+            )
+        reload_lock = reload_state["lock"]
 
         # The revision the CALLER is asking to load (the mcp_rev its poll
         # observed). Empty on legacy clients and manual /reload-mcp — those
@@ -179,11 +187,9 @@ def _(rid, params: dict) -> dict:
             reload racing a config edit): re-hash after discovery and repeat
             until the hash is stable, so the generation we mark completed
             always reflects the config that was actually loaded."""
-            global _mcp_reload_gen, _mcp_reload_loaded_rev
-
             loaded = _compute_mcp_rev()
             for _ in range(_MCP_RELOAD_MAX_PASSES):
-                shutdown_mcp_servers()
+                shutdown_mcp_servers(scope=reload_scope)
                 discover_mcp_tools()
                 after = _compute_mcp_rev()
                 if after == loaded:
@@ -191,8 +197,8 @@ def _(rid, params: dict) -> dict:
                 loaded = after
 
             _refresh_session_agent()
-            _mcp_reload_loaded_rev = loaded
-            _mcp_reload_gen += 1
+            reload_state["loaded_rev"] = loaded
+            reload_state["gen"] += 1
 
         # Serialize reloads. The LEADER (won the non-blocking acquire) runs the
         # full reload. A FOLLOWER (lock busy) snapshots the generation, waits,
@@ -205,19 +211,24 @@ def _(rid, params: dict) -> dict:
         # this request observed → re-run the full reload, so a failed or
         # stale leader can never leave a follower acking a revision that was
         # never loaded.
-        if _mcp_reload_lock.acquire(blocking=False):
+        if reload_lock.acquire(blocking=False):
             try:
                 _do_full_reload()
             finally:
-                _mcp_reload_lock.release()
+                reload_lock.release()
 
-            return _finish_reload(rid, params, coalesced=False)
+            return _finish_reload(
+                rid,
+                params,
+                coalesced=False,
+                loaded_rev=reload_state["loaded_rev"],
+            )
 
-        gen_before = _mcp_reload_gen
+        gen_before = reload_state["gen"]
 
-        with _mcp_reload_lock:
-            leader_completed = _mcp_reload_gen > gen_before
-            rev_satisfied = not req_rev or req_rev == _mcp_reload_loaded_rev
+        with reload_lock:
+            leader_completed = reload_state["gen"] > gen_before
+            rev_satisfied = not req_rev or req_rev == reload_state["loaded_rev"]
 
             if leader_completed and rev_satisfied:
                 _refresh_session_agent()
@@ -226,7 +237,12 @@ def _(rid, params: dict) -> dict:
                 _do_full_reload()
                 coalesced = False
 
-        return _finish_reload(rid, params, coalesced=coalesced)
+        return _finish_reload(
+            rid,
+            params,
+            coalesced=coalesced,
+            loaded_rev=reload_state["loaded_rev"],
+        )
     except Exception as e:
         return _err(rid, 5015, str(e))
 
