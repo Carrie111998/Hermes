@@ -23,7 +23,7 @@ import { atom, type ReadableAtom } from 'nanostores'
 import { openSession, type OpenSessionIntent } from '@/app/open-session'
 import { $narrowViewport } from '@/components/pane-shell/tree/store'
 import { onGatewayEvent } from '@/contrib/events'
-import { getLogs, getStatus } from '@/hermes'
+import { getLogs, getStatus, type HermesGateway } from '@/hermes'
 import { $gateway, ensureGatewayForAgent, openGatewayForAgent, openGatewayForProfile } from '@/store/gateway'
 import { notify, notifyError } from '@/store/notifications'
 import { $activeGatewayProfile, ensureGatewayProfile, newSessionInProfile, setShowAllProfiles } from '@/store/profile'
@@ -212,7 +212,14 @@ export const host = {
     }
 
     return gateway.request<T>(method, params)
-  }
+  },
+
+  /** The LIVE gateway instance for the active profile (null before the first
+   *  socket opens). Most plugins want `host.request`; this exists for SDK
+   *  components that take a `HermesGateway` prop directly (e.g. `McpTab`),
+   *  which need the instance, not just a JSON-RPC door. Re-read per use — the
+   *  active instance changes on a profile swap. */
+  getGateway: (): HermesGateway | null => $gateway.get()
 }
 
 // -- react bridge -------------------------------------------------------------
@@ -221,6 +228,22 @@ export const host = {
 // commands, routes, themes, panes, composer extensions, and bar items with
 // the same area ids + payload types core uses.
 export { COMPOSER_AREAS, type ComposerAttachmentProvider, type ComposerMiddleware } from '@/app/chat/composer/contrib'
+
+// -- capabilities: the real Settings → Capabilities components ----------------
+
+/** THE full MCP tab core Settings renders — per-server enable + OAuth sign-in
+ *  + API-key setup + live probes, not a checkbox list. Route-decoupled so it
+ *  renders anywhere (a plugin dialog); pass a live `gateway` (see
+ *  `host.getGateway()`) and an optional `profile` to scope it to one bot. */
+export { McpTab } from '@/app/skills/mcp-tab'
+/** THE full per-toolset config panel core Settings renders — provider picker,
+ *  env vars / API keys, model catalog picker, and post-setup runners. Route-
+ *  decoupled (the "manage keys" deep link is a no-op outside the router); pass
+ *  `toolset`, optional `onConfiguredChange`, and an optional `profile`. */
+export { ToolsetConfigPanel } from '@/app/settings/toolset-config-panel'
+/** The live gateway instance type — for typing the `gateway` prop `McpTab`
+ *  takes; obtain the instance from `host.getGateway()`. */
+export type { HermesGateway } from '@/hermes'
 
 // -- ui: the design language --------------------------------------------------
 
