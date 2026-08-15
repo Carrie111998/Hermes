@@ -6,7 +6,6 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useLocation } from 'react-router'
 
 import { PlatformAvatar } from '@/app/messaging/platform-icon'
-import { Button } from '@/components/ui/button'
 import { Codicon } from '@/components/ui/codicon'
 import { ContextMenu, ContextMenuContent, ContextMenuTrigger } from '@/components/ui/context-menu'
 import { GlyphSpinner } from '@/components/ui/glyph-spinner'
@@ -21,7 +20,7 @@ import {
   SidebarMenuButton,
   SidebarMenuItem
 } from '@/components/ui/sidebar'
-import { Tip, TipKeybindLabel } from '@/components/ui/tooltip'
+import { TipKeybindLabel } from '@/components/ui/tooltip'
 import { useContributions } from '@/contrib/react/use-contributions'
 import { searchSessions, type SessionInfo, type SessionSearchResult } from '@/hermes'
 import { useI18n } from '@/i18n'
@@ -136,7 +135,6 @@ import {
 import type { SidebarNavItem } from '../../types'
 
 import { SidebarCronJobsSection } from './cron-jobs-section'
-import { SidebarFilterMenu } from './filter-menu'
 import { SidebarLoadMoreRow } from './load-more-row'
 import { orderByIds, reconcileOrderIds, resolveManualSessionOrderIds, sameIds } from './order'
 import { ProfileRail } from './profile-switcher'
@@ -149,19 +147,18 @@ import {
   overlayLivePreviews,
   PROJECT_PREVIEW_COUNT,
   ProjectBackRow,
-  ProjectMenu,
   projectTreeCwd,
   sessionRecency as sessionTime,
   type SidebarProjectTree,
   type SidebarSessionGroup,
   type SidebarWorkspaceTree,
   sortProjectsForOverview,
-  StartWorkButton,
   useRepoWorktreeMap
 } from './projects'
 import { WorktreeDialog } from './projects/worktree-dialog'
 import { SidebarBlankState, SidebarPinnedEmptyState, SidebarSessionSkeletons } from './section-states'
 import { buildSessionByAnyId } from './session-index'
+import { SessionsHeaderAction } from './sessions-header-action'
 import { SidebarSessionsSection, VIRTUALIZE_THRESHOLD } from './sessions-section'
 import { CONTEXT_SPLIT_KIT, SplitSubmenu } from './split-submenu'
 
@@ -232,18 +229,6 @@ const SCROLL_GUTTER = '[scrollbar-gutter:stable]'
 
 // A non-session group's scroll body: own scroller when tall, flattened when compact.
 const GROUP_BODY = cn(SCROLL_Y, COMPACT_FLAT)
-
-// Section-header action icons stay hidden until the whole header row is hovered
-// (group/section lives on SidebarSectionHeader), mirroring the artifacts/file
-// browser header affordances. focus-visible keeps them keyboard-reachable.
-const HEADER_ACTION_BTN =
-  'text-(--ui-text-tertiary) opacity-0 transition-opacity hover:bg-(--ui-control-hover-background) hover:text-foreground group-hover/section:opacity-100 focus-visible:opacity-100'
-
-// The view toggle (overview group toggle / in-project back) is the one control
-// that stays visible at all times — it's the stable navigation affordance, not
-// a hover-revealed action.
-const HEADER_NAV_BTN =
-  'text-(--ui-text-tertiary) opacity-70 transition-opacity hover:bg-(--ui-control-hover-background) hover:text-foreground hover:opacity-100 focus-visible:opacity-100'
 
 // FTS results cover sessions that aren't in the loaded page; synthesize a
 // minimal SessionInfo so they render in the same row component (resume works
@@ -1646,63 +1631,17 @@ export function ChatSidebar({
                 grouping={showArchived || rankedGlobally ? 'none' : grouping === 'status' ? 'status' : 'date'}
                 groups={displayAgentGroups}
                 headerAction={
-                  inProject && enteredProject ? (
-                    <div className="group/workspace flex shrink-0 items-center gap-0.5">
-                      {enteredProject.path && <StartWorkButton repoPath={enteredProject.path} />}
-                      {/* Home has no folder and no record to rename, theme, or delete. */}
-                      {!enteredProject.isNoProject && (
-                        <ProjectMenu
-                          isActive={enteredProject.id === activeProjectId}
-                          onExitScope={exitProjectScope}
-                          project={enteredProject}
-                          scoped
-                        />
-                      )}
-                      <div className="grid size-6 place-items-center">
-                        <Tip label={s.showProjects}>
-                          <Button
-                            aria-label={s.showProjects}
-                            className={HEADER_NAV_BTN}
-                            onClick={event => {
-                              event.stopPropagation()
-                              exitProjectScope()
-                            }}
-                            size="icon-xs"
-                            variant="ghost"
-                          >
-                            <Codicon name="list-unordered" size="0.75rem" />
-                          </Button>
-                        </Tip>
-                      </div>
-                    </div>
-                  ) : (
-                    <div className="flex shrink-0 items-center gap-0.5">
-                      {!showAllProfiles ? (
-                        <Tip label={agentsGrouped ? s.projects.newButton : s.nav['new-session']}>
-                          <Button
-                            aria-label={agentsGrouped ? s.projects.newButton : s.nav['new-session']}
-                            className={HEADER_ACTION_BTN}
-                            onClick={event => {
-                              event.stopPropagation()
-
-                              if (agentsGrouped) {
-                                openProjectCreate()
-                              } else {
-                                onNewSessionInWorkspace(null)
-                              }
-                            }}
-                            size="icon-xs"
-                            variant="ghost"
-                          >
-                            <Codicon name="add" size="0.75rem" />
-                          </Button>
-                        </Tip>
-                      ) : null}
-                      <div className="grid size-6 place-items-center">
-                        <SidebarFilterMenu className={HEADER_NAV_BTN} />
-                      </div>
-                    </div>
-                  )
+                  <SessionsHeaderAction
+                    activeProjectId={activeProjectId}
+                    agentsGrouped={agentsGrouped}
+                    enteredProject={enteredProject}
+                    inProject={inProject}
+                    labels={{ newProject: s.projects.newButton, newSession: s.nav['new-session'], showProjects: s.showProjects }}
+                    onExitProjectScope={exitProjectScope}
+                    onNewSessionInWorkspace={onNewSessionInWorkspace}
+                    onOpenProjectCreate={openProjectCreate}
+                    showAllProfiles={showAllProfiles}
+                  />
                 }
                 label={sessionsLabel}
                 labelMeta={
