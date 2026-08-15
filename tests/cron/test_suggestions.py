@@ -62,6 +62,11 @@ class TestStore:
         with pytest.raises(ValueError):
             store.add_suggestion(title="x", description="d", source="bogus", job_spec={}, dedup_key="k")
 
+    def test_audit_source_is_accepted(self, store):
+        rec = _add(store, key="audit:k1", title="Audit Gate", source="audit")
+        assert rec is not None
+        assert rec["source"] == "audit"
+
     def test_usage_source_is_consent_first_self_improvement(self, store):
         """Background review suggestions must stay pending until user acceptance."""
         rec = _add(

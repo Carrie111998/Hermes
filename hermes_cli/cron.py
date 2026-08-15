@@ -471,6 +471,42 @@ def _job_action(action: str, job_id: str, success_verb: str) -> int:
     return 0
 
 
+def cron_audit(args) -> int:
+    """Audit scheduled jobs for missing verification gates."""
+    from cron.jobs import load_jobs
+    from cron.gate_audit import (
+        audit_jobs,
+        format_audit_report,
+        suggest_audit_remediations,
+    )
+
+    jobs = load_jobs()
+    findings = audit_jobs(jobs)
+
+    if getattr(args, "json", False):
+        print(json.dumps([f.as_dict() for f in findings], indent=2))
+        return 0
+
+    report = format_audit_report(findings)
+    print(report)
+
+    if getattr(args, "suggest", False):
+        created = suggest_audit_remediations(findings, jobs)
+        if created:
+            print(
+                color(
+                    f"\nCreated {len(created)} suggestion(s) — run /suggestions to review.",
+                    Colors.GREEN,
+                )
+            )
+        else:
+            print(
+                "\nNo new suggestions created (backlog full or already proposed/handled)."
+            )
+
+    return 0
+
+
 def cron_command(args):
     """Handle cron subcommands."""
     subcmd = getattr(args, 'cron_command', None)
@@ -483,6 +519,9 @@ def cron_command(args):
     if subcmd == "status":
         cron_status()
         return 0
+
+    if subcmd == "audit":
+        return cron_audit(args)
 
     if subcmd == "tick":
         cron_tick()
@@ -511,5 +550,5 @@ def cron_command(args):
         return _job_action("remove", args.job_id, "Removed")
 
     print(f"Unknown cron command: {subcmd}")
-    print("Usage: hermes cron [list|create|edit|pause|resume|run|remove|status|runs|tick]")
+    print("Usage: hermes cron [list|create|edit|pause|resume|run|remove|status|runs|tick|audit]")
     sys.exit(1)

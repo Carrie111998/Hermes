@@ -188,6 +188,17 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
     cron_runs.add_argument("job_id", nargs="?", help="Optional job ID filter")
     cron_runs.add_argument("--limit", type=int, default=20, help="Rows to show (1-500)")
 
+    # cron audit
+    cron_audit = cron_subparsers.add_parser(
+        "audit", help="Audit scheduled jobs for missing verification gates"
+    )
+    cron_audit.add_argument("--json", action="store_true", help="Output findings as JSON")
+    cron_audit.add_argument(
+        "--suggest",
+        action="store_true",
+        help="Register proposed remediations as pending /suggestions",
+    )
+
     # cron tick (mostly for debugging)
     cron_tick = cron_subparsers.add_parser("tick", help="Run due jobs once and exit")
     add_accept_hooks_flag(cron_tick)

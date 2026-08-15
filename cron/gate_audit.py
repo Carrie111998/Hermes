@@ -305,3 +305,67 @@ def format_audit_report(findings: Sequence[Finding]) -> str:
         lines.append(f"    • {finding.summary}")
         lines.append(f"      → {finding.recommendation}")
     return "\n".join(lines)
+
+
+def suggest_audit_remediations(
+    findings: Sequence[Finding],
+    jobs: Sequence[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Propose suggestions in cron/suggestions.py for audited jobs with gate findings.
+
+    Returns the list of created suggestion records.
+    """
+    from cron.suggestions import add_suggestion
+
+    by_id = {_job_id(j): j for j in jobs if isinstance(j, dict) and _job_id(j)}
+    created: List[Dict[str, Any]] = []
+
+    for finding in findings:
+        job = by_id.get(finding.job_id)
+        if not job:
+            continue
+
+        if finding.kind == UNGATED_AGENT_JOB:
+            prod_model = (_model_of(job) or "").lower()
+            checker_model = "gpt-4o-mini" if "haiku" in prod_model else "claude-3-5-haiku"
+            spec = {
+                "name": f"{finding.job_name} Checker",
+                "prompt": (
+                    "Review the output from the previous task. "
+                    "Verify it satisfies requirements and is accurate. "
+                    "Reply with PASS if good, or provide a concise failure reason."
+                ),
+                "schedule": job.get("schedule", "every 1d"),
+                "model": checker_model,
+                "context_from": [finding.job_id],
+                "deliver": job.get("deliver") or "origin",
+            }
+            rec = add_suggestion(
+                title=f"Gate: {finding.job_name} checker",
+                description=f"Add chained checker for {finding.job_name} on {checker_model}.",
+                source="audit",
+                job_spec=spec,
+                dedup_key=f"audit:checker:{finding.job_id}",
+            )
+            if rec:
+                created.append(rec)
+
+        elif finding.kind == MECHANICAL_LLM_JOB and job.get("script"):
+            spec = {
+                "name": f"{finding.job_name} (script)",
+                "schedule": job.get("schedule", "every 1d"),
+                "script": job.get("script"),
+                "no_agent": True,
+                "deliver": job.get("deliver") or "origin",
+            }
+            rec = add_suggestion(
+                title=f"Demote: {finding.job_name} to script",
+                description=f"Demote {finding.job_name} to no_agent script watchdog.",
+                source="audit",
+                job_spec=spec,
+                dedup_key=f"audit:demote:{finding.job_id}",
+            )
+            if rec:
+                created.append(rec)
+
+    return created

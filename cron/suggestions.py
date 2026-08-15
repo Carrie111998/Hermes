@@ -56,7 +56,7 @@ _suggestions_lock = threading.Lock()
 # new suggestions are dropped (the user should clear the backlog first).
 MAX_PENDING = 5
 
-VALID_SOURCES = frozenset({"catalog", "blueprint", "usage", "integration"})
+VALID_SOURCES = frozenset({"catalog", "blueprint", "usage", "integration", "audit"})
 _STATUS_PENDING = "pending"
 _STATUS_ACCEPTED = "accepted"
 _STATUS_DISMISSED = "dismissed"

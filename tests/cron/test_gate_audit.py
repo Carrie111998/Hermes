@@ -16,6 +16,7 @@ from cron.gate_audit import (
     feeds_a_decision,
     format_audit_report,
     looks_mechanical,
+    suggest_audit_remediations,
 )
 
 
@@ -207,3 +208,54 @@ def test_report_lists_each_finding_with_its_fix():
 def test_decision_marker_helper():
     assert feeds_a_decision(job(prompt="what should we do about the backlog"))
     assert not feeds_a_decision(job(prompt="list yesterday's merged PRs"))
+
+
+# ── suggestions bridge ───────────────────────────────────────────────────────
+
+def test_suggest_audit_remediations_creates_checker_suggestion(tmp_path, monkeypatch):
+    import importlib
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    import hermes_constants
+    importlib.reload(hermes_constants)
+    import cron.suggestions as store
+    importlib.reload(store)
+
+    jobs = [job(id="j1", name="Daily Summary", model="claude-3-5-sonnet", prompt="summarize PRs")]
+    findings = audit_jobs(jobs)
+    assert len(findings) == 1
+    assert findings[0].kind == UNGATED_AGENT_JOB
+
+    created = suggest_audit_remediations(findings, jobs)
+    assert len(created) == 1
+    assert created[0]["title"] == "Gate: Daily Summary checker"
+    assert created[0]["source"] == "audit"
+    assert created[0]["job_spec"]["context_from"] == ["j1"]
+    assert created[0]["job_spec"]["model"] == "claude-3-5-haiku"
+
+    # Repeated suggestion is deduplicated
+    created_again = suggest_audit_remediations(findings, jobs)
+    assert created_again == []
+
+
+def test_suggest_audit_remediations_creates_demote_suggestion_for_script(tmp_path, monkeypatch):
+    import importlib
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    import hermes_constants
+    importlib.reload(hermes_constants)
+    import cron.suggestions as store
+    importlib.reload(store)
+
+    jobs = [job(id="j2", name="Disk Check", script="check_disk.sh", prompt="check if disk space is low")]
+    findings = audit_jobs(jobs)
+    assert len(findings) == 2  # MECHANICAL_LLM_JOB + UNGATED_AGENT_JOB
+
+    created = suggest_audit_remediations(findings, jobs)
+    demote_suggestions = [c for c in created if c["title"] == "Demote: Disk Check to script"]
+    assert len(demote_suggestions) == 1
+    assert demote_suggestions[0]["source"] == "audit"
+    assert demote_suggestions[0]["job_spec"]["no_agent"] is True
+    assert demote_suggestions[0]["job_spec"]["script"] == "check_disk.sh"
