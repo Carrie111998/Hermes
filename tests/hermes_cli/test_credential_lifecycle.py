@@ -150,3 +150,51 @@ def test_update_rotates_config_yaml_model_mirror(hermes_home):
 # ---------------------------------------------------------------------------
 
 
+def test_save_env_value_refuses_onepassword_managed_key(hermes_home):
+    _write_config(
+        hermes_home,
+        "secrets:\n"
+        "  onepassword:\n"
+        "    enabled: true\n"
+        "    env:\n"
+        '      ANTHROPIC_API_KEY: "op://Private/Anthropic/credential"\n',
+    )
+    from hermes_cli.config import save_env_value
+
+    with pytest.raises(ValueError, match="1Password"):
+        save_env_value("ANTHROPIC_API_KEY", "sk-ant-" + "x" * 24)
+
+    assert not hermes_home.joinpath(".env").exists()
+
+
+def test_save_env_value_unaffected_for_key_not_mapped_in_onepassword(hermes_home):
+    _write_config(
+        hermes_home,
+        "secrets:\n"
+        "  onepassword:\n"
+        "    enabled: true\n"
+        "    env:\n"
+        '      ANTHROPIC_API_KEY: "op://Private/Anthropic/credential"\n',
+    )
+    from hermes_cli.config import load_env, save_env_value
+
+    new_value = "sk-or-" + "y" * 24
+    save_env_value("OPENROUTER_API_KEY", new_value)
+    assert load_env()["OPENROUTER_API_KEY"] == new_value
+
+
+def test_save_env_value_unaffected_when_onepassword_disabled(hermes_home):
+    _write_config(
+        hermes_home,
+        "secrets:\n"
+        "  onepassword:\n"
+        "    enabled: false\n"
+        "    env:\n"
+        '      ANTHROPIC_API_KEY: "op://Private/Anthropic/credential"\n',
+    )
+    from hermes_cli.config import load_env, save_env_value
+
+    new_value = "sk-ant-" + "w" * 24
+    save_env_value("ANTHROPIC_API_KEY", new_value)
+    assert load_env()["ANTHROPIC_API_KEY"] == new_value
+
