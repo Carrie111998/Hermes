@@ -12,8 +12,12 @@ one JSON document on stdout; diagnostics on stderr only.
 from __future__ import annotations
 
 import json
+import os
 import sys
+from pathlib import Path
 from typing import NoReturn
+
+from hermes_constants import get_hermes_home
 
 # Long CLI flags whose argument value must be redacted from the cmdline.
 _SENSITIVE_LONG_FLAGS: list[str] = [
@@ -140,6 +144,58 @@ def _is_pausable_gateway(cmdline: str) -> bool:
     return looks_like_gateway_command_line(cmdline)
 
 
+def _detect_managed_node_processes() -> list[tuple[int, str, str]]:
+    """Find processes executing from ``HERMES_HOME/node`` on Windows.
+
+    The portable Node runtime is part of the managed Hermes installation.
+    Long-lived tools such as n8n must not map its ``node.exe`` while an update
+    may replace that tree.  Report these holders separately from venv Python
+    processes so the Desktop updater can fail closed before mutating files.
+    """
+    if sys.platform != "win32":
+        return []
+    try:
+        import psutil  # noqa: PLC0415
+    except Exception:
+        return []
+
+    try:
+        node_prefix = str((Path(get_hermes_home()) / "node").resolve()).lower().rstrip("\\/") + os.sep
+    except (OSError, ValueError):
+        node_prefix = str(Path(get_hermes_home()) / "node").lower().rstrip("\\/") + os.sep
+
+    skip = {os.getpid()}
+    try:
+        skip.update(int(proc.pid) for proc in psutil.Process().parents())
+    except Exception:
+        pass
+
+    matches: list[tuple[int, str, str]] = []
+    try:
+        processes = psutil.process_iter(["pid", "exe", "name", "cmdline"])
+    except Exception:
+        return []
+    for proc in processes:
+        try:
+            info = proc.info
+            pid = int(info.get("pid"))
+            exe = info.get("exe")
+            if pid in skip or not exe:
+                continue
+            try:
+                exe_norm = str(Path(exe).resolve()).lower()
+            except (OSError, ValueError):
+                exe_norm = str(exe).lower()
+            if not exe_norm.startswith(node_prefix):
+                continue
+            name = str(info.get("name") or Path(exe).name)
+            cmdline = " ".join(info.get("cmdline") or [])
+            matches.append((pid, name, cmdline))
+        except Exception:
+            continue
+    return matches
+
+
 def main() -> None:
     """Entry point.  Prints one JSON doc to stdout.  Exits 0 for valid scan."""
     try:
@@ -154,7 +210,7 @@ def main() -> None:
     except Exception as exc:
         _emit_probe_fail(f"scan aborted: {exc}")
 
-    processes = [
+    venv_processes = [
         {
             "pid": pid,
             "name": name,
@@ -166,6 +222,16 @@ def main() -> None:
         for pid, name, cmdline in matches
         if not _is_pausable_gateway(cmdline)
     ]
+    managed_node_matches = _detect_managed_node_processes()
+    managed_node_processes = [
+        {
+            "pid": pid,
+            "name": name,
+            "cmdline": _redact_sensitive_cmdline(cmdline)[:120],
+        }
+        for pid, name, cmdline in managed_node_matches
+    ]
+    processes = venv_processes + managed_node_processes
     exempted = sum(1 for _pid, _name, cmdline in matches if _is_pausable_gateway(cmdline))
     data = {
         "ok": True,
@@ -174,6 +240,7 @@ def main() -> None:
         # Diagnostic only: gateway processes present but not counted as
         # blockers because the downstream updater pauses them itself.
         "pausable_gateways": exempted,
+        "managed_node_processes": len(managed_node_processes),
     }
     print(json.dumps(data))
     sys.exit(0)

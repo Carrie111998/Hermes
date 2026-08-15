@@ -17,6 +17,7 @@ import pytest
 
 import agent.redact as redact_module
 from hermes_cli._scan_venv_blockers import (
+    _detect_managed_node_processes,
     _is_pausable_gateway,
     _probe_fail_json,
     _redact_sensitive_cmdline,
@@ -159,6 +160,10 @@ def _run_main_with_detector(monkeypatch, capsys, matches):
     import hermes_cli.main as cli_main
 
     monkeypatch.setattr(cli_main, "_detect_venv_python_processes", lambda: matches)
+    monkeypatch.setattr(
+        "hermes_cli._scan_venv_blockers._detect_managed_node_processes",
+        lambda: [],
+    )
     with pytest.raises(SystemExit) as excinfo:
         main()
     out = capsys.readouterr().out
@@ -200,6 +205,66 @@ def test_main_psutil_missing_is_probe_failure_not_clear(monkeypatch, capsys):
     assert data["ok"] is False
     assert data["probe_failed"] is True
     assert "psutil" in captured.err.lower()
+def test_detect_managed_node_processes_reports_only_hermes_node(monkeypatch):
+    """Long-lived tools must not hold HERMES_HOME/node open during updates."""
+    class FakeProcess:
+        def __init__(self, pid, exe, cmdline):
+            self.info = {
+                "pid": pid,
+                "exe": exe,
+                "name": "node.exe",
+                "cmdline": cmdline,
+            }
+
+    fake_psutil = types.SimpleNamespace(
+        Process=lambda *args: types.SimpleNamespace(parents=lambda: []),
+        process_iter=lambda _attrs: [
+            FakeProcess(
+                101,
+                r"C:\Users\Capital\AppData\Local\hermes\node\node.exe",
+                ["node.exe", "n8n", "start"],
+            ),
+            FakeProcess(
+                202,
+                r"C:\Program Files\nodejs\node.exe",
+                ["node.exe", "server.js"],
+            ),
+        ],
+    )
+    monkeypatch.setitem(sys.modules, "psutil", fake_psutil)
+    monkeypatch.setattr(
+        "hermes_cli._scan_venv_blockers.get_hermes_home",
+        lambda: r"C:\Users\Capital\AppData\Local\hermes",
+    )
+
+    matches = _detect_managed_node_processes()
+
+    assert matches == [(101, "node.exe", "node.exe n8n start")]
+
+
+def test_main_reports_managed_node_as_update_blocker(monkeypatch, capsys):
+    """The Desktop preflight must fail closed on Hermes-managed Node holders."""
+    for name, mod in _psutil_fake().items():
+        monkeypatch.setitem(sys.modules, name, mod)
+    import hermes_cli.main as cli_main
+
+    monkeypatch.setattr(cli_main, "_detect_venv_python_processes", lambda: [])
+    monkeypatch.setattr(
+        "hermes_cli._scan_venv_blockers._detect_managed_node_processes",
+        lambda: [(303, "node.exe", "node.exe n8n start")],
+    )
+
+    with pytest.raises(SystemExit) as excinfo:
+        main()
+    data = json.loads(capsys.readouterr().out)
+
+    assert excinfo.value.code == 0
+    assert data["blocked"] is True
+    assert data["processes"] == [
+        {"pid": 303, "name": "node.exe", "cmdline": "node.exe n8n start"}
+    ]
+    assert data["managed_node_processes"] == 1
+
 
 
 def test_main_exempts_gateway_chain_but_keeps_other_holders(monkeypatch, capsys):
