@@ -2245,6 +2245,80 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
         logger.warning("mark_job_run: job_id %s not found, skipping save", job_id)
 
 
+# Delivery-failure signatures that are *persistent transport* failures rather
+# than transient blips. A 404 "Unknown Channel" is the canonical case: the
+# configured delivery target (often an ephemeral Discord/Slack thread spawned
+# when the job was created) no longer resolves. Logging it once is fine;
+# logging it 57 times while the job keeps "Last run: ok" is a silent failure of
+# observability — the agent's output is discarded on the wire and nobody is
+# told. These jobs MUST surface as degraded so an operator notices.
+_DELIVERY_DEGRADED_SIGNATURES = (
+    "unknown channel",          # Discord API 404 code 10003
+    "10003",                    # Discord error code for "Unknown Channel"
+    "unknown thread",           # Slack thread gone
+    "thread not found",
+    "invalid webhook",          # Discord deleted webhook
+    "channel_not_found",        # Telegram/Slack variants
+    "recipient not found",
+)
+
+
+def classify_delivery_failure(delivery_error: Optional[str]) -> str:
+    """Classify a delivery error string as ``"persistent"`` or ``"transient"``.
+
+    ``"persistent"`` means the delivery target itself is unreachable and will
+    keep failing every tick (e.g. a dead thread/channel id) — the job should be
+    marked degraded so the failure is observable. ``"transient"`` means a
+    recoverable condition (rate limit, timeout, network blip) that a later tick
+    may succeed on.
+    """
+    if not delivery_error:
+        return "transient"
+    low = delivery_error.lower()
+    if any(sig in low for sig in _DELIVERY_DEGRADED_SIGNATURES):
+        return "persistent"
+    return "transient"
+
+
+def mark_job_degraded(
+    job_id: str,
+    delivery_error: str,
+    *,
+    classification: Optional[str] = None,
+) -> None:
+    """Flag a cron job as delivery-degraded after a *persistent* transport failure.
+
+    Persists the failure into the job record (``last_delivery_error`` plus a new
+    ``delivery_degraded`` flag + ``delivery_degraded_at`` timestamp) so a dead
+    delivery target is no longer invisible: ``cron list`` / the dashboard show
+    it, and an operator can fix the target. The job keeps running and stays
+    enabled (the agent work still succeeds) — degradation is about delivery
+    observability, not about disabling the job. ``state`` is left untouched
+    (recurring jobs must never be silently disabled; see mark_job_run).
+
+    ``_deliver_result`` calls this. Re-entrancy-safe: it funnels through the
+    same ``_jobs_lock()`` RLock as every other cron mutation.
+    """
+    if classification is None:
+        classification = classify_delivery_failure(delivery_error)
+    with _jobs_lock():
+        jobs = load_jobs()
+        for job in jobs:
+            if job.get("id") != job_id:
+                continue
+            job["last_delivery_error"] = delivery_error
+            job["delivery_degraded"] = True
+            job["delivery_degraded_class"] = classification
+            job["delivery_degraded_at"] = _hermes_now().isoformat()
+            save_jobs(jobs)
+            logger.warning(
+                "Job '%s' (%s) marked delivery-degraded [%s]: %s",
+                job.get("name", job_id), job_id, classification, delivery_error,
+            )
+            return
+    logger.warning("mark_job_degraded: job_id %s not found, skipping", job_id)
+
+
 def _write_wedged_oneshot_diagnostic(job: Dict[str, Any]) -> None:
     """Leave an operator-visible trace when a wedged one-shot is removed.
 

@@ -427,7 +427,16 @@ _LEGACY_HOME_TARGET_ENV_VARS = {
     "QQBOT_HOME_CHANNEL": "QQ_HOME_CHANNEL",
 }
 
-from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_runs, claim_dispatch, heartbeat_run_claim
+from cron.jobs import (  # noqa: E402
+    get_due_jobs,
+    mark_job_run,
+    save_job_output,
+    advance_next_runs,
+    claim_dispatch,
+    heartbeat_run_claim,
+    mark_job_degraded,
+    classify_delivery_failure,
+)
 from cron.executions import create_execution, finish_execution, mark_execution_running
 
 # Sentinel: when a cron agent has nothing new to report, it can start its
@@ -2800,7 +2809,28 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
             )
 
     if delivery_errors:
-        return "; ".join(delivery_errors)
+        joined = "; ".join(delivery_errors)
+        # Degradation rule (#t_6887f404): a *persistent* delivery failure — the
+        # canonical case being a Discord/Slack 404 "Unknown Channel" where the
+        # configured target (often an ephemeral thread spawned when the job was
+        # created) has stopped resolving — must surface as degraded, not just
+        # log an ERROR and let the job keep reporting "Last run: ok". 57 such
+        # silent failures shipped to a dead thread before anyone noticed. We
+        # persist the failure into the job record so `cron list` / the dashboard
+        # show it. The job is NOT disabled (the agent work still succeeds) — only
+        # its delivery is flagged, so an operator can repoint the target.
+        classification = classify_delivery_failure(joined)
+        if classification == "persistent":
+            try:
+                mark_job_degraded(
+                    job["id"], joined, classification=classification
+                )
+            except Exception as deg_err:
+                logger.debug(
+                    "Job '%s': failed to persist delivery-degraded flag: %s",
+                    job.get("id", "?"), deg_err,
+                )
+        return joined
     return None
 
 
