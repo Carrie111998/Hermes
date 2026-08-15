@@ -2266,7 +2266,37 @@ def _is_channel_dm_topic(
     return is_channel
 
 
-def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Optional[str]:
+def _cron_delivery_metadata(job: dict, run_metadata: Optional[dict] = None) -> dict:
+    """Build the structured cron context exposed to live platform adapters."""
+    if run_metadata is None:
+        run_metadata = job.get("_cron_run_metadata")
+    metadata = {
+        "job_id": job["id"],
+        "job_name": job.get("name") or job["id"],
+        "schedule": job.get("schedule"),
+        "deliver": job.get("deliver", "local"),
+    }
+    origin = _resolve_origin(job)
+    if origin:
+        metadata["origin"] = {
+            key: origin[key]
+            for key in ("platform", "chat_id", "thread_id")
+            if origin.get(key) is not None
+        }
+    for key in ("status", "ran_at", "response_id", "session_id", "model", "provider"):
+        value = (run_metadata or {}).get(key)
+        if value is not None:
+            metadata[key] = value
+    return metadata
+
+
+def _deliver_result(
+    job: dict,
+    content: str,
+    adapters=None,
+    loop=None,
+    run_metadata: Optional[dict] = None,
+) -> Optional[str]:
     """
     Deliver job output to the configured target(s) (origin chat, specific platform, etc.).
 
@@ -2583,10 +2613,13 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 route_metadata = {
                     "direct_messages_topic_id": str(thread_id),
                     "job_id": job["id"],
+                    "cron": _cron_delivery_metadata(job, run_metadata),
                 }
                 # Media metadata mirrors the text routing so attachments land in
                 # the same DM topic instead of the General lane (#22773).
-                media_metadata = {"direct_messages_topic_id": str(thread_id)}
+                media_metadata = {
+                    "direct_messages_topic_id": str(thread_id),
+                }
             else:
                 # Forum-style topic (private chat / supergroup) or non-topic
                 # target: route via message_thread_id (#52060).  Put thread_id in
@@ -2597,7 +2630,10 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 # anchor, so the metadata key bypasses that check and lets the
                 # adapter route via a plain message_thread_id.
                 route_thread_id = str(thread_id) if thread_id is not None else None
-                route_metadata = {"job_id": job["id"]}
+                route_metadata = {
+                    "job_id": job["id"],
+                    "cron": _cron_delivery_metadata(job, run_metadata),
+                }
                 if route_thread_id:
                     route_metadata["thread_id"] = route_thread_id
                 media_metadata = {"thread_id": thread_id} if thread_id else None
@@ -5344,6 +5380,13 @@ def run_job(
             )
 
         final_response = result.get("final_response", "") or ""
+        agent._cron_result_metadata = {
+            key: result[key]
+            for key in (
+                "response_id", "session_id", "model", "provider",
+            )
+            if result.get(key) is not None
+        }
         # Strip leaked placeholder text that upstream may inject on empty completions.
         if final_response.strip() == "(No response generated)":
             final_response = ""
@@ -5877,6 +5920,7 @@ def _run_one_job_body(
         # below once delivery is done. Defense-in-depth alongside the
         # interpreter-shutdown guard in _deliver_result.
         _deferred_agents: list = []
+        run_metadata: dict = {}
         try:
             if fire_claim_lost is None:
                 success, output, final_response, error = run_job(
@@ -5902,6 +5946,19 @@ def _run_one_job_body(
             raise
         finally:
             reset_secret_scope(_scope_token)
+
+        # This body invokes run_job exactly once, so its (sole) deferred agent
+        # owns the primary conversation response. Delegated agents run inline
+        # and are never added to this teardown holder; choose the first entry
+        # defensively if a future caller contributes more than one.
+        if _deferred_agents:
+            _agent_metadata = getattr(
+                _deferred_agents[0], "_cron_result_metadata", None
+            )
+            if isinstance(_agent_metadata, dict):
+                run_metadata.update(_agent_metadata)
+        run_metadata["status"] = "completed" if success else "failed"
+        run_metadata["ran_at"] = _utcnow_iso_ms()
 
         if _fire_claim_ownership_lost():
             for _deferred_agent in _deferred_agents:
@@ -6052,7 +6109,7 @@ def _run_one_job_body(
                             raise _FireClaimLostDuringSideEffect
                         delivery_attempted = True
                         delivery_error = _deliver_result(
-                            job,
+                            {**job, "_cron_run_metadata": run_metadata},
                             deliver_content,
                             adapters=adapters,
                             loop=loop,
@@ -6191,7 +6248,13 @@ def _run_one_job_body(
             try:
                 delivery_attempted = True
                 delivery_error = _deliver_result(
-                    job,
+                    {
+                        **job,
+                        "_cron_run_metadata": {
+                            "status": "failed",
+                            "ran_at": _utcnow_iso_ms(),
+                        },
+                    },
                     _summarize_cron_failure_for_delivery(job, _err_text),
                     adapters=adapters,
                     loop=loop,

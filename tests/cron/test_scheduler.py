@@ -1,10 +1,12 @@
 """Tests for cron/scheduler.py — origin resolution, delivery routing, and error logging."""
 
+import asyncio
 import contextlib
 import itertools
 import json
 import logging
 import os
+from concurrent.futures import Future
 from unittest.mock import AsyncMock, patch, MagicMock
 
 import pytest
@@ -160,6 +162,126 @@ class TestResolveOrigin:
         """
         job = {"origin": non_dict_origin}
         assert _resolve_origin(job) is None
+
+
+class TestCronDeliveryMetadata:
+    def test_live_adapter_receives_structured_cron_run_metadata(self):
+        """Cron context must cross the scheduler-to-adapter boundary intact."""
+        from gateway.config import GatewayConfig, Platform, PlatformConfig
+
+        job = {
+            "id": "nightly-report",
+            "name": "Nightly report",
+            "schedule": {"kind": "cron", "expr": "0 9 * * *"},
+            "deliver": "origin",
+            "origin": {
+                "platform": "telegram",
+                "chat_id": "12345",
+                "thread_id": "77",
+                "chat_name": "Operations",
+            },
+        }
+        sent_metadata = []
+
+        class RecordingAdapter:
+            async def send(self, chat_id, content, metadata=None):
+                sent_metadata.append(metadata)
+                return {"success": True}
+
+        loop = MagicMock()
+        loop.is_running.return_value = True
+
+        def run_coro(coro, _loop):
+            future = Future()
+            try:
+                future.set_result(asyncio.run(coro))
+            except BaseException as exc:  # noqa: BLE001 - preserve future behavior
+                future.set_exception(exc)
+            return future
+
+        config = GatewayConfig(
+            platforms={Platform.TELEGRAM: PlatformConfig(enabled=True)}
+        )
+        run_metadata = {
+            "status": "completed",
+            "ran_at": "2026-08-15T12:00:00.000+00:00",
+            "response_id": "resp_123",
+            "session_id": "cron_nightly-report_20260815",
+            "model": "gpt-5.6",
+            "provider": "openai",
+        }
+
+        with patch("gateway.config.load_gateway_config", return_value=config), \
+             patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
+             patch("asyncio.run_coroutine_threadsafe", side_effect=run_coro):
+            assert _deliver_result(
+                job,
+                "The report is ready.",
+                adapters={Platform.TELEGRAM: RecordingAdapter()},
+                loop=loop,
+                run_metadata=run_metadata,
+            ) is None
+
+        assert sent_metadata == [{
+            "job_id": "nightly-report",
+            "thread_id": "77",
+            "cron": {
+                "job_id": "nightly-report",
+                "job_name": "Nightly report",
+                "schedule": {"kind": "cron", "expr": "0 9 * * *"},
+                "deliver": "origin",
+                "origin": {
+                    "platform": "telegram",
+                    "chat_id": "12345",
+                    "thread_id": "77",
+                },
+                **run_metadata,
+            },
+        }]
+
+    def test_delivery_uses_primary_deferred_agent_metadata(self, monkeypatch):
+        """A defensive multi-agent holder must retain the job's own response."""
+        import cron.scheduler as scheduler
+
+        primary_agent = MagicMock()
+        primary_agent._cron_result_metadata = {
+            "response_id": "resp_primary",
+            "session_id": "cron_primary",
+        }
+        secondary_agent = MagicMock()
+        secondary_agent._cron_result_metadata = {
+            "response_id": "resp_secondary",
+            "session_id": "cron_secondary",
+        }
+        delivered_metadata = []
+
+        def fake_run_job(_job, *, defer_agent_teardown, **_kwargs):
+            defer_agent_teardown.extend((primary_agent, secondary_agent))
+            return True, "output", "response", None
+
+        monkeypatch.setattr(
+            scheduler, "create_execution", lambda *_args, **_kwargs: {"id": "exec-1"}
+        )
+        monkeypatch.setattr(scheduler, "claim_dispatch", lambda _job_id: True)
+        monkeypatch.setattr(scheduler, "mark_execution_running", lambda _execution_id: None)
+        monkeypatch.setattr(scheduler, "run_job", fake_run_job)
+        monkeypatch.setattr(scheduler, "save_job_output", lambda *_args: "/tmp/output.md")
+        monkeypatch.setattr(
+            scheduler,
+            "_deliver_result",
+            lambda delivery_job, *_args, **_kwargs: (
+                delivered_metadata.append(delivery_job["_cron_run_metadata"]) or None
+            ),
+        )
+        monkeypatch.setattr(scheduler, "_teardown_cron_agent", lambda *_args: None)
+        monkeypatch.setattr(scheduler, "mark_job_run", lambda *_args, **_kwargs: True)
+        monkeypatch.setattr(scheduler, "finish_execution", lambda *_args, **_kwargs: None)
+
+        assert scheduler.run_one_job({"id": "primary", "deliver": "telegram"}) is True
+        assert delivered_metadata[0]["response_id"] == "resp_primary"
+        assert delivered_metadata[0]["session_id"] == "cron_primary"
+        assert delivered_metadata[0]["status"] == "completed"
+        assert "ran_at" in delivered_metadata[0]
 
 
 class TestResolveDeliveryTarget:
@@ -479,6 +601,7 @@ class TestDeliverResultWrapping:
                 f"Here is TTS\nMEDIA:{media_path}",
                 adapters={Platform.DISCORD: adapter},
                 loop=loop,
+                run_metadata={"status": "completed", "response_id": "resp_123"},
             )
 
         # Text should be sent without the MEDIA tag
@@ -486,11 +609,21 @@ class TestDeliverResultWrapping:
         text_sent = adapter.send.call_args[0][1]
         assert "MEDIA:" not in text_sent
         assert "Here is TTS" in text_sent
+        assert adapter.send.call_args.kwargs["metadata"]["cron"] == {
+            "job_id": "tts-job",
+            "job_name": "tts-job",
+            "schedule": None,
+            "deliver": "origin",
+            "origin": {"platform": "discord", "chat_id": "9876"},
+            "status": "completed",
+            "response_id": "resp_123",
+        }
 
         # Audio file should be sent as a voice attachment
         adapter.send_voice.assert_called_once()
         voice_call = adapter.send_voice.call_args
         assert voice_call[1]["audio_path"] == str(media_path)
+        assert voice_call.kwargs["metadata"] is None
 
 
 class TestDeliverResultErrorReturns:
@@ -563,6 +696,33 @@ class TestRunJobSessionPersistence:
         assert call_args[0][1] == "cron_complete"
         fake_db.close.assert_called_once()
         mock_agent.close.assert_called_once()
+
+    def test_run_job_keeps_response_context_for_deferred_delivery(self, tmp_path):
+        job = {"id": "response-context", "name": "test", "prompt": "hello"}
+
+        with self._run_job_patches(tmp_path) as (_, mock_agent_cls):
+            mock_agent = mock_agent_cls.return_value
+            mock_agent.run_conversation.return_value = {
+                "final_response": "ok",
+                "response_id": "resp_123",
+                "session_id": "cron_response-context_20260815",
+                "model": "gpt-5.6",
+                "provider": "openai",
+            }
+            deferred_agents = []
+            success, _, _, error = run_job(
+                job, defer_agent_teardown=deferred_agents
+            )
+
+        assert success is True
+        assert error is None
+        assert deferred_agents == [mock_agent]
+        assert mock_agent._cron_result_metadata == {
+            "response_id": "resp_123",
+            "session_id": "cron_response-context_20260815",
+            "model": "gpt-5.6",
+            "provider": "openai",
+        }
 
 
     @contextlib.contextmanager
@@ -2555,4 +2715,3 @@ class TestSetCronSessionTitle:
         out = _set_cron_session_title(db, "sess-1", "Nightly Synthesis")
         assert out == "Nightly Synthesis #2"
         db.get_next_title_in_lineage.assert_called_once_with("Nightly Synthesis")
-
