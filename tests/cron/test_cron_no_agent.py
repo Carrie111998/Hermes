@@ -12,10 +12,49 @@ Covers:
 from __future__ import annotations
 
 import json
+import os
+import pathlib
+import shutil
 import subprocess
 from unittest.mock import patch
 
 import pytest
+
+
+def _has_working_bash() -> bool:
+    """True when bash can actually execute a script given a Windows path.
+
+    ``shutil.which("bash")`` alone is not enough on Windows:
+    - the WindowsApps shim hands off to WSL, which mangles Windows paths
+      (``C:\\...`` loses its backslashes) and exits 127 — see #62514;
+    - Git Bash handles Windows paths fine.
+
+    Probe by running a real script file through bash and requiring its
+    stdout to come back (see #86830).
+    """
+    import os
+    import tempfile
+
+    bash = shutil.which("bash")
+    if not bash:
+        return False
+    probe = pathlib.Path(tempfile.gettempdir()) / f"hermes_bash_probe_{os.getpid()}.sh"
+    try:
+        probe.write_text("echo PROBE_123\n", encoding="utf-8")
+        result = subprocess.run(
+            [bash, str(probe)], capture_output=True, text=True, timeout=10
+        )
+        return result.returncode == 0 and "PROBE_123" in result.stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    finally:
+        try:
+            probe.unlink()
+        except OSError:
+            pass
+
+
+_HAS_WORKING_BASH = _has_working_bash()
 
 
 @pytest.fixture
@@ -88,6 +127,10 @@ def test_cronjob_tool_create_no_agent_without_script_errors(hermes_env):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.skipif(
+    not _HAS_WORKING_BASH,
+    reason="no working bash (WindowsApps shim does not count)",
+)
 def test_run_job_no_agent_success_returns_script_stdout(hermes_env):
     """Happy path: script exits 0 with output, delivered verbatim."""
     from cron.jobs import create_job
@@ -106,6 +149,10 @@ def test_run_job_no_agent_success_returns_script_stdout(hermes_env):
     assert "RAM 92% on host" in doc
 
 
+@pytest.mark.skipif(
+    not _HAS_WORKING_BASH,
+    reason="no working bash (WindowsApps shim does not count)",
+)
 def test_run_job_no_agent_reloads_dotenv_before_script(hermes_env, monkeypatch):
     """Regression: a standalone cron tick process starts without home-channel
     vars in its environment, and the agent path's per-run dotenv reload never
