@@ -191,8 +191,10 @@ def _sql_session_last_active(alias: str = "s") -> str:
     ``last_activity_at`` can lag ``MAX(messages.timestamp)``.
     """
     msg_max = (
-        f"(SELECT MAX({_sql_date_representable_timestamp('_act_m.timestamp')}) FROM messages _act_m "
-        f"WHERE _act_m.session_id = {alias}.id)"
+        f"(SELECT MAX(_act_m.timestamp) FROM messages _act_m "
+        f"WHERE _act_m.session_id = {alias}.id "
+        f"AND typeof(_act_m.timestamp) IN ('integer', 'real') "
+        f"AND _act_m.timestamp BETWEEN -{_JS_DATE_MAX_UNIX_SECONDS} AND {_JS_DATE_MAX_UNIX_SECONDS})"
     )
     return (
         f"COALESCE("
@@ -208,8 +210,10 @@ def _sql_session_last_active(alias: str = "s") -> str:
 def _sql_session_last_active_by_id(session_id_expr: str) -> str:
     """Same freshest-of expression keyed by a session-id SQL expression."""
     msg_max = (
-        f"(SELECT MAX({_sql_date_representable_timestamp('_act_m.timestamp')}) FROM messages _act_m "
-        f"WHERE _act_m.session_id = {session_id_expr})"
+        f"(SELECT MAX(_act_m.timestamp) FROM messages _act_m "
+        f"WHERE _act_m.session_id = {session_id_expr} "
+        f"AND typeof(_act_m.timestamp) IN ('integer', 'real') "
+        f"AND _act_m.timestamp BETWEEN -{_JS_DATE_MAX_UNIX_SECONDS} AND {_JS_DATE_MAX_UNIX_SECONDS})"
     )
     activity = (
         f"(SELECT {_sql_date_representable_timestamp('last_activity_at')} FROM sessions _act_s "

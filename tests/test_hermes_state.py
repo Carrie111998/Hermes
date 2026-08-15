@@ -12,6 +12,7 @@ import pytest
 import hermes_state
 from agent.session_activity import ActivityProvenance
 from hermes_state import SCHEMA_SQL, SCHEMA_VERSION, SessionDB
+from hermes_state_common import _sql_session_last_active, _sql_session_last_active_by_id
 
 
 class _NoFtsCursor(sqlite3.Cursor):
@@ -2042,6 +2043,25 @@ class TestListSessionsRich:
             db._conn.commit()
 
         assert db.list_sessions_rich()[0]["last_active"] == message_at
+
+    @pytest.mark.parametrize(
+        "last_active_sql",
+        [_sql_session_last_active("s"), _sql_session_last_active_by_id("s.id")],
+    )
+    def test_message_recency_uses_timestamp_range_index(self, db, last_active_sql):
+        """Date-safe recency helpers keep the session/timestamp index fast path."""
+        db.create_session("s1", "cli")
+        db.append_message("s1", "user", "hello")
+
+        plan = db._conn.execute(
+            "EXPLAIN QUERY PLAN "
+            f"SELECT {last_active_sql} FROM sessions s WHERE s.id = ?",
+            ("s1",),
+        ).fetchall()
+        detail = " ".join(row[-1] for row in plan)
+
+        assert "idx_messages_session (" in detail, detail
+        assert "timestamp>?" in detail and "timestamp<?" in detail, detail
 
     def test_last_active_is_none_when_only_started_at_is_outside_the_date_range(self, db):
         """A session without any renderable recency candidate exposes no timestamp."""
