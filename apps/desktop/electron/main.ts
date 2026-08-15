@@ -1106,7 +1106,8 @@ function registerMediaProtocol() {
         bypassCustomProtocolHandlers: true,
         credentials: 'omit',
         headers,
-        method
+        method,
+        redirect: 'error'
       }),
     fetchRemoteWithCookies: (url, headers, method) => {
       const oauthSession = getOauthSession()
@@ -1119,7 +1120,8 @@ function registerMediaProtocol() {
         bypassCustomProtocolHandlers: true,
         credentials: 'include',
         headers,
-        method
+        method,
+        redirect: 'error'
       })
     },
     resolveLocalFile: async filePath => {
