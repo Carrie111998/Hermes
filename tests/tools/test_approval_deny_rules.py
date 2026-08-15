@@ -68,6 +68,15 @@ class TestMatchUserDenyRule:
             "VAR=1 git push --force origin main",
             "env VAR=1 git push --force origin main",
             "sudo -u root git push --force origin main",
+            ">approval.log git push --force origin main",
+            "2>/dev/null git push --force origin main",
+            "VAR=1 2>/dev/null git push --force origin main",
+            "command -p git push --force origin main",
+            "exec -a deploy git push --force origin main",
+            "nohup -- git push --force origin main",
+            "setsid -f git push --force origin main",
+            "time -p git push --force origin main",
+            "coproc git push --force origin main",
             'cd repo && git pu""sh --force origin main',
         ],
     )
@@ -133,7 +142,16 @@ class TestMatchUserDenyRule:
                 "case x in outer) case y in inner) true ;; esac ;; "
                 "fallback) git push --force origin main ;; esac"
             ),
+            (
+                "case x in @(deploy|force)) "
+                "git push --force origin main ;; esac"
+            ),
+            (
+                "case x in +([[:alpha:]]|deploy)) "
+                "git push --force origin main ;; esac"
+            ),
             "if git push --force origin main; then true; fi",
+            "if true; then ${primary:-${fallback:-git}} push --force; fi",
         ],
     )
     def test_matches_after_reserved_word_transitions(
@@ -155,6 +173,16 @@ class TestMatchUserDenyRule:
             self, deny_config, command):
         deny_config(["git push --force*"])
         assert mod._match_user_deny_rule(command) is None
+
+    def test_nested_parameter_word_is_read_as_one_token(self):
+        command = "${primary:-${fallback:-git}} push --force"
+        start, end, word = mod._read_shell_syntax_word(command, 0)
+        assert (start, end) == (0, len("${primary:-${fallback:-git}}"))
+        assert word == "${primary:-${fallback:-git}}"
+
+    def test_command_query_option_does_not_execute_named_program(self, deny_config):
+        deny_config(["git push --force*"])
+        assert mod._match_user_deny_rule("command -v git push --force") is None
 
 
 class TestDenyBeatsYolo:
@@ -192,6 +220,28 @@ class TestDenyBeatsYolo:
 
         result = mod.check_dangerous_command(
             "for item in a b; do git push --force origin main; done", "local")
+        assert result["approved"] is False
+        assert result.get("user_deny") is True
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            ">approval.log git push --force origin main",
+            "VAR=1 2>/dev/null git push --force origin main",
+            "command -p git push --force origin main",
+            "coproc git push --force origin main",
+            (
+                "case x in @(deploy|force)) "
+                "git push --force origin main ;; esac"
+            ),
+        ],
+    )
+    def test_residual_shell_forms_deny_before_yolo(
+            self, deny_config, clean_env, monkeypatch, command):
+        deny_config(["git push --force*"])
+        monkeypatch.setattr(mod, "_YOLO_MODE_FROZEN", True)
+
+        result = mod.check_dangerous_command(command, "local")
         assert result["approved"] is False
         assert result.get("user_deny") is True
 
