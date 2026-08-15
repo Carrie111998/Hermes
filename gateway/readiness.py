@@ -41,6 +41,12 @@ def _unrepaired_corruption_marker(path: Path) -> bool:
     importing ``hermes_state``. Any failed attempt on the current
     fingerprint is enough to report degraded — waiting for the attempt
     budget to exhaust would keep the probe green while repair retries churn.
+
+    The ``size:mtime_ns`` fingerprint can false-match on filesystems with
+    coarse mtime granularity if a repair rewrites the file to the same size
+    within one timestamp tick — the probe then stays degraded until the next
+    successful write bumps the mtime. Acceptable: the failure mode is a
+    briefly pessimistic health signal, never a false green.
     """
     ledger_path = path.with_name(path.name + ".repair-attempts.json")
     try:

@@ -59,8 +59,6 @@ def test_collect_runtime_readiness_degrades_on_invalid_config_and_stopped_gatewa
     assert (home / "config.yaml").read_text(encoding="utf-8") == "model: [unterminated"
 
 
-
-
 def test_state_db_probe_degrades_on_unrepaired_corruption_ledger(tmp_path, monkeypatch):
     """A repair-attempts ledger matching the current file bytes must flip the
     state_db probe to degraded even though the schema page still reads fine
@@ -170,3 +168,45 @@ def test_state_db_probe_catches_sessions_root_page_corruption(tmp_path, monkeypa
     )
 
     assert result["checks"]["state_db"]["status"] == "degraded"
+
+
+def test_corruption_ledger_contract_parity_with_hermes_state(tmp_path, monkeypatch):
+    """Guard the cross-module contract: the probe hand-parses the sidecar
+    ledger that ``hermes_state`` writes (filename, ``fingerprint`` format,
+    ``failed_attempts`` key). Drive the REAL writer here so any schema change
+    in ``hermes_state`` fails this test instead of silently re-opening the
+    false-green gap this probe exists to close."""
+    import hermes_state
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    db_path = home / "state.db"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("CREATE TABLE probe (id INTEGER PRIMARY KEY)")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    def _probe_status() -> str:
+        result = collect_runtime_readiness(
+            configured_model="test/model",
+            runtime_status={"gateway_state": "running", "platforms": {}},
+            active_api_runs=0,
+        )
+        return result["checks"]["state_db"]["status"]
+
+    # Failed repair recorded by the real writer -> probe must degrade.
+    hermes_state._record_repair_outcome(db_path, repaired=False)
+    ledger_path = hermes_state._repair_ledger_path(db_path)
+    assert ledger_path.exists(), "writer no longer produces the sidecar ledger"
+    assert ledger_path == db_path.with_name(db_path.name + ".repair-attempts.json"), (
+        "ledger filename contract changed — update gateway/readiness.py"
+    )
+    assert _probe_status() == "degraded", (
+        "probe no longer recognises hermes_state's ledger schema — "
+        "the fingerprint/failed_attempts contract has drifted"
+    )
+
+    # Successful repair recorded by the real writer -> ledger cleared,
+    # probe must return to ok.
+    hermes_state._record_repair_outcome(db_path, repaired=True)
+    assert not ledger_path.exists()
+    assert _probe_status() == "ok"
