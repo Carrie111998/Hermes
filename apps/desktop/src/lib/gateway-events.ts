@@ -22,6 +22,7 @@ const UNSCOPED_STREAM_EVENT_TYPES = new Set([
   'browser.progress',
   'clarify.request',
   'error',
+  'mcp.setup.request',
   'message.complete',
   'message.delta',
   'message.interim',
@@ -67,6 +68,22 @@ export interface GatewayEventSessionRoute {
   drop: boolean
   nextUnscopedStreamSessionId: null | string
   sessionId: null | string
+}
+
+export function approvalReplaySessionId(
+  eventType: string | undefined,
+  activeSessionId: null | string,
+  routedSessionId: null | string
+): null | string {
+  if (eventType === 'gateway.ready') {
+    return activeSessionId
+  }
+
+  if (eventType === 'session.info') {
+    return routedSessionId
+  }
+
+  return null
 }
 
 /**
