@@ -213,6 +213,7 @@ export function SkillsView({ setStatusbarItemGroup: _setStatusbarItemGroup, ...p
     queryFn: getProfiles,
     staleTime: 60_000
   })
+
   const profiles = profilesData?.profiles ?? []
 
   const {
@@ -378,6 +379,7 @@ export function SkillsView({ setStatusbarItemGroup: _setStatusbarItemGroup, ...p
 
   async function handleToggleToolset(toolset: ToolsetInfo, enabled: boolean) {
     const scopedToolsetKey = [...TOOLSETS_QUERY_KEY, scopeKey]
+
     const writeScoped = (fn: (cur: ToolsetInfo[] | undefined) => ToolsetInfo[] | undefined) =>
       queryClient.setQueryData<ToolsetInfo[]>(scopedToolsetKey, prev => fn(prev) ?? prev)
 

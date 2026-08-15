@@ -139,6 +139,9 @@ describe('SkillsView toolset management', () => {
   it('scopes Tools config to the profile chosen in the selector', async () => {
     // Two profiles → the "Configuring:" selector renders. Picking a non-active
     // profile must re-fetch toolsets scoped to THAT profile.
+    // jsdom's scrollIntoView is missing/non-functional; Radix Select calls it
+    // on open. Force a stub so the dropdown can render in the test env.
+    Element.prototype.scrollIntoView = vi.fn()
     getProfiles.mockResolvedValue({
       profiles: [
         { name: 'default', is_default: true },

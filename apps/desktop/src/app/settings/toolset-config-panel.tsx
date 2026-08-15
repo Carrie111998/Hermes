@@ -322,7 +322,7 @@ function PostSetupRunner({ toolset, postSetupKey, installed = false, onComplete,
         setRunning(false)
       }
     }
-  }, [toolset, postSetupKey, onComplete, copy])
+  }, [toolset, postSetupKey, onComplete, copy, profile])
 
   return (
     <div className="grid gap-2 rounded-lg bg-background/55 p-2.5">
@@ -862,8 +862,8 @@ export function ToolsetConfigPanel({ toolset, onConfiguredChange, profile }: Too
                     installed={provider.status === 'ready'}
                     onComplete={() => void refresh()}
                     postSetupKey={provider.post_setup}
-                    toolset={toolset}
                     profile={profile}
+                    toolset={toolset}
                   />
                 )}
                 {toolset === 'tts' && provider.tts_provider && (
@@ -875,9 +875,9 @@ export function ToolsetConfigPanel({ toolset, onConfiguredChange, profile }: Too
                 {MODEL_CATALOG_TOOLSETS.has(toolset) && (
                   <ModelCatalogPicker
                     isActiveBackend={provider.is_active || cfg?.active_provider === provider.name}
+                    profile={profile}
                     providerName={provider.name}
                     toolset={toolset}
-                    profile={profile}
                   />
                 )}
               </div>
