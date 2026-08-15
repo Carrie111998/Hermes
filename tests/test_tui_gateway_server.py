@@ -11493,6 +11493,79 @@ def test_session_not_running_before_agent_ready_emits_error_event(monkeypatch):
         server._sessions.pop("sid", None)
 
 
+def test_interrupt_never_waits_on_the_deferred_agent_build(monkeypatch):
+    """Stop must resolve its session without blocking on the in-flight build.
+
+    `_wait_agent` sits on `agent_ready` for up to 30s — the same Event the build
+    being cancelled has not set yet — and `session.interrupt` is not in
+    `_LONG_HANDLERS`, so it runs inline on the socket reader thread and takes
+    every RPC queued behind it down with it. Counting the call pins that
+    directly and fails in milliseconds, where the end-to-end tests above can
+    only catch a regression by actually spending the 30 seconds.
+    """
+    seen = {"wait": 0}
+    session = _session(running=True)
+    session["agent"] = None
+    session["agent_ready"] = threading.Event()
+    server._sessions["sid-nowait"] = session
+    monkeypatch.setattr(
+        server, "_wait_agent", lambda *_args, **_kwargs: seen.__setitem__("wait", seen["wait"] + 1)
+    )
+    monkeypatch.setattr(server, "_start_agent_build", lambda *_args: None)
+
+    try:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "session.interrupt",
+                "params": {"session_id": "sid-nowait"},
+            }
+        )
+        assert resp.get("result") == {"status": "interrupted"}, f"got error: {resp.get('error')}"
+        assert seen["wait"] == 0
+        # The flag the deferred waiter polls before it starts the turn.
+        assert session.get("_turn_cancel_requested") is True
+        # Stop must not have needed the build to finish to get there.
+        assert session["agent_ready"].is_set() is False
+    finally:
+        server._sessions.pop("sid-nowait", None)
+
+
+def test_interrupt_recovers_a_session_whose_agent_build_failed(monkeypatch):
+    """A failed build must not leave Stop as the one thing that cannot run.
+
+    `_wait_agent` returns 5032 for a set `agent_ready` too, whenever
+    `agent_error` is populated — so once a build failed, `session.interrupt`
+    errored out before reaching the cancel/`running` cleanup below it. Nothing
+    else clears `running` on that path, so the session stayed busy: every later
+    prompt.submit hit the busy branch and queued, with no way back short of a
+    backend restart. This is the same permanent-busy trap the compute-host
+    branch guards against, reached through the in-process branch instead.
+    """
+    session = _session(running=True)
+    session["agent"] = None
+    ready = threading.Event()
+    ready.set()  # the build finished — it just finished by failing
+    session["agent_ready"] = ready
+    session["agent_error"] = "provider metadata fetch failed"
+    server._sessions["sid-failed"] = session
+    monkeypatch.setattr(server, "_start_agent_build", lambda *_args: None)
+
+    try:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "session.interrupt",
+                "params": {"session_id": "sid-failed"},
+            }
+        )
+        assert resp.get("result") == {"status": "interrupted"}, f"got error: {resp.get('error')}"
+        assert session.get("_turn_cancel_requested") is True
+        assert session["running"] is False
+    finally:
+        server._sessions.pop("sid-failed", None)
+
+
 def test_slow_agent_build_delivers_prompt_instead_of_timing_out(monkeypatch):
     """#63078 server-side half: a deferred build slower than the old 30s
     ``_wait_agent`` cliff must NOT eat the first message. The patient wait
