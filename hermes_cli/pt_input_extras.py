@@ -126,6 +126,79 @@ def install_cmd_backspace_alias() -> int:
     return changed
 
 
+def install_ctrl_k_modify_other_keys_alias() -> int:
+    """Map Ctrl+K's Kitty CSI-u / xterm modifyOtherKeys byte sequences to
+    the existing ``Keys.ControlK`` (kill-to-end-of-line) binding.
+
+    Sequences mapped:
+      - "\\x1b[107;5u"    — Kitty keyboard protocol / CSI-u, modifier=5 (Ctrl)
+      - "\\x1b[27;5;107~" — xterm modifyOtherKeys=2, modifier=5 (Ctrl)
+
+    Only the plain (unmodified) \\x0b byte is mapped to Keys.ControlK by
+    stock prompt_toolkit. With modifyOtherKeys/CSI-u active (tmux over
+    SSH, Ghostty, iTerm2, Kitty, and others), that plain byte is never
+    sent for Ctrl+K -- the raw CSI sequence arrives instead and, being
+    unmapped, is split into literal characters by Vt100Parser and
+    inserted verbatim into the buffer (e.g. "?[27;5;107~"). Unlike
+    Shift+Space below, a direct mapping to Keys.ControlK is sufficient
+    here: the existing kill-line binding fires normally once the
+    sequence resolves to that key (issue #86866).
+
+    Returns the number of sequences whose mapping was changed.
+    """
+    try:
+        from prompt_toolkit.input.ansi_escape_sequences import ANSI_SEQUENCES
+        from prompt_toolkit.keys import Keys
+    except Exception:
+        return 0
+
+    changed = 0
+    for seq in ("\x1b[107;5u", "\x1b[27;5;107~"):
+        if ANSI_SEQUENCES.get(seq) != Keys.ControlK:
+            ANSI_SEQUENCES[seq] = Keys.ControlK
+            changed += 1
+    return changed
+
+
+def install_shift_space_alias() -> int:
+    """Map Shift+Space's Kitty CSI-u / xterm modifyOtherKeys byte
+    sequences to ``Keys.ControlSpace`` -- an otherwise-unused
+    prompt_toolkit key that Hermes does not bind anywhere else --
+    repurposed here as a token this module's caller (cli.py) binds a
+    dedicated handler to, inserting a literal space.
+
+    Sequences mapped:
+      - "\\x1b[32;2u"    — Kitty keyboard protocol / CSI-u, modifier=2 (Shift)
+      - "\\x1b[27;2;32~" — xterm modifyOtherKeys=2, modifier=2 (Shift)
+
+    A direct mapping to plain " " (space) is NOT sufficient here, unlike
+    the Ctrl+K alias above: ``Vt100Parser._call_handler`` passes the full
+    raw matched prefix as the resulting KeyPress's ``data`` payload, and
+    prompt_toolkit's default self-insert binding inserts ``event.data``
+    -- so mapping to a plain space character would still insert the raw
+    CSI bytes verbatim, not an actual space (verified under a real pty).
+    A key that has its own explicit binding is required instead; see the
+    ``Keys.ControlSpace`` handler registered in cli.py's KeyBindings
+    setup, which calls ``event.current_buffer.insert_text(" ")``
+    directly rather than relying on self-insert's data-echo behavior
+    (issue #86866).
+
+    Returns the number of sequences whose mapping was changed.
+    """
+    try:
+        from prompt_toolkit.input.ansi_escape_sequences import ANSI_SEQUENCES
+        from prompt_toolkit.keys import Keys
+    except Exception:
+        return 0
+
+    changed = 0
+    for seq in ("\x1b[32;2u", "\x1b[27;2;32~"):
+        if ANSI_SEQUENCES.get(seq) != Keys.ControlSpace:
+            ANSI_SEQUENCES[seq] = Keys.ControlSpace
+            changed += 1
+    return changed
+
+
 def install_ignored_terminal_sequences() -> int:
     """Map terminal-emitted noise sequences to ``Keys.Ignore`` so they
     are consumed by the VT100 parser before they reach key bindings or

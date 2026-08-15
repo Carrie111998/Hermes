@@ -80,14 +80,18 @@ try:
     from hermes_cli.pt_input_extras import (
         install_cmd_backspace_alias,
         install_ctrl_enter_alias,
+        install_ctrl_k_modify_other_keys_alias,
         install_ignored_terminal_sequences,
         install_shift_enter_alias,
+        install_shift_space_alias,
     )
     install_shift_enter_alias()
     install_ctrl_enter_alias()
     install_cmd_backspace_alias()
     install_ignored_terminal_sequences()
-    del install_shift_enter_alias, install_ctrl_enter_alias, install_cmd_backspace_alias, install_ignored_terminal_sequences
+    install_ctrl_k_modify_other_keys_alias()
+    install_shift_space_alias()
+    del install_shift_enter_alias, install_ctrl_enter_alias, install_cmd_backspace_alias, install_ignored_terminal_sequences, install_ctrl_k_modify_other_keys_alias, install_shift_space_alias
 except Exception:
     pass
 import threading
@@ -16542,6 +16546,26 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             except Exception:
                 pass
             return None
+
+        from prompt_toolkit.keys import Keys as _ShiftSpaceKeys
+
+        @kb.add(_ShiftSpaceKeys.ControlSpace, eager=True)
+        def handle_shift_space_alias(event):
+            """Insert a literal space for the Shift+Space alias registered by
+            install_shift_space_alias() in hermes_cli.pt_input_extras.
+
+            That function maps the Kitty CSI-u / xterm modifyOtherKeys byte
+            sequences for Shift+Space to Keys.ControlSpace (an otherwise
+            unused prompt_toolkit key) at the VT100-parser level. A direct
+            ANSI_SEQUENCES mapping to a plain space character is not
+            sufficient: Vt100Parser._call_handler passes the full raw
+            matched prefix as the resulting KeyPress's `data`, and stock
+            self-insert would echo that raw payload (e.g. "\\x1b[27;2;32~")
+            verbatim rather than a space. This binding sidesteps self-insert
+            entirely and inserts the intended character directly (issue
+            #86866).
+            """
+            event.current_buffer.insert_text(" ")
 
         def handle_enter(event):
             """Handle Enter key - submit input.
