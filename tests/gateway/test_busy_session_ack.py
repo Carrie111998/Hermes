@@ -650,11 +650,12 @@ class TestBusySessionAck:
         runner.adapters[event.source.platform] = adapter
 
         # Mock the drain-specific methods
-        runner._queue_during_drain_enabled = lambda: False
+        runner._queue_during_drain_enabled = MagicMock(return_value=False)
         runner._status_action_gerund = lambda: "restarting"
 
         result = await runner._handle_active_session_busy_message(event, sk)
         assert result is True
+        runner._queue_during_drain_enabled.assert_called_once_with("interrupt")
 
         call_kwargs = adapter._send_with_retry.call_args
         content = call_kwargs.kwargs.get("content", "")

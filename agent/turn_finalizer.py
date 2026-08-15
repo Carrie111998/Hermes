@@ -324,6 +324,15 @@ def finalize_turn(
         _cleanup_errors.append(f"persist_session: {_persist_err}")
         logger.error("finalize_turn: _persist_session failed: %s", _persist_err, exc_info=True)
 
+    # The gateway owns a separate in-memory history projection. Keep the
+    # agent-side canonical working transcript available even when finalization
+    # reports a cleanup error, so a crashed turn cannot make the next prompt
+    # resume from the pre-turn snapshot.
+    try:
+        agent._session_messages = messages
+    except Exception:
+        pass
+
     # ── Turn-exit diagnostic log ─────────────────────────────────────
     # Always logged at INFO so agent.log captures WHY every turn ended.
     # When the last message is a tool result (agent was mid-work), log

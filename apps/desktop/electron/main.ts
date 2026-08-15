@@ -3424,15 +3424,15 @@ function writeDefaultProjectDir(dir) {
 }
 
 function createPythonBackend(root, label, backendArgs, options: any = {}) {
-  const python = findPythonForRoot(root)
+  const venvRoot = [path.join(root, '.venv'), path.join(root, 'venv')].find((candidate) =>
+    fileExists(getVenvPython(candidate))
+  ) || path.join(root, 'venv')
+  const venvPython = getVenvPython(venvRoot)
+  const command = fileExists(venvPython) ? venvPython : findPythonForRoot(root)
 
-  if (!python) {
+  if (!command) {
     return null
   }
-
-  const venvRoot = path.join(root, 'venv')
-  const venvPython = getVenvPython(venvRoot)
-  const command = IS_WINDOWS && fileExists(venvPython) ? venvPython : python
 
   return {
     kind: 'python',

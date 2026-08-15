@@ -20,6 +20,7 @@ import {
   type StatusGroup,
   stopBackgroundProcess
 } from '@/store/composer-status'
+import { $goalsBySession, refreshSessionGoal } from '@/store/goals'
 import { $previewStatusBySession, dismissPreviewArtifact } from '@/store/preview-status'
 import { $threadScrolledUp } from '@/store/thread-scroll'
 import { openSessionInNewWindow } from '@/store/windows'
@@ -68,6 +69,7 @@ export function ComposerStatusStack({ queue, sessionId }: ComposerStatusStackPro
   const { t } = useI18n()
   const navigate = useNavigate()
   const itemsBySession = useStore($statusItemsBySession)
+  const goalsBySession = useStore($goalsBySession)
   const previewsBySession = useStore($previewStatusBySession)
   const scrolledUp = useStore($threadScrolledUp)
 
@@ -77,12 +79,14 @@ export function ComposerStatusStack({ queue, sessionId }: ComposerStatusStackPro
   )
 
   const previews = sessionId ? (previewsBySession[sessionId] ?? []) : []
+  const goal = sessionId ? goalsBySession[sessionId] : undefined
 
   // Seed from the registry on session open; event-driven refreshes (terminal /
   // process tool completions) live in use-message-stream.
   useEffect(() => {
     if (sessionId) {
       void refreshBackgroundProcesses(sessionId)
+      void refreshSessionGoal(sessionId).catch(() => undefined)
     }
   }, [sessionId])
 
@@ -122,6 +126,24 @@ export function ComposerStatusStack({ queue, sessionId }: ComposerStatusStackPro
   const previewBlock = <div className="px-1 py-0.5">{previewRows}</div>
 
   const sections: { key: string; node: ReactNode }[] = []
+
+  if (goal) {
+    sections.push({
+      key: 'goal',
+      node: (
+        <StatusSection
+          defaultCollapsed={false}
+          icon={<Codicon className="text-muted-foreground/70" name="target" size="0.8rem" />}
+          label={`Goal · ${goal.status} · ${goal.turnsUsed}/${goal.maxTurns}`}
+        >
+          <div className="px-2 py-1 text-sm text-muted-foreground">
+            <div className="text-foreground">{goal.goal}</div>
+            <div>{goal.outcome}{goal.nextAction ? ` · ${goal.nextAction}` : ''}</div>
+          </div>
+        </StatusSection>
+      )
+    })
+  }
 
   for (const group of groups) {
     sections.push({

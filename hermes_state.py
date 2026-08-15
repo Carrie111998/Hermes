@@ -7136,6 +7136,20 @@ class SessionDB:
             return None
         return row["value"] if isinstance(row, sqlite3.Row) else row[0]
 
+    def list_meta(self, prefix: str = "") -> Dict[str, str]:
+        """Read a bounded snapshot of metadata entries by key prefix."""
+        prefix = str(prefix or "")
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT key, value FROM state_meta WHERE key LIKE ? ORDER BY key",
+                (f"{prefix}%",),
+            ).fetchall()
+        return {
+            (row["key"] if isinstance(row, sqlite3.Row) else row[0]):
+            (row["value"] if isinstance(row, sqlite3.Row) else row[1])
+            for row in rows
+        }
+
     def set_meta(self, key: str, value: str) -> None:
         """Write a value to the state_meta key/value store."""
         def _do(conn):

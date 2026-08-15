@@ -78,20 +78,22 @@ class TestStuckLoopDetection:
         assert suspended == 0
         assert mock_entry.suspended is False
 
-    def test_clear_on_success(self, runner_with_home):
+    @pytest.mark.asyncio
+    async def test_clear_on_success(self, runner_with_home):
         runner, home = runner_with_home
         runner._increment_restart_failure_counts({"session:a", "session:b"})
-        runner._clear_restart_failure_count("session:a")
+        await runner._clear_restart_failure_count("session:a")
 
         path = home / runner._STUCK_LOOP_FILE
         counts = json.loads(path.read_text())
         assert "session:a" not in counts
         assert "session:b" in counts
 
-    def test_clear_removes_file_when_empty(self, runner_with_home):
+    @pytest.mark.asyncio
+    async def test_clear_removes_file_when_empty(self, runner_with_home):
         runner, home = runner_with_home
         runner._increment_restart_failure_counts({"session:a"})
-        runner._clear_restart_failure_count("session:a")
+        await runner._clear_restart_failure_count("session:a")
         assert not (home / runner._STUCK_LOOP_FILE).exists()
 
     def test_suspend_clears_file(self, runner_with_home):
@@ -107,9 +109,10 @@ class TestStuckLoopDetection:
         runner._suspend_stuck_loop_sessions()
         assert not (home / runner._STUCK_LOOP_FILE).exists()
 
-    def test_no_file_no_crash(self, runner_with_home):
+    @pytest.mark.asyncio
+    async def test_no_file_no_crash(self, runner_with_home):
         runner, home = runner_with_home
         # No file exists — should return 0 and not crash
         assert runner._suspend_stuck_loop_sessions() == 0
         # Clear on nonexistent file — should not crash
-        runner._clear_restart_failure_count("nonexistent")
+        await runner._clear_restart_failure_count("nonexistent")

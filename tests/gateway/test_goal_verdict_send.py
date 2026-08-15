@@ -74,6 +74,11 @@ def _make_runner_with_adapter(session_id: str = None):
     runner._running_agents_ts = {}
     runner._queued_events = {}
 
+    async def _inline_context_executor(func, *args):
+        return func(*args)
+
+    runner._run_in_executor_with_context = _inline_context_executor
+
     src = _make_source()
     # Default to a unique session_id so xdist parallel runs on the same worker
     # don't see each other's GoalManager state (DEFAULT_DB_PATH gets frozen at
@@ -119,7 +124,8 @@ async def test_goal_verdict_done_sent_via_adapter_send(hermes_home):
     assert len(adapter.sends) == 1, f"expected 1 send, got {len(adapter.sends)}: {adapter.sends}"
     msg = adapter.sends[0]
     assert msg["chat_id"] == "c1"
-    assert "Goal achieved" in msg["content"]
+    assert "waiting for authority" in msg["content"]
+    assert "completion evidence" in msg["content"]
     assert "the feature shipped" in msg["content"]
 
 
@@ -149,6 +155,74 @@ async def test_goal_verdict_continue_enqueues_continuation(hermes_home):
     assert "Continuing toward goal" in adapter.sends[0]["content"]
     # Continuation prompt enqueued for next turn
     assert adapter._pending_messages, "continuation prompt must be enqueued in pending_messages"
+
+
+@pytest.mark.asyncio
+async def test_fifo_rejection_retains_unenqueued_checkpoint(hermes_home, monkeypatch):
+    runner, adapter, session_entry, src = _make_runner_with_adapter()
+    from hermes_cli.goals import GoalManager
+
+    mgr = GoalManager(session_entry.session_id)
+    mgr.set("recover rejected enqueue")
+    monkeypatch.setattr(runner, "_enqueue_fifo", lambda *_args, **_kwargs: False)
+    with patch("hermes_cli.goals.judge_goal", return_value=("continue", "still needs work", False, None, False)):
+        await runner._post_turn_goal_continuation(
+            session_entry=session_entry,
+            source=src,
+            final_response="partial",
+        )
+        await asyncio.sleep(0.05)
+
+    state = GoalManager(session_entry.session_id).state
+    assert state.continuation_pending is True
+    assert "continuation_enqueued_at" not in state.migration
+    assert not adapter._pending_messages
+
+
+@pytest.mark.asyncio
+async def test_graph_failure_is_checkpointed_with_graph_identity(hermes_home):
+    runner, adapter, session_entry, src = _make_runner_with_adapter()
+    from hermes_cli.goals import GoalManager
+
+    mgr = GoalManager(session_entry.session_id)
+    mgr.set("graph work")
+    await runner._post_turn_goal_continuation(
+        session_entry=session_entry,
+        source=src,
+        final_response="partial graph output",
+        agent_result={
+            "graph_run_id": "graph-failed-1",
+            "graph_outcome": "failed",
+            "error": "subgraph failed",
+        },
+    )
+    state = GoalManager(session_entry.session_id).state
+    assert state.outcome == "CONTINUATION_REQUIRED"
+    assert state.checkpoint["graph_run_ids"] == ["graph-failed-1"]
+    assert state.checkpoint["stop_reason"] == "gateway turn ended without usable output"
+
+
+@pytest.mark.asyncio
+async def test_graph_cancellation_beats_automatic_continuation(hermes_home):
+    runner, adapter, session_entry, src = _make_runner_with_adapter()
+    from hermes_cli.goals import GoalManager
+
+    mgr = GoalManager(session_entry.session_id)
+    mgr.set("cancelled graph work")
+    await runner._post_turn_goal_continuation(
+        session_entry=session_entry,
+        source=src,
+        final_response="",
+        agent_result={
+            "graph_run_id": "graph-cancelled-1",
+            "graph_outcome": "cancelled",
+            "interrupted": True,
+        },
+    )
+    state = GoalManager(session_entry.session_id).state
+    assert state.outcome == "CANCELLED"
+    assert state.status == "paused"
+    assert not adapter._pending_messages
 
 
 @pytest.mark.asyncio

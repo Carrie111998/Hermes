@@ -287,8 +287,8 @@ class TestGoalManager:
         assert mgr2.state.goal == "do the thing"
         assert mgr2.is_active()
 
-    def test_evaluate_after_turn_done(self, hermes_home):
-        """Judge says done → status=done, no continuation."""
+    def test_evaluate_after_turn_done_requires_authority(self, hermes_home):
+        """Judge prose cannot complete a goal without verified evidence."""
         from hermes_cli import goals
         from hermes_cli.goals import GoalManager
 
@@ -298,10 +298,11 @@ class TestGoalManager:
         with patch.object(goals, "judge_goal", return_value=("done", "shipped", False, None, False)):
             decision = mgr.evaluate_after_turn("I shipped the feature.")
 
-        assert decision["verdict"] == "done"
+        assert decision["verdict"] == "waiting_for_authority"
         assert decision["should_continue"] is False
         assert decision["continuation_prompt"] is None
-        assert mgr.state.status == "done"
+        assert mgr.state.status == "active"
+        assert mgr.state.outcome == goals.WAITING_FOR_AUTHORITY
         assert mgr.state.turns_used == 1
 
     def test_evaluate_after_turn_continue_under_budget(self, hermes_home):

@@ -111,6 +111,7 @@ class TestResolveCommand:
         assert resolve_command("gateway").name == "platforms"
         assert resolve_command("set-home").name == "sethome"
         assert resolve_command("reload_mcp").name == "reload-mcp"
+        assert resolve_command("llm_pipeline").name == "llm-pipeline"
         assert resolve_command("codex_runtime").name == "codex-runtime"
         assert resolve_command("tasks").name == "agents"
 
@@ -261,6 +262,12 @@ class TestTelegramBotCommands:
         names = {name for name, _ in telegram_bot_commands()}
         assert "codex_runtime" in names
         assert "codex-runtime" not in names
+
+    def test_llm_pipeline_has_underscore_alias_for_telegram(self):
+        """Telegram autocomplete exposes /llm-pipeline as /llm_pipeline."""
+        names = {name for name, _ in telegram_bot_commands()}
+        assert "llm_pipeline" in names
+        assert "llm-pipeline" not in names
 
 
 class TestSlackSubcommandMap:

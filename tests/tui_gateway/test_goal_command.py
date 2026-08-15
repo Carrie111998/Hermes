@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import importlib
 import threading
+import uuid
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -34,7 +35,7 @@ def hermes_home(tmp_path, monkeypatch):
 
 
 @pytest.fixture()
-def server(hermes_home):
+def server(hermes_home, monkeypatch):
     with patch.dict(
         "sys.modules",
         {
@@ -43,6 +44,13 @@ def server(hermes_home):
         },
     ):
         mod = importlib.import_module("tui_gateway.server")
+        # The module may have been imported by another test before this fixture
+        # set HERMES_HOME. Repoint its cached home/config explicitly so this
+        # contract suite never reads the operator's live config or goal DB.
+        monkeypatch.setattr(mod, "_hermes_home", hermes_home)
+        mod._cfg_cache = None
+        mod._cfg_mtime = None
+        mod._cfg_path = None
         yield mod
         # Reset module-level session state without re-importing. importlib.reload
         # would re-register the module's atexit hooks (ThreadPoolExecutor
@@ -59,8 +67,8 @@ def server(hermes_home):
 
 @pytest.fixture()
 def session(server):
-    sid = "sid-test"
-    session_key = "tui-goal-session-1"
+    sid = f"sid-{uuid.uuid4().hex}"
+    session_key = f"tui-goal-session-{uuid.uuid4().hex}"
     s = {
         "session_key": session_key,
         "history": [],
@@ -77,6 +85,20 @@ def session(server):
 def _call(server, method, **params):
     handler = server._methods[method]
     return handler(1, params)
+
+
+def test_prompt_submit_surfaces_session_persistence_failure_before_kickoff(server, session, monkeypatch):
+    sid, _, state = session
+    started = []
+    monkeypatch.setattr(server, "_ensure_session_db_row", lambda _session: False)
+    monkeypatch.setattr(server, "_start_agent_build", lambda *_args, **_kwargs: started.append(True))
+
+    response = _call(server, "prompt.submit", session_id=sid, text="must not launch")
+
+    assert response["error"]["code"] == 5006
+    assert "persistence failed" in response["error"]["message"]
+    assert state["running"] is False
+    assert not started
 
 
 # ── command.dispatch /goal ────────────────────────────────────────────
@@ -122,6 +144,51 @@ def test_goal_set_returns_send_with_notice(server, session):
     assert mgr.state.status == "active"
 
 
+def test_goal_status_rpc_projects_canonical_goal_state_without_mutation(server, session):
+    """The desktop must hydrate from GoalManager/SessionDB, never status prose."""
+    sid, session_key, _ = session
+    _call(server, "command.dispatch", name="goal", arg="build a rocket", session_id=sid)
+
+    response = _call(server, "goal.status", session_id=sid)
+    projection = response["result"]
+
+    assert projection["exists"] is True
+    assert projection["session_id"] == sid
+    assert projection["session_key"] == session_key
+    assert projection["goal"] == "build a rocket"
+    assert projection["status"] == "active"
+    assert projection["outcome"] == "GOAL_ACTIVE"
+    assert projection["turns_used"] == 0
+    assert projection["max_turns"] == 20
+    assert projection["checkpoint_revision"] == 0
+    assert projection["continuation_pending"] is False
+    # Control-plane secrets/internal lifecycle state must not leak into UI.
+    assert "continuation_token" not in projection
+    assert "continuation_claimed_by" not in projection
+    assert "checkpoint" not in projection
+    assert "completion_evidence" not in projection
+
+    # Read-only projection: a fresh canonical manager observes identical state.
+    from hermes_cli.goals import GoalManager
+
+    state = GoalManager(session_key).state
+    assert state is not None
+    assert projection["goal_id"] == state.goal_id
+    assert projection["turns_used"] == state.turns_used
+
+
+def test_goal_status_rpc_reports_no_goal_without_creating_one(server, session):
+    sid, session_key, _ = session
+
+    response = _call(server, "goal.status", session_id=sid)
+
+    assert response["result"] == {
+        "exists": False,
+        "session_id": sid,
+        "session_key": session_key,
+    }
+
+
 def test_goal_pause_after_set(server, session):
     sid, session_key, _ = session
     _call(server, "command.dispatch", name="goal", arg="write a story", session_id=sid)
@@ -134,17 +201,85 @@ def test_goal_pause_after_set(server, session):
     assert GoalManager(session_key).state.status == "paused"
 
 
-def test_goal_resume_reactivates(server, session):
+def test_goal_resume_reactivates_and_returns_one_continuation_dispatch(server, session):
     sid, session_key, _ = session
     _call(server, "command.dispatch", name="goal", arg="write a story", session_id=sid)
     _call(server, "command.dispatch", name="goal", arg="pause", session_id=sid)
     r = _call(server, "command.dispatch", name="goal", arg="resume", session_id=sid)
-    assert r["result"]["type"] == "exec"
-    assert "resumed" in r["result"]["output"].lower()
+    result = r["result"]
+    assert result["type"] == "send"
+    assert "resumed" in result["notice"].lower()
+    assert result["message"].startswith("[Continuing toward your standing goal]")
 
     from hermes_cli.goals import GoalManager
 
-    assert GoalManager(session_key).state.status == "active"
+    state = GoalManager(session_key).state
+    assert state.status == "active"
+    assert state.continuation_pending is True
+    assert state.checkpoint_revision == 1
+
+
+def test_goal_compression_exhaustion_retries_once_without_spending_turn(server, session):
+    sid, session_key, state = session
+    _call(server, "command.dispatch", name="goal", arg="finish despite pressure", session_id=sid)
+
+    decision = server._plan_goal_compression_recovery(
+        state,
+        {"failed": True, "compression_exhausted": True},
+        status="error",
+        raw="",
+    )
+
+    from hermes_cli.goals import GoalManager
+
+    persisted = GoalManager(session_key).state
+    assert decision["should_continue"] is True
+    assert persisted.turns_used == 0
+    assert persisted.continuation_pending is True
+    assert persisted.checkpoint["stop_reason"] == "CONTEXT_COMPRESSION_EXHAUSTED"
+    assert state[server._GOAL_COMPRESSION_RECOVERY_ATTEMPTS]["attempts"] == 1
+
+
+def test_goal_compression_retry_bound_survives_gateway_restart(server, session):
+    sid, session_key, state = session
+    _call(server, "command.dispatch", name="goal", arg="bounded recovery", session_id=sid)
+    exhausted = {"failed": True, "compression_exhausted": True}
+
+    first = server._plan_goal_compression_recovery(
+        state, exhausted, status="error", raw=""
+    )
+    assert first["should_continue"] is True
+
+    from hermes_cli.goals import GoalManager
+
+    # The queued synthetic turn owns consumption. Simulate that admission,
+    # then drop process-local accounting as a gateway restart would.
+    assert GoalManager(session_key).start_continuation() is True
+    state.pop(server._GOAL_COMPRESSION_RECOVERY_ATTEMPTS, None)
+
+    second = server._plan_goal_compression_recovery(
+        state, exhausted, status="error", raw=""
+    )
+    persisted = GoalManager(session_key).state
+    assert second["should_continue"] is False
+    assert second["verdict"] == "compression_exhausted"
+    assert persisted.status == "paused"
+    assert persisted.turns_used == 0
+
+
+def test_successful_goal_turn_clears_process_local_compression_recovery(server, session):
+    _, _, state = session
+    state[server._GOAL_COMPRESSION_RECOVERY_ATTEMPTS] = {
+        "goal_id": "old-goal",
+        "attempts": 1,
+    }
+
+    decision = server._plan_goal_compression_recovery(
+        state, {"completed": True}, status="complete", raw="usable response"
+    )
+
+    assert decision is None
+    assert server._GOAL_COMPRESSION_RECOVERY_ATTEMPTS not in state
 
 
 def test_goal_clear_removes_active_goal(server, session):

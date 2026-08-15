@@ -113,9 +113,9 @@ class TestInterruptAutoPause:
         assert mgr.state.status == "active"
 
 
-class TestEmptyResponseSkip:
-    def test_empty_response_does_not_invoke_judge(self, hermes_home):
-        """Whitespace-only replies skip judging (transient failure guard)."""
+class TestEmptyResponseCheckpoint:
+    def test_empty_response_is_checkpointed_without_judge(self, hermes_home):
+        """Whitespace-only replies become a typed execution failure."""
         sid = f"sid-empty-{uuid.uuid4().hex}"
         cli, mgr = _make_cli_with_goal(sid)
         cli._last_turn_interrupted = False
@@ -130,12 +130,14 @@ class TestEmptyResponseSkip:
             )
             cli._maybe_continue_goal_after_turn()
 
-        # No continuation queued; goal still active (neither paused nor done).
-        assert cli._pending_input.empty()
+        # The failure is checkpointed and a bounded retry is queued.
+        assert not cli._pending_input.empty()
         assert mgr.state.status == "active"
+        assert mgr.state.outcome == "CONTINUATION_REQUIRED"
+        assert mgr.state.checkpoint is not None
 
-    def test_no_assistant_message_skipped(self, hermes_home):
-        """Conversation with zero assistant replies must not trip the judge."""
+    def test_no_assistant_message_is_checkpointed(self, hermes_home):
+        """Conversation with zero assistant replies is not silently ignored."""
         sid = f"sid-noassistant-{uuid.uuid4().hex}"
         cli, mgr = _make_cli_with_goal(sid)
         cli._last_turn_interrupted = False
@@ -149,8 +151,10 @@ class TestEmptyResponseSkip:
             )
             cli._maybe_continue_goal_after_turn()
 
-        assert cli._pending_input.empty()
+        assert not cli._pending_input.empty()
         assert mgr.state.status == "active"
+        assert mgr.state.outcome == "CONTINUATION_REQUIRED"
+        assert mgr.state.checkpoint is not None
 
 
 class TestHealthyTurnStillRuns:
@@ -179,7 +183,7 @@ class TestHealthyTurnStillRuns:
         assert "Continuing toward your standing goal" in queued
         assert mgr.state.status == "active"
 
-    def test_clean_response_marks_done_when_judge_says_done(self, hermes_home):
+    def test_clean_response_waits_for_completion_authority(self, hermes_home):
         sid = f"sid-done-{uuid.uuid4().hex}"
         cli, mgr = _make_cli_with_goal(sid)
         cli._last_turn_interrupted = False
@@ -194,7 +198,8 @@ class TestHealthyTurnStillRuns:
             cli._maybe_continue_goal_after_turn()
 
         assert cli._pending_input.empty()
-        assert mgr.state.status == "done"
+        assert mgr.state.status == "active"
+        assert mgr.state.outcome == "WAITING_FOR_AUTHORITY"
 
 
 class TestInterruptFlagLifecycle:

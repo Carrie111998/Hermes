@@ -109,8 +109,9 @@ class RiPipeline:
 
 # ── Phase 2: RiChatCompletionsTransport (universal) ───────────────
 #
-# Plugs into the chat_completion_helpers dispatch. Active when
-# HERMES_RI_PIPELINE=1. Provider-agnostic — works for any
+# Plugs into the chat_completion_helpers dispatch. Active by default when
+# the native extension is available and not runtime-disabled. Provider-
+# agnostic — works for any OpenAI-compatible provider.
 # OpenAI-compatible provider. Set HERMES_RI_PIPELINE_PROVIDERS to
 # a comma-separated whitelist to restrict (e.g. 'ollama-launch,deepseek').
 # Falls through to the stock httpx/openai path on any error.
@@ -127,19 +128,47 @@ def _should_use_ri_pipeline(agent) -> bool:
     Provider-agnostic — works for any OpenAI-compatible provider.
     Set HERMES_RI_PIPELINE=0 to disable, or HERMES_RI_PIPELINE_PROVIDERS
     to a comma-separated whitelist (e.g. 'ollama-launch,deepseek').
+    If no env whitelist is set, agent._ri_pipeline_enabled and
+    agent._ri_pipeline_providers from config.yaml determine eligibility.
     """
     if _os.environ.get("HERMES_RI_PIPELINE") == "0":
         return False
     if not _NATIVE_AVAILABLE:
         return False
 
-    whitelist = _os.environ.get("HERMES_RI_PIPELINE_PROVIDERS", "")
-    if whitelist:
-        allowed = {p.strip() for p in whitelist.split(",") if p.strip()}
-        return getattr(agent, "provider", "") in allowed
+    if not bool(getattr(agent, "_ri_pipeline_enabled", True)):
+        return False
 
-    # No whitelist — all providers eligible
+    whitelist = _os.environ.get("HERMES_RI_PIPELINE_PROVIDERS")
+    if whitelist:
+        allowed = _normalize_ri_pipeline_provider_list(whitelist)
+        return str(getattr(agent, "provider", "")).strip().lower() in allowed
+
+    config_whitelist = _normalize_ri_pipeline_provider_list(
+        getattr(agent, "_ri_pipeline_providers", [])
+    )
+    if config_whitelist:
+        return str(getattr(agent, "provider", "")).strip().lower() in config_whitelist
+
     return True
+
+
+def _normalize_ri_pipeline_provider_list(raw_providers):
+    """Normalize a provider whitelist input into a lowercase set."""
+    if raw_providers is None:
+        return set()
+    if isinstance(raw_providers, str):
+        values = raw_providers.split(",")
+    elif isinstance(raw_providers, (list, tuple, set)):
+        values = raw_providers
+    else:
+        return set()
+
+    return {
+        str(value).strip().lower()
+        for value in values
+        if str(value).strip()
+    }
 
 
 def ri_pipeline_chat_completion(agent, api_kwargs: dict):

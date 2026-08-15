@@ -13,6 +13,7 @@ import threading
 import time
 import types
 
+from hermes_cli import goals
 from tui_gateway import server
 
 
@@ -176,3 +177,22 @@ def test_drain_releases_running_on_dispatch_failure(monkeypatch):
     assert server._drain_queued_prompt("r1", "sid", session) is True
     # Failure must not leave the session wedged as running.
     assert session["running"] is False
+
+
+def test_goal_continuation_consumer_starts_once_and_rejects_replay(monkeypatch, tmp_path):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    goals._DB_CACHE.clear()
+    manager = goals.GoalManager("session-key")
+    manager.set("recover exactly once")
+    decision = manager.evaluate_after_turn(
+        "", turn_outcome=goals.EXECUTION_FAILED, turn_metadata={"reason": "provider stopped"}
+    )
+    prompt = decision["continuation_prompt"]
+    session = _session(session_key="session-key")
+
+    assert server._begin_goal_continuation_turn("runtime-id", session, prompt) is True
+    assert goals.GoalManager("session-key").state.continuation_pending is False
+    session["running"] = False
+    assert server._begin_goal_continuation_turn("runtime-id", session, prompt) is False

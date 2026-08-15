@@ -13,6 +13,7 @@ from __future__ import annotations
 from unittest.mock import MagicMock, patch
 
 import pytest
+from tui_gateway.server import _child_run_active as _canonical_child_run_active
 
 
 @pytest.fixture()
@@ -31,6 +32,14 @@ def server():
         import importlib
 
         mod = importlib.import_module("tui_gateway.server")
+        # This module is shared with the rest of the TUI test process; clean on
+        # entry as well as teardown so earlier relay tests cannot leak liveness.
+        mod._sessions.clear()
+        mod._pending.clear()
+        mod._answers.clear()
+        mod._child_mirrors.clear()
+        mod._active_child_runs.clear()
+        mod.__dict__["_child_run_active"] = _canonical_child_run_active
         yield mod
         mod._sessions.clear()
         mod._pending.clear()

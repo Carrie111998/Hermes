@@ -10,7 +10,7 @@ Usage (in agent_init or run_agent)::
 
     from agent.transports.ri_context_compressor import RiContextCompressor
     agent.context_compressor = RiContextCompressor(
-        token_budget=8000, name="ri-context-governor",
+        token_budget=8000, name="legacy-ri-context-compressor",
         fallback_compressor=builtin_compressor,
     )
 """
@@ -58,7 +58,9 @@ CEA_GRAPH_TIMEOUT = int(os.environ.get("CEA_GRAPH_TIMEOUT", "5"))
 # A message whose edit risk prediction carries at least one risk flag with
 # this confidence is considered causally important and protected from
 # compression (when it falls outside the default protect window).
-CEA_RISK_PROTECT_CONFIDENCE = float(os.environ.get("CEA_RISK_PROTECT_CONFIDENCE", "0.5"))
+CEA_RISK_PROTECT_CONFIDENCE = float(
+    os.environ.get("CEA_RISK_PROTECT_CONFIDENCE", "0.5")
+)
 # Tool names that indicate a file-edit operation worth querying the graph for.
 _CEA_EDIT_TOOLS = {"patch", "write_file"}
 # Matches a plausible source file path (absolute or relative with extension).
@@ -141,10 +143,15 @@ class RiContextCompressor(ContextEngine):
     def __init__(
         self,
         token_budget: int = 8000,
-        name: str = "ri-context-governor",
+        name: str = "legacy-ri-context-compressor",
         fallback_compressor: Any = None,
         diminishing_returns_ratio: float = _DIMINISHING_RETURNS_RATIO,
     ):
+        if name == "ri-context-governor":
+            raise ValueError(
+                "'ri-context-governor' is reserved for the certified CLI-backed "
+                "context-engine plugin; use 'legacy-ri-context-compressor' explicitly"
+            )
         self.token_budget = token_budget
         self._name = name
         self._fallback = fallback_compressor
@@ -358,8 +365,10 @@ class RiContextCompressor(ContextEngine):
 
             logger.info(
                 "context-governor stage-1: %d→%d msgs, %d→%d tokens (%.1f%% saved, receipt=%s)",
-                len(messages), len(compacted),
-                original_tokens, result.get("compacted_approx_tokens", 0),
+                len(messages),
+                len(compacted),
+                original_tokens,
+                result.get("compacted_approx_tokens", 0),
                 savings_ratio * 100,
                 result.get("receipt_id", "?"),
             )
@@ -369,7 +378,8 @@ class RiContextCompressor(ContextEngine):
                 logger.info(
                     "context-governor savings %.1f%% below threshold %.1f%% — "
                     "falling back to LLM summarizer with receipt preservation",
-                    savings_ratio * 100, self._diminishing_ratio * 100,
+                    savings_ratio * 100,
+                    self._diminishing_ratio * 100,
                 )
                 self._last_summary_fallback_used = True
                 # Pass the compacted (not original) messages to the LLM
@@ -393,9 +403,7 @@ class RiContextCompressor(ContextEngine):
                 messages, current_tokens, focus_topic, force, memory_context
             )
 
-    def _cea_protect_last_n(
-        self, msg_dicts: List[Dict[str, Any]]
-    ) -> Optional[int]:
+    def _cea_protect_last_n(self, msg_dicts: List[Dict[str, Any]]) -> Optional[int]:
         """Compute an expanded protect_last_n from the real CEA graph.
 
         Scans messages for file-edit tool calls, queries cea-graph predict,
@@ -443,11 +451,15 @@ class RiContextCompressor(ContextEngine):
                     continue
                 sig_json = json.dumps(
                     {
-                        "op_kind": flag.get("op_signature", {}).get("op_kind", "replace"),
+                        "op_kind": flag.get("op_signature", {}).get(
+                            "op_kind", "replace"
+                        ),
                         "anchor_kind": flag.get("op_signature", {}).get(
                             "anchor_kind", "range"
                         ),
-                        "lines_added": flag.get("op_signature", {}).get("lines_added", 0),
+                        "lines_added": flag.get("op_signature", {}).get(
+                            "lines_added", 0
+                        ),
                         "lines_removed": flag.get("op_signature", {}).get(
                             "lines_removed", 0
                         ),
@@ -457,7 +469,9 @@ class RiContextCompressor(ContextEngine):
                         "file_extension": flag.get("op_signature", {}).get(
                             "file_extension", ""
                         ),
-                        "scope_tag": flag.get("op_signature", {}).get("scope_tag", "unknown"),
+                        "scope_tag": flag.get("op_signature", {}).get(
+                            "scope_tag", "unknown"
+                        ),
                         "op_index": 0,
                         "file_index": 0,
                     },
@@ -523,8 +537,10 @@ class RiContextCompressor(ContextEngine):
             return messages
 
     def __repr__(self) -> str:
-        status = "native+llm" if self.available and self.fallback_available else (
-            "native" if self.available else "unavailable"
+        status = (
+            "native+llm"
+            if self.available and self.fallback_available
+            else ("native" if self.available else "unavailable")
         )
         return f"RiContextCompressor(budget={self.token_budget}, {status})"
 
@@ -576,10 +592,17 @@ class RiContextCompressor(ContextEngine):
                 summary_target_ratio=0.20,
             )
             for name in (
-                "context_length", "threshold_tokens", "threshold_percent",
-                "protect_first_n", "protect_last_n", "compression_count",
-                "last_prompt_tokens", "last_completion_tokens", "last_total_tokens",
-                "last_compression_rough_tokens", "awaiting_real_usage_after_compression",
+                "context_length",
+                "threshold_tokens",
+                "threshold_percent",
+                "protect_first_n",
+                "protect_last_n",
+                "compression_count",
+                "last_prompt_tokens",
+                "last_completion_tokens",
+                "last_total_tokens",
+                "last_compression_rough_tokens",
+                "awaiting_real_usage_after_compression",
             ):
                 pending_name = f"_pending_{name}"
                 if hasattr(self, pending_name):
@@ -587,16 +610,14 @@ class RiContextCompressor(ContextEngine):
                     delattr(self, pending_name)
             logger.info(
                 "RiContextCompressor: fallback LLM summarizer constructed "
-                "(model=%s, ctx_len=%d)", model, context_length
+                "(model=%s, ctx_len=%d)",
+                model,
+                context_length,
             )
         except Exception as exc:
-            logger.warning(
-                "RiContextCompressor: could not construct fallback: %s", exc
-            )
+            logger.warning("RiContextCompressor: could not construct fallback: %s", exc)
 
-    def bind_session_state(
-        self, session_db: Any = None, session_id: str = ""
-    ) -> None:
+    def bind_session_state(self, session_db: Any = None, session_id: str = "") -> None:
         """Forward session binding to fallback compressor."""
         if self._fallback is not None and hasattr(self._fallback, "bind_session_state"):
             self._fallback.bind_session_state(
@@ -619,8 +640,7 @@ class RiContextCompressor(ContextEngine):
 
     def should_compress(self, prompt_tokens: Optional[int] = None) -> bool:
         return bool(
-            self._fallback is not None
-            and self._fallback.should_compress(prompt_tokens)
+            self._fallback is not None and self._fallback.should_compress(prompt_tokens)
         )
 
     def should_defer_preflight_to_real_usage(self, rough_tokens: int) -> bool:
@@ -631,8 +651,7 @@ class RiContextCompressor(ContextEngine):
 
     def has_content_to_compress(self, messages: List[Dict[str, Any]]) -> bool:
         return bool(
-            self._fallback is None
-            or self._fallback.has_content_to_compress(messages)
+            self._fallback is None or self._fallback.has_content_to_compress(messages)
         )
 
     def on_session_start(self, session_id: str, **kwargs) -> None:

@@ -1337,10 +1337,25 @@ def _on_compute_host_turn_done(rid: str, sid: str, session: dict, frame: dict) -
                 pass
         session["running"] = False
         session["last_active"] = time.time()
-        _clear_inflight_turn(session)
+        if is_error:
+            _fail_inflight_turn(
+                session,
+                str(frame.get("message") or "compute host turn failed"),
+            )
+        else:
+            _clear_inflight_turn(session)
     if is_error:
         message = str(frame.get("message") or "compute host turn failed")
-        _emit("message.complete", sid, {"text": f"Error: {message}", "status": "error"})
+        _emit(
+            "message.complete",
+            sid,
+            {
+                "text": f"Error: {message}",
+                "status": "error",
+                "error": message,
+                "recoverable": True,
+            },
+        )
     _apply_compute_host_metadata_mirror(session, frame)
     try:
         info = _session_info(session.get("agent"), session)
@@ -1553,6 +1568,90 @@ def _wait_agent(session: dict, rid: str, timeout: float = 30.0) -> dict | None:
     return _err(rid, 5032, err) if err else None
 
 
+_AGENT_BUILD_WAIT_SLICE = 5.0
+_AGENT_BUILD_SLOW_NOTICE_AFTER = 30.0
+_AGENT_BUILD_SLOW_NOTICE_KEY = "agent-build-slow"
+
+
+def _agent_build_wait_cap() -> float:
+    """Bound the deferred first-prompt wait without dropping slow builds."""
+    try:
+        agent_cfg = _load_cfg().get("agent") or {}
+        raw = agent_cfg.get("build_wait_timeout")
+        if raw is not None:
+            value = float(raw)
+            if value > 0:
+                return value
+    except Exception:
+        pass
+    return 600.0
+
+
+def _wait_agent_for_prompt(session: dict, rid: str, sid: str) -> dict | None:
+    """Wait patiently for a deferred build that already owns a user prompt.
+
+    Ported from newer upstream Hermes (#63078).  ``prompt.submit`` has already
+    accepted the turn, so the ordinary 30-second RPC wait is not an admissible
+    message-loss boundary.  This path remains bounded, reports one slow-build
+    notice, honors cancellation between slices, and fails only when the build
+    itself fails or is genuinely hung.
+    """
+    ready = session.get("agent_ready")
+    if ready is None:
+        return None
+    start = time.monotonic()
+    cap = _agent_build_wait_cap()
+    notified_slow = False
+    while not ready.wait(timeout=_AGENT_BUILD_WAIT_SLICE):
+        with session["history_lock"]:
+            cancelled = session.get("_turn_cancel_requested") or not session.get(
+                "running"
+            )
+        if cancelled:
+            return None
+        waited = time.monotonic() - start
+        if waited >= cap:
+            return _err(
+                rid,
+                5032,
+                f"agent initialization timed out after {int(waited)}s — "
+                "your message was not sent; retry once the session is ready",
+            )
+        build_thread = session.get("_agent_build_thread")
+        if (
+            build_thread is not None
+            and not build_thread.is_alive()
+            and not ready.is_set()
+        ):
+            return _err(
+                rid,
+                5032,
+                session.get("agent_error")
+                or "agent initialization failed before completing",
+            )
+        if not notified_slow and waited >= _AGENT_BUILD_SLOW_NOTICE_AFTER:
+            notified_slow = True
+            _emit(
+                "notification.show",
+                sid,
+                {
+                    "text": (
+                        "Still starting the agent (tool discovery / model "
+                        "setup) — your message will be sent as soon as it's ready."
+                    ),
+                    "level": "info",
+                    "kind": "agent",
+                    "ttl_ms": None,
+                    "key": _AGENT_BUILD_SLOW_NOTICE_KEY,
+                    "id": _AGENT_BUILD_SLOW_NOTICE_KEY,
+                },
+            )
+    if notified_slow:
+        _emit("notification.clear", sid, {"key": _AGENT_BUILD_SLOW_NOTICE_KEY})
+    err = session.get("agent_error")
+    return _err(rid, 5032, err) if err else None
+
+
 def _start_agent_build(sid: str, session: dict) -> None:
     """Start building the real AIAgent for a TUI session, once.
 
@@ -1729,7 +1828,11 @@ def _start_agent_build(sid: str, session: dict) -> None:
                     pass
             ready.set()
 
-    threading.Thread(target=_build, daemon=True).start()
+    build_thread = threading.Thread(target=_build, daemon=True)
+    # A patient first-prompt waiter must distinguish a merely slow build from a
+    # dead build thread whose ready event will never be signalled.
+    session["_agent_build_thread"] = build_thread
+    build_thread.start()
 
 
 def _sess_nowait(params, rid):
@@ -1931,13 +2034,13 @@ def _register_session_cwd(session: dict | None) -> None:
         pass
 
 
-def _ensure_session_db_row(session: dict) -> None:
-    """Idempotently persist the session's DB row on first real activity.
+def _ensure_session_db_row(session: dict) -> bool:
+    """Idempotently persist the session's DB row before first real activity.
 
-    Called from prompt.submit so a row only exists once the user actually sends
-    a message — abandoned drafts never leave an empty "Untitled" session behind.
-    Uses INSERT OR IGNORE under the hood, so re-calls (and the AIAgent's own
-    lazy create) are no-ops.
+    Returns ``True`` only after the owning SessionDB accepted the create. Callers
+    must not start a turn when this admission write fails: a visible prompt or
+    goal kickoff without its durable session row is an explicit failure, not a
+    recoverable-looking streaming state.
 
     Only an *explicitly chosen* workspace is persisted as the session's cwd.
     The agent still runs in the auto-detected directory (session["cwd"]), but
@@ -1948,7 +2051,7 @@ def _ensure_session_db_row(session: dict) -> None:
     """
     key = session.get("session_key")
     if not key:
-        return
+        return False
     # Persist into the session's own profile db (global remote mode), not the
     # launch profile's — otherwise the row lands in the wrong state.db, the
     # unified list mis-tags it, and resume 404s ("session not found").
@@ -1960,13 +2063,13 @@ def _ensure_session_db_row(session: dict) -> None:
             db = SessionDB(db_path=Path(profile_home) / "state.db")
         except Exception:
             logger.debug("failed to open profile db for session row", exc_info=True)
-            return
+            return False
         close_db = True
     else:
         db = _get_db()
         close_db = False
     if db is None:
-        return
+        return False
     # The session's own model/effort/fast pick — the composer override shipped on
     # session.create, or a restored /model switch — must own the row's model +
     # model_config. The agent isn't built yet at first prompt.submit, so derive
@@ -2036,12 +2139,14 @@ def _ensure_session_db_row(session: dict) -> None:
         )
     except Exception:
         logger.debug("failed to persist desktop session row", exc_info=True)
+        return False
     finally:
         if close_db:
             try:
                 db.close()
             except Exception:
                 pass
+    return True
 
 
 def _persist_branch_seed(session: dict) -> None:
@@ -5676,6 +5781,31 @@ def _clear_inflight_turn(session: dict) -> None:
     session["inflight_turn"] = None
 
 
+def _fail_inflight_turn(session: dict, error: Any) -> None:
+    """Retain one terminal failed-turn snapshot for reconnect recovery.
+
+    Caller must hold ``history_lock``.  A subsequent turn replaces the snapshot
+    through ``_start_inflight_turn``; it is never a second history authority.
+    """
+    message = (
+        str(error)
+        if not isinstance(error, BaseException)
+        else (str(error) or type(error).__name__)
+    )
+    now = time.time()
+    turn = session.get("inflight_turn")
+    if not isinstance(turn, dict):
+        turn = {"assistant": "", "user": "", "started_at": now}
+    turn["assistant"] = str(turn.get("assistant") or "")
+    turn["user"] = str(turn.get("user") or "")
+    turn["error"] = message or "turn failed"
+    turn["status"] = "error"
+    turn["recoverable"] = True
+    turn["streaming"] = False
+    turn["updated_at"] = now
+    session["inflight_turn"] = turn
+
+
 def _enqueue_prompt(session: dict, text: Any, transport: Any) -> None:
     """Stash a message to run as the very next turn once the live one ends.
 
@@ -5777,6 +5907,32 @@ def _handle_busy_submit(
     return _ok(rid, {"status": "queued"})
 
 
+def _begin_goal_continuation_turn(sid: str, session: dict, prompt: str) -> bool:
+    """Consume a durable goal checkpoint exactly when its synthetic TUI turn starts.
+
+    The post-turn evaluator only creates/queues the checkpoint. This function is
+    the consumer boundary: a replayed local follow-up cannot launch another agent
+    run after the first consumer clears ``continuation_pending``.
+    """
+    with session["history_lock"]:
+        if session.get("running"):
+            return False
+        session["running"] = True
+    try:
+        from hermes_cli.goals import GoalManager
+
+        manager = GoalManager(session_id=str(session.get("session_key") or ""))
+        if prompt != manager.next_continuation_prompt() or not manager.start_continuation():
+            raise RuntimeError("goal continuation is stale, invalid, or already consumed")
+        return True
+    except Exception as exc:
+        with session["history_lock"]:
+            session["running"] = False
+            _clear_inflight_turn(session)
+        print(f"[tui_gateway] goal continuation not started: {exc}", file=sys.stderr)
+        return False
+
+
 def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
     """Fire a queued next-turn prompt if one is waiting and the session is idle.
 
@@ -5821,13 +5977,58 @@ def _inflight_snapshot(session: dict) -> dict | None:
     user = str(turn.get("user") or "").strip()
     assistant = str(turn.get("assistant") or "")
     streaming = bool(turn.get("streaming"))
-    if not user and not assistant and not streaming:
+    error = str(turn.get("error") or "").strip()
+    if not user and not assistant and not streaming and not error:
         return None
-    return {
+    snapshot = {
         "assistant": assistant,
         "streaming": streaming,
         "user": user,
     }
+    if error:
+        snapshot["error"] = error
+        snapshot["status"] = str(turn.get("status") or "error")
+        snapshot["recoverable"] = bool(turn.get("recoverable"))
+    return snapshot
+
+
+def _emit_terminal_turn_error(sid: str, session: dict, error: Any) -> None:
+    """Emit a terminal error frame and keep its reconnect projection."""
+    with session["history_lock"]:
+        _fail_inflight_turn(session, error)
+        turn = session.get("inflight_turn") or {}
+        message = str(turn.get("error") or "turn failed")
+        partial = str(turn.get("assistant") or "")
+        cols = int(session.get("cols", 80))
+    text = partial or f"Error: {message}"
+    agent = session.get("agent")
+    payload = {
+        "text": text,
+        "usage": _get_usage(agent) if agent is not None else {},
+        "status": "error",
+        "error": message,
+        "recoverable": True,
+    }
+    if partial:
+        payload["partial"] = True
+    try:
+        rendered = render_message(text, cols)
+    except Exception:
+        rendered = ""
+    if rendered:
+        payload["rendered"] = rendered
+    _emit("message.complete", sid, payload)
+
+
+def _restore_agent_history_after_turn_error(session: dict, agent: Any) -> bool:
+    """Keep the agent's canonical working transcript after a turn crash."""
+    agent_messages = getattr(agent, "_session_messages", None)
+    if not isinstance(agent_messages, list):
+        return False
+    with session["history_lock"]:
+        session["history"] = list(agent_messages)
+        session["history_version"] = int(session.get("history_version", 0)) + 1
+    return True
 
 
 def _queued_prompt_snapshot(session: dict) -> dict | None:
@@ -9568,6 +9769,7 @@ def _(rid, params: dict) -> dict:
     sid = params.get("session_id", "")
     raw_text = params.get("text", "")
     text = sanitize_user_prompt_text(raw_text) if isinstance(raw_text, str) else raw_text
+    goal_continuation = bool(params.get("goal_continuation", False))
     truncate_user_ordinal = params.get("truncate_before_user_ordinal")
     session, err = _sess_nowait(params, rid)
     if err:
@@ -9597,6 +9799,36 @@ def _(rid, params: dict) -> dict:
         # claim so this prompt starts normally instead of being stranded in a
         # queue whose drain already ran.
 
+    # A watch session's run lives in the parent turn; it must reject before any
+    # persistence attempt, otherwise a child-run admission failure masks the
+    # owner-correct busy result and can create a stray row.
+    with session["history_lock"]:
+        if session.get("lazy") and _child_run_active(str(session.get("session_key") or "")):
+            return _err(rid, 4009, "subagent still running — wait for it to finish")
+
+        # Validate edit/truncation coordinates before storage admission. An
+        # invalid request owns a 4xxx response and must never be masked by an
+        # unrelated persistence failure or touch durable state.
+        if truncate_user_ordinal is not None:
+            try:
+                validated_truncate_ordinal = int(truncate_user_ordinal)
+            except (TypeError, ValueError):
+                return _err(rid, 4004, "truncate_before_user_ordinal must be an integer")
+            user_count = sum(
+                1 for message in session.get("history", [])
+                if message.get("role") == "user"
+            )
+            if validated_truncate_ordinal < 0 or validated_truncate_ordinal >= user_count:
+                return _err(rid, 4018, "target user message is no longer in session history")
+        else:
+            validated_truncate_ordinal = None
+
+    # The process that owns the agent/turn owns persistence admission. Inline
+    # turns admit here; an isolated turn admits inside the compute host before
+    # it emits turn.started. This avoids two database owners for one turn.
+    if not turn_isolation and not _ensure_session_db_row(session):
+        return _err(rid, 5006, "session persistence failed; prompt was not started")
+
     with session["history_lock"]:
         # A watch session's run lives in the PARENT turn, so its own running
         # flag is False — without this, typing mid-run builds a second agent
@@ -9605,19 +9837,13 @@ def _(rid, params: dict) -> dict:
         # the upgrade resumes the child's transcript as a normal conversation.
         if session.get("lazy") and _child_run_active(str(session.get("session_key") or "")):
             return _err(rid, 4009, "subagent still running — wait for it to finish")
-        if truncate_user_ordinal is not None:
-            try:
-                ordinal = int(truncate_user_ordinal)
-            except (TypeError, ValueError):
-                return _err(rid, 4004, "truncate_before_user_ordinal must be an integer")
+        if validated_truncate_ordinal is not None:
+            ordinal = validated_truncate_ordinal
             history = session.get("history", [])
             user_indices = [i for i, m in enumerate(history) if m.get("role") == "user"]
-            # Reject out-of-range ordinals on BOTH ends. A negative value would
-            # otherwise sail past the upper-bound check and hit Python's negative
-            # indexing below (user_indices[-1] -> the LAST user turn), silently
-            # truncating history to everything before it and persisting that loss
-            # via replace_messages — an unrecoverable overwrite of the session DB.
-            if ordinal < 0 or ordinal >= len(user_indices):
+            # History can change between validation and admission only through a
+            # separate owner defect; retain the defensive upper-bound check.
+            if ordinal >= len(user_indices):
                 return _err(rid, 4018, "target user message is no longer in session history")
             truncated = history[: user_indices[ordinal]]
             session["history"] = truncated
@@ -9641,34 +9867,51 @@ def _(rid, params: dict) -> dict:
             sid,
             isolated_response["error"].get("message", "unknown error"),
         )
+        if not _ensure_session_db_row(session):
+            with session["history_lock"]:
+                session["running"] = False
+                _fail_inflight_turn(session, "session persistence failed")
+            return _err(rid, 5006, "session persistence failed; prompt was not started")
 
-    # Persist the DB row lazily, now that the user has actually sent a message.
-    _ensure_session_db_row(session)
     # A branch becomes real here: copy its parent's transcript into the row so it
     # resumes with full context (the agent won't persist the seed itself).
     _persist_branch_seed(session)
     _start_agent_build(sid, session)
 
     def run_after_agent_ready() -> None:
-        err = _wait_agent(session, rid)
+        # The prompt is already accepted. A cold build that outlives the
+        # ordinary 30-second RPC wait must remain attached to this turn.
+        err = _wait_agent_for_prompt(session, rid, sid)
         if err:
-            _emit(
-                "error",
+            _emit_terminal_turn_error(
                 sid,
-                {
-                    "message": err.get("error", {}).get(
-                        "message", "agent initialization failed"
-                    )
-                },
+                session,
+                (err.get("error") or {}).get(
+                    "message", "agent initialization failed"
+                ),
             )
             with session["history_lock"]:
                 session["running"] = False
-                _clear_inflight_turn(session)
+                session["last_active"] = time.time()
+            _emit("session.info", sid, _session_info(session.get("agent"), session))
             return
         with session["history_lock"]:
             if session.get("_turn_cancel_requested") or not session.get("running"):
                 session["running"] = False
                 _clear_inflight_turn(session)
+                return
+        if goal_continuation:
+            try:
+                from hermes_cli.goals import GoalManager
+
+                manager = GoalManager(session_id=str(session.get("session_key") or ""))
+                if text != manager.next_continuation_prompt() or not manager.start_continuation():
+                    raise RuntimeError("goal continuation is stale, invalid, or already consumed")
+            except Exception as exc:
+                with session["history_lock"]:
+                    session["running"] = False
+                    _clear_inflight_turn(session)
+                _emit("error", sid, {"message": f"goal continuation not started: {exc}"})
                 return
         _run_prompt_submit(rid, sid, session, text)
 
@@ -10085,13 +10328,126 @@ def _start_notification_poller(sid: str, session: dict) -> threading.Event:
     return stop
 
 
+_GOAL_COMPRESSION_RECOVERY_ATTEMPTS = "_goal_compression_recovery_attempts"
+_GOAL_COMPRESSION_RECOVERY_LIMIT = 1
+
+
+def _is_successful_goal_turn(result: Any, status: str, raw: Any) -> bool:
+    """Return whether a turn produced a real response the goal judge may use."""
+    return bool(
+        status == "complete"
+        and isinstance(raw, str)
+        and raw.strip()
+        and not (isinstance(result, dict) and result.get("failed"))
+        and not (isinstance(result, dict) and result.get("completed") is False)
+    )
+
+
+def _plan_goal_compression_recovery(
+    session: dict,
+    result: Any,
+    *,
+    status: str,
+    raw: Any,
+) -> dict[str, Any] | None:
+    """Create one durable retry after exhaustion, then pause without judging.
+
+    This preserves newer Hermes recovery semantics while routing the retry
+    through Ares' additive typed checkpoint. Compression failed before a usable
+    goal turn existed, so neither the judge nor the cumulative turn budget owns
+    it.
+    """
+    if not (isinstance(result, dict) and result.get("compression_exhausted")):
+        if _is_successful_goal_turn(result, status, raw):
+            session.pop(_GOAL_COMPRESSION_RECOVERY_ATTEMPTS, None)
+        return None
+
+    from hermes_cli.goals import GoalManager
+
+    session_key = str(session.get("session_key") or "")
+    if not session_key:
+        return None
+    try:
+        goals_cfg = _load_cfg().get("goals") or {}
+        max_turns = int(goals_cfg.get("max_turns", 20) or 20)
+    except Exception:
+        max_turns = 20
+    manager = GoalManager(session_id=session_key, default_max_turns=max_turns)
+    if not manager.is_active():
+        session.pop(_GOAL_COMPRESSION_RECOVERY_ATTEMPTS, None)
+        return None
+
+    goal_id = str(manager.state.goal_id)
+    recovery = session.get(_GOAL_COMPRESSION_RECOVERY_ATTEMPTS)
+    attempts = 0
+    if isinstance(recovery, dict) and recovery.get("goal_id") == goal_id:
+        try:
+            attempts = int(recovery.get("attempts", 0) or 0)
+        except (TypeError, ValueError):
+            attempts = 0
+
+    reason = "CONTEXT_COMPRESSION_EXHAUSTED"
+    # The in-memory counter is only a scheduling optimization.  After a
+    # gateway restart, recover the prior attempt from the canonical durable
+    # checkpoint once its queued continuation has actually started.  This
+    # keeps the one-retry bound from resetting with the process while avoiding
+    # a stale historical checkpoint suppressing a later, unrelated recovery.
+    checkpoint = manager.state.checkpoint
+    if (
+        attempts == 0
+        and manager.state.last_stop_reason == "CONTINUATION_STARTED"
+        and isinstance(checkpoint, dict)
+        and checkpoint.get("stop_reason") == reason
+    ):
+        attempts = 1
+    if attempts < _GOAL_COMPRESSION_RECOVERY_LIMIT:
+        decision = manager.checkpoint_recovery(
+            reason,
+            metadata={"reason": "context compression exhausted before a usable turn"},
+        )
+        if decision.get("should_continue"):
+            session[_GOAL_COMPRESSION_RECOVERY_ATTEMPTS] = {
+                "goal_id": goal_id,
+                "attempts": attempts + 1,
+            }
+            decision["message"] = (
+                "Context compression was exhausted. Retrying the active goal once "
+                "from its durable checkpoint."
+            )
+        return decision
+
+    state = manager.pause(reason="context compression exhausted twice consecutively")
+    session.pop(_GOAL_COMPRESSION_RECOVERY_ATTEMPTS, None)
+    if state is None:
+        return {
+            "status": "active",
+            "should_continue": False,
+            "continuation_prompt": None,
+            "verdict": "persistence_failed",
+            "reason": reason,
+            "message": "Goal pause could not be persisted after repeated compression exhaustion.",
+        }
+    return {
+        "status": "paused",
+        "should_continue": False,
+        "continuation_prompt": None,
+        "verdict": "compression_exhausted",
+        "reason": reason,
+        "message": (
+            "Goal paused after context compression was exhausted twice. "
+            "Run /compress, then /goal resume to continue."
+        ),
+    }
+
+
 def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
     with session["history_lock"]:
         history = list(session["history"])
         history_version = int(session.get("history_version", 0))
         images = list(session.get("attached_images", []))
         session["attached_images"] = []
-        if not isinstance(session.get("inflight_turn"), dict):
+        inflight = session.get("inflight_turn")
+        if not isinstance(inflight, dict) or inflight.get("status") == "error":
             _start_inflight_turn(session, text)
     agent = session["agent"]
     if hasattr(agent, "clear_interrupt"):
@@ -10106,6 +10462,7 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
         session_tokens = []
         home_token = None  # per-turn HERMES_HOME override for a resumed remote profile
         goal_followup = None  # set by the post-turn goal hook below
+        turn_error_retained = False
         one_turn_restore = session.pop("one_turn_model_restore", None)
         try:
             from tools.approval import (
@@ -10373,13 +10730,25 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                 payload["reasoning"] = last_reasoning
             if status_note:
                 payload["warning"] = status_note
-            if result.get("response_previewed"):
+            if isinstance(result, dict) and result.get("response_previewed"):
                 payload["response_previewed"] = True
             rendered = render_message(raw, cols)
             if rendered:
                 payload["rendered"] = rendered
             with session["history_lock"]:
-                _clear_inflight_turn(session)
+                if status == "error":
+                    _fail_inflight_turn(
+                        session,
+                        result.get("error") if isinstance(result, dict) else raw,
+                    )
+                    turn_error_retained = True
+                else:
+                    _clear_inflight_turn(session)
+            if status == "error":
+                payload["error"] = str(
+                    (result.get("error") if isinstance(result, dict) else "") or raw
+                )
+                payload["recoverable"] = True
             _emit("message.complete", sid, payload)
 
             # ── /goal continuation (Ralph-style loop) ─────────────────
@@ -10390,47 +10759,48 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
             # ("✓ Goal achieved" / "⏸ budget exhausted") is surfaced as
             # a system line so the user sees progress regardless of
             # outcome. Mirrors gateway/run._post_turn_goal_continuation.
-            if status == "complete" and isinstance(raw, str) and raw.strip():
+            sid_key = session.get("session_key") or ""
+            if sid_key:
                 try:
                     from hermes_cli.goals import GoalManager
-
-                    sid_key = session.get("session_key") or ""
-                    if sid_key:
-                        try:
-                            goals_cfg = _load_cfg().get("goals") or {}
-                            goal_max_turns = int(goals_cfg.get("max_turns", 20) or 20)
-                        except Exception:
-                            goal_max_turns = 20
-                        goal_mgr = GoalManager(
-                            session_id=sid_key,
-                            default_max_turns=goal_max_turns,
+                    try:
+                        goals_cfg = _load_cfg().get("goals") or {}
+                        goal_max_turns = int(goals_cfg.get("max_turns", 20) or 20)
+                    except Exception:
+                        goal_max_turns = 20
+                    goal_mgr = GoalManager(session_id=sid_key, default_max_turns=goal_max_turns)
+                    if goal_mgr.is_active():
+                        decision = _plan_goal_compression_recovery(
+                            session, result, status=status, raw=raw
                         )
-                        if goal_mgr.is_active():
+                        if decision is None:
                             try:
                                 from hermes_cli.goals import gather_background_processes as _gather_bg
                                 _bg_procs = _gather_bg()
                             except Exception:
                                 _bg_procs = None
+                            turn_outcome = None if _is_successful_goal_turn(result, status, raw) else "EXECUTION_FAILED"
                             decision = goal_mgr.evaluate_after_turn(
-                                raw,
+                                raw if isinstance(raw, str) else "",
                                 user_initiated=True,
                                 background_processes=_bg_procs,
+                                turn_outcome=turn_outcome,
+                                turn_metadata={"reason": "TUI turn produced no usable assistant output"} if turn_outcome else None,
                             )
-                            verdict_msg = decision.get("message") or ""
-                            if verdict_msg:
-                                _emit(
-                                    "status.update",
-                                    sid,
-                                    {"kind": "goal", "text": verdict_msg},
-                                )
-                            if decision.get("should_continue"):
-                                cont_prompt = decision.get("continuation_prompt") or ""
-                                if cont_prompt:
+                        verdict_msg = decision.get("message") or ""
+                        if verdict_msg:
+                            _emit("status.update", sid, {"kind": "goal", "text": verdict_msg})
+                        if decision.get("should_continue"):
+                            cont_prompt = decision.get("continuation_prompt") or ""
+                            if cont_prompt:
+                                if goal_mgr.claim_continuation(f"tui:{os.getpid()}:{id(goal_mgr)}"):
                                     goal_followup = cont_prompt
+                                    goal_mgr.release_continuation(queued=True)
+                                else:
+                                    print("[tui_gateway] continuation already claimed; checkpoint retained", file=sys.stderr)
                 except Exception as _goal_exc:
                     print(
-                        f"[tui_gateway] goal continuation hook failed: "
-                        f"{type(_goal_exc).__name__}: {_goal_exc}",
+                        f"[tui_gateway] goal continuation hook failed: {type(_goal_exc).__name__}: {_goal_exc}",
                         file=sys.stderr,
                     )
 
@@ -10540,7 +10910,18 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
             print(
                 f"[gateway-turn] {type(e).__name__}: {e}", file=sys.stderr, flush=True
             )
-            _emit("error", sid, {"message": str(e)})
+            _restore_agent_history_after_turn_error(session, agent)
+            try:
+                _emit_terminal_turn_error(sid, session, e)
+                turn_error_retained = True
+            except Exception as emit_exc:
+                print(
+                    f"[gateway-turn] terminal error emit failed: "
+                    f"{type(emit_exc).__name__}: {emit_exc}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                _emit("error", sid, {"message": str(e)})
         finally:
             if one_turn_restore:
                 try:
@@ -10564,7 +10945,8 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
             with session["history_lock"]:
                 session["running"] = False
                 session["last_active"] = time.time()
-                _clear_inflight_turn(session)
+                if not turn_error_retained:
+                    _clear_inflight_turn(session)
             _emit("session.info", sid, _session_info(agent, session))
 
         # A user prompt that arrived mid-turn (interrupt + queue) wins over
@@ -10580,12 +10962,10 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
         # prompt.submit sets running=True under the history_lock and
         # we check that guard before re-firing.
         if goal_followup:
-            with session["history_lock"]:
-                if session.get("running"):
-                    # User already sent something — their turn wins,
-                    # the judge will re-run on the next turn anyway.
-                    return
-                session["running"] = True
+            if not _begin_goal_continuation_turn(sid, session, goal_followup):
+                # A user already claimed this session, or a stale/replayed
+                # checkpoint was rejected. No synthetic turn may launch.
+                return
             try:
                 _emit("message.start", sid)
                 _run_prompt_submit(rid, sid, session, goal_followup)
@@ -13484,6 +13864,50 @@ def _resolve_name(name: str) -> str:
         return name
 
 
+@method("goal.status")
+def _(rid, params: dict) -> dict:
+    """Return a read-only desktop projection of canonical GoalManager state.
+
+    This deliberately exposes no continuation token, lease identity, raw
+    checkpoint, or completion evidence.  It is a rebuildable UI projection;
+    GoalManager + SessionDB remain the lifecycle and persistence owners.
+    """
+    sid = params.get("session_id", "")
+    session = _sessions.get(sid)
+    if not session:
+        return _err(rid, 4001, "no active session")
+    session_key = session.get("session_key") or ""
+    if not session_key:
+        return _err(rid, 4001, "no session key")
+    try:
+        from hermes_cli.goals import GoalManager
+
+        state = GoalManager(session_id=session_key).state
+    except Exception as exc:
+        return _err(rid, 5030, f"goals unavailable: {exc}")
+    if state is None:
+        return _ok(rid, {"exists": False, "session_id": sid, "session_key": session_key})
+    return _ok(
+        rid,
+        {
+            "exists": True,
+            "session_id": sid,
+            "session_key": session_key,
+            "goal_id": state.goal_id,
+            "goal": state.goal,
+            "status": state.status,
+            "outcome": state.outcome,
+            "turns_used": state.turns_used,
+            "max_turns": state.max_turns,
+            "next_action": state.next_action,
+            "last_stop_reason": state.last_stop_reason,
+            "continuation_pending": state.continuation_pending,
+            "checkpoint_revision": state.checkpoint_revision,
+            "updated_at": state.last_turn_at or state.created_at,
+        },
+    )
+
+
 @method("command.dispatch")
 def _(rid, params: dict) -> dict:
     name, arg = params.get("name", "").lstrip("/"), params.get("arg", "")
@@ -13774,25 +14198,36 @@ def _(rid, params: dict) -> dict:
         if lower == "resume":
             state = mgr.resume()
             if state is None:
-                return _ok(rid, {"type": "exec", "output": "No goal to resume."})
+                return _ok(rid, {"type": "exec", "output": "Goal resume could not be persisted."})
             return _ok(
                 rid,
                 {
-                    "type": "exec",
-                    "output": (
-                        f"▶ Goal resumed: {state.goal}\n"
-                        "Send any message to continue, or wait — I'll take the next step on the next turn."
-                    ),
+                    "type": "send",
+                    "notice": f"▶ Goal resumed: {state.goal}",
+                    "message": mgr.next_continuation_prompt(),
                 },
             )
-        if lower in {"clear", "stop", "done"}:
+        if lower == "done":
+            had = mgr.has_goal()
+            mgr.clear()
+            return _ok(rid, {"type": "exec", "output": "✓ Goal cancelled/cleared." if had else "No active goal."})
+        if lower == "complete" or lower.startswith("complete ") or lower.startswith("done "):
+            evidence = arg.split(None, 1)[1].strip() if " " in arg else ""
+            if not evidence:
+                return _ok(rid, {"type": "exec", "output": "Usage: /goal complete <evidence>."})
+            try:
+                output = "✓ Goal completed with explicit evidence." if mgr.confirm_completion(evidence, source="user-command") else "No active goal to complete."
+            except ValueError as exc:
+                output = f"/goal complete: {exc}"
+            return _ok(rid, {"type": "exec", "output": output})
+        if lower in {"clear", "stop"}:
             had = mgr.has_goal()
             mgr.clear()
             return _ok(
                 rid,
                 {
                     "type": "exec",
-                    "output": "✓ Goal cleared." if had else "No active goal.",
+                    "output": "✓ Goal cancelled/cleared." if had else "No active goal.",
                 },
             )
 

@@ -133,6 +133,8 @@ COMMAND_REGISTRY: list[CommandDef] = [
                cli_only=True),
     CommandDef("model", "Switch model (session-scoped; --global to persist)", "Configuration",
                args_hint="[model] [--provider name] [--global|--session] [--refresh]"),
+    CommandDef("llm-pipeline", "Toggle Rust-backed llm-pipeline transport", "Configuration",
+               aliases=("llm_pipeline",), args_hint="[on|off|status|providers ...]"),
     CommandDef("codex-runtime", "Toggle codex app-server runtime for OpenAI/Codex models",
                "Configuration", aliases=("codex_runtime",),
                args_hint="[auto|codex_app_server]"),
@@ -1167,7 +1169,11 @@ _SLACK_PRIORITY_ALIASES = ("btw", "bg")
 #   - moa: high-cost slash mode, available through /hermes moa to avoid
 #     displacing existing native Slack slash commands at the 50-command cap.
 #   - debug: the log/report upload surface; reached via /hermes debug on Slack.
-_SLACK_VIA_HERMES_ONLY = frozenset({"topup", "moa", "debug"})
+#   - version: long-tail /version parity command; kept via /hermes to avoid
+#     displacing a higher-priority production slash.
+#   - llm_pipeline: new transport switch command, still useful on Slack but
+#     low-frequency enough to route via /hermes on the cap-constrained surface.
+_SLACK_VIA_HERMES_ONLY = frozenset({"topup", "moa", "debug", "version", "llm_pipeline"})
 
 
 def _sanitize_slack_name(raw: str) -> str:

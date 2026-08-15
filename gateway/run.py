@@ -3134,6 +3134,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._show_reasoning = self._load_show_reasoning()
         self._busy_input_mode = self._load_busy_input_mode()
         self._busy_text_mode = self._load_busy_text_mode()
+        # Secondary-profile busy modes are snapshotted during multiplex
+        # startup. Busy-message handlers consult these maps by routed source
+        # without rereading config or mutating process-global environment.
+        self._busy_input_modes_by_profile: Dict[str, str] = {}
+        self._busy_text_modes_by_profile: Dict[str, str] = {}
         self._restart_drain_timeout = self._load_restart_drain_timeout()
         self._provider_routing = self._load_provider_routing()
         self._fallback_model = self._load_fallback_model()
@@ -4773,11 +4778,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     def _status_action_gerund(self) -> str:
         return "restarting" if self._restart_requested else "shutting down"
 
-    def _queue_during_drain_enabled(self) -> bool:
+    def _queue_during_drain_enabled(
+        self, busy_input_mode: Optional[str] = None
+    ) -> bool:
         # Both "queue" and "steer" modes imply the user doesn't want messages
         # to be lost during restart — queue them for the newly-spawned gateway
         # process to pick up.  "interrupt" mode drops them (current behaviour).
-        return self._restart_requested and self._busy_input_mode in {"queue", "steer"}
+        mode = busy_input_mode or self._busy_input_mode
+        return self._restart_requested and mode in {"queue", "steer"}
 
     # -------- /queue FIFO helpers --------------------------------------
     # /queue must produce one full agent turn per invocation, in FIFO
@@ -4790,13 +4798,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     # it up.  Clearing happens on /new and /reset via
     # _handle_reset_command.
 
-    def _enqueue_fifo(self, session_key: str, queued_event: "MessageEvent", adapter: Any) -> None:
+    def _enqueue_fifo(self, session_key: str, queued_event: "MessageEvent", adapter: Any) -> bool:
         """Append a /queue event to the FIFO chain for a session."""
         if adapter is None:
-            return
+            return False
         pending_slot = getattr(adapter, "_pending_messages", None)
         if pending_slot is None:
-            return
+            return False
         queued_events = getattr(self, "_queued_events", None)
         if queued_events is None:
             queued_events = {}
@@ -4805,6 +4813,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             queued_events.setdefault(session_key, []).append(queued_event)
         else:
             pending_slot[session_key] = queued_event
+        return True
 
     def _promote_queued_event(
         self,
@@ -5406,6 +5415,76 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return "queue" if input_mode == "queue" else "interrupt"
 
     @staticmethod
+    def _busy_modes_from_config(
+        config: dict,
+        *,
+        fallback_input: str,
+        fallback_text: str,
+    ) -> tuple[str, str]:
+        """Resolve one profile's busy modes without consulting process env."""
+        raw_input = str(
+            cfg_get(config, "display", "busy_input_mode", default="") or ""
+        ).strip().lower()
+        input_mode = (
+            raw_input
+            if raw_input in {"interrupt", "queue", "steer"}
+            else fallback_input
+        )
+
+        raw_text = str(
+            cfg_get(config, "display", "busy_text_mode", default="") or ""
+        ).strip().lower()
+        if raw_text in {"interrupt", "queue"}:
+            text_mode = raw_text
+        elif raw_input in {"interrupt", "queue", "steer"}:
+            text_mode = "queue" if input_mode == "queue" else "interrupt"
+        else:
+            text_mode = fallback_text
+        return input_mode, text_mode
+
+    def _snapshot_profile_busy_modes(self, profile_name: str, config: dict) -> None:
+        """Cache a routed profile's busy policy for this gateway lifetime."""
+        input_mode, text_mode = self._busy_modes_from_config(
+            config,
+            fallback_input=getattr(self, "_busy_input_mode", "interrupt"),
+            fallback_text=getattr(self, "_busy_text_mode", "interrupt"),
+        )
+        input_modes = self.__dict__.setdefault("_busy_input_modes_by_profile", {})
+        text_modes = self.__dict__.setdefault("_busy_text_modes_by_profile", {})
+        input_modes[profile_name] = input_mode
+        text_modes[profile_name] = text_mode
+
+    def _busy_profile_name_for_source(self, source: SessionSource) -> Optional[str]:
+        """Return the routed profile whose busy policy applies, if any."""
+        if not getattr(getattr(self, "config", None), "multiplex_profiles", False):
+            return None
+        name = str(getattr(source, "profile", "") or "").strip()
+        if not name:
+            try:
+                name = str(self._profile_name_for_source(source) or "").strip()
+            except Exception:
+                name = ""
+        return name or None
+
+    def _effective_busy_input_mode(self, source: SessionSource) -> str:
+        """Resolve busy input mode from the routed profile startup snapshot."""
+        fallback = getattr(self, "_busy_input_mode", "interrupt")
+        profile_name = self._busy_profile_name_for_source(source)
+        if not profile_name:
+            return fallback
+        modes = getattr(self, "_busy_input_modes_by_profile", None)
+        return modes.get(profile_name, fallback) if isinstance(modes, dict) else fallback
+
+    def _effective_busy_text_mode(self, source: SessionSource) -> str:
+        """Resolve legacy busy text mode from the routed profile snapshot."""
+        fallback = getattr(self, "_busy_text_mode", "interrupt")
+        profile_name = self._busy_profile_name_for_source(source)
+        if not profile_name:
+            return fallback
+        modes = getattr(self, "_busy_text_modes_by_profile", None)
+        return modes.get(profile_name, fallback) if isinstance(modes, dict) else fallback
+
+    @staticmethod
     def _load_restart_drain_timeout() -> float:
         """Load graceful gateway restart/stop drain timeout in seconds."""
         raw = os.getenv("HERMES_RESTART_DRAIN_TIMEOUT", "").strip()
@@ -5780,6 +5859,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             return True  # handled (silently dropped); do not fall through
 
+        effective_mode = self._effective_busy_input_mode(event.source)
+
         # --- Draining case (gateway restarting/stopping) ---
         if self._draining:
             adapter = self._adapter_for_source(event.source)
@@ -5788,7 +5869,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             reply_anchor = self._reply_anchor_for_event(event)
             thread_meta = self._thread_metadata_for_source(event.source, reply_anchor)
-            if self._queue_during_drain_enabled():
+            if self._queue_during_drain_enabled(effective_mode):
                 self._queue_or_replace_pending_event(session_key, event)
                 message = f"⏳ Gateway {self._status_action_gerund()} — queued for the next turn after it comes back."
             else:
@@ -5904,8 +5985,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         running_agent = self._running_agents.get(session_key)
 
-        effective_mode = self._busy_input_mode
-        busy_text_mode = getattr(self, "_busy_text_mode", "interrupt")
+        busy_text_mode = self._effective_busy_text_mode(event.source)
         if (
             event.message_type == MessageType.TEXT
             and busy_text_mode == "queue"
@@ -6671,11 +6751,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         return suspended
 
-    def _clear_restart_failure_count(self, session_key: str) -> None:
-        """Clear the restart-failure counter for a session that completed OK.
-
-        Called after a successful agent turn to signal the loop is broken.
-        """
+    async def _clear_restart_failure_count(self, session_key: str) -> None:
+        """Clear a recovered session's restart counter without blocking the loop."""
         import json
 
         path = _hermes_home / self._STUCK_LOOP_FILE
@@ -6686,7 +6763,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if session_key in counts:
                 del counts[session_key]
                 if counts:
-                    atomic_json_write(path, counts, indent=None)
+                    await asyncio.to_thread(atomic_json_write, path, counts, indent=None)
                 else:
                     path.unlink(missing_ok=True)
         except Exception:
@@ -6987,7 +7064,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             await adapter.handle_message(event)
             session_tasks = getattr(adapter, "_session_tasks", {})
             task = session_tasks.get(session_key) if isinstance(session_tasks, dict) else None
-            if task is not None:
+            # If this task has already produced a follow-up/late-arrival drain,
+            # ownership can legitimately move to a brand-new task. Awaiting only
+            # the original owner avoids blocking forever on a task we did not
+            # create, while still waiting for the actual startup turn when the
+            # resume task stayed put end-to-end.
+            if task is not None and session_tasks.get(session_key) is task:
                 await asyncio.shield(task)
         finally:
             # _schedule_resume_pending_sessions pre-claims the runner slot
@@ -7915,6 +7997,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         self._running = True
         self._update_runtime_status("running")
+
+        # Recover persisted goal checkpoints only after adapters and FIFO
+        # routing are ready. Missing origins remain durable and visible rather
+        # than being converted into an unaddressable synthetic message.
+        try:
+            await self._recover_persisted_goal_continuations()
+        except Exception:
+            logger.exception("Persisted goal startup recovery failed")
 
         # Loop-liveness heartbeat (#66892): an asyncio task so a frozen loop
         # stops refreshing ``state/gateway.heartbeat``. Cancelled with the
@@ -9450,8 +9540,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         from gateway.config import load_gateway_config
 
         with _profile_runtime_scope(profile_home):
+            profile_runtime_cfg = _load_gateway_runtime_config()
             profile_cfg = load_gateway_config()
             violation = _own_policy_open_startup_violation(profile_cfg)
+        self._snapshot_profile_busy_modes(profile_name, profile_runtime_cfg)
         if violation:
             raise MultiplexConfigError(
                 f"Profile '{profile_name}' enables {violation}. "
@@ -9557,12 +9649,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             self._make_profile_fatal_error_handler(profile_name, platform)
         )
         adapter.set_session_store(self.session_store)
-        adapter.set_busy_session_handler(self._handle_active_session_busy_message)
+        adapter.set_busy_session_handler(
+            self._make_profile_busy_session_handler(profile_name)
+        )
         adapter.set_topic_recovery_fn(self._recover_telegram_topic_thread_id)
         adapter.set_authorization_check(
             self._make_adapter_auth_check(platform, profile_name=profile_name)
         )
-        adapter._busy_text_mode = self._busy_text_mode
+        text_modes = getattr(self, "_busy_text_modes_by_profile", None)
+        adapter._busy_text_mode = (
+            text_modes.get(profile_name, self._busy_text_mode)
+            if isinstance(text_modes, dict)
+            else self._busy_text_mode
+        )
 
     async def _run_secondary_profile_reconnect(
         self, profile_name: str, platform: Platform
@@ -9756,6 +9855,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 with _profile_runtime_scope(profile_home):
                     return await self._handle_message(event)
             return await self._handle_message(event)
+
+        return _handler
+
+    def _make_profile_busy_session_handler(self, profile_name: str):
+        """Stamp an owning adapter's profile before resolving busy policy."""
+        async def _handler(event, _session_key):
+            try:
+                if getattr(event, "source", None) is not None and not event.source.profile:
+                    event.source.profile = profile_name
+            except Exception:
+                pass
+            routed_session_key = self._session_key_for_source(event.source)
+            return await self._handle_active_session_busy_message(
+                event, routed_session_key
+            )
 
         return _handler
 
@@ -10546,6 +10660,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return ("Agent is running — wait or /stop first, then "
                         "change runtime.")
 
+            # /llm-pipeline must not be used while the agent is running.
+            # Transport mode changes should apply on the next message after a
+            # session refresh.
+            if _cmd_def_inner and _cmd_def_inner.name == "llm-pipeline":
+                return "Agent is running — wait or /stop first, then change transport."
+
             # /approve and /deny must bypass the running-agent interrupt path.
             # The agent thread is blocked on a threading.Event inside
             # tools/approval.py — sending an interrupt won't unblock it.
@@ -10654,6 +10774,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     merge_pending_message_event(adapter._pending_messages, _quick_key, event)
                 return None
 
+            effective_busy_input_mode = self._effective_busy_input_mode(source)
             _telegram_followup_grace = float(
                 os.getenv("HERMES_TELEGRAM_FOLLOWUP_GRACE_SECONDS", "3.0")
             )
@@ -10672,7 +10793,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 adapter = self._adapter_for_source(source)
                 if adapter:
-                    if self._busy_input_mode == "queue":
+                    if effective_busy_input_mode == "queue":
                         self._enqueue_fifo(_quick_key, event, adapter)
                     else:
                         merge_pending_message_event(
@@ -10703,18 +10824,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
                 return None
             if self._draining:
-                if self._queue_during_drain_enabled():
+                queue_during_drain = self._queue_during_drain_enabled(
+                    effective_busy_input_mode
+                )
+                if queue_during_drain:
                     self._queue_or_replace_pending_event(_quick_key, event)
                 return (
                     f"⏳ Gateway {self._status_action_gerund()} — queued for the next turn after it comes back."
-                    if self._queue_during_drain_enabled()
+                    if queue_during_drain
                     else f"⏳ Gateway is {self._status_action_gerund()} and is not accepting another turn right now."
                 )
-            if self._busy_input_mode == "queue":
+            if effective_busy_input_mode == "queue":
                 logger.debug("PRIORITY queue follow-up for session %s", _quick_key)
                 self._queue_or_replace_pending_event(_quick_key, event)
                 return None
-            if self._busy_input_mode == "steer":
+            if effective_busy_input_mode == "steer":
                 # Steer mode: inject text into the running agent mid-run via
                 # agent.steer().  Falls back to queue semantics if the payload
                 # is empty, the agent lacks steer(), or steer() rejects.
@@ -10989,6 +11113,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         if canonical == "codex-runtime":
             return await self._handle_codex_runtime_command(event)
+
+        if canonical == "llm-pipeline":
+            return await self._handle_llm_pipeline_command(event)
 
         if canonical == "personality":
             return await self._handle_personality_command(event)
@@ -11479,20 +11606,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _final_text = str(_agent_result.get("final_response") or "")
                 elif isinstance(_agent_result, str):
                     _final_text = _agent_result
-                # Skip for empty responses (interrupted / errored) — the
-                # judge would almost always say "continue" and we'd loop
-                # on error. Let the user drive the next turn.
-                if _final_text.strip():
-                    try:
-                        session_entry = await self.async_session_store.get_or_create_session(source)
-                    except Exception:
-                        session_entry = None
-                    if session_entry is not None:
-                        await self._post_turn_goal_continuation(
-                            session_entry=session_entry,
-                            source=source,
-                            final_response=_final_text,
-                        )
+                # Every active goal turn gets an explicit lifecycle outcome,
+                # including empty/failed/budget-limited turns.
+                try:
+                    session_entry = await self.async_session_store.get_or_create_session(source)
+                except Exception:
+                    session_entry = None
+                if session_entry is not None:
+                    await self._post_turn_goal_continuation(
+                        session_entry=session_entry,
+                        source=source,
+                        final_response=_final_text,
+                        agent_result=_agent_result if isinstance(_agent_result, dict) else None,
+                    )
             except Exception as _goal_exc:
                 logger.debug("goal continuation hook failed: %s", _goal_exc)
             return _agent_result
@@ -13076,7 +13202,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # succeeded and subsequent messages should no longer receive
             # the restart-interruption system note.
             if session_key and _should_clear_resume_pending_after_turn(agent_result):
-                self._clear_restart_failure_count(session_key)
+                await self._clear_restart_failure_count(session_key)
                 try:
                     await self.async_session_store.clear_resume_pending(session_key)
                 except Exception as _e:
@@ -14121,6 +14247,86 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return GoalManager(session_id=sid, default_max_turns=max_turns), session_entry
 
 
+    async def _recover_persisted_goal_continuations(self) -> None:
+        """Migrate legacy goal rows and enqueue each durable continuation once.
+
+        Startup recovery is deliberately conservative: the goal owner is
+        migrated before any enqueue side effect, missing session origins leave
+        a typed checkpoint pending, and the same persisted lease used by
+        normal turn-boundary continuation prevents duplicate workers.
+        """
+        try:
+            from hermes_cli.goals import GoalManager, list_persisted_goals
+        except Exception as exc:
+            logger.error("goal startup recovery unavailable: %s", exc)
+            return
+        try:
+            await self.async_session_store._ensure_loaded()
+        except Exception as exc:
+            logger.error("goal startup recovery could not load sessions: %s", exc)
+            return
+
+        entries_by_sid = {
+            getattr(entry, "session_id", ""): entry
+            for entry in getattr(self.session_store, "_entries", {}).values()
+            if getattr(entry, "session_id", None)
+        }
+        max_turns = self._goal_max_turns_from_config()
+        for sid, _snapshot in list_persisted_goals():
+            mgr = GoalManager(session_id=sid, default_max_turns=max_turns)
+            migration = mgr.migrate_legacy_state()
+            if migration.get("migrated"):
+                logger.info(
+                    "Migrated persisted goal %s to lifecycle schema %s (goal_id=%s)",
+                    sid,
+                    migration.get("schema_version"),
+                    migration.get("goal_id"),
+                )
+            state = mgr.state
+            if state is None or state.status != "active" or not state.continuation_pending:
+                continue
+
+            entry = entries_by_sid.get(sid)
+            source = getattr(entry, "origin", None) if entry is not None else None
+            adapter = self._adapter_for_source(source) if source is not None else None
+            session_key = None
+            if source is not None:
+                try:
+                    session_key = self._session_key_for_source(source)
+                except Exception:
+                    session_key = None
+            if adapter is None or not session_key:
+                logger.warning(
+                    "Goal %s checkpoint retained after startup: no durable session origin/adapter",
+                    sid,
+                )
+                continue
+
+            owner = f"gateway-startup:{os.getpid()}:{id(self)}"
+            if not mgr.claim_continuation(owner):
+                logger.info("Goal %s continuation already claimed; retaining checkpoint", sid)
+                continue
+            try:
+                event = MessageEvent(
+                    text=mgr.next_continuation_prompt(),
+                    message_type=MessageType.TEXT,
+                    source=source,
+                    message_id=None,
+                    channel_prompt=None,
+                )
+                if not self._enqueue_fifo(session_key, event, adapter):
+                    raise RuntimeError("adapter FIFO rejected recovered continuation")
+                mgr.release_continuation(queued=True)
+                logger.info("Queued one recovered goal continuation for %s", sid)
+            except Exception as exc:
+                mgr.release_continuation(queued=False)
+                logger.error(
+                    "Goal %s startup continuation enqueue failed; checkpoint retained: %s",
+                    sid,
+                    exc,
+                )
+
+
 
     async def _send_goal_status_notice(self, source: Any, message: str) -> None:
         """Send a /goal judge status line back to the originating chat/thread."""
@@ -14190,6 +14396,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         session_entry: Any,
         source: Any,
         final_response: str,
+        agent_result: Optional[Dict[str, Any]] = None,
     ) -> None:
         """Run the goal judge after a gateway turn and, if still active,
         enqueue a continuation prompt for the same session.
@@ -14217,16 +14424,54 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not mgr.is_active():
             return
 
+        turn_outcome = None
+        turn_metadata = None
+        if isinstance(agent_result, dict):
+            exit_reason = str(agent_result.get("turn_exit_reason") or "")
+            graph_run_ids = agent_result.get("graph_run_ids") or agent_result.get("graph_run_id") or []
+            if isinstance(graph_run_ids, str):
+                graph_run_ids = [graph_run_ids]
+            graph_outcome = str(
+                agent_result.get("graph_outcome")
+                or agent_result.get("subgraph_outcome")
+                or ""
+            ).lower()
+            turn_metadata = {
+                "reason": exit_reason or "gateway turn ended without usable output",
+                "graph_run_ids": list(graph_run_ids),
+                "graph_outcome": graph_outcome or None,
+                "receipt_ids": list(agent_result.get("receipt_ids") or []),
+            }
+            if graph_outcome in {"cancelled", "canceled", "interrupted"} or agent_result.get("interrupted"):
+                turn_outcome = "CANCELLED"
+            elif graph_outcome in {"failed", "failure", "error"}:
+                turn_outcome = "EXECUTION_FAILED"
+            elif agent_result.get("failed") or agent_result.get("error") or agent_result.get("partial"):
+                turn_outcome = "PROVIDER_FAILED" if "provider" in exit_reason.lower() or "api" in exit_reason.lower() else "EXECUTION_FAILED"
+            elif "max_iterations" in exit_reason or "budget_exhausted" in exit_reason:
+                turn_outcome = "TURN_BUDGET_EXHAUSTED"
+            elif not final_response.strip():
+                turn_outcome = "EXECUTION_FAILED"
+        elif not str(final_response or "").strip():
+            turn_outcome = "EXECUTION_FAILED"
+
         try:
             from hermes_cli.goals import gather_background_processes as _gather_bg
             _bg_procs = _gather_bg()
         except Exception:
             _bg_procs = None
 
-        decision = mgr.evaluate_after_turn(
-            final_response or "",
-            user_initiated=True,
-            background_processes=_bg_procs,
+        # Goal judging can make a synchronous auxiliary-provider request.
+        # Preserve per-session contextvars while moving that blocking work off
+        # the gateway loop; otherwise heartbeats and restart recovery stall.
+        decision = await self._run_in_executor_with_context(
+            lambda: mgr.evaluate_after_turn(
+                final_response or "",
+                user_initiated=True,
+                background_processes=_bg_procs,
+                turn_outcome=turn_outcome,
+                turn_metadata=turn_metadata,
+            ),
         )
         msg = decision.get("message") or ""
 
@@ -14248,6 +14493,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         # Enqueue via the adapter's FIFO so a user message already in
         # flight preempts the continuation naturally.
+        owner = f"gateway:{os.getpid()}:{id(self)}"
+        if not mgr.claim_continuation(owner):
+            logger.warning("goal continuation already claimed; checkpoint retained")
+            return
         try:
             adapter = self._adapter_for_source(source)
             _quick_key = self._session_key_for_source(source)
@@ -14259,9 +14508,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     message_id=None,
                     channel_prompt=None,
                 )
-                self._enqueue_fifo(_quick_key, cont_event, adapter)
+                if not self._enqueue_fifo(_quick_key, cont_event, adapter):
+                    raise RuntimeError("adapter FIFO rejected continuation")
+                mgr.release_continuation(queued=True)
+            else:
+                mgr.release_continuation(queued=False)
+                logger.error("goal continuation has no adapter/session key; checkpoint remains pending")
         except Exception as exc:
-            logger.debug("goal continuation: enqueue failed: %s", exc)
+            mgr.release_continuation(queued=False)
+            logger.error("goal continuation: enqueue failed; checkpoint remains pending: %s", exc)
 
 
 
@@ -21973,12 +22228,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 next_session_key = session_key
                 if pending_event is not None:
                     next_source = getattr(pending_event, "source", None) or source
-                    if self._is_goal_continuation_event(pending_event) and not self._goal_still_active_for_session(session_id):
-                        logger.info(
-                            "Discarding stale goal continuation for session %s — goal is no longer active",
-                            session_key or "?",
-                        )
-                        return result
+                    if self._is_goal_continuation_event(pending_event):
+                        try:
+                            from hermes_cli.goals import GoalManager
+                            _continuation_started = GoalManager(session_id=session_id).start_continuation()
+                        except Exception:
+                            _continuation_started = False
+                        if not _continuation_started:
+                            logger.info(
+                                "Discarding stale/replayed goal continuation for session %s",
+                                session_key or "?",
+                            )
+                            return result
                     # Resolve the follow-up's session key BEFORE preparing the
                     # inbound text: _prepare_inbound_message_text buffers native
                     # image paths under the key it is given, and the recursive

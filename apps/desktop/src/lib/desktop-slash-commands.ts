@@ -152,6 +152,7 @@ const DESKTOP_COMMAND_SPECS: readonly DesktopCommandSpec[] = [
   { name: '/debug', description: 'Create a debug report', surface: exec() },
   { name: '/goal', description: 'Manage the standing goal for this session', surface: exec() },
   { name: '/personality', description: 'Switch personality for this session', surface: exec(), args: true },
+  { name: '/llm-pipeline', description: 'Toggle Rust-backed llm-pipeline transport', aliases: ['/llm_pipeline'], surface: exec(), args: true },
   {
     name: '/pet',
     description: 'Toggle or adopt a petdex mascot (/pet, /pet list, /pet boba)',

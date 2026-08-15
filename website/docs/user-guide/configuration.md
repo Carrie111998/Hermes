@@ -845,6 +845,33 @@ When the iteration budget is fully exhausted, the CLI shows a notification to th
 
 `agent.api_max_retries` controls how many times Hermes retries a provider API call on transient errors (rate limits, connection drops, 5xx) **before** fallback-provider switching engages. The default is `3` — four attempts total. If you have [fallback providers](/user-guide/features/fallback-providers) configured and want to fail over faster, drop this to `0` so the first transient error on your primary immediately hands off to the fallback instead of churning retries against the flaky endpoint.
 
+## llm-pipeline Transport
+
+`llm-pipeline` is a Rust-backed OpenAI-compatible transport that Hermes can use for
+non-streaming Chat Completions calls when `agent.llm_pipeline.enabled` is on.
+
+```yaml
+agent:
+  llm_pipeline:
+    enabled: true               # master switch; false disables RI for all providers
+    providers: []               # empty = all providers eligible, or list provider ids
+```
+
+Typical values:
+
+- `enabled: true` (default): permit RI where native extension is installed.
+- `enabled: false`: force legacy OpenAI/SDK path for all providers.
+- `providers: ["ollama-launch", "openrouter"]`: only these providers use RI.
+
+Legacy runtime environment variables are also supported as overrides:
+
+- `HERMES_RI_PIPELINE=0` disables RI for the current process.
+- `HERMES_RI_PIPELINE_PROVIDERS="ollama-launch,deepseek"` limits RI to those providers and
+  overrides `agent.llm_pipeline.providers`.
+
+If you keep both list knobs empty, RI applies broadly (subject to native extension
+availability) and all provider calls follow the Rust fast path.
+
 ## Standing Goals (`/goal`)
 
 When a standing goal is active, Hermes judges whether each assistant response satisfies it. If not, it feeds a continuation prompt back into the same session and keeps working until the goal is done, the turn budget is exhausted, or the user pauses/clears it. The turn budget is the real backstop — judge failures fail **open** (continue) so a flaky judge never wedges progress.

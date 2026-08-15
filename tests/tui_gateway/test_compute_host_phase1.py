@@ -77,6 +77,50 @@ def test_compute_host_frame_protocol_round_trip():
         host.close()
 
 
+def test_real_compute_host_turn_fails_before_start_when_persistence_admission_fails(
+    monkeypatch,
+):
+    from tui_gateway import server
+
+    out = io.StringIO()
+    host = ComputeHost(stdout=out, max_workers=1, heartbeat_secs=0)
+    session = {
+        "session_key": "persist-failure",
+        "history": [],
+        "history_lock": threading.Lock(),
+        "history_version": 0,
+        "running": False,
+    }
+    launched = []
+    monkeypatch.setattr(host, "_ensure_server_session", lambda _server, _frame: session)
+    monkeypatch.setattr(server, "_ensure_session_db_row", lambda _session: False)
+    monkeypatch.setattr(
+        server,
+        "_run_prompt_submit",
+        lambda *_args, **_kwargs: launched.append(True),
+    )
+    try:
+        host.handle_frame(
+            {
+                "type": "turn.start",
+                "sid": "persist-failure-sid",
+                "request_id": "persist-failure-turn",
+                "text": "must not run",
+            }
+        )
+        failed = _wait_for_frame(
+            out,
+            lambda frame: frame.get("request_id") == "persist-failure-turn",
+        )
+    finally:
+        host.close()
+
+    assert failed["type"] == "turn.error"
+    assert failed["reason"] == "session_persistence_failed"
+    assert launched == []
+    assert session["running"] is False
+
+
 def test_compute_host_interrupt_control_is_not_queued_behind_turn():
     out = io.StringIO()
     host = ComputeHost(stdout=out, max_workers=1, heartbeat_secs=0)

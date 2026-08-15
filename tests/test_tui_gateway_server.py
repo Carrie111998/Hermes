@@ -218,9 +218,12 @@ def test_prompt_submit_dispatches_to_compute_host_when_turn_isolation_enabled(mo
     monkeypatch.setattr(
         server,
         "_ensure_session_db_row",
-        lambda _session: parent_writes.__setitem__(
-            "ensure_session", parent_writes["ensure_session"] + 1
-        ),
+        lambda _session: (
+            parent_writes.__setitem__(
+                "ensure_session", parent_writes["ensure_session"] + 1
+            ),
+            True,
+        )[1],
     )
     monkeypatch.setattr(
         server,
@@ -289,10 +292,14 @@ def test_prompt_submit_fails_open_inline_when_compute_host_dispatch_breaks(monke
     inline_calls = []
     monkeypatch.setattr(server, "_load_cfg", lambda: {"dashboard": {"turn_isolation": True}})
     monkeypatch.setattr(server, "_get_compute_host_supervisor", lambda _cfg=None: _BrokenSupervisor())
-    monkeypatch.setattr(server, "_ensure_session_db_row", lambda _session: None)
+    monkeypatch.setattr(server, "_ensure_session_db_row", lambda _session: True)
     monkeypatch.setattr(server, "_persist_branch_seed", lambda _session: None)
     monkeypatch.setattr(server, "_start_agent_build", lambda _sid, _session: None)
-    monkeypatch.setattr(server, "_wait_agent", lambda _session, _rid: None)
+    monkeypatch.setattr(
+        server,
+        "_wait_agent_for_prompt",
+        lambda _session, _rid, _sid: None,
+    )
     monkeypatch.setattr(
         server,
         "_run_prompt_submit",
@@ -461,7 +468,7 @@ def test_prompt_submit_golden_transcript_matches_flag_off_and_on(monkeypatch):
     fixed_info = {"model": "gold-model", "provider": "gold-provider", "usage": {"total": 15}}
     usage = server._get_usage(_Agent())
     monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
-    monkeypatch.setattr(server, "_ensure_session_db_row", lambda _session: None)
+    monkeypatch.setattr(server, "_ensure_session_db_row", lambda _session: True)
     monkeypatch.setattr(server, "_persist_branch_seed", lambda _session: None)
     monkeypatch.setattr(server, "_session_info", lambda _agent, _session=None: dict(fixed_info))
     monkeypatch.setattr(server, "make_stream_renderer", lambda _cols: None)
@@ -4180,6 +4187,7 @@ def test_session_create_drops_pending_title_on_valueerror(monkeypatch):
 
     server._sessions["sid"] = session
     monkeypatch.setattr(server, "_get_db", lambda: _FakeDB())
+    monkeypatch.setattr(server, "_ensure_session_db_row", lambda _session: True)
     monkeypatch.setattr(server, "_emit", lambda *a, **kw: None)
     monkeypatch.setattr(server, "make_stream_renderer", lambda cols: None)
     monkeypatch.setattr(server, "render_message", lambda raw, cols: None)
@@ -6983,7 +6991,7 @@ def test_prompt_submit_sanitizes_bracketed_paste_before_agent(monkeypatch):
         monkeypatch.setattr(server, "render_message", lambda _t, _c: "")
         monkeypatch.setattr(server, "_emit", lambda *a: None)
         monkeypatch.setattr(server, "_start_agent_build", lambda *a, **k: None)
-        monkeypatch.setattr(server, "_ensure_session_db_row", lambda *a, **k: None)
+        monkeypatch.setattr(server, "_ensure_session_db_row", lambda *a, **k: True)
         monkeypatch.setattr(server, "_persist_branch_seed", lambda *a, **k: None)
 
         resp = server.handle_request(
@@ -7100,6 +7108,7 @@ def test_prompt_submit_can_truncate_before_user_ordinal(monkeypatch):
         monkeypatch.setattr(server, "render_message", lambda _t, _c: "")
         monkeypatch.setattr(server, "_emit", lambda *a: None)
         monkeypatch.setattr(server, "_get_db", lambda: stub_db)
+        monkeypatch.setattr(server, "_ensure_session_db_row", lambda _session: True)
 
         resp = server.handle_request(
             {
@@ -7311,10 +7320,14 @@ def test_interrupt_before_agent_ready_prevents_late_turn_start(monkeypatch):
     try:
         monkeypatch.setattr(server.threading, "Thread", _FakeThread)
         monkeypatch.setattr(server, "_emit", lambda *args, **kwargs: None)
-        monkeypatch.setattr(server, "_ensure_session_db_row", lambda session: None)
+        monkeypatch.setattr(server, "_ensure_session_db_row", lambda session: True)
         monkeypatch.setattr(server, "_persist_branch_seed", lambda session: None)
         monkeypatch.setattr(server, "_start_agent_build", lambda sid, session: None)
-        monkeypatch.setattr(server, "_wait_agent", lambda session, rid: None)
+        monkeypatch.setattr(
+            server,
+            "_wait_agent_for_prompt",
+            lambda session, rid, sid: None,
+        )
         monkeypatch.setattr(
             server,
             "_run_prompt_submit",
@@ -8215,6 +8228,7 @@ def test_prompt_submit_auto_titles_session_on_complete(monkeypatch):
     monkeypatch.setattr(server, "make_stream_renderer", lambda cols: None)
     monkeypatch.setattr(server, "render_message", lambda raw, cols: None)
     monkeypatch.setattr(server, "_get_db", lambda: None)
+    monkeypatch.setattr(server, "_ensure_session_db_row", lambda _session: True)
 
     with patch("agent.title_generator.maybe_auto_title") as mock_title:
         server.handle_request(
@@ -8332,6 +8346,7 @@ def test_prompt_submit_surfaces_backend_error_as_visible_text(monkeypatch):
     monkeypatch.setattr(server, "make_stream_renderer", lambda cols: None)
     monkeypatch.setattr(server, "render_message", lambda raw, cols: None)
     monkeypatch.setattr(server, "_get_db", lambda: None)
+    monkeypatch.setattr(server, "_ensure_session_db_row", lambda _session: True)
 
     server.handle_request(
         {
@@ -8377,6 +8392,7 @@ def test_prompt_submit_preserves_empty_response_without_error(monkeypatch):
     monkeypatch.setattr(server, "make_stream_renderer", lambda cols: None)
     monkeypatch.setattr(server, "render_message", lambda raw, cols: None)
     monkeypatch.setattr(server, "_get_db", lambda: None)
+    monkeypatch.setattr(server, "_ensure_session_db_row", lambda _session: True)
 
     server.handle_request(
         {
@@ -8539,6 +8555,7 @@ def test_session_activate_returns_inflight_stream_before_completion(monkeypatch)
     monkeypatch.setattr(server, "make_stream_renderer", lambda cols: None)
     monkeypatch.setattr(server, "render_message", lambda raw, cols: None)
     monkeypatch.setattr(server, "_get_db", lambda: None)
+    monkeypatch.setattr(server, "_ensure_session_db_row", lambda _session: True)
     monkeypatch.setattr(server, "_session_info", lambda agent: {"model": agent.model})
 
     def _emit(event, sid, payload=None):

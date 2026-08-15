@@ -153,6 +153,25 @@ def test_gui_forwards_desktop_environment_overrides(tmp_path, monkeypatch):
     assert launch_env["HERMES_DESKTOP_IGNORE_EXISTING"] == "1"
     assert launch_env["HERMES_DESKTOP_HERMES_ROOT"] == str(hermes_root)
     assert launch_env["HERMES_DESKTOP_CWD"] == str(cwd)
+    assert launch_env["HERMES_DESKTOP_PYTHON"] == str(Path(cli_main.sys.executable).resolve())
+
+
+def test_gui_preserves_explicit_desktop_python_override(tmp_path, monkeypatch):
+    root = _make_desktop_tree(tmp_path)
+    explicit_python = tmp_path / "operator-python"
+    explicit_python.write_text("", encoding="utf-8")
+    monkeypatch.setattr(cli_main, "PROJECT_ROOT", root)
+    monkeypatch.setenv("HERMES_DESKTOP_PYTHON", str(explicit_python))
+    packaged_exe = _make_packaged_executable(root, monkeypatch)
+
+    launch_ok = subprocess.CompletedProcess([str(packaged_exe)], 0)
+
+    with patch("hermes_cli.main.subprocess.run", return_value=launch_ok) as mock_run, \
+         pytest.raises(SystemExit) as exc:
+        cli_main.cmd_gui(_ns(skip_build=True))
+
+    assert exc.value.code == 0
+    assert mock_run.call_args.kwargs["env"]["HERMES_DESKTOP_PYTHON"] == str(explicit_python)
 
 
 def test_gui_exits_when_npm_missing(tmp_path, monkeypatch, capsys):

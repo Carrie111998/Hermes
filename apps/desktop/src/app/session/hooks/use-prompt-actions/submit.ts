@@ -26,8 +26,7 @@ import {
   isProviderSetupError,
   isSessionBusyError,
   isSessionNotFoundError,
-  type SubmitTextOptions,
-  withSessionBusyRetry
+  type SubmitTextOptions
 } from './utils'
 
 interface SubmitPromptDeps {
@@ -456,8 +455,10 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
         let submitErr: unknown = null
 
         try {
-          await withSessionBusyRetry(() =>
-            requestGateway('prompt.submit', { session_id: sessionId, text }, PROMPT_SUBMIT_REQUEST_TIMEOUT_MS)
+          await requestGateway(
+            'prompt.submit',
+            { session_id: sessionId, text, ...(options?.goalContinuation ? { goal_continuation: true } : {}) },
+            PROMPT_SUBMIT_REQUEST_TIMEOUT_MS
           )
         } catch (firstErr) {
           const recoverStoredSessionId = targetStoredSessionId ?? selectedStoredSessionIdRef.current
@@ -484,8 +485,10 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
                 activeSessionIdRef.current = recoveredId
               }
 
-              await withSessionBusyRetry(() =>
-                requestGateway('prompt.submit', { session_id: recoveredId, text }, PROMPT_SUBMIT_REQUEST_TIMEOUT_MS)
+              await requestGateway(
+                'prompt.submit',
+                { session_id: recoveredId, text, ...(options?.goalContinuation ? { goal_continuation: true } : {}) },
+                PROMPT_SUBMIT_REQUEST_TIMEOUT_MS
               )
             } else {
               submitErr = firstErr

@@ -178,13 +178,12 @@ export function useSlashCommand(deps: SlashCommandDeps) {
             renderSlashOutput(`⚡ loading skill: ${dispatch.name}`)
           }
 
-          if (busyRef.current) {
-            renderSlashOutput('session busy — /interrupt the current turn before sending this command')
-
-            return
+          const accepted = await submitPromptText(message, {
+            goalContinuation: name === 'goal' && arg.trim().toLowerCase() === 'resume'
+          })
+          if (!accepted) {
+            renderSlashOutput(`/${name}: kickoff or continuation was not accepted; canonical goal state remains recoverable.`)
           }
-
-          await submitPromptText(message)
         }
 
         try {

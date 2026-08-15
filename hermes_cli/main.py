@@ -5975,6 +5975,18 @@ def cmd_gui(args: argparse.Namespace):
 
     # with_hermes_node_path() copies os.environ when called with no arg.
     env = with_hermes_node_path()
+    # The Python process that launched the Desktop CLI is the only interpreter
+    # we have already proven can import this Hermes installation.  Source-root
+    # mode otherwise makes Electron probe ``<root>/.venv`` / ``<root>/venv``
+    # and finally PATH, which can select an unrelated system Python that sees
+    # the source via PYTHONPATH but lacks runtime extras such as WebSockets.
+    # An explicit source root makes this CLI's interpreter the authoritative
+    # runtime.  Do not retain an inherited Desktop pointer from a previous
+    # installed runtime in that case.
+    if getattr(args, "hermes_root", None):
+        env["HERMES_DESKTOP_PYTHON"] = str(Path(sys.executable).resolve())
+    else:
+        env.setdefault("HERMES_DESKTOP_PYTHON", str(Path(sys.executable).resolve()))
     if getattr(args, "fake_boot", False):
         env["HERMES_DESKTOP_BOOT_FAKE"] = "1"
     if getattr(args, "ignore_existing", False):

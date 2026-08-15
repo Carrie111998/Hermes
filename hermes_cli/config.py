@@ -1072,6 +1072,20 @@ DEFAULT_CONFIG = {
         # compounds over a long conversation.  Costs ~70 tokens in the cached
         # system prompt.  Set False to disable globally.
         "parallel_tool_call_guidance": True,
+        # Native llm-pipeline transport controls (RecursiveIntell stack). When
+        # enabled, Hermes can route compatible non-streaming chat-completions
+        # calls through the Rust-backed llm-pipeline transport instead of the
+        # default OpenAI client.
+        "llm_pipeline": {
+            # Master switch. Keep true by default for systems that have
+            # llm-pipeline installed; set false to force legacy OpenAI
+            # client behavior for all providers.
+            "enabled": True,
+            # Optional provider whitelist. Empty means all providers are
+            # eligible; non-empty limits transport activation to matching
+            # provider names (for example "ollama-launch,deepseek").
+            "providers": [],
+        },
         # Local-environment toolchain probe — surfaces Python/pip/uv/PEP-668
         # state in the system prompt when something non-default is detected
         # (e.g. python3 has no pip module, pip→python version mismatch, PEP
