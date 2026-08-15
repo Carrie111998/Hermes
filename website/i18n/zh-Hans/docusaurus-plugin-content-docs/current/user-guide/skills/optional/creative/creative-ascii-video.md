@@ -14,8 +14,8 @@ ASCII 视频：将视频/音频转换为彩色 ASCII MP4/GIF。
 
 | | |
 |---|---|
-| 来源 | 内置（默认安装） |
-| 路径 | `skills/creative/ascii-video` |
+| 来源 | 可选 — 通过 `hermes skills install official/creative/ascii-video` 安装 |
+| 路径 | `optional-skills/creative/ascii-video` |
 | 平台 | linux, macos, windows |
 
 ## 参考：完整 SKILL.md

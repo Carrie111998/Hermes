@@ -37,19 +37,16 @@ Hermes 在执行 `hermes update` 时也会同步内置技能，但同步清单�
 |-------|-------------|------|
 | [`architecture-diagram`](/user-guide/skills/bundled/creative/creative-architecture-diagram) | 以 HTML 形式生成深色主题的 SVG 架构/云/基础设施图。 | `creative/architecture-diagram` |
 | [`ascii-art`](/user-guide/skills/bundled/creative/creative-ascii-art) | ASCII 艺术：pyfiglet、cowsay、boxes、图像转 ASCII。 | `creative/ascii-art` |
-| [`ascii-video`](/user-guide/skills/bundled/creative/creative-ascii-video) | ASCII 视频：将视频/音频转换为彩色 ASCII MP4/GIF。 | `creative/ascii-video` |
 | [`baoyu-infographic`](/user-guide/skills/bundled/creative/creative-baoyu-infographic) | 信息图（可视化）：21 种布局 × 21 种风格。 | `creative/baoyu-infographic` |
 | [`claude-design`](/user-guide/skills/bundled/creative/creative-claude-design) | 设计一次性 HTML 制品（落地页、幻灯片、原型）。 | `creative/claude-design` |
 | [`comfyui`](/user-guide/skills/bundled/creative/creative-comfyui) | 使用 ComfyUI 生成图像、视频和音频——安装、启动、管理节点/模型、运行带参数注入的工作流。使用官方 comfy-cli 管理生命周期，通过 REST/WebSocket API 直接执行。 | `creative/comfyui` |
 | [`design-md`](/user-guide/skills/bundled/creative/creative-design-md) | 编写/验证/导出 Google 的 DESIGN.md token 规范文件。 | `creative/design-md` |
 | [`excalidraw`](/user-guide/skills/bundled/creative/creative-excalidraw) | 手绘风格的 Excalidraw JSON 图表（架构、流程、时序）。 | `creative/excalidraw` |
 | [`humanizer`](/user-guide/skills/bundled/creative/creative-humanizer) | 人性化文本：去除 AI 腔，加入真实语气。 | `creative/humanizer` |
-| [`manim-video`](/user-guide/skills/bundled/creative/creative-manim-video) | Manim CE 动画：3Blue1Brown 风格数学/算法视频。 | `creative/manim-video` |
 | [`p5js`](/user-guide/skills/bundled/creative/creative-p5js) | p5.js 草图：生成艺术、着色器、交互、3D。 | `creative/p5js` |
 | [`popular-web-designs`](/user-guide/skills/bundled/creative/creative-popular-web-designs) | 54 种真实设计系统（Stripe、Linear、Vercel）的 HTML/CSS 实现。 | `creative/popular-web-designs` |
 | [`pretext`](/user-guide/skills/bundled/creative/creative-pretext) | 使用 @chenglou/pretext 构建创意浏览器 demo——无 DOM 的文本布局，支持 ASCII 艺术、绕障碍物的排版流、文字即几何游戏、动态排版和文字驱动的生成艺术。生成单文件 HTML。 | `creative/pretext` |
 | [`sketch`](/user-guide/skills/bundled/creative/creative-sketch) | 一次性 HTML 原型：生成 2-3 个设计变体供对比。 | `creative/sketch` |
-| [`songwriting-and-ai-music`](/user-guide/skills/bundled/creative/creative-songwriting-and-ai-music) | 歌曲创作技巧与 Suno AI 音乐 prompt（提示词）。 | `creative/songwriting-and-ai-music` |
 | [`touchdesigner-mcp`](/user-guide/skills/bundled/creative/creative-touchdesigner-mcp) | 通过 twozero MCP 控制运行中的 TouchDesigner 实例——创建算子、设置参数、连接节点、执行 Python、构建实时视觉效果。36 个原生工具。 | `creative/touchdesigner-mcp` |
 
 ## devops
@@ -89,8 +86,6 @@ Hermes 在执行 `hermes update` 时也会同步内置技能，但同步清单�
 
 | 技能 | 描述 | 路径 |
 |-------|-------------|------|
-| [`gif-search`](/user-guide/skills/bundled/media/media-gif-search) | 通过 curl + jq 从 Tenor 搜索/下载 GIF。 | `media/gif-search` |
-| [`songsee`](/user-guide/skills/bundled/media/media-songsee) | 通过 CLI 生成音频频谱图/特征（mel、chroma、MFCC）。 | `media/songsee` |
 | [`youtube-content`](/user-guide/skills/bundled/media/media-youtube-content) | 将 YouTube 字幕转换为摘要、推文串、博客文章。 | `media/youtube-content` |
 
 ## mlops

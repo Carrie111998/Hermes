@@ -14,8 +14,8 @@ description: "通过 CLI 生成音频频谱图/特征（mel、chroma、MFCC）"
 
 | | |
 |---|---|
-| 来源 | 内置（默认安装） |
-| 路径 | `skills/media/songsee` |
+| 来源 | 可选 — 通过 `hermes skills install official/media/songsee` 安装 |
+| 路径 | `optional-skills/media/songsee` |
 | 版本 | `1.0.0` |
 | 作者 | community |
 | 许可证 | MIT |

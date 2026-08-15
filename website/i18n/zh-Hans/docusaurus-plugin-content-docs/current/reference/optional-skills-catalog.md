@@ -52,12 +52,15 @@ hermes skills uninstall <skill-name>
 
 | 技能 | 描述 |
 |-------|-------------|
+| [**ascii-video**](/user-guide/skills/optional/creative/creative-ascii-video) | ASCII 视频：将视频/音频转换为彩色 ASCII MP4/GIF。 |
 | [**audiocraft-audio-generation**](/user-guide/skills/optional/creative/creative-audiocraft-audio-generation) | AudioCraft：MusicGen 文本转音乐、AudioGen 文本转音效。 |
 | [**concept-diagrams**](/user-guide/skills/optional/creative/creative-concept-diagrams) | 生成扁平、极简、支持亮色/暗色模式的 SVG 图表，输出为独立 HTML 文件，采用统一的教育视觉语言，包含 9 种语义色阶、句首大写排版及自动暗色模式。最适合教育和说明类内容。 |
 | [**heartmula**](/user-guide/skills/optional/creative/creative-heartmula) | HeartMuLa：根据歌词 + 标签生成类 Suno 风格的歌曲。 |
 | [**hyperframes**](/user-guide/skills/optional/creative/creative-hyperframes) | 使用 HyperFrames 创建基于 HTML 的视频合成、动态标题卡、社交叠层、字幕访谈视频、音频响应视觉效果及着色器转场。HTML 是视频的唯一来源。适用于用户希望制作任何视频内容的场景。 |
 | [**kanban-video-orchestrator**](/user-guide/skills/optional/creative/creative-kanban-video-orchestrator) | 规划、搭建并监控由 Hermes Kanban 支撑的多 agent 视频制作流水线。适用于用户希望制作任何类型视频的场景 — 叙事影片、产品/营销视频、MV、解说视频、ASCII/终端艺术、抽象/生成式循环等。 |
+| [**manim-video**](/user-guide/skills/optional/creative/creative-manim-video) | Manim CE 动画：3Blue1Brown 风格数学/算法视频。 |
 | [**meme-generation**](/user-guide/skills/optional/creative/creative-meme-generation) | 通过选取模板并使用 Pillow 叠加文字来生成真实的 meme 图片，输出实际的 .png 文件。 |
+| [**songwriting-and-ai-music**](/user-guide/skills/optional/creative/creative-songwriting-and-ai-music) | 歌曲创作技巧与 Suno AI 音乐 prompt（提示词）。 |
 
 ## data-science
 
@@ -113,6 +116,13 @@ hermes skills uninstall <skill-name>
 |-------|-------------|
 | [**fastmcp**](/user-guide/skills/optional/mcp/mcp-fastmcp) | 使用 Python 中的 FastMCP 构建、测试、检查、安装和部署 MCP 服务器。适用于创建新 MCP 服务器、将 API 或数据库封装为 MCP 工具、暴露资源或 prompt（提示词），或为 Claude Code、Cursor 等准备 FastMCP 服务器的场景。 |
 | [**mcporter**](/user-guide/skills/optional/mcp/mcp-mcporter) | 使用 mcporter CLI 列出、配置、鉴权并直接调用 MCP 服务器/工具（HTTP 或 stdio），包括临时服务器、配置编辑及 CLI/类型生成。 |
+
+## media
+
+| 技能 | 描述 |
+|-------|-------------|
+| [**gif-search**](/user-guide/skills/optional/media/media-gif-search) | 通过 curl + jq 从 Tenor 搜索/下载 GIF。 |
+| [**songsee**](/user-guide/skills/optional/media/media-songsee) | 通过 CLI 生成音频频谱图/特征（mel、chroma、MFCC）。 |
 
 ## migration
 

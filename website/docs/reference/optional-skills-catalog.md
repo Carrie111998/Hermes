@@ -55,6 +55,7 @@ hermes skills uninstall <skill-name>
 
 | Skill | Description |
 |-------|-------------|
+| [**ascii-video**](/docs/user-guide/skills/optional/creative/creative-ascii-video) | ASCII video: convert video/audio to colored ASCII MP4/GIF. |
 | [**audiocraft-audio-generation**](/docs/user-guide/skills/optional/creative/creative-audiocraft-audio-generation) | AudioCraft: MusicGen text-to-music, AudioGen text-to-sound. |
 | [**baoyu-article-illustrator**](/docs/user-guide/skills/optional/creative/creative-baoyu-article-illustrator) | Article illustrations: type × style × palette consistency. |
 | [**baoyu-comic**](/docs/user-guide/skills/optional/creative/creative-baoyu-comic) | Knowledge comics (知识漫画): educational, biography, tutorial. |
@@ -63,9 +64,11 @@ hermes skills uninstall <skill-name>
 | [**heartmula**](/docs/user-guide/skills/optional/creative/creative-heartmula) | HeartMuLa: Suno-like song generation from lyrics + tags. |
 | [**hyperframes**](/docs/user-guide/skills/optional/creative/creative-hyperframes) | Render MP4/WebM videos from HTML compositions. |
 | [**kanban-video-orchestrator**](/docs/user-guide/skills/optional/creative/creative-kanban-video-orchestrator) | Plan and run multi-agent video production pipelines. |
+| [**manim-video**](/docs/user-guide/skills/optional/creative/creative-manim-video) | Manim CE animations: 3Blue1Brown math/algo videos. |
 | [**meme-generation**](/docs/user-guide/skills/optional/creative/creative-meme-generation) | Create meme PNGs from templates with Pillow text overlay. |
 | [**pixel-art**](/docs/user-guide/skills/optional/creative/creative-pixel-art) | Pixel art w/ era palettes (NES, Game Boy, PICO-8). |
 | [**social-media-content-calendar**](/docs/user-guide/skills/optional/creative/creative-social-media-content-calendar) | Plan multi-platform social campaigns: briefs to posting. |
+| [**songwriting-and-ai-music**](/docs/user-guide/skills/optional/creative/creative-songwriting-and-ai-music) | Songwriting craft and Suno AI music prompts. |
 | [**tldraw-offline**](/docs/user-guide/skills/optional/creative/creative-tldraw-offline) | Drive and script tldraw offline canvases with an agent. |
 | [**unreal-mcp**](/docs/user-guide/skills/optional/creative/creative-unreal-mcp) | Automate Unreal Engine editor scenes, actors, and renders. |
 
@@ -133,6 +136,13 @@ hermes skills uninstall <skill-name>
 | [**fastmcp**](/docs/user-guide/skills/optional/mcp/mcp-fastmcp) | Build, test, and deploy Python MCP servers. |
 | [**mcp-oauth-remote-gateway**](/docs/user-guide/skills/optional/mcp/mcp-mcp-oauth-remote-gateway) | Manual OAuth for remote MCP servers on headless gateways. |
 | [**mcporter**](/docs/user-guide/skills/optional/mcp/mcp-mcporter) | List, auth, and call MCP servers/tools from the terminal. |
+
+## media
+
+| Skill | Description |
+|-------|-------------|
+| [**gif-search**](/docs/user-guide/skills/optional/media/media-gif-search) | Search/download GIFs from Tenor via curl + jq. |
+| [**songsee**](/docs/user-guide/skills/optional/media/media-songsee) | Audio spectrograms/features (mel, chroma, MFCC) via CLI. |
 
 ## migration
 
