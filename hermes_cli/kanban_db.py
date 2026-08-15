@@ -9533,7 +9533,9 @@ def _count_running_workers_across_boards(
     current_path = current_db_path.resolve()
     try:
         paths = []
-        for meta in list_boards(include_archived=False):
+        # Archived boards can still have live worker processes until their
+        # current runs exit, so they continue to consume host capacity.
+        for meta in list_boards(include_archived=True):
             slug = meta.get("slug") or DEFAULT_BOARD
             # Do not use kanban_db_path() here: workers inherit a pinned
             # HERMES_KANBAN_DB for isolation, and that override would collapse

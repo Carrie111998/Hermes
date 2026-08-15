@@ -2294,7 +2294,7 @@ def dispatch(
         max_concurrent_workers = int(raw_worker_cap)
         if max_concurrent_workers < 1:
             max_concurrent_workers = 3
-    except (TypeError, ValueError, AttributeError):
+    except Exception:
         max_concurrent_workers = 3
     conn = _conn(board=board)
     try:

@@ -2872,7 +2872,7 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
             max_concurrent_workers = int(raw_worker_cap)
             if max_concurrent_workers < 1:
                 max_concurrent_workers = 3
-        except (TypeError, ValueError, AttributeError):
+        except Exception:
             max_concurrent_workers = 3
         kb.run_daemon(
             interval=args.interval,

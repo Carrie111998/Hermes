@@ -124,6 +124,37 @@ def test_host_worker_cap_counts_siblings_from_pinned_worker_env(tmp_path, monkey
     assert len(result.spawned) == 1
 
 
+def test_host_worker_cap_counts_archived_boards_with_live_workers(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import profiles
+
+    kb._INITIALIZED_PATHS.clear()
+    kb.create_board("archived")
+    monkeypatch.setattr(profiles, "profile_exists", lambda _name: True)
+    with kb.connect_closing(board="archived") as archived_conn:
+        task_id = kb.create_task(archived_conn, title="running", assignee="worker")
+        archived_conn.execute(
+            "UPDATE tasks SET status='running', worker_pid=950000 WHERE id=?",
+            (task_id,),
+        )
+        archived_conn.commit()
+    kb.write_board_metadata("archived", archived=True)
+
+    with kb.connect_closing(board="default") as default_conn:
+        for index in range(3):
+            kb.create_task(default_conn, title=f"ready-{index}", assignee="worker")
+        result = kb.dispatch_once(
+            default_conn,
+            board="default",
+            spawn_fn=lambda *_args, **_kwargs: 960_000,
+            max_concurrent_workers=3,
+        )
+
+    assert len(result.spawned) == 2
+
+
 def test_host_worker_cap_fails_closed_when_capacity_lock_cannot_open(
     tmp_path, monkeypatch
 ):
@@ -175,3 +206,29 @@ def test_dashboard_dispatch_passes_host_worker_cap(monkeypatch):
 
     plugin_api.dispatch(dry_run=False, max_n=8, board="default")
     assert captured["max_concurrent_workers"] == 2
+
+
+def test_dashboard_dispatch_uses_safe_cap_when_config_load_fails(monkeypatch):
+    from hermes_cli import kanban_db as kb
+    import hermes_cli.config as config
+    from plugins.kanban.dashboard import plugin_api
+
+    captured = {}
+
+    class FakeConn:
+        def close(self):
+            pass
+
+    def fail_config_load():
+        raise OSError("config unreadable")
+
+    monkeypatch.setattr(config, "load_config", fail_config_load)
+    monkeypatch.setattr(plugin_api, "_conn", lambda **_kwargs: FakeConn())
+    monkeypatch.setattr(
+        plugin_api.kanban_db,
+        "dispatch_once",
+        lambda _conn, **kwargs: captured.update(kwargs) or kb.DispatchResult(),
+    )
+
+    plugin_api.dispatch(dry_run=False, max_n=8, board="default")
+    assert captured["max_concurrent_workers"] == 3
