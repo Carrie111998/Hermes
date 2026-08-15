@@ -23,6 +23,7 @@ from gateway.project_router import (
     analyze_project_setup,
     apply_project_setup,
     bootstrap_registry,
+    project_details,
     project_keys,
     project_path,
     register_project,
@@ -447,21 +448,87 @@ def test_project_aliases_persist_and_conflicts_never_reassign(tmp_path):
 
     reopened = SessionDB(db_path=db_path)
     assert resolve_project_reference(reopened, "NAIL WEBSITE") == ("newmoon",)
+    assert project_details(reopened, "newmoon")[2] == (
+        "nail site",
+        "nail website",
+        "nails site",
+        "new moon",
+        "new moon nails",
+    )
     fresh = SessionDB(db_path=tmp_path / "fresh-state.db")
     assert resolve_project_reference(fresh, "nail website") == ()
 
 
 @pytest.mark.asyncio
-async def test_project_alias_commands_mutate_registry_without_agent_dispatch(tmp_path):
+async def test_project_alias_commands_mutate_registry_show_sorted_aliases_and_bypass_routing(tmp_path):
     runner = _runner(tmp_path)
     runner._handle_message_with_agent = AsyncMock()
 
-    added = await runner._handle_message(_event("!project alias add newmoon nail website"))
+    added = await runner._handle_message(_event("!project alias add newmoon Nail Website"))
     removed = await runner._handle_message(_event("!project alias remove newmoon nail website"))
 
-    assert added == "Project alias added: newmoon → nail website"
-    assert removed == "Project alias removed: newmoon → nail website"
+    assert added == (
+        "Alias added: nail website\n"
+        "Project: newmoon\n"
+        "Aliases:\n"
+        "- nail site\n"
+        "- nail website\n"
+        "- nails site\n"
+        "- new moon\n"
+        "- new moon nails"
+    )
+    assert removed == (
+        "Alias removed: nail website\n"
+        "Project: newmoon\n"
+        "Aliases:\n"
+        "- nail site\n"
+        "- nails site\n"
+        "- new moon\n"
+        "- new moon nails"
+    )
     assert resolve_project_reference(runner._session_db._db, "nail website") == ()
+    runner._handle_message_with_agent.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_project_aliases_lists_all_or_one_and_unknown_key_is_safe(tmp_path):
+    runner = _runner(tmp_path)
+    runner._handle_message_with_agent = AsyncMock()
+    trinity = _make_project(tmp_path, "trinity-water")
+    register_project(runner._session_db._db, str(trinity))
+
+    all_aliases = await runner._handle_message(_event("!project aliases"))
+    one_aliases = await runner._handle_message(_event("!project aliases newmoon"))
+    no_aliases = await runner._handle_message(_event("!project aliases trinitywater"))
+    unknown = await runner._handle_message(_event("!project aliases missing"))
+
+    assert all_aliases == (
+        "Project aliases:\n\n"
+        "- fivehours (Five Hours)\n"
+        "  - five hours\n"
+        "  - save five hours\n\n"
+        "- newmoon (New Moon Nails)\n"
+        "  - nail site\n"
+        "  - nails site\n"
+        "  - new moon\n"
+        "  - new moon nails\n\n"
+        "- trinitywater (Trinity Water)\n"
+        "  - none"
+    )
+    assert one_aliases == (
+        "Project: newmoon\n"
+        "Name: New Moon Nails\n"
+        "Aliases:\n"
+        "- nail site\n"
+        "- nails site\n"
+        "- new moon\n"
+        "- new moon nails"
+    )
+    assert no_aliases == "Project: trinitywater\nName: Trinity Water\nAliases:\n- none"
+    assert unknown == (
+        "Project aliases failed: unknown project 'missing'. "
+        "Valid projects: fivehours, newmoon, trinitywater"
+    )
     runner._handle_message_with_agent.assert_not_awaited()
 
 
@@ -626,10 +693,19 @@ async def test_project_list_is_deterministic_and_unknown_keys_are_dynamic(tmp_pa
     unknown = await runner._handle_message(_event("!project unknown"))
 
     assert listed == (
-        "Registered projects:\n"
-        "- fivehours → /home/rle/projects/savefivehours\n"
-        "- newmoon → /home/rle/projects/NewMoonNailsAndSpa\n"
-        f"- zebraapp → {project.resolve()}"
+        "Registered projects:\n\n"
+        "- fivehours\n"
+        "  Name: Five Hours\n"
+        "  Aliases: five hours, save five hours\n"
+        "  Path: /home/rle/projects/savefivehours\n\n"
+        "- newmoon\n"
+        "  Name: New Moon Nails\n"
+        "  Aliases: nail site, nails site, new moon, new moon nails\n"
+        "  Path: /home/rle/projects/NewMoonNailsAndSpa\n\n"
+        "- zebraapp\n"
+        "  Name: Zebra App\n"
+        "  Aliases: none\n"
+        f"  Path: {project.resolve()}"
     )
     assert "Valid projects: fivehours, newmoon, zebraapp" in unknown
 

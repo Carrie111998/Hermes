@@ -16171,9 +16171,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 analyze_project_setup,
                 apply_project_setup,
                 clear_project,
-                project_keys,
-                project_path,
+                project_details,
                 register_project,
+                registered_project_details,
                 remove_project_alias,
                 render_project_setup_apply_result,
                 render_project_setup_plan,
@@ -16195,11 +16195,39 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 key, path = project
                 return f"Active project: {key}\nPath: {path}"
             if action == "list" and not remainder.strip():
-                projects = project_keys(self._session_db._db)
                 lines = ["Registered projects:"]
-                lines.extend(
-                    f"- {key} → {project_path(self._session_db._db, key)}" for key in projects
-                )
+                for key, display_name, aliases, path in registered_project_details(self._session_db._db):
+                    alias_text = ", ".join(aliases) if aliases else "none"
+                    lines.extend(
+                        [
+                            "",
+                            f"- {key}",
+                            f"  Name: {display_name}",
+                            f"  Aliases: {alias_text}",
+                            f"  Path: {path}",
+                        ]
+                    )
+                return "\n".join(lines)
+            if action == "aliases":
+                alias_key = remainder.strip()
+                if not alias_key:
+                    lines = ["Project aliases:"]
+                    for key, display_name, aliases, _path in registered_project_details(self._session_db._db):
+                        lines.extend(["", f"- {key} ({display_name})"])
+                        lines.extend(f"  - {alias}" for alias in aliases)
+                        if not aliases:
+                            lines.append("  - none")
+                    return "\n".join(lines)
+                if len(alias_key.split()) != 1:
+                    return "Project aliases failed: usage: !project aliases [<key>]"
+                try:
+                    key, display_name, aliases, _path = project_details(self._session_db._db, alias_key)
+                except ValueError as exc:
+                    return f"Project aliases failed: {exc}"
+                lines = [f"Project: {key}", f"Name: {display_name}", "Aliases:"]
+                lines.extend(f"- {alias}" for alias in aliases)
+                if not aliases:
+                    lines.append("- none")
                 return "\n".join(lines)
             if action == "alias":
                 alias_args = remainder.strip().split(maxsplit=2)
@@ -16212,10 +16240,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         if operation == "add"
                         else remove_project_alias(self._session_db._db, key, alias)
                     )
+                    normalized_key, _display_name, aliases, _path = project_details(
+                        self._session_db._db, key
+                    )
                 except ValueError as exc:
                     return f"Project alias failed: {exc}"
                 verb = "added" if operation == "add" else "removed"
-                return f"Project alias {verb}: {key} → {normalized_alias}"
+                lines = [f"Alias {verb}: {normalized_alias}", f"Project: {normalized_key}", "Aliases:"]
+                lines.extend(f"- {current_alias}" for current_alias in aliases)
+                if not aliases:
+                    lines.append("- none")
+                return "\n".join(lines)
             if action == "setup":
                 setup_args = remainder.split()
                 if len(setup_args) == 1:

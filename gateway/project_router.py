@@ -228,6 +228,28 @@ def project_path(db, key: str) -> Path | None:
     return Path(entry["path"]) if entry else None
 
 
+def project_details(db, key: str) -> tuple[str, str, tuple[str, ...], Path]:
+    """Return one project's normalized key, display metadata, and canonical path."""
+    normalized_key = normalize_project_key(key)
+    entry = _registry_projects(db).get(normalized_key)
+    if entry is None:
+        raise ValueError(
+            f"unknown project '{normalized_key}'. Valid projects: {', '.join(project_keys(db))}"
+        )
+    metadata = entry["metadata"]
+    return (
+        normalized_key,
+        metadata["display_name"],
+        tuple(metadata["aliases"]),
+        Path(entry["path"]),
+    )
+
+
+def registered_project_details(db) -> tuple[tuple[str, str, tuple[str, ...], Path], ...]:
+    """Return every registered project in deterministic key and alias order."""
+    return tuple(project_details(db, key) for key in project_keys(db))
+
+
 def _routing_phrases(key: str, metadata: dict) -> tuple[str, ...]:
     phrases = {_normalize_routing_phrase(key)}
     display_name = metadata.get("display_name")
