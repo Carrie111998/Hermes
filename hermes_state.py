@@ -2383,7 +2383,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     "reconnecting and retrying the write once: %s", exc,
                 )
                 try:
-                    self._reopen_write_connection()
+                    # Re-open atomically under the same lock the write path
+                    # uses, so no other writer can be mid-use of self._conn while
+                    # it is replaced (closes the cross-thread race window).
+                    with self._lock:
+                        self._reopen_write_connection()
                 except Exception as reconnect_exc:  # noqa: BLE001
                     logger.warning("Session DB reopen after released handle failed: %s", reconnect_exc)
                     raise
