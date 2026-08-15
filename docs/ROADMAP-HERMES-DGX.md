@@ -17,11 +17,11 @@
 
 | Reference | Current evidence | Meaning |
 |---|---|---|
-| origin/main | 826349ccbfe165ef9f2f7f47f72ed53226c13603 | Canonical Hermes mainline after AUTH-002 target-config merge. |
+| origin/main | 77bcb5d0717ed4b31daec8a9ef701057528e08ae | Canonical Hermes mainline after HERMES-TELEGRAM-TRANSPORT-001 merge (PR #19). |
 | origin/ticket/T0127-v2026.8.3-merged | release staging branch | DGX release input; not the ARCH merge target. |
 | live DGX checkout | /home/cwliao/.hermes/hermes-agent | Claude-owned; do not edit or reset. |
-| live DGX deployed commit | 1b3d4449553433100038f38e7b58f2f2dc489fa7 | Release snapshot deployed; gateway active after restart. |
-| live DGX release snapshot | `/home/cwliao/.hermes/releases/v2026.8.15-hermes-calendar-guard-1b3d444955` | Service cwd and PYTHONPATH target; live checkout remains untouched. |
+| live DGX deployed commit | 77bcb5d0717ed4b31daec8a9ef701057528e08ae | Release snapshot deployed; gateway active after restart, Telegram polling progress not observed. |
+| live DGX release snapshot | `/home/cwliao/.hermes/releases/v2026.8.15-hermes-telegram-transport-77bcb5d0717e` | Service cwd and PYTHONPATH target; live checkout remains untouched. |
 | rollback ref | backup/pre-arch-001-deploy-20260810T031625Z | DGX-local pre-ARCH-001 deploy ref; preserved for rollback. |
 | Telegram controlled-execution merge | af99f0f1ad52e266fcc2cfbf261e1ee9f71e39c2 | PR #10 merged; CI run 31571694814 successful; deployed to DGX. |
 | HERMES-AUTH-001 merge | 63bcd7acbbb93d2c797090800ac1e4677b590449 | PR #14 merged; main CI run 31791195033 passed; deployed to DGX. |
@@ -94,11 +94,11 @@ docs/plans/2026-08-10-hermes-skills-roadmap.md.
 | HERMES-SKILLS-002 to HERMES-SKILLCLAW-001 | proposed | Select only after the relevant contract and evidence gates are reviewed. |
 | HERMES-AUTH-002 | READY_FOR_MERGE | Commit `5e8df81b6`; targeted tests 21 passed, CI run `31873607667` and Windows wrapper job `94985879064` passed, and authenticated DGX Claude/AGY implementation re-review reached PASS consensus; merge and deployment remain separate gates. |
 | HERMES-CALENDAR-GUARD-001 | MERGED_DEPLOYED | PR #17/#18 merged; immutable DGX release and recovery timer verified. |
-| HERMES-TELEGRAM-TRANSPORT-001 | REVIEW_PASS_PENDING_CI | `ticket/hermes-telegram-transport-001`; bounded pool lifecycle and jittered reconnect backoff implemented. Compile/diff checks pass; focused Telegram tests pass (`51 passed`) in a disposable pinned review venv; authenticated DGX Claude/AGY re-review reached PASS on packet `1dd4ffbd…66d5e`; CI is next. |
+| HERMES-TELEGRAM-TRANSPORT-001 | MERGED_DEPLOYED_RUNTIME_DEGRADED | PR #19 merged as `77bcb5d0`; CI run `31883895988` required checks passed; immutable DGX release is active with service MainPID `3504674`, but no qualifying Telegram polling progress was observed. |
 
 ## Runtime and deployment boundary
 
-HERMES-CALENDAR-GUARD-001 is the latest verified DGX deployment in an isolated
+HERMES-TELEGRAM-TRANSPORT-001 is the latest DGX deployment in an isolated
 release snapshot; the live checkout remains untouched and drop-in
 `29-hermes-calendar-guard-1b3d444955.conf` selects it. Rollback remains
 available by restoring the preceding drop-in/release selection. The service

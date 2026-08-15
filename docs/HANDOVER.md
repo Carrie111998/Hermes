@@ -41,24 +41,24 @@
   the configured SPARK target. Gateway polling still reports network timeout /
   reconnect warnings, so inbound polling is not claimed as healthy.
 - **Deferred or pending:** HERMES-MONITORING-001 remains `BLOCKED`;
-  `HERMES-TELEGRAM-TRANSPORT-001` is `REVIEW_PASS_PENDING_CI` with local
-  compile/diff checks passed and focused pytest passing in the disposable
-  pinned review venv (`51 passed`).
+  `HERMES-TELEGRAM-TRANSPORT-001` is
+  `MERGED_DEPLOYED_RUNTIME_DEGRADED`: CI/merge/deployment passed, but the
+  bounded post-deploy window showed no Telegram polling progress.
   Live skill synchronization, SkillClaw work, and unrelated DGX service
   changes remain separate work.
 
 ## 3. Verified runtime and deployment state
 
 - **Mainline versus deployed code:** mainline and deployed code are
-  `1b3d4449553433100038f38e7b58f2f2dc489fa7`; DGX uses
-  `/home/cwliao/.hermes/releases/v2026.8.15-hermes-calendar-guard-1b3d444955`
+  `77bcb5d0717ed4b31daec8a9ef701057528e08ae`; DGX uses
+  `/home/cwliao/.hermes/releases/v2026.8.15-hermes-telegram-transport-77bcb5d0717e`
   selected through `29-hermes-calendar-guard-1b3d444955.conf`. The live source
   checkout remains untouched.
 - **DGX service evidence:** the configured DGX target;
-  `hermes-gateway.service` is active/running with MainPID `3161529`, exit
-  status `0`, and `NRestarts=0`; cwd and release identity match the merged
-  release. `hermes-gateway-recovery.timer` is active/waiting and its oneshot
-  has `Result=success`.
+  `hermes-gateway.service` is active/running with MainPID `3504674`, exit
+  status `0`, and `NRestarts=0`; cwd and release identity match merged SHA
+  `77bcb5d0`. Telegram polling did not produce qualifying progress during the
+  bounded post-deploy window, so service health is not Telegram readiness.
 - **DGX SSH evidence:** a bounded WSL probe returned `SSH_OK` through the
   authenticated route. No credentials were stored.
 - **Storage and safety:** this handover refresh does not mutate Hermes memory,
@@ -69,11 +69,12 @@
 ### Current ticket: HERMES-TELEGRAM-TRANSPORT-001
 
 - **Plan:** `docs/plans/2026-08-15-hermes-telegram-transport-001.md`
-- **Status:** `REVIEW_PASS_PENDING_CI`.
+- **Status:** `MERGED_DEPLOYED_RUNTIME_DEGRADED`.
 - **Scope:** bounded Telegram polling recovery with generation-bound progress,
   request-pool lifecycle bounds, jittered retry backoff, and hermetic tests.
-- **Required next action:** run CI for the reviewed correction set. Keep merge
-  and deployment separately authorized.
+- **Required next action:** diagnose the DGX initial Telegram connection/network
+  path or execute the documented rollback trigger. Do not claim inbound
+  readiness without direct evidence.
 
 ### Other ticket state
 
@@ -93,8 +94,9 @@
 Ticket implementation, local tests, independent cross-review, reconciliation,
 CI, merge, DGX deployment, runtime health, and Telegram delivery are separate
 gates. A pass at one gate cannot be reported as a pass at another. The current
-Telegram ticket has implementation evidence but no implementation-review,
-CI, merge, deployment, or live inbound evidence yet.
+Telegram ticket has implementation-review, CI, merge, and deployment evidence,
+but no live inbound or outbound Telegram evidence; service active is not
+Telegram readiness.
 
 ## 5. Safe continuation instructions
 

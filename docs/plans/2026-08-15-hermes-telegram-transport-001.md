@@ -1,6 +1,6 @@
 ---
 title: "HERMES-TELEGRAM-TRANSPORT-001: restore Telegram polling health"
-status: REVIEW_PASS_PENDING_CI
+status: MERGED_DEPLOYED_RUNTIME_DEGRADED
 date: 2026-08-15
 type: reliability
 ticket: HERMES-TELEGRAM-TRANSPORT-001
@@ -202,8 +202,9 @@ and the implementation/test/deployment gate order.
   `pytest -p no:cacheprovider tests/gateway/test_telegram_network_reconnect.py
   tests/gateway/test_telegram_start_polling_timeout.py -q` passed: `51 passed
   in 16.26s`, including the cross-generation pool-drain regression.
-- No CI, DGX deployment, service restart, live inbound verification, outbound
-  verification, or rollback execution has been performed.
+- No DGX deployment, service restart, live inbound verification, outbound
+  verification, or rollback execution had been performed at implementation
+  review time; deployment evidence is recorded below.
 
 ## Post-implementation review evidence
 
@@ -212,16 +213,41 @@ and the implementation/test/deployment gate order.
   `55-0940189-03`, packet hash matched.
 - Authenticated DGX Claude `PASS` and authenticated DGX AGY `PASS` were
   independently returned for the same packet and correction set.
-- Review found no remaining implementation defect. CI is the next gate; merge,
-  deployment, and runtime verification remain separately unauthorized.
+- Review found no remaining implementation defect. CI, merge, and deployment
+  evidence are recorded separately below; runtime Telegram delivery remains
+  unproven.
+
+## Merge and deployment evidence
+
+- PR #19 merged with squash commit
+  `77bcb5d0717ed4b31daec8a9ef701057528e08ae`.
+- GitHub Actions CI run `31883895988` required checks passed after rerunning
+  the unrelated `tests/gateway/test_stream_consumer_fresh_final.py` slice.
+- DGX host preflight matched `55-0940189-03`; the prior release was
+  `/home/cwliao/.hermes/releases/v2026.8.15-hermes-calendar-guard-1b3d444955`.
+- New immutable release:
+  `/home/cwliao/.hermes/releases/v2026.8.15-hermes-telegram-transport-77bcb5d0717e`.
+  `.hermes-release-sha` and `gateway_boot_fingerprint` both identify the
+  merged SHA. The Telegram adapter compiled before restart.
+- Rollback metadata is preserved under
+  `/home/cwliao/.hermes/deploy-backups/hermes-telegram-transport-77bcb5d0717e`.
+- `hermes-gateway.service` restarted through `systemctl --user`; post-deploy
+  state is active/running, MainPID `3504674`, `NRestarts=0`, and
+  `ExecMainStatus=0`, with the new release as `WorkingDirectory`.
+- Runtime boundary: no qualifying `getUpdates` progress or Telegram inbound
+  delivery was observed during the bounded post-deploy window; logs remained at
+  the initial Telegram connection attempt. Service health is therefore active
+  but Telegram polling is `DEGRADED`, not healthy. No outbound delivery test or
+  rollback was executed.
 
 ## Current implementation gate
 
-`REVIEW_PASS_PENDING_CI`: independent Claude + AGY review reached PASS on the
-same correction set. CI is required before any merge or deployment decision; no
-DGX mutation is authorized by this ticket.
+`MERGED_DEPLOYED_RUNTIME_DEGRADED`: implementation review, CI, merge, and
+immutable deployment passed their respective gates. Telegram inbound readiness
+remains unproven/degraded; investigate the network/initial-connect path or use
+the documented rollback trigger before claiming runtime health.
 
 ## Current gate
 
-`REVIEW_PASS_PENDING_CI`. No merge, deployment, DGX mutation, or Telegram
-credential/network action is authorized by this plan.
+`MERGED_DEPLOYED_RUNTIME_DEGRADED`. No Telegram inbound/outbound delivery
+claim is authorized by this plan without direct evidence.
