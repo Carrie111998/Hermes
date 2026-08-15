@@ -373,6 +373,12 @@ so an out-of-date dispatcher cannot accept a rollover it cannot safely release.
 Use `kanban.safe_checkpoint.prompt_hint` for local guidance on when to roll
 over; an empty value uses the generic context-pressure reminder.
 
+Comment wakes treat comments written through the CLI or dashboard as
+operator-originated even when their display author matches the assignee.
+Display authors are not authenticated identity claims: Kanban boards are a
+trusted-operator surface, and recorded write-surface provenance narrows (but
+does not eliminate) that trust boundary.
+
 ### Recommended handoff evidence
 
 `kanban_complete(summary=..., metadata={...})` is intentionally flexible:
@@ -639,8 +645,9 @@ Workflow policy keys:
 | `human_comment_wake_overrides_mute` | `false` | Also wake the worker for a passive `notify` subscription, which normally mutes agent wakes while keeping ordinary notifications. |
 | `safe_checkpoint.enabled` | `false` | Enable fenced safe checkpoints, including the worker tool, prompt guidance, and persistent-dispatcher capability advertisement. |
 | `safe_checkpoint.prompt_hint` | `""` | Optional extra guidance on when workers should checkpoint. Empty uses the built-in generic context-pressure guidance. |
-| `workspace_conflict` | `"allow"` | Workspace collision policy: `allow` preserves current behavior; `warn` dispatches and logs; `serialize` skips candidates sharing a running task's workspace. |
-| `default_subscriptions` | `[]` | Notify-subscribe targets added on every task creation path. Each target is `platform:chat_id[:thread_id]`, matching `kanban_notify-subscribe`; duplicate inherited or session-auto targets remain one subscription. |
+| `workspace_conflict` | `"allow"` | Workspace collision policy: `allow` preserves current behavior; `warn` dispatches and logs; `serialize` skips candidates sharing a running task's workspace. The serialization guarantee is per board under the one-dispatcher-per-board model, not a global cross-board lease. |
+| `default_subscriptions` | `[]` | Notify-subscribe targets added on every task creation path. Each target is `platform:chat_id[:thread_id]`; split only the first colon for platform, and treat the last segment as `thread_id` only when it is an integer (so Matrix `!room:server` IDs work). Duplicate inherited or session-auto targets remain one subscription. |
+| `default_subscription_notifier_profile` | creating profile | Optional gateway profile that owns configured default-subscription delivery. Empty uses the task creator's profile. |
 | `validate_on_create` | `"warn"` | Creation validation policy: `off`, `warn` (log violations but create), or `strict` (reject). Checks skills, profiles, and explicit-workspace policy. |
 | `require_explicit_workspace` | `false` | When validation is active, treat an implicit `scratch` workspace as a violation. |
 | `deadline_warning_fraction` | `0.0` | Fraction of a task's runtime cap at which to nudge the worker to checkpoint. Valid values are `0 < f <= 1`; `0` disables the nudge. With safe checkpoints disabled, the nudge says to finish or block at a coherent boundary and does not promise a rollover. |

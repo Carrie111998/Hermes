@@ -103,15 +103,25 @@ def _running_git_commit() -> str:
     git = shutil.which("git")
     if git:
         try:
-            result = subprocess.run(
-                [git, "rev-parse", "--short", "HEAD"],
-                cwd=str(Path(__file__).resolve().parent.parent),
+            package_root = Path(__file__).resolve().parent.parent
+            root_result = subprocess.run(
+                [git, "rev-parse", "--show-toplevel"],
+                cwd=str(package_root),
                 capture_output=True,
                 text=True,
                 timeout=5,
             )
-            if result.returncode == 0 and result.stdout.strip():
-                return result.stdout.strip()
+            if root_result.returncode == 0 and Path(root_result.stdout.strip()).resolve() == package_root:
+                result = subprocess.run(
+                    [git, "rev-parse", "--short", "HEAD"],
+                    cwd=str(package_root), capture_output=True, text=True, timeout=5,
+                )
+                if result.returncode == 0 and result.stdout.strip():
+                    dirty = subprocess.run(
+                        [git, "status", "--porcelain"], cwd=str(package_root),
+                        capture_output=True, text=True, timeout=5,
+                    )
+                    return result.stdout.strip() + ("-dirty" if dirty.stdout.strip() else "")
         except (OSError, subprocess.SubprocessError):
             logger.debug("Could not resolve gateway git commit", exc_info=True)
     try:
@@ -136,7 +146,8 @@ def _kanban_dispatch_in_gateway_enabled() -> bool:
         logger.debug("Could not resolve kanban dispatcher config", exc_info=True)
         return False
     kanban_config = config.get("kanban", {}) if isinstance(config, dict) else {}
-    return bool(kanban_config.get("dispatch_in_gateway", True))
+    from hermes_cli.kanban_config import enabled
+    return enabled(kanban_config.get("dispatch_in_gateway", True))
 
 
 # End reasons that mean the USER deliberately closed this thread of work
@@ -11867,7 +11878,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         logger.info(
             "Gateway code: commit=%s; kanban dispatch-in-gateway=%s",
             self._running_git_commit,
-            "enabled" if self._kanban_dispatch_in_gateway_enabled else "disabled",
+            "configured" if self._kanban_dispatch_in_gateway_enabled else "disabled",
         )
         # Enable faulthandler for stack dumps on freezes/crashes (#70344).
         # Falls back to a log file when sys.stderr is None (Windows VBS /
@@ -11989,7 +12000,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 gateway_state="starting",
                 exit_reason=None,
                 git_commit=self._running_git_commit,
-                kanban_dispatch_in_gateway=self._kanban_dispatch_in_gateway_enabled,
             )
         except Exception:
             pass

@@ -978,6 +978,7 @@ def test_workflow_policy_config_defaults_preserve_current_behavior():
     assert policy["safe_checkpoint"] == {"enabled": False, "prompt_hint": ""}
     assert policy["workspace_conflict"] == "allow"
     assert policy["default_subscriptions"] == []
+    assert policy["default_subscription_notifier_profile"] is None
     assert policy["validate_on_create"] == "warn"
     assert policy["require_explicit_workspace"] is False
     assert policy["deadline_warning_fraction"] == 0.0
@@ -997,6 +998,7 @@ def test_workflow_policy_config_accepts_enabled_values(tmp_path, monkeypatch):
         "  workspace_conflict: serialize\n"
         "  default_subscriptions:\n"
         "    - gateway:ops\n"
+        "  default_subscription_notifier_profile: notifier\n"
         "  validate_on_create: strict\n"
         "  require_explicit_workspace: true\n"
         "  deadline_warning_fraction: 0.75\n",
@@ -1013,6 +1015,7 @@ def test_workflow_policy_config_accepts_enabled_values(tmp_path, monkeypatch):
     }
     assert policy["workspace_conflict"] == "serialize"
     assert policy["default_subscriptions"] == ["gateway:ops"]
+    assert policy["default_subscription_notifier_profile"] == "notifier"
     assert policy["validate_on_create"] == "strict"
     assert policy["require_explicit_workspace"] is True
     assert policy["deadline_warning_fraction"] == 0.75
@@ -1461,4 +1464,3 @@ def test_notify_sub_starts_caught_up_on_active_task(kanban_home):
         assert events == [], "historical events must not replay to a new sub"
     finally:
         conn.close()
-

@@ -2439,6 +2439,9 @@ DEFAULT_CONFIG = {
         # Notify targets applied to every task creation path. Entries use the
         # same target format as ``kanban_notify-subscribe``.
         "default_subscriptions": [],
+        # Optional owner for configured default-subscription deliveries. None
+        # means the profile that created the task owns its own gateway route.
+        "default_subscription_notifier_profile": None,
         # Task-creation validation policy: off, warn, or strict. Warn is
         # behavior-compatible because violations only produce log lines.
         "validate_on_create": "warn",

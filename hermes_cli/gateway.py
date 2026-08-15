@@ -6045,7 +6045,12 @@ def _runtime_health_lines() -> list[str]:
 
     git_commit = state.get("git_commit")
     if git_commit:
-        dispatch = "enabled" if state.get("kanban_dispatch_in_gateway") else "disabled"
+        raw_dispatch = state.get("kanban_dispatch_in_gateway")
+        dispatch = (
+            raw_dispatch
+            if raw_dispatch in {"enabled", "disabled", "contended"}
+            else ("enabled" if raw_dispatch else "disabled")
+        )
         lines.append(
             f"Running code: {git_commit} (kanban dispatch-in-gateway: {dispatch})"
         )

@@ -498,6 +498,18 @@ def test_add_comment(client):
     assert comments[0]["author"] == "teknium"
 
 
+def test_dashboard_omitted_workspace_remains_implicit(client, kanban_home):
+    (kanban_home / "config.yaml").write_text(
+        "kanban:\n  validate_on_create: strict\n  require_explicit_workspace: true\n",
+        encoding="utf-8",
+    )
+
+    response = client.post("/api/plugins/kanban/tasks", json={"title": "implicit"})
+
+    assert response.status_code == 400
+    assert "implicit scratch" in response.json()["detail"]
+
+
 # ---------------------------------------------------------------------------
 # Dispatch nudge
 # ---------------------------------------------------------------------------
@@ -1228,5 +1240,4 @@ def test_specify_happy_path(client, monkeypatch):
 # ---------------------------------------------------------------------------
 # Final result visibility for Done cards
 # ---------------------------------------------------------------------------
-
 

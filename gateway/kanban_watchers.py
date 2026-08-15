@@ -196,6 +196,14 @@ class GatewayKanbanWatchersMixin:
         self._kanban_dispatcher_lock_handle = None
         _release_singleton_lock(handle)
 
+    def _report_kanban_dispatch_state(self, state: str) -> None:
+        """Persist actual dispatcher ownership after config/lock resolution."""
+        try:
+            from gateway.status import write_runtime_status
+            write_runtime_status(kanban_dispatch_in_gateway=state)
+        except Exception:
+            logger.debug("kanban dispatcher: could not persist ownership state", exc_info=True)
+
     async def _kanban_notifier_watcher(self, interval: float = 5.0) -> None:
         """Poll ``kanban_notify_subs`` and deliver terminal events to users.
 
@@ -836,12 +844,23 @@ class GatewayKanbanWatchersMixin:
                                 _comment_author = str(
                                     (_comment_event.payload or {}).get("author") or ""
                                 ).strip()
-                                # Ignore worker and origin resolution comments to prevent a wake loop.
+                                _comment_source = str(
+                                    (_comment_event.payload or {}).get("source") or ""
+                                ).strip().lower()
+                                # CLI/dashboard provenance records an operator
+                                # surface even when the displayed author equals
+                                # the assignee profile.  For legacy/tool events,
+                                # retain the conservative identity heuristic.
                                 if (
                                     _comment_author
-                                    and _comment_author != _assignee_name
-                                    and _comment_author != _notifier_name
                                     and _comment_event.id > d["block_event_id"]
+                                    and (
+                                        _comment_source in {"cli", "dashboard"}
+                                        or (
+                                            _comment_author != _assignee_name
+                                            and _comment_author != _notifier_name
+                                        )
+                                    )
                                 ):
                                     _comment_wake = _comment_author
                         # Terminal events wake only modes that opt in, while a
@@ -1324,26 +1343,31 @@ class GatewayKanbanWatchersMixin:
         try:
             from hermes_cli.config import load_config as _load_config
         except Exception:
+            self._report_kanban_dispatch_state("disabled")
             logger.warning("kanban dispatcher: config loader unavailable; disabled")
             return
         env_override = os.environ.get("HERMES_KANBAN_DISPATCH_IN_GATEWAY", "").strip().lower()
         if env_override in {"0", "false", "no", "off"}:
+            self._report_kanban_dispatch_state("disabled")
             logger.info("kanban dispatcher: disabled via HERMES_KANBAN_DISPATCH_IN_GATEWAY env")
             return
 
         try:
             cfg = _load_config()
         except Exception as exc:
+            self._report_kanban_dispatch_state("disabled")
             logger.warning("kanban dispatcher: cannot load config (%s); disabled", exc)
             return
         kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
-        if not kanban_cfg.get("dispatch_in_gateway", True):
+        from hermes_cli.kanban_config import enabled as _enabled
+        if not _enabled(kanban_cfg.get("dispatch_in_gateway", True)):
+            self._report_kanban_dispatch_state("disabled")
             logger.info(
                 "kanban dispatcher: disabled via config kanban.dispatch_in_gateway=false"
             )
             return
         checkpoint_cfg = kanban_cfg.get("safe_checkpoint", {})
-        safe_checkpoint_enabled = bool(
+        safe_checkpoint_enabled = _enabled(
             checkpoint_cfg.get("enabled", False)
             if isinstance(checkpoint_cfg, dict)
             else False
@@ -1366,6 +1390,7 @@ class GatewayKanbanWatchersMixin:
         _lock_path = _kb.kanban_home() / "kanban" / ".dispatcher.lock"
         _lock_handle, _lock_state = _acquire_singleton_lock(_lock_path)
         if _lock_state == "contended":
+            self._report_kanban_dispatch_state("contended")
             logger.info(
                 "kanban dispatcher: another gateway already holds the dispatcher "
                 "lock (%s); this gateway will NOT dispatch.", _lock_path,
@@ -1373,8 +1398,10 @@ class GatewayKanbanWatchersMixin:
             return
         if _lock_state == "held":
             self._kanban_dispatcher_lock_handle = _lock_handle  # hold for process lifetime
+            self._report_kanban_dispatch_state("enabled")
             logger.info("kanban dispatcher: holding singleton dispatcher lock (%s)", _lock_path)
         else:
+            self._report_kanban_dispatch_state("enabled")
             logger.warning(
                 "kanban dispatcher: advisory lock unavailable at %s; proceeding "
                 "on config control alone.", _lock_path,

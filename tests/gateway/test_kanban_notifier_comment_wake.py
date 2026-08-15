@@ -141,6 +141,25 @@ def test_human_comment_wakes_once_silently_and_preserves_block(tmp_path, monkeyp
     assert len(adapter.handled) == 1
 
 
+@pytest.mark.parametrize("source", ["cli", "dashboard"])
+def test_operator_surface_comment_wakes_even_when_display_author_is_assignee(
+    tmp_path, monkeypatch, source,
+):
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "comments.db"))
+    kb.init_db()
+    task_id = _commentable_task()
+    conn = kb.connect()
+    try:
+        kb.add_comment(conn, task_id, "worker", "Human decision", source=source)
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+
+    assert len(adapter.handled) == 1
+
+
 def test_comment_before_needs_input_block_does_not_wake(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "comments.db"))
     kb.init_db()

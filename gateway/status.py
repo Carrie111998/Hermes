@@ -1023,7 +1023,7 @@ def write_runtime_status(
     if git_commit is not _UNSET:
         payload["git_commit"] = git_commit
     if kanban_dispatch_in_gateway is not _UNSET:
-        payload["kanban_dispatch_in_gateway"] = bool(kanban_dispatch_in_gateway)
+        payload["kanban_dispatch_in_gateway"] = kanban_dispatch_in_gateway
 
     if platform is not _UNSET:
         platform_payload = payload["platforms"].get(platform, {})

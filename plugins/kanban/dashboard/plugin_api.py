@@ -601,7 +601,7 @@ class CreateTaskBody(BaseModel):
     assignee: Optional[str] = None
     tenant: Optional[str] = None
     priority: int = 0
-    workspace_kind: str = "scratch"
+    workspace_kind: Optional[str] = None
     workspace_path: Optional[str] = None
     parents: list[str] = Field(default_factory=list)
     triage: bool = False
@@ -625,13 +625,18 @@ def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
+        workspace_kind_kwargs = (
+            {"workspace_kind": payload.workspace_kind}
+            if payload.workspace_kind is not None
+            else {}
+        )
         task_id = kanban_db.create_task(
             conn,
             title=payload.title,
             body=payload.body,
             assignee=payload.assignee,
             created_by="dashboard",
-            workspace_kind=payload.workspace_kind,
+            workspace_explicit=(payload.workspace_kind is not None or payload.workspace_path is not None),
             workspace_path=payload.workspace_path,
             tenant=payload.tenant,
             priority=payload.priority,
@@ -647,6 +652,7 @@ def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
             reasoning_effort=payload.reasoning_effort,
             project_id=payload.project_id,
             board=board,
+            **workspace_kind_kwargs,
         )
         task = kanban_db.get_task(conn, task_id)
         body: dict[str, Any] = {"task": _task_dict(task) if task else None}
@@ -1246,7 +1252,11 @@ def add_comment(task_id: str, payload: CommentBody, board: Optional[str] = Query
         if kanban_db.get_task(conn, task_id) is None:
             raise HTTPException(status_code=404, detail=f"task {task_id} not found")
         kanban_db.add_comment(
-            conn, task_id, author=payload.author or "dashboard", body=payload.body,
+            conn,
+            task_id,
+            author=payload.author or "dashboard",
+            body=payload.body,
+            source="dashboard",
         )
         return {"ok": True}
     finally:
