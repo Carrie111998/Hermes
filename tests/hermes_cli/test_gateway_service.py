@@ -2332,6 +2332,47 @@ class TestGatewayStopGraceBudget:
         )
         assert timeout > force_after, "the wait must outlast its own escalation"
 
+    @pytest.mark.parametrize(
+        "bootout_returncode, ownership",
+        [
+            (0, "launchd owns the escalation"),
+            (5, "the CLI owns it — detached fallback process (#23387)"),
+        ],
+    )
+    def test_uninstall_keeps_the_plist_when_the_gateway_survives(
+        self, monkeypatch, tmp_path, capsys, bootout_returncode, ownership
+    ):
+        """Deleting the service definition under a live gateway strands the user.
+
+        With the plist gone there is no supported way back: `hermes gateway
+        stop` takes the same unsupervised fall-through, and `hermes gateway
+        start` bootstraps a SECOND instance against the same bot token and
+        port. So when the wait reports the PID still alive, uninstall must
+        keep the plist and say so rather than printing its two success lines.
+        The rule holds whichever side owned the escalation.
+        """
+        plist_path = tmp_path / "ai.hermes.gateway.plist"
+        plist_path.write_text("<plist/>")
+        self._stub_launchd_uninstall(
+            monkeypatch,
+            plist_path,
+            bootout_returncode=bootout_returncode,
+            exit_result=False,
+        )
+
+        gateway_cli.launchd_uninstall()
+
+        out = capsys.readouterr().out
+        assert plist_path.exists(), (
+            f"the plist is the only way left to stop the gateway ({ownership})"
+        )
+        assert "✓ Removed" not in out
+        assert "✓ Service uninstalled" not in out, (
+            "uninstall reported success for a gateway that is still running"
+        )
+        assert "still running" in out
+        assert "hermes gateway stop" in out, "the operator needs the way out"
+
     def test_start_all_waits_out_the_budget_before_force_killing(self, monkeypatch):
         """`gateway start --all` SIGTERMs every stale gateway, then escalates.
 
