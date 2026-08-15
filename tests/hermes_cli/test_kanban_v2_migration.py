@@ -16,7 +16,7 @@ from hermes_cli import kanban_v2_migration as migration
 # ---------------------------------------------------------------------------
 
 _PRE_INTEGRATION_SQL = (
-    Path(__file__).resolve().parent.parent.parent
+    Path(__file__).resolve().parent.parent
     / "fixtures" / "kanban" / "v2_migration" / "pre_integration.sql"
 )
 
@@ -57,6 +57,13 @@ def empty_scratch_db(tmp_path: Path) -> Path:
                 blocked INTEGER NOT NULL DEFAULT 0,
                 source_commit_required INTEGER NOT NULL DEFAULT 0,
                 source_commit_forbidden INTEGER NOT NULL DEFAULT 0
+            )"""
+        )
+        conn.execute(
+            """CREATE TABLE board_governance (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                qualification_required INTEGER NOT NULL DEFAULT 0
+                                   CHECK (qualification_required IN (0, 1))
             )"""
         )
         conn.execute(
@@ -303,6 +310,13 @@ def test_apply_rejects_active_run(tmp_path: Path) -> None:
                 blocked INTEGER NOT NULL DEFAULT 0,
                 source_commit_required INTEGER NOT NULL DEFAULT 0,
                 source_commit_forbidden INTEGER NOT NULL DEFAULT 0
+            )"""
+        )
+        conn.execute(
+            """CREATE TABLE board_governance (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                qualification_required INTEGER NOT NULL DEFAULT 0
+                                   CHECK (qualification_required IN (0, 1))
             )"""
         )
         conn.execute("INSERT INTO board_governance (id, qualification_required) VALUES (1, 0)")
