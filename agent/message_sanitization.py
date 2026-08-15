@@ -646,6 +646,15 @@ def uniquify_tool_call_ids(tool_calls: list) -> list:
 #                hence the " " single-space pad, #17341).
 #     mimo     — provider "xiaomi", model contains "mimo", or host
 #                *.xiaomimimo.com.
+#   soft-echo (preserve-or-strip, never fabricate) — RESERVED for zai:
+#     z.ai's documented Preserved Thinking (thinking.clear_thinking=false,
+#     issue #11483) wants verbatim reasoning_content replay.  NOT wired yet:
+#     live probes (2026-08-15) show the OpenAI-compat wire accepts the field
+#     but silently drops it from model attention (billed, unseen) — only the
+#     Anthropic wire (/api/anthropic/v1/messages) honors thinking-block
+#     replay.  Do not add a zai rule until the chat-completions transport
+#     actually delivers replayed reasoning; until then replay would be cost
+#     without benefit.
 #   strict side (field rejected with 400/422 "Extra inputs are not
 #     permitted"): everyone else — Mistral, Cerebras, Groq, SambaNova, …
 #     (#45655). Strip the key entirely, even a single-space pad.
@@ -710,16 +719,26 @@ def needs_reasoning_echo(provider: Any, model: Any, base_url: Any) -> bool:
 
 
 def apply_reasoning_content_policy(
-    source_msg: dict, api_msg: dict, needs_thinking_pad: bool
+    source_msg: dict, api_msg: dict, needs_thinking_pad: bool,
+    family: str | None = None,
 ) -> None:
     """Copy provider-facing reasoning fields onto an API replay message.
 
     ``needs_thinking_pad`` is the require-side flag (see
     ``needs_reasoning_echo`` / the agent's cached
     ``_needs_thinking_reasoning_pad``). Mutates ``api_msg`` in place.
+
+    ``family`` names the matched echo family when a caller supplies one
+    (``"kimi"``, ``"deepseek"``, ``"mimo"``), else ``None``.  Reserved for
+    soft echo families (zai Preserved Thinking, issue #11483) that must
+    replay real reasoning but never fabricate pads — no such family is
+    wired yet (see the direction-table comment above).  ``family=None``
+    keeps today's exact behavior.
     """
     if source_msg.get("role") != "assistant":
         return
+    # No soft family is active today; strict semantics for everyone.
+    strict = family is None or family != "__soft__"
 
     # 1. Explicit reasoning_content already set.
     #
@@ -763,6 +782,7 @@ def apply_reasoning_content_policy(
     normalized_reasoning = source_msg.get("reasoning")
     if (
         needs_thinking_pad
+        and strict
         and source_msg.get("tool_calls")
         and isinstance(normalized_reasoning, str)
         and normalized_reasoning
@@ -791,7 +811,7 @@ def apply_reasoning_content_policy(
     # Pro tightened validation and rejects empty string with HTTP 400
     # ("The reasoning content in the thinking mode must be passed back
     # to the API"). Refs #17341.
-    if needs_thinking_pad:
+    if needs_thinking_pad and strict:
         api_msg["reasoning_content"] = " "
         return
 
@@ -800,7 +820,10 @@ def apply_reasoning_content_policy(
     api_msg.pop("reasoning_content", None)
 
 
-def reapply_reasoning_echo(api_messages: list, needs_thinking_pad: bool) -> int:
+
+def reapply_reasoning_echo(
+    api_messages: list, needs_thinking_pad: bool, family: str | None = None
+) -> int:
     """Re-pad (or strip) assistant turns' reasoning_content for the active provider.
 
     ``api_messages`` is built once, before the retry loop, while the *primary*
@@ -836,7 +859,9 @@ def reapply_reasoning_echo(api_messages: list, needs_thinking_pad: bool) -> int:
         if needs_thinking_pad:
             if api_msg.get("reasoning_content"):
                 continue
-            apply_reasoning_content_policy(api_msg, api_msg, needs_thinking_pad)
+            apply_reasoning_content_policy(
+                api_msg, api_msg, needs_thinking_pad, family=family
+            )
             if api_msg.get("reasoning_content"):
                 changed += 1
         else:
