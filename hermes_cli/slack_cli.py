@@ -91,6 +91,7 @@ def _build_full_manifest(
         "im:write",
         "mpim:history",
         "mpim:read",
+        "pins:read",
         "reactions:read",
         "users:read",
     ]

@@ -95,12 +95,21 @@ Navigate to **Features → OAuth & Permissions** in the sidebar. Scroll to **Sco
 | `users:read` | Look up user information |
 | `files:read` | Read and download attached files, including voice notes/audio |
 | `files:write` | Upload files (images, audio, documents) |
+| `pins:read` | Load pinned channel instructions and lazily access documents attached to pinned messages |
 
 :::caution Missing scopes = missing features
 Without `channels:history` and `groups:history`, the bot **will not receive messages in channels** —
 it will only work in DMs. Without `files:read`, Hermes can chat but **cannot reliably read user-uploaded attachments**.
 These are the most commonly missed scopes.
 :::
+
+Pinned Slack message text is included as channel-level context for Hermes. Files
+attached to pinned messages are listed by name and Slack file ID but are not
+downloaded automatically. Hermes downloads a listed document only when it needs
+the file during a turn. Pin the upload message itself; links to other messages
+and standalone file IDs are not resolved. If `pins.list` fails, Hermes reports
+the error and stops the turn rather than answering without the pinned
+instructions.
 
 **Optional scopes:**
 

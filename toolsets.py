@@ -345,6 +345,12 @@ TOOLSETS = {
         "includes": [],
     },
 
+    "slack_pinned_files": {
+        "description": "Lazy access to files attached to pinned Slack messages",
+        "tools": ["slack_download_pinned_file"],
+        "includes": [],
+    },
+
     "yuanbao": {
         "description": "Yuanbao platform tools - group info, member queries, DM, stickers",
         "tools": [
@@ -536,7 +542,7 @@ TOOLSETS = {
     
     "hermes-slack": {
         "description": "Slack bot toolset - full access for workspace use (terminal has safety checks)",
-        "tools": _HERMES_CORE_TOOLS,
+        "tools": _HERMES_CORE_TOOLS + ["slack_download_pinned_file"],
         "includes": []
     },
     

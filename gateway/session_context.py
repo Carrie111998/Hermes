@@ -89,6 +89,31 @@ _SESSION_USER_NAME: ContextVar = ContextVar("HERMES_SESSION_USER_NAME", default=
 _SESSION_SCOPE_ID: ContextVar = ContextVar("HERMES_SESSION_SCOPE_ID", default=_UNSET)
 _SESSION_KEY: ContextVar = ContextVar("HERMES_SESSION_KEY", default=_UNSET)
 _SESSION_ID: ContextVar = ContextVar("HERMES_SESSION_ID", default=_UNSET)
+
+
+class _SlackPinnedFileAuthorization:
+    """Mutable turn capability shared by copied async contexts."""
+
+    def __init__(self, file_ids) -> None:
+        self.file_ids = frozenset(
+            str(file_id) for file_id in (file_ids or ()) if file_id
+        )
+        self.active = True
+
+
+_SLACK_PINNED_FILE_IDS: ContextVar = ContextVar(
+    "HERMES_SLACK_PINNED_FILE_IDS", default=None
+)
+
+
+def _clear_slack_pinned_file_ids() -> None:
+    """Revoke this capability for this task and any copied child contexts."""
+    authorization = _SLACK_PINNED_FILE_IDS.get()
+    if isinstance(authorization, _SlackPinnedFileAuthorization):
+        authorization.active = False
+    _SLACK_PINNED_FILE_IDS.set(None)
+
+
 # In-process UI session/window id for multi-session desktop/TUI hosts. This is
 # intentionally separate from HERMES_SESSION_ID: the latter is the durable
 # conversation/session-db id, while the UI id is the live frontend tab/window
@@ -315,6 +340,7 @@ def clear_session_vars(tokens: list) -> None:
         _CRON_SESSION,
     ):
         var.set("")
+    _clear_slack_pinned_file_ids()
     # Reset async-delivery capability to the "never set" sentinel rather than a
     # falsy value: a cleared context should fall back to the default-supported
     # behavior (CLI / unaware paths), not be mistaken for an opted-out
@@ -364,6 +390,7 @@ def reset_session_vars() -> None:
     """
     for var in _VAR_MAP.values():
         var.set(_UNSET)
+    _clear_slack_pinned_file_ids()
     # Reset the async-delivery capability to "never bound here" (_UNSET) for the
     # same inheritance-leak reason as the mapped vars above — see clear_session_vars,
     # which resets this var on the handler-exit path for the symmetric concern.
@@ -400,6 +427,31 @@ def get_session_env(name: str, default: str = "") -> str:
             return value
     # Fall back to os.environ for CLI, cron, and test compatibility
     return os.getenv(name, default)
+
+
+def set_slack_pinned_file_ids(file_ids) -> Any:
+    """Bind the Slack file IDs authorised by the current turn's pins listing."""
+    authorization = _SlackPinnedFileAuthorization(file_ids)
+    token = _SLACK_PINNED_FILE_IDS.set(authorization)
+    return token, authorization
+
+
+def get_slack_pinned_file_ids() -> frozenset[str]:
+    """Return the Slack file IDs authorised for the current turn."""
+    authorization = _SLACK_PINNED_FILE_IDS.get()
+    if (
+        isinstance(authorization, _SlackPinnedFileAuthorization)
+        and authorization.active
+    ):
+        return authorization.file_ids
+    return frozenset()
+
+
+def reset_slack_pinned_file_ids(token) -> None:
+    """Revoke this turn's capability and restore the previous context binding."""
+    context_token, authorization = token
+    authorization.active = False
+    _SLACK_PINNED_FILE_IDS.reset(context_token)
 
 
 # Surfaces that are not a human chat channel. The gateway binds a platform

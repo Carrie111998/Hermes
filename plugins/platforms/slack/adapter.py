@@ -48,6 +48,7 @@ from gateway.platforms.base import (
     MessageType,
     ProcessingOutcome,
     SendResult,
+    SLACK_PINNED_FILES_METADATA_KEY,
     SUPPORTED_DOCUMENT_TYPES,
     SUPPORTED_VIDEO_TYPES,
     _TEXT_INJECT_EXTENSIONS,
@@ -77,6 +78,7 @@ except Exception:
 _HERMES_SLACK_USER_AGENT_PREFIX = f"HermesAgent/{_HERMES_VERSION}"
 
 _SLACK_ERROR_BODY_LIMIT_BYTES = 8 * 1024
+SLACK_DOCUMENT_MAX_BYTES = 20 * 1024 * 1024
 
 
 async def _read_error_text_limited(
@@ -4464,6 +4466,92 @@ class SlackAdapter(BasePlatformAdapter):
             f"mention of you, even if their name is similar."
         )
 
+    async def _fetch_pinned_channel_context(
+        self, channel_id: str, team_id: str = ""
+    ) -> tuple[str, Dict[str, str]]:
+        """Return prompt text and the files attached to this channel's pins."""
+        response = await self._get_client(
+            channel_id, team_id=team_id or None
+        ).pins_list(channel=channel_id)
+        payload = _slack_response_payload(response)
+        if not payload.get("ok"):
+            raise RuntimeError(payload.get("error") or "pins.list failed")
+
+        messages: List[str] = []
+        allowed_files: Dict[str, str] = {}
+        for item in payload.get("items") or []:
+            if not isinstance(item, dict) or item.get("type") != "message":
+                continue
+            message = item.get("message")
+            if not isinstance(message, dict):
+                continue
+
+            text = str(message.get("text") or "").strip()
+            document_lines: List[str] = []
+            for file_obj in message.get("files") or []:
+                if not isinstance(file_obj, dict):
+                    continue
+                file_id = str(file_obj.get("id") or "").strip()
+                if not file_id:
+                    continue
+                name = str(
+                    file_obj.get("name")
+                    or file_obj.get("title")
+                    or "Slack document"
+                ).strip()
+                allowed_files[file_id] = name
+                document_lines.append(f"- {name} (Slack file ID: {file_id})")
+
+            parts = [text] if text else []
+            if document_lines:
+                parts.extend(["Pinned documents:", *document_lines])
+            if parts:
+                messages.append("\n".join(parts))
+
+        if not messages:
+            return "", allowed_files
+        header = "## Pinned Slack channel context"
+        if allowed_files:
+            header += (
+                "\n\nUse `slack_download_pinned_file` with a listed Slack file ID "
+                "if you need to read a pinned document."
+            )
+        return (
+            header + "\n\n" + "\n\n".join(messages),
+            allowed_files,
+        )
+
+    async def download_pinned_file(
+        self, *, file_id: str, channel_id: str, team_id: str = ""
+    ) -> Dict[str, str]:
+        """Resolve one authorised pinned file via files.info and download it."""
+        response = await self._get_client(
+            channel_id, team_id=team_id or None
+        ).files_info(file=file_id)
+        payload = _slack_response_payload(response)
+        if not payload.get("ok"):
+            raise RuntimeError(payload.get("error") or "files.info failed")
+        file_obj = payload.get("file")
+        if not isinstance(file_obj, dict) or str(file_obj.get("id") or "") != file_id:
+            raise RuntimeError("files.info returned an unexpected file")
+
+        file_size = int(file_obj.get("size") or 0)
+        if not file_size or file_size > SLACK_DOCUMENT_MAX_BYTES:
+            raise ValueError("Pinned document is too large or has an unknown size")
+
+        url = str(
+            file_obj.get("url_private_download") or file_obj.get("url_private") or ""
+        )
+        if not url:
+            raise RuntimeError("files.info returned no private download URL")
+        name = str(file_obj.get("name") or file_obj.get("title") or "document")
+        mimetype = str(file_obj.get("mimetype") or "application/octet-stream")
+        raw_bytes = await self._download_slack_file_bytes(url, team_id=team_id)
+        if len(raw_bytes) > SLACK_DOCUMENT_MAX_BYTES:
+            raise ValueError("Pinned document exceeds the 20 MB limit")
+        path = cache_document_from_bytes(raw_bytes, name)
+        return {"path": path, "name": name, "mimetype": mimetype}
+
     async def _resolve_user_is_bot(
         self, user_id: str, chat_id: str = "", team_id: str = ""
     ) -> bool:
@@ -6617,8 +6705,7 @@ class SlackAdapter(BasePlatformAdapter):
 
                     # Check file size (Slack limit: 20 MB for bots)
                     file_size = f.get("size", 0)
-                    MAX_DOC_BYTES = 20 * 1024 * 1024
-                    if not file_size or file_size > MAX_DOC_BYTES:
+                    if not file_size or file_size > SLACK_DOCUMENT_MAX_BYTES:
                         logger.warning(
                             "[Slack] Document too large or unknown size: %s", file_size
                         )
@@ -6746,6 +6833,29 @@ class SlackAdapter(BasePlatformAdapter):
             channel_id,
             None,
         )
+        try:
+            _pinned_prompt, _pinned_files = await self._fetch_pinned_channel_context(
+                channel_id, team_id
+            )
+        except Exception as exc:
+            logger.warning(
+                "[Slack] Could not load pinned context for channel %s: %s",
+                channel_id,
+                exc,
+            )
+            await self.send(
+                channel_id,
+                "⚠️ I couldn't load this channel's pinned instructions, so I stopped this turn.",
+                reply_to=(thread_ts if thread_ts and thread_ts != ts else None),
+                metadata={"slack_team_id": team_id} if team_id else None,
+            )
+            return
+        if _pinned_prompt:
+            _channel_prompt = (
+                f"{_channel_prompt}\n\n{_pinned_prompt}".strip()
+                if _channel_prompt
+                else _pinned_prompt
+            )
         # Prepend the bot's Slack identity (ephemeral — applied at API-call
         # time, never persisted, so prompt caching is preserved) so the agent
         # knows its own handle and won't read a human's mention as a self-
@@ -6814,6 +6924,7 @@ class SlackAdapter(BasePlatformAdapter):
                 "slack_team_id": team_id,
                 "slack_channel_id": channel_id,
                 "slack_thread_ts": thread_ts,
+                SLACK_PINNED_FILES_METADATA_KEY: _pinned_files,
             },
         )
 

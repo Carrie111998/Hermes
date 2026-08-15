@@ -186,6 +186,7 @@ def adapter():
             }
         }
     )
+    a._app.client.pins_list = AsyncMock(return_value={"ok": True, "items": []})
     a._bot_user_id = "U_BOT"
     a._running = True
     # Capture events instead of processing them
@@ -272,6 +273,8 @@ class TestSlackWorkspaceCollisionIsolation:
         team_two.users_info = AsyncMock(
             return_value={"user": {"profile": {"display_name": "Bob"}}}
         )
+        team_one.pins_list = AsyncMock(return_value={"ok": True, "items": []})
+        team_two.pins_list = AsyncMock(return_value={"ok": True, "items": []})
         adapter._team_clients.update({"T_ONE": team_one, "T_TWO": team_two})
 
         event = {
@@ -2673,6 +2676,7 @@ class TestThreadReplyHandling:
                 }
             }
         )
+        a._app.client.pins_list = AsyncMock(return_value={"ok": True, "items": []})
         a._bot_user_id = "U_BOT"
         a._team_bot_user_ids = {"T_TEAM": "U_BOT"}
         a._running = True
@@ -2886,6 +2890,7 @@ class TestAssistantThreadLifecycle:
                 }
             }
         )
+        a._app.client.pins_list = AsyncMock(return_value={"ok": True, "items": []})
         a._bot_user_id = "U_BOT"
         a._team_bot_user_ids = {"T_TEAM": "U_BOT"}
         a._running = True
@@ -4371,6 +4376,7 @@ class TestThreadImageContext:
                 }
             }
         )
+        a._app.client.pins_list = AsyncMock(return_value={"ok": True, "items": []})
         a._bot_user_id = "U_BOT"
         a._team_bot_user_ids = {"T_TEAM": "U_BOT"}
         a._running = True

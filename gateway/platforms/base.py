@@ -2290,6 +2290,9 @@ class ProcessingOutcome(Enum):
     CANCELLED = "cancelled"
 
 
+SLACK_PINNED_FILES_METADATA_KEY = "slack_pinned_files"
+
+
 @dataclass
 class MessageEvent:
     """

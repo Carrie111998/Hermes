@@ -19153,7 +19153,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             run_generation,
         )
 
+        _slack_pinned_files_token = None
         try:
+            # Bind the allowlist inside the region whose finally block clears it.
+            # Earlier message preparation does not run agent tools.
+            from gateway.session_context import set_slack_pinned_file_ids
+            from gateway.platforms.base import SLACK_PINNED_FILES_METADATA_KEY
+            _slack_pinned_files_token = set_slack_pinned_file_ids(
+                ((getattr(event, "metadata", None) or {}).get(
+                    SLACK_PINNED_FILES_METADATA_KEY
+                ) or {}).keys()
+            )
             # Emit agent:start hook
             hook_ctx = {
                 "platform": source.platform.value if source.platform else "",
@@ -19920,6 +19930,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
         finally:
             # Restore session context variables to their pre-handler state
+            if _slack_pinned_files_token is not None:
+                from gateway.session_context import reset_slack_pinned_file_ids
+                reset_slack_pinned_file_ids(_slack_pinned_files_token)
             self._clear_session_env(_session_env_tokens)
 
     def _reset_notice_session_info(self, source: SessionSource) -> str:
