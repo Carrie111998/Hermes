@@ -2843,8 +2843,9 @@ def _systemd_memory_directives(hermes_home: str | Path | None = None) -> str:
         )
         return "".join(f"{directive}={value}\n" for directive, value in limits if value)
     except Exception:
-        logger.debug(
-            "Could not resolve effective systemd memory configuration",
+        logger.warning(
+            "Could not resolve effective systemd memory configuration; "
+            "generated unit will not include MemoryHigh/MemoryMax",
             exc_info=True,
         )
         return ""

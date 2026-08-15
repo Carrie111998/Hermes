@@ -77,6 +77,40 @@ class TestLimitCoercion:
 
 
 class TestGeneratedUnit:
+    @pytest.mark.parametrize(
+        ("high", "maximum"),
+        [("8G", "6G"), ("80%", "60%"), ("1G 500M", "1G")],
+    )
+    def test_invalid_order_retains_hard_max_and_drops_high(
+        self, monkeypatch, high, maximum, caplog
+    ):
+        unit = _unit_with(
+            monkeypatch,
+            {"systemd_memory_high": high, "systemd_memory_max": maximum},
+        )
+
+        assert "MemoryHigh=" not in unit
+        assert f"MemoryMax={maximum}" in unit
+        assert "exceeds" in caplog.text
+
+    def test_comparable_limits_allow_equal_values(self, monkeypatch):
+        unit = _unit_with(
+            monkeypatch,
+            {"systemd_memory_high": "8G", "systemd_memory_max": "8G"},
+        )
+
+        assert "MemoryHigh=8G" in unit
+        assert "MemoryMax=8G" in unit
+
+    def test_mixed_byte_and_percentage_limits_are_preserved(self, monkeypatch):
+        unit = _unit_with(
+            monkeypatch,
+            {"systemd_memory_high": "80%", "systemd_memory_max": "8G"},
+        )
+
+        assert "MemoryHigh=80%" in unit
+        assert "MemoryMax=8G" in unit
+
     def test_unset_config_emits_no_memory_directives(self, monkeypatch):
         """Default stays exactly as it is today: no ceiling, no surprise kills."""
         unit = _unit_with(monkeypatch, {})

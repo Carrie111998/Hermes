@@ -200,6 +200,62 @@ _SYSTEMD_SIZE = r"\d+(?:\.\d+)?[KMGTPE]?"
 _SYSTEMD_MEMORY_LIMIT_RE = re.compile(
     rf"(?:(?P<size>{_SYSTEMD_SIZE}(?:[ \t]+{_SYSTEMD_SIZE})*)|100%|[1-9]\d?%|infinity)\Z"
 )
+_SYSTEMD_MEMORY_SUFFIXES = {
+    "": 1,
+    "K": 1024,
+    "M": 1024**2,
+    "G": 1024**3,
+    "T": 1024**4,
+    "P": 1024**5,
+    "E": 1024**6,
+}
+
+
+def _comparable_systemd_memory_limit(value: str) -> tuple[str, float] | None:
+    """Return a comparable kind/value for a validated systemd limit.
+
+    Byte sizes and percentages cannot be compared without knowing the unit's
+    physical-memory baseline, so mixed kinds deliberately remain unchecked.
+    ``None`` also keeps this helper private to the cross-field validation path;
+    syntax validation remains the responsibility of ``coerce_systemd_memory_limit``.
+    """
+    if value == "infinity":
+        return ("bytes", float("inf"))
+    if value.endswith("%"):
+        return ("percent", float(value[:-1]))
+    total = 0.0
+    for part in value.split():
+        match = re.fullmatch(r"(\d+(?:\.\d+)?)([KMGTPE]?)", part)
+        if match is None:
+            return None
+        total += float(match.group(1)) * _SYSTEMD_MEMORY_SUFFIXES[match.group(2)]
+    return ("bytes", total)
+
+
+def _validate_systemd_memory_order(
+    high: str, maximum: str
+) -> tuple[str, str]:
+    """Ensure a comparable ``MemoryHigh`` never exceeds ``MemoryMax``.
+
+    If an operator supplies an impossible pair, retain the hard ``MemoryMax``
+    and omit only ``MemoryHigh``. This preserves containment while avoiding a
+    unit that systemd rejects. Mixed byte/percentage units remain accepted
+    because their ordering depends on the host's physical-memory size.
+    """
+    if not high or not maximum:
+        return high, maximum
+    high_value = _comparable_systemd_memory_limit(high)
+    max_value = _comparable_systemd_memory_limit(maximum)
+    if high_value is not None and max_value is not None and high_value[0] == max_value[0]:
+        if high_value[1] > max_value[1]:
+            logger.warning(
+                "Ignoring gateway.systemd_memory_high=%r because it exceeds "
+                "gateway.systemd_memory_max=%r; retaining MemoryMax",
+                high,
+                maximum,
+            )
+            return "", maximum
+    return high, maximum
 
 
 def coerce_systemd_memory_limit(
@@ -239,9 +295,9 @@ def coerce_systemd_memory_limit(
             value,
         )
         return ""
-    if match.group("size") and not any(
+    if match.group("size") and sum(
         float(part.rstrip("KMGTPE")) for part in raw.split()
-    ):
+    ) <= 0:
         logger.warning("Ignoring invalid %s=%r (expected a positive size)", key, value)
         return ""
     return raw
@@ -1029,6 +1085,9 @@ class GatewayConfig:
         )
         self.systemd_memory_max = coerce_systemd_memory_limit(
             self.systemd_memory_max, "gateway.systemd_memory_max"
+        )
+        self.systemd_memory_high, self.systemd_memory_max = _validate_systemd_memory_order(
+            self.systemd_memory_high, self.systemd_memory_max
         )
 
     def get_connected_platforms(self) -> List[Platform]:
