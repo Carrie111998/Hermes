@@ -456,6 +456,47 @@ class TestLoadTranscriptDBOnly:
 class TestSessionStoreSwitchSession:
     """Regression coverage for gateway /resume session switching semantics."""
 
+    def test_resume_restores_session_health_metadata(self, tmp_path):
+        from hermes_state import SessionDB
+
+        config = GatewayConfig()
+        with patch("gateway.session.SessionStore._ensure_loaded"):
+            store = SessionStore(sessions_dir=tmp_path / "sessions", config=config)
+        db = SessionDB(db_path=tmp_path / "state.db")
+        store._db = db
+        store._loaded = True
+
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="chat-health",
+            chat_type="dm",
+            user_id="user-health",
+        )
+        original = store.get_or_create_session(source)
+        health_state = {
+            "suggestion_count": 2,
+            "last_suggested_at": 1_000.5,
+            "failure_streak": 0,
+            "compression_count": 1,
+        }
+
+        assert store.set_session_metadata_if_current(
+            original.session_key,
+            original.session_id,
+            "session_health",
+            health_state,
+        )
+        replacement = store.reset_session(original.session_key)
+        assert replacement is not None
+        assert replacement.session_id != original.session_id
+        assert "session_health" not in replacement.metadata
+
+        resumed = store.switch_session(original.session_key, original.session_id)
+
+        assert resumed is not None
+        assert resumed.metadata["session_health"] == health_state
+        db.close()
+
     def test_switch_session_reopens_target_session_in_db(self, tmp_path):
         from hermes_state import SessionDB
 
@@ -1351,6 +1392,37 @@ class TestSessionMetadata:
         assert store.get_session_metadata(replacement.session_key, "session_health") == {
             "suggestion_count": 1
         }
+
+    def test_session_health_cas_checks_route_before_durable_write(self, tmp_path):
+        config = GatewayConfig()
+        store = SessionStore(sessions_dir=tmp_path, config=config)
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="123",
+            chat_type="dm",
+            user_id="456",
+        )
+        original = store.get_or_create_session(source)
+        replacement = store.reset_session(original.session_key)
+        assert replacement is not None
+        store._db = MagicMock()
+
+        assert not store.set_session_metadata_if_current(
+            original.session_key,
+            original.session_id,
+            "session_health",
+            {"suggestion_count": 1},
+        )
+        store._db.set_session_health_state.assert_not_called()
+
+        store._db.set_session_health_state.return_value = False
+        assert not store.set_session_metadata_if_current(
+            replacement.session_key,
+            replacement.session_id,
+            "session_health",
+            {"suggestion_count": 1},
+        )
+        assert store.get_session_metadata(replacement.session_key, "session_health") is None
 
 
 class TestRewriteTranscriptPreservesReasoning:

@@ -301,6 +301,59 @@ class TestSessionLifecycle:
         assert session["model"] == "test-model"
         assert session["ended_at"] is None
 
+    def test_session_health_state_is_bounded_and_tolerates_bad_storage(self, db):
+        db.create_session(session_id="health", source="telegram")
+        state = {
+            "suggestion_count": 2,
+            "last_suggested_at": 1_000.5,
+            "failure_streak": 0,
+        }
+
+        assert db.set_session_health_state("health", state) is True
+        assert db.get_session_health_state("health") == state
+        assert db.set_session_health_state("missing", state) is False
+        assert db.set_session_health_state("health", {"bad": 1}) is False
+        assert db.set_session_health_state("health", {"failure_streak": True}) is False
+        assert db.set_session_health_state("health", {"failure_streak": 1.5}) is False
+        assert db.set_session_health_state("health", {"last_suggested_at": -1}) is False
+        assert db.set_session_health_state("health", {"last_suggested_at": float("nan")}) is False
+
+        db._conn.execute(
+            "UPDATE sessions SET session_health_json = ? WHERE id = ?",
+            ("not-json", "health"),
+        )
+        db._conn.commit()
+        assert db.get_session_health_state("health") is None
+
+        db._conn.execute(
+            "UPDATE sessions SET session_health_json = ? WHERE id = ?",
+            ('{"suggestion_count":"bad"}', "health"),
+        )
+        db._conn.commit()
+        assert db.get_session_health_state("health") is None
+        assert db.get_session_health_state("missing") is None
+
+    def test_session_health_column_reconciles_on_upgrade(self, tmp_path):
+        db_path = tmp_path / "legacy-state.db"
+        seeded = SessionDB(db_path=db_path)
+        seeded.close()
+        conn = sqlite3.connect(str(db_path))
+        try:
+            conn.execute("ALTER TABLE sessions DROP COLUMN session_health_json")
+            conn.commit()
+        finally:
+            conn.close()
+
+        upgraded = SessionDB(db_path=db_path)
+        try:
+            columns = {
+                row[1]
+                for row in upgraded._conn.execute("PRAGMA table_info(sessions)")
+            }
+            assert "session_health_json" in columns
+        finally:
+            upgraded.close()
+
 
     def test_branch_resume_does_not_include_parent_messages_added_after_fork(self, db):
         """A branch owns its copied transcript, not the parent's later turns."""

@@ -21,6 +21,7 @@ import errno
 import hashlib
 import json
 import logging
+import math
 import os
 import queue
 import random
@@ -358,6 +359,31 @@ def _delete_delegate_children(conn, parent_ids: List[str]) -> List[str]:
     return ids
 
 T = TypeVar("T")
+
+_SESSION_HEALTH_STATE_KEYS = frozenset(
+    {
+        "suggestion_count",
+        "last_suggested_at",
+        "failure_streak",
+        "compression_count",
+    }
+)
+
+
+def _valid_session_health_state(state: Any) -> bool:
+    if not isinstance(state, dict) or any(
+        key not in _SESSION_HEALTH_STATE_KEYS for key in state
+    ):
+        return False
+    for key, value in state.items():
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return False
+        if not math.isfinite(float(value)) or value < 0:
+            return False
+        if key != "last_suggested_at" and not isinstance(value, int):
+            return False
+    return True
+
 
 DEFAULT_DB_PATH = get_hermes_home() / "state.db"
 
@@ -6895,6 +6921,55 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 (session_id,),
             )
         self._execute_write(_do)
+
+    def set_session_health_state(
+        self, session_id: str, state: Dict[str, Any]
+    ) -> bool:
+        """Persist bounded adviser state on the durable session row."""
+        if not session_id or not _valid_session_health_state(state):
+            return False
+        try:
+            payload = json.dumps(
+                state,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
+        except (TypeError, ValueError, OverflowError):
+            return False
+        if len(payload.encode("utf-8")) > 4096:
+            return False
+
+        def _do(conn):
+            updated = conn.execute(
+                "UPDATE sessions SET session_health_json = ? WHERE id = ?",
+                (payload, session_id),
+            )
+            return updated.rowcount == 1
+
+        return bool(self._execute_write(_do))
+
+    def get_session_health_state(
+        self, session_id: str
+    ) -> Optional[Dict[str, Any]]:
+        """Load adviser state; return None for missing or malformed rows."""
+        if not session_id:
+            return None
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT session_health_json FROM sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        payload = row[0]
+        if payload in (None, ""):
+            return {}
+        try:
+            state = json.loads(payload)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None
+        return state if _valid_session_health_state(state) else None
 
     def promote_to_session_reset(
         self, session_id: str, reason: str = "session_reset"

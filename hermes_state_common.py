@@ -376,6 +376,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     thread_id TEXT,
     display_name TEXT,
     origin_json TEXT,
+    session_health_json TEXT,
     expiry_finalized INTEGER DEFAULT 0,
     model TEXT,
     model_config TEXT,

@@ -3100,6 +3100,10 @@ class SessionStore:
             entry = self._entries.get(session_key)
             if entry is None or entry.session_id != expected_session_id:
                 return False
+            if key == "session_health" and self._db:
+                persist = getattr(self._db, "set_session_health_state", None)
+                if not callable(persist) or not persist(expected_session_id, value):
+                    return False
             entry.metadata[key] = value
             self._save()
             return True
@@ -3578,6 +3582,26 @@ class SessionStore:
             if old_entry.session_id == target_session_id:
                 return old_entry
 
+            resumed_metadata: Dict[str, Any] = {}
+            if self._db:
+                try:
+                    loader = getattr(self._db, "get_session_health_state", None)
+                    health_state = (
+                        loader(target_session_id) if callable(loader) else None
+                    )
+                    if isinstance(health_state, dict) and health_state:
+                        resumed_metadata["session_health"] = health_state
+                    elif health_state is None:
+                        # Missing or malformed durable state cannot safely prove
+                        # the historical notice count. Advice is optional.
+                        resumed_metadata["session_health"] = {"suggestion_count": 2}
+                except Exception as exc:
+                    logger.debug("Session health state restore failed: %s", exc)
+                    resumed_metadata["session_health"] = {"suggestion_count": 2}
+            else:
+                # No-DB mode cannot prove prior notice count across resume.
+                resumed_metadata["session_health"] = {"suggestion_count": 2}
+
             db_end_session_id = old_entry.session_id
 
             now = _now()
@@ -3590,6 +3614,7 @@ class SessionStore:
                 display_name=old_entry.display_name,
                 platform=old_entry.platform,
                 chat_type=old_entry.chat_type,
+                metadata=resumed_metadata,
             )
 
             self._entries[session_key] = new_entry
