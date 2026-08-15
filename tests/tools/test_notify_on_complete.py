@@ -72,6 +72,20 @@ class TestCompletionQueue:
         assert registry.completion_queue.empty()
 
 
+    def test_completion_keeps_runtime_ui_owner(self, registry):
+        s = _make_session(notify_on_complete=True, output="done")
+        s.origin_ui_session_id = "runtime-session-a"
+        s.exited = True
+        s.exit_code = 0
+        registry._running[s.id] = s
+
+        with patch.object(registry, "_write_checkpoint"):
+            registry._move_to_finished(s)
+
+        completion = registry.completion_queue.get_nowait()
+        assert completion["origin_ui_session_id"] == "runtime-session-a"
+
+
     def test_move_to_finished_idempotent_no_duplicate(self, registry):
         """Calling _move_to_finished twice must NOT enqueue two notifications.
 
@@ -290,7 +304,7 @@ def _silent_bg_base_config(tmp_path):
     }
 
 
-def _silent_bg_harness(monkeypatch, tmp_path):
+def _silent_bg_harness(monkeypatch, tmp_path, spawned_kwargs=None):
     """Common test fixture: patch enough of terminal_tool to spawn a fake
     background process and capture the JSON result the agent sees."""
     import tools.terminal_tool as terminal_tool_module
@@ -301,6 +315,8 @@ def _silent_bg_harness(monkeypatch, tmp_path):
     dummy_env = SimpleNamespace(env={})
 
     def fake_spawn_local(**kwargs):
+        if spawned_kwargs is not None:
+            spawned_kwargs.update(kwargs)
         return SimpleNamespace(
             id="proc_silent_test",
             pid=4242,
@@ -321,6 +337,24 @@ def _silent_bg_harness(monkeypatch, tmp_path):
     monkeypatch.setitem(terminal_tool_module._active_environments, "default", dummy_env)
     monkeypatch.setitem(terminal_tool_module._last_activity, "default", 0.0)
     return terminal_tool_module
+
+
+def test_background_process_captures_runtime_ui_session_before_spawn(
+    monkeypatch, tmp_path
+):
+    from gateway.session_context import clear_session_vars, set_session_vars
+
+    spawned_kwargs = {}
+    tt = _silent_bg_harness(monkeypatch, tmp_path, spawned_kwargs)
+    tokens = set_session_vars(ui_session_id="runtime-session-a")
+    try:
+        tt.terminal_tool(command="python worker.py", background=True)
+    finally:
+        clear_session_vars(tokens)
+        tt._active_environments.pop("default", None)
+        tt._last_activity.pop("default", None)
+
+    assert spawned_kwargs["origin_ui_session_id"] == "runtime-session-a"
 
 
 def test_background_without_notify_emits_silent_process_hint(monkeypatch, tmp_path):
