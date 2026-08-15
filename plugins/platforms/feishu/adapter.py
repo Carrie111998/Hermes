@@ -4019,9 +4019,22 @@ class FeishuAdapter(BasePlatformAdapter):
             self._record_webhook_anomaly(remote_ip, "400-encrypted")
             return web.json_response({"code": 400, "msg": "encrypted webhook payloads are not supported"}, status=400)
 
+        event_type = str((payload.get("header") or {}).get("event_type") or "")
+        if event_type == "card.action.trigger" and not (
+            self._verification_token and self._encrypt_key
+        ):
+            logger.error(
+                "[Feishu] Card-action webhook rejected: strong authentication "
+                "requires verification token and encrypt key"
+            )
+            self._record_webhook_anomaly(remote_ip, "503-card-auth")
+            return web.Response(
+                status=503,
+                text="Card-action webhook authentication unavailable",
+            )
+
         self._clear_webhook_anomaly(remote_ip)
 
-        event_type = str((payload.get("header") or {}).get("event_type") or "")
         data = self._namespace_from_mapping(payload)
         if event_type == "im.message.receive_v1":
             self._on_message_event(data)

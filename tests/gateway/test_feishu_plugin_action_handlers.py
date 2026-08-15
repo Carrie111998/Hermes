@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import importlib.util
 import asyncio
+import hashlib
 import json
 import sys
 import threading
@@ -54,6 +55,19 @@ from plugins.platforms.feishu.adapter import FeishuAdapter  # noqa: E402
 
 
 PLUGIN_ACTION = "popaskin_ads.pending_write"
+TEST_ENCRYPT_KEY = "encrypt-key-test"
+
+
+def _signed_webhook_headers(body: bytes) -> dict[str, str]:
+    timestamp = "1720000000"
+    nonce = "nonce-test"
+    content = f"{timestamp}{nonce}{TEST_ENCRYPT_KEY}{body.decode('utf-8')}"
+    return {
+        "Content-Type": "application/json",
+        "x-lark-request-timestamp": timestamp,
+        "x-lark-request-nonce": nonce,
+        "x-lark-signature": hashlib.sha256(content.encode("utf-8")).hexdigest(),
+    }
 
 
 class _FakeToast:
@@ -95,6 +109,7 @@ def _make_adapter(*, loop_ready: bool = False) -> FeishuAdapter:
     adapter._app_id = "cli_test"
     adapter._app_secret = "app-secret-test"
     adapter._verification_token = "verify-token-test"
+    adapter._encrypt_key = TEST_ENCRYPT_KEY
     if loop_ready:
         adapter._loop = MagicMock()
         adapter._loop.is_closed.return_value = False
@@ -188,7 +203,7 @@ def _make_webhook_request(
     return SimpleNamespace(
         remote="127.0.0.1",
         content_length=None,
-        headers={"Content-Type": "application/json"},
+        headers=_signed_webhook_headers(body),
         content=_FakeRequestContent(body),
     )
 
@@ -266,6 +281,19 @@ class TestFeishuPluginCardActionDispatch:
 
         assert response.status == 503
         assert response.text == "Webhook authentication unavailable"
+
+    def test_webhook_card_action_rejects_verification_token_only(self):
+        adapter = _make_adapter(loop_ready=False)
+        adapter._encrypt_key = ""
+
+        response = asyncio.run(
+            adapter._handle_webhook_request(
+                _make_webhook_request(event_id="evt_token_only")
+            )
+        )
+
+        assert response.status == 503
+        assert response.text == "Card-action webhook authentication unavailable"
 
     @staticmethod
     def _manager_with(callback=None, route: str = PLUGIN_ACTION):
@@ -384,7 +412,7 @@ class TestFeishuPluginCardActionDispatch:
         request = SimpleNamespace(
             remote="127.0.0.1",
             content_length=None,
-            headers={"Content-Type": "application/json"},
+            headers=_signed_webhook_headers(body),
             content=_FakeRequestContent(body),
         )
 
