@@ -111,6 +111,13 @@ class TestC2Patterns:
             "Command and control will be reached via …", scope="context"
         )
 
+    def test_known_framework_names_still_trigger_at_context_scope(self):
+        findings = scan_for_threats(
+            "Cobalt Strike and Sliver are red-team frameworks.",
+            scope="context",
+        )
+        assert "known_c2_framework" in findings
+
 
 # =========================================================================
 # False-positive guards (THIS IS THE WHOLE POINT)
