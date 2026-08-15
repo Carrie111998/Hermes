@@ -49,6 +49,8 @@ def _get_exa_client() -> Any:
     """
     import tools.web_tools as _wt
 
+    # Intentionally lock-free after publication; the slow path double-checks
+    # under the lock before constructing the singleton.
     cached = getattr(_wt, "_exa_client", None)
     if cached is not None:
         return cached
@@ -88,7 +90,8 @@ def _reset_client_for_tests() -> None:
     """Drop the cached Exa client so tests can re-instantiate cleanly."""
     import tools.web_tools as _wt
 
-    _wt._exa_client = None
+    with _client_lock:
+        _wt._exa_client = None
 
 
 class ExaWebSearchProvider(WebSearchProvider):

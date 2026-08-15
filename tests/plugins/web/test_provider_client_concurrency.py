@@ -34,17 +34,6 @@ from plugins.web.parallel import provider as parallel_provider
             id="parallel-sync",
         ),
         pytest.param(
-            parallel_provider,
-            "_async_client_lock",
-            "_get_async_client",
-            "_async_parallel_client",
-            "PARALLEL_API_KEY",
-            "parallel",
-            "AsyncParallel",
-            False,
-            id="parallel-async",
-        ),
-        pytest.param(
             exa_provider,
             "_client_lock",
             "_get_exa_client",

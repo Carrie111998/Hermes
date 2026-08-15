@@ -43,7 +43,6 @@ logger = logging.getLogger(__name__)
 # The plugin reads/writes through that public module (see
 # :func:`_get_sync_client` / :func:`_get_async_client`).
 _sync_client_lock = threading.Lock()
-_async_client_lock = threading.Lock()
 
 
 def _ensure_parallel_sdk_installed() -> None:
@@ -72,6 +71,8 @@ def _get_sync_client() -> Any:
     """
     import tools.web_tools as _wt
 
+    # Intentionally lock-free after publication; the slow path double-checks
+    # under the lock before constructing the singleton.
     cached = getattr(_wt, "_parallel_client", None)
     if cached is not None:
         return cached
@@ -109,26 +110,21 @@ def _get_async_client() -> Any:
     if cached is not None:
         return cached
 
-    with _async_client_lock:
-        cached = getattr(_wt, "_async_parallel_client", None)
-        if cached is not None:
-            return cached
+    from agent.web_search_provider import get_provider_env
 
-        from agent.web_search_provider import get_provider_env
+    api_key = get_provider_env("PARALLEL_API_KEY")
+    if not api_key:
+        raise ValueError(
+            "PARALLEL_API_KEY environment variable not set. "
+            "Get your API key at https://parallel.ai"
+        )
 
-        api_key = get_provider_env("PARALLEL_API_KEY")
-        if not api_key:
-            raise ValueError(
-                "PARALLEL_API_KEY environment variable not set. "
-                "Get your API key at https://parallel.ai"
-            )
+    _ensure_parallel_sdk_installed()
+    from parallel import AsyncParallel  # noqa: WPS433 — deliberately lazy
 
-        _ensure_parallel_sdk_installed()
-        from parallel import AsyncParallel  # noqa: WPS433 — deliberately lazy
-
-        client = AsyncParallel(api_key=api_key)
-        _wt._async_parallel_client = client
-        return client
+    client = AsyncParallel(api_key=api_key)
+    _wt._async_parallel_client = client
+    return client
 
 
 def _reset_clients_for_tests() -> None:
@@ -139,7 +135,8 @@ def _reset_clients_for_tests() -> None:
     """
     import tools.web_tools as _wt
 
-    _wt._parallel_client = None
+    with _sync_client_lock:
+        _wt._parallel_client = None
     _wt._async_parallel_client = None
 
 
