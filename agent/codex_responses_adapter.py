@@ -151,6 +151,21 @@ def _neutralize_harmony_structure(value: Any) -> Any:
 # Multimodal content helpers
 # ---------------------------------------------------------------------------
 
+def _apply_azure_output_text_annotations(parts: List[Dict[str, Any]]) -> None:
+    """Add the ``annotations`` field Azure AI Foundry requires on output text.
+
+    Azure's Responses schema validates replayed assistant ``output_text``
+    parts against the *output* message shape, which carries a mandatory
+    ``annotations`` array; omitting it is rejected. The field belongs to
+    text parts only — ``input_image`` parts have no ``annotations`` member
+    in the schema, so stamping one there sends a part shape Azure never
+    documented. Scope the default strictly to ``output_text`` (#63257).
+    """
+    for part in parts:
+        if isinstance(part, dict) and part.get("type") == "output_text":
+            part.setdefault("annotations", [])
+
+
 def _chat_content_to_responses_parts(content: Any, *, role: str = "user") -> List[Dict[str, Any]]:
     """Convert chat-style multimodal content to Responses API input parts.
 
@@ -627,8 +642,7 @@ def _chat_messages_to_responses_input(
                             continue
 
                         if is_azure_foundry:
-                            for _cpart in normalized_content_parts:
-                                _cpart.setdefault("annotations", [])
+                            _apply_azure_output_text_annotations(normalized_content_parts)
 
                         replay_item = {
                             "type": "message",
@@ -655,8 +669,7 @@ def _chat_messages_to_responses_input(
                     pass
                 elif content_parts:
                     if is_azure_foundry:
-                        for _cpart in content_parts:
-                            _cpart.setdefault("annotations", [])
+                        _apply_azure_output_text_annotations(content_parts)
                     items.append({"role": "assistant", "content": content_parts})
                 elif content_text.strip():
                     items.append({"role": "assistant", "content": content_text})
@@ -941,8 +954,7 @@ def _preflight_codex_input_items(
                     text = str(text)
                 normalized_content.append({"type": "output_text", "text": sanitize_text(text)})
             if is_azure_foundry:
-                for _cpart in normalized_content:
-                    _cpart.setdefault("annotations", [])
+                _apply_azure_output_text_annotations(normalized_content)
             if not normalized_content:
                 raise ValueError(f"Codex Responses input[{idx}] message item must contain at least one text part.")
             normalized_item: Dict[str, Any] = {
@@ -1013,8 +1025,7 @@ def _preflight_codex_input_items(
                             f"Codex Responses input[{idx}].content[{part_idx}] has unsupported type {part.get('type')!r}."
                         )
                 if is_azure_foundry and role == "assistant":
-                    for _cpart in validated:
-                        _cpart.setdefault("annotations", [])
+                    _apply_azure_output_text_annotations(validated)
                 normalized.append({"role": role, "content": validated})
                 continue
             if not isinstance(content, str):
