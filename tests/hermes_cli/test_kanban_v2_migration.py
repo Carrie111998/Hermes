@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -388,3 +389,305 @@ def test_snapshot_is_restorable(pre_integration_db: Path, tmp_path: Path) -> Non
 # apply/verify/idempotent/zero-change/snapshot tests cover the full
 # lifecycle without subprocess dependency.
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# E08R2 spec behaviours: grandfathering, checked-out blocker, and local
+# historical persisted-outcome classification. Scratch DB + scratch repo only.
+# ---------------------------------------------------------------------------
+
+_INTEGRATION_SCHEMA = """
+CREATE TABLE tasks (
+    id TEXT PRIMARY KEY, title TEXT NOT NULL, body TEXT,
+    assignee TEXT, status TEXT NOT NULL, created_at INTEGER NOT NULL,
+    completed_at INTEGER,
+    workflow_template_id TEXT, current_step_key TEXT,
+    work_item_kind TEXT NOT NULL DEFAULT 'card',
+    running INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE epic_memberships (
+    epic_id TEXT NOT NULL, task_id TEXT NOT NULL UNIQUE,
+    created_at INTEGER NOT NULL, PRIMARY KEY (epic_id, task_id)
+);
+CREATE TABLE epic_story_integrations (
+    epic_id TEXT NOT NULL, story_id TEXT NOT NULL,
+    source_sha TEXT NOT NULL, candidate_sha TEXT,
+    integrated_at INTEGER NOT NULL,
+    PRIMARY KEY (epic_id, story_id, source_sha)
+);
+CREATE TABLE task_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id TEXT NOT NULL, step_key TEXT, status TEXT NOT NULL,
+    started_at INTEGER NOT NULL, ended_at INTEGER,
+    outcome TEXT, metadata TEXT
+);
+"""
+
+
+def _init_scratch_repo(repo: Path) -> str:
+    """Create a scratch git repo on ``main``; return the init commit SHA."""
+    repo.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        ["git", "init", "-b", "main", str(repo)],
+        check=True, capture_output=True, text=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "config", "user.email", "migration@example.com"],
+        check=True, capture_output=True, text=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "config", "user.name", "Migration Test"],
+        check=True, capture_output=True, text=True,
+    )
+    (repo / "README.md").write_text("hello\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "-C", str(repo), "add", "README.md"],
+        check=True, capture_output=True, text=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "commit", "-m", "init"],
+        check=True, capture_output=True, text=True,
+    )
+    return subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+
+
+def _commit_file(repo: Path, name: str, content: str, message: str) -> str:
+    """Write + commit a file on the current branch; return the new SHA."""
+    (repo / name).write_text(content, encoding="utf-8")
+    subprocess.run(
+        ["git", "-C", str(repo), "add", name],
+        check=True, capture_output=True, text=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "commit", "-m", message],
+        check=True, capture_output=True, text=True,
+    )
+    return subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+
+
+def _build_integration_db(
+    db: Path,
+    *,
+    epic_id: str = "t_e1",
+    member_id: str = "t_m1",
+    source_sha: str,
+    candidate_sha: str,
+    dev_receipt_sha: str | None,
+    membership: bool = True,
+    member_status: str = "done",
+) -> None:
+    """Build a scratch DB with one epic + one member carrying integration data."""
+    with sqlite3.connect(str(db)) as conn:
+        conn.executescript(_INTEGRATION_SCHEMA)
+        conn.execute(
+            "INSERT INTO tasks (id, title, status, created_at, work_item_kind) "
+            "VALUES (?, 'Epic', 'ready', 1, 'epic')",
+            (epic_id,),
+        )
+        conn.execute(
+            "INSERT INTO tasks (id, title, status, created_at, work_item_kind, completed_at) "
+            "VALUES (?, 'Done member', ?, 2, 'card', 3)",
+            (member_id, member_status),
+        )
+        if membership:
+            conn.execute(
+                "INSERT INTO epic_memberships (epic_id, task_id, created_at) "
+                "VALUES (?, ?, 4)",
+                (epic_id, member_id),
+            )
+        conn.execute(
+            "INSERT INTO epic_story_integrations "
+            "(epic_id, story_id, source_sha, candidate_sha, integrated_at) "
+            "VALUES (?, ?, ?, ?, 5)",
+            (epic_id, member_id, source_sha, candidate_sha),
+        )
+        if dev_receipt_sha is not None:
+            conn.execute(
+                "INSERT INTO task_runs "
+                "(task_id, step_key, status, started_at, ended_at, outcome, metadata) "
+                "VALUES (?, 'development', 'completed', 6, 7, 'completed', ?)",
+                (member_id, json.dumps(
+                    {"source_completion_receipt": {"commit_sha": dev_receipt_sha}}
+                )),
+            )
+
+
+def test_grandfather_done_member_integration_fact(tmp_path: Path) -> None:
+    """A done member with exact durable evidence is grandfathered as integrated."""
+    repo = tmp_path / "repo"
+    base_sha = _init_scratch_repo(repo)
+    subprocess.run(
+        ["git", "-C", str(repo), "switch", "-c", "epic/t_e1"],
+        check=True, capture_output=True, text=True,
+    )
+    _commit_file(repo, "epic.txt", "tip\n", "epic tip")
+    subprocess.run(
+        ["git", "-C", str(repo), "switch", "main"],
+        check=True, capture_output=True, text=True,
+    )
+
+    db = tmp_path / "integration.db"
+    _build_integration_db(
+        db,
+        source_sha=base_sha,
+        candidate_sha=base_sha,
+        dev_receipt_sha=base_sha,
+    )
+
+    result = migration.audit_db(str(db), repo_root=str(repo))
+    assert result["grandfathered"] == [
+        {"epic_id": "t_e1", "task_id": "t_m1", "grandfathered": True}
+    ]
+
+
+def test_grandfather_requires_exact_durable_evidence(tmp_path: Path) -> None:
+    """Grandfathering fails closed on any missing or inconsistent evidence link."""
+    repo = tmp_path / "repo"
+    base_sha = _init_scratch_repo(repo)
+    subprocess.run(
+        ["git", "-C", str(repo), "switch", "-c", "epic/t_e1"],
+        check=True, capture_output=True, text=True,
+    )
+    _commit_file(repo, "epic.txt", "tip\n", "epic tip")
+    subprocess.run(
+        ["git", "-C", str(repo), "switch", "main"],
+        check=True, capture_output=True, text=True,
+    )
+    # A commit on main that is NOT an ancestor of the epic tip.
+    foreign_sha = _commit_file(repo, "foreign.txt", "foreign\n", "foreign")
+
+    def is_grandfathered(db: Path) -> bool:
+        entries = migration.audit_db(str(db), repo_root=str(repo))["grandfathered"]
+        return entries == [{"epic_id": "t_e1", "task_id": "t_m1", "grandfathered": True}]
+
+    # Membership mismatch.
+    db = tmp_path / "no_membership.db"
+    _build_integration_db(
+        db, source_sha=base_sha, candidate_sha=base_sha,
+        dev_receipt_sha=base_sha, membership=False,
+    )
+    assert not is_grandfathered(db)
+
+    # source_sha != latest Development handoff SHA.
+    db = tmp_path / "stale_source.db"
+    _build_integration_db(
+        db, source_sha="0" * 40, candidate_sha=base_sha, dev_receipt_sha=base_sha,
+    )
+    assert not is_grandfathered(db)
+
+    # candidate_sha is not a full existing commit.
+    db = tmp_path / "foreign_candidate.db"
+    _build_integration_db(
+        db, source_sha=base_sha, candidate_sha="1" * 40, dev_receipt_sha=base_sha,
+    )
+    assert not is_grandfathered(db)
+
+    # candidate is not an ancestor of the current Epic tip.
+    db = tmp_path / "non_ancestor.db"
+    _build_integration_db(
+        db, source_sha=foreign_sha, candidate_sha=foreign_sha,
+        dev_receipt_sha=foreign_sha,
+    )
+    assert not is_grandfathered(db)
+
+
+def test_grandfather_never_from_approval_history(tmp_path: Path) -> None:
+    """Approval history and redundant approved metadata never grandfather a fact."""
+    repo = tmp_path / "repo"
+    base_sha = _init_scratch_repo(repo)
+    subprocess.run(
+        ["git", "-C", str(repo), "switch", "-c", "epic/t_e1"],
+        check=True, capture_output=True, text=True,
+    )
+    _commit_file(repo, "epic.txt", "tip\n", "epic tip")
+    subprocess.run(
+        ["git", "-C", str(repo), "switch", "main"],
+        check=True, capture_output=True, text=True,
+    )
+
+    # A matching fact row exists, but there is NO Development handoff — only a
+    # review approval carrying candidate metadata. Approval never grandfathers.
+    db = tmp_path / "approval_only.db"
+    _build_integration_db(
+        db, source_sha=base_sha, candidate_sha=base_sha, dev_receipt_sha=None,
+    )
+    with sqlite3.connect(str(db)) as conn:
+        conn.execute(
+            "INSERT INTO task_runs "
+            "(task_id, step_key, status, started_at, ended_at, outcome, metadata) "
+            "VALUES ('t_m1', 'review', 'completed', 6, 7, 'completed', ?)",
+            (json.dumps({"workflow_outcome": {"verdict": "approved"},
+                         "candidate_sha": base_sha}),),
+        )
+    entries = migration.audit_db(str(db), repo_root=str(repo))["grandfathered"]
+    assert entries == [{"epic_id": "t_e1", "task_id": "t_m1", "grandfathered": False}]
+
+    # A Development run exists but carries no handoff receipt, while a review
+    # run's approved metadata is present. Redundant approved metadata creates
+    # no fact and no authority.
+    db2 = tmp_path / "approved_no_receipt.db"
+    _build_integration_db(
+        db2, source_sha=base_sha, candidate_sha=base_sha, dev_receipt_sha=None,
+    )
+    with sqlite3.connect(str(db2)) as conn:
+        conn.execute(
+            "INSERT INTO task_runs "
+            "(task_id, step_key, status, started_at, ended_at, outcome, metadata) "
+            "VALUES ('t_m1', 'development', 'completed', 6, 7, 'completed', '{}')"
+        )
+        conn.execute(
+            "INSERT INTO task_runs "
+            "(task_id, step_key, status, started_at, ended_at, outcome, metadata) "
+            "VALUES ('t_m1', 'review', 'completed', 8, 9, 'completed', ?)",
+            (json.dumps({"workflow_outcome": {"verdict": "approved"},
+                         "candidate_sha": base_sha}),),
+        )
+    entries2 = migration.audit_db(str(db2), repo_root=str(repo))["grandfathered"]
+    assert entries2 == [{"epic_id": "t_e1", "task_id": "t_m1", "grandfathered": False}]
+
+
+def test_checked_out_epic_branch_reported_as_blocker(tmp_path: Path) -> None:
+    """A checked-out affected Epic branch blocks the dry-run unconditionally."""
+    repo = tmp_path / "repo"
+    _init_scratch_repo(repo)
+    # Leave the epic branch checked out in the main worktree — clean, but the
+    # refusal is unconditional (matching the CAS-time checked-out refusal).
+    subprocess.run(
+        ["git", "-C", str(repo), "switch", "-c", "epic/t_e1"],
+        check=True, capture_output=True, text=True,
+    )
+
+    db = tmp_path / "checked_out.db"
+    with sqlite3.connect(str(db)) as conn:
+        conn.executescript(_INTEGRATION_SCHEMA)
+        conn.execute(
+            "INSERT INTO tasks (id, title, status, created_at, work_item_kind) "
+            "VALUES ('t_e1', 'Epic', 'ready', 1, 'epic')"
+        )
+
+    with pytest.raises(migration.MigrationBlocked, match="checked out"):
+        migration.audit_db(str(db), repo_root=str(repo))
+
+
+def test_historical_persisted_outcome_classification_stays_local() -> None:
+    """The persisted-outcome classification lives only in the migration module."""
+    from hermes_cli import kanban_db as kb
+
+    # The classification contract: only a completed Development handoff is
+    # authoritative; approval-shaped verdicts are non-authoritative.
+    assert migration._HISTORICAL_DEVELOPMENT_HANDOFF_OUTCOMES == frozenset({"completed"})
+    assert "approved" in migration._HISTORICAL_NON_AUTHORITATIVE_VERDICTS
+    assert "passed" in migration._HISTORICAL_NON_AUTHORITATIVE_VERDICTS
+
+    # No completion or outcome-validation path may import or consult it.
+    for symbol in (
+        "_HISTORICAL_DEVELOPMENT_HANDOFF_OUTCOMES",
+        "_HISTORICAL_NON_AUTHORITATIVE_VERDICTS",
+    ):
+        assert not hasattr(kb, symbol), f"kanban_db must not expose {symbol}"
