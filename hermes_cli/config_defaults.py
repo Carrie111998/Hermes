@@ -3274,6 +3274,31 @@ DEFAULT_CONFIG = {
         #   True  = always disable the overlay
         #   False = always enable the overlay
         "no_overlay": None,
+        # cua-driver permission mode for this Hermes install.
+        #   standard (default) — cua-driver's own approval boundary. Protected
+        #     operations (e.g. attaching to an existing signed-in browser
+        #     profile) fail closed unless grant_existing_profile is enabled
+        #     below.
+        #   bounded — repeatable automation under a user-reviewed session
+        #     policy manifest (set capability_manifest below). No runtime
+        #     prompts; anything outside the manifest fails closed inside
+        #     cua-driver.
+        # `unrestricted` is intentionally NOT accepted here: it stays bound to
+        # the explicit per-session YOLO toggle so a config line can never
+        # silently bypass approvals.
+        "permission_mode": "standard",
+        # Absolute or ~ path to the reviewed cua-driver session-policy
+        # manifest YAML used when permission_mode is "bounded". See
+        # https://cua.ai/docs/reference/cua-driver/permission-modes
+        "capability_manifest": "",
+        # Pre-authorize existing-profile browser attachment in standard mode
+        # (cua-driver's trusted-launcher `--grant existing-profile`). When
+        # true, the agent can attach to your already-running, signed-in
+        # Chrome/Edge window — exposing that profile's live pages, cookies,
+        # and storage to the browser protocol — without a per-use prompt.
+        # Leave false to keep existing-profile attachment failing closed;
+        # isolated driver-owned profiles work either way.
+        "grant_existing_profile": False,
     },
 
     # =========================================================================
