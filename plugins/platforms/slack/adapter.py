@@ -7254,62 +7254,91 @@ class SlackAdapter(BasePlatformAdapter):
         user_name: Optional[str] = None,
         team_id: str = "",
     ) -> bool:
-        """Return whether a Slack interactive caller may perform gated actions."""
+        """Check the ordinary synchronous Slack/gateway authorization policy."""
         normalized_user_id = str(user_id or "").strip()
         if not normalized_user_id:
             return False
-
         runner = getattr(getattr(self, "_message_handler", None), "__self__", None)
         auth_fn = getattr(runner, "_is_user_authorized", None)
         if callable(auth_fn):
             try:
                 from gateway.session import SessionSource
 
-                source = SessionSource(
+                return bool(auth_fn(SessionSource(
                     platform=Platform.SLACK,
                     chat_id=str(channel_id or normalized_user_id),
                     chat_type="dm" if str(channel_id or "").startswith("D") else "group",
                     user_id=normalized_user_id,
                     user_name=str(user_name).strip() if user_name else None,
                     scope_id=str(team_id) if team_id else None,
-                )
-                return bool(auth_fn(source))
+                )))
             except Exception:
-                logger.debug(
-                    "[Slack] Falling back to env-only interactive auth for user %s",
-                    normalized_user_id,
-                    exc_info=True,
-                )
-
+                logger.debug("[Slack] Gateway interactive auth failed", exc_info=True)
+                return False
         if os.getenv("SLACK_ALLOW_ALL_USERS", "").lower() in {"true", "1", "yes"}:
             return True
-
+        try:
+            from agent.secret_scope import get_secret
+        except Exception:
+            get_secret = lambda name: None
         def _env(name: str) -> str:
-            # Multiplex: profile .env is in secret_scope, not process environ.
-            try:
-                from agent.secret_scope import get_secret
+            value = get_secret(name)
+            return str(value).strip() if value else (os.getenv(name) or "").strip()
+        allowed = {
+            item.strip()
+            for name in ("SLACK_ALLOWED_USERS", "GATEWAY_ALLOWED_USERS")
+            for item in _env(name).split(",")
+            if item.strip()
+        }
+        if allowed:
+            return "*" in allowed or normalized_user_id in allowed
+        return _env("SLACK_ALLOW_ALL_USERS").lower() in {"true", "1", "yes"} or _env(
+            "GATEWAY_ALLOW_ALL_USERS"
+        ).lower() in {"true", "1", "yes"}
 
-                val = get_secret(name)
-                if val is not None and str(val).strip():
-                    return str(val).strip()
-            except Exception:
-                pass
-            return (os.getenv(name) or "").strip()
+    async def _authorize_interactive_user(
+        self,
+        user_id: str,
+        *,
+        channel_id: str = "",
+        user_name: Optional[str] = None,
+        team_id: str = "",
+    ) -> bool:
+        """Return whether a Slack interactive caller may perform gated actions.
 
-        allowed_ids = set()
-        platform_allowlist = _env("SLACK_ALLOWED_USERS")
-        if platform_allowlist:
-            allowed_ids.update(uid.strip() for uid in platform_allowlist.split(",") if uid.strip())
-        global_allowlist = _env("GATEWAY_ALLOWED_USERS")
-        if global_allowlist:
-            allowed_ids.update(uid.strip() for uid in global_allowlist.split(",") if uid.strip())
+        Block Kit actions do not pass through the normal message edge.  Run the
+        same external-resource check here before consulting the ordinary
+        gateway authorization predicate; otherwise configured membership
+        enforcement would either be bypassed or make every interactive action
+        fail at the final gate because it has no local marker.
+        """
+        normalized_user_id = str(user_id or "").strip()
+        if not normalized_user_id:
+            return False
 
-        if allowed_ids:
-            return "*" in allowed_ids or normalized_user_id in allowed_ids
+        from gateway.session import SessionSource
 
-        if _env("SLACK_ALLOW_ALL_USERS").lower() in {"true", "1", "yes"}:
-            return True
-        return _env("GATEWAY_ALLOW_ALL_USERS").lower() in {"true", "1", "yes"}
+        source = SessionSource(
+            platform=Platform.SLACK,
+            chat_id=str(channel_id or normalized_user_id),
+            chat_type="dm" if str(channel_id or "").startswith("D") else "group",
+            user_id=normalized_user_id,
+            user_name=str(user_name).strip() if user_name else None,
+            scope_id=str(team_id) if team_id else None,
+        )
+        if not await self._authorize_external_resource(
+            normalized_user_id,
+            chat_id=str(channel_id or normalized_user_id),
+            team_id=str(team_id or ""),
+            source=source,
+        ):
+            return False
+        return self._is_interactive_user_authorized(
+            normalized_user_id,
+            channel_id=channel_id,
+            user_name=user_name,
+            team_id=team_id,
+        )
 
     async def _handle_slash_confirm_action(self, ack, body, action) -> None:
         """Handle a slash-confirm button click from Block Kit."""
@@ -7323,7 +7352,7 @@ class SlackAdapter(BasePlatformAdapter):
         channel_id = body.get("channel", {}).get("id", "")
         user_name = body.get("user", {}).get("name", "unknown")
         user_id = body.get("user", {}).get("id", "")
-        if not self._is_interactive_user_authorized(
+        if not await self._authorize_interactive_user(
             user_id,
             channel_id=channel_id,
             user_name=user_name,
@@ -7446,6 +7475,12 @@ class SlackAdapter(BasePlatformAdapter):
         message = body.get("message", {}) or {}
         channel_id = (body.get("channel") or {}).get("id", "")
         user_id = (body.get("user") or {}).get("id", "")
+        team_id = self._event_team_id({}, body)
+        if not await self._authorize_interactive_user(
+            user_id, channel_id=channel_id, team_id=team_id
+        ):
+            logger.warning("[Slack] Unauthorized feedback click by %s - ignoring", user_id)
+            return
         logger.info(
             "[Slack] Feedback button clicked: value=%s user=%s channel=%s ts=%s",
             value,
@@ -7467,7 +7502,7 @@ class SlackAdapter(BasePlatformAdapter):
         user_name = body.get("user", {}).get("name", "unknown")
         user_id = body.get("user", {}).get("id", "")
 
-        if not self._is_interactive_user_authorized(
+        if not await self._authorize_interactive_user(
             user_id,
             channel_id=channel_id,
             user_name=user_name,
@@ -7626,11 +7661,13 @@ class SlackAdapter(BasePlatformAdapter):
         channel_id = body.get("channel", {}).get("id", "")
         user_name = body.get("user", {}).get("name", "unknown")
         user_id = body.get("user", {}).get("id", "")
+        team_id = self._event_team_id({}, body)
 
-        if not self._is_interactive_user_authorized(
+        if not await self._authorize_interactive_user(
             user_id,
             channel_id=channel_id,
             user_name=user_name,
+            team_id=team_id,
         ):
             logger.warning(
                 "[Slack] Unauthorized clarify click by %s (%s) - ignoring",
@@ -8337,6 +8374,21 @@ class SlackAdapter(BasePlatformAdapter):
             thread_id=thread_id,
             scope_id=team_id or None,
         )
+
+        # Native slash commands bypass the message-event edge, so authorize
+        # them before dispatching to the gateway.  Keep the result on the
+        # local source marker so the final gateway gate applies the same
+        # fail-closed predicate as ordinary Slack messages.
+        if not await self._authorize_external_resource(
+            str(user_id or ""),
+            chat_id=str(channel_id or ""),
+            team_id=str(team_id or ""),
+            source=source,
+        ):
+            logger.warning(
+                "[Slack] Unauthorized slash command by %s - ignoring", user_id
+            )
+            return
 
         event = MessageEvent(
             text=text,
