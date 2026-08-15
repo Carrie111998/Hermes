@@ -32,7 +32,16 @@ def _git_init(path):
         ["add", "-A"],
         ["commit", "-q", "-m", "init commit"],
     ):
-        subprocess.run([shutil.which("git"), "-C", str(path), *args], check=True, env=env)
+        # cwd= is behaviour-neutral here (``git -C`` already picks the repo) but
+        # is NOT optional hygiene: `env` above is a curated dict with no
+        # SYSTEMDRIVE/PROGRAMDATA, and run_tests_parallel.py spawns every worker
+        # with cwd=repo_root. A child that can't expand the registry's
+        # `%SystemDrive%\ProgramData` known-folder template falls back to the
+        # literal string as a RELATIVE path and builds the tree under its CWD --
+        # i.e. a literal "%SystemDrive%/" directory in the checkout root. Pinning
+        # cwd keeps any such fallout inside tmp_path.
+        subprocess.run([shutil.which("git"), "-C", str(path), *args], check=True,
+                       env=env, cwd=str(path))
 
 
 # ── resolver ──────────────────────────────────────────────────────────────
@@ -63,7 +72,9 @@ class TestIsCodingContext:
         }
         (tmp_path / "notes.md").write_text("# my novel\n")
         for args in (["init", "-q", "-b", "main"], ["add", "-A"], ["commit", "-q", "-m", "notes"]):
-            subprocess.run([shutil.which("git"), "-C", str(tmp_path), *args], check=True, env=env)
+            # cwd= pinned for the same reason as in _git_init above.
+            subprocess.run([shutil.which("git"), "-C", str(tmp_path), *args], check=True,
+                           env=env, cwd=str(tmp_path))
 
         assert cc.is_coding_context(platform="cli", cwd=tmp_path, config=cfg) is False
         # …but adding a manifest or source file makes it a code workspace.
@@ -203,6 +214,8 @@ class TestProjectFacts:
             env={"PATH": os.environ.get("PATH", ""), "HOME": str(tmp_path),
                  "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
                  "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"},
+            # cwd= pinned for the same reason as in _git_init above.
+            cwd=str(main_tree),
         )
         block = cc.build_coding_workspace_block(worktree)
         assert "Worktree: linked" in block
