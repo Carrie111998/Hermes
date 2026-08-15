@@ -8,7 +8,6 @@ import { fileURLToPath } from "node:url";
 const webRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const repoRoot = resolve(webRoot, "..");
 const standalone = existsSync(resolve(webRoot, "package-lock.json"));
-const buildRoot = standalone ? webRoot : repoRoot;
 
 function run(command, args, cwd, capture = false) {
   const result = spawnSync(command, args, {
@@ -21,10 +20,11 @@ function run(command, args, cwd, capture = false) {
 }
 
 function runBuild(root) {
-  const mappedWebRoot = standalone ? root : resolve(root, "web");
+  const mappedWebRoot = resolve(root, "web");
+  const dependencyRoot = standalone ? mappedWebRoot : root;
   const steps = [
-    [resolve(root, "node_modules", "typescript", "bin", "tsc"), "-b"],
-    [resolve(root, "node_modules", "vite", "bin", "vite.js"), "build"],
+    [resolve(dependencyRoot, "node_modules", "typescript", "bin", "tsc"), "-b"],
+    [resolve(dependencyRoot, "node_modules", "vite", "bin", "vite.js"), "build"],
   ];
 
   for (const [entrypoint, ...args] of steps) {
@@ -47,8 +47,8 @@ function createSubstMapping(target) {
 }
 
 let status;
-if (process.platform === "win32" && /[#?]/.test(buildRoot)) {
-  const drive = createSubstMapping(buildRoot);
+if (process.platform === "win32" && /[#?]/.test(repoRoot)) {
+  const drive = createSubstMapping(repoRoot);
   console.log(
     `[web] Vite-incompatible install path detected; building through temporary ${drive} mapping.`,
   );
@@ -64,7 +64,7 @@ if (process.platform === "win32" && /[#?]/.test(buildRoot)) {
     }
   }
 } else {
-  status = runBuild(buildRoot);
+  status = runBuild(repoRoot);
 }
 
 process.exit(status);
