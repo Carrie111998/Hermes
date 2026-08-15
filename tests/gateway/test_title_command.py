@@ -15,13 +15,16 @@ from gateway.session import SessionSource
 
 
 def _make_event(text="/title", platform=Platform.TELEGRAM,
-                user_id="12345", chat_id="67890"):
+                user_id="12345", chat_id="67890", thread_id=None,
+                chat_type="dm"):
     """Build a MessageEvent for testing."""
     source = SessionSource(
         platform=platform,
         user_id=user_id,
         chat_id=chat_id,
         user_name="testuser",
+        thread_id=thread_id,
+        chat_type=chat_type,
     )
     return MessageEvent(text=text, source=source)
 
@@ -47,6 +50,49 @@ def _make_runner(session_db=None):
     runner.session_store = mock_store
 
     return runner
+
+
+class TestHandleRenameCommand:
+    @pytest.mark.asyncio
+    async def test_rename_requires_discord_thread(self, tmp_path):
+        from hermes_state import SessionDB
+        db = SessionDB(db_path=tmp_path / "state.db")
+        runner = _make_runner(session_db=db)
+
+        result = await runner._handle_rename_command(
+            _make_event(text="/rename New Name", platform=Platform.TELEGRAM)
+        )
+        assert "only available in Discord threads" in result
+
+        result = await runner._handle_rename_command(
+            _make_event(text="/rename New Name", platform=Platform.DISCORD)
+        )
+        assert "must be used inside a Discord thread" in result
+        db.close()
+
+    @pytest.mark.asyncio
+    async def test_rename_sets_title_and_edits_visible_thread(self, tmp_path):
+        from hermes_state import SessionDB
+        db = SessionDB(db_path=tmp_path / "state.db")
+        db.create_session("test_session_123", "discord")
+        runner = _make_runner(session_db=db)
+        adapter = MagicMock()
+        adapter.rename_thread = AsyncMock(return_value=True)
+        runner.adapters = {Platform.DISCORD: adapter}
+
+        event = _make_event(
+            text="/rename Clean Thread Name",
+            platform=Platform.DISCORD,
+            chat_id="999",
+            thread_id="999",
+            chat_type="thread",
+        )
+        result = await runner._handle_rename_command(event)
+
+        assert "Renamed this Discord thread" in result
+        assert db.get_session_title("test_session_123") == "Clean Thread Name"
+        adapter.rename_thread.assert_awaited_once_with("999", "Clean Thread Name")
+        db.close()
 
 
 # ---------------------------------------------------------------------------

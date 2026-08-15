@@ -4603,6 +4603,92 @@ class GatewaySlashCommandsMixin:
             else:
                 return t("gateway.title.current_no_title", session_id=session_id)
 
+    def _derive_discord_rename_title_from_history(self, session_id: str) -> str:
+        """Best-effort deterministic title from recent stored user messages."""
+        try:
+            history = self.session_store.load_transcript(session_id) or []
+        except Exception:
+            history = []
+        for msg in reversed(history):
+            if not isinstance(msg, dict) or msg.get("role") != "user":
+                continue
+            content = msg.get("content") or ""
+            if isinstance(content, list):
+                content = " ".join(
+                    str(item.get("text") or item.get("content") or "")
+                    if isinstance(item, dict) else str(item)
+                    for item in content
+                )
+            raw = re.sub(r"\[[^\]]+\]", " ", str(content))
+            raw = re.sub(r"^\s*[^:\n]{1,80}:\s*", "", raw)
+            raw = re.sub(r"https?://\S+", "", raw)
+            raw = re.sub(r"[`*_~>#|]", "", raw)
+            raw = re.sub(r"\s+", " ", raw).strip(" -:.,\n\t")
+            if not raw or raw.startswith("/"):
+                continue
+            words = raw.split()
+            return " ".join(words[:10]) or "Hermes Thread"
+        return "Hermes Thread"
+
+    async def _handle_rename_command(self, event: MessageEvent) -> str:
+        """Rename the visible Discord thread and persist the session title."""
+        source = event.source
+        if source.platform != Platform.DISCORD:
+            return "/rename is only available in Discord threads. Use /title for the Hermes session."
+        if not source.thread_id:
+            return "/rename must be used inside a Discord thread."
+        if not self._session_db:
+            from hermes_state import format_session_db_unavailable
+            return format_session_db_unavailable(prefix=t("gateway.shared.session_db_unavailable_prefix"))
+
+        session_entry = await self.async_session_store.get_or_create_session(source)
+        session_id = session_entry.session_id
+        existing_title = await self._session_db.get_session_title(session_id)
+        if existing_title is None:
+            try:
+                await self._session_db.create_session(
+                    session_id=session_id,
+                    source=source.platform.value,
+                    user_id=source.user_id,
+                    chat_id=source.chat_id,
+                    chat_type=source.chat_type,
+                    thread_id=source.thread_id,
+                )
+            except Exception:
+                pass
+
+        raw_title = event.get_command_args().strip() or existing_title or ""
+        if not raw_title:
+            raw_title = self._derive_discord_rename_title_from_history(session_id)
+
+        from hermes_state import SessionDB
+        try:
+            title = SessionDB.sanitize_title(raw_title)
+        except ValueError as exc:
+            return t("gateway.shared.warn_passthrough", error=exc)
+        if not title:
+            return "No usable title could be derived. Try `/rename <name>`."
+
+        try:
+            await self._session_db.set_session_title(session_id, title)
+        except ValueError as exc:
+            return t("gateway.shared.warn_passthrough", error=exc)
+        except Exception:
+            logger.debug("Failed to store session title from /rename", exc_info=True)
+
+        adapter = self.adapters.get(source.platform)
+        rename = getattr(adapter, "rename_thread", None) if adapter else None
+        if not callable(rename):
+            return f"Session title set to **{title}**, but this Discord adapter cannot rename threads."
+        try:
+            changed = await rename(str(source.thread_id), title)
+        except Exception as exc:
+            logger.warning("Discord /rename failed for thread %s: %s", source.thread_id, exc, exc_info=True)
+            return f"Session title set to **{title}**, but Discord thread rename failed: {exc}"
+        if changed:
+            return f"Renamed this Discord thread to **{title}**."
+        return f"Session title set to **{title}**, but Discord did not change the visible thread name."
+
     async def _handle_resume_command(self, event: MessageEvent) -> str:
         """Handle /resume command — list or switch to a previous session."""
         if not self._session_db:

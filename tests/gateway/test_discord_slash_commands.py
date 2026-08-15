@@ -142,6 +142,20 @@ async def test_registers_native_thread_slash_command(adapter):
 
 
 @pytest.mark.asyncio
+async def test_registers_native_rename_slash_command(adapter):
+    adapter._run_simple_slash = AsyncMock()
+    adapter._register_slash_commands()
+
+    command = adapter._client.tree.commands["rename"]
+    interaction = SimpleNamespace()
+    await command(interaction, name="Clean Thread Name")
+
+    adapter._run_simple_slash.assert_awaited_once_with(
+        interaction, "/rename Clean Thread Name"
+    )
+
+
+@pytest.mark.asyncio
 async def test_run_simple_slash_executes_when_defer_interaction_expired(adapter):
     class UnknownInteraction(Exception):
         status = 404

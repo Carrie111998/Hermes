@@ -5880,6 +5880,11 @@ class DiscordAdapter(BasePlatformAdapter):
         async def slash_title(interaction: discord.Interaction, name: str = ""):
             await self._run_simple_slash(interaction, f"/title {name}".strip())
 
+        @tree.command(name="rename", description="Rename the current Discord thread from session title or context")
+        @discord.app_commands.describe(name="Thread name. Leave empty to derive from session context.")
+        async def slash_rename(interaction: discord.Interaction, name: str = ""):
+            await self._run_simple_slash(interaction, f"/rename {name}".strip())
+
         @tree.command(name="resume", description="Resume a previously-named session")
         @discord.app_commands.describe(name="Session name to resume. Leave empty to list sessions.")
         async def slash_resume(interaction: discord.Interaction, name: str = ""):
