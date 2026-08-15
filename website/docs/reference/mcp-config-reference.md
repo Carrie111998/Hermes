@@ -64,6 +64,7 @@ mcp_servers:
 | `max_lifetime_seconds` | number | stdio | Optional stdio server recycle after age (`0` disables). May also live under a `lifecycle:` mapping |
 | `tools` | mapping | both | Filtering and utility-tool policy |
 | `auth` | string | HTTP | Authentication method. Set to `oauth` to enable OAuth 2.1 with PKCE |
+| `bearer_refresh_cmd` | string | HTTP | Shell command that prints a fresh bearer token to stdout. Invoked automatically after a 401 during (re)connect; see [Bearer refresh command](#bearer-refresh-command) below. |
 | `sampling` | mapping | both | Server-initiated LLM request policy (see MCP guide) |
 | `elicitation` | mapping | both | Server-initiated user-input requests. `enabled` (default `true`) and `timeout` in seconds (default `300`). Form-mode requests route through the approval surface; URL-mode is declined (see MCP guide) |
 | `trust` | string | both | Trust tier: `full` (default) or `untrusted`. On an `untrusted` server, every write-capable tool call (any tool without a `readOnlyHint: true` annotation) requires user approval through the standard approval surface before it runs. `readOnlyHint` is a server-supplied *hint* — a lying server can at most skip approval for tools it claims are read-only, never gain extra access — so mark any server you don't fully control as `untrusted`. Unrecognized values are treated as `untrusted` (fail-closed) |
@@ -335,3 +336,29 @@ Behavior:
 - Tokens are persisted to `~/.hermes/mcp-tokens/<server>.json` and reused across sessions
 - Token refresh is automatic; re-authorization only happens when refresh fails
 - Only applies to HTTP/StreamableHTTP transport (`url`-based servers)
+
+## Bearer refresh command
+
+For HTTP servers whose bearer is minted out-of-band (e.g. a signed
+role-scoped JWT from an internal issuer, a Key-Vault-fetched service
+token, or an RFC 8693 token-exchange result), set
+`bearer_refresh_cmd` on the server entry:
+
+```yaml
+mcp_servers:
+  gbrain:
+    url: "http://127.0.0.1:7777/mcp"
+    headers:
+      Authorization: "Bearer ${GBRAIN_MCP_BEARER}"
+    bearer_refresh_cmd: "/etc/hermes/refresh-mcp-bearer.sh"
+```
+
+Contract:
+- **Shell execution.** The value is passed to `asyncio.create_subprocess_shell` — the operator writes any invocation form (`/path/to/script.sh`, `bash -c '…'`, `az keyvault secret show … --query value -o tsv`). Do not embed untrusted input; the string is executed by the shell.
+- **Stdout is the new bearer.** stdout is stripped and installed verbatim as the bearer value in the `Authorization` header. Nothing else is parsed. Empty output, short output (< 16 chars), output containing whitespace, and common error-marker outputs (`ERROR: …`, `FAILED …`, HTML/JSON error blobs) are rejected — refresh returns false and the existing bearer is left unchanged.
+- **When it fires.** After any auth failure (`401`) during a (re)connect attempt. The refresh is attempted once, then the connect is retried immediately (no retry burn) if the refresh succeeded.
+- **Cooldown.** 60 seconds minimum between refresh attempts. A refresh that just ran and did not fix things falls through to normal retry/backoff logic.
+- **Interaction with the initial-auth-stop guard.** By default hermes stops after a single initial-connect auth failure to avoid looping a broken OAuth config through repeated browser prompts. Configuring `bearer_refresh_cmd` is a NON-interactive, opt-in exception to that guard: hermes will attempt one refresh before honoring the stop. If the refresh command fails or returns a bad token, the stop is honored as before — there is no path where a broken refresh command causes an infinite loop.
+- **Operator responsibility.** The command must be safe to invoke repeatedly (respect the 60s cooldown notwithstanding), must exit non-zero on failure, and must print ONLY the token on stdout (any preamble/log output must go to stderr).
+
+Applies to HTTP/StreamableHTTP transport only.
