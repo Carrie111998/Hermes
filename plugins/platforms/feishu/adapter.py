@@ -153,9 +153,28 @@ def _get_scoped_secret(name, default=None):
     ``gateway/platforms/whatsapp_common.py::_get_wsecret``.
     """
     try:
+        from agent.secret_scope import (
+            current_secret_scope,
+            get_secret as _scoped_get_secret,
+            is_multiplex_active,
+        )
+
         val = _scoped_get_secret(name, default)
+        if val is not None:
+            return val
+        # get_secret returned None. Under multiplex WITH a scope installed the
+        # scope is authoritative: a miss is a miss — borrowing from os.environ
+        # would leak another profile's value (e.g. the default profile's
+        # allowlist into a secondary adapter, #86905). Only the unscoped
+        # default-profile path (UnscopedSecretError below, or multiplex off)
+        # falls back to the process environment.
+        if current_secret_scope() is not None and is_multiplex_active():
+            return default
     except _UnscopedSecretError:
-        val = os.getenv(name)
+        # Default-profile adapter constructing unscoped under multiplex:
+        # os.environ is this profile's own value.
+        pass
+    val = os.getenv(name)
     return val if val is not None else default
 
 
