@@ -4986,6 +4986,12 @@ def run_one_job(
             drift_skip = drift_skip_silent or (
                 bool(error) and DRIFT_SKIP_MARKER in str(error)
             )
+            empty_response_error = None
+            if success and not final_response.strip():
+                empty_response_error = (
+                    "Agent completed but produced empty response "
+                    "(model error, timeout, or misconfiguration)"
+                )
             if blocked_config and not success:
                 # Blocked-config alert: bypass the generic failure summarizer
                 # (whose auth/timeout heuristics would mislabel this as a
@@ -5023,6 +5029,15 @@ def run_one_job(
                 should_deliver = False
             unresolved_origin = False
             delivery_job = job
+            if empty_response_error:
+                # Empty responses keep their established no-delivery behavior
+                # unless this local job has an explicit failure-alert fallback.
+                delivery_job = _job_for_result_delivery(job, success=False)
+                if delivery_job is not job:
+                    deliver_content = _summarize_cron_failure_for_delivery(
+                        job, empty_response_error
+                    )
+                    should_deliver = bool(deliver_content.strip())
             # Cron silence suppression — see _is_cron_silence_response.  Replaces the
             # old `SILENT_MARKER in ...upper()` substring check, which both leaked
             # bracketless near-markers ("SILENT" / "NO_REPLY") and wrongly swallowed
@@ -5034,7 +5049,8 @@ def run_one_job(
                 should_deliver = False
 
             if should_deliver:
-                delivery_job = _job_for_result_delivery(job, success=success)
+                if delivery_job is job:
+                    delivery_job = _job_for_result_delivery(job, success=success)
                 unresolved_origin = (
                     _normalize_deliver_value(delivery_job.get("deliver", "local")) == "origin"
                     and not _resolve_delivery_targets(delivery_job)
@@ -5056,9 +5072,9 @@ def run_one_job(
         # Treat empty final_response as a soft failure so last_status
         # is not "ok" — the agent ran but produced nothing useful.
         # (issue #8585)
-        if success and not final_response.strip():
+        if empty_response_error:
             success = False
-            error = "Agent completed but produced empty response (model error, timeout, or misconfiguration)"
+            error = empty_response_error
 
         if not _consume_interrupted_flag(job["id"]):
             if blocked_config:

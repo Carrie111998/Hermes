@@ -94,6 +94,20 @@ def test_null_failure_delivery_keeps_failed_job_local(monkeypatch):
     assert ("deliver", "failed-local", None) in calls
 
 
+def test_empty_response_failure_uses_configured_failure_delivery(monkeypatch):
+    calls = _patch_pipeline(monkeypatch, success=True, final="   \n\t  ")
+    monkeypatch.setattr(
+        s,
+        "load_config",
+        lambda: {"cron": {"delivery": {"failure": "telegram:alerts"}}},
+    )
+
+    assert s.run_one_job({"id": "empty-local", "deliver": "local"}) is True
+
+    assert ("deliver", "empty-local", "telegram:alerts") in calls
+    assert calls[-1] == ("mark", "empty-local", False)
+
+
 def test_success_and_nonlocal_failure_keep_their_job_delivery(monkeypatch):
     monkeypatch.setattr(
         s,
