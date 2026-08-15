@@ -2464,9 +2464,34 @@ class HindsightMemoryProvider(MemoryProvider):
         with self._prefetch_lock:
             self._prefetch_result = ""
             self._prefetch_count = 0
-            self._opportunistic_generation += 1
-            self._opportunistic_ready.clear()
-            self._opportunistic_pending = None
+            if new_id == self._session_id:
+                # Rewind/in-place compression invalidates every result owned by
+                # this session's previous transcript generation.
+                self._opportunistic_generation += 1
+                self._opportunistic_ready.clear()
+                self._opportunistic_pending = None
+            else:
+                # /new publishes the agent's new session id before its deferred
+                # provider boundary completes. Preserve work that a prompt has
+                # already launched for that new id while rejecting old-session
+                # results. If the active call is old, bumping the generation
+                # drops it; the worker rebases a preserved new-session pending
+                # key onto the new generation when it advances.
+                self._opportunistic_ready = [
+                    item
+                    for item in self._opportunistic_ready
+                    if item.session_id == new_id
+                ]
+                if (
+                    self._opportunistic_pending is not None
+                    and self._opportunistic_pending[0] != new_id
+                ):
+                    self._opportunistic_pending = None
+                if (
+                    self._opportunistic_inflight is not None
+                    and self._opportunistic_inflight[0] != new_id
+                ):
+                    self._opportunistic_generation += 1
             if not (self._prefetch_thread and self._prefetch_thread.is_alive()):
                 self._opportunistic_inflight = None
 

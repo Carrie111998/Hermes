@@ -705,6 +705,7 @@ def build_turn_context(
     # collect only already-ready results at the existing prefetch boundary
     # below, before api_content is finalized and persisted.
     _early_prefetch_session_id = agent.session_id or ""
+    _prefetch_invalidated_by_idle_compression = False
     if agent._memory_manager:
         try:
             _early_query = (
@@ -857,6 +858,7 @@ def build_turn_context(
                 # must leave the turn's flush baseline and user-message index
                 # untouched.
                 if messages is not _idle_input:
+                    _prefetch_invalidated_by_idle_compression = True
                     conversation_history = conversation_history_after_compression(
                         agent, messages, conversation_history
                     )
@@ -1301,11 +1303,15 @@ def build_turn_context(
             _query = original_user_message if isinstance(original_user_message, str) else ""
             if not is_trivial_prompt(_query):
                 _prefetch_session_id = agent.session_id or ""
-                # Compression may rotate the session after the early launch.
-                # Hindsight correctly invalidates the old generation at that
-                # boundary, so give the new session its own launch before the
+                # Compression may invalidate the early launch, either by
+                # rotating the session or by rewinding it in place. Give the
+                # post-compression generation its own launch before the
                 # zero-wait collection point.
-                if _prefetch_session_id != _early_prefetch_session_id:
+                if (
+                    _prefetch_session_id != _early_prefetch_session_id
+                    or _prefetch_invalidated_by_idle_compression
+                    or _preflight_compressed
+                ):
                     agent._memory_manager.start_prefetch_all(
                         _query,
                         session_id=_prefetch_session_id,

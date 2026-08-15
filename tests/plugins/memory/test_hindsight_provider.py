@@ -624,6 +624,31 @@ class TestPrefetch:
 
         assert new_completed.wait(timeout=2.0)
 
+    def test_recall_async_preserves_new_session_inflight_before_deferred_switch(
+        self, provider_with_config
+    ):
+        p = provider_with_config(recall_async=True)
+        recall_started = threading.Event()
+        release_recall = threading.Event()
+
+        async def _recall(**kwargs):
+            recall_started.set()
+            release_recall.wait(timeout=2.0)
+            return SimpleNamespace(results=[SimpleNamespace(text=kwargs["query"])])
+
+        p._client.arecall = AsyncMock(side_effect=_recall)
+        p.start_prefetch("new query", session_id="new-session", turn_number=1)
+        assert recall_started.wait(timeout=2.0)
+        worker = p._prefetch_thread
+        real_join = worker.join
+        worker.join = lambda timeout=None: None
+
+        p.on_session_switch("new-session")
+        release_recall.set()
+        real_join(timeout=2.0)
+
+        assert "new query" in p.prefetch("next query", session_id="new-session")
+
     def test_recall_async_never_waits_and_carries_late_result(self, provider_with_config):
         p = provider_with_config(recall_async=True)
         recall_started = threading.Event()
