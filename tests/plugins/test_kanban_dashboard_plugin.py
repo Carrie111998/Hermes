@@ -79,6 +79,12 @@ def test_board_empty(client):
     assert data["tenants"] == []
     assert data["assignees"] == []
     assert data["latest_event_id"] == 0
+    # Default-on L3x cross-column swim lanes: two rows, no cards.
+    assert data["swim_lanes"] is not None
+    assert len(data["swim_lanes"]) == 2
+    assert data["swim_lanes"][0]["id"] == "l3x"
+    assert data["swim_lanes"][1]["id"] == "__other__"
+    assert all(lane["task_count"] == 0 for lane in data["swim_lanes"])
 
 
 # ---------------------------------------------------------------------------
@@ -944,6 +950,72 @@ def test_bulk_empty_ids_400(client):
 
 
 # ---------------------------------------------------------------------------
+# L3x cross-column swim lanes
+# ---------------------------------------------------------------------------
+
+
+def test_board_swim_lanes_partition_l3x_and_other(client):
+    """L3x-assigned tasks land in the l3x swim lane across all status columns."""
+    placements = [
+        ("L3x ready", "l3x", "ready"),
+        ("L3x review", "l3x", "review"),
+        ("R1ft todo", "R1ft", "todo"),
+        ("Unassigned triage", None, "triage"),
+    ]
+    created = []
+    for title, assignee, status in placements:
+        payload = {"title": title}
+        if assignee:
+            payload["assignee"] = assignee
+        r = client.post("/api/plugins/kanban/tasks", json=payload)
+        assert r.status_code == 200, r.text
+        task = r.json()["task"]
+        with kb.connect() as conn:
+            with kb.write_txn(conn):
+                conn.execute(
+                    "UPDATE tasks SET status = ?, assignee = ? WHERE id = ?",
+                    (status, assignee, task["id"]),
+                )
+        created.append({**task, "status": status, "assignee": assignee})
+
+    r = client.get("/api/plugins/kanban/board")
+    assert r.status_code == 200
+    data = r.json()
+    swim = data["swim_lanes"]
+    assert swim is not None
+    l3x_lane = next(lane for lane in swim if lane["id"] == "l3x")
+    other_lane = next(lane for lane in swim if lane["id"] == "__other__")
+
+    assert l3x_lane["task_count"] == 2
+    assert other_lane["task_count"] == 2
+
+    l3x_ready = next(c for c in l3x_lane["columns"] if c["name"] == "ready")
+    l3x_review = next(c for c in l3x_lane["columns"] if c["name"] == "review")
+    assert {t["id"] for t in l3x_ready["tasks"]} == {created[0]["id"]}
+    assert {t["id"] for t in l3x_review["tasks"]} == {created[1]["id"]}
+
+    other_triage = next(c for c in other_lane["columns"] if c["name"] == "triage")
+    other_todo = next(c for c in other_lane["columns"] if c["name"] == "todo")
+    assert {t["id"] for t in other_triage["tasks"]} == {created[3]["id"]}
+    assert {t["id"] for t in other_todo["tasks"]} == {created[2]["id"]}
+
+    flat_ids = {t["id"] for col in data["columns"] for t in col["tasks"]}
+    assert flat_ids == {t["id"] for t in created}
+
+
+def test_board_swim_lanes_disabled_via_config(tmp_path, monkeypatch, client):
+    home = Path(os.environ["HERMES_HOME"])
+    (home / "config.yaml").write_text(
+        "dashboard:\n"
+        "  kanban:\n"
+        "    l3x_swim_lane: false\n"
+    )
+    r = client.get("/api/plugins/kanban/board")
+    assert r.status_code == 200
+    assert r.json()["swim_lanes"] is None
+
+
+# ---------------------------------------------------------------------------
 # /config endpoint
 # ---------------------------------------------------------------------------
 
@@ -963,6 +1035,8 @@ def test_config_reads_dashboard_kanban_section(tmp_path, monkeypatch, client):
     data = r.json()
     assert data["default_tenant"] == "acme"
     assert data["lane_by_profile"] is False
+    assert data["l3x_swim_lane"] is True
+    assert data["l3x_swim_lane_assignee"] == "l3x"
     assert data["include_archived_by_default"] is True
     assert data["render_markdown"] is False
 

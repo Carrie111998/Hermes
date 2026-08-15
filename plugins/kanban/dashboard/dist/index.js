@@ -626,6 +626,8 @@
     const [includeArchived, setIncludeArchived] = useState(false);
     const [search, setSearch] = useState("");
     const [laneByProfile, setLaneByProfile] = useState(true);
+    const [l3xSwimLane, setL3xSwimLane] = useState(true);
+    const [l3xSwimLaneAssignee, setL3xSwimLaneAssignee] = useState("l3x");
     const [configApplied, setConfigApplied] = useState(false);
 
     const [selectedTaskId, setSelectedTaskId] = useState(null);
@@ -655,6 +657,8 @@
           if (!configApplied) {
             if (c.default_tenant) setTenantFilter(c.default_tenant);
             if (typeof c.lane_by_profile === "boolean") setLaneByProfile(c.lane_by_profile);
+            if (typeof c.l3x_swim_lane === "boolean") setL3xSwimLane(c.l3x_swim_lane);
+            if (c.l3x_swim_lane_assignee) setL3xSwimLaneAssignee(c.l3x_swim_lane_assignee);
             if (typeof c.include_archived_by_default === "boolean") setIncludeArchived(c.include_archived_by_default);
             setConfigApplied(true);
           }
@@ -1316,6 +1320,9 @@
           board: filteredBoard,
           boardMeta: boardList.find(function (item) { return item.slug === board; }) || null,
           laneByProfile,
+          l3xSwimLane,
+          l3xSwimLaneAssignee,
+          assigneeFilter,
           selectedIds,
           failedIds,
           draggingTaskId,
@@ -2683,6 +2690,50 @@
   }
 
   // -------------------------------------------------------------------------
+  // Cross-column swim lanes (L3x vs other assignees)
+  // -------------------------------------------------------------------------
+
+  var L3X_SWIM_LANE_OTHER_ID = "__other__";
+
+  function partitionSwimLanes(columns, l3xAssignee) {
+    var l3xCols = [];
+    var otherCols = [];
+    for (var i = 0; i < columns.length; i++) {
+      var col = columns[i];
+      var tasks = col.tasks || [];
+      var l3xTasks = [];
+      var otherTasks = [];
+      for (var j = 0; j < tasks.length; j++) {
+        if (tasks[j].assignee === l3xAssignee) l3xTasks.push(tasks[j]);
+        else otherTasks.push(tasks[j]);
+      }
+      l3xCols.push({ name: col.name, tasks: l3xTasks });
+      otherCols.push({ name: col.name, tasks: otherTasks });
+    }
+    function laneCount(cols) {
+      var n = 0;
+      for (var k = 0; k < cols.length; k++) n += (cols[k].tasks || []).length;
+      return n;
+    }
+    return [
+      {
+        id: l3xAssignee,
+        label: l3xAssignee,
+        assignee: l3xAssignee,
+        task_count: laneCount(l3xCols),
+        columns: l3xCols,
+      },
+      {
+        id: L3X_SWIM_LANE_OTHER_ID,
+        label: "Other",
+        assignee: null,
+        task_count: laneCount(otherCols),
+        columns: otherCols,
+      },
+    ];
+  }
+
+  // -------------------------------------------------------------------------
   // Columns
   // -------------------------------------------------------------------------
 
@@ -2783,6 +2834,88 @@
     const handleDragEnd = useCallback(function () {
       if (props.onDragEnd) props.onDragEnd();
     }, [props.onDragEnd]);
+
+    const swimLanes = useMemo(function () {
+      if (!props.l3xSwimLane || !props.board || !props.board.columns) return null;
+      return partitionSwimLanes(props.board.columns, props.l3xSwimLaneAssignee || "l3x");
+    }, [props.l3xSwimLane, props.l3xSwimLaneAssignee, props.board]);
+
+    const visibleSwimLanes = useMemo(function () {
+      if (!swimLanes) return null;
+      var filter = props.assigneeFilter || "";
+      var l3x = props.l3xSwimLaneAssignee || "l3x";
+      if (filter === l3x) {
+        return swimLanes.filter(function (lane) { return lane.id === l3x; });
+      }
+      if (filter && filter !== l3x) {
+        return swimLanes.filter(function (lane) { return lane.id === L3X_SWIM_LANE_OTHER_ID; });
+      }
+      return swimLanes;
+    }, [swimLanes, props.assigneeFilter, props.l3xSwimLaneAssignee]);
+
+    function renderColumnGrid(boardSlice, gridKey, showTrash) {
+      return [
+        boardSlice.columns.map(function (col) {
+          return h(Column, {
+            key: gridKey + ":" + col.name,
+            column: col,
+            boardMeta: props.boardMeta,
+            laneByProfile: props.laneByProfile,
+            selectedIds: props.selectedIds,
+            failedIds: props.failedIds,
+            draggingTaskId: props.draggingTaskId,
+            toggleSelected: props.toggleSelected,
+            toggleRange: props.toggleRange,
+            selectAllInColumn: props.selectAllInColumn,
+            onMove: props.onMove,
+            onMoveSelected: props.onMoveSelected,
+            onOpen: props.onOpen,
+            onCreate: props.onCreate,
+            allTasks: props.allTasks,
+          });
+        }),
+        showTrash ? h(TrashDropZone, {
+          draggingTaskId: props.draggingTaskId,
+          selectedIds: props.selectedIds,
+          onDelete: props.onDelete,
+          onDeleteSelected: props.onDeleteSelected,
+        }) : null,
+      ];
+    }
+
+    if (visibleSwimLanes && visibleSwimLanes.length > 0) {
+      return h("div", { className: "hermes-kanban-swim-board" },
+        visibleSwimLanes.map(function (lane, laneIdx) {
+          var isLast = laneIdx === visibleSwimLanes.length - 1;
+          return h("section", {
+            key: lane.id,
+            className: "hermes-kanban-swim-row",
+            "aria-label": lane.label + " swim lane",
+          },
+            h("header", { className: "hermes-kanban-swim-row-head" },
+              h("span", { className: "hermes-kanban-swim-row-name" }, lane.label),
+              h("span", { className: "hermes-kanban-swim-row-count",
+                          title: lane.task_count + " task" + (lane.task_count === 1 ? "" : "s") },
+                lane.task_count),
+            ),
+            h("div", {
+              ref: isLast ? columnsRef : null,
+              className: cn(
+                "hermes-kanban-columns",
+                isLast && isScrollable ? "hermes-kanban-columns--scrollable" : "",
+                isLast && isPanning ? "hermes-kanban-columns--panning" : "",
+              ),
+              onDragStart: handleDragStart,
+              onDragEnd: handleDragEnd,
+              onMouseDown: isLast ? handleMouseDown : undefined,
+            },
+              renderColumnGrid({ columns: lane.columns }, lane.id, isLast),
+            ),
+          );
+        }),
+      );
+    }
+
     return h("div", {
       ref: columnsRef,
       className: cn(
@@ -2794,31 +2927,7 @@
       onDragEnd: handleDragEnd,
       onMouseDown: handleMouseDown,
     },
-      props.board.columns.map(function (col) {
-        return h(Column, {
-          key: col.name,
-          column: col,
-          boardMeta: props.boardMeta,
-          laneByProfile: props.laneByProfile,
-          selectedIds: props.selectedIds,
-          failedIds: props.failedIds,
-          draggingTaskId: props.draggingTaskId,
-          toggleSelected: props.toggleSelected,
-          toggleRange: props.toggleRange,
-          selectAllInColumn: props.selectAllInColumn,
-          onMove: props.onMove,
-          onMoveSelected: props.onMoveSelected,
-          onOpen: props.onOpen,
-          onCreate: props.onCreate,
-          allTasks: props.allTasks,
-        });
-      }),
-      h(TrashDropZone, {
-        draggingTaskId: props.draggingTaskId,
-        selectedIds: props.selectedIds,
-        onDelete: props.onDelete,
-        onDeleteSelected: props.onDeleteSelected,
-      }),
+      renderColumnGrid(props.board, "flat", true),
     );
   }
 

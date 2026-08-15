@@ -151,8 +151,52 @@ BOARD_COLUMNS: list[str] = [
     "triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done",
 ]
 
+# Cross-column swim lane for the L3x assignee profile. The dashboard renders
+# tasks assigned to ``L3X_SWIM_LANE_ASSIGNEE`` in a dedicated horizontal row
+# spanning every lifecycle column; all other assignees (including unassigned)
+# land in the companion "Other" row.
+L3X_SWIM_LANE_ASSIGNEE = "l3x"
+L3X_SWIM_LANE_OTHER_ID = "__other__"
+L3X_SWIM_LANE_OTHER_LABEL = "Other"
+
 
 _CARD_SUMMARY_PREVIEW_CHARS = 200
+
+
+def partition_swim_lanes(
+    columns: list[dict[str, Any]],
+    *,
+    l3x_assignee: str = L3X_SWIM_LANE_ASSIGNEE,
+) -> list[dict[str, Any]]:
+    """Split board columns into L3x vs non-L3x cross-column swim lanes.
+
+    Each lane carries the full status column set so the UI can render a
+    status grid per row without duplicating cards across lanes.
+    """
+    l3x_cols: list[dict[str, Any]] = []
+    other_cols: list[dict[str, Any]] = []
+    for col in columns:
+        tasks = col.get("tasks") or []
+        l3x_tasks = [t for t in tasks if t.get("assignee") == l3x_assignee]
+        other_tasks = [t for t in tasks if t.get("assignee") != l3x_assignee]
+        l3x_cols.append({"name": col["name"], "tasks": l3x_tasks})
+        other_cols.append({"name": col["name"], "tasks": other_tasks})
+    return [
+        {
+            "id": l3x_assignee,
+            "label": l3x_assignee,
+            "assignee": l3x_assignee,
+            "task_count": sum(len(c["tasks"]) for c in l3x_cols),
+            "columns": l3x_cols,
+        },
+        {
+            "id": L3X_SWIM_LANE_OTHER_ID,
+            "label": L3X_SWIM_LANE_OTHER_LABEL,
+            "assignee": None,
+            "task_count": sum(len(c["tasks"]) for c in other_cols),
+            "columns": other_cols,
+        },
+    ]
 
 
 def _task_dict(
@@ -499,10 +543,25 @@ def get_board(
             )
         ]
 
+        column_payload = [
+            {"name": name, "tasks": columns[name]} for name in columns.keys()
+        ]
+        try:
+            from hermes_cli.config import load_config
+            cfg = load_config() or {}
+        except Exception:
+            cfg = {}
+        k_cfg = ((cfg.get("dashboard") or {}).get("kanban") or {})
+        l3x_swim_lane = bool(k_cfg.get("l3x_swim_lane", True))
+        l3x_assignee = str(k_cfg.get("l3x_swim_lane_assignee") or L3X_SWIM_LANE_ASSIGNEE)
+
         return {
-            "columns": [
-                {"name": name, "tasks": columns[name]} for name in columns.keys()
-            ],
+            "columns": column_payload,
+            "swim_lanes": (
+                partition_swim_lanes(column_payload, l3x_assignee=l3x_assignee)
+                if l3x_swim_lane
+                else None
+            ),
             "tenants": tenants,
             "assignees": assignees,
             "latest_event_id": int(latest_event_id),
@@ -2033,6 +2092,10 @@ def get_config():
     return {
         "default_tenant": k_cfg.get("default_tenant") or "",
         "lane_by_profile": bool(k_cfg.get("lane_by_profile", True)),
+        "l3x_swim_lane": bool(k_cfg.get("l3x_swim_lane", True)),
+        "l3x_swim_lane_assignee": str(
+            k_cfg.get("l3x_swim_lane_assignee") or L3X_SWIM_LANE_ASSIGNEE
+        ),
         "include_archived_by_default": bool(k_cfg.get("include_archived_by_default", False)),
         "render_markdown": bool(k_cfg.get("render_markdown", True)),
     }
