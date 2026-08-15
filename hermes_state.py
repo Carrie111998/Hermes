@@ -1495,6 +1495,7 @@ def is_disk_full_error(exc: BaseException | str | None) -> bool:
 PERSISTENCE_ERROR_CAUSES = (
     "locked",
     "compression",
+    "compression_closed",
     "turn_lease",
     "disk",
     "unknown",
@@ -1515,6 +1516,10 @@ def classify_persistence_error(exc_or_str) -> str:
       database write lock); transient, retry-later guidance applies.
     * ``"compression"`` — a live compression lease refused the transcript
       write; the database itself is healthy and unlocked.
+    * ``"compression_closed"`` — the write targeted a session already
+      rotated (closed) by compression and no live continuation was adopted;
+      the store is healthy — the client must refresh/adopt the new session
+      id, so disk-space advice would be a misdiagnosis.
     * ``"turn_lease"`` — a presented session-turn-lease holder no longer
       owns the conversation (expired, released, or reclaimed); fail-fast
       fencing, not a storage fault.
@@ -1532,11 +1537,15 @@ def classify_persistence_error(exc_or_str) -> str:
     # survived RPC wrapping).
     if isinstance(exc_or_str, SessionTurnLeaseLostError):
         return "turn_lease"
+    if isinstance(exc_or_str, CompressionSessionClosedError):
+        return "compression_closed"
     if isinstance(exc_or_str, CompressionSessionBusyError):
         return "compression"
     text = str(exc_or_str).lower()
     if "turn lease" in text:
         return "turn_lease"
+    if "closed by compression" in text:
+        return "compression_closed"
     if "being compressed" in text or "compression lease" in text:
         return "compression"
     if (
@@ -2827,6 +2836,16 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 data["system_prompt"] = resolved
         return data
 
+    @staticmethod
+    def _close_connection_quietly(conn: Optional[sqlite3.Connection]) -> None:
+        """Close a partially initialized connection without masking its error."""
+        if conn is None:
+            return
+        try:
+            conn.close()
+        except Exception:
+            logger.debug("Could not close a SessionDB connection", exc_info=True)
+
     def __init__(self, db_path: Path = None, read_only: bool = False):
         self.db_path = db_path or _default_db_path()
         # Fail hard (before any connection/pragma/mkdir) if a pytest-context
@@ -2924,6 +2943,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         self._token_writer_thread: Optional[threading.Thread] = None
         self._token_writer_stop = False
         self._token_writer_busy = False
+        initialization_complete = False
         try:
             if read_only:
                 # Read-only attach for cross-profile aggregation: SELECT-only,
@@ -2948,8 +2968,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 # only so read-only search keeps its FTS and trigram paths.
                 # Close the connection on ANY probe failure (e.g. malformed
                 # schema raises DatabaseError, not the OperationalError the
-                # probe handles): the outer except re-raises without cleanup,
-                # and a leaked tracked connection blocks _backup_db_file's
+                # probe handles). The constructor's outer finally also covers
+                # failures before this probe and BaseException paths, so a
+                # leaked tracked connection cannot block _backup_db_file's
                 # raw-copy for the rest of the process — the writable heal
                 # that follows would then repair WITHOUT its forensic backup.
                 try:
@@ -2973,6 +2994,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     except Exception:
                         pass
                     raise
+                initialization_complete = True
                 return
 
             self.db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -3106,6 +3128,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             # racing session lifecycle and the surprise disk/latency cost on
             # an unattended open. (An interrupted optimize resumes when the
             # user re-runs the command.)
+            initialization_complete = True
         except Exception as exc:
             # Capture the cause so /resume and friends can surface WHY the
             # session DB is unavailable instead of a bare "Session database
@@ -3121,6 +3144,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             # ``hermes_state._set_last_init_error(None)`` explicitly.
             _set_last_init_error(f"{type(exc).__name__}: {exc}")
             raise
+        finally:
+            if not initialization_complete:
+                conn, self._conn = self._conn, None
+                self._close_connection_quietly(conn)
 
     # ── Read-path split ──
 
@@ -3992,8 +4019,33 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                             "WAL checkpoint (PASSIVE) at close failed: %s",
                             exc,
                         )
-                self._conn.close()
-                self._conn = None
+                conn, self._conn = self._conn, None
+                self._close_connection_quietly(conn)
+
+    def __del__(self) -> None:
+        """Safety net: close the connection if the caller forgot.
+
+        ``atexit.register`` in ``__init__`` pins this instance alive until
+        interpreter exit, which prevents GC from collecting orphaned
+        ``SessionDB`` instances on exception paths.  When callers forget
+        ``.close()``, the sqlite FDs leak until the process exits (EMFILE).
+
+        A ``__del__`` finalizer is the last-resort guard: it fires when the
+        GC collects the object, which *can* happen once ``atexit`` is
+        unregistered (via ``close()``) **or** when the atexit-held
+        reference is the only remaining root and the interpreter is
+        shutting down.  During normal interpreter teardown the order of
+        module cleanup is undefined, so we guard every attribute access.
+
+        Delegates to ``close()`` so the read pool, token writer, and atexit
+        hook are all cleaned up — not just the writer connection.
+        """
+        if self.__dict__.get("_conn") is None:
+            return
+        try:
+            self.close()
+        except Exception:
+            pass
 
     # ── Chunked FTS rebuild engine (v23 opt-in optimize) ──
     #
@@ -9142,6 +9194,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         self,
         session_id: str,
         include_inactive: bool = False,
+        include_compacted: bool = False,
         limit: Optional[int] = None,
         offset: int = 0,
         latest: bool = False,
@@ -9153,6 +9206,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         ``include_inactive=True`` to load soft-deleted rows (e.g. for
         audit / debug views of rewound history). See
         :meth:`rewind_to_message` for the soft-delete mechanic.
+
+        Pass ``include_compacted=True`` to additionally load rows preserved
+        by in-place context compaction (``active=0, compacted=1``). Those are
+        durable display history, not soft-deleted rows — a user-visible
+        transcript read must not drop them, or earlier turns silently become
+        unreachable once the UI exhausts its active-only window. Soft-deleted
+        Undo/Rewind rows (``active=0, compacted=0``) stay excluded; use
+        ``include_inactive`` for those.
 
         Ordered by AUTOINCREMENT id (true insertion order) rather than
         timestamp — see c03acca50 for the WSL2 clock-regression rationale.
@@ -9172,7 +9233,18 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         """
         if after_id is not None and (latest or offset):
             raise ValueError("after_id is incompatible with latest/offset paging")
-        active_clause = "" if include_inactive else " AND active = 1"
+        if after_id is not None and include_compacted:
+            raise ValueError("after_id is incompatible with include_compacted (deduped display reads use offset paging)")
+        if include_inactive:
+            # Audit / debug reads: every row, including soft-deleted.
+            active_clause = ""
+        elif include_compacted:
+            # Display history: active rows plus rows preserved by in-place
+            # compaction (active=0, compacted=1), but never soft-deleted
+            # Undo/Rewind rows (active=0, compacted=0).
+            active_clause = " AND (active = 1 OR compacted = 1)"
+        else:
+            active_clause = " AND active = 1"
         keyset_clause = " AND id > ?" if after_id is not None else ""
         sql = (
             "SELECT * FROM messages WHERE session_id = ?"
@@ -9181,15 +9253,57 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         params: list = [session_id]
         if after_id is not None:
             params.append(after_id)
-        if limit is not None or offset:
-            # SQLite's OFFSET requires LIMIT; -1 means "no limit".
-            sql += " LIMIT ? OFFSET ?"
-            params.extend([-1 if limit is None else limit, offset])
-        with self._read_ctx() as conn:
-            cursor = conn.execute(sql, params)
-            rows = cursor.fetchall()
-        if latest:
-            rows.reverse()
+        if include_compacted:
+            # Compaction epochs copy the protected tail into each new
+            # generation, so the same logical message can exist as several
+            # rows (identical role/content/timestamp) with different active
+            # flags and ids. A display read must surface each message exactly
+            # once: prefer the live row, then the newest generation. Read the
+            # full display set (a session's rows are bounded; the UI-level
+            # 500-row cap lives in the endpoint, not here), dedupe in Python,
+            # then apply paging.
+            with self._read_ctx() as conn:
+                cursor = conn.execute(
+                    "SELECT * FROM messages WHERE session_id = ?" + active_clause
+                    + " ORDER BY id ASC",
+                    [session_id],
+                )
+                all_rows = cursor.fetchall()
+            seen: dict = {}
+            for row in all_rows:
+                # Tool fields participate in the dedupe key: compaction copies
+                # them verbatim, so identical tool messages across generations
+                # still collapse, while distinct tool calls that happen to
+                # share role/content/timestamp are never merged.
+                key = (
+                    row["role"],
+                    row["content"],
+                    row["timestamp"],
+                    row["tool_call_id"],
+                    row["tool_calls"],
+                    row["tool_name"],
+                )
+                cur = seen.get(key)
+                if cur is None or (row["active"], row["id"]) > (cur["active"], cur["id"]):
+                    seen[key] = row
+            rows = sorted(seen.values(), key=lambda r: r["id"])
+            if latest:
+                rows = rows[::-1]
+            rows = rows[offset:]
+            if limit is not None:
+                rows = rows[:limit]
+            if latest:
+                rows = rows[::-1]
+        else:
+            if limit is not None or offset:
+                # SQLite's OFFSET requires LIMIT; -1 means "no limit".
+                sql += " LIMIT ? OFFSET ?"
+                params.extend([-1 if limit is None else limit, offset])
+            with self._read_ctx() as conn:
+                cursor = conn.execute(sql, params)
+                rows = cursor.fetchall()
+            if latest:
+                rows.reverse()
         result = []
         for row in rows:
             msg = dict(row)

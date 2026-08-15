@@ -3038,6 +3038,61 @@ def _detect_venv_python_processes(
         matches.append((int(pid), str(name), cmdline_raw))
     return matches
 
+# Native-extension modules that pin files inside the venv once imported.  If
+# the updater process itself has any of these loaded, the dependency sync
+# below cannot rewrite the backing ``.pyd``/``.dll`` — Windows blocks REPLACE
+# on a mapped image — and the update dies with ``os error 5`` between
+# uninstall and reinstall, stranding the venv half-updated (#83569).
+# ``cryptography`` is the canonical case: ``hermes_cli.main`` imports it at
+# startup while resolving external secret sources, so EVERY CLI-driven
+# ``hermes update`` used to self-lock before that import was made lazy.
+# Keep this guard as defence-in-depth against future eager imports (new
+# secret sources, plugins absorbed into core, refactors of the startup
+# order).  Keys are module prefixes in ``sys.modules``; values are display
+# names.
+_SELF_LOCKING_NATIVE_MODULES: dict[str, str] = {
+    "cryptography.hazmat.bindings._rust": "cryptography (_rust.pyd)",
+}
+
+
+def _detect_self_loaded_native_modules() -> list[str]:
+    """Native venv extensions already loaded into THIS updater process.
+
+    Returns display names (empty off Windows — POSIX lets a running process
+    keep using an unlinked inode, so self-locking is a Windows-only hazard).
+    Never raises.
+    """
+    if not _m()._is_windows():
+        return []
+    found = [
+        display
+        for prefix, display in _SELF_LOCKING_NATIVE_MODULES.items()
+        if prefix in sys.modules
+    ]
+    return sorted(set(found))
+
+
+def _defer_update_for_self_lock(loaded: list[str]) -> None:
+    """Bail out before the dependency sync when the updater holds a lock.
+
+    The install cannot win this race from inside the locked process — even
+    killing threads would not unmap the image — so defer it: drop the
+    update-incomplete marker (next launch's fresh process completes the
+    install before importing anything heavy), explain, and exit 2 like the
+    other preflight refusals.
+    """
+    print("✗ This updater process has already loaded native venv modules that")
+    print("  the dependency sync must replace:")
+    for name in loaded:
+        print(f"    {name}")
+    print()
+    print("  On Windows a mapped extension cannot be replaced by the process")
+    print("  holding it. The update has been deferred: the next `hermes` launch")
+    print("  will complete it in a fresh process before anything imports these")
+    print("  modules.")
+    _m()._write_update_incomplete_marker()
+
+
 def _format_venv_python_holders_message(matches: list[tuple[int, str, str]]) -> str:
     """Explain which venv processes block the update and how to clear them."""
     lines = [
@@ -3467,6 +3522,13 @@ def _cold_start_windows_gateway_after_update() -> None:
     Best-effort and idempotent: re-checks that nothing is running first so a
     concurrent start (e.g. the autostart entry firing) can't produce a
     duplicate gateway.
+
+    A successful ``Popen`` only proves the process was created, not that it
+    survived (e.g. a Windows job object denying breakaway kills it before it
+    logs anything — #84185). So the success line is gated on the same
+    post-spawn liveness poll every other ``_spawn_detached`` caller uses
+    (``gateway_windows._report_gateway_start``), instead of being printed
+    unconditionally from the returned PID.
     """
     if not _m()._is_windows():
         return
@@ -3495,7 +3557,7 @@ def _cold_start_windows_gateway_after_update() -> None:
 
     if pid:
         print()
-        print(f"  ✓ Starting Windows gateway after update (PID {pid})")
+        gateway_windows._report_gateway_start(f"cold-start after update (PID {pid})")
 
 def _for_each_systemd_gateway_unit(
     list_units_stdout: str,
@@ -3547,6 +3609,47 @@ def _warn_incomplete_gateway_fleet_restart(failed_units: list) -> None:
     print("    hermes gateway status")
     print("    systemctl --user restart <unit>   # user-scope")
     print("    sudo systemctl restart <unit>     # system-scope")
+
+def _surviving_gateway_pids_after_failed_restart():
+    """Best-effort PIDs of gateways still running after the restart phase died.
+
+    Returns ``None`` when the answer cannot be determined — most importantly
+    when ``hermes_cli.gateway`` itself no longer imports, which is one of the
+    ways the restart phase aborts in the first place (the update replaced the
+    checkout under a process that already loaded the old modules). ``None`` and
+    a non-empty list are both treated as "assume stale" by the caller; only a
+    positive empty result is proof that nothing needs restarting.
+    """
+    try:
+        from hermes_cli.gateway import find_gateway_pids
+
+        return list(find_gateway_pids(all_profiles=True))
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug("Could not probe for surviving gateways after update: %s", exc)
+        return None
+
+def _warn_gateway_restart_phase_aborted(exc: BaseException, pids) -> None:
+    """Print a recovery warning when the whole restart phase raised.
+
+    Issue #78574: the gateway auto-restart phase was wrapped in a blanket
+    ``except Exception`` that only logged at debug level, so an early failure
+    (e.g. importing ``hermes_cli.gateway`` from the freshly pulled checkout)
+    erased every drain/restart line from the update output. The update still
+    printed "Update complete!" and exited 0 while the running gateway kept
+    serving pre-update modules against replaced source files — the next turn
+    died with an ImportError.
+    """
+    print()
+    print(f"⚠ Update incomplete — gateway auto-restart failed: {exc}")
+    if pids:
+        listed = ", ".join(str(pid) for pid in pids)
+        print(f"  Gateway process(es) still running pre-update code: {listed}")
+    else:
+        print("  Any gateway still running is serving pre-update code")
+        print("  (mixed sys.modules) against the updated checkout.")
+    print("  Restart it manually, then verify:")
+    print("    hermes gateway restart")
+    print("    hermes gateway status")
 
 def _refresh_windows_gateway_launchers() -> None:
     """Regenerate installed Windows gateway launcher scripts after update.
@@ -4004,6 +4107,20 @@ def _cmd_update_impl(args, gateway_mode: bool):
             _m()._resume_windows_gateways_after_update(_windows_gateway_resume)
             sys.exit(2)
 
+    # Self-lock preflight: the venv-holder sweep above excludes this process
+    # by design (a CLI `hermes update` IS the venv python), so an updater
+    # that has already imported a native venv extension would sail through
+    # and lock its own dependency sync — the #83569 failure mode. Refuse
+    # before touching the checkout; the marker makes the next fresh launch
+    # finish the install. Deliberately not bypassed by --force-venv: that
+    # escape hatches external holders; it cannot unmap an image from the
+    # running process.
+    _self_locked = _m()._detect_self_loaded_native_modules()
+    if _self_locked:
+        _m()._defer_update_for_self_lock(_self_locked)
+        _m()._resume_windows_gateways_after_update(_windows_gateway_resume)
+        sys.exit(2)
+
     # Try git-based update first, fall back to ZIP download on Windows
     # when git file I/O is broken (antivirus, NTFS filter drivers, etc.)
     use_zip_update = False
@@ -4434,6 +4551,31 @@ def _cmd_update_impl(args, gateway_mode: bool):
                     )
 
         _invalidate_update_cache()
+
+        # Verify HEAD actually moved (issue #79678). ``merge --ff-only``
+        # succeeding only means the merge completed, not that the update
+        # applied: a checkout that is pinned to a raw SHA (detached HEAD) can
+        # report "N new commit(s)" against origin yet still sit on the old
+        # commit afterward (the branch-switch step re-detaches to the SHA).
+        # Before this guard, ``hermes update`` printed "✓ Code updated!" and
+        # reinstalled deps + rebuilt the desktop app against the stale tree —
+        # no error, no warning, ``hermes doctor`` healthy. Compare pre-pull
+        # and post-pull HEAD; if they match, surface the no-op instead of
+        # claiming success.
+        post_pull_sha = _capture_head_sha(git_cmd, _m().PROJECT_ROOT)
+        if pre_pull_sha and post_pull_sha == pre_pull_sha:
+            print()
+            print("✗ Code did not move — update was a no-op.")
+            print(
+                f"  HEAD is pinned to {pre_pull_sha[:10]} (detached checkout); "
+                f"origin/{branch} advanced but the working tree stayed put."
+            )
+            print(
+                "  Reattach to the branch and retry: "
+                f"git -C {_m().PROJECT_ROOT} checkout {branch} && hermes update"
+            )
+            _m()._resume_windows_gateways_after_update(_windows_gateway_resume)
+            sys.exit(1)
 
         # Clear stale .pyc bytecode cache — prevents ImportError on gateway
         # restart when updated source references names that didn't exist in
@@ -5118,6 +5260,13 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 pass
 
         gateway_fleet_restart_incomplete = False
+        # Snapshot of gateways running before we touch anything. Stays empty
+        # until we successfully import the probe and are about to stop/drain —
+        # so an exception raised before we touch any gateway keeps this empty
+        # (nothing to fail closed on), while a failure after we have stopped a
+        # discovered gateway lets the handler fail closed on an empty survivor
+        # probe rather than reporting a clean update (#78574).
+        _pre_restart_gateway_pids: list | None = []
 
         # Auto-restart ALL gateways after update.
         # The code update (git pull) is shared across all profiles, so every
@@ -5296,6 +5445,17 @@ def _cmd_update_impl(args, gateway_mode: bool):
             killed_pids = set()
             relaunched_profiles = []
             externally_supervised_profiles = []
+
+            # Record which gateways are running before any stop/drain, so a
+            # later failure that leaves the survivor probe empty can still be
+            # recognised as "a running gateway was stopped and did not come
+            # back" rather than "nothing was running" (#78574). Best-effort:
+            # if the probe itself raises, leave the snapshot as-is (the
+            # survivor probe's own None result already fails closed).
+            try:
+                _pre_restart_gateway_pids = list(find_gateway_pids(all_profiles=True))
+            except Exception:
+                _pre_restart_gateway_pids = None
 
             # --- Systemd services (Linux) ---
             # Discover all hermes-gateway* units (default + profiles)
@@ -5779,6 +5939,28 @@ def _cmd_update_impl(args, gateway_mode: bool):
 
         except Exception as e:
             logger.debug("Gateway restart during update failed: %s", e)
+            # An exception escaping the whole phase means the drain/restart
+            # output the user relies on never printed. Don't let that pass for
+            # a clean update: surface it and treat the fleet as stale unless we
+            # can positively prove no gateway is running (#78574).
+            #
+            # A positive-empty ``_surviving`` is only proof-of-safety when
+            # nothing was running before we touched anything. If a gateway was
+            # discovered pre-restart and none survive now, it was stopped and
+            # its replacement was never verified — the same fail-open contract
+            # this fix closes — so we must still fail closed on ``[]``.
+            _surviving = _surviving_gateway_pids_after_failed_restart()
+            if _restart_phase_failure_is_incomplete(
+                _surviving, _pre_restart_gateway_pids
+            ):
+                gateway_fleet_restart_incomplete = True
+                _warn_gateway_restart_phase_aborted(e, _surviving)
+                if gateway_mode:
+                    _exit_code_path = get_hermes_home() / ".update_exit_code"
+                    try:
+                        _exit_code_path.write_text("1", encoding="utf-8")
+                    except OSError:
+                        pass
 
         _m()._resume_windows_gateways_after_update(_windows_gateway_resume)
 
@@ -5839,6 +6021,27 @@ def _cmd_update_impl(args, gateway_mode: bool):
             sys.exit(1)
 
 # --- Hoisted from the body of _cmd_update_impl (self-contained, no closure state) ---
+
+def _restart_phase_failure_is_incomplete(surviving, pre_restart_pids) -> bool:
+    """Whether an escaped gateway-restart-phase exception must fail the update.
+
+    Fail closed unless we can positively prove the fleet is safe:
+
+    * ``surviving is None`` — the survivor probe could not determine state
+      (typically the freshly-pulled ``hermes_cli.gateway`` no longer imports,
+      one of the ways the phase aborts). Assume stale.
+    * ``surviving`` non-empty — a gateway is still running pre-update code.
+    * ``surviving == []`` — nothing is running now. That is proof-of-safety
+      ONLY when nothing was running before we touched anything. If a gateway
+      was discovered pre-restart (``pre_restart_pids`` non-empty, or ``None``
+      meaning the pre-state could not be read), it was stopped without a
+      verified replacement, so we still fail closed (#78574).
+    """
+    if surviving is None or surviving:
+        return True
+    # surviving == []: safe only if we know nothing was running beforehand.
+    return pre_restart_pids is None or bool(pre_restart_pids)
+
 
 def _print_items(items, label, key, fallback_key=None):
     if not items:
