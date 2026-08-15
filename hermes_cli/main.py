@@ -11750,12 +11750,16 @@ def main():
         help="1Password (op:// references) integration",
     )
 
-    # Lazy import — only pays for itself when this subcommand is actually used.
-    from hermes_cli import secrets_cli as _secrets_cli
-    from hermes_cli import onepassword_secrets_cli as _op_secrets_cli
+    # Registering the secret-manager commands imports their native crypto
+    # dependencies while the top-level parser is being assembled.  A recovered
+    # update retry must stay native-module-free until its dependency mutation
+    # finishes; this process cannot be dispatching ``secrets`` at the same time.
+    if not _early_recovery_mod._should_skip_external_secret_sources():
+        from hermes_cli import secrets_cli as _secrets_cli
+        from hermes_cli import onepassword_secrets_cli as _op_secrets_cli
 
-    _secrets_cli.register_cli(secrets_bw)
-    _op_secrets_cli.register_cli(secrets_op)
+        _secrets_cli.register_cli(secrets_bw)
+        _op_secrets_cli.register_cli(secrets_op)
 
     def _dispatch_secrets(args):  # noqa: ANN001
         sub = getattr(args, "secrets_command", None)
