@@ -2070,6 +2070,40 @@ def init_agent(
             _compression_cfg.get("proactive_prune_min_reclaim_tokens", 4096), 4096
         ),
     )
+    # In-place tool-result prune (head+tail+marker) — opt-in, default OFF.
+    # Runs before the summarization region is selected in the in-loop
+    # compression pre-pass and rewrites the persisted transcript through the
+    # same archive_and_compact mechanism as in-place compaction. Only tool
+    # results over threshold_chars are touched, and only down to
+    # head_chars + marker + tail_chars. The compressor re-validates the
+    # budget combination (head + marker + tail must fit threshold) and
+    # disables the feature if it is unsatisfiable.
+    _tool_result_prune_cfg = _compression_cfg.get("tool_result_prune", {})
+    if not isinstance(_tool_result_prune_cfg, dict):
+        _tool_result_prune_cfg = {}
+    compression_tool_result_prune = {
+        "enabled": is_truthy_value(
+            _tool_result_prune_cfg.get("enabled"), default=False
+        ),
+        "threshold_chars": max(
+            1,
+            _parse_prune_int(
+                _tool_result_prune_cfg.get("threshold_chars", 8192), 8192
+            ),
+        ),
+        "head_chars": max(
+            0,
+            _parse_prune_int(
+                _tool_result_prune_cfg.get("head_chars", 4096), 4096
+            ),
+        ),
+        "tail_chars": max(
+            0,
+            _parse_prune_int(
+                _tool_result_prune_cfg.get("tail_chars", 1024), 1024
+            ),
+        ),
+    }
     # protect_first_n is the number of non-system messages to protect at
     # the head, in addition to the system prompt (which is always
     # implicitly protected by the compressor).  Floor at 0 — a value of
@@ -2617,6 +2651,7 @@ def init_agent(
             proactive_prune_min_result_chars=compression_proactive_prune_min_chars,
             proactive_prune_min_reclaim_tokens=compression_proactive_prune_min_reclaim,
             min_tail_user_messages=compression_min_tail_users,
+            tool_result_prune=compression_tool_result_prune,
         )
     _bind_session_state = getattr(agent.context_compressor, "bind_session_state", None)
     if callable(_bind_session_state):

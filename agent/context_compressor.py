@@ -522,6 +522,190 @@ _PRUNED_TOOL_PLACEHOLDER = "[Old tool output cleared to save context space]"
 # is never re-summarized away on a later prune pass).
 _PRUNE_MIN_CHARS = 200
 
+# Marker substituted for the removed middle span of an in-place-pruned tool
+# result (compression.tool_result_prune). A standalone line between blank
+# lines — model-visible text, pinned verbatim: consumers (tests, future
+# renderers) may rely on the exact bytes. Must never change; it also doubles
+# as the idempotence/immunity marker that keeps the deterministic demote
+# pass (_prune_old_tool_results) from re-replacing an already-pruned result.
+PRUNE_MARKER = "\n\n[... tool result middle pruned ...]\n\n"
+
+# Conservative defaults for compression.tool_result_prune. A pruned result
+# is head_chars + marker + tail_chars — validation (see
+# resolve_tool_result_prune_config) requires that sum to stay at or below
+# threshold_chars so a prune can never emit MORE than it removes.
+_TOOL_RESULT_PRUNE_DEFAULTS = {
+    "enabled": False,
+    "threshold_chars": 8192,
+    "head_chars": 4096,
+    "tail_chars": 1024,
+}
+
+
+def _coerce_prune_budget(value: Any, default: int, *, positive: bool) -> int:
+    """Coerce one numeric prune budget with the hardened parse semantics.
+
+    Booleans are rejected (bool subclasses int — YAML `true` would coerce to
+    1), fractional floats are rejected rather than truncated, integral floats
+    and numeric strings are accepted; anything else falls back to ``default``.
+    ``positive=True`` requires >= 1 (threshold), otherwise >= 0 (head/tail).
+    """
+    if isinstance(value, bool):
+        return default
+    if isinstance(value, int):
+        ival = value
+    elif isinstance(value, float):
+        if not value.is_integer():
+            return default
+        ival = int(value)
+    else:
+        try:
+            ival = int(str(value).strip())
+        except (TypeError, ValueError):
+            return default
+    if positive:
+        return ival if ival >= 1 else default
+    return ival if ival >= 0 else default
+
+
+def resolve_tool_result_prune_config(
+    raw: Optional[Dict[str, Any]],
+) -> tuple[bool, int, int, int]:
+    """Resolve and validate ``compression.tool_result_prune``.
+
+    Returns ``(enabled, threshold_chars, head_chars, tail_chars)``.
+    Conservative by design: any malformed or unsatisfiable combination
+    disables the feature (with a logged warning) rather than risking a prune
+    that emits more characters than it removes or produces an empty body.
+    ``head_chars + len(PRUNE_MARKER) + tail_chars`` must be at most
+    ``threshold_chars`` — otherwise the pruned result could exceed the very
+    budget it is meant to enforce.
+    """
+    if not isinstance(raw, dict):
+        return (
+            _TOOL_RESULT_PRUNE_DEFAULTS["enabled"],
+            _TOOL_RESULT_PRUNE_DEFAULTS["threshold_chars"],
+            _TOOL_RESULT_PRUNE_DEFAULTS["head_chars"],
+            _TOOL_RESULT_PRUNE_DEFAULTS["tail_chars"],
+        )
+    enabled = bool(raw.get("enabled", _TOOL_RESULT_PRUNE_DEFAULTS["enabled"]))
+    threshold = _coerce_prune_budget(
+        raw.get("threshold_chars", _TOOL_RESULT_PRUNE_DEFAULTS["threshold_chars"]),
+        _TOOL_RESULT_PRUNE_DEFAULTS["threshold_chars"],
+        positive=True,
+    )
+    head = _coerce_prune_budget(
+        raw.get("head_chars", _TOOL_RESULT_PRUNE_DEFAULTS["head_chars"]),
+        _TOOL_RESULT_PRUNE_DEFAULTS["head_chars"],
+        positive=False,
+    )
+    tail = _coerce_prune_budget(
+        raw.get("tail_chars", _TOOL_RESULT_PRUNE_DEFAULTS["tail_chars"]),
+        _TOOL_RESULT_PRUNE_DEFAULTS["tail_chars"],
+        positive=False,
+    )
+    if head + len(PRUNE_MARKER) + tail > threshold:
+        logger.warning(
+            "compression.tool_result_prune: head_chars (%d) + marker (%d) + "
+            "tail_chars (%d) exceeds threshold_chars (%d) — disabling the "
+            "feature (conservative default)",
+            head, len(PRUNE_MARKER), tail, threshold,
+        )
+        return (
+            False,
+            _TOOL_RESULT_PRUNE_DEFAULTS["threshold_chars"],
+            _TOOL_RESULT_PRUNE_DEFAULTS["head_chars"],
+            _TOOL_RESULT_PRUNE_DEFAULTS["tail_chars"],
+        )
+    return enabled, threshold, head, tail
+
+
+def prune_tool_result_content(
+    content: Any,
+    threshold_chars: int,
+    head_chars: int,
+    tail_chars: int,
+    marker: str = PRUNE_MARKER,
+) -> Any:
+    """Prune an oversized tool-result body to head + marker + tail.
+
+    In-place by contract: the caller keeps the message node (same position,
+    same role, same ``tool_call_id``) and swaps only ``content``. Returns the
+    INPUT object unchanged when the content is within budget, so callers can
+    detect a rewrite by identity (``result is content``).
+
+    String bodies are sliced by Unicode code point: Python ``str`` indexes
+    code points (no surrogate pairs), so a retained boundary can never split
+    a surrogate pair — matching the TS reference implementation.
+
+    List bodies (multimodal parts) prune only ``type == "text"`` parts,
+    preserving every non-text part and the relative order of all parts. Text
+    spans across parts are measured and removed as one contiguous span, with
+    the marker inserted at the first part that intersects the removed span
+    (same semantics as the TS pruner). Any other body shape is never pruned.
+
+    Requires ``head_chars + len(marker) + tail_chars <= threshold_chars``
+    (enforced by ``resolve_tool_result_prune_config``) so the result is
+    strictly smaller than the input and within budget; the pruned output is
+    also idempotent — a second pass finds it within budget and leaves it
+    byte-identical.
+    """
+    if isinstance(content, str):
+        total = len(content)
+        if total <= threshold_chars:
+            return content
+        removed_start = head_chars
+        removed_end = total - tail_chars
+        return content[:removed_start] + marker + content[removed_end:]
+
+    if isinstance(content, list):
+        text_parts = [
+            part
+            for part in content
+            if isinstance(part, dict)
+            and part.get("type") == "text"
+            and isinstance(part.get("text"), str)
+        ]
+        total = sum(len(part["text"]) for part in text_parts)
+        if total <= threshold_chars:
+            return content
+        removed_start = head_chars
+        removed_end = total - tail_chars
+        pruned: List[Any] = []
+        consumed = 0
+        marker_inserted = False
+        for part in content:
+            if not (
+                isinstance(part, dict)
+                and part.get("type") == "text"
+                and isinstance(part.get("text"), str)
+            ):
+                pruned.append(part)
+                continue
+            text = part["text"]
+            block_start = consumed
+            block_end = block_start + len(text)
+            head_end = min(len(text), max(0, removed_start - block_start))
+            tail_start = min(len(text), max(0, removed_end - block_start))
+            intersects = block_start < removed_end and block_end > removed_start
+            m = marker if (intersects and not marker_inserted) else ""
+            if m:
+                marker_inserted = True
+            new_text = text[:head_end] + m + text[tail_start:]
+            if new_text:
+                pruned.append({**part, "text": new_text})
+            consumed = block_end
+        # Validated budgets (head + marker + tail <= threshold < total)
+        # guarantee a non-empty removed text span, so marker_inserted is
+        # always True here; the guard mirrors the TS implementation's
+        # fail-safe and must never fire in practice.
+        if not marker_inserted:
+            return content
+        return pruned
+
+    return content  # unknown body shape — never pruned
+
+
 # Non-response sentinels the clarify callbacks embed as ``user_response`` when
 # the user never actually answered (timeout / no-user contexts). These must
 # not be quoted as a user answer during compaction. Sources:
@@ -1081,6 +1265,57 @@ def _last_assistant_index(messages: "List[Dict[str, Any]]") -> int:
         if isinstance(msg, dict) and msg.get("role") == "assistant":
             return i
     return -1
+
+
+def _tool_prune_boundary(
+    result: List[Dict[str, Any]],
+    protect_tail_count: int,
+    protect_tail_tokens: int | None,
+) -> int:
+    """Compute the index below which tool messages are prunable.
+
+    Shared by ``_prune_old_tool_results`` and ``_prune_tool_results_in_place``
+    so every deterministic tool-result pre-pass protects the same recent tail.
+
+    Token-budget approach when ``protect_tail_tokens`` is given: walk
+    backward accumulating tokens, capping the message-count floor the same
+    way tail-cut does so a default ``protect_last_n=20`` cannot lock a bulky
+    recent tool run outside the compressible / prunable window (#61932).
+    Same newest-turn-only thinking charge as the tail-cut walk (#73624) —
+    this boundary decides which tool results stay prunable, and overcharging
+    stale thinking shrinks that window.
+
+    The budget walk is translated into a "protected count", the floor is
+    applied in count-space (where ``max`` reads naturally: protect at least
+    ``min_protect`` messages or whatever the budget reserved, whichever is
+    more), then converted back to a prune boundary. Doing this in index-space
+    with ``max`` would invert the direction (smaller index = MORE protected),
+    so a generous budget would silently get truncated back down to
+    ``min_protect``.
+    """
+    if protect_tail_tokens is not None and protect_tail_tokens > 0:
+        accumulated = 0
+        boundary = len(result)
+        min_protect = min(
+            protect_tail_count,
+            len(result),
+            _MAX_TAIL_MESSAGE_FLOOR,
+        )
+        _newest_asst_idx = _last_assistant_index(result)
+        for i in range(len(result) - 1, -1, -1):
+            msg = result[i]
+            msg_tokens = _estimate_msg_budget_tokens(
+                msg, charge_stale_thinking=(i == _newest_asst_idx)
+            )
+            if accumulated + msg_tokens > protect_tail_tokens and (len(result) - i) >= min_protect:
+                boundary = i
+                break
+            accumulated += msg_tokens
+            boundary = i
+        budget_protect_count = len(result) - boundary
+        protected_count = max(budget_protect_count, min_protect)
+        return len(result) - protected_count
+    return len(result) - protect_tail_count
 
 
 def _content_text_for_contains(content: Any) -> str:
@@ -2533,6 +2768,7 @@ class ContextCompressor(ContextEngine):
         proactive_prune_min_result_chars: int = 8000,
         proactive_prune_min_reclaim_tokens: int = 4096,
         min_tail_user_messages: int = 1,
+        tool_result_prune: Optional[Dict[str, Any]] = None,
     ):
         self.model = model
         self.base_url = base_url
@@ -2591,6 +2827,22 @@ class ContextCompressor(ContextEngine):
         # one until the prompt has regrown the tokens just reclaimed.
         self._proactive_prune_rearm_tokens: int = 0
         self.min_tail_user_messages = min_tail_user_messages
+        # In-place tool-result prune (compression.tool_result_prune):
+        # oversized tool results (role="tool", content > threshold_chars) are
+        # pruned in their OWN message node — same position, role and
+        # tool_call_id — down to head + marker + tail, as a no-LLM pre-pass
+        # that runs BEFORE the summarization region is selected. Default OFF
+        # (opt-in): each commit rewrites already-sent history, a prompt-cache
+        # break that is only sanctioned at a compression boundary — which is
+        # exactly where this runs. See resolve_tool_result_prune_config for
+        # the conservative validation (an unsatisfiable budget disables the
+        # feature rather than risking a prune that grows the message).
+        (
+            self._tool_result_prune_enabled,
+            self._tool_result_prune_threshold_chars,
+            self._tool_result_prune_head_chars,
+            self._tool_result_prune_tail_chars,
+        ) = resolve_tool_result_prune_config(tool_result_prune)
         self.summary_target_ratio = max(0.10, min(summary_target_ratio, 0.80))
         self.quiet_mode = quiet_mode
         # Output-token reservation: the provider carves max_tokens out of the
@@ -3097,6 +3349,113 @@ class ContextCompressor(ContextEngine):
     # Tool output pruning (cheap pre-pass, no LLM call)
     # ------------------------------------------------------------------
 
+    def _prune_tool_results_in_place(
+        self,
+        messages: List[Dict[str, Any]],
+        protect_tail_count: int,
+        protect_tail_tokens: int | None = None,
+    ) -> tuple[List[Dict[str, Any]], int]:
+        """Prune oversized tool results in place: head + marker + tail.
+
+        Config-gated (``compression.tool_result_prune.enabled``, default
+        off). Runs BEFORE the summarization region is selected: shrinking
+        oversized tool bodies often makes the whole transcript fit the tail
+        budget, so compression returns at the no-compressible-window check
+        without ever calling the summarizer.
+
+        Unlike ``_prune_old_tool_results`` (which REPLACES an old tool result
+        with a 1-line summary), this keeps the node in place — same position,
+        same role, same ``tool_call_id`` — and rewrites only ``content`` to
+        head + marker + tail (see ``prune_tool_result_content``). It never
+        touches non-tool messages and never breaks tool-call/result pairing:
+        the result row itself is rewritten, not removed.
+
+        Tail protection mirrors the deterministic demote pass
+        (``_tool_prune_boundary``): only tool results older than the
+        protected tail (``protect_tail_count`` / ``protect_tail_tokens``)
+        are pruned, so the active turn's recent tool output stays verbatim.
+
+        A committed prune rewrites message bodies the provider has already
+        seen — a prompt-cache break exactly like a compression boundary.
+        Compression is the one sanctioned cache break, and this pass only
+        ever runs at a compression event, so no extra hysteresis gate is
+        needed. The commit is durable through the same mechanism as in-place
+        compaction (``archive_and_compact``), mirroring
+        ``prune_tool_results_only``: the pruned dicts are stamped
+        ``_DB_PERSISTED_MARKER`` so the next append-only flush skips them
+        instead of re-inserting them on top of the archived originals. When
+        the session store is bound but the atomic rewrite is unavailable or
+        fails, the prune is NOT committed — the input object is returned
+        unchanged so the in-memory transcript can never drift from the DB
+        (a failed rewrite followed by an append-only flush would duplicate
+        the transcript on resume). Without a bound store there is no flush to
+        desync, so the in-memory prune still lands for the current turn.
+
+        Returns ``(messages, 0)`` — the input object — when disabled or when
+        nothing was pruned (standard no-op caller contract).
+        """
+        if not self._tool_result_prune_enabled:
+            return messages, 0
+        if not messages:
+            return messages, 0
+        # Capability gate BEFORE the scan (mirrors prune_tool_results_only):
+        # a bound store that can't persist the prune atomically (duck-typed /
+        # plugin session store without archive_and_compact) makes every prune
+        # either a duplicate-on-resume hazard or a permanent no-op — don't
+        # pay the scan for it.
+        session_db = getattr(self, "_session_db", None)
+        session_id = getattr(self, "_session_id", "")
+        if (
+            session_db
+            and session_id
+            and not callable(getattr(session_db, "archive_and_compact", None))
+        ):
+            return messages, 0
+
+        result = [m.copy() for m in messages]
+        boundary = _tool_prune_boundary(
+            result, protect_tail_count, protect_tail_tokens
+        )
+        pruned = 0
+        for i in range(max(0, boundary)):
+            msg = result[i]
+            if msg.get("role") != "tool":
+                continue
+            content = msg.get("content")
+            new_content = prune_tool_result_content(
+                content,
+                self._tool_result_prune_threshold_chars,
+                self._tool_result_prune_head_chars,
+                self._tool_result_prune_tail_chars,
+            )
+            if new_content is content:
+                continue
+            new_msg = {**msg, "content": new_content}
+            # Content rewritten → the api_content sidecar (the exact bytes
+            # previously sent) is stale; drop it so replay can't resend the
+            # pre-prune bytes. Same rule every content-rewrite path follows
+            # (drop_stale_api_content) — cost is one cache boundary miss,
+            # never wrong content.
+            drop_stale_api_content(new_msg)
+            result[i] = new_msg
+            pruned += 1
+        if not pruned:
+            return messages, 0
+        if session_db and session_id:
+            try:
+                session_db.archive_and_compact(session_id, result)
+            except Exception as exc:
+                logger.warning(
+                    "In-place tool-result prune DB commit failed; keeping the "
+                    "original transcript: %s",
+                    exc,
+                )
+                return messages, 0
+            for msg in result:
+                if isinstance(msg, dict):
+                    msg[_DB_PERSISTED_MARKER] = True
+        return result, pruned
+
     def _prune_old_tool_results(
         self, messages: List[Dict[str, Any]], protect_tail_count: int,
         protect_tail_tokens: int | None = None,
@@ -3151,44 +3510,9 @@ class ContextCompressor(ContextEngine):
                         call_id_to_tool[cid] = (name, args_str)
 
         # Determine the prune boundary
-        if protect_tail_tokens is not None and protect_tail_tokens > 0:
-            # Token-budget approach: walk backward accumulating tokens.
-            # Cap the message-count floor the same way tail-cut does so a
-            # default protect_last_n=20 cannot lock a bulky recent tool run
-            # outside the compressible / prunable window (#61932).
-            accumulated = 0
-            boundary = len(result)
-            min_protect = min(
-                protect_tail_count,
-                len(result),
-                _MAX_TAIL_MESSAGE_FLOOR,
-            )
-            # Same newest-turn-only thinking charge as the tail-cut walk
-            # (#73624) — this boundary decides which tool results stay
-            # prunable, and overcharging stale thinking shrinks that window.
-            _newest_asst_idx = _last_assistant_index(result)
-            for i in range(len(result) - 1, -1, -1):
-                msg = result[i]
-                msg_tokens = _estimate_msg_budget_tokens(
-                    msg, charge_stale_thinking=(i == _newest_asst_idx)
-                )
-                if accumulated + msg_tokens > protect_tail_tokens and (len(result) - i) >= min_protect:
-                    boundary = i
-                    break
-                accumulated += msg_tokens
-                boundary = i
-            # Translate the budget walk into a "protected count", apply the
-            # floor in count-space (where `max` reads naturally: protect at
-            # least `min_protect` messages or whatever the budget reserved,
-            # whichever is more), then convert back to a prune boundary.
-            # Doing this in index-space with `max` would invert the direction
-            # (smaller index = MORE protected), so a generous budget would
-            # silently get truncated back down to `min_protect`.
-            budget_protect_count = len(result) - boundary
-            protected_count = max(budget_protect_count, min_protect)
-            prune_boundary = len(result) - protected_count
-        else:
-            prune_boundary = len(result) - protect_tail_count
+        prune_boundary = _tool_prune_boundary(
+            result, protect_tail_count, protect_tail_tokens
+        )
 
         # Pass 1: Deduplicate identical tool results.
         # When the same file is read multiple times, keep only the most recent
@@ -3246,6 +3570,12 @@ class ContextCompressor(ContextEngine):
                 pruned += 1
                 return True
             if not isinstance(content, str):
+                return False
+            # In-place-pruned results (head+tail+marker, opt-in
+            # compression.tool_result_prune) are already shrunk
+            # deterministically while keeping their content; re-demoting them
+            # to a 1-line summary would defeat the opt-in retention contract.
+            if PRUNE_MARKER in content:
                 return False
             if not content or content == _PRUNED_TOOL_PLACEHOLDER:
                 return False
@@ -6435,7 +6765,12 @@ This compaction should PRIORITISE preserving all information related to the focu
         """Compress conversation messages by summarizing middle turns.
 
         Algorithm:
-          1. Prune old tool results (cheap pre-pass, no LLM call)
+          1. In-place tool-result prune (opt-in, compression.tool_result_prune,
+             no LLM call): oversized tool results are shrunk in their own node
+             to head + marker + tail, BEFORE region selection — which often
+             makes the whole transcript fit the tail budget, skipping the
+             summarizer entirely (also rewrites the persisted history).
+          1b. Prune old tool results (cheap pre-pass, no LLM call)
           2. Protect head messages (system prompt + first exchange)
           3. Find tail boundary by token budget (~20K tokens of recent context)
           4. Summarize middle turns with structured LLM prompt (skipped
@@ -6523,7 +6858,30 @@ This compaction should PRIORITISE preserving all information related to the focu
 
         display_tokens = current_tokens if current_tokens else self.last_prompt_tokens or estimate_messages_tokens_rough(messages)
 
-        # Phase 1: Prune old tool results (cheap, no LLM call)
+        # Phase 1: In-place tool-result prune (head+tail+marker, no LLM call).
+        # Config-gated (compression.tool_result_prune, default off). Runs
+        # BEFORE the deterministic demote pass AND before region selection:
+        # an oversized tool result is shrunk in its own node (same position,
+        # role, tool_call_id) to head + marker + tail, which often makes the
+        # whole transcript fit the tail budget — so compression returns at
+        # the no-compressible-window check below without ever calling the
+        # summarizer. The commit is durable through the same
+        # archive_and_compact mechanism as in-place compaction, so the
+        # reclaimed state survives resume even when no summarization follows.
+        if self._tool_result_prune_enabled:
+            messages, in_place_pruned = self._prune_tool_results_in_place(
+                messages,
+                protect_tail_count=self.protect_last_n,
+                protect_tail_tokens=self.tail_token_budget,
+            )
+            if in_place_pruned and not self.quiet_mode:
+                logger.info(
+                    "Pre-compression: pruned %d oversized tool result(s) in "
+                    "place (head+tail+marker)",
+                    in_place_pruned,
+                )
+
+        # Phase 1b: Prune old tool results (cheap, no LLM call)
         messages, pruned_count = self._prune_old_tool_results(
             messages, protect_tail_count=self.protect_last_n,
             protect_tail_tokens=self.tail_token_budget,

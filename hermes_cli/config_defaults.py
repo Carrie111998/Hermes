@@ -806,6 +806,34 @@ DEFAULT_CONFIG = {
                                       # session_search and recoverable, not deleted.
                                       # Default True since 2107b86024; set False to
                                       # restore the legacy rotating-compaction path.
+        "tool_result_prune": {        # opt-in, default OFF: oversized tool results
+                                      # (role="tool", content > threshold_chars) are
+                                      # pruned in their OWN message node — same
+                                      # position, role and tool_call_id — down to
+                                      # head_chars + marker + tail_chars, as a
+                                      # no-LLM pre-pass that runs BEFORE the
+                                      # summarization region is selected in the
+                                      # in-loop compression. Shrinking oversized
+                                      # tool bodies often makes the transcript fit
+                                      # the tail budget, avoiding the summarizer
+                                      # entirely. Tail protection mirrors the
+                                      # region selection (recent tool output stays
+                                      # verbatim); the commit rewrites the
+                                      # persisted transcript via the same
+                                      # archive_and_compact mechanism as in-place
+                                      # compaction, so the reclaimed state is
+                                      # durable even when no summarization
+                                      # follows. Each commit is a prompt-cache
+                                      # break — sanctioned because it only ever
+                                      # runs at a compression event. head_chars +
+                                      # marker + tail_chars must stay <=
+                                      # threshold_chars; an unsatisfiable budget
+                                      # disables the feature.
+            "enabled": False,
+            "threshold_chars": 8192,
+            "head_chars": 4096,
+            "tail_chars": 1024,
+        },
         "model_thresholds": {},       # Per-model threshold overrides. Keys are
                                       # substring-matched against the model name
                                       # (longest match wins); values replace the
