@@ -15,6 +15,7 @@ from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import MessageEvent, MessageType
 from gateway.project_router import (
     active_project_path,
+    analyze_project_setup,
     bootstrap_registry,
     project_keys,
     project_path,
@@ -36,6 +37,14 @@ def _make_project(tmp_path: Path, name: str, *, agents: bool = True) -> Path:
     if agents:
         (project / "AGENTS.md").write_text("# Agent context\n")
     return project
+
+
+def _repository_snapshot(path: Path) -> dict[str, tuple[bytes, int]]:
+    return {
+        str(candidate.relative_to(path)): (candidate.read_bytes(), candidate.stat().st_mtime_ns)
+        for candidate in sorted(path.rglob("*"))
+        if candidate.is_file()
+    }
 
 
 def _source() -> SessionSource:
@@ -491,3 +500,128 @@ async def test_project_list_is_deterministic_and_unknown_keys_are_dynamic(tmp_pa
         f"- zebraapp → {project.resolve()}"
     )
     assert "Valid projects: fivehours, newmoon, zebraapp" in unknown
+
+
+def test_setup_analysis_for_minimal_repo_recommends_agent_context_without_writes(tmp_path):
+    db = SessionDB(db_path=tmp_path / "state.db")
+    project = _make_project(tmp_path, "minimal", agents=False)
+    (project / "package.json").write_text('{"scripts":{"prepare":"touch executed"}}\n')
+    before = _repository_snapshot(project)
+    register_project(db, str(project))
+
+    plan = analyze_project_setup(db, "minimal")
+
+    assert plan.key == "minimal"
+    assert plan.path == project.resolve()
+    assert plan.found == ("README.md", "package.json")
+    assert [(item.action, item.target, item.category) for item in plan.recommendations] == [
+        ("create", "AGENTS.md", "recommended"),
+    ]
+    assert plan.not_needed == (
+        "docs/STATUS.md — no documentation convention detected",
+        "docs/decisions/ — no documentation or ADR convention detected",
+    )
+    assert plan.authoritative_sources == (("README.md", "project overview"),)
+    assert _repository_snapshot(project) == before
+    assert not (project / "executed").exists()
+
+
+@pytest.mark.asyncio
+async def test_project_setup_known_project_returns_deterministic_read_only_plan(tmp_path):
+    runner = _runner(tmp_path)
+    runner._handle_message_with_agent = AsyncMock()
+    project = _make_project(tmp_path, "Mature App")
+    (project / "CONTRIBUTING.md").write_text("# Contributing\n")
+    (project / "docs").mkdir()
+    (project / "docs" / "adr").mkdir()
+    (project / "docs" / "adr" / "0001-record.md").write_text("# ADR\n")
+    register_project(runner._session_db._db, str(project))
+    before = _repository_snapshot(project)
+
+    response = await runner._handle_message(_event("!project setup matureapp"))
+
+    assert response == (
+        f"Project setup analysis: matureapp\nPath: {project.resolve()}\n\n"
+        "Found:\n- AGENTS.md\n- README.md\n- CONTRIBUTING.md\n- docs/\n- docs/adr/\n\n"
+        "Recommended:\n- docs/STATUS.md — concise current-state snapshot would aid ongoing work\n\n"
+        "Not currently needed:\n- AGENTS.md — existing repository agent instructions are present\n"
+        "- docs/decisions/ — existing ADR convention: docs/adr/\n\n"
+        "Authoritative sources:\n- AGENTS.md — repository agent instructions\n"
+        "- README.md — project overview\n- CONTRIBUTING.md — contribution conventions\n\n"
+        "No repository files were changed."
+    )
+    assert _repository_snapshot(project) == before
+    runner._handle_message_with_agent.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_project_setup_unknown_key_lists_dynamic_keys_without_dispatch(tmp_path):
+    runner = _runner(tmp_path)
+    runner._handle_message_with_agent = AsyncMock()
+    project = _make_project(tmp_path, "Zebra App")
+    register_project(runner._session_db._db, str(project))
+
+    response = await runner._handle_message(_event("!project setup missing"))
+
+    assert response == (
+        "Project setup failed: unknown project 'missing'. "
+        "Valid projects: fivehours, newmoon, zebraapp"
+    )
+    runner._handle_message_with_agent.assert_not_awaited()
+
+
+def test_setup_analysis_respects_claude_and_existing_personal_context_conventions(tmp_path):
+    db = SessionDB(db_path=tmp_path / "state.db")
+    project = _make_project(tmp_path, "personal")
+    (project / "CLAUDE.md").write_text("# Repository instructions\n")
+    (project / "docs").mkdir()
+    (project / "docs" / "STATUS.md").write_text("# Current status\n")
+    (project / "docs" / "decisions").mkdir()
+    (project / "docs" / "decisions" / "001.md").write_text("# Decision\n")
+    register_project(db, str(project))
+
+    plan = analyze_project_setup(db, "personal")
+
+    assert plan.found == (
+        "AGENTS.md",
+        "README.md",
+        "CLAUDE.md",
+        "docs/",
+        "docs/STATUS.md",
+        "docs/decisions/",
+    )
+    assert plan.recommendations == ()
+    assert plan.not_needed == (
+        "AGENTS.md — existing repository agent instructions are present",
+        "docs/STATUS.md — current-state context already exists",
+        "docs/decisions/ — existing ADR convention: docs/decisions/",
+    )
+    assert plan.authoritative_sources == (
+        ("AGENTS.md", "repository agent instructions"),
+        ("README.md", "project overview"),
+        ("CLAUDE.md", "repository agent instructions"),
+        ("docs/STATUS.md", "current implementation state"),
+    )
+
+
+def test_setup_analysis_detects_readme_variants_and_claude_instruction_convention(tmp_path):
+    db = SessionDB(db_path=tmp_path / "state.db")
+    project = _make_project(tmp_path, "variant", agents=False)
+    (project / "README.md").unlink()
+    (project / "README.rst").write_text("Variant project overview\n")
+    (project / "CLAUDE.md").write_text("Repository agent instructions\n")
+    (project / "requirements-dev.txt").write_text("pytest\n")
+    (project / "docs").mkdir()
+    register_project(db, str(project))
+
+    first = analyze_project_setup(db, "variant")
+    second = analyze_project_setup(db, "variant")
+
+    assert first == second
+    assert first.found == ("README.rst", "CLAUDE.md", "requirements-dev.txt", "docs/")
+    assert all(item.target != "AGENTS.md" for item in first.recommendations)
+    assert first.not_needed[0] == "AGENTS.md — existing repository agent instructions are present"
+    assert first.authoritative_sources[:2] == (
+        ("README.rst", "project overview"),
+        ("CLAUDE.md", "repository agent instructions"),
+    )

@@ -16167,10 +16167,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             action = action.lower()
             from gateway.project_router import (
                 active_project,
+                analyze_project_setup,
                 clear_project,
                 project_keys,
                 project_path,
                 register_project,
+                render_project_setup_plan,
                 select_project,
             )
 
@@ -16195,6 +16197,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     f"- {key} → {project_path(self._session_db._db, key)}" for key in projects
                 )
                 return "\n".join(lines)
+            if action == "setup":
+                try:
+                    plan = analyze_project_setup(self._session_db._db, remainder.strip())
+                except ValueError as exc:
+                    return f"Project setup failed: {exc}"
+                return render_project_setup_plan(plan)
             if action == "add":
                 try:
                     project = register_project(self._session_db._db, remainder.strip())

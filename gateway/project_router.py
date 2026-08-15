@@ -58,6 +58,28 @@ class RegisteredProject:
     context: tuple[tuple[str, bool], ...]
 
 
+@dataclass(frozen=True)
+class SetupRecommendation:
+    """A proposed repository-context change for a future explicit apply step."""
+
+    action: str
+    target: str
+    reason: str
+    category: str
+
+
+@dataclass(frozen=True)
+class ProjectSetupPlan:
+    """Read-only repository-context analysis; it deliberately holds no pending state."""
+
+    key: str
+    path: Path
+    found: tuple[str, ...]
+    recommendations: tuple[SetupRecommendation, ...]
+    not_needed: tuple[str, ...]
+    authoritative_sources: tuple[tuple[str, str], ...]
+
+
 def normalize_project_key(value: str) -> str:
     """Return a Matrix-friendly key derived from a directory or project name."""
     return re.sub(r"[^a-z0-9]+", "", (value or "").casefold())
@@ -119,6 +141,183 @@ def project_path(db, key: str) -> Path | None:
 def inspect_project_context(path: Path) -> tuple[tuple[str, bool], ...]:
     """Inspect bounded, static repository context without executing project code."""
     return tuple((label, present(path)) for label, present in _CONTEXT_PATHS)
+
+
+def _existing_files(path: Path, pattern: str) -> tuple[Path, ...]:
+    return tuple(sorted(candidate for candidate in path.glob(pattern) if candidate.is_file()))
+
+
+def _has_static_content(path: Path) -> bool:
+    """Check whether a text context file has content without executing it."""
+    try:
+        return bool(path.read_text(encoding="utf-8", errors="replace").strip())
+    except OSError:
+        return False
+
+
+def _setup_adr_paths(path: Path) -> tuple[str, ...]:
+    """Return established ADR/decision locations in deterministic preference order."""
+    candidates = (
+        "docs/decisions",
+        "docs/adr",
+        "docs/adrs",
+        "decisions",
+        "adr",
+        "adrs",
+        "docs/ADR.md",
+        "ADR.md",
+    )
+    return tuple(
+        candidate + "/" if (path / candidate).is_dir() else candidate
+        for candidate in candidates
+        if (path / candidate).is_dir() or (path / candidate).is_file()
+    )
+
+
+def analyze_project_setup(db, key: str) -> ProjectSetupPlan:
+    """Analyze one registered repository using only static filesystem inspection.
+
+    This function neither executes repository content nor writes repository or
+    registry state. The structured recommendations are intentionally suitable
+    for a later, separately authorized apply command.
+    """
+    normalized_key = normalize_project_key(key)
+    path = project_path(db, normalized_key)
+    if path is None:
+        raise ValueError(
+            f"unknown project '{normalized_key}'. Valid projects: {', '.join(project_keys(db))}"
+        )
+    if not path.is_dir():
+        raise ValueError(f"configured project path does not exist: {path}")
+
+    agents = path / "AGENTS.md"
+    claude = path / "CLAUDE.md"
+    contributing = path / "CONTRIBUTING.md"
+    docs = path / "docs"
+    status = docs / "STATUS.md"
+    readmes = _existing_files(path, "README*")
+    requirements = _existing_files(path, "requirements*.txt")
+    manifests = tuple(
+        candidate
+        for candidate in (path / "package.json", path / "pyproject.toml", path / "Cargo.toml", path / "go.mod")
+        if candidate.is_file()
+    ) + requirements
+    adr_paths = _setup_adr_paths(path)
+    github_context = tuple(
+        f".github/{candidate.name}"
+        for candidate in _existing_files(path / ".github", "*.md")
+        if candidate.name.upper() in {"CONTRIBUTING.MD", "INSTRUCTIONS.MD", "AGENTS.MD"}
+    )
+    github_agent_context = tuple(
+        candidate
+        for candidate in _existing_files(path / ".github", "*.md")
+        if candidate.name.upper() in {"INSTRUCTIONS.MD", "AGENTS.MD"}
+    )
+
+    found: list[str] = []
+    for candidate in (agents, *readmes, contributing, claude, *manifests):
+        if candidate.is_file():
+            found.append(candidate.relative_to(path).as_posix())
+    if docs.is_dir():
+        found.append("docs/")
+    if status.is_file():
+        found.append("docs/STATUS.md")
+    found.extend(adr_paths)
+    found.extend(github_context)
+
+    recommendations: list[SetupRecommendation] = []
+    not_needed: list[str] = []
+    has_agent_convention = any(
+        _has_static_content(candidate) for candidate in (agents, claude, *github_agent_context)
+    )
+    if has_agent_convention:
+        not_needed.append("AGENTS.md — existing repository agent instructions are present")
+    else:
+        recommendations.append(
+            SetupRecommendation(
+                action="create",
+                target="AGENTS.md",
+                reason="minimal repo-specific agent operating context is absent",
+                category="recommended",
+            )
+        )
+
+    if status.is_file():
+        not_needed.append("docs/STATUS.md — current-state context already exists")
+    elif docs.is_dir():
+        recommendations.append(
+            SetupRecommendation(
+                action="create",
+                target="docs/STATUS.md",
+                reason="concise current-state snapshot would aid ongoing work",
+                category="recommended",
+            )
+        )
+    else:
+        not_needed.append("docs/STATUS.md — no documentation convention detected")
+
+    if adr_paths:
+        not_needed.append(f"docs/decisions/ — existing ADR convention: {adr_paths[0]}")
+    elif docs.is_dir() and (contributing.is_file() or has_agent_convention) and manifests:
+        recommendations.append(
+            SetupRecommendation(
+                action="create",
+                target="docs/decisions/",
+                reason="durable technical decisions are likely useful for this documented repository",
+                category="recommended",
+            )
+        )
+    elif docs.is_dir():
+        not_needed.append("docs/decisions/ — no clear durable-decision need detected")
+    else:
+        not_needed.append("docs/decisions/ — no documentation or ADR convention detected")
+
+    authoritative_sources: list[tuple[str, str]] = []
+    for candidate, role in (
+        (agents, "repository agent instructions"),
+        (readmes[0] if readmes else None, "project overview"),
+        (contributing, "contribution conventions"),
+        (claude, "repository agent instructions"),
+        (status, "current implementation state"),
+    ):
+        if candidate is not None and candidate.is_file() and _has_static_content(candidate):
+            authoritative_sources.append((candidate.relative_to(path).as_posix(), role))
+
+    return ProjectSetupPlan(
+        key=normalized_key,
+        path=path,
+        found=tuple(found),
+        recommendations=tuple(recommendations),
+        not_needed=tuple(not_needed),
+        authoritative_sources=tuple(authoritative_sources),
+    )
+
+
+def render_project_setup_plan(plan: ProjectSetupPlan) -> str:
+    """Render a concise, deterministic Matrix-safe representation of a plan."""
+    lines = [f"Project setup analysis: {plan.key}", f"Path: {plan.path}"]
+    if plan.found:
+        lines.extend(["", "Found:", *(f"- {item}" for item in plan.found)])
+    if plan.recommendations:
+        lines.extend(
+            [
+                "",
+                "Recommended:",
+                *(f"- {item.target} — {item.reason}" for item in plan.recommendations),
+            ]
+        )
+    if plan.not_needed:
+        lines.extend(["", "Not currently needed:", *(f"- {item}" for item in plan.not_needed)])
+    if plan.authoritative_sources:
+        lines.extend(
+            [
+                "",
+                "Authoritative sources:",
+                *(f"- {source} — {role}" for source, role in plan.authoritative_sources),
+            ]
+        )
+    lines.extend(["", "No repository files were changed."])
+    return "\n".join(lines)
 
 
 def _appears_to_be_project(path: Path) -> bool:
