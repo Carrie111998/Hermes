@@ -2554,6 +2554,15 @@ def _get_platform_tools(
     agent_cfg = config.get("agent") or {}
     disabled_toolsets = agent_cfg.get("disabled_toolsets") or []
     if disabled_toolsets:
+        # A JSON-array string like '["a"]' should be parsed (#86661)
+        if isinstance(disabled_toolsets, str):
+            import json
+            try:
+                parsed = json.loads(disabled_toolsets)
+                if isinstance(parsed, list):
+                    disabled_toolsets = parsed
+            except (json.JSONDecodeError, ValueError):
+                pass
         disabled_set = {str(ts) for ts in disabled_toolsets}
         enabled_toolsets -= disabled_set
 
