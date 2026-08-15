@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import signal
 import subprocess
@@ -80,12 +81,39 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     return args
 
 
+def _child_env() -> dict:
+    """Env for the wrapped child process.
+
+    macOS launchd sets ``XPC_SERVICE_NAME=<job label>`` only on its direct
+    child. When this wrapper (itself the direct child) spawns the real gateway,
+    libSystem resets ``XPC_SERVICE_NAME`` to ``"0"`` in the grandchild, which
+    strips the supervisor marker that the gateway's supervised-conflict guard
+    relies on (``is_gateway_supervisor_process``). The guard then refuses the
+    service's own startup in an infinite spawn→refuse→respawn loop. Propagate
+    the alternate marker ``HERMES_GATEWAY_EXTERNAL_SUPERVISOR`` so the guard
+    recognizes the supervised context.
+
+    Detection is scoped to the launchd-service case: the wrapper is spawned
+    directly by launchd (PPID 1 on macOS) *and* carries a real job label in
+    XPC_SERVICE_NAME. The detached-fallback path (wrapper spawned by the CLI)
+    and interactive shells (XPC_SERVICE_NAME=0) are deliberately excluded so
+    a manually started gateway is never mislabeled as supervised.
+    """
+    env = dict(os.environ)
+    xpc = env.get("XPC_SERVICE_NAME", "")
+    if os.getppid() == 1 and xpc and xpc != "0":
+        env["HERMES_GATEWAY_EXTERNAL_SUPERVISOR"] = "1"
+    return env
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parse_args(argv)
     log_path: Path = args.error_log
 
     try:
-        proc = subprocess.Popen(args.command, stderr=subprocess.PIPE)
+        proc = subprocess.Popen(
+            args.command, stderr=subprocess.PIPE, env=_child_env()
+        )
     except OSError as exc:
         log_path.parent.mkdir(parents=True, exist_ok=True)
         with log_path.open("a", encoding="utf-8", buffering=1) as log_file:
