@@ -3519,7 +3519,12 @@ class TelegramAdapter(BasePlatformAdapter):
 
             disable_fallback = (os.getenv("HERMES_TELEGRAM_DISABLE_FALLBACK_IPS", "").strip().lower() in {"1", "true", "yes", "on"})
             fallback_ips = self._fallback_ips()
-            if not fallback_ips:
+            # Skip auto-discovery entirely when the fallback transport is
+            # disabled: the branch below would discard the result anyway, so
+            # the DoH round trip is pure boot latency, and its WARNING reads
+            # to operators as a connectivity fault on an otherwise healthy
+            # gateway (they then re-apply an env remedy already in place).
+            if not fallback_ips and not disable_fallback:
                 logger.warning("[%s] Discovering Telegram API fallback IPs via DNS-over-HTTPS…", self.name)
                 fallback_ips = await discover_fallback_ips()
                 logger.info(
@@ -3621,7 +3626,11 @@ class TelegramAdapter(BasePlatformAdapter):
             _init_timeout = _env_float("HERMES_TELEGRAM_INIT_TIMEOUT", 30.0)
             for _attempt in range(_max_connect):
                 try:
-                    logger.warning(
+                    # The first attempt succeeds on essentially every boot —
+                    # log it as progress. Only a retry (attempt 2+) means
+                    # something actually went wrong and deserves WARNING.
+                    logger.log(
+                        logging.INFO if _attempt == 0 else logging.WARNING,
                         "[%s] Connecting to Telegram (attempt %d/%d)…",
                         self.name, _attempt + 1, _max_connect,
                     )
