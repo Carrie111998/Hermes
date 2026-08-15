@@ -12,6 +12,7 @@ import {
   listBaseBranches,
   listBranches,
   parseWorktrees,
+  removeWorktree,
   sanitizeBranch,
   switchBranch
 } from './git-worktree-ops'
@@ -188,6 +189,47 @@ test('addWorktree: existingBranch checks the branch out without a new branch', a
       execFileSync('git', ['branch', '--show-current'], { cwd: result.path }).toString().trim(),
       'cool/feature'
     )
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('addWorktree: keeps the main checkout clean by locally excluding .worktrees', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'hermes-clean-worktrees-'))
+  const git = (...args) => execFileSync('git', args, { cwd: dir }).toString().trim()
+
+  try {
+    await ensureGitRepo('git', dir)
+    const result = await addWorktree(dir, { branch: 'hermes/clean', name: 'clean' }, 'git')
+
+    assert.ok(fs.existsSync(result.path))
+    assert.equal(git('status', '--porcelain'), '')
+
+    const excludePath = path.resolve(dir, git('rev-parse', '--git-path', 'info/exclude'))
+
+    assert.match(fs.readFileSync(excludePath, 'utf8'), /^\/\.worktrees\/$/m)
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('removeWorktree: deletes an owned automatic branch only when it still equals its base', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'hermes-clean-owned-branch-'))
+  const git = (...args) => execFileSync('git', args, { cwd: dir }).toString().trim()
+
+  try {
+    await ensureGitRepo('git', dir)
+    const base = git('branch', '--show-current')
+    const result = await addWorktree(dir, { base, branch: 'hermes/session-owned', name: 'owned' }, 'git')
+
+    await removeWorktree(
+      dir,
+      result.path,
+      { deleteBranch: { base, branch: result.branch }, force: false },
+      'git'
+    )
+
+    assert.equal(git('branch', '--list', result.branch), '')
   } finally {
     fs.rmSync(dir, { recursive: true, force: true })
   }

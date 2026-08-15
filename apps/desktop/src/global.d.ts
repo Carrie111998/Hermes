@@ -258,7 +258,7 @@ declare global {
         worktreeRemove: (
           repoPath: string,
           worktreePath: string,
-          options?: { force?: boolean }
+          options?: { deleteBranch?: { base: string; branch: string }; force?: boolean }
         ) => Promise<{ removed: string }>
         branchSwitch: (repoPath: string, branch: string) => Promise<{ branch: string }>
         // The local branches, plus the remote-tracking refs that have no local
