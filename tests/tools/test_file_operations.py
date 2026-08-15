@@ -450,7 +450,7 @@ class TestSearchFilesFallbackHiddenPaths:
 
         for p in [visible_file, nested_hidden_file, visible_nested_file, hidden_dir_file]:
             p.parent.mkdir(parents=True, exist_ok=True)
-            p.write_text("x")
+            p.write_text("x", encoding="utf-8")
 
         ops = ShellFileOperations(self._make_env())
         monkeypatch.setattr(ops, "_has_command", lambda command: command == "find")
@@ -469,7 +469,7 @@ class TestSearchFilesFallbackHiddenPaths:
 
         for p in [visible_file, visible_nested_file, hidden_dir_file]:
             p.parent.mkdir(parents=True, exist_ok=True)
-            p.write_text("x")
+            p.write_text("x", encoding="utf-8")
 
         ops = ShellFileOperations(self._make_env())
         monkeypatch.setattr(ops, "_has_command", lambda command: command == "find")
@@ -484,7 +484,7 @@ class TestSearchFilesFallbackHiddenPaths:
         other = root / "target-gamma" / "audit-report.md"
         for file_path in (wanted, other):
             file_path.parent.mkdir(parents=True, exist_ok=True)
-            file_path.write_text("x")
+            file_path.write_text("x", encoding="utf-8")
 
         ops = ShellFileOperations(self._make_env())
         monkeypatch.setattr(ops, "_has_command", lambda command: command == "rg")
@@ -638,7 +638,7 @@ class TestAtomicWriteNewFilePermissions:
             os.umask(old_umask)
 
         assert result.error is None, f"write failed: {result.error}"
-        assert dest.read_text() == "test content\n"
+        assert dest.read_text(encoding="utf-8") == "test content\n"
         expected_mode = 0o666 & ~test_umask
         actual_mode = dest.stat().st_mode & 0o777
         assert actual_mode == expected_mode, (
@@ -651,13 +651,13 @@ class TestAtomicWriteNewFilePermissions:
         mode preservation (e.g. an executable script stays 0755)."""
         ops = ShellFileOperations(make_real_subprocess_env(str(tmp_path)))
         dest = tmp_path / "existing.sh"
-        dest.write_text("#!/bin/sh\n")
+        dest.write_text("#!/bin/sh\n", encoding="utf-8")
         dest.chmod(0o755)
 
         result = ops.write_file(str(dest), "#!/bin/sh\necho updated\n")
 
         assert result.error is None, f"write failed: {result.error}"
-        assert dest.read_text() == "#!/bin/sh\necho updated\n"
+        assert dest.read_text(encoding="utf-8") == "#!/bin/sh\necho updated\n"
         assert dest.stat().st_mode & 0o777 == 0o755
 
 
@@ -672,7 +672,7 @@ class TestAtomicWriteThroughSymlink:
         ops = ShellFileOperations(make_real_subprocess_env(str(tmp_path)))
         real = tmp_path / "real.txt"
         link = tmp_path / "link.txt"
-        real.write_text("original\n")
+        real.write_text("original\n", encoding="utf-8")
         link.symlink_to(real)
 
         result = ops.write_file(str(link), "newcontent\n")
@@ -681,7 +681,7 @@ class TestAtomicWriteThroughSymlink:
         # The link must survive as a symlink...
         assert link.is_symlink(), "symlink was replaced by a plain file"
         # ...and the real target must carry the new content.
-        assert real.read_text() == "newcontent\n"
+        assert real.read_text(encoding="utf-8") == "newcontent\n"
         assert os.path.realpath(link) == str(real)
 
     def test_write_through_broken_symlink_falls_back(self, tmp_path):
@@ -695,7 +695,7 @@ class TestAtomicWriteThroughSymlink:
 
         assert result.error is None, f"write failed: {result.error}"
         assert target.exists()
-        assert target.read_text() == "data\n"
+        assert target.read_text(encoding="utf-8") == "data\n"
 
 
 class TestReadNonUtf8IsBinary:
