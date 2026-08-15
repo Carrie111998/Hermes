@@ -252,6 +252,7 @@ def _cmd_run(args) -> int:
         if dry:
             print(
                 f"auto (preview): {auto.get('checked', 0)} candidate skill(s) "
+                f"({auto.get('needs_review', 0)} need review) "
                 "— no transitions applied in dry-run"
             )
         else:

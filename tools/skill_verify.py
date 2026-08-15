@@ -114,7 +114,14 @@ def _resolve_command(skill_dir: Path, relative_path: str) -> Optional[List[str]]
     if not script.exists():
         return None
     interp = _INTERPRETERS.get(script.suffix)
-    return [*interp, str(script)] if interp else [str(script)]
+    if interp is None:
+        logger.debug(
+            "Verify script suffix not allowed: %s (allowed: %s)",
+            script.suffix or "<none>",
+            ", ".join(sorted(_INTERPRETERS)),
+        )
+        return None
+    return [*interp, str(script)]
 
 
 def _run(cmd: List[str], cwd: Path, timeout: int) -> subprocess.CompletedProcess:

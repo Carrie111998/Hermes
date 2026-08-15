@@ -1123,13 +1123,17 @@ def bump_outcome(
     _mutate(skill_name, _apply)
 
 
-def failure_rate(skill_name: str) -> Optional[float]:
-    """Recent-window failure rate for *skill_name*, or None with too few samples."""
-    rec = get_record(skill_name)
-    outcomes = rec.get("recent_outcomes")
+def _failure_rate_from_outcomes(outcomes: Any) -> Optional[float]:
+    """Recent-window failure rate from a ``recent_outcomes`` list, or None
+    when there are too few samples to judge."""
     if not isinstance(outcomes, list) or len(outcomes) < _OUTCOME_MIN_SAMPLES:
         return None
     return sum(1 for o in outcomes if o is False) / len(outcomes)
+
+
+def failure_rate(skill_name: str) -> Optional[float]:
+    """Recent-window failure rate for *skill_name*, or None with too few samples."""
+    return _failure_rate_from_outcomes(get_record(skill_name).get("recent_outcomes"))
 
 
 def recent_failure_reason(rec: Dict[str, Any]) -> str:
@@ -1468,10 +1472,7 @@ def curated_report() -> List[Dict[str, Any]]:
         row["last_activity_at"] = latest_activity_at(row)
         row["activity_count"] = activity_count(row)
         outcomes = row.get("recent_outcomes")
-        if isinstance(outcomes, list) and len(outcomes) >= _OUTCOME_MIN_SAMPLES:
-            row["failure_rate"] = sum(1 for o in outcomes if o is False) / len(outcomes)
-        else:
-            row["failure_rate"] = None
+        row["failure_rate"] = _failure_rate_from_outcomes(outcomes)
         row["recent_unknown_count"] = (
             sum(1 for o in outcomes if o is None)
             if isinstance(outcomes, list)

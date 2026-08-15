@@ -1246,8 +1246,8 @@ def build_turn_context(
         agent._turn_skill_accumulator_token = arm_turn_skill_accumulator(
             agent._turn_used_skills
         )
-    except Exception:
-        pass
+    except Exception as _arm_err:
+        logger.debug("turn skill accumulator arm failed: %s", _arm_err)
 
     # Record the execution thread so interrupt()/clear_interrupt() can scope
     # the tool-level interrupt signal to THIS agent's thread only.

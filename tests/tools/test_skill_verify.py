@@ -368,6 +368,21 @@ def test_missing_script_returns_none(verify_env):
     assert run_verification("svc_missing", d, env["task_cwd"]) is None
 
 
+def test_unrecognized_script_suffix_is_refused(verify_env):
+    """A verifier run path whose suffix has no mapped interpreter must be
+    refused (None), not executed as a raw shell command."""
+    env = verify_env
+    d = _write_skill_with_verify(
+        env["skills"], "svc_bad_suffix", _verify_block("scripts/verify.xyz")
+    )
+    _write_script(d, "scripts/verify.xyz", "#!/bin/sh\necho ok\n")
+    env["skill_usage"].set_verify_enabled("svc_bad_suffix", True)
+
+    from tools.skill_verify import run_verification
+
+    assert run_verification("svc_bad_suffix", d, env["task_cwd"]) is None
+
+
 # ---------------------------------------------------------------------------
 # Wiring — verify_and_record_outcome feeds bump_outcome
 # ---------------------------------------------------------------------------

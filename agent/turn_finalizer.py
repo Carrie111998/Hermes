@@ -22,6 +22,7 @@ keep the exact logger name (``"agent.conversation_loop"``).
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 
@@ -321,15 +322,12 @@ def finalize_turn(
     # list of parts; the trajectory format wants a plain string.
     try:
         _traj_outcome = _turn_outcome.task_succeeded if _turn_outcome else None
-        if _traj_outcome is not None:
-            agent._save_trajectory(
-                messages,
-                _summarize_user_message_for_log(user_message),
-                completed,
-                outcome=_traj_outcome,
-            )
-        else:
-            agent._save_trajectory(messages, _summarize_user_message_for_log(user_message), completed)
+        agent._save_trajectory(
+            messages,
+            _summarize_user_message_for_log(user_message),
+            completed,
+            outcome=_traj_outcome,
+        )
     except Exception as _save_err:
         _cleanup_errors.append(f"save_trajectory: {_save_err}")
         logger.error("finalize_turn: _save_trajectory failed: %s", _save_err, exc_info=True)
@@ -750,7 +748,7 @@ def finalize_turn(
         # ACSS Hypothesize consumer reads this seam from the edge.
         "skills_used": sorted(getattr(agent, "_turn_used_skills", None) or ()),
         "outcome": (
-            _turn_outcome.__dict__ if _turn_outcome is not None else None
+            dataclasses.asdict(_turn_outcome) if _turn_outcome is not None else None
         ),
         "response_transformed": _response_transformed,
         "pre_transform_response": _pre_transform_response,

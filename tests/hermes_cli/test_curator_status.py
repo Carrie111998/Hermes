@@ -99,6 +99,32 @@ def test_status_no_skills_produces_clean_empty_output(curator_status_env):
     assert "least active" not in out
 
 
+def test_run_dry_run_preview_reports_needs_review_count(curator_status_env, monkeypatch):
+    """The dry-run preview must surface the needs_review count the run would
+    act on, not just the raw candidate count."""
+    env = curator_status_env
+    from agent import curator
+
+    monkeypatch.setattr(
+        curator,
+        "run_curator_review",
+        lambda **kw: {
+            "auto_transitions": {"checked": 5, "needs_review": 2},
+            "summary_so_far": "",
+        },
+    )
+
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        rc = env["curator_cli"]._cmd_run(Namespace(dry_run=True, background=False,
+                                                  synchronous=True, consolidate=False))
+    out = buf.getvalue()
+
+    assert rc == 0
+    assert "2 need review" in out
+    assert "no transitions applied in dry-run" in out
+
+
 
 
 
