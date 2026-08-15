@@ -1517,6 +1517,17 @@ install_deps() {
             fi
         fi
 
+        # Termux/Android: cryptography>=50.0.0's on-device wheel omits libpython
+        # from the _rust.abi3.so DT_NEEDED list, so the dynamic loader cannot
+        # resolve Python C-API symbols (PyLong_Type/PyBaseObject_Type) and Hermes
+        # fails to load its bundled secret sources. Patch it post-install.
+        # See NousResearch/hermes-agent#83680.
+        if [ -f "$INSTALL_DIR/scripts/fix_termux_cryptography.sh" ]; then
+            log_info "Fixing Termux cryptography DT_NEEDED (PyLong_Type/PyBaseObject_Type)…"
+            bash "$INSTALL_DIR/scripts/fix_termux_cryptography.sh" "$PIP_PYTHON" || \
+                log_warn "cryptography DT_NEEDED fix skipped — see #83680 for the manual patchelf step."
+        fi
+
         log_success "Main package installed"
         log_info "Termux note: matrix e2ee and local faster-whisper extras are excluded from .[termux-all] due to upstream Android wheel/toolchain blockers."
         log_info "Termux note: browser/WhatsApp tooling is not installed by default; see the Termux guide for optional follow-up steps."
