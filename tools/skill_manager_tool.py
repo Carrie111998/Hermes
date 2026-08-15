@@ -365,6 +365,12 @@ def _stage_governed_shared_patch(
 
     source_task = task_id or session_id or "skill-manage-patch"
     evidence_ref = f"hermes:{origin}:{source_task}"
+    try:
+        from hermes_cli.profiles import get_active_profile_name
+
+        source_profile = get_active_profile_name()
+    except Exception:
+        source_profile = os.environ.get("HERMES_PROFILE") or "default"
     command = [
         sys.executable,
         str(steward),
@@ -384,7 +390,7 @@ def _stage_governed_shared_patch(
         "--source-agent",
         "hermes",
         "--source-profile",
-        os.environ.get("HERMES_PROFILE") or "default",
+        source_profile,
         "--source-task",
         source_task,
         "--scope-rationale",
