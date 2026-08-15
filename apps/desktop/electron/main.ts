@@ -3839,7 +3839,10 @@ function fetchJson(url, token, options: any = {}) {
         method: options.method || 'GET',
         headers: {
           'Content-Type': contentType,
-          'X-Ares-Session-Token': token,
+          // The gateway protocol remains X-Hermes-Session-Token while its
+          // Python runtime is renamed internally. Product branding must not
+          // change this authenticated wire contract.
+          'X-Hermes-Session-Token': token,
           ...(body ? { 'Content-Length': String(body.length) } : {})
         }
       },
@@ -3905,7 +3908,7 @@ function fetchJson(url, token, options: any = {}) {
 function fetchPublicJson(url, options: any = {}) {
   // Credential-free JSON GET/POST for public gateway endpoints
   // (``/api/status``, ``/api/auth/providers``). Unlike ``fetchJson`` it sends
-  // NO ``X-Ares-Session-Token`` header — used by the auth-mode probe before
+  // NO ``X-Hermes-Session-Token`` header — used by the auth-mode probe before
   // any credentials exist, and any time we must not leak a token to an
   // endpoint that doesn't need one.
   return new Promise((resolve, reject) => {
