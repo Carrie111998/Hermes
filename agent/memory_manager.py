@@ -169,13 +169,14 @@ _INTERNAL_NOTE_RE = re.compile(
     r'\[System note:\s*The following is recalled memory context,\s*NOT new user input\.\s*Treat as (?:informational background data|authoritative reference data[^\]]*)\.\]\s*',
     re.IGNORECASE,
 )
-_PROMPT_STRUCTURING_TAG_RE = re.compile(
-    r'</?[A-Za-z][A-Za-z0-9:_-]*(?:\s+[^<>]*?)?\s*/?>'
-    r'|<\s*/?\s*(?:'
+_PROMPT_ROLE_TAG_NAME_PATTERN = (
     r'analysis|assistant|developer|final|human|input|instructions?|observation|'
     r'output|response|result|system|thinking|user|'
     r'function(?:_calls?|_result)?|tool(?:_calls?|_result|_use)?'
-    r')\b[^<>]*>',
+)
+_PROMPT_STRUCTURING_TAG_RE = re.compile(
+    r'</?[A-Za-z][A-Za-z0-9:_-]*(?:\s+[^<>]*?)?\s*/?>'
+    rf'|<\s*/?\s*(?:{_PROMPT_ROLE_TAG_NAME_PATTERN})\b[^<>]*>',
     re.IGNORECASE,
 )
 _MODEL_TEMPLATE_CONTROL_RE = re.compile(
@@ -183,6 +184,10 @@ _MODEL_TEMPLATE_CONTROL_RE = re.compile(
     r'|<\s*/?\s*(?:s|bos|eos|(?:begin|start|end)_of_(?:text|turn))\s*>'
     r'|<<\s*/?\s*SYS\s*>>'
     r'|\[\s*/?\s*INST\s*\]',
+    re.IGNORECASE,
+)
+_PROMPT_TAG_OPENER_RE = re.compile(
+    rf'<(?=/?[A-Za-z_:!?]|\s*/?\s*(?:{_PROMPT_ROLE_TAG_NAME_PATTERN})\b)',
     re.IGNORECASE,
 )
 
@@ -212,10 +217,15 @@ def _neutralize_prompt_structuring_tokens(text: str) -> str:
     tokens while preserving the payload text.
     """
     text = _PROMPT_STRUCTURING_TAG_RE.sub(_escape_prompt_delimiters, text)
-    return _MODEL_TEMPLATE_CONTROL_RE.sub(
+    text = _MODEL_TEMPLATE_CONTROL_RE.sub(
         _escape_prompt_delimiters,
         text,
     )
+    # A malformed candidate can contain another ``<`` before its closing
+    # delimiter, so whole-token matching alone can leave its first opener raw.
+    # Encoding the opener is sufficient to keep provider text data-only while
+    # preserving ordinary comparisons such as ``2 < 3``.
+    return _PROMPT_TAG_OPENER_RE.sub('&lt;', text)
 
 
 class StreamingContextScrubber:
