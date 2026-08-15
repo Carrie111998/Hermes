@@ -529,6 +529,7 @@ export interface Translations {
     customKeyNamePlaceholder: string;
     add: string;
     invalidKeyName: string;
+    managedByOnePassword?: string;
   };
 
   // ── OAuth ──

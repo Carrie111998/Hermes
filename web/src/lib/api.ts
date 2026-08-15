@@ -1964,6 +1964,9 @@ export interface EnvVarInfo {
   channel_managed?: boolean;
   /** True when this key is set in .env but not in any catalog (user-added custom key). */
   custom?: boolean;
+  /** 'onepassword' when this key is resolved via the 1Password secret source
+   * (secrets.onepassword.env in config.yaml) rather than stored in .env. */
+  managed_by?: string | null;
 }
 
 export interface TelegramOnboardingStartResponse {
