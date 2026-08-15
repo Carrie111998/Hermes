@@ -220,6 +220,8 @@ async def test_non_slack_dm_approval_keeps_thread_id():
 async def test_slack_relay_advertises_status_text():
     adapter, _stub = _wire("D1", "dm")
     assert adapter.supports_status_text is True
+    assert adapter.supports_status_text_for_chat("D1") is True
+    assert adapter.prefers_status_text_for_tool_progress_for_chat("D1") is True
 
 
 @pytest.mark.asyncio
@@ -229,6 +231,8 @@ async def test_non_slack_relay_does_not_advertise_status_text():
         PlatformConfig(), _slack_desc(platform="discord"), transport=stub
     )
     assert adapter.supports_status_text is False
+    assert adapter.supports_status_text_for_chat("D1") is False
+    assert adapter.prefers_status_text_for_tool_progress_for_chat("D1") is False
 
 
 @pytest.mark.asyncio

@@ -242,6 +242,20 @@ class RelayAdapter(BasePlatformAdapter):
     def message_len_fn_for_chat(self, chat_id: str) -> Callable[[str], int]:
         return _LEN_FNS.get(self._descriptor_for_chat(chat_id).len_unit, len)
 
+    def supports_status_text_for_chat(self, chat_id: str) -> bool:
+        """Resolve Slack's text status on a multiplexed relay per chat."""
+        platform = self._platform_by_chat.get(str(chat_id))
+        if platform:
+            return platform == Platform.SLACK.value
+        return self._descriptor_for_chat(chat_id).platform == Platform.SLACK.value
+
+    def prefers_status_text_for_tool_progress_for_chat(self, chat_id: str) -> bool:
+        """Use Slack's transient status instead of durable progress revisions."""
+        platform = self._platform_by_chat.get(str(chat_id))
+        if platform:
+            return platform == Platform.SLACK.value
+        return self._descriptor_for_chat(chat_id).platform == Platform.SLACK.value
+
     def supports_draft_streaming(
         self,
         chat_type: Optional[str] = None,

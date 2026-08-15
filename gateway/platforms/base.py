@@ -2910,6 +2910,26 @@ class BasePlatformAdapter(ABC):
     # never see these calls.
     supports_status_text: bool = False
 
+    def supports_status_text_for_chat(self, chat_id: str) -> bool:
+        """Resolve text-status support for a specific chat."""
+        return self.supports_status_text
+
+    # Prefer the platform's ephemeral text status over durable, repeatedly
+    # edited tool-progress messages. Slack sets this because chat.update keeps
+    # every accumulated progress snapshot in the message's revision history,
+    # while assistant.threads.setStatus is the native current-action surface.
+    # When the native status surface is disabled or unavailable, the safe
+    # fallback is final-answer-only — never an unbounded durable edit history.
+    prefers_status_text_for_tool_progress: bool = False
+
+    def prefers_status_text_for_tool_progress_for_chat(self, chat_id: str) -> bool:
+        """Resolve the ephemeral-progress preference for a specific chat.
+
+        Native adapters return their scalar capability. Multiplexing adapters
+        (Relay) override this because one adapter can front several platforms.
+        """
+        return self.prefers_status_text_for_tool_progress
+
     def set_status_text(self, chat_id: str, text: Optional[str]) -> None:
         """Set or clear (``None``) the live working-state phrase for a chat.
 

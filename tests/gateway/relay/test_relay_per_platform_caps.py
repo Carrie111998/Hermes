@@ -51,6 +51,7 @@ def _descriptor(platform: str, max_len: int, len_unit: str = "chars") -> Capabil
 
 DISCORD = _descriptor("discord", 2000)
 TELEGRAM = _descriptor("telegram", 4096, len_unit="utf16")
+SLACK = _descriptor("slack", 39000)
 
 
 class MultiDescriptorStub(StubConnector):
@@ -150,6 +151,27 @@ async def test_adapter_resolves_per_chat_limits_from_inbound_platform():
     surrogate = "\U0001f600"  # 2 UTF-16 units, 1 codepoint
     assert adapter.message_len_fn_for_chat("tg-1")(surrogate) == 2
     assert adapter.message_len_fn_for_chat("dc-1")(surrogate) == 1
+
+
+@pytest.mark.asyncio
+async def test_adapter_resolves_slack_status_capabilities_per_chat():
+    """A Slack chat gets native status even when Telegram is the relay primary."""
+    stub = MultiDescriptorStub(TELEGRAM, DISCORD, SLACK)
+    stub._identities = [
+        ("telegram", "bot-9"),
+        ("discord", "app-1"),
+        ("slack", "app-2"),
+    ]
+    adapter = RelayAdapter(PlatformConfig(), TELEGRAM, transport=stub)  # type: ignore[arg-type]
+    await adapter.connect()
+
+    await _push(stub, Platform.SLACK, "slack-1")
+    await _push(stub, Platform.DISCORD, "dc-1")
+
+    assert adapter.supports_status_text_for_chat("slack-1") is True
+    assert adapter.prefers_status_text_for_tool_progress_for_chat("slack-1") is True
+    assert adapter.supports_status_text_for_chat("dc-1") is False
+    assert adapter.prefers_status_text_for_tool_progress_for_chat("dc-1") is False
 
 
 # ───────────────────── stream consumer integration ─────────────────────

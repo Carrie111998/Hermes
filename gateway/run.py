@@ -4266,8 +4266,9 @@ class TurnRunner:
         Consumes the ID-bearing lifecycle dicts queued by
         native_tool_start_callback / native_tool_complete_callback and renders
         them through the adapter's chat.startStream plan/task-card stream.
-        On any native failure, falls back to an editable in-thread text
-        message so progress stays live for the rest of the turn.
+        On native failure, Slack degrades to its ephemeral status line (or the
+        final answer when status is unavailable) instead of creating an
+        editable message whose revisions accumulate in Slack history.
         """
         ctx = self._ctx
         tasks: Dict[str, Dict[str, str]] = {}
@@ -4275,6 +4276,28 @@ class TurnRunner:
         fallback_msg_id: Optional[str] = None
         native_failed = False
         anonymous_seq = 0
+
+        _prefers_status_for_progress = getattr(
+            adapter,
+            "prefers_status_text_for_tool_progress_for_chat",
+            None,
+        )
+        # The source platform is authoritative: capability discovery may be
+        # stale, absent, or fail, but a Slack turn must never revive durable
+        # send/edit progress after a native-card failure.
+        status_only_fallback = ctx.source.platform == Platform.SLACK
+        if callable(_prefers_status_for_progress):
+            try:
+                status_only_fallback = (
+                    status_only_fallback
+                    or bool(_prefers_status_for_progress(ctx.source.chat_id))
+                )
+            except Exception:
+                pass
+        else:
+            status_only_fallback = status_only_fallback or bool(
+                getattr(adapter, "prefers_status_text_for_tool_progress", False)
+            )
 
         def _compact(value: Any, limit: int = 120) -> str:
             text = re.sub(r"\s+", " ", str(value or "")).strip()
@@ -4380,11 +4403,20 @@ class TurnRunner:
                 if getattr(result, "success", False):
                     return
                 native_failed = True
+                if status_only_fallback:
+                    logger.warning(
+                        "Slack native task-card progress failed; continuing "
+                        "with ephemeral status/final-answer-only: %s",
+                        getattr(result, "error", "unknown error"),
+                    )
+                    return
                 logger.warning(
-                    "Slack native task-card progress failed; falling back "
-                    "to an editable text update: %s",
+                    "Native task-card progress failed; falling back to an "
+                    "editable text update: %s",
                     getattr(result, "error", "unknown error"),
                 )
+            if status_only_fallback:
+                return
             # Once the native rail fails, every later lifecycle event
             # edits the same fallback message so progress remains live.
             await _send_or_edit_fallback()
@@ -4843,6 +4875,10 @@ class TurnRunner:
             pass
         from agent.display import build_tool_preview
 
+        # Native task cards use ID-bearing callbacks instead of the ordinary
+        # progress callback. Mirror the event into that callback so Slack's
+        # independent assistant status line still receives the current phrase.
+        self.progress_callback("tool.started", tool_name, "", args)
         ctx.progress_queue.put(
             {
                 "type": "tool.started",
@@ -4868,6 +4904,7 @@ class TurnRunner:
             pass
         from agent.display import _detect_tool_failure
 
+        self.progress_callback("tool.completed", tool_name, "", args)
         is_error, _ = _detect_tool_failure(str(tool_name or "tool"), result)
         ctx.progress_queue.put(
             {
@@ -27431,7 +27468,56 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             user_config, platform_key, "live_status", "full"
         )
         _live_status_adapter = self._adapter_for_source(source)
-        if not getattr(_live_status_adapter, "supports_status_text", False):
+        # Slack must never fall back to a cumulatively edited progress message.
+        # The source platform is authoritative even when an adapter capability
+        # check is unavailable or a relay's descriptor cache is cold.
+        _suppress_durable_progress = source.platform == Platform.SLACK
+        if _live_status_adapter is not None:
+            _prefers_status_for_progress = getattr(
+                _live_status_adapter,
+                "prefers_status_text_for_tool_progress_for_chat",
+                None,
+            )
+            if callable(_prefers_status_for_progress):
+                try:
+                    _suppress_durable_progress = (
+                        _suppress_durable_progress
+                        or bool(_prefers_status_for_progress(source.chat_id))
+                    )
+                except Exception:
+                    pass
+            else:
+                _suppress_durable_progress = _suppress_durable_progress or bool(
+                    getattr(
+                        _live_status_adapter,
+                        "prefers_status_text_for_tool_progress",
+                        False,
+                    )
+                )
+        if _suppress_durable_progress:
+            # Native Assistant status is a transient current-action
+            # surface. Do not also build a durable, cumulatively edited
+            # progress bubble: Slack records every chat.update as a message
+            # revision, so a long run otherwise exposes hundreds of
+            # historical snapshots. If native status is disabled or cannot
+            # render in this context, final-answer-only is safer than
+            # reviving the unbounded revision history.
+            tool_progress_enabled = False
+        _supports_status_for_chat = getattr(
+            _live_status_adapter,
+            "supports_status_text_for_chat",
+            None,
+        )
+        if callable(_supports_status_for_chat):
+            try:
+                _has_status_text = bool(_supports_status_for_chat(source.chat_id))
+            except Exception:
+                _has_status_text = False
+        else:
+            _has_status_text = bool(
+                getattr(_live_status_adapter, "supports_status_text", False)
+            )
+        if not _has_status_text:
             _live_status_adapter = None
         if _live_status_mode == "off":
             _live_status_adapter = None

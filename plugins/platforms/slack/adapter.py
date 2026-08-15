@@ -912,6 +912,11 @@ class SlackAdapter(BasePlatformAdapter):
     # Slack's typing indicator is a text status line (assistant.threads
     # .setStatus), so the gateway feeds it live per-tool phrases.
     supports_status_text = True
+    # Never mirror that same tool stream into a durable chat.update bubble.
+    # Slack retains each edit as a message revision, which exposes the entire
+    # accumulated run history (hundreds of snapshots on long turns). The
+    # Assistant status line is the intended transient current-action UI.
+    prefers_status_text_for_tool_progress = True
     splits_long_messages = True  # send() chunks via truncate_message(MAX_MESSAGE_LENGTH)
     # Slack blocks typed native slash commands inside threads ("/approve is
     # not supported in threads. Sorry!").  The adapter rewrites a leading

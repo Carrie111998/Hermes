@@ -12,7 +12,10 @@ import pytest
 import gateway.platforms.base as base_platform
 from gateway.config import Platform, PlatformConfig, StreamingConfig
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
+from gateway.relay.adapter import RelayAdapter
+from gateway.relay.descriptor import CONTRACT_VERSION, CapabilityDescriptor
 from gateway.session import SessionSource
+from tests.gateway.relay.stub_connector import StubConnector
 
 
 class ProgressCaptureAdapter(BasePlatformAdapter):
@@ -57,6 +60,16 @@ class ProgressCaptureAdapter(BasePlatformAdapter):
 
     async def get_chat_info(self, chat_id: str):
         return {"id": chat_id}
+
+
+class SlackNativeStatusCaptureAdapter(ProgressCaptureAdapter):
+    """Slack-like adapter that exposes the native Assistant status line."""
+
+    supports_status_text = True
+    prefers_status_text_for_tool_progress = True
+
+    def __init__(self):
+        super().__init__(platform=Platform.SLACK)
 
 
 class DiscordProgressCaptureAdapter(ProgressCaptureAdapter):
@@ -230,10 +243,18 @@ class FakeAgent:
 
 
 class NativeTaskCardAdapter(ProgressCaptureAdapter):
+    supports_status_text = True
+    prefers_status_text_for_tool_progress = True
+
     def __init__(self, platform=Platform.SLACK):
         super().__init__(platform=platform)
         self.native_updates = []
         self.native_stops = 0
+        self.status_updates = []
+
+    def set_status_text(self, chat_id, text):
+        self.status_updates.append({"chat_id": chat_id, "text": text})
+        super().set_status_text(chat_id, text)
 
     def native_task_cards_enabled(self):
         return True
@@ -281,6 +302,18 @@ class FailingNativeTaskCardAdapter(NativeTaskCardAdapter):
     async def send_native_task_card_progress(self, *args, **kwargs) -> SendResult:
         await super().send_native_task_card_progress(*args, **kwargs)
         return SendResult(success=False, error="native stream unavailable", retryable=True)
+
+
+class FailingNativeTaskCardNoPreferenceAdapter(FailingNativeTaskCardAdapter):
+    supports_status_text = False
+    prefers_status_text_for_tool_progress = False
+
+
+class FailingNativeTaskCardRaisingPreferenceAdapter(
+    FailingNativeTaskCardNoPreferenceAdapter
+):
+    def prefers_status_text_for_tool_progress_for_chat(self, chat_id):
+        raise RuntimeError("capability probe unavailable")
 
 
 class DuplicateNativeToolsAgent:
@@ -481,8 +514,10 @@ def _make_runner(adapter):
 
 
 @pytest.mark.asyncio
-async def test_run_agent_progress_uses_event_message_id_for_slack_dm(monkeypatch, tmp_path):
-    """Slack DM progress should keep event ts fallback threading."""
+async def test_slack_dm_never_falls_back_to_durable_progress_without_native_status(
+    monkeypatch, tmp_path
+):
+    """Slack fails closed to final-answer-only if native status is unavailable."""
     monkeypatch.setenv("HERMES_TOOL_PROGRESS_MODE", "all")
     # Since PR #8006, Slack's built-in display tier sets tool_progress="off"
     # by default. Override via config so this test still exercises the
@@ -525,13 +560,164 @@ async def test_run_agent_progress_uses_event_message_id_for_slack_dm(monkeypatch
     )
 
     assert result["final_response"] == "done"
-    assert adapter.sent
-    expected_metadata = {
-        "thread_id": "1234567890.000001",
-        "message_id": "1234567890.000001",
-    }
-    assert adapter.sent[0]["metadata"] == expected_metadata
-    assert all(call["metadata"] == expected_metadata for call in adapter.typing)
+    assert adapter.sent == []
+    assert adapter.edits == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("live_status", ["full", "off"])
+async def test_slack_native_status_never_creates_durable_tool_progress_history(
+    monkeypatch, tmp_path, live_status
+):
+    """Explicit ``tool_progress: all`` must not turn Slack into edit history.
+
+    Slack renders every ``chat.update`` as another message revision. Long agent
+    runs therefore exposed hundreds of historical tool-progress snapshots from
+    one accumulated bubble. The current action belongs in
+    ``assistant.threads.setStatus``; no durable progress message should be sent.
+    """
+    import yaml
+
+    (tmp_path / "config.yaml").write_text(
+        yaml.dump(
+            {
+                "display": {
+                    "platforms": {
+                        "slack": {
+                            "tool_progress": "all",
+                            "live_status": live_status,
+                        }
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    fake_dotenv = types.ModuleType("dotenv")
+    fake_dotenv.load_dotenv = lambda *args, **kwargs: None
+    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
+
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = FakeAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+
+    adapter = SlackNativeStatusCaptureAdapter()
+    runner = _make_runner(adapter)
+    gateway_run = importlib.import_module("gateway.run")
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(
+        gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"}
+    )
+
+    source = SessionSource(
+        platform=Platform.SLACK,
+        chat_id="D123",
+        chat_type="dm",
+    )
+
+    result = await runner._run_agent(
+        message="hello",
+        context_prompt="",
+        history=[],
+        source=source,
+        session_id="sess-slack-native-status",
+        session_key="agent:main:slack:dm:D123",
+        event_message_id="1234567890.000001",
+    )
+
+    assert result["final_response"] == "done"
+    assert adapter.sent == []
+    assert adapter.edits == []
+    if live_status == "full":
+        assert adapter._status_text.get("D123")
+    else:
+        assert not adapter._status_text.get("D123")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("lookup_failure", ["missing", "raises"])
+async def test_relay_slack_known_platform_suppresses_durable_progress_without_descriptor(
+    monkeypatch, tmp_path, lookup_failure
+):
+    """Known relay Slack chats fail closed when descriptor lookup is unavailable."""
+    import yaml
+
+    (tmp_path / "config.yaml").write_text(
+        yaml.dump(
+            {
+                "display": {
+                    "platforms": {
+                        "slack": {
+                            "tool_progress": "all",
+                            "live_status": "full",
+                        }
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    fake_dotenv = types.ModuleType("dotenv")
+    fake_dotenv.load_dotenv = lambda *args, **kwargs: None  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = FakeAgent  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+
+    primary = CapabilityDescriptor(
+        contract_version=CONTRACT_VERSION,
+        platform="telegram",
+        label="Telegram",
+        max_message_length=4096,
+        supports_draft_streaming=False,
+        supports_edit=True,
+        supports_threads=True,
+        markdown_dialect="telegram_html",
+        len_unit="utf16",
+    )
+    transport = StubConnector(primary)
+    transport._identities = [("telegram", "bot-1"), ("slack", "app-1")]
+    if lookup_failure == "raises":
+        def _raise_lookup(_platform):
+            raise RuntimeError("descriptor catalog unavailable")
+
+        transport.descriptor_for_platform = _raise_lookup  # type: ignore[attr-defined]
+
+    adapter = RelayAdapter(
+        PlatformConfig(enabled=True), primary, transport=transport  # type: ignore[arg-type]
+    )
+    adapter._platform_by_chat["C1"] = "slack"
+    adapter._chat_type_by_chat["C1"] = "dm"
+    adapter._last_inbound_ts_by_chat["C1"] = "1234567890.000001"
+    runner = _make_runner(adapter)
+    gateway_run = importlib.import_module("gateway.run")
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(
+        gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"}
+    )
+
+    source = SessionSource(
+        platform=Platform.SLACK,
+        chat_id="C1",
+        chat_type="dm",
+        thread_id="1234567890.000001",
+        delivered_via_upstream_relay=True,
+    )
+    result = await runner._run_agent(
+        message="hello",
+        context_prompt="",
+        history=[],
+        source=source,
+        session_id=f"sess-relay-slack-{lookup_failure}",
+        session_key=f"agent:main:slack:dm:C1:{lookup_failure}",
+    )
+
+    assert result["final_response"] == "done"
+    assert adapter.supports_status_text_for_chat("C1") is True
+    assert adapter.prefers_status_text_for_tool_progress_for_chat("C1") is True
+    assert not [frame for frame in transport.sent if frame.get("op") in {"send", "edit"}]
 
 
 @pytest.mark.asyncio
@@ -1104,7 +1290,7 @@ async def test_slack_native_progress_correlates_concurrent_duplicate_tools_by_id
 
 
 @pytest.mark.asyncio
-async def test_slack_native_failure_keeps_editing_one_live_text_fallback(
+async def test_slack_native_failure_falls_back_to_status_without_durable_history(
     monkeypatch, tmp_path
 ):
     adapter, result = await _run_with_agent(
@@ -1121,13 +1307,43 @@ async def test_slack_native_failure_keeps_editing_one_live_text_fallback(
     )
 
     assert result["final_response"] == "done"
+    assert isinstance(adapter, FailingNativeTaskCardAdapter)
     assert len(adapter.native_updates) == 1
-    assert len(adapter.sent) == 1
-    assert adapter.sent[0]["content"].endswith("web_search - alpha - running")
-    assert len(adapter.edits) >= 2
-    assert {edit["message_id"] for edit in adapter.edits} == {"progress-1"}
-    assert adapter.edits[-1]["content"].endswith("web_search - beta - error")
-    assert "web_search - alpha - complete" in adapter.edits[-1]["content"]
+    assert adapter.sent == []
+    assert adapter.edits == []
+    assert any(update["text"] for update in adapter.status_updates)
+    assert adapter.native_stops == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "adapter_cls",
+    [
+        FailingNativeTaskCardNoPreferenceAdapter,
+        FailingNativeTaskCardRaisingPreferenceAdapter,
+    ],
+)
+async def test_slack_native_failure_is_final_only_when_preference_probe_is_unusable(
+    monkeypatch, tmp_path, adapter_cls
+):
+    """The Slack source is authoritative when adapter capability probing fails."""
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        DuplicateNativeToolsAgent,
+        session_id=f"sess-native-fail-closed-{adapter_cls.__name__}",
+        platform=Platform.SLACK,
+        chat_id="C1",
+        thread_id="thread-1",
+        adapter_cls=adapter_cls,
+        user_id="U1",
+        scope_id="T1",
+    )
+
+    assert result["final_response"] == "done"
+    assert isinstance(adapter, FailingNativeTaskCardNoPreferenceAdapter)
+    assert adapter.sent == []
+    assert adapter.edits == []
     assert adapter.native_stops == 1
 
 
@@ -1145,7 +1361,7 @@ async def test_retryable_overflow_edit_keeps_editable_bubble_identity(monkeypatc
                 "interim_assistant_messages": False,
             }
         },
-        platform=Platform.SLACK,
+        platform=Platform.TELEGRAM,
         chat_id="C123",
         chat_type="direct",
         thread_id="1700000000.000100",
