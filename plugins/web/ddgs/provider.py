@@ -396,13 +396,18 @@ class DDGSWebSearchProvider(WebSearchProvider):
         a hard wall-clock timeout (``_SEARCH_TIMEOUT_SECS``) so a hung native
         ``primp`` call cannot freeze the Hermes process (#36776, #68096).
         """
-        try:
-            import ddgs  # type: ignore  # noqa: F401 — availability probe
-        except ImportError:
-            return {
-                "success": False,
-                "error": "ddgs package is not installed — run `pip install ddgs`",
-            }
+        # On Termux/Android the `ddgs` package imports but crashes at runtime
+        # (primp Rust panic). The disposable worker falls back to the
+        # `requests`-based HTML scraper there, so the package is NOT required
+        # for search to succeed. Only non-Termux platforms need `ddgs`.
+        if not _is_termux():
+            try:
+                import ddgs  # type: ignore  # noqa: F401 — availability probe
+            except ImportError:
+                return {
+                    "success": False,
+                    "error": "ddgs package is not installed — run `pip install ddgs`",
+                }
 
         # DDGS().text yields at most `max_results` items; we cap defensively
         # in case the package ignores the hint.
