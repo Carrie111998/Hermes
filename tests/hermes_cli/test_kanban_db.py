@@ -11077,6 +11077,93 @@ def _make_epic_branch(repo: Path, epic_branch: str, *, from_branch: str = "main"
     return sha
 
 
+def _make_fact_ready_epic(board: str, repo: Path) -> tuple[str, list[str]]:
+    """Build one Epic member with current terminal authority and facts."""
+    epic, children = _make_epic_with_children(board, n_children=1)
+    story_id = children[0]
+    story_branch = f"story/{story_id}"
+    review_base_sha = _head_sha(repo)
+    source_sha = _make_epic_branch(repo, story_branch)
+    epic_branch = kb.epic_branch_for(epic)
+    subprocess.run(
+        ["git", "-C", str(repo), "switch", "-c", epic_branch, story_branch],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    _commit_file(repo, "epic_tip.txt", "epic tip\n", "epic tip")
+    subprocess.run(
+        ["git", "-C", str(repo), "switch", "main"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    with kb.connect(board=board) as conn:
+        kb.set_branch_name(conn, story_id, story_branch)
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET workflow_template_id='product', "
+                "current_step_key='done', status='done', completed_at=1, "
+                "assignee=NULL, running=0, blocked=0, current_run_id=NULL "
+                "WHERE id=?",
+                (story_id,),
+            )
+            kb._synthesize_ended_run(
+                conn,
+                story_id,
+                outcome="advanced",
+                step_key="test",
+                metadata={
+                    "test_branch": story_branch,
+                    "test_head_sha": source_sha,
+                    "workflow_outcome": {"verdict": "passed"},
+                    "ai_provenance": {
+                        "writer": {"agent": "developer"},
+                        "tester": {"agent": "tester"},
+                    },
+                },
+            )
+            review_run_id = kb._synthesize_ended_run(
+                conn,
+                story_id,
+                outcome="advanced",
+                step_key="review",
+                metadata={
+                    "review_branch": story_branch,
+                    "review_base_sha": review_base_sha,
+                    "review_head_sha": source_sha,
+                    "workflow_outcome": {"verdict": "approved"},
+                    "ai_provenance": {
+                        "writer": {"agent": "developer"},
+                        "reviewer": {"agent": "reviewer"},
+                    },
+                },
+            )
+            conn.execute(
+                "INSERT INTO story_integration_intents ("
+                "epic_id, story_id, source_sha, source_branch, review_run_id, "
+                "review_base_sha, status, candidate_sha, created_at, updated_at"
+                ") VALUES (?, ?, ?, ?, ?, ?, 'integrated', ?, 90, 90)",
+                (
+                    epic,
+                    story_id,
+                    source_sha,
+                    story_branch,
+                    review_run_id,
+                    review_base_sha,
+                    source_sha,
+                ),
+            )
+            conn.execute(
+                "INSERT INTO epic_story_integrations "
+                "(epic_id, story_id, source_sha, candidate_sha, integrated_at) "
+                "VALUES (?, ?, ?, ?, 90)",
+                (epic, story_id, source_sha, source_sha),
+            )
+    return epic, children
+
+
 def _record_git_calls(monkeypatch) -> list[list[str]]:
     """Monkeypatch ``subprocess.run`` to record every argv while still
     executing real git. Returns the list calls are appended to."""
@@ -11290,10 +11377,7 @@ def test_merge_epic_preserves_explicit_injected_candidate_verification(
     _configure_candidate_verification(
         board, repo, command=("python", "-c", "raise SystemExit(9)")
     )
-    epic, children = _make_epic_with_children(board, n_children=1)
-    with kb.connect(board=board) as conn:
-        _set_task_status(conn, children[0], "done")
-    _make_epic_branch(repo, kb.epic_branch_for(epic))
+    epic, children = _make_fact_ready_epic(board, repo)
     injected = unittest.mock.Mock(return_value=True)
 
     with kb.connect(board=board) as conn:
@@ -11394,10 +11478,7 @@ def test_verified_candidate_crash_reuses_persisted_receipt(
             "p.write_text(p.read_text() + 'x' if p.exists() else 'x')",
         ),
     )
-    epic, children = _make_epic_with_children(board, n_children=1)
-    with kb.connect(board=board) as conn:
-        _set_task_status(conn, children[0], "done")
-    _make_epic_branch(repo, kb.epic_branch_for(epic))
+    epic, children = _make_fact_ready_epic(board, repo)
     monkeypatch.setenv("GIT_AUTHOR_DATE", "2001-01-01T00:00:00+00:00")
     monkeypatch.setenv("GIT_COMMITTER_DATE", "2001-01-01T00:00:00+00:00")
     apply = unittest.mock.Mock(side_effect=[False, True])
@@ -11531,11 +11612,7 @@ def test_merge_epic_records_configured_profile_failure_as_attention_required(
     }
     meta_path.write_text(json.dumps(meta), encoding="utf-8")
 
-    epic, children = _make_epic_with_children(board, n_children=1)
-    with kb.connect(board=board) as conn:
-        _set_task_status(conn, children[0], "done")
-    epic_branch = kb.epic_branch_for(epic)
-    _make_epic_branch(repo, epic_branch)
+    epic, children = _make_fact_ready_epic(board, repo)
 
     with kb.connect(board=board) as conn:
         result = kb.merge_epic_to_main(conn, epic, board=board)
