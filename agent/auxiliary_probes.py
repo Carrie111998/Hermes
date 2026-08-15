@@ -2,15 +2,22 @@
 
 # Probe and status helpers extracted from auxiliary_client.py.
 
+import contextlib
+import logging
+from typing import Optional
+
+logger = logging.getLogger("agent.auxiliary_client")  # pin god module name
 
 
 def _aux_probe_active() -> bool:
+    from agent.auxiliary_client import _aux_probe_state  # late import to avoid cycle
     return bool(getattr(_aux_probe_state, "active", False))
 
 
 @contextlib.contextmanager
 def aux_probe_mode():
     """Resolve provider availability without constructing real SDK clients."""
+    from agent.auxiliary_client import _aux_probe_state  # late import to avoid cycle
     prev = getattr(_aux_probe_state, "active", False)
     _aux_probe_state.active = True
     try:
@@ -20,11 +27,13 @@ def aux_probe_mode():
 
 
 def _aux_interrupt_protected() -> bool:
+    from agent.auxiliary_client import _aux_interrupt_protection  # late import
     return bool(getattr(_aux_interrupt_protection, "active", False))
 
 
 def _aux_interrupt_cancel_requested() -> bool:
     """Return whether an explicit host cancel overrides aux protection."""
+    from agent.auxiliary_client import _aux_interrupt_protection  # late import
     event = getattr(_aux_interrupt_protection, "cancel_event", None)
     if event is not None:
         try:
@@ -43,6 +52,7 @@ def _aux_interrupt_cancel_requested() -> bool:
 
 
 def _aux_progress_active() -> bool:
+    from agent.auxiliary_client import _aux_progress  # late import to avoid cycle
     return getattr(_aux_progress, "hook", None) is not None
 
 
@@ -53,6 +63,7 @@ def aux_progress_hook(hook):
     ``hook=None`` is a no-op passthrough so callers can wire it
     unconditionally. Re-entrant-safe: restores the previous hook on exit.
     """
+    from agent.auxiliary_client import _aux_progress  # late import to avoid cycle
     prev = getattr(_aux_progress, "hook", None)
     _aux_progress.hook = hook if callable(hook) else prev
     try:
@@ -67,6 +78,10 @@ def _aux_stream_total_ceiling(effective_timeout: Optional[float]) -> float:
     Generous by design — the idle timeout is the real guard; this only stops
     a degenerate stream that trickles one token per idle window forever.
     """
+    from agent.auxiliary_client import (  # late import to avoid cycle
+        _AUX_STREAM_CEILING_FLOOR_SECONDS,
+        _AUX_STREAM_CEILING_MULTIPLIER,
+    )
     try:
         timeout = float(effective_timeout) if effective_timeout is not None else 0.0
     except (TypeError, ValueError):

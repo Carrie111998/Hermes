@@ -2,9 +2,15 @@
 
 # Provider classification and normalization helpers.
 
+import os
+from typing import Any, Dict, Optional
 
 
 def _normalize_aux_provider(provider: Optional[str]) -> str:
+    from agent.auxiliary_client import (  # late import to avoid cycle
+        _PROVIDER_ALIASES,
+        _read_main_provider,
+    )
     normalized = (provider or "auto").strip().lower()
     if normalized.startswith("custom:"):
         suffix = normalized.split(":", 1)[1].strip()
@@ -38,6 +44,7 @@ def _is_arcee_trinity_thinking(model: Optional[str]) -> bool:
 
 def _nous_base_url() -> str:
     """Resolve the Nous inference base URL from env or default."""
+    from agent.auxiliary_client import _NOUS_DEFAULT_BASE_URL  # late import
     return os.getenv("NOUS_INFERENCE_BASE_URL", _NOUS_DEFAULT_BASE_URL)
 
 
@@ -47,6 +54,7 @@ def _is_free_model(model: Optional[str]) -> bool:
 
 
 def _current_custom_base_url() -> str:
+    from agent.auxiliary_client import _resolve_custom_runtime  # late import
     custom_base, _, _ = _resolve_custom_runtime()
     return custom_base or ""
 
@@ -65,11 +73,16 @@ def _normalize_main_runtime(main_runtime: Optional[Dict[str, Any]]) -> Dict[str,
         # remaining isolated across concurrent gateway sessions. Never fall
         # back to compatibility mirrors here: another session may have written
         # them most recently, which would leak its endpoint/key into this call.
+        from agent.auxiliary_client import (  # late import to avoid cycle
+            _RUNTIME_MAIN_CONTEXT,
+            _compat_runtime_main,
+        )
         main_runtime = _RUNTIME_MAIN_CONTEXT.get()
         if main_runtime is None:
             main_runtime = _compat_runtime_main()
     if not isinstance(main_runtime, dict):
         return {}
+    from agent.auxiliary_client import _MAIN_RUNTIME_CONTEXT_FIELDS  # late import
     normalized: Dict[str, Any] = {}
     for field in _MAIN_RUNTIME_CONTEXT_FIELDS:
         value = main_runtime.get(field)
@@ -94,6 +107,7 @@ def _normalize_chain_label(provider: str) -> str:
     """
     if not provider:
         return ""
+    from agent.auxiliary_client import _AUX_UNHEALTHY_LABEL_ALIASES  # late import
     p = str(provider).strip().lower()
     return _AUX_UNHEALTHY_LABEL_ALIASES.get(p, p)
 
@@ -115,4 +129,5 @@ def _normalize_vision_provider(provider: Optional[str]) -> str:
 
 
 def _strict_vision_backend_available(provider: str) -> bool:
+    from agent.auxiliary_client import _resolve_strict_vision_backend  # late import
     return _resolve_strict_vision_backend(provider)[0] is not None
