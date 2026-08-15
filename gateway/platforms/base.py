@@ -5855,10 +5855,16 @@ class BasePlatformAdapter(ABC):
             extra.get("thread_sessions_per_user"),
             False,
         )
+        session_store = getattr(self, "_session_store", None)
         return build_session_key(
             source,
             group_sessions_per_user=group_sessions_per_user,
             thread_sessions_per_user=thread_sessions_per_user,
+            profile=(
+                session_store._resolve_profile_for_key(source)
+                if session_store is not None
+                else None
+            ),
         )
 
     async def cancel_session_processing(
