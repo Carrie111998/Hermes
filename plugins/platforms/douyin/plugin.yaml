@@ -1,0 +1,43 @@
+name: douyin-platform
+label: Douyin
+kind: platform
+version: 1.0.0
+description: >
+  Douyin (Chinese TikTok) Open Platform gateway adapter for Hermes Agent.
+  Receives webhook events from Douyin Open Platform (with HMAC-SHA256
+  signature verification) and relays messages between Douyin chats and
+  the Hermes agent. Supports scene-aware outbound messaging with send grants.
+author: Hermes Agent contributors
+requires_env:
+  - name: DOUYIN_CLIENT_KEY
+    description: "Douyin Open Platform client key"
+    prompt: "Douyin client key"
+    url: "https://open.douyin.com/"
+    password: false
+  - name: DOUYIN_CLIENT_SECRET
+    description: "Douyin Open Platform client secret"
+    prompt: "Douyin client secret"
+    url: "https://open.douyin.com/"
+    password: true
+  - name: DOUYIN_OPEN_ID
+    description: "Douyin user open ID"
+    prompt: "Douyin open ID"
+    password: false
+  - name: DOUYIN_WEBHOOK_SECRET
+    description: "Douyin webhook signature secret (used for HMAC-SHA256 verification)"
+    prompt: "Douyin webhook secret"
+    url: "https://open.douyin.com/"
+    password: true
+optional_env:
+  - name: DOUYIN_WEBHOOK_PORT
+    description: "Webhook listen port (default: 8648)"
+    prompt: "Webhook port"
+    password: false
+  - name: DOUYIN_WEBHOOK_HOST
+    description: "Webhook bind host (default: 0.0.0.0)"
+    prompt: "Webhook host"
+    password: false
+  - name: DOUYIN_HOME_CONVERSATION
+    description: "Default conversation ID for cron / notification delivery"
+    prompt: "Home conversation ID (or empty)"
+    password: false

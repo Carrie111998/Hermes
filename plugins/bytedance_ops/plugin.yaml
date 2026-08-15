@@ -1,0 +1,25 @@
+name: bytedance-ops
+label: ByteDance Operations
+kind: tools
+version: 1.0.0
+description: >
+  TikTok Organic, TikTok Creator, TikTok Business Messaging admin, and
+  Douyin content operations tools for Hermes Agent.
+author: Hermes Agent contributors
+requires_env:
+  - name: TIKTOK_BUSINESS_ACCESS_TOKEN
+    description: "TikTok Business Center access token"
+    prompt: "TikTok access token"
+    url: "https://business.tiktok.com/"
+    password: true
+  - name: TIKTOK_BUSINESS_ACCOUNT_ID
+    description: "TikTok Business Account ID"
+    prompt: "TikTok Business Account ID"
+    url: "https://business.tiktok.com/"
+    password: false
+optional_env:
+  - name: DOUYIN_CLIENT_KEY
+    description: "Douyin Open Platform client key"
+    prompt: "Douyin client key"
+    url: "https://open.douyin.com/"
+    password: false

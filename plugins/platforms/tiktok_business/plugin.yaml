@@ -1,0 +1,39 @@
+name: tiktok-business-platform
+label: TikTok Business
+kind: platform
+version: 1.0.0
+description: >
+  TikTok Business Messaging API gateway adapter for Hermes Agent.
+  Receives webhook events from TikTok Business Messaging API (with
+  HMAC-SHA256 signature verification) and relays messages between
+  TikTok chats and the Hermes agent. Supports outbound messaging,
+  auto-messages, comments, folders, and conversations.
+author: Hermes Agent contributors
+requires_env:
+  - name: TIKTOK_BUSINESS_ACCESS_TOKEN
+    description: "TikTok Business Center access token"
+    prompt: "TikTok access token"
+    url: "https://business.tiktok.com/"
+    password: true
+  - name: TIKTOK_BUSINESS_ACCOUNT_ID
+    description: "TikTok Business Account ID"
+    prompt: "TikTok Business Account ID"
+    url: "https://business.tiktok.com/"
+    password: false
+optional_env:
+  - name: TIKTOK_BUSINESS_PORT
+    description: "Webhook listen port (default: 8647)"
+    prompt: "Webhook port"
+    password: false
+  - name: TIKTOK_BUSINESS_HOST
+    description: "Webhook bind host (default: 0.0.0.0)"
+    prompt: "Webhook host"
+    password: false
+  - name: TIKTOK_BUSINESS_ALLOWED_USERS
+    description: "Comma-separated TikTok user open IDs allowed to DM the bot"
+    prompt: "Allowed user IDs (comma-separated)"
+    password: false
+  - name: TIKTOK_BUSINESS_ALLOW_ALL_USERS
+    description: "Allow any TikTok user to talk to the bot (dev only)"
+    prompt: "Allow all users? (true/false)"
+    password: false
