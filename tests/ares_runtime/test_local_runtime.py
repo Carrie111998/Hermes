@@ -178,6 +178,7 @@ def test_update_activates_only_the_verified_upstream_candidate(tmp_path: Path, m
 
     assert changed is True
     assert runtime.active_release()[0] == candidate_revision
+    assert runtime.paths.launcher_path.is_file()
     assert runtime._release_metadata(candidate_revision)["upstream_revision"] == _git(
         upstream, "rev-parse", "HEAD"
     )

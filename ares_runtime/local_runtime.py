@@ -861,13 +861,23 @@ if (config or {}).get('context', {}).get('engine') == 'ri-context-governor':
                     desktop=desktop,
                 )
             self._activate(revision)
+            # The launcher is part of the selected runtime contract.  Refresh
+            # it before systemd starts the newly selected source so an update
+            # never hands off through stale wrapper code.
+            self._install_launcher()
             if self.paths.unit_path.exists():
                 try:
                     self._install_gateway_unit()
                     self._systemctl("daemon-reload")
                     self._systemctl("restart", "ares-gateway.service")
-                    time.sleep(1)
-                    if not self._systemctl("is-active", "--quiet", "ares-gateway.service", required=False):
+                    deadline = time.monotonic() + 15
+                    while time.monotonic() < deadline:
+                        if self._systemctl(
+                            "is-active", "--quiet", "ares-gateway.service", required=False
+                        ):
+                            break
+                        time.sleep(0.5)
+                    else:
                         raise AresLocalRuntimeError("Ares gateway did not remain active after update")
                 except Exception:
                     if old_active is not None:
