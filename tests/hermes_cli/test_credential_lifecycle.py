@@ -198,3 +198,31 @@ def test_save_env_value_unaffected_when_onepassword_disabled(hermes_home):
     save_env_value("ANTHROPIC_API_KEY", new_value)
     assert load_env()["ANTHROPIC_API_KEY"] == new_value
 
+
+def test_get_env_reports_onepassword_managed_key(hermes_home, monkeypatch):
+    _write_config(
+        hermes_home,
+        "secrets:\n"
+        "  onepassword:\n"
+        "    enabled: true\n"
+        "    env:\n"
+        '      ANTHROPIC_API_KEY: "op://Private/Anthropic/credential"\n',
+    )
+    resolved = "sk-ant-" + "z" * 24
+    monkeypatch.setenv("ANTHROPIC_API_KEY", resolved)
+
+    resp = client.get("/api/env", headers=HEADERS)
+    assert resp.status_code == 200
+    row = resp.json()["ANTHROPIC_API_KEY"]
+    assert row["is_set"] is True
+    assert row["managed_by"] == "onepassword"
+    assert resolved not in resp.text
+
+
+def test_get_env_unmapped_key_has_no_managed_by(hermes_home):
+    resp = client.get("/api/env", headers=HEADERS)
+    assert resp.status_code == 200
+    row = resp.json()["ANTHROPIC_API_KEY"]
+    assert row["is_set"] is False
+    assert row.get("managed_by") is None
+

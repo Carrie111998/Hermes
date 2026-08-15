@@ -69,6 +69,7 @@ from hermes_cli.config import (
     get_process_hermes_home,
     load_config,
     load_env,
+    onepassword_managed_env_keys,
     read_raw_config,
     resolve_cron_model_drift_defaults,
     save_config,
@@ -7210,9 +7211,16 @@ def _get_env_vars_sync(profile: Optional[str] = None):
         env_on_disk = load_env()
     channel_keys = _channel_managed_env_keys()
     catalog_meta = _catalog_provider_env_metadata()
+    onepassword_keys = onepassword_managed_env_keys()
 
     def _row(var_name: str, info: dict, *, custom: bool = False) -> dict:
         value = env_on_disk.get(var_name)
+        managed_by_onepassword = var_name in onepassword_keys
+        if not value and managed_by_onepassword:
+            # Resolved into this process's os.environ at startup by the
+            # onepassword secret source — intentionally never written to
+            # .env (docs/rfcs/2026-08-onepassword-provider-keys.md).
+            value = os.environ.get(var_name)
         cat_meta = catalog_meta.get(var_name) or {}
         # Hand OPTIONAL_ENV_VARS prose wins where present; the catalog fills any
         # gaps (description/url) and always supplies provider grouping hints.
@@ -7240,6 +7248,7 @@ def _get_env_vars_sync(profile: Optional[str] = None):
             # Keys page can list (and let the user manage) them instead of
             # hiding everything it doesn't recognise.
             "custom": custom,
+            "managed_by": "onepassword" if managed_by_onepassword else None,
         }
 
     result = {}
