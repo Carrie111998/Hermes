@@ -235,6 +235,7 @@ def test_launcher_resolves_the_selected_runtime_dynamically(tmp_path: Path) -> N
 
     assert str(runtime.paths.current_link) in launcher
     assert "-m ares_runtime.local_runtime" in launcher
+    assert 'cd "$runtime_root"' in launcher
     assert f"export HERMES_HOME={str(runtime.paths.agent_home)!r}" in launcher
     assert "export ARES_MANAGED_RUNTIME=1" in launcher
     assert "Coding" not in launcher

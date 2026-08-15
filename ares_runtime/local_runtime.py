@@ -699,6 +699,7 @@ if (config or {}).get('context', {}).get('engine') == 'ri-context-governor':
             "  printf '%s\\n' 'Ares runtime is not installed; run ares setup from the Ares checkout.' >&2\n"
             "  exit 1\n"
             "fi\n"
+            "cd \"$runtime_root\"\n"
             "exec \"$python\" -m ares_runtime.local_runtime \"$@\"\n"
         )
         temporary = self.paths.launcher_path.with_name(f".{self.paths.launcher_path.name}.{uuid.uuid4().hex}")
