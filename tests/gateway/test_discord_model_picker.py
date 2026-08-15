@@ -83,3 +83,47 @@ async def test_model_picker_clears_controls_before_running_switch_callback():
     interaction.edit_original_response.assert_awaited_once()
 
 
+@pytest.mark.asyncio
+async def test_model_picker_labels_keep_full_model_id_namespace():
+    """Aggregator providers can serve the same bare name from multiple
+    upstreams (deepseek-v4-pro vs nim/deepseek-v4-pro). The dropdown must
+    label each option with its FULL model ID so those duplicates stay
+    distinguishable instead of collapsing to the stripped short name.
+    """
+    view = ModelPickerView(
+        providers=[
+            {
+                "slug": "cliproxy",
+                "name": "cliproxy",
+                "models": [
+                    "deepseek-v4-pro",
+                    "nim/deepseek-v4-pro",
+                    "claude-sonnet-5",
+                ],
+                "total_models": 3,
+                "is_current": True,
+            }
+        ],
+        current_model="deepseek-v4-pro",
+        current_provider="cliproxy",
+        session_key="session-1",
+        on_model_selected=AsyncMock(),
+        allowed_user_ids={"123"},
+    )
+
+    view._build_model_select("cliproxy")
+
+    model_select = next(
+        c for c in view.children if getattr(c, "custom_id", "") == "model_model_select"
+    )
+    labels = [o.label for o in model_select.options]
+    assert labels == ["deepseek-v4-pro", "nim/deepseek-v4-pro", "claude-sonnet-5"]
+    # The namespaced entry must NOT have been stripped to the bare name.
+    assert labels.count("deepseek-v4-pro") == 1
+    assert "nim/deepseek-v4-pro" in labels
+    # Values carry the full ID so selection still routes correctly.
+    values = [o.value for o in model_select.options]
+    assert values == ["deepseek-v4-pro", "nim/deepseek-v4-pro", "claude-sonnet-5"]
+
+
+

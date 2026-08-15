@@ -8838,7 +8838,14 @@ def _define_discord_view_classes() -> None:
             models = provider.get("models", [])
             options = []
             for model_id in models[:25]:
-                short = model_id.split("/")[-1] if "/" in model_id else model_id
+                # Label with the FULL model ID, not the stripped short name.
+                # Custom aggregator endpoints (e.g. a local CI proxy) serve
+                # models from many upstream providers; several upstreams can
+                # use the same bare name (deepseek-v4-pro vs nim/deepseek-v4-pro).
+                # Stripping the namespace made those duplicates indistinguishable
+                # in the picker. The value already carries the full ID, so only
+                # the visible label changes — selection is unaffected.
+                short = model_id
                 options.append(
                     discord.SelectOption(
                         label=_truncate_discord_component_text(
