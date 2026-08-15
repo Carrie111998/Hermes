@@ -242,6 +242,31 @@ def test_detect_managed_node_processes_reports_only_hermes_node(monkeypatch):
     assert matches == [(101, "node.exe", "node.exe n8n start")]
 
 
+def test_managed_node_process_enumeration_failure_is_probe_failure(monkeypatch, capsys):
+    """A broken Node process probe must never be reported as an all-clear scan."""
+    for name, mod in _psutil_fake().items():
+        monkeypatch.setitem(sys.modules, name, mod)
+    import hermes_cli.main as cli_main
+
+    monkeypatch.setattr(cli_main, "_detect_venv_python_processes", lambda: [])
+    monkeypatch.setattr(
+        "hermes_cli._scan_venv_blockers._detect_managed_node_processes",
+        lambda: (_ for _ in ()).throw(RuntimeError("process enumeration failed")),
+    )
+
+    with pytest.raises(SystemExit) as excinfo:
+        main()
+    captured = capsys.readouterr()
+    data = json.loads(captured.out)
+
+    assert excinfo.value.code == 1
+    assert data["ok"] is False
+    assert data["probe_failed"] is True
+    assert data["blocked"] is False
+    assert "managed Node scan aborted" in data["error"]
+    assert "process enumeration failed" in captured.err
+
+
 def test_main_reports_managed_node_as_update_blocker(monkeypatch, capsys):
     """The Desktop preflight must fail closed on Hermes-managed Node holders."""
     for name, mod in _psutil_fake().items():

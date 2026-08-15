@@ -156,8 +156,8 @@ def _detect_managed_node_processes() -> list[tuple[int, str, str]]:
         return []
     try:
         import psutil  # noqa: PLC0415
-    except Exception:
-        return []
+    except Exception as exc:
+        raise RuntimeError(f"managed Node process probe unavailable: {exc}") from exc
 
     try:
         node_prefix = str((Path(get_hermes_home()) / "node").resolve()).lower().rstrip("\\/") + os.sep
@@ -173,8 +173,8 @@ def _detect_managed_node_processes() -> list[tuple[int, str, str]]:
     matches: list[tuple[int, str, str]] = []
     try:
         processes = psutil.process_iter(["pid", "exe", "name", "cmdline"])
-    except Exception:
-        return []
+    except Exception as exc:
+        raise RuntimeError(f"managed Node process enumeration failed: {exc}") from exc
     for proc in processes:
         try:
             info = proc.info
@@ -222,7 +222,10 @@ def main() -> None:
         for pid, name, cmdline in matches
         if not _is_pausable_gateway(cmdline)
     ]
-    managed_node_matches = _detect_managed_node_processes()
+    try:
+        managed_node_matches = _detect_managed_node_processes()
+    except Exception as exc:
+        _emit_probe_fail(f"managed Node scan aborted: {exc}")
     managed_node_processes = [
         {
             "pid": pid,
