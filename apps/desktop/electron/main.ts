@@ -159,6 +159,7 @@ import { snapHudBounds } from './hud-snap'
 import { createHudSnapShortcut } from './hud-snap-shortcut'
 import { buildHudWindowUrl } from './hud-url'
 import { createLinkTitleWindow, guardLinkTitleSession, readLinkTitleWindowTitle } from './link-title-window'
+import { registerLoginItemHandlers } from './login-item'
 import { ensureMainWindow } from './main-window-lifecycle'
 import {
   oauthGuardMayHardFail,
@@ -10028,6 +10029,8 @@ function createWindow() {
     sendWindowStateChanged()
   })
 }
+
+registerLoginItemHandlers(app, ipcMain)
 
 ipcMain.handle('hermes:connection', async (_event, profile) => ensureBackend(profile))
 // Reconnect-after-wake recovery. A REMOTE primary backend has no child process,
