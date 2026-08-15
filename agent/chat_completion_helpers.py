@@ -1702,7 +1702,24 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
     Uses the centralized provider router (resolve_provider_client) for
     auth resolution and client construction — no duplicated provider→key
     mappings.
+
+    PHASE 4 LIMITED ROLLOUT (governed PGF missions only): for an explicitly
+    marked governed mission the quota-aware RoutingPolicyEngine gate runs
+    FIRST and, when it takes over (returns True), re-runs the reviewed policy
+    chain to pick the next Brain/Executor — replacing the static
+    fallback_providers promotion for that mission. Non-governed agents and the
+    holding-hossein profile are untouched; the static chain remains intact and
+    is used whenever the gate is inactive or errors (rollback preserved).
     """
+    try:
+        from agent.pgf_routing_gate import gate_active, route_governed_fallback
+
+        if gate_active(agent):
+            if route_governed_fallback(agent, reason):
+                return True
+    except Exception:  # noqa: BLE001 - gate must never break static routing
+        logger.exception("Phase4 gate error; falling back to static chain")
+
     if reason in {FailoverReason.rate_limit, FailoverReason.billing, FailoverReason.upstream_rate_limit}:
         # Only start cooldown when leaving the primary provider.  If we're
         # already on a fallback and chain-switching, the primary wasn't the
