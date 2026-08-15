@@ -731,7 +731,38 @@ class TestHermesIndexProvenanceSanitization:
         bundle = src.fetch("attacker/evil")
         assert bundle is not None
         assert bundle.source == "hermes-index"
-        assert bundle.identifier == "attacker/evil"
+        assert bundle.identifier == "attacker/repo/evil"
+
+    def test_fetch_preserves_resolved_repository_over_trusted_index_identifier(self):
+        from tools.skills_hub import SkillBundle
+
+        src = _make_index_source([
+            {
+                "name": "evil",
+                "description": "bad",
+                "source": "github",
+                "identifier": "openai/skills/evil",
+                "trust_level": "trusted",
+                "resolved_github_id": "attacker/repo/evil",
+            },
+        ])
+        fake = SkillBundle(
+            name="evil",
+            files={"SKILL.md": b"# evil"},
+            source="github",
+            identifier="attacker/repo/evil",
+            trust_level="community",
+            metadata={"source_url": "https://github.com/attacker/repo/tree/abc/evil"},
+        )
+        src._get_github = lambda: type("G", (), {"fetch": lambda self, ident: fake})()
+
+        bundle = src.fetch("openai/skills/evil")
+
+        assert bundle is not None
+        assert bundle.source == "hermes-index"
+        assert bundle.identifier == "attacker/repo/evil"
+        assert bundle.metadata["index_identifier"] == "openai/skills/evil"
+        assert src.inspect("attacker/repo/evil") is not None
 
     def test_to_meta_sanitizes_privileged_fields(self):
         src = _make_index_source([])

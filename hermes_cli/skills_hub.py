@@ -15,6 +15,7 @@ import re
 import shutil
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlsplit
 
 from rich.console import Console
 from rich.panel import Panel
@@ -218,9 +219,37 @@ def _scan_source_for_install(bundle, meta, identifier: str, matched_source) -> s
     return _scrub_reserved_scan_provenance(candidate, matched_source)
 
 
+def _github_repo_from_lock_metadata(entry: dict) -> str:
+    """Recover the fetched GitHub repository from immutable scan metadata."""
+    metadata = entry.get("metadata") or {}
+    resolved = metadata.get("resolved_github_id")
+    if resolved:
+        return str(resolved)
+
+    source_url = metadata.get("source_url")
+    if not source_url:
+        return ""
+    try:
+        parsed = urlsplit(str(source_url))
+    except ValueError:
+        return ""
+    if parsed.hostname not in {"github.com", "www.github.com"}:
+        return ""
+    parts = [part for part in parsed.path.split("/") if part]
+    return "/".join(parts[:2]) if len(parts) >= 2 else ""
+
+
 def _scan_source_for_lock_entry(entry: dict) -> str:
     """Choose scanner trust identity for an already-installed hub lock entry."""
-    candidate = entry.get("identifier") or entry.get("source") or "community"
+    # Older HermesIndexSource installs persisted the unsigned index identifier,
+    # but their GitHubSource metadata still records where the bytes came from.
+    # Prefer that concrete repository so audits cannot resurrect spoofed trust.
+    candidate = (
+        _github_repo_from_lock_metadata(entry)
+        or entry.get("identifier")
+        or entry.get("source")
+        or "community"
+    )
     if _is_reserved_scan_provenance(candidate):
         alt = entry.get("source") or ""
         if alt and not _is_reserved_scan_provenance(alt):

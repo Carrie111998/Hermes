@@ -4200,8 +4200,13 @@ class HermesIndexSource(SkillSource):
         if resolved:
             bundle = self._get_github().fetch(resolved)
             if bundle:
-                bundle.source = _sanitize_index_source(entry.get("source", "hermes-index"))
-                bundle.identifier = identifier
+                # The index is an unsigned resolver, not the content origin.
+                # Keep the identifier produced by GitHubSource so scanner trust
+                # follows the repository that supplied the bytes, never the
+                # index-controlled display identifier.
+                bundle.source = "hermes-index"
+                bundle.metadata["index_identifier"] = identifier
+                bundle.metadata["resolved_github_id"] = resolved
                 return bundle
 
         # Fall back to identifier-based fetch via repo/path
@@ -4211,8 +4216,9 @@ class HermesIndexSource(SkillSource):
             github_id = f"{repo}/{path}"
             bundle = self._get_github().fetch(github_id)
             if bundle:
-                bundle.source = _sanitize_index_source(entry.get("source", "hermes-index"))
-                bundle.identifier = identifier
+                bundle.source = "hermes-index"
+                bundle.metadata["index_identifier"] = identifier
+                bundle.metadata["resolved_github_id"] = github_id
                 return bundle
 
         return None
@@ -4232,6 +4238,18 @@ class HermesIndexSource(SkillSource):
         # Exact identifier match
         for s in skills:
             if s.get("identifier") == identifier:
+                return s
+
+        # Lock entries created from index installs persist the concrete GitHub
+        # identifier. Accept it on update without restoring trust in the
+        # unsigned display identifier.
+        for s in skills:
+            resolved = s.get("resolved_github_id")
+            if not resolved:
+                repo = s.get("repo", "")
+                path = s.get("path", "")
+                resolved = f"{repo}/{path}" if repo and path else ""
+            if resolved == identifier:
                 return s
 
         # Try without source prefix (e.g. "skills-sh/" stripped)

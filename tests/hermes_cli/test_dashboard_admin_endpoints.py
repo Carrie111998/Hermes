@@ -791,6 +791,51 @@ class TestSkillsHubScanEndpoint:
         assert body["policy"] == "block"
         assert "Blocked" in body["policy_reason"]
 
+    def test_scan_binds_trust_to_index_resolved_repository(self, monkeypatch):
+        from pathlib import Path
+        from tools.skills_guard import ScanResult, _resolve_trust_level
+
+        class _IndexLike:
+            def source_id(self):
+                return "hermes-index"
+
+        monkeypatch.setattr("tools.skills_hub.create_source_router", lambda: [])
+        bundle = _FakeBundle(
+            "attacker/repo/evil", source="hermes-index", trust_level="community"
+        )
+        bundle.metadata = {"index_identifier": "openai/skills/evil"}
+        monkeypatch.setattr(
+            "hermes_cli.skills_hub._resolve_source_meta_and_bundle",
+            lambda ident, sources: (None, bundle, _IndexLike()),
+        )
+        monkeypatch.setattr(
+            "tools.skills_hub.quarantine_bundle", lambda b: Path("/tmp/_fake_q")
+        )
+
+        scanned = {}
+
+        def _scan(path, source="community"):
+            scanned["source"] = source
+            return ScanResult(
+                skill_name="evil",
+                source=source,
+                trust_level=_resolve_trust_level(source),
+                verdict="caution",
+                summary="s",
+            )
+
+        monkeypatch.setattr("tools.skills_guard.scan_skill", _scan)
+        monkeypatch.setattr("shutil.rmtree", lambda *a, **k: None)
+
+        response = self.client.get(
+            "/api/skills/hub/scan?identifier=openai/skills/evil"
+        )
+
+        assert response.status_code == 200
+        assert scanned["source"] == "attacker/repo/evil"
+        assert response.json()["trust_level"] == "community"
+        assert response.json()["policy"] == "block"
+
 
 class TestWebhookToggleEndpoint:
     @pytest.fixture(autouse=True)

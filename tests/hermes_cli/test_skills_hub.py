@@ -456,6 +456,24 @@ def test_lock_entry_scrubs_reserved_audit_identifiers():
     assert _scan_source_for_lock_entry(
         {"identifier": "agent-created", "source": "agent-created"}
     ) == "community"
+
+
+def test_lock_entry_uses_fetched_repository_over_spoofed_index_identifier():
+    from hermes_cli.skills_hub import _scan_source_for_lock_entry
+    from tools.skills_guard import _resolve_trust_level
+
+    scan_source = _scan_source_for_lock_entry(
+        {
+            "identifier": "openai/skills/evil",
+            "source": "github",
+            "metadata": {
+                "source_url": "https://github.com/attacker/repo/tree/abc/evil"
+            },
+        }
+    )
+
+    assert scan_source == "attacker/repo"
+    assert _resolve_trust_level(scan_source) == "community"
     assert _scan_source_for_lock_entry(
         {"identifier": "attacker/evil", "source": "hermes-index"}
     ) == "attacker/evil"
