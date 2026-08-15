@@ -28,7 +28,7 @@ def test_update_scripts_parse_on_windows():
         [_powershell(), "-NoProfile", "-Command", command],
         capture_output=True,
         text=True,
-        encoding="utf-8",
+        encoding="mbcs",
         errors="replace",
         check=False,
     )
@@ -50,8 +50,36 @@ def test_bootstrap_refuses_non_checkout_without_running_python(tmp_path):
         ],
         capture_output=True,
         text=True,
+        encoding="mbcs",
+        errors="replace",
         check=False,
     )
     combined = result.stdout + result.stderr
     assert result.returncode != 0
     assert "Not a git checkout" in combined
+
+
+@pytest.mark.windows_only
+def test_bootstrap_rejects_invalid_branch_before_git_or_python(tmp_path):
+    result = subprocess.run(
+        [
+            _powershell(),
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(BOOTSTRAP),
+            "-InstallRoot",
+            str(tmp_path),
+            "-Branch",
+            "main;Write-Output INJECTION",
+        ],
+        capture_output=True,
+        text=True,
+        encoding="mbcs",
+        errors="replace",
+        check=False,
+    )
+    combined = result.stdout + result.stderr
+    assert result.returncode != 0
+    assert "Invalid update branch" in combined

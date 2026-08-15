@@ -18,6 +18,11 @@ $root = [System.IO.Path]::GetFullPath($InstallRoot)
 $git = "git"
 $python = Join-Path $root "venv\Scripts\python.exe"
 
+if ([string]::IsNullOrWhiteSpace($Branch) -or
+    $Branch -notmatch '^[A-Za-z0-9._/-]+$' -or $Branch.Contains("..")) {
+    throw "Invalid update branch: $Branch"
+}
+
 function Invoke-Native([string]$FilePath, [string[]]$Arguments) {
     & $FilePath @Arguments
     if ($LASTEXITCODE -ne 0) {
@@ -35,6 +40,9 @@ if (-not (Test-Path -LiteralPath $python)) {
 # Do not silently destroy user work.  The normal updater owns stash policy;
 # this escape hatch only runs when that updater could not reach its new code.
 $status = (& $git -C $root status --porcelain 2>&1 | Out-String).Trim()
+if ($LASTEXITCODE -ne 0) {
+    throw "Unable to inspect working tree: $root"
+}
 if ($status) {
     throw "Working tree is not clean; preserve local changes, then rerun the update bootstrap"
 }
