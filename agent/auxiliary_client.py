@@ -144,21 +144,30 @@ class _AuxProbeClientStub:
 
     def __repr__(self) -> str:
         return "<aux availability-probe client stub>"
+from agent.auxiliary_probes import (
+    _aux_interrupt_cancel_requested,
+    _aux_interrupt_protected,
+    _aux_probe_active,
+    _aux_progress_active,
+    _aux_stream_total_ceiling,
+    aux_probe_mode,
+    aux_progress_hook,
+)
 
+from agent.auxiliary_providers import (
+    _current_custom_base_url,
+    _is_arcee_trinity_thinking,
+    _is_free_model,
+    _is_kimi_model,
+    _normalize_aux_provider,
+    _normalize_chain_label,
+    _normalize_main_runtime,
+    _normalize_resolved_model,
+    _normalize_vision_provider,
+    _nous_base_url,
+    _strict_vision_backend_available,
+)
 
-def _aux_probe_active() -> bool:
-    return bool(getattr(_aux_probe_state, "active", False))
-
-
-@contextlib.contextmanager
-def aux_probe_mode():
-    """Resolve provider availability without constructing real SDK clients."""
-    prev = getattr(_aux_probe_state, "active", False)
-    _aux_probe_state.active = True
-    try:
-        yield
-    finally:
-        _aux_probe_state.active = prev
 
 from agent.credential_pool import load_pool
 from agent.model_metadata import MINIMUM_CONTEXT_LENGTH, get_model_context_length
@@ -305,29 +314,6 @@ class AuxiliaryExplicitCancellation(BaseException):
         super().__init__("auxiliary request explicitly cancelled by host")
 
 
-def _aux_interrupt_protected() -> bool:
-    return bool(getattr(_aux_interrupt_protection, "active", False))
-
-
-def _aux_interrupt_cancel_requested() -> bool:
-    """Return whether an explicit host cancel overrides aux protection."""
-    event = getattr(_aux_interrupt_protection, "cancel_event", None)
-    if event is not None:
-        try:
-            return bool(event.is_set())
-        except Exception:
-            logger.debug("aux interrupt cancel event check failed", exc_info=True)
-            return False
-    check = getattr(_aux_interrupt_protection, "cancel_check", None)
-    if not callable(check):
-        return False
-    try:
-        return bool(check())
-    except Exception:
-        logger.debug("aux interrupt cancel check failed", exc_info=True)
-        return False
-
-
 @contextlib.contextmanager
 def aux_interrupt_protection(
     active: bool = True,
@@ -434,25 +420,6 @@ def _notify_aux_progress() -> None:
         hook()
     except Exception:
         logger.debug("aux progress hook failed", exc_info=True)
-
-
-def _aux_progress_active() -> bool:
-    return getattr(_aux_progress, "hook", None) is not None
-
-
-@contextlib.contextmanager
-def aux_progress_hook(hook):
-    """Install *hook* as the current thread's aux forward-progress callback.
-
-    ``hook=None`` is a no-op passthrough so callers can wire it
-    unconditionally. Re-entrant-safe: restores the previous hook on exit.
-    """
-    prev = getattr(_aux_progress, "hook", None)
-    _aux_progress.hook = hook if callable(hook) else prev
-    try:
-        yield
-    finally:
-        _aux_progress.hook = prev
 
 
 def _run_protected_sync_provider_call(
@@ -582,44 +549,12 @@ _PROVIDER_ALIASES = {
 }
 
 
-def _normalize_aux_provider(provider: Optional[str]) -> str:
-    normalized = (provider or "auto").strip().lower()
-    if normalized.startswith("custom:"):
-        suffix = normalized.split(":", 1)[1].strip()
-        if not suffix:
-            return "custom"
-        normalized = suffix
-    if normalized == "codex":
-        return "openai-codex"
-    if normalized == "main":
-        # Resolve to the user's actual main provider so named custom providers
-        # and non-aggregator providers (DeepSeek, Alibaba, etc.) work correctly.
-        main_prov = (_read_main_provider() or "").strip().lower()
-        if main_prov and main_prov not in {"auto", "main", ""}:
-            normalized = main_prov
-        else:
-            return "custom"
-    return _PROVIDER_ALIASES.get(normalized, normalized)
-
-
 # Sentinel: when returned by _fixed_temperature_for_model(), callers must
 # strip the ``temperature`` key from API kwargs entirely so the provider's
 # server-side default applies.  Kimi/Moonshot models manage temperature
 # internally — sending *any* value (even the "correct" one) can conflict
 # with gateway-side mode selection (thinking → 1.0, non-thinking → 0.6).
 OMIT_TEMPERATURE: object = object()
-
-
-def _is_kimi_model(model: Optional[str]) -> bool:
-    """True for any Kimi / Moonshot model that manages temperature server-side."""
-    bare = (model or "").strip().lower().rsplit("/", 1)[-1]
-    return bare.startswith("kimi-") or bare == "kimi"
-
-
-def _is_arcee_trinity_thinking(model: Optional[str]) -> bool:
-    """True for Arcee Trinity Large Thinking (direct or via OpenRouter)."""
-    bare = (model or "").strip().lower().rsplit("/", 1)[-1]
-    return bare == "trinity-large-thinking"
 
 
 # Context window enforced by ChatGPT's Codex OAuth backend for the
@@ -2435,11 +2370,6 @@ def _nous_api_key(provider: dict) -> str:
     return ""
 
 
-def _nous_base_url() -> str:
-    """Resolve the Nous inference base URL from env or default."""
-    return os.getenv("NOUS_INFERENCE_BASE_URL", _NOUS_DEFAULT_BASE_URL)
-
-
 def _resolve_nous_pool_runtime_api(*, force_refresh: bool = False) -> Optional[tuple[str, str]]:
     """Resolve Nous auxiliary credentials from the selected pool entry."""
     try:
@@ -2737,11 +2667,6 @@ def _resolve_api_key_provider() -> Tuple[Optional[OpenAI], Optional[str]]:
 
 
 _paid_lane_warned: set = set()
-
-
-def _is_free_model(model: Optional[str]) -> bool:
-    """True when ``model`` is an OpenRouter free SKU (``:free`` suffix)."""
-    return bool(model) and str(model).strip().endswith(":free")
 
 
 def _aux_openrouter_settings() -> Tuple[bool, str]:
@@ -3507,11 +3432,6 @@ def _resolve_custom_runtime() -> Tuple[Optional[str], Optional[str], Optional[st
     return custom_base, custom_key.strip(), custom_mode
 
 
-def _current_custom_base_url() -> str:
-    custom_base, _, _ = _resolve_custom_runtime()
-    return custom_base or ""
-
-
 def _validate_proxy_env_urls() -> None:
     """Fail fast with a clear error when proxy env vars have malformed URLs.
 
@@ -3875,41 +3795,6 @@ _MAIN_RUNTIME_FIELDS = ("provider", "model", "base_url", "api_key", "api_mode", 
 _MAIN_RUNTIME_CONTEXT_FIELDS = _MAIN_RUNTIME_FIELDS + ("requested_provider",)
 
 
-def _normalize_main_runtime(main_runtime: Optional[Dict[str, Any]]) -> Dict[str, Any]:
-    """Return a sanitized copy of a live main-runtime override.
-
-    Most fields are stripped strings. ``api_key`` may legitimately be a
-    zero-arg callable (Azure Foundry Entra ID token provider) — preserve
-    those as-is so auxiliary clients inherit the same authentication
-    surface as the main agent. The OpenAI SDK accepts ``Callable[[], str]``
-    for ``api_key`` and calls it before every request.
-    """
-    if main_runtime is None:
-        # Context-local state is inherited by tool worker wrappers while
-        # remaining isolated across concurrent gateway sessions. Never fall
-        # back to compatibility mirrors here: another session may have written
-        # them most recently, which would leak its endpoint/key into this call.
-        main_runtime = _RUNTIME_MAIN_CONTEXT.get()
-        if main_runtime is None:
-            main_runtime = _compat_runtime_main()
-    if not isinstance(main_runtime, dict):
-        return {}
-    normalized: Dict[str, Any] = {}
-    for field in _MAIN_RUNTIME_CONTEXT_FIELDS:
-        value = main_runtime.get(field)
-        # Preserve a callable api_key (Entra ID bearer provider) unchanged.
-        if field == "api_key" and callable(value) and not isinstance(value, str):
-            normalized[field] = value
-            continue
-        if isinstance(value, str) and value.strip():
-            normalized[field] = value.strip()
-    for identity_field in ("provider", "requested_provider"):
-        identity = normalized.get(identity_field)
-        if isinstance(identity, str):
-            normalized[identity_field] = identity.lower()
-    return normalized
-
-
 def _get_provider_chain() -> List[tuple]:
     """Return the ordered provider detection chain.
 
@@ -3966,18 +3851,6 @@ _AUX_UNHEALTHY_LABEL_ALIASES = {
     "openai-codex": "openai-codex",
     "codex": "openai-codex",
 }
-
-
-def _normalize_chain_label(provider: str) -> str:
-    """Normalize a resolved_provider value to a chain label used by
-    ``_get_provider_chain()``. Falls back to the lowercased input for
-    direct API-key providers (deepseek, alibaba, minimax, etc.) which
-    each report their own provider name from the api-key chain.
-    """
-    if not provider:
-        return ""
-    p = str(provider).strip().lower()
-    return _AUX_UNHEALTHY_LABEL_ALIASES.get(p, p)
 
 
 def _mark_provider_unhealthy(provider: str, ttl: Optional[float] = None) -> None:
@@ -6041,18 +5914,6 @@ def _to_async_client(sync_client, model: str, is_vision: bool = False):
     return AsyncOpenAI(**async_kwargs), model
 
 
-def _normalize_resolved_model(model_name: Optional[str], provider: str) -> Optional[str]:
-    """Normalize a resolved model for the provider that will receive it."""
-    if not model_name:
-        return model_name
-    try:
-        from hermes_cli.model_normalize import normalize_model_for_provider
-
-        return normalize_model_for_provider(model_name, provider)
-    except Exception:
-        return model_name
-
-
 def resolve_provider_client(
     provider: str,
     model: str = None,
@@ -6964,10 +6825,6 @@ def _main_model_supports_vision(provider: str, model: Optional[str]) -> bool:
     return bool(supports)
 
 
-def _normalize_vision_provider(provider: Optional[str]) -> str:
-    return _normalize_aux_provider(provider)
-
-
 def _resolve_strict_vision_backend(
     provider: str,
     model: Optional[str] = None,
@@ -7007,10 +6864,6 @@ def _resolve_strict_vision_backend(
     if provider == "custom":
         return _try_custom_endpoint()
     return None, None
-
-
-def _strict_vision_backend_available(provider: str) -> bool:
-    return _resolve_strict_vision_backend(provider)[0] is not None
 
 
 def get_available_vision_backends() -> List[str]:
@@ -8643,20 +8496,6 @@ def _obj_get(obj: Any, key: str, default: Any = None) -> Any:
 
 _AUX_STREAM_CEILING_FLOOR_SECONDS = 600.0
 _AUX_STREAM_CEILING_MULTIPLIER = 4.0
-
-
-def _aux_stream_total_ceiling(effective_timeout: Optional[float]) -> float:
-    """Absolute wall-clock bound for a progress-hooked streamed aux call.
-
-    Generous by design — the idle timeout is the real guard; this only stops
-    a degenerate stream that trickles one token per idle window forever.
-    """
-    try:
-        timeout = float(effective_timeout) if effective_timeout is not None else 0.0
-    except (TypeError, ValueError):
-        timeout = 0.0
-    return max(_AUX_STREAM_CEILING_FLOOR_SECONDS,
-               _AUX_STREAM_CEILING_MULTIPLIER * timeout)
 
 
 def _client_streams_internally(client: Any) -> bool:

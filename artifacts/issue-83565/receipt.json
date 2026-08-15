@@ -1,0 +1,206 @@
+{
+  "schema": "hermes.issue-83565.packet-apply.v2",
+  "packet_pin": "50d98fc1f3d49d7a7b522eaa7f4553cd864a0218",
+  "applied_to": "bab9a85b67f42b7c7931d1f7c769f504893c3d63",
+  "changes": [
+    {
+      "path": "tools\\child_process_env_policy.py",
+      "action": "write",
+      "detail": "central credential-boundary policy"
+    },
+    {
+      "path": "tools/environments/local.py",
+      "action": "replace-functions",
+      "detail": "three subprocess env factories routed through central policy"
+    },
+    {
+      "path": "tools/environments/base.py",
+      "action": "replace-function",
+      "detail": "shared remote-backend Popen boundary sanitizes by default"
+    },
+    {
+      "path": "tools/code_execution_tool.py",
+      "action": "replace-function",
+      "detail": "execute_code scrub uses the central hard-deny policy while retaining its allowlist"
+    },
+    {
+      "path": "tools/environments/singularity.py",
+      "action": "singularity-lifecycle-env",
+      "detail": "4 lifecycle/build operations hardened"
+    },
+    {
+      "path": "agent/lsp/client.py",
+      "action": "rewrite-spawn-env",
+      "detail": "1 ambient subprocess operations hardened"
+    },
+    {
+      "path": "agent/lsp/install.py",
+      "action": "rewrite-spawn-env",
+      "detail": "2 ambient subprocess operations hardened"
+    },
+    {
+      "path": "hermes_cli/kanban_db.py",
+      "action": "rewrite-spawn-env",
+      "detail": "10 ambient subprocess operations hardened"
+    },
+    {
+      "path": "plugins/google_meet/meet_bot.py",
+      "action": "rewrite-spawn-env",
+      "detail": "1 ambient subprocess operations hardened"
+    },
+    {
+      "path": "plugins/google_meet/process_manager.py",
+      "action": "rewrite-spawn-env",
+      "detail": "1 ambient subprocess operations hardened"
+    },
+    {
+      "path": "plugins/memory/byterover/__init__.py",
+      "action": "rewrite-spawn-env",
+      "detail": "1 ambient subprocess operations hardened"
+    },
+    {
+      "path": "plugins/platforms/buzz/adapter.py",
+      "action": "rewrite-spawn-env",
+      "detail": "1 ambient subprocess operations hardened"
+    },
+    {
+      "path": "plugins/platforms/photon/adapter.py",
+      "action": "rewrite-spawn-env",
+      "detail": "5 ambient subprocess operations hardened"
+    },
+    {
+      "path": "plugins/platforms/whatsapp/adapter.py",
+      "action": "rewrite-spawn-env",
+      "detail": "6 ambient subprocess operations hardened"
+    },
+    {
+      "path": "tools/environments/docker.py",
+      "action": "rewrite-spawn-env",
+      "detail": "19 ambient subprocess operations hardened"
+    },
+    {
+      "path": "tools/environments/local.py",
+      "action": "rewrite-spawn-env",
+      "detail": "2 ambient subprocess operations hardened"
+    },
+    {
+      "path": "tui_gateway/host_supervisor.py",
+      "action": "rewrite-spawn-env",
+      "detail": "1 ambient subprocess operations hardened"
+    },
+    {
+      "path": "tui_gateway/methods_tools.py",
+      "action": "rewrite-spawn-env",
+      "detail": "1 ambient subprocess operations hardened"
+    },
+    {
+      "path": "tui_gateway/server.py",
+      "action": "rewrite-spawn-env",
+      "detail": "3 ambient subprocess operations hardened"
+    },
+    {
+      "path": "agent/secret_sources/bitwarden.py",
+      "action": "minimal-helper-env",
+      "detail": "1 privileged helper operations isolated"
+    },
+    {
+      "path": "agent/secret_sources/onepassword.py",
+      "action": "minimal-helper-env",
+      "detail": "1 privileged helper operations isolated"
+    },
+    {
+      "path": "hermes_cli/onepassword_secrets_cli.py",
+      "action": "minimal-helper-env",
+      "detail": "3 privileged helper operations isolated"
+    },
+    {
+      "path": "hermes_cli/secrets_cli.py",
+      "action": "minimal-helper-env",
+      "detail": "3 privileged helper operations isolated"
+    },
+    {
+      "path": "apps\\desktop\\electron\\scrub-child-env.ts",
+      "action": "create",
+      "detail": "Electron child-env credential policy"
+    },
+    {
+      "path": "apps/desktop/electron/bootstrap-runner.ts",
+      "action": "desktop-scrub",
+      "detail": "2 process.env child constructions hardened"
+    },
+    {
+      "path": "apps/desktop/electron/main.ts",
+      "action": "desktop-scrub",
+      "detail": "10 process.env child constructions hardened"
+    },
+    {
+      "path": "scripts/security/verify_child_process_env_boundary.py",
+      "action": "write",
+      "detail": "campaign enforcement artifact"
+    },
+    {
+      "path": "tests/security/test_child_process_env_sink_ledger.py",
+      "action": "write",
+      "detail": "campaign enforcement artifact"
+    },
+    {
+      "path": "tests/tools/test_child_process_credential_inheritance_policy.py",
+      "action": "write",
+      "detail": "campaign enforcement artifact"
+    },
+    {
+      "path": "docs/security/issue-83565-child-process-credential-boundary.md",
+      "action": "write",
+      "detail": "campaign enforcement artifact"
+    }
+  ],
+  "git_diff_check": "pass",
+  "sink_ledger": {
+    "schema": "hermes.issue-83565.sink-ledger.v2",
+    "status": "pass",
+    "checked_count": 24,
+    "checked": [
+      "tools/environments/base.py",
+      "tools/environments/local.py",
+      "tools/environments/singularity.py",
+      "tools/environments/docker.py",
+      "agent/lsp/client.py",
+      "agent/lsp/install.py",
+      "tui_gateway/host_supervisor.py",
+      "tui_gateway/methods_tools.py",
+      "tui_gateway/server.py",
+      "hermes_cli/kanban_db.py",
+      "tools/checkpoint_manager.py",
+      "tools/code_execution_tool.py",
+      "plugins/platforms/whatsapp/adapter.py",
+      "agent/secret_sources/bitwarden.py",
+      "agent/secret_sources/onepassword.py",
+      "hermes_cli/secrets_cli.py",
+      "hermes_cli/onepassword_secrets_cli.py",
+      "plugins/platforms/raft/adapter.py",
+      "plugins/google_meet/meet_bot.py",
+      "plugins/google_meet/process_manager.py",
+      "plugins/memory/byterover/__init__.py",
+      "plugins/platforms/buzz/adapter.py",
+      "plugins/platforms/photon/adapter.py",
+      "agent/secret_sources/command.py"
+    ],
+    "findings": []
+  },
+  "focused_tests": [
+    {
+      "command": [
+        "C:\\Users\\andre\\AppData\\Local\\Microsoft\\WindowsApps\\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\\python.exe",
+        "-m",
+        "pytest",
+        "-q",
+        "tests/security/test_child_process_env_sink_ledger.py",
+        "tests/tools/test_child_process_credential_inheritance_policy.py"
+      ],
+      "returncode": 0,
+      "stdout": "...                                                                      [100%]\n3 passed in 19.54s\n",
+      "stderr": ""
+    }
+  ],
+  "patch_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+}
