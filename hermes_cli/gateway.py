@@ -5124,6 +5124,33 @@ def _wait_for_gateway_exit(
     return True
 
 
+def _abort_on_surviving_gateway(action: str) -> None:
+    """Stop a start/restart that the preceding stop did not actually clear.
+
+    ``_wait_for_gateway_exit`` returns False only once its own force-kill
+    deadline has passed and the PID is *still* alive — it has already sent
+    SIGKILL and printed "still running after Ns — restart may fail". Naming
+    the restart in that warning is the whole point: the caller is about to
+    start a replacement, and doing so is worse than failing here.
+    gateway/run.py writes gateway.pid at startup, so the new process takes
+    over the survivor's record and the survivor becomes precisely the orphan
+    stop_profile_gateway() has to sweep for afterwards (#75936) — no longer
+    reachable through `hermes gateway stop`, still holding the webhook port
+    and the same bot token.
+
+    Never returns; exits non-zero the same way the service-restart failure
+    below it does.
+    """
+    print()
+    print(f"✗ Gateway {action} aborted — the previous gateway is still running.")
+    print(
+        "  Starting a second instance would take over the PID file and leave the"
+    )
+    print("  survivor unreachable from the CLI, holding the same port.")
+    print("  Check `hermes gateway status`, then retry once it is down.")
+    sys.exit(1)
+
+
 def launchd_restart():
     label = get_launchd_label()
     target = f"{_launchd_domain()}/{label}"
@@ -7886,10 +7913,14 @@ def _gateway_command_inner(args):
                 print(f"✓ Stopped {total} gateway process(es) across all profiles")
             # The service stop above and kill_gateway_processes() both signal
             # gracefully; escalate only once the manager's own budget is spent.
-            _wait_for_gateway_exit(
+            # A False here means the PID outlived even that SIGKILL, so the
+            # fresh start below would stack a second gateway on the first.
+            exited = _wait_for_gateway_exit(
                 timeout=_GATEWAY_STOP_WAIT_SECONDS,
                 force_after=_GATEWAY_STOP_GRACE_SECONDS,
             )
+            if not exited:
+                _abort_on_surviving_gateway("restart")
 
             # Start the current profile's service fresh
             print("Starting gateway...")
