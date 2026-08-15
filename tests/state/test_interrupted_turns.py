@@ -239,3 +239,175 @@ def test_missing_record_reads_as_none(tmp_path):
     db = SessionDB(tmp_path / "state.db")
     assert db.read_interrupted_turn("nobody") is None
     assert not db.clear_interrupted_turn("nobody", owner=_owner("a"))
+
+
+def test_two_racing_claimants_produce_exactly_one_winner(tmp_path):
+    """Two processes that both find one orphan: one runs it, one stands down.
+
+    Both read the record before either writes, which is the race a crash on a
+    shared HERMES_HOME produces when two clients resume the same conversation
+    at once. The claim is a compare-and-swap on the record they read, so the
+    second update matches no row.
+    """
+    path = tmp_path / "state.db"
+    first, second = SessionDB(path), SessionDB(path)
+    first.record_interrupted_turn("shared", "the interrupted prompt", owner=_owner("a"))
+
+    seen_first = first.read_interrupted_turn("shared")
+    seen_second = second.read_interrupted_turn("shared")
+    claimed_first = first.claim_interrupted_turn("shared", expected=seen_first)
+    claimed_second = second.claim_interrupted_turn("shared", expected=seen_second)
+
+    assert claimed_first is not None
+    assert claimed_first["prompt"] == "the interrupted prompt"
+    assert claimed_second is None
+    # The loser leaves the record exactly as the winner left it.
+    survivor = second.read_interrupted_turn("shared")
+    assert survivor["attempts"] == 1
+
+
+def test_a_claim_bumps_the_attempt_count_durably(tmp_path):
+    """The crash-loop ceiling has to advance before the caller does anything."""
+    db = SessionDB(tmp_path / "state.db")
+    db.record_interrupted_turn("abc", "crashy prompt", attempts=1, owner=_owner("a"))
+
+    claimed = db.claim_interrupted_turn(
+        "abc", expected=db.read_interrupted_turn("abc")
+    )
+
+    assert claimed["attempts"] == 2
+    assert db.read_interrupted_turn("abc")["attempts"] == 2
+
+
+def test_a_claim_against_a_record_that_moved_on_abstains(tmp_path):
+    """The owning process re-recorded it, so it is a live turn, not an orphan."""
+    db = SessionDB(tmp_path / "state.db")
+    db.record_interrupted_turn("abc", "prompt", attempts=1, owner=_owner("a"))
+    stale = dict(db.read_interrupted_turn("abc"), attempts=0)
+
+    assert db.claim_interrupted_turn("abc", expected=stale) is None
+    assert db.read_interrupted_turn("abc")["attempts"] == 1
+    assert db.read_interrupted_turn("abc")["owner"] == _owner("a")
+
+
+def test_a_re_record_between_read_and_claim_defeats_the_claim(tmp_path):
+    """The ABA the counter alone cannot see: same attempts, different turn.
+
+    ``record_interrupted_turn`` is last-writer-wins and stamps ``attempts=0``
+    on every user-initiated turn, so the value a resuming process read off an
+    orphan recurs the moment somebody starts a *new* turn on the same
+    conversation. The prologue that writes that row runs long before the
+    engine takes the turn lease, so "fresh record, no lease yet" is an
+    ordinary state and the lease peek reads it as free. Were the counter the
+    whole token, this claim would win and the resuming process would
+    auto-continue a prompt another process is running right now.
+    """
+    path = tmp_path / "state.db"
+    resuming, live = SessionDB(path), SessionDB(path)
+    resuming.record_interrupted_turn(
+        "shared", "the orphaned prompt", attempts=0, owner=_owner("crashed")
+    )
+
+    gate_read = resuming.read_interrupted_turn("shared")
+    assert gate_read["attempts"] == 0
+    # The other process starts a live user turn. Same counter value, new turn.
+    time.sleep(0.02)
+    live.record_interrupted_turn(
+        "shared", "the prompt that is running right now", attempts=0, owner=_owner("live")
+    )
+    assert live.read_interrupted_turn("shared")["attempts"] == 0
+
+    assert resuming.claim_interrupted_turn("shared", expected=gate_read) is None
+    survivor = live.read_interrupted_turn("shared")
+    assert survivor["prompt"] == "the prompt that is running right now"
+    assert survivor["attempts"] == 0
+    assert survivor["owner"] == _owner("live")
+
+
+def test_a_re_record_of_the_same_prompt_by_the_same_owner_defeats_the_claim(tmp_path):
+    """The narrow leg: only ``started_at`` moved, and that is enough.
+
+    A process that crashed and came back re-runs its own interrupted prompt
+    under its own owner stamp. Attempts, prompt and owner all match what the
+    resuming process read; the write is visible only in the timestamp, which
+    ``record_interrupted_turn`` stamps fresh on every write.
+    """
+    path = tmp_path / "state.db"
+    resuming, live = SessionDB(path), SessionDB(path)
+    resuming.record_interrupted_turn("shared", "same prompt", owner=_owner("same"))
+
+    gate_read = resuming.read_interrupted_turn("shared")
+    time.sleep(0.02)
+    live.record_interrupted_turn("shared", "same prompt", owner=_owner("same"))
+    fresh = live.read_interrupted_turn("shared")
+    assert fresh["attempts"] == gate_read["attempts"]
+    assert fresh["prompt"] == gate_read["prompt"]
+    assert fresh["owner"] == gate_read["owner"]
+    assert fresh["started_at"] > gate_read["started_at"]
+
+    assert resuming.claim_interrupted_turn("shared", expected=gate_read) is None
+    assert live.read_interrupted_turn("shared")["attempts"] == 0
+
+
+def test_a_claim_leaves_the_true_owner_able_to_retire_its_record(tmp_path):
+    """The claim must not take the stamp the retire check reads.
+
+    A claim can land on a record whose owner is alive — the row it matched may
+    have been re-recorded by a turn that is running, or written by a process
+    whose lease lapsed while it kept working. If the claim restamped ``owner``,
+    that process could never retire its own record when its turn concluded, and
+    the record of a finished turn would sit there for a later resume to re-run.
+    """
+    path = tmp_path / "state.db"
+    running, claimant = SessionDB(path), SessionDB(path)
+    running.record_interrupted_turn("shared", "the live prompt", owner=_owner("running"))
+
+    claimed = claimant.claim_interrupted_turn(
+        "shared", expected=claimant.read_interrupted_turn("shared")
+    )
+
+    assert claimed is not None
+    assert claimed["owner"] == _owner("running")
+    # The turn concludes in the process that actually ran it.
+    assert running.clear_interrupted_turn("shared", owner=_owner("running"))
+    assert running.read_interrupted_turn("shared") is None
+
+
+def test_a_claim_leaves_the_cause_column_alone(tmp_path):
+    """``cause`` describes where the record came from, not who holds it."""
+    db = SessionDB(tmp_path / "state.db")
+    db.import_interrupted_turns([("abc", {"prompt": "legacy", "attempts": 0, "started_at": time.time()})])
+    assert db.read_interrupted_turn("abc")["cause"] == "migrated"
+
+    claimed = db.claim_interrupted_turn(
+        "abc", expected=db.read_interrupted_turn("abc")
+    )
+
+    assert claimed["cause"] == "migrated"
+
+
+def test_a_claim_against_a_retired_record_abstains(tmp_path):
+    db = SessionDB(tmp_path / "state.db")
+
+    assert (
+        db.claim_interrupted_turn(
+            "abc",
+            expected={"attempts": 0, "started_at": time.time(), "prompt": "p", "owner": None},
+        )
+        is None
+    )
+
+
+def test_a_claim_resolves_the_compression_lineage_root(tmp_path):
+    """Same key space as the turn lease, so a rotation cannot hide a record."""
+    db = SessionDB(tmp_path / "state.db")
+    db.create_session("root", source="test")
+    db.end_session("root", "compression")
+    db.create_session("child", source="test", parent_session_id="root")
+    db.record_interrupted_turn("root", "recorded before the rotation", owner=None)
+
+    claimed = db.claim_interrupted_turn(
+        "child", expected=db.read_interrupted_turn("child")
+    )
+
+    assert claimed["prompt"] == "recorded before the rotation"

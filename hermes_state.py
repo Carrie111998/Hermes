@@ -5987,6 +5987,53 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         self._execute_write(_do)
 
+    def get_session_turn_lease_holder(self, session_id: str) -> Optional[str]:
+        """Return the live holder of this conversation's turn lease, or None.
+
+        The read-only counterpart to :meth:`try_acquire_session_turn_lease`,
+        for callers that need to know whether a turn is running elsewhere
+        without taking the conversation away from it. "Live" means what
+        acquisition means: a row that has not expired and whose holder the
+        dead-process probe does not prove gone. Probe doubt reads as live, so
+        a caller that stands down on a holder stands down conservatively.
+
+        A failed read raises rather than reporting None. "No holder" is a
+        licence: callers act on it, and one of the things they may do with it
+        is delete a record. An unreadable lease table is not evidence that
+        nobody is running the turn, so it must not be reported as if it were.
+        The caller decides what doubt means for its own path.
+        """
+        if not session_id:
+            return None
+        now = time.time()
+        try:
+            with self._read_ctx() as conn:
+                conversation_id = self._session_turn_lease_key_on_conn(
+                    conn, session_id
+                )
+                row = conn.execute(
+                    "SELECT holder, expires_at FROM session_turn_leases "
+                    "WHERE conversation_id = ?",
+                    (conversation_id,),
+                ).fetchone()
+        except sqlite3.Error as exc:
+            logger.warning(
+                "get_session_turn_lease_holder(%s) failed: %s", session_id, exc,
+            )
+            raise
+        if row is None:
+            return None
+        holder = str(row["holder"] or "")
+        if not holder:
+            return None
+        try:
+            expired = float(row["expires_at"]) <= now
+        except (TypeError, ValueError):
+            expired = False  # unreadable expiry is doubt, and doubt is live
+        if expired or _compression_lock_holder_process_is_dead(holder):
+            return None
+        return holder
+
     # ── Interrupted turns ────────────────────────────────────────────────
     #
     # A turn that started running and never reached a terminal frame leaves a
@@ -6253,6 +6300,117 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 "clear_interrupted_turn(%s) failed: %s", session_id, exc,
             )
             return False
+
+    def claim_interrupted_turn(
+        self,
+        session_id: str,
+        *,
+        expected: Mapping[str, Any],
+    ) -> Optional[dict]:
+        """Take one interrupted-turn record for re-running, or return None.
+
+        The claim is a compare-and-swap whose token is the record itself.
+        ``expected`` is the mapping :meth:`read_interrupted_turn` returned, and
+        the bump lands only while the row still carries every field of it —
+        ``attempts``, ``started_at``, ``prompt`` and ``owner``. Two processes
+        that read the same orphaned record therefore produce exactly one
+        claimant, because the loser's UPDATE matches no row.
+
+        Matching the whole record, rather than the counter alone, is what makes
+        the token a version rather than a value. ``attempts`` is not monotonic
+        across writers: :meth:`record_interrupted_turn` is last-writer-wins and
+        stamps ``attempts=0`` on every user-initiated turn, so a counter value
+        a reader saw can recur under a *different* turn. Any write by any
+        process replaces at least one of the four fields — a new turn brings a
+        new ``started_at`` and, from another process, a new ``owner`` — so an
+        intervening re-record invalidates the token and the claim loses, which
+        is the safe direction.
+
+        Nothing is deleted, so the process that stands down leaves the record
+        where it found it for a later resume: deferring a recovery costs one
+        resume, while running a conversation twice cannot be taken back.
+
+        The claim also mutates as little as it can: it bumps ``attempts`` and
+        touches nothing else. In particular it does not restamp ``owner``. That
+        column is the retire check in :meth:`clear_interrupted_turn`, and a
+        claimant that took it would leave the true owner unable to retire its
+        own record when its turn ended — the record of a finished turn would
+        then outlive it and be re-run later. A claimant that goes on to run the
+        turn re-records under its own owner on the way in, which is where that
+        stamp belongs.
+
+        The bump is durable before the caller starts anything fallible, which
+        is what stops a continuation that dies inside its own startup from
+        re-firing without end.
+
+        Storage failure is an abstention, not an exception: this runs on the
+        resume path, where the honest answer to "can this process take the
+        conversation" is no.
+
+        Returns the claimed record, ``attempts`` already incremented, or None.
+        """
+        if not session_id or not isinstance(expected, Mapping):
+            return None
+        try:
+            seen = max(0, int(expected.get("attempts") or 0))
+            seen_started_at = float(expected.get("started_at") or 0)
+        except (TypeError, ValueError):
+            return None
+        seen_prompt = str(expected.get("prompt") or "")
+        if not seen_prompt.strip():
+            return None
+        seen_owner = expected.get("owner")
+        seen_owner = None if seen_owner is None else str(seen_owner)
+
+        def _do(conn):
+            conversation_id = self._session_turn_lease_key_on_conn(conn, session_id)
+            # ``IS`` rather than ``=`` on the two nullable-in-practice columns:
+            # an imported legacy record carries owner NULL, and ``= NULL`` is
+            # never true, which would make such a record unclaimable forever.
+            cursor = conn.execute(
+                "UPDATE interrupted_turns SET attempts = ? "
+                "WHERE conversation_id = ? AND attempts = ? AND started_at IS ? "
+                "AND prompt IS ? AND owner IS ?",
+                (
+                    seen + 1,
+                    conversation_id,
+                    seen,
+                    seen_started_at,
+                    seen_prompt,
+                    seen_owner,
+                ),
+            )
+            if cursor.rowcount <= 0:
+                return None
+            row = conn.execute(
+                "SELECT prompt, attempts, started_at, owner, cause "
+                "FROM interrupted_turns WHERE conversation_id = ?",
+                (conversation_id,),
+            ).fetchone()
+            return dict(row) if row is not None else None
+
+        try:
+            claimed = self._execute_write(_do)
+        except sqlite3.Error as exc:
+            logger.warning(
+                "claim_interrupted_turn(%s) failed: %s", session_id, exc,
+            )
+            return None
+        if not claimed:
+            return None
+        prompt = str(claimed.get("prompt") or "")
+        if not prompt.strip():
+            return None
+        try:
+            return {
+                "attempts": max(0, int(claimed.get("attempts") or 0)),
+                "prompt": prompt,
+                "started_at": float(claimed.get("started_at") or 0),
+                "owner": claimed.get("owner"),
+                "cause": claimed.get("cause"),
+            }
+        except (TypeError, ValueError):
+            return None
 
     def get_compression_lock_holder(self, session_id: str) -> Optional[str]:
         """Return the current (non-expired) holder for ``session_id``, or None.

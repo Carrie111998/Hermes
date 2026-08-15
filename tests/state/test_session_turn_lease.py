@@ -667,3 +667,76 @@ def test_turn_lease_fence_walks_continuation_that_inherited_fork_markers(tmp_pat
     ]
     db.release_session_turn_lease("delegate-continuation", delegate_holder)
     db.release_session_turn_lease("branch-continuation", branch_holder)
+
+
+def test_lease_holder_reads_back_while_the_lease_is_live(tmp_path):
+    """A caller can ask who owns the conversation without taking it."""
+    db = SessionDB(tmp_path / "state.db")
+    db.create_session("shared", source="test")
+    holder = f"pid={os.getpid()}:turn=live:platform=test"
+
+    assert db.get_session_turn_lease_holder("shared") is None
+    assert db.try_acquire_session_turn_lease("shared", holder, ttl_seconds=300)
+    assert db.get_session_turn_lease_holder("shared") == holder
+
+    db.release_session_turn_lease("shared", holder)
+    assert db.get_session_turn_lease_holder("shared") is None
+
+
+def test_lease_holder_ignores_an_expired_row(tmp_path):
+    db = SessionDB(tmp_path / "state.db")
+    db.create_session("shared", source="test")
+    holder = f"pid={os.getpid()}:turn=expiring:platform=test"
+
+    assert db.try_acquire_session_turn_lease("shared", holder, ttl_seconds=0.1)
+    time.sleep(0.2)
+
+    assert db.get_session_turn_lease_holder("shared") is None
+
+
+def test_lease_holder_ignores_a_dead_process(tmp_path, monkeypatch: pytest.MonkeyPatch):
+    """A row a dead process left behind is not a running turn."""
+    db = SessionDB(tmp_path / "state.db")
+    db.create_session("shared", source="test")
+    dead_holder = "pid=424242:turn=dead:platform=test"
+    assert db.try_acquire_session_turn_lease("shared", dead_holder, ttl_seconds=300)
+
+    probed: list[int] = []
+
+    def pid_exists(pid: int) -> bool:
+        probed.append(pid)
+        return False
+
+    monkeypatch.setattr(hermes_state, "psutil", SimpleNamespace(pid_exists=pid_exists))
+
+    assert db.get_session_turn_lease_holder("shared") is None
+    assert probed == [424242]
+
+
+def test_lease_holder_keeps_a_holder_the_probe_cannot_judge(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+):
+    """Probe doubt reads as live, so a caller stands down conservatively."""
+    db = SessionDB(tmp_path / "state.db")
+    db.create_session("shared", source="test")
+    holder = "pid=424242:turn=unknown:platform=test"
+    assert db.try_acquire_session_turn_lease("shared", holder, ttl_seconds=300)
+
+    def pid_exists(pid: int) -> bool:
+        raise OSError("no answer")
+
+    monkeypatch.setattr(hermes_state, "psutil", SimpleNamespace(pid_exists=pid_exists))
+
+    assert db.get_session_turn_lease_holder("shared") == holder
+
+
+def test_lease_holder_resolves_the_compression_lineage_root(tmp_path):
+    db = SessionDB(tmp_path / "state.db")
+    db.create_session("root", source="test")
+    db.end_session("root", "compression")
+    db.create_session("child", source="test", parent_session_id="root")
+    holder = f"pid={os.getpid()}:turn=live:platform=test"
+
+    assert db.try_acquire_session_turn_lease("root", holder, ttl_seconds=300)
+
+    assert db.get_session_turn_lease_holder("child") == holder
