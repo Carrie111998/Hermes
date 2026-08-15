@@ -476,7 +476,11 @@ if (config or {}).get('context', {}).get('engine') == 'ri-context-governor':
             os.replace(staging, final_dir)
         except Exception:
             if staging.exists():
-                shutil.rmtree(staging)
+                # Preserve the primary candidate error (for example an
+                # upstream revision that advanced during the fetch).  A
+                # transient file created while Git releases its checkout must
+                # not replace that actionable error with cleanup noise.
+                shutil.rmtree(staging, ignore_errors=True)
             raise
 
     @staticmethod
