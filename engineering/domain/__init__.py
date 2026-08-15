@@ -1,6 +1,14 @@
 """Engineering domain models."""
 
 from .evidence import Evidence, EvidenceKind, EvidenceStatus
+from .verification import (
+    InvalidVerificationResult,
+    VerificationCheckKind,
+    VerificationCheckResult,
+    VerificationCheckStatus,
+    VerificationResult,
+    VerificationVerdict,
+)
 from .workflow import (
     ALLOWED_STATE_TRANSITIONS,
     TERMINAL_STATES,
@@ -19,6 +27,12 @@ __all__ = [
     "EvidenceKind",
     "EvidenceStatus",
     "InvalidWorkflowTransition",
+    "InvalidVerificationResult",
+    "VerificationCheckKind",
+    "VerificationCheckResult",
+    "VerificationCheckStatus",
+    "VerificationResult",
+    "VerificationVerdict",
     "WorkflowDomainError",
     "WorkflowRun",
     "WorkflowState",
