@@ -1,144 +1,77 @@
-"""Regression tests for Node dependency recovery on an already-current checkout."""
+"""Residual Node recovery guarantees for an already-current checkout."""
 
 from __future__ import annotations
 
-import subprocess
-from types import SimpleNamespace
-from unittest.mock import patch
+from pathlib import Path
+from unittest.mock import MagicMock, patch
 
-from hermes_cli import main as cli_main
 from hermes_cli import update_cmd
 
 
-def _args() -> SimpleNamespace:
-    return SimpleNamespace(
-        backup=False,
-        branch=None,
-        force=False,
-        force_venv=False,
-        gateway=False,
-        no_backup=True,
-        yes=True,
-    )
+def _module_mock(*health: bool) -> MagicMock:
+    module = MagicMock()
+    module.return_value.PROJECT_ROOT = Path("/tmp/hermes-agent")
+    module.return_value._npm_lockfile_changed.side_effect = health
+    return module
 
 
-def _current_checkout_git(cmd, **_kwargs):
-    joined = " ".join(str(part) for part in cmd)
-    if "rev-parse --abbrev-ref HEAD" in joined:
-        return subprocess.CompletedProcess(cmd, 0, stdout="main\n", stderr="")
-    if "rev-list HEAD..origin/main --count" in joined:
-        return subprocess.CompletedProcess(cmd, 0, stdout="0\n", stderr="")
-    return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
-
-
-def test_current_checkout_repairs_incomplete_node_refresh(capsys):
-    """No new commits must not bypass a known-incomplete Node dependency tree."""
+def test_current_checkout_reports_repair_and_refreshes_dashboard(capsys):
+    """A repaired Node tree is rebuilt, activated, and reported as repaired."""
+    completion = MagicMock()
+    module = _module_mock(True, False)
 
     with (
-        patch("subprocess.run", side_effect=_current_checkout_git),
-        patch.object(cli_main, "_is_windows", return_value=False),
-        patch.object(cli_main, "_run_pre_update_backup", return_value=None),
-        patch.object(cli_main, "_pause_windows_gateways_for_update", return_value=None),
-        patch.object(cli_main, "_resume_windows_gateways_after_update"),
-        patch.object(update_cmd, "_discard_lockfile_churn"),
-        patch.object(update_cmd, "_normalize_managed_eol"),
-        patch.object(
-            cli_main,
-            "_get_origin_url",
-            return_value="https://github.com/NousResearch/hermes-agent.git",
-        ),
-        patch.object(cli_main, "_stash_local_changes_if_needed", return_value=None),
-        patch.object(update_cmd, "_invalidate_update_cache"),
-        patch("hermes_cli.managed_uv.update_managed_uv"),
-        patch("hermes_cli.managed_uv.ensure_uv", return_value=None),
-        patch.object(update_cmd, "_venv_core_imports_healthy", return_value=(True, "")),
-        patch.object(
-            update_cmd, "_npm_lockfile_changed", side_effect=[True, False]
-        ) as changed,
-        patch.object(
-            update_cmd, "_update_node_dependencies", return_value=[]
-        ) as repair,
-        patch.object(cli_main, "_build_web_ui", return_value=True) as build,
+        patch.object(update_cmd, "_m", module),
+        patch.object(update_cmd, "_update_node_dependencies", return_value=[]) as repair,
         patch.object(update_cmd, "_finish_dashboard_update_cleanup") as cleanup,
     ):
-        cli_main._cmd_update_impl(_args(), gateway_mode=False)
+        update_cmd._repair_node_deps_on_current_checkout(completion)
 
-    assert changed.call_count == 2
     repair.assert_called_once_with()
-    build.assert_called_once_with(cli_main.PROJECT_ROOT / "web")
+    module.return_value._build_web_ui.assert_called_once_with(
+        module.return_value.PROJECT_ROOT / "web"
+    )
     cleanup.assert_called_once_with([])
-    output = capsys.readouterr().out
-    assert "Node.js dependencies repaired" in output
+    completion.assert_called_once_with("✓ Update complete!")
+    assert "Node.js dependencies repaired" in capsys.readouterr().out
 
 
-def test_current_checkout_does_not_claim_repair_while_node_health_is_incomplete(capsys):
+def test_current_checkout_does_not_claim_success_while_health_stays_incomplete(capsys):
     """A no-error npm result is not success while dependency health stays stale."""
+    completion = MagicMock()
+    module = _module_mock(True, True)
 
     with (
-        patch("subprocess.run", side_effect=_current_checkout_git),
-        patch.object(cli_main, "_is_windows", return_value=False),
-        patch.object(cli_main, "_run_pre_update_backup", return_value=None),
-        patch.object(cli_main, "_pause_windows_gateways_for_update", return_value=None),
-        patch.object(cli_main, "_resume_windows_gateways_after_update"),
-        patch.object(update_cmd, "_discard_lockfile_churn"),
-        patch.object(update_cmd, "_normalize_managed_eol"),
-        patch.object(
-            cli_main,
-            "_get_origin_url",
-            return_value="https://github.com/NousResearch/hermes-agent.git",
-        ),
-        patch.object(cli_main, "_stash_local_changes_if_needed", return_value=None),
-        patch.object(update_cmd, "_invalidate_update_cache"),
-        patch("hermes_cli.managed_uv.update_managed_uv"),
-        patch("hermes_cli.managed_uv.ensure_uv", return_value=None),
-        patch.object(update_cmd, "_venv_core_imports_healthy", return_value=(True, "")),
-        patch.object(update_cmd, "_npm_lockfile_changed", return_value=True) as changed,
+        patch.object(update_cmd, "_m", module),
         patch.object(update_cmd, "_update_node_dependencies", return_value=[]),
-        patch.object(cli_main, "_build_web_ui", return_value=True) as build,
         patch.object(update_cmd, "_finish_dashboard_update_cleanup") as cleanup,
     ):
-        cli_main._cmd_update_impl(_args(), gateway_mode=False)
+        update_cmd._repair_node_deps_on_current_checkout(completion)
 
-    assert changed.call_count >= 2
-    build.assert_not_called()
-    assert cleanup.call_args.args[0]
+    module.return_value._build_web_ui.assert_not_called()
+    cleanup.assert_called_once_with(["dependency health check"])
+    assert "could not be repaired" in completion.call_args.args[0]
     output = capsys.readouterr().out
-    assert "Node.js dependencies remain incomplete" in output
-    assert "Node.js dependencies repaired" not in output
-    assert "Already up to date!" not in output
+    assert "remain incomplete" in output
+    assert "Already up to date" not in output
 
 
-def test_current_checkout_surfaces_failed_node_repair(capsys):
-    """A failed retry must not rebuild/restart or claim the install is healthy."""
+def test_current_checkout_failed_repair_leaves_dashboard_untouched(capsys):
+    """An npm failure remains visible and cannot restart a dashboard on stale deps."""
+    completion = MagicMock()
+    module = _module_mock(True)
+    failures = ["ui-tui, web workspaces"]
 
-    failures = ["repo root"]
     with (
-        patch("subprocess.run", side_effect=_current_checkout_git),
-        patch.object(cli_main, "_is_windows", return_value=False),
-        patch.object(cli_main, "_run_pre_update_backup", return_value=None),
-        patch.object(cli_main, "_pause_windows_gateways_for_update", return_value=None),
-        patch.object(cli_main, "_resume_windows_gateways_after_update"),
-        patch.object(update_cmd, "_discard_lockfile_churn"),
-        patch.object(update_cmd, "_normalize_managed_eol"),
-        patch.object(
-            cli_main,
-            "_get_origin_url",
-            return_value="https://github.com/NousResearch/hermes-agent.git",
-        ),
-        patch.object(cli_main, "_stash_local_changes_if_needed", return_value=None),
-        patch.object(update_cmd, "_invalidate_update_cache"),
-        patch("hermes_cli.managed_uv.update_managed_uv"),
-        patch("hermes_cli.managed_uv.ensure_uv", return_value=None),
-        patch.object(update_cmd, "_venv_core_imports_healthy", return_value=(True, "")),
-        patch.object(update_cmd, "_npm_lockfile_changed", return_value=True),
+        patch.object(update_cmd, "_m", module),
         patch.object(update_cmd, "_update_node_dependencies", return_value=failures),
-        patch.object(cli_main, "_build_web_ui", return_value=True) as build,
         patch.object(update_cmd, "_finish_dashboard_update_cleanup") as cleanup,
     ):
-        cli_main._cmd_update_impl(_args(), gateway_mode=False)
+        update_cmd._repair_node_deps_on_current_checkout(completion)
 
-    build.assert_not_called()
+    module.return_value._build_web_ui.assert_not_called()
     cleanup.assert_called_once_with(failures)
+    assert "could not be repaired" in completion.call_args.args[0]
     output = capsys.readouterr().out
-    assert "Node.js dependencies remain incomplete" in output
-    assert "Already up to date!" not in output
+    assert "Node.js refresh failed" in output
+    assert "Already up to date" not in output
