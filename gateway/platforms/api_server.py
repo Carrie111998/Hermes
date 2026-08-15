@@ -69,9 +69,14 @@ _api_request_profile: ContextVar[Optional[str]] = ContextVar(
 )
 
 def _approval_event_choices(*, smart_denied: bool, allow_permanent: bool) -> list[str]:
-    if smart_denied:
-        return ["once", "deny"]
-    return ["once", "session", "always", "deny"] if allow_permanent else ["once", "session", "deny"]
+    """Choices supported by the identity-bound /v1/runs approval protocol.
+
+    Backend approval capabilities may include session or permanent grants for
+    interactive gateway clients, but this endpoint's resolver and advertised
+    contract intentionally accept only one-shot approval or denial.
+    """
+    del smart_denied, allow_permanent
+    return ["once", "deny"]
 
 
 try:

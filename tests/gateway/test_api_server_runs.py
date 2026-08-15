@@ -35,13 +35,13 @@ from tools import approval as approval_mod
 @pytest.mark.parametrize(
     ("smart_denied", "allow_permanent", "expected"),
     [
-        (False, True, ["once", "session", "always", "deny"]),
-        (False, False, ["once", "session", "deny"]),
+        (False, True, ["once", "deny"]),
+        (False, False, ["once", "deny"]),
         (True, True, ["once", "deny"]),
         (True, False, ["once", "deny"]),
     ],
 )
-def test_approval_event_choices_follow_backend_capabilities(
+def test_identity_bound_run_approval_event_choices_never_widen(
     smart_denied, allow_permanent, expected
 ):
     assert _approval_event_choices(
