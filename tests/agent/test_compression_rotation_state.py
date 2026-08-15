@@ -670,8 +670,17 @@ class TestTodoSnapshotScaffoldingTails:
             {"role": "user", "content": previously_merged},
         )
 
+        # The no-growth fence correctly aborts a compression whose fallback
+        # metadata is larger than the tiny fixture it would replace. Make the
+        # source transcript materially larger so this test reaches the
+        # snapshot strip/reinjection path it is asserting.
         compressed, _ = agent._compress_context(
-            _msgs(), "sys", approx_tokens=120_000
+            [
+                {"role": "user", "content": f"m{i} " + "x" * 200}
+                for i in range(20)
+            ],
+            "sys",
+            approx_tokens=120_000,
         )
 
         tail = compressed[-1]
