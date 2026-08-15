@@ -10233,6 +10233,17 @@ function createWindow() {
   mainWindow.on('hide', () => sendWindowStateChanged())
   mainWindow.on('show', () => sendWindowStateChanged())
 
+  // Windows: a frameless window with titleBarOverlay can repaint its
+  // Windows-Control-Overlay region with the raw native (unstyled black)
+  // frame for one compositor frame when DWM redraws on WM_ACTIVATE --
+  // most visible when refocusing an already-open window (taskbar click,
+  // alt-tab), not just on first show. Re-pushing the overlay options on
+  // focus forces Chromium to redraw that strip with the correct themed
+  // colors immediately instead of leaving the stale native frame visible.
+  // applyTitleBarOverlay already no-ops safely on platforms/builds where
+  // this isn't applicable.
+  mainWindow.on('focus', () => applyTitleBarOverlay(mainWindow))
+
   // Reopen where the user left off. close is the backstop, flushed
   // synchronously before the window is gone.
   bindGeometryPersistence(mainWindow, schedulePersistWindowState)
