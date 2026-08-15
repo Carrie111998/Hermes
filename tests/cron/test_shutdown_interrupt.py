@@ -116,6 +116,24 @@ class TestMarkRunningJobsInterrupted:
 
         assert "job-1" in sched._interrupted_job_ids
 
+    def test_legacy_no_owner_output_is_distinguished_from_registered_runs(self):
+        import cron.scheduler as sched
+
+        sched._running_job_ids.add("legacy-job")
+
+        with patch("cron.scheduler.save_job_output") as mock_save, \
+             patch("cron.scheduler.mark_job_run") as mock_mark:
+            marked = sched.mark_running_jobs_interrupted("shutdown")
+
+        assert marked == ["legacy-job"]
+        mock_mark.assert_not_called()
+        mock_save.assert_called_once()
+        assert mock_save.call_args.args[0] == "legacy-job"
+        output_doc = mock_save.call_args.args[1]
+        assert "**Artifact Scope:** best-effort-no-owner" in output_doc
+        assert "**Durable Fire Owner:** missing" in output_doc
+        assert "does not record a persisted run status or fire claim" in output_doc
+
     def test_output_save_failure_does_not_block_last_status_mark(self):
         """The shutdown path should still mark the job failed even if the
         best-effort interrupted-output audit file cannot be written."""
