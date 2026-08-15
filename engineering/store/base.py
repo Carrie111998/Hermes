@@ -28,6 +28,34 @@ class EvidenceNotFound(EngineeringStoreError):
     """Raised when requested evidence does not exist."""
 
 
+class VerificationNotFound(EngineeringStoreError):
+    """Raised when a requested verification result does not exist."""
+
+
+class ReviewNotFound(EngineeringStoreError):
+    """Raised when a requested review result does not exist."""
+
+
+class EngineeringStoreConflict(EngineeringStoreError):
+    """Base error for immutable-result persistence conflicts."""
+
+
+class VerificationAlreadyExists(EngineeringStoreConflict):
+    """Raised when a verification already exists for an attempt."""
+
+
+class ReviewAlreadyExists(EngineeringStoreConflict):
+    """Raised when a review already exists for an attempt."""
+
+
+class EngineeringStoreCorruption(EngineeringStoreError):
+    """Raised when persisted Engineering data cannot be reconstructed."""
+
+
+class InvalidWorkflowIdentifier(EngineeringStoreError, ValueError):
+    """Raised when a workflow identity is unsafe for path composition."""
+
+
 class EngineeringStore(Protocol):
     """Capabilities required from an Engineering persistence provider."""
 

@@ -2,11 +2,19 @@
 
 from .base import (
     EngineeringStore,
+    EngineeringStoreConflict,
+    EngineeringStoreCorruption,
     EngineeringStoreError,
     EvidenceNotFound,
+    InvalidWorkflowIdentifier,
+    ReviewAlreadyExists,
+    ReviewNotFound,
+    VerificationAlreadyExists,
+    VerificationNotFound,
     WorkflowAlreadyExists,
     WorkflowNotFound,
 )
+from .file import FileEngineeringStore
 from .records import (
     SCHEMA_VERSION,
     EvidenceRecord,
@@ -29,14 +37,22 @@ from .records import (
 __all__ = [
     "SCHEMA_VERSION",
     "EngineeringStore",
+    "EngineeringStoreConflict",
+    "EngineeringStoreCorruption",
     "EngineeringStoreError",
     "EvidenceNotFound",
     "EvidenceRecord",
+    "FileEngineeringStore",
     "InvalidPersistenceRecord",
+    "InvalidWorkflowIdentifier",
     "PersistenceRecordError",
+    "ReviewAlreadyExists",
+    "ReviewNotFound",
     "ReviewRecord",
     "UnsupportedSchemaVersion",
     "VerificationRecord",
+    "VerificationAlreadyExists",
+    "VerificationNotFound",
     "WorkflowAlreadyExists",
     "WorkflowNotFound",
     "WorkflowRecord",
