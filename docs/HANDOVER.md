@@ -1,118 +1,70 @@
 # Project Handover - hermes-agent
 
-**Plan key:** hermes-agent
-**Last verified:** 2026-08-15
-**Handover owner/session:** Codex
+**Plan key:** hermes-agent  
+**Last verified:** 2026-08-16  
+**Handover owner/session:** Codex  
 **Authoritative project log:** `docs/ROADMAP-HERMES-DGX.md`
 
 ## 1. Project identity and boundary
 
-- **Purpose:** Hermes is a private-first agent gateway and CLI with memory,
-  skills, scheduled jobs, delegated agents, and messaging-platform adapters.
+- **Purpose:** Hermes is a private-first agent gateway and CLI with memory, skills, scheduled jobs, delegated agents, and messaging-platform adapters.
 - **Repository:** <https://github.com/cwliao/hermes-agent>
-- **Working checkout:** `D:/PROJECT/Hermes/.worktrees/hermes-auth-002`.
-- **Canonical remote:** `origin` -> `git@github.com:cwliao/hermes-agent.git`.
-- **Canonical mainline:** `origin/main` at
-  `4c5b93701810c4f870a59ffab5ed570c911fcf50`.
-- **Current checkout branch:** `ticket/hermes-telegram-transport-001`.
-- **Current checkout HEAD at implementation handoff:** `6bb24ec25`.
-- **DGX runtime:** configured target, checkout
-  `/home/cwliao/.hermes/hermes-agent`, service `hermes-gateway.service`.
-- **In scope:** Hermes CLI, gateway, runtime state, platform adapters, CI,
-  skills, documentation, and explicitly ticketed deployment work.
-- **Out of scope by default:** laptop files as handover sources, unrelated DGX
-  services, credentials/tokens, and external marketplace or SkillClaw changes
-  without a separate reviewed ticket.
+- **Canonical mainline:** `main` at `0fe3773ccfbec860984d0dc93adc4875ca2d5d4b` (PR #22).
+- **DGX runtime:** configured target, live source checkout `/home/cwliao/.hermes/hermes-agent`, user service `hermes-gateway.service`.
+- **In scope:** Hermes CLI, gateway, runtime state, platform adapters, CI, skills, documentation, and explicitly ticketed deployment work.
+- **Out of scope by default:** laptop files as handover sources, unrelated DGX services, credentials/tokens, and external marketplace or SkillClaw changes without a separate reviewed ticket.
+
+The DGX source checkout is a deployment input and remains separate from the immutable release selected by systemd. No laptop checkout is authoritative for runtime state.
 
 ## 2. Goal and roadmap
 
-- **Current goal:** Diagnose the DGX Telegram initial connection/network path or
-  execute the documented rollback trigger for
-  `HERMES-TELEGRAM-TRANSPORT-001`; do not claim inbound readiness without direct
-  evidence.
-- **Completed and verified:** HERMES-AUTH-001 merged as PR #14 at
-  `63bcd7ac` after main CI run `31791195033` passed all required checks,
-  including the Windows wrapper job.
-- **Completed and deployed:** HERMES-CALENDAR-GUARD-001 merged through PR #17
-  and correction PR #18; the merged historical release is `1b3d444955...`, and DGX runs immutable
-  release snapshot
-  `v2026.8.15-hermes-calendar-guard-1b3d444955`.
-- **Telegram evidence:** direct outbound verification through the merged
-  release returned `success=true`, `message_id=1919`, and `mirrored=true` for
-  the configured SPARK target. Gateway polling still reports network timeout /
-  reconnect warnings, so inbound polling is not claimed as healthy.
-- **Deferred or pending:** HERMES-MONITORING-001 remains `BLOCKED`;
-  `HERMES-TELEGRAM-TRANSPORT-001` is
-  `MERGED_DEPLOYED_RUNTIME_DEGRADED`: CI/merge/deployment passed, but the
-  bounded post-deploy window showed no Telegram polling progress.
-  Live skill synchronization, SkillClaw work, and unrelated DGX service
-  changes remain separate work.
+- **Current goal:** diagnose the remaining Telegram inbound polling degradation after the merged transport implementation; do not claim inbound readiness from process health or a returned `start_polling()`.
+- **Completed and deployed:** HERMES-UPDATE-001 Lane 2/3 correction set, PR #22, merged SHA `0fe3773ccfbec860984d0dc93adc4875ca2d5d4b`; immutable DGX release is active.
+- **E2E state:** gateway process/service is healthy and outbound Telegram delivery passed, but inbound polling has no qualifying `getUpdates` progress evidence.
+- **Deferred:** ARCH-002 remains the next core candidate after the active Telegram transport gate; HERMES-MONITORING-001 remains blocked and does not absorb this transport diagnosis.
 
 ## 3. Verified runtime and deployment state
 
-- **Mainline versus deployed code:** mainline and deployed code are
-  `77bcb5d0717ed4b31daec8a9ef701057528e08ae`; DGX uses
-  `/home/cwliao/.hermes/releases/v2026.8.15-hermes-telegram-transport-77bcb5d0717e`
-  selected through `30-hermes-telegram-transport-77bcb5d0717e.conf`. The live source
-  checkout remains untouched.
-- **DGX service evidence:** the configured DGX target;
-  `hermes-gateway.service` is active/running with MainPID `3504674`, exit
-  status `0`, and `NRestarts=0`; cwd and release identity match merged SHA
-  `77bcb5d0`. Telegram polling did not produce qualifying progress during the
-  bounded post-deploy window, so service health is not Telegram readiness.
-- **DGX SSH evidence:** a bounded WSL probe returned `SSH_OK` through the
-  authenticated route. No credentials were stored.
-- **Storage and safety:** this handover refresh does not mutate Hermes memory,
-  user data, credentials, or scheduled tasks.
+- **DGX release:** `/home/cwliao/.hermes/releases/v2026.8.16-hermes-update-001-0fe3773ccf`.
+- **Release identity:** `.hermes-release-sha` is `0fe3773ccfbec860984d0dc93adc4875ca2d5d4b`.
+- **Effective gateway drop-in:** `31-hermes-update-001-0fe3773ccf.conf`; the prior `30-hermes-telegram-transport-77bcb5d0717e.conf` and release remain available for rollback.
+- **Gateway evidence:** `active/running`, MainPID `3992364`, `ExecMainStatus=0`, `NRestarts=0`; effective WorkingDirectory and PYTHONPATH point to the new release.
+- **Calendar guard evidence:** recovery timer `active/waiting`; its service and wrapper now point to the new release. The old release and drop-in were not deleted.
+- **Source checkout evidence:** live checkout remains clean at HEAD `1c14d2b9df29da845fb2a56b2fbe12cf8ee507cb`; it was not reset, overwritten, or used as the active runtime source.
+
+### Telegram E2E boundary
+
+- **Outbound:** `hermes send --to telegram:SPARK --json` returned `success=true`, `message_id=1967`, `mirrored=true`.
+- **Inbound:** after restart at approximately `06:31:43` CST, logs showed connection and menu registration through approximately `06:31:52`, but no qualifying successful `getUpdates` progress was observed through `06:37:25` CST. The inbound state remains `DEGRADED/UNPROVEN`.
+- **Interpretation:** service health PASS and outbound delivery PASS do not upgrade Telegram inbound readiness. The CLI also reports an installed-service-definition-outdated warning; the effective systemd drop-in was separately verified and is running the intended release.
 
 ## 4. Ticket and gate state
 
-### Current ticket: HERMES-TELEGRAM-TRANSPORT-001
+### Current lane: HERMES-TELEGRAM-TRANSPORT-001 diagnosis
 
-- **Plan:** `docs/plans/2026-08-15-hermes-telegram-transport-001.md`
+- **Plan:** `docs/plans/2026-08-15-hermes-telegram-transport-001.md`.
 - **Status:** `MERGED_DEPLOYED_RUNTIME_DEGRADED`.
-- **Scope:** bounded Telegram polling recovery with generation-bound progress,
-  request-pool lifecycle bounds, jittered retry backoff, and hermetic tests.
-- **Required next action:** diagnose the DGX initial Telegram connection/network
-  path or execute the documented rollback trigger. Do not claim inbound
-  readiness without direct evidence.
+- **Next action:** map the current DGX primary/fallback Telegram network path and polling-progress ownership, then prepare a narrow correction only if the root cause is confirmed.
+- **Do not:** claim inbound readiness, fold ARCH-002 or monitoring work into this lane, or change credentials/allowlists/webhook state.
 
 ### Other ticket state
 
-- `HERMES-MONITORING-001`: `BLOCKED`; DGX SSH and agentmemory health reporting
-  is not cleared for merge or deployment.
-- `HERMES-AUTH-001`: `MERGED_DEPLOYED`; main CI, DGX runtime, and outbound
-  Telegram evidence are recorded above.
-- `HERMES-CALENDAR-GUARD-001`: `MERGED_DEPLOYED`; PR #17 introduced the
-  recovery path and PR #18 corrected the release-wrapper/venv deployment
-  integration. DGX timer and recovery oneshot are verified healthy.
-- `HERMES-RELIABILITY-002`: implementation remains separate; do not infer
-  completion from historical checkout files.
-- `ARCH-002`: proposed next core ticket; not started here.
+- `HERMES-UPDATE-001`: `MERGED_DEPLOYED`; PR #22, SHA `0fe3773c...`, Lane 2/3 review PASS and 33 targeted tests passed.
+- `HERMES-AUTH-001`: merged/deployed separately.
+- `HERMES-CALENDAR-GUARD-001`: merged/deployed; timer and recovery unit remain active.
+- `HERMES-MONITORING-001`: BLOCKED; do not infer readiness from this deployment.
+- `ARCH-002`: proposed next core ticket, deferred until the current Telegram transport gate is resolved or explicitly re-sequenced.
 
 ### Gate rule
 
-Ticket implementation, local tests, independent cross-review, reconciliation,
-CI, merge, DGX deployment, runtime health, and Telegram delivery are separate
-gates. A pass at one gate cannot be reported as a pass at another. The current
-Telegram ticket has implementation-review, CI, merge, and deployment evidence,
-but no live inbound or outbound Telegram evidence; service active is not
-Telegram readiness.
+Implementation, tests, independent review, reconciliation, CI, merge, deployment, service health, inbound polling, outbound delivery, and rollback are separate gates. The current lane has merge/deployment/service/outbound evidence but remains blocked on inbound polling evidence.
 
 ## 5. Safe continuation instructions
 
-1. Read this handover, `docs/ROADMAP-HERMES-DGX.md`, and the current ticket
-   plan before acting.
-2. Verify the exact repository root, remote, branch, HEAD, and worktree before
-   using any project fact.
-3. Preserve every pre-existing dirty and untracked file; do not reset, clean,
-   discard, or overwrite unrelated work.
-4. Use the repository's managed `.venv` for tests and CLI checks.
-5. Route Claude/Codex/AGY only to a uniquely addressable, real authenticated
-   session: DGX Spark first, then local WSL, then native Windows. A headless
-   fallback is allowed only after those candidates are unavailable and a
-   bounded preflight proves it is authenticated and usable.
-6. Do not change DGX runtime state without a reviewed deployment gate and
-   rollback evidence; the current release already has both.
-7. Before ending the next session, refresh this handover with verified facts
-   only, including the exact next action and any remaining gate.
+1. Read this handover, `docs/ROADMAP-HERMES-DGX.md`, and the current ticket plan before acting.
+2. Verify repository identity, current GitHub `main` SHA, DGX hostname, service, effective drop-ins, release marker, and rollback release.
+3. Preserve the dirty laptop worktree and the DGX live source checkout; do not reset, clean, or overwrite either.
+4. Use bounded, read-only DGX diagnostics for the Telegram network/polling diagnosis before implementation.
+5. Keep the current release and prior `30-...` release/drop-in as rollback evidence.
+6. Record direct inbound and outbound evidence separately; service active alone is insufficient.
+7. Refresh this handover only with verified facts and exact next action.

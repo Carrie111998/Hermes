@@ -251,3 +251,27 @@ the documented rollback trigger before claiming runtime health.
 
 `MERGED_DEPLOYED_RUNTIME_DEGRADED`. No Telegram inbound/outbound delivery
 claim is authorized by this plan without direct evidence.
+
+
+## Post-deploy E2E verification (2026-08-16)
+
+- The separately authorized deployment selected immutable release
+  `/home/cwliao/.hermes/releases/v2026.8.16-hermes-update-001-0fe3773ccf`
+  with marker SHA `0fe3773ccfbec860984d0dc93adc4875ca2d5d4b`.
+- Effective `hermes-gateway.service` evidence after restart: `active/running`,
+  MainPID `3992364`, `ExecMainStatus=0`, `NRestarts=0`, and WorkingDirectory
+  and PYTHONPATH matched the new release. The calendar-guard timer was
+  `active/waiting` and its unit/wrapper were updated to the same release.
+- Outbound E2E through the configured Hermes path
+  `hermes send --to telegram:SPARK --json` returned
+  `success=true`, `message_id=1967`, and `mirrored=true`.
+- Inbound E2E remains unproven/degraded. After restart at approximately
+  `06:31:43` CST, logs showed Telegram connection and command-menu
+  registration through approximately `06:31:52`, but no qualifying successful
+  `getUpdates` progress was observed through `06:37:25` CST. A connected
+  polling mode and an active systemd service do not clear this gate.
+- Result: service/process health PASS; outbound delivery PASS; inbound polling
+  DEGRADED/UNPROVEN; overall Telegram E2E is PARTIAL.
+- Next action: diagnose the DGX primary/fallback Telegram network path and the
+  exact polling-progress ownership before opening a correction set. Keep
+  ARCH-002 and monitoring work separate.
