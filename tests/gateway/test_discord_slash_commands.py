@@ -449,6 +449,36 @@ async def test_rename_thread_edits_only_when_current_name_matches(adapter):
     )
 
 
+@pytest.mark.asyncio
+async def test_rename_thread_accepts_shared_gateway_contract_kwargs(adapter):
+    """Native Discord must accept the same rename kwargs as relay adapters.
+
+    The gateway calls every adapter through one polymorphic contract.  Native
+    Discord ignores relay-only routing hints, but rejecting them prevents the
+    semantic rename from running at all.
+    """
+    thread = SimpleNamespace(
+        id=999,
+        name="raw user prompt",
+        edit=AsyncMock(),
+    )
+    adapter._client.get_channel = lambda _id: thread
+
+    result = await adapter.rename_thread(
+        "999",
+        "Semantic Session Title",
+        only_if_current_name="raw user prompt",
+        prefer_connector_created=False,
+        parent_chat_id=None,
+    )
+
+    assert result is True
+    thread.edit.assert_awaited_once_with(
+        name="Semantic Session Title",
+        reason="Hermes semantic session title",
+    )
+
+
 # ------------------------------------------------------------------
 # Auto-thread integration in _handle_message
 # ------------------------------------------------------------------
