@@ -336,3 +336,20 @@ def test_free_worker_unknown_mapping_fails_closed(gate):
     a = _agent(marker=True, task_class="MECHANICAL_EXECUTION")
     ok = gate._run_free_worker(a, "not_a_worker", {})
     assert ok is False
+
+@pytest.mark.parametrize(
+    "msg,expected",
+    [
+        # Regression: "pr" must NOT match inside "approved"/"update" (substring
+        # false-positive routed a mechanical patch to CODE_REVIEW, defeating the
+        # FREE execution lane). Now word-boundary matched.
+        ("apply the exact approved mechanical patch: rename file and update import", "MECHANICAL_EXECUTION"),
+        ("make cp the file to the backup dir", "MECHANICAL_EXECUTION"),
+        ("run sed to replace the version constant", "MECHANICAL_EXECUTION"),
+        # "pr" as a real standalone token still routes to CODE_REVIEW.
+        ("review this pr for bugs", "CODE_REVIEW"),
+        ("review the pull request for correctness", "CODE_REVIEW"),
+    ],
+)
+def test_classify_word_boundary_for_short_keywords(gate, msg, expected):
+    assert gate.classify_task(msg) == expected

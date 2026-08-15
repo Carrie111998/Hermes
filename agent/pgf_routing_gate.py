@@ -38,6 +38,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -539,6 +540,24 @@ _TASK_KEYWORDS: dict[str, list[str]] = {
 }
 
 
+#: Short, high-collision keywords that must be matched as WHOLE words (word
+#: boundary) rather than substrings, so e.g. ``pr`` (pull-request) does not
+#: fire inside "a**pr**oved" / "u**pr**ate" and hijack a mechanical task.
+_WORD_ONLY_KEYWORDS = frozenset({"pr", "cp", "mv", "sed", "ls", "find", "date"})
+
+
+def _matches(low: str, keyword: str) -> bool:
+    """True when `keyword` appears in `low`.
+
+    Short high-collision keywords (``pr``, ``cp``, ``mv``, ...) are matched as
+    whole words (``\\b`` boundaries) so substrings inside common words cannot
+    cause a false routing class. All other keywords use substring matching.
+    """
+    if keyword in _WORD_ONLY_KEYWORDS:
+        return bool(re.search(rf"(?<![a-z0-9]){re.escape(keyword)}(?![a-z0-9])", low))
+    return keyword in low
+
+
 def classify_task(user_message: Any, task_id: str | None = None) -> str:
     """Deterministic task classification for a governed PGF task.
 
@@ -558,11 +577,11 @@ def classify_task(user_message: Any, task_id: str | None = None) -> str:
 
     # High-value reasoning classes checked first (order matters: earlier wins).
     for klass in ("CRITICAL_REASONING", "ARCHITECTURE", "COMPLEX_DEBUGGING", "CODE_REVIEW"):
-        if any(kw in low for kw in _TASK_KEYWORDS[klass]):
+        if any(_matches(low, kw) for kw in _TASK_KEYWORDS[klass]):
             return klass
 
     for klass in ("TEST_VALIDATION", "MECHANICAL_EXECUTION", "SUMMARIZATION"):
-        if any(kw in low for kw in _TASK_KEYWORDS[klass]):
+        if any(_matches(low, kw) for kw in _TASK_KEYWORDS[klass]):
             return klass
 
     return "NORMAL_CODING"
