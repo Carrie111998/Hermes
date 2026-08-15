@@ -11,6 +11,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { ClientSessionState } from '@/app/types'
 import { createClientSessionState } from '@/lib/chat-runtime'
+import { clearAllPrompts, sessionApprovalRequest, setApprovalRequest } from '@/store/prompts'
 import type { RpcEvent } from '@/types/hermes'
 
 import { STREAM_DELTA_FLUSH_MS } from './utils'
@@ -18,6 +19,7 @@ import { STREAM_DELTA_FLUSH_MS } from './utils'
 import { useMessageStream } from './index'
 
 const SID = 'stale-pending-session'
+const OTHER_SID = 'other-session'
 
 let handleEvent: ((event: RpcEvent) => void) | null = null
 let states: Map<string, ClientSessionState>
@@ -71,10 +73,12 @@ describe('turn end without message.complete (session.info running=false)', () =>
   beforeEach(() => {
     handleEvent = null
     states = new Map()
+    clearAllPrompts()
   })
 
   afterEach(() => {
     cleanup()
+    clearAllPrompts()
     vi.useRealTimers()
     vi.restoreAllMocks()
   })
@@ -124,5 +128,27 @@ describe('turn end without message.complete (session.info running=false)', () =>
     // pending, and the stream binding is released.
     expect(state?.messages.every(message => !message.pending)).toBe(true)
     expect(state?.streamId).toBeNull()
+  })
+
+  it('retires only the finished session approval when message.complete was missed', async () => {
+    await mountHarness()
+
+    emit({ session_id: SID, type: 'message.start', payload: {} })
+    emit({
+      payload: { command: 'rm stale', description: 'stale request' },
+      session_id: SID,
+      type: 'approval.request'
+    })
+    setApprovalRequest({ command: 'rm other', description: 'other request', sessionId: OTHER_SID })
+
+    expect(states.get(SID)?.needsInput).toBe(true)
+
+    emit({ payload: { running: false }, session_id: SID, type: 'session.info' })
+
+    expect(sessionApprovalRequest(SID).get()).toBeNull()
+    expect(sessionApprovalRequest(OTHER_SID).get()?.command).toBe('rm other')
+    expect(states.get(SID)?.awaitingResponse).toBe(false)
+    expect(states.get(SID)?.busy).toBe(false)
+    expect(states.get(SID)?.needsInput).toBe(false)
   })
 })
