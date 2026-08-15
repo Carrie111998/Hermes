@@ -77,7 +77,12 @@ def _count_tool_errors(messages) -> int:
     key (``tools.registry.tool_error``'s canonical shape).
     """
     count = 0
-    for m in messages:
+    # Scan backward and stop at the last ``user`` message: ``messages`` is the
+    # full session history, and earlier turns' tool errors must not be counted
+    # against this turn (nor re-parsed — tool payloads are routinely large).
+    for m in reversed(messages):
+        if isinstance(m, dict) and m.get("role") == "user":
+            break  # turn boundary — earlier errors belong to prior turns
         if not isinstance(m, dict) or m.get("role") != "tool":
             continue
         content = m.get("content")

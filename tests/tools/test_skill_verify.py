@@ -288,6 +288,33 @@ def test_verifier_timeout_returns_failure(verify_env):
     assert elapsed < 4
 
 
+@pytest.mark.live_system_guard_bypass
+def test_applicability_probe_timeout_is_skip_not_fail(verify_env):
+    """A slow applicability probe means the turn was never judgeable — it must
+    SKIP (None), never record a mechanical FAIL against the skill."""
+    env = verify_env
+    d = _write_skill_with_verify(
+        env["skills"],
+        "svc_probe_slow",
+        _verify_block(
+            "scripts/verify.py",
+            applicability="scripts/applicable.py",
+            timeout=1,
+        ),
+    )
+    _write_script(d, "scripts/applicable.py", _sleep_script(5))
+    _write_script(d, "scripts/verify.py", _json_script(False, "should not run"))
+    env["skill_usage"].set_verify_enabled("svc_probe_slow", True)
+
+    from tools.skill_verify import run_verification
+
+    start = time.monotonic()
+    outcome = run_verification("svc_probe_slow", d, env["task_cwd"])
+    elapsed = time.monotonic() - start
+    assert outcome is None  # skip, not a FAIL
+    assert elapsed < 4  # bounded by min(timeout, 10), not the 5s sleep
+
+
 def test_missing_verify_block_returns_none(verify_env):
     env = verify_env
     d = env["skills"] / "svc_no_verify"
@@ -305,15 +332,23 @@ def test_missing_verify_block_returns_none(verify_env):
 
 def test_script_escaping_skill_dir_is_refused(verify_env):
     """A verifier run path pointing outside the skill dir is a hostile or buggy
-    author — refuse to execute rather than follow it."""
+    author — refuse to execute rather than follow it.
+
+    The run path resolves to a REAL file outside the skill dir (created
+    below), so ``_resolve_command``'s escape check — not a missing script —
+    is the only thing that can produce None.
+    """
     env = verify_env
     outside = env["task_cwd"] / "outside.py"
     outside.write_text(_json_script(True, "nope"), encoding="utf-8")
+    # Relative path from <home>/skills/svc_escape to <tmp_path>/task/outside.py
+    escape_path = "../../../task/outside.py"
     d = _write_skill_with_verify(
         env["skills"],
         "svc_escape",
-        _verify_block("../task/outside.py"),
+        _verify_block(escape_path),
     )
+    assert (d / escape_path).resolve() == outside.resolve()
     env["skill_usage"].set_verify_enabled("svc_escape", True)
 
     from tools.skill_verify import run_verification
@@ -350,4 +385,8 @@ def test_verify_and_record_outcome_records_verdict(verify_env):
     outcome = verify_and_record_outcome("svc_record", d, env["task_cwd"])
     assert outcome is not None
     assert outcome.success is False
-    assert env["skill_usage"].get_record("svc_record")["recent_outcomes"] == [False]
+    rec = env["skill_usage"].get_record("svc_record")
+    assert rec["recent_outcomes"] == [False]
+    # The verifier's reason must be preserved for the curator review pass —
+    # bump_outcome stores it alongside the verdict.
+    assert rec["recent_outcome_reasons"] == ["failed check"]

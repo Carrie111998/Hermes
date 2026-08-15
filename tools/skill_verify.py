@@ -167,7 +167,18 @@ def run_verification(
             probe_cmd = _resolve_command(skill_dir, spec.applicability_check)
             if probe_cmd is None:
                 return None
-            probe = _run(probe_cmd, cwd=task_cwd, timeout=min(spec.timeout_seconds, 10))
+            probe_timeout = min(spec.timeout_seconds, 10)
+            try:
+                probe = _run(probe_cmd, cwd=task_cwd, timeout=probe_timeout)
+            except subprocess.TimeoutExpired:
+                # A slow probe is not a judgment: the turn was never judgeable,
+                # so it must SKIP (None), never record a mechanical FAIL.
+                logger.debug(
+                    "applicability probe for %s timed out after %ss — skip",
+                    skill_name,
+                    probe_timeout,
+                )
+                return None
             if probe.returncode != 0:
                 return None  # not applicable this turn — skip, don't judge
 
@@ -193,5 +204,5 @@ def verify_and_record_outcome(
     """Run verification and, if it produced a judgment, feed it to bump_outcome()."""
     outcome = run_verification(skill_name, skill_dir, task_cwd)
     if outcome is not None:
-        bump_outcome(skill_name, outcome.success)
+        bump_outcome(skill_name, outcome.success, reason=outcome.reason or None)
     return outcome
