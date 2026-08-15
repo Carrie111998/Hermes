@@ -58,6 +58,11 @@ RuntimeValidator = Callable[[], bool]
 # a pasted stack trace.
 MAX_TITLE_INPUT_CHARS = 1000
 
+# Contextual Discord thread titles are generated only after the first assistant
+# response completes. Keep enough of that turn to include useful tool output and
+# the answer, while still bounding the auxiliary request.
+MAX_CONTEXTUAL_TITLE_INPUT_CHARS = 6000
+
 # Cap on the instant derived title. Deliberately shorter than the model's
 # budget: a raw sentence fragment reads worse the longer it runs. Cline and
 # Codex CLI independently landed on the same ~50-char slice.
@@ -439,6 +444,136 @@ def generate_title(
             except Exception:
                 logger.debug("Title generation failure_callback raised", exc_info=True)
         return None
+
+
+def generate_contextual_title(
+    opening_message: str,
+    context: list,
+    failure_callback: Optional[FailureCallback] = None,
+    main_runtime: Optional[dict] = None,
+    runtime_validator: Optional[RuntimeValidator] = None,
+) -> Optional[str]:
+    """Generate a title from a completed first-turn transcript.
+
+    This is separate from normal session auto-titling, which runs at turn start
+    from the opener alone. Discord auto-thread renaming needs the richer
+    semantics available after tools and the assistant response have completed.
+    """
+    if not _auto_title_enabled():
+        return None
+    if runtime_validator is not None:
+        try:
+            if not runtime_validator():
+                return None
+        except Exception:
+            logger.debug("Contextual-title runtime validator raised; proceeding", exc_info=True)
+
+    transcript = []
+    for message in context or []:
+        if not isinstance(message, dict):
+            continue
+        role = str(message.get("role") or "").strip().lower()
+        if role not in {"user", "assistant", "tool"}:
+            continue
+        text = flatten_message_text(message.get("content")).strip()
+        if text:
+            transcript.append(f"{role.upper()}: {text}")
+    if not transcript or not any(line.startswith("ASSISTANT:") for line in transcript):
+        return None
+
+    opener = _summarize_user_message(opening_message)[:MAX_TITLE_INPUT_CHARS]
+    transcript_text = "\n".join(transcript)[-MAX_CONTEXTUAL_TITLE_INPUT_CHARS:]
+    user_content = (
+        f"Opening request:\n{opener}\n\n"
+        f"Completed first-turn transcript:\n{transcript_text}"
+    )
+    language = _title_language()
+    language_rule = (
+        _LANGUAGE_RULE_PINNED.format(language=language)
+        if language
+        else _LANGUAGE_RULE_MATCH_USER
+    )
+    prompt = _TITLE_PROMPT_TEMPLATE.replace("__LANGUAGE_RULE__", language_rule)
+    prompt = prompt.replace(
+        "Given the user's opening message",
+        "Given the user's opening message and completed first-turn transcript",
+    )
+
+    try:
+        response = call_llm(
+            task="title_generation",
+            messages=[
+                {"role": "system", "content": prompt},
+                {"role": "user", "content": user_content},
+            ],
+            max_tokens=64,
+            temperature=0.3,
+            main_runtime=main_runtime,
+            extra_body={"response_format": _TITLE_RESPONSE_FORMAT},
+        )
+        content = response.choices[0].message.content or ""
+        return _clean_title(_extract_title_text(content))
+    except Exception as exc:
+        logger.warning("Contextual title generation failed: %s", exc)
+        logger.debug("Contextual title generation traceback", exc_info=True)
+        if failure_callback is not None:
+            try:
+                failure_callback("contextual title generation", exc)
+            except Exception:
+                logger.debug("Contextual title failure_callback raised", exc_info=True)
+        return None
+
+
+def maybe_generate_contextual_title(
+    session_db,
+    session_id: str,
+    opening_message: str,
+    context: list,
+    *,
+    failure_callback: Optional[FailureCallback] = None,
+    main_runtime: Optional[dict] = None,
+    title_callback: Optional[TitleCallback] = None,
+    runtime_validator: Optional[RuntimeValidator] = None,
+) -> None:
+    """Generate a post-response contextual title on a daemon thread.
+
+    The result is delivered to ``title_callback`` but is not persisted as the
+    session title: normal opener-based auto-titling owns that row, while this
+    richer one-shot title is specifically for a Discord auto-thread rename.
+    """
+    if not session_id or not opening_message or not context or title_callback is None:
+        return
+
+    def _worker() -> None:
+        try:
+            if session_db is not None:
+                from agent.aux_accounting import set_accounting_context
+                from agent.portal_tags import set_conversation_context
+
+                conversation_id = session_id
+                try:
+                    conversation_id = session_db.get_conversation_root(session_id) or session_id
+                except Exception:
+                    pass
+                set_conversation_context(conversation_id)
+                set_accounting_context(session_db, session_id)
+            title = generate_contextual_title(
+                opening_message,
+                context,
+                failure_callback=failure_callback,
+                main_runtime=main_runtime,
+                runtime_validator=runtime_validator,
+            )
+            if title:
+                title_callback(title, "llm")
+        except Exception:
+            logger.debug("Contextual auto-title worker failed", exc_info=True)
+
+    threading.Thread(
+        target=_worker,
+        daemon=True,
+        name="contextual-auto-title",
+    ).start()
 
 
 def _persist_session_title(session_db, session_id, title, *, source, dedupe=True):

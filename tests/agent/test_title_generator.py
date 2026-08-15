@@ -5,6 +5,7 @@ from unittest.mock import MagicMock, patch
 
 
 from agent.title_generator import (
+    generate_contextual_title,
     generate_title,
     auto_title_session,
     maybe_auto_title,
@@ -45,6 +46,24 @@ class TestGenerateTitle:
 
         assert captured_kwargs["task"] == "title_generation"
         assert captured_kwargs["timeout"] is None
+
+    def test_contextual_title_includes_completed_tool_and_assistant_context(self):
+        response = MagicMock()
+        response.choices = [MagicMock()]
+        response.choices[0].message.content = '{"title":"Reusable agent workflows"}'
+        context = [
+            {"role": "user", "content": "Summarize this recording"},
+            {"role": "tool", "content": "Transcript covers Buzz, Orca, and reusable skills"},
+            {"role": "assistant", "content": "The recording explains reusable agent workflows"},
+        ]
+
+        with patch("agent.title_generator.call_llm", return_value=response) as llm:
+            title = generate_contextual_title("Summarize this recording", context)
+
+        assert title == "Reusable agent workflows"
+        title_input = llm.call_args.kwargs["messages"][1]["content"]
+        assert "Buzz, Orca" in title_input
+        assert "The recording explains reusable agent workflows" in title_input
 
 
 
