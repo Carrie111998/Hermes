@@ -28,6 +28,7 @@ from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_epic_release as ker
 from hermes_cli import kanban_intake
 from hermes_cli import kanban_swarm as ks
+from hermes_cli import kanban_v2_migration
 
 
 # ---------------------------------------------------------------------------
@@ -277,6 +278,30 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         help="Restore a migration's immutable pre-apply snapshot",
     )
     p_qualification_migrate.add_argument(
+        "--json", action="store_true", help="Emit the full machine-readable result"
+    )
+
+    # --- v2-migrate ---
+    p_v2_migrate = sub.add_parser(
+        "v2-migrate",
+        help="Audit or migrate a scratch kanban DB copy to product v2",
+    )
+    p_v2_migrate.add_argument(
+        "db_path",
+        metavar="<db-path>",
+        help="Absolute path to the scratch SQLite DB copy to audit or migrate",
+    )
+    p_v2_migrate.add_argument(
+        "--apply",
+        action="store_true",
+        help="Snapshot, backfill product workflow metadata, and produce receipt",
+    )
+    p_v2_migrate.add_argument(
+        "--recovery-root",
+        metavar="<dir>",
+        help="Directory for immutable migration snapshots (default: next to the DB)",
+    )
+    p_v2_migrate.add_argument(
         "--json", action="store_true", help="Emit the full machine-readable result"
     )
 
@@ -1187,7 +1212,7 @@ def kanban_command(args: argparse.Namespace) -> int:
         # These migrations own their full safety boundaries: dry-run must be
         # byte-for-byte read-only, while apply must snapshot before any schema
         # migration. Their implementations open the boards themselves.
-        if action not in {"qualification-migrate", "legacy-reconcile"}:
+        if action not in {"qualification-migrate", "legacy-reconcile", "v2-migrate"}:
             try:
                 kb.init_db()
             except Exception as exc:
@@ -1197,6 +1222,7 @@ def kanban_command(args: argparse.Namespace) -> int:
         handlers = {
             "init":     _cmd_init,
             "qualification-migrate": _cmd_qualification_migrate,
+            "v2-migrate": _cmd_v2_migrate,
             "legacy-reconcile": _cmd_legacy_reconcile,
             "create":   _cmd_create,
             "swarm":    _cmd_swarm,
@@ -1715,6 +1741,42 @@ def _cmd_qualification_migrate(args: argparse.Namespace) -> int:
             f"{counts['running']} running, {counts['ambiguous']} ambiguous."
         )
         print("Ready to apply." if result["strict_ready"] else "Not safe to apply.")
+    return 0
+
+
+def _cmd_v2_migrate(args: argparse.Namespace) -> int:
+    db_path = getattr(args, "db_path", "")
+    if not db_path:
+        print("kanban v2-migrate: <db-path> is required", file=sys.stderr)
+        return 2
+
+    try:
+        if args.apply:
+            result = kanban_v2_migration.apply_db(
+                db_path,
+                recovery_root=args.recovery_root,
+            )
+        else:
+            result = kanban_v2_migration.audit_db(db_path)
+    except kanban_v2_migration.MigrationBlocked as exc:
+        print(f"kanban v2-migrate: blocked: {exc}", file=sys.stderr)
+        return 1
+
+    if args.json:
+        print(json.dumps(result, indent=2, sort_keys=True, default=str))
+    elif args.apply:
+        print(
+            f"V2 migration applied: {result['changed']} task(s) backfilled to product workflow. "
+            f"Receipt: {result['receipt_path']}"
+        )
+    else:
+        counts = result["counts"]
+        print(
+            f"V2 dry-run: {counts['total']} task(s), "
+            f"{counts['already_product']} already product, "
+            f"{counts['needs_migration']} need migration."
+        )
+        print("Ready to apply." if not counts.get("active", 0) else "Not safe to apply.")
     return 0
 
 
