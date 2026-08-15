@@ -2798,6 +2798,7 @@ def cmd_chat(args):
     # authoritative site because it runs before tool imports freeze
     # _YOLO_MODE_FROZEN.  This redundant set is a safety net for callers
     # that invoke cmd_chat directly (e.g. subcommand dispatch).
+    _apply_config_isolation(args)
     if getattr(args, "yolo", False):
         os.environ["HERMES_YOLO_MODE"] = "1"
 
@@ -11169,12 +11170,18 @@ def _prepare_agent_startup(args) -> None:
         )
 
 
+def _apply_config_isolation(args) -> None:
+    safe_mode = getattr(args, "safe_mode", False)
+    if getattr(args, "ignore_user_config", False) or safe_mode:
+        os.environ["HERMES_IGNORE_USER_CONFIG"] = "1"
+    if getattr(args, "ignore_rules", False) or safe_mode:
+        os.environ["HERMES_IGNORE_RULES"] = "1"
+
+
 def _apply_safe_mode(args) -> None:
-    if not getattr(args, "safe_mode", False):
-        return
-    os.environ["HERMES_SAFE_MODE"] = "1"
-    os.environ["HERMES_IGNORE_USER_CONFIG"] = "1"
-    os.environ["HERMES_IGNORE_RULES"] = "1"
+    _apply_config_isolation(args)
+    if getattr(args, "safe_mode", False):
+        os.environ["HERMES_SAFE_MODE"] = "1"
 
 
 def _set_chat_arg_defaults(args) -> None:
@@ -11244,6 +11251,7 @@ def _try_fast_chat_launch() -> bool:
     if getattr(args, "command", None) not in {None, "chat"}:
         return False
 
+    _apply_config_isolation(args)
     if getattr(args, "yolo", False):
         os.environ["HERMES_YOLO_MODE"] = "1"
     _prepare_agent_startup(args)
@@ -11305,6 +11313,7 @@ def _try_termux_fast_cli_launch() -> bool:
         _print_version_info(check_updates=False)
         return True
 
+    _apply_config_isolation(args)
     if getattr(args, "oneshot", None):
         _prepare_agent_startup(args)
         _confirm_startup_expensive_model_override(args)
@@ -12983,6 +12992,10 @@ def main():
     if args.version:
         cmd_version(args)
         return
+
+    # Config/rule isolation must precede startup imports so it also applies to
+    # one-shot mode, which dispatches before cmd_chat().
+    _apply_config_isolation(args)
 
     # --yolo: set HERMES_YOLO_MODE *before* plugin discovery.  The call to
     # _prepare_agent_startup() below triggers discover_plugins() → tool
