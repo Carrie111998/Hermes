@@ -534,7 +534,7 @@ function Start-DesktopRelaunch {
     return $spawned
 }
 
-function Invoke-HermesStep([string]$Exe, [string[]]$HermesArgs, [string]$Tag) {
+function Invoke-ProcessStep([string]$Exe, [string[]]$ProcessArgs, [string]$Tag) {
     # The window shows nothing live, so no line-pump: both pipes drain
     # asynchronously (no deadlock however chatty the child) while a small
     # DoEvents loop keeps the marquee animating through long silent
@@ -547,7 +547,7 @@ function Invoke-HermesStep([string]$Exe, [string[]]$HermesArgs, [string]$Tag) {
     $psi.FileName = $Exe
     # .Arguments string (PS 5.1 / .NET Framework has no ArgumentList).
     # Args here are fixed flags + a branch ref; quote each defensively.
-    $psi.Arguments = ($HermesArgs | ForEach-Object { '"{0}"' -f ($_ -replace '"', '\"') }) -join ' '
+    $psi.Arguments = ($ProcessArgs | ForEach-Object { '"{0}"' -f ($_ -replace '"', '\"') }) -join ' '
     $psi.UseShellExecute = $false
     $psi.RedirectStandardOutput = $true
     $psi.RedirectStandardError = $true
@@ -582,6 +582,14 @@ function Invoke-HermesStep([string]$Exe, [string[]]$HermesArgs, [string]$Tag) {
     return @{ Code = $proc.ExitCode; Output = $all }
 }
 
+function Invoke-HermesStep([string]$Exe, [string[]]$HermesArgs, [string]$Tag) {
+    return Invoke-ProcessStep $Exe $HermesArgs $Tag
+}
+
+function Invoke-ExternalStep([string]$Exe, [string[]]$ProcessArgs, [string]$Tag) {
+    return Invoke-ProcessStep $Exe $ProcessArgs $Tag
+}
+
 function Invoke-UpdateBootstrap([string]$Root, [string]$Ref) {
     # The Python updater can be too old to fetch the commit that fixes its own
     # self-lock preflight.  Run the recovery from PowerShell (an OS component,
@@ -601,7 +609,7 @@ function Invoke-UpdateBootstrap([string]$Root, [string]$Ref) {
         "-InstallRoot", $Root, "-Branch", $Ref, "-NoRelaunch"
     )
     Write-HandoffLog "self-lock exit 2: advancing checkout through external bootstrap"
-    return Invoke-HermesStep $powershell $bootstrapArgs "bootstrap"
+    return Invoke-ExternalStep $powershell $bootstrapArgs "bootstrap"
 }
 
 $finalCode = 1
