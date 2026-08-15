@@ -492,9 +492,29 @@ def finalize_turn(
         try:
             _failed = getattr(agent, "_turn_failed_file_mutations", None) or {}
             if _failed and agent._file_mutation_verifier_enabled():
-                footer = agent._format_file_mutation_failure_footer(_failed)
-                if footer:
-                    final_response = final_response.rstrip() + "\n\n" + footer
+                _reconcile = getattr(agent, "_reconcile_file_mutation_failures", None)
+                if callable(_reconcile):
+                    _unchanged, _changed_elsewhere = _reconcile()
+                else:
+                    # Backward compatibility for duck-typed agents that only
+                    # implement the original verifier surface.
+                    _unchanged, _changed_elsewhere = _failed, {}
+
+                _footers = []
+                if _unchanged:
+                    _footer = agent._format_file_mutation_failure_footer(_unchanged)
+                    if _footer:
+                        _footers.append(_footer)
+                if _changed_elsewhere:
+                    _footer = agent._format_file_mutation_out_of_band_footer(
+                        _changed_elsewhere
+                    )
+                    if _footer:
+                        _footers.append(_footer)
+                if _footers:
+                    final_response = (
+                        final_response.rstrip() + "\n\n" + "\n\n".join(_footers)
+                    )
         except Exception as _ver_err:
             logger.debug("file-mutation verifier footer failed: %s", _ver_err)
 
