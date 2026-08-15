@@ -49,6 +49,24 @@ display:
   compact: true
   streaming: true
 
+# Auxiliary models — use NVIDIA NIM for title generation and compression
+auxiliary:
+  title_generation:
+    provider: nvidia
+    model: meta/llama-3.1-8b-instruct
+    base_url: https://integrate.api.nvidia.com/v1
+    key_env: NVIDIA_API_KEY
+  compression:
+    provider: nvidia
+    model: meta/llama-3.1-8b-instruct
+    base_url: https://integrate.api.nvidia.com/v1
+    key_env: NVIDIA_API_KEY
+  vision:
+    provider: nvidia
+    model: meta/llama-3.2-11b-vision-instruct
+    base_url: https://integrate.api.nvidia.com/v1
+    key_env: NVIDIA_API_KEY
+
 # Memory: full limits to carry TAD project knowledge
 memory:
   memory_enabled: true
