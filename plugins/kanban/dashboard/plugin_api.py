@@ -134,10 +134,13 @@ def _signal_ws_validation_error(ws: "WebSocket") -> Optional[str]:
     if not board_raw:
         return "board is required"
     try:
-        if not kanban_db._normalize_board_slug(board_raw):
+        normed_board = kanban_db._normalize_board_slug(board_raw)
+        if not normed_board:
             return "board is required"
     except ValueError as exc:
         return str(exc)
+    if normed_board != kanban_db.DEFAULT_BOARD and not kanban_db.board_exists(normed_board):
+        return f"board {normed_board!r} does not exist"
 
     since_raw = ws.query_params.get("since")
     if since_raw is not None:

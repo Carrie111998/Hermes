@@ -149,6 +149,18 @@ async def test_signal_mode_requires_board(kanban_home, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_signal_mode_rejects_nonexistent_board(kanban_home, monkeypatch):
+    mod = _load_plugin_module()
+    monkeypatch.setattr(mod, "_ws_upgrade_authorized", lambda ws: True)
+    ws = _FakeWebSocket([("view", "signal"), ("board", "no-such-board")])
+
+    await asyncio.wait_for(mod.stream_events(ws), timeout=5)
+
+    assert not ws.accepted
+    assert ws.closed_with == mod.http_status.WS_1008_POLICY_VIOLATION
+
+
+@pytest.mark.asyncio
 async def test_signal_mode_rejects_malformed_since_instead_of_coercing(kanban_home, monkeypatch):
     mod = _load_plugin_module()
     monkeypatch.setattr(mod, "_ws_upgrade_authorized", lambda ws: True)
