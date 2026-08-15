@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import sys
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
@@ -167,12 +168,38 @@ def _write_usage_file(path: Optional[str], result: dict, failure: Optional[str] 
         pass
 
 
+_WORKER_CONTEXT_ENV_VARS = ("HERMES_KANBAN_TASK", "HERMES_KANBAN_BOARD")
+
+
+def _diagnostic_slug(value: object) -> str:
+    candidate = str(value or "").strip()
+    if candidate and re.fullmatch(r"[A-Za-z0-9._:/+\-]+", candidate):
+        return candidate
+    return "UNKNOWN"
+
+
+def _isolated_precondition_error(toolsets: object, usage_file: Optional[str]) -> Optional[str]:
+    present = [name for name in _WORKER_CONTEXT_ENV_VARS if os.environ.get(name, "").strip()]
+    if present:
+        return (
+            "hermes -z --isolated: refusing to run inside a Kanban worker / "
+            f"delegation context ({', '.join(present)} set).\n"
+        )
+    if _normalize_toolsets(toolsets) is not None:
+        return "hermes -z --isolated: --toolsets cannot be combined with --isolated.\n"
+    if usage_file:
+        return "hermes -z --isolated: --usage-file cannot be combined with --isolated.\n"
+    return None
+
+
 def run_oneshot(
     prompt: str,
     model: Optional[str] = None,
     provider: Optional[str] = None,
     toolsets: object = None,
     usage_file: Optional[str] = None,
+    isolated: bool = False,
+    show_response_metadata: bool = False,
 ) -> int:
     """Execute a single prompt and print only the final content block.
 
@@ -195,6 +222,9 @@ def run_oneshot(
     # handlers added by setup_logging() keep working (they're attached to
     # the root logger's handler list, not affected by level), but no
     # bytes reach the terminal.
+    if show_response_metadata and not isolated:
+        sys.stderr.write("hermes -z: --show-response-metadata requires --isolated.\n")
+        return 2
     logging.disable(logging.CRITICAL)
 
     # --provider without --model is ambiguous: carrying the user's configured
@@ -210,16 +240,25 @@ def run_oneshot(
         )
         return 2
 
-    explicit_toolsets, toolsets_error = _validate_explicit_toolsets(toolsets)
-    if toolsets_error:
-        sys.stderr.write(toolsets_error)
-        return 2
-    use_config_toolsets = _normalize_toolsets(toolsets) is None
+    if isolated:
+        isolated_error = _isolated_precondition_error(toolsets, usage_file)
+        if isolated_error:
+            sys.stderr.write(isolated_error)
+            return 2
+        explicit_toolsets = []
+        use_config_toolsets = False
+    else:
+        explicit_toolsets, toolsets_error = _validate_explicit_toolsets(toolsets)
+        if toolsets_error:
+            sys.stderr.write(toolsets_error)
+            return 2
+        use_config_toolsets = _normalize_toolsets(toolsets) is None
 
     # Auto-approve any shell / tool approvals.  Non-interactive by
     # definition — a prompt would hang forever.
-    os.environ["HERMES_YOLO_MODE"] = "1"
-    os.environ["HERMES_ACCEPT_HOOKS"] = "1"
+    if not isolated:
+        os.environ["HERMES_YOLO_MODE"] = "1"
+        os.environ["HERMES_ACCEPT_HOOKS"] = "1"
 
     # One-shot prints a single final response and exits: there is no later turn
     # for a detached subagent's completion to re-enter, and nothing here drains
@@ -248,6 +287,7 @@ def run_oneshot(
                     provider=provider,
                     toolsets=explicit_toolsets,
                     use_config_toolsets=use_config_toolsets,
+                    isolated=isolated,
                 )
             except BaseException as exc:  # noqa: BLE001
                 # Capture anything that escapes the agent (including OSError
@@ -276,6 +316,13 @@ def run_oneshot(
         return 1
 
     _write_usage_file(usage_file, result)
+
+    if show_response_metadata:
+        real_stderr.write("HTTP_STATUS=UNKNOWN\n")
+        real_stderr.write(f"REQUESTED_MODEL={_diagnostic_slug(result.get('model'))}\n")
+        real_stderr.write(f"RESPONSE_MODEL={_diagnostic_slug(result.get('response_model'))}\n")
+        real_stderr.write(f"ROUTING_PROVIDER={_diagnostic_slug(result.get('provider'))}\n")
+        real_stderr.flush()
 
     # Model text can contain lone UTF-16 surrogates (invalid in UTF-8). Writing
     # those to a real stdout TextIO raises UnicodeEncodeError and aborts with
@@ -325,18 +372,19 @@ def _run_agent(
     provider: Optional[str] = None,
     toolsets: object = None,
     use_config_toolsets: bool = True,
+    isolated: bool = False,
 ) -> tuple[str, dict]:
     """Build an AIAgent exactly like a normal CLI chat turn would, then
     run a single conversation.  Returns ``(final_response, run_result)``."""
     # Imports are local so they don't run when hermes is invoked for
     # other commands (keeps top-level CLI startup cheap).
-    from hermes_cli.config import load_config
+    from hermes_cli.config import load_config, load_config_isolated
     from hermes_cli.models import detect_provider_for_model
     from hermes_cli.runtime_provider import resolve_runtime_provider
     from hermes_cli.tools_config import _get_platform_tools
     from run_agent import AIAgent
 
-    cfg = load_config()
+    cfg = load_config_isolated() if isolated else load_config()
 
     # Resolve effective model: explicit arg → env var → config.
     model_cfg = cfg.get("model") or {}
@@ -403,6 +451,8 @@ def _run_agent(
     toolsets_list = _normalize_toolsets(toolsets)
     if toolsets_list is None and use_config_toolsets:
         toolsets_list = sorted(_get_platform_tools(cfg, "cli"))
+    if isolated:
+        toolsets_list = []
 
     # Ensure MCP tools are discovered before building the agent.  Oneshot
     # bypasses cli.py's _prepare_agent_startup MCP background path and
@@ -411,14 +461,14 @@ def _run_agent(
     # registered yet.  This helper starts discovery if needed (idempotent) and
     # bounded-waits with the larger single-query bound (default 15s) because
     # there is only ONE turn and no between-turns late-binding refresh (#38448).
-    from hermes_cli.mcp_startup import ensure_mcp_discovery_before_agent_build
+    if not isolated:
+        from hermes_cli.mcp_startup import ensure_mcp_discovery_before_agent_build
+        ensure_mcp_discovery_before_agent_build(
+            logger=logging.getLogger(__name__),
+            single_query=True,
+        )
 
-    ensure_mcp_discovery_before_agent_build(
-        logger=logging.getLogger(__name__),
-        single_query=True,
-    )
-
-    session_db = _create_session_db_for_oneshot()
+    session_db = None if isolated else _create_session_db_for_oneshot()
     # The try spans agent construction (not just ``chat``) so the SQLite store
     # opened above is always closed — including when ``AIAgent(...)`` itself
     # raises on a provider/config error. The one-shot exit path hard-exits via
@@ -428,7 +478,22 @@ def _run_agent(
         # Read the effective fallback chain from profile config so oneshot
         # workers honour the same merge semantics as interactive CLI and
         # gateway sessions.
-        _fb = get_fallback_chain(cfg)
+        _fb = None if isolated else get_fallback_chain(cfg)
+        _isolated_kwargs = (
+            dict(
+                skip_context_files=True,
+                load_soul_identity=False,
+                skip_memory=True,
+                skip_background_review=True,
+                persist_session=False,
+                minimal_system_prompt=True,
+                api_max_attempts=1,
+                checkpoints_enabled=False,
+                save_trajectories=False,
+                isolated_runtime=True,
+            )
+            if isolated else {}
+        )
 
         agent = AIAgent(
             api_key=runtime.get("api_key"),
@@ -455,6 +520,7 @@ def _run_agent(
             #   - dangerous-command approval → bypassed via HERMES_YOLO_MODE=1
             #   - skill secret capture → returns gracefully when no callback set
             clarify_callback=_oneshot_clarify_callback,
+            **_isolated_kwargs,
         )
 
         # Belt-and-braces: make sure AIAgent doesn't invoke any streaming

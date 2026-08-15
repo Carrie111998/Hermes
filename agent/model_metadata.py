@@ -1173,21 +1173,30 @@ def _add_model_aliases(cache: Dict[str, Dict[str, Any]], model_id: str, entry: D
         cache.setdefault(bare_model, entry)
 
 
-def fetch_model_metadata(force_refresh: bool = False) -> Dict[str, Dict[str, Any]]:
+def fetch_model_metadata(
+    force_refresh: bool = False,
+    *,
+    read_only: bool = False,
+) -> Dict[str, Dict[str, Any]]:
     """Fetch model metadata from OpenRouter (cached for 1 hour)."""
     global _model_metadata_cache, _model_metadata_cache_time
 
     if not force_refresh and _model_metadata_cache and (time.time() - _model_metadata_cache_time) < _MODEL_CACHE_TTL:
         return _model_metadata_cache
 
-    if not force_refresh:
+    if not force_refresh or read_only:
         disk_age = _model_metadata_disk_cache_age_seconds()
-        if disk_age is not None and disk_age < _MODEL_CACHE_TTL:
+        if disk_age is not None and (read_only or disk_age < _MODEL_CACHE_TTL):
             disk_cache = _load_model_metadata_disk_cache()
             if disk_cache:
                 _model_metadata_cache = disk_cache
                 _model_metadata_cache_time = time.time() - disk_age
                 return _model_metadata_cache
+
+    # Persistence-isolated callers may consume an existing cache regardless
+    # of age, but must never refresh it over the network or write it back.
+    if read_only:
+        return {}
 
     try:
         _ensure_requests()

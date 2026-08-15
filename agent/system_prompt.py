@@ -353,6 +353,12 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     session — that's the only way to keep upstream prompt caches
     warm across turns.
     """
+    if getattr(agent, "_minimal_system_prompt", False):
+        minimal = DEFAULT_AGENT_IDENTITY
+        if system_message:
+            minimal = f"{minimal}\n\n{system_message.strip()}"
+        return {"stable": minimal, "context": "", "volatile": ""}
+
     # Local import to avoid pulling model_tools at module load.  Tests
     # patch ``run_agent.get_toolset_for_tool`` and similar helpers, so
     # we resolve through ``_ra()`` to honor those patches.
@@ -388,6 +394,15 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     if not _soul_loaded:
         # Fallback to hardcoded identity
         stable_parts.append(DEFAULT_AGENT_IDENTITY)
+
+    # Persona is a verified, immutable overlay on the shared runtime identity.
+    # It does not activate tools, skills, memory, or permissions.  Isolated P5
+    # never sets a kernel, and minimal-system-prompt returned above remains
+    # byte-for-byte unchanged.
+    _persona_kernel = getattr(agent, "_persona_kernel", None)
+    if _persona_kernel is not None:
+        from agent.persona.composer import compose_persona_prompt
+        stable_parts.append(compose_persona_prompt(_persona_kernel))
 
     # Pointer to the hermes-agent skill + docs for user questions about Hermes itself.
     stable_parts.append(HERMES_AGENT_HELP_GUIDANCE)
@@ -705,6 +720,16 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # API-call time only so it stays out of the cached/stored system prompt.
     if system_message is not None:
         context_parts.append(system_message)
+
+    # Reflective growth is explicitly enabled and selected at agent creation.
+    # It is untrusted, non-canonical context, never part of the identity prefix.
+    # Owner-approved Controlled Knowledge precedes lower-trust reflection.
+    _knowledge_context = getattr(agent, "_persona_knowledge_context", "")
+    if _knowledge_context:
+        context_parts.append(_knowledge_context)
+    _growth_context = getattr(agent, "_persona_growth_context", "")
+    if _growth_context:
+        context_parts.append(_growth_context)
 
     if not agent.skip_context_files:
         # Prefer the configured TERMINAL_CWD (gateway mode). When unset (local

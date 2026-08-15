@@ -3291,6 +3291,25 @@ def load_config_readonly() -> Dict[str, Any]:
     return _load_config_impl(want_deepcopy=False)
 
 
+def load_config_isolated() -> Dict[str, Any]:
+    """Read effective user config without creating or modifying any path."""
+    config = copy.deepcopy(DEFAULT_CONFIG)
+    try:
+        user_config = read_user_config_raw()
+        if "max_turns" in user_config:
+            agent_user_config = dict(user_config.get("agent") or {})
+            if agent_user_config.get("max_turns") is None:
+                agent_user_config["max_turns"] = user_config["max_turns"]
+            user_config["agent"] = agent_user_config
+            user_config.pop("max_turns", None)
+        config = _deep_merge(config, user_config)
+    except Exception:
+        pass
+    return _expand_env_vars(
+        _normalize_root_model_keys(_normalize_max_turns_config(config))
+    )
+
+
 def write_platform_config_field(
     platform_key: str,
     field_key: str,
@@ -3444,6 +3463,10 @@ def apply_terminal_config_to_env(
 
 
 def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
+    from hermes_cli.bootstrap_policy import is_isolated_oneshot
+
+    if is_isolated_oneshot():
+        return load_config_isolated()
     with _CONFIG_LOCK:
         ensure_hermes_home()
         config_path = get_config_path()

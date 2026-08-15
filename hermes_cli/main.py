@@ -173,6 +173,16 @@ def _cleanup_oneshot_runtime() -> None:
         pass
 
 
+def _enforce_isolated_requires_oneshot(args) -> None:
+    from hermes_cli._parser import validate_isolated_oneshot
+
+    error = validate_isolated_oneshot(args)
+    if error:
+        sys.stderr.write(error + "\n")
+        sys.stderr.flush()
+        raise SystemExit(2)
+
+
 def _run_and_exit_oneshot(
     prompt: str,
     *,
@@ -180,6 +190,8 @@ def _run_and_exit_oneshot(
     provider: object = None,
     toolsets: object = None,
     usage_file: object = None,
+    isolated: bool = False,
+    show_response_metadata: bool = False,
 ) -> None:
     try:
         from hermes_cli.oneshot import run_oneshot
@@ -190,6 +202,8 @@ def _run_and_exit_oneshot(
             provider=provider,
             toolsets=toolsets,
             usage_file=usage_file,
+            isolated=isolated,
+            show_response_metadata=show_response_metadata,
         )
     except KeyboardInterrupt:
         rc = 130
@@ -692,12 +706,15 @@ def _apply_profile_override() -> None:
 
 _apply_profile_override()
 
+from hermes_cli.bootstrap_policy import is_isolated_oneshot as _bootstrap_isolated
+
 # Load .env from ~/.hermes/.env first, then project root as dev fallback.
 # User-managed env files should override stale shell exports on restart.
 from hermes_cli.config import get_hermes_home
 from hermes_cli.env_loader import load_hermes_dotenv
 
-load_hermes_dotenv(project_env=PROJECT_ROOT / ".env")
+if not _bootstrap_isolated():
+    load_hermes_dotenv(project_env=PROJECT_ROOT / ".env")
 
 # Bridge security.redact_secrets from config.yaml → HERMES_REDACT_SECRETS env
 # var BEFORE hermes_logging imports agent.redact (which snapshots the flag at
@@ -748,6 +765,8 @@ except Exception:
 # Dashboard entrypoints bootstrap with GUI mode so gui.log is always present
 # during GUI testing, including pre-dispatch startup failures.
 try:
+    if _bootstrap_isolated():
+        raise RuntimeError("isolated one-shot suppresses file logging bootstrap")
     from hermes_logging import setup_logging as _setup_logging
 
     _setup_logging(
@@ -11080,6 +11099,10 @@ def _prepare_agent_startup(args) -> None:
         os.environ["HERMES_YOLO_MODE"] = "1"
     _apply_safe_mode(args)
 
+    from hermes_cli._parser import isolated_oneshot_active
+    if isolated_oneshot_active(args):
+        return
+
     _sub_attr, _sub_set = _AGENT_SUBCOMMANDS.get(args.command, (None, None))
     if not (
         args.command in _AGENT_COMMANDS
@@ -11229,6 +11252,7 @@ def _try_fast_chat_launch() -> bool:
         # Flags the light parser doesn't know — could belong to a plugin
         # subcommand or a newer full-parser flag. Fall back to full dispatch.
         return False
+    _enforce_isolated_requires_oneshot(args)
     if getattr(args, "version", False):
         return False
     if getattr(args, "command", None) not in {None, "chat"}:
@@ -11246,6 +11270,8 @@ def _try_fast_chat_launch() -> bool:
             provider=getattr(args, "provider", None),
             toolsets=getattr(args, "toolsets", None),
             usage_file=getattr(args, "usage_file", None),
+            isolated=getattr(args, "isolated_oneshot", False),
+            show_response_metadata=getattr(args, "show_response_metadata", False),
         )
 
     if (args.resume or args.continue_last) and args.command is None:
@@ -11289,6 +11315,7 @@ def _try_termux_fast_cli_launch() -> bool:
     parser, _subparsers, chat_parser = build_top_level_parser()
     chat_parser.set_defaults(func=cmd_chat)
     args = parser.parse_args(_coalesce_session_name_args(argv))
+    _enforce_isolated_requires_oneshot(args)
 
     if getattr(args, "version", False):
         _print_version_info(check_updates=False)
@@ -11303,6 +11330,8 @@ def _try_termux_fast_cli_launch() -> bool:
             provider=getattr(args, "provider", None),
             toolsets=getattr(args, "toolsets", None),
             usage_file=getattr(args, "usage_file", None),
+            isolated=getattr(args, "isolated_oneshot", False),
+            show_response_metadata=getattr(args, "show_response_metadata", False),
         )
 
     if (args.resume or args.continue_last) and args.command is None:
@@ -11355,6 +11384,7 @@ def _try_termux_fast_tui_launch() -> bool:
     parser, _subparsers, chat_parser = build_top_level_parser()
     chat_parser.set_defaults(func=cmd_chat)
     args = parser.parse_args(_coalesce_session_name_args(sys.argv[1:]))
+    _enforce_isolated_requires_oneshot(args)
 
     # Preserve top-level behaviours whose semantics are not "launch chat/TUI".
     if getattr(args, "version", False) or getattr(args, "oneshot", None):
@@ -12967,6 +12997,8 @@ def main():
         subparsers.required = False
         args = parser.parse_args(_processed_argv)
 
+    _enforce_isolated_requires_oneshot(args)
+
     # Handle --version flag
     if args.version:
         cmd_version(args)
@@ -12998,6 +13030,8 @@ def main():
             provider=getattr(args, "provider", None),
             toolsets=getattr(args, "toolsets", None),
             usage_file=getattr(args, "usage_file", None),
+            isolated=getattr(args, "isolated_oneshot", False),
+            show_response_metadata=getattr(args, "show_response_metadata", False),
         )
 
     # Handle top-level --resume / --continue as shortcut to chat

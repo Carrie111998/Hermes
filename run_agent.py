@@ -119,6 +119,7 @@ from agent.interrupt_compat import request_hard_interrupt
 
 
 from hermes_cli.env_loader import load_hermes_dotenv
+from hermes_cli.bootstrap_policy import is_isolated_oneshot as _bootstrap_isolated
 from hermes_cli.timeouts import (
     get_provider_request_timeout,
     get_provider_stale_timeout,
@@ -126,7 +127,11 @@ from hermes_cli.timeouts import (
 
 _hermes_home = get_hermes_home()
 _project_env = Path(__file__).parent / '.env'
-_loaded_env_paths = load_hermes_dotenv(hermes_home=_hermes_home, project_env=_project_env)
+_loaded_env_paths = (
+    []
+    if _bootstrap_isolated()
+    else load_hermes_dotenv(hermes_home=_hermes_home, project_env=_project_env)
+)
 if _loaded_env_paths:
     for _env_path in _loaded_env_paths:
         logger.info("Loaded environment variables from %s", _env_path)
@@ -141,9 +146,19 @@ from model_tools import (
     handle_function_call,  # noqa: F401  # re-exported for tests that mock.patch("run_agent.handle_function_call")
     check_toolset_requirements,  # noqa: F401  # re-exported for tests that mock.patch("run_agent.check_toolset_requirements")
 )
-from tools.terminal_tool import cleanup_vm, get_active_env
 from tools.interrupt import set_interrupt as _set_interrupt
-from tools.browser_tool import cleanup_browser
+if _bootstrap_isolated():
+    def cleanup_vm(*_args, **_kwargs):
+        return None
+
+    def get_active_env(*_args, **_kwargs):
+        return None
+
+    def cleanup_browser(*_args, **_kwargs):
+        return None
+else:
+    from tools.terminal_tool import cleanup_vm, get_active_env
+    from tools.browser_tool import cleanup_browser
 
 
 # Agent internals extracted to agent/ package for modularity
@@ -510,6 +525,15 @@ class AIAgent:
         checkpoint_max_file_size_mb: int = 10,
         pass_session_id: bool = False,
         requested_provider: str = None,
+        persist_session: bool = True,
+        minimal_system_prompt: bool = False,
+        api_max_attempts: int = None,
+        isolated_runtime: bool = False,
+        persona_id: str = None,
+        persona_growth_read: bool = False,
+        persona_growth_write: bool = False,
+        persona_growth_query: str = "",
+        persona_knowledge_read: bool = False,
     ):
         """Forwarder — see ``agent.agent_init.init_agent``."""
         if tool_delay is not None:
@@ -597,6 +621,15 @@ class AIAgent:
             checkpoint_max_total_size_mb=checkpoint_max_total_size_mb,
             checkpoint_max_file_size_mb=checkpoint_max_file_size_mb,
             pass_session_id=pass_session_id,
+            persist_session=persist_session,
+            minimal_system_prompt=minimal_system_prompt,
+            api_max_attempts=api_max_attempts,
+            isolated_runtime=isolated_runtime,
+            persona_id=persona_id,
+            persona_growth_read=persona_growth_read,
+            persona_growth_write=persona_growth_write,
+            persona_growth_query=persona_growth_query,
+            persona_knowledge_read=persona_knowledge_read,
         )
 
     def _get_session_db_for_recall(self):
@@ -6686,7 +6719,9 @@ class AIAgent:
         return interruptible_streaming_api_call(self, api_kwargs, on_first_delta=on_first_delta)
 
     def _try_activate_fallback(self, reason: "FailoverReason | None" = None) -> bool:
-        """Forwarder — see ``agent.chat_completion_helpers.try_activate_fallback``."""
+        """Forwarder to the shared fallback implementation."""
+        if getattr(self, "_fallback_disabled", False):
+            return False
         from agent.chat_completion_helpers import try_activate_fallback
         return try_activate_fallback(self, reason)
 
@@ -7632,7 +7667,11 @@ class AIAgent:
         # it buys is the turns AFTER compaction reading the cache it wrote.
         token = None
         if get_conversation_context() is None:
-            root = self._conversation_root_id()
+            root = (
+                ""
+                if getattr(self, "_isolated_runtime", False)
+                else self._conversation_root_id()
+            )
             if root:
                 token = set_conversation_context(root)
         # Every AIAgent compression has a fence, including ordinary in-turn and
@@ -8379,7 +8418,11 @@ class AIAgent:
             # web_extract, session_search, MoA slots, background-review forks
             # (which copy this Context into their thread) — inherits the
             # ``conversation=<root>`` tag with zero per-call-site plumbing.
-            token = set_conversation_context(self._conversation_root_id())
+            token = set_conversation_context(
+                ""
+                if getattr(self, "_isolated_runtime", False)
+                else self._conversation_root_id()
+            )
             # Publish the session accounting handles the same way so auxiliary
             # calls record their token usage into session_model_usage (task
             # dimension) — the fix for aux spend being invisible in analytics
