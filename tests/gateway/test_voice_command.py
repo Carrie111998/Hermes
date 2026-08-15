@@ -372,6 +372,7 @@ class TestDiscordPlayTtsSkip:
         adapter.platform = Platform.DISCORD
         adapter.config = config
         adapter._voice_clients = {}
+        adapter._voice_channel_intents = {}
         adapter._voice_locks = {}
         adapter._voice_text_channels = {}
         adapter._voice_sources = {}
@@ -716,6 +717,7 @@ class TestDiscordVoiceChannelMethods:
         adapter.config = config
         adapter._client = MagicMock()
         adapter._voice_clients = {}
+        adapter._voice_channel_intents = {}
         adapter._voice_locks = {}
         adapter._voice_text_channels = {}
         adapter._voice_sources = {}
@@ -1260,6 +1262,7 @@ class TestVoiceTimeoutCleansRunnerState:
         adapter.platform = Platform.DISCORD
         adapter.config = config
         adapter._voice_clients = {}
+        adapter._voice_channel_intents = {}
         adapter._voice_locks = {}
         adapter._voice_text_channels = {}
         adapter._voice_sources = {}
@@ -1323,6 +1326,7 @@ class TestPlaybackTimeout:
         adapter.platform = Platform.DISCORD
         adapter.config = config
         adapter._voice_clients = {}
+        adapter._voice_channel_intents = {}
         adapter._voice_locks = {}
         adapter._voice_text_channels = {}
         adapter._voice_sources = {}
@@ -1441,6 +1445,7 @@ class TestVoiceChannelAwareness:
         config.token = "fake-token"
         adapter = object.__new__(DiscordAdapter)
         adapter._voice_clients = {}
+        adapter._voice_channel_intents = {}
         adapter._voice_locks = {}
         adapter._voice_text_channels = {}
         adapter._voice_sources = {}
@@ -1715,6 +1720,7 @@ class TestVoiceTTSPlayback:
         adapter.platform = Platform.DISCORD
         adapter.config = config
         adapter._voice_clients = {}
+        adapter._voice_channel_intents = {}
         adapter._voice_locks = {}
         adapter._voice_text_channels = {}
         adapter._voice_sources = {}
@@ -1820,6 +1826,7 @@ class TestUDPKeepalive:
         adapter.platform = Platform.DISCORD
         adapter.config = config
         adapter._voice_clients = {}
+        adapter._voice_channel_intents = {}
         adapter._voice_locks = {}
         adapter._voice_text_channels = {}
         adapter._voice_sources = {}
