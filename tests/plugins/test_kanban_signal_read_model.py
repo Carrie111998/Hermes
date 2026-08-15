@@ -372,6 +372,31 @@ def test_signal_websocket_rejects_noncanonical_queries(signal_client, query):
     assert exc.value.code == 1008
 
 
+def test_signal_ws_delegates_to_canonical_web_auth(signal_home, monkeypatch):
+    module = _load_plugin_module()
+    observed = []
+
+    from hermes_cli import web_server
+
+    def deny(websocket):
+        observed.append(websocket)
+        return False
+
+    monkeypatch.setattr(web_server, "_ws_auth_ok", deny)
+    app = FastAPI()
+    app.include_router(module.router, prefix="/api/plugins/kanban")
+
+    with TestClient(app) as client:
+        with pytest.raises(WebSocketDisconnect) as exc:
+            with client.websocket_connect(
+                "/api/plugins/kanban/events?view=signal&board=default&since=0&token=denied"
+            ):
+                pass
+
+    assert exc.value.code == 1008
+    assert len(observed) == 1
+
+
 def test_signal_websocket_resets_after_history_rotation(signal_client):
     conn = kb.connect()
     try:
