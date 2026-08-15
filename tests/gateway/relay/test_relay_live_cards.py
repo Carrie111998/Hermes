@@ -204,13 +204,13 @@ class TestTaskCardOps:
         adapter, stub = _connected_adapter()
         result = loop.run_until_complete(
             adapter.send_native_task_card_progress(
-                chat_id="C1", card_id="turn-1", tasks=_tasks()
+                chat_id="C1", tasks=_tasks(), reply_to="1700.100"
             )
         )
         assert result.success
         frames = [s for s in stub.sent if s.get("op") == "task_card"]
         assert len(frames) == 1
-        assert frames[0]["card_id"] == "turn-1"
+        assert frames[0]["card_id"] == "turn:1700.100"
         chunk_ids = [c["id"] for c in frames[0]["chunks"]]
         assert chunk_ids == ["call_1", "call_2"]
         statuses = {c["id"]: c["status"] for c in frames[0]["chunks"]}
@@ -220,11 +220,11 @@ class TestTaskCardOps:
         adapter, stub = _connected_adapter()
         loop.run_until_complete(
             adapter.send_native_task_card_progress(
-                chat_id="C1", card_id="turn-1", tasks=_tasks()
+                chat_id="C1", tasks=_tasks(), reply_to="1700.100"
             )
         )
         loop.run_until_complete(
-            adapter.stop_native_task_card_progress(chat_id="C1", card_id="turn-1")
+            adapter.stop_native_task_card_progress(chat_id="C1", reply_to="1700.100")
         )
         assert [s["op"] for s in stub.sent] == ["task_card", "task_card_stop"]
 
@@ -239,7 +239,7 @@ class TestTaskCardOps:
         assert adapter.supports_native_task_cards() is False
         result = loop.run_until_complete(
             adapter.send_native_task_card_progress(
-                chat_id="C1", card_id="t", tasks=_tasks()
+                chat_id="C1", tasks=_tasks(), reply_to="t"
             )
         )
         assert not result.success

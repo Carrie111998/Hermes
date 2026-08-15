@@ -363,11 +363,23 @@ class RelayAdapter(BasePlatformAdapter):
     async def send_native_task_card_progress(
         self,
         chat_id: str,
-        card_id: str,
         tasks: list,
+        *,
+        title: str = "Hermes is working",
+        reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
+        fallback_text: Optional[str] = None,
     ) -> SendResult:
         """Relay leg of the #85476 task-card lane: emit one card frame.
+
+        SIGNATURE CONTRACT (live-canary finding): the TurnRunner calls this
+        with the NATIVE Slack adapter's keyword contract (tasks/title/
+        reply_to/metadata/fallback_text) — not a card_id. The card stream
+        key is derived per (chat, reply_to-thread): one card per turn
+        thread, matching the connector's (channel, card_id) keying.
+        ``fallback_text``/``title`` are accepted for contract parity; the
+        connector's plan-mode stream renders task chunks, so they are not
+        forwarded.
 
         ``tasks`` are the TurnRunner's normalized task dicts (id/title/
         status/details/output); the connector maps them onto its
@@ -380,13 +392,19 @@ class RelayAdapter(BasePlatformAdapter):
             )
         if self._transport is None:
             return SendResult(success=False, error="no transport")
+        card_id = f"turn:{reply_to or 'root'}"
+        merged_meta = dict(metadata or {})
+        if reply_to and "thread_ts" not in merged_meta:
+            # Slack card streams are thread replies (same rule as draft):
+            # anchor on the triggering message when the runner gave us one.
+            merged_meta["thread_ts"] = str(reply_to)
         result = await self._transport.send_outbound(
             {
                 "op": "task_card",
                 "chat_id": chat_id,
                 "card_id": card_id,
                 "chunks": [dict(t) for t in tasks],
-                "metadata": self._with_scope(chat_id, dict(metadata or {})),
+                "metadata": self._with_scope(chat_id, merged_meta),
             },
             platform=self._platform_by_chat.get(str(chat_id)),
         )
@@ -399,16 +417,22 @@ class RelayAdapter(BasePlatformAdapter):
     async def stop_native_task_card_progress(
         self,
         chat_id: str,
-        card_id: str,
+        *,
+        reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
-        """Seal the card stream at turn end (idempotent connector-side)."""
+        """Seal the card stream at turn end (idempotent connector-side).
+
+        Same NATIVE-contract signature as send (canary finding above);
+        card key derived identically so the stop hits the open stream.
+        """
         if not self.supports_native_task_cards():
             return SendResult(
                 success=False, error="connector does not advertise task_card"
             )
         if self._transport is None:
             return SendResult(success=False, error="no transport")
+        card_id = f"turn:{reply_to or 'root'}"
         result = await self._transport.send_outbound(
             {
                 "op": "task_card_stop",
