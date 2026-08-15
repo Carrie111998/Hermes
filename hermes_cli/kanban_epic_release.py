@@ -1,8 +1,10 @@
-"""Read-only Epic readiness and frozen immutable-release row types.
+"""Read-only Epic readiness, frozen immutable-release row types, and typed
+release invalidation results.
 
-Lifecycle transitions, candidate preparation, and CI observation are introduced
-by later cards. This module is intentionally limited to strict persistence
-parsing and derivation from current durable facts.
+Lifecycle transitions, candidate preparation, and CI observation are owned by
+``hermes_cli.kanban_db``.  This module is intentionally limited to strict
+persistence parsing, derivation from current durable facts, and the typed
+invalidation error/result shapes the release seam consumes.
 """
 
 from __future__ import annotations
@@ -37,6 +39,15 @@ class EpicReleasePreparationError(RuntimeError):
         super().__init__(self.code)
 
 
+class EpicReleaseInvalidationError(RuntimeError):
+    """Typed refusal while invalidating an Epic release snapshot."""
+
+    def __init__(self, code: str, evidence: Mapping[str, object] | None = None):
+        self.code = str(code)
+        self.evidence = dict(evidence or {})
+        super().__init__(self.code)
+
+
 @dataclass(frozen=True)
 class EpicReleaseSnapshot:
     id: int
@@ -52,6 +63,29 @@ class EpicReleaseSnapshot:
     pushed_sha: str | None
     created_at: int
     updated_at: int
+
+
+@dataclass(frozen=True)
+class EpicReleaseInvalidation:
+    """Typed outcome of one bounded Epic release invalidation attempt.
+
+    ``kind`` is one of:
+
+    * ``invalidated`` — proven authority/input drift: the snapshot row was
+      atomically marked ``invalidated`` with typed audit evidence, then the
+      exact release-candidate ref was deleted only when it still pinned the
+      recorded SHA (``candidate_ref_deleted`` records the ref outcome).
+    * ``exact`` — the active snapshot still matches every current input and
+      is left untouched.
+    * ``missing`` — no active snapshot exists for the epic; nothing to do.
+    * ``unverifiable`` — drift cannot be proven right now (repository or
+      board authority unavailable); the snapshot is preserved untouched.
+    """
+
+    kind: Literal["invalidated", "exact", "missing", "unverifiable"]
+    snapshot: EpicReleaseSnapshot | None
+    evidence: Mapping[str, object]
+    candidate_ref_deleted: bool
 
 
 @dataclass(frozen=True)

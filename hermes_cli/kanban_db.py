@@ -85,7 +85,7 @@ import threading
 import logging
 import time
 from contextvars import ContextVar, Token
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Iterable, Mapping, Optional, Protocol, Tuple
 
@@ -123,6 +123,8 @@ from hermes_cli.kanban_repository import (
 )
 from hermes_cli.kanban_epic_release import (
     EpicReadiness,
+    EpicReleaseInvalidation,
+    EpicReleaseInvalidationError,
     EpicReleaseMember,
     EpicReleasePreparationError,
     EpicReleaseSnapshot,
@@ -15024,26 +15026,52 @@ def _epic_release_snapshot_members(
     return tuple(epic_release_member_from_row(row) for row in rows)
 
 
-def _epic_release_snapshot_matches(
+def _epic_release_snapshot_mismatch_evidence(
     conn: sqlite3.Connection,
     snapshot: EpicReleaseSnapshot,
     *,
     epic_id: str,
     inputs: _EpicReleaseInputs,
-) -> bool:
-    if (
-        snapshot.epic_id != epic_id
-        or snapshot.epic_tip_sha != inputs.epic_tip_sha
-        or snapshot.target_branch != inputs.target_branch
-        or snapshot.target_pre_sha != inputs.target_pre_sha
-        or snapshot.repository_contract_digest != inputs.contract_digest
-        or snapshot.status not in _EPIC_RELEASE_ACTIVE_STATUSES
-    ):
-        return False
+) -> dict[str, Any]:
+    """Accumulate typed drift evidence for one active snapshot.
+
+    An empty result means the snapshot still matches every current input
+    exactly.  Each key records the per-field snapshot value alongside the
+    current authority it no longer matches.
+    """
+
+    evidence: dict[str, Any] = {}
+    if snapshot.epic_id != epic_id:
+        evidence["epic_id"] = {
+            "snapshot": snapshot.epic_id,
+            "current": epic_id,
+        }
+    if snapshot.epic_tip_sha != inputs.epic_tip_sha:
+        evidence["epic_tip_sha"] = {
+            "snapshot": snapshot.epic_tip_sha,
+            "current": inputs.epic_tip_sha,
+        }
+    if snapshot.target_branch != inputs.target_branch:
+        evidence["target_branch"] = {
+            "snapshot": snapshot.target_branch,
+            "current": inputs.target_branch,
+        }
+    if snapshot.target_pre_sha != inputs.target_pre_sha:
+        evidence["target_pre_sha"] = {
+            "snapshot": snapshot.target_pre_sha,
+            "current": inputs.target_pre_sha,
+        }
+    if snapshot.repository_contract_digest != inputs.contract_digest:
+        evidence["repository_contract_digest"] = {
+            "snapshot": snapshot.repository_contract_digest,
+            "current": inputs.contract_digest,
+        }
+    if snapshot.status not in _EPIC_RELEASE_ACTIVE_STATUSES:
+        evidence["status"] = {"snapshot": snapshot.status}
     try:
         validate_release_candidate_ref(snapshot.candidate_ref)
     except RepositoryConfigurationError:
-        return False
+        evidence["candidate_ref"] = {"snapshot": snapshot.candidate_ref}
     expected_members = tuple(
         EpicReleaseMember(
             snapshot_id=snapshot.id,
@@ -15056,28 +15084,74 @@ def _epic_release_snapshot_matches(
         for story_id, source_sha, candidate_sha, integrated_at in inputs.members
     )
     try:
-        if _epic_release_snapshot_members(conn, snapshot.id) != expected_members:
-            return False
-    except ValueError:
-        return False
+        current_members = _epic_release_snapshot_members(conn, snapshot.id)
+    except ValueError as exc:
+        evidence["members"] = {"error": str(exc)}
+    else:
+        if current_members != expected_members:
+            evidence["members"] = {
+                "snapshot": [
+                    {
+                        "story_id": member.story_id,
+                        "source_sha": member.source_sha,
+                        "candidate_sha": member.candidate_sha,
+                        "integrated_at": member.integrated_at,
+                    }
+                    for member in current_members
+                ],
+                "current": [
+                    {
+                        "story_id": member.story_id,
+                        "source_sha": member.source_sha,
+                        "candidate_sha": member.candidate_sha,
+                        "integrated_at": member.integrated_at,
+                    }
+                    for member in expected_members
+                ],
+            }
     event = conn.execute(
         "SELECT task_id, kind, payload FROM task_events WHERE id=?",
         (snapshot.aggregate_verification_event_id,),
     ).fetchone()
-    if event is None or event["task_id"] != epic_id or event["kind"] != "repository_verification":
-        return False
-    try:
-        payload = json.loads(event["payload"]) if event["payload"] else None
-    except (TypeError, ValueError):
-        return False
-    return isinstance(payload, Mapping) and verification_receipt_matches(
-        payload,
-        source_sha=inputs.epic_tip_sha,
-        candidate_sha=snapshot.release_candidate_sha,
-        contract_digest=inputs.contract_digest,
-        gate_kind="epic_release",
-        subject_id=epic_id,
-        profile_name="epic_release",
+    receipt_evidence: dict[str, Any] = {}
+    if (
+        event is None
+        or event["task_id"] != epic_id
+        or event["kind"] != "repository_verification"
+    ):
+        receipt_evidence["event"] = {
+            "task_id": event["task_id"] if event is not None else None,
+            "kind": event["kind"] if event is not None else None,
+        }
+    else:
+        try:
+            payload = json.loads(event["payload"]) if event["payload"] else None
+        except (TypeError, ValueError):
+            payload = None
+        if not isinstance(payload, Mapping) or not verification_receipt_matches(
+            payload,
+            source_sha=inputs.epic_tip_sha,
+            candidate_sha=snapshot.release_candidate_sha,
+            contract_digest=inputs.contract_digest,
+            gate_kind="epic_release",
+            subject_id=epic_id,
+            profile_name="epic_release",
+        ):
+            receipt_evidence["receipt"] = {"matches": False}
+    if receipt_evidence:
+        evidence["aggregate_verification_event"] = receipt_evidence
+    return evidence
+
+
+def _epic_release_snapshot_matches(
+    conn: sqlite3.Connection,
+    snapshot: EpicReleaseSnapshot,
+    *,
+    epic_id: str,
+    inputs: _EpicReleaseInputs,
+) -> bool:
+    return not _epic_release_snapshot_mismatch_evidence(
+        conn, snapshot, epic_id=epic_id, inputs=inputs
     )
 
 
@@ -15198,6 +15272,201 @@ def _cleanup_epic_release_candidate(candidate: IntegrationCandidate) -> bool:
         )
     except (RepositoryConfigurationError, OSError, subprocess.SubprocessError):
         return False
+
+
+def _epic_release_invalidate_durably(
+    conn: sqlite3.Connection,
+    *,
+    epic_id: str,
+    snapshot: EpicReleaseSnapshot,
+    evidence: dict[str, Any],
+) -> None:
+    """Atomically mark only the exact active snapshot invalidated.
+
+    Re-checks that the active row is still the same snapshot inside the
+    IMMEDIATE transaction (a concurrent preparation may have won), then
+    records the status flip together with the typed drift evidence.
+    """
+
+    now = int(time.time())
+    with authorized_governance_write(), write_txn(conn):
+        locked_row = _epic_release_active_row(conn, epic_id)
+        if locked_row is None or int(locked_row["id"]) != snapshot.id:
+            raise EpicReleaseInvalidationError(
+                "active_snapshot_changed",
+                {"epic_id": epic_id, "snapshot_id": snapshot.id},
+            )
+        conn.execute(
+            "UPDATE epic_release_snapshots SET status='invalidated', updated_at=? "
+            "WHERE id=? AND status IN ('awaiting_push', 'ci_pending', 'ci_failed')",
+            (now, snapshot.id),
+        )
+        _append_event(
+            conn,
+            epic_id,
+            "epic_release_invalidated",
+            {
+                "epic_id": epic_id,
+                "snapshot_id": snapshot.id,
+                "drift": evidence,
+                "candidate_ref": snapshot.candidate_ref,
+                "release_candidate_sha": snapshot.release_candidate_sha,
+                "invalidated_at": now,
+            },
+        )
+
+
+def invalidate_epic_release_snapshot(
+    conn: sqlite3.Connection,
+    epic_id: str,
+    *,
+    board: Optional[str] = None,
+    board_meta: Optional[dict] = None,
+) -> EpicReleaseInvalidation:
+    """Invalidate the exact active Epic release snapshot when authority drifted.
+
+    Proven drift — a changed Epic tip, target pre-SHA, repository contract,
+    member set/pins, readiness blockers, or aggregate verification
+    event/receipt, or an invalid candidate ref — atomically marks only that
+    epic's active snapshot ``invalidated`` with typed audit evidence.  After
+    the durable invalidation the snapshot's ``candidate_ref`` is deleted only
+    when it still pins the recorded ``release_candidate_sha``; an absent,
+    mismatched, or repointed ref is preserved and reported.  An exact
+    snapshot is returned untouched so E05B1 preparation replay can keep it,
+    and unverifiable states never invalidate.
+    """
+
+    if conn.in_transaction:
+        raise EpicReleaseInvalidationError(
+            "active_transaction", {"epic_id": epic_id}
+        )
+
+    row = _epic_release_active_row(conn, epic_id)
+    if row is None:
+        return EpicReleaseInvalidation("missing", None, {}, False)
+    try:
+        snapshot = epic_release_snapshot_from_row(row)
+    except ValueError as exc:
+        raise EpicReleaseInvalidationError(
+            "invalid_active_snapshot",
+            {"epic_id": epic_id, "snapshot_id": row["id"], "error": str(exc)},
+        ) from exc
+
+    meta = board_meta if board_meta is not None else product_board_metadata(board)
+    if meta is None or not _handoff_v2_enabled(meta) or not _is_epic_task(conn, epic_id):
+        return EpicReleaseInvalidation(
+            "unverifiable", snapshot, {"code": "not_governed_epic"}, False
+        )
+    try:
+        contract = repository_contract_for_metadata(meta)
+    except (RepositoryConfigurationError, OSError, ValueError) as exc:
+        return EpicReleaseInvalidation(
+            "unverifiable",
+            snapshot,
+            {"code": "repository_unavailable", "error": str(exc)},
+            False,
+        )
+    if contract is None:
+        return EpicReleaseInvalidation(
+            "unverifiable", snapshot, {"code": "missing_repository_contract"}, False
+        )
+    if "epic_release" not in contract.verification:
+        return EpicReleaseInvalidation(
+            "unverifiable",
+            snapshot,
+            {"code": "missing_epic_release_profile"},
+            False,
+        )
+
+    evidence: dict[str, Any]
+    try:
+        inputs, _contract, _branch = _epic_release_inputs(
+            conn, epic_id, board=board, board_meta=meta
+        )
+    except EpicReleasePreparationError as exc:
+        if exc.code in ("not_ready", "readiness_tip_mismatch"):
+            evidence = {"inputs_error": exc.code, **exc.evidence}
+        else:
+            return EpicReleaseInvalidation(
+                "unverifiable", snapshot, {"code": exc.code, **exc.evidence}, False
+            )
+    else:
+        evidence = _epic_release_snapshot_mismatch_evidence(
+            conn, snapshot, epic_id=epic_id, inputs=inputs
+        )
+        if not evidence:
+            return EpicReleaseInvalidation("exact", snapshot, {}, False)
+
+    _epic_release_invalidate_durably(
+        conn, epic_id=epic_id, snapshot=snapshot, evidence=evidence
+    )
+
+    deleted = False
+    try:
+        deleted = delete_release_candidate_ref(
+            contract.repo_root,
+            candidate_ref=snapshot.candidate_ref,
+            candidate_sha=snapshot.release_candidate_sha,
+        )
+    except (RepositoryConfigurationError, OSError, subprocess.SubprocessError):
+        deleted = False
+    with authorized_governance_write(), write_txn(conn):
+        _append_event(
+            conn,
+            epic_id,
+            "epic_release_invalidated",
+            {
+                "epic_id": epic_id,
+                "snapshot_id": snapshot.id,
+                "candidate_ref": snapshot.candidate_ref,
+                "release_candidate_sha": snapshot.release_candidate_sha,
+                "candidate_ref_deleted": bool(deleted),
+            },
+        )
+
+    invalidated = replace(
+        snapshot,
+        status="invalidated",
+        updated_at=int(time.time()),
+    )
+    return EpicReleaseInvalidation(
+        "invalidated", invalidated, evidence, bool(deleted)
+    )
+
+
+def invalidate_stale_epic_release_snapshots(
+    conn: sqlite3.Connection,
+    *,
+    board: Optional[str] = None,
+    board_meta: Optional[dict] = None,
+) -> tuple[EpicReleaseInvalidation, ...]:
+    """Invalidate every stale active Epic release snapshot on the board.
+
+    Bounded sweep over the currently active snapshots: only proven drift
+    invalidates and only the drifted epic's exact release ref is touched.
+    Exact and unverifiable snapshots are returned untouched, so no unrelated
+    snapshot or ref changes.
+    """
+
+    if conn.in_transaction:
+        raise EpicReleaseInvalidationError("active_transaction", {})
+    meta = board_meta if board_meta is not None else product_board_metadata(board)
+    if meta is None or not _handoff_v2_enabled(meta):
+        return ()
+    placeholders = ",".join("?" for _ in _EPIC_RELEASE_ACTIVE_STATUSES)
+    rows = conn.execute(
+        f"SELECT DISTINCT epic_id FROM epic_release_snapshots "  # noqa: S608 -- placeholders only
+        f"WHERE status IN ({placeholders}) ORDER BY epic_id",
+        _EPIC_RELEASE_ACTIVE_STATUSES,
+    ).fetchall()
+    results: list[EpicReleaseInvalidation] = []
+    for (epic_id,) in rows:
+        results.append(
+            invalidate_epic_release_snapshot(
+                conn, str(epic_id), board=board, board_meta=meta
+            )
+        )
+    return tuple(results)
 
 
 def prepare_epic_release_snapshot(

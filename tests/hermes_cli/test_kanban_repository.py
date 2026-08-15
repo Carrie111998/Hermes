@@ -662,6 +662,50 @@ def test_release_candidate_ref_uses_release_namespace_and_exact_cleanup(
     assert exc_info.value.code == "malformed_release_candidate_ref"
 
 
+def test_release_candidate_ref_preserves_repointed_and_mismatched_refs(
+    repository: Path,
+):
+    """Exact ref deletion and preservation on expected-old mismatch at repo level.
+
+    A repointed release-candidate ref must survive when the invalidation
+    expected-old SHA no longer matches, and must be deletable only when the
+    exact current SHA is expected.  An already-absent ref is an idempotent
+    success and never re-creates the ref.
+    """
+
+    candidate_ref = f"{RELEASE_CANDIDATE_REF_PREFIX}exact"
+    first_sha = _git(repository, "rev-parse", "HEAD")
+    later_sha = _commit(repository, "later.txt", "later\n", "later")
+    _git(repository, "update-ref", candidate_ref, first_sha)
+
+    # Repointed — expected old SHA no longer matches → preserved.
+    _git(repository, "update-ref", candidate_ref, later_sha)
+    assert delete_release_candidate_ref(
+        repository, candidate_ref=candidate_ref, candidate_sha=first_sha
+    ) is False
+    assert _git(repository, "rev-parse", candidate_ref) == later_sha
+
+    # Exact current SHA → deleted.
+    assert delete_release_candidate_ref(
+        repository, candidate_ref=candidate_ref, candidate_sha=later_sha
+    ) is True
+    assert subprocess.run(
+        ["git", "-C", str(repository), "rev-parse", "--verify", candidate_ref],
+        capture_output=True,
+        text=True,
+    ).returncode != 0
+
+    # Idempotent — absent ref is a success.
+    assert delete_release_candidate_ref(
+        repository, candidate_ref=candidate_ref, candidate_sha=later_sha
+    ) is True
+    assert subprocess.run(
+        ["git", "-C", str(repository), "rev-parse", "--verify", candidate_ref],
+        capture_output=True,
+        text=True,
+    ).returncode != 0
+
+
 @pytest.mark.parametrize(
     ("scenario", "expected_kind", "expected_current", "expected_updates"),
     [

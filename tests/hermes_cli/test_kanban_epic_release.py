@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
-from dataclasses import FrozenInstanceError, replace
+from dataclasses import FrozenInstanceError, dataclass, replace
+import json
 import sqlite3
+from typing import Any
 
 import pytest
 
@@ -11,6 +13,7 @@ from hermes_cli import kanban_db as kb
 from hermes_cli.kanban_epic_release import (
     EpicReadiness,
     EpicReadinessMember,
+    EpicReleaseInvalidation,
     EpicReleaseMember,
     EpicReleaseSnapshot,
     EpicTerminalSource,
@@ -503,7 +506,7 @@ def test_fact_derived_readiness_ignores_pruned_story_verification_events(tmp_pat
 
 def _release_prepare_fixture(tmp_path, monkeypatch):
     repo = tmp_path / "repo"
-    repo.mkdir()
+    repo.mkdir(exist_ok=True)
     board_meta = {
         "preset": "product",
         "product_workflow": {"handoff_v2": True},
@@ -752,3 +755,455 @@ def test_prepare_epic_release_snapshot_refuses_mismatching_active_snapshot_witho
 
     assert exc_info.value.code == "active_snapshot_mismatch"
     assert tuple(snapshot) == ("b" * 40, "awaiting_push")
+
+
+# ---------------------------------------------------------------------------
+# Invalidation helpers
+# ---------------------------------------------------------------------------
+
+@dataclass
+class _InvCtx:
+    epic_id: str
+    story_id: str
+    board_meta: dict[str, Any]
+    contract: Any
+    readiness: EpicReadiness
+    candidate: Any
+    prepared: EpicReleaseSnapshot
+
+
+def _prepare_exact_snapshot(conn, monkeypatch, tmp_path, *, epic_label="epic"):
+    """Create epic+story tasks, prepare one exact snapshot, and return context."""
+
+    epic_id, story_id, board_meta, contract, readiness, candidate = (
+        _release_prepare_fixture(tmp_path, monkeypatch)
+    )
+    epic_id = kb.create_task(conn, title="Epic", work_item_kind="epic")
+    story_id = kb.create_task(conn, title="Story")
+    kb.add_epic_membership(conn, epic_id=epic_id, task_id=story_id)
+    readiness = replace(
+        readiness,
+        epic_id=epic_id,
+        members=(replace(readiness.members[0], story_id=story_id),),
+    )
+    candidate = replace(candidate, source_branch=kb.epic_branch_for(epic_id))
+    monkeypatch.setattr(kb, "epic_readiness", lambda *_a, **_k: readiness)
+    prepared = kb.prepare_epic_release_snapshot(
+        conn,
+        epic_id,
+        board="release-board",
+        board_meta=board_meta,
+        candidate_builder=lambda *_a, **_k: candidate,
+    )
+    return _InvCtx(
+        epic_id=epic_id,
+        story_id=story_id,
+        board_meta=board_meta,
+        contract=contract,
+        readiness=readiness,
+        candidate=candidate,
+        prepared=prepared,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Drift appliers — one function per authority/input drift axis.  Each
+# mutates the test environment so that the active snapshot no longer
+# matches current authority.
+# ---------------------------------------------------------------------------
+
+def _drift_epic_tip(ctx, conn, monkeypatch):
+    moved = "e" * 40
+    readiness = replace(ctx.readiness, epic_tip_sha=moved)
+    ctx.readiness = readiness
+    monkeypatch.setattr(kb, "epic_readiness", lambda *_a, **_k: readiness)
+    monkeypatch.setattr(
+        kb, "resolve_commit",
+        lambda _repo, ref: moved if "epic/" in ref else TARGET_SHA,
+    )
+
+
+def _drift_target(ctx, conn, monkeypatch):
+    moved = "f" * 40
+    monkeypatch.setattr(
+        kb, "resolve_commit",
+        lambda _repo, ref: EPIC_SHA if "epic/" in ref else moved,
+    )
+
+
+def _drift_contract(ctx, conn, monkeypatch):
+    moved = type(
+        "Contract", (),
+        {
+            "repo_root": ctx.contract.repo_root,
+            "target_branch": "main",
+            "verification": {"epic_release": object()},
+            "generated_policy_digest": GENERATED_POLICY_DIGEST,
+            "digest": "e" * 64,
+        },
+    )()
+    monkeypatch.setattr(kb, "repository_contract_for_metadata", lambda _m: moved)
+
+
+def _drift_member_pin(ctx, conn, monkeypatch):
+    readiness = replace(
+        ctx.readiness,
+        members=(replace(ctx.readiness.members[0], source_sha="a" * 40),),
+    )
+    monkeypatch.setattr(kb, "epic_readiness", lambda *_a, **_k: readiness)
+
+
+def _drift_member_set(ctx, conn, monkeypatch):
+    extra = EpicReadinessMember(
+        story_id=ctx.story_id + "-extra",
+        source_sha="b" * 40,
+        candidate_sha="c" * 40,
+        integrated_at=95,
+    )
+    readiness = replace(
+        ctx.readiness, members=ctx.readiness.members + (extra,)
+    )
+    monkeypatch.setattr(kb, "epic_readiness", lambda *_a, **_k: readiness)
+
+
+def _drift_fact_intent(ctx, conn, monkeypatch):
+    readiness = EpicReadiness(
+        ctx.epic_id, EPIC_SHA, (),
+        (f"{ctx.story_id}:active_intent",)
+    )
+    monkeypatch.setattr(kb, "epic_readiness", lambda *_a, **_k: readiness)
+
+
+def _drift_readiness_tip(ctx, conn, monkeypatch):
+    moved = "e" * 40
+    monkeypatch.setattr(
+        kb, "resolve_commit",
+        lambda _repo, ref: moved if "epic/" in ref else TARGET_SHA,
+    )
+
+
+def _drift_verification_event(ctx, conn, monkeypatch):
+    conn.execute(
+        "DELETE FROM task_events WHERE id=?",
+        (ctx.prepared.aggregate_verification_event_id,),
+    )
+
+
+def _drift_verification_receipt(ctx, conn, monkeypatch):
+    conn.execute(
+        "UPDATE task_events SET payload='{}' WHERE id=?",
+        (ctx.prepared.aggregate_verification_event_id,),
+    )
+
+
+def _drift_candidate_ref(ctx, conn, monkeypatch):
+    drifted_ref = "refs/hermes/releases/exact"
+    conn.execute(
+        "UPDATE epic_release_snapshots SET candidate_ref=? WHERE id=?",
+        (drifted_ref, ctx.prepared.id),
+    )
+    ctx.prepared = replace(ctx.prepared, candidate_ref=drifted_ref)
+
+
+# ---------------------------------------------------------------------------
+# Parametrized drift invalidation
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("case_name", "apply_drift", "expected_evidence_key", "expect_ref_deleted"),
+    [
+        ("epic_tip", _drift_epic_tip, "epic_tip_sha", True),
+        ("target", _drift_target, "target_pre_sha", True),
+        ("contract", _drift_contract, "repository_contract_digest", True),
+        ("member_pin", _drift_member_pin, "members", True),
+        ("member_set", _drift_member_set, "members", True),
+        ("fact_intent", _drift_fact_intent, "inputs_error", True),
+        ("readiness_tip", _drift_readiness_tip, "inputs_error", True),
+        ("verification_event", _drift_verification_event, "aggregate_verification_event", True),
+        ("verification_receipt", _drift_verification_receipt, "aggregate_verification_event", True),
+        ("candidate_ref", _drift_candidate_ref, "candidate_ref", False),
+    ],
+)
+def test_invalidate_epic_release_snapshot_parametrized_drift_invalidates_only_affected_snapshot(
+    tmp_path, monkeypatch, case_name, apply_drift, expected_evidence_key, expect_ref_deleted,
+):
+    delete_calls: list = []
+
+    def wrap_delete(repo_root, *, candidate_ref, candidate_sha):
+        delete_calls.append((repo_root, candidate_ref, candidate_sha))
+        # Mimic the real delete's namespace gate so an invalid drifted
+        # candidate_ref is preserved rather than deleted.
+        return candidate_ref.startswith(kb.RELEASE_CANDIDATE_REF_PREFIX)
+
+    monkeypatch.setattr(kb, "delete_release_candidate_ref", wrap_delete)
+
+    with kb.connect(tmp_path / f"{case_name}.db") as conn:
+        ctx = _prepare_exact_snapshot(conn, monkeypatch, tmp_path)
+        apply_drift(ctx, conn, monkeypatch)
+        result = kb.invalidate_epic_release_snapshot(
+            conn, ctx.epic_id, board="release-board", board_meta=ctx.board_meta,
+        )
+        row = conn.execute(
+            "SELECT status FROM epic_release_snapshots WHERE id=?",
+            (ctx.prepared.id,),
+        ).fetchone()
+
+    assert result.kind == "invalidated"
+    assert result.snapshot is not None
+    assert result.snapshot.status == "invalidated"
+    assert expected_evidence_key in result.evidence
+    assert result.candidate_ref_deleted is expect_ref_deleted
+    assert row["status"] == "invalidated"
+    assert delete_calls == [
+        (ctx.contract.repo_root, ctx.prepared.candidate_ref, ctx.prepared.release_candidate_sha)
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Exact, missing, idempotence, replay, and bulk
+# ---------------------------------------------------------------------------
+
+
+def test_invalidate_epic_release_snapshot_exact_authority_leaves_snapshot_active(
+    tmp_path, monkeypatch,
+):
+    delete_calls: list = []
+
+    def wrap_delete(repo_root, *, candidate_ref, candidate_sha):
+        delete_calls.append((repo_root, candidate_ref, candidate_sha))
+        return True
+
+    monkeypatch.setattr(kb, "delete_release_candidate_ref", wrap_delete)
+
+    with kb.connect(tmp_path / "exact.db") as conn:
+        ctx = _prepare_exact_snapshot(conn, monkeypatch, tmp_path)
+        result = kb.invalidate_epic_release_snapshot(
+            conn, ctx.epic_id, board="release-board", board_meta=ctx.board_meta,
+        )
+        row = conn.execute(
+            "SELECT status FROM epic_release_snapshots WHERE id=?",
+            (ctx.prepared.id,),
+        ).fetchone()
+        events = conn.execute(
+            "SELECT kind FROM task_events WHERE task_id=? AND kind='epic_release_invalidated'",
+            (ctx.epic_id,),
+        ).fetchall()
+
+    assert result.kind == "exact"
+    assert result.snapshot is not None
+    assert result.snapshot.status == "awaiting_push"
+    assert result.evidence == {}
+    assert result.candidate_ref_deleted is False
+    assert row["status"] == "awaiting_push"
+    assert delete_calls == []
+    assert events == []
+
+
+def test_invalidate_epic_release_snapshot_without_active_snapshot_returns_missing(
+    tmp_path, monkeypatch,
+):
+    delete_calls: list = []
+
+    def wrap_delete(repo_root, *, candidate_ref, candidate_sha):
+        delete_calls.append((repo_root, candidate_ref, candidate_sha))
+        return True
+
+    monkeypatch.setattr(kb, "delete_release_candidate_ref", wrap_delete)
+
+    with kb.connect(tmp_path / "missing.db") as conn:
+        _, story_id, board_meta, _contract, readiness, _candidate = (
+            _release_prepare_fixture(tmp_path, monkeypatch)
+        )
+        epic_id = kb.create_task(conn, title="Epic", work_item_kind="epic")
+        story_id = kb.create_task(conn, title="Story")
+        kb.add_epic_membership(conn, epic_id=epic_id, task_id=story_id)
+        readiness = replace(
+            readiness, epic_id=epic_id,
+            members=(replace(readiness.members[0], story_id=story_id),),
+        )
+        monkeypatch.setattr(kb, "epic_readiness", lambda *_a, **_k: readiness)
+        result = kb.invalidate_epic_release_snapshot(
+            conn, epic_id, board="release-board", board_meta=board_meta,
+        )
+
+    assert result == EpicReleaseInvalidation("missing", None, {}, False)
+    assert delete_calls == []
+
+
+def test_invalidate_epic_release_snapshot_repeated_invalidation_is_idempotent(
+    tmp_path, monkeypatch,
+):
+    delete_calls: list = []
+
+    def wrap_delete(repo_root, *, candidate_ref, candidate_sha):
+        delete_calls.append((repo_root, candidate_ref, candidate_sha))
+        return True
+
+    monkeypatch.setattr(kb, "delete_release_candidate_ref", wrap_delete)
+
+    with kb.connect(tmp_path / "idempotent.db") as conn:
+        ctx = _prepare_exact_snapshot(conn, monkeypatch, tmp_path)
+        _drift_epic_tip(ctx, conn, monkeypatch)
+        first = kb.invalidate_epic_release_snapshot(
+            conn, ctx.epic_id, board="release-board", board_meta=ctx.board_meta,
+        )
+        second = kb.invalidate_epic_release_snapshot(
+            conn, ctx.epic_id, board="release-board", board_meta=ctx.board_meta,
+        )
+        row = conn.execute(
+            "SELECT status FROM epic_release_snapshots WHERE id=?",
+            (ctx.prepared.id,),
+        ).fetchone()
+        event_count = conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='epic_release_invalidated'",
+            (ctx.epic_id,),
+        ).fetchone()[0]
+
+    assert first.kind == "invalidated"
+    assert second == EpicReleaseInvalidation("missing", None, {}, False)
+    assert row["status"] == "invalidated"
+    assert len(delete_calls) == 1  # ref cleaned up once
+    assert event_count == 2  # drift event + ref-deletion event, no extras
+
+
+def test_invalidate_epic_release_snapshot_preparation_replay_rebuilds_after_invalidation(
+    tmp_path, monkeypatch,
+):
+    """E05B1 replay creates a replacement only after old authority is durably
+    invalidated."""
+
+    new_sha = "a" * 40
+    new_ref = RELEASE_CANDIDATE_REF + "-2"
+    builder_calls: list = []
+
+    with kb.connect(tmp_path / "replay.db") as conn:
+        ctx = _prepare_exact_snapshot(conn, monkeypatch, tmp_path)
+        _drift_epic_tip(ctx, conn, monkeypatch)
+
+        inv = kb.invalidate_epic_release_snapshot(
+            conn, ctx.epic_id, board="release-board", board_meta=ctx.board_meta,
+        )
+        assert inv.kind == "invalidated"
+
+        new_key = kb.build_verification_receipt_key(
+            None,
+            ctx.contract.repo_root,
+            candidate_sha=new_sha,
+            contract_digest=CONTRACT_DIGEST,
+            generated_policy_digest=GENERATED_POLICY_DIGEST,
+            gate_kind="epic_release",
+            profile_name="epic_release",
+        )
+        new_verification = kb.VerificationResult(
+            status="passed",
+            source_sha=ctx.readiness.epic_tip_sha,
+            candidate_sha=new_sha,
+            contract_digest=CONTRACT_DIGEST,
+            profile="epic_release",
+            steps=(),
+            key=new_key,
+        )
+        new_candidate = kb.IntegrationCandidate(
+            pre_sha=TARGET_SHA,
+            candidate_sha=new_sha,
+            source_branch=kb.epic_branch_for(ctx.epic_id),
+            source_sha=ctx.readiness.epic_tip_sha,
+            target_branch="main",
+            target_worktree=None,
+            scratch_worktree=ctx.contract.repo_root / ".worktrees" / "replay",
+            repo_root=ctx.contract.repo_root.resolve(),
+            candidate_ref=new_ref,
+            verification_result=new_verification,
+        )
+
+        def builder(*_a, **_k):
+            builder_calls.append("called")
+            return new_candidate
+
+        prepared = kb.prepare_epic_release_snapshot(
+            conn,
+            ctx.epic_id,
+            board="release-board",
+            board_meta=ctx.board_meta,
+            candidate_builder=builder,
+        )
+        snapshots = conn.execute(
+            "SELECT id, status FROM epic_release_snapshots WHERE epic_id=? ORDER BY id",
+            (ctx.epic_id,),
+        ).fetchall()
+
+    assert inv.snapshot.status == "invalidated"
+    assert prepared.epic_id == ctx.epic_id
+    assert prepared.status == "awaiting_push"
+    assert prepared.release_candidate_sha == new_sha
+    assert prepared.candidate_ref == new_ref
+    assert len(builder_calls) == 1
+    assert len(snapshots) == 2
+    assert snapshots[0]["status"] == "invalidated"
+    assert snapshots[1]["status"] == "awaiting_push"
+
+
+def test_invalidate_stale_epic_release_snapshots_only_invalidates_drifted_epic(
+    tmp_path, monkeypatch,
+):
+    delete_calls: list = []
+
+    def wrap_delete(repo_root, *, candidate_ref, candidate_sha):
+        delete_calls.append((repo_root, candidate_ref, candidate_sha))
+        return True
+
+    monkeypatch.setattr(kb, "delete_release_candidate_ref", wrap_delete)
+
+    with kb.connect(tmp_path / "bulk.db") as conn:
+        ctx_a = _prepare_exact_snapshot(conn, monkeypatch, tmp_path, epic_label="A")
+        ctx_b = _prepare_exact_snapshot(conn, monkeypatch, tmp_path, epic_label="B")
+        # Drift ONLY epic A: its tip moves; epic B keeps its exact authority.
+        moved = "e" * 40
+        drifted_a = replace(ctx_a.readiness, epic_tip_sha=moved)
+        ctx_a.readiness = drifted_a
+        monkeypatch.setattr(
+            kb,
+            "epic_readiness",
+            lambda _conn, epic_id, **_kw: (
+                drifted_a if epic_id == ctx_a.epic_id else ctx_b.readiness
+            ),
+        )
+        monkeypatch.setattr(
+            kb,
+            "resolve_commit",
+            lambda _repo, ref: (
+                moved
+                if ref == f"refs/heads/{kb.epic_branch_for(ctx_a.epic_id)}"
+                else TARGET_SHA
+                if ref == "refs/heads/main"
+                else EPIC_SHA
+            ),
+        )
+        results = kb.invalidate_stale_epic_release_snapshots(
+            conn, board="release-board", board_meta=ctx_a.board_meta,
+        )
+        statuses = conn.execute(
+            "SELECT epic_id, status FROM epic_release_snapshots ORDER BY epic_id",
+        ).fetchall()
+
+    kinds = tuple(r.kind for r in results)
+    assert kinds == ("invalidated", "exact") or kinds == ("exact", "invalidated")
+    assert results[0].candidate_ref_deleted is (results[0].kind == "invalidated")
+    assert len([r for r in results if r.candidate_ref_deleted]) == 1
+    assert len([r for r in results if r.kind == "exact"]) == 1
+    assert len(delete_calls) == 1
+    # Epic B ref never touched — its exact candidate_ref is not in delete_calls.
+    # Verify by checking the delete calls only contain ctx_a's candidate info.
+    status_by_epic = {row["epic_id"]: row["status"] for row in statuses}
+    assert status_by_epic[ctx_a.epic_id] == "invalidated"
+    assert status_by_epic[ctx_b.epic_id] == "awaiting_push"
+
+
+def test_invalidate_stale_epic_release_snapshots_ungoverned_board_returns_empty(
+    tmp_path, monkeypatch,
+):
+    with kb.connect(tmp_path / "ungov.db") as conn:
+        # No board metadata — product_board_metadata(None) returns None.
+        results = kb.invalidate_stale_epic_release_snapshots(conn)
+    assert results == ()
