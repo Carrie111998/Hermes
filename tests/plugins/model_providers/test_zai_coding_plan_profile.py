@@ -1,9 +1,13 @@
 """zai-coding-plan profile: endpoint separation from the standard zai provider.
 
-Coding-plan subscriptions authenticate on /api/coding/paas/v4; the standard
-/api/paas/v4 route rejects coding-plan keys (HTTP 429, code 1113). The
-dedicated profile mirrors alibaba-coding-plan / kimi-coding so coding-plan
-users get a working default without hand-editing GLM_BASE_URL.
+Coding-plan subscriptions authenticate on different endpoints than the
+standard /api/paas/v4 route (which rejects coding-plan keys with HTTP 429,
+code 1113). The profile defaults to z.ai's Anthropic wire
+(api.z.ai/api/anthropic) — the endpoint where preserved thinking actually
+reaches the model for agent tool loops (the OpenAI-compat routes accept
+replayed reasoning_content but silently drop it from model attention;
+probed 2026-08-15). Mirrors alibaba-coding-plan / kimi-coding so
+coding-plan users get a working default without hand-editing GLM_BASE_URL.
 """
 
 from __future__ import annotations
@@ -22,14 +26,23 @@ def coding_profile():
 
 
 class TestZaiCodingPlanProfile:
-    def test_coding_endpoint_is_default(self, coding_profile):
+    def test_anthropic_endpoint_is_default(self, coding_profile):
         import providers
 
-        assert coding_profile.base_url == "https://api.z.ai/api/coding/paas/v4"
+        # Anthropic wire: preserved thinking reaches the model here (the
+        # OpenAI-compat /api/coding/paas/v4 route accepts replayed
+        # reasoning_content but silently drops it — probed 2026-08-15).
+        assert coding_profile.base_url == "https://api.z.ai/api/anthropic"
         std = providers.get_provider_profile("zai")
         assert std.base_url != coding_profile.base_url, (
             "coding-plan profile must not share the standard endpoint"
         )
+
+    def test_base_url_triggers_anthropic_adapter(self, coding_profile):
+        """The /anthropic suffix is what agent_init.py keys on to select
+        the Anthropic Messages adapter — pin the contract the default
+        depends on."""
+        assert coding_profile.base_url.rstrip("/").endswith("/anthropic")
 
     def test_distinct_from_standard_zai(self, coding_profile):
         import providers
@@ -44,11 +57,14 @@ class TestZaiCodingPlanProfile:
         assert "ZAI_API_KEY" in coding_profile.env_vars
 
     def test_shares_glm_reasoning_wiring(self, coding_profile):
-        """Subclassing ZaiProfile keeps the GLM thinking / reasoning_effort
-        wiring — the coding endpoint speaks the same wire shape."""
+        """Subclassing ZaiProfile keeps the GLM thinking / reasoning wiring.
+        On the Anthropic default the transport builds the request shape
+        (thinking blocks / budget_tokens) natively, so the profile wiring
+        stays shared with the standard zai provider."""
         extra_body, top_level = coding_profile.build_api_kwargs_extras(
             reasoning_config={"enabled": True, "effort": "high"},
             model="glm-5.2",
+            base_url="https://api.z.ai/api/paas/v4",
         )
         assert top_level == {"reasoning_effort": "high"}
         assert extra_body.get("thinking") == {"type": "enabled"}
