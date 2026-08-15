@@ -1080,13 +1080,22 @@ def _resolve_windows_powershell_host() -> str:
         raise FileNotFoundError(
             "Windows PowerShell host unresolved: SystemRoot/WINDIR is unset"
         )
+    root = Path(system_root)
+    if not root.is_absolute():
+        raise FileNotFoundError(
+            f"Windows PowerShell system root must be absolute: {system_root}"
+        )
     candidate = (
-        Path(system_root)
+        root
         / "System32"
         / "WindowsPowerShell"
         / "v1.0"
         / "powershell.exe"
     )
+    if not candidate.is_absolute():
+        raise FileNotFoundError(
+            f"Windows PowerShell host path must be absolute: {candidate}"
+        )
     if candidate.is_file():
         return str(candidate)
     raise FileNotFoundError(f"Windows PowerShell host not found at {candidate}")

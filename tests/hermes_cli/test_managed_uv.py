@@ -748,6 +748,28 @@ class TestWindowsPowershellHostResolution:
         with pytest.raises(FileNotFoundError, match="Windows PowerShell host"):
             _resolve_windows_powershell_host()
 
+    def test_resolve_rejects_relative_systemroot(self, tmp_path, monkeypatch):
+        from hermes_cli.managed_uv import _resolve_windows_powershell_host
+
+        self._fake_system_powershell(tmp_path)
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("SystemRoot", "Windows")
+        monkeypatch.delenv("WINDIR", raising=False)
+
+        with pytest.raises(FileNotFoundError, match="must be absolute"):
+            _resolve_windows_powershell_host()
+
+    def test_resolve_rejects_relative_windir(self, tmp_path, monkeypatch):
+        from hermes_cli.managed_uv import _resolve_windows_powershell_host
+
+        self._fake_system_powershell(tmp_path)
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.delenv("SystemRoot", raising=False)
+        monkeypatch.setenv("WINDIR", "Windows")
+
+        with pytest.raises(FileNotFoundError, match="must be absolute"):
+            _resolve_windows_powershell_host()
+
     def test_install_uv_windows_uses_absolute_host_not_bare_name(
         self, tmp_path, monkeypatch
     ):
