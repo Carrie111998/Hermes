@@ -1722,7 +1722,6 @@ export interface Translations {
       openInSplit: string
       copyIdFailed: string
       sessionActions: string
-      markRead: string
       sessionRunning: string
       needsInput: string
       waitingForAnswer: string
