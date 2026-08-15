@@ -3946,6 +3946,9 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
     all_keys = approval_data.get("pattern_keys", [primary_key])
 
     entry = _ApprovalEntry(approval_data)
+    # Expose the exact queue entry to the notify callback so button-based
+    # adapters can bind their token to this request via resolve_gateway_approval(request_id=…).
+    approval_data["request_id"] = entry.data["request_id"]
     with _lock:
         _gateway_queues.setdefault(session_key, []).append(entry)
 

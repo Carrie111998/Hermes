@@ -121,7 +121,7 @@ class TestSlackExecApproval:
         token = elements[0]["value"]
         assert token != "agent:main:slack:group:C1:1111"
         assert token.isdigit()
-        assert adapter._approval_state[int(token)] == "agent:main:slack:group:C1:1111"
+        assert adapter._approval_state[int(token)] == ("agent:main:slack:group:C1:1111", "")
         for e in elements:
             assert e["value"] == token
 
@@ -158,7 +158,7 @@ class TestSlackApprovalAction:
         adapter = _make_adapter()
         _attach_auth_runner(adapter)
         adapter._approval_resolved["1.2"] = False
-        adapter._approval_state[1] = "session-key"
+        adapter._approval_state[1] = ("session-key", "")
 
         # Simulate Slack re-escaping: original was ~2990 chars, but & → &amp;
         # etc. inflates it past 3000.
@@ -233,6 +233,57 @@ class TestSlackApprovalAction:
 
         ack.assert_called_once()
         mock_resolve.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_click_resolves_bound_request_not_queue_head(self):
+        """A token bound to a specific request_id resolves that exact request
+        (not the session's oldest FIFO entry) via resolve_gateway_approval."""
+        adapter = _make_adapter()
+        _attach_auth_runner(adapter)
+        adapter._approval_resolved["1234.5678"] = False
+        adapter._approval_state[1] = ("session-key", "req-abc")
+
+        ack = AsyncMock()
+        body = {
+            "message": {"ts": "1234.5678", "blocks": []},
+            "channel": {"id": "C1"},
+            "user": {"name": "owner", "id": "U_OWNER"},
+        }
+        action = {"action_id": "hermes_approve_once", "value": "1"}
+        mock_client = adapter._team_clients["T1"]
+        mock_client.chat_update = AsyncMock()
+
+        with patch("tools.approval.resolve_gateway_approval", return_value=1) as mock_resolve:
+            await adapter._handle_approval_action(ack, body, action)
+
+        mock_resolve.assert_called_once_with(
+            "session-key", "once", request_id="req-abc"
+        )
+
+    @pytest.mark.asyncio
+    async def test_stale_token_reports_expired_when_request_gone(self):
+        """A token whose request already left the queue (timed out/resolved)
+        must not resolve anything and must render as expired."""
+        adapter = _make_adapter()
+        _attach_auth_runner(adapter)
+        adapter._approval_resolved["1234.5678"] = False
+        adapter._approval_state[1] = ("session-key", "req-abc")
+
+        ack = AsyncMock()
+        body = {
+            "message": {"ts": "1234.5678", "blocks": []},
+            "channel": {"id": "C1"},
+            "user": {"name": "owner", "id": "U_OWNER"},
+        }
+        action = {"action_id": "hermes_approve_once", "value": "1"}
+        mock_client = adapter._team_clients["T1"]
+        mock_client.chat_update = AsyncMock()
+
+        with patch("tools.approval.resolve_gateway_approval", return_value=0):
+            await adapter._handle_approval_action(ack, body, action)
+
+        update_kwargs = mock_client.chat_update.call_args[1]
+        assert "expired" in update_kwargs["text"].lower()
 
 
 class TestSlackInteractiveAuth:
