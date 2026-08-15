@@ -1,0 +1,19 @@
+{
+  "name": "Herbie Active Task Supervisor watchdog",
+  "schedule": "*/15 * * * *",
+  "prompt": "Script-only deterministic Herbie Active Task Supervisor watchdog. Emits owner notifications only when task state requires attention; healthy/no-change runs are silent.",
+  "script": "herbie_task_supervisor_watchdog.py",
+  "no_agent": true,
+  "deliver": "origin",
+  "enabled": false,
+  "state": "paused",
+  "workdir": null,
+  "repeat": "forever",
+  "activation_status": "DISABLED_PENDING_INDEPENDENT_REVIEW",
+  "safety_notes": [
+    "Do not activate before Steve and independent review approval.",
+    "Do not modify the StartLine audit-request watcher job.",
+    "Do not modify the StartLine Phase 3B-1 transaction reconciliation monitor job.",
+    "Script-only no_agent mode: no LLM invocation on healthy intervals."
+  ]
+}

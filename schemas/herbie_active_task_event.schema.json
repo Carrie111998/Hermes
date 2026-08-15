@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Herbie Active Task Supervisor Event",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["at", "task_id", "event"],
+  "properties": {
+    "at": { "type": "string" },
+    "task_id": { "type": ["string", "null"] },
+    "event": {
+      "type": "string",
+      "enum": [
+        "state_transition",
+        "owner_notification_emitted",
+        "owner_notification_delivered",
+        "internal_nudge_recorded",
+        "checkpoint_recorded",
+        "watchdog_failure",
+        "manual_update"
+      ]
+    },
+    "from": { "type": ["string", "null"] },
+    "to": { "type": ["string", "null"] },
+    "kind": { "type": ["string", "null"] },
+    "incident_key": { "type": ["string", "null"] },
+    "detail": { "type": ["string", "null"] }
+  }
+}
