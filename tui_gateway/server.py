@@ -1500,13 +1500,29 @@ class _UnknownProfileError(Exception):
     Raised by :func:`_profile_home` so every consumer — direct callers,
     :func:`_db_for_profile`, and the :func:`_profile_db` contextmanager —
     fails closed instead of silently operating on the launch profile's
-    home/state.db. :func:`handle_request` maps it to JSON-RPC error 4028
-    before any launch-profile DB access happens.
+    home/state.db. :func:`handle_request` maps it to a JSON-RPC
+    unknown-profile error before any launch-profile DB access happens.
     """
 
     def __init__(self, profile: str):
         self.profile = profile
         super().__init__(profile)
+
+
+_CAPABILITY_PROFILE_NOT_FOUND_METHODS = frozenset(
+    {
+        "cron.manage",
+        "skills.manage",
+        "mcp.catalog",
+        "mcp.servers.list",
+        "mcp.servers.add",
+        "mcp.servers.set_api_key",
+        "mcp.servers.test",
+        "mcp.servers.remove",
+        "mcp.servers.oauth.start",
+        "mcp.servers.oauth.poll",
+    }
+)
 
 
 def _profile_home(profile: str | None) -> Path | None:
@@ -2100,6 +2116,12 @@ def handle_request(req: dict) -> dict | None:
             _profile_home(raw_profile)
         return fn(rid, params)
     except _UnknownProfileError as exc:
+        # Capability RPCs already exposed a handler-specific unknown-profile
+        # contract before this central guard was added. Keep validating here
+        # (so malformed identifiers never reach path construction), but
+        # preserve that RPC family's established error envelope.
+        if method in _CAPABILITY_PROFILE_NOT_FOUND_METHODS:
+            return _err(rid, 4064, f"profile {exc.profile!r} not found")
         # Fail closed: a request that names a profile absent on this host must
         # never be served from the launch profile's home/state.db. Code 4028
         # (4025 collides with handoff.request; 4028 is shared with other

@@ -19438,6 +19438,36 @@ def test_non_string_profile_rejected_as_invalid_params(monkeypatch, tmp_path, ba
     assert resp["error"]["message"] == "invalid params: profile must be a string"
 
 
+@pytest.mark.parametrize(
+    "method",
+    [
+        "cron.manage",
+        "skills.manage",
+        "mcp.catalog",
+        "mcp.servers.list",
+        "mcp.servers.add",
+        "mcp.servers.set_api_key",
+        "mcp.servers.test",
+        "mcp.servers.remove",
+        "mcp.servers.oauth.start",
+        "mcp.servers.oauth.poll",
+    ],
+)
+def test_capability_rpcs_preserve_unknown_profile_error_contract(
+    monkeypatch, tmp_path, method
+):
+    """Capability RPCs keep their established 4064 envelope while the
+    central guard validates the profile before any handler runs."""
+    _setup_synthetic_profiles_c2(monkeypatch, tmp_path, present=("alpha",))
+    resp = server.handle_request(
+        {"id": "cap-profile", "method": method, "params": {"profile": "ghost"}}
+    )
+    assert resp["error"] == {
+        "code": 4064,
+        "message": "profile 'ghost' not found",
+    }
+
+
 def test_null_profile_still_uses_launch(monkeypatch, tmp_path):
     """``profile: null`` (and omitted) keep launch behavior — only present,
     non-null, non-string values are malformed."""
