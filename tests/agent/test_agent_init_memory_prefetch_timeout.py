@@ -17,11 +17,25 @@ def test_configured_external_prefetch_timeout_is_parsed():
         _external_prefetch_timeout_from_config({"external_prefetch_timeout": "0.5"})
         == 0.5
     )
+    assert (
+        _external_prefetch_timeout_from_config({"external_prefetch_timeout": 60}) == 60
+    )
 
 
 @pytest.mark.parametrize(
     "raw",
-    [True, -1, HUGE_INT, math.nan, math.inf, -math.inf, "nan", "inf", "1e999"],
+    [
+        True,
+        -1,
+        HUGE_INT,
+        1e308,
+        math.nan,
+        math.inf,
+        -math.inf,
+        "nan",
+        "inf",
+        "1e999",
+    ],
 )
 def test_malformed_or_nonfinite_timeout_uses_manager_default(raw):
     assert (
@@ -30,9 +44,9 @@ def test_malformed_or_nonfinite_timeout_uses_manager_default(raw):
     )
 
 
-@pytest.mark.parametrize("raw", [HUGE_INT, math.nan, math.inf, -math.inf])
+@pytest.mark.parametrize("raw", [HUGE_INT, 1e308, math.nan, math.inf, -math.inf])
 def test_memory_manager_rejects_direct_invalid_timeouts(raw):
-    with pytest.raises(ValueError, match="finite and positive"):
+    with pytest.raises(ValueError, match="external_prefetch_timeout"):
         MemoryManager(external_prefetch_timeout=raw)
 
 

@@ -33,7 +33,7 @@ from urllib.parse import parse_qs, urlparse, urlunparse
 
 from agent.context_compressor import ContextCompressor
 from agent.iteration_budget import IterationBudget
-from agent.memory_manager import StreamingContextScrubber
+from agent.memory_manager import MAX_EXTERNAL_PREFETCH_TIMEOUT_S, StreamingContextScrubber
 from agent.session_activity import ActivityProvenance
 from agent.model_metadata import (
     MINIMUM_CONTEXT_LENGTH,
@@ -119,9 +119,13 @@ def _external_prefetch_timeout_from_config(mem_config: Any) -> float | None:
             "Ignoring invalid memory.external_prefetch_timeout=%r; using default", raw
         )
         return None
-    if not math.isfinite(value) or value <= 0:
+    if (
+        not math.isfinite(value)
+        or value <= 0
+        or value > MAX_EXTERNAL_PREFETCH_TIMEOUT_S
+    ):
         logger.warning(
-            "Ignoring non-finite or non-positive memory.external_prefetch_timeout=%r; using default",
+            "Ignoring out-of-range memory.external_prefetch_timeout=%r; using default",
             raw,
         )
         return None
