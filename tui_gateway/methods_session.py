@@ -3085,7 +3085,22 @@ def _(rid, params: dict) -> dict:
         except Exception:
             pass
         return _ok(rid, {"status": "interrupted", "turn_isolation": True})
-    session, err = _sess(params, rid)
+    # Resolve WITHOUT waiting on the deferred agent build. `_sess` calls
+    # `_wait_agent`, which blocks up to 30s on the very `agent_ready` Event the
+    # build being cancelled is holding — so Stop waited on its own target. Two
+    # ways that hurt, both on the default path (`session.create` always seeds
+    # `agent: None` + an unset `agent_ready`, and `prompt.submit` returns before
+    # the build finishes):
+    #   * build completes under 30s -> Stop is merely late, but `session.interrupt`
+    #     is not in `_LONG_HANDLERS`, so it runs inline on the socket reader thread
+    #     and every RPC queued behind it stalls too.
+    #   * build outlives 30s -> `_wait_agent` returns 5032 and we bail out HERE,
+    #     before `_turn_cancel_requested` is ever set. `_wait_agent_for_prompt`
+    #     then polls that unset flag up to `agent.build_wait_timeout` (600s) and
+    #     starts the turn anyway: the cancelled message runs.
+    # Nothing above needs a built agent, so resolve the record and let the build
+    # keep warming in the background.
+    session, err = _sess_building(params, rid)
     if err:
         return err
     # Safety net: if the turn's run thread is already gone but `running` stayed
@@ -3103,7 +3118,11 @@ def _(rid, params: dict) -> dict:
         session["queued_prompt"] = None
         session.pop("queued_prompts", None)
         session["_queued_prompt_generation"] = int(session.get("_queued_prompt_generation", 0)) + 1
-    if should_interrupt:
+    # `agent` is None while the deferred build is still in flight — newly
+    # reachable here now that we no longer wait for it. There is nothing to
+    # interrupt yet; `_turn_cancel_requested` (set above) is what the build's
+    # waiter checks before it starts the turn.
+    if should_interrupt and session.get("agent") is not None:
         from agent.interrupt_compat import request_hard_interrupt
 
         request_hard_interrupt(session["agent"])
