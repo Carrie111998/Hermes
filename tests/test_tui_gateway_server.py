@@ -15686,6 +15686,38 @@ def test_shutdown_sessions_closes_every_session_via_helper(monkeypatch):
         server._sessions.clear()
 
 
+def test_shutdown_sessions_spares_a_session_whose_turn_is_running(monkeypatch):
+    """The atexit sweep must not spend a live session's one-shot finalize latch.
+
+    Nothing joins the turn thread, so finalizing mid-turn persists a truncated
+    transcript, commits memory from it and releases the active-session lease
+    under live work, leaving the session permanently un-finalizable. Unfinalized
+    stays recoverable through the turn-end flush.
+    """
+    monkeypatch.setattr(server, "_release_gateway_wake_owner", lambda: False)
+    torn = []
+    monkeypatch.setattr(
+        server,
+        "_teardown_session",
+        lambda session, *, end_reason: torn.append((session["_sid"], end_reason)),
+    )
+    server._sessions.clear()
+    live = {"running": True}
+    idle = {"running": False}
+    server._sessions["live"] = live
+    server._sessions["idle"] = idle
+    try:
+        server._shutdown_sessions()
+        # The idle session is reclaimed exactly as before.
+        assert torn == [("idle", "tui_shutdown")]
+        assert "idle" not in server._sessions
+        # The live one is left registered and un-latched.
+        assert server._sessions.get("live") is live
+        assert not live.get("_finalized")
+    finally:
+        server._sessions.clear()
+
+
 def _idle_evictable_session(now):
     """A session that satisfies every eviction precondition."""
     ready = threading.Event()
