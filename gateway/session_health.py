@@ -7,6 +7,7 @@ turn and persist ``next_state`` in the routing entry's metadata.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Any, Mapping
 
@@ -90,10 +91,25 @@ def _state_value(state: Mapping[str, Any], key: str) -> int:
     return _nonnegative_int(state.get(key), 0)
 
 
+def _state_timestamp(state: Mapping[str, Any], key: str) -> float:
+    value = state.get(key)
+    if value is None or isinstance(value, bool):
+        return 0.0
+    try:
+        timestamp = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return 0.0
+    return timestamp if math.isfinite(timestamp) and timestamp >= 0.0 else 0.0
+
+
 def _disabled_decision(state: Mapping[str, Any] | None) -> SessionHealthDecision:
     raw = state if isinstance(state, Mapping) else {}
     next_state: dict[str, int | float] = {
-        key: _state_value(raw, key)
+        key: (
+            _state_timestamp(raw, key)
+            if key == "last_suggested_at"
+            else _state_value(raw, key)
+        )
         for key in (
             "suggestion_count",
             "last_suggested_at",
@@ -203,7 +219,7 @@ def evaluate_session_health(
 
     raw_state = state if isinstance(state, Mapping) else {}
     suggestion_count = _state_value(raw_state, "suggestion_count")
-    last_suggested_at = _state_value(raw_state, "last_suggested_at")
+    last_suggested_at = _state_timestamp(raw_state, "last_suggested_at")
     previous_failure_streak = _state_value(raw_state, "failure_streak")
     compression_count = _state_value(raw_state, "compression_count") + int(
         bool(compressed)

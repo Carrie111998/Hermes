@@ -170,6 +170,34 @@ def test_successful_turn_can_use_persisted_failure_and_compression_signals():
     assert decision.next_state["compression_count"] == 2
 
 
+def test_cooldown_preserves_fractional_timestamp_precision():
+    state = {
+        "suggestion_count": 1,
+        "last_suggested_at": 1_000.9,
+        "failure_streak": 0,
+        "compression_count": 0,
+    }
+
+    just_before_full_cooldown = _evaluate(
+        message_count=200,
+        tool_call_count=100,
+        prompt_tokens=90_000,
+        state=state,
+        now=87_400.5,
+    )
+    at_full_cooldown = _evaluate(
+        message_count=200,
+        tool_call_count=100,
+        prompt_tokens=90_000,
+        state=state,
+        now=87_400.9,
+    )
+
+    assert just_before_full_cooldown.should_suggest is False
+    assert just_before_full_cooldown.next_state["last_suggested_at"] == 1_000.9
+    assert at_full_cooldown.should_suggest is True
+
+
 def test_cooldown_and_maximum_prevent_repeated_nagging():
     initial = _evaluate(message_count=120, tool_call_count=40)
     during_cooldown = _evaluate(
