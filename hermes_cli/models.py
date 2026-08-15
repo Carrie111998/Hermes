@@ -4371,24 +4371,86 @@ def normalize_copilot_model_id(
     return raw
 
 
+# Cache for the reasoning-lookup token resolution. `github_model_reasoning_efforts`
+# is a hot path (the WebUI reasoning chip and the agent's per-turn send gates both
+# call it with no explicit credential), and `_resolve_copilot_catalog_api_key()` is
+# expensive: it can shell out to `gh auth token` and exchange pool candidates,
+# measured at ~1.1s per call on a cold path. `fetch_github_model_catalog` already
+# has its own 5-minute TTL, so without this the catalog was served from cache while
+# the token was re-resolved from scratch every single call.
+#
+# A negative result is cached too, with a shorter TTL: when there is no usable
+# credential the resolution is just as slow, and the offline fallback is the
+# correct answer for that window anyway.
+_copilot_reasoning_token_cache: Optional[str] = None
+_copilot_reasoning_token_cache_time: float = 0.0
+_COPILOT_REASONING_TOKEN_TTL = 300  # 5 min, matches the catalog cache
+_COPILOT_REASONING_TOKEN_NEGATIVE_TTL = 60  # retry a missing credential sooner
+
+
+def _cached_copilot_reasoning_token() -> str:
+    """`_resolve_copilot_catalog_api_key()` behind a short TTL.
+
+    Keeps the reasoning lookup off the credential-resolution path on every
+    call while still picking up a newly-added credential within a minute.
+    """
+    global _copilot_reasoning_token_cache, _copilot_reasoning_token_cache_time
+
+    now = time.monotonic()
+    if _copilot_reasoning_token_cache is not None:
+        ttl = (
+            _COPILOT_REASONING_TOKEN_TTL
+            if _copilot_reasoning_token_cache
+            else _COPILOT_REASONING_TOKEN_NEGATIVE_TTL
+        )
+        if (now - _copilot_reasoning_token_cache_time) < ttl:
+            return _copilot_reasoning_token_cache
+
+    try:
+        token = _resolve_copilot_catalog_api_key()
+    except Exception:
+        token = ""
+    _copilot_reasoning_token_cache = token or ""
+    _copilot_reasoning_token_cache_time = now
+    return _copilot_reasoning_token_cache
+
+
 def _copilot_claude_supports_reasoning_effort(bare_model: str) -> bool:
     """True for Copilot-hosted Claude models that advertise an effort ladder.
 
-    Live catalog (2026-08): opus/sonnet 4.6+ and unversioned 5.x expose
-    ``reasoning_effort``; 3.x and 4.0–4.5 (including haiku-4.5) do not.
+    Offline fallback only — used when the live ``/models`` catalog is
+    unreachable. The catalog stays authoritative whenever it answers.
+
+    Fails CLOSED: a Claude id must positively prove it carries a version at
+    or above the adaptive-thinking generation, otherwise it resolves to
+    "no ladder". Guessing the other way is the expensive direction — it
+    offers the user a control the provider then rejects with a 400.
+
+    Live catalog (2026-08): opus/sonnet 4.6+ and 5.x expose
+    ``reasoning_effort``; 3.x, 4.0-4.5 and haiku-4.5 do not.
     """
     raw = (bare_model or "").strip().lower()
     if "claude" not in raw:
         return False
-    if re.search(r"claude-3\b", raw) or re.search(r"claude-3[.\-]", raw):
-        return False
+
+    # An explicit major.minor is the only fully unambiguous form.
+    # `(?!\d)` keeps a trailing date stamp from being read as a minor.
     match = re.search(r"(\d+)[.\-](\d{1,2})(?!\d)", raw)
     if match:
         return (int(match.group(1)), int(match.group(2))) >= (4, 6)
-    major_only = re.search(r"[-.](\d+)(?:[-.]\d{6,})?(?:\b|-)", raw)
-    if major_only:
+
+    # No minor version. Only a bare major >= 5 qualifies, and it must be a
+    # real version token — NOT a date stamp, and NOT a size qualifier that
+    # happens to follow a digit. Require the number to be delimited and to
+    # carry no 6+ digit run (date stamps such as 4-20250514).
+    major_only = re.search(r"(?:^|[-.])(\d{1,2})(?![\d])", raw)
+    if major_only and not re.search(r"\d{6,}", raw):
         return int(major_only.group(1)) >= 5
-    return True
+
+    # Unversioned ("claude-sonnet", "claude-opus") or otherwise unparseable:
+    # fail closed. Previously this returned True, which exposed a ladder for
+    # ids whose generation we cannot establish.
+    return False
 
 
 def _github_reasoning_efforts_for_model_id(model_id: str) -> list[str]:
@@ -4639,7 +4701,7 @@ def github_model_reasoning_efforts(
     cached catalog. An explicit catalog still wins and skips auth.
     """
     if catalog is None and not api_key:
-        resolved = _resolve_copilot_catalog_api_key()
+        resolved = _cached_copilot_reasoning_token()
         if resolved:
             api_key = resolved
 
