@@ -11,7 +11,7 @@
 # =============================================================================
 
 model:
-  default: deepseek-ai/deepseek-v4-flash
+  default: deepseek-ai/deepseek-v4-flash-0731
   provider: nvidia
   base_url: https://integrate.api.nvidia.com/v1
 
@@ -58,28 +58,25 @@ memory:
   nudge_interval: 10
   flush_min_turns: 6
 
-# Fallback providers (free NVIDIA models — ordered by token efficiency)
+# Fallback providers (NVIDIA NIM models — verified against /v1/models catalog)
 fallback_providers:
   - provider: nvidia
     model: stepfun-ai/step-3.7-flash
     key_env: NVIDIA_API_KEY
   - provider: nvidia
-    model: minimaxai/minimax-m2.7
+    model: minimaxai/minimax-m3
     key_env: NVIDIA_API_KEY
   - provider: nvidia
-    model: deepseek-ai/deepseek-v4-flash
+    model: deepseek-ai/deepseek-v4-flash-0731
     key_env: NVIDIA_API_KEY
   - provider: nvidia
-    model: qwen/qwen3.5-122b
+    model: z-ai/glm-5.2
     key_env: NVIDIA_API_KEY
   - provider: nvidia
-    model: glm-5.2
+    model: nvidia/nemotron-3-ultra-550b-a55b
     key_env: NVIDIA_API_KEY
   - provider: nvidia
-    model: deepseek-ai/deepseek-v4-pro
-    key_env: NVIDIA_API_KEY
-  - provider: nvidia
-    model: nvidia/nemotron-3-ultra-550b
+    model: meta/llama-3.3-70b-instruct
     key_env: NVIDIA_API_KEY
 
 tts:
@@ -106,4 +103,4 @@ platform_toolsets:
 prompt_caching:
   cache_ttl: 5m
 
-_config_version: 34
+_config_version: 33

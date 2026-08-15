@@ -418,8 +418,16 @@ COPY --chmod=0755 docker/entrypoint-dispatch.sh /opt/hermes/docker/entrypoint-di
 # binary by absolute path, so this PATH ordering is transparent to
 # every other consumer.
 ENV PATH="/opt/hermes/bin:/opt/hermes/.venv/bin:/opt/data/.local/bin:${PATH}"
-RUN mkdir -p /opt/data
+RUN mkdir -p /opt/data /opt/data-seed /opt/memories-seed
 VOLUME [ "/opt/data" ]
+
+# Easypanel config overlay — when easypanel-config.yaml is present in
+# the image, the 025-easypanel-config cont-init script deploys it to
+# /opt/data/config.yaml on every boot so model/provider changes take
+# effect on redeploy.  Non-Easypanel builds that don't include this
+# file are unaffected (the script exits early).
+COPY docker/easypanel-config.yaml /opt/hermes/docker/easypanel-config.yaml
+COPY --chmod=0755 docker/cont-init.d/025-easypanel-config /etc/cont-init.d/025-easypanel-config
 
 # The image ENTRYPOINT is a tiny dispatcher rather than `/init` directly.
 # When the image really owns PID 1 (normal Docker / Podman), the dispatcher

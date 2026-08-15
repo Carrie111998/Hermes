@@ -19,18 +19,18 @@ if [ "$(id -u)" = 0 ]; then
         chown hermes:hermes "$HERMES_HOME/.env"
         chmod 600 "$HERMES_HOME/.env"
     fi
-    if [ ! -f "$HERMES_HOME/config.yaml" ]; then
-        # Seed from overlay first, then fallback to Easypanel-optimized config
-        if [ -f "$DATA_SEED/config.yaml" ]; then
-            cp "$DATA_SEED/config.yaml" "$HERMES_HOME/config.yaml"
-        elif [ -f "$INSTALL_DIR/docker/easypanel-config.yaml" ]; then
-            cp "$INSTALL_DIR/docker/easypanel-config.yaml" "$HERMES_HOME/config.yaml"
-        elif [ -f "$INSTALL_DIR/cli-config.yaml.example" ]; then
-            cp "$INSTALL_DIR/cli-config.yaml.example" "$HERMES_HOME/config.yaml"
-        fi
-        chown hermes:hermes "$HERMES_HOME/config.yaml" 2>/dev/null || true
-        chmod 640 "$HERMES_HOME/config.yaml" 2>/dev/null || true
+    # Always deploy the Easypanel-optimized config so model/provider
+    # changes take effect on redeploy (the persistent volume may have
+    # a stale config from a previous image).  User customizations
+    # should go in the overlay ($DATA_SEED/config.yaml) which takes
+    # precedence; the base config is overwritten every boot.
+    if [ -f "$DATA_SEED/config.yaml" ]; then
+        cp "$DATA_SEED/config.yaml" "$HERMES_HOME/config.yaml"
+    elif [ -f "$INSTALL_DIR/docker/easypanel-config.yaml" ]; then
+        cp "$INSTALL_DIR/docker/easypanel-config.yaml" "$HERMES_HOME/config.yaml"
     fi
+    chown hermes:hermes "$HERMES_HOME/config.yaml" 2>/dev/null || true
+    chmod 640 "$HERMES_HOME/config.yaml" 2>/dev/null || true
     if [ ! -f "$HERMES_HOME/SOUL.md" ]; then
         # Seed from overlay first, then fallback to inline default
         if [ -f "$DATA_SEED/SOUL.md" ]; then

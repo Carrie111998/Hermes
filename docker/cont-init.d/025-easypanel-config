@@ -1,0 +1,86 @@
+#!/command/with-contenv sh
+# shellcheck shell=sh
+# Easypanel config overlay — always deploy the optimized config so
+# model/provider changes take effect on redeploy.  Only activates when
+# /opt/hermes/docker/easypanel-config.yaml exists in the image
+# (non-Easypanel builds won't include this file, so this is a no-op
+# for standard Docker / Podman / Fly deployments).
+#
+# Runs after 01-hermes-setup (stage2-hook.sh) which does first-boot
+# seeding.  This script unconditionally overwrites config.yaml so a
+# stale config on the persistent volume can't hold an outdated model
+# or provider.
+
+EASYPANEL_CONFIG="/opt/hermes/docker/easypanel-config.yaml"
+HERMES_HOME="${HERMES_HOME:-/opt/data}"
+
+if [ ! -f "$EASYPANEL_CONFIG" ]; then
+    exit 0
+fi
+
+# Seed SOUL.md on first boot (stage2-hook.sh does this too, but
+# only when the file is missing — we also seed from the Easypanel
+# overlay if it exists).
+DATA_SEED="/opt/data-seed"
+MEMORIES_SEED="/opt/memories-seed"
+
+if [ ! -f "$HERMES_HOME/SOUL.md" ]; then
+    if [ -f "$DATA_SEED/SOUL.md" ]; then
+        cp "$DATA_SEED/SOUL.md" "$HERMES_HOME/SOUL.md"
+    else
+        printf 'You are Hermes Agent, an intelligent AI assistant. You are helpful, knowledgeable, and direct.\n' \
+            > "$HERMES_HOME/SOUL.md"
+    fi
+    chown hermes:hermes "$HERMES_HOME/SOUL.md" 2>/dev/null || true
+fi
+
+# Seed memories on first boot
+mkdir -p "$HERMES_HOME/memories" 2>/dev/null || true
+if [ -f "$MEMORIES_SEED/MEMORY.md" ] && [ ! -f "$HERMES_HOME/memories/MEMORY.md" ]; then
+    cp "$MEMORIES_SEED/MEMORY.md" "$HERMES_HOME/memories/MEMORY.md"
+    chown hermes:hermes "$HERMES_HOME/memories/MEMORY.md" 2>/dev/null || true
+fi
+if [ -f "$MEMORIES_SEED/USER.md" ] && [ ! -f "$HERMES_HOME/memories/USER.md" ]; then
+    cp "$MEMORIES_SEED/USER.md" "$HERMES_HOME/memories/USER.md"
+    chown hermes:hermes "$HERMES_HOME/memories/USER.md" 2>/dev/null || true
+fi
+
+# Seed git config for the hermes user (enables private repo cloning)
+if [ -n "${GITHUB_PAT:-}" ] && [ ! -f "$HERMES_HOME/.gitconfig" ]; then
+    printf '[credential]\n\thelper = store\n[user]\n\tname = Hermes Agent\n\temail = hermes@tad.do\n[core]\n\tautocrlf = input\n' \
+        > "$HERMES_HOME/.gitconfig"
+    printf 'https://tadtaxiadvertising:%s@github.com\n' "$GITHUB_PAT" \
+        > "$HERMES_HOME/.git-credentials"
+    chown hermes:hermes "$HERMES_HOME/.gitconfig" "$HERMES_HOME/.git-credentials" 2>/dev/null || true
+    chmod 600 "$HERMES_HOME/.git-credentials" 2>/dev/null || true
+fi
+
+# Create runtime subdirectories owned by hermes
+mkdir -p \
+    "$HERMES_HOME/cron" \
+    "$HERMES_HOME/sessions" \
+    "$HERMES_HOME/logs" \
+    "$HERMES_HOME/hooks" \
+    "$HERMES_HOME/memories" \
+    "$HERMES_HOME/skills" \
+    "$HERMES_HOME/lazy-packages" \
+    "$HERMES_HOME/platforms/pairing" \
+    "$HERMES_HOME/cache" 2>/dev/null || true
+chown -R hermes:hermes \
+    "$HERMES_HOME/cron" \
+    "$HERMES_HOME/sessions" \
+    "$HERMES_HOME/logs" \
+    "$HERMES_HOME/hooks" \
+    "$HERMES_HOME/memories" \
+    "$HERMES_HOME/skills" \
+    "$HERMES_HOME/lazy-packages" \
+    "$HERMES_HOME/platforms/pairing" \
+    "$HERMES_HOME/cache" 2>/dev/null || true
+
+# Always deploy the Easypanel-optimized config.  This ensures model/
+# provider changes take effect on every redeploy, even when a stale
+# config.yaml persists on the mounted volume from a previous image.
+cp "$EASYPANEL_CONFIG" "$HERMES_HOME/config.yaml"
+chown hermes:hermes "$HERMES_HOME/config.yaml" 2>/dev/null || true
+chmod 640 "$HERMES_HOME/config.yaml" 2>/dev/null || true
+echo "[easypanel] Deployed optimized config to $HERMES_HOME/config.yaml"
