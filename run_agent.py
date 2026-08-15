@@ -900,6 +900,8 @@ class AIAgent:
             fn(*args, **kwargs)
         except (OSError, ValueError):
             pass
+        except KeyboardInterrupt:
+            raise
 
     def _vprint(self, *args, force: bool = False, **kwargs):
         """Verbose print — suppressed when actively streaming tokens.
