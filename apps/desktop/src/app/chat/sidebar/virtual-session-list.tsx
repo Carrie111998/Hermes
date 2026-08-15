@@ -47,6 +47,8 @@ export interface VirtualSessionListProps {
 }
 
 const ROW_ESTIMATE_PX = 28
+// Date dividers are shorter than session rows (label + tight padding).
+const DIVIDER_ROW_ESTIMATE_PX = 26
 // Matches the card's typical rendered height (four lines when a preview
 // exists) so long card lists don't jump under the scroll thumb before
 // self-measurement catches up.
@@ -74,7 +76,12 @@ export const VirtualSessionList: FC<VirtualSessionListProps> = ({
 
   const virtualizer = useVirtualizer({
     count: listRows.length,
-    estimateSize: () => (card ? CARD_ROW_ESTIMATE_PX : ROW_ESTIMATE_PX),
+    estimateSize: index =>
+      listRows[index]?.kind === 'divider'
+        ? DIVIDER_ROW_ESTIMATE_PX
+        : card
+          ? CARD_ROW_ESTIMATE_PX
+          : ROW_ESTIMATE_PX,
     getItemKey: index => {
       const row = listRows[index]
 
@@ -83,6 +90,7 @@ export const VirtualSessionList: FC<VirtualSessionListProps> = ({
     getScrollElement: () => scrollerRef.current,
     // jsdom-friendly default; the real rect takes over on first observe.
     initialRect: { height: 600, width: 240 },
+    gap: 1,
     overscan: OVERSCAN_ROWS
   })
 
@@ -159,7 +167,7 @@ export const VirtualSessionList: FC<VirtualSessionListProps> = ({
       // hover — and the wrapper no longer stacks a second scroller, so the
       // double-gutter this class change was reaching for is already gone.
       className={cn(
-        'scrollbar-fade relative min-h-0 flex-1 overflow-x-hidden overflow-y-auto overscroll-contain',
+        'scrollbar-fade relative min-h-0 flex-1 overflow-x-hidden overflow-y-auto overscroll-contain [overflow-anchor:none]',
         className
       )}
       ref={scrollerRef}
