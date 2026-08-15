@@ -13,6 +13,48 @@ import pytest
 import hermes_cli.gateway as gateway
 
 
+@pytest.mark.parametrize(
+    ("all_profiles", "expected_pattern"),
+    [(False, "hermes-gateway-andrej.service"), (True, "hermes-gateway*")],
+)
+def test_get_service_pids_scopes_systemd_unit_listing(
+    monkeypatch, all_profiles, expected_pattern
+):
+    calls = []
+
+    def fake_run(args, **kwargs):
+        calls.append(args)
+        if "list-units" in args:
+            return SimpleNamespace(
+                stdout="hermes-gateway-andrej.service loaded active running\n",
+                returncode=0,
+            )
+        return SimpleNamespace(stdout="701\n", returncode=0)
+
+    monkeypatch.setattr(gateway, "supports_systemd_services", lambda: True)
+    monkeypatch.setattr(gateway, "is_macos", lambda: False)
+    monkeypatch.setattr(gateway, "get_service_name", lambda: "hermes-gateway-andrej")
+    monkeypatch.setattr(gateway.subprocess, "run", fake_run)
+
+    assert gateway._get_service_pids(all_profiles=all_profiles) == {701}
+    list_calls = [args for args in calls if "list-units" in args]
+    assert list_calls
+    assert all(expected_pattern in args for args in list_calls)
+
+
+def test_find_gateway_pids_scopes_service_pids_to_current_profile(monkeypatch):
+    def service_pids(*, all_profiles):
+        return {701, 702} if all_profiles else {701}
+
+    monkeypatch.setattr(gateway, "_get_service_pids", service_pids)
+    monkeypatch.setattr("gateway.status.get_running_pid", lambda: None)
+    monkeypatch.setattr(gateway, "supports_systemd_services", lambda: True)
+    monkeypatch.setattr(gateway, "_scan_gateway_pids", lambda *args, **kwargs: [])
+
+    assert gateway.find_gateway_pids() == [701]
+    assert set(gateway.find_gateway_pids(all_profiles=True)) == {701, 702}
+
+
 def _install_fake_gateway_run(monkeypatch, start_gateway):
     module = ModuleType("gateway.run")
     module.start_gateway = start_gateway

@@ -97,25 +97,34 @@ class ProfileGatewayProcess:
     pid: int
 
 
-def _get_service_pids() -> set:
+def _get_service_pids(*, all_profiles: bool = True) -> set:
     """Return PIDs currently managed by systemd or launchd gateway services.
 
     Used to avoid killing freshly-restarted service processes when sweeping
     for stale manual gateway processes after a service restart.  Relies on the
     service manager having committed the new PID before the restart command
     returns (true for both systemd and launchd in practice).
+
+    When ``all_profiles`` is false, systemd discovery is restricted to the
+    current profile's unit. Launchd already addresses the current profile by
+    its scoped label, so its behavior is unchanged.
     """
     pids: set = set()
 
     # --- systemd (Linux): user and system scopes ---
     if supports_systemd_services():
+        unit_pattern = (
+            "hermes-gateway*"
+            if all_profiles
+            else f"{get_service_name()}.service"
+        )
         for scope_args in [["systemctl", "--user"], ["systemctl"]]:
             try:
                 result = subprocess.run(
                     scope_args
                     + [
                         "list-units",
-                        "hermes-gateway*",
+                        unit_pattern,
                         "--plain",
                         "--no-legend",
                         "--no-pager",
@@ -738,7 +747,7 @@ def find_gateway_pids(
             _append_unique_pid(pids, get_running_pid(), _exclude)
         except Exception:
             pass
-    for pid in _get_service_pids():
+    for pid in _get_service_pids(all_profiles=all_profiles):
         _append_unique_pid(pids, pid, _exclude)
     try:
         include_restart_managers = not supports_systemd_services()
