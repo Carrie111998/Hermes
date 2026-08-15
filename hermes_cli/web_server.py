@@ -2695,10 +2695,17 @@ async def download_ticket(request: Request, path: str):
         raise HTTPException(status_code=403, detail="Access to sensitive files is not allowed")
 
     from hermes_cli.dashboard_auth.download_ticket import build_download_url
+    from hermes_cli.dashboard_auth.prefix import resolve_public_url
 
+    # Behind a reverse proxy, ``request.base_url`` can expose the internal
+    # scheme/host, which the external viewer cannot reach. When the operator
+    # declared a public URL (HERMES_DASHBOARD_PUBLIC_URL / dashboard.public_url)
+    # prefer it so the minted link points at the externally reachable base;
+    # otherwise fall back to the request-derived base.
+    base = resolve_public_url() or str(request.base_url).rstrip("/")
     return {
         "ok": True,
-        "url": build_download_url(str(request.base_url).rstrip("/"), str(target)),
+        "url": build_download_url(base, str(target)),
         "path": str(target),
     }
 
