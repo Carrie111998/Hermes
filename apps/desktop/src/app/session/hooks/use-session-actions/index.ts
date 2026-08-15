@@ -9,6 +9,7 @@ import { type ChatMessage, preserveLocalAssistantErrors, toChatMessages } from '
 import { isMissingRpcMethod } from '@/lib/gateway-rpc'
 import { recoverInFlightTurnJournal } from '@/lib/inflight-turn-journal'
 import { setSessionYolo } from '@/lib/yolo-session'
+import { normalizeChoices, setClarifyRequest } from '@/store/clarify'
 import { migrateSessionDraft } from '@/store/composer'
 import { clearQueuedPrompts, migrateQueuedPrompts } from '@/store/composer-queue'
 import { $pinnedSessionIds } from '@/store/layout'
@@ -21,6 +22,7 @@ import {
   tombstoneSessions,
   untombstoneSessions
 } from '@/store/projects'
+import { setApprovalRequest } from '@/store/prompts'
 import {
   $activeSessionStoredIdRotation,
   $currentCwd,
@@ -84,6 +86,7 @@ import {
   patchSessionWorkspace,
   preserveLocalPendingTurnMessages,
   reconcileResumeMessages,
+  resolveResumedBusy,
   resolveSessionProfile,
   resolveStoredSession,
   sessionMatchesStoredId,
@@ -190,6 +193,49 @@ interface FreshSessionDraftOptions {
   preserveRoute?: boolean
   replaceRoute?: boolean
   workspaceTarget?: NewChatWorkspaceTarget
+}
+
+function restorePendingApproval(response: SessionResumeResponse, sessionId: string): boolean {
+  const pending = response.pending_approval
+
+  if (!pending) {
+    return false
+  }
+
+  setApprovalRequest({
+    allowPermanent: pending.allow_permanent !== false,
+    choices: pending.choices,
+    command: pending.command ?? '',
+    description: pending.description ?? 'dangerous command',
+    requestId: typeof pending.request_id === 'string' ? pending.request_id : undefined,
+    sessionId,
+    smartDenied: pending.smart_denied === true
+  })
+
+  return true
+}
+
+function restorePendingClarify(response: SessionResumeResponse, sessionId: string): boolean {
+  // Same replay class as pending_approval: the clarify.request event was
+  // emitted while this client's transport was detached, so without the resume
+  // snapshot the question stays invisible until it times out server-side.
+  const pending = response.pending_clarify
+
+  if (!pending || typeof pending.request_id !== 'string' || typeof pending.question !== 'string') {
+    return false
+  }
+
+  const choices = normalizeChoices(pending.choices)
+
+  setClarifyRequest({
+    choices: choices.length > 0 ? choices : null,
+    multiSelect: pending.multi_select === true,
+    question: pending.question,
+    requestId: pending.request_id,
+    sessionId
+  })
+
+  return true
 }
 
 function normalizeNewChatWorkspaceTarget(target: NewChatWorkspaceTarget): NewChatWorkspaceTarget {
@@ -344,7 +390,9 @@ export function useSessionActions({
       if (!hasWorkspaceTarget) {
         // In a project → the repo's default-branch checkout; not in a project →
         // detached. So cmd-n does not inherit an unrelated linked worktree.
-        setCurrentCwd(resolveNewSessionCwd())
+        // Transient: a resolved default is not the user naming a workspace, and
+        // remembering it here would make the NEXT new chat inherit it.
+        setCurrentCwdTransient(resolveNewSessionCwd())
       } else if (workspaceTarget === null) {
         setCurrentCwdTransient('')
       } else if (typeof workspaceTarget === 'string') {
@@ -498,7 +546,7 @@ export function useSessionActions({
       try {
         // Fresh tile → the caller's workspace when one was named (the sidebar
         // "+" on a project/worktree lane), else the resolved new-session cwd
-        // (focused session's project → project scope → default).
+        // (project scope → configured default).
         const params = await desktopSessionCreateParams((options?.cwd || resolveNewSessionCwd()).trim())
         const created = await requestGateway<SessionCreateResponse>('session.create', params)
         const stored = created.stored_session_id
@@ -533,7 +581,7 @@ export function useSessionActions({
         patchSessionTile(stored, { runtimeId: created.session_id })
 
         if (dir === 'center' && runtimeInfo?.cwd) {
-          setCurrentCwd(runtimeInfo.cwd)
+          setCurrentCwdTransient(runtimeInfo.cwd)
           setWorkspaceCwdOwner(stored)
         }
 
@@ -716,7 +764,7 @@ export function useSessionActions({
           setActiveSessionId(cachedRuntimeId)
           activeSessionIdRef.current = cachedRuntimeId
           syncSessionStateToView(cachedRuntimeId, cachedViewState)
-          setCurrentCwd(cachedViewState.cwd)
+          setCurrentCwdTransient(cachedViewState.cwd)
           // The warm cache IS this conversation's own workspace truth, so the
           // switch is already re-homed here. This claim cannot wait for
           // `session.activate`: its missing-RPC compat branch returns before
@@ -765,14 +813,31 @@ export function useSessionActions({
               sessionStateByRuntimeIdRef.current.delete(cachedRuntimeId)
               dropSessionState(cachedRuntimeId)
             } else {
+              const pendingApproval = restorePendingApproval(activated, cachedRuntimeId)
+              const pendingClarify = restorePendingClarify(activated, cachedRuntimeId)
               const runtimeInfo = applyRuntimeInfo(activated.info)
 
-              let activatedMessages =
-                activated.messages.length || activated.inflight || activated.queued
+              // `omit_messages` means the response carries NO transcript, not
+              // an empty one — the cache is the base and the live projection is
+              // a tail to graft onto it. Reconciling against the empty list
+              // instead rebuilds the thread out of the projection alone, so
+              // activating a session that is mid-turn somewhere else (leaving
+              // HUD mode is exactly that) collapsed the whole conversation down
+              // to the in-flight prompt until the turn finished and the
+              // post-turn hydrate restored it.
+              let activatedMessages = activated.messages_omitted
+                ? appendLiveSessionProjection(cachedViewState.messages, activated)
+                : activated.messages.length || activated.inflight || activated.queued
                   ? reconcileAuthoritativeMessages(activated.messages, cachedViewState.messages, activated)
                   : cachedViewState.messages
 
-              const running = Boolean(activated.running ?? cachedViewState.busy)
+              // #70449: never let the activate snapshot's stale running:false
+              // rewind a turn that started while the RPC was in flight — read
+              // the freshest cache entry, not the pre-await cachedViewState.
+              const running = resolveResumedBusy(
+                activated.running ?? cachedViewState.busy,
+                Boolean(sessionStateByRuntimeIdRef.current.get(cachedRuntimeId)?.busy)
+              )
 
               // While idle, the persisted REST transcript is the display
               // authority: session.activate returns the runtime's compressed
@@ -793,7 +858,17 @@ export function useSessionActions({
                   !activatedStoredSessionId ||
                   persisted.session_id === activatedStoredSessionId
 
-                if (persisted && persistedMatchesActivatedSession) {
+                // An empty REST page is not proof the transcript is empty — it's
+                // also what a backend respawn returns while its state.db read
+                // races the activate response. Reconciling against it anyway
+                // wipes the just-restored activate/cache transcript (the same
+                // wipe the `activated.messages.length || ...` guard above
+                // already prevents for the activate payload itself).
+                if (
+                  persisted &&
+                  persistedMatchesActivatedSession &&
+                  (persisted.messages.length || !activatedMessages.length)
+                ) {
                   activatedMessages = reconcileAuthoritativeMessages(persisted.messages, activatedMessages)
                 }
               }
@@ -805,7 +880,12 @@ export function useSessionActions({
                   ...(runtimeInfo ?? {}),
                   messages: activatedMessages,
                   busy: running,
-                  awaitingResponse: running
+                  awaitingResponse: running,
+                  needsInput: pendingApproval || pendingClarify || state.needsInput,
+                  // Adopting someone else's turn: we'll stream its reply
+                  // without ever having received its prompt, so the settle
+                  // path must not take the "I saw it all" shortcut.
+                  adoptedRunningTurn: state.adoptedRunningTurn || running
                 }),
                 storedSessionId
               )
@@ -965,12 +1045,27 @@ export function useSessionActions({
                   ? preserveLocalPendingTurnMessages(currentMessages, resumeStartMessages)
                   : currentMessages
 
-                const resumedMessages = reconcileAuthoritativeMessages(resumed.messages, previousMessages, resumed)
+                // Omitted, not empty — same trap as the activate path above.
+                // The REST prefetch IS the transcript here; the resume payload
+                // only contributes the live tail, so graft rather than rebuild.
+                // (Without a usable prefetch there is nothing better to stand
+                // on, so the projection alone remains the degraded fallback.)
+                const resumedMessages =
+                  resumed.messages_omitted && prefetchApplied && prefetchMatchesResumedSession
+                    ? appendLiveSessionProjection(localSnapshot, resumed)
+                    : reconcileAuthoritativeMessages(resumed.messages, previousMessages, resumed)
 
                 return chatMessageArraysEquivalent(currentMessages, resumedMessages) ? currentMessages : resumedMessages
               })()
 
-        resumedRunning = Boolean((resumed as { running?: boolean }).running)
+        // #70449: same stale-snapshot guard as the warm path — a turn that
+        // started while the resume RPC was in flight has already marked the
+        // rebound runtime busy via gateway events; the snapshot must not
+        // rewind it to idle just because the user opened the chat.
+        resumedRunning = resolveResumedBusy(
+          (resumed as { running?: boolean }).running,
+          Boolean(sessionStateByRuntimeIdRef.current.get(resumed.session_id)?.busy)
+        )
 
         // Crash-survivable turn progress: fold a journaled in-flight tail
         // (persisted by use-session-state-cache while the turn streamed;
@@ -1010,6 +1105,8 @@ export function useSessionActions({
 
         setActiveSessionId(resumed.session_id)
         activeSessionIdRef.current = resumed.session_id
+        const pendingApproval = restorePendingApproval(resumed, resumed.session_id)
+        const pendingClarify = restorePendingClarify(resumed, resumed.session_id)
         const runtimeInfo = applyRuntimeInfo(resumed.info)
 
         patchSessionWorkspace(storedSessionId, runtimeInfo?.cwd)
@@ -1022,6 +1119,8 @@ export function useSessionActions({
             messages: messagesForView,
             busy: resumedRunning,
             awaitingResponse: resumedRunning && !recoveredInFlightTail,
+            needsInput: pendingApproval || pendingClarify || state.needsInput,
+            adoptedRunningTurn: state.adoptedRunningTurn || resumedRunning,
             ...(inFlightRecovery.applied
               ? {
                   sawAssistantPayload: true,

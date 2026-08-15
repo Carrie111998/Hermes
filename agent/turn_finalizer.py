@@ -26,6 +26,7 @@ import os
 
 from agent.codex_responses_adapter import _summarize_user_message_for_log
 from agent.message_content import flatten_message_text
+from agent.message_sanitization import _sanitize_surrogates
 
 
 def _is_pure_tool_call_tail(msg: dict) -> bool:
@@ -639,6 +640,18 @@ def finalize_turn(
             last_reasoning = msg["reasoning"]
             break
 
+    # Class-level surrogate chokepoint (#80366, #55143, #55309, #19819):
+    # ``final_response`` is often the RAW SDK content
+    # (``assistant_message.content``), not the sanitized copy stored in
+    # history by ``build_assistant_message``. Any lone UTF-16 surrogate
+    # (U+D800–U+DFFF) in it crashes downstream consumers — oneshot stdout
+    # writes, Telegram's ``utf16_len`` length check, Signal formatting,
+    # JSON envelope encodes — on every provider (Ollama, NVIDIA NIM, …).
+    # Scrub once here, where model text leaves the conversation loop, so
+    # every delivery surface receives valid Unicode.
+    if isinstance(final_response, str):
+        final_response = _sanitize_surrogates(final_response)
+
     # Build result with interrupt info if applicable
     result = {
         "final_response": final_response,
@@ -686,8 +699,8 @@ def finalize_turn(
             "health (`hermes doctor`), then send your message again"
         )
         # Machine-readable cause for the gateway/desktop: exactly
-        # 'session_persistence_failed:<locked|disk|unknown>'. Never clobber a
-        # failure_reason another path already stamped on this result.
+        # 'session_persistence_failed:<locked|compression|turn_lease|disk|unknown>'.
+        # Never clobber a failure_reason another path already stamped.
         if "failure_reason" not in result:
             _cause = getattr(agent, "_last_persistence_error_cause", None)
             result["failure_reason"] = (
