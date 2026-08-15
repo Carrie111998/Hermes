@@ -151,6 +151,36 @@ def _resolve_lineage(db, session_id: str) -> str:
     return _resolve_to_parent(db, session_id)[0]
 
 
+def _session_route_key(db, session_id: str) -> Optional[str]:
+    """Return a persisted route key for comparison without exposing it."""
+    if not session_id:
+        return None
+    try:
+        session = db.get_session(session_id) or {}
+        route_key = session.get("session_key")
+        return str(route_key) if route_key else None
+    except Exception as e:
+        logging.debug(
+            "Unable to resolve route key for session %s: %s",
+            session_id,
+            e,
+            exc_info=True,
+        )
+        return None
+
+
+def _scope_relation(db, current_route_key: Optional[str], session_id: str) -> str:
+    """Classify a result relative to the current route without leaking keys."""
+    if not current_route_key:
+        return "unknown"
+    result_route_key = _session_route_key(db, session_id)
+    if not result_route_key:
+        return "unknown"
+    if result_route_key == current_route_key:
+        return "current_route"
+    return "other_route"
+
+
 def _is_compression_ended(db, session_id: str) -> bool:
     """Return True if *session_id* itself ended with ``end_reason='compression'``.
 
@@ -699,6 +729,7 @@ def _discover(
     """Discovery shape: FTS5 + anchored window + bookends per hit. Single call."""
     role_list = role_filter if role_filter else ["user", "assistant"]
     current_lineage_root = _resolve_lineage(db, current_session_id) if current_session_id else None
+    current_route_key = _session_route_key(db, current_session_id)
     title_result = _title_match_result(db, query, current_lineage_root)
 
     try:
@@ -831,6 +862,11 @@ def _discover(
         results.append(entry)
 
     for entry in results:
+        entry["scope_relation"] = _scope_relation(
+            db,
+            current_route_key,
+            entry.get("session_id"),
+        )
         entry["link"] = _session_link(entry["session_id"], link_profile)
 
     _final_payload = {
@@ -996,12 +1032,21 @@ SESSION_SEARCH_SCHEMA = {
         "and why before falling back to session history. Do not conclude 'not found' "
         "or 'no prior correspondence' from session_search alone when a direct source "
         "was provided.\n\n"
+        "CURRENT-SCOPE LIMIT\n\n"
+        "  Discovery results carry `scope_relation`: `current_route` means the same "
+        "canonical conversation route, `other_route` means a different route, and "
+        "`unknown` means the relationship could not be proved. Same-route history is "
+        "still historical context, not proof of current state or an explicit user "
+        "action. Never use another-route or unknown history to establish the current "
+        "conversation's state, and never infer that the user issued `/reset` from "
+        "session history or reset-like metadata alone.\n\n"
         "FOUR CALLING SHAPES\n\n"
         "  1) DISCOVERY — pass `query`:\n"
         "     session_search(query=\"auth refactor\", limit=3)\n"
         "     Runs FTS5, dedupes hits by session lineage, returns the top N sessions. "
         "Each result carries:\n"
         "       - session_id, title, when, source\n"
+        "       - scope_relation: current_route, other_route, or unknown\n"
         "       - snippet: FTS5-highlighted match excerpt\n"
         "       - bookend_start: first 3 user+assistant messages of the session "
         "(the goal / kickoff)\n"
