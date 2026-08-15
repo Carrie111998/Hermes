@@ -1093,9 +1093,11 @@ class GatewayKanbanWatchersMixin:
           2. ``event_payload['summary']`` (truncated first line)
           3. ``task.result`` (legacy fallback)
 
-        Files are restricted to the task workspace or its durable attachment
-        directory, deduplicated, and silently skipped when missing. Delivery
-        errors are logged but do not break the notifier loop.
+        Files are restricted to the task's durable attachment directory,
+        deduplicated, and silently skipped when missing. Completion stages
+        workspace artifacts there before this notifier runs, so adapters never
+        receive a worker-mutable workspace path. Delivery errors are logged but
+        do not break the notifier loop.
         """
         from pathlib import Path as _Path
 
@@ -1144,16 +1146,6 @@ class GatewayKanbanWatchersMixin:
             return
 
         allowed_roots: list[_Path] = []
-        workspace_path = (
-            getattr(task, "workspace_path", None) if task is not None else None
-        )
-        if workspace_path:
-            try:
-                allowed_roots.append(
-                    _Path(workspace_path).expanduser().resolve(strict=False)
-                )
-            except (OSError, RuntimeError):
-                pass
         task_id = getattr(task, "id", None) if task is not None else None
         if task_id:
             try:
@@ -1175,7 +1167,7 @@ class GatewayKanbanWatchersMixin:
                     confined.append(str(resolved))
                 else:
                     logger.warning(
-                        "kanban notifier: skipping artifact outside task workspace: %s",
+                        "kanban notifier: skipping unstaged task artifact: %s",
                         candidate,
                     )
             except (OSError, RuntimeError):

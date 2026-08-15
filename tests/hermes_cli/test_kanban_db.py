@@ -612,6 +612,81 @@ def test_complete_task_persists_scratch_artifacts_before_cleanup(kanban_home):
     ]
 
 
+def test_complete_task_stages_dir_workspace_legacy_artifact(
+    kanban_home,
+    tmp_path,
+):
+    """Persistent workspaces also stage a durable path outside worker control."""
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    artifact = workspace / "report.pdf"
+    artifact.write_bytes(b"expected report")
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="persistent report",
+            workspace_kind="dir",
+            workspace_path=str(workspace),
+        )
+        assert kb.complete_task(
+            conn,
+            task_id,
+            summary=f"produced {artifact}",
+        )
+        completed = [
+            event for event in kb.list_events(conn, task_id)
+            if event.kind == "completed"
+        ][-1]
+        persisted = Path(completed.payload["artifacts"][0])
+        run = kb.latest_run(conn, task_id)
+        attachments = kb.list_attachments(conn, task_id)
+
+    assert artifact.exists(), "persistent workspace content must remain in place"
+    assert persisted.parent == kb.task_attachments_dir(task_id)
+    assert persisted != artifact
+    assert persisted.read_bytes() == b"expected report"
+    assert run is not None
+    assert run.metadata["artifacts"] == [str(persisted)]
+    assert [(item.filename, item.stored_path) for item in attachments] == [
+        ("report.pdf", str(persisted.resolve()))
+    ]
+
+
+def test_complete_task_stages_dir_artifact_on_connection_board(
+    kanban_home,
+    tmp_path,
+):
+    """An explicit board connection owns staging even when current is default."""
+    kb.create_board("other")
+    workspace = tmp_path / "other-project"
+    workspace.mkdir()
+    artifact = workspace / "report.pdf"
+    artifact.write_bytes(b"other board")
+
+    with kb.connect(board="other") as conn:
+        task_id = kb.create_task(
+            conn,
+            title="other-board report",
+            workspace_kind="dir",
+            workspace_path=str(workspace),
+        )
+        assert kb.complete_task(
+            conn,
+            task_id,
+            summary="done",
+            metadata={"artifacts": [str(artifact)]},
+        )
+        completed = [
+            event for event in kb.list_events(conn, task_id)
+            if event.kind == "completed"
+        ][-1]
+        persisted = Path(completed.payload["artifacts"][0])
+
+    assert persisted.parent == kb.task_attachments_dir(task_id, board="other")
+    assert not kb.task_attachments_dir(task_id, board="default").exists()
+
+
 @pytest.mark.parametrize("via_workspace_symlink", [False, True])
 def test_complete_task_rejects_artifacts_outside_scratch_workspace(
     kanban_home,

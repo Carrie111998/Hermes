@@ -793,6 +793,24 @@ def task_attachments_dir(task_id: str, board: Optional[str] = None) -> Path:
     return attachments_root(board=board) / task_id
 
 
+def _connection_board(conn: sqlite3.Connection) -> str:
+    """Derive board ownership from an open connection's main DB path."""
+    try:
+        row = conn.execute("PRAGMA database_list").fetchone()
+        db_path = Path(row["file"]).resolve(strict=False)
+        default_db = (kanban_home() / "kanban.db").resolve(strict=False)
+        if db_path == default_db:
+            return DEFAULT_BOARD
+        relative = db_path.relative_to(boards_root().resolve(strict=False))
+        if len(relative.parts) == 2 and relative.parts[1] == "kanban.db":
+            board = _normalize_board_slug(relative.parts[0])
+            if board:
+                return board
+    except (OSError, RuntimeError, TypeError, ValueError):
+        pass
+    return get_current_board()
+
+
 def worker_logs_dir(board: Optional[str] = None) -> Path:
     """Return the directory under which per-task worker logs are written.
 
@@ -5543,7 +5561,7 @@ def complete_task(
         if cur.rowcount != 1:
             return False
         if isinstance(metadata, dict):
-            _persist_scratch_completion_artifacts(conn, task_id, metadata)
+            _persist_completion_artifacts(conn, task_id, metadata)
             for stored_path in metadata.pop("_staged_artifacts", []):
                 path = Path(stored_path)
                 _insert_completion_attachment(
@@ -5671,20 +5689,22 @@ def _merge_completion_prose_artifacts(
     summary: Optional[str],
     result: Optional[str],
 ) -> Optional[dict]:
-    """Promote existing scratch files named in legacy completion prose.
+    """Promote existing workspace files named in legacy completion prose.
 
     ``artifacts=[...]`` is preferred. Older workers only wrote an absolute
-    deliverable path in ``summary``/``result``; discover it while scratch still
-    exists so cleanup cannot erase the file the user was promised.
+    deliverable path in ``summary``/``result``; discover it before completion
+    so it can be staged outside the worker-controlled workspace.
     """
     row = conn.execute(
-        "SELECT workspace_kind, workspace_path FROM tasks WHERE id = ?",
+        "SELECT workspace_path FROM tasks WHERE id = ?",
         (task_id,),
     ).fetchone()
-    if not row or row["workspace_kind"] != "scratch" or not row["workspace_path"]:
+    if not row or not row["workspace_path"]:
         return metadata
     workspace = Path(row["workspace_path"]).expanduser()
-    if not _is_managed_scratch_path(workspace):
+    try:
+        workspace_root = workspace.resolve(strict=True)
+    except (OSError, RuntimeError):
         return metadata
     text = "\n".join(part for part in (summary, result) if part)
     if not text:
@@ -5694,8 +5714,13 @@ def _merge_completion_prose_artifacts(
     for match in re.finditer(prefix + r"(?:[/\\][^\s`\"'<>]+)", text):
         raw = match.group(0).rstrip(".,;:!?)]}")
         candidate = Path(raw)
-        if candidate.is_file():
-            discovered.append(str(candidate))
+        try:
+            resolved = candidate.resolve(strict=True)
+            resolved.relative_to(workspace_root)
+        except (OSError, RuntimeError, ValueError):
+            continue
+        if resolved.is_file():
+            discovered.append(str(resolved))
     if not discovered:
         return metadata
     updated = dict(metadata) if isinstance(metadata, dict) else {}
@@ -5710,32 +5735,32 @@ def _merge_completion_prose_artifacts(
     return updated
 
 
-def _persist_scratch_completion_artifacts(
+def _persist_completion_artifacts(
     conn: sqlite3.Connection,
     task_id: str,
     metadata: dict,
 ) -> None:
-    """Copy scratch-workspace completion artifacts before cleanup removes them."""
+    """Stage completion artifacts outside the worker-controlled workspace."""
     raw_artifacts = metadata.get("artifacts")
     if not isinstance(raw_artifacts, (list, tuple)):
         return
 
     row = conn.execute(
-        "SELECT workspace_kind, workspace_path FROM tasks WHERE id = ?",
+        "SELECT workspace_path FROM tasks WHERE id = ?",
         (task_id,),
     ).fetchone()
-    if not row or row["workspace_kind"] != "scratch" or not row["workspace_path"]:
+    if not row or not row["workspace_path"]:
         return
 
     workspace = Path(row["workspace_path"]).expanduser()
-    is_managed, board = _managed_scratch_path_info(workspace)
-    if not is_managed:
-        return
+    board = _connection_board(conn)
 
     try:
-        workspace_root = workspace.resolve()
-    except OSError:
-        return
+        workspace_root = workspace.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise ArtifactPreservationError(
+            "completion artifacts require an available task workspace"
+        ) from exc
 
     attachment_dir = task_attachments_dir(task_id, board=board)
     persisted: list[str] = []
@@ -5763,7 +5788,7 @@ def _persist_scratch_completion_artifacts(
         except OSError as exc:
             _discard_copies()
             raise ArtifactPreservationError(
-                f"declared scratch artifact is unavailable: {artifact}"
+                f"declared completion artifact is unavailable: {artifact}"
             ) from exc
 
         if not resolved_src.is_relative_to(workspace_root):
@@ -5777,17 +5802,17 @@ def _persist_scratch_completion_artifacts(
         except OSError as exc:
             _discard_copies()
             raise ArtifactPreservationError(
-                f"declared scratch artifact is unavailable or not a regular file: {artifact}"
+                f"declared completion artifact is unavailable or not a regular file: {artifact}"
             ) from exc
         if not stat.S_ISREG(expected_stat.st_mode):
             _discard_copies()
             raise ArtifactPreservationError(
-                f"declared scratch artifact is unavailable or not a regular file: {artifact}"
+                f"declared completion artifact is unavailable or not a regular file: {artifact}"
             )
         if expected_stat.st_size > KANBAN_ATTACHMENT_MAX_BYTES:
             _discard_copies()
             raise ArtifactPreservationError(
-                f"declared scratch artifact exceeds the "
+                f"declared completion artifact exceeds the "
                 f"{KANBAN_ATTACHMENT_MAX_BYTES}-byte limit: {artifact}"
             )
 
@@ -5808,18 +5833,18 @@ def _persist_scratch_completion_artifacts(
                 opened_stat = os.fstat(source_file.fileno())
                 if not stat.S_ISREG(opened_stat.st_mode):
                     raise ArtifactPreservationError(
-                        f"declared scratch artifact is not a regular file: {artifact}"
+                        f"declared completion artifact is not a regular file: {artifact}"
                     )
                 if (
                     opened_stat.st_dev != expected_stat.st_dev
                     or opened_stat.st_ino != expected_stat.st_ino
                 ):
                     raise ArtifactPreservationError(
-                        f"declared scratch artifact changed before it could be copied: {artifact}"
+                        f"declared completion artifact changed before it could be copied: {artifact}"
                     )
                 if opened_stat.st_size > KANBAN_ATTACHMENT_MAX_BYTES:
                     raise ArtifactPreservationError(
-                        f"declared scratch artifact exceeds the "
+                        f"declared completion artifact exceeds the "
                         f"{KANBAN_ATTACHMENT_MAX_BYTES}-byte limit: {artifact}"
                     )
                 copied = 0
@@ -5827,7 +5852,7 @@ def _persist_scratch_completion_artifacts(
                     copied += len(chunk)
                     if copied > KANBAN_ATTACHMENT_MAX_BYTES:
                         raise ArtifactPreservationError(
-                            f"declared scratch artifact grew beyond the size limit: {artifact}"
+                            f"declared completion artifact grew beyond the size limit: {artifact}"
                         )
                     destination_file.write(chunk)
         except Exception as exc:
@@ -5840,7 +5865,7 @@ def _persist_scratch_completion_artifacts(
             if isinstance(exc, ArtifactPreservationError):
                 raise
             raise ArtifactPreservationError(
-                f"could not preserve declared scratch artifact {artifact}: {exc}"
+                f"could not preserve declared completion artifact {artifact}: {exc}"
             ) from exc
 
         used_destinations.add(dest)

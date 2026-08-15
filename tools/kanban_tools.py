@@ -1846,11 +1846,10 @@ KANBAN_COMPLETE_SCHEMA = {
                     "lands with the completion notification. Skip "
                     "intermediate scratch files and references that "
                     "are not the deliverable. Each path must exist and resolve "
-                    "inside the task workspace at completion. Files inside a "
-                    "managed scratch workspace are copied to durable task "
-                    "attachments before cleanup; a missing declared scratch "
-                    "artifact keeps the task in-flight so you can fix the "
-                    "path and retry."
+                    "inside the task workspace at completion. Accepted files "
+                    "are copied to durable task attachments before the "
+                    "completion event is emitted; a missing declaration keeps "
+                    "the task in-flight so you can fix the path and retry."
                 ),
             },
             "board": _board_schema_prop(),

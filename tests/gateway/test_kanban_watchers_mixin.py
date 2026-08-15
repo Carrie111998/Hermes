@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+from pathlib import Path
 from types import SimpleNamespace
 
 from gateway.kanban_watchers import GatewayKanbanWatchersMixin
@@ -40,7 +41,7 @@ class _ArtifactAdapter:
         self.documents.append(file_path)
 
 
-def test_legacy_completion_paths_are_confined_to_task_workspace(tmp_path):
+def test_notifier_rejects_unstaged_completion_paths(tmp_path):
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     inside = workspace / "inside.pdf"
@@ -67,7 +68,7 @@ def test_legacy_completion_paths_are_confined_to_task_workspace(tmp_path):
         )
     )
 
-    assert adapter.documents == [str(inside.resolve())]
+    assert adapter.documents == []
 
 
 def test_durable_task_attachment_remains_deliverable(
@@ -104,3 +105,41 @@ def test_durable_task_attachment_remains_deliverable(
     )
 
     assert adapter.documents == [str(stored.resolve())]
+
+
+def test_notifier_never_hands_mutable_workspace_path_to_adapter(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    artifact = workspace / "report.pdf"
+    outside = tmp_path / "outside.pdf"
+    artifact.write_bytes(b"expected report")
+    outside.write_bytes(b"host secret")
+
+    class SwappingAdapter(_ArtifactAdapter):
+        def __init__(self):
+            super().__init__()
+            self.uploaded: list[bytes] = []
+
+        async def send_document(self, *, file_path: str, **_kwargs):
+            artifact.unlink()
+            artifact.symlink_to(outside)
+            self.uploaded.append(Path(file_path).read_bytes())
+
+    adapter = SwappingAdapter()
+    task = SimpleNamespace(
+        id="t_raced",
+        workspace_path=str(workspace),
+        result=None,
+    )
+
+    asyncio.run(
+        GatewayKanbanWatchersMixin()._deliver_kanban_artifacts(
+            adapter=adapter,
+            chat_id="chat",
+            metadata={},
+            event_payload={"artifacts": [str(artifact)]},
+            task=task,
+        )
+    )
+
+    assert adapter.uploaded == []
