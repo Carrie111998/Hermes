@@ -4,8 +4,9 @@ Skill Manager Tool -- Agent-Managed Skill Creation & Editing
 
 Allows the agent to create, update, and delete skills, turning successful
 approaches into reusable procedural knowledge. New skills are created in
-~/.hermes/skills/. Existing skills (bundled, hub-installed, or user-created)
-can be modified or deleted wherever they live.
+~/.hermes/skills/. Existing skills can be modified wherever they live except
+for governed portable skills under ~/.agents/skills/: those use the external,
+agent-neutral skill-steward proposal flow and are never mutated directly.
 
 Skills are the agent's procedural memory: they capture *how to do a specific
 type of task* based on proven experience. General memory (MEMORY.md, USER.md) is
@@ -32,11 +33,14 @@ Directory layout for user skills:
             └── SKILL.md
 """
 
+import contextvars as _ctxvars
 import json
 import logging
+import os
 import re
 import shutil
-import contextvars as _ctxvars
+import subprocess
+import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -298,6 +302,139 @@ def _pinned_guard(name: str) -> Optional[str]:
     return None
 
 
+def _governed_shared_skills_root() -> Path:
+    """Canonical portable-skill root governed by the agent-neutral steward."""
+    configured = os.environ.get("HERMES_SHARED_SKILLS_ROOT")
+    root = Path(configured).expanduser() if configured else Path.home() / ".agents" / "skills"
+    return root.resolve()
+
+
+def _is_governed_shared_skill_path(skill_dir: Path) -> bool:
+    try:
+        return skill_dir.resolve().is_relative_to(_governed_shared_skills_root())
+    except (OSError, RuntimeError, ValueError):
+        return False
+
+
+def _stage_governed_shared_patch(
+    name: str,
+    old_string: str,
+    new_string: str,
+    file_path: Optional[str],
+    replace_all: bool,
+    task_id: Optional[str],
+    session_id: Optional[str],
+) -> Dict[str, Any]:
+    """Stage a portable shared-skill patch without mutating its package."""
+    if replace_all:
+        return {
+            "success": False,
+            "error": (
+                "Governed shared-skill proposals require one exact replacement; "
+                "replace_all is not supported."
+            ),
+        }
+
+    shared_root = _governed_shared_skills_root()
+    agents_root = shared_root.parent
+    configured = os.environ.get("HERMES_SKILL_STEWARD_PATH")
+    steward = (
+        Path(configured).expanduser()
+        if configured
+        else agents_root / "validation" / "skill_steward.py"
+    )
+    if not steward.is_file():
+        return {
+            "success": False,
+            "error": (
+                f"Shared skill '{name}' is governed, but skill-steward was not "
+                f"found at {steward}. No mutation was performed."
+            ),
+        }
+
+    try:
+        from tools.skill_provenance import (
+            get_current_write_origin,
+            is_background_review,
+        )
+        origin = get_current_write_origin()
+        background = is_background_review()
+    except Exception:
+        origin = "foreground"
+        background = False
+
+    source_task = task_id or session_id or "skill-manage-patch"
+    evidence_ref = f"hermes:{origin}:{source_task}"
+    command = [
+        sys.executable,
+        str(steward),
+        "--agents-root",
+        str(agents_root),
+        "propose",
+        "--skill",
+        name,
+        "--old-string",
+        old_string,
+        "--new-string",
+        new_string,
+        "--file-path",
+        file_path or "SKILL.md",
+        "--evidence-ref",
+        evidence_ref,
+        "--source-agent",
+        "hermes",
+        "--source-profile",
+        os.environ.get("HERMES_PROFILE") or "default",
+        "--source-task",
+        source_task,
+        "--scope-rationale",
+        "portable procedural improvement observed during verified Hermes use",
+        "--json",
+    ]
+    try:
+        completed = subprocess.run(
+            command,
+            text=True,
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return {
+            "success": False,
+            "error": f"skill-steward proposal failed safely: {exc}",
+        }
+    if completed.returncode != 0:
+        detail = completed.stderr.strip() or completed.stdout.strip() or "unknown error"
+        return {
+            "success": False,
+            "error": f"skill-steward proposal failed safely: {detail}",
+        }
+    try:
+        staged = json.loads(completed.stdout)
+        proposal_id = staged["proposal_id"]
+    except (json.JSONDecodeError, KeyError, TypeError) as exc:
+        return {
+            "success": False,
+            "error": f"skill-steward returned an invalid proposal receipt: {exc}",
+        }
+    return {
+        "success": True,
+        "staged": True,
+        "_proposal_staged": True,
+        "mutation_performed": False,
+        "proposal_id": proposal_id,
+        "proposal_path": str(agents_root / "proposals" / f"{proposal_id}.json"),
+        "message": (
+            f"Shared-skill patch for '{name}' staged as {proposal_id}; "
+            "the active skill was not changed. Review with "
+            f"`skill-steward diff {proposal_id}` and apply with "
+            f"`skill-steward approve {proposal_id}`."
+        ),
+        "background_origin": background,
+    }
+
+
 def _background_review_write_guard(
     name: str,
     skill_dir: Path,
@@ -337,6 +474,11 @@ def _background_review_write_guard(
             }
     except Exception:
         logger.debug("pinned skill guard lookup failed for %s", name, exc_info=True)
+
+    # Portable shared skills are never mutated by the review fork. Patch
+    # requests continue to _patch_skill(), which records a steward proposal.
+    if action == "patch" and _is_governed_shared_skill_path(skill_dir):
+        return None
 
     try:
         from agent.skill_utils import is_external_skill_path
@@ -1069,8 +1211,10 @@ def _patch_skill(
     name: str,
     old_string: str,
     new_string: str,
-    file_path: str = None,
+    file_path: Optional[str] = None,
     replace_all: bool = False,
+    task_id: Optional[str] = None,
+    session_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Targeted find-and-replace within a skill file.
 
@@ -1118,6 +1262,28 @@ def _patch_skill(
     )
     if read_guard:
         return read_guard
+
+    if _is_governed_shared_skill_path(skill_dir):
+        current = target.read_text(encoding="utf-8")
+        match_count = current.count(old_string)
+        if match_count != 1:
+            return {
+                "success": False,
+                "error": (
+                    "Governed shared-skill proposals require an exact unique "
+                    f"anchor; found {match_count} occurrences in "
+                    f"{file_path or 'SKILL.md'}."
+                ),
+            }
+        return _stage_governed_shared_patch(
+            name,
+            old_string,
+            new_string,
+            file_path,
+            replace_all,
+            task_id,
+            session_id,
+        )
 
     content = target.read_text(encoding="utf-8")
 
@@ -1562,11 +1728,28 @@ def skill_manage(
     if preflight is not None:
         return json.dumps(preflight, ensure_ascii=False)
 
-    # Approval gate: when on, stages the write for review (skills are too large
-    # to review inline, so they always stage regardless of origin); when off
-    # (default) passes straight through. The gate is bypassed when this call is
-    # itself replaying an already-approved staged write (_skill_apply_pending).
-    gate_result = _apply_skill_write_gate(
+    existing = _find_skill(name) if action in {
+        "edit", "patch", "delete", "write_file", "remove_file"
+    } else None
+    governed_shared = bool(
+        existing and _is_governed_shared_skill_path(existing["path"])
+    )
+    if governed_shared and action != "patch":
+        return json.dumps(
+            {
+                "success": False,
+                "error": (
+                    f"Shared skill '{name}' is governed by skill-steward. "
+                    "Direct edit/delete/support-file mutations are disabled; "
+                    "submit a steward proposal instead."
+                ),
+            },
+            ensure_ascii=False,
+        )
+
+    # Governed portable patches always enter the agent-neutral steward. Do not
+    # send them through Hermes's local write-approval queue first.
+    gate_result = None if governed_shared else _apply_skill_write_gate(
         action, name, content=content, category=category,
         file_path=file_path, file_content=file_content,
         old_string=old_string, new_string=new_string,
@@ -1590,7 +1773,15 @@ def skill_manage(
             return tool_error("old_string is required for 'patch'. Provide the text to find.", success=False)
         if new_string is None:
             return tool_error("new_string is required for 'patch'. Use empty string to delete matched text.", success=False)
-        result = _patch_skill(name, old_string, new_string, file_path, replace_all)
+        result = _patch_skill(
+            name,
+            old_string,
+            new_string,
+            file_path,
+            replace_all,
+            task_id,
+            session_id,
+        )
 
     elif action == "delete":
         result = _delete_skill(name, absorbed_into=absorbed_into)
@@ -1610,7 +1801,7 @@ def skill_manage(
     else:
         result = {"success": False, "error": f"Unknown action '{action}'. Use: create, edit, patch, delete, write_file, remove_file"}
 
-    if result.get("success"):
+    if result.get("success") and not result.get("_proposal_staged"):
         try:
             from agent.prompt_builder import clear_skills_system_prompt_cache
             clear_skills_system_prompt_cache(clear_snapshot=True)
@@ -1672,7 +1863,7 @@ SKILL_MANAGE_SCHEMA = {
     "description": (
         "Manage skills (create, update, delete). Skills are your procedural "
         "memory — reusable approaches for recurring task types. "
-        f"New skills go to {display_hermes_home()}/skills/; existing skills can be modified wherever they live.\n\n"
+        f"New skills go to {display_hermes_home()}/skills/; existing skills can be modified wherever they live, except governed shared skills under ~/.agents/skills/. Shared patches are staged through skill-steward for review; other direct shared mutations are refused.\n\n"
         "Actions: create (full SKILL.md + optional category), "
         "patch (old_string/new_string — preferred for fixes), "
         "edit (full SKILL.md rewrite — major overhauls only), "

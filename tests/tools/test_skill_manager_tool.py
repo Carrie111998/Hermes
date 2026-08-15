@@ -569,6 +569,107 @@ class TestExternalSkillMutations:
         # No duplicate in local
         assert not (local / "ext-skill").exists()
 
+    def test_governed_shared_patch_stages_without_mutating(self, tmp_path, monkeypatch):
+        local = tmp_path / "local"
+        shared = tmp_path / ".agents" / "skills"
+        local.mkdir(parents=True); shared.mkdir(parents=True)
+        skill_dir = _write_external_skill(shared)
+        monkeypatch.setenv("HERMES_SHARED_SKILLS_ROOT", str(shared))
+        staged = {
+            "success": True,
+            "staged": True,
+            "_proposal_staged": True,
+            "proposal_id": "proposal-123",
+            "message": "Shared-skill improvement staged for review.",
+        }
+
+        with _two_roots(local, shared), patch(
+            "tools.skill_manager_tool._stage_governed_shared_patch",
+            return_value=staged,
+            create=True,
+        ) as stage_patch:
+            raw = skill_manage(
+                action="patch",
+                name="ext-skill",
+                old_string="OLD_MARKER",
+                new_string="NEW_MARKER",
+                task_id="task-123",
+                session_id="session-123",
+            )
+
+        result = json.loads(raw)
+        assert result["success"] is True
+        assert result["staged"] is True
+        assert result["proposal_id"] == "proposal-123"
+        assert "OLD_MARKER" in (skill_dir / "SKILL.md").read_text()
+        stage_patch.assert_called_once()
+
+    def test_background_review_stages_governed_shared_patch(self, tmp_path, monkeypatch):
+        from tools.skill_manager_tool import mark_background_review_skill_read
+        from tools.skill_provenance import (
+            BACKGROUND_REVIEW,
+            reset_current_write_origin,
+            set_current_write_origin,
+        )
+
+        local = tmp_path / "local"
+        shared = tmp_path / ".agents" / "skills"
+        local.mkdir(parents=True); shared.mkdir(parents=True)
+        skill_dir = _write_external_skill(shared)
+        monkeypatch.setenv("HERMES_SHARED_SKILLS_ROOT", str(shared))
+        staged = {
+            "success": True,
+            "staged": True,
+            "_proposal_staged": True,
+            "proposal_id": "proposal-bg",
+            "message": "Shared-skill improvement staged for review.",
+        }
+
+        token = set_current_write_origin(BACKGROUND_REVIEW)
+        try:
+            mark_background_review_skill_read(skill_dir / "SKILL.md")
+            with _two_roots(local, shared), patch(
+                "tools.skill_manager_tool._stage_governed_shared_patch",
+                return_value=staged,
+                create=True,
+            ) as stage_patch:
+                raw = skill_manage(
+                    action="patch",
+                    name="ext-skill",
+                    old_string="OLD_MARKER",
+                    new_string="NEW_MARKER",
+                    task_id="background-task",
+                )
+        finally:
+            reset_current_write_origin(token)
+
+        result = json.loads(raw)
+        assert result["success"] is True
+        assert result["proposal_id"] == "proposal-bg"
+        assert "OLD_MARKER" in (skill_dir / "SKILL.md").read_text()
+        stage_patch.assert_called_once()
+
+    def test_governed_shared_non_patch_mutation_is_refused(self, tmp_path, monkeypatch):
+        local = tmp_path / "local"
+        shared = tmp_path / ".agents" / "skills"
+        local.mkdir(parents=True); shared.mkdir(parents=True)
+        skill_dir = _write_external_skill(shared)
+        monkeypatch.setenv("HERMES_SHARED_SKILLS_ROOT", str(shared))
+
+        with _two_roots(local, shared):
+            raw = skill_manage(
+                action="edit",
+                name="ext-skill",
+                content=(skill_dir / "SKILL.md").read_text().replace(
+                    "OLD_MARKER", "NEW_MARKER"
+                ),
+            )
+
+        result = json.loads(raw)
+        assert result["success"] is False
+        assert "skill-steward" in result["error"]
+        assert "OLD_MARKER" in (skill_dir / "SKILL.md").read_text()
+
 
     def test_background_review_refuses_to_patch_pinned_skill(self, tmp_path):
         """#25839: the autonomous review fork respects pin like the curator
