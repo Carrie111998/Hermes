@@ -14,6 +14,8 @@ Hermes can identify older servers that expose the legacy status-only health
 response, but only when anonymous OpenAPI metadata also identifies the service
 as OpenViking. OpenViking 0.2.6 and earlier are deprecated for this integration;
 upgrade them to receive the current health contract and compatibility fixes.
+Selecting a peer with `X-OpenViking-Actor-Peer` requires OpenViking 0.4.0 or
+newer; older 0.3.x servers retain their legacy agent-filtering limitation.
 
 ## Setup
 
@@ -31,9 +33,11 @@ Then configure Hermes:
 hermes memory setup    # select "openviking"
 ```
 
-The setup can link to an existing `~/.openviking/ovcli.conf`, copy its current
-connection values into the active profile's `.env`, or create a minimal
-`ovcli.conf` when one does not exist.
+The setup can link an existing `~/.openviking/ovcli.conf` profile. Linking is
+an explicit shared-file choice: the selected external file is read at runtime
+and its values are not copied into `.env`. To isolate credentials, use
+separate saved ovcli profiles or manual split profile configuration. Setup can
+also create a minimal `ovcli.conf` when one does not exist.
 
 Or manually:
 
@@ -74,9 +78,13 @@ memory:
     agent: hermes
 ```
 
-The setup command may store all selected connection values in the profile's
-`.env`. The legacy `OPENVIKING_ENDPOINT`, `OPENVIKING_ACCOUNT`,
-`OPENVIKING_USER`, and `OPENVIKING_AGENT` overrides remain supported. Bound
+Manual configuration keeps only `OPENVIKING_API_KEY` in the active profile's
+`.env`; put `endpoint`, `account`, `user`, and `agent` under
+`memory.openviking` in the active profile's `config.yaml`. The wizard's legacy
+`Keep in Hermes only` option still stores selected connection values in `.env`;
+users who want non-secrets out of `.env` should use the default `Mirror to
+OpenViking store` option or manual split configuration. Legacy
+`OPENVIKING_*` environment overrides remain supported. Bound
 profiles resolve identity from their own secret scope; the process-level
 `OPENVIKING_ENDPOINT` remains a non-secret fallback when the profile supplies
 none.
@@ -103,6 +111,8 @@ and `mode=create`, using the current-user shorthand
 `viking://user/memories/...`. Hermes sends `OPENVIKING_AGENT` as the peer
 identity through the `X-OpenViking-Actor-Peer` header. OpenViking applies the
 authenticated account's namespace policy and may return a canonical URI.
+Peer selection requires OpenViking 0.4.0+; 0.3.x servers retain their legacy
+agent-filtering limitation.
 Explicit remembers do not depend on session commit extraction.
 
 Hermes built-in `memory` tool additions are mirrored to OpenViking after the

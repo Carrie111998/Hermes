@@ -1117,7 +1117,9 @@ def _is_local_openviking_url(value: str) -> bool:
     return scheme == "http" and (parsed.hostname or "").lower() in _LOCAL_OPENVIKING_HOSTS
 
 
-def _load_hermes_openviking_config(hermes_home: Optional[str] = None) -> dict:
+def _load_hermes_openviking_config(
+    hermes_home: Optional[str] = None, *, env: Optional[dict] = None
+) -> dict:
     try:
         from hermes_cli.config import load_config_readonly
 
@@ -1129,11 +1131,19 @@ def _load_hermes_openviking_config(hermes_home: Optional[str] = None) -> dict:
 
             home_token = set_hermes_home_override(hermes_home)
             try:
-                config = load_config_readonly()
+                config = (
+                    load_config_readonly(env=env)
+                    if env is not None
+                    else load_config_readonly()
+                )
             finally:
                 reset_hermes_home_override(home_token)
         else:
-            config = load_config_readonly()
+            config = (
+                load_config_readonly(env=env)
+                if env is not None
+                else load_config_readonly()
+            )
         memory_config = config.get("memory", {}) if isinstance(config, dict) else {}
         provider_config = memory_config.get("openviking", {}) if isinstance(memory_config, dict) else {}
         return dict(provider_config) if isinstance(provider_config, dict) else {}
@@ -1217,7 +1227,10 @@ def _resolve_connection_settings(
     user = user_env if user_env is not None else _first_nonempty(
         ovcli_values.get("user"), _clean_config_value(provider_config.get("user"))
     )
-    if env is not None and not api_key:
+    if not api_key:
+        # Intentional local/trusted-mode normalization at this settings boundary.
+        # _VikingClient preserves an explicit "" for the separate purpose of
+        # preventing ambient-process fallback when callers bypass this resolver.
         account = account or "default"
         user = user or "default"
 
@@ -1373,47 +1386,6 @@ def _validate_openviking_reachability(endpoint: str) -> tuple[bool, str]:
     return False, f"OpenViking server is not reachable at {endpoint}."
 
 
-def _validate_openviking_auth(values: dict) -> tuple[bool, str]:
-    try:
-        endpoint = _normalize_openviking_url(values.get("endpoint"))
-        client = _VikingClient(
-            endpoint,
-            _clean_config_value(values.get("api_key")),
-            account=_clean_config_value(values.get("account")),
-            user=_clean_config_value(values.get("user")),
-            agent=_clean_config_value(values.get("agent")) or _DEFAULT_AGENT,
-        )
-        client.validate_auth()
-    except Exception as e:
-        return False, f"OpenViking authentication validation failed: {_format_openviking_exception(e)}"
-    return True, ""
-
-
-def _validate_openviking_root_access(values: dict) -> tuple[bool, str]:
-    try:
-        endpoint = _normalize_openviking_url(values.get("endpoint"))
-        client = _VikingClient(
-            endpoint,
-            _clean_config_value(values.get("api_key")),
-            agent=_clean_config_value(values.get("agent")) or _DEFAULT_AGENT,
-        )
-        client.validate_root_access()
-    except Exception as e:
-        return False, f"OpenViking root API key validation failed: {_format_openviking_exception(e)}"
-    return True, ""
-
-
-def _validate_openviking_user_key_scope(values: dict) -> tuple[bool, str]:
-    root_ok, _message = _validate_openviking_root_access(values)
-    if not root_ok:
-        return True, ""
-    return (
-        False,
-        "That key has ROOT access. Choose Root API key and provide account/user, "
-        "or enter a user API key.",
-    )
-
-
 def _status_code_from_error(error: Exception) -> Optional[int]:
     if isinstance(error, _OpenVikingHTTPError):
         return error.status_code
@@ -1448,13 +1420,18 @@ def _validate_openviking_setup_values(
     api_key = _clean_config_value(values.get("api_key"))
     if require_api_key and not api_key:
         return False, "Remote OpenViking configs require an API key.", None
+    account = _clean_config_value(values.get("account"))
+    user = _clean_config_value(values.get("user"))
+    if not api_key:
+        account = account or "default"
+        user = user or "default"
 
     try:
         client = _VikingClient(
             endpoint,
             api_key,
-            account=_clean_config_value(values.get("account")),
-            user=_clean_config_value(values.get("user")),
+            account=account,
+            user=user,
             agent=_clean_config_value(values.get("agent")) or _DEFAULT_AGENT,
         )
         identity, health = _probe_openviking_identity(client)
@@ -2356,7 +2333,9 @@ class OpenVikingMemoryProvider(MemoryProvider):
             from agent.secret_scope import load_env_file
 
             profile_env = load_env_file(Path(active_home) / ".env")
-            provider_config = _load_hermes_openviking_config(active_home)
+            provider_config = _load_hermes_openviking_config(
+                active_home, env=profile_env
+            )
             if profile_env and profile_env.get("OPENVIKING_ENDPOINT", "").strip():
                 return True
             if (
@@ -2922,12 +2901,13 @@ class OpenVikingMemoryProvider(MemoryProvider):
 
     def _profile_config_and_env(self) -> tuple[dict, Optional[dict]]:
         home = self._hermes_home if self._hermes_home_bound else None
+        profile_env = _profile_openviking_env(home)
         provider_config = (
-            _load_hermes_openviking_config(home)
+            _load_hermes_openviking_config(home, env=profile_env)
             if home
             else _load_hermes_openviking_config()
         )
-        return provider_config, _profile_openviking_env(home)
+        return provider_config, profile_env
 
     def _ensure_client_locked(self) -> Optional["_VikingClient"]:
         """Resolve and publish one client/config state under the refresh lock."""
