@@ -490,6 +490,50 @@ class TestLocalDeliveryNotice:
         assert created["deliver"] == "origin"
         assert "local-only cron job" not in created["message"]
 
+    @staticmethod
+    def _fake_scheduler(name: str):
+        class _S:
+            def __init__(self, n):
+                self.name = n
+
+        return _S(name)
+
+    def test_builtin_scheduler_without_gateway_emits_warning(self, monkeypatch):
+        from tools import cronjob_tools
+
+        monkeypatch.setattr(
+            cronjob_tools, "resolve_cron_scheduler", lambda: self._fake_scheduler("builtin")
+        )
+        monkeypatch.setattr("hermes_cli.gateway.find_gateway_pids", lambda: [])
+
+        created = json.loads(cronjob(action="create", prompt="x", schedule="every 2m"))
+        assert created["success"] is True
+        assert "Gateway is not running" in created["message"]
+
+    def test_non_builtin_scheduler_omits_gateway_warning(self, monkeypatch):
+        from tools import cronjob_tools
+
+        monkeypatch.setattr(
+            cronjob_tools, "resolve_cron_scheduler", lambda: self._fake_scheduler("chronos")
+        )
+        monkeypatch.setattr("hermes_cli.gateway.find_gateway_pids", lambda: [])
+
+        created = json.loads(cronjob(action="create", prompt="x", schedule="every 2m"))
+        assert created["success"] is True
+        assert "Gateway is not running" not in created["message"]
+
+    def test_running_gateway_omits_warning(self, monkeypatch):
+        from tools import cronjob_tools
+
+        monkeypatch.setattr(
+            cronjob_tools, "resolve_cron_scheduler", lambda: self._fake_scheduler("builtin")
+        )
+        monkeypatch.setattr("hermes_cli.gateway.find_gateway_pids", lambda: [1234])
+
+        created = json.loads(cronjob(action="create", prompt="x", schedule="every 2m"))
+        assert created["success"] is True
+        assert "Gateway is not running" not in created["message"]
+
 
 class TestValidateCronBaseUrl:
     """The cron base_url guard must not let a NAMED custom provider's stored

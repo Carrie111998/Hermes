@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
 from hermes_constants import display_hermes_home
+from cron.scheduler_provider import resolve_cron_scheduler
 
 logger = logging.getLogger(__name__)
 
@@ -391,6 +392,31 @@ def _local_delivery_notice(job: Dict[str, Any], user_deliver: Optional[str]) -> 
         "notified when it runs, recreate or update the job with deliver set to "
         "a gateway-connected platform, e.g. deliver='telegram' or deliver='all'."
     )
+
+
+def _gateway_not_running_warning() -> Optional[str]:
+    """Return a creation warning when jobs are configured but won't fire.
+
+    The tool currently succeeds even when the built-in scheduler is active and no
+    gateway process is running; that means jobs are persisted but inert.
+    """
+    try:
+        if resolve_cron_scheduler().name != "builtin":
+            return None
+    except Exception as e:
+        logger.debug("Unable to resolve cron scheduler for gateway warning check: %s", e)
+        return None
+
+    try:
+        from hermes_cli.gateway import find_gateway_pids
+
+        if find_gateway_pids():
+            return None
+    except Exception as e:
+        logger.debug("Unable to inspect gateway process state for cron warning: %s", e)
+        return None
+
+    return "⚠  Gateway is not running — cron jobs won't fire automatically."
 
 
 def _repeat_display(job: Dict[str, Any]) -> str:
@@ -1260,8 +1286,14 @@ def cronjob(
                 return tool_error(_partial.pop("error"), success=False, **_partial)
             _create_message = f"Cron job '{job['name']}' created."
             _local_notice = _local_delivery_notice(job, _normalize_deliver_param(deliver))
+            _gateway_warning = _gateway_not_running_warning()
+            notices = []
             if _local_notice:
-                _create_message = f"{_create_message} {_local_notice}"
+                notices.append(_local_notice)
+            if _gateway_warning:
+                notices.append(_gateway_warning)
+            if notices:
+                _create_message = f"{_create_message} {' '.join(notices)}"
             return json.dumps(
                 {
                     "success": True,
