@@ -228,8 +228,7 @@ export function reorderableRowIds(rows: SidebarListRow[]): string[] {
 }
 
 /**
- * clusterByTopic moved to lib for layering (sidebar order.ts is an app
- * module; session-branch-tree.ts is a lib module). Re-exported here so
- * existing app callers and tests keep working unchanged.
+ * clusterByTopic lives in lib/session-branch-tree.ts (a lib module) so the
+ * sidebar order module re-exports it without inverting the app→lib layering.
  */
-export { clusterByTopic } from '@/lib/session-topic-cluster'
+export { clusterByTopic } from '@/lib/session-branch-tree'
