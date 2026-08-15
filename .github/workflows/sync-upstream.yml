@@ -74,10 +74,14 @@ jobs:
       - name: Report drift before changing anything
         run: |
           set -euo pipefail
-          echo "files differing: $(git diff --name-only upstream/main origin/main | wc -l)"
-          echo "only upstream:   $(git diff --name-status upstream/main origin/main | grep -c '^D' || true)"
-          echo "only here:       $(git diff --name-status upstream/main origin/main | grep -c '^A' || true)"
-          if git diff --quiet upstream/main origin/main; then
+          # Count commits BEHIND, not a two-way file diff. The diff also counts
+          # the fork's OWN files (CODEOWNERS, this workflow), so it never
+          # reaches zero and the already-in-sync exit can never fire. The timer
+          # version of this ran 183 times with 0 no-ops for exactly that
+          # reason, 99 of them failing to open a PR with no commits in it.
+          echo "behind upstream: $(git rev-list --count origin/main..upstream/main) commits"
+          echo "only here:       $(git diff --name-status upstream/main origin/main | grep -c '^A' || true) fork-owned files"
+          if [ "$(git rev-list --count origin/main..upstream/main)" -eq 0 ]; then
             echo "ALREADY_IN_SYNC=1" >> "$GITHUB_ENV"
           fi
 
