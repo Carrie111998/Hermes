@@ -595,6 +595,42 @@ export function createReconnectScheduler(startFn, {
 }
 
 /**
+ * Exponential backoff with jitter for reconnect delays.
+ *
+ * Why: a fixed retry delay (e.g. 3s) hammers the server during any sustained
+ * outage, and pure exponential backoff makes every client retry in lockstep
+ * after a shared outage (thundering herd). Jitter (± jitterFactor, default
+ * ±20%) spreads retries so a fleet of bridges does not synchronise.
+ *
+ * Returns { next(), reset() }:
+ *   - next(): next delay in ms. Sequence: base, base*2, base*4, ... capped at
+ *     maxMs, each randomised by ±jitterFactor (inclusive bounds).
+ *   - reset(): restart the sequence (call after a successful connection).
+ *
+ * `random` is injectable for deterministic tests (default Math.random, which
+ * is fine at call-site scale and never used for security).
+ */
+export function createReconnectBackoff({
+  baseMs = 3000,
+  maxMs = 300000,
+  jitterFactor = 0.2,
+  random = Math.random,
+} = {}) {
+  let attempts = 0;
+  function next() {
+    const exp = Math.min(baseMs * Math.pow(2, attempts), maxMs);
+    attempts += 1;
+    const range = exp * jitterFactor;
+    // [exp - range, exp + range]; random() in [0,1) keeps the upper bound inclusive-ish
+    return Math.round(exp - range + random() * 2 * range);
+  }
+  function reset() {
+    attempts = 0;
+  }
+  return { next, reset };
+}
+
+/**
  * Version resolution guard. fetchLatestBaileysVersion() is a plain fetch to
  * raw.githubusercontent.com with no AbortSignal; a stalled connection can
  * pend forever and wedge the reconnect path (the scheduler above cannot

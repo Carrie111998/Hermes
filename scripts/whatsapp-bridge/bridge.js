@@ -36,6 +36,7 @@ import { classifyOwnerMessageGate } from './owner_message_gate.js';
 import {
   buildPollPayload,
   createReconnectScheduler,
+  createReconnectBackoff,
   createVersionResolver,
   buildLocationPayload,
   buildTextSendPayload,
@@ -396,6 +397,7 @@ function emitPairEvent(event) {
 }
 
 const scheduleReconnect = createReconnectScheduler(() => startSocket());
+const reconnectBackoff = createReconnectBackoff();
 const getWAVersion = createVersionResolver(fetchLatestBaileysVersion);
 
 async function startSocket() {
@@ -447,17 +449,22 @@ async function startSocket() {
       } else {
         // 515 = restart requested (common after pairing). Always reconnect.
         emitPairEvent({ event: 'disconnected', reason });
+        // Exponential backoff with jitter for every other disconnect — a fixed
+        // 3s retry hammers the server during outages, and pure exponential
+        // retries thundering-herd after shared outages. Reset on open.
+        const delayMs = reason === 515 ? 1000 : reconnectBackoff.next();
         if (!PAIR_JSON) {
           if (reason === 515) {
             console.log('↻ WhatsApp requested restart (code 515). Reconnecting...');
           } else {
-            console.log(`⚠️  Connection closed (reason: ${reason}). Reconnecting in 3s...`);
+            console.log(`⚠️  Connection closed (reason: ${reason}). Reconnecting in ${delayMs / 1000}s...`);
           }
         }
-        scheduleReconnect(reason === 515 ? 1000 : 3000);
+        scheduleReconnect(delayMs);
       }
     } else if (connection === 'open') {
       connectionState = 'connected';
+      reconnectBackoff.reset();
       const connectedUser = sock?.user
         ? {
             id: sock.user.id || null,

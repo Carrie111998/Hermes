@@ -18,6 +18,7 @@ import { strict as assert } from 'node:assert';
 import {
   createReconnectScheduler,
   createVersionResolver,
+  createReconnectBackoff,
 } from './bridge_helpers.js';
 
 const tick = () => new Promise(resolve => setImmediate(resolve));
@@ -148,3 +149,66 @@ const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 }
 
 console.log('bridge.reconnect.test.mjs: all assertions passed');
+
+// -- createReconnectBackoff ------------------------------------------------
+
+// Exponential sequence with no jitter (random -> 0.5 keeps the midpoint).
+{
+  const backoff = createReconnectBackoff({ random: () => 0.5 });
+  const delays = [3000, 6000, 12000, 24000, 48000, 96000, 192000, 300000, 300000];
+  for (const expected of delays) {
+    assert.equal(backoff.next(), expected, `expected ${expected}ms`);
+  }
+}
+
+// Cap holds at maxMs and does not grow past it.
+{
+  const backoff = createReconnectBackoff({ maxMs: 10000, random: () => 0.5 });
+  for (let i = 0; i < 10; i += 1) {
+    assert.ok(backoff.next() <= 10000, 'delay must never exceed maxMs');
+  }
+}
+
+// Jitter bounds: random() in [0, 1) must keep every delay within ±jitterFactor.
+{
+  const baseMs = 3000, maxMs = 30000;
+  const factor = 0.2;
+  // worst cases: random() -> 0 (min) and random() -> 0.999... (max)
+  for (const r of [0, 0.999999]) {
+    const backoff = createReconnectBackoff({ baseMs, maxMs, jitterFactor: factor, random: () => r });
+    for (let i = 0; i < 50; i += 1) {
+      const d = backoff.next();
+      assert.ok(d >= 0, `delay must not be negative (got ${d})`);
+      // every delay must be within ±20% of SOME exponential step <= maxMs,
+      // where the capped step is included and repeats once the cap is hit
+      let ok = false;
+      let exp = baseMs;
+      while (true) {
+        const step = Math.min(exp, maxMs);
+        const lo = step * (1 - factor), hi = step * (1 + factor);
+        if (d >= lo && d <= hi) { ok = true; break; }
+        if (step >= maxMs) break; // every later step is the cap; checked once
+        exp *= 2;
+      }
+      assert.ok(ok, `delay ${d} outside ±20% of any exponential step`);
+    }
+  }
+}
+
+// reset() restarts the sequence.
+{
+  const backoff = createReconnectBackoff({ random: () => 0.5 });
+  assert.equal(backoff.next(), 3000);
+  assert.equal(backoff.next(), 6000);
+  backoff.reset();
+  assert.equal(backoff.next(), 3000, 'reset must restart from baseMs');
+}
+
+// Deterministic per-call jitter: same random() -> same delay for a fixed step.
+{
+  const a = createReconnectBackoff({ random: () => 0.1 });
+  const b = createReconnectBackoff({ random: () => 0.1 });
+  assert.equal(a.next(), b.next());
+}
+
+console.log('createReconnectBackoff: all assertions passed');
