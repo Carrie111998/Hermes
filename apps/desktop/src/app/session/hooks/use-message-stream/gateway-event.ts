@@ -534,7 +534,7 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
             state => {
               const busy = Boolean(payload!.running)
 
-              if (state.busy === busy && (busy || !state.awaitingResponse)) {
+              if (state.busy === busy && (busy || (!state.awaitingResponse && !state.needsInput))) {
                 return state
               }
 
@@ -556,13 +556,14 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
               }
 
               if (state.awaitingResponse && !state.sawAssistantPayload) {
-                return state
+                return state.needsInput ? { ...state, needsInput: false } : state
               }
 
               return {
                 ...state,
                 awaitingResponse: false,
                 busy,
+                needsInput: false,
                 // The turn is over but its streaming bubble may still say
                 // pending — running=false from the agent loop's finally block
                 // is the ONLY settle signal when message.complete never

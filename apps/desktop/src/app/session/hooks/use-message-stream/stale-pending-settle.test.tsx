@@ -134,12 +134,19 @@ describe('turn end without message.complete (session.info running=false)', () =>
     await mountHarness()
 
     emit({ session_id: SID, type: 'message.start', payload: {} })
-    setApprovalRequest({ command: 'rm stale', description: 'stale request', sessionId: SID })
+    emit({
+      payload: { command: 'rm stale', description: 'stale request' },
+      session_id: SID,
+      type: 'approval.request'
+    })
     setApprovalRequest({ command: 'rm other', description: 'other request', sessionId: OTHER_SID })
+
+    expect(states.get(SID)?.needsInput).toBe(true)
 
     emit({ payload: { running: false }, session_id: SID, type: 'session.info' })
 
     expect(sessionApprovalRequest(SID).get()).toBeNull()
     expect(sessionApprovalRequest(OTHER_SID).get()?.command).toBe('rm other')
+    expect(states.get(SID)?.needsInput).toBe(false)
   })
 })
