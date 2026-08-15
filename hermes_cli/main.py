@@ -1625,6 +1625,11 @@ def _create_titled_session(title: str) -> Optional[str]:
         db.set_session_title(new_session_id, title)
         return new_session_id
     except Exception:
+        # Programmatic callers (the #86794 use case) rely on --create-if-missing
+        # being deterministic; swallow the failure to keep the error path simple,
+        # but log the underlying cause so it lands in errors.log and stays
+        # debuggable (DB lock, I/O error, import error — all otherwise invisible).
+        logger.exception("Failed to create titled session %r", title)
         return None
     finally:
         if db is not None:
@@ -1678,6 +1683,15 @@ def _resolve_continue_arg(args, *, use_tui: bool) -> None:
                 sys.exit(1)
         else:
             # -c with no argument — continue the most recent session
+            if getattr(args, "create_if_missing", False):
+                # --create-if-missing only makes sense with a named session;
+                # with a bare -c there is nothing to create, so surface the
+                # no-op to programmatic callers instead of silently ignoring it.
+                print(
+                    "--create-if-missing requires a session name: "
+                    "`-c <name> --create-if-missing`",
+                    file=sys.stderr,
+                )
             source = "tui" if use_tui else "cli"
             last_id = _resolve_last_session(source=source)
             if not last_id and source == "tui":
