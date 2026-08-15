@@ -1207,19 +1207,23 @@ class GatewayKanbanWatchersMixin:
             logger.warning("kanban dispatcher: config loader unavailable; disabled")
             return
         env_override = os.environ.get("HERMES_KANBAN_DISPATCH_IN_GATEWAY", "").strip().lower()
-        if env_override in {"0", "false", "no", "off"}:
-            logger.info("kanban dispatcher: disabled via HERMES_KANBAN_DISPATCH_IN_GATEWAY env")
-            return
 
         try:
             cfg = _load_config()
         except Exception as exc:
             logger.warning("kanban dispatcher: cannot load config (%s); disabled", exc)
             return
-        kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
-        if not kanban_cfg.get("dispatch_in_gateway", False):
+        raw_kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
+        kanban_cfg = raw_kanban_cfg if isinstance(raw_kanban_cfg, dict) else {}
+        dispatch_enabled = (
+            env_override not in {"0", "false", "no", "off"}
+            if env_override
+            else bool(kanban_cfg.get("dispatch_in_gateway", False))
+        )
+        if not dispatch_enabled:
             logger.info(
-                "kanban dispatcher: disabled via config kanban.dispatch_in_gateway=false"
+                "kanban dispatcher: disabled; set kanban.dispatch_in_gateway=true "
+                "to enable automatic dispatch"
             )
             return
 
@@ -1229,9 +1233,8 @@ class GatewayKanbanWatchersMixin:
             logger.warning("kanban dispatcher: kanban_db not importable; dispatcher disabled")
             return
 
-        # Single-dispatcher backstop. dispatch_in_gateway defaults to true, so a
-        # new profile gateway (or a same-profile restart race) can silently
-        # start a second dispatcher; concurrent dispatchers double reclaim
+        # Single-dispatcher backstop. Config drift or a same-profile restart
+        # race can start a second dispatcher; concurrent dispatchers double reclaim
         # frequency, double claim-attempt events, and — with
         # wal_autocheckpoint=0 — concurrent manual WAL checkpoints can corrupt
         # index pages. The lock lives at the machine-global kanban root

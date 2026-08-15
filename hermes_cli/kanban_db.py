@@ -1681,7 +1681,7 @@ def _cross_process_init_lock(path: Path):
 
 
 @contextlib.contextmanager
-def _dispatch_tick_lock(db_path: Path):
+def _dispatch_tick_lock(db_path: Path, *, fail_open: bool = True):
     """Non-blocking single-writer guard around one dispatcher tick.
 
     Yields ``True`` when this process holds the board's dispatch lock and
@@ -1710,6 +1710,8 @@ def _dispatch_tick_lock(db_path: Path):
     platforms without ``fcntl``/``msvcrt`` the guard degrades to a no-op
     (yields ``True``) — single-writer enforcement is best-effort and the
     orphan-dispatcher scenario is specific to POSIX service managers.
+    Callers that protect a hard safety invariant may set ``fail_open=False``
+    so inability to create the lock skips the guarded operation.
     """
     lock_path = db_path.with_name(db_path.name + ".dispatch.lock")
     handle = None
@@ -1739,8 +1741,7 @@ def _dispatch_tick_lock(db_path: Path):
                 acquired = False
     except OSError:
         # Could not even open the lock file (permissions, read-only FS).
-        # Degrade to a no-op so a probe failure never blocks dispatch.
-        acquired = True
+        acquired = fail_open
         handle = None
     try:
         yield acquired
@@ -9531,10 +9532,18 @@ def _count_running_workers_across_boards(
     """
     current_path = current_db_path.resolve()
     try:
-        paths = [
-            kanban_db_path(board=meta.get("slug") or DEFAULT_BOARD)
-            for meta in list_boards(include_archived=False)
-        ]
+        paths = []
+        for meta in list_boards(include_archived=False):
+            slug = meta.get("slug") or DEFAULT_BOARD
+            # Do not use kanban_db_path() here: workers inherit a pinned
+            # HERMES_KANBAN_DB for isolation, and that override would collapse
+            # every sibling slug to the current board and undercount capacity.
+            path = (
+                kanban_home() / "kanban.db"
+                if slug == DEFAULT_BOARD
+                else board_dir(slug) / "kanban.db"
+            )
+            paths.append(path)
     except Exception as exc:
         raise RuntimeError("could not enumerate kanban boards") from exc
     if all(path.resolve() != current_path for path in paths):
@@ -9656,7 +9665,7 @@ def dispatch_once(
 
     if isinstance(max_concurrent_workers, int) and max_concurrent_workers > 0:
         global_lock_path = kanban_home() / "kanban" / ".worker-capacity"
-        with _dispatch_tick_lock(global_lock_path) as global_held:
+        with _dispatch_tick_lock(global_lock_path, fail_open=False) as global_held:
             if not global_held:
                 result = DispatchResult(skipped_locked=True)
             else:

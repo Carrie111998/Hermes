@@ -147,9 +147,9 @@ def _check_dispatcher_presence(
 
     Used by ``hermes kanban create`` (and callers) to warn when a task
     will sit in ``ready`` because nothing is there to pick it up.
-    Defensive against import failures and config-read errors — if the
-    probe itself errors, we return ``(True, "")`` so we don't spam
-    false warnings (better to miss a warning than to cry wolf).
+    Defensive against liveness-probe failures, which remain silent to avoid
+    false warnings. Configuration failures instead mirror the actual watcher
+    and report dispatch disabled because automatic dispatch fails closed.
 
     ``hermes_home`` scopes the probe to a named profile's directory. The
     dashboard plugin API passes it because the dashboard backend process can
@@ -183,10 +183,17 @@ def _check_dispatcher_presence(
     # Even if the gateway is up, dispatch_in_gateway may be off.
     try:
         from hermes_cli.config import load_config
-        cfg = load_config()
-        dispatch_on = bool(cfg.get("kanban", {}).get("dispatch_in_gateway", False))
+
+        env_override = os.environ.get(
+            "HERMES_KANBAN_DISPATCH_IN_GATEWAY", ""
+        ).strip().lower()
+        if env_override:
+            dispatch_on = env_override not in {"0", "false", "no", "off"}
+        else:
+            cfg = load_config()
+            dispatch_on = bool(cfg.get("kanban", {}).get("dispatch_in_gateway", False))
     except Exception:
-        dispatch_on = True  # can't tell — assume default
+        dispatch_on = False  # watcher also fails closed when config cannot load
 
     if pid and dispatch_on:
         return (True, f"gateway pid={pid}, dispatch enabled")
@@ -2749,13 +2756,15 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
             "hermes kanban daemon: DEPRECATED — the dispatcher now runs\n"
             "inside the gateway. To use kanban:\n"
             "\n"
-            "    hermes gateway start       # starts the gateway + embedded dispatcher\n"
+            "    hermes config set kanban.dispatch_in_gateway true\n"
+            "    hermes gateway start       # starts the explicitly enabled dispatcher\n"
             "\n"
             "Ready tasks will be picked up on the next dispatcher tick\n"
             "(default: every 60 seconds). Configure via config.yaml:\n"
             "\n"
             "    kanban:\n"
-            "      dispatch_in_gateway: true      # default\n"
+            "      dispatch_in_gateway: true      # explicit opt-in; default false\n"
+            "      max_concurrent_workers: 3      # host-wide safety cap\n"
             "      dispatch_interval_seconds: 60\n"
             "      failure_limit: 2              # consecutive non-success attempts before auto-block\n"
             "\n"
@@ -2784,7 +2793,7 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
         f"Kanban dispatcher running STANDALONE via --force "
         f"(interval={args.interval}s, pid={os.getpid()}). "
         f"Ctrl-C to stop. NOTE: if a gateway is also running with "
-        f"dispatch_in_gateway=true (default), you have two dispatchers "
+        f"dispatch_in_gateway=true, you have two dispatchers "
         f"racing for claims.",
         file=sys.stderr,
     )
