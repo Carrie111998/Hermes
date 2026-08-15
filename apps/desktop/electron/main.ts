@@ -94,6 +94,7 @@ import {
 import { describeCrashReason, installCrashForensics } from './crash-forensics'
 import { adoptServedDashboardToken } from './dashboard-token'
 import { loadOrCreateInstallationId, sshOwnershipId } from './desktop-installation'
+import { formatDesktopLogLine } from './desktop-log-line'
 import {
   buildPosixCleanupScript,
   buildWindowsCleanupScript,
@@ -320,6 +321,10 @@ const IS_WSL = isWslEnvironment()
 // build SDK, so gate Tahoe workarounds on Darwin instead.
 const DARWIN_MAJOR = IS_MAC ? Number.parseInt(os.release(), 10) || 0 : 0
 const APP_ROOT = app.getAppPath()
+
+// Device-local preference: block F12 from opening DevTools.
+// Set dynamically via IPC from the renderer Settings → Advanced.
+let f12Blocked = false
 
 // Preload must be plain JS — Electron's sandbox can't run .ts, and tsx's
 // ESM loader is broken on Electron 40's Node (ERR_INVALID_RETURN_PROPERTY_VALUE).
@@ -1343,7 +1348,10 @@ function rememberLog(chunk) {
     return
   }
 
-  const lines = text.split(/\r?\n/).map(line => `[hermes] ${line}`)
+  // One timestamp per chunk: lines arriving in the same event happened
+  // at the same moment.  ISO-8601 UTC, matching agent.log/gateway.log.
+  const stamp = new Date().toISOString()
+  const lines = text.split(/\r?\n/).map(line => formatDesktopLogLine(line, stamp))
   hermesLog.push(...lines)
 
   if (hermesLog.length > 300) {
@@ -5820,7 +5828,11 @@ function buildApplicationMenu() {
     submenu: [
       { role: 'reload' },
       { role: 'forceReload' },
-      { role: 'toggleDevTools' },
+      {
+        label: 'Toggle Developer Tools',
+        accelerator: process.platform === 'darwin' ? 'Alt+Cmd+I' : 'Ctrl+Shift+I',
+        click: (_menuItem, browserWindow) => toggleDevTools(browserWindow || mainWindow)
+      },
       { type: 'separator' },
       {
         label: 'Actual Size',
@@ -5881,9 +5893,20 @@ function toggleDevTools(window) {
 }
 
 function installDevToolsShortcut(window) {
-  // F12 / Cmd+Opt+I works in both dev and packaged builds.
+  // Only Ctrl+Shift+I (or Cmd+Opt+I on Mac) opens DevTools.
+  // F12 is explicitly blocked so Chromium's built-in handler doesn't open it.
   window.webContents.on('before-input-event', (event, input) => {
     const key = input.key.toLowerCase()
+
+    // F12 opens DevTools by default; block only when the user disabled it.
+    if (input.key === 'F12') {
+      if (f12Blocked) {
+        event.preventDefault()
+
+        return
+      }
+      // Not blocked — fall through to open DevTools.
+    }
 
     const isInspectShortcut =
       input.key === 'F12' ||
@@ -10559,8 +10582,14 @@ function spawnHudWindow(sessionId, profile) {
       hudWindow = null
     }
 
-    // Closed from its own side (⌘W) — put the app back so the user is never
-    // left with no surface, and correct every window's toggle.
+    // Closed from its own side (⌘W) — closeHudWindow()'s dispose() never ran,
+    // so the global snap shortcut would otherwise stay registered (and stuck
+    // taken) with no HUD left to apply it to. dispose() is idempotent, so
+    // this is safe even if closeHudWindow() already released it.
+    hudSnapShortcut.dispose()
+
+    // Put the app back so the user is never left with no surface, and
+    // correct every window's toggle.
     restoreMainWindowFromHud()
     broadcastHudState(false)
   })
@@ -12650,6 +12679,30 @@ ipcMain.on('hermes:quick-entry:state', (_event, payload) => {
 
 ipcMain.on('hermes:quick-entry:dismiss', () => hideQuickEntryWindow())
 
+// Disable F12 DevTools: maintained in the main process so a cold launch
+// restores it before any window is shown (applied on ready). The renderer
+// toggles it from Settings → Advanced over IPC. See store/disable-f12.
+const DISABLE_F12_CONFIG_PATH = path.join(app.getPath('userData'), 'disable-f12.json')
+
+function readPersistedDisableF12() {
+  try {
+    return JSON.parse(fs.readFileSync(DISABLE_F12_CONFIG_PATH, 'utf8')).on === true
+  } catch {
+    return false
+  }
+}
+
+ipcMain.on('hermes:devtools:disable-f12', (_event, on) => {
+  f12Blocked = Boolean(on)
+
+  try {
+    fs.mkdirSync(path.dirname(DISABLE_F12_CONFIG_PATH), { recursive: true })
+    fs.writeFileSync(DISABLE_F12_CONFIG_PATH, JSON.stringify({ on: f12Blocked }, null, 2), 'utf8')
+  } catch (error) {
+    rememberLog(`[disable-f12] write failed: ${error.message}`)
+  }
+})
+
 ipcMain.handle('hermes:openExternal', (_event, url) => {
   if (!openExternalUrl(url)) {
     throw new Error('Invalid external URL')
@@ -13782,6 +13835,7 @@ app.whenReady().then(() => {
   configureSpellChecker()
   registerPowerResumeListeners()
   keepAwake.set(readPersistedKeepAwake())
+  f12Blocked = readPersistedDisableF12()
   // Quick Entry's global chord — registered on ready so a cold launch restores
   // it without the renderer visiting Settings. A failed registration is logged
   // here and surfaced in Settings via the IPC state (never silent).
