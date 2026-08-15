@@ -3,6 +3,18 @@
 </p>
 
 # Hermes Agent ☤
+
+> ### This fork: cloud memory — dual-write `state.db` to a remote database
+>
+> I run Hermes on several machines with a shared persona but isolated
+> memories: the agent on machine B has no idea what the agent on machine A
+> did last week. This fork fixes that: every write to the local SQLite
+> `state.db` is dual-written to a shared MySQL/MariaDB database in real
+> time, so session memory becomes cross-machine and cross-region. SQLite
+> stays the runtime source of truth; the remote database down or
+> unconfigured means stock single-machine behavior. Currently MySQL/MariaDB;
+> other backends may follow. Setup in ~5 minutes:
+> see **[docs/cloud-memory/README.md](docs/cloud-memory/README.md)**.
 <p align="center">
   <a href="https://hermes-agent.nousresearch.com/">Hermes Agent</a> | <a href="https://hermes-agent.nousresearch.com/">Hermes Desktop</a>
 </p>

@@ -4257,6 +4257,17 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # first flush of a new session fails and the turn is aborted as
         # session_persistence_failed. Ride out long sibling holds.
         self._execute_write(_do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S)
+        # [mysql-mirror patch] Dual-write the resulting session row to MySQL.
+        # Read-back from SQLite (authoritative) — best-effort, never raises.
+        try:
+            row = self._conn.execute(
+                "SELECT * FROM sessions WHERE id = ?", (session_id,)
+            ).fetchone()
+            if row is not None:
+                from tools.mysql_mirror import mirror_session
+                mirror_session(dict(row))
+        except Exception:
+            pass
 
     def create_session(self, session_id: str, source: str, **kwargs) -> str:
         """Create a new session record. Returns the session_id."""
@@ -6986,6 +6997,23 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 now,
             ),
         )
+        # [mysql-mirror patch] UPSERT this usage row to MySQL (best-effort).
+        # Mirrors the accumulated totals by reading the row back after the
+        # SQLite upsert — keeps MySQL consistent without reimplementing the
+        # ON CONFLICT delta logic.
+        try:
+            usage_row = conn.execute(
+                "SELECT * FROM session_model_usage WHERE session_id = ? "
+                "AND model = ? AND billing_provider = ? "
+                "AND billing_base_url = ? AND billing_mode = ? AND task = ?",
+                (session_id, eff_model, eff_provider, eff_base_url,
+                 eff_billing_mode, task or ""),
+            ).fetchone()
+            if usage_row is not None:
+                from tools.mysql_mirror import mirror_usage
+                mirror_usage(session_id, eff_model, dict(usage_row))
+        except Exception:
+            pass
 
     def ensure_session(
         self,
@@ -8512,9 +8540,32 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # a sibling process legitimately holding the write lock for seconds
         # (VACUUM, TRUNCATE checkpoint at close, an older pre-bounded-merge
         # process's FTS optimize) can't destroy a healthy turn (#74478).
-        return self._execute_write(
+        msg_id = self._execute_write(
             _do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S
         )
+        # [mysql-mirror patch] Dual-write this message to MySQL (best-effort).
+        try:
+            from tools.mysql_mirror import mirror_message
+            mirror_message(
+                msg_id, session_id, role, content=stored_content,
+                tool_call_id=tool_call_id, tool_calls=tool_calls_json,
+                tool_name=tool_name, timestamp=message_timestamp,
+                token_count=token_count, finish_reason=finish_reason,
+                reasoning=reasoning, reasoning_content=reasoning_content,
+                reasoning_details=reasoning_details,
+                codex_reasoning_items=codex_reasoning_items,
+                codex_message_items=codex_message_items,
+                platform_message_id=platform_message_id,
+                observed=observed, active=1,
+                effect_disposition=effect_disposition,
+                api_content=api_content if isinstance(api_content, str) else None,
+                display_kind=display_kind if isinstance(display_kind, str) else None,
+                display_metadata=json.loads(display_metadata_json)
+                if isinstance(display_metadata_json, str) else display_metadata_json,
+            )
+        except Exception:
+            pass
+        return msg_id
 
     def append_messages_batch(
         self,
@@ -8593,9 +8644,24 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return inserted
 
         # Same criticality as append_message: this IS the turn's transcript.
-        return self._execute_write(
+        inserted = self._execute_write(
             _do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S
         )
+        # [mysql-mirror patch] Dual-write the batch to MySQL (best-effort).
+        # The input dicts carry no row ids (SQLite autoincrement assigns
+        # them), so read the inserted rows back from the authoritative DB.
+        try:
+            rows = self._conn.execute(
+                "SELECT * FROM messages WHERE session_id = ? "
+                "ORDER BY id DESC LIMIT ?",
+                (session_id, inserted),
+            ).fetchall()
+            if rows:
+                from tools.mysql_mirror import mirror_messages_batch
+                mirror_messages_batch(session_id, [dict(r) for r in reversed(rows)])
+        except Exception:
+            pass
+        return inserted
 
     def set_latest_matching_message_display_kind(
         self, session_id: str, *, role: str, content: str, display_kind: str,
