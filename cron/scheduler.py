@@ -1998,17 +1998,6 @@ def _resolve_single_delivery_target(job: dict, deliver_value: str) -> Optional[d
             )
             return None
 
-        if (
-            thread_id is None
-            and platform_key == "slack"
-            and origin
-            and str(origin.get("platform") or "").lower() == platform_key
-            and str(origin.get("chat_id")) == str(chat_id)
-            and origin.get("thread_id")
-            and not _origin_thread_is_stale(origin)
-        ):
-            thread_id = origin.get("thread_id")
-
         return {
             "platform": platform_name,
             "chat_id": chat_id,

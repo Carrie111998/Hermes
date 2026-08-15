@@ -199,6 +199,23 @@ class TestResolveDeliveryTarget:
             "thread_id": None,
         }
 
+    def test_explicit_slack_channel_target_does_not_inherit_origin_thread(self):
+        job = {
+            "deliver": "slack:C0BAC08MFJQ",
+            "origin": {
+                "platform": "slack",
+                "chat_id": "C0BAC08MFJQ",
+                "thread_id": "1784409341.664739",
+            },
+        }
+
+        assert _resolve_delivery_target(job) == {
+            "platform": "slack",
+            "chat_id": "C0BAC08MFJQ",
+            "thread_id": None,
+        }
+
+
     def test_telegram_cron_thread_id_overrides_home_thread_id(self, monkeypatch):
         """TELEGRAM_CRON_THREAD_ID wins over TELEGRAM_HOME_CHANNEL_THREAD_ID for cron (#24409)."""
         monkeypatch.setenv("TELEGRAM_HOME_CHANNEL", "-1001234567890")
