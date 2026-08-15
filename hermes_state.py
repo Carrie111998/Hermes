@@ -8416,6 +8416,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         include_pinned: bool = False,
         session_key: str = None,
         include_hidden: bool = False,
+        session_group_id: str = None,
     ) -> List[Dict[str, Any]]:
         """List sessions with preview (first user message) and last active timestamp.
 
@@ -8470,6 +8471,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         Pass ``session_key`` to restrict results to one stable gateway
         conversation scope (DM, group, channel, or thread, including the
         configured per-user isolation policy).
+
+        Pass ``session_group_id`` to restrict the SQL page to conversations
+        whose surfaced row or compression-chain continuation belongs to that
+        group. The predicate is applied before LIMIT/OFFSET.
         """
         # Rows carry token/cost totals — drain queued deltas first so
         # listings (sidebar, /resume, dashboards) show exact counters.
@@ -8600,6 +8605,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     )
                     id_params.append(_like_pattern(compact_needle))
                 filter_clauses.append(search_clause + "))")
+            if session_group_id:
+                filter_clauses.append(
+                    "EXISTS (SELECT 1 FROM chain gq"
+                    " JOIN session_group_members gm ON gm.session_id = gq.cur_id"
+                    " WHERE gq.root_id = s.id AND gm.group_id = ?)"
+                )
+                id_params.append(session_group_id)
             if filter_clauses:
                 combined = " AND ".join(filter_clauses)
                 outer_where = (
@@ -8647,6 +8659,17 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             # only applies to the outer select.
             params = params + params + id_params + [limit, offset]
         else:
+            if session_group_id:
+                group_clause = (
+                    "s.id IN (SELECT session_id FROM session_group_members "
+                    "WHERE group_id = ?)"
+                )
+                where_sql = (
+                    f"{where_sql} AND {group_clause}"
+                    if where_sql
+                    else f"WHERE {group_clause}"
+                )
+                params.append(session_group_id)
             _sel = self._compact_session_cols() if compact_rows else "s.*"
             query = f"""
                 SELECT {_sel}{prompt_select},
@@ -10695,6 +10718,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 "GROUP BY g.id ORDER BY g.created_at ASC, g.name COLLATE NOCASE ASC"
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def get_session_group(self, id_or_name: str) -> Optional[Dict[str, Any]]:
+        """Return one group by id or case-insensitive name."""
+        with self._lock:
+            row = self._resolve_session_group(self._conn, id_or_name)
+        return dict(row) if row is not None else None
 
     def session_ids_for_group(self, id_or_name: str) -> Optional[Set[str]]:
         """Return member ids, or ``None`` when the requested group is unknown."""

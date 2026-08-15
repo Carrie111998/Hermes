@@ -488,6 +488,7 @@ def _list_recent_sessions(
     current_session_id: str = None,
     link_profile: str = None,
     group_session_ids: Optional[Set[str]] = None,
+    session_group_id: str = None,
 ) -> str:
     """Return metadata for the most recent sessions (no LLM calls, no FTS5)."""
     try:
@@ -502,6 +503,7 @@ def _list_recent_sessions(
             limit=limit + 15,
             exclude_sources=list(_HIDDEN_SESSION_SOURCES),
             order_by_last_active=True,
+            session_group_id=session_group_id,
         )  # fetch extra so we can skip current / compression roots
 
         current_root, has_compression_hop = (
@@ -512,8 +514,6 @@ def _list_recent_sessions(
         results = []
         for s in sessions:
             sid = s.get("id", "")
-            if group_session_ids is not None and sid not in group_session_ids:
-                continue
             if sid == current_session_id:
                 continue
             # Compression continuation: the root's original turns were
@@ -770,6 +770,7 @@ def _discover(
     current_session_id: str = None,
     link_profile: str = None,
     group_session_ids: Optional[Set[str]] = None,
+    session_group_id: str = None,
 ) -> str:
     """Discovery shape: FTS5 plus adaptive or full result hydration."""
     role_list = role_filter if role_filter else ["user", "assistant"]
@@ -792,6 +793,7 @@ def _discover(
             offset=0,
             sort=sort,
             fields=_DISCOVER_SEARCH_FIELDS,
+            session_group_id=session_group_id,
         )
     except Exception as e:
         logging.error("FTS5 search failed: %s", e, exc_info=True)
@@ -1011,10 +1013,13 @@ def _session_search_impl(
             current_session_id = None
 
     group_session_ids: Optional[Set[str]] = None
+    session_group_id: Optional[str] = None
     if isinstance(group, str) and group.strip():
-        group_session_ids = db.session_ids_for_group(group.strip())
-        if group_session_ids is None:
+        group_meta = db.get_session_group(group.strip())
+        if group_meta is None:
             return tool_error(f"session group not found: {group.strip()}", success=False)
+        session_group_id = group_meta["id"]
+        group_session_ids = db.session_ids_for_group(session_group_id)
 
     # Scroll shape takes precedence — explicit anchor beats any query.
     if (isinstance(session_id, str) and session_id.strip()) and around_message_id is not None:
@@ -1063,6 +1068,7 @@ def _session_search_impl(
             current_session_id,
             link_profile=profile,
             group_session_ids=group_session_ids,
+            session_group_id=session_group_id,
         )
 
     # Parse role_filter
@@ -1093,6 +1099,7 @@ def _session_search_impl(
         current_session_id=current_session_id,
         link_profile=profile,
         group_session_ids=group_session_ids,
+        session_group_id=session_group_id,
     )
 
 
