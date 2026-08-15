@@ -438,10 +438,7 @@ function Column({
   }
 
   return (
-    <div
-      {...dragHandlers}
-      className={cn(KANBAN_LAYOUT.lane, wash)}
-    >
+    <div {...dragHandlers} className={cn(KANBAN_LAYOUT.lane, wash)}>
       <header className="mb-1.5 flex h-5 items-center gap-1.5 px-1">
         <span className="size-1.5 rounded-full" style={{ backgroundColor: meta.tone }} />
         <Tip label={columnHelp(k, column.name)}>
