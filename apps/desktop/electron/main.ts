@@ -96,7 +96,7 @@ import {
   upsertConnection
 } from './connection-registry'
 import { describeCrashReason, installCrashForensics } from './crash-forensics'
-import { adoptServedDashboardToken } from './dashboard-token'
+import { adoptServedDashboardToken, resolveManagedBackendToken } from './dashboard-token'
 import { loadOrCreateInstallationId, sshOwnershipId } from './desktop-installation'
 import { formatDesktopLogLine } from './desktop-log-line'
 import {
@@ -9555,7 +9555,7 @@ async function spawnPoolBackend(profile, entry) {
   await Promise.race([waitForHermes(baseUrl, token), startFailed])
   ready = true
 
-  const authToken = await adoptServedDashboardToken(baseUrl, token, {
+  const authToken = await resolveManagedBackendToken(backend.args, baseUrl, token, {
     childAlive: () => child.exitCode === null && !child.killed,
     label: `Hermes backend for profile "${profile}"`,
     rememberLog
@@ -9932,7 +9932,7 @@ async function startHermes() {
     backendReady = true
     backendStartFailure = null
 
-    const authToken = await adoptServedDashboardToken(baseUrl, token, {
+    const authToken = await resolveManagedBackendToken(backend.args, baseUrl, token, {
       childAlive: () => hermesProcess.exitCode === null && !hermesProcess.killed,
       rememberLog
     })
