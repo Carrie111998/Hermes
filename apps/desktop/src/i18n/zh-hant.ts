@@ -671,8 +671,7 @@ export const zhHant = defineLocale({
       couldNotSave: '無法儲存憑證。',
       remove: '移除',
       getKey: '取得金鑰',
-      saving: '儲存中',
-      managedByOnePassword: 'Managed via 1Password'
+      saving: '儲存中'
     },
     envActions: {
       actions: '動作',

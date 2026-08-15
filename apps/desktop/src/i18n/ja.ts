@@ -685,8 +685,7 @@ export const ja = defineLocale({
       couldNotSave: '認証情報を保存できませんでした。',
       remove: '削除',
       getKey: 'キーを取得',
-      saving: '保存中',
-      managedByOnePassword: 'Managed via 1Password'
+      saving: '保存中'
     },
     envActions: {
       actions: 'アクション',

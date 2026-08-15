@@ -646,8 +646,7 @@ export const ar = defineLocale({
       couldNotSave: 'تعذّر حفظ بيانات الاعتماد.',
       remove: 'إزالة',
       getKey: 'احصل على مفتاح',
-      saving: 'جار الحفظ',
-      managedByOnePassword: 'Managed via 1Password'
+      saving: 'جار الحفظ'
     },
     envActions: {
       actions: 'إجراءات',
