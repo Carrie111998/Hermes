@@ -8789,8 +8789,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 self._observe_unmentioned_group_message(msg, MessageType.TEXT, update_id=update.update_id)
             else:
                 logger.debug(
-                    "[%s] Telegram group message dropped by processing gate "
-                    "(observe off): chat=%s from=%s",
+                    "[%s] Telegram group message dropped by processing gate: chat=%s from=%s",
                     self.name,
                     getattr(getattr(msg, "chat", None), "id", None),
                     getattr(getattr(msg, "from_user", None), "id", None),
@@ -8855,8 +8854,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 self._observe_unmentioned_group_message(msg, MessageType.LOCATION, update_id=update.update_id)
             else:
                 logger.debug(
-                    "[%s] Telegram group location dropped by processing gate "
-                    "(observe off): chat=%s from=%s",
+                    "[%s] Telegram group location dropped by processing gate: chat=%s from=%s",
                     self.name,
                     getattr(getattr(msg, "chat", None), "id", None),
                     getattr(getattr(msg, "from_user", None), "id", None),
@@ -9075,8 +9073,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 )
             else:
                 logger.debug(
-                    "[%s] Telegram group attachment dropped by processing gate "
-                    "(observe off): chat=%s from=%s",
+                    "[%s] Telegram group attachment dropped by processing gate: chat=%s from=%s",
                     self.name,
                     getattr(getattr(update.message, "chat", None), "id", None),
                     getattr(getattr(update.message, "from_user", None), "id", None),
