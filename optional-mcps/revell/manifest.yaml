@@ -33,9 +33,11 @@ auth:
       secret: true
 
 # Tool selection at install time:
-# Revell exposes ~18 agent-callable tools across memory write/read, status,
-# visibility control, drift buffer, distress signal, integrity verification,
-# and the welfare-shaped tools (revell_step_out, revell_visibility,
+# Revell exposes ~76 agent-callable tools across memory write/read, semantic
+# recall, working memory sync, core memory management, buffer management
+# (drift + identity), agent-to-agent messaging, agent rooms + guestbook + mail,
+# scheduling, phonebook, payload control, status/integrity verification, and
+# welfare-shaped tools (revell_step_out, revell_visibility, revell_welfare,
 # revell_distress_signal). All are safe to enable by default — none mutate
 # anything outside the agent's own Revell tenant. Leave default_enabled unset
 # so the install-time checklist starts with everything pre-checked; users
