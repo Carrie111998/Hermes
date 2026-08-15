@@ -45,19 +45,22 @@ The Ares bootstrap targets Unix-like shells (Linux, macOS, and WSL). The standar
 Review the installer before executing it, then clone and run it locally:
 
 ```bash
-git clone https://github.com/RecursiveIntell/hermes-agent.git ares
-cd ares
-bash install.sh
+git clone https://github.com/RecursiveIntell/Ares.git Ares
+cd Ares
+uv sync --locked --extra all
+.venv/bin/ares setup --source "$PWD"
 ```
 
-The installer creates:
+The one-time setup creates:
 
-- source checkout: `~/.ares/ares-agent`
-- isolated runtime: `~/.ares/ares-agent/.venv`
-- Ares data home: `~/.ares`
+- Ares agent home and independent configuration: `~/.ares/`
+- stable runtime releases: `~/.ares/runtime/releases/<commit>/`
+- atomic current/previous runtime pointers: `~/.ares/runtime/current` and `previous`
+- Ares control state: `~/.ares/runtime-state/`
 - launcher: `~/.local/bin/ares`
+- gateway service: `ares-gateway.service`
 
-It deliberately **does not** create credentials, configure a provider, enable MCP servers, change an existing Hermes home, or start background services.
+On first setup, Ares explicitly snapshots the existing `~/.hermes` settings, credentials, installed skills, plugins, and profiles into `~/.ares` so the current agent configuration works without manual re-entry. It never uses `~/.hermes` as a fallback afterward: the two installations can be updated, configured, and run independently. The development checkout remains separate and is never used as a fallback after setup.
 
 If `~/.local/bin` is not on your `PATH`, add it using your shell’s normal profile mechanism. Then configure a provider and verify the runtime:
 
@@ -67,7 +70,7 @@ ares --version
 ares doctor
 ```
 
-A successful `ares --version` proves the generated launcher can reach the installed Hermes-compatible runtime. `ares doctor` is the next diagnostic gate; provider setup is not complete until you have supplied your own provider credentials through the supported local flow.
+A successful `ares --version` proves the generated launcher can reach the selected stable Hermes-compatible runtime. `ares doctor` is the next diagnostic gate; provider setup is not complete until you have supplied your own provider credentials through the supported local flow. Use `ares tui`, `ares desktop`, and `ares gateway status` for normal operation. `ares update` builds a new stable release from the configured branch and switches it only after the build succeeds; `ares rollback` returns to the previous release.
 
 ### Install the Recursive Agent plugin (optional)
 
@@ -120,7 +123,7 @@ This is different from treating a chat summary as proof. Ares can expose a path 
 
 ## Configuration and operations
 
-Ares preserves normal Hermes configuration semantics. The `ares` launcher sets `HERMES_HOME=~/.ares` by default; you can choose a different home at bootstrap time with `--hermes-home PATH`.
+Ares preserves the Hermes-compatible configuration format but owns `~/.ares` as an independent agent home. The `ares` launcher sets the runtime process to that home only; Hermes and Ares can therefore use different providers, skills, plugins, sessions, and gateway lifecycles on the same machine without mutating one another.
 
 Do not copy structured configuration blindly between homes. In particular:
 
