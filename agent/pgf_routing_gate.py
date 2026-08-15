@@ -549,12 +549,29 @@ _WORD_ONLY_KEYWORDS = frozenset({"pr", "cp", "mv", "sed", "ls", "find", "date"})
 def _matches(low: str, keyword: str) -> bool:
     """True when `keyword` appears in `low`.
 
-    Short high-collision keywords (``pr``, ``cp``, ``mv``, ...) are matched as
-    whole words (``\\b`` boundaries) so substrings inside common words cannot
-    cause a false routing class. All other keywords use substring matching.
+    Short high-collision keywords (``pr``, ``cp``, ``mv``, ``ls``, ``find``,
+    ``sed``, ``date``) are matched as whole words (``\\b`` boundaries) so
+    substrings inside common words cannot cause a false routing class. The task
+    keyword table stores several with a trailing space (``cp ``, ``mv ``,
+    ``ls ``, ``find ``) so they don't collide with longer words; those are
+    normalized (whitespace stripped) before the word-only membership check, and
+    the trailing-space form is still matched as a prefix-then-boundary in the
+    message text. All other keywords use substring matching.
     """
-    if keyword in _WORD_ONLY_KEYWORDS:
-        return bool(re.search(rf"(?<![a-z0-9]){re.escape(keyword)}(?![a-z0-9])", low))
+    normalized = keyword.rstrip()
+    if normalized in _WORD_ONLY_KEYWORDS:
+        # Match the keyword as a whole token: boundary before, and (for
+        # trailing-space forms like "cp ") an end-of-token boundary after the
+        # letter(s) rather than requiring the literal space.
+        pat = rf"(?<![a-z0-9]){re.escape(normalized)}"
+        if keyword.endswith(" ") and len(normalized) >= 2:
+            pat += r"(?![a-z0-9])"
+        else:
+            pat += r"(?!\w)"
+        return bool(re.search(pat, low))
+    if keyword.endswith(" "):
+        # e.g. "git status ", "wait for ", "move file " -> literal prefix+space.
+        return keyword.strip() in low
     return keyword in low
 
 
@@ -665,7 +682,13 @@ def route_pre_invocation(agent, user_message: Any = None, task_id: str | None = 
             agent._pgf_pre_invocation_gate = "ACTIVE"
             agent._pgf_failure_replan_gate = "ACTIVE"
             agent._pgf_task_class = classified
-            agent._pgf_governed_brain = brain if brain is not None else getattr(agent, "_pgf_governed_brain", None)
+            # FREE dispatch means a free worker is handling this mechanical task
+            # and there is NO Brain for it. Clear any stale prior brain so
+            # audit/display never show a leftover Brain for a free-lane task.
+            if free_dispatched:
+                agent._pgf_governed_brain = None
+            else:
+                agent._pgf_governed_brain = brain if brain is not None else getattr(agent, "_pgf_governed_brain", None)
         except Exception:  # noqa: BLE001
             pass
 

@@ -353,3 +353,20 @@ def test_free_worker_unknown_mapping_fails_closed(gate):
 )
 def test_classify_word_boundary_for_short_keywords(gate, msg, expected):
     assert gate.classify_task(msg) == expected
+
+
+@pytest.mark.parametrize(
+    "msg,expected",
+    [
+        # R1B: trailing-space keywords (cp/mv/ls/find) must get word-boundary
+        # protection so "scp"/"scp" do not hijack, while "cp "/"use cp" still
+        # routes to MECHANICAL_EXECUTION.
+        ("use scp to copy the file", "NORMAL_CODING"),
+        ("make cp the file to the backup dir", "MECHANICAL_EXECUTION"),
+        ("use cp command", "MECHANICAL_EXECUTION"),
+        ("the date is important here", "NORMAL_CODING"),
+        ("find the symbol then git status", "MECHANICAL_EXECUTION"),
+    ],
+)
+def test_classify_trailing_space_keywords_word_boundary(gate, msg, expected):
+    assert gate.classify_task(msg) == expected
