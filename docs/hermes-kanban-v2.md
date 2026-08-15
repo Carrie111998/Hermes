@@ -161,20 +161,38 @@ repository service and must be recorded as a distinct observation.
 Run the proof against a temporary bare remote, local clone, board database, and
 worktrees. Capture the exact command, result count, duration, authority SHAs,
 retained diagnostic paths, and clean/dirty status. The repository proof should
-show that a configured non-checked-out `base_ref` resolves correctly, a newer
+show that a configured non-checked-out ``base_ref`` resolves correctly, a newer
 Epic tip refreshes the story, the configured command passes, generated output
 is restored, and the remote refs are byte-for-byte unchanged.
 
 ```bash
 scripts/run_tests.sh \
   tests/hermes_cli/test_kanban_repository.py \
-  tests/e2e/test_kanban_product_recovery_flow.py -q
+  tests/e2e/test_kanban_product_recovery_flow.py \
+  tests/e2e/test_kanban_epic_integration_release.py -q
+```
 
+The E2E epic-integration file (``test_kanban_epic_integration_release.py``)
+provides the structural no-remote-write proof: a push-refusing fake ``git``
+executable on PATH logs every engine invocation and exercises the full public
+path — dispatcher (``reconcile``), integrator (story→Epic-merge lifecycle),
+snapshot (prepare + invalidation), dashboard API (release-state), CLI
+(``release-state`` and ``v2-migrate``), CI observer (``observe_epic_release_ci``),
+and migration (audit/apply/grandfathering) — asserting zero ``push``
+invocations and a byte-identical bare remote after every operation. Only the
+harness-side ``FakeGit.real()`` runner may write to the remote.
+
+The recovery-flow file (``test_kanban_product_recovery_flow.py``) carries an
+additional cross-surface no-push test exercising the same public paths through
+the fake ``git`` and asserting the remote is untouched.
+
+```bash
 rg -n "git push|push --force|update-ref.*refs/remotes" \
   hermes_cli/kanban_repository.py \
   hermes_cli/kanban_db.py \
   tests/hermes_cli/test_kanban_repository.py \
-  tests/e2e/test_kanban_product_recovery_flow.py
+  tests/e2e/test_kanban_product_recovery_flow.py \
+  tests/e2e/test_kanban_epic_integration_release.py
 ```
 
 The scan may match explicit refusal text or fixture assertions, but it must not

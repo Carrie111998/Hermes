@@ -1,9 +1,19 @@
-"""End-to-end acceptance coverage for a governed product recovery story."""
+"""End-to-end acceptance coverage for a governed product recovery story.
+
+Includes the structural no-push boundary proof: a fake ``git`` executable
+on PATH that logs every engine invocation and refuses ``push`` is used to
+prove that the dispatcher, integrator, snapshot, API, CLI, observer, and
+migration public paths never reach a remote-write verb, and that the
+temporary bare remote stays byte-for-byte unchanged.
+"""
 
 from __future__ import annotations
 
+import argparse
 import importlib.util
 import json
+import shutil
+import sqlite3
 import subprocess
 import sys
 from pathlib import Path
@@ -744,4 +754,135 @@ def test_public_reconcile_routes_integration_failure_without_approval_or_graph_g
     )
     assert not event_kinds.intersection(
         {"approval_requested", "release_requested", "release_approved"}
+    )
+
+
+# ---------------------------------------------------------------------------
+# No-push boundary proof (fake git across every public engine path)
+# ---------------------------------------------------------------------------
+
+def test_no_push_boundary_across_all_public_paths(
+    governed_profile: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A push-refusing fake git proves no engine public path issues a
+    remote-write verb and the bare remote stays byte-for-byte unchanged.
+
+    Exercises the dispatcher (``reconcile``), the integrator (story
+    integration intent lifecycle), the snapshot path (prepare +
+    invalidate), the dashboard API, the release-state CLI, the CI
+    observer, and the v2-migrate CLI dry-run — all through the fake git.
+    """
+    from tests.e2e.test_kanban_epic_integration_release import (
+        FakeGit,
+        _ProductFixture,
+        _create_epic,
+        _create_epic_member,
+        _default_product_board_metadata,
+        _drive_story_to_review,
+        _load_api_module,
+    )
+
+    fake_git = FakeGit(tmp_path / "fake-git", monkeypatch)
+
+    board = "no-push-boundary"
+    remote = tmp_path / "remote.git"
+    clone = tmp_path / "clone"
+    remote.mkdir()
+    clone.mkdir(parents=True)
+    fake_git.real(tmp_path, "init", "--bare", "-b", "main", str(remote))
+    fake_git.real(tmp_path, "clone", str(remote), str(clone))
+    fake_git.real(clone, "config", "user.email", "no-push@e2e.test")
+    fake_git.real(clone, "config", "user.name", "No Push Boundary")
+    script_dir = clone / "tests" / "e2e_scripts"
+    script_dir.mkdir(parents=True, exist_ok=True)
+    (script_dir / "run_tests.sh").write_text(
+        "#!/bin/sh\nset -eu\necho ok\nexit 0\n", encoding="utf-8",
+    )
+    (script_dir / "run_tests.sh").chmod(0o755)
+    (clone / ".gitignore").write_text("*.pyc\n__pycache__/\n")
+    _default_product_board_metadata(board, clone)
+    fake_git.real(clone, "add", ".gitignore", "tests/e2e_scripts/run_tests.sh")
+    fake_git.real(clone, "commit", "-m", "initial")
+    initial_sha = fake_git.real(clone, "rev-parse", "HEAD").stdout.strip()
+    fake_git.real(clone, "push", "origin", "main")
+    fake_git.reset_log()
+
+    remote_refs_before = fake_git.real(remote, "show-ref").stdout
+
+    product = _ProductFixture(
+        board=board, repo=clone, remote=remote,
+        fake_git=fake_git, initial_sha=initial_sha,
+    )
+
+    with kb.connect(board=board) as conn:
+        epic_id = _create_epic(conn, "Epic: no-push proof")
+        story_id, worktree, branch = _create_epic_member(
+            conn, product, board, epic_id,
+        )
+
+        # Dispatcher + integrator: full story lifecycle through reconcile.
+        _drive_story_to_review(conn, story_id, worktree, branch, board)
+        result = kb.reconcile(conn, board=board, spawn_ready=False)
+        assert story_id in result.integrated
+
+        # Snapshot path: prepare + drift invalidation.
+        snap = kb.prepare_epic_release_snapshot(conn, epic_id, board=board)
+        assert snap.status == "awaiting_push"
+        fake_git.real(clone, "switch", "main")
+        (clone / "marker.txt").write_text("advance\n", encoding="utf-8")
+        fake_git.real(clone, "add", "marker.txt")
+        fake_git.real(clone, "commit", "-m", "main advance")
+        inv = kb.invalidate_epic_release_snapshot(conn, epic_id, board=board)
+        assert inv.kind == "invalidated"
+
+        # Observer path: read-only CI observation (target pre-image drift
+        # invalidates again; nothing is pushed).
+        obs = kb.observe_epic_release_ci(conn, epic_id, board=board)
+        assert obs.kind in {"invalidated", "missing", "unavailable"}
+
+        # API path: read-only release-state endpoints.
+        dashboard = _load_api_module()
+        app = FastAPI()
+        app.include_router(dashboard.router, prefix="/api/plugins/kanban")
+        api = TestClient(app)
+        resp = api.get(
+            f"/api/plugins/kanban/tasks/{epic_id}/release-state?board={board}",
+        )
+        assert resp.status_code == 200, resp.text
+        resp2 = api.get(
+            f"/api/plugins/kanban/tasks/{story_id}?board={board}",
+        )
+        assert resp2.status_code == 200, resp2.text
+
+        # CLI path: release-state read model + v2-migrate dry-run handler.
+        from hermes_cli import kanban as kanban_cli
+        state = kanban_cli._task_release_state(conn, epic_id, board=board)
+        assert state["kind"] == "epic"
+
+        live_db = kb.kanban_db_path(board=board)
+        with sqlite3.connect(str(live_db)) as raw:
+            raw.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        scratch_db = tmp_path / "scratch-cli.db"
+        shutil.copy2(live_db, scratch_db)
+        migrate_args = argparse.Namespace(
+            db_path=str(scratch_db), apply=False,
+            recovery_root=None, json=True,
+        )
+        assert kanban_cli._cmd_v2_migrate(migrate_args) == 0
+
+    remote_refs_after = fake_git.real(remote, "show-ref").stdout
+
+    # The structural guarantee: zero push invocations across every public
+    # path exercised above, and the remote untouched.
+    assert fake_git.invocations, (
+        "fake git observed no engine invocations — PATH wiring is broken"
+    )
+    assert fake_git.push_invocations == [], (
+        f"ENGINE ISSUED GIT PUSH: {fake_git.push_invocations}"
+    )
+    assert remote_refs_after == remote_refs_before, (
+        "bare remote changed during engine activity:\n"
+        f"before:\n{remote_refs_before}\nafter:\n{remote_refs_after}"
     )
