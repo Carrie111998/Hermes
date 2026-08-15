@@ -582,6 +582,28 @@ function Invoke-HermesStep([string]$Exe, [string[]]$HermesArgs, [string]$Tag) {
     return @{ Code = $proc.ExitCode; Output = $all }
 }
 
+function Invoke-UpdateBootstrap([string]$Root, [string]$Ref) {
+    # The Python updater can be too old to fetch the commit that fixes its own
+    # self-lock preflight.  Run the recovery from PowerShell (an OS component,
+    # not the locked venv interpreter) so git can advance the checkout first.
+    $bootstrap = Join-Path $Root "scripts\desktop-update\bootstrap.ps1"
+    if (-not (Test-Path -LiteralPath $bootstrap)) {
+        Write-HandoffLog "bootstrap unavailable in this checkout; preserving exit 2"
+        return $null
+    }
+    $powershell = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
+    if (-not (Test-Path -LiteralPath $powershell)) {
+        Write-HandoffLog "bootstrap unavailable: Windows PowerShell not found"
+        return $null
+    }
+    $bootstrapArgs = @(
+        "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $bootstrap,
+        "-InstallRoot", $Root, "-Branch", $Ref, "-NoRelaunch"
+    )
+    Write-HandoffLog "self-lock exit 2: advancing checkout through external bootstrap"
+    return Invoke-HermesStep $powershell $bootstrapArgs "bootstrap"
+}
+
 $finalCode = 1
 $finalMsg = "update did not complete"
 
@@ -728,9 +750,24 @@ try {
     $res = Invoke-HermesStep $pythonExe $updateArgs "update"
     Write-HandoffLog "hermes update exit code: $($res.Code)"
 
+    # A pre-#86857 checkout can reject every Python update before it reaches
+    # git fetch.  The marker is the recoverable self-lock signal; use the
+    # OS-level bootstrap to fetch the fix and then retry from a fresh Python
+    # interpreter. Ordinary exit-2 safety refusals remain terminal.
+    if ($res.Code -eq 2 -and (Test-Path -LiteralPath (Join-Path $InstallRoot ".update-incomplete"))) {
+        $boot = Invoke-UpdateBootstrap $InstallRoot $Branch
+        if ($boot -and $boot.Code -eq 0) {
+            $res = @{ Code = 0; Output = $boot.Output }
+            Write-HandoffLog "external bootstrap completed the update"
+        } elseif ($boot) {
+            Write-HandoffLog "external bootstrap failed with exit code $($boot.Code)"
+        }
+    }
+
     if ($res.Code -ne 0 -and $res.Code -ne 2) {
         # One retry for the update-boundary class (fresh code on disk, stale
-        # code in memory). Exit 2 ("close all Hermes windows") is not retryable.
+        # code in memory). Non-marker exit 2 ("close all Hermes windows")
+        # remains terminal and is not retried.
         Write-HandoffLog "first attempt failed; retrying once (freshly pulled fix loads on the second run)"
         $res = Invoke-HermesStep $pythonExe $updateArgs "update"
         Write-HandoffLog "retry exit code: $($res.Code)"
