@@ -143,7 +143,7 @@ import type { SidebarNavItem } from '../../types'
 import { SidebarCronJobsSection } from './cron-jobs-section'
 import { SidebarFilterMenu } from './filter-menu'
 import { SidebarLoadMoreRow } from './load-more-row'
-import { orderByIds, reconcileOrderIds, resolveManualSessionOrderIds, sameIds } from './order'
+import { clusterByTopic, orderByIds, reconcileOrderIds, resolveManualSessionOrderIds, sameIds } from './order'
 import { ProfileRail } from './profile-switcher'
 import { ProjectDialog } from './project-dialog'
 import {
@@ -517,9 +517,16 @@ export function ChatSidebar({
   // Recents by activity (last_active || started_at). User send stamps
   // last_active immediately. Ordering by status doesn't sort here — it re-slots
   // rows *inside* whatever dividers are on, via sortOrderIds below — so the
-  // date buckets stay chronological either way.
+  // date buckets stay chronological either way. Sessions whose titles carry a
+  // [Topic] prefix are clustered together (adjacent, siblings still
+  // recency-sorted) so e.g. [凭证] rows stay in one block.
   const sortedSessions = useMemo(
-    () => [...visibleSessions].sort((a, b) => sessionTime(b) - sessionTime(a)),
+    () =>
+      clusterByTopic(
+        [...visibleSessions].sort((a, b) => sessionTime(b) - sessionTime(a)),
+        session => session.id,
+        session => session.title
+      ),
     [visibleSessions]
   )
 
@@ -674,7 +681,12 @@ export function ChatSidebar({
   // date group inside the section (orderRowsWithinGroups) rather than baked
   // into the list here, so a drag ranks a row among its own day's chats
   // instead of flattening the whole sidebar into an undated manual mode.
-  const agentSessions = unpinnedAgentSessions
+  // Sessions whose titles carry a [Topic] prefix are clustered together so
+  // same-topic rows stay adjacent on top of that recency baseline.
+  const agentSessions = useMemo(
+    () => clusterByTopic(unpinnedAgentSessions, s => s.id, s => s.title),
+    [unpinnedAgentSessions]
+  )
 
   // Recents are local-only: messaging-platform sessions are fetched as their
   // own slice ($messagingSessions) and rendered in self-managed per-platform

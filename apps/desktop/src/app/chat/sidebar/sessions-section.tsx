@@ -9,7 +9,7 @@ import { SidebarGroup, SidebarGroupContent } from '@/components/ui/sidebar'
 import type { HermesGitWorktree } from '@/global'
 import type { SessionInfo } from '@/hermes'
 import { useI18n } from '@/i18n'
-import { flattenSessionsWithBranches } from '@/lib/session-branch-tree'
+import { clusterEntriesByTopic, flattenSessionsWithBranches } from '@/lib/session-branch-tree'
 import {
   groupEntriesByRecency,
   groupEntriesByStatus,
@@ -319,6 +319,18 @@ export function SidebarSessionsSection({
     [renderRow]
   )
 
+  // Same as `renderRows`, but re-clusters same-topic sessions after the
+  // flatten step's recency re-sort. Profile/source groups render every
+  // profile's sessions flat, so [Topic]-prefixed rows must stay adjacent
+  // here too — the flat recents path handles this in `flatRows` instead.
+  const renderRowsClustered = useCallback(
+    (items: SessionInfo[]) =>
+      clusterEntriesByTopic(flattenSessionsWithBranches(items)).map(({ branchStem, session }) =>
+        renderRow(session, false, branchStem)
+      ),
+    [renderRow]
+  )
+
   // Same as `renderRows`, but with date dividers folded in — used for
   // entered-project lanes so a lane spanning multiple days reads
   // chronologically, matching the flat recents list.
@@ -334,20 +346,26 @@ export function SidebarSessionsSection({
   )
 
   // Flat recents as list rows: grouped by recency when enabled, plain otherwise.
+  // Same-topic sessions ([凭证]…) are clustered back together after the
+  // flatten step's recency re-sort, before date bucketing inserts dividers.
   // The hand-picked order is then applied INSIDE each date group, so dragging a
   // row ranks it among its own day's chats instead of freezing the whole list
   // into an undated manual mode.
   const flatRows: SidebarListRow[] = useMemo(() => {
+    // Same-topic sessions ([凭证]…) are clustered back together after the
+    // flatten step's recency re-sort, before any grouping inserts dividers.
+    // Pinned / plain lists (grouping === 'none') keep their caller order.
+    const clustered = grouping !== 'none' ? clusterEntriesByTopic(displayEntries) : displayEntries
     const rows =
       grouping === 'date'
-        ? groupEntriesByRecency(displayEntries)
+        ? groupEntriesByRecency(clustered)
         : grouping === 'status'
           ? groupEntriesByStatus(
-              displayEntries,
+              clustered,
               entry => hasLiveTurn(dotStates[entry.session.id] ?? 'idle'),
               statusDividerLabels
             )
-          : toSessionRows(displayEntries)
+          : toSessionRows(clustered)
 
     return manualOrderIds?.length ? orderRowsWithinGroups(rows, manualOrderIds) : rows
   }, [grouping, displayEntries, dotStates, manualOrderIds, statusDividerLabels])
@@ -445,12 +463,14 @@ export function SidebarSessionsSection({
     )
   } else if (groups?.length) {
     // Profile/source groups never reorder; render them flat with static rows.
+    // renderRowsClustered keeps [Topic]-prefixed sessions adjacent after the
+    // flatten step's recency re-sort (flat recents handles this in flatRows).
     inner = groups.map(group => (
       <SidebarWorkspaceGroup
         group={group}
         key={group.id}
         onNewSession={onNewSessionInWorkspace}
-        renderRows={renderRows}
+        renderRows={renderRowsClustered}
       />
     ))
   } else if (flatVirtualized) {

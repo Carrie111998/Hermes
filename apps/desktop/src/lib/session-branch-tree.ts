@@ -122,3 +122,100 @@ export function flattenSessionsWithBranches(
 
   return out
 }
+
+/**
+ * Cluster entries whose root session title carries a `[Topic]` prefix so the
+ * whole parent→branches block moves together. Recency sorting inside
+ * flattenSessionsWithBranches reorders roots by group activity, which would
+ * otherwise scatter same-topic conversations across the date buckets; this
+ * runs after flattening (and before date bucketing) to pull them back
+ * together while keeping every block's internal order intact.
+ */
+export function clusterEntriesByTopic(entries: readonly SidebarSessionEntry[]): SidebarSessionEntry[] {
+  // Flatten emits depth-first, so each root is immediately followed by its
+  // branch children — cut blocks at every root.
+  const blocks: SidebarSessionEntry[][] = []
+
+  for (const entry of entries) {
+    if (!entry.branchStem) {
+      blocks.push([entry])
+    } else if (blocks.length) {
+      blocks[blocks.length - 1].push(entry)
+    } else {
+      // Defensive: a stray branch with no root still gets its own block.
+      blocks.push([entry])
+    }
+  }
+
+  if (blocks.length < 2) {
+    return entries as SidebarSessionEntry[]
+  }
+
+  const clustered = clusterByTopic(
+    blocks,
+    block => block[0].session.id,
+    block => block[0].session.title
+  )
+
+  return clustered.flat()
+}
+
+/**
+ * Cluster items whose titles share a `[Topic]` prefix so they sit adjacent,
+ * while preserving the caller's recency baseline: scan the (recency-sorted)
+ * list and, on first sight of a topic, pull every other item with the same
+ * prefix up to follow it. Untitled / unprefixed items stay in their original
+ * positions. Sibling order inside a cluster follows the baseline order.
+ */
+export function clusterByTopic<T>(
+  items: T[],
+  getId: (item: T) => string,
+  getTitle: (item: T) => string | null | undefined
+): T[] {
+  const topicOf = (title?: string | null) => title?.match(/^\[([^\]]+)\]/)?.[1] ?? null
+
+  const byTopic = new Map<string, T[]>()
+
+  for (const item of items) {
+    const topic = topicOf(getTitle(item))
+
+    if (topic) {
+      const siblings = byTopic.get(topic)
+
+      if (siblings) {
+        siblings.push(item)
+      } else {
+        byTopic.set(topic, [item])
+      }
+    }
+  }
+
+  const placed = new Set<string>()
+  const out: T[] = []
+
+  for (const item of items) {
+    const id = getId(item)
+
+    if (placed.has(id)) {
+      continue
+    }
+
+    out.push(item)
+    placed.add(id)
+
+    const topic = topicOf(getTitle(item))
+
+    if (topic) {
+      for (const sibling of byTopic.get(topic) ?? []) {
+        const siblingId = getId(sibling)
+
+        if (!placed.has(siblingId)) {
+          out.push(sibling)
+          placed.add(siblingId)
+        }
+      }
+    }
+  }
+
+  return out
+}

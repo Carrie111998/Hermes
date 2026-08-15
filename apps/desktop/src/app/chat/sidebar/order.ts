@@ -226,3 +226,9 @@ function clusterId(rows: SidebarListRow[]): string {
 export function reorderableRowIds(rows: SidebarListRow[]): string[] {
   return rows.flatMap(row => (row.kind === 'session' && !row.entry.branchStem ? [row.entry.session.id] : []))
 }
+
+/**
+ * clusterByTopic lives in lib/session-branch-tree.ts (a lib module) so the
+ * sidebar order module re-exports it without inverting the app→lib layering.
+ */
+export { clusterByTopic } from '@/lib/session-branch-tree'
