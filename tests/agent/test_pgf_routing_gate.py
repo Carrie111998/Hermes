@@ -370,3 +370,37 @@ def test_classify_word_boundary_for_short_keywords(gate, msg, expected):
 )
 def test_classify_trailing_space_keywords_word_boundary(gate, msg, expected):
     assert gate.classify_task(msg) == expected
+
+
+class TestFreeWorkerPoolCascade:
+    """Intra-pool fallback: a dead/unregistered worker cascades to the next
+    ranked free worker instead of failing the FREE lane or over-promoting."""
+
+    def test_dead_worker_cascades_to_next_ranked(self, gate, monkeypatch):
+        a = _agent(marker=True, task_class="MECHANICAL_EXECUTION")
+        # "nemotron_ultra" is a pool member but we simulate a dead mapping by
+        # temporarily removing it -> cascade to next ranked (north_mini_code).
+        monkeypatch.setitem(gate._FREE_WORKER_TO_RUNTIME, "nemotron_ultra", None)
+        ok = gate._run_free_worker(a, "nemotron_ultra", {})
+        assert ok is True
+        assert a.provider == "openrouter"
+        assert a.model == "cohere/north-mini-code:free"  # next ranked worker
+
+    def test_stepfun_removed_fails_closed(self, gate):
+        # stepfun was removed entirely (not a pool member) -> no cascade -> False.
+        a = _agent(marker=True, task_class="MECHANICAL_EXECUTION")
+        ok = gate._run_free_worker(a, "stepfun", {})
+        assert ok is False
+
+    def test_unknown_worker_fails_closed(self, gate):
+        a = _agent(marker=True, task_class="MECHANICAL_EXECUTION")
+        # Unknown worker not in pool -> no cascade -> False (no PAYG).
+        ok = gate._run_free_worker(a, "not_a_worker", {})
+        assert ok is False
+
+    def test_ranked_pool_order(self, gate):
+        assert gate._FREE_WORKER_POOL == (
+            "nemotron", "nemotron_ultra", "north_mini_code", "gpt_oss")
+        # all mapped
+        for w in gate._FREE_WORKER_POOL:
+            assert w in gate._FREE_WORKER_TO_RUNTIME

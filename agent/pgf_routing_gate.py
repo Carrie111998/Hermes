@@ -62,9 +62,22 @@ _BRAIN_TO_RUNTIME: dict[str, tuple[str, str]] = {
 #: (policy_status=FREE) for bounded mechanical work; the gate dispatches to the
 #: actual free model here. Both are the configured free-tier endpoints.
 _FREE_WORKER_TO_RUNTIME: dict[str, tuple[str, str]] = {
-    "nemotron": ("openrouter", "nvidia/nemotron-3-super-120b-a12b:free"),
-    "stepfun": ("nous", "stepfun/step-3.7-flash:free"),
+    # Ranked by the 2026-08-15 live capability canary (see
+    # .pgf/control-plane/free-pool/). All verified FREE on this OpenRouter key.
+    "nemotron": ("openrouter", "nvidia/nemotron-3-super-120b-a12b:free"),   # 1st: proven mechanical+JSON
+    "nemotron_ultra": ("openrouter", "nvidia/nemotron-3-ultra-550b-a55b:free"),  # 2nd: stronger reasoning
+    "north_mini_code": ("openrouter", "cohere/north-mini-code:free"),        # 3rd: code-named
+    "gpt_oss": ("openrouter", "openai/gpt-oss-20b:free"),                    # 4th: reserve
+    # Removed: stepfun (endpoint no longer served), qwen/qwen3-coder:free and
+    # nex-agi/nex-n2-pro:free (NOT free-tier on this key -> would be PAYG).
 }
+
+#: Ranked free-executor pool (measured capability, first = preferred). Used for
+#: intra-pool fallback: if the preferred worker cannot be dispatched, the gate
+#: cascades to the next ranked worker instead of over-promoting to PAYG/Claude.
+_FREE_WORKER_POOL: tuple[str, ...] = (
+    "nemotron", "nemotron_ultra", "north_mini_code", "gpt_oss",
+)
 _PYTHON = "/usr/bin/python3"
 _PLAN_TIMEOUT_S = 15.0
 
@@ -357,12 +370,32 @@ def _run_free_worker(agent, worker: str, plan: dict | None) -> bool:
     """Dispatch the current task to a FREE worker executor.
 
     Returns True only when the agent's runtime provider/model were actually set
-    to the free endpoint (so the next invocation uses the FREE model). Never
+    to a free endpoint (so the next invocation uses the FREE model). Never
     promotes the free worker to Brain. Persists the FREE dispatch record.
+
+    Intra-pool fallback: if `worker` has no runtime mapping (e.g. a dead or
+    unregistered free model), cascade to the next ranked worker in
+    ``_FREE_WORKER_POOL`` rather than failing the whole FREE lane. Still never
+    falls through to PAYG/Claude here.
     """
     pair = _FREE_WORKER_TO_RUNTIME.get(worker)
     if pair is None:
-        logger.warning("pgf_routing_gate: free worker %r has no runtime mapping", worker)
+        # Intra-pool fallback ONLY for a known free worker (in the pool) whose
+        # mapping is missing/dead. An unknown worker name fails closed — never
+        # arbitrarily start the pool from the top.
+        if worker in _FREE_WORKER_POOL:
+            idx = _FREE_WORKER_POOL.index(worker)
+            for candidate in _FREE_WORKER_POOL[idx + 1:]:
+                if candidate in _FREE_WORKER_TO_RUNTIME:
+                    logger.warning(
+                        "pgf_routing_gate: free worker %r unavailable — cascading to %r",
+                        worker, candidate,
+                    )
+                    worker = candidate
+                    pair = _FREE_WORKER_TO_RUNTIME[candidate]
+                    break
+    if pair is None:
+        logger.warning("pgf_routing_gate: no free worker available for %r", worker)
         return False
     provider, model = pair
     try:
