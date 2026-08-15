@@ -4377,7 +4377,7 @@ def _launchd_unsupported_marker_exists() -> bool:
     return _launchd_unsupported_marker_path().exists()
 
 
-def _gateway_run_command() -> list[str]:
+def _gateway_run_command(*, external_supervisor: bool = False) -> list[str]:
     """Build the `python -m hermes_cli.main [--profile X] gateway run --replace` argv.
 
     Profile-aware: honors the active HERMES_HOME via `_profile_arg()` so the
@@ -4388,11 +4388,20 @@ def _gateway_run_command() -> list[str]:
     if profile_arg:
         cmd.extend(profile_arg.split())
     cmd.extend(["gateway", "run", "--replace"])
+    if external_supervisor:
+        cmd.append("--external-supervisor")
     return cmd
 
 
-def _timestamped_stderr_gateway_command(error_log: Path) -> list[str]:
+def _timestamped_stderr_gateway_command(
+    error_log: Path, *, external_supervisor: bool = False
+) -> list[str]:
     """Wrap gateway run so raw stderr lines are timestamped before file write."""
+    gateway_command = (
+        _gateway_run_command(external_supervisor=True)
+        if external_supervisor
+        else _gateway_run_command()
+    )
     return [
         get_python_path(),
         "-m",
@@ -4400,7 +4409,7 @@ def _timestamped_stderr_gateway_command(error_log: Path) -> list[str]:
         "--error-log",
         str(error_log),
         "--",
-        *_gateway_run_command(),
+        *gateway_command,
     ]
 
 
@@ -4494,11 +4503,15 @@ def generate_launchd_plist() -> str:
     err_path = log_dir / "gateway.error.log"
 
     # Build ProgramArguments array, including --profile when using a named profile.
-    # The stderr wrapper preserves launchd's restart semantics while adding
-    # timestamps to raw stderr lines before they land in gateway.error.log.
+    # Python's subprocess child on macOS receives XPC_SERVICE_NAME="0" even when
+    # launchd gave the stderr wrapper the real job label. Declare ownership
+    # explicitly so the child cannot mistake its own launchd job for a competing
+    # supervised gateway and enter a respawn/refuse loop.
     prog_args = [
         f"<string>{part}</string>"
-        for part in _timestamped_stderr_gateway_command(err_path)
+        for part in _timestamped_stderr_gateway_command(
+            err_path, external_supervisor=True
+        )
     ]
     prog_args_xml = "\n        ".join(prog_args)
 
@@ -4547,6 +4560,8 @@ def generate_launchd_plist() -> str:
         <string>{venv_dir}</string>
         <key>HERMES_HOME</key>
         <string>{hermes_home}</string>
+        <key>{EXTERNAL_GATEWAY_SUPERVISOR_ENV}</key>
+        <string>1</string>
     </dict>
 
     <key>LimitLoadToSessionType</key>
@@ -5198,8 +5213,8 @@ def _running_under_gateway_supervisor() -> bool:
 
       - systemd sets ``INVOCATION_ID`` for every unit it launches (the same
         marker ``gateway/run.py`` already uses to pick the restart path).
-      - launchd sets ``XPC_SERVICE_NAME`` to the job label for jobs it spawns;
-        interactive shells inherit the sentinel ``"0"`` instead.
+      - launchd sets ``XPC_SERVICE_NAME`` to the job label for the direct job,
+        but macOS resets it to the sentinel ``"0"`` in subprocess children.
       - the s6-overlay container longrun exports ``HERMES_S6_SUPERVISED_CHILD``.
       - wrapped services can opt in with ``--external-supervisor`` when their
         launcher strips the native systemd/launchd marker.

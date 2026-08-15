@@ -20,6 +20,26 @@ def test_external_marker_identifies_supervisor_process(monkeypatch):
     assert gateway._running_under_gateway_supervisor() is True
 
 
+def test_shell_without_marker_still_refuses_running_supervised_gateway(
+    monkeypatch, capsys
+):
+    _clear_native_supervisor_markers(monkeypatch)
+    monkeypatch.delenv(gateway.EXTERNAL_GATEWAY_SUPERVISOR_ENV, raising=False)
+    monkeypatch.setattr(
+        gateway,
+        "get_gateway_runtime_snapshot",
+        lambda: gateway.GatewayRuntimeSnapshot(
+            manager="launchd", service_installed=True, service_running=True
+        ),
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        gateway._guard_supervised_gateway_conflict()
+
+    assert exc_info.value.code == 1
+    assert "already running under launchd" in capsys.readouterr().out
+
+
 def test_gateway_run_external_supervisor_flag_marks_process(monkeypatch):
     monkeypatch.delenv(gateway.EXTERNAL_GATEWAY_SUPERVISOR_ENV, raising=False)
     monkeypatch.setattr(

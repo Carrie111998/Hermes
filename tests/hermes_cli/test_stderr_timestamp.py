@@ -3,6 +3,7 @@
 import re
 import sys
 
+from gateway.restart import EXTERNAL_GATEWAY_SUPERVISOR_ENV
 from hermes_cli import stderr_timestamp
 
 
@@ -34,3 +35,21 @@ def test_main_timestamps_each_stderr_line(tmp_path):
     assert re.fullmatch(f"{timestamp} first failure", lines[0])
     assert re.fullmatch(f"{timestamp} second failure without newline", lines[1])
     assert lines[2] == "2026-07-15 12:34:56,789 already timestamped"
+
+
+def test_main_preserves_explicit_supervisor_marker_for_child(
+    tmp_path, monkeypatch
+):
+    log_path = tmp_path / "gateway.error.log"
+    monkeypatch.setenv(EXTERNAL_GATEWAY_SUPERVISOR_ENV, "1")
+    code = (
+        "import os, sys; "
+        f"sys.stderr.write(os.environ.get({EXTERNAL_GATEWAY_SUPERVISOR_ENV!r}, 'missing'))"
+    )
+
+    rc = stderr_timestamp.main(
+        ["--error-log", str(log_path), "--", sys.executable, "-c", code]
+    )
+
+    assert rc == 0
+    assert log_path.read_text(encoding="utf-8").rstrip().endswith(" 1")
