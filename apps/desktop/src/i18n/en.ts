@@ -454,6 +454,8 @@ export const en: Translations = {
       backdropTitle: 'Chat Backdrop',
       backdropDesc: 'The faint statue image behind the conversation.',
       reactionsTitle: 'Message Reactions',
+      skillSuggestionsTitle: 'Skill Suggestions',
+      skillSuggestionsDesc: 'Suggest matching slash commands while you type — Tab to accept, hover to see the skill description.',
       reactionsDesc: 'iMessage-style emoji tapbacks — react to messages, and Hermes can react to yours.',
       embedsTitle: 'Inline Embeds',
       embedsDesc:
@@ -2030,6 +2032,7 @@ export const en: Translations = {
     commonCommands: 'Common commands',
     hotkeys: 'Hotkeys',
     helpFooter: 'opens the full panel · backspace dismisses',
+    ghostShiftTabHint: 'Shift+Tab to cycle',
     commandDescs: {
       '/help': 'full list of commands + hotkeys',
       '/clear': 'start a new session',
@@ -2093,6 +2096,12 @@ export const en: Translations = {
     snippetsDesc: 'Pick a starter prompt to drop into the composer.',
     dropFiles: 'Drop files to attach',
     dropSession: 'Drop to link this chat',
+    skillStripPrefix: 'Try typing: ',
+    skillStripDismiss: 'Hide suggestions',
+    onboardingTitle: 'Welcome to Hermes Desktop',
+    onboardingLine1: 'Click here to start a conversation',
+    onboardingLine2: 'Type / to see every command · @ to reference files · /help for the full manual',
+    onboardingAck: 'Got it',
     snippets: {
       codeReview: {
         label: 'Code review',

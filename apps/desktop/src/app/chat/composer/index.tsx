@@ -71,6 +71,8 @@ import { ComposerStatusStack } from './status-stack'
 import { CodingStatusRow } from './status-stack/coding-row'
 import { extractClipboardImageBlobs, openDirectiveScope } from './text-utils'
 import { ComposerTriggerPopover } from './trigger-popover'
+import { peekCachedSlashCompletion } from '@/lib/slash-completion-cache'
+import { GhostSuggestionView, SkillStripView, describeCommand, useGhostSuggestion, useSkillStrip } from './ghost-suggestion'
 import type { ChatBarProps } from './types'
 import { isRedoShortcut, isUndoShortcut } from './undo-history'
 import { UrlDialog } from './url-dialog'
@@ -363,6 +365,42 @@ export function ChatBar({
     triggerLoading
   } = useComposerTrigger({ at, draftRef, editorRef, emoji, recordUndoPoint, requestMainFocus, setComposerText, slash })
 
+  // Ghost suggestion: while the user types free text (no trigger character),
+  // surface a single matching skill command inline as a faded ghost. The
+  // active command can be cycled with Shift+Tab; Tab accepts it. Already-used
+  // commands in this session are filtered out so we never re-suggest what
+  // the user just picked.
+  const ghostComposingRef = useRef(false)
+  // Commands the user already accepted or dismissed for this draft. We
+  // mutate the Set in place so React doesn't re-render on every ref update;
+  // the hook reads through `rejectedCommandsRef` on each candidate change.
+  const rejectedCommandsRef = useRef<Set<string>>(new Set())
+  const ghost = useGhostSuggestion({
+    draftRef,
+    editorRef,
+    composingRef: ghostComposingRef,
+    gateway: gateway ?? null,
+    rejectedCommandsRef
+  })
+
+  // Skill strip: a transient hint ABOVE the composer listing the top matched
+  // skills with one-line descriptions. It fades out by itself (~1.8s) so it
+  // advertises capability without obstructing the draft; 不再显示 persists
+  // the dismissal in localStorage.
+  const skillStrip = useSkillStrip(draftRef, ghost.candidates)
+
+  // Full description for the hover marquee on the ghost command: live catalog
+  // first, then the built-in fallback table.
+  const ghostDescription = useMemo(() => {
+    const command = ghost.active?.command
+
+    if (!command) {
+      return null
+    }
+
+    return describeCommand(command, peekCachedSlashCompletion('catalog'))
+  }, [ghost.active])
+
   // Pull the live contentEditable text into draftRef + the AUI composer state
   // (which drives `hasComposerPayload` → the send button). Shared by the input
   // and compositionend paths so committed IME text reaches state through either.
@@ -509,6 +547,34 @@ export function ChatBar({
     // preedit fires submitDraft() and splits the message mid-word.
     if (composingRef.current || event.nativeEvent.isComposing) {
       return
+    }
+
+    // Ghost suggestion: cycle / accept / dismiss keys take priority over
+    // the rest of the keydown chain. Escape drops the ghost for the current
+    // draft; Shift+Tab cycles to the previous candidate; Tab accepts the
+    // active one (or cycles forward when Shift is not held). The Tab/Enter
+    // branch below is for trigger popovers and stays unaffected because
+    // it only fires when `trigger` is set, which is mutually exclusive with
+    // a visible ghost (the ghost hides for any draft that contains a
+    // trigger character).
+    if (ghost.active) {
+      if (event.key === 'Escape') {
+        event.preventDefault()
+        ghost.dismiss()
+        return
+      }
+
+      if (event.key === 'Tab') {
+        event.preventDefault()
+
+        if (event.shiftKey) {
+          ghost.cyclePrev()
+        } else {
+          ghost.accept()
+        }
+
+        return
+      }
     }
 
     // Undo/redo before anything else — we own the stack (see useComposerUndo),
@@ -988,6 +1054,7 @@ export function ChatBar({
         spellCheck={false}
         suppressContentEditableWarning
       />
+      <GhostSuggestionView command={ghost.active?.command ?? null} description={ghostDescription} />
       <ComposerDirectiveActions editorRef={editorRef} />
       {/* assistant-ui requires ComposerPrimitive.Input somewhere in the tree
         so the composer-state binding (text + IME + paste + form-submit hookup)
@@ -1112,6 +1179,10 @@ export function ChatBar({
             }
             sessionId={statusSessionId}
           />
+          {/* Skill strip: transient hint above the composer. Rendered as a dock
+            child (NOT inside composer-fade, which is overflow-hidden and would
+            clip the strip) so it is actually visible above the input. */}
+          <SkillStripView items={skillStrip.items} onDismissForever={skillStrip.dismissForever} />
           <ComposerPrimitive.Root
             className={cn(
               'group/composer relative w-full overflow-visible rounded-2xl',

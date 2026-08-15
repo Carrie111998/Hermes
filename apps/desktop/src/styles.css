@@ -2264,3 +2264,13 @@ button[data-slot='aui_msg-reactions'] svg {
     opacity: 0.4;
   }
 }
+
+/* Ghost suggestion hover marquee — 技能描述跑马灯 (left-scroll loop) */
+@keyframes composer-ghost-marquee {
+  0% {
+    transform: translateX(0);
+  }
+  100% {
+    transform: translateX(-50%);
+  }
+}

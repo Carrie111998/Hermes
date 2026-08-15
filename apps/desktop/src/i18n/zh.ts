@@ -446,6 +446,8 @@ export const zh: Translations = {
       backdropTitle: '聊天背景',
       backdropDesc: '对话后方那张淡淡的雕像图片。',
       reactionsTitle: '消息回应',
+      skillSuggestionsTitle: '技能建议',
+      skillSuggestionsDesc: '输入时自动推荐匹配的斜杠命令，按 Tab 补全，悬停查看技能描述。',
       reactionsDesc: 'iMessage 风格的表情回应 — 你可以给消息添加回应，Hermes 也能回应你的消息。',
       embedsTitle: '内嵌预览',
       embedsDesc:
@@ -2223,6 +2225,7 @@ export const zh: Translations = {
     commonCommands: '常用命令',
     hotkeys: '快捷键',
     helpFooter: '打开完整面板 · 退格键关闭',
+    ghostShiftTabHint: '按 Shift+Tab 切换',
     commandDescs: {
       '/help': '命令与快捷键的完整列表',
       '/clear': '开始新会话',
@@ -2286,6 +2289,12 @@ export const zh: Translations = {
     snippetsDesc: '选择一个起始提示词放入输入框。',
     dropFiles: '拖放文件以附加',
     dropSession: '拖放以链接此对话',
+    skillStripPrefix: '试试输入：',
+    skillStripDismiss: '不再显示',
+    onboardingTitle: '欢迎使用 Hermes Desktop',
+    onboardingLine1: '点按这里开始对话',
+    onboardingLine2: '输入 / 查看所有命令 · @ 引用文件 · /help 看完整手册',
+    onboardingAck: '知道了',
     snippets: {
       codeReview: {
         label: '代码审查',
