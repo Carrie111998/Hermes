@@ -7978,9 +7978,147 @@ class DispatchResult:
 # so both ``os.WIFEXITED`` / ``os.WEXITSTATUS`` and ``os.WIFSIGNALED`` can
 # be consulted. Entries are trimmed by age (and total size cap as a
 # belt-and-braces against unbounded growth on exotic platforms).
+#
+# Survives gateway restarts via JSON persistence at
+# ``<kanban_home>/run/state/kanban/recent_worker_exits.json``. The
+# dispatcher process is the only writer (workers are the children being
+# reaped; cron recover / sweeper don't call this). Persistence is
+# synchronous (atomic temp+rename) and best-effort: a missing /
+# unwriteable store must NEVER prevent the gateway from starting or
+# from classifying workers. See investigation t_81a6af02 for the bug
+# class this guards against (gateway restart storm wiped the in-process
+# dict, causing workers that died during the previous gateway's
+# lifetime to be misclassified as ``"pid N not alive"``).
 _RECENT_WORKER_EXIT_TTL_SECONDS = 600
 _RECENT_WORKER_EXITS_MAX = 4096
 _recent_worker_exits: "dict[int, tuple[int, float]]" = {}
+_persist_lock = threading.Lock()
+
+
+def _recent_exits_persist_path() -> Optional[Path]:
+    """Return the JSON file path for persisting the recent-exits registry.
+
+    Returns ``None`` when no HERMES root is resolvable (very early import
+    in tests) so callers can no-op instead of crashing.
+    """
+    try:
+        root = kanban_home()
+    except Exception:
+        return None
+    return root / "run" / "state" / "kanban" / "recent_worker_exits.json"
+
+
+def _persist_recent_worker_exits() -> None:
+    """Atomically write the current registry to disk.
+
+    Best-effort: any error (disk full, permission denied, missing root)
+    is swallowed after a single warning. The dispatcher's classification
+    path must keep working when persistence is unavailable — the in-memory
+    dict is still authoritative for the lifetime of this process.
+
+    No ``fsync`` here. The atomic ``os.replace`` (rename) gives us
+    visibility semantics (a reader sees either the old file or the new
+    one, never a half-written one). An ``fsync`` would add ~1ms per
+    write and only matters on hard crashes — and on a hard crash,
+    losing the last few entries is acceptable: the registry is
+    advisory (TTL=600s) and the cost of losing <1s of writes is
+    bounded by the next reap tick.
+    """
+    path = _recent_exits_persist_path()
+    if path is None:
+        return
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # JSON dump is bounded (≤ 4096 entries; pid:int + status:int +
+        # ts:float ≈ ~80 bytes per entry → ≤ ~330 KB worst case, sub-ms
+        # to serialize). Atomic temp+rename so a crash mid-write leaves
+        # the previous file intact rather than a half-written one.
+        payload = {
+            str(pid): [int(status), float(ts)]
+            for pid, (status, ts) in _recent_worker_exits.items()
+        }
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, separators=(",", ":"))
+            fh.flush()
+        os.replace(tmp, path)
+    except Exception as exc:
+        # Swallow + warn once. Don't let persistence failures kill the
+        # dispatcher — the in-memory dict is the source of truth for this
+        # process's lifetime, and the next call will retry.
+        try:
+            logging.getLogger(__name__).warning(
+                "kanban: failed to persist recent worker exits to %s: %s",
+                path, exc,
+            )
+        except Exception:
+            pass
+
+
+def _load_persisted_recent_worker_exits() -> int:
+    """Populate ``_recent_worker_exits`` from disk on gateway startup.
+
+    Called once at module import. Best-effort: a missing / corrupt /
+    permission-denied file logs a warning and returns 0; the dispatcher
+    still starts (and just sees the post-restart world as "no recent
+    exits", which is the same behaviour as before this fix — strictly
+    better for the restart-storm case because the file IS expected to
+    be present from a previous gateway life).
+
+    Returns the number of entries loaded (useful for tests).
+    """
+    path = _recent_exits_persist_path()
+    if path is None or not path.exists():
+        return 0
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            payload = json.load(fh)
+    except Exception as exc:
+        try:
+            logging.getLogger(__name__).warning(
+                "kanban: failed to load persisted recent worker exits "
+                "from %s: %s — starting with empty registry",
+                path, exc,
+            )
+        except Exception:
+            pass
+        return 0
+    if not isinstance(payload, dict):
+        return 0
+    loaded = 0
+    cutoff = time.time() - _RECENT_WORKER_EXIT_TTL_SECONDS
+    for k, v in payload.items():
+        try:
+            pid = int(k)
+            if pid <= 0:
+                continue
+            if not (isinstance(v, list) and len(v) == 2):
+                continue
+            status = int(v[0])
+            ts = float(v[1])
+        except (ValueError, TypeError):
+            continue
+        # Drop entries that already aged out — the registry only needs
+        # to classify workers that died within the last TTL window.
+        if ts < cutoff:
+            continue
+        _recent_worker_exits[pid] = (status, ts)
+        loaded += 1
+        # Respect the size cap on load too: oldest-first trim if we ever
+        # exceed it (a very long-lived previous gateway + a tiny TTL).
+        if len(_recent_worker_exits) >= _RECENT_WORKER_EXITS_MAX:
+            break
+    return loaded
+
+
+# Populate from disk at import time. Wrapped so import never fails on a
+# missing / unreadable persisted file (the loader itself swallows
+# errors, but belt-and-braces against any unexpected exception during
+# module init).
+try:
+    _load_persisted_recent_worker_exits()
+except Exception:
+    pass
 
 
 def _record_worker_exit(pid: int, raw_status: int) -> None:
@@ -7988,6 +8126,8 @@ def _record_worker_exit(pid: int, raw_status: int) -> None:
 
     Called from the reap loop in ``dispatch_once``. Safe to call many
     times; duplicate pids overwrite (pids can cycle, latest wins).
+    Persists to disk after each insert so a gateway restart doesn't
+    wipe the registry — see investigation t_81a6af02.
     """
     if not pid or pid <= 0:
         return
@@ -8004,6 +8144,12 @@ def _record_worker_exit(pid: int, raw_status: int) -> None:
         ordered = sorted(_recent_worker_exits.items(), key=lambda kv: kv[1][1])
         for _pid, _ in ordered[: len(ordered) // 2]:
             _recent_worker_exits.pop(_pid, None)
+    # Persist so a gateway restart can replay this entry. Held under
+    # the lock so concurrent calls from the reap loop (rare, but
+    # possible on a busy tick) don't race on the temp file. The lock
+    # is uncontended in the common case (one reap tick at a time).
+    with _persist_lock:
+        _persist_recent_worker_exits()
 
 
 def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
