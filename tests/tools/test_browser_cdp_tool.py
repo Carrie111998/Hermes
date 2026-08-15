@@ -569,15 +569,24 @@ def test_target_navigation_result_is_revalidated_and_blank_on_private_redirect(
     assert "error" in result
     assert "landed on a private or internal address" in result["error"]
     calls = cdp_server.received()
-    assert [call["method"] for call in calls] == [
+    expected = [
         "Target.getTargets",
         "Target.attachToTarget",
-        "Page.enable",
-        "Page.getFrameTree",
-        method,
-        "Page.getFrameTree",
-        "Page.navigate",
     ]
+    if method == "Page.reload":
+        # Reload is not allowlisted, so the selected-target private-page
+        # revalidation runs immediately after attach.
+        expected.append("Page.getFrameTree")
+    expected.extend(
+        [
+            "Page.enable",
+            "Page.getFrameTree",
+            method,
+            "Page.getFrameTree",
+            "Page.navigate",
+        ]
+    )
+    assert [call["method"] for call in calls] == expected
     assert calls[-1]["params"] == {"url": "about:blank"}
 
 
@@ -862,7 +871,7 @@ def test_frame_id_raw_frames_fallback_blocks_private_oopif(monkeypatch):
 
 
 def test_frame_id_allowlist_survives_private_oopif(monkeypatch):
-    """Navigation/inspection allowlist must still reach supervisor on private frames."""
+    """Non-reload allowlist methods must still reach supervisor on private frames."""
     import tools.browser_tool as bt
     import tools.browser_supervisor as bs
 
@@ -939,7 +948,7 @@ def test_frame_id_allowlist_survives_private_oopif(monkeypatch):
 
     result = json.loads(
         browser_cdp_tool.browser_cdp(
-            method="Page.reload",
+            method="Page.stopLoading",
             params={},
             frame_id="oopif-private",
             task_id="task-1",
@@ -955,8 +964,185 @@ def test_frame_id_allowlist_survives_private_oopif(monkeypatch):
     assert len(properties) == 2
     assert {entry["source"] for entry in properties.values()} == {"first", "second"}
     assert supervisor.cdp_calls == [
-        {"method": "Page.reload", "params": {}, "session_id": "child-session"}
+        {"method": "Page.stopLoading", "params": {}, "session_id": "child-session"}
     ]
+
+
+def test_frame_id_reload_blocked_on_private_oopif(monkeypatch):
+    """Page.reload must not re-fetch an already-private OOPIF child session."""
+    import tools.browser_tool as bt
+    import tools.browser_supervisor as bs
+
+    monkeypatch.setattr(bt, "_eval_ssrf_guard_active", lambda task_id: True)
+    monkeypatch.setattr(bt, "_current_page_private_url", lambda task_id: None)
+
+    private_frame = _FakeFrame(
+        frame_id="oopif-private",
+        url=PRIVATE_URL,
+        origin="http://169.254.169.254",
+        session_id="child-session",
+    )
+    supervisor = _FakeSupervisor(
+        frame_tree={
+            "top": {
+                "frame_id": "top-1",
+                "url": "https://example.com/",
+                "origin": "https://example.com",
+            },
+            "children": [private_frame.to_dict()],
+        },
+        frames={"oopif-private": private_frame},
+    )
+    supervisor._loop = type(
+        "Loop",
+        (),
+        {"is_running": staticmethod(lambda: True)},
+    )()
+    monkeypatch.setattr(bs.SUPERVISOR_REGISTRY, "get", lambda task_id: supervisor)
+
+    result = json.loads(
+        browser_cdp_tool.browser_cdp(
+            method="Page.reload",
+            params={},
+            frame_id="oopif-private",
+            task_id="task-1",
+        )
+    )
+
+    assert "error" in result
+    assert PRIVATE_URL in result["error"]
+    assert supervisor.cdp_calls == []
+
+
+def test_frame_id_navigate_redirect_to_private_is_blanked(monkeypatch):
+    """frame_id Page.navigate must post-check and blank public-to-private landings."""
+    import tools.browser_tool as bt
+    import tools.browser_supervisor as bs
+
+    monkeypatch.setattr(bt, "_eval_ssrf_guard_active", lambda task_id: True)
+    monkeypatch.setattr(bt, "_current_page_private_url", lambda task_id: None)
+    monkeypatch.setattr(bt, "_is_always_blocked_url", lambda url: False)
+    monkeypatch.setattr(bt, "_is_safe_url", lambda url: url != PRIVATE_URL)
+
+    public_frame = _FakeFrame(
+        frame_id="oopif-public",
+        url="https://public.example/widget",
+        origin="https://public.example",
+        session_id="child-session",
+    )
+
+    class _NavSupervisor(_FakeSupervisor):
+        def __init__(self):
+            super().__init__(
+                frame_tree={
+                    "top": {
+                        "frame_id": "top-1",
+                        "url": "https://example.com/",
+                        "origin": "https://example.com",
+                    },
+                    "children": [public_frame.to_dict()],
+                },
+                frames={"oopif-public": public_frame},
+            )
+            self._loop = type(
+                "Loop",
+                (),
+                {"is_running": staticmethod(lambda: True)},
+            )()
+
+        async def _cdp(self, method, params=None, *, session_id=None, timeout=10.0):
+            self.cdp_calls.append(
+                {"method": method, "params": params or {}, "session_id": session_id}
+            )
+            if method == "Page.navigate" and (params or {}).get("url") != "about:blank":
+                public_frame._data["url"] = PRIVATE_URL
+                public_frame._data["origin"] = "http://169.254.169.254"
+                return {
+                    "result": {
+                        "frameId": "oopif-public",
+                        "loaderId": "private-loader",
+                    }
+                }
+            if method == "Page.getFrameTree":
+                return {
+                    "result": {
+                        "frameTree": {
+                            "frame": {
+                                "id": "oopif-public",
+                                "url": public_frame._data["url"],
+                            }
+                        }
+                    }
+                }
+            if method == "Page.navigate" and (params or {}).get("url") == "about:blank":
+                public_frame._data["url"] = "about:blank"
+                public_frame._data["origin"] = "null"
+                return {"result": {"frameId": "oopif-public", "loaderId": "blank-loader"}}
+            return {"result": {}}
+
+    supervisor = _NavSupervisor()
+    monkeypatch.setattr(bs.SUPERVISOR_REGISTRY, "get", lambda task_id: supervisor)
+
+    def fake_schedule(coro, loop):
+        class _Fut:
+            def result(self, timeout=None):
+                return asyncio.run(coro)
+
+        return _Fut()
+
+    monkeypatch.setattr(
+        "agent.async_utils.safe_schedule_threadsafe", fake_schedule
+    )
+
+    result = json.loads(
+        browser_cdp_tool.browser_cdp(
+            method="Page.navigate",
+            params={"url": "https://public.example/redirect"},
+            frame_id="oopif-public",
+            task_id="task-1",
+        )
+    )
+
+    assert "error" in result
+    assert "landed on a private or internal address" in result["error"]
+    assert "frame reset to about:blank" in result["error"]
+    assert [call["method"] for call in supervisor.cdp_calls] == [
+        "Page.navigate",
+        "Page.getFrameTree",
+        "Page.navigate",
+    ]
+    assert supervisor.cdp_calls[-1]["params"] == {"url": "about:blank"}
+    assert public_frame._data["url"] == "about:blank"
+
+
+def test_target_reload_blocked_when_selected_target_is_private(cdp_server, monkeypatch):
+    """Page.reload must not attach to an already-private page target."""
+    import tools.browser_tool as bt
+
+    monkeypatch.setattr(bt, "_eval_ssrf_guard_active", lambda task_id: True)
+    monkeypatch.setattr(bt, "_current_page_private_url", lambda task_id: None)
+    monkeypatch.setattr(bt, "_is_always_blocked_url", lambda url: False)
+    monkeypatch.setattr(bt, "_is_safe_url", lambda url: url != PRIVATE_URL)
+    cdp_server.on(
+        "Target.getTargets",
+        lambda params, sid: {
+            "targetInfos": [
+                {"targetId": "private-page", "type": "page", "url": PRIVATE_URL}
+            ]
+        },
+    )
+
+    result = json.loads(
+        browser_cdp_tool.browser_cdp(
+            method="Page.reload",
+            target_id="private-page",
+            task_id="task-1",
+        )
+    )
+
+    assert "error" in result
+    assert "private or internal address" in result["error"]
+    assert [call["method"] for call in cdp_server.received()] == ["Target.getTargets"]
 
 
 def test_frame_id_revalidates_live_url_before_dispatch(monkeypatch):

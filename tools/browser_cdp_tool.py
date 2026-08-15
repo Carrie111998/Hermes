@@ -32,12 +32,13 @@ _CDP_PRIVATE_PAGE_ALLOWED_METHODS = {
     # Browser/target inspection does not read the current page body, cookies,
     # DOM, storage, or screenshots. Keep these working so the model can list
     # tabs or navigate away from a blocked page.
+    # Page.reload is intentionally excluded: reloading an already-private
+    # page re-requests private/internal content. Use Page.navigate to leave.
     "Browser.getVersion",
     "Target.getTargets",
     "Target.attachToTarget",
     "Target.detachFromTarget",
     "Page.navigate",
-    "Page.reload",
     "Page.stopLoading",
 }
 
@@ -267,6 +268,122 @@ def _live_selected_frame_info(supervisor: Any, frame_id: str) -> Optional[Dict[s
         if raw is None:
             return None
         return raw.to_dict()
+
+
+async def _revalidate_supervisor_frame_navigation(
+    *,
+    supervisor: Any,
+    task_id: str,
+    frame_id: str,
+    session_id: str,
+    method: str,
+    timeout: float,
+) -> None:
+    """Fail closed when frame_id navigate/reload lands on a private address.
+
+    ``Page.navigate`` remains allowlisted so a private OOPIF can be left, but
+    public-to-private redirects (and reload of a page that becomes private)
+    must not keep the child session on an internal URL. Mirror the target-scoped
+    post-check: inspect live frame metadata + ``Page.getFrameTree``, then reset
+    to ``about:blank`` when blocked.
+    """
+    try:
+        from tools import browser_tool as bt  # type: ignore[import-not-found]
+
+        if not bt._eval_ssrf_guard_active(task_id):  # type: ignore[attr-defined]
+            return
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(
+            "browser_cdp: frame navigation guard activation probe failed: %s",
+            exc,
+        )
+        raise _BrowserCdpFrameGuardBlocked(
+            tool_error(
+                "Blocked: selected-frame SSRF guard activation probe failed after "
+                f"{method}; raw CDP navigation could expose private page content "
+                "or state.",
+                method=method,
+                cdp_docs=CDP_DOCS_URL,
+            )
+        ) from exc
+
+    live_info = _live_selected_frame_info(supervisor, frame_id)
+    live_url = str((live_info or {}).get("url") or "").strip()
+    live_origin = str((live_info or {}).get("origin") or "").strip()
+
+    tree_url = ""
+    try:
+        tree_msg = await supervisor._cdp(  # type: ignore[attr-defined]
+            "Page.getFrameTree",
+            {},
+            session_id=session_id,
+            timeout=timeout,
+        )
+        frame_tree = tree_msg.get("result", {}).get("frameTree", {})
+        selected = _find_frame_in_tree(frame_tree, frame_id)
+        if selected is None:
+            # OOPIF child sessions often expose only the selected frame as root.
+            selected = frame_tree.get("frame", {})
+        tree_url = str((selected or {}).get("url") or "").strip()
+    except _BrowserCdpFrameGuardBlocked:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(
+            "browser_cdp: Page.getFrameTree after frame %s failed: %s",
+            method,
+            exc,
+        )
+        # Fall through to live supervisor metadata; empty sources fail closed below.
+
+    try:
+        blocked = _private_address_from_candidates(live_url, live_origin, tree_url)
+    except Exception as exc:  # noqa: BLE001
+        raise _BrowserCdpFrameGuardBlocked(
+            tool_error(
+                "Blocked: selected-frame private-page guard probe failed after "
+                f"{method}; raw CDP navigation could expose private page content "
+                "or state.",
+                method=method,
+                cdp_docs=CDP_DOCS_URL,
+            )
+        ) from exc
+
+    if not live_url and not live_origin and not tree_url:
+        raise _BrowserCdpFrameGuardBlocked(
+            tool_error(
+                "Blocked: selected OOPIF frame has no URL/origin metadata after "
+                f"{method}; raw CDP navigation could expose private page content "
+                "or state.",
+                method=method,
+                cdp_docs=CDP_DOCS_URL,
+            )
+        )
+
+    if not blocked:
+        return
+
+    blank_error: Optional[str] = None
+    try:
+        await supervisor._cdp(  # type: ignore[attr-defined]
+            "Page.navigate",
+            {"url": "about:blank"},
+            session_id=session_id,
+            timeout=timeout,
+        )
+    except Exception as exc:  # noqa: BLE001
+        blank_error = f"failed to reset frame to about:blank: {exc}"
+
+    reset_status = (
+        f"; {blank_error}" if blank_error else "; frame reset to about:blank"
+    )
+    raise _BrowserCdpFrameGuardBlocked(
+        tool_error(
+            "Blocked: frame navigation landed on a private or internal address "
+            f"({blocked}){reset_status}",
+            method=method,
+            cdp_docs=CDP_DOCS_URL,
+        )
+    )
 
 
 def _browser_cdp_private_guard(
@@ -922,6 +1039,15 @@ def _browser_cdp_via_supervisor(
             session_id=live_sid,
             timeout=timeout,
         )
+        if method in _CDP_TARGET_NAVIGATION_METHODS:
+            await _revalidate_supervisor_frame_navigation(
+                supervisor=supervisor,
+                task_id=task_id,
+                frame_id=frame_id,
+                session_id=live_sid,
+                method=method,
+                timeout=timeout,
+            )
         return result_msg, live_sid
 
     try:
