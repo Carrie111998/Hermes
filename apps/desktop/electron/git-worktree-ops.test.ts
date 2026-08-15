@@ -16,6 +16,20 @@ import {
   switchBranch
 } from './git-worktree-ops'
 
+function removeTempDirAfterGitProbe(dir: string) {
+  try {
+    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 })
+  } catch (error: any) {
+    // Native Windows can retain the failed `git` probe's directory handle
+    // beyond Vitest teardown. That is not a listBranches product failure.
+    if (process.platform === 'win32' && (error?.code === 'EBUSY' || error?.code === 'EPERM')) {
+      return
+    }
+
+    throw error
+  }
+}
+
 test('sanitizeBranch: spaces → hyphens, forbidden chars dropped, edges trimmed', () => {
   assert.equal(sanitizeBranch('beach vibes'), 'beach-vibes')
   assert.equal(sanitizeBranch('feat/cool thing'), 'feat/cool-thing')
@@ -164,7 +178,10 @@ test('listBranches: empty on a non-repo path', async () => {
   try {
     assert.deepEqual(await listBranches(dir, 'git'), [])
   } finally {
-    fs.rmSync(dir, { recursive: true, force: true })
+    // Windows can retain git's short-lived directory handle after the failed
+    // non-repository probe; retry cleanup rather than misclassifying teardown
+    // lock timing as a listBranches product failure.
+    removeTempDirAfterGitProbe(dir)
   }
 })
 
