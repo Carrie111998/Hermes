@@ -51,7 +51,8 @@ def check_cli_voice_speak_cap() -> tuple[bool, str]:
 def check_playback_wait() -> tuple[bool, str]:
     from tools import voice_mode as vm
 
-    src = inspect.getsource(vm.play_audio_file)
+    playback_impl = getattr(vm, "_play_audio_file_impl", vm.play_audio_file)
+    src = inspect.getsource(playback_impl)
     if "proc.wait(timeout=300)" in src:
         return False, "play_audio_file still uses flat proc.wait(timeout=300)"
     if "_audio_file_duration_seconds" not in src:

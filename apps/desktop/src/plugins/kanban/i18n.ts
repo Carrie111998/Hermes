@@ -29,7 +29,7 @@ type KanbanMessages = {
   noMatch: string
   noTasks: string
   open: string
-  select: string
+  select: (modifier: string) => string
   deselect: string
   moveTo: (label: string) => string
   delete: string
@@ -65,6 +65,10 @@ type KanbanMessages = {
   workspace: string
   boardDefaultSuffix: string
   workspaceOverride: string
+  model: string
+  modelInherit: string
+  modelClear: string
+  modelHint: string
   workspaceInherit: string
   workspaceInheritDir: (dir: string) => string
   workspaceInheritGeneric: string
@@ -213,7 +217,7 @@ const en: KanbanMessages = {
   noMatch: 'No tasks match the filters',
   noTasks: 'No tasks on this board',
   open: 'Open',
-  select: 'Select (⌘-click)',
+  select: modifier => `Select (${modifier}-click)`,
   deselect: 'Deselect',
   moveTo: label => `Move to ${label}`,
   delete: 'Delete',
@@ -250,6 +254,10 @@ const en: KanbanMessages = {
   workspace: 'Workspace',
   boardDefaultSuffix: ' · board default',
   workspaceOverride: 'Workspace path (optional override)',
+  model: 'Model',
+  modelInherit: 'Profile default',
+  modelClear: 'Clear model override',
+  modelHint: 'Runs this task on a specific model and thinking depth. Unset uses the assigned profile’s own.',
   workspaceInherit: 'Inherits the board’s project directory',
   workspaceInheritDir: dir => `Leave empty to inherit ${dir}`,
   workspaceInheritGeneric: 'Leave empty to inherit the board’s project directory.',
@@ -401,7 +409,7 @@ const ja: KanbanMessages = {
   noMatch: 'フィルタに一致するタスクはありません',
   noTasks: 'このボードにタスクはありません',
   open: '開く',
-  select: '選択（⌘クリック）',
+  select: modifier => `選択（${modifier}クリック）`,
   deselect: '選択解除',
   moveTo: label => `${label} へ移動`,
   delete: '削除',
@@ -438,6 +446,10 @@ const ja: KanbanMessages = {
   workspace: 'ワークスペース',
   boardDefaultSuffix: '・ボード既定',
   workspaceOverride: 'ワークスペースパス（任意の上書き）',
+  model: 'モデル',
+  modelInherit: 'プロファイル既定',
+  modelClear: 'モデル指定を解除',
+  modelHint: 'このタスクを特定のモデルと思考深度で実行します。未設定なら担当プロファイルの設定を使用します。',
   workspaceInherit: 'ボードのプロジェクトディレクトリを継承',
   workspaceInheritDir: dir => `空欄にすると ${dir} を継承します`,
   workspaceInheritGeneric: '空欄にするとボードのプロジェクトディレクトリを継承します。',
@@ -588,7 +600,7 @@ const zh: KanbanMessages = {
   noMatch: '没有符合筛选条件的任务',
   noTasks: '此面板暂无任务',
   open: '打开',
-  select: '选择（⌘点击）',
+  select: modifier => `选择（${modifier}点击）`,
   deselect: '取消选择',
   moveTo: label => `移动到 ${label}`,
   delete: '删除',
@@ -624,6 +636,10 @@ const zh: KanbanMessages = {
   workspace: '工作区',
   boardDefaultSuffix: '・面板默认',
   workspaceOverride: '工作区路径（可选覆盖）',
+  model: '模型',
+  modelInherit: '配置文件默认',
+  modelClear: '清除模型覆盖',
+  modelHint: '让该任务使用指定的模型与思考深度。未设置时使用所指派配置文件自身的设置。',
   workspaceInherit: '继承面板的项目目录',
   workspaceInheritDir: dir => `留空则继承 ${dir}`,
   workspaceInheritGeneric: '留空则继承面板的项目目录。',
@@ -772,7 +788,7 @@ const zhHant: KanbanMessages = {
   noMatch: '沒有符合篩選條件的任務',
   noTasks: '此面板尚無任務',
   open: '開啟',
-  select: '選取（⌘點擊）',
+  select: modifier => `選取（${modifier}點擊）`,
   deselect: '取消選取',
   moveTo: label => `移至 ${label}`,
   delete: '刪除',
@@ -808,6 +824,10 @@ const zhHant: KanbanMessages = {
   workspace: '工作區',
   boardDefaultSuffix: '・面板預設',
   workspaceOverride: '工作區路徑（選填覆寫）',
+  model: '模型',
+  modelInherit: '設定檔預設',
+  modelClear: '清除模型覆寫',
+  modelHint: '讓此任務使用指定的模型與思考深度。未設定時使用所指派設定檔本身的設定。',
   workspaceInherit: '繼承面板的專案目錄',
   workspaceInheritDir: dir => `留空則繼承 ${dir}`,
   workspaceInheritGeneric: '留空則繼承面板的專案目錄。',
