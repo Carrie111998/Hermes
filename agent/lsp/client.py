@@ -56,7 +56,11 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Set
 from urllib.parse import quote, unquote
 
-from hermes_cli._subprocess_compat import windows_batch_command, windows_hide_flags
+from hermes_cli._subprocess_compat import (
+    kill_process_tree,
+    windows_batch_proxy_command,
+    windows_hide_flags,
+)
 
 from agent.lsp.protocol import (
     ERROR_CONTENT_MODIFIED,
@@ -296,15 +300,9 @@ class LSPClient:
             raise
 
     @staticmethod
-    def _win_shell_command(cmd: List[str], env: Dict[str, str]) -> str:
-        """Build a safely quoted command for a Windows batch launcher.
-
-        ``cmd.exe`` treats characters such as ``&`` as operators even when
-        Python passes arguments as a list. Put each argument in the child
-        environment and expand it inside quotes so valid Windows paths and
-        arguments containing shell metacharacters retain their identity.
-        """
-        return windows_batch_command(cmd, env, prefix="HERMES_LSP_COMMAND")
+    def _win_batch_proxy_command(cmd: List[str]) -> List[str]:
+        """Build native argv for the explicit, AutoRun-disabled batch relay."""
+        return windows_batch_proxy_command(cmd)
 
     async def _spawn(self) -> None:
         env = dict(os.environ)
@@ -340,9 +338,9 @@ class LSPClient:
                 "creationflags": creationflags,
             }
             if use_windows_shell:
-                command_line = self._win_shell_command(cmd, env)
-                self._proc = await asyncio.create_subprocess_shell(
-                    command_line, **spawn_kwargs
+                proxy_command = self._win_batch_proxy_command(cmd)
+                self._proc = await asyncio.create_subprocess_exec(
+                    proxy_command[0], *proxy_command[1:], **spawn_kwargs
                 )
             else:
                 self._proc = await asyncio.create_subprocess_exec(
@@ -533,16 +531,27 @@ class LSPClient:
                 return
             if proc.returncode is None:
                 try:
-                    proc.terminate()
+                    # A server that received shutdown+exit gets one bounded
+                    # chance to leave cleanly before whole-tree termination.
+                    await asyncio.wait_for(proc.wait(), timeout=SHUTDOWN_GRACE)
+                except asyncio.TimeoutError:
+                    # The shared compat helper delegates to agent.deadline's
+                    # portable tree-kill and retains its legacy fail-open
+                    # fallback for partial-install/teardown environments.
+                    await asyncio.to_thread(kill_process_tree, proc)
                     try:
                         await asyncio.wait_for(proc.wait(), timeout=SHUTDOWN_GRACE)
-                    except asyncio.TimeoutError:
-                        try:
-                            proc.kill()
-                            await proc.wait()
-                        except ProcessLookupError:
-                            pass
-                except ProcessLookupError:
+                    except (asyncio.TimeoutError, ProcessLookupError):
+                        pass
+            # asyncio's proactor subprocess transport keeps its pipe handles and
+            # a pending-connection callback alive even after the process exits.
+            # Close it while the loop is still running so GC never calls __del__
+            # against a closed loop and Windows releases the pipes promptly.
+            transport = getattr(proc, "_transport", None)
+            if transport is not None:
+                try:
+                    transport.close()
+                except Exception:  # noqa: BLE001
                     pass
 
     # ------------------------------------------------------------------
