@@ -3903,6 +3903,56 @@ def _preflight_check_provider_key(job: dict, cfg: dict) -> Optional[str]:
     return None
 
 
+def _preflight_check_toolsets(job: dict, cfg: dict) -> Optional[str]:
+    """Block explicit per-job toolsets that resolve to zero usable tools.
+
+    A non-empty ``enabled_toolsets`` value is an operator-authored allowlist.
+    Silently dropping an unavailable entry can leave an execution job with a
+    misleading partial capability surface (for example, ``file`` without the
+    requested ``web`` tools). Default/platform toolsets remain best-effort.
+    """
+    if job.get("no_agent"):
+        return None
+
+    requested = job.get("enabled_toolsets")
+    if isinstance(requested, str):
+        requested = [requested]
+    if not isinstance(requested, list) or not requested:
+        return None
+
+    from hermes_cli.tools_config import enabled_mcp_server_names
+
+    mcp_names = set(enabled_mcp_server_names(cfg))
+
+    from model_tools import get_tool_definitions
+
+    disabled = _resolve_cron_disabled_toolsets(cfg)
+    non_registry_toolsets = {"no_mcp", "context_engine"}
+    for raw_name in requested:
+        name = str(raw_name).strip()
+        if (
+            not name
+            or name in mcp_names
+            or name in disabled
+            or name in non_registry_toolsets
+        ):
+            continue
+        definitions = get_tool_definitions(
+            enabled_toolsets=[name],
+            disabled_toolsets=disabled,
+            quiet_mode=True,
+            skip_tool_search_assembly=True,
+        )
+        if not definitions:
+            return (
+                f"requested toolset '{name}' resolves to zero available tools "
+                "in this cron runtime. Configure its required provider, "
+                "credentials, package, or system dependency; remove it from "
+                "the job; or add an operational fallback toolset."
+            )
+    return None
+
+
 def _preflight_check_delivery(job: dict) -> Optional[str]:
     """Check the job's delivery target(s) resolve to configured platforms.
 
@@ -4031,6 +4081,7 @@ def _preflight_job_config(job: dict, cfg: dict) -> Optional[str]:
     """
     for name, check in (
         ("provider_key", lambda: _preflight_check_provider_key(job, cfg)),
+        ("toolsets", lambda: _preflight_check_toolsets(job, cfg)),
         ("skills", lambda: _preflight_check_skills(job)),
         ("delivery", lambda: _preflight_check_delivery(job)),
     ):

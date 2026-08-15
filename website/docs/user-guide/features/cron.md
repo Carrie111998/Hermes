@@ -632,6 +632,19 @@ Cron jobs inherit your configured fallback providers and credential pool rotatio
 
 This means cron jobs that run at high frequency or during peak hours are more resilient — a single rate-limited key won't fail the entire run.
 
+## Toolset preflight
+
+A non-empty per-job `enabled_toolsets` list is treated as an explicit capability contract. Before constructing the agent, Hermes resolves each requested toolset through the same runtime availability checks used for normal tools. If a requested toolset resolves to zero usable tools—for example, `web` with no configured provider or installed keyless backend—the run is marked `blocked_config`, no inference call is made, and the alert explains how to configure, remove, or replace the unavailable toolset.
+
+This check applies only to explicit per-job allowlists. Platform/default toolsets remain best-effort, MCP server toolsets keep their own discovery path, toolsets intentionally disabled by cron policy (such as interactive clarification or memory) are skipped, and non-registry control or late-bound entries such as `no_mcp` and `context_engine` are not treated as missing dependencies.
+
+To opt out of all cron configuration preflight checks and restore the legacy run-and-fail behavior:
+
+```yaml
+cron:
+  preflight: false
+```
+
 ## Schedule formats
 
 The agent's final response is automatically delivered to the job's `deliver:` target — the agent no longer fires messages itself, so the user-facing content simply goes in the final response. To deliver to **additional or different** targets, list multiple `deliver:` targets on the cron job (comma-separated, e.g. `deliver: "telegram,discord"`) rather than having the agent send them.

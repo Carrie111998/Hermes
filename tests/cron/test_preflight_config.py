@@ -314,6 +314,130 @@ class TestSkillReadiness:
         assert agent_constructed is True
 
 
+class TestExplicitToolsetAvailability:
+    def test_unavailable_explicit_toolset_blocks_before_agent(self, tmp_path):
+        """An explicitly requested toolset that resolves to zero tools blocks.
+
+        ``enabled_toolsets`` is an allowlist, but an explicit entry is also an
+        operator assertion that the capability exists. Silently dropping an
+        unavailable entry can turn an execution job into a planning-only job.
+        """
+
+        def fake_tool_definitions(*, enabled_toolsets=None, **_kwargs):
+            if enabled_toolsets == ["web"]:
+                return []
+            return [{"function": {"name": "read_file"}}]
+
+        job = _job(enabled_toolsets=["file", "web"])
+        with cron_jobs.use_cron_store(tmp_path):
+            cron_jobs.save_jobs([job])
+            with patch(
+                "model_tools.get_tool_definitions",
+                side_effect=fake_tool_definitions,
+            ):
+                success, output, final_response, error, agent_constructed = \
+                    _run_job_patched(job, tmp_path)
+
+        assert agent_constructed is False
+        assert success is False
+        assert error is not None and "[blocked_config]" in error
+        assert "web" in f"{error} {output}"
+        assert "zero" in f"{error} {output}".lower()
+
+    def test_available_explicit_toolsets_run_normally(self, tmp_path):
+        def fake_tool_definitions(*, enabled_toolsets=None, **_kwargs):
+            names = {
+                "file": "read_file",
+                "web": "web_search",
+            }
+            return [
+                {"function": {"name": names[name]}}
+                for name in enabled_toolsets or []
+                if name in names
+            ]
+
+        job = _job(enabled_toolsets=["file", "web"])
+        with cron_jobs.use_cron_store(tmp_path):
+            cron_jobs.save_jobs([job])
+            with patch(
+                "model_tools.get_tool_definitions",
+                side_effect=fake_tool_definitions,
+            ):
+                success, _output, _final, error, agent_constructed = \
+                    _run_job_patched(job, tmp_path)
+
+        assert success is True
+        assert error is None
+        assert agent_constructed is True
+
+
+    def test_no_mcp_sentinel_is_not_treated_as_missing_toolset(self, tmp_path):
+        job = _job(enabled_toolsets=["file", "no_mcp"])
+        with cron_jobs.use_cron_store(tmp_path):
+            cron_jobs.save_jobs([job])
+            success, _output, _final, error, agent_constructed = \
+                _run_job_patched(job, tmp_path)
+
+        assert success is True
+        assert error is None
+        assert agent_constructed is True
+
+    def test_context_engine_is_not_treated_as_empty_static_toolset(self, tmp_path):
+        job = _job(enabled_toolsets=["context_engine"])
+        with cron_jobs.use_cron_store(tmp_path):
+            cron_jobs.save_jobs([job])
+            success, _output, _final, error, agent_constructed = \
+                _run_job_patched(job, tmp_path)
+
+        assert success is True
+        assert error is None
+        assert agent_constructed is True
+
+    def test_policy_disabled_toolset_does_not_block(self, tmp_path):
+        job = _job(enabled_toolsets=["memory", "file"])
+        with cron_jobs.use_cron_store(tmp_path):
+            cron_jobs.save_jobs([job])
+            success, _output, _final, error, agent_constructed = \
+                _run_job_patched(job, tmp_path)
+
+        assert success is True
+        assert error is None
+        assert agent_constructed is True
+
+    def test_no_agent_job_bypasses_toolset_preflight(self, tmp_path):
+        job = _job(no_agent=True, enabled_toolsets=["unavailable"])
+        assert sched._preflight_check_toolsets(job, {}) is None
+
+    def test_toolset_resolution_error_fails_open(self, tmp_path):
+        job = _job(enabled_toolsets=["web"])
+        with cron_jobs.use_cron_store(tmp_path):
+            cron_jobs.save_jobs([job])
+            with patch(
+                "model_tools.get_tool_definitions",
+                side_effect=RuntimeError("registry unavailable"),
+            ):
+                success, _output, _final, error, agent_constructed = \
+                    _run_job_patched(job, tmp_path)
+
+        assert success is True
+        assert error is None
+        assert agent_constructed is True
+
+
+    def test_mcp_name_resolution_error_fails_open(self):
+        job = _job(enabled_toolsets=["configured_mcp"])
+        with patch(
+            "hermes_cli.runtime_provider.resolve_runtime_provider",
+            return_value=dict(_RUNTIME),
+        ), patch(
+            "hermes_cli.tools_config.enabled_mcp_server_names",
+            side_effect=RuntimeError("MCP config unavailable"),
+        ), patch("model_tools.get_tool_definitions", return_value=[]):
+            reason = sched._preflight_job_config(job, {})
+
+        assert reason is None
+
+
 class TestDeliveryPlatform:
     def test_unknown_delivery_platform_blocks(self, tmp_path):
         job = _job(deliver="notaplatform")
