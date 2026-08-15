@@ -6,6 +6,7 @@ import logging
 import os
 import shutil
 import subprocess
+import sys
 import time
 import pytest
 from pathlib import Path
@@ -16,6 +17,7 @@ from tools.checkpoint_manager import (
     _shadow_repo_path,
     _init_store,
     _run_git,
+    _run_git_z_paths,
     _git_env,
     _project_hash,
     _store_path,
@@ -71,6 +73,35 @@ def mgr(work_dir, checkpoint_base, monkeypatch):
 def disabled_mgr(checkpoint_base, monkeypatch):
     monkeypatch.setattr("tools.checkpoint_manager.CHECKPOINT_BASE", checkpoint_base)
     return CheckpointManager(enabled=False)
+
+
+class TestBinaryGitPathOutput:
+    def test_round_trips_non_utf8_and_carriage_returns(
+        self, checkpoint_base, monkeypatch, tmp_path,
+    ):
+        raw_paths = [b"\xff.txt", b"a\rname", b"b\r\nname"]
+        completed = subprocess.CompletedProcess(
+            args=["git"], returncode=0,
+            stdout=b"\x00".join(raw_paths) + b"\x00", stderr=b"",
+        )
+        captured = {}
+
+        def fake_run(*args, **kwargs):
+            captured.update(kwargs)
+            return completed
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        ok, paths, error = _run_git_z_paths(
+            ["ls-files", "-z"], checkpoint_base, str(tmp_path),
+        )
+
+        assert ok is True
+        assert error == ""
+        assert captured["text"] is False
+        assert [
+            path.encode(sys.getfilesystemencoding(), errors="surrogateescape")
+            for path in paths
+        ] == raw_paths
 
 
 # =========================================================================
@@ -269,6 +300,32 @@ class TestRealPruning:
         assert "small.py" in names
         assert "weights.bin" not in names  # filtered by size cap
 
+    def test_oversize_filter_treats_git_metacharacters_literally(
+        self, tmp_path, checkpoint_base, monkeypatch,
+    ):
+        monkeypatch.setattr("tools.checkpoint_manager.CHECKPOINT_BASE", checkpoint_base)
+        wd = tmp_path / "literal-oversize"
+        wd.mkdir()
+        literal = wd / "file[1].bin"
+        sibling = wd / "file1.bin"
+        literal.write_bytes(b"x" * (2 * 1024 * 1024))
+        sibling.write_bytes(b"small")
+
+        manager = CheckpointManager(
+            enabled=True, max_snapshots=5, max_file_size_mb=1,
+        )
+        assert manager.ensure_checkpoint(str(wd), "initial") is True
+
+        store = _store_path(checkpoint_base)
+        ok, files, _ = _run_git(
+            ["ls-tree", "-r", "--name-only", _ref_name(_project_hash(str(wd)))],
+            store, str(wd),
+        )
+        assert ok is True
+        names = set(files.splitlines())
+        assert literal.name not in names
+        assert sibling.name in names
+
 
 # =========================================================================
 # CheckpointManager — restoring
@@ -280,6 +337,361 @@ class TestRestore:
         mgr.ensure_checkpoint(str(work_dir), "initial")
         assert mgr.restore(str(work_dir), "deadbeef1234")["success"] is False
 
+    @pytest.mark.parametrize("position", [0, -1], ids=["newest", "oldest"])
+    def test_restore_at_retention_cap_preserves_target(
+        self, checkpoint_base, monkeypatch, work_dir, position,
+    ):
+        monkeypatch.setattr("tools.checkpoint_manager.CHECKPOINT_BASE", checkpoint_base)
+        manager = CheckpointManager(enabled=True, max_snapshots=3)
+        for version in range(3):
+            manager.new_turn()
+            (work_dir / "main.py").write_text(f"v{version}\n")
+            assert manager.ensure_checkpoint(str(work_dir), f"v{version}") is True
+
+        target = manager.list_checkpoints(str(work_dir))[position]
+        (work_dir / "main.py").write_text("dirty\n")
+
+        result = manager.restore(str(work_dir), target["hash"])
+        assert result["success"] is True
+        assert result["reason"] == target["reason"]
+        assert (work_dir / "main.py").read_text() == f"{target['reason']}\n"
+        store = _store_path(checkpoint_base)
+        ok, pins, _ = _run_git(
+            ["for-each-ref", "--format=%(refname)", "refs/restore-pins/hermes"],
+            store,
+            str(work_dir),
+        )
+        assert ok is True
+        assert pins == ""
+
+    def test_restore_forces_undo_snapshot_when_worktree_matches_tip(
+        self, mgr, work_dir,
+    ):
+        (work_dir / "main.py").write_text("baseline\n")
+        assert mgr.ensure_checkpoint(str(work_dir), "baseline") is True
+        baseline = mgr.list_checkpoints(str(work_dir))[0]
+        mgr.new_turn()
+        (work_dir / "main.py").write_text("current\n")
+        assert mgr.ensure_checkpoint(str(work_dir), "current") is True
+
+        result = mgr.restore(str(work_dir), baseline["hash"])
+        assert result["success"] is True
+        assert (work_dir / "main.py").read_text() == "baseline\n"
+        undo = mgr.list_checkpoints(str(work_dir))[0]
+        assert undo["reason"].startswith("pre-rollback snapshot")
+
+        result = mgr.restore(str(work_dir), undo["hash"])
+        assert result["success"] is True
+        assert (work_dir / "main.py").read_text() == "current\n"
+
+    def test_restore_aborts_when_pre_rollback_snapshot_fails(
+        self, mgr, monkeypatch, work_dir,
+    ):
+        assert mgr.ensure_checkpoint(str(work_dir), "baseline") is True
+        baseline = mgr.list_checkpoints(str(work_dir))[0]
+        before_hashes = [row["hash"] for row in mgr.list_checkpoints(str(work_dir))]
+        (work_dir / "main.py").write_text("dirty\n")
+        late = work_dir / "late.py"
+        late.write_text("must survive\n")
+        monkeypatch.setattr("tools.checkpoint_manager._MAX_FILES", 0)
+
+        result = mgr.restore(str(work_dir), baseline["hash"])
+        assert result["success"] is False
+        assert "pre-rollback" in result["error"].lower()
+        assert (work_dir / "main.py").read_text() == "dirty\n"
+        assert late.read_text() == "must survive\n"
+        assert [row["hash"] for row in mgr.list_checkpoints(str(work_dir))] == before_hashes
+
+    def test_restore_aborts_when_forced_snapshot_omits_oversize_tracked_file(
+        self, checkpoint_base, monkeypatch, tmp_path,
+    ):
+        monkeypatch.setattr("tools.checkpoint_manager.CHECKPOINT_BASE", checkpoint_base)
+        manager = CheckpointManager(
+            enabled=True, max_snapshots=50, max_file_size_mb=1,
+        )
+        project = tmp_path / "oversize-restore"
+        project.mkdir()
+        tracked = project / "tracked.bin"
+        tracked.write_bytes(b"x")
+        assert manager.ensure_checkpoint(str(project), "baseline") is True
+        baseline = manager.list_checkpoints(str(project))[0]
+        before_hashes = [
+            row["hash"] for row in manager.list_checkpoints(str(project))
+        ]
+        oversized = b"z" * (2 * 1024 * 1024)
+        tracked.write_bytes(oversized)
+
+        result = manager.restore(str(project), baseline["hash"])
+        assert result["success"] is False
+        assert "pre-rollback" in result["error"].lower()
+        assert tracked.read_bytes() == oversized
+        assert [
+            row["hash"] for row in manager.list_checkpoints(str(project))
+        ] == before_hashes
+
+    @pytest.mark.parametrize("file_path", [None, "payload.txt"], ids=["full", "file"])
+    def test_restore_aborts_when_ignored_collision_is_missing_from_undo(
+        self, checkpoint_base, monkeypatch, tmp_path, file_path,
+    ):
+        monkeypatch.setattr("tools.checkpoint_manager.CHECKPOINT_BASE", checkpoint_base)
+        manager = CheckpointManager(enabled=True, max_snapshots=50)
+        project = tmp_path / "ignored-collision"
+        project.mkdir()
+        payload = project / "payload.txt"
+        payload.write_text("baseline\n")
+        assert manager.ensure_checkpoint(str(project), "baseline") is True
+        baseline = manager.list_checkpoints(str(project))[0]
+
+        manager.new_turn()
+        payload.unlink()
+        (project / ".gitignore").write_text("payload.txt\n")
+        assert manager.ensure_checkpoint(str(project), "ignore payload") is True
+        before_hashes = [
+            row["hash"] for row in manager.list_checkpoints(str(project))
+        ]
+        payload.write_text("valuable ignored data\n")
+
+        result = manager.restore(
+            str(project), baseline["hash"], file_path=file_path,
+        )
+        assert result["success"] is False
+        assert "pre-rollback" in result["error"].lower()
+        assert payload.read_text() == "valuable ignored data\n"
+        assert [
+            row["hash"] for row in manager.list_checkpoints(str(project))
+        ] == before_hashes
+
+    def test_restore_aborts_when_ignored_ancestor_is_missing_from_undo(
+        self, checkpoint_base, monkeypatch, tmp_path,
+    ):
+        monkeypatch.setattr("tools.checkpoint_manager.CHECKPOINT_BASE", checkpoint_base)
+        manager = CheckpointManager(enabled=True, max_snapshots=50)
+        project = tmp_path / "ignored-ancestor"
+        nested = project / "nested"
+        nested.mkdir(parents=True)
+        payload = nested / "payload.txt"
+        payload.write_text("baseline\n")
+        assert manager.ensure_checkpoint(str(project), "baseline") is True
+        baseline = manager.list_checkpoints(str(project))[0]
+
+        manager.new_turn()
+        payload.unlink()
+        nested.rmdir()
+        (project / ".gitignore").write_text("nested\n")
+        assert manager.ensure_checkpoint(str(project), "ignore ancestor") is True
+        before_hashes = [
+            row["hash"] for row in manager.list_checkpoints(str(project))
+        ]
+        nested.write_text("valuable ignored ancestor\n")
+
+        result = manager.restore(str(project), baseline["hash"])
+        assert result["success"] is False
+        assert "pre-rollback" in result["error"].lower()
+        assert nested.is_file()
+        assert nested.read_text() == "valuable ignored ancestor\n"
+        assert [
+            row["hash"] for row in manager.list_checkpoints(str(project))
+        ] == before_hashes
+
+    def test_restore_preserves_leading_space_in_nul_delimited_scope(
+        self, checkpoint_base, monkeypatch, tmp_path,
+    ):
+        monkeypatch.setattr("tools.checkpoint_manager.CHECKPOINT_BASE", checkpoint_base)
+        manager = CheckpointManager(enabled=True, max_snapshots=50)
+        project = tmp_path / "leading-space"
+        project.mkdir()
+        payload = project / " payload.txt"
+        payload.write_text("baseline\n")
+        assert manager.ensure_checkpoint(str(project), "baseline") is True
+        baseline = manager.list_checkpoints(str(project))[0]
+
+        manager.new_turn()
+        payload.unlink()
+        (project / ".gitignore").write_text(" payload.txt\n")
+        assert manager.ensure_checkpoint(str(project), "ignore payload") is True
+        before_hashes = [
+            row["hash"] for row in manager.list_checkpoints(str(project))
+        ]
+        payload.write_text("valuable leading-space data\n")
+
+        result = manager.restore(str(project), baseline["hash"])
+        assert result["success"] is False
+        assert "pre-rollback" in result["error"].lower()
+        assert payload.read_text() == "valuable leading-space data\n"
+        assert [
+            row["hash"] for row in manager.list_checkpoints(str(project))
+        ] == before_hashes
+
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX permits raw non-UTF-8 names")
+    def test_restore_preserves_non_utf8_filename_bytes(
+        self, checkpoint_base, monkeypatch, tmp_path,
+    ):
+        monkeypatch.setattr("tools.checkpoint_manager.CHECKPOINT_BASE", checkpoint_base)
+        manager = CheckpointManager(enabled=True, max_snapshots=50)
+        project = tmp_path / "non-utf8"
+        project.mkdir()
+        raw_name = b"\xff.txt"
+        raw_path = os.path.join(os.fsencode(project), raw_name)
+        with open(raw_path, "wb") as stream:
+            stream.write(b"baseline\n")
+        assert manager.ensure_checkpoint(str(project), "baseline") is True
+        baseline = manager.list_checkpoints(str(project))[0]
+
+        manager.new_turn()
+        os.unlink(raw_path)
+        (project / ".gitignore").write_bytes(raw_name + b"\n")
+        assert manager.ensure_checkpoint(str(project), "ignore payload") is True
+        before_hashes = [
+            row["hash"] for row in manager.list_checkpoints(str(project))
+        ]
+        with open(raw_path, "wb") as stream:
+            stream.write(b"valuable non-utf8 data\n")
+
+        result = manager.restore(str(project), baseline["hash"])
+        assert result["success"] is False
+        with open(raw_path, "rb") as stream:
+            assert stream.read() == b"valuable non-utf8 data\n"
+        assert [
+            row["hash"] for row in manager.list_checkpoints(str(project))
+        ] == before_hashes
+
+    @pytest.mark.parametrize("file_path", [None, "b.txt"], ids=["full", "single-file"])
+    def test_restore_rejects_checkpoint_from_another_project(
+        self, checkpoint_base, monkeypatch, tmp_path, file_path,
+    ):
+        monkeypatch.setattr("tools.checkpoint_manager.CHECKPOINT_BASE", checkpoint_base)
+        manager = CheckpointManager(enabled=True, max_snapshots=50)
+        project_a = tmp_path / "project-a"
+        project_b = tmp_path / "project-b"
+        project_a.mkdir()
+        project_b.mkdir()
+        a_file = project_a / "a.txt"
+        a_file.write_text("a baseline\n")
+        (project_b / "b.txt").write_text("b baseline\n")
+        assert manager.ensure_checkpoint(str(project_a), "A") is True
+        a_hashes = [row["hash"] for row in manager.list_checkpoints(str(project_a))]
+        manager.new_turn()
+        assert manager.ensure_checkpoint(str(project_b), "B") is True
+        b_checkpoint = manager.list_checkpoints(str(project_b))[0]
+        a_file.write_text("a dirty\n")
+
+        result = manager.restore(
+            str(project_a), b_checkpoint["hash"], file_path=file_path,
+        )
+        assert result["success"] is False
+        assert "does not belong" in result["error"]
+        assert a_file.read_text() == "a dirty\n"
+        assert not (project_a / "b.txt").exists()
+        assert [row["hash"] for row in manager.list_checkpoints(str(project_a))] == a_hashes
+
+    def test_single_file_restore_rejects_adversarial_pathspec_magic(
+        self, mgr, work_dir,
+    ):
+        assert mgr.ensure_checkpoint(str(work_dir), "baseline") is True
+        baseline = mgr.list_checkpoints(str(work_dir))[0]
+        (work_dir / "main.py").write_text("dirty main\n")
+        (work_dir / "README.md").write_text("dirty readme\n")
+        added = work_dir / "new.py"
+        added.write_text("new\n")
+
+        result = mgr.restore(str(work_dir), baseline["hash"], file_path=":(top)**")
+        assert result["success"] is False
+        assert (work_dir / "main.py").read_text() == "dirty main\n"
+        assert (work_dir / "README.md").read_text() == "dirty readme\n"
+        assert added.read_text() == "new\n"
+
+    def test_full_restore_round_trip_removes_checkpoint_tracked_additions(
+        self, mgr, work_dir,
+    ):
+        baseline_main = (work_dir / "main.py").read_text()
+        baseline_readme = (work_dir / "README.md").read_text()
+        assert mgr.ensure_checkpoint(str(work_dir), "baseline") is True
+        baseline = mgr.list_checkpoints(str(work_dir))[0]["hash"]
+
+        (work_dir / "main.py").write_text("changed\n")
+        (work_dir / "README.md").unlink()
+        added = work_dir / "feature.py"
+        added.write_text("new\n")
+        excluded = work_dir / "diagnostic.log"
+        excluded.write_text("preserve me\n")
+
+        result = mgr.restore(str(work_dir), baseline)
+        assert result["success"] is True
+        assert (work_dir / "main.py").read_text() == baseline_main
+        assert (work_dir / "README.md").read_text() == baseline_readme
+        assert not added.exists()
+        assert excluded.read_text() == "preserve me\n"
+
+        pre_rollback = mgr.list_checkpoints(str(work_dir))[0]
+        assert pre_rollback["reason"].startswith("pre-rollback snapshot")
+        result = mgr.restore(str(work_dir), pre_rollback["hash"])
+        assert result["success"] is True
+        assert (work_dir / "main.py").read_text() == "changed\n"
+        assert not (work_dir / "README.md").exists()
+        assert added.read_text() == "new\n"
+        assert excluded.read_text() == "preserve me\n"
+
+    def test_single_file_restore_does_not_change_sibling_paths(self, mgr, work_dir):
+        baseline_main = (work_dir / "main.py").read_text()
+        assert mgr.ensure_checkpoint(str(work_dir), "baseline") is True
+        baseline = mgr.list_checkpoints(str(work_dir))[0]["hash"]
+
+        (work_dir / "main.py").write_text("changed main\n")
+        (work_dir / "README.md").write_text("changed sibling\n")
+        sibling_addition = work_dir / "feature.py"
+        sibling_addition.write_text("leave me\n")
+
+        result = mgr.restore(str(work_dir), baseline, file_path="main.py")
+        assert result["success"] is True
+        assert (work_dir / "main.py").read_text() == baseline_main
+        assert (work_dir / "README.md").read_text() == "changed sibling\n"
+        assert sibling_addition.read_text() == "leave me\n"
+
+    def test_single_file_restore_removes_path_absent_from_checkpoint(
+        self, mgr, work_dir,
+    ):
+        baseline_readme = (work_dir / "README.md").read_text()
+        assert mgr.ensure_checkpoint(str(work_dir), "baseline") is True
+        baseline = mgr.list_checkpoints(str(work_dir))[0]["hash"]
+
+        added = work_dir / "feature.py"
+        added.write_text("remove me\n")
+        (work_dir / "README.md").write_text("changed sibling\n")
+
+        result = mgr.restore(str(work_dir), baseline, file_path="feature.py")
+        assert result["success"] is True
+        assert not added.exists()
+        assert (work_dir / "README.md").read_text() == "changed sibling\n"
+        assert (work_dir / "README.md").read_text() != baseline_readme
+
+    def test_single_file_restore_treats_git_metacharacters_literally(
+        self, mgr, work_dir,
+    ):
+        literal = work_dir / "file[1].py"
+        wildcard_match = work_dir / "file1.py"
+        literal.write_text("baseline literal\n")
+        wildcard_match.write_text("baseline sibling\n")
+        assert mgr.ensure_checkpoint(str(work_dir), "baseline") is True
+        baseline = mgr.list_checkpoints(str(work_dir))[0]["hash"]
+
+        literal.write_text("changed literal\n")
+        wildcard_match.write_text("changed sibling\n")
+
+        result = mgr.restore(str(work_dir), baseline, file_path=literal.name)
+        assert result["success"] is True
+        assert literal.read_text() == "baseline literal\n"
+        assert wildcard_match.read_text() == "changed sibling\n"
+
+    def test_single_file_restore_normalizes_in_root_dot_segments(self, mgr, work_dir):
+        baseline_main = (work_dir / "main.py").read_text()
+        (work_dir / "sub").mkdir()
+        assert mgr.ensure_checkpoint(str(work_dir), "baseline") is True
+        baseline = mgr.list_checkpoints(str(work_dir))[0]["hash"]
+        (work_dir / "main.py").write_text("changed\n")
+
+        result = mgr.restore(str(work_dir), baseline, file_path="sub/../main.py")
+        assert result["success"] is True
+        assert (work_dir / "main.py").read_text() == baseline_main
 
     def test_tilde_path_supports_diff_and_restore_flow(
         self, checkpoint_base, fake_home, monkeypatch,
