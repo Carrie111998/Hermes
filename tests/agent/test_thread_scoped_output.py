@@ -94,3 +94,76 @@ def test_repeated_contexts_never_write_to_a_closed_sink():
             sys.stdout.fileno()
     finally:
         sys.stdout = original
+
+
+def _displace_and_silence(cycles: int) -> None:
+    """Churn cycle: a process-global redirect displaces the proxy, a worker
+    then reinstalls it via thread_scoped_silence, and the redirect's exit
+    restores the stale binding — the pattern that used to leak one
+    /dev/null handle per cycle."""
+    for _ in range(cycles):
+        buf = io.StringIO()
+        saved = sys.stdout
+        sys.stdout = buf
+        try:
+            with thread_scoped_silence():
+                pass
+        finally:
+            sys.stdout = saved
+
+
+def test_proxy_reinstall_reuses_sink_and_never_chains():
+    """Reinstalls after displacement must reuse the first proxy's sink and
+    must not chain proxy -> proxy (chains keep every old sink referenced
+    and open for the process lifetime)."""
+    import agent.thread_scoped_output as tso
+
+    original = sys.stdout
+    sys.stdout = io.StringIO()
+    try:
+        with thread_scoped_silence():
+            pass
+        first_sink = tso._installed["stdout"]._sink
+        _displace_and_silence(25)
+        # sys.stdout now points at a stale proxy (redirect-exit restore);
+        # the next reinstall must unwrap it, not chain onto it.
+        with thread_scoped_silence():
+            pass
+        current = tso._installed["stdout"]
+        assert current._sink is first_sink
+        assert not isinstance(current._passthrough, tso._ThreadRoutingStream)
+    finally:
+        sys.stdout = original
+
+
+def test_proxy_reinstall_churn_does_not_grow_devnull_fds():
+    """End-to-end fd invariant: repeated displacement cycles keep the
+    process's /dev/null descriptor count flat (Linux /proc only)."""
+    import os
+
+    import pytest
+
+    fd_dir = "/proc/self/fd"
+    if not os.path.isdir(fd_dir):
+        pytest.skip("needs /proc fd introspection")
+
+    def devnull_fds() -> int:
+        count = 0
+        for fd in os.listdir(fd_dir):
+            try:
+                if os.readlink(os.path.join(fd_dir, fd)) == os.devnull:
+                    count += 1
+            except OSError:
+                pass
+        return count
+
+    original = sys.stdout
+    sys.stdout = io.StringIO()
+    try:
+        with thread_scoped_silence():
+            pass
+        baseline = devnull_fds()
+        _displace_and_silence(40)
+        assert devnull_fds() == baseline
+    finally:
+        sys.stdout = original

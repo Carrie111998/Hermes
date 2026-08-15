@@ -111,12 +111,34 @@ def _ensure_installed(attr: str, passthrough: TextIO) -> "_ThreadRoutingStream":
         current = getattr(sys, attr, None)
         if proxy is not None and current is proxy:
             return proxy
-        # Capture whatever is currently bound as the passthrough. If a prior
-        # global redirect_stdout is active, route non-silenced threads to that
-        # stream to preserve the old behavior.
-        passthrough = current if current is not None else passthrough
-        sink = open(os.devnull, "w", encoding="utf-8")
-        proxy = _ThreadRoutingStream(passthrough, sink)
+        # Our proxy was displaced — almost always by a process-global
+        # redirect_stdout/redirect_stderr wrapping a worker body. Capture
+        # whatever is currently bound as the passthrough (preserving the
+        # redirect's routing for non-silenced threads), with two details that
+        # keep the reinstall itself from leaking:
+        #
+        # 1. Reuse the displaced proxy's sink instead of opening a fresh
+        #    os.devnull handle.  The sink is a stateless null writer that
+        #    every generation of the proxy can share; opening one per
+        #    reinstall pinned one more /dev/null fd for the life of the
+        #    process.
+        # 2. Never chain onto a stale proxy: a global redirect's __exit__ can
+        #    restore an older proxy over the one we registered, so the stream
+        #    we capture here may itself be a _ThreadRoutingStream.  Unwrap to
+        #    its passthrough instead of chaining — chained proxies keep every
+        #    older generation strongly referenced, which is how the leaked
+        #    sinks survived GC.
+        sink = (
+            proxy._sink
+            if proxy is not None
+            else open(os.devnull, "w", encoding="utf-8")
+        )
+        target: TextIO = current if current is not None else passthrough
+        seen: set[int] = set()
+        while isinstance(target, _ThreadRoutingStream) and id(target) not in seen:
+            seen.add(id(target))
+            target = target._passthrough
+        proxy = _ThreadRoutingStream(target, sink)
         setattr(sys, attr, proxy)
         _installed[attr] = proxy
         return proxy
