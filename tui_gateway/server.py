@@ -7052,13 +7052,9 @@ def _active_image_routing_identity(agent: Any) -> tuple[str, str]:
 def _enrich_with_attached_images(user_text: str, image_paths: list[str]) -> str:
     """Pre-analyze attached images via vision and prepend descriptions to user text."""
     import asyncio, json as _json
-    from tools.vision_tools import vision_analyze_tool
+    from tools.vision_tools import vision_analyze_tool, get_vision_analysis_prompt
 
-    prompt = (
-        "Describe everything visible in this image in thorough detail. "
-        "Include any text, code, data, objects, people, layout, colors, "
-        "and any other notable visual information."
-    )
+    prompt = get_vision_analysis_prompt()
 
     parts: list[str] = []
     for path in image_paths:

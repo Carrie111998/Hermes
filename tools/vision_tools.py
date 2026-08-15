@@ -97,6 +97,42 @@ _VISION_DOWNLOAD_TIMEOUT = _resolve_download_timeout()
 # attacker-hosted multi-gigabyte files or decompression bombs.
 _VISION_MAX_DOWNLOAD_BYTES = 50 * 1024 * 1024
 
+# Default prompt used when pre-analyzing a user-attached image through the
+# auxiliary vision pipeline. The concise variant is the deliberate default:
+# it caps output at 2-4 sentences and skips decorative detail, which
+# materially reduces token cost per image. Configurable per-install via
+# ``auxiliary.vision.analysis_prompt`` in config.yaml.
+_DEFAULT_VISION_ANALYSIS_PROMPT = (
+    "Concisely describe this image in 2-4 sentences "
+    "(~200 Chinese characters or ~150 English words). "
+    "Cover the main subject, key visible text/data/code, and overall context. "
+    "If it is a chart, diagram, or scientific figure, include the important "
+    "labels, legend, and key values. Skip decorative details."
+)
+
+
+def get_vision_analysis_prompt() -> str:
+    """Return the pre-analysis prompt for vision, from config or default.
+
+    Reads ``auxiliary.vision.analysis_prompt`` from config.yaml. If set to a
+    non-empty string that value is used verbatim; otherwise the built-in
+    ``_DEFAULT_VISION_ANALYSIS_PROMPT`` is returned.
+
+    A single source of truth for every call site that pre-analyzes a
+    user-attached image (CLI, gateway, TUI, run_agent), so the prompt cannot
+    drift between entry points.
+    """
+    try:
+        from hermes_cli.config import cfg_get, load_config
+
+        cfg = load_config()
+        val = cfg_get(cfg, "auxiliary", "vision", "analysis_prompt")
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+    except Exception:
+        pass
+    return _DEFAULT_VISION_ANALYSIS_PROMPT
+
 
 # ---------------------------------------------------------------------------
 # CPU-burst concurrency cap (vision encode/resize)

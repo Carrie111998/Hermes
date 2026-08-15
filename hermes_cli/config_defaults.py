@@ -947,6 +947,7 @@ DEFAULT_CONFIG = {
             "extra_body": {},      # OpenAI-compatible provider-specific request fields
             "reasoning_effort": "",  # per-task thinking level: none|minimal|low|medium|high|xhigh|max|ultra (empty = provider default)
             "download_timeout": 30,  # seconds — image HTTP download timeout; increase for slow connections
+            "analysis_prompt": "",   # override the pre-analysis prompt sent for user-attached images (empty = built-in concise default)
         },
         "web_extract": {
             "provider": "auto",
