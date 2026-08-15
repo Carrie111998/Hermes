@@ -1,3 +1,4 @@
+import { useStore } from '@nanostores/react'
 import { useEffect, useMemo, useRef, useState } from 'react'
 
 import { ModelCatalogMenu, ModelMenuCloseContext, type ModelMenuController } from '@/app/shell/model-catalog-menu'
@@ -15,9 +16,10 @@ import { Network } from '@/lib/icons'
 import { reasoningEffortLabel } from '@/lib/reasoning-effort'
 import { cn } from '@/lib/utils'
 import { notifyError } from '@/store/notifications'
+import { $activeGatewayProfile, normalizeProfileKey } from '@/store/profile'
 import type { DelegationRouteConfig, DelegationRoutesConfig, HermesConfigRecord } from '@/types/hermes'
 
-import { setHermesConfigCache, useHermesConfigRecord } from '../hooks/use-config-record'
+import { hermesConfigCacheWriter, useHermesConfigRecord } from '../hooks/use-config-record'
 import { useOnProfileSwitch } from '../hooks/use-on-profile-switch'
 
 import { ListRow, SectionHeading } from './primitives'
@@ -157,7 +159,9 @@ function DetachedRouteModelField({ onChange, value }: { onChange: (next: RouteCh
 export function DelegationRoutesSettings() {
   const { t } = useI18n()
   const copy = t.settings.model.delegationRoutes
-  const { data: config } = useHermesConfigRecord()
+  const profile = normalizeProfileKey(useStore($activeGatewayProfile))
+  const { data: config, isPending } = useHermesConfigRecord(profile)
+  const setConfigCache = hermesConfigCacheWriter(profile)
   const configuredRoutes = useMemo(() => delegationRoutesFromConfig(config), [config])
   const [routes, setRoutes] = useState<DelegationRoutesConfig>(configuredRoutes)
   const [draft, setDraft] = useState<null | RouteDraft>(null)
@@ -168,6 +172,7 @@ export function DelegationRoutesSettings() {
   useEffect(() => setRoutes(configuredRoutes), [configuredRoutes])
   useOnProfileSwitch(() => {
     profileEpoch.current += 1
+    setRoutes({})
     setDraft(null)
     setError('')
     setSaving(false)
@@ -175,6 +180,7 @@ export function DelegationRoutesSettings() {
 
   const persist = async (nextRoutes: DelegationRoutesConfig) => {
     const epoch = profileEpoch.current
+    const targetProfile = profile
     const previous = routes
     setRoutes(nextRoutes)
     setError('')
@@ -189,14 +195,14 @@ export function DelegationRoutesSettings() {
 
     const nextConfig = { ...config, delegation: { ...previousDelegation, routes: nextRoutes } }
 
-    setHermesConfigCache(nextConfig)
+    setConfigCache(nextConfig)
 
     try {
-      await saveDelegationRoutes(nextRoutes)
+      await saveDelegationRoutes(nextRoutes, targetProfile)
     } catch (err) {
       if (profileEpoch.current === epoch) {
         setRoutes(previous)
-        setHermesConfigCache({ ...config, delegation: { ...previousDelegation, routes: previous } })
+        setConfigCache({ ...config, delegation: { ...previousDelegation, routes: previous } })
         notifyError(err, copy.saveFailed)
       }
 
@@ -288,7 +294,7 @@ export function DelegationRoutesSettings() {
     <section>
       <div className="mb-2.5 flex items-center justify-between">
         <SectionHeading icon={Network} title={copy.title} />
-        <Button disabled={saving || draft !== null} onClick={beginAdd} size="sm" variant="textStrong">
+        <Button disabled={isPending || !config || saving || draft !== null} onClick={beginAdd} size="sm" variant="textStrong">
           {copy.add}
         </Button>
       </div>
@@ -299,12 +305,12 @@ export function DelegationRoutesSettings() {
           <ListRow
             action={
               <div className="flex shrink-0 items-center gap-1.5">
-                <Button disabled={saving} onClick={() => beginEdit(alias)} size="sm" variant="textStrong">
+                <Button disabled={isPending || !config || saving} onClick={() => beginEdit(alias)} size="sm" variant="textStrong">
                   {copy.change}
                 </Button>
                 <Button
                   aria-label={copy.removeAria(alias)}
-                  disabled={saving}
+                  disabled={isPending || !config || saving}
                   onClick={() => void remove(alias)}
                   size="sm"
                   variant="text"

@@ -4334,6 +4334,33 @@ _ROUTE_ALLOWED_FIELDS = frozenset(
 _ROUTE_FORBIDDEN_SECRET_FIELDS = frozenset(
     {"api_key", "key", "token", "password", "secret", "command", "args"}
 )
+_ROUTE_REQUEST_OVERRIDE_ALLOWED_FIELDS = frozenset(
+    {
+        "frequency_penalty",
+        "logprobs",
+        "n",
+        "presence_penalty",
+        "seed",
+        "stop",
+        "temperature",
+        "top_logprobs",
+        "top_p",
+    }
+)
+_ROUTE_CREDENTIAL_KEY_MARKERS = frozenset(
+    {
+        "apikey",
+        "authorization",
+        "cookie",
+        "credential",
+        "password",
+        "passwd",
+        "proxyauthorization",
+        "secret",
+        "setcookie",
+        "token",
+    }
+)
 
 
 def _configured_routes(cfg: dict) -> Dict[str, dict]:
@@ -4350,15 +4377,33 @@ def _configured_routes(cfg: dict) -> Dict[str, dict]:
 def _safe_route_alias_names(cfg: dict) -> List[str]:
     safe = []
     for alias, definition in _configured_routes(cfg).items():
-        keys = set(definition)
-        if (
-            keys.isdisjoint(_ROUTE_FORBIDDEN_SECRET_FIELDS)
-            and keys.issubset(_ROUTE_ALLOWED_FIELDS)
-            and str(definition.get("provider") or "").strip()
-            and str(definition.get("model") or "").strip()
-        ):
+        try:
+            _validate_delegation_route_definition(alias, definition)
+        except ValueError:
+            continue
+        else:
             safe.append(alias)
     return sorted(safe)
+
+
+def _credential_key_path(value: Any, path: str = "request_overrides") -> Optional[str]:
+    """Return the first credential-shaped mapping key nested in *value*."""
+    if isinstance(value, dict):
+        for raw_key, nested in value.items():
+            key = str(raw_key)
+            normalized = re.sub(r"[^a-z0-9]", "", key.lower())
+            key_path = f"{path}.{key}"
+            if normalized in _ROUTE_CREDENTIAL_KEY_MARKERS:
+                return key_path
+            found = _credential_key_path(nested, key_path)
+            if found:
+                return found
+    elif isinstance(value, list):
+        for index, nested in enumerate(value):
+            found = _credential_key_path(nested, f"{path}[{index}]")
+            if found:
+                return found
+    return None
 
 
 def _validate_delegation_route_definition(alias: str, definition: Any) -> Dict[str, Any]:
@@ -4391,6 +4436,26 @@ def _validate_delegation_route_definition(alias: str, definition: Any) -> Dict[s
         raise ValueError(
             f"Delegation route alias '{alias}' must define both provider and model."
         )
+    base_url = str(definition.get("base_url") or "").strip()
+    if base_url:
+        try:
+            parsed_url = urlsplit(base_url)
+        except ValueError as exc:
+            raise ValueError(
+                f"Delegation route alias '{alias}' base_url is invalid."
+            ) from exc
+        if (
+            parsed_url.scheme not in {"http", "https"}
+            or not parsed_url.hostname
+            or parsed_url.username is not None
+            or parsed_url.password is not None
+            or parsed_url.query
+            or parsed_url.fragment
+        ):
+            raise ValueError(
+                f"Delegation route alias '{alias}' base_url must be an http(s) "
+                "endpoint without embedded credentials, query parameters, or fragments."
+            )
     api_mode = str(definition.get("api_mode") or "").strip().lower()
     if api_mode and api_mode not in {
         "chat_completions",
@@ -4422,6 +4487,24 @@ def _validate_delegation_route_definition(alias: str, definition: Any) -> Dict[s
         raise ValueError(
             f"Delegation route alias '{alias}' request_overrides must be an object."
         )
+    if isinstance(request_overrides, dict):
+        credential_path = _credential_key_path(request_overrides)
+        if credential_path:
+            raise ValueError(
+                f"Delegation route alias '{alias}' request_overrides contains "
+                f"forbidden credential field '{credential_path}'."
+            )
+        unsupported_overrides = sorted(
+            key
+            for key in request_overrides
+            if key not in _ROUTE_REQUEST_OVERRIDE_ALLOWED_FIELDS
+        )
+        if unsupported_overrides:
+            raise ValueError(
+                f"Delegation route alias '{alias}' request_overrides contains "
+                f"unsupported fields: {', '.join(unsupported_overrides)}. "
+                "Only safe inference parameters are accepted."
+            )
     return copy.deepcopy(definition)
 
 

@@ -1,28 +1,32 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { $visibleModels } from '@/store/model-visibility'
+import { $activeGatewayProfile } from '@/store/profile'
 
 const getGlobalModelOptions = vi.fn()
 const saveDelegationRoutes = vi.fn()
 const setConfigCache = vi.fn()
-let config: Record<string, unknown> = {}
+let config: Record<string, unknown> | undefined = {}
+let profileSwitchHandler: (() => void) | null = null
 
 vi.mock('@/hermes', () => ({
   getApiRequestProfile: () => 'default',
   getGlobalModelOptions: (...args: unknown[]) => getGlobalModelOptions(...args),
-  saveDelegationRoutes: (routes: unknown) => saveDelegationRoutes(routes),
+  saveDelegationRoutes: (...args: unknown[]) => saveDelegationRoutes(...args),
   setApiRequestProfile: vi.fn()
 }))
 
 vi.mock('../hooks/use-config-record', () => ({
-  setHermesConfigCache: (next: Record<string, unknown>) => setConfigCache(next),
-  useHermesConfigRecord: () => ({ data: config })
+  hermesConfigCacheWriter: () => (next: Record<string, unknown>) => setConfigCache(next),
+  useHermesConfigRecord: () => ({ data: config, isPending: config === undefined })
 }))
 
 vi.mock('../hooks/use-on-profile-switch', () => ({
-  useOnProfileSwitch: () => {}
+  useOnProfileSwitch: (handler: () => void) => {
+    profileSwitchHandler = handler
+  }
 }))
 
 beforeAll(() => {
@@ -33,6 +37,8 @@ beforeAll(() => {
 
 beforeEach(() => {
   $visibleModels.set(null)
+  $activeGatewayProfile.set('default')
+  profileSwitchHandler = null
   config = {
     delegation: {
       max_spawn_depth: 3,
@@ -63,6 +69,7 @@ beforeEach(() => {
 afterEach(() => {
   cleanup()
   vi.clearAllMocks()
+  profileSwitchHandler = null
 })
 
 async function renderSettings() {
@@ -102,7 +109,7 @@ describe('DelegationRoutesSettings', () => {
 
     fireEvent.click(await screen.findByRole('button', { name: 'Remove careful' }))
 
-    await waitFor(() => expect(saveDelegationRoutes).toHaveBeenCalledWith({}))
+    await waitFor(() => expect(saveDelegationRoutes).toHaveBeenCalledWith({}, 'default'))
     expect(setConfigCache).toHaveBeenCalledWith({
       delegation: { max_spawn_depth: 3, routes: {} }
     })
@@ -120,12 +127,30 @@ describe('DelegationRoutesSettings', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Save route' }))
 
     await waitFor(() =>
-      expect(saveDelegationRoutes).toHaveBeenCalledWith({
-        fast: {
-          model: 'gemini-3.1-pro',
-          provider: 'google'
-        }
-      })
+      expect(saveDelegationRoutes).toHaveBeenCalledWith(
+        {
+          fast: {
+            model: 'gemini-3.1-pro',
+            provider: 'google'
+          }
+        },
+        'default'
+      )
     )
+  })
+
+  it('disables stale route actions while a switched profile config is loading', async () => {
+    await renderSettings()
+    expect(await screen.findByText('careful')).toBeTruthy()
+
+    config = undefined
+    await act(async () => {
+      $activeGatewayProfile.set('work')
+      profileSwitchHandler?.()
+    })
+
+    expect(screen.getByRole('button', { name: 'Add route' }).hasAttribute('disabled')).toBe(true)
+    expect(screen.queryByText('careful')).toBeNull()
+    expect(saveDelegationRoutes).not.toHaveBeenCalled()
   })
 })

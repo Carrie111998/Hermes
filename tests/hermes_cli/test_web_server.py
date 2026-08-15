@@ -2383,6 +2383,24 @@ class TestConfigRoundTrip:
 
         assert response.status_code == 400
 
+    def test_desktop_rejects_credentials_nested_in_route_overrides(self):
+        response = self.client.put(
+            "/api/config/delegation-routes",
+            json={
+                "routes": {
+                    "unsafe": {
+                        "provider": "openrouter",
+                        "model": "x-ai/grok-4.6",
+                        "request_overrides": {
+                            "headers": {"Authorization": "Bearer route-secret"}
+                        },
+                    }
+                }
+            },
+        )
+
+        assert response.status_code == 400
+
 
 # ---------------------------------------------------------------------------
 # New feature endpoint tests

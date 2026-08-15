@@ -985,10 +985,11 @@ export function saveHermesConfig(config: HermesConfigRecord): Promise<{ ok: bool
 }
 
 export function saveDelegationRoutes(
-  routes: DelegationRoutesConfig
+  routes: DelegationRoutesConfig,
+  profile?: null | string
 ): Promise<{ ok: boolean; routes: DelegationRoutesConfig }> {
   return window.hermesDesktop.api<{ ok: boolean; routes: DelegationRoutesConfig }>({
-    ...profileScoped(),
+    ...profileScoped(profile),
     path: '/api/config/delegation-routes',
     method: 'PUT',
     body: { routes }

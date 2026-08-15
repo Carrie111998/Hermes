@@ -173,6 +173,65 @@ def test_alias_rejects_invalid_reasoning_before_child_construction():
     build.assert_not_called()
 
 
+def test_alias_rejects_credential_fields_nested_in_request_overrides():
+    cfg = {
+        "routes": {
+            "unsafe": {
+                "provider": "openrouter",
+                "model": "x-ai/grok-4.6",
+                "request_overrides": {
+                    "headers": {"Authorization": "Bearer route-secret"}
+                },
+            }
+        }
+    }
+    with (
+        patch("tools.delegate_tool._load_config", return_value=cfg),
+        patch("tools.delegate_tool._build_child_preserving_parent_tools") as build,
+    ):
+        result = json.loads(delegate_task(goal="research", route="unsafe", parent_agent=_parent()))
+
+    assert "request_overrides" in result["error"]
+    assert "authorization" in result["error"].lower()
+    build.assert_not_called()
+
+
+def test_alias_rejects_non_inference_request_override_fields():
+    cfg = {
+        "routes": {
+            "unsafe": {
+                "provider": "openrouter",
+                "model": "x-ai/grok-4.6",
+                "request_overrides": {"extra_body": {"trace": "private"}},
+            }
+        }
+    }
+
+    with patch("tools.delegate_tool._load_config", return_value=cfg):
+        result = json.loads(delegate_task(goal="research", route="unsafe", parent_agent=_parent()))
+
+    assert "request_overrides" in result["error"]
+    assert "extra_body" in result["error"]
+
+
+def test_alias_rejects_credential_bearing_base_url():
+    cfg = {
+        "routes": {
+            "unsafe": {
+                "provider": "custom:gateway",
+                "model": "worker",
+                "base_url": "https://user:password@gateway.example/v1?token=secret",
+            }
+        }
+    }
+
+    with patch("tools.delegate_tool._load_config", return_value=cfg):
+        result = json.loads(delegate_task(goal="research", route="unsafe", parent_agent=_parent()))
+
+    assert "base_url" in result["error"]
+    assert "credentials" in result["error"]
+
+
 def test_batch_routes_resolve_independently_with_task_precedence():
     cfg = {
         "provider": "nous",
