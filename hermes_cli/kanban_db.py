@@ -103,6 +103,7 @@ from hermes_cli.kanban_repository import (
     RefreshRequest,
     RefreshResult,
     RELEASE_CANDIDATE_REF_PREFIX,
+    TargetHeadsObservation,
     VerificationProfile,
     VerificationResult,
     VerificationStepResult,
@@ -112,6 +113,7 @@ from hermes_cli.kanban_repository import (
     delete_release_candidate_ref,
     inspect_evidence_workspace,
     load_repository_contract,
+    observe_target_heads,
     refresh_story_branch,
     resolve_commit,
     restore_generated_paths,
@@ -123,6 +125,8 @@ from hermes_cli.kanban_repository import (
 )
 from hermes_cli.kanban_epic_release import (
     EpicReadiness,
+    EpicReleaseHandoff,
+    EpicReleaseHandoffError,
     EpicReleaseInvalidation,
     EpicReleaseInvalidationError,
     EpicReleaseMember,
@@ -15401,6 +15405,35 @@ def invalidate_epic_release_snapshot(
         conn, epic_id=epic_id, snapshot=snapshot, evidence=evidence
     )
 
+    deleted = _epic_release_delete_candidate_and_record(
+        conn, epic_id=epic_id, snapshot=snapshot, contract=contract
+    )
+
+    invalidated = replace(
+        snapshot,
+        status="invalidated",
+        updated_at=int(time.time()),
+    )
+    return EpicReleaseInvalidation(
+        "invalidated", invalidated, evidence, bool(deleted)
+    )
+
+
+def _epic_release_delete_candidate_and_record(
+    conn: sqlite3.Connection,
+    *,
+    epic_id: str,
+    snapshot: EpicReleaseSnapshot,
+    contract: RepositoryContract,
+) -> bool:
+    """Exact-SHA candidate-ref cleanup plus the typed ref-outcome audit event.
+
+    Shared by invalidation and by the release handoff's proven-drift
+    refusal: the retained release-candidate ref is deleted only when it
+    still pins the recorded SHA, and the outcome is recorded either way.
+    An absent or repointed ref is preserved and reported, never recreated.
+    """
+
     deleted = False
     try:
         deleted = delete_release_candidate_ref(
@@ -15423,15 +15456,7 @@ def invalidate_epic_release_snapshot(
                 "candidate_ref_deleted": bool(deleted),
             },
         )
-
-    invalidated = replace(
-        snapshot,
-        status="invalidated",
-        updated_at=int(time.time()),
-    )
-    return EpicReleaseInvalidation(
-        "invalidated", invalidated, evidence, bool(deleted)
-    )
+    return deleted
 
 
 def invalidate_stale_epic_release_snapshots(
@@ -15664,6 +15689,234 @@ def prepare_epic_release_snapshot(
     if candidate is not None and not persisted:
         _cleanup_epic_release_candidate(candidate)
     return winner
+
+
+def build_epic_release_handoff(
+    conn: sqlite3.Connection,
+    epic_id: str,
+    *,
+    board: Optional[str] = None,
+    board_meta: Optional[dict] = None,
+) -> EpicReleaseHandoff:
+    """Build truthful immutable release evidence for a human operator.
+
+    The handoff is assembled only after two immediate rechecks, and it is
+    refused — never partially returned — when either recheck fails:
+
+    1. The active snapshot is re-derived against current durable authority
+       (Epic tip, target pre-SHA, contract, member pins, aggregate
+       verification event/receipt).  Any proven drift invalidates the
+       snapshot durably (exact-SHA candidate-ref cleanup included) and
+       refuses the handoff.
+    2. The local and read-only remote target heads are observed right now
+       via :func:`observe_target_heads` and compared to the snapshot's
+       ``target_pre_sha``.  A mismatch invalidates and refuses; an
+       unavailable local or remote target refuses without invalidating
+       (drift cannot be proven, so the snapshot is preserved).
+
+    The returned :class:`EpicReleaseHandoff` carries only plain data —
+    IDs, full SHAs, member keys, contract digest, aggregate verification
+    event, required CI workflows, candidate ref, observed heads, and one
+    plain-language external action.  It deliberately contains no merge or
+    push command and exposes no capability to perform either.
+    """
+
+    if conn.in_transaction:
+        raise EpicReleaseHandoffError("active_transaction", {"epic_id": epic_id})
+
+    meta = board_meta if board_meta is not None else product_board_metadata(board)
+    if meta is None or not _handoff_v2_enabled(meta) or not _is_epic_task(conn, epic_id):
+        raise EpicReleaseHandoffError("not_governed_epic", {"epic_id": epic_id})
+    try:
+        contract = repository_contract_for_metadata(meta)
+    except (RepositoryConfigurationError, OSError, ValueError) as exc:
+        raise EpicReleaseHandoffError(
+            "repository_unavailable", {"epic_id": epic_id, "error": str(exc)}
+        ) from exc
+    if contract is None:
+        raise EpicReleaseHandoffError(
+            "missing_repository_contract", {"epic_id": epic_id}
+        )
+    if "epic_release" not in contract.verification:
+        raise EpicReleaseHandoffError(
+            "missing_epic_release_profile", {"epic_id": epic_id}
+        )
+
+    row = _epic_release_active_row(conn, epic_id)
+    if row is None:
+        raise EpicReleaseHandoffError("no_active_snapshot", {"epic_id": epic_id})
+    try:
+        snapshot = epic_release_snapshot_from_row(row)
+    except ValueError as exc:
+        raise EpicReleaseHandoffError(
+            "invalid_active_snapshot",
+            {"epic_id": epic_id, "snapshot_id": row["id"], "error": str(exc)},
+        ) from exc
+
+    # --- Recheck 1: current durable authority. ------------------------------
+    drift: dict[str, Any] = {}
+    try:
+        inputs, _contract, _branch = _epic_release_inputs(
+            conn, epic_id, board=board, board_meta=meta
+        )
+    except EpicReleasePreparationError as exc:
+        if exc.code in ("not_ready", "readiness_tip_mismatch"):
+            drift = {"inputs_error": exc.code, **exc.evidence}
+        else:
+            raise EpicReleaseHandoffError(
+                exc.code, {"epic_id": epic_id, **exc.evidence}
+            ) from exc
+    else:
+        drift = _epic_release_snapshot_mismatch_evidence(
+            conn, snapshot, epic_id=epic_id, inputs=inputs
+        )
+    if drift:
+        _epic_release_invalidate_durably(
+            conn, epic_id=epic_id, snapshot=snapshot, evidence=drift
+        )
+        deleted = _epic_release_delete_candidate_and_record(
+            conn, epic_id=epic_id, snapshot=snapshot, contract=contract
+        )
+        raise EpicReleaseHandoffError(
+            "snapshot_drifted",
+            {
+                "epic_id": epic_id,
+                "snapshot_id": snapshot.id,
+                "drift": drift,
+                "candidate_ref_deleted": bool(deleted),
+            },
+        )
+
+    # --- Recheck 2: immediate local and read-only remote target heads. ------
+    try:
+        observation = observe_target_heads(
+            contract.repo_root,
+            target_branch=contract.target_branch,
+            base_ref=contract.base_ref,
+        )
+    except RepositoryConfigurationError as exc:
+        raise EpicReleaseHandoffError(
+            "repository_unavailable", {"epic_id": epic_id, "error": exc.code}
+        ) from exc
+    if observation.local_head is None:
+        raise EpicReleaseHandoffError(
+            "local_target_unavailable",
+            {"epic_id": epic_id, "target_branch": contract.target_branch},
+        )
+    if observation.local_head != snapshot.target_pre_sha:
+        _epic_release_invalidate_durably(
+            conn,
+            epic_id=epic_id,
+            snapshot=snapshot,
+            evidence={
+                "target_pre_sha": {
+                    "snapshot": snapshot.target_pre_sha,
+                    "local_head": observation.local_head,
+                },
+                "handoff": "local_target_moved",
+            },
+        )
+        deleted = _epic_release_delete_candidate_and_record(
+            conn, epic_id=epic_id, snapshot=snapshot, contract=contract
+        )
+        raise EpicReleaseHandoffError(
+            "local_target_moved",
+            {
+                "epic_id": epic_id,
+                "snapshot_id": snapshot.id,
+                "snapshot_pre_sha": snapshot.target_pre_sha,
+                "local_head": observation.local_head,
+                "candidate_ref_deleted": bool(deleted),
+            },
+        )
+    if not observation.remote_available or observation.remote_head is None:
+        raise EpicReleaseHandoffError(
+            "remote_unavailable",
+            {
+                "epic_id": epic_id,
+                "snapshot_id": snapshot.id,
+                "remote_name": observation.remote_name,
+                "target_branch": contract.target_branch,
+            },
+        )
+    if observation.remote_head != snapshot.target_pre_sha:
+        _epic_release_invalidate_durably(
+            conn,
+            epic_id=epic_id,
+            snapshot=snapshot,
+            evidence={
+                "target_pre_sha": {
+                    "snapshot": snapshot.target_pre_sha,
+                    "remote_head": observation.remote_head,
+                    "remote_name": observation.remote_name,
+                },
+                "handoff": "remote_target_moved",
+            },
+        )
+        deleted = _epic_release_delete_candidate_and_record(
+            conn, epic_id=epic_id, snapshot=snapshot, contract=contract
+        )
+        raise EpicReleaseHandoffError(
+            "remote_target_moved",
+            {
+                "epic_id": epic_id,
+                "snapshot_id": snapshot.id,
+                "snapshot_pre_sha": snapshot.target_pre_sha,
+                "remote_head": observation.remote_head,
+                "remote_name": observation.remote_name,
+                "candidate_ref_deleted": bool(deleted),
+            },
+        )
+
+    # --- Assemble the immutable, human-facing evidence payload. -------------
+    event = conn.execute(
+        "SELECT task_id, kind, payload FROM task_events WHERE id=?",
+        (snapshot.aggregate_verification_event_id,),
+    ).fetchone()
+    if (
+        event is None
+        or event["task_id"] != epic_id
+        or event["kind"] != "repository_verification"
+    ):
+        raise EpicReleaseHandoffError(
+            "aggregate_event_unavailable",
+            {"epic_id": epic_id, "snapshot_id": snapshot.id},
+        )
+    try:
+        receipt = json.loads(event["payload"]) if event["payload"] else None
+    except (TypeError, ValueError) as exc:
+        raise EpicReleaseHandoffError(
+            "aggregate_event_unavailable",
+            {"epic_id": epic_id, "snapshot_id": snapshot.id, "error": str(exc)},
+        ) from exc
+    if not isinstance(receipt, Mapping):
+        raise EpicReleaseHandoffError(
+            "aggregate_event_unavailable",
+            {"epic_id": epic_id, "snapshot_id": snapshot.id},
+        )
+
+    members = _epic_release_snapshot_members(conn, snapshot.id)
+    action = (
+        f"Epic release snapshot {snapshot.id} for epic {epic_id} is pinned at "
+        f"{snapshot.candidate_ref} ({snapshot.release_candidate_sha}) against "
+        f"target pre-image {snapshot.target_pre_sha} on branch "
+        f"{snapshot.target_branch} of remote {observation.remote_name}. "
+        "A human release operator must review this pinned evidence and perform "
+        "the release out-of-band."
+    )
+    return EpicReleaseHandoff(
+        epic_id=epic_id,
+        snapshot=snapshot,
+        members=members,
+        workflows=tuple(contract.ci_workflows),
+        aggregate_event_kind=str(event["kind"]),
+        aggregate_event_receipt=dict(receipt),
+        local_target_head=observation.local_head,
+        remote_target_head=observation.remote_head,
+        remote_name=observation.remote_name,
+        action=action,
+        checked_at=int(time.time()),
+    )
 
 
 def _merge_epic_fail_safe(

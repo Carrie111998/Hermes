@@ -13,6 +13,8 @@ from hermes_cli import kanban_db as kb
 from hermes_cli.kanban_epic_release import (
     EpicReadiness,
     EpicReadinessMember,
+    EpicReleaseHandoff,
+    EpicReleaseHandoffError,
     EpicReleaseInvalidation,
     EpicReleaseMember,
     EpicReleaseSnapshot,
@@ -21,6 +23,7 @@ from hermes_cli.kanban_epic_release import (
     epic_release_member_from_row,
     epic_release_snapshot_from_row,
 )
+from hermes_cli.kanban_repository import TargetHeadsObservation
 
 
 EPIC_SHA = "1" * 40
@@ -517,9 +520,11 @@ def _release_prepare_fixture(tmp_path, monkeypatch):
         (),
         {
             "repo_root": repo.resolve(),
+            "base_ref": "refs/remotes/origin/main",
             "target_branch": "main",
             "verification": {"epic_release": object()},
             "generated_policy_digest": GENERATED_POLICY_DIGEST,
+            "ci_workflows": ("CI", "Deploy Test"),
             "digest": CONTRACT_DIGEST,
         },
     )()
@@ -1207,3 +1212,297 @@ def test_invalidate_stale_epic_release_snapshots_ungoverned_board_returns_empty(
         # No board metadata — product_board_metadata(None) returns None.
         results = kb.invalidate_stale_epic_release_snapshots(conn)
     assert results == ()
+
+
+# ---------------------------------------------------------------------------
+# E06 — Pinned human release handoff
+# ---------------------------------------------------------------------------
+
+
+def _handoff_observe(
+    monkeypatch,
+    *,
+    local_head: str | None = TARGET_SHA,
+    remote_head: str | None = TARGET_SHA,
+    remote_available: bool = True,
+    remote_name: str = "origin",
+):
+    def observe(_repo_root, *, target_branch, base_ref):
+        return TargetHeadsObservation(
+            local_head=local_head,
+            remote_head=remote_head,
+            remote_name=remote_name,
+            remote_available=remote_available,
+        )
+
+    monkeypatch.setattr(kb, "observe_target_heads", observe)
+
+
+def _handoff_delete_calls(monkeypatch):
+    calls: list = []
+
+    def wrap_delete(repo_root, *, candidate_ref, candidate_sha):
+        calls.append((repo_root, candidate_ref, candidate_sha))
+        return True
+
+    monkeypatch.setattr(kb, "delete_release_candidate_ref", wrap_delete)
+    return calls
+
+
+def test_build_release_handoff_returns_truthful_immutable_evidence_with_plain_action(
+    tmp_path, monkeypatch,
+):
+    _handoff_observe(monkeypatch)
+    with kb.connect(tmp_path / "handoff.db") as conn:
+        ctx = _prepare_exact_snapshot(conn, monkeypatch, tmp_path)
+        handoff = kb.build_epic_release_handoff(
+            conn, ctx.epic_id, board="release-board", board_meta=ctx.board_meta,
+        )
+        events = conn.execute(
+            "SELECT kind FROM task_events WHERE task_id=? "
+            "AND kind='epic_release_invalidated'",
+            (ctx.epic_id,),
+        ).fetchall()
+
+    assert isinstance(handoff, EpicReleaseHandoff)
+    assert handoff.epic_id == ctx.epic_id
+    assert handoff.snapshot == ctx.prepared
+    assert handoff.members == (
+        EpicReleaseMember(
+            snapshot_id=ctx.prepared.id,
+            epic_id=ctx.epic_id,
+            story_id=ctx.story_id,
+            source_sha=SOURCE_SHA,
+            candidate_sha=MEMBER_CANDIDATE_SHA,
+            integrated_at=90,
+        ),
+    )
+    assert handoff.workflows == ("CI", "Deploy Test")
+    assert handoff.aggregate_event_kind == "repository_verification"
+    assert (
+        handoff.aggregate_event_receipt["candidate_sha"] == AGGREGATE_CANDIDATE_SHA
+    )
+    assert (
+        handoff.aggregate_event_receipt["source_sha"] == EPIC_SHA
+    )
+    assert handoff.local_target_head == TARGET_SHA
+    assert handoff.remote_target_head == TARGET_SHA
+    assert handoff.remote_name == "origin"
+    assert handoff.checked_at > 0
+    # The plain external action carries the pinned ref and full SHAs but is
+    # prose for a human — no executable release primitive anywhere.
+    assert ctx.prepared.candidate_ref in handoff.action
+    assert ctx.prepared.release_candidate_sha in handoff.action
+    assert ctx.prepared.target_pre_sha in handoff.action
+    assert "git " not in handoff.action
+    assert "merge" not in handoff.action
+    assert "push" not in handoff.action
+    assert events == []
+
+
+def test_build_release_handoff_refuses_and_invalidates_on_local_target_mismatch(
+    tmp_path, monkeypatch,
+):
+    moved = "f" * 40
+    _handoff_observe(monkeypatch, local_head=moved)
+    delete_calls = _handoff_delete_calls(monkeypatch)
+
+    with kb.connect(tmp_path / "handoff-local.db") as conn:
+        ctx = _prepare_exact_snapshot(conn, monkeypatch, tmp_path)
+        with pytest.raises(EpicReleaseHandoffError) as exc_info:
+            kb.build_epic_release_handoff(
+                conn, ctx.epic_id, board="release-board", board_meta=ctx.board_meta,
+            )
+        row = conn.execute(
+            "SELECT status FROM epic_release_snapshots WHERE id=?",
+            (ctx.prepared.id,),
+        ).fetchone()
+
+    assert exc_info.value.code == "local_target_moved"
+    assert exc_info.value.evidence["local_head"] == moved
+    assert exc_info.value.evidence["snapshot_pre_sha"] == TARGET_SHA
+    assert row["status"] == "invalidated"
+    assert delete_calls == [
+        (
+            ctx.contract.repo_root,
+            ctx.prepared.candidate_ref,
+            ctx.prepared.release_candidate_sha,
+        )
+    ]
+
+
+def test_build_release_handoff_refuses_and_invalidates_on_remote_target_mismatch(
+    tmp_path, monkeypatch,
+):
+    moved = "f" * 40
+    _handoff_observe(monkeypatch, remote_head=moved)
+    delete_calls = _handoff_delete_calls(monkeypatch)
+
+    with kb.connect(tmp_path / "handoff-remote.db") as conn:
+        ctx = _prepare_exact_snapshot(conn, monkeypatch, tmp_path)
+        with pytest.raises(EpicReleaseHandoffError) as exc_info:
+            kb.build_epic_release_handoff(
+                conn, ctx.epic_id, board="release-board", board_meta=ctx.board_meta,
+            )
+        row = conn.execute(
+            "SELECT status FROM epic_release_snapshots WHERE id=?",
+            (ctx.prepared.id,),
+        ).fetchone()
+
+    assert exc_info.value.code == "remote_target_moved"
+    assert exc_info.value.evidence["remote_head"] == moved
+    assert exc_info.value.evidence["snapshot_pre_sha"] == TARGET_SHA
+    assert row["status"] == "invalidated"
+    assert delete_calls == [
+        (
+            ctx.contract.repo_root,
+            ctx.prepared.candidate_ref,
+            ctx.prepared.release_candidate_sha,
+        )
+    ]
+
+
+def test_build_release_handoff_refuses_without_invalidating_on_remote_unavailability(
+    tmp_path, monkeypatch,
+):
+    _handoff_observe(monkeypatch, remote_head=None, remote_available=False)
+    delete_calls = _handoff_delete_calls(monkeypatch)
+
+    with kb.connect(tmp_path / "handoff-unavail.db") as conn:
+        ctx = _prepare_exact_snapshot(conn, monkeypatch, tmp_path)
+        with pytest.raises(EpicReleaseHandoffError) as exc_info:
+            kb.build_epic_release_handoff(
+                conn, ctx.epic_id, board="release-board", board_meta=ctx.board_meta,
+            )
+        row = conn.execute(
+            "SELECT status FROM epic_release_snapshots WHERE id=?",
+            (ctx.prepared.id,),
+        ).fetchone()
+        invalidations = conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id=? "
+            "AND kind='epic_release_invalidated'",
+            (ctx.epic_id,),
+        ).fetchone()[0]
+
+    assert exc_info.value.code == "remote_unavailable"
+    assert exc_info.value.evidence["remote_name"] == "origin"
+    # Unavailability cannot prove drift: the snapshot is preserved untouched.
+    assert row["status"] == "awaiting_push"
+    assert delete_calls == []
+    assert invalidations == 0
+
+
+def test_build_release_handoff_remote_unavailable_then_available_handoff_succeeds(
+    tmp_path, monkeypatch,
+):
+    delete_calls = _handoff_delete_calls(monkeypatch)
+    _handoff_observe(monkeypatch, remote_head=None, remote_available=False)
+
+    with kb.connect(tmp_path / "handoff-retry.db") as conn:
+        ctx = _prepare_exact_snapshot(conn, monkeypatch, tmp_path)
+        with pytest.raises(EpicReleaseHandoffError) as first:
+            kb.build_epic_release_handoff(
+                conn, ctx.epic_id, board="release-board", board_meta=ctx.board_meta,
+            )
+        _handoff_observe(monkeypatch)
+        handoff = kb.build_epic_release_handoff(
+            conn, ctx.epic_id, board="release-board", board_meta=ctx.board_meta,
+        )
+        row = conn.execute(
+            "SELECT status FROM epic_release_snapshots WHERE id=?",
+            (ctx.prepared.id,),
+        ).fetchone()
+
+    assert first.value.code == "remote_unavailable"
+    assert handoff.remote_target_head == TARGET_SHA
+    assert row["status"] == "awaiting_push"
+    assert delete_calls == []
+
+
+def test_build_release_handoff_refuses_without_invalidating_on_local_unavailability(
+    tmp_path, monkeypatch,
+):
+    _handoff_observe(monkeypatch, local_head=None)
+    delete_calls = _handoff_delete_calls(monkeypatch)
+
+    with kb.connect(tmp_path / "handoff-local-unavail.db") as conn:
+        ctx = _prepare_exact_snapshot(conn, monkeypatch, tmp_path)
+        with pytest.raises(EpicReleaseHandoffError) as exc_info:
+            kb.build_epic_release_handoff(
+                conn, ctx.epic_id, board="release-board", board_meta=ctx.board_meta,
+            )
+        row = conn.execute(
+            "SELECT status FROM epic_release_snapshots WHERE id=?",
+            (ctx.prepared.id,),
+        ).fetchone()
+
+    assert exc_info.value.code == "local_target_unavailable"
+    assert row["status"] == "awaiting_push"
+    assert delete_calls == []
+
+
+def test_build_release_handoff_refuses_and_invalidates_on_snapshot_authority_drift(
+    tmp_path, monkeypatch,
+):
+    _handoff_observe(monkeypatch)
+    delete_calls = _handoff_delete_calls(monkeypatch)
+
+    with kb.connect(tmp_path / "handoff-drift.db") as conn:
+        ctx = _prepare_exact_snapshot(conn, monkeypatch, tmp_path)
+        _drift_epic_tip(ctx, conn, monkeypatch)
+        with pytest.raises(EpicReleaseHandoffError) as exc_info:
+            kb.build_epic_release_handoff(
+                conn, ctx.epic_id, board="release-board", board_meta=ctx.board_meta,
+            )
+        row = conn.execute(
+            "SELECT status FROM epic_release_snapshots WHERE id=?",
+            (ctx.prepared.id,),
+        ).fetchone()
+
+    assert exc_info.value.code == "snapshot_drifted"
+    evidence = exc_info.value.evidence
+    assert isinstance(evidence, dict)
+    drift = evidence["drift"]
+    assert isinstance(drift, dict)
+    assert "epic_tip_sha" in drift
+    assert row["status"] == "invalidated"
+    assert delete_calls == [
+        (
+            ctx.contract.repo_root,
+            ctx.prepared.candidate_ref,
+            ctx.prepared.release_candidate_sha,
+        )
+    ]
+
+
+def test_build_release_handoff_refuses_without_active_snapshot(tmp_path, monkeypatch):
+    _handoff_observe(monkeypatch)
+    with kb.connect(tmp_path / "handoff-none.db") as conn:
+        _fixture_epic_id, _story_id, board_meta, _contract, readiness, _candidate = (
+            _release_prepare_fixture(tmp_path, monkeypatch)
+        )
+        epic_id = kb.create_task(conn, title="Epic", work_item_kind="epic")
+        story_id = kb.create_task(conn, title="Story")
+        kb.add_epic_membership(conn, epic_id=epic_id, task_id=story_id)
+        readiness = replace(
+            readiness, epic_id=epic_id,
+            members=(replace(readiness.members[0], story_id=story_id),),
+        )
+        monkeypatch.setattr(kb, "epic_readiness", lambda *_a, **_k: readiness)
+        with pytest.raises(EpicReleaseHandoffError) as exc_info:
+            kb.build_epic_release_handoff(
+                conn, epic_id, board="release-board", board_meta=board_meta,
+            )
+
+    assert exc_info.value.code == "no_active_snapshot"
+
+
+def test_build_release_handoff_refuses_on_ungoverned_board(tmp_path, monkeypatch):
+    _handoff_observe(monkeypatch)
+    monkeypatch.setattr(kb, "product_board_metadata", lambda _board=None: None)
+    with kb.connect(tmp_path / "handoff-ungov.db") as conn:
+        epic_id = kb.create_task(conn, title="Epic", work_item_kind="epic")
+        with pytest.raises(EpicReleaseHandoffError) as exc_info:
+            kb.build_epic_release_handoff(conn, epic_id, board="release-board")
+
+    assert exc_info.value.code == "not_governed_epic"

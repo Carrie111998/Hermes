@@ -16,6 +16,7 @@ from hermes_cli.kanban_repository import (
     RELEASE_CANDIDATE_REF_PREFIX,
     RepositoryConfigurationError,
     RefreshRequest,
+    TargetHeadsObservation,
     VerificationCommand,
     VerificationProfile,
     advance_prepared_candidate_ref,
@@ -27,6 +28,7 @@ from hermes_cli.kanban_repository import (
     inspect_evidence_workspace,
     inspect_prepared_candidate_ref,
     load_repository_contract,
+    observe_target_heads,
     refresh_story_branch,
     resolve_commit,
     restore_generated_paths,
@@ -1471,3 +1473,188 @@ def test_repository_boundary_refreshes_verifies_and_preserves_remote_refs(
         "refs/heads",
     ) == remote_refs_before
     assert _git(repository, "rev-parse", "refs/remotes/origin/main") == local_remote_base_before
+
+
+# ---------------------------------------------------------------------------
+# E06 — Read-only target-head observation for the human release handoff
+# ---------------------------------------------------------------------------
+
+
+def test_observe_target_heads_reads_diverged_local_and_remote_heads_without_syncing(
+    tmp_path: Path,
+):
+    remote, repository, base_sha = _remote_fixture(tmp_path)
+    local_main = _commit(repository, "extra.txt", "extra\n", "local-only move")
+
+    observation = observe_target_heads(
+        repository, target_branch="main", base_ref="refs/remotes/origin/main"
+    )
+
+    assert observation.local_head == local_main
+    assert observation.remote_head == base_sha
+    assert observation.remote_name == "origin"
+    assert observation.remote_available is True
+    assert observation.local_head != observation.remote_head
+    # Strictly read-only: the bare remote and the local remote-tracking ref
+    # are exactly as they were — no fetch, no sync, no remote write.
+    assert _git_dir(remote, "rev-parse", "refs/heads/main") == base_sha
+    assert _git(repository, "rev-parse", "refs/remotes/origin/main") == base_sha
+
+
+def test_observe_target_heads_fake_transport_refuses_remote_write_verbs_before_subprocess(
+    repository: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    """The observation seam refuses every write verb before any subprocess.
+
+    A fake transport stands in for the subprocess boundary: any merge,
+    push, fetch, update-ref, reset, clean, checkout, branch, tag, or
+    worktree verb raises immediately, proving the production path never
+    even attempts one.  The observation completes with read verbs only.
+    """
+
+    local_sha = _git(repository, "rev-parse", "HEAD")
+    remote_sha = _git(repository, "rev-parse", "refs/remotes/origin/main")
+    calls: list[tuple[str, ...]] = []
+    forbidden = (
+        "push",
+        "fetch",
+        "pull",
+        "update-ref",
+        "merge",
+        "reset",
+        "clean",
+        "checkout",
+        "switch",
+        "branch",
+        "tag",
+        "worktree",
+        "stash",
+        "gc",
+        "prune",
+        "clone",
+    )
+
+    def fake_observe(path: Path, *args: str):
+        calls.append(args)
+        assert not any(verb in args for verb in forbidden), (
+            f"remote-write verb attempted before subprocess: {args}"
+        )
+        if args[:2] == ("rev-parse", "--verify"):
+            return subprocess.CompletedProcess(
+                ["git", *args], 0, f"{local_sha}\n", ""
+            )
+        if args[:2] == ("ls-remote", "--heads"):
+            return subprocess.CompletedProcess(
+                ["git", *args], 0, f"{remote_sha}\trefs/heads/main\n", ""
+            )
+        raise AssertionError(f"unexpected Git observation: {args}")
+
+    monkeypatch.setattr(repository_module, "_remote_observe_git", fake_observe)
+
+    observation = observe_target_heads(
+        repository, target_branch="main", base_ref="refs/remotes/origin/main"
+    )
+
+    assert observation == TargetHeadsObservation(
+        local_head=local_sha,
+        remote_head=remote_sha,
+        remote_name="origin",
+        remote_available=True,
+    )
+    assert calls
+    assert {call[0] for call in calls} == {"rev-parse", "ls-remote"}
+
+
+def test_observe_target_heads_reports_remote_unavailability_without_remote_write(
+    repository: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    local_sha = _git(repository, "rev-parse", "HEAD")
+    calls: list[tuple[str, ...]] = []
+
+    def fake_observe(path: Path, *args: str):
+        calls.append(args)
+        if args[:2] == ("rev-parse", "--verify"):
+            return subprocess.CompletedProcess(
+                ["git", *args], 0, f"{local_sha}\n", ""
+            )
+        if args[:2] == ("ls-remote", "--heads"):
+            return subprocess.CompletedProcess(
+                ["git", *args], 128, "", "fatal: could not read from remote"
+            )
+        raise AssertionError(f"unexpected Git observation: {args}")
+
+    monkeypatch.setattr(repository_module, "_remote_observe_git", fake_observe)
+
+    observation = observe_target_heads(
+        repository, target_branch="main", base_ref="refs/remotes/origin/main"
+    )
+
+    assert observation.local_head == local_sha
+    assert observation.remote_head is None
+    assert observation.remote_available is False
+    assert {call[0] for call in calls} == {"rev-parse", "ls-remote"}
+
+
+def test_observe_target_heads_transport_failure_is_reported_not_raised(
+    repository: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    def fail_transport(path: Path, *args: str):
+        return None  # _remote_observe_git returns None on OSError / SubprocessError
+
+    monkeypatch.setattr(repository_module, "_remote_observe_git", fail_transport)
+
+    observation = observe_target_heads(
+        repository, target_branch="main", base_ref="refs/remotes/origin/main"
+    )
+
+    assert observation.local_head is None
+    assert observation.remote_head is None
+    assert observation.remote_available is False
+
+
+def test_observe_target_heads_missing_remote_branch_is_available_but_headless(
+    repository: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    local_sha = _git(repository, "rev-parse", "HEAD")
+
+    def fake_observe(path: Path, *args: str):
+        if args[:2] == ("rev-parse", "--verify"):
+            return subprocess.CompletedProcess(
+                ["git", *args], 0, f"{local_sha}\n", ""
+            )
+        if args[:2] == ("ls-remote", "--heads"):
+            return subprocess.CompletedProcess(["git", *args], 0, "", "")
+        raise AssertionError(f"unexpected Git observation: {args}")
+
+    monkeypatch.setattr(repository_module, "_remote_observe_git", fake_observe)
+
+    observation = observe_target_heads(
+        repository, target_branch="main", base_ref="refs/remotes/origin/main"
+    )
+
+    assert observation.local_head == local_sha
+    assert observation.remote_head is None
+    assert observation.remote_available is True
+
+
+@pytest.mark.parametrize(
+    ("target_branch", "base_ref", "code"),
+    [
+        ("", "refs/remotes/origin/main", "malformed_target_branch"),
+        (" main", "refs/remotes/origin/main", "malformed_target_branch"),
+        ("main", "refs/heads/main", "malformed_base_ref"),
+        ("main", "", "malformed_base_ref"),
+        ("main", "refs/remotes/origin", "malformed_base_ref"),
+        ("main", "refs/remotes/", "malformed_base_ref"),
+        ("main", "refs/remotes//main", "malformed_base_ref"),
+    ],
+)
+def test_observe_target_heads_rejects_malformed_target_branch_and_base_ref(
+    repository: Path, target_branch: str, base_ref: str, code: str
+):
+    with pytest.raises(RepositoryConfigurationError) as exc_info:
+        observe_target_heads(
+            repository, target_branch=target_branch, base_ref=base_ref
+        )
+
+    assert exc_info.value.code == code

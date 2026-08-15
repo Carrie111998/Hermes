@@ -862,6 +862,24 @@ class EvidenceWorkspaceResult:
         return self.declared_generated
 
 
+@dataclass(frozen=True)
+class TargetHeadsObservation:
+    """Read-only local and remote target-head observation for a handoff recheck.
+
+    ``local_head`` is ``None`` when the local branch cannot be resolved.
+    ``remote_head`` is ``None`` when the remote is unreachable or the
+    target branch does not exist on it.  ``remote_available`` is false
+    only when ``git ls-remote`` itself failed; a branch that simply
+    does not exist on the remote sets ``remote_head=None`` and
+    ``remote_available=True``.
+    """
+
+    local_head: str | None
+    remote_head: str | None
+    remote_name: str
+    remote_available: bool
+
+
 def _evidence_git(workspace: Path, *args: str) -> subprocess.CompletedProcess[str]:
     """Run one bounded, read-only or explicit-path Git operation."""
 
@@ -877,6 +895,32 @@ def _evidence_git(workspace: Path, *args: str) -> subprocess.CompletedProcess[st
         )
     except (OSError, subprocess.SubprocessError) as exc:
         raise EvidenceWorkspaceError("git_error", str(exc)) from exc
+
+
+def _remote_observe_git(
+    repo_root: Path, *args: str
+) -> subprocess.CompletedProcess[str] | None:
+    """Run one bounded, shell-free, strictly read-only Git observation.
+
+    This seam exists so handoff tests can substitute a fake transport and
+    prove that the observation path never issues a remote-write verb.
+    The only commands routed through it are ``rev-parse`` and
+    ``ls-remote``.  Returns ``None`` instead of raising so a failing
+    observation reads as "unavailable" rather than crashing the handoff.
+    """
+
+    try:
+        return subprocess.run(
+            ["git", "-C", str(repo_root), *args],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
 
 
 def _evidence_paths(value: object) -> tuple[PurePosixPath, ...]:
@@ -1680,6 +1724,79 @@ def delete_release_candidate_ref(
         root, "update-ref", "-d", candidate_ref, candidate_sha
     )
     return deleted.returncode == 0 and _prepared_ref_sha(root, candidate_ref) is None
+
+
+def observe_target_heads(
+    repo_root: Path, *, target_branch: str, base_ref: str
+) -> TargetHeadsObservation:
+    """Observe the exact local and remote heads of the release target branch.
+
+    Local head:  ``git rev-parse --verify refs/heads/<target>^{commit}``.
+    Remote head: ``git ls-remote <remote> refs/heads/<target>`` — strictly
+    read-only; no fetch, no remote-write verb, and no local ref update.
+    The remote name is derived from the configured ``base_ref``
+    (``refs/remotes/<remote>/<branch>``) so no extra configuration key is
+    needed.  Both results are reported even when unavailable so the caller
+    can truthfully refuse rather than guess.
+    """
+
+    root = Path(repo_root).expanduser().resolve(strict=False)
+    if (
+        not isinstance(target_branch, str)
+        or not target_branch
+        or target_branch != target_branch.strip()
+        or "\x00" in target_branch
+    ):
+        raise _error("malformed_target_branch")
+    if (
+        not isinstance(base_ref, str)
+        or not base_ref.startswith("refs/remotes/")
+        or base_ref != base_ref.strip()
+        or "\x00" in base_ref
+    ):
+        raise _error("malformed_base_ref")
+    remote_path = base_ref[len("refs/remotes/") :]
+    if (
+        not remote_path
+        or "/" not in remote_path
+        or remote_path.split("/", 1)[0] in {"", "."}
+    ):
+        raise _error("malformed_base_ref")
+
+    remote_name = remote_path.split("/", 1)[0]
+
+    local_head: str | None = None
+    local = _remote_observe_git(
+        root, "rev-parse", "--verify", f"refs/heads/{target_branch}^{{commit}}"
+    )
+    if local is not None:
+        value = (local.stdout or "").strip()
+        if local.returncode == 0 and FULL_SHA.fullmatch(value):
+            local_head = value
+
+    remote_head: str | None = None
+    remote_available = False
+    remote = _remote_observe_git(
+        root, "ls-remote", "--heads", remote_name, f"refs/heads/{target_branch}"
+    )
+    if remote is None:
+        remote_available = False
+    elif remote.returncode != 0:
+        remote_available = False
+    else:
+        remote_available = True
+        for line in (remote.stdout or "").splitlines():
+            parts = line.split()
+            if parts and FULL_SHA.fullmatch(parts[0]):
+                remote_head = parts[0]
+                break
+
+    return TargetHeadsObservation(
+        local_head=local_head,
+        remote_head=remote_head,
+        remote_name=remote_name,
+        remote_available=remote_available,
+    )
 
 
 def _refresh_git(

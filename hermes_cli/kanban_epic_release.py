@@ -48,6 +48,22 @@ class EpicReleaseInvalidationError(RuntimeError):
         super().__init__(self.code)
 
 
+class EpicReleaseHandoffError(RuntimeError):
+    """Typed refusal while building a human release handoff.
+
+    The handoff is refused — never partially assembled — whenever the
+    snapshot's evidence cannot be rechecked truthfully (repository or
+    remote unavailable) or when the recheck proves the snapshot is no
+    longer the exact release authority (target moved locally or on the
+    remote, or any snapshot input drifted).
+    """
+
+    def __init__(self, code: str, evidence: Mapping[str, object] | None = None):
+        self.code = str(code)
+        self.evidence = dict(evidence or {})
+        super().__init__(self.code)
+
+
 @dataclass(frozen=True)
 class EpicReleaseSnapshot:
     id: int
@@ -86,6 +102,33 @@ class EpicReleaseInvalidation:
     snapshot: EpicReleaseSnapshot | None
     evidence: Mapping[str, object]
     candidate_ref_deleted: bool
+
+
+@dataclass(frozen=True)
+class EpicReleaseHandoff:
+    """Truthful immutable release evidence for a human release operator.
+
+    Built only after the snapshot's authority has been rechecked against
+    the immediate local and remote target heads.  Every field is plain
+    data — IDs, full SHAs, member keys, the repository contract digest
+    (via ``snapshot.repository_contract_digest``), the aggregate
+    verification event, the required CI workflows, the candidate ref, the
+    observed target heads, and one plain-language external action.  There
+    is deliberately no merge or push capability here: ``action`` is prose
+    for a human and nothing in this shape is executable by the board.
+    """
+
+    epic_id: str
+    snapshot: EpicReleaseSnapshot
+    members: tuple[EpicReleaseMember, ...]
+    workflows: tuple[str, ...]
+    aggregate_event_kind: str
+    aggregate_event_receipt: Mapping[str, object]
+    local_target_head: str
+    remote_target_head: str
+    remote_name: str
+    action: str
+    checked_at: int
 
 
 @dataclass(frozen=True)
