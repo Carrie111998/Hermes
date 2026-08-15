@@ -56,6 +56,41 @@ def _neuter_agent_prewarm_timer(request, monkeypatch):
     yield
 
 
+@pytest.fixture(autouse=True)
+def _reap_leaked_notification_pollers():
+    """Stop and join notification pollers leaked by each test.
+
+    session.init/create paths start a per-session poller daemon thread. A
+    poller left running by one test steals-and-requeues events off the
+    PROCESS-GLOBAL process_registry.completion_queue while a later test is
+    asserting on it — the root cause of the flaky
+    test_run_prompt_submit_requeues_all_unstarted_notifications_with_real_threading
+    (two CI hits on unrelated PRs, Aug 2026). Set every registered poller's
+    stop event (the loop wakes at least every 0.5s), then join with ONE
+    small shared budget — never per-thread — so teardown stays O(seconds)
+    for the whole file even when many tests leaked pollers.
+    """
+    yield
+    pollers = [
+        (stop, thread)
+        for stop, thread in list(server._notification_pollers)
+        if thread.is_alive()
+    ]
+    for stop, _thread in pollers:
+        stop.set()
+    deadline = time.time() + 3.0
+    for _stop, thread in pollers:
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            break
+        thread.join(timeout=remaining)
+    server._notification_pollers[:] = [
+        (stop, thread)
+        for stop, thread in server._notification_pollers
+        if thread.is_alive()
+    ]
+
+
 def test_session_slot_is_claimed_on_first_turn_not_on_create(monkeypatch, tmp_path):
     home = tmp_path / ".hermes"
     home.mkdir()
@@ -3125,10 +3160,11 @@ def test_session_cwd_set_profile_session_updates_profile_db(monkeypatch, tmp_pat
 
 
 def test_stored_session_runtime_overrides_skips_bare_billing_provider():
-    """A bare billing bucket ("custom"/"auto"/"openrouter") must not be restored as the
-    provider identity on resume. A custom endpoint that never used `/model` persists only
+    """A bare billing bucket ("custom"/"auto") must not be restored as the provider
+    identity on resume. A custom endpoint that never used `/model` persists only
     `billing_provider="custom"`; restoring that broke `session.resume` with "No LLM provider
-    configured" (agent_init treats it as non-routable). A real provider, or an explicit
+    configured" (agent_init treats it as non-routable). ``"openrouter"`` is NOT a bare bucket
+    — it is a fully routable provider; see #57588. A real provider, or an explicit
     `model_config.provider`, is still restored.
     """
     # Bare "custom" bucket, no explicit model_config.provider: no provider override restored.
@@ -3136,7 +3172,7 @@ def test_stored_session_runtime_overrides_skips_bare_billing_provider():
     assert "provider_override" not in ov
     assert ov["model_override"]["provider"] is None
 
-    for bare in ("auto", "openrouter", "custom"):
+    for bare in ("auto", "custom"):
         ov = server._stored_session_runtime_overrides({"model": "m", "billing_provider": bare})
         assert "provider_override" not in ov
 
@@ -3163,6 +3199,33 @@ def test_stored_session_runtime_overrides_restores_explicit_normal_tier():
 
     assert "service_tier_override" in overrides
     assert overrides["service_tier_override"] == ""
+
+
+def test_openrouter_session_resume_restores_provider():
+    """OpenRouter is a fully routable provider — sessions that used OpenRouter must
+    restore the "openrouter" provider override on resume, not fall through to whatever
+    the current global model is.  (#57588)
+    """
+    # OpenRouter session with no explicit model_config.provider (the common case
+    # for sessions that never used /model): billing_provider="openrouter" should
+    # be restored as the provider override.
+    ov = server._stored_session_runtime_overrides(
+        {"model": "anthropic/claude-opus-4.8", "billing_provider": "openrouter"}
+    )
+    assert ov["provider_override"] == "openrouter"
+    assert ov["model_override"]["provider"] == "openrouter"
+    assert ov["model_override"]["model"] == "anthropic/claude-opus-4.8"
+
+    # When an explicit model_config.provider exists, it takes precedence over
+    # billing_provider (this path was already correct).
+    ov = server._stored_session_runtime_overrides(
+        {
+            "model": "anthropic/claude-opus-4.8",
+            "billing_provider": "openrouter",
+            "model_config": {"provider": "openrouter", "base_url": "https://openrouter.ai/api/v1"},
+        }
+    )
+    assert ov["provider_override"] == "openrouter"
 
 
 def test_persist_live_session_runtime_preserves_resume_metadata(monkeypatch):
@@ -18017,3 +18080,143 @@ def test_prompt_submit_unconfirmed_truncation_refuses_before_target_resolution(
         assert len(sess["history"]) == 4
     finally:
         server._sessions.pop(sid, None)
+
+
+def test_persist_live_session_system_prompt_uses_profile_home(monkeypatch, tmp_path):
+    """Issue #50233: _persist_live_session_system_prompt must re-bind
+    HERMES_HOME to the session's profile before rebuilding the system
+    prompt.  Without this, a /model switch rebuilds the prompt with the
+    root profile's SOUL.md and skills instead of the session's profile.
+    """
+    profile_home = tmp_path / "profile-work"
+    profile_home.mkdir()
+    (profile_home / "SOUL.md").write_text(
+        "# Work persona\nYou are a work agent.", encoding="utf-8"
+    )
+
+    built_homes = []
+
+    class FakeAgent:
+        model = "test-model"
+        provider = "test"
+        _cached_system_prompt = None
+        _session_db = None
+
+        def _build_system_prompt(self, system_message=None):
+            from hermes_constants import get_hermes_home
+            home = get_hermes_home()
+            built_homes.append(str(home))
+            soul = (
+                (home / "SOUL.md").read_text(encoding="utf-8")
+                if (home / "SOUL.md").exists()
+                else ""
+            )
+            return f"System prompt from {home}\n{soul}"
+
+    class FakeDB:
+        def update_system_prompt(self, session_id, prompt):
+            pass
+
+    agent = FakeAgent()
+    agent._session_db = FakeDB()
+    session = {
+        "agent": agent,
+        "session_key": "test-key",
+        "profile_home": str(profile_home),
+    }
+
+    server._persist_live_session_system_prompt(session)
+
+    # The system prompt must have been built while the override pointed
+    # to the profile home, not the root ~/.hermes.
+    assert len(built_homes) == 1, f"expected 1 build, got {built_homes}"
+    assert str(profile_home) in built_homes[0], (
+        f"system prompt built with wrong home: {built_homes[0]}"
+    )
+    assert "Work persona" in agent._cached_system_prompt
+
+    # The override must have been reset after the call.
+    from hermes_constants import get_hermes_home_override
+    assert get_hermes_home_override() is None
+
+
+def test_persist_live_session_system_prompt_no_profile_is_unchanged(monkeypatch):
+    """Sessions without a profile_home must not set/clear any override —
+    the function should behave identically to before the fix."""
+    class FakeAgent:
+        model = "test"
+        _cached_system_prompt = None
+        _session_db = None
+
+        def _build_system_prompt(self, system_message=None):
+            return "plain prompt"
+
+    class FakeDB:
+        def update_system_prompt(self, session_id, prompt):
+            pass
+
+    agent = FakeAgent()
+    agent._session_db = FakeDB()
+    session = {
+        "agent": agent,
+        "session_key": "test-key",
+        "profile_home": None,
+    }
+
+    # Should not raise, should still build and cache.
+    server._persist_live_session_system_prompt(session)
+    assert agent._cached_system_prompt == "plain prompt"
+
+
+def test_persist_live_session_system_prompt_restores_pre_existing_override(tmp_path):
+    """reset_hermes_home_override() restores the previous ContextVar state,
+    not just the unset case: when a caller already holds an override, the
+    persist call must scope to the session's profile and then hand the
+    caller's override back, rather than clearing it to None."""
+    from hermes_constants import get_hermes_home_override
+
+    outer_home = tmp_path / "profile-outer"
+    outer_home.mkdir()
+    inner_home = tmp_path / "profile-inner"
+    inner_home.mkdir()
+    (inner_home / "SOUL.md").write_text(
+        "# Inner persona\nYou are the inner agent.", encoding="utf-8"
+    )
+
+    built_homes = []
+
+    class FakeAgent:
+        model = "test-model"
+        provider = "test"
+        _cached_system_prompt = None
+        _session_db = None
+
+        def _build_system_prompt(self, system_message=None):
+            from hermes_constants import get_hermes_home
+            built_homes.append(str(get_hermes_home()))
+            return "inner prompt"
+
+    class FakeDB:
+        def update_system_prompt(self, session_id, prompt):
+            pass
+
+    agent = FakeAgent()
+    agent._session_db = FakeDB()
+    session = {
+        "agent": agent,
+        "session_key": "test-key",
+        "profile_home": str(inner_home),
+    }
+
+    outer_token = set_hermes_home_override(outer_home)
+    try:
+        server._persist_live_session_system_prompt(session)
+
+        # The prompt was built under the session's profile, not the outer one.
+        assert built_homes == [str(inner_home)]
+        # The caller's pre-existing override survived, instead of being reset
+        # to None.
+        assert get_hermes_home_override() == str(outer_home)
+    finally:
+        reset_hermes_home_override(outer_token)
+    assert get_hermes_home_override() is None
