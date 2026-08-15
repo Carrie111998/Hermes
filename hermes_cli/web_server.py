@@ -287,6 +287,10 @@ app.include_router(_memory_oauth_router)
 # ---------------------------------------------------------------------------
 _SESSION_TOKEN = os.environ.get("HERMES_DASHBOARD_SESSION_TOKEN") or secrets.token_urlsafe(32)
 _SESSION_HEADER_NAME = "X-Hermes-Session-Token"
+# Ares Desktop builds published before the header rename still send this
+# equivalent session header. Keep it accepted while packaged clients upgrade;
+# it carries the same ephemeral per-process token.
+_LEGACY_SESSION_HEADER_NAME = "X-Ares-Session-Token"
 _SSH_OWNER_NONCE: Optional[str] = None
 
 
@@ -350,7 +354,9 @@ def _has_valid_session_token(request: Request) -> bool:
     accept the legacy Bearer path for backward compatibility with older
     dashboard bundles.
     """
-    session_header = request.headers.get(_SESSION_HEADER_NAME, "")
+    session_header = request.headers.get(_SESSION_HEADER_NAME, "") or request.headers.get(
+        _LEGACY_SESSION_HEADER_NAME, ""
+    )
     if session_header and hmac.compare_digest(
         session_header.encode(),
         _SESSION_TOKEN.encode(),
