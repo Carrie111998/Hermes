@@ -593,6 +593,40 @@ def _requires_argument(args_hint: str) -> bool:
     return args_hint.strip().startswith("<")
 
 
+def _alias_label() -> str:
+    """Return the localized ``alias`` label used in gateway help lines."""
+    try:
+        from agent.i18n import t
+    except Exception:  # pragma: no cover - i18n is optional at import time
+        return "alias"
+    value = t("gateway.help.alias")
+    return "alias" if value == "gateway.help.alias" else value
+
+
+def localized_command_description(name: str, description: str) -> str:
+    """Return the ``display.language`` translation of a command description.
+
+    Falls back to ``description`` (the registry's English text) whenever the
+    catalog has no entry for ``name`` -- which is the normal case for plugin
+    and skill commands, and for any locale that has not been translated yet.
+    Command *names* are never localized: Telegram's Bot API only accepts
+    latin letters, digits, and underscores.
+    """
+    key = f"command_descriptions.{name}"
+    try:
+        from agent.i18n import t
+    except Exception:  # pragma: no cover - i18n is optional at import time
+        return description
+    try:
+        value = t(key)
+    except Exception:  # pragma: no cover - a broken catalog must not break menus
+        logger.debug("command description lookup failed for %r", name, exc_info=True)
+        return description
+    # ``t`` echoes the key back when neither the target locale nor the English
+    # baseline defines it; treat that as "not translated".
+    return description if value == key else value
+
+
 def gateway_help_lines() -> list[str]:
     """Generate gateway help text lines from the registry."""
     overrides = _resolve_config_gates()
@@ -607,8 +641,10 @@ def gateway_help_lines() -> list[str]:
             if a.replace("-", "_") == cmd.name.replace("-", "_") and a != cmd.name:
                 continue
             alias_parts.append(f"`/{a}`")
-        alias_note = f" (alias: {', '.join(alias_parts)})" if alias_parts else ""
-        lines.append(f"`/{cmd.name}{args}` -- {cmd.description}{alias_note}")
+        alias_label = _alias_label()
+        alias_note = f" ({alias_label}: {', '.join(alias_parts)})" if alias_parts else ""
+        description = localized_command_description(cmd.name, cmd.description)
+        lines.append(f"`/{cmd.name}{args}` -- {description}{alias_note}")
     return lines
 
 
@@ -668,7 +704,11 @@ def telegram_bot_commands() -> list[tuple[str, str]]:
         # the menu hurts discoverability (issue #24312).
         tg_name = _sanitize_telegram_name(cmd.name)
         if tg_name:
-            result.append((tg_name, cmd.description))
+            # Look the translation up by canonical name -- ``tg_name`` has
+            # hyphens rewritten to underscores for the Bot API.
+            result.append(
+                (tg_name, localized_command_description(cmd.name, cmd.description))
+            )
     for name, description, args_hint in _iter_plugin_command_entries():
         if _requires_argument(args_hint):
             continue

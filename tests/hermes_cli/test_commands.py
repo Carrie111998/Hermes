@@ -1,5 +1,6 @@
 """Tests for the central command registry and autocomplete."""
 
+import pytest
 from prompt_toolkit.completion import CompleteEvent
 from prompt_toolkit.document import Document
 
@@ -21,6 +22,7 @@ from hermes_cli.commands import (
     _sanitize_telegram_name,
     discord_skill_commands,
     gateway_help_lines,
+    localized_command_description,
     resolve_command,
     slack_app_manifest,
     slack_native_slashes,
@@ -1036,3 +1038,54 @@ class TestPluginCommandEnumeration:
         slack_names = set(slack_subcommand_map())
         assert "status" in tg_names
         assert "status" in slack_names
+
+
+class TestLocalizedCommandDescriptions:
+    """`display.language` localizes /help and Telegram menu descriptions."""
+
+    @pytest.fixture(autouse=True)
+    def _clear_i18n_cache(self):
+        from agent import i18n
+
+        i18n.reset_language_cache()
+        yield
+        i18n.reset_language_cache()
+
+    def test_unknown_command_falls_back_to_registry_text(self, monkeypatch):
+        monkeypatch.setenv("HERMES_LANGUAGE", "ru")
+        assert (
+            localized_command_description("no-such-command", "Registry text")
+            == "Registry text"
+        )
+
+    def test_english_keeps_registry_descriptions(self, monkeypatch):
+        monkeypatch.setenv("HERMES_LANGUAGE", "en")
+        descriptions = dict(telegram_bot_commands())
+        assert descriptions["help"] == "Show available commands"
+
+    def test_russian_translates_menu_descriptions(self, monkeypatch):
+        monkeypatch.setenv("HERMES_LANGUAGE", "ru")
+        descriptions = dict(telegram_bot_commands())
+        assert descriptions["help"] == "Помощь по командам"
+        assert descriptions["new"] == "Новая сессия"
+        # Hyphenated names are looked up by canonical name, not the
+        # underscore-sanitized Telegram name.
+        assert descriptions["reload_mcp"] == "Перезагрузить MCP-серверы"
+
+    def test_untranslated_locale_falls_back_to_english(self, monkeypatch):
+        monkeypatch.setenv("HERMES_LANGUAGE", "ja")
+        descriptions = dict(telegram_bot_commands())
+        assert descriptions["help"] == "Show available commands"
+
+    def test_gateway_help_lines_are_localized(self, monkeypatch):
+        monkeypatch.setenv("HERMES_LANGUAGE", "ru")
+        joined = "\n".join(gateway_help_lines())
+        assert "Помощь по командам" in joined
+        assert "алиас:" in joined
+
+    def test_gateway_help_lines_stay_english_by_default(self, monkeypatch):
+        monkeypatch.setenv("HERMES_LANGUAGE", "en")
+        joined = "\n".join(gateway_help_lines())
+        assert "Show available commands" in joined
+        assert "alias:" in joined
+        assert "Помощь по командам" not in joined
