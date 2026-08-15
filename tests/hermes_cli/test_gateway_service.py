@@ -2083,8 +2083,13 @@ class TestGatewayStopGraceBudget:
     # never below 60s). The CLI's escalation must not land before this.
     MIN_PLATFORM_STOP_BUDGET = 25.0
 
-    def _stub_launchd_stop(self, monkeypatch, *, bootout_error=None):
-        """Drive launchd_stop() with launchctl and the exit wait instrumented."""
+    def _stub_launchd_stop(self, monkeypatch, *, bootout_error=None, exit_result=True):
+        """Drive launchd_stop() with launchctl and the exit wait instrumented.
+
+        ``exit_result`` is what the stubbed ``_wait_for_gateway_exit`` returns:
+        True for a gateway that exited inside the budget, False for one whose
+        PID is still alive when the wait gives up.
+        """
         waits = []
         terminations = []
 
@@ -2108,7 +2113,7 @@ class TestGatewayStopGraceBudget:
             gateway_cli,
             "_wait_for_gateway_exit",
             lambda timeout=None, force_after=None: (
-                waits.append((timeout, force_after)) or True
+                waits.append((timeout, force_after)) or exit_result
             ),
         )
         monkeypatch.setattr(
@@ -2136,6 +2141,35 @@ class TestGatewayStopGraceBudget:
         assert force_after is None, "CLI must not pre-empt launchd's ExitTimeOut"
         assert timeout >= self.MIN_PLATFORM_STOP_BUDGET
         assert terminations == [], "no signal is owed; bootout already sent SIGTERM"
+
+    @pytest.mark.parametrize("exited", [True, False])
+    def test_stop_claims_success_only_when_launchd_actually_reaped_the_process(
+        self, monkeypatch, capsys, exited
+    ):
+        """The success line must follow the wait's verdict, not just its return.
+
+        Waiting out launchd's ExitTimeOut instead of force-killing inside it
+        makes "the budget expired and the PID is still alive" a reachable
+        outcome rather than the near-impossibility it was when the CLI
+        SIGKILLed 5s in. _wait_for_gateway_exit() reports that by printing the
+        surviving PID and returning False, so an unconditional "✓ Service
+        stopped" prints directly underneath its own warning and tells the
+        operator the opposite of what happened -- who then restarts onto a
+        gateway still holding the WAL write lock, the PID file and the
+        runtime lock.
+        """
+        self._stub_launchd_stop(monkeypatch, exit_result=exited)
+
+        gateway_cli.launchd_stop()
+
+        out = capsys.readouterr().out
+        assert ("✓ Service stopped" in out) is exited, (
+            "the stop reported success without observing the process exit"
+            if not exited
+            else "a clean stop must still report success"
+        )
+        if not exited:
+            assert "still running" in out, "a failed stop must say so"
 
     @pytest.mark.parametrize(
         "returncode, why",
