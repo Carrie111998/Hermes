@@ -15280,6 +15280,29 @@ def test_session_not_evictable_violating_each_exemption(monkeypatch):
     assert server._session_is_evictable("s", _idle_evictable_session(now), now) is False
 
 
+def test_session_live_status_waiting_on_blocking_approval(monkeypatch):
+    """A session blocked on a dangerous-command approval must report
+    `waiting`, not `working` — the sidebar `needs-input` dot depends on
+    this status, and clarify/sudo already report `waiting` via
+    `_session_pending_kind`, but approvals live in a separate registry
+    (`tools/approval.py`) that this status previously never consulted."""
+    monkeypatch.setattr(server, "_session_pending_kind", lambda sid: "")
+    from tools import approval
+
+    monkeypatch.setattr(approval, "_gateway_queues", {"sess-key-1": ["entry"]})
+    session = {"running": True, "session_key": "sess-key-1"}
+    assert server._session_live_status("s", session) == "waiting"
+
+
+def test_session_live_status_working_without_pending_approval(monkeypatch):
+    monkeypatch.setattr(server, "_session_pending_kind", lambda sid: "")
+    from tools import approval
+
+    monkeypatch.setattr(approval, "_gateway_queues", {})
+    session = {"running": True, "session_key": "sess-key-1"}
+    assert server._session_live_status("s", session) == "working"
+
+
 def test_reap_idle_sessions_closes_only_evictable(monkeypatch):
     closed = []
     monkeypatch.setattr(server, "_session_pending_kind", lambda sid: "")
