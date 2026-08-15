@@ -17,7 +17,7 @@
 
 | Reference | Current evidence | Meaning |
 |---|---|---|
-| origin/main | 1b3d4449553433100038f38e7b58f2f2dc489fa7 | Canonical Hermes mainline after Calendar Guard correction PR #18. |
+| origin/main | 826349ccbfe165ef9f2f7f47f72ed53226c13603 | Canonical Hermes mainline after AUTH-002 target-config merge. |
 | origin/ticket/T0127-v2026.8.3-merged | release staging branch | DGX release input; not the ARCH merge target. |
 | live DGX checkout | /home/cwliao/.hermes/hermes-agent | Claude-owned; do not edit or reset. |
 | live DGX deployed commit | 1b3d4449553433100038f38e7b58f2f2dc489fa7 | Release snapshot deployed; gateway active after restart. |
@@ -94,6 +94,7 @@ docs/plans/2026-08-10-hermes-skills-roadmap.md.
 | HERMES-SKILLS-002 to HERMES-SKILLCLAW-001 | proposed | Select only after the relevant contract and evidence gates are reviewed. |
 | HERMES-AUTH-002 | READY_FOR_MERGE | Commit `5e8df81b6`; targeted tests 21 passed, CI run `31873607667` and Windows wrapper job `94985879064` passed, and authenticated DGX Claude/AGY implementation re-review reached PASS consensus; merge and deployment remain separate gates. |
 | HERMES-CALENDAR-GUARD-001 | MERGED_DEPLOYED | PR #17/#18 merged; immutable DGX release and recovery timer verified. |
+| HERMES-TELEGRAM-TRANSPORT-001 | REVIEW_PASS_PENDING_CI | `ticket/hermes-telegram-transport-001`; bounded pool lifecycle and jittered reconnect backoff implemented. Compile/diff checks pass; focused Telegram tests pass (`51 passed`) in a disposable pinned review venv; authenticated DGX Claude/AGY re-review reached PASS on packet `1dd4ffbd…66d5e`; CI is next. |
 
 ## Runtime and deployment boundary
 

@@ -10,6 +10,7 @@ import ast
 import asyncio
 from pathlib import Path
 import sys
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -222,6 +223,99 @@ async def test_reconnect_triggers_fatal_after_max_retries():
     assert adapter.has_fatal_error
     assert adapter.fatal_error_code == "telegram_network_error"
     fatal_handler.assert_called_once()
+
+
+def test_polling_retry_delay_is_jittered_and_bounded(monkeypatch):
+    """Reconnect backoff must spread attempts without exceeding its ceiling."""
+    monkeypatch.setattr(tg_adapter.random, "uniform", lambda _low, high: high)
+
+    first = tg_adapter._polling_retry_delay(1)
+    fourth = tg_adapter._polling_retry_delay(4)
+    exhausted = tg_adapter._polling_retry_delay(100)
+
+    assert 5.0 < first <= 6.0
+    assert 40.0 < fourth <= 48.0
+    assert exhausted == 60.0
+
+
+@pytest.mark.asyncio
+async def test_reconnect_uses_bounded_jittered_delay(monkeypatch):
+    """The reconnect ladder must consume the bounded delay helper."""
+    adapter = _make_adapter()
+    adapter._polling_network_error_count = 1
+    mock_app, _ = _make_mock_app()
+    adapter._app = mock_app
+    monkeypatch.setattr(tg_adapter, "_polling_retry_delay", lambda _attempt: 1.25)
+
+    with patch("asyncio.sleep", new_callable=AsyncMock) as sleep:
+        await adapter._handle_polling_network_error(Exception("network"))
+
+    sleep.assert_any_await(1.25)
+    await _complete_current_polling_generation(adapter)
+
+
+@pytest.mark.asyncio
+async def test_reconnect_continues_when_polling_pool_shutdown_hangs():
+    """A wedged pool shutdown cannot block the next polling generation."""
+    adapter = _make_adapter()
+    adapter._polling_network_error_count = 1
+    mock_app, mock_polling_req = _make_mock_app()
+
+    async def hang_shutdown():
+        await asyncio.Event().wait()
+
+    mock_polling_req.shutdown = hang_shutdown
+    adapter._app = mock_app
+
+    with patch.object(tg_adapter, "_POLLING_REQUEST_OP_TIMEOUT", 0.01), \
+        patch("asyncio.sleep", new_callable=AsyncMock):
+        await adapter._handle_polling_network_error(Exception("pool wedged"))
+
+    mock_polling_req.initialize.assert_awaited_once()
+    mock_app.updater.start_polling.assert_awaited_once()
+    await _complete_current_polling_generation(adapter)
+
+
+@pytest.mark.asyncio
+async def test_polling_pool_drain_remains_bounded_across_generations():
+    """A timed-out drain does not poison the next generation's pool reset."""
+    adapter = _make_adapter()
+    mock_app, mock_polling_req = _make_mock_app()
+    shutdown_calls = []
+
+    async def shutdown():
+        shutdown_calls.append(len(shutdown_calls) + 1)
+        if len(shutdown_calls) == 1:
+            await asyncio.Event().wait()
+
+    mock_polling_req.shutdown = shutdown
+    adapter._app = mock_app
+
+    with patch.object(tg_adapter, "_POLLING_REQUEST_OP_TIMEOUT", 0.01):
+        await adapter._drain_polling_connections()
+        await adapter._drain_polling_connections()
+
+    assert shutdown_calls == [1, 2]
+    assert mock_polling_req.initialize.await_count == 2
+
+
+def test_polling_progress_accepts_empty_success_and_rejects_stale_generation():
+    """Only the current generation's successful getUpdates response heals it."""
+    adapter = _make_adapter()
+    first_generation, first_progress = adapter._begin_polling_generation()
+    second_generation, second_progress = adapter._begin_polling_generation()
+    request = SimpleNamespace(
+        parse_json_payload=lambda _payload: {"ok": True, "result": []}
+    )
+
+    adapter._observe_polling_request_result(request, first_generation, (200, b"{}"))
+    assert not first_progress.is_set()
+    assert not second_progress.is_set()
+    assert adapter._send_path_degraded is True
+
+    adapter._observe_polling_request_result(request, second_generation, (200, b"{}"))
+    assert second_progress.is_set()
+    assert adapter._send_path_degraded is False
 
 
 # ---------------------------------------------------------------------------

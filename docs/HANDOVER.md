@@ -13,10 +13,9 @@
 - **Working checkout:** `D:/PROJECT/Hermes/.worktrees/hermes-auth-002`.
 - **Canonical remote:** `origin` -> `git@github.com:cwliao/hermes-agent.git`.
 - **Canonical mainline:** `origin/main` at
-  `1b3d4449553433100038f38e7b58f2f2dc489fa7`.
-- **Current checkout branch:** `ticket/hermes-auth-002-target-config`.
-- **Current checkout HEAD at implementation-review handoff:** `5e8df81b6`
-  (`test: isolate DGX wrapper resolver harness`).
+  `826349ccbfe165ef9f2f7f47f72ed53226c13603`.
+- **Current checkout branch:** `ticket/hermes-telegram-transport-001`.
+- **Current checkout HEAD at implementation handoff:** `6bb24ec25`.
 - **DGX runtime:** configured target, checkout
   `/home/cwliao/.hermes/hermes-agent`, service `hermes-gateway.service`.
 - **In scope:** Hermes CLI, gateway, runtime state, platform adapters, CI,
@@ -27,9 +26,9 @@
 
 ## 2. Goal and roadmap
 
-- **Current goal:** Merge the independently reviewed and CI-green
-  `HERMES-AUTH-002` implementation when the merge authorization is exercised;
-  keep deployment separately authorized.
+- **Current goal:** Complete implementation review and CI for
+  `HERMES-TELEGRAM-TRANSPORT-001`; keep merge and deployment separately
+  authorized.
 - **Completed and verified:** HERMES-AUTH-001 merged as PR #14 at
   `63bcd7ac` after main CI run `31791195033` passed all required checks,
   including the Windows wrapper job.
@@ -42,9 +41,11 @@
   the configured SPARK target. Gateway polling still reports network timeout /
   reconnect warnings, so inbound polling is not claimed as healthy.
 - **Deferred or pending:** HERMES-MONITORING-001 remains `BLOCKED`;
-  HERMES-AUTH-002 is `READY_FOR_MERGE` after CI and independent
-  implementation-review consensus. Live skill synchronization,
-  SkillClaw work, and unrelated DGX service changes remain separate work.
+  `HERMES-TELEGRAM-TRANSPORT-001` is `REVIEW_PASS_PENDING_CI` with local
+  compile/diff checks passed and focused pytest passing in the disposable
+  pinned review venv (`51 passed`).
+  Live skill synchronization, SkillClaw work, and unrelated DGX service
+  changes remain separate work.
 
 ## 3. Verified runtime and deployment state
 
@@ -65,15 +66,14 @@
 
 ## 4. Ticket and gate state
 
-### Current ticket: HERMES-AUTH-002
+### Current ticket: HERMES-TELEGRAM-TRANSPORT-001
 
-- **Plan:** `docs/plans/2026-08-14-hermes-auth-002-target-config.md`
-- **Status:** `READY_FOR_MERGE`.
-- **Scope:** parameterize public DGX SSH host/user metadata through existing
-  Hermes user configuration; preserve strict host-key and fail-closed auth
-  behavior.
-- **Required next action:** merge PR #16 after verifying its current
-  ready-for-merge state. Keep deployment separately authorized.
+- **Plan:** `docs/plans/2026-08-15-hermes-telegram-transport-001.md`
+- **Status:** `REVIEW_PASS_PENDING_CI`.
+- **Scope:** bounded Telegram polling recovery with generation-bound progress,
+  request-pool lifecycle bounds, jittered retry backoff, and hermetic tests.
+- **Required next action:** run CI for the reviewed correction set. Keep merge
+  and deployment separately authorized.
 
 ### Other ticket state
 
@@ -92,9 +92,9 @@
 
 Ticket implementation, local tests, independent cross-review, reconciliation,
 CI, merge, DGX deployment, runtime health, and Telegram delivery are separate
-gates. A pass at one gate cannot be reported as a pass at another. The
-AUTH-002 implementation-review and CI gates are complete; merge and deployment
-are not complete. Telegram readiness and future ticket gates remain separate.
+gates. A pass at one gate cannot be reported as a pass at another. The current
+Telegram ticket has implementation evidence but no implementation-review,
+CI, merge, deployment, or live inbound evidence yet.
 
 ## 5. Safe continuation instructions
 

@@ -15,6 +15,7 @@ import json
 import logging
 import os
 import html as _html
+import random
 import re
 import threading
 from contextvars import ContextVar
@@ -475,12 +476,32 @@ _UPDATER_STOP_TIMEOUT = 15.0
 # reconnect ladder from stalling indefinitely and allows the heartbeat loop to
 # trigger its own recovery path. Refs: NousResearch/hermes-agent#59614
 _UPDATER_START_TIMEOUT = 30.0
+# Each request-pool lifecycle operation must be bounded independently. A
+# wedged httpx client must not hold the reconnect owner forever while it waits
+# for shutdown or initialization to finish.
+_POLLING_REQUEST_OP_TIMEOUT = 15.0
 # A generation is not healthy until the dedicated getUpdates request returns
 # successfully. This exceeds a normal long-poll cycle for healthy idle bots.
 _POLLING_PROGRESS_TIMEOUT = 60.0
 _POLLING_GENERATION_CONTEXT: ContextVar[Optional[int]] = ContextVar(
     "telegram_polling_generation", default=None
 )
+_POLLING_RETRY_BASE_DELAY = 5.0
+_POLLING_RETRY_MAX_DELAY = 60.0
+_POLLING_RETRY_JITTER_RATIO = 0.20
+
+
+def _polling_retry_delay(attempt: int) -> float:
+    """Return a bounded exponential reconnect delay with multiplicative jitter."""
+    exponential = min(
+        _POLLING_RETRY_BASE_DELAY * (2 ** max(attempt - 1, 0)),
+        _POLLING_RETRY_MAX_DELAY,
+    )
+    jitter = random.uniform(
+        1.0 - _POLLING_RETRY_JITTER_RATIO,
+        1.0 + _POLLING_RETRY_JITTER_RATIO,
+    )
+    return min(_POLLING_RETRY_MAX_DELAY, exponential * jitter)
 
 
 class _PollingLifecycleAbort(RuntimeError):
@@ -1918,16 +1939,30 @@ class TelegramAdapter(BasePlatformAdapter):
         except Exception:
             return
         try:
-            await polling_req.shutdown()
+            await asyncio.wait_for(
+                polling_req.shutdown(), timeout=_POLLING_REQUEST_OP_TIMEOUT
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "[%s] Polling request shutdown timed out; continuing reconnect",
+                self.name,
+            )
         except Exception:
             logger.debug(
                 "[%s] Polling request shutdown failed (non-fatal)",
                 self.name, exc_info=True,
             )
         try:
-            await polling_req.initialize()
+            await asyncio.wait_for(
+                polling_req.initialize(), timeout=_POLLING_REQUEST_OP_TIMEOUT
+            )
             logger.debug(
                 "[%s] Polling request pool drained before reconnect", self.name
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "[%s] Polling request initialize timed out; reconnect remains bounded",
+                self.name,
             )
         except Exception:
             logger.debug(
@@ -2247,7 +2282,8 @@ class TelegramAdapter(BasePlatformAdapter):
         reconnect, etc.).  The gateway process stays alive but the long-poll
         connection silently dies; without this handler the bot never recovers.
 
-        Strategy: exponential back-off (5s, 10s, 20s, 40s, 60s cap) up to
+        Strategy: jittered exponential back-off (5s, 10s, 20s, 40s, 60s cap)
+        up to
         MAX_NETWORK_RETRIES attempts, then mark the adapter retryable-fatal so
         the supervisor restarts the gateway process.
         """
@@ -2257,8 +2293,6 @@ class TelegramAdapter(BasePlatformAdapter):
             return
 
         MAX_NETWORK_RETRIES = 10
-        BASE_DELAY = 5
-        MAX_DELAY = 60
 
         self._polling_network_error_count += 1
         self._send_path_degraded = True
@@ -2274,10 +2308,10 @@ class TelegramAdapter(BasePlatformAdapter):
             await self._notify_fatal_error()
             return
 
-        delay = min(BASE_DELAY * (2 ** (attempt - 1)), MAX_DELAY)
+        delay = _polling_retry_delay(attempt)
         safe_error = _redact_telegram_error_text(error)
         logger.warning(
-            "[%s] Telegram network error (attempt %d/%d), reconnecting in %ds. Error: %s",
+            "[%s] Telegram network error (attempt %d/%d), reconnecting in %.1fs. Error: %s",
             self.name, attempt, MAX_NETWORK_RETRIES, delay, safe_error,
         )
         await asyncio.sleep(delay)
