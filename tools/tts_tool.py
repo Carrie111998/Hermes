@@ -2099,7 +2099,20 @@ def _generate_xai_tts(text: str, output_path: str, tts_config: Dict[str, Any]) -
 
     from tools.xai_http import resolve_xai_http_credentials
 
-    creds = resolve_xai_http_credentials()
+    # TTS is API-billed. Prefer an explicit API key because subscription OAuth
+    # can authorize chat while returning 403 for /v1/tts. Other xAI features
+    # keep the general OAuth-first resolver order.
+    explicit_key = str(get_env_value("XAI_API_KEY") or "").strip()
+    if explicit_key:
+        creds = {
+            "provider": "xai",
+            "api_key": explicit_key,
+            "base_url": str(
+                get_env_value("XAI_BASE_URL") or DEFAULT_XAI_BASE_URL
+            ).strip().rstrip("/"),
+        }
+    else:
+        creds = resolve_xai_http_credentials()
     api_key = str(creds.get("api_key") or "").strip()
     if not api_key:
         raise ValueError("No xAI credentials found. Configure xAI OAuth in `hermes model` or set XAI_API_KEY.")

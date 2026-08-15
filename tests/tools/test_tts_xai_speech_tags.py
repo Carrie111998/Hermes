@@ -158,6 +158,44 @@ def test_generate_xai_tts_uses_oauth_pinned_base_url(tmp_path, monkeypatch):
     assert captured["headers"]["Authorization"] == "Bearer oauth-bearer-token"
 
 
+def test_generate_xai_tts_prefers_explicit_api_key_over_oauth(tmp_path, monkeypatch):
+    """TTS requires API billing even when chat OAuth is configured (#87045)."""
+    captured = {}
+
+    class FakeResponse:
+        content = b"audio"
+
+        def raise_for_status(self):
+            pass
+
+    def fake_post(url, *, headers, json, timeout, stream):
+        captured["url"] = url
+        captured["headers"] = headers
+        return FakeResponse()
+
+    monkeypatch.setattr(
+        "tools.tts_tool.get_env_value",
+        lambda name, default=None: {
+            "XAI_API_KEY": "paid-api-key",
+            "XAI_BASE_URL": "https://api-key.example/v1/",
+        }.get(name, default),
+    )
+    monkeypatch.setattr(
+        "tools.xai_http.resolve_xai_http_credentials",
+        lambda: {
+            "provider": "xai-oauth",
+            "api_key": "oauth-token",
+            "base_url": "https://oauth.example/v1",
+        },
+    )
+    monkeypatch.setattr("requests.post", fake_post)
+
+    _generate_xai_tts("hello", str(tmp_path / "out.mp3"), {})
+
+    assert captured["headers"]["Authorization"] == "Bearer paid-api-key"
+    assert captured["url"] == "https://api-key.example/v1/tts"
+
+
 def test_auto_speech_tags_calls_auxiliary_rewriter_with_tts_audio_tags_task():
     """When input has no explicit speech tags, the function must call the
     auxiliary rewriter with task='tts_audio_tags' and a system prompt
