@@ -1596,6 +1596,23 @@ def _reap_unsupervised_gateway_orphans(extra_exclude: set | None = None) -> bool
         orphans = [p for p in find_gateway_pids(exclude_pids=own) if p and p > 0]
     except Exception:
         return False
+    if is_windows():
+        # Stale/missing-pidfile hardening: the exemption above only knows the
+        # recorded PID, but service launchers stamp HERMES_GATEWAY_DETACHED=1
+        # on supervised gateway processes, so a live Scheduled-Task gateway is
+        # still identifiable even when gateway.pid is stale or missing.
+        # Best-effort: if the env can't be read, keep current behaviour.
+        try:
+            import psutil  # type: ignore
+
+            orphans = [
+                p
+                for p in orphans
+                if psutil.Process(p).environ().get("HERMES_GATEWAY_DETACHED", "").strip().lower()
+                != "1"
+            ]
+        except Exception:
+            pass
     if not orphans:
         return False
 

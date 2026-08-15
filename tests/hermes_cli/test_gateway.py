@@ -509,10 +509,17 @@ class TestReapUnsupervisedGatewayOrphansWindows:
     """
 
     @staticmethod
-    def _install_fake_psutil(monkeypatch, chain):
+    def _install_fake_psutil(monkeypatch, chain, environ=None):
         """Install a fake psutil module exposing the given process chain."""
         by_pid = {proc.pid: proc for proc in chain}
-        fake_psutil = SimpleNamespace(Process=lambda pid: by_pid[pid])
+        envs = environ or {}
+
+        def _process(pid):
+            proc = by_pid[pid]
+            proc.environ = lambda: envs.get(pid, {})
+            return proc
+
+        fake_psutil = SimpleNamespace(Process=_process)
         monkeypatch.setitem(sys.modules, "psutil", fake_psutil)
 
     def test_windows_excludes_recorded_pid_and_bootstrap_from_kill(self, monkeypatch):
@@ -599,6 +606,51 @@ class TestReapUnsupervisedGatewayOrphansWindows:
 
         assert result is False  # no orphans reaped
         assert killed_pids == []  # nothing was killed
+
+    def test_windows_spares_detached_marker_gateway_when_pidfile_stale(self, monkeypatch):
+        """Even with a stale/missing pidfile, a HERMES_GATEWAY_DETACHED=1
+        process must not be reaped (env-marker hardening, #86100 review)."""
+        detached_pid = 52617  # Scheduled-Task gateway (env marker set)
+        orphan_pid = 99998    # a real orphan that should still be reaped
+
+        monkeypatch.setattr(gateway, "is_windows", lambda: True)
+        monkeypatch.setattr(gateway, "is_macos", lambda: False)
+        monkeypatch.setattr(gateway, "supports_systemd_services", lambda: False)
+
+        detached = SimpleNamespace(pid=detached_pid, parent=lambda: None)
+        orphan = SimpleNamespace(pid=orphan_pid, parent=lambda: None)
+        self._install_fake_psutil(
+            monkeypatch,
+            [detached, orphan],
+            environ={detached_pid: {"HERMES_GATEWAY_DETACHED": "1"}},
+        )
+
+        # Stale pidfile: get_running_pid() returns None, so no pidfile-based
+        # exemption applies — only the env marker protects the gateway.
+        monkeypatch.setattr("gateway.status.get_running_pid", lambda: None)
+        monkeypatch.setattr(
+            gateway,
+            "find_gateway_pids",
+            lambda exclude_pids=None: [
+                p
+                for p in [detached_pid, orphan_pid]
+                if p not in (exclude_pids or set())
+            ],
+        )
+
+        killed_pids = []
+        monkeypatch.setattr(gateway.os, "kill", lambda pid, sig: killed_pids.append((pid, sig)))
+        monkeypatch.setattr("gateway.status._pid_exists", lambda pid: False)
+        monkeypatch.setattr("gateway.status.write_planned_stop_marker", lambda pid: None)
+        monkeypatch.setattr("time.sleep", lambda _: None)
+        monkeypatch.setattr("time.monotonic", lambda: 1.0)
+
+        result = gateway._reap_unsupervised_gateway_orphans()
+
+        assert result is True  # the real orphan was reaped
+        killed = [pid for pid, _ in killed_pids]
+        assert orphan_pid in killed       # the real orphan was killed
+        assert detached_pid not in killed  # the detached-marked gateway survived
 
 
 def test_module_has_logger():
