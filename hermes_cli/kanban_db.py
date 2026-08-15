@@ -9396,7 +9396,8 @@ def check_respawn_guard(
         requeued_after = conn.execute(
             "SELECT 1 FROM task_events "
             "WHERE task_id = ? AND created_at >= ? "
-            "AND kind IN ('status', 'promoted', 'unblocked', 'reclaimed') "
+            "AND kind IN ('status', 'promoted', 'unblocked', 'reclaimed', "
+            "'review_reopened') "
             "LIMIT 1",
             (task_id, completed_at),
         ).fetchone()
@@ -9404,6 +9405,19 @@ def check_respawn_guard(
             return "recent_success"
 
     # 4. GitHub PR URL in a recent comment — prior worker already opened a PR.
+    #    Exception: review_reopened is the canonical, explicit instruction to
+    #    continue work on that SAME PR. Only bypass while the latest review
+    #    lifecycle event is a reopen; once the worker requests review again,
+    #    the ordinary active-PR guard applies to any accidental ready requeue.
+    latest_review_event = conn.execute(
+        "SELECT kind FROM task_events WHERE task_id = ? "
+        "AND kind IN ('review_requested', 'review_reopened') "
+        "ORDER BY created_at DESC, id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if latest_review_event and latest_review_event["kind"] == "review_reopened":
+        return None
+
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
     for c in conn.execute(
         "SELECT body FROM task_comments WHERE task_id = ? AND created_at >= ?",
