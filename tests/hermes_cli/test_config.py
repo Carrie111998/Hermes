@@ -846,6 +846,7 @@ class TestCustomProviderCompatibility:
                             "extra_body": {
                                 "chat_template_kwargs": {"enable_thinking": False}
                             },
+                            "pricing": {"currency": "RUB", "rate": 0.011},
                         },
                         {
                             "name": "List Models",
@@ -876,6 +877,7 @@ class TestCustomProviderCompatibility:
         assert provider["extra_body"] == {
             "chat_template_kwargs": {"enable_thinking": False}
         }
+        assert provider["pricing"] == {"currency": "RUB", "rate": 0.011}
         assert raw["providers"]["list-models"]["models"] == {
             "alpha": {},
             "beta": {},
@@ -886,6 +888,10 @@ class TestCustomProviderCompatibility:
         )
         assert compatible_provider["models"] == model_map
         assert compatible_provider["key_env"] == "KIMI_CODING_API_KEY"
+        assert compatible_provider["pricing"] == {
+            "currency": "RUB",
+            "rate": 0.011,
+        }
 
     def test_providers_dict_resolves_at_runtime(self, tmp_path):
         """After migration deleted custom_providers, get_compatible_custom_providers

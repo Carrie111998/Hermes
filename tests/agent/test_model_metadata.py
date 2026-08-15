@@ -567,6 +567,42 @@ class TestFetchEndpointModelMetadata:
         not_found.close.assert_called_once()
         success.close.assert_called_once()
 
+    def test_currency_semantics_survive_endpoint_metadata_normalization(self):
+        import agent.model_metadata as mm
+
+        response = MagicMock()
+        response.status_code = 200
+        response.json.return_value = {
+            "data": [
+                {
+                    "id": "nested",
+                    "pricing": {
+                        "prompt": "0.000008137",
+                        "completion": "0.000020133",
+                        "currency": "RUB",
+                        "rate": "0.011",
+                    },
+                },
+                {
+                    "id": "top-level",
+                    "pricing": {
+                        "prompt": "0.000008137",
+                        "completion": "0.000020133",
+                    },
+                    "currency": "RUB",
+                    "rate": "0.011",
+                },
+            ]
+        }
+
+        with patch("agent.model_metadata.requests.get", return_value=response):
+            result = mm.fetch_endpoint_model_metadata("https://custom.example/v1")
+
+        assert result["nested"]["pricing"]["currency"] == "RUB"
+        assert result["nested"]["pricing"]["rate"] == "0.011"
+        assert result["top-level"]["currency"] == "RUB"
+        assert result["top-level"]["rate"] == "0.011"
+
 
 # =========================================================================
 # Nous Portal context-window resolution (provider="nous")

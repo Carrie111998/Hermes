@@ -1,4 +1,7 @@
+from decimal import Decimal
 from types import SimpleNamespace
+
+import pytest
 
 from agent.usage_pricing import (
     CanonicalUsage,
@@ -8,13 +11,6 @@ from agent.usage_pricing import (
     normalize_usage,
     resolve_billing_route,
 )
-from decimal import Decimal
-
-
-
-
-
-
 
 
 def test_normalize_usage_reads_deepseek_native_cache_hit_tokens():
@@ -314,6 +310,166 @@ def test_vertex_default_model_estimates_cached_usage(monkeypatch):
 
     assert result.status == "estimated"
     assert result.amount_usd is not None and result.amount_usd > 0
+
+
+def test_custom_endpoint_converts_declared_rub_pricing_to_usd(monkeypatch):
+    """A non-USD catalog rate must be converted before entering USD accounting."""
+    monkeypatch.setattr(
+        "agent.usage_pricing.fetch_endpoint_model_metadata",
+        lambda *_args, **_kwargs: {
+            "deepseek/deepseek-v4-flash": {
+                "pricing": {
+                    "prompt": "0.000008137",
+                    "completion": "0.000020133",
+                    "cache_read": "0.000001",
+                    "cache_write": "0.000002",
+                    "request": "1.5",
+                    "currency": "RUB",
+                    "rate": "0.011",
+                }
+            }
+        },
+    )
+
+    entry = get_pricing_entry(
+        "deepseek/deepseek-v4-flash",
+        provider="custom",
+        base_url="https://router.example/v1",
+    )
+
+    assert entry is not None
+    assert entry.input_cost_per_million == Decimal("0.089507")
+    assert entry.output_cost_per_million == Decimal("0.221463")
+    assert entry.cache_read_cost_per_million == Decimal("0.011")
+    assert entry.cache_write_cost_per_million == Decimal("0.022")
+    assert entry.request_cost == Decimal("0.0165")
+
+
+def test_custom_endpoint_uses_provider_currency_override(monkeypatch):
+    """Provider config supplies currency semantics when /models omits them."""
+    monkeypatch.setattr(
+        "agent.usage_pricing.fetch_endpoint_model_metadata",
+        lambda *_args, **_kwargs: {
+            "model": {
+                "pricing": {"prompt": "0.000008137", "completion": "0.000020133"}
+            }
+        },
+    )
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config_readonly",
+        lambda: {
+            "providers": {
+                "router": {
+                    "api": "https://router.example/v1/",
+                    "pricing": {"currency": "RUB", "rate": "0.011"},
+                }
+            }
+        },
+    )
+
+    entry = get_pricing_entry(
+        "model", provider="custom", base_url="https://router.example/v1"
+    )
+
+    assert entry is not None
+    assert entry.input_cost_per_million == Decimal("0.089507")
+    assert entry.output_cost_per_million == Decimal("0.221463")
+
+
+def test_named_custom_provider_selects_its_own_same_url_override(monkeypatch):
+    monkeypatch.setattr(
+        "agent.usage_pricing.fetch_endpoint_model_metadata",
+        lambda *_args, **_kwargs: {
+            "model": {"pricing": {"prompt": "0.000001", "completion": "0.000002"}}
+        },
+    )
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config_readonly",
+        lambda: {
+            "providers": {
+                "first": {
+                    "api": "https://router.example/v1",
+                    "pricing": {"currency": "RUB", "rate": "0.01"},
+                },
+                "second": {
+                    "api": "https://router.example/v1",
+                    "pricing": {"currency": "RUB", "rate": "0.02"},
+                },
+            }
+        },
+    )
+
+    entry = get_pricing_entry(
+        "model", provider="second", base_url="https://router.example/v1"
+    )
+
+    assert entry is not None
+    assert entry.input_cost_per_million == Decimal("0.02")
+    assert entry.output_cost_per_million == Decimal("0.04")
+
+
+def test_custom_endpoint_rejects_non_usd_pricing_without_rate(monkeypatch):
+    """Never relabel a declared foreign-currency amount as USD by guessing."""
+    monkeypatch.setattr(
+        "agent.usage_pricing.fetch_endpoint_model_metadata",
+        lambda *_args, **_kwargs: {
+            "model": {
+                "pricing": {
+                    "prompt": "0.000008137",
+                    "completion": "0.000020133",
+                    "currency": "RUB",
+                }
+            }
+        },
+    )
+
+    assert (
+        get_pricing_entry(
+            "model", provider="custom", base_url="https://router.example/v1"
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize("rate", ["NaN", "Infinity"])
+def test_custom_endpoint_rejects_nonfinite_currency_rate(monkeypatch, rate):
+    monkeypatch.setattr(
+        "agent.usage_pricing.fetch_endpoint_model_metadata",
+        lambda *_args, **_kwargs: {
+            "model": {
+                "pricing": {
+                    "prompt": "0.000008137",
+                    "completion": "0.000020133",
+                    "currency": "RUB",
+                    "rate": rate,
+                }
+            }
+        },
+    )
+
+    assert (
+        get_pricing_entry(
+            "model", provider="custom", base_url="https://router.example/v1"
+        )
+        is None
+    )
+
+
+def test_custom_endpoint_keeps_legacy_usd_pricing_unchanged(monkeypatch):
+    monkeypatch.setattr(
+        "agent.usage_pricing.fetch_endpoint_model_metadata",
+        lambda *_args, **_kwargs: {
+            "model": {"pricing": {"prompt": "0.000001", "completion": "0.000002"}}
+        },
+    )
+
+    entry = get_pricing_entry(
+        "model", provider="custom", base_url="https://usd.example/v1"
+    )
+
+    assert entry is not None
+    assert entry.input_cost_per_million == Decimal("1")
+    assert entry.output_cost_per_million == Decimal("2")
 
 
 def test_normalize_usage_minimax_logs_cache_observability(caplog):
