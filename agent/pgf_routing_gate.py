@@ -55,6 +55,15 @@ _BRAIN_TO_RUNTIME: dict[str, tuple[str, str]] = {
     "openrouter": ("openrouter", "deepseek/deepseek-v4-flash"),
     "deepseek": ("openrouter", "deepseek/deepseek-v4-flash"),
 }
+
+#: FREE execution workers -> concrete invocable provider/model (Rule E). These
+#: are EXECUTORS, never Brains. The runtime routing engine selects them
+#: (policy_status=FREE) for bounded mechanical work; the gate dispatches to the
+#: actual free model here. Both are the configured free-tier endpoints.
+_FREE_WORKER_TO_RUNTIME: dict[str, tuple[str, str]] = {
+    "nemotron": ("openrouter", "nvidia/nemotron-3-super-120b-a12b:free"),
+    "stepfun": ("nous", "stepfun/step-3.7-flash:free"),
+}
 _PYTHON = "/usr/bin/python3"
 _PLAN_TIMEOUT_S = 15.0
 
@@ -322,6 +331,111 @@ def _apply_selection(agent, brain: str, *, failed_provider: str | None = None, p
         return False
 
 
+# --- FREE execution lane (Rule E) -----------------------------------------
+
+#: Task classes eligible for a FREE worker as the EXECUTOR. Critical reasoning
+#: and architecture/review are NEVER eligible — quality preserved for Claude.
+_FREE_ELIGIBLE_CLASSES = frozenset(
+    {
+        "MECHANICAL_EXECUTION",
+        "TEST_VALIDATION",
+        "SUMMARIZATION",
+        "NORMAL_CODING",
+    }
+)
+
+
+def free_worker_eligible(task_class: str | None) -> bool:
+    """True only for bounded mechanical tasks eligible for a FREE worker. Critical
+    reasoning (ARCHITECTURE, COMPLEX_DEBUGGING, CODE_REVIEW, CRITICAL_REASONING)
+    is never sent to a free model merely because it is free."""
+    return bool(task_class and task_class.upper() in _FREE_ELIGIBLE_CLASSES)
+
+
+def _run_free_worker(agent, worker: str, plan: dict | None) -> bool:
+    """Dispatch the current task to a FREE worker executor.
+
+    Returns True only when the agent's runtime provider/model were actually set
+    to the free endpoint (so the next invocation uses the FREE model). Never
+    promotes the free worker to Brain. Persists the FREE dispatch record.
+    """
+    pair = _FREE_WORKER_TO_RUNTIME.get(worker)
+    if pair is None:
+        logger.warning("pgf_routing_gate: free worker %r has no runtime mapping", worker)
+        return False
+    provider, model = pair
+    try:
+        agent.provider = provider
+        agent.model = model
+        agent.requested_provider = provider
+        if hasattr(agent, "_transport_cache"):
+            try:
+                agent._transport_cache.clear()
+            except Exception:  # noqa: BLE001
+                pass
+        _persist_free_utilization(
+            worker=worker,
+            task_class=getattr(agent, "_pgf_task_class", "MECHANICAL_EXECUTION"),
+            provider=provider,
+            model=model,
+            outcome="dispatched",
+        )
+        logger.info("pgf_routing_gate: FREE lane dispatched worker=%s -> %s/%s", worker, provider, model)
+        return True
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("pgf_routing_gate: free dispatch failed: %s", exc)
+        return False
+
+
+FREE_QUALITY_GATES = [  # deterministic checks; cheap/free to run
+    "expected_files_changed",
+    "tests",
+    "ruff_lint",
+    "type_checks",
+    "diff_scope",
+    "schema_output_validation",
+    "no_unauthorized_files",
+    "no_governance_violation",
+]
+
+
+def evaluate_free_quality_gate(worker: str, task_class: str | None, gate_results: dict | None = None) -> bool:
+    """Deterministic quality gate for FREE worker output. The free output is
+    PROVISIONAL until every applicable gate passes.
+
+    `gate_results` maps gate-name -> bool (PASS). When omitted (or present),
+    all configured gates must be PASS. Returns True (accept) only on full pass.
+    """
+    results = gate_results if gate_results is not None else {}
+    for gate in FREE_QUALITY_GATES:
+        val = results.get(gate)
+        if val is not True:
+            _persist_free_utilization(
+                worker=worker, task_class=task_class,
+                provider=None, model=None,
+                outcome=f"quality_gate_failed:{gate}" if val is False else "quality_gate_pending",
+            )
+            return False
+    return True
+
+
+def _persist_free_utilization(*, worker: str, task_class: str | None, provider: str | None,
+                              model: str | None, outcome: str) -> str | None:
+    """Persist a FREE-worker utilization / quality-gate record for audit + /pgf."""
+    try:
+        records = _PGF_REPO_ROOT / ".pgf" / "control-plane" / "orchestration-decisions"
+        records.mkdir(parents=True, exist_ok=True)
+        path = records / f"free-utilization-{_ts()}.json"
+        payload = {
+            "worker": worker, "task_class": task_class,
+            "provider": provider, "model": model, "outcome": outcome,
+        }
+        path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+        return str(path)
+    except OSError:
+        return None
+
+
 def _persist_replan_activation(
     *, failed_provider: str | None, selected_brain: str | None,
     executor: str | None, activation_result: str,
@@ -508,6 +622,20 @@ def route_pre_invocation(agent, user_message: Any = None, task_id: str | None = 
             expected_billing = "PAYG_AUTO"
         elif status == "PAYG_ESCALATION":
             expected_billing = "PAYG (cost gate)"
+        executor = plan_dict.get("executor")
+
+        # FREE EXECUTION LANE (Rule E): when the routing engine selected a FREE
+        # worker executor for an ELIGIBLE mechanical task, actually dispatch to
+        # the free model so real workload uses it instead of PAYG. The free
+        # worker becomes the runtime provider/model (never the Brain). A
+        # non-eligible class (critical reasoning) never routes to free.
+        free_dispatched = False
+        if status == "FREE" and executor in _FREE_WORKER_TO_RUNTIME and free_worker_eligible(classified):
+            free_dispatched = _run_free_worker(agent, executor, plan_dict)
+            if free_dispatched:
+                brain = None
+                agent._pgf_governed_free_worker = executor
+                logger.info("pgf_routing_gate: FREE lane active for %s via %s", classified, executor)
 
         # Persist full audit: task class, quota snapshot, brain, executor,
         # reasoning, expected billing class.

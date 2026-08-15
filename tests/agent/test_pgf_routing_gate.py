@@ -291,3 +291,48 @@ def test_f1_rollback_undoes_mutation_when_prior_attr_was_none(gate):
     # The rejected brain must not be left on requested_provider.
     assert not hasattr(a, "requested_provider") or a.requested_provider != "anthropic"
     assert not hasattr(a, "_pgf_governed_brain") or a._pgf_governed_brain != "claude"
+
+
+# --- FREE execution lane (Rule E) ----------------------------------------
+
+
+def test_free_worker_dispatch_uses_free_model(gate):
+    """A FREE plan dispatches the runtime to the free model, not PAYG."""
+    a = _agent(marker=True, task_class="MECHANICAL_EXECUTION")
+    a.provider = "deepseek"  # would otherwise be the fallback executor
+    plan = {"status": "FREE", "brain": None, "executor": "nemotron"}
+    ok = gate._run_free_worker(a, "nemotron", plan)
+    assert ok is True
+    assert a.provider == "openrouter"
+    assert a.model == "nvidia/nemotron-3-super-120b-a12b:free"
+
+
+def test_free_worker_never_brain_for_architecture(gate):
+    """ARCHITECTURE is not free-eligible — critical reasoning never goes free."""
+    assert gate.free_worker_eligible("ARCHITECTURE") is False
+    assert gate.free_worker_eligible("COMPLEX_DEBUGGING") is False
+    assert gate.free_worker_eligible("CODE_REVIEW") is False
+    assert gate.free_worker_eligible("CRITICAL_REASONING") is False
+
+
+def test_free_worker_eligible_mechanical(gate):
+    """Mechanical/test/summarization classes ARE free-eligible."""
+    assert gate.free_worker_eligible("MECHANICAL_EXECUTION") is True
+    assert gate.free_worker_eligible("TEST_VALIDATION") is True
+    assert gate.free_worker_eligible("SUMMARIZATION") is True
+    assert gate.free_worker_eligible("NORMAL_CODING") is True
+
+
+def test_free_quality_gate_passes_only_on_full_accept(gate):
+    """Free output is provisional until every deterministic gate passes."""
+    full = {g: True for g in gate.FREE_QUALITY_GATES}
+    assert gate.evaluate_free_quality_gate("nemotron", "MECHANICAL_EXECUTION", full) is True
+    assert gate.evaluate_free_quality_gate("nemotron", "MECHANICAL_EXECUTION", {"tests": False}) is False
+    assert gate.evaluate_free_quality_gate("nemotron", "MECHANICAL_EXECUTION", None) is False  # pending
+
+
+def test_free_worker_unknown_mapping_fails_closed(gate):
+    """An unmapped free worker must not dispatch (fail closed)."""
+    a = _agent(marker=True, task_class="MECHANICAL_EXECUTION")
+    ok = gate._run_free_worker(a, "not_a_worker", {})
+    assert ok is False
