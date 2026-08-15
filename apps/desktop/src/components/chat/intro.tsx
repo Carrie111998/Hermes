@@ -20,7 +20,6 @@ export type IntroProps = {
 
 const NEUTRAL_PERSONALITIES = new Set(['', 'default', 'none', 'neutral'])
 const assetPath = (path: string) => `${import.meta.env.BASE_URL}${path.replace(/^\/+/, '')}`
-const ARES_SPLASH = assetPath('ares/splash.png')
 const ARES_WORDMARK = assetPath('ares/wordmark.png')
 
 const FALLBACK_COPY: IntroCopy[] = [
@@ -166,7 +165,6 @@ export function Intro({ personality, seed }: IntroProps) {
       className="pointer-events-none relative isolate flex w-full min-w-0 flex-col items-center justify-center overflow-hidden px-0.5 py-10 text-center text-muted-foreground sm:px-6 lg:px-8"
       data-slot="aui_intro"
     >
-      <img aria-hidden="true" className="absolute inset-0 -z-10 size-full object-cover opacity-20" src={ARES_SPLASH} />
       <div className="w-full min-w-0">
         <img alt="Ares" className="mx-auto mb-4 h-auto w-full max-w-sm object-contain" src={ARES_WORDMARK} />
         <p className="m-0 text-center leading-normal tracking-tight">{copy.body}</p>
