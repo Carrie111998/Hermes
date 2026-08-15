@@ -199,7 +199,11 @@ def _fetch_remote() -> Optional[List[PluginIndexEntry]]:
         _write_cache(text)
         return entries
     except Exception as exc:
-        logger.debug("plugin index: remote fetch failed (%s): %s", url, exc)
+        logger.warning(
+            "plugin index: remote fetch failed (%s): %s; using cached or bundled fallback",
+            url,
+            exc,
+        )
         return None
 
 
