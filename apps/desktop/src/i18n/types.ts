@@ -1809,6 +1809,12 @@ export interface Translations {
       done: (skill: string) => string
       doneTip: string
     }
+    githubSuggestions: {
+      label: string
+      tip: string
+      done: string
+      doneTip: string
+    }
     repairSuggestions: {
       label: (server: string) => string
       tip: (server: string) => string
