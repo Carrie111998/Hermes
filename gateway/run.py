@@ -29499,10 +29499,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         }
         provider = persisted.get("provider")
         if provider:
-            # Re-resolve credentials for the persisted provider. On failure
-            # (e.g. credentials were removed since the switch) keep the
-            # credential-less override — _resolve_session_agent_runtime falls
-            # back to env-based resolution and applies model/provider on top.
+            # Re-resolve credentials for the persisted provider. If the
+            # provider is no longer configured or its credentials have been
+            # removed, do not apply the override — falling back to the global
+            # default model and provider prevents a stale "UNKNOWN <provider>"
+            # failure on the next turn.
             try:
                 runtime = _resolve_runtime_agent_kwargs_for_provider(provider)
                 override["api_key"] = runtime.get("api_key")
@@ -29517,11 +29518,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if not override.get("base_url"):
                     override["base_url"] = runtime.get("base_url")
             except Exception:
-                logger.debug(
-                    "Credential re-resolution failed for persisted override "
-                    "(provider=%s); using credential-less override",
-                    provider, exc_info=True,
+                logger.info(
+                    "Dropping stale persisted /model override for session=%s "
+                    "because provider %r can no longer be resolved",
+                    session_key, provider,
                 )
+                return
         self._session_state(session_key).conversation.model_override = override
         logger.info(
             "Rehydrated persisted /model override for session=%s: model=%s provider=%s",
@@ -29544,37 +29546,43 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not override:
             return model, runtime_kwargs
         model = override.get("model", model)
-        for key in (
-            "provider",
-            "requested_provider",
-            "api_key",
-            "base_url",
-            "api_mode",
-            "credential_pool",
-            "capabilities",
-            "max_tokens",
-        ):
-            val = override.get(key)
-            if val is not None:
-                runtime_kwargs[key] = val
-        # request_overrides reflects the switched-to provider; apply whenever
-        # the override recorded it (even as None) so switching to a provider
-        # without configured overrides clears a stale value left by the
-        # default provider's runtime resolution.
-        if "request_overrides" in override:
-            override_request_overrides = override.get("request_overrides")
-            if isinstance(override_request_overrides, dict) and override_request_overrides:
-                runtime_kwargs["request_overrides"] = dict(override_request_overrides)
-            else:
-                runtime_kwargs["request_overrides"] = override_request_overrides
-        if (
-            runtime_kwargs.get("api_key")
-            and runtime_kwargs.get("credential_pool") is None
-            and override.get("provider")
-        ):
-            runtime_kwargs["credential_pool"] = _credential_pool_for_provider(
-                override.get("provider")
-            )
+        # Only apply the provider/runtime keys if the override still carries
+        # a resolvable credential. A credential-less override (e.g. the
+        # provider was removed from config after the switch) would otherwise
+        # poison runtime_kwargs with a stale provider and produce an
+        # "UNKNOWN <provider>" failure downstream.
+        if override.get("api_key"):
+            for key in (
+                "provider",
+                "requested_provider",
+                "api_key",
+                "base_url",
+                "api_mode",
+                "credential_pool",
+                "capabilities",
+                "max_tokens",
+            ):
+                val = override.get(key)
+                if val is not None:
+                    runtime_kwargs[key] = val
+            # request_overrides reflects the switched-to provider; apply
+            # whenever the override recorded it (even as None) so switching
+            # to a provider without configured overrides clears stale runtime
+            # values from the default provider.
+            if "request_overrides" in override:
+                override_request_overrides = override.get("request_overrides")
+                if isinstance(override_request_overrides, dict) and override_request_overrides:
+                    runtime_kwargs["request_overrides"] = dict(override_request_overrides)
+                else:
+                    runtime_kwargs["request_overrides"] = override_request_overrides
+            if (
+                runtime_kwargs.get("api_key")
+                and runtime_kwargs.get("credential_pool") is None
+                and override.get("provider")
+            ):
+                runtime_kwargs["credential_pool"] = _credential_pool_for_provider(
+                    override.get("provider")
+                )
         return model, runtime_kwargs
 
     def _snapshot_session_model_override(self, session_key: str) -> dict:
