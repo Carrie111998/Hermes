@@ -235,6 +235,31 @@ def test_build_environment_is_scoped_to_the_ares_agent_home(tmp_path: Path) -> N
     assert environment["UV_PROJECT_ENVIRONMENT"] == str(tmp_path / "candidate" / ".venv")
 
 
+def test_runtime_build_uses_supported_editable_source_install(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime = _runtime(tmp_path)
+    source = tmp_path / "candidate"
+    python = source / ".venv" / "bin" / "python"
+    python.parent.mkdir(parents=True)
+    python.touch()
+    calls: list[list[str]] = []
+
+    import hermes_cli.managed_uv as managed_uv
+
+    monkeypatch.setattr(managed_uv, "ensure_uv", lambda: Path("/managed/uv"))
+    monkeypatch.setattr(
+        runtime,
+        "_run",
+        lambda command, **_kwargs: calls.append([str(value) for value in command]),
+    )
+
+    runtime._build_runtime(source, desktop=False)
+
+    sync = calls[0]
+    assert sync == ["/managed/uv", "sync", "--locked", "--extra", "all", "--no-dev"]
+
+
 def test_gateway_unit_uses_the_explicit_foreground_action(tmp_path: Path) -> None:
     runtime = _runtime(tmp_path)
     runtime._install_gateway_unit()

@@ -415,7 +415,10 @@ if (config or {}).get('context', {}).get('engine') == 'ri-context-governor':
             raise AresLocalRuntimeError("`uv` is required to build the stable Ares runtime")
         environment = self._build_environment(source)
         self._run(
-            [str(uv), "sync", "--locked", "--extra", "all", "--no-dev", "--no-editable"],
+            # Hermes intentionally rejects non-editable wheel builds.  Ares
+            # releases retain their immutable source beside the venv, so its
+            # supported editable development install remains release-safe.
+            [str(uv), "sync", "--locked", "--extra", "all", "--no-dev"],
             cwd=source,
             env=environment,
         )
