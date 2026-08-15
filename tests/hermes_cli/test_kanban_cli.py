@@ -40,6 +40,17 @@ def kanban_home(tmp_path, monkeypatch):
 
 
 
+def test_fmt_ts_tolerates_string_timestamps():
+    """A worker writing `completed_at` as an ISO string (or epoch-as-str) must
+    not crash `_fmt_ts` — it should render like any numeric timestamp."""
+    assert kc._fmt_ts("2026-08-04T21:05:15.679975") == "2026-08-04 21:05"
+    assert kc._fmt_ts("2026-08-04 21:05:15") == "2026-08-04 21:05"
+    assert kc._fmt_ts("1785902715") == "2026-08-04 21:05"
+    assert kc._fmt_ts(1785902715) == "2026-08-04 21:05"
+    assert kc._fmt_ts(None) == ""
+    assert kc._fmt_ts(0) == ""
+
+
 def test_kanban_list_json_includes_session_id(kanban_home):
     """JSON output exposes `session_id` so external clients (Scarf, web
     dashboards) don't need a side query to filter by chat session."""
