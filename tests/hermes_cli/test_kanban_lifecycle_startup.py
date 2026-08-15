@@ -23,6 +23,7 @@ def _lifecycle_env(
 def _clear_lifecycle_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
     monkeypatch.delenv("HERMES_KANBAN_WORKER_SCOPE", raising=False)
+    monkeypatch.delenv("HERMES_TUI", raising=False)
 
 
 def _agent_args(command: str = "chat") -> Namespace:
@@ -604,7 +605,7 @@ def _install_startup_spies(monkeypatch: pytest.MonkeyPatch) -> dict[str, int]:
     calls = {"plugin": 0, "mcp_background": 0, "mcp_inline": 0, "hook": 0}
 
     plugins = types.ModuleType("hermes_cli.plugins")
-    plugins.discover_plugins = lambda: calls.__setitem__(
+    plugins.start_background_plugin_discovery = lambda: calls.__setitem__(
         "plugin", calls["plugin"] + 1
     )
     monkeypatch.setitem(sys.modules, "hermes_cli.plugins", plugins)
