@@ -16163,15 +16163,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _matrix_project_args = _matrix_parts[1] if len(_matrix_parts) > 1 else ""
         if _matrix_project_args is not None:
             arg = _matrix_project_args.strip().lower()
-            if arg == "newmoon":
-                from gateway.project_router import select_project
-                session_key = self._session_key_for_source(source)
-                try:
-                    path = select_project(self._session_db._db, session_key, arg)
-                except ValueError as exc:
-                    return f"Project selection failed: {exc}"
-                self._evict_cached_agent(session_key)
-                return f"Active project: newmoon ({path})"
+            from gateway.project_router import select_project
+
+            session_key = self._session_key_for_source(source)
+            try:
+                path = select_project(self._session_db._db, session_key, arg)
+            except ValueError as exc:
+                return f"Project selection failed: {exc}"
+            self._evict_cached_agent(session_key)
+            return f"Active project: {arg} ({path})"
 
         from hermes_cli.commands import (
             GATEWAY_KNOWN_COMMANDS,

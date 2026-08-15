@@ -5,8 +5,13 @@ from pathlib import Path
 
 PROJECTS = {
     "newmoon": "/home/rle/projects/NewMoonNailsAndSpa",
+    "fivehours": "/home/rle/projects/savefivehours",
 }
 _META_PREFIX = "matrix_project_router:"
+
+
+def project_keys() -> tuple[str, ...]:
+    return tuple(sorted(PROJECTS))
 
 
 def project_path(key: str) -> Path | None:
@@ -15,12 +20,15 @@ def project_path(key: str) -> Path | None:
 
 
 def select_project(db, session_key: str, key: str) -> Path:
-    path = project_path(key)
+    normalized_key = (key or "").strip().lower()
+    path = project_path(normalized_key)
     if path is None:
-        raise ValueError("unknown project")
+        raise ValueError(
+            f"unknown project '{normalized_key}'. Valid projects: {', '.join(project_keys())}"
+        )
     if not path.is_dir():
         raise ValueError(f"configured project path does not exist: {path}")
-    db.set_meta(_META_PREFIX + session_key, key)
+    db.set_meta(_META_PREFIX + session_key, normalized_key)
     return path
 
 

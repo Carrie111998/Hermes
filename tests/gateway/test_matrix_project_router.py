@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 from datetime import datetime
+from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, call
 
 import pytest
 
@@ -17,7 +18,8 @@ from gateway.session import SessionContext, SessionEntry, SessionSource, build_s
 from hermes_state import SessionDB
 
 
-PROJECT_PATH = PROJECTS["newmoon"]
+NEWMOON_PATH = PROJECTS["newmoon"]
+FIVEHOURS_PATH = "/home/rle/projects/savefivehours"
 
 
 def _source() -> SessionSource:
@@ -113,36 +115,82 @@ def _runner(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_project_newmoon_intercepts_persists_and_evicts_cached_agent(tmp_path):
+@pytest.mark.parametrize(
+    ("key", "path"),
+    [("newmoon", NEWMOON_PATH), ("fivehours", FIVEHOURS_PATH)],
+)
+async def test_project_selection_intercepts_persists_and_evicts_cached_agent(tmp_path, key, path):
     runner = _runner(tmp_path)
     session_key = build_session_key(_source())
     runner._handle_message_with_agent = AsyncMock()
 
-    response = await runner._handle_message(_event("!project newmoon"))
+    response = await runner._handle_message(_event(f"!project {key}"))
 
-    assert response == f"Active project: newmoon ({PROJECT_PATH})"
-    assert active_project_path(runner._session_db._db, session_key) == project_path("newmoon")
+    assert response == f"Active project: {key} ({path})"
+    assert runner._session_db._db.get_meta("matrix_project_router:" + session_key) == key
+    assert active_project_path(runner._session_db._db, session_key) == project_path(key)
     runner._evict_cached_agent.assert_called_once_with(session_key)
     runner._handle_message_with_agent.assert_not_awaited()
 
 
-def test_selected_matrix_session_binds_project_cwd_and_discovers_agents_md(tmp_path):
+@pytest.mark.parametrize(
+    ("key", "path", "agents_text"),
+    [
+        ("newmoon", NEWMOON_PATH, "Authoritative context"),
+        ("fivehours", FIVEHOURS_PATH, "Authoritative sources"),
+    ],
+)
+def test_selected_matrix_session_binds_project_cwd_and_discovers_agents_md(
+    tmp_path, key, path, agents_text
+):
     runner = _runner(tmp_path)
     session_key = build_session_key(_source())
-    runner._session_db._db.set_meta("matrix_project_router:" + session_key, "newmoon")
+    runner._session_db._db.set_meta("matrix_project_router:" + session_key, key)
     context = SessionContext(
         source=_source(), connected_platforms=[], home_channels={}, session_key=session_key
     )
 
     tokens = runner._set_session_env(context)
     try:
-        assert resolve_agent_cwd() == project_path("newmoon")
-        assert resolve_context_cwd() == project_path("newmoon")
+        assert resolve_agent_cwd() == Path(path)
+        assert resolve_context_cwd() == Path(path)
         prompt = build_context_files_prompt(cwd=str(resolve_context_cwd()), skip_soul=True)
         assert "# AGENTS.md" in prompt
-        assert "Authoritative context" in prompt
+        assert agents_text in prompt
     finally:
         runner._clear_session_env(tokens)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("first", "second"),
+    [("newmoon", "fivehours"), ("fivehours", "newmoon")],
+)
+async def test_project_selection_switches_active_project_and_evicts_each_time(tmp_path, first, second):
+    runner = _runner(tmp_path)
+    session_key = build_session_key(_source())
+    runner._handle_message_with_agent = AsyncMock()
+
+    await runner._handle_message(_event(f"!project {first}"))
+    response = await runner._handle_message(_event(f"!project {second}"))
+
+    assert response == f"Active project: {second} ({PROJECTS[second]})"
+    assert runner._session_db._db.get_meta("matrix_project_router:" + session_key) == second
+    assert active_project_path(runner._session_db._db, session_key) == project_path(second)
+    assert runner._evict_cached_agent.call_args_list == [call(session_key), call(session_key)]
+    runner._handle_message_with_agent.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_unknown_project_does_not_dispatch_and_lists_valid_keys(tmp_path):
+    runner = _runner(tmp_path)
+    runner._handle_message_with_agent = AsyncMock()
+
+    response = await runner._handle_message(_event("!project unknown"))
+
+    assert response == "Project selection failed: unknown project 'unknown'. Valid projects: fivehours, newmoon"
+    runner._evict_cached_agent.assert_not_called()
+    runner._handle_message_with_agent.assert_not_awaited()
 
 
 @pytest.mark.asyncio
