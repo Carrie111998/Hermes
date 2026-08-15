@@ -3298,28 +3298,51 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         """
         conn = self._checkout_read_conn()
         if conn is not None:
+            discarded = False
             try:
                 yield conn
+            except sqlite3.DatabaseError as exc:
+                # Runtime connection corruption (#20260809): a sibling
+                # process replaced/truncated the backing file. The write
+                # path self-heals via _reconnect_after_notadb, but a pooled
+                # reader raised here is currently returned to the pool by
+                # the finally below, so the NEXT checkout reuses the same
+                # stale descriptor and fails again — reads stay broken until
+                # process restart while writes look healthy. Discard the
+                # poisoned connection (close + release its permit) instead
+                # of returning it, and clear the open-failure backoff so the
+                # next read opens a fresh connection immediately.
+                if _is_not_a_database_error(exc):
+                    discarded = True
+                    with self._read_conns_lock:
+                        self._read_open_failed_at = 0.0
+                raise
             finally:
-                returned = False
-                with self._read_conns_lock:
-                    if not self._read_conns_closed:
-                        try:
-                            self._read_pool.put_nowait(conn)
-                            returned = True
-                        except queue.Full:
-                            pass
-                if not returned:
-                    # close() has already drained the pool, so this connection
-                    # is surplus. Close it here — dropping it on the floor is
-                    # what leaked the fd.
-                    #
-                    # queue.Full is now unreachable in practice (permits and
-                    # maxsize are both _READ_POOL_MAX, so there can never be a
-                    # ninth connection to return), but the branch stays: it is
-                    # load-bearing if those two ever drift apart, and a leak is
-                    # the failure mode it prevents.
+                if discarded:
+                    # Do NOT return here — a return in a finally block
+                    # swallows the exception re-raised in the except above.
                     self._close_read_conn(conn)
+                else:
+                    returned = False
+                    with self._read_conns_lock:
+                        if not self._read_conns_closed:
+                            try:
+                                self._read_pool.put_nowait(conn)
+                                returned = True
+                            except queue.Full:
+                                pass
+                    if not returned:
+                        # close() has already drained the pool, so this
+                        # connection is surplus. Close it here — dropping it
+                        # on the floor is what leaked the fd.
+                        #
+                        # queue.Full is now unreachable in practice (permits
+                        # and maxsize are both _READ_POOL_MAX, so there can
+                        # never be a ninth connection to return), but the
+                        # branch stays: it is load-bearing if those two ever
+                        # drift apart, and a leak is the failure mode it
+                        # prevents.
+                        self._close_read_conn(conn)
             return
         with self._lock:
             yield self._conn

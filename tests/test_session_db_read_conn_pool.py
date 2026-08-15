@@ -35,6 +35,7 @@ holds POSIX locks on that inode, so raw descriptor counts lag the real
 connection count and make such assertions flaky.
 """
 
+import sqlite3
 import threading
 
 import pytest
@@ -384,3 +385,87 @@ def test_close_returns_every_permit(db):
     for _ in range(_READ_POOL_MAX):
         assert db._read_permits.acquire(blocking=False), "close() stranded a permit"
     assert not db._read_permits.acquire(blocking=False), "close() over-released"
+
+
+@pytest.mark.requires_wal
+def test_notadb_reader_is_discarded_not_returned(db, monkeypatch):
+    """A pooled reader that hits 'file is not a database' must be discarded.
+
+    Runtime connection corruption (#20260809) breaks every connection opened
+    against the replaced/truncated file. The write path self-heals via
+    ``_reconnect_after_notadb``, but without this fix the poisoned reader is
+    returned to ``_read_pool`` by ``_read_ctx``'s finally, so the next
+    checkout reuses the same stale descriptor and fails again — reads stay
+    broken until process restart while writes look healthy.
+    """
+    import sqlite3 as _sqlite3
+
+    from hermes_state import _is_not_a_database_error
+
+    class _PoisonedConn:
+        """Proxy that raises on execute when armed, otherwise delegates."""
+
+        def __init__(self, real):
+            self._real = real
+            self._poisoned = True
+
+        def execute(self, *a, **kw):
+            if self._poisoned:
+                raise _sqlite3.DatabaseError("file is not a database")
+            return self._real.execute(*a, **kw)
+
+        def __getattr__(self, name):
+            return getattr(self._real, name)
+
+    # Prime the pool with a poisoned connection (as a sibling process
+    # replacing the backing file would leave it).
+    real = db._checkout_read_conn()
+    assert real is not None
+    db._read_pool.put_nowait(_PoisonedConn(real))
+    assert db._read_pool.qsize() >= 1, "pool should hold the primed reader"
+
+    # A read through the poisoned pooled connection must raise the corruption
+    # error AND leave the pool drained (the broken conn was closed, not
+    # returned).
+    with pytest.raises(_sqlite3.DatabaseError, match="not a database"):
+        with db._read_ctx() as conn:
+            conn.execute("SELECT 1")
+    assert db._read_pool.qsize() == 0, (
+        "poisoned reader was returned to the pool; next checkout would "
+        "reuse the stale descriptor"
+    )
+
+    # The next read must open a fresh, healthy connection and succeed.
+    assert db.get_session("s1") is not None
+
+
+@pytest.mark.requires_wal
+def test_non_notadb_error_still_returns_conn(db, monkeypatch):
+    """Unrelated DatabaseErrors keep the normal return-to-pool behaviour."""
+    import sqlite3 as _sqlite3
+
+    class _BoomConn:
+        """Proxy that raises a non-corruption error when armed."""
+
+        def __init__(self, real):
+            self._real = real
+            self._boom = True
+
+        def execute(self, *a, **kw):
+            if self._boom:
+                raise _sqlite3.DatabaseError("database is locked")
+            return self._real.execute(*a, **kw)
+
+        def __getattr__(self, name):
+            return getattr(self._real, name)
+
+    real = db._checkout_read_conn()
+    assert real is not None
+    db._read_pool.put_nowait(_BoomConn(real))
+    assert db._read_pool.qsize() >= 1
+
+    with pytest.raises(_sqlite3.DatabaseError, match="database is locked"):
+        with db._read_ctx() as conn:
+            conn.execute("SELECT 1")
+    # Not the corruption class: normal pool semantics preserved.
+    assert db._read_pool.qsize() >= 1
