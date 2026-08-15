@@ -221,6 +221,8 @@ def _scan_source_for_install(bundle, meta, identifier: str, matched_source) -> s
 
 def _github_repo_from_lock_metadata(entry: dict) -> str:
     """Recover the fetched GitHub repository from immutable scan metadata."""
+    if entry.get("source") not in {"github", "hermes-index"}:
+        return ""
     metadata = entry.get("metadata") or {}
     resolved = metadata.get("resolved_github_id")
     if resolved:

@@ -478,3 +478,19 @@ def test_lock_entry_uses_fetched_repository_over_spoofed_index_identifier():
         {"identifier": "attacker/evil", "source": "hermes-index"}
     ) == "attacker/evil"
 
+
+def test_lock_entry_ignores_github_url_metadata_from_non_github_adapter():
+    from hermes_cli.skills_hub import _scan_source_for_lock_entry
+    from tools.skills_guard import _resolve_trust_level
+
+    scan_source = _scan_source_for_lock_entry(
+        {
+            "identifier": "browse-sh/evil",
+            "source": "browse-sh",
+            "metadata": {"source_url": "https://github.com/openai/skills/evil"},
+        }
+    )
+
+    assert scan_source == "browse-sh/evil"
+    assert _resolve_trust_level(scan_source) == "community"
+
