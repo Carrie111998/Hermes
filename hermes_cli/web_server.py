@@ -7582,9 +7582,14 @@ def list_custom_endpoints(profile: Optional[str] = None):
 
 @app.post("/api/providers/custom-endpoints")
 def upsert_custom_endpoint(body: CustomEndpointUpdate, profile: Optional[str] = None):
-    """Create or update a v12+ ``providers`` custom endpoint entry."""
+    """Create or update a v12+ ``providers`` custom endpoint entry.
+
+    The explicit body ``profile`` beats the query param (issue #84451): a
+    custom endpoint written for a child profile lands in that profile's
+    config.yaml, not the Default profile's."""
+    effective_profile = body.profile or profile
     try:
-        with _config_profile_scope(profile):
+        with _config_profile_scope(effective_profile):
             cfg = load_config()
             endpoint_id, _entry = _write_custom_endpoint(cfg, body)
             save_config(cfg)

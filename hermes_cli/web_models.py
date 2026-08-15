@@ -60,6 +60,11 @@ class CustomEndpointUpdate(BaseModel):
     discover_models: bool = True
     make_default: bool = False
     models: Optional[List[str]] = None
+    # Explicit body profile beats the query param injected by the global
+    # dashboard profile switcher (same precedence as other scoped writes) —
+    # issue #84451: a custom endpoint written for a child profile must land
+    # in that profile's config.yaml, not Default.
+    profile: Optional[str] = None
 
 
 class MessagingPlatformUpdate(BaseModel):

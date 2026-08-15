@@ -922,7 +922,9 @@ export function saveCustomEndpoint(endpoint: CustomEndpointUpdate): Promise<Cust
     ...profileScoped(),
     path: '/api/providers/custom-endpoints',
     method: 'POST',
-    body: endpoint
+    // Carry the profile in the body too, so the server scopes the write to the
+    // child profile regardless of backend pooling (issue #84451).
+    body: { ...endpoint, ...profileScoped() }
   })
 }
 

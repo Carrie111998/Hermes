@@ -190,6 +190,10 @@ export interface CustomEndpointUpdate {
   model: string
   models?: string[]
   name: string
+  /** The child profile this write targets — the server scopes the write to it
+   *  (issue #84451: a child-profile endpoint must land in the child's
+   *  config.yaml, not Default). */
+  profile?: string
 }
 
 export interface CustomEndpointValidationResponse {
