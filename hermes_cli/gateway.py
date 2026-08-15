@@ -4849,11 +4849,65 @@ def launchd_install(force: bool = False):
 def launchd_uninstall():
     plist_path = get_launchd_plist_path()
     label = get_launchd_label()
-    subprocess.run(
-        ["launchctl", "bootout", f"{_launchd_domain()}/{label}"],
-        check=False,
-        timeout=90,
-    )
+    target = f"{_launchd_domain()}/{label}"
+
+    pid = None
+    try:
+        from gateway.status import get_running_pid, write_planned_stop_marker
+
+        pid = get_running_pid(cleanup_stale=False)
+        if pid is not None:
+            write_planned_stop_marker(pid)
+    except Exception:
+        pid = None
+
+    # Same bootout fall-through launchd_stop() handles: "job already unloaded"
+    # (3/113/125) and "domain unmanageable" (5/125 — the macOS 26+ detached
+    # fallback process, #23387) both mean launchd never took the job, so it
+    # will not send SIGTERM and will not escalate. Uninstall previously sent
+    # nothing at all on that path, leaving the gateway running.
+    #
+    # Any other launchctl failure is left to launchd: uninstall has always
+    # tolerated a failing bootout (it ran with check=False), and pre-empting
+    # a job launchd may still be supervising would just get the process
+    # respawned by KeepAlive.
+    launchd_owns_exit = True
+    try:
+        subprocess.run(["launchctl", "bootout", target], check=True, timeout=90)
+    except subprocess.CalledProcessError as e:
+        if _launchd_error_indicates_unloaded(e) or _launchctl_domain_unsupported(
+            e.returncode
+        ):
+            launchd_owns_exit = False
+
+    if launchd_owns_exit:
+        exited = _wait_for_gateway_exit(
+            timeout=_GATEWAY_STOP_WAIT_SECONDS, force_after=None
+        )
+    else:
+        if pid is not None:
+            try:
+                terminate_pid(pid, force=False)
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+        exited = _wait_for_gateway_exit(
+            timeout=_GATEWAY_STOP_WAIT_SECONDS,
+            force_after=_GATEWAY_STOP_GRACE_SECONDS,
+        )
+
+    if not exited:
+        # Keep the plist. Removing the service definition out from under a
+        # live gateway strands the operator: `hermes gateway stop` then takes
+        # this same unsupervised fall-through, and `hermes gateway start`
+        # bootstraps a SECOND instance against the same bot token and port.
+        # systemd_uninstall() does not have this problem because `systemctl
+        # stop` is synchronous — it does not return until the unit is down.
+        print(
+            f"⚠ Gateway is still running after {_GATEWAY_STOP_WAIT_SECONDS:.0f}s; "
+            f"keeping {plist_path} so the service can still be stopped."
+        )
+        print("  Stop it, then re-run: hermes gateway stop && hermes gateway uninstall")
+        return
 
     if plist_path.exists():
         plist_path.unlink()
