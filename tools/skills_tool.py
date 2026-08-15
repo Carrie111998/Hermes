@@ -992,7 +992,14 @@ def _iter_contained_skill_files(
                 continue
 
     if directory.exists():
-        yield from _walk(directory, frozenset())
+        try:
+            root_ancestor = frozenset({skill_dir.resolve()})
+            initial_ancestors = (
+                frozenset() if directory.resolve() == skill_dir.resolve() else root_ancestor
+            )
+        except OSError:
+            return
+        yield from _walk(directory, initial_ancestors)
 
 
 def skill_view(

@@ -648,6 +648,49 @@ class TestSkillDirectoryHeader:
         assert "payload.py" not in msg
         assert "secret.md" not in msg
 
+    @pytest.mark.skipif(
+        os.name != "nt",
+        reason="Windows junction support required",
+    )
+    def test_fallback_prunes_junction_cycle_to_skill_root(self, tmp_path):
+        skills_root = tmp_path / "skills"
+        skills_root.mkdir()
+        skill_dir = _make_skill(skills_root, "junction-cycle")
+        scripts_dir = skill_dir / "scripts"
+        scripts_dir.mkdir()
+        (scripts_dir / "safe.py").write_text("print('safe')")
+        subprocess.run(
+            [
+                "cmd.exe",
+                "/c",
+                "mklink",
+                "/J",
+                str(scripts_dir / "loop"),
+                str(skill_dir),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+        loaded = {
+            "success": True,
+            "name": "junction-cycle",
+            "content": "Do the thing.",
+            "skill_dir": str(skill_dir),
+            "linked_files": {},
+        }
+        with (
+            patch("tools.skills_tool.SKILLS_DIR", skills_root),
+            patch("tools.skills_tool.skill_view", return_value=json.dumps(loaded)),
+        ):
+            scan_skill_commands()
+            msg = build_skill_invocation_message("/junction-cycle")
+
+        assert msg is not None
+        assert "safe.py" in msg
+        assert "loop" not in msg
+
 
 class TestTemplateVarSubstitution:
     """``${HERMES_SKILL_DIR}`` and ``${HERMES_SESSION_ID}`` in SKILL.md body

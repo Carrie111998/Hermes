@@ -278,7 +278,7 @@ def _build_skill_message(
     session_id: str | None = None,
 ) -> str:
     """Format a loaded skill into a user/system message payload."""
-    from tools.skills_tool import SKILLS_DIR
+    from tools.skills_tool import SKILLS_DIR, _iter_contained_skill_files
 
     content = str(loaded_skill.get("content") or "")
 
@@ -346,14 +346,12 @@ def _build_skill_message(
     if not supporting and skill_dir:
         for subdir in ("references", "templates", "scripts", "assets"):
             subdir_path = skill_dir / subdir
-            if not subdir_path.exists():
-                continue
-            if validate_within_dir(subdir_path, skill_dir):
-                continue
-            for f in sorted(subdir_path.rglob("*")):
-                if not f.is_file() or f.is_symlink():
-                    continue
-                if validate_within_dir(f, skill_dir):
+            for f in sorted(
+                _iter_contained_skill_files(
+                    subdir_path, skill_dir, recursive=True
+                )
+            ):
+                if f.is_symlink():
                     continue
                 rel = str(f.relative_to(skill_dir))
                 supporting.append(rel)
