@@ -239,6 +239,72 @@ def test_non_mention_rejection_logs_generic_processing_gate(caplog):
     asyncio.run(_run())
 
 
+def test_self_message_rejection_logs_generic_processing_gate(caplog):
+    # Negative path: the bot's OWN outgoing message (returned by getUpdates in
+    # supergroups) is rejected by _is_own_message before any mention gate.
+    # It must log the same generic "processing gate" line, not a mention label.
+    async def _run():
+        adapter = _make_adapter(require_mention=False)
+        update = SimpleNamespace(
+            update_id=7005,
+            message=_group_message("my own outgoing", from_user_id=999),  # bot id
+            effective_message=None,
+        )
+        with caplog.at_level("DEBUG", logger="plugins.platforms.telegram.adapter"):
+            await adapter._handle_text_message(update, SimpleNamespace())
+
+        adapter._message_handler.assert_not_awaited()
+        assert "dropped by processing gate" in caplog.text
+        assert "require_mention gate" not in caplog.text
+
+    asyncio.run(_run())
+
+
+def test_ignored_thread_rejection_logs_generic_processing_gate(caplog):
+    # Negative path: a message inside an ignored topic/thread is rejected by
+    # the ignored_threads gate before any mention logic. It must log the same
+    # generic "processing gate" line.
+    async def _run():
+        adapter = _make_adapter(require_mention=False, ignored_threads=[11])
+        update = SimpleNamespace(
+            update_id=7006,
+            message=_group_message("topic chatter", thread_id=11),
+            effective_message=None,
+        )
+        with caplog.at_level("DEBUG", logger="plugins.platforms.telegram.adapter"):
+            await adapter._handle_text_message(update, SimpleNamespace())
+
+        adapter._message_handler.assert_not_awaited()
+        assert "dropped by processing gate" in caplog.text
+        assert "require_mention gate" not in caplog.text
+
+    asyncio.run(_run())
+
+
+def test_foreign_bot_mention_rejection_logs_generic_processing_gate(caplog):
+    # Negative path: with exclusive_bot_mentions enabled, a message that
+    # @mentions a DIFFERENT bot handle is rejected by the exclusive-mention
+    # gate. It must log the same generic "processing gate" line.
+    async def _run():
+        adapter = _make_adapter(require_mention=False, exclusive_bot_mentions=True)
+        update = SimpleNamespace(
+            update_id=7007,
+            message=_group_message(
+                "hi @other_bot",
+                entities=[_mention_entity("hi @other_bot", mention="@other_bot")],
+            ),
+            effective_message=None,
+        )
+        with caplog.at_level("DEBUG", logger="plugins.platforms.telegram.adapter"):
+            await adapter._handle_text_message(update, SimpleNamespace())
+
+        adapter._message_handler.assert_not_awaited()
+        assert "dropped by processing gate" in caplog.text
+        assert "require_mention gate" not in caplog.text
+
+    asyncio.run(_run())
+
+
 def test_unmentioned_group_messages_can_be_observed_without_dispatching():
     async def _run():
         adapter = _make_adapter(
