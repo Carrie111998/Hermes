@@ -17,6 +17,7 @@ import os
 import re
 import time
 import unicodedata
+from urllib.parse import urlencode
 from dataclasses import dataclass, field
 from typing import Callable, ClassVar, Dict, Optional, Any, Tuple, List
 
@@ -951,6 +952,9 @@ class SlackAdapter(BasePlatformAdapter):
         # the name cache. Used to catch peer-agent posts that arrive as plain
         # user messages without bot_id/subtype=bot_message markers.
         self._user_is_bot_cache: Dict[Tuple[str, str], bool] = {}
+        self._external_resource_cache: Dict[Tuple[str, str], float] = {}
+        self._EXTERNAL_RESOURCE_CACHE_TTL = 15.0
+        self._EXTERNAL_RESOURCE_CACHE_MAX = 1024
         self._socket_mode_task: Optional[asyncio.Task] = None
         # Multi-workspace support
         self._team_clients: Dict[str, Any] = {}  # team_id → WebClient
@@ -4285,6 +4289,77 @@ class SlackAdapter(BasePlatformAdapter):
 
     # ----- User identity resolution -----
 
+    def _external_resource_config(self) -> Optional[dict]:
+        value = (self.config.extra or {}).get("external_resource_authz")
+        return value if isinstance(value, dict) and value.get("resource") and value.get("endpoint") else None
+
+    def external_resource_authorization_required(self) -> bool:
+        return self._external_resource_config() is not None
+
+    def external_resource_authorized(self, source: Any) -> bool:
+        """Read only the local marker set by the async Slack edge check."""
+        if not self.external_resource_authorization_required():
+            return True
+        return getattr(source, "external_resource_authorized", False) is True
+
+    async def _authorize_external_resource(
+        self, user_id: str, *, chat_id: str, team_id: str, source: Any
+    ) -> bool:
+        config = self._external_resource_config()
+        if config is None:
+            return True
+        resource = str(config["resource"]).strip()
+        endpoint = str(config["endpoint"]).strip()
+        token_name = str(config.get("token_secret") or "").strip()
+        if not resource or not endpoint.startswith(("http://", "https://")) or not token_name:
+            return False
+        try:
+            token = get_secret(token_name)
+            if not token:
+                return False
+            client = self._get_client(chat_id, team_id=team_id or None) if chat_id else self._app.client
+            result = _slack_response_payload(await client.users_info(user=user_id))
+            user = result.get("user") if isinstance(result, dict) else None
+            profile = user.get("profile") if isinstance(user, dict) else None
+            email = profile.get("email") if isinstance(profile, dict) else None
+            if not isinstance(email, str) or not email.strip() or profile.get("email_verified") is not True:
+                return False
+            email = email.strip().lower()
+            key = (resource, email)
+            now = time.monotonic()
+            expiry = self._external_resource_cache.get(key)
+            if expiry is not None:
+                if expiry > now:
+                    source.external_resource_authorized = True
+                    return True
+                self._external_resource_cache.pop(key, None)
+            query = urlencode({"slug": resource, "email": email})
+            timeout = aiohttp.ClientTimeout(total=3.0)
+            headers = {"Authorization": f"Bearer {str(token).strip()}"}
+            separator = "&" if "?" in endpoint else "?"
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(f"{endpoint}{separator}{query}", headers=headers) as response:
+                    if response.status != 200:
+                        return False
+                    payload = await response.json(content_type=None)
+            if not isinstance(payload, dict) or payload.get("active") is not True:
+                return False
+            try:
+                cache_ttl = min(float(config.get("cache_ttl", 15.0)), 15.0)
+            except (TypeError, ValueError):
+                return False
+            if cache_ttl <= 0:
+                return False
+            self._external_resource_cache[key] = now + cache_ttl
+            if len(self._external_resource_cache) > self._EXTERNAL_RESOURCE_CACHE_MAX:
+                oldest = next(iter(self._external_resource_cache))
+                self._external_resource_cache.pop(oldest, None)
+            source.external_resource_authorized = True
+            return True
+        except Exception:
+            logger.warning("[Slack] external resource authorization failed", exc_info=True)
+            return False
+
     async def _resolve_user_name(
         self, user_id: str, chat_id: str = "", team_id: str = ""
     ) -> str:
@@ -6049,6 +6124,17 @@ class SlackAdapter(BasePlatformAdapter):
                 user_id=user_id,
                 user_name="",
             )
+            if not await self._authorize_external_resource(
+                user_id,
+                chat_id=channel_id,
+                team_id=str(team_id or ""),
+                source=_source,
+            ):
+                logger.warning(
+                    "[Slack] Early reject of user %s by external resource authorization",
+                    user_id,
+                )
+                return
             if not _auth_fn(_source):
                 logger.warning(
                     "[Slack] Early reject of unauthorized user %s in channel %s",
@@ -6056,6 +6142,9 @@ class SlackAdapter(BasePlatformAdapter):
                     channel_id,
                 )
                 return
+            _external_resource_authorized = _source.external_resource_authorized
+        else:
+            _external_resource_authorized = False
 
         # Build thread_ts for session keying.
         # In channels: fall back to ts so each top-level @mention starts a
@@ -6734,6 +6823,7 @@ class SlackAdapter(BasePlatformAdapter):
             # (they carry no user_id to match against the allowlist).
             is_bot=bool(event.get("bot_id")) or event.get("subtype") == "bot_message",
         )
+        source.external_resource_authorized = _external_resource_authorized
 
         # Per-channel ephemeral prompt
         from gateway.platforms.base import (
