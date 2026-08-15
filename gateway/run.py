@@ -17781,7 +17781,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # is referencing. History can contain the same or similar text
             # multiple times, and without an explicit pointer the agent has to
             # guess (or answer for both subjects). Token overhead is minimal.
-            reply_snippet = event.reply_to_text[:500]
+            # The quoted text is another participant's content; neutralize it
+            # so an embedded newline cannot break out of the bracketed line.
+            # The [:500] cap is the intended bound, hence max_chars=0.
+            reply_snippet = neutralize_untrusted_inline_text(
+                event.reply_to_text[:500], max_chars=0
+            )
             if getattr(event, "reply_to_is_own_message", False):
                 message_text = (
                     f'[Replying to your previous message: "{reply_snippet}"]\n\n'
