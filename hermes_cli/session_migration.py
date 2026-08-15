@@ -48,6 +48,11 @@ from typing import Callable, Iterable, Optional
 # Chain-relink detection
 # ---------------------------------------------------------------------------
 
+# Confirmation callback shared by the destructive commands. Callers pass
+# ``(items, title)`` and may also pass ``selected=`` (pre-checked indices);
+# returns the set of indices to process, or None/empty when cancelled.
+ConfirmFn = Callable[..., Optional[set[int]]]
+
 # Children that must never be treated as compression continuations.
 _DELEGATE_EXPR = (
     "json_extract(COALESCE(s.model_config, '{}'), '$._delegate_from') IS NULL"
@@ -85,8 +90,8 @@ def _first_message_content(db, session_id: str) -> Optional[str]:
 def _starts_with_compaction_summary(db, session_id: str) -> bool:
     """True if the session's first message is a context-compaction handoff.
 
-    The authoritative signal for \"this root is really the continuation of an
-    older conversation\": old Hermes builds wrote compression continuations
+    The authoritative signal for "this root is really the continuation of an
+    older conversation": old Hermes builds wrote compression continuations
     as independent roots whose first persisted message is the compaction
     handoff (``SUMMARY_PREFIX`` / ``LEGACY_SUMMARY_PREFIX`` / any
     ``_HISTORICAL_SUMMARY_PREFIXES`` entry — the frozen set of every wire
@@ -101,29 +106,30 @@ def _starts_with_compaction_summary(db, session_id: str) -> bool:
     content = _first_message_content(db, session_id)
     if not content:
         return False
+    text = content.lstrip()
     try:
-        from agent.context_compressor import (
-            ContextCompressor,
-            LEGACY_SUMMARY_PREFIX,
-            SUMMARY_PREFIX,
-            _HISTORICAL_SUMMARY_PREFIXES,
-        )
+        # Reuse the official matcher (keeps the historical-prefix frozen set
+        # in sync automatically instead of duplicating it here).
+        from agent.context_compressor import ContextCompressor
+
+        return ContextCompressor._starts_with_summary_prefix(text)
     except Exception:  # noqa: BLE001 — optional import; fall back to prefixes
-        # ContextCompressor is not importable in a minimal environment;
-        # match the current/legacy prefixes directly.
-        LEGACY_SUMMARY_PREFIX = "[CONTEXT SUMMARY]:"
-        _HISTORICAL_SUMMARY_PREFIXES = ()
         try:
-            from agent.context_compressor import SUMMARY_PREFIX
+            from agent.context_compressor import (
+                LEGACY_SUMMARY_PREFIX,
+                SUMMARY_PREFIX,
+                _HISTORICAL_SUMMARY_PREFIXES,
+            )
         except Exception:  # noqa: BLE001
+            LEGACY_SUMMARY_PREFIX = "[CONTEXT SUMMARY]:"
+            _HISTORICAL_SUMMARY_PREFIXES = ()
             SUMMARY_PREFIX = (
                 "[CONTEXT COMPACTION — REFERENCE ONLY] Earlier turns "
                 "were compacted into the summary below."
             )
-    text = content.lstrip()
-    if text.startswith(SUMMARY_PREFIX) or text.startswith(LEGACY_SUMMARY_PREFIX):
-        return True
-    return any(text.startswith(p) for p in _HISTORICAL_SUMMARY_PREFIXES)
+        if text.startswith(SUMMARY_PREFIX) or text.startswith(LEGACY_SUMMARY_PREFIX):
+            return True
+        return any(text.startswith(p) for p in _HISTORICAL_SUMMARY_PREFIXES)
 
 
 def find_orphaned_chain_candidates(db, *, min_group: int = 2) -> list[dict]:
@@ -222,13 +228,18 @@ def find_orphaned_chain_candidates(db, *, min_group: int = 2) -> list[dict]:
 
 
 def _first_user_message(db, session_id: str) -> Optional[str]:
-    """Return the first user message of a session, if any."""
+    """Return the first user message of a session, if any.
+
+    Ordering matches the official preview subquery (``ORDER BY
+    m.timestamp, m.id``) so truncation detection uses the same \"first\"
+    message the sidebar previews.
+    """
     row = db._conn.execute(
         """
         SELECT content FROM messages
         WHERE session_id = ? AND role = 'user'
           AND content IS NOT NULL AND content != ''
-        ORDER BY id LIMIT 1
+        ORDER BY timestamp, id LIMIT 1
         """,
         (session_id,),
     ).fetchone()
@@ -381,7 +392,7 @@ def repair_chains(
     *,
     apply_changes: bool = False,
     progress: Optional[Callable[[str], None]] = None,
-    confirm: Optional[Callable[..., Optional[set[int]]]] = None,
+    confirm: Optional[ConfirmFn] = None,
 ) -> dict:
     """Detect and repair orphaned compression chains. Returns a stats dict.
 
@@ -425,11 +436,11 @@ def repair_chains(
         items = []
         for i, g in enumerate(orphan_groups):
             if g["signal"] == "both":
-                note = "压缩交接证据"
+                note = "compaction-handoff evidence"
             elif g["signal"] == "same-title":
-                note = "⚠ 仅标题相同，可能非同一对话"
+                note = "⚠ title match only — may not be same conversation"
             else:  # "handoff"
-                note = "⚠ 仅单侧交接提示，可能非同一对话"
+                note = "⚠ one-sided handoff — may not be same conversation"
             items.append(
                 f"{note}  {g['title'][:40]!r}  "
                 f"({len(g['sessions'])} roots: "
@@ -534,7 +545,7 @@ def retitle_missing(
     include_legacy_truncated: bool = True,
     limit: int = 500,
     progress: Optional[Callable[[str], None]] = None,
-    confirm: Optional[Callable[[list[str], str], Optional[set[int]]]] = None,
+    confirm: Optional[ConfirmFn] = None,
 ) -> dict:
     """Regenerate missing/truncated session titles. Returns a stats dict.
 
@@ -825,17 +836,6 @@ def _merge_chain_stats(db, chain: list[str]) -> dict:
     }
 
 
-def _backup_before_merge(db) -> Optional[Path]:
-    """Timestamped full snapshot via VACUUM INTO (safe against a live
-    connection, mirroring the clean-markers backup convention)."""
-    import datetime
-
-    stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    dest = db.db_path.with_name(f"{db.db_path.name}.pre-merge-chains-{stamp}")
-    db._conn.execute("VACUUM INTO ?", (str(dest),))
-    return dest
-
-
 def _backup_before_mutation(db, label: str) -> Optional[Path]:
     """Timestamped full state.db snapshot before any destructive command.
 
@@ -874,23 +874,23 @@ def _describe_title_model() -> str:
     timeout = aux.get("timeout", 30)
     reasoning_effort = str(aux.get("reasoning_effort") or "").strip()
 
-    lines = ["命名用模型 (auxiliary.title_generation):"]
+    lines = ["Title-generation model (auxiliary.title_generation):"]
     lines.append(f"  enabled        : {enabled}")
     lines.append(f"  provider       : {provider}")
 
     if provider == "auto":
-        main_provider = str(model_cfg.get("provider") or "").strip() or "(未配置)"
-        main_model = str(model_cfg.get("model") or "").strip() or "(未配置)"
-        lines.append(f"  ↳ auto 回退     : 主模型 {main_provider} / {main_model}")
+        main_provider = str(model_cfg.get("provider") or "").strip() or "(unset)"
+        main_model = str(model_cfg.get("model") or "").strip() or "(unset)"
+        lines.append(f"  ↳ auto → main   : {main_provider} / {main_model}")
         if model:
-            lines.append(f"  model          : {model} (显式覆盖)")
+            lines.append(f"  model          : {model} (explicit override)")
     else:
-        lines.append(f"  model          : {model or '(跟随 provider 默认)'}")
+        lines.append(f"  model          : {model or '(provider default)'}")
 
     if base_url:
         lines.append(f"  base_url       : {base_url}")
     if api_key:
-        lines.append(f"  api_key        : {'***已配置***' if api_key else '(空)'}")
+        lines.append(f"  api_key        : {'***configured***' if api_key else '(empty)'}")
     lines.append(f"  prefer_fast    : {prefer_fast}")
     if reasoning_effort:
         lines.append(f"  reasoning      : {reasoning_effort}")
@@ -904,9 +904,9 @@ def _describe_title_model() -> str:
         return host in ("127.0.0.1", "localhost", "::1", "0.0.0.0")
 
     if api_key or (base_url and not _is_local_url(base_url)):
-        endpoint = "云端 API（可能产生资费）"
+        endpoint = "CLOUD API — may incur cost"
     else:
-        endpoint = "本地模型（无资费）"
+        endpoint = "local model — no cost"
     lines.append(f"  endpoint       : {endpoint}")
 
     return "\n".join(lines)
@@ -917,7 +917,6 @@ def _confirm_candidates(
     title: str,
     *,
     selected: Optional[set[int]] = None,
-    status_fn: Optional[Callable[[set[int]], str]] = None,
 ) -> Optional[set[int]]:
     """Interactive checklist confirmation for destructive edits.
 
@@ -944,7 +943,6 @@ def _confirm_candidates(
             # default) — for destructive commands cancel means "do nothing",
             # otherwise pressing ESC would still process the pre-checks.
             cancel_returns=set(),
-            status_fn=status_fn,
         )
     except (EOFError, KeyboardInterrupt):
         return None
@@ -957,7 +955,7 @@ def merge_compression_chains(
     apply_changes: bool = False,
     backup: bool = True,
     progress: Optional[Callable[[str], None]] = None,
-    confirm: Optional[Callable[[list[str], str], Optional[set[int]]]] = None,
+    confirm: Optional[ConfirmFn] = None,
 ) -> dict:
     """Flatten fork compression chains into single in-place sessions.
 
@@ -1023,7 +1021,7 @@ def merge_compression_chains(
     # Automatic backup before any write.
     if backup:
         try:
-            backup_path = _backup_before_merge(db)
+            backup_path = _backup_before_mutation(db, "merge-chains")
             stats["backup_path"] = str(backup_path)
             log(f"✓ backup: {backup_path}")
         except Exception as exc:  # noqa: BLE001 — backup refusal is a HARD STOP

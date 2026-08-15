@@ -450,8 +450,8 @@ class TestDescribeTitleModel:
         desc = _describe_title_model()
         assert "provider       : deepseek" in desc
         assert "deepseek-chat" in desc
-        assert "云端 API（可能产生资费）" in desc
-        assert "api_key        : ***已配置***" in desc
+        assert "CLOUD API — may incur cost" in desc
+        assert "api_key        : ***configured***" in desc
 
     def test_local_provider_no_cost(self, monkeypatch):
         import hermes_cli.config as config_mod
@@ -474,7 +474,7 @@ class TestDescribeTitleModel:
         desc = _describe_title_model()
         assert "provider       : lmstudio" in desc
         assert "qwen3-27b" in desc
-        assert "本地模型（无资费）" in desc
+        assert "local model — no cost" in desc
 
     def test_auto_falls_back_to_main_model(self, monkeypatch):
         import hermes_cli.config as config_mod
@@ -489,7 +489,7 @@ class TestDescribeTitleModel:
         )
         desc = _describe_title_model()
         assert "provider       : auto" in desc
-        assert "主模型 deepseek / deepseek-chat" in desc
+        assert "deepseek / deepseek-chat" in desc
 
 
 # ---------------------------------------------------------------------------
@@ -620,7 +620,7 @@ class TestRepairChains:
 
         repair_chains(db, apply_changes=True, confirm=confirm)
 
-        assert any("仅标题相同" in it for it in captured["items"])
+        assert any("title match only" in it for it in captured["items"])
         # weak-signal group is NOT pre-checked
         assert captured["selected"] == set()
 
@@ -638,7 +638,7 @@ class TestRepairChains:
         repair_chains(db, apply_changes=True, confirm=confirm)
 
         # strong-signal group carries the evidence label and is pre-checked
-        assert any("压缩交接证据" in it for it in captured["items"])
+        assert any("compaction-handoff evidence" in it for it in captured["items"])
         assert captured["selected"] == {0}
 
     def test_esc_cancel_does_nothing_even_with_preselected(self, db):
