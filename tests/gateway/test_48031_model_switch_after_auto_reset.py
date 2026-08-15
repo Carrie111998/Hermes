@@ -25,17 +25,18 @@ import inspect
 
 from gateway import run as gateway_run
 from gateway import runner_lifecycle as gateway_lifecycle
+from gateway import runner_lifecycle_2 as gateway_lifecycle_2
 from gateway import slash_commands as gateway_slash
 
 
 def _runner_source() -> str:
-    """Concatenated source of the runner class (run.py + runner_lifecycle.py).
+    """Concatenated source of the runner class (run.py + runner_lifecycle.py + runner_lifecycle_2.py).
 
     The god-file decomposition campaign moved the gateway lifecycle methods
     out of ``gateway/run.py`` into ``gateway/runner_lifecycle.py``; the AST
     invariant below must scan both files.
     """
-    return inspect.getsource(gateway_run) + "\n" + inspect.getsource(gateway_lifecycle)
+    return inspect.getsource(gateway_run) + "\n" + inspect.getsource(gateway_lifecycle) + "\n" + inspect.getsource(gateway_lifecycle_2)
 
 
 def _assigns_false(node: ast.AST, attr: str) -> bool:

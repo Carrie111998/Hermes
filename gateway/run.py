@@ -2470,6 +2470,7 @@ from gateway.session_state import (
 from gateway.authz_mixin import GatewayAuthorizationMixin
 from gateway.kanban_watchers import GatewayKanbanWatchersMixin
 from gateway.runner_lifecycle import GatewayRunnerLifecycleMixin
+from gateway.runner_lifecycle_2 import GatewayRunnerLifecycle2Mixin
 from gateway.slash_commands import GatewaySlashCommandsMixin
 from gateway.turn_context import TurnContext
 from gateway.platforms.base import (
@@ -6344,7 +6345,7 @@ class TurnRunner:
 
 
 
-class GatewayRunner(GatewayRunnerLifecycleMixin, GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, GatewaySlashCommandsMixin):
+class GatewayRunner(GatewayRunnerLifecycleMixin, GatewayRunnerLifecycle2Mixin, GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, GatewaySlashCommandsMixin):
 
     def _reset_notice_session_info(self, source: SessionSource) -> str:
         """Session-info block for the auto-reset notice, profile-scoped.
