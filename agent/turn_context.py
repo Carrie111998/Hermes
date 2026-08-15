@@ -700,6 +700,24 @@ def build_turn_context(
     # Preserve the original user message (no nudge injection).
     original_user_message = persist_user_message if persist_user_message is not None else user_message
 
+    # Give memory providers the full remainder of the turn prologue to recall
+    # against the current query. This hook must return immediately; providers
+    # collect only already-ready results at the existing prefetch boundary
+    # below, before api_content is finalized and persisted.
+    if agent._memory_manager:
+        try:
+            _early_query = (
+                original_user_message if isinstance(original_user_message, str) else ""
+            )
+            if not is_trivial_prompt(_early_query):
+                agent._memory_manager.start_prefetch_all(
+                    _early_query,
+                    session_id=agent.session_id or "",
+                    turn_number=agent._user_turn_count,
+                )
+        except Exception:
+            pass
+
     # Track memory nudge trigger (turn-based, checked here).
     should_review_memory = False
     if (agent._memory_nudge_interval > 0
