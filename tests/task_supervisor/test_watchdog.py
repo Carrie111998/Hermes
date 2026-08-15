@@ -21,7 +21,7 @@ def write_task(base: Path, **overrides):
     task = {
         "task_id": "HERBIE-20260815-1200-test-task",
         "title": "Synthetic task",
-        "owner": "Steve",
+        "owner": "owner",
         "spec_filename": "spec.md",
         "spec_path": "/tmp/spec.md",
         "spec_version": "test",
@@ -230,7 +230,7 @@ def test_tool_budget_stop_state_notifies(tmp_path):
 def test_queued_task_does_not_replace_active_and_notice_delivered_once(tmp_path):
     active = write_task(tmp_path, status="ACTIVE", current_step="first task running")
     paths = LedgerPaths(tmp_path, tmp_path / "active_task.json", tmp_path / "events.jsonl", tmp_path / "dedupe_state.json")
-    queued = create_task_entry(paths, task_id="HERBIE-20260815-1201-second-task", title="Second task", owner="Steve", spec_filename="second.md", spec_path="/tmp/second.md", spec_version="test", spec_sha256="b" * 64, now=t(12, 1))
+    queued = create_task_entry(paths, task_id="HERBIE-20260815-1201-second-task", title="Second task", owner="owner", spec_filename="second.md", spec_path="/tmp/second.md", spec_version="test", spec_sha256="b" * 64, now=t(12, 1))
     store = load_store(paths)
     assert store["active_task_id"] == active["task_id"]
     assert store["tasks"][active["task_id"]]["current_step"] == "first task running"
@@ -246,7 +246,7 @@ def test_queued_task_does_not_replace_active_and_notice_delivered_once(tmp_path)
 def test_parallel_task_can_be_received_when_owner_authorizes_parallelism(tmp_path):
     write_task(tmp_path, status="ACTIVE", current_step="first task running")
     paths = LedgerPaths(tmp_path, tmp_path / "active_task.json", tmp_path / "events.jsonl", tmp_path / "dedupe_state.json")
-    task = create_task_entry(paths, task_id="HERBIE-20260815-1201-second-task", title="Second task", owner="Steve", spec_filename="second.md", spec_path="/tmp/second.md", spec_version="test", spec_sha256="b" * 64, now=t(12, 1), parallel_authorized=True)
+    task = create_task_entry(paths, task_id="HERBIE-20260815-1201-second-task", title="Second task", owner="owner", spec_filename="second.md", spec_path="/tmp/second.md", spec_version="test", spec_sha256="b" * 64, now=t(12, 1), parallel_authorized=True)
     assert task["status"] == "RECEIVED"
     assert load_store(paths)["active_task_id"] == task["task_id"]
 

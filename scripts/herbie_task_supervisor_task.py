@@ -31,7 +31,7 @@ def main(argv: list[str] | None = None) -> int:
     start.add_argument("--base-dir", type=Path, default=None)
     start.add_argument("--task-id", required=True)
     start.add_argument("--title", required=True)
-    start.add_argument("--owner", default="Steve")
+    start.add_argument("--owner", default="owner")
     start.add_argument("--spec-path", type=Path, required=True)
     start.add_argument("--spec-version", default="unspecified")
     start.add_argument("--parallel-authorized", action="store_true")

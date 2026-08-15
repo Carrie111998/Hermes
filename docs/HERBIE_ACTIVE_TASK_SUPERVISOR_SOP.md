@@ -2,7 +2,7 @@
 
 ## Purpose
 
-The Active Task Supervisor is a deterministic control plane for consequential owner-assigned tasks. It prevents silent disappearance while Herbie is unacknowledged, blocked, waiting for Steve, stale, out of tool budget, queued behind another task, ready for review, complete, or aborted.
+The Active Task Supervisor is a deterministic control plane for consequential owner-assigned tasks. It prevents silent disappearance while Herbie is unacknowledged, blocked, waiting for owner, stale, out of tool budget, queued behind another task, ready for review, complete, or aborted.
 
 The Herbie Execution Operating Charter remains authoritative for execution discipline. This SOP describes the runtime state, watchdog behavior, review/activation process, rollback, and recovery lifecycle.
 
@@ -41,7 +41,7 @@ Entrypoint:
 python3 scripts/herbie_task_supervisor_task.py start \
   --task-id HERBIE-YYYYMMDD-HHMM-slug \
   --title "Task title" \
-  --owner Steve \
+  --owner owner \
   --spec-path /absolute/path/to/spec.md \
   --spec-version "version label"
 ```
@@ -96,7 +96,7 @@ A task may not stop while still `ACTIVE`. Before stopping, transition to `BLOCKE
 Script entrypoint:
 
 ```bash
-python3 scripts/herbie_task_supervisor_watchdog.py --transport send-message --owner-target telegram:8285712655
+python3 scripts/herbie_task_supervisor_watchdog.py --transport send-message --owner-target ${HERMES_TASK_SUPERVISOR_OWNER_TARGET}
 ```
 
 Disabled cron manifest:
@@ -106,7 +106,7 @@ Disabled cron manifest:
 - Delivery: `local`
 - Script: absolute reviewed script path plus `--transport send-message --owner-target telegram`
 - Workdir: exact reviewed runtime checkout
-- State: disabled/paused until Steve + independent review approval
+- State: disabled/paused until owner + independent review approval
 
 Healthy/no-change runs print nothing and exit 0. Successful owner notifications are sent by the deterministic transport adapter, not by cron stdout, so cron delivery is local to avoid duplicate messages. Non-zero exit surfaces transport or state failure.
 
@@ -121,7 +121,7 @@ The watchdog uses a durable outbox record per incident key:
 
 The incident is not permanently deduped until the owner transport returns success. On transport failure the outbox remains pending/failed-retryable, task `last_owner_notification_attempt_at` may update, `last_owner_update_at` does **not** update, and a later run retries. Successful delivery updates `last_owner_update_at` and `last_owner_notification_delivered_at`.
 
-Approved V1 transport is Hermes' reviewed `send_message` path, pinned to Steve's Telegram owner path by `--owner-target telegram` unless activation review approves a more specific target. Stdout-confirmed transport is only for tests/manual local validation and is not the recurring cron transport.
+Approved V1 transport is Hermes' reviewed `send_message` path, pinned to owner's Telegram owner path by `--owner-target telegram` unless activation review approves a more specific target. Stdout-confirmed transport is only for tests/manual local validation and is not the recurring cron transport.
 
 ## Watchdog behavior
 
@@ -160,7 +160,7 @@ If execution cannot safely continue because of tool/session limits:
 1. export diff/state and checkpoint any work;
 2. update the task ledger to `BLOCKED` or `READY_FOR_INDEPENDENT_REVIEW`;
 3. record checkpoint commit/artifact path;
-4. notify Steve immediately;
+4. notify owner immediately;
 5. do not leave the task `ACTIVE`.
 
 ## Activation steps after independent review
@@ -169,7 +169,7 @@ Do not activate before review. After approval:
 
 1. Use the exact reviewed local/fork commit.
 2. Ensure `cron-manifests/herbie_active_task_supervisor.disabled.json` has `reviewed_commit` set to that exact commit, a clean reviewed `workdir`, and an absolute reviewed script path.
-3. Create the scheduler job only after Steve approval.
+3. Create the scheduler job only after operator approval.
 4. Confirm `no_agent: true`, schedule `*/15 * * * *`, `deliver: local`, and `--transport send-message`.
 5. Run no-task smoke: exit 0 silently.
 6. Run temporary synthetic owner-transport validation with messages labeled `HERBIE TASK SUPERVISOR TEST — No action required`.
@@ -178,11 +178,11 @@ Do not activate before review. After approval:
 ## Rollback
 
 1. Pause or remove only the Active Task Supervisor cron job.
-2. Do not modify the StartLine audit-request watcher.
-3. Do not modify the StartLine Phase 3B-1 transaction reconciliation monitor.
+2. Do not modify the existing private audit-request watcher.
+3. Do not modify the existing private transaction reconciliation monitor.
 4. Preserve `$HERMES_HOME/task-supervisor/*` for forensic review.
 5. If rollback is due to false alerts, archive `notification_outbox.json` and `dedupe_state.json` with a timestamp before restarting.
 
 ## Explicit non-goals
 
-This supervisor does not authorize Candidate 17 work, prospect sourcing, mockup creation, race-director outreach, form submissions, production marketing data writes, Phase 2A-1C, or Phase 2A-2. It also must not alter existing StartLine audit-request watcher or transaction reconciliation monitor jobs.
+This supervisor does not authorize Candidate 17 work, prospect sourcing, mockup creation, race-director outreach, form submissions, production marketing data writes, Phase 2A-1C, or Phase 2A-2. It also must not alter existing existing private audit-request watcher or transaction reconciliation monitor jobs.
