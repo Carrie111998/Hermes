@@ -58,6 +58,11 @@ _BRAIN_TO_RUNTIME: dict[str, tuple[str, str]] = {
 _PYTHON = "/usr/bin/python3"
 _PLAN_TIMEOUT_S = 15.0
 
+#: Sentinel distinguishing "agent never had this attribute" from a prior None,
+#: so a failed activation can both restore a prior value and undo a mutation
+#: back to None.
+_MISSING = object()
+
 #: Quota anomaly guard: if a single expensive-model call consumes more than
 #: this fraction of the 5h window, we stop further calls and warn the operator.
 ANOMALY_THRESHOLD_PCT = 10.0
@@ -224,6 +229,24 @@ def _resolve_brain_runtime(brain: str) -> tuple[str | None, str | None]:
     return pair
 
 
+def _restore_attr(agent, name: str, prior: object) -> None:
+    """Restore `agent.<name>` to its pre-mutation value for rollback.
+
+    If the agent had no such attribute before (`prior is _MISSING`), the
+    mutation made during a failed activation is removed so it can never be read
+    as pointing at a rejected brain. If it had a value (including None), that
+    value is restored exactly. Never raises.
+    """
+    try:
+        if prior is _MISSING:
+            if hasattr(agent, name):
+                delattr(agent, name)
+        else:
+            setattr(agent, name, prior)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def _apply_selection(agent, brain: str, *, failed_provider: str | None = None, plan: dict | None = None) -> bool:
     """F1: actually switch the agent to the selected Brain/provider/model.
 
@@ -238,10 +261,10 @@ def _apply_selection(agent, brain: str, *, failed_provider: str | None = None, p
     caller fails closed and the legacy static chain is preserved. The static
     ``fallback_providers`` chain is left untouched for rollback.
     """
-    prev_provider = getattr(agent, "provider", None)
-    prev_model = getattr(agent, "model", None)
-    prev_requested = getattr(agent, "requested_provider", None)
-    prev_brain = getattr(agent, "_pgf_governed_brain", None)
+    prev_provider = getattr(agent, "provider", _MISSING)
+    prev_model = getattr(agent, "model", _MISSING)
+    prev_requested = getattr(agent, "requested_provider", _MISSING)
+    prev_brain = getattr(agent, "_pgf_governed_brain", _MISSING)
     try:
         provider, model = _resolve_brain_runtime(brain)
         if not provider or not model:
@@ -280,18 +303,14 @@ def _apply_selection(agent, brain: str, *, failed_provider: str | None = None, p
     except Exception as exc:  # noqa: BLE001 - never let the gate crash routing
         logger.warning("pgf_routing_gate: _apply_selection failed: %s", exc)
         # Restore previous state atomically so a failed activation cannot leave a
-        # provider/requested_provider desync pointing at the rejected brain.
-        try:
-            if prev_provider is not None:
-                agent.provider = prev_provider
-            if prev_model is not None:
-                agent.model = prev_model
-            if prev_requested is not None:
-                agent.requested_provider = prev_requested
-            if prev_brain is not None:
-                agent._pgf_governed_brain = prev_brain
-        except Exception:  # noqa: BLE001
-            pass
+        # provider/requested_provider desync pointing at the rejected brain. Use
+        # the _MISSING sentinel (captured before mutation) so we can both restore
+        # a prior value AND undo a mutation back to None when the agent had no
+        # prior value (fresh agent) — never leaving the rejected brain behind.
+        _restore_attr(agent, "provider", prev_provider)
+        _restore_attr(agent, "model", prev_model)
+        _restore_attr(agent, "requested_provider", prev_requested)
+        _restore_attr(agent, "_pgf_governed_brain", prev_brain)
         _persist_replan_activation(
             failed_provider=failed_provider,
             selected_brain=brain,

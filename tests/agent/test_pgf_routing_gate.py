@@ -266,3 +266,28 @@ def test_f1_replan_activation_persisted(gate):
     assert call.kwargs["activation_result"] == "activated"
     assert call.kwargs["retry_provider"] == "anthropic"
     assert call.kwargs["retry_model"] == "claude-sonnet-5"
+
+
+def test_f1_rollback_undoes_mutation_when_prior_attr_was_none(gate):
+    """F1 rollback hardener: if a fresh agent had no prior requested_provider
+    and activation fails after setting it, the rejected brain must be undone
+    (requested_provider removed / set back), not left pointing at the failure."""
+    a = _agent(marker=True)
+    # Fresh agent: `_agent` does not define requested_provider / _pgf_governed_brain,
+    # so their prior state is _MISSING (never had one).
+
+    # Force _apply_selection to raise AFTER mutating by making the first persist
+    # (activation_result="activated") call explode, while the failure-path
+    # persist (activation_result="failed") call succeeds.
+    def _boom_persist(**kw):
+        if kw.get("activation_result") == "activated":
+            raise RuntimeError("persist exploded after state was mutated")
+        return "/tmp/r"
+
+    with mock.patch.object(gate, "_persist_replan_activation", side_effect=_boom_persist):
+        switched = gate._apply_selection(a, "claude", failed_provider="openai-codex", plan={})
+
+    assert switched is False
+    # The rejected brain must not be left on requested_provider.
+    assert not hasattr(a, "requested_provider") or a.requested_provider != "anthropic"
+    assert not hasattr(a, "_pgf_governed_brain") or a._pgf_governed_brain != "claude"
