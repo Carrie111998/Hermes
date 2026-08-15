@@ -143,6 +143,24 @@ def _conn(board: Optional[str] = None):
     return kanban_db.connect(board=board)
 
 
+def _release_state_payload(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    board: Optional[str] = None,
+) -> dict[str, Any]:
+    """Truthful read-only release state via the CLI's shared read model.
+
+    Epics return the named lifecycle state (collecting_members,
+    aggregate_verification, awaiting_final_release, ci_pending, ci_failed,
+    done) with snapshot evidence; members return their integration state.
+    ``actionable`` is True only after the E06 target re-check succeeds.
+    """
+    from hermes_cli import kanban as kanban_cli
+
+    return kanban_cli._task_release_state(conn, task_id, board=board)
+
+
 # ---------------------------------------------------------------------------
 # Serialization helpers
 # ---------------------------------------------------------------------------
@@ -1127,14 +1145,21 @@ def get_board(
         epics: list[dict[str, Any]] = []
         for t in tasks:
             if t.work_item_kind == "epic":
-                epics.append(
-                    {
-                        "id": t.id,
-                        "title": t.title,
-                        "workItemKind": "epic",
-                        "progress": kanban_db.epic_progress(conn, t.id),
-                    }
-                )
+                entry: dict[str, Any] = {
+                    "id": t.id,
+                    "title": t.title,
+                    "workItemKind": "epic",
+                    "progress": kanban_db.epic_progress(conn, t.id),
+                }
+                try:
+                    release = _release_state_payload(conn, t.id, board=board)
+                    entry["release_state"] = release["state"]
+                    entry["release_actionable"] = bool(release.get("actionable"))
+                except Exception as exc:  # never break the board for one epic
+                    log.warning("release state for %s failed: %s", t.id, exc)
+                    entry["release_state"] = None
+                    entry["release_actionable"] = False
+                epics.append(entry)
                 continue
             full = summary_map.get(t.id)
             preview = (
@@ -1292,6 +1317,7 @@ def get_task(
         if task.work_item_kind == "epic":
             members = kanban_db.list_epic_members(conn, task_id)
             progress = kanban_db.epic_progress(conn, task_id)
+            release = _release_state_payload(conn, task_id, board=board)
             response["members"] = members
             response["progress"] = progress
             contract = response["work_contract"] or {}
@@ -1305,9 +1331,39 @@ def get_task(
                 "definition_of_done": handover.get("done_when") or [],
                 "members": members,
                 "progress": progress,
-                "release_state": progress["release_state"],
+                "release_state": release["state"],
+                "release": release,
             }
+        elif kanban_db.epic_id_for_task(conn, task_id) is not None:
+            # Epic-member cards: integration state only — no Release/Measure.
+            response["member_release_state"] = _release_state_payload(
+                conn, task_id, board=board
+            )
         return response
+    finally:
+        conn.close()
+
+
+@router.get("/tasks/{task_id}/release-state")
+def get_task_release_state(
+    task_id: str,
+    board: Optional[str] = Query(None),
+):
+    """Read-only release lifecycle state for a task.
+
+    Epics: named lifecycle state + immutable snapshot evidence. Members:
+    integration state (attempt/safe code/fact). Standalone product cards:
+    their workflow step. ``actionable`` is True only when the E06 target
+    re-check (``build_epic_release_handoff``) confirms the pinned handoff
+    right now; no route here invokes merge or push.
+    """
+    board = _resolve_board(board)
+    conn = _conn(board=board)
+    try:
+        task = kanban_db.get_task(conn, task_id)
+        if task is None:
+            raise HTTPException(status_code=404, detail=f"task {task_id} not found")
+        return _release_state_payload(conn, task_id, board=board)
     finally:
         conn.close()
 
