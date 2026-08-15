@@ -187,12 +187,36 @@ class TestCLIStatusBar:
 
 
 
-    def test_spinner_height_uses_display_width_for_wide_characters(self):
+    def test_spinner_height_reserved_constant_one_row(self):
+        # #70031: the spinner row height must stay 1 whether or not spinner
+        # text exists, so the chrome canvas never grows mid-turn (a height
+        # change forces prompt_toolkit to scroll the old chrome into
+        # scrollback, stacking repeated frames). Wide text is clipped by
+        # wrap_lines=False instead of wrapping to a second row.
         cli_obj = _make_cli()
-        cli_obj._spinner_text = "你" * 40
         cli_obj._tool_start_time = 0
 
-        assert cli_obj._spinner_widget_height(width=64) == 2
+        assert cli_obj._spinner_widget_height(width=64) == 1
+        cli_obj._spinner_text = "你" * 40
+        assert cli_obj._spinner_widget_height(width=64) == 1
+
+    def test_spinner_loop_branch_never_repaints_while_agent_runs(self):
+        # #70031 invariant: while the agent runs (no child command) the
+        # background loop must NOT issue periodic repaints.
+        assert cli_mod.spinner_loop_branch(True, False, 2.0) == "repaint_fast"
+        assert cli_mod.spinner_loop_branch(False, True, 2.0) == "stable"
+        assert cli_mod.spinner_loop_branch(False, True, 0.0) == "stable"
+        assert cli_mod.spinner_loop_branch(False, False, 2.0) == "idle_tick"
+        assert cli_mod.spinner_loop_branch(False, False, 0.0) == "idle_stable"
+
+    def test_resolve_idle_refresh_interval_clamps_and_defaults(self):
+        assert cli_mod.resolve_idle_refresh_interval() == 0.0
+        with patch.object(cli_mod, "CLI_CONFIG", {"display": {"cli_refresh_interval": 2.0}}):
+            assert cli_mod.resolve_idle_refresh_interval() == 2.0
+        with patch.object(cli_mod, "CLI_CONFIG", {"display": {"cli_refresh_interval": 99}}):
+            assert cli_mod.resolve_idle_refresh_interval() == 30.0
+        with patch.object(cli_mod, "CLI_CONFIG", {"display": {"cli_refresh_interval": "junk"}}):
+            assert cli_mod.resolve_idle_refresh_interval() == 0.0
 
 
     def test_voice_status_bar_compacts_on_narrow_terminals(self):
