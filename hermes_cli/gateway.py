@@ -7705,10 +7705,15 @@ def _gateway_command_inner(args):
                 )
                 # kill_gateway_processes() sends SIGTERM; give those drains the
                 # service manager's own budget before escalating to SIGKILL.
-                _wait_for_gateway_exit(
+                # If one outlives that too, do not go on to bootstrap a second
+                # instance against the same bot token and port — the outcome
+                # launchd_uninstall() keeps its plist to avoid.
+                exited = _wait_for_gateway_exit(
                     timeout=_GATEWAY_STOP_WAIT_SECONDS,
                     force_after=_GATEWAY_STOP_GRACE_SECONDS,
                 )
+                if not exited:
+                    _abort_on_surviving_gateway("start")
 
         if is_termux():
             print(
