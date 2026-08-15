@@ -464,7 +464,9 @@ class CodexAppServerSession:
                     message = (
                         f"{base}\ncodex stderr (last {len(tail)} lines):\n{joined}"
                     )
-        return redact_sensitive_text(message, force=True)
+        return redact_sensitive_text(
+            message, force=True, redact_url_credentials=True
+        )
 
     # ---------- per-turn ----------
 

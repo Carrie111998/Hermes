@@ -488,8 +488,8 @@ class TestRunTurn:
         """When codex stderr has content (non-OAuth), the tail gets attached
         to the user-facing error so config/provider problems are debuggable
         instead of just 'Internal error'. Credential-shaped values in stderr
-        are redacted via agent.redact(force=True); web-URL query params pass
-        through (see fix(redact): pass web URLs through unchanged)."""
+        are redacted via agent.redact(force=True), including credential-named
+        URL query parameters at this non-navigation error sink."""
         client = FakeClient()
         client.set_stderr_tail([
             "ERROR: provider auth failed",
@@ -512,6 +512,7 @@ class TestRunTurn:
         # Stderr tail attached
         assert "codex stderr" in r.error
         assert "provider auth failed" in r.error
+        assert "querysecret12345" not in r.error
         # Credential-shaped values still redacted (sk- prefix + Bearer header)
         assert "sk-live-deadbeefdeadbeef" not in r.error
         # Non-OAuth → should NOT retire (subprocess JSON-RPC is still healthy).
@@ -569,6 +570,28 @@ class TestRunTurn:
         assert "codex stderr" not in r.error
         assert secret not in r.error
         assert r.should_retire is False
+
+    def test_turn_start_failure_redacts_opaque_url_credentials(self):
+        client = FakeClient()
+        client.set_stderr_tail([])
+        from agent.transports.codex_app_server import CodexAppServerError
+
+        secret = "opaque-query-value-12345"
+
+        def boom(method, params):
+            if method == "turn/start":
+                raise CodexAppServerError(
+                    code=-32603,
+                    message=f"provider failed https://api.example/v1?api_key={secret}",
+                )
+            return {"thread": {"id": "t"}, "activePermissionProfile": {"id": "x"}}
+
+        client._request_handler = boom
+        r = make_session(client).run_turn("hi", turn_timeout=2.0)
+
+        assert r.error is not None
+        assert "turn/start failed" in r.error
+        assert secret not in r.error
 
     def test_turn_start_timeout_attaches_redacted_stderr_tail(self):
         """A non-OAuth TimeoutError on turn/start surfaces with codex stderr
@@ -700,6 +723,26 @@ class TestRunTurn:
         s = make_session(client)
         r = s.run_turn("x", turn_timeout=1.0)
         assert r.error and "model error" in r.error
+
+    def test_failed_turn_redacts_opaque_url_credentials(self):
+        client = FakeClient()
+        secret = "opaque-query-value-67890"
+        client.queue_notification(
+            "turn/completed", threadId="t",
+            turn={
+                "id": "tu1",
+                "status": "failed",
+                "error": {
+                    "message": f"provider failed https://api.example/v1?token={secret}"
+                },
+            },
+        )
+
+        r = make_session(client).run_turn("x", turn_timeout=1.0)
+
+        assert r.error is not None
+        assert "turn ended status=failed" in r.error
+        assert secret not in r.error
 
     def test_run_turn_records_native_compaction_item(self):
         client = FakeClient()
