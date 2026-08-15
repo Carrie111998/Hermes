@@ -3157,8 +3157,9 @@ def _append_node_dir_for_service(
 ) -> None:
     """Add the Node directory a generated service unit should use to *path_entries*.
 
-    The Hermes-managed Node under ``$HERMES_HOME/node`` goes first when it
-    exists. A bare ``shutil.which("node")`` cannot be trusted on its own here:
+    The Hermes-managed Node under ``$HERMES_HOME/node`` goes first when its
+    tree contains a Node/npm/npx shim. A bare ``shutil.which("node")`` cannot
+    be trusted on its own here:
     a service unit is written once and then survives reboots, so resolving a
     system Node that happens to be ahead on the installing shell's PATH bakes
     the wrong interpreter in permanently — the exact failure the desktop
@@ -3172,10 +3173,14 @@ def _append_node_dir_for_service(
     candidate dir (hardened home) means "skip the rung", not "crash the
     generator".
 
-    PATH lookup remains the fallback rung for installs with no managed Node.
+    PATH lookup remains the fallback rung for installs with no managed Node tree.
     """
-    from hermes_constants import iter_hermes_node_dirs
+    from hermes_constants import (
+        hermes_managed_node_tree_present,
+        iter_hermes_node_dirs,
+    )
 
+    managed_node_present = hermes_managed_node_tree_present(hermes_root)
     for directory in iter_hermes_node_dirs(hermes_root):
         entry = str(directory)
         try:
@@ -3184,6 +3189,14 @@ def _append_node_dir_for_service(
             present = False
         if present and entry not in path_entries:
             path_entries.append(entry)
+
+    # A real Hermes-managed Node tree is authoritative. Do not let the shell
+    # that happens to generate the service add a second, machine-dependent
+    # Node directory after it. An empty leftover managed directory does not
+    # suppress the fallback: hermes_managed_node_tree_present() requires an
+    # actual Node/npm/npx shim.
+    if managed_node_present:
+        return
 
     resolved_node = shutil.which("node")
     if not resolved_node:

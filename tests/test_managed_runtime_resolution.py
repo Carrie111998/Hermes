@@ -80,8 +80,8 @@ _ALLOWED: dict[tuple[str, str], str] = {
         "guidance."
     ),
     ("hermes_cli/gateway.py", "node"): (
-        "Fallback rung of _append_node_dir_for_service(), after the managed "
-        "dirs from iter_hermes_node_dirs() are already appended."
+        "Fallback rung of _append_node_dir_for_service(), used only when no "
+        "Hermes-managed Node tree is present."
     ),
     ("hermes_cli/main.py", "node"): (
         "_ensure_tui_node()'s idempotence gate: the question really is 'is "
