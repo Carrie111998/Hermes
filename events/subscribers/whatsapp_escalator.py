@@ -406,6 +406,36 @@ class WhatsAppEscalator(BaseSubscriber):
             probe = p.get("probe", "?")
             after = str(p.get("after", "down")).upper()
             text = f"🔑 Credential loss: {probe} is {after}. {p.get('detail', '')}".strip()
+        elif et == EventType.MODEL_RATE_LIMITED:
+            # Added 2026-08-14 with the event type. Without an arm here the
+            # message fell through to the generic key:value dump
+            # ("model_rate_limited: provider: deepseek · model: ... ·
+            # outcome: chain_exhausted"), which is the one place an operator
+            # reads at 3am. The two ACT outcomes are deliberately worded
+            # apart because their REMEDY differs: chain_exhausted means every
+            # configured alternative is also down (wait, or divert outside the
+            # chain); no_fallback means none was ever configured (go add one).
+            _outcome = (p.get("outcome") or "").strip().lower()
+            _model = p.get("model") or "?"
+            _provider = p.get("provider") or "?"
+            _calls = p.get("diverted_calls") or 0
+            if _outcome == "recovered":
+                text = (f"{_model} ({_provider}) is back — rate limit cleared "
+                        f"after {_calls} diverted call(s).")
+            elif _outcome == "no_fallback":
+                text = (f"{_model} ({_provider}) is rate limited and has NO "
+                        f"fallback configured — runs are failing. {_calls} "
+                        f"call(s) affected. Add a fallback provider.")
+            elif _outcome == "chain_exhausted":
+                text = (f"{_model} ({_provider}) is rate limited and every "
+                        f"fallback is exhausted — runs are failing. {_calls} "
+                        f"call(s) affected.")
+            else:
+                text = (f"{_model} ({_provider}) is rate limited — traffic "
+                        f"diverted to {p.get('fallback_model') or '?'}. "
+                        f"{_calls} call(s) so far.")
+            if p.get("resets_at"):
+                text += f" Resets {p['resets_at']}."
         elif et == EventType.WATCHDOG_BURST:
             text = watchdog_burst_body(p)
         elif et == EventType.WATCHDOG_PROBE_TRANSITION:
