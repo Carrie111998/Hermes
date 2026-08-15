@@ -9,7 +9,9 @@ against the bundled Bitwarden source.
 
 from __future__ import annotations
 
+import subprocess
 import sys
+import textwrap
 import time
 from pathlib import Path
 
@@ -361,3 +363,39 @@ class TestOnePasswordConformance(SecretSourceConformance):
         monkeypatch.setattr(op, "find_op", lambda *_a, **_kw: None)
         monkeypatch.delenv("OP_SERVICE_ACCOUNT_TOKEN", raising=False)
         return op.OnePasswordSource()
+
+
+class TestNoEagerCryptographyImport:
+    """#86735 regression: registering the bundled sources must not load
+    ``cryptography``.
+
+    Every CLI/gateway process imports the secret-source registry, and
+    Bitwarden's module used to import ``cryptography.hazmat...`` at module
+    level. On Windows a mapped native extension (``cryptography._rust``)
+    cannot be replaced once loaded, so ``hermes update``'s self-lock
+    preflight deferred every update before it could even pull commits.
+    The imports are now lazy; this test proves it in a clean interpreter
+    (a subprocess, so the test runner's own imports cannot mask a
+    regression).
+    """
+
+    def test_builtin_registration_does_not_import_cryptography(self):
+        code = textwrap.dedent(
+            """
+            import sys
+            from agent.secret_sources import registry
+            registry._ensure_builtin_sources()
+            print("cryptography" in sys.modules)
+            print("cryptography.hazmat.bindings._rust" in sys.modules)
+            """
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", code],
+            capture_output=True,
+            text=True,
+            cwd=str(ROOT),
+        )
+        assert result.returncode == 0, result.stderr
+        lines = result.stdout.strip().splitlines()
+        assert lines[0] == "False"
+        assert lines[1] == "False"

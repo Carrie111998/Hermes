@@ -47,9 +47,12 @@ import zipfile
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+# NOTE: cryptography is intentionally NOT imported at module level.  It pulls
+# in native bindings (cryptography._rust on Windows) that a mapped extension
+# cannot replace once loaded — and this module is imported unconditionally by
+# the secret-source registry for every CLI/gateway process, so an eager import
+# trips `hermes update`'s self-lock preflight on Windows before it can even
+# pull new commits (#86735).  Import lazily inside the functions that use it.
 
 from agent.secret_sources._cache import (
     CachedFetch as _CachedFetch,
@@ -375,6 +378,11 @@ def _b64d(text: str) -> bytes:
 
 def _derive_encrypted_cache_key(access_token: str, salt: bytes) -> bytes:
     """Derive the local cache encryption key from the bootstrap BWS token."""
+    # Lazy: cryptography must not load unless an encrypted cache is actually
+    # in use (see the module-level NOTE — #86735).
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+
     return HKDF(
         algorithm=hashes.SHA256(),
         length=32,
@@ -407,6 +415,10 @@ def _write_encrypted_disk_cache(
         nonce = os.urandom(12)
         serialized_key = _cache_key_str(cache_key)
         key = _derive_encrypted_cache_key(access_token, salt)
+        # Lazy: cryptography must not load unless an encrypted cache is
+        # actually in use (see the module-level NOTE — #86735).
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
         plaintext = json.dumps(
             {"secrets": entry.secrets, "fetched_at": entry.fetched_at},
             separators=(",", ":"),
@@ -471,6 +483,10 @@ def _read_encrypted_disk_cache(
         nonce = _b64d(str(payload.get("nonce", "")))
         ciphertext = _b64d(str(payload.get("ciphertext", "")))
         key = _derive_encrypted_cache_key(access_token, salt)
+        # Lazy: cryptography must not load unless an encrypted cache is
+        # actually in use (see the module-level NOTE — #86735).
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
         raw = AESGCM(key).decrypt(
             nonce, ciphertext, serialized_key.encode("utf-8")
         )
