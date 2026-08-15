@@ -66,10 +66,12 @@ def _base_subprocess_env() -> dict:
     # child interpreter honors them ahead of its own site-packages — so the
     # CLI imports compiled C-extensions (e.g. pydantic_core) built for the
     # wrong interpreter and crashes on ABI mismatch (#83427, #84841, #86006,
-    # #86104). Strip both — the CLI manages its own environment and never
-    # needs Hermes's import path.
+    # #86104). VIRTUAL_ENV can likewise make a child launcher select Hermes's
+    # interpreter. Strip all three — the CLI manages its own environment and
+    # never needs Hermes's runtime overlays.
     env.pop("PYTHONPATH", None)
     env.pop("PYTHONHOME", None)
+    env.pop("VIRTUAL_ENV", None)
     env.setdefault("ANONYMIZED_TELEMETRY", "false")
     return env
 
