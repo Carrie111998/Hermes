@@ -10319,7 +10319,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
     def get_resume_message_count(self, session_id: str) -> int:
         """Count active rows that a full resume would materialize."""
-        session_ids = self._session_lineage_root_to_tip(session_id)
+        session_ids = self._session_replay_lineage_root_to_tip(session_id)
         placeholders = ",".join("?" for _ in session_ids)
         with self._read_ctx() as conn:
             row = conn.execute(
@@ -10350,7 +10350,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             # return value, and an unbounded lineage COUNT here would do the
             # exact pathological work the disable exists to avoid.
             return 0
-        session_ids = self._session_lineage_root_to_tip(session_id)
+        session_ids = self._session_replay_lineage_root_to_tip(session_id)
         placeholders = ",".join("?" for _ in session_ids)
         with self._read_ctx() as conn:
             row = conn.execute(
@@ -10518,11 +10518,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 except (json.JSONDecodeError, TypeError):
                     config = None
                 branch_parent = config.get("_branched_from") if isinstance(config, dict) else None
+                parent_id = session["parent_session_id"]
                 # Compression continuations can inherit branch provenance. It
                 # marks this edge as a fork only when it names this row's parent.
-                if branch_parent == session["parent_session_id"]:
+                if branch_parent and branch_parent == parent_id:
                     break
-                current = session["parent_session_id"]
+                current = parent_id
         return list(reversed(chain)) or [session_id]
 
     @staticmethod

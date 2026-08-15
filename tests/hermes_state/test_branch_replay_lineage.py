@@ -2,7 +2,7 @@
 
 import pytest
 
-from hermes_state import SessionDB
+from hermes_state import SessionDB, SessionResumeTooLargeError
 
 
 @pytest.fixture
@@ -152,3 +152,32 @@ def test_compression_after_branch_replays_from_branch_boundary(db):
         "branch before compression prompt",
         "branch before compression answer",
     ]
+
+
+def test_resume_safety_counts_only_the_branch_aware_replay_lineage(db):
+    db.create_session("root", source="desktop")
+    _append_turn(db, "root", "fork snapshot")
+
+    db.create_session(
+        "branch",
+        source="desktop",
+        parent_session_id="root",
+        model_config={"_branched_from": "root"},
+    )
+    _append_turn(db, "branch", "fork snapshot")
+    _append_turn(db, "branch", "branch before compression")
+    db.end_session("branch", "compression")
+
+    db.create_session(
+        "continuation",
+        source="desktop",
+        parent_session_id="branch",
+        model_config={"_branched_from": "root"},
+    )
+    _append_turn(db, "continuation", "branch after compression")
+
+    assert db.get_resume_message_count("continuation") == 6
+    assert db.assert_resume_safe("continuation", max_messages=6) == 6
+    with pytest.raises(SessionResumeTooLargeError) as exc_info:
+        db.assert_resume_safe("continuation", max_messages=5)
+    assert exc_info.value.message_count == 6
