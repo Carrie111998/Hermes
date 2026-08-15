@@ -2941,3 +2941,78 @@ class TestApplyDatabasePragmas:
             assert conn.execute("PRAGMA wal_autocheckpoint").fetchone()[0] == before
         finally:
             conn.close()
+
+
+# =========================================================================
+# Released-handle recovery (TrackedConnection NULL-without-exception)
+# =========================================================================
+
+class TestReleasedHandleRecovery:
+    """The CPython SystemError \"<conn> returned NULL without setting an
+    exception\" surfaces when a method call lands on a sqlite3.Connection whose
+    underlying C handle was freed (aggravated at shutdown by the daemon
+    token-writer thread). The fix reconnects once and retries the write instead
+    of dropping a transcript/token delta."""
+
+    def test_append_message_reconnects_after_released_handle_systemerror(self, db, monkeypatch):
+        sid = db.create_session(session_id="s1", source="cli", model="m")
+        reopen = mock.Mock(wraps=db._reopen_write_connection)
+        monkeypatch.setattr(db, "_reopen_write_connection", reopen)
+
+        # Force the FIRST write to raise the released-handle SystemError, then
+        # let the reconnected connection succeed.
+        real_execute = db._conn.execute
+        calls = {"n": 0}
+
+        def explode_execute(sql, *a, **k):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise SystemError(
+                    "<hermes_cli.sqlite_safe_read.TrackedConnection object at 0x1> "
+                    "returned NULL without setting an exception"
+                )
+            return real_execute(sql, *a, **k)
+
+        monkeypatch.setattr(db._conn, "execute", explode_execute)
+
+        mid = db.append_message(sid, role="user", content="hello")
+        assert mid > 0
+        reopen.assert_called_once()
+        row = db.get_messages(sid)
+        assert any(r["content"] == "hello" for r in row if r["role"] == "user")
+
+    def test_second_systemError_not_swallowed(self, db, monkeypatch):
+        """A second released-handle SystemError (reconnect did not fix) must not
+        be retried forever — it propagates rather than masking (guard runs once)."""
+        sid = db.create_session(session_id="s2", source="cli", model="m")
+        total_executes = {"n": 0}
+
+        def explode_execute(sql, *args, **k):
+            total_executes["n"] += 1
+            raise SystemError(
+                "<TrackedConnection object at 0x2> returned NULL without setting an exception"
+            )
+
+        # Keep the reconnected connection ALSO exploding, so the retry after
+        # reopen hits a second SystemError and the once-only guard must raise.
+        orig_reopen = db._reopen_write_connection
+
+        def reopen_then_fail():
+            orig_reopen()
+            db._conn.execute = explode_execute
+
+        monkeypatch.setattr(db, "_reopen_write_connection", reopen_then_fail)
+        monkeypatch.setattr(db._conn, "execute", explode_execute)
+        with pytest.raises(SystemError):
+            db.update_token_counts(sid, input_tokens=5)
+        # Exactly two attempts happened: the fail + the post-reopen fail. The
+        # guard must NOT loop a third time.
+        assert total_executes["n"] == 2
+
+    def test_reopen_preserves_database_contents(self, db):
+        """Reopen yields a working connection against the same healthy file."""
+        sid = db.create_session(session_id="s3", source="cli", model="m")
+        db.append_message(sid, role="user", content="before")
+        db._reopen_write_connection()
+        row = db.get_messages(sid)
+        assert any(r["content"] == "before" for r in row if r["role"] == "user")

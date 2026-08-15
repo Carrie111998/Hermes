@@ -2346,6 +2346,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         if patience_s is None:
             patience_s = self._WRITE_PATIENCE_S
         deadline = time.monotonic() + patience_s
+        reopened = False
         while True:
             try:
                 with self._lock:
@@ -2366,6 +2367,28 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 if self._write_count % self._FTS_MERGE_EVERY_N_WRITES == 0:
                     self._try_incremental_merge_fts()
                 return result
+            except SystemError as exc:
+                # Released sqlite3 C handle: "<conn> returned NULL without
+                # setting an exception" (CPython SystemError from a stale
+                # connection, aggravated at shutdown by the daemon token-writer
+                # thread). The DB file is healthy; reconnect once and retry the
+                # write instead of dropping a transcript/token delta. Do not
+                # retry more than once (a genuinely-freed handle would reopen
+                # successfully; further SystemErrors are a different fault).
+                err_msg = str(exc).lower()
+                if "returned null without setting an exception" not in err_msg or reopened:
+                    raise
+                logger.warning(
+                    "Session DB released connection handle (SystemError) — "
+                    "reconnecting and retrying the write once: %s", exc,
+                )
+                try:
+                    self._reopen_write_connection()
+                except Exception as reconnect_exc:  # noqa: BLE001
+                    logger.warning("Session DB reopen after released handle failed: %s", reconnect_exc)
+                    raise
+                reopened = True
+                continue
             except sqlite3.OperationalError as exc:
                 err_msg = str(exc).lower()
                 if "locked" in err_msg or "busy" in err_msg:
@@ -2544,6 +2567,35 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     logger.debug("WAL checkpoint (TRUNCATE) at close failed: %s", exc)
                 self._conn.close()
                 self._conn = None
+
+    def _reopen_write_connection(self) -> None:
+        """Narrow recovery for a released sqlite3 C handle (the CPython
+        ``SystemError '<conn> returned NULL without setting an exception'``).
+
+        That SystemError is what surfaces when a method call lands on a
+        ``sqlite3.Connection`` whose underlying C handle was freed — aggravated
+        at shutdown by the daemon token-writer thread or a stale reference.
+        The database file is healthy; only the connection object is stale.
+        Drop the old (possibly released) handle and open a fresh one so the
+        immediately-following write retries cleanly. Never treats the file as
+        corrupt and never touches the DB contents.
+        """
+        old = self._conn
+        self._conn = None
+        if old is not None:
+            try:
+                # The stale handle may itself raise on close; ignore it.
+                sqlite3.Connection.close(old)
+            except Exception:  # noqa: BLE001
+                pass
+        # Rebuild the writer connection exactly as the open path does.
+        self._conn = _connect_tracked_db(
+            str(self.db_path),
+            check_same_thread=False,
+            timeout=1.0,
+            isolation_level=None,
+        )
+        self._conn.row_factory = sqlite3.Row
 
     # ── Chunked FTS rebuild engine (v23 opt-in optimize) ──
     #
