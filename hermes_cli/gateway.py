@@ -4401,6 +4401,11 @@ def _timestamped_stderr_gateway_command(error_log: Path) -> list[str]:
         str(error_log),
         "--",
         *_gateway_run_command(),
+        # launchd injects XPC_SERVICE_NAME into the outer stderr_timestamp
+        # wrapper but does not propagate it to this inner subprocess.
+        # --external-supervisor tells gateway run it is managed by launchd so
+        # it does not trigger the duplicate-instance guard and exit with code 1.
+        "--external-supervisor",
     ]
 
 
