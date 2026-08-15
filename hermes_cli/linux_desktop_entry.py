@@ -57,18 +57,46 @@ def icon_path(project_root: Path) -> Path:
     return project_root / "apps" / "desktop" / "assets" / "icon.png"
 
 
+def _is_python_script(path: Path) -> bool:
+    """True when ``path`` is a script whose shebang names a Python interpreter.
+
+    A desktop entry runs without shell ``PATH`` customizations, so a bare
+    script with an ``env python`` shebang resolves to the *system*
+    interpreter, which lacks the project's dependencies. Such a binary
+    must be launched through the interpreter that is actually running
+    Hermes instead.
+    """
+    try:
+        with path.open("rb") as fh:
+            first = fh.readline(128)
+    except OSError:
+        return False
+    return first.startswith(b"#!") and b"python" in first
+
+
 def resolve_exec_command() -> str:
     """Build the absolute ``Exec=`` command line for ``hermes desktop``.
 
     Prefer the real ``hermes`` executable (argv[0] or PATH). When Hermes
     runs as a module with no launcher installed, use the current
-    interpreter, also absolute.
+    interpreter, also absolute. A Python-script binary is invoked through
+    ``sys.executable``: the desktop entry runs without shell ``PATH``
+    customizations, so a bare script with an ``env python3`` shebang
+    resolves to the system interpreter and fails (missing deps).
     """
     from hermes_cli.relaunch import resolve_hermes_bin
 
     bin_path = resolve_hermes_bin()
     if bin_path:
-        argv = [str(Path(bin_path).resolve()), "desktop"]
+        resolved = Path(bin_path).resolve()
+        if _is_python_script(resolved):
+            # sys.executable verbatim, never resolved: venv pythons are
+            # symlinks, and realpath()ing one lands on the *base*
+            # interpreter, which breaks venv site-packages discovery
+            # (pyvenv.cfg is found via the symlink's directory).
+            argv = [sys.executable, str(resolved), "desktop"]
+        else:
+            argv = [str(resolved), "desktop"]
     else:
         argv = [str(Path(sys.executable).resolve()), "-m", "hermes_cli.main", "desktop"]
     return " ".join(_quote_exec_arg(a) for a in argv)
