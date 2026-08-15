@@ -67,6 +67,10 @@ export function todosForHydration(todos: readonly TodoItem[] | null): TodoItem[]
 // drops out of the stack on its own.
 const FINISHED_LINGER_MS = 4_000
 const clearTimers = new Map<string, ReturnType<typeof setTimeout>>()
+const hasSessionTodos = (map: Record<string, TodoItem[]>, sid: string): boolean => Object.hasOwn(map, sid)
+
+const getSessionTodos = (map: Record<string, TodoItem[]>, sid: string): TodoItem[] | undefined =>
+  hasSessionTodos(map, sid) ? map[sid] : undefined
 
 function cancelScheduledClear(sid: string) {
   const timer = clearTimers.get(sid)
@@ -101,7 +105,7 @@ export function clearSessionTodos(sid: string) {
 
   const map = $todosBySession.get()
 
-  if (!(sid in map)) {
+  if (!hasSessionTodos(map, sid)) {
     return
   }
 
@@ -115,7 +119,7 @@ export function clearSessionTodos(sid: string) {
 // composer forever. A finished list is left untouched so its short linger
 // still shows the last checkmark landing.
 export function clearActiveSessionTodos(sid: string) {
-  const todos = $todosBySession.get()[sid]
+  const todos = getSessionTodos($todosBySession.get(), sid)
 
   if (!todos || !todoListActive(todos)) {
     return
