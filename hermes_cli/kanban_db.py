@@ -7568,6 +7568,24 @@ def _worktree_base_ref(repo_root: Path) -> str:
                 if line.startswith("ref: refs/heads/") and line.endswith("\tHEAD"):
                     branch = line.removeprefix("ref: refs/heads/").removesuffix("\tHEAD")
                     remote_default = f"refs/remotes/origin/{branch}"
+                    if not _is_commit(remote_default):
+                        targeted_fetch = subprocess.run(
+                            [
+                                "git", "-C", str(repo_root), "fetch", "origin",
+                                f"+refs/heads/{branch}:{remote_default}",
+                            ],
+                            capture_output=True,
+                            text=True, encoding="utf-8", errors="replace",
+                            timeout=60,
+                            check=False,
+                            stdin=subprocess.DEVNULL,
+                            env=env,
+                        )
+                        if targeted_fetch.returncode != 0:
+                            _log.debug(
+                                "kanban remote default fetch failed: %s",
+                                (targeted_fetch.stderr or targeted_fetch.stdout or "").strip(),
+                            )
                     if _is_commit(remote_default):
                         candidates.append(remote_default)
                     break

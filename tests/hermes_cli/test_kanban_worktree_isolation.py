@@ -167,6 +167,28 @@ def test_new_worktree_branch_refreshes_changed_default_when_old_branch_exists(tm
     assert remote_head != main_head
 
 
+def test_new_worktree_branch_fetches_changed_default_outside_refspec(tmp_path):
+    repo, seed = _make_remote_backed_repo(tmp_path, default_branch="main")
+    remote = Path(_git_output(repo, "remote", "get-url", "origin"))
+    _git(
+        repo,
+        "config",
+        "remote.origin.fetch",
+        "+refs/heads/main:refs/remotes/origin/main",
+    )
+    main_head = _git_output(repo, "rev-parse", "refs/remotes/origin/main")
+    _git(seed, "switch", "-c", "trunk")
+    remote_head = _commit_file(seed, "remote.txt", "remote\n", "create trunk")
+    _git(seed, "push", "-u", "origin", "trunk")
+    _git(remote, "symbolic-ref", "HEAD", "refs/heads/trunk")
+    target = repo / ".worktrees" / "new-task"
+
+    kb._ensure_git_worktree(repo, target, "project/new-task")
+
+    assert _git_output(target, "rev-parse", "HEAD") == remote_head
+    assert remote_head != main_head
+
+
 def test_new_worktree_branch_refreshes_dangling_origin_head(tmp_path):
     repo, seed = _make_remote_backed_repo(tmp_path, default_branch="master")
     remote = Path(_git_output(repo, "remote", "get-url", "origin"))
