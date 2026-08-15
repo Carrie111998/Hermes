@@ -1,8 +1,10 @@
 """Tests for model_tools.py — function call dispatch, agent-loop interception, legacy toolsets."""
 
 import json
+from pathlib import Path
 from unittest.mock import ANY, call, patch
 
+import tools.terminal_tool as terminal_tool
 
 from model_tools import (
     handle_function_call,
@@ -150,6 +152,75 @@ class TestHandleFunctionCall:
         post_call = next(call for call in hook_calls if call[0] == "post_tool_call")
         assert pre_call[1]["middleware_trace"] == expected_trace
         assert post_call[1]["middleware_trace"] == expected_trace
+
+    def test_terminal_dispatch_preserves_external_delivery_identity(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        calls = []
+
+        class FakeEnv:
+            env = {}
+
+            def execute(self, command, **kwargs):
+                calls.append((command, kwargs))
+                return {"output": "ok", "returncode": 0}
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+        monkeypatch.setattr(
+            terminal_tool,
+            "_active_environments",
+            {"task": FakeEnv()},
+        )
+        monkeypatch.setattr(terminal_tool, "_last_activity", {})
+        monkeypatch.setattr(terminal_tool, "_task_env_overrides", {})
+        monkeypatch.setattr(
+            terminal_tool,
+            "_get_env_config",
+            lambda: {
+                "env_type": "local",
+                "cwd": "/default",
+                "timeout": 60,
+                "lifetime_seconds": 3600,
+            },
+        )
+        monkeypatch.setattr(
+            terminal_tool,
+            "_check_all_guards",
+            lambda command, env_type, **kwargs: {"approved": True},
+        )
+        monkeypatch.setattr("hermes_cli.plugins.has_hook", lambda name: False)
+
+        result = json.loads(
+            handle_function_call(
+                "terminal",
+                {"command": "python3 deliver.py"},
+                task_id="task",
+                session_id="session",
+                turn_id="turn",
+                tool_call_id="call-delivery",
+                skip_pre_tool_call_hook=True,
+                skip_tool_request_middleware=True,
+            )
+        )
+
+        assert result["exit_code"] == 0
+        executed, kwargs = calls[0]
+        assert executed.startswith("export HERMES_TURN_RECEIPT_FILE=")
+        exported_path = Path(executed.split("=", 1)[1].split("; ", 1)[0])
+        from agent.external_delivery import external_delivery_receipt_path
+
+        assert exported_path == external_delivery_receipt_path(
+            "session",
+            "turn",
+            "call-delivery",
+        )
+        assert kwargs == {
+            "timeout": 60,
+            "cwd": "/default",
+            "bounded_capture": True,
+        }
 
     def test_registry_exception_emits_terminal_tool_hook(self, monkeypatch):
         from hermes_cli import lifecycle

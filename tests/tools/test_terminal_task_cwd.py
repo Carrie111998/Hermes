@@ -1,6 +1,7 @@
 """Regression tests for task/session cwd propagation in terminal_tool."""
 
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import tools.terminal_tool as terminal_tool
@@ -74,6 +75,55 @@ def test_explicit_workdir_still_wins_over_registered_task_cwd(monkeypatch):
 
     assert result["exit_code"] == 0
     assert calls == [{"timeout": 60, "cwd": "/explicit/workdir", "bounded_capture": True}]
+
+
+def test_foreground_local_command_receives_per_call_delivery_receipt_path(
+    tmp_path,
+    monkeypatch,
+):
+    calls = []
+
+    class FakeEnv:
+        env = {}
+
+        def execute(self, command, **kwargs):
+            calls.append((command, kwargs))
+            return {"output": "ok", "returncode": 0}
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    monkeypatch.setattr(terminal_tool, "_active_environments", {"task": FakeEnv()})
+    monkeypatch.setattr(terminal_tool, "_last_activity", {})
+    monkeypatch.setattr(terminal_tool, "_task_env_overrides", {})
+    monkeypatch.setattr(terminal_tool, "_get_env_config", lambda: _minimal_terminal_config())
+    monkeypatch.setattr(
+        terminal_tool,
+        "_check_all_guards",
+        lambda command, env_type, **kwargs: {"approved": True},
+    )
+
+    result = json.loads(
+        terminal_tool.terminal_tool(
+            command="python3 deliver.py && python3 verify.py",
+            task_id="task",
+            session_id="session",
+            turn_id="turn",
+            tool_call_id="call-1",
+        )
+    )
+
+    assert result["exit_code"] == 0
+    executed, kwargs = calls[0]
+    assert executed.startswith("export HERMES_TURN_RECEIPT_FILE=")
+    assert executed.endswith("; python3 deliver.py && python3 verify.py")
+    exported_path = executed.split("=", 1)[1].split("; ", 1)[0]
+    assert Path(exported_path).parent == (
+        tmp_path / ".hermes" / "runtime" / "external-delivery"
+    )
+    assert kwargs == {
+        "timeout": 60,
+        "cwd": "/default",
+        "bounded_capture": True,
+    }
 
 
 def test_explicit_workdir_does_not_persist_into_session_cwd(monkeypatch):
