@@ -26,8 +26,6 @@ _RELEVANCE_LEX_WEIGHT = 0.55   # lexical (Jaccard) weight in the blend
 _RELEVANCE_HRR_WEIGHT = 0.45   # HRR structural weight in the blend
 _REASON_LEX_WEIGHT = 0.6       # lexical weight in reason()'s AND blend
 _REASON_HRR_WEIGHT = 0.4       # HRR weight in reason()'s AND blend
-_TRUST_NEUTRAL = 0.4           # trust-weighting floor (compression lower bound)
-_TRUST_GAIN = 0.6              # trust-weighting gain (compression span)
 
 
 class FactRetriever:
@@ -284,11 +282,10 @@ class FactRetriever:
         # Lexical prefilter
         cands = self._fts_candidates(query, category, 0.0, limit * 3)
         if not cands:
-            # Fall back to search() — same graceful degradation the old
-            # probe/related paths provided. _fts_candidates and search()
-            # share the same FTS candidate surface, but if they ever
-            # diverge (tokenizer differences, disabled FTS), we degrade
-            # to the full pipeline instead of returning empty.
+            # Preserve probe/related's historical fallback contract.
+            # search() currently shares the same FTS candidate source, but
+            # keeping the fallback avoids coupling these retrieval paths
+            # if they diverge later.
             return self.search(query, category=category, limit=limit)
 
         query_tokens = self._tokenize(query)
