@@ -13452,6 +13452,48 @@ def main():
         help="Write the changes (default: dry run; interactive confirm + automatic backup)",
     )
 
+    sessions_restore_db = sessions_subparsers.add_parser(
+        "restore-db",
+        help="Restore state.db from a pre-* snapshot (stops holding processes first)",
+        description=(
+            "Restores ~/.hermes/state.db from a timestamped .pre-* snapshot "
+            "taken by the other maintenance commands (or any snapshot next to "
+            "the DB). Every live Hermes process (gateway, dashboard backend, "
+            "TUI, CLI sessions) holds state.db open with WAL/SHM state and "
+            "in-memory caches, so restoring over a live DB corrupts it; this "
+            "command first finds and stops those processes (SIGTERM then "
+            "SIGKILL survivors), clears stale -wal/-shm files, swaps the "
+            "snapshot in, and verifies the result. Refuses to touch live "
+            "processes unless --force is passed; --dry-run only reports "
+            "holders and the snapshot it would restore. Stopped processes "
+            "are not auto-restarted — the command prints each one's restart "
+            "command so you can bring services back once you are happy with "
+            "the restored data. The chosen snapshot is integrity-checked "
+            "before anything is written (never skippable)."
+        ),
+    )
+    sessions_restore_db.add_argument(
+        "--snapshot",
+        help=(
+            "Snapshot to restore (absolute path, or basename resolved next "
+            "to the DB; default: newest .pre-* snapshot, or an interactive "
+            "picker when several exist)"
+        ),
+    )
+    sessions_restore_db.add_argument(
+        "--force",
+        action="store_true",
+        help=(
+            "Stop processes holding state.db automatically (SIGTERM then "
+            "SIGKILL survivors). Without it, live holders cause an abort."
+        ),
+    )
+    sessions_restore_db.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Report holders and the snapshot only; kill/write nothing",
+    )
+
     sessions_browse = sessions_subparsers.add_parser(
         "browse",
         help="Interactive session picker — browse, search, and resume sessions",

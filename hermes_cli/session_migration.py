@@ -43,6 +43,8 @@ import time
 from pathlib import Path
 from typing import Callable, Iterable, Optional
 
+from hermes_state_common import _sql_session_last_active
+
 
 # ---------------------------------------------------------------------------
 # Chain-relink detection
@@ -468,6 +470,9 @@ def repair_chains(
         if chosen is not None and i not in chosen:
             return False
         g = orphan_groups[i]
+        if len(g["sessions"]) < 2:
+            # No sibling to relink — never counts as a write.
+            return False
         if g["signal"] != "both" and chosen is None:
             # No interactive confirm: weak-signal groups are never auto-
             # relinked (safe default).
@@ -496,6 +501,12 @@ def repair_chains(
                 f"(orphaned compression segments?): {ids}"
             )
             if not apply_changes:
+                continue
+            # A single-root group has no sibling to relink — marking the root
+            # compression-ended without a child would only corrupt its
+            # end_reason semantics. Skip it entirely.
+            if len(g["sessions"]) < 2:
+                stats["skipped"] += 1
                 continue
             if chosen is not None and i not in chosen:
                 continue
@@ -738,6 +749,7 @@ def _walk_compression_chain(db, head: str) -> list[str]:
               CASE WHEN child.end_reason = 'compression' THEN 0
                    WHEN child.ended_at IS NULL THEN 1
                    ELSE 2 END,
+              {_sql_session_last_active('child')} DESC,
               child.started_at DESC, child.id DESC
             LIMIT 1
             """,
@@ -839,15 +851,21 @@ def _merge_chain_stats(db, chain: list[str]) -> dict:
 def _backup_before_mutation(db, label: str) -> Optional[Path]:
     """Timestamped full state.db snapshot before any destructive command.
 
-    All ``--apply`` paths take a snapshot first so a mistake is always
-    recoverable. Returns the snapshot path (or None if the DB path is not
-    writable/absent, in which case callers decide whether to abort).
+    Reuses the official ``hermes_cli.backup.copy_db_and_verify`` (SQLite
+    backup API — WAL-safe against a live connection — plus integrity
+    verification of the destination). All ``--apply`` paths take a snapshot
+    first so a mistake is always recoverable. Returns the snapshot path, or
+    None when the DB path is missing/not writable (callers then decide
+    whether to abort).
     """
     import datetime
 
+    from hermes_cli.backup import copy_db_and_verify
+
     stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     dest = db.db_path.with_name(f"{db.db_path.name}.pre-{label}-{stamp}")
-    db._conn.execute("VACUUM INTO ?", (str(dest),))
+    if not copy_db_and_verify(db.db_path, dest):
+        raise RuntimeError(f"snapshot verification failed: {dest}")
     return dest
 
 
@@ -890,7 +908,7 @@ def _describe_title_model() -> str:
     if base_url:
         lines.append(f"  base_url       : {base_url}")
     if api_key:
-        lines.append(f"  api_key        : {'***configured***' if api_key else '(empty)'}")
+        lines.append(f"  api_key        : ***configured***")
     lines.append(f"  prefer_fast    : {prefer_fast}")
     if reasoning_effort:
         lines.append(f"  reasoning      : {reasoning_effort}")
@@ -947,6 +965,24 @@ def _confirm_candidates(
     except (EOFError, KeyboardInterrupt):
         return None
     return chosen
+
+
+def _confirm_snapshot(
+    items: list[str],
+    title: str,
+) -> Optional[int]:
+    """Single-select confirmation for choosing one snapshot to restore.
+
+    Thin wrapper over the official ``curses_single_select`` (↑↓ navigate,
+    ENTER confirm, ESC cancel; non-TTY falls back to a numbered prompt).
+    Returns the selected index, or None on cancel.
+    """
+    from hermes_cli.curses_ui import curses_single_select
+
+    try:
+        return curses_single_select(title, items, default_index=0)
+    except (EOFError, KeyboardInterrupt):
+        return None
 
 
 def merge_compression_chains(
@@ -1219,4 +1255,339 @@ def merge_compression_chains(
         f"usage orphans={verify['usage_orphans']} "
         f"{'✅ OK' if stats['verified'] else '❌ MISMATCH'}"
     )
+    return stats
+
+
+# ---------------------------------------------------------------------------
+# state.db restore (hermes sessions restore-db)
+# ---------------------------------------------------------------------------
+
+
+def _db_holder_matches(path: str, db_path: Path) -> bool:
+    """True when an open file path refers to *db_path* or its WAL/SHM files."""
+    try:
+        p = Path(path)
+    except (TypeError, ValueError):
+        return False
+    return (
+        p == db_path
+        or p == db_path.with_name(db_path.name + "-wal")
+        or p == db_path.with_name(db_path.name + "-shm")
+    )
+
+
+def _find_state_db_holders(db_path: Path) -> list[int]:
+    """PIDs of processes with *db_path* (or its WAL/SHM) open.
+
+    Uses psutil's ``open_files()`` — same library the gateway and dashboard
+    process management already depend on. The caller's own PID is excluded.
+    """
+    try:
+        import psutil
+    except Exception:  # noqa: BLE001
+        return []
+    me = os.getpid()
+    holders: list[int] = []
+    for proc in psutil.process_iter(["pid"]):
+        try:
+            pid = proc.info["pid"]
+            if pid == me:
+                continue
+            try:
+                files = proc.open_files()
+            except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+                continue
+            if any(_db_holder_matches(f.path, db_path) for f in files):
+                holders.append(pid)
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+    return sorted(holders)
+
+
+def _kill_processes(holders: list[int], log: Callable[[str], None]) -> tuple[list[int], list[tuple[int, str]]]:
+    """Stop processes holding state.db (SIGTERM → 3s grace → SIGKILL).
+
+    Mirrors the official dashboard-process teardown in
+    ``hermes_cli.dashboard_procs``: a clean SIGTERM first so the process can
+    flush, then SIGKILL survivors. Returns ``(killed, failed)``.
+    """
+    if not holders:
+        return [], []
+    killed: list[int] = []
+    failed: list[tuple[int, str]] = []
+    if sys.platform == "win32":
+        for pid in holders:
+            try:
+                import subprocess
+
+                result = subprocess.run(
+                    ["taskkill", "/PID", str(pid), "/F"],
+                    capture_output=True, text=True, encoding="utf-8",
+                    errors="replace", timeout=10,
+                )
+                if result.returncode == 0:
+                    killed.append(pid)
+                else:
+                    failed.append((pid, (result.stderr or result.stdout or "").strip()))
+            except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as e:
+                failed.append((pid, str(e)))
+        return killed, failed
+
+    import signal as _signal
+
+    for pid in holders:
+        try:
+            os.kill(pid, _signal.SIGTERM)
+        except ProcessLookupError:
+            killed.append(pid)
+        except (PermissionError, OSError) as e:
+            failed.append((pid, str(e)))
+
+    deadline = time.monotonic() + 3.0
+    pending = [p for p in holders if p not in killed and p not in {f[0] for f in failed}]
+    while pending and time.monotonic() < deadline:
+        time.sleep(0.1)
+        still: list[int] = []
+        for pid in pending:
+            try:
+                os.kill(pid, 0)
+                still.append(pid)
+            except ProcessLookupError:
+                killed.append(pid)
+            except (PermissionError, OSError):
+                still.append(pid)
+        pending = still
+
+    for pid in pending:
+        try:
+            os.kill(pid, _signal.SIGKILL)
+            killed.append(pid)
+        except ProcessLookupError:
+            killed.append(pid)
+        except (PermissionError, OSError) as e:
+            failed.append((pid, str(e)))
+    return killed, failed
+
+
+def _list_snapshot_candidates(db_path: Path) -> list[Path]:
+    """Timestamped ``.pre-<label>-<stamp>`` snapshots next to *db_path*.
+
+    Newest first, ordered by the ``YYYYMMDD_HHMMSS`` stamp parsed from the
+    filename — NOT the raw basename, whose lexicographic order is dominated
+    by the label (``repair-chains`` vs ``merge-chains``).
+    """
+
+    def _stamp(p: Path) -> str:
+        name = p.name[len(f"{db_path.name}.pre-"):]
+        parts = name.rsplit("-", 1)
+        return parts[-1] if len(parts) == 2 else ""
+
+    return sorted(
+        (p for p in db_path.parent.glob(f"{db_path.name}.pre-*")
+         if p.is_file() and p.name.startswith(f"{db_path.name}.pre-")),
+        key=_stamp,
+        reverse=True,
+    )
+
+
+def restore_state_db(
+    db_path,
+    snapshot: Optional[str] = None,
+    *,
+    force: bool = False,
+    dry_run: bool = False,
+    progress: Optional[Callable[[str], None]] = None,
+    confirm: Optional[Callable[[list[str], str], Optional[int]]] = None,
+) -> dict:
+    """Restore ``state.db`` from a ``.pre-*`` snapshot.
+
+    Because every live Hermes process (gateway, dashboard backend, TUI, CLI
+    sessions) holds ``state.db`` open — with WAL/SHM state and in-memory
+    caches — restoring over a live DB corrupts it (stale WAL frames, cached
+    writes re-persisted after the swap). This command therefore:
+
+    1. Finds every process with the DB (or its WAL/SHM) open.
+    2. Stops them (SIGTERM → 3s grace → SIGKILL), unless ``--dry-run``.
+    3. Clears any leftover ``-wal``/``-shm`` files (they belong to the old DB).
+    4. Copies the snapshot over ``state.db``.
+    5. Verifies the restored file (``verify_sqlite_integrity``).
+
+    ``snapshot`` names a ``.pre-*`` file (absolute path, or basename resolved
+    next to the DB). When omitted and more than one snapshot exists, the
+    ``confirm`` callback (``curses_single_select``) lets the user pick one —
+    it returns the selected index, or None to cancel. With one snapshot it is
+    chosen directly.
+
+    The chosen snapshot is **always** integrity-verified before anything is
+    written — a corrupted snapshot must never replace a live DB. A failed
+    verification is a hard stop. The restored file is verified again after
+    the swap.
+
+    Stopped processes are **not** auto-restarted (the restored DB may need
+    inspection first, and a freshly-spawned gateway would start writing to
+    it immediately). Their exact argv is captured before the kill and the
+    restart commands are printed, mirroring the official ``--stop``
+    behaviour.
+
+    With ``--dry-run`` nothing is killed or written.
+
+    Returns a stats dict: ``{"snapshot": str, "holders": [...], "killed":
+    [...], "failed": [...], "restored": bool, "verified": bool}``.
+    """
+    log = progress or (lambda msg: None)
+    dbp = Path(db_path)
+
+    # Resolve the snapshot.
+    if snapshot:
+        snap = Path(snapshot)
+        if not snap.is_absolute():
+            snap = dbp.parent / snap
+        # Security: the snapshot must live next to the DB — restoring an
+        # arbitrary file (e.g. another profile's state.db) could silently
+        # replace this DB with the wrong data. Mirror the official snapshot
+        # restore's traversal guard.
+        db_dir = dbp.parent.resolve()
+        try:
+            snap.resolve().relative_to(db_dir)
+        except ValueError:
+            raise RuntimeError(
+                f"refusing to restore: snapshot {snap} is outside {dbp.parent} "
+                "(snapshots must live next to the database)"
+            ) from None
+        if not snap.is_file():
+            raise RuntimeError(f"snapshot not found: {snap}")
+    else:
+        snaps = _list_snapshot_candidates(dbp)
+        if not snaps:
+            raise RuntimeError(
+                f"no state.db snapshots found next to {dbp}; pass --snapshot"
+            )
+        if len(snaps) == 1:
+            snap = snaps[0]
+            log(f"ℹ snapshot: {snap.name}")
+        elif confirm is not None:
+            items = [f"{s.name} ({s.stat().st_size / 1024 / 1024:.1f} MB)" for s in snaps]
+            idx = confirm(items, "Select a state.db snapshot to restore (↑↓ ENTER, ESC cancel)")
+            if idx is None:
+                log("Cancelled — nothing restored.")
+                return {
+                    "snapshot": None, "holders": [], "killed": [],
+                    "failed": [], "restored": False, "verified": False,
+                }
+            snap = snaps[idx]
+            log(f"ℹ selected snapshot: {snap.name}")
+        else:
+            snap = snaps[0]
+            log(f"ℹ newest snapshot: {snap.name}")
+
+    # The snapshot must be valid BEFORE anything is written — restoring a
+    # corrupted snapshot over a live DB is irreversible damage. This check is
+    # never skippable (no --no-verify flag).
+    from hermes_cli.backup import verify_sqlite_integrity
+
+    snap_integrity = verify_sqlite_integrity(snap, run_pragma=True)
+    if not snap_integrity.get("valid"):
+        raise RuntimeError(
+            f"refusing to restore: snapshot {snap} failed integrity "
+            f"verification ({snap_integrity.get('message') or 'invalid'})"
+        )
+    log(f"✓ snapshot integrity: {snap.name} OK")
+
+    holders = _find_state_db_holders(dbp)
+    stats: dict = {
+        "snapshot": str(snap),
+        "holders": holders,
+        "killed": [],
+        "failed": [],
+        "restored": False,
+        "verified": False,
+    }
+    holder_cmds: dict[int, list[str]] = {}
+
+    log(f"⚠ {len(holders)} process(es) holding {dbp.name}: {', '.join(map(str, holders)) or 'none'}")
+    if dry_run:
+        log("dry run — no processes stopped, no files written.")
+        return stats
+
+    if holders and not force:
+        raise RuntimeError(
+            "refusing to restore over live processes; re-run with --force to "
+            "stop them, or stop them manually and re-run"
+        )
+
+    if holders:
+        # Capture each holder's argv BEFORE killing it so we can print the
+        # exact restart command afterwards (official --stop behaviour: never
+        # auto-restart a process that was holding a DB we just swapped, but
+        # do tell the user how to bring services back).
+        if sys.platform != "win32":
+            try:
+                from hermes_cli.main import _dashboard_cmdline_for_pid
+            except Exception:  # noqa: BLE001 — best-effort only
+                _dashboard_cmdline_for_pid = None
+            if _dashboard_cmdline_for_pid is not None:
+                for pid in holders:
+                    argv = _dashboard_cmdline_for_pid(pid)
+                    if argv:
+                        holder_cmds[pid] = argv
+
+        killed, failed = _kill_processes(holders, log)
+        stats["killed"] = killed
+        stats["failed"] = failed
+        if failed and not force:
+            raise RuntimeError(
+                f"failed to stop {len(failed)} process(es): {failed}"
+            )
+        if killed:
+            log(f"✓ stopped {len(killed)} process(es): {', '.join(map(str, killed))}")
+        # Give the OS a beat to release file handles.
+        time.sleep(0.3)
+
+    # Remove stale WAL/SHM belonging to the pre-restore DB.
+    for suffix in ("-wal", "-shm"):
+        side = dbp.with_name(dbp.name + suffix)
+        if side.exists():
+            side.unlink()
+            log(f"✓ removed stale {side.name}")
+
+    # Swap the snapshot in.
+    import shutil
+
+    tmp = dbp.with_name(f".{dbp.name}.restore_tmp")
+    shutil.copy2(snap, tmp)
+    dbp.unlink(missing_ok=True)
+    shutil.move(str(tmp), str(dbp))
+    stats["restored"] = True
+    log(f"✓ restored {dbp.name} ← {snap.name}")
+
+    # Verify the restored file — also never skippable.
+    integrity = verify_sqlite_integrity(dbp, run_pragma=True)
+    stats["verified"] = bool(integrity.get("valid"))
+    log(
+        f"✓ verify: {dbp.name} {'✅ OK' if stats['verified'] else '❌ INVALID'} "
+        f"({integrity.get('message') or 'integrity check passed'})"
+    )
+    if not stats["verified"]:
+        raise RuntimeError(f"restored {dbp.name} failed integrity verification")
+
+    # Tell the user how to bring the stopped processes back (official --stop
+    # style: print the restart command, never auto-restart — the restored DB
+    # may need inspection first, and a freshly-spawned gateway would start
+    # writing to it immediately).
+    if stats["killed"]:
+        log("")
+        log("  Restart stopped processes when you're ready (nothing was auto-restarted):")
+        seen_cmds: set[str] = set()
+        for pid in stats["killed"]:
+            argv = holder_cmds.get(pid)
+            if argv:
+                display = " ".join(argv)
+                if display not in seen_cmds:
+                    seen_cmds.add(display)
+                    log(f"    {display}")
+            else:
+                log(f"    (PID {pid}: could not recover its command line; restart it manually)")
+        if not seen_cmds:
+            log("    hermes gateway run   # gateway")
+            log("    hermes dashboard --port 0   # desktop backend")
     return stats

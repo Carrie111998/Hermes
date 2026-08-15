@@ -684,6 +684,32 @@ class TestRepairChains:
 
         assert stats["orphaned_chain_groups"] == 0
 
+    def test_single_handoff_root_forced_relink_is_noop(self, db):
+        """A lone handoff root (no sibling) forced via the checklist must
+        NOT be marked compression-ended — without a child that would corrupt
+        its end_reason semantics."""
+        _mk(db, "r1", title="Lone", source="llm",
+            msg="[CONTEXT SUMMARY]: handoff body")
+
+        # Orphan detection reports the single handoff root as a group.
+        groups = find_orphaned_chain_candidates(db)
+        assert len(groups) == 1
+        assert groups[0]["signal"] == "handoff"
+        assert len(groups[0]["sessions"]) == 1
+
+        # User forces the relink of that group; still nothing may be written.
+        stats = repair_chains(
+            db, apply_changes=True, confirm=lambda items, title, **kw: {0},
+        )
+
+        assert stats["relinked"] == 0
+        assert stats["skipped"] == 1
+        # The root must NOT have been marked compression-ended.
+        row = db._conn.execute(
+            "SELECT end_reason FROM sessions WHERE id='r1'"
+        ).fetchone()
+        assert row[0] != "compression"
+
 
 class TestMergeAtomicity:
     def test_merge_rolls_back_on_failure(self, db):
@@ -980,3 +1006,385 @@ class TestMergeCompressionChains:
 
         assert stats["chains"] == 0
         assert stats["segments"] == 0
+
+
+# ---------------------------------------------------------------------------
+# restore-db (hermes sessions restore-db)
+# ---------------------------------------------------------------------------
+
+
+class TestRestoreState:
+    def test_db_holder_matches_main_wal_shm(self, tmp_path):
+        from hermes_cli.session_migration import _db_holder_matches
+
+        dbp = tmp_path / "state.db"
+        assert _db_holder_matches(str(dbp), dbp)
+        assert _db_holder_matches(str(dbp.with_name("state.db-wal")), dbp)
+        assert _db_holder_matches(str(dbp.with_name("state.db-shm")), dbp)
+        assert not _db_holder_matches(str(tmp_path / "other.db"), dbp)
+        assert not _db_holder_matches("", dbp)
+
+    def test_list_snapshot_candidates_sorted(self, tmp_path):
+        from hermes_cli.session_migration import _list_snapshot_candidates
+
+        dbp = tmp_path / "state.db"
+        (tmp_path / "state.db.pre-repair-chains-20260815_010000").touch()
+        (tmp_path / "state.db.pre-merge-chains-20260815_020000").touch()
+        (tmp_path / "state.db").touch()  # not a snapshot
+        (tmp_path / "other.pre-x").touch()  # different prefix
+
+        snaps = _list_snapshot_candidates(dbp)
+        # Newest first: 02:00 stamp sorts after 01:00, then reversed.
+        assert [p.name for p in snaps] == [
+            "state.db.pre-merge-chains-20260815_020000",
+            "state.db.pre-repair-chains-20260815_010000",
+        ]
+
+    def test_restore_dry_run_reports_holders_only(self, tmp_path):
+        from hermes_cli.session_migration import restore_state_db
+
+        import sqlite3
+
+        dbp = tmp_path / "state.db"
+        conn = sqlite3.connect(dbp)
+        conn.execute("CREATE TABLE t (v)")
+        conn.commit()
+        conn.close()
+        before = dbp.read_bytes()
+
+        snap = tmp_path / "state.db.pre-test-20260815_000000"
+        sconn = sqlite3.connect(snap)
+        sconn.execute("CREATE TABLE t (v)")
+        sconn.commit()
+        sconn.close()
+
+        stats = restore_state_db(dbp, snapshot=snap.name, dry_run=True)
+
+        assert stats["snapshot"] == str(snap)
+        assert stats["restored"] is False
+        assert stats["killed"] == []
+        # Dry run must not touch the DB or the snapshot.
+        assert dbp.read_bytes() == before
+
+    def test_restore_no_snapshot_raises(self, tmp_path):
+        from hermes_cli.session_migration import restore_state_db
+
+        dbp = tmp_path / "state.db"
+        dbp.write_bytes(b"x")
+
+        with pytest.raises(RuntimeError, match="no state.db snapshots"):
+            restore_state_db(dbp, dry_run=True)
+
+    def test_restore_missing_explicit_snapshot_raises(self, tmp_path):
+        from hermes_cli.session_migration import restore_state_db
+
+        dbp = tmp_path / "state.db"
+        dbp.write_bytes(b"x")
+
+        with pytest.raises(RuntimeError, match="snapshot not found"):
+            restore_state_db(dbp, snapshot="nope.db", dry_run=True)
+
+    def test_restore_rejects_snapshot_outside_db_dir(self, tmp_path):
+        from hermes_cli.session_migration import restore_state_db
+
+        dbp = tmp_path / "state.db"
+        dbp.write_bytes(b"x")
+
+        # A snapshot outside the DB's directory (e.g. another profile's DB)
+        # must be refused — mirroring the official snapshot restore
+        # traversal guard. tmp_path.parent is guaranteed outside tmp_path.
+        other = tmp_path.parent / f"outside-{tmp_path.name}.db"
+        other.write_bytes(b"y")
+        try:
+            with pytest.raises(RuntimeError, match="outside"):
+                restore_state_db(dbp, snapshot=str(other), dry_run=True)
+        finally:
+            other.unlink(missing_ok=True)
+
+        # Absolute path inside the DB dir is fine (existence checked next).
+        with pytest.raises(RuntimeError, match="snapshot not found"):
+            restore_state_db(
+                dbp, snapshot=str(tmp_path / "state.db.pre-x-20260815_000000"),
+                dry_run=True,
+            )
+
+    def test_restore_swaps_db_and_clears_wal(self, tmp_path):
+        from hermes_cli.session_migration import restore_state_db
+
+        # Real SQLite DB so verification passes.
+        import sqlite3
+
+        dbp = tmp_path / "state.db"
+        conn = sqlite3.connect(dbp)
+        conn.execute("CREATE TABLE t (v)")
+        conn.execute("INSERT INTO t VALUES ('before')")
+        conn.commit()
+        conn.close()
+
+        # Snapshot with different content.
+        snap = tmp_path / "state.db.pre-test-20260815_000000"
+        sconn = sqlite3.connect(snap)
+        sconn.execute("CREATE TABLE t (v)")
+        sconn.execute("INSERT INTO t VALUES ('after')")
+        sconn.commit()
+        sconn.close()
+
+        # Stale WAL/SHM that must be removed.
+        (tmp_path / "state.db-wal").write_bytes(b"stale")
+        (tmp_path / "state.db-shm").write_bytes(b"stale")
+
+        stats = restore_state_db(dbp, snapshot=snap.name, force=True)
+
+        assert stats["restored"] is True
+        assert stats["verified"] is True
+        assert not (tmp_path / "state.db-wal").exists()
+        assert not (tmp_path / "state.db-shm").exists()
+        # Restored DB contains the snapshot's data.
+        conn = sqlite3.connect(dbp)
+        val = conn.execute("SELECT v FROM t").fetchone()[0]
+        conn.close()
+        assert val == "after"
+
+    def test_restore_refuses_live_holders_without_force(self, tmp_path, monkeypatch):
+        from hermes_cli.session_migration import restore_state_db
+
+        import sqlite3
+
+        dbp = tmp_path / "state.db"
+        conn = sqlite3.connect(dbp)
+        conn.execute("CREATE TABLE t (v)")
+        conn.execute("INSERT INTO t VALUES ('before')")
+        conn.commit()
+        conn.close()
+
+        snap = tmp_path / "state.db.pre-test-20260815_000000"
+        sconn = sqlite3.connect(snap)
+        sconn.execute("CREATE TABLE t (v)")
+        sconn.execute("INSERT INTO t VALUES ('after')")
+        sconn.commit()
+        sconn.close()
+
+        monkeypatch.setattr(
+            "hermes_cli.session_migration._find_state_db_holders",
+            lambda db_path: [12345],
+        )
+
+        with pytest.raises(RuntimeError, match="refusing to restore"):
+            restore_state_db(dbp, snapshot=snap.name, force=False)
+        conn = sqlite3.connect(dbp)
+        val = conn.execute("SELECT v FROM t").fetchone()[0]
+        conn.close()
+        assert val == "before"  # untouched
+
+    def test_restore_rejects_corrupt_snapshot(self, tmp_path):
+        from hermes_cli.session_migration import restore_state_db
+
+        dbp = tmp_path / "state.db"
+        dbp.write_bytes(b"not-a-db")
+        snap = tmp_path / "state.db.pre-test-20260815_000000"
+        snap.write_bytes(b"also-not-a-db")
+
+        with pytest.raises(RuntimeError, match="failed integrity verification"):
+            restore_state_db(dbp, snapshot=snap.name, force=True)
+        assert dbp.read_bytes() == b"not-a-db"  # untouched
+
+    def test_restore_picks_newest_with_multiple_snapshots(self, tmp_path, monkeypatch):
+        from hermes_cli.session_migration import restore_state_db
+
+        import sqlite3
+
+        def _mk_snap(name, value):
+            p = tmp_path / name
+            conn = sqlite3.connect(p)
+            conn.execute("CREATE TABLE t (v)")
+            conn.execute("INSERT INTO t VALUES (?)", (value,))
+            conn.commit()
+            conn.close()
+            return p
+
+        dbp = tmp_path / "state.db"
+        conn = sqlite3.connect(dbp)
+        conn.execute("CREATE TABLE t (v)")
+        conn.execute("INSERT INTO t VALUES ('live')")
+        conn.commit()
+        conn.close()
+
+        _mk_snap("state.db.pre-merge-chains-20260815_020000", "newest")
+        _mk_snap("state.db.pre-repair-chains-20260815_010000", "old")
+
+        # Multiple snapshots, no confirm callback → newest (by stamp) wins.
+        stats = restore_state_db(dbp, force=True)
+
+        assert stats["restored"] is True
+        assert "020000" in stats["snapshot"]  # newest stamp
+        conn = sqlite3.connect(dbp)
+        val = conn.execute("SELECT v FROM t").fetchone()[0]
+        conn.close()
+        assert val == "newest"
+
+    def test_restore_single_select_with_confirm(self, tmp_path, monkeypatch):
+        from hermes_cli.session_migration import restore_state_db
+
+        import sqlite3
+
+        def _mk_snap(name, value):
+            p = tmp_path / name
+            conn = sqlite3.connect(p)
+            conn.execute("CREATE TABLE t (v)")
+            conn.execute("INSERT INTO t VALUES (?)", (value,))
+            conn.commit()
+            conn.close()
+            return p
+
+        dbp = tmp_path / "state.db"
+        conn = sqlite3.connect(dbp)
+        conn.execute("CREATE TABLE t (v)")
+        conn.execute("INSERT INTO t VALUES ('live')")
+        conn.commit()
+        conn.close()
+
+        _mk_snap("state.db.pre-a-20260815_010000", "A")
+        _mk_snap("state.db.pre-b-20260815_020000", "B")
+
+        # confirm picks index 0 (the "B" snapshot — newest first in items).
+        seen = {}
+
+        def _fake_confirm(items, title):
+            seen["items"] = items
+            return 0
+
+        stats = restore_state_db(dbp, force=True, confirm=_fake_confirm)
+
+        assert stats["restored"] is True
+        assert seen["items"], "confirm must be offered the snapshot list"
+        conn = sqlite3.connect(dbp)
+        val = conn.execute("SELECT v FROM t").fetchone()[0]
+        conn.close()
+        assert val == "B"
+
+    def test_restore_cancel_returns_empty_stats(self, tmp_path, monkeypatch):
+        from hermes_cli.session_migration import restore_state_db
+
+        import sqlite3
+
+        def _mk_snap(name, value):
+            p = tmp_path / name
+            conn = sqlite3.connect(p)
+            conn.execute("CREATE TABLE t (v)")
+            conn.execute("INSERT INTO t VALUES (?)", (value,))
+            conn.commit()
+            conn.close()
+            return p
+
+        dbp = tmp_path / "state.db"
+        conn = sqlite3.connect(dbp)
+        conn.execute("CREATE TABLE t (v)")
+        conn.execute("INSERT INTO t VALUES ('live')")
+        conn.commit()
+        conn.close()
+
+        _mk_snap("state.db.pre-a-20260815_010000", "A")
+        _mk_snap("state.db.pre-b-20260815_020000", "B")
+
+        stats = restore_state_db(
+            dbp, force=True, confirm=lambda items, title: None
+        )
+
+        assert stats["restored"] is False
+        assert stats["snapshot"] is None
+        conn = sqlite3.connect(dbp)
+        val = conn.execute("SELECT v FROM t").fetchone()[0]
+        conn.close()
+        assert val == "live"  # untouched
+
+    def test_restore_kills_holders_with_force(self, tmp_path, monkeypatch):
+        from hermes_cli.session_migration import restore_state_db
+
+        import sqlite3
+
+        dbp = tmp_path / "state.db"
+        conn = sqlite3.connect(dbp)
+        conn.execute("CREATE TABLE t (v)")
+        conn.execute("INSERT INTO t VALUES ('before')")
+        conn.commit()
+        conn.close()
+
+        snap = tmp_path / "state.db.pre-test-20260815_000000"
+        sconn = sqlite3.connect(snap)
+        sconn.execute("CREATE TABLE t (v)")
+        sconn.execute("INSERT INTO t VALUES ('after')")
+        sconn.commit()
+        sconn.close()
+
+        monkeypatch.setattr(
+            "hermes_cli.session_migration._find_state_db_holders",
+            lambda db_path: [12345],
+        )
+        monkeypatch.setattr(
+            "hermes_cli.session_migration._kill_processes",
+            lambda holders, log: ([12345], []),
+        )
+
+        stats = restore_state_db(dbp, snapshot=snap.name, force=True)
+
+        assert stats["killed"] == [12345]
+        assert stats["restored"] is True
+        conn = sqlite3.connect(dbp)
+        val = conn.execute("SELECT v FROM t").fetchone()[0]
+        conn.close()
+        assert val == "after"
+
+    def test_restore_prints_restart_hints_after_kill(self, tmp_path, monkeypatch):
+        from hermes_cli.session_migration import restore_state_db
+
+        import sqlite3
+
+        dbp = tmp_path / "state.db"
+        conn = sqlite3.connect(dbp)
+        conn.execute("CREATE TABLE t (v)")
+        conn.execute("INSERT INTO t VALUES ('before')")
+        conn.commit()
+        conn.close()
+
+        snap = tmp_path / "state.db.pre-test-20260815_000000"
+        sconn = sqlite3.connect(snap)
+        sconn.execute("CREATE TABLE t (v)")
+        sconn.execute("INSERT INTO t VALUES ('after')")
+        sconn.commit()
+        sconn.close()
+
+        monkeypatch.setattr(
+            "hermes_cli.session_migration._find_state_db_holders",
+            lambda db_path: [12345],
+        )
+        monkeypatch.setattr(
+            "hermes_cli.session_migration._kill_processes",
+            lambda holders, log: ([12345], []),
+        )
+        # Simulate the official argv capture for PID 12345 (the function is
+        # imported from hermes_cli.main inside restore_state_db, so patch
+        # it at its definition site).
+        monkeypatch.setattr(
+            "hermes_cli.main._dashboard_cmdline_for_pid",
+            lambda pid: ["python", "-m", "hermes_cli.main", "gateway", "run"],
+        )
+
+        lines: list[str] = []
+        stats = restore_state_db(
+            dbp, snapshot=snap.name, force=True,
+            progress=lambda msg: lines.append(msg),
+        )
+
+        assert stats["killed"] == [12345]
+        joined = "\n".join(lines)
+        assert "Restart stopped processes" in joined
+        assert "hermes_cli.main gateway run" in joined
+        # Nothing was auto-restarted (no respawn call).
+        assert "auto-restarted" in joined
+
+    def test_kill_processes_handles_empty(self):
+        from hermes_cli.session_migration import _kill_processes
+
+        killed, failed = _kill_processes([], lambda m: None)
+        assert killed == []
+        assert failed == []

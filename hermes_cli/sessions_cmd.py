@@ -127,6 +127,19 @@ def cmd_sessions(args, sessions_parser=None):
     def _log(msg):
         print(msg)
 
+    def _print_restore_hint(backup_path: str):
+        """Official-style pointer to the restore command after a --apply write.
+
+        Mirrors the ``Next step — offline recovery`` hint the repair
+        command prints: short lead line, then the exact command the user can
+        run to undo the change.
+        """
+        print()
+        print("  If the result looks wrong, restore the pre-change snapshot:")
+        print(f"    hermes sessions restore-db --snapshot {backup_path} --force")
+        print("  (This stops processes holding state.db, restores the backup,")
+        print("   and verifies it. --force is required while Hermes is running.)")
+
     action = args.sessions_action
 
     # 'repair' and 'recover' must run BEFORE opening SessionDB(): a
@@ -310,6 +323,45 @@ def cmd_sessions(args, sessions_parser=None):
 
         run_sessions_import(args)
         return
+    if action == "restore-db":
+        # Runs BEFORE opening SessionDB(): restoring swaps the file under
+        # every live connection, so this command must not hold one itself.
+        from hermes_state import DEFAULT_DB_PATH as _DEFAULT_DB_PATH
+
+        from hermes_cli.session_migration import (
+            _confirm_snapshot,
+            restore_state_db,
+        )
+
+        db_path = _DEFAULT_DB_PATH
+        snapshot = getattr(args, "snapshot", None)
+        force = bool(getattr(args, "force", False))
+        dry_run = bool(getattr(args, "dry_run", False))
+
+        try:
+            stats = restore_state_db(
+                db_path,
+                snapshot=snapshot,
+                force=force,
+                dry_run=dry_run,
+                progress=_log,
+                confirm=_confirm_snapshot if not snapshot else None,
+            )
+        except Exception as exc:  # noqa: BLE001 — user-facing failure
+            print(f"✗ restore failed: {exc}")
+            return 1
+        print()
+        print(
+            f"✓ snapshot={stats['snapshot']} "
+            f"holders={len(stats['holders'])} "
+            f"killed={len(stats['killed'])} "
+            f"failed={len(stats['failed'])} "
+            f"restored={'yes' if stats['restored'] else 'no'} "
+            f"verified={'yes' if stats['verified'] else 'no'}"
+        )
+        if dry_run:
+            print("Dry run — nothing killed, nothing written.")
+        return 0
 
     try:
         from hermes_state import SessionDB
@@ -1175,6 +1227,8 @@ def cmd_sessions(args, sessions_parser=None):
             print(f"  backup: {stats['backup_path']}")
         if not apply_changes:
             print("Dry run — nothing written.")
+        elif stats["backup_path"]:
+            _print_restore_hint(stats["backup_path"])
 
     elif action == "retitle-missing":
         from hermes_cli.session_migration import (
@@ -1228,6 +1282,8 @@ def cmd_sessions(args, sessions_parser=None):
             print(f"  backup: {stats['backup_path']}")
         if not apply_changes:
             print("Dry run — nothing written.")
+        elif stats["backup_path"]:
+            _print_restore_hint(stats["backup_path"])
 
     elif action == "merge-chains":
         from hermes_cli.session_migration import (
@@ -1268,6 +1324,8 @@ def cmd_sessions(args, sessions_parser=None):
             print(f"  backup: {merge_stats['backup_path']}")
         if not apply_changes:
             print("Dry run — nothing written.")
+        elif merge_stats["backup_path"]:
+            _print_restore_hint(merge_stats["backup_path"])
 
     elif action == "browse":
         limit = getattr(args, "limit", 500) or 500
