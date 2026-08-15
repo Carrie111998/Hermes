@@ -15,6 +15,7 @@ npx PID — on timeout.
 
 from __future__ import annotations
 
+import os
 import subprocess
 from unittest.mock import MagicMock, patch
 
@@ -124,7 +125,7 @@ def test_merges_extended_path_so_managed_only_npx_can_find_sibling_node():
 
 
 def test_runs_in_its_own_process_group_on_posix(monkeypatch):
-    monkeypatch.setattr("os.name", "posix")
+    monkeypatch.setattr("tools.browser_tool._runtime_os_name", lambda: "posix")
     with patch("tools.browser_tool._resolve_npx_bin", return_value="/usr/bin/npx"), \
          patch("subprocess.Popen", return_value=_mock_proc()) as mock_popen:
         warm_agent_browser_npx_cache()
@@ -137,7 +138,7 @@ def test_uses_new_process_group_creationflag_on_windows_instead_of_start_new_ses
     """start_new_session is a POSIX-only Popen kwarg (raises on Windows).
     The Windows equivalent for _kill_process_tree's taskkill /T to have a
     coherent tree to kill is CREATE_NEW_PROCESS_GROUP via creationflags."""
-    with patch("os.name", "nt"), \
+    with patch("tools.browser_tool._runtime_os_name", return_value="nt"), \
          patch("tools.browser_tool._resolve_npx_bin", return_value="C:\\npx.cmd"), \
          patch("tools.browser_tool._build_browser_env", return_value={"PATH": "C:\\Windows"}), \
          patch("tools.browser_tool._merge_browser_path", side_effect=lambda p: p), \
@@ -222,26 +223,28 @@ class TestKillProcessTree:
 
         proc = MagicMock()
         proc.pid = 999
-        monkeypatch.setattr("os.name", "posix")
-        monkeypatch.setattr("os.getpgid", lambda pid: 999)
+        monkeypatch.setattr("tools.browser_tool._runtime_os_name", lambda: "posix")
+        monkeypatch.setattr(os, "getpgid", lambda pid: 999, raising=False)
         killpg_calls = []
         monkeypatch.setattr(
-            "os.killpg", lambda pgid, sig: killpg_calls.append((pgid, sig))
+            os, "killpg", lambda pgid, sig: killpg_calls.append((pgid, sig)),
+            raising=False,
         )
 
         _kill_process_tree(proc)
 
-        assert killpg_calls == [(999, signal.SIGTERM), (999, signal.SIGKILL)]
+        sigkill = getattr(signal, "SIGKILL", signal.SIGTERM)
+        assert killpg_calls == [(999, signal.SIGTERM), (999, sigkill)]
 
     def test_posix_missing_process_returns_silently(self, monkeypatch):
         proc = MagicMock()
         proc.pid = 999
-        monkeypatch.setattr("os.name", "posix")
+        monkeypatch.setattr("tools.browser_tool._runtime_os_name", lambda: "posix")
 
         def _raise(pid):
             raise ProcessLookupError()
 
-        monkeypatch.setattr("os.getpgid", _raise)
+        monkeypatch.setattr(os, "getpgid", _raise, raising=False)
 
         _kill_process_tree(proc)  # must not raise
 
@@ -257,7 +260,7 @@ class TestKillProcessTree:
 
         proc = MagicMock()
         proc.pid = 999
-        monkeypatch.setattr("os.name", "posix")
+        monkeypatch.setattr("tools.browser_tool._runtime_os_name", lambda: "posix")
         monkeypatch.delattr(os_module, "killpg", raising=False)
 
         _kill_process_tree(proc)
@@ -270,7 +273,7 @@ class TestKillProcessTree:
         proc = MagicMock()
         proc.pid = 999
         proc.kill.side_effect = OSError("already reaped")
-        monkeypatch.setattr("os.name", "posix")
+        monkeypatch.setattr("tools.browser_tool._runtime_os_name", lambda: "posix")
         monkeypatch.delattr(os_module, "killpg", raising=False)
 
         _kill_process_tree(proc)  # must not raise
@@ -283,15 +286,15 @@ class TestKillProcessTree:
 
         proc = MagicMock()
         proc.pid = 999
-        monkeypatch.setattr("os.name", "posix")
-        monkeypatch.setattr("os.getpgid", lambda pid: 999)
+        monkeypatch.setattr("tools.browser_tool._runtime_os_name", lambda: "posix")
+        monkeypatch.setattr(os, "getpgid", lambda pid: 999, raising=False)
         killpg_calls = []
 
         def fake_killpg(pgid, sig):
             killpg_calls.append((pgid, sig))
             raise PermissionError()
 
-        monkeypatch.setattr("os.killpg", fake_killpg)
+        monkeypatch.setattr(os, "killpg", fake_killpg, raising=False)
 
         _kill_process_tree(proc)  # must not raise
 
@@ -300,7 +303,7 @@ class TestKillProcessTree:
     def test_windows_uses_taskkill_with_tree_and_force_flags(self, monkeypatch):
         proc = MagicMock()
         proc.pid = 4321
-        monkeypatch.setattr("os.name", "nt")
+        monkeypatch.setattr("tools.browser_tool._runtime_os_name", lambda: "nt")
         with patch("subprocess.run") as mock_run:
             _kill_process_tree(proc)
 
@@ -311,6 +314,6 @@ class TestKillProcessTree:
     def test_windows_taskkill_failure_does_not_raise(self, monkeypatch):
         proc = MagicMock()
         proc.pid = 4321
-        monkeypatch.setattr("os.name", "nt")
+        monkeypatch.setattr("tools.browser_tool._runtime_os_name", lambda: "nt")
         with patch("subprocess.run", side_effect=OSError("taskkill missing")):
             _kill_process_tree(proc)  # must not raise
