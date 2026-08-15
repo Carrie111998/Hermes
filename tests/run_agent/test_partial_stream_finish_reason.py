@@ -497,6 +497,193 @@ class TestContentFilterStallActivatesFallback:
 
 
 
+class TestRepeatedStreamDropActivatesFallback:
+    """A partial-stream stub that arrives AGAIN after one continuation retry
+    escalates to the fallback chain instead of burning the remaining retries
+    against the same broken provider.
+
+    During a provider/edge streaming outage every retry restarts the reply
+    from scratch and stalls again, so the old behavior stitched 4-5 identical
+    partials into one garbled response ("Didn't go through. Let me check...
+    Didn't go through. Let me check...") at full context cost per pass, and
+    the configured fallback chain was never consulted.  Policy: ONE retry on
+    the primary (rides the provider-side prompt cache, absorbs transient
+    blips), then fall back.
+    """
+
+    @staticmethod
+    def _text_stub(content="Let me check the API docs."):
+        from tests.run_agent.test_run_agent import _mock_assistant_msg
+        return SimpleNamespace(
+            id=PARTIAL_STREAM_STUB_ID,
+            model="test/model",
+            choices=[SimpleNamespace(
+                index=0,
+                message=_mock_assistant_msg(content=content),
+                finish_reason=FINISH_REASON_LENGTH,
+            )],
+            usage=None,
+        )
+
+    def test_second_stub_activates_fallback_after_one_retry(self, loop_agent):
+        from tests.run_agent.test_run_agent import _mock_assistant_msg, _mock_response
+
+        recovery = _mock_response(
+            content="Recovered on the fallback provider.", finish_reason="stop",
+        )
+        loop_agent.client.chat.completions.create.side_effect = [
+            self._text_stub(), self._text_stub(), recovery,
+        ]
+        loop_agent._fallback_chain = [
+            {"provider": "anthropic", "model": "claude-sonnet-4-6"},
+        ]
+        loop_agent._fallback_index = 0
+        fb_calls = {"n": 0}
+
+        def _fake_activate(reason=None):
+            fb_calls["n"] += 1
+            loop_agent._fallback_index = len(loop_agent._fallback_chain)
+            return True
+
+        with (
+            patch.object(loop_agent, "_persist_session"),
+            patch.object(loop_agent, "_save_trajectory"),
+            patch.object(loop_agent, "_cleanup_task_resources"),
+            patch.object(loop_agent, "_try_activate_fallback",
+                         side_effect=_fake_activate),
+        ):
+            result = loop_agent.run_conversation("draft the post")
+
+        assert fb_calls["n"] == 1, (
+            "A second consecutive stream-drop stub must activate fallback "
+            "exactly once — after ONE primary retry, not after exhausting "
+            "all continuation retries."
+        )
+        # primary + one continuation retry + fallback recovery
+        assert loop_agent.client.chat.completions.create.call_count == 3
+        assert result["completed"] is True
+        # The rollback must wipe the stitched partials: the reply is the
+        # fallback's clean answer, not "Let me check... Let me check...".
+        assert result["final_response"] == "Recovered on the fallback provider."
+
+    def test_first_stub_retries_primary_without_fallback(self, loop_agent):
+        """One stub is a routine blip: the primary gets its continuation
+        retry and the fallback chain is NOT consulted."""
+        from tests.run_agent.test_run_agent import _mock_assistant_msg, _mock_response
+
+        continuation = _mock_response(
+            content="and here is the rest.", finish_reason="stop",
+        )
+        loop_agent.client.chat.completions.create.side_effect = [
+            self._text_stub("The first half "), continuation,
+        ]
+        loop_agent._fallback_chain = [
+            {"provider": "anthropic", "model": "claude-sonnet-4-6"},
+        ]
+        loop_agent._fallback_index = 0
+        fb_calls = {"n": 0}
+
+        def _fake_activate(reason=None):
+            fb_calls["n"] += 1
+            return True
+
+        with (
+            patch.object(loop_agent, "_persist_session"),
+            patch.object(loop_agent, "_save_trajectory"),
+            patch.object(loop_agent, "_cleanup_task_resources"),
+            patch.object(loop_agent, "_try_activate_fallback",
+                         side_effect=_fake_activate),
+        ):
+            result = loop_agent.run_conversation("tell me something")
+
+        assert fb_calls["n"] == 0, (
+            "A single stream-drop stub must NOT fail over — the one primary "
+            "retry is kept to ride the provider-side prompt cache."
+        )
+        assert loop_agent.client.chat.completions.create.call_count == 2
+        assert "first half" in result["final_response"]
+        assert "rest" in result["final_response"]
+
+    def test_repeat_stub_without_chain_keeps_giveup_behavior(self, loop_agent):
+        """No fallback configured: the loop keeps the existing bounded
+        continuation behavior and gives up with the truncation error."""
+        loop_agent.client.chat.completions.create.side_effect = [
+            self._text_stub() for _ in range(4)
+        ]
+        loop_agent._fallback_chain = []
+        loop_agent._fallback_index = 0
+
+        with (
+            patch.object(loop_agent, "_persist_session"),
+            patch.object(loop_agent, "_save_trajectory"),
+            patch.object(loop_agent, "_cleanup_task_resources"),
+        ):
+            result = loop_agent.run_conversation("draft the post")
+
+        assert loop_agent.client.chat.completions.create.call_count == 4
+        assert result["completed"] is False
+        assert "remained truncated" in (result.get("error") or "")
+
+    def test_second_tool_call_stall_activates_fallback(self, loop_agent):
+        """Same policy on the truncated-tool-call path: a second stub stall
+        mid tool-call escalates instead of burning retries 2-4."""
+        from tests.run_agent.test_run_agent import _mock_assistant_msg, _mock_response
+
+        partial_tc = SimpleNamespace(
+            id="call_1",
+            type="function",
+            function=SimpleNamespace(name="write_file", arguments='{"path": "/tmp/x'),
+        )
+
+        def _tc_stub():
+            return SimpleNamespace(
+                id=PARTIAL_STREAM_STUB_ID,
+                model="test/model",
+                choices=[SimpleNamespace(
+                    index=0,
+                    message=_mock_assistant_msg(
+                        content="", tool_calls=[partial_tc],
+                    ),
+                    finish_reason=FINISH_REASON_LENGTH,
+                )],
+                usage=None,
+            )
+
+        recovery = _mock_response(
+            content="Done on the fallback provider.", finish_reason="stop",
+        )
+        loop_agent.client.chat.completions.create.side_effect = [
+            _tc_stub(), _tc_stub(), recovery,
+        ]
+        loop_agent._fallback_chain = [
+            {"provider": "anthropic", "model": "claude-sonnet-4-6"},
+        ]
+        loop_agent._fallback_index = 0
+        fb_calls = {"n": 0}
+
+        def _fake_activate(reason=None):
+            fb_calls["n"] += 1
+            loop_agent._fallback_index = len(loop_agent._fallback_chain)
+            return True
+
+        with (
+            patch.object(loop_agent, "_persist_session"),
+            patch.object(loop_agent, "_save_trajectory"),
+            patch.object(loop_agent, "_cleanup_task_resources"),
+            patch.object(loop_agent, "_try_activate_fallback",
+                         side_effect=_fake_activate),
+        ):
+            result = loop_agent.run_conversation("write me a file")
+
+        assert fb_calls["n"] == 1, (
+            "A second stub stall mid tool-call must activate fallback after "
+            "ONE primary retry."
+        )
+        assert loop_agent.client.chat.completions.create.call_count == 3
+        assert result["final_response"] == "Done on the fallback provider."
+        assert result["completed"] is True
+
+
 class TestEmptyPartialStreamStubNotPersisted:
     """Regression for the session-poisoning bug hit with moonshotai/kimi-k3
     via OpenRouter (2026-07-20): a stream dropped mid-``write_file`` tool

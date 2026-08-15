@@ -3438,6 +3438,68 @@ def run_conversation(
                                 f"(may re-hit filter)...",
                                 force=True,
                             )
+                        # ── Repeated stream-drop stall → fallback ──
+                        # A partial-stream stub arriving AGAIN after a
+                        # continuation retry means the primary's stream path
+                        # is unhealthy (provider/edge outage), not a one-off
+                        # network blip.  Burning the remaining continuation
+                        # retries against the same provider replays the
+                        # failure at full context cost and stitches N
+                        # restarted partials into one garbled reply (the
+                        # model re-answers from scratch each pass, so the
+                        # user sees the same sentence repeated 4-5x followed
+                        # by the truncation notice).  Same economics as the
+                        # content-filter escalation above — but keep ONE
+                        # retry on the primary first: a single retry rides
+                        # the provider-side prompt cache and absorbs the
+                        # routine transient blip, while failing over
+                        # immediately would pay a guaranteed cache-cold
+                        # marshal on every hiccup.
+                        _is_repeat_stream_stall = (
+                            getattr(response, "id", "") == PARTIAL_STREAM_STUB_ID
+                            and length_continue_retries >= 1
+                        )
+                        if (
+                            _is_repeat_stream_stall
+                            and agent._fallback_index < len(agent._fallback_chain)
+                        ):
+                            agent._vprint(
+                                f"{agent.log_prefix}🔌 Stream dropped again after a "
+                                f"continuation retry — activating fallback provider...",
+                                force=True,
+                            )
+                            agent._emit_status(
+                                "Stream kept dropping; switching to fallback..."
+                            )
+                            if agent._try_activate_fallback():
+                                # Roll partials appended by the prior
+                                # continuation pass back to the last clean
+                                # turn so the fallback provider gets a
+                                # coherent continuation point (mirrors the
+                                # content-filter escalation above).
+                                if truncated_response_parts:
+                                    messages = agent._get_messages_up_to_last_assistant(messages)
+                                # Unmark survivors: their text left the stitched partial.
+                                for _frag in messages:
+                                    if isinstance(_frag, dict):
+                                        _frag.pop("_length_continuation_fragment", None)
+                                        _frag.pop("_length_continuation_nudge", None)
+                                agent._session_messages = messages
+                                length_continue_retries = 0
+                                truncated_response_parts = []
+                                retry_count = 0
+                                compression_attempts = 0
+                                _retry.primary_recovery_attempted = False
+                                _retry.restart_with_rebuilt_messages = True
+                                break
+                            # Chain exhausted/unavailable — fall through to
+                            # the normal continuation (best-effort, may loop).
+                            agent._vprint(
+                                f"{agent.log_prefix}⚠️  No fallback provider "
+                                f"available — continuing with same provider "
+                                f"(stream may keep dropping)...",
+                                force=True,
+                            )
                         if assistant_message is not None and not _trunc_has_tool_calls:
                             length_continue_retries += 1
                             # An EMPTY partial-stream stub (stream dropped
@@ -3554,6 +3616,40 @@ def run_conversation(
                             _is_stub_stall = (
                                 getattr(response, "id", "") == PARTIAL_STREAM_STUB_ID
                             )
+                            # Same policy as the text path above: one retry
+                            # on the primary absorbs a transient blip; a
+                            # SECOND stub stall means the stream path is
+                            # down — escalate to the fallback chain instead
+                            # of burning the remaining retries against it.
+                            # (Broken responses are never appended in this
+                            # path, so no message rollback is needed.)
+                            if (
+                                _is_stub_stall
+                                and truncated_tool_call_retries >= 1
+                                and agent._fallback_index < len(agent._fallback_chain)
+                            ):
+                                agent._flush_status_buffer()
+                                agent._vprint(
+                                    f"{agent.log_prefix}🔌 Stream dropped mid "
+                                    f"tool-call again — activating fallback "
+                                    f"provider...",
+                                    force=True,
+                                )
+                                agent._emit_status(
+                                    "Stream kept dropping; switching to fallback..."
+                                )
+                                if agent._try_activate_fallback():
+                                    truncated_tool_call_retries = 0
+                                    retry_count = 0
+                                    _retry.primary_recovery_attempted = False
+                                    _retry.restart_with_rebuilt_messages = True
+                                    break
+                                agent._vprint(
+                                    f"{agent.log_prefix}⚠️  No fallback provider "
+                                    f"available — continuing with same provider "
+                                    f"(stream may keep dropping)...",
+                                    force=True,
+                                )
                             if truncated_tool_call_retries < 4:
                                 truncated_tool_call_retries += 1
                                 if _is_stub_stall:
