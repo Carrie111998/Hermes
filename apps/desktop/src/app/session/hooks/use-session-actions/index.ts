@@ -14,6 +14,7 @@ import { migrateSessionDraft } from '@/store/composer'
 import { clearQueuedPrompts, migrateQueuedPrompts } from '@/store/composer-queue'
 import { $pinnedSessionIds } from '@/store/layout'
 import { clearNotifications, notify, notifyError } from '@/store/notifications'
+import { prunePreviewTabsForSession } from '@/store/preview'
 import { $activeGatewayProfile, $newChatProfile, ensureGatewayProfile, normalizeProfileKey } from '@/store/profile'
 import {
   beginSessionMutation,
@@ -1616,6 +1617,14 @@ export function useSessionActions({
         // back, and a rolled-back row must keep its watermark/marker.
         forgetSessionUnread(removedIds, removed?.profile)
         clearQueuedPrompts(storedSessionId)
+
+        // Preview tabs are session-owned: drop them with the session (pinned
+        // tabs survive — they belong to the workspace, not the session).
+        for (const id of removedIds) {
+          if (id) {
+            prunePreviewTabsForSession(id)
+          }
+        }
 
         if (closingRuntimeId) {
           clearQueuedPrompts(closingRuntimeId)

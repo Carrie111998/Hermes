@@ -17,6 +17,7 @@ import { invalidateStripTools } from '@/components/pane-shell/tree/store'
 import { Codicon } from '@/components/ui/codicon'
 import type { PaneStripTool } from '@/components/ui/pane-tab'
 import { translateNow } from '@/i18n'
+import { $previewTabs, setPreviewTabPinned } from '@/store/preview'
 
 import { createPreviewConsoleState, type PreviewConsoleState } from './preview-console-state'
 
@@ -94,4 +95,22 @@ export function previewStripTools(tabId: string): readonly PaneStripTool[] {
       onSelect: () => devTools?.toggle()
     }
   ]
+}
+
+/** The pin toggle for a preview tab. Pinned tabs render in every session —
+ *  the explicit cross-session workspace; everything else belongs to the
+ *  session that opened it. */
+export function previewPinTool(tabId: string): PaneStripTool {
+  const pinned = Boolean($previewTabs.get().find(tab => tab.id === tabId)?.pinned)
+
+  return {
+    active: pinned,
+    icon: <Codicon name={pinned ? 'pinned' : 'pin'} size="0.8125rem" />,
+    id: 'preview-pin',
+    label: translateNow(pinned ? 'preview.unpin' : 'preview.pin'),
+    onSelect: () => {
+      setPreviewTabPinned(tabId, !pinned)
+      invalidateStripTools()
+    }
+  }
 }

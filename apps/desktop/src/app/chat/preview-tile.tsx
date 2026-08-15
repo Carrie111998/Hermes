@@ -15,11 +15,11 @@ import { $activeTreeGroup, $layoutTree, revealTreePane } from '@/components/pane
 import { FileTypeIcon } from '@/components/ui/file-type-icon'
 import { ToolIcon } from '@/components/ui/tool-icon'
 import { $rightRailActiveTabId, type RightRailTabId, selectRightRailTab } from '@/store/layout'
-import { $previewTabs, closeRightRailTab, type PreviewTarget } from '@/store/preview'
+import { $previewTabs, $visiblePreviewTabs, closeRightRailTab, type PreviewTarget } from '@/store/preview'
 
 import { paneMirror } from './pane-mirror'
 import { PreviewTilePane } from './right-rail/preview'
-import { forgetPreviewStripTools, previewStripTools } from './right-rail/preview-strip-tools'
+import { forgetPreviewStripTools, previewPinTool, previewStripTools } from './right-rail/preview-strip-tools'
 
 /** The target behind a tile id, or null once its tab is gone. */
 function targetFor(tabId: string): PreviewTarget | null {
@@ -92,7 +92,23 @@ export function watchPreviewTiles(): void {
   }
 
   $rightRailActiveTabId.listen(reveal)
-  $previewTabs.listen(reveal)
+  // Visible-list changes: a re-open of the already-active tab refreshes the
+  // target through the visible list too, while tab mutations belonging to a
+  // BACKGROUND session must not try to reveal panes that are not mounted.
+  $visiblePreviewTabs.listen(reveal)
+
+  // A session switch (or an unpin) can leave the active tab outside the
+  // visible set — re-home the selection to the first visible tab so the strip
+  // and the pane never point at a hidden preview.
+  const rehome = () => {
+    const visible = $visiblePreviewTabs.get()
+
+    if (!visible.some(tab => tab.id === $rightRailActiveTabId.get())) {
+      selectRightRailTab(visible[0]?.id ?? null)
+    }
+  }
+
+  $visiblePreviewTabs.listen(rehome)
 
   // And the reverse: clicking a preview TAB activates its pane in the TREE
   // only, so the store's selection must follow or `$previewTarget` (⌘L quote
@@ -121,7 +137,10 @@ export function watchPreviewTiles(): void {
 }
 
 const watchPreviewTileMirror = paneMirror<{ id: string }>({
-  source: $previewTabs,
+  // Only the ACTIVE session's tabs (plus pins) become panes — switching
+  // sessions swaps the drawer; a hidden tab's pane leaves the tree without
+  // closing the tab (paneMirror's sync disposes, it doesn't call close).
+  source: $visiblePreviewTabs,
   key: tab => tab.id,
   prefix: PREVIEW_TILE_PREFIX,
   // Identical to route (page) tiles: its own zone docked beside main, sized by
@@ -134,7 +153,11 @@ const watchPreviewTileMirror = paneMirror<{ id: string }>({
   tabLead: tabId => <PreviewTabLead tabId={tabId} />,
   // Console + DevTools as bare strip glyphs after the last tab, where "+" sits.
   // Only a URL preview has a webview behind it, so a file/artifact tab gets none.
-  stripTools: tabId => (targetFor(tabId)?.kind === 'url' ? previewStripTools(tabId) : []),
+  // The pin toggle rides on every preview tab.
+  stripTools: tabId => [
+    ...(targetFor(tabId)?.kind === 'url' ? previewStripTools(tabId) : []),
+    previewPinTool(tabId)
+  ],
   render: tabId => <PreviewTilePane tabId={tabId} />,
   close: tabId => {
     forgetPreviewStripTools(tabId)
