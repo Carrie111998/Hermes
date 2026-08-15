@@ -1,0 +1,88 @@
+"""zai-coding-plan profile: endpoint separation from the standard zai provider.
+
+Coding-plan subscriptions authenticate on /api/coding/paas/v4; the standard
+/api/paas/v4 route rejects coding-plan keys (HTTP 429, code 1113). The
+dedicated profile mirrors alibaba-coding-plan / kimi-coding so coding-plan
+users get a working default without hand-editing GLM_BASE_URL.
+"""
+
+from __future__ import annotations
+
+import pytest
+
+
+@pytest.fixture
+def coding_profile():
+    import model_tools  # noqa: F401  — triggers plugin discovery
+    import providers
+
+    p = providers.get_provider_profile("zai-coding-plan")
+    assert p is not None, "zai-coding-plan must be registered"
+    return p
+
+
+class TestZaiCodingPlanProfile:
+    def test_coding_endpoint_is_default(self, coding_profile):
+        import providers
+
+        assert coding_profile.base_url == "https://api.z.ai/api/coding/paas/v4"
+        std = providers.get_provider_profile("zai")
+        assert std.base_url != coding_profile.base_url, (
+            "coding-plan profile must not share the standard endpoint"
+        )
+
+    def test_distinct_from_standard_zai(self, coding_profile):
+        import providers
+
+        assert coding_profile.name == "zai-coding-plan"
+        assert coding_profile.name != "zai"
+
+    def test_env_var_chain_includes_fallback(self, coding_profile):
+        """Dedicated vars first, ZAI_API_KEY as fallback so users with one
+        key don't need to duplicate it."""
+        assert coding_profile.env_vars[0] == "ZAI_CODING_PLAN_API_KEY"
+        assert "ZAI_API_KEY" in coding_profile.env_vars
+
+    def test_shares_glm_reasoning_wiring(self, coding_profile):
+        """Subclassing ZaiProfile keeps the GLM thinking / reasoning_effort
+        wiring — the coding endpoint speaks the same wire shape."""
+        extra_body, top_level = coding_profile.build_api_kwargs_extras(
+            reasoning_config={"enabled": True, "effort": "high"},
+            model="glm-5.2",
+        )
+        assert top_level == {"reasoning_effort": "high"}
+        assert extra_body.get("thinking") == {"type": "enabled"}
+
+    def test_model_list_registered(self):
+        from hermes_cli.models import _PROVIDER_MODELS
+
+        assert "zai-coding-plan" in _PROVIDER_MODELS
+        # glm-5.2 is the effort-dial model guaranteed on main; 5.3 arrives
+        # with the GLM-5.3 support PR — assert the shared core only.
+        assert "glm-5.2" in _PROVIDER_MODELS["zai-coding-plan"]
+
+    def test_aliases_normalize_to_coding_plan(self):
+        from hermes_cli.models import curated_models_for_provider, normalize_provider
+
+        for alias in ("zai-coding", "glm-coding", "z-ai-coding"):
+            assert normalize_provider(alias) == "zai-coding-plan", alias
+
+        # The public curated-models path resolves aliases to the coding list.
+        models = [m for m, _ in curated_models_for_provider("glm-coding")]
+        assert any(m == "glm-5.2" for m in models), models
+
+    def test_bundled_import_binds_bundled_zai_profile(self):
+        """Documented limitation: the cross-plugin import pins this profile
+        to the BUNDLED ZaiProfile class. A user-plugin override of ``zai``
+        loads later under a _hermes_user_provider_* module name and does not
+        affect this profile. Assert the binding is at least the bundled one
+        (deterministic behavior rather than accidental)."""
+        import sys
+
+        import providers  # noqa: F401  — discovery
+
+        assert "plugins.model_providers.zai" in sys.modules
+        # get_provider_profile returns the registered instance whose class
+        # comes from the bundled module.
+        p = providers.get_provider_profile("zai-coding-plan")
+        assert type(p).__module__ == "plugins.model_providers.zai"
