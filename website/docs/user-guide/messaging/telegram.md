@@ -1248,6 +1248,59 @@ Keys are chat IDs (groups/supergroups) or forum topic IDs. For forum groups, top
 
 Numeric YAML keys are automatically normalized to strings.
 
+## Session-health suggestions
+
+The gateway can monitor deterministic conversation-health signals and suggest
+`/new` when a Telegram session has become both long and complex. This is an
+**advisory only**: it never resets, rotates, truncates, or edits a conversation.
+The client can continue in the current session for follow-up work.
+
+Enable it with:
+
+```bash
+hermes config set gateway.session_health.enabled true
+```
+
+The policy is hard-scoped to Telegram and cannot be retargeted to another
+platform through configuration. It requires at least two independent signals
+before the first suggestion. State is stored in the gateway routing entry, so
+cooldowns survive gateway restarts. A failed turn updates the failure streak
+but never adds a tip to an error response.
+
+```yaml
+gateway:
+  session_health:
+    enabled: true
+    min_messages: 80
+    min_tool_calls: 25
+    min_age_seconds: 129600      # 36 hours; age alone never triggers
+    min_prompt_tokens: 72000
+    min_context_ratio: 0.45
+    min_compressions: 2
+    min_failure_streak: 2
+    min_signals: 2
+    strong_signals: 3
+    cooldown_seconds: 86400
+    max_suggestions: 2
+```
+
+A threshold of `0` disables that individual signal. `max_suggestions: 0`
+disables delivery while retaining the rest of the configuration. Anti-spam
+invariants cannot be weakened by configuration: the first notice always needs
+at least two signals, repeats need at least three, the cooldown is never shorter
+than 24 hours, and a session receives at most two notices. Suggestions are added
+only after a successful visible response; streamed replies receive a single
+trailing message. Interrupted, partial, incomplete, and failed turns update the
+failure streak but never receive advisory text. A deliverable notice attempt
+reserves its cooldown/quota before platform dispatch; this fail-closed ordering
+prevents a crash or ambiguous send failure from causing repeat spam. Suggestions
+are not injected into model history and are not included in automatic voice
+replies.
+
+`/new` starts a fresh active chat context. It does not delete the previous
+session or saved memory. The gateway's separate `session_reset` policy remains
+unchanged and defaults to no automatic reset.
+
 ## Troubleshooting
 
 | Problem | Solution |

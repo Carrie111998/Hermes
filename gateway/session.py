@@ -3081,6 +3081,29 @@ class SessionStore:
             self._save()
             return True
 
+    def set_session_metadata_if_current(
+        self,
+        session_key: str,
+        expected_session_id: str,
+        key: str,
+        value: Any,
+    ) -> bool:
+        """Persist metadata only while the route still owns the expected session.
+
+        This compare-and-swap prevents an old async turn from writing bookkeeping
+        into a replacement entry created by ``/new``, ``/reset``, or ``/resume``.
+        """
+        if not session_key or not expected_session_id:
+            return False
+        with self._lock:
+            self._ensure_loaded_locked()
+            entry = self._entries.get(session_key)
+            if entry is None or entry.session_id != expected_session_id:
+                return False
+            entry.metadata[key] = value
+            self._save()
+            return True
+
     def set_model_override(
         self, session_key: str, override: Optional[Dict[str, Any]]
     ) -> None:

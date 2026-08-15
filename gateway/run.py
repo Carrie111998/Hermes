@@ -20984,6 +20984,132 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             ):
                 await self._send_voice_reply(event, response)
 
+            # Advisory-only session health check.  This runs after transcript
+            # persistence and after voice generation, so it neither enters the
+            # model's history nor gets read aloud.  The evaluator never resets a
+            # session; it can only return a `/new` suggestion.  Persisting the
+            # cooldown state is a prerequisite for delivery so a restart cannot
+            # turn the tip into repeated chat noise.
+            _session_health_advice = ""
+            if (
+                session_key
+                and session_entry
+                and not bool(getattr(event, "internal", False))
+                and not _intentional_silence
+                and not agent_result.get("compression_exhausted")
+            ):
+                try:
+                    from gateway.session_health import (
+                        count_session_activity as _count_session_activity,
+                        evaluate_session_health as _evaluate_session_health,
+                        session_health_can_deliver as _session_health_can_deliver,
+                        session_health_turn_failed as _session_health_turn_failed,
+                    )
+
+                    _old_health_state = session_entry.metadata.get(
+                        "session_health", {}
+                    )
+                    if not isinstance(_old_health_state, dict):
+                        _old_health_state = {}
+                    _health_message_count, _health_tool_call_count = (
+                        _count_session_activity(agent_messages)
+                    )
+                    _health_now = time.time()
+                    _health_can_deliver = _session_health_can_deliver(
+                        response=response,
+                        already_sent=bool(agent_result.get("already_sent")),
+                        intentional_silence=_intentional_silence,
+                    )
+                    _health_decision = _evaluate_session_health(
+                        user_config=_load_gateway_config(),
+                        platform_key=_platform_config_key(source.platform),
+                        message_count=_health_message_count,
+                        tool_call_count=_health_tool_call_count,
+                        session_age_seconds=max(
+                            0,
+                            int(_health_now - session_entry.created_at.timestamp()),
+                        ),
+                        prompt_tokens=agent_result.get("last_prompt_tokens", 0) or 0,
+                        context_length=agent_result.get("context_length", 0) or 0,
+                        agent_failed=_session_health_turn_failed(
+                            agent_result,
+                            str(agent_result.get("final_response") or ""),
+                            gateway_error=hidden_reasoning_incomplete,
+                        ),
+                        can_deliver=_health_can_deliver,
+                        compressed=bool(
+                            agent_result.get("compacted_in_place")
+                            or (
+                                agent_result.get("session_id")
+                                and agent_result.get("session_id")
+                                != _run_start_session_id
+                            )
+                        ),
+                        state=_old_health_state,
+                        now=_health_now,
+                    )
+                    _health_route_current = self._is_session_run_current(
+                        session_key, run_generation
+                    )
+                    _health_state_persisted = _health_route_current
+                    if (
+                        _health_route_current
+                        and _health_decision.next_state != _old_health_state
+                    ):
+                        _health_state_persisted = bool(
+                            await self.async_session_store.set_session_metadata_if_current(
+                                session_key,
+                                session_entry.session_id,
+                                "session_health",
+                                _health_decision.next_state,
+                            )
+                        )
+                    _health_route_current = (
+                        _health_state_persisted
+                        and self._is_session_run_current(session_key, run_generation)
+                    )
+                    if (
+                        _health_decision.should_suggest
+                        and _health_route_current
+                        and _health_can_deliver
+                    ):
+                        _session_health_advice = _health_decision.message
+                        logger.info(
+                            "Session health suggestion ready for %s "
+                            "(level=%s signals=%s)",
+                            session_key,
+                            _health_decision.level,
+                            ",".join(_health_decision.signals),
+                        )
+                except Exception as _health_err:
+                    logger.debug(
+                        "session health evaluation failed for %s: %s",
+                        session_key,
+                        _health_err,
+                    )
+                    _session_health_advice = ""
+
+            _session_health_trailing = ""
+            try:
+                from gateway.session_health import (
+                    plan_session_health_delivery as _plan_session_health_delivery,
+                )
+
+                _health_delivery = _plan_session_health_delivery(
+                    response=response,
+                    advice=_session_health_advice,
+                    already_sent=bool(agent_result.get("already_sent")),
+                )
+                response = _health_delivery.response
+                _session_health_trailing = _health_delivery.trailing_message
+            except Exception as _health_delivery_err:
+                logger.debug(
+                    "session health delivery planning failed for %s: %s",
+                    session_key,
+                    _health_delivery_err,
+                )
+                _session_health_trailing = ""
+
             # If streaming already delivered the response, extract and
             # deliver any MEDIA: files before returning None.  Streaming
             # sends raw text chunks that include MEDIA: tags — the normal
@@ -21017,6 +21143,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             )
                     except Exception as _e:
                         logger.debug("trailing footer send failed: %s", _e)
+                if _session_health_trailing:
+                    try:
+                        _health_adapter = self._adapter_for_source(source)
+                        if _health_adapter:
+                            await _health_adapter.send(
+                                source.chat_id,
+                                _session_health_trailing,
+                                metadata=self._thread_metadata_for_source(
+                                    source, self._reply_anchor_for_event(event)
+                                ),
+                            )
+                    except Exception as _e:
+                        logger.debug("trailing session health send failed: %s", _e)
                 # This branch returns None so the adapter does not send the
                 # body twice. /loop and /goal hooks in _handle_message read
                 # the return value, so stash the delivered text on the event

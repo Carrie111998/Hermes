@@ -2986,6 +2986,26 @@ DEFAULT_CONFIG = {
         # crash/restart, as before.
         "delivery_ledger": True,
 
+        # Advisory-only conversation health monitoring. Disabled by default;
+        # when enabled, the gateway may append a rate-limited `/new` suggestion
+        # after a successful visible turn. It never resets or rotates a session.
+        # The evaluator enforces at least two signals, a 24-hour cooldown, and
+        # at most two suggestions even if lower/greater values are configured.
+        "session_health": {
+            "enabled": False,
+            "min_messages": 80,
+            "min_tool_calls": 25,
+            "min_age_seconds": 129600,
+            "min_prompt_tokens": 72000,
+            "min_context_ratio": 0.45,
+            "min_compressions": 2,
+            "min_failure_streak": 2,
+            "min_signals": 2,
+            "strong_signals": 3,
+            "cooldown_seconds": 86400,
+            "max_suggestions": 2,
+        },
+
         # Seconds the gateway waits for a single messaging platform to finish
         # connecting during startup (and on reconnect). Discord in particular
         # can blow past the old fixed 30s when an account has many slash

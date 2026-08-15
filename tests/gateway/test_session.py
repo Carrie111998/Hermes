@@ -1319,6 +1319,39 @@ class TestSessionMetadata:
         # And the restart freshness gate must still see it as idle.
         assert store.suspend_recently_active(max_age_seconds=120) == 0
 
+    def test_metadata_compare_and_swap_rejects_replaced_session(self, tmp_path):
+        config = GatewayConfig()
+        store = SessionStore(sessions_dir=tmp_path, config=config)
+        store._db = None
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="123",
+            chat_type="dm",
+            user_id="456",
+        )
+
+        original = store.get_or_create_session(source)
+        replacement = store.reset_session(original.session_key)
+
+        assert replacement is not None
+        assert replacement.session_id != original.session_id
+        assert not store.set_session_metadata_if_current(
+            original.session_key,
+            original.session_id,
+            "session_health",
+            {"suggestion_count": 1},
+        )
+        assert store.get_session_metadata(original.session_key, "session_health") is None
+        assert store.set_session_metadata_if_current(
+            replacement.session_key,
+            replacement.session_id,
+            "session_health",
+            {"suggestion_count": 1},
+        )
+        assert store.get_session_metadata(replacement.session_key, "session_health") == {
+            "suggestion_count": 1
+        }
+
 
 class TestRewriteTranscriptPreservesReasoning:
     """rewrite_transcript must not drop reasoning fields from SQLite."""
