@@ -4978,6 +4978,20 @@ def run_one_job(
                 )
             else:
                 deliver_content = final_response if success else _summarize_cron_failure_for_delivery(job, error)
+                # Tag the delivered message when the response actually came
+                # from a fallback provider, not the job's configured primary
+                # -- fallback quality varies, and a silent degrade on a
+                # judgment-critical job should be visible, not just usable.
+                if success and _deferred_agents:
+                    _fb_agent = _deferred_agents[0]
+                    _fb_idx = int(getattr(_fb_agent, "_fallback_index", 0) or 0)
+                    if _fb_idx > 0:
+                        _fb_provider = str(getattr(_fb_agent, "provider", "") or "unknown")
+                        _fb_model = str(getattr(_fb_agent, "model", "") or "unknown")
+                        deliver_content = (
+                            f"[ran on fallback #{_fb_idx}: {_fb_model} via {_fb_provider}, "
+                            f"not the configured primary]\n\n{deliver_content}"
+                        )
                 if drift_skip and not success:
                     # Drift-skip alert: bypass the generic summarizer's
                     # 180-char truncation (it would eat the remediation
