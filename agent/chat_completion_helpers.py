@@ -3916,6 +3916,30 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 # Usage comes in the final chunk with empty choices
                 if hasattr(chunk, "usage") and chunk.usage:
                     usage_obj = chunk.usage
+                # Some OpenAI-compatible providers (DeepInfra, etc.)
+                # return validation errors as in-stream error chunks:
+                # choices=None with error_type/error_message in
+                # model_extra.  Without this check the error is
+                # silently dropped and the stream ends empty →
+                # EmptyStreamError → misleading "empty stream" message
+                # and pointless retries on the same bad request. (#65631)
+                _err_type = getattr(chunk, "error_type", None)
+                _err_msg = getattr(chunk, "error_message", None)
+                if _err_type or _err_msg:
+                    _status = _status_code_from_payload(
+                        {"code": _err_type, "message": _err_msg}
+                    ) or _status_code_from_value(_err_type)
+                    raise ProviderStreamError(
+                        status_code=_status,
+                        body=_provider_error_body(
+                            {
+                                "code": _err_type or "provider_in_stream_error",
+                                "message": str(_err_msg or chunk),
+                            },
+                            _status,
+                        ),
+                        raw_text=f"{_err_type}: {_err_msg}",
+                    )
                 continue
 
             delta = chunk.choices[0].delta
