@@ -26,6 +26,7 @@ the full ``.asend()`` round-trip — the integration tests in
 These tests drive the wrapper through a manual ``.asend()`` sequence to prove
 the bridge forwards responses correctly into the inner SDK generator.
 """
+
 from __future__ import annotations
 
 import pytest
@@ -126,7 +127,11 @@ async def test_hermes_provider_forwards_401_triggers_refresh(tmp_path, monkeypat
     branch which begins discovery (yielding a metadata-discovery request).
     """
     import httpx
-    from mcp.shared.auth import OAuthClientInformationFull, OAuthClientMetadata, OAuthToken
+    from mcp.shared.auth import (
+        OAuthClientInformationFull,
+        OAuthClientMetadata,
+        OAuthToken,
+    )
     from pydantic import AnyUrl
 
     from tools.mcp_oauth import HermesTokenStorage
@@ -181,7 +186,9 @@ async def test_hermes_provider_forwards_401_triggers_refresh(tmp_path, monkeypat
     fake_401 = httpx.Response(
         401,
         request=outbound,
-        headers={"www-authenticate": 'Bearer resource_metadata="https://example.com/.well-known/oauth-protected-resource"'},
+        headers={
+            "www-authenticate": 'Bearer resource_metadata="https://example.com/.well-known/oauth-protected-resource"'
+        },
     )
 
     # The correct bridge forwards the 401 into the SDK; the SDK then yields
@@ -196,6 +203,84 @@ async def test_hermes_provider_forwards_401_triggers_refresh(tmp_path, monkeypat
 
     # Clean up the generator — we don't need to complete the full dance.
     await flow.aclose()
+
+
+@pytest.mark.asyncio
+async def test_httpx_timeout_closes_inner_flow_and_releases_lock(tmp_path, monkeypatch):
+    """HTTPX teardown must release the SDK lock and leave the provider reusable."""
+    import httpx
+    from mcp.shared.auth import (
+        OAuthClientInformationFull,
+        OAuthClientMetadata,
+        OAuthToken,
+    )
+    from pydantic import AnyUrl
+
+    from tools.mcp_oauth import HermesTokenStorage
+    from tools.mcp_oauth_manager import _HERMES_PROVIDER_CLS, reset_manager_for_tests
+
+    assert _HERMES_PROVIDER_CLS is not None
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    reset_manager_for_tests()
+
+    storage = HermesTokenStorage("srv")
+    await storage.set_tokens(
+        OAuthToken(
+            access_token="old_access",
+            token_type="Bearer",
+            expires_in=3600,
+            refresh_token="old_refresh",
+        )
+    )
+    await storage.set_client_info(
+        OAuthClientInformationFull(
+            client_id="test-client",
+            redirect_uris=[AnyUrl("http://127.0.0.1:12345/callback")],
+            grant_types=["authorization_code", "refresh_token"],
+            response_types=["code"],
+            token_endpoint_auth_method="none",
+        )
+    )
+
+    provider = _HERMES_PROVIDER_CLS(
+        server_name="srv",
+        server_url="https://example.com/mcp",
+        client_metadata=OAuthClientMetadata(
+            redirect_uris=[AnyUrl("http://127.0.0.1:12345/callback")],
+            client_name="Hermes Agent",
+        ),
+        storage=storage,
+        redirect_handler=_noop_redirect,
+        callback_handler=_noop_callback,
+    )
+
+    attempts = 0
+
+    async def handle_request(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        assert provider.context.lock.locked()
+        if attempts == 1:
+            raise httpx.ReadTimeout("forced OAuth transport timeout", request=request)
+        return httpx.Response(200, request=request)
+
+    async with httpx.AsyncClient(
+        auth=provider,
+        transport=httpx.MockTransport(handle_request),
+    ) as client:
+        with pytest.raises(httpx.ReadTimeout, match="forced OAuth transport timeout"):
+            await client.post("https://example.com/mcp")
+
+        # HTTPX closes the outer auth flow in a finally block. The Hermes
+        # bridge must close the delegated SDK generator in that same task.
+        assert not provider.context.lock.locked()
+
+        response = await client.post("https://example.com/mcp")
+
+    assert response.status_code == 200
+    assert attempts == 2
+    assert not provider.context.lock.locked()
 
 
 async def _noop_redirect(_url: str) -> None:

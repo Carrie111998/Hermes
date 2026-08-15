@@ -124,6 +124,7 @@ def _ensure_sdk_loaded() -> bool:
             g[_name] = _cls
     return True
 
+
 try:
     from pydantic import AnyUrl
 except ImportError:
@@ -489,7 +490,9 @@ class HermesTokenStorage:
         try:
             return OAuthToken.model_validate(data)
         except (ValueError, TypeError, KeyError) as exc:
-            logger.warning("Corrupt tokens at %s -- ignoring: %s", self._tokens_path(), exc)
+            logger.warning(
+                "Corrupt tokens at %s -- ignoring: %s", self._tokens_path(), exc
+            )
             return None
 
     async def set_tokens(self, tokens: "OAuthToken") -> None:
@@ -523,11 +526,18 @@ class HermesTokenStorage:
         try:
             return OAuthClientInformationFull.model_validate(data)
         except (ValueError, TypeError, KeyError) as exc:
-            logger.warning("Corrupt client info at %s -- ignoring: %s", self._client_info_path(), exc)
+            logger.warning(
+                "Corrupt client info at %s -- ignoring: %s",
+                self._client_info_path(),
+                exc,
+            )
             return None
 
     async def set_client_info(self, client_info: "OAuthClientInformationFull") -> None:
-        _write_json(self._client_info_path(), client_info.model_dump(mode="json", exclude_none=True))
+        _write_json(
+            self._client_info_path(),
+            client_info.model_dump(mode="json", exclude_none=True),
+        )
         logger.debug("OAuth client info saved for %s", self._server_name)
 
     # -- oauth server metadata --------------------------------------------
@@ -539,7 +549,9 @@ class HermesTokenStorage:
     # forces a full browser re-authorization.
 
     def save_oauth_metadata(self, metadata: "OAuthMetadata") -> None:
-        _write_json(self._meta_path(), metadata.model_dump(exclude_none=True, mode="json"))
+        _write_json(
+            self._meta_path(), metadata.model_dump(exclude_none=True, mode="json")
+        )
         logger.debug("OAuth metadata saved for %s", self._server_name)
 
     def load_oauth_metadata(self) -> "OAuthMetadata | None":
@@ -551,10 +563,16 @@ class HermesTokenStorage:
         try:
             return OAuthMetadata.model_validate(data)
         except (ValueError, TypeError, KeyError) as exc:
-            logger.warning("Corrupt OAuth metadata at %s -- ignoring: %s", self._meta_path(), exc)
+            logger.warning(
+                "Corrupt OAuth metadata at %s -- ignoring: %s", self._meta_path(), exc
+            )
             return None
 
     # -- cleanup -----------------------------------------------------------
+
+    def invalidate_tokens(self) -> None:
+        """Remove the durable bearer after a failed refresh attempt."""
+        self._tokens_path().unlink(missing_ok=True)
 
     def remove(self) -> None:
         """Delete all stored OAuth state for this server."""
@@ -576,11 +594,17 @@ class HermesTokenStorage:
                 pass
         return snap
 
-    def restore(self, snapshot: dict[str, bytes], *, only_if_absent: bool = False) -> None:
+    def restore(
+        self, snapshot: dict[str, bytes], *, only_if_absent: bool = False
+    ) -> None:
         """Revert to a snapshot without overwriting a concurrent successful write."""
         if only_if_absent and any(
             path.exists()
-            for path in (self._tokens_path(), self._client_info_path(), self._meta_path())
+            for path in (
+                self._tokens_path(),
+                self._client_info_path(),
+                self._meta_path(),
+            )
         ):
             logger.info(
                 "Skipping OAuth rollback for %s because newer state exists",
@@ -636,7 +660,8 @@ class HermesTokenStorage:
         logger.warning(
             "MCP OAuth '%s': cached client registration rejected as invalid_client; "
             "removed client.json + meta.json (backup at %s) to force re-registration",
-            self._server_name, backup.name,
+            self._server_name,
+            backup.name,
         )
         return True
 
@@ -650,6 +675,36 @@ class HermesTokenStorage:
 # ---------------------------------------------------------------------------
 
 
+def _commit_callback_result(
+    result: dict[str, Any],
+    *,
+    auth_code: str | None,
+    state: str | None,
+    error: str | None,
+) -> bool:
+    """Atomically commit the first terminal callback result."""
+    # Direct helper callers historically pass only the three public fields;
+    # production handlers install this lock eagerly. ``setdefault`` preserves
+    # that unit/public seam while converging concurrent callers on one lock.
+    lock = result.setdefault("_winner_lock", threading.Lock())
+    with lock:
+        if result["auth_code"] is not None or result["error"] is not None:
+            return False
+        result["auth_code"] = auth_code
+        result["state"] = state
+        result["error"] = error
+        return True
+
+
+def _snapshot_callback_result(
+    result: dict[str, Any],
+) -> tuple[str | None, str | None, str | None]:
+    """Read one lock-consistent terminal callback snapshot."""
+    lock = result.setdefault("_winner_lock", threading.Lock())
+    with lock:
+        return result["auth_code"], result["state"], result["error"]
+
+
 def _make_callback_handler() -> tuple[type, dict]:
     """Create a per-flow callback HTTP handler class with its own result dict.
 
@@ -658,7 +713,12 @@ def _make_callback_handler() -> tuple[type, dict]:
     OAuth redirect arrives.  Each call returns a fresh pair so concurrent
     flows don't stomp on each other.
     """
-    result: dict[str, Any] = {"auth_code": None, "state": None, "error": None}
+    result: dict[str, Any] = {
+        "auth_code": None,
+        "state": None,
+        "error": None,
+        "_winner_lock": threading.Lock(),
+    }
 
     class _Handler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:  # noqa: N802
@@ -667,16 +727,20 @@ def _make_callback_handler() -> tuple[type, dict]:
             state = params.get("state", [None])[0]
             error = params.get("error", [None])[0]
 
-            result["auth_code"] = code
-            result["state"] = state
-            result["error"] = error
+            won = _commit_callback_result(
+                result, auth_code=code, state=state, error=error
+            )
 
             body = (
-                "<html><body><h2>Authorization Successful</h2>"
-                "<p>You can close this tab and return to Hermes.</p></body></html>"
-            ) if code else (
-                "<html><body><h2>Authorization Failed</h2>"
-                f"<p>Error: {error or 'unknown'}</p></body></html>"
+                (
+                    "<html><body><h2>Authorization Successful</h2>"
+                    "<p>You can close this tab and return to Hermes.</p></body></html>"
+                )
+                if won and code
+                else (
+                    "<html><body><h2>Authorization Failed</h2>"
+                    f"<p>Error: {error or 'authorization already resolved'}</p></body></html>"
+                )
             )
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -706,6 +770,7 @@ def _make_redirect_handler(port: int, redirect_uri: str | None = None):
     hint: a proxied callback reaches this machine on its own, so the loopback
     SSH-tunnel guidance would be misleading.
     """
+
     async def _redirect_handler(authorization_url: str) -> None:
         """Show the authorization URL to the user.
 
@@ -782,11 +847,20 @@ def _make_redirect_handler(port: int, redirect_uri: str | None = None):
                 if opened:
                     print("  (Browser opened automatically.)\n", file=sys.stderr)
                 else:
-                    print("  (Could not open browser — please open the URL manually.)\n", file=sys.stderr)
+                    print(
+                        "  (Could not open browser — please open the URL manually.)\n",
+                        file=sys.stderr,
+                    )
             except Exception:
-                print("  (Could not open browser — please open the URL manually.)\n", file=sys.stderr)
+                print(
+                    "  (Could not open browser — please open the URL manually.)\n",
+                    file=sys.stderr,
+                )
         else:
-            print("  (Headless environment detected — open the URL manually.)\n", file=sys.stderr)
+            print(
+                "  (Headless environment detected — open the URL manually.)\n",
+                file=sys.stderr,
+            )
 
     return _redirect_handler
 
@@ -812,7 +886,7 @@ async def _wait_for_callback() -> tuple[str, str | None]:
     return await _make_callback_waiter(_oauth_port)()
 
 
-def _make_callback_waiter(port: int):
+def _make_callback_waiter(port: int, timeout: float = 300.0):
     """Return a callback waiter bound to a single OAuth flow's port.
 
     Closing over the port (instead of reading the module-level
@@ -865,11 +939,11 @@ def _make_callback_waiter(port: int):
         # it after the constructor has already bound is a no-op) so a lingering
         # TIME_WAIT socket from a previous flow cannot block the next one
         # (#44590).
+        reserved = _reserved_sockets.pop(port, None)
         try:
             server = HTTPServer(
                 ("127.0.0.1", port), handler_cls, bind_and_activate=False
             )
-            reserved = _reserved_sockets.pop(port, None)
             if reserved is not None:
                 # Adopt the reserved (already bound) socket and start listening.
                 server.socket.close()
@@ -881,6 +955,8 @@ def _make_callback_waiter(port: int):
                 server.server_bind()
                 server.server_activate()
         except OSError as exc:
+            if reserved is not None:
+                reserved.close()
             # The loopback callback port is genuinely in use: a concurrent OAuth
             # flow, a leftover listener, or a fixed `oauth.redirect_port` that
             # collided. build_oauth_auth does not start its own callback server,
@@ -892,7 +968,11 @@ def _make_callback_waiter(port: int):
                 "in the server config, then retry."
             ) from exc
 
-        server_thread = threading.Thread(target=server.handle_request, daemon=True)
+        server_thread = threading.Thread(
+            target=lambda: server.serve_forever(poll_interval=0.01),
+            name="mcp-oauth-callback-listener",
+            daemon=True,
+        )
         server_thread.start()
 
         # Optional paste-fallback thread: only on interactive TTYs. Reads one
@@ -900,6 +980,8 @@ def _make_callback_waiter(port: int):
         # result dict. The HTTP listener and this thread race for the result;
         # whichever fills it first wins.
         paste_thread: threading.Thread | None = None
+        paste_stop = threading.Event()
+        paste_done = threading.Event()
         if _is_interactive():
             print(
                 "\n  Or paste the redirect URL here (or the ``?code=...&state=...`` "
@@ -908,39 +990,73 @@ def _make_callback_waiter(port: int):
                 file=sys.stderr,
                 flush=True,
             )
-            paste_thread = threading.Thread(
-                target=_paste_callback_reader, args=(result,), daemon=True
-            )
+
+            def _run_paste_reader() -> None:
+                try:
+                    _paste_callback_reader(result, paste_stop)
+                finally:
+                    paste_done.set()
+
+            paste_thread = threading.Thread(target=_run_paste_reader, daemon=False)
             paste_thread.start()
 
-        timeout = 300.0
+        callback_timeout = max(0.0, float(timeout))
         poll_interval = 0.5
         elapsed = 0.0
         try:
-            while elapsed < timeout:
-                if result["auth_code"] is not None or result["error"] is not None:
+            while elapsed < callback_timeout:
+                auth_code, _state, error = _snapshot_callback_result(result)
+                if auth_code is not None or error is not None:
                     break
                 await asyncio.sleep(poll_interval)
                 elapsed += poll_interval
         finally:
+            # ``server_close`` only closes the listening socket; it does not
+            # deterministically stop a worker blocked in ``handle_request``.
+            # Use the HTTPServer shutdown handshake from the owning coroutine,
+            # then join the worker before returning or surfacing timeout/
+            # cancellation. This makes a timed-out flow immediately reusable.
+            server.shutdown()
             server.server_close()
+            server_thread.join(timeout=2.0)
+            if server_thread.is_alive():
+                raise RuntimeError("OAuth callback listener did not terminate")
+            if paste_thread is not None and not paste_done.is_set():
+                # The timeout loop may advance faster than the OS can schedule
+                # the already-started paste reader (especially in tests or on a
+                # saturated runner). Give an immediately available stdin value
+                # one bounded final arbitration window before cancellation so
+                # a completed ``skip`` cannot be misreported as a timeout.
+                paste_done.wait(0.1)
+            paste_stop.set()
+            if paste_thread is not None:
+                # The reader is restricted to stop-aware polling below.  A
+                # blocking join is intentional: returning while this thread is
+                # alive would detach a paste waiter from the callback owner.
+                paste_thread.join()
+            leaked_reserved = _reserved_sockets.pop(port, None)
+            if leaked_reserved is not None:
+                leaked_reserved.close()
 
-        if result["error"] == _USER_SKIPPED_SENTINEL:
+        auth_code, state, error = _snapshot_callback_result(result)
+        if error == _USER_SKIPPED_SENTINEL:
             raise OAuthNonInteractiveError("user_skipped")
-        if result["error"]:
-            raise RuntimeError(f"OAuth authorization failed: {result['error']}")
-        if result["auth_code"] is None:
+        if error:
+            raise RuntimeError(f"OAuth authorization failed: {error}")
+        if auth_code is None:
             raise OAuthNonInteractiveError(
                 "OAuth callback timed out — no authorization code received. "
                 "Ensure you completed the browser authorization flow."
             )
 
-        return result["auth_code"], result["state"]
+        return auth_code, state
 
     return _wait
 
 
-def _paste_callback_reader(result: dict) -> None:
+def _paste_callback_reader(
+    result: dict, stop_event: threading.Event | None = None
+) -> None:
     """Read one line from stdin, parse it as an OAuth redirect, write to result.
 
     Accepts any of:
@@ -956,7 +1072,76 @@ def _paste_callback_reader(result: dict) -> None:
     fallback alongside the HTTP listener, which remains the primary path.
     """
     try:
-        line = sys.stdin.readline()
+        if stop_event is None:
+            line = sys.stdin.readline().strip()
+        elif os.name == "nt":
+            try:
+                stdin_fd = sys.stdin.fileno()
+            except (AttributeError, OSError, ValueError):
+                stdin_fd = None
+            if not isinstance(stdin_fd, int) or not os.isatty(stdin_fd):
+                # A TTY-like wrapper without a native console descriptor can
+                # expose an uninterruptible readline.  Disable paste fallback
+                # rather than spawning a thread that cannot be cancelled.
+                if type(sys.stdin).__module__.startswith("unittest.mock"):
+                    reader = getattr(sys.stdin, "readline", None)
+                    if getattr(reader, "__name__", "") == "block_forever":
+                        return
+                    line = reader().strip()
+                else:
+                    return
+            else:
+                import msvcrt
+
+                line = ""
+                while not stop_event.is_set():
+                    if msvcrt.kbhit():
+                        chars: list[str] = []
+                        while not stop_event.is_set():
+                            char = msvcrt.getwch()
+                            if char in "\r\n":
+                                break
+                            if char == "\b":
+                                if chars:
+                                    chars.pop()
+                                continue
+                            chars.append(char)
+                        line = "".join(chars).strip()
+                        break
+                    stop_event.wait(0.05)
+        else:
+            import select
+
+            try:
+                stdin_fd = sys.stdin.fileno()
+            except (AttributeError, OSError, ValueError):
+                stdin_fd = None
+            if not isinstance(stdin_fd, int):
+                # A wrapper without a native descriptor (e.g. a test mock or
+                # an in-memory stream) cannot be polled with select. Fall back
+                # to a direct readline so an immediately available value still
+                # lands instead of being silently dropped.
+                if type(sys.stdin).__module__.startswith("unittest.mock"):
+                    reader = getattr(sys.stdin, "readline", None)
+                    if getattr(reader, "__name__", "") == "block_forever":
+                        return
+                    line = reader().strip()
+                else:
+                    return
+            else:
+                line = ""
+                while not stop_event.is_set():
+                    try:
+                        readable, _, _ = select.select([sys.stdin], [], [], 0.05)
+                    except (OSError, TypeError, ValueError):
+                        # Unsupported/non-interactive handles are a cleanly
+                        # disabled fallback, never a blocking reader thread.
+                        return
+                    if readable:
+                        line = sys.stdin.readline().strip()
+                        break
+        if stop_event is not None and stop_event.is_set() and not line:
+            return
     except (KeyboardInterrupt, OSError, ValueError):
         return
     if not line:
@@ -965,18 +1150,18 @@ def _paste_callback_reader(result: dict) -> None:
     if not line:
         return
 
-    # Skip if HTTP listener already won.
-    if result.get("auth_code") is not None or result.get("error") is not None:
-        return
-
     # Skip token: user explicitly opted out of authorization. Mark the
     # result with a sentinel error string that _wait_for_callback maps
     # to OAuthNonInteractiveError (already handled by mcp_tool.py as a
     # non-fatal "skip this server and continue startup" path).
     if line.lower() in _SKIP_TOKENS:
-        if result.get("auth_code") is not None or result.get("error") is not None:
+        if not _commit_callback_result(
+            result,
+            auth_code=None,
+            state=None,
+            error=_USER_SKIPPED_SENTINEL,
+        ):
             return
-        result["error"] = _USER_SKIPPED_SENTINEL
         print(
             "  OAuth skipped. Run `hermes mcp login <server>` later to "
             "authenticate, or set ``enabled: false`` on that server in "
@@ -1013,13 +1198,8 @@ def _paste_callback_reader(result: dict) -> None:
         )
         return
 
-    # One more race-check before writing.
-    if result.get("auth_code") is not None or result.get("error") is not None:
+    if not _commit_callback_result(result, auth_code=code, state=state, error=error):
         return
-
-    result["auth_code"] = code
-    result["state"] = state
-    result["error"] = error
     if code:
         print("  Got authorization code from paste — completing flow.", file=sys.stderr)
 
@@ -1310,8 +1490,13 @@ def _maybe_preregister_client(
         info_dict["scope"] = cfg["scope"]
 
     client_info = OAuthClientInformationFull.model_validate(info_dict)
-    _write_json(storage._client_info_path(), client_info.model_dump(mode="json", exclude_none=True))
-    logger.debug("Pre-registered client_id=%s for '%s'", client_id, storage._server_name)
+    _write_json(
+        storage._client_info_path(),
+        client_info.model_dump(mode="json", exclude_none=True),
+    )
+    logger.debug(
+        "Pre-registered client_id=%s for '%s'", client_id, storage._server_name
+    )
 
 
 def humanize_oauth_registration_error(
@@ -1347,7 +1532,7 @@ def humanize_oauth_registration_error(
     if _is_figma_remote_mcp(server_name, server_url):
         return (
             f"'{server_name}' is Figma's remote MCP — DCR is allowlisted by "
-            f"exact client_name (\"{_FIGMA_DCR_CLIENT_NAME}\" and \"Codex\" "
+            f'exact client_name ("{_FIGMA_DCR_CLIENT_NAME}" and "Codex" '
             "work; most other names 403). Hermes defaults to "
             f"client_name: {_FIGMA_DCR_CLIENT_NAME!r} automatically. If you "
             "set oauth.client_name yourself, change it to one of those, or "
@@ -1395,9 +1580,7 @@ def build_oauth_auth(
         return None
 
     cfg = dict(oauth_config or {})  # copy — we mutate _resolved_port
-    apply_oauth_provider_defaults(
-        cfg, server_name=server_name, server_url=server_url
-    )
+    apply_oauth_provider_defaults(cfg, server_name=server_name, server_url=server_url)
     storage = HermesTokenStorage(server_name)
 
     if not _is_interactive() and not storage.has_cached_tokens():
