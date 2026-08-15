@@ -362,6 +362,55 @@ async function remotePidAlive(ssh, pid) {
   }
 }
 
+// The installer exposes Hermes through an executable wrapper that delegates to
+// either a console script or `python <checked-in entrypoint>`. Keep using the
+// wrapper for version/capability probes (#74411), but bind process ownership to
+// the exact delegated entrypoint that appears in /proc/<pid>/cmdline.
+async function resolveHermesOwnershipPath(ssh, hermesPath) {
+  const script =
+    'import os,shlex,stat,sys\n' +
+    'p=os.path.expanduser(sys.argv[1])\n' +
+    'process_path=p\n' +
+    'try:\n' +
+    ' s=os.stat(p,follow_symlinks=False)\n' +
+    ' owner_ok=not hasattr(os,"getuid") or s.st_uid==os.getuid()\n' +
+    ' safe=stat.S_ISREG(s.st_mode) and owner_ok and not (s.st_mode&0o022)\n' +
+    ' if safe:\n' +
+    '  data=open(p,"r",encoding="utf-8",errors="ignore").read(4096)\n' +
+    '  lines=data.splitlines()\n' +
+    '  canonical=len(lines)==4 and lines[:3]==["#!/usr/bin/env bash","unset PYTHONPATH","unset PYTHONHOME"]\n' +
+    '  if canonical:\n' +
+    '   process_path=""\n' +
+    '   words=shlex.split(lines[3])\n' +
+    '   target=None\n' +
+    '   delegated=[]\n' +
+    '   if len(words)==3 and words[0]=="exec" and words[2]=="$@":target=words[1];delegated=[(words[1],False)]\n' +
+    '   elif len(words)==4 and words[0]=="exec" and os.path.basename(words[1]).startswith("python") and words[3]=="$@":target=words[2];delegated=[(words[1],True),(words[2],False)]\n' +
+    '   delegated=[(os.path.expanduser(x),is_interpreter) for x,is_interpreter in delegated]\n' +
+    '   if target and all(os.path.isabs(x) for x,_ in delegated):\n' +
+    '    checked=[]\n' +
+    '    for x,is_interpreter in delegated:\n' +
+    '     ls=os.stat(x,follow_symlinks=False)\n' +
+    '     resolved=os.path.realpath(x) if is_interpreter and stat.S_ISLNK(ls.st_mode) else x\n' +
+    '     rs=os.stat(resolved,follow_symlinks=False)\n' +
+    '     writable_mask=0o002 if is_interpreter else 0o022\n' +
+    '     checked.append(stat.S_ISREG(rs.st_mode) and (not hasattr(os,"getuid") or rs.st_uid==os.getuid()) and not (rs.st_mode&writable_mask))\n' +
+    '    if all(checked):process_path=os.path.expanduser(target)\n' +
+    'except (OSError,ValueError):pass\n' +
+    'print("PROCESS_PATH="+process_path)'
+
+  const out = String((await ssh.exec(`python3 -c ${shq(script)} ${shq(hermesPath)}`)) || '').trim()
+  const processPath = out.startsWith('PROCESS_PATH=') ? out.slice('PROCESS_PATH='.length) : ''
+
+  if (processPath) {
+    validateRemotePath(processPath)
+
+    return processPath
+  }
+
+  return null
+}
+
 // A pid is "provably ours" only if its remote cmdline carries our dashboard
 // args — never kill a pid we can't positively identify as our dashboard.
 async function pidIsOurDashboard(ssh, pid, spawnNonce, hermesPath = '') {
@@ -370,11 +419,17 @@ async function pidIsOurDashboard(ssh, pid, spawnNonce, hermesPath = '') {
   }
 
   try {
+    const processHermesPath = await resolveHermesOwnershipPath(ssh, hermesPath)
+
+    if (!processHermesPath) {
+      return false
+    }
+
     const script =
       'import os,shlex,subprocess,sys\n' +
-      `pid=${Number(pid)}\n` +
-      `expected=os.path.expanduser(${shq(hermesPath)})\n` +
-      `nonce=${shq(spawnNonce)}\n` +
+      'pid=int(sys.argv[1])\n' +
+      'expected=os.path.expanduser(sys.argv[2])\n' +
+      'nonce=sys.argv[3]\n' +
       'try:\n' +
       ' raw=open(f"/proc/{pid}/cmdline","rb").read()\n' +
       ' args=[x.decode("utf-8","surrogateescape") for x in raw.split(b"\\0") if x]\n' +
@@ -384,14 +439,17 @@ async function pidIsOurDashboard(ssh, pid, spawnNonce, hermesPath = '') {
       'ok=False\n' +
       'try:\n' +
       ' serve=args.index("serve")\n' +
-      ' owner=args.index("--ssh-owner-nonce",serve+1)\n' +
+      ' tail=args[serve+1:]\n' +
+      ' owners=[i for i,value in enumerate(tail) if value=="--ssh-owner-nonce"]\n' +
       ' direct=args[0]==expected\n' +
       ' python_entry=len(args)>1 and args[1]==expected and os.path.basename(args[0]).startswith("python")\n' +
-      ' ok=(direct or python_entry) and "--isolated" in args[serve+1:] and args[owner+1]==nonce\n' +
+      ' ok=(direct or python_entry) and args.count("serve")==1 and tail.count("--isolated")==1 and len(owners)==1 and owners[0]+1<len(tail) and tail[owners[0]+1]==nonce\n' +
       'except (ValueError,IndexError):pass\n' +
       'print("OWNED" if ok else "FOREIGN")'
 
-    const out = await ssh.exec(`python3 -c ${shq(script)}`)
+    const out = await ssh.exec(
+      `python3 -c ${shq(script)} ${shq(String(Number(pid)))} ${shq(processHermesPath)} ${shq(spawnNonce)}`
+    )
 
     return String(out || '').trim() === 'OWNED'
   } catch (cause) {
@@ -406,15 +464,29 @@ async function pidIsOurDashboard(ssh, pid, spawnNonce, hermesPath = '') {
 async function cleanupStale(ssh, ownershipId, lock, pidAlive = true) {
   if (pidAlive && lock && (await pidIsOurDashboard(ssh, lock.pid, lock.spawnNonce, lock.hermesPath))) {
     try {
+      const pid = Number(lock.pid)
+
       const result = (
         await ssh.exec(
-          `kill ${Number(lock.pid)} && ` +
-            `i=0; while kill -0 ${Number(lock.pid)} 2>/dev/null; do ` +
-            `i=$((i+1)); [ "$i" -ge 50 ] && exit 1; sleep 0.1; done`
+          `kill ${pid} && ` +
+            `i=0; while kill -0 ${pid} 2>/dev/null; do ` +
+            `i=$((i+1)); [ "$i" -ge 50 ] && { echo STILL_RUNNING; exit 0; }; sleep 0.1; done; echo EXITED`
         )
       ).trim()
 
-      void result
+      if (result === 'STILL_RUNNING') {
+        const stillOurs = await pidIsOurDashboard(ssh, pid, lock.spawnNonce, lock.hermesPath)
+
+        if (!stillOurs) {
+          throw new Error('SSH backend process ownership changed before force termination.')
+        }
+
+        await ssh.exec(
+          `kill -KILL ${pid} && ` +
+            `i=0; while kill -0 ${pid} 2>/dev/null; do ` +
+            `i=$((i+1)); [ "$i" -ge 50 ] && exit 1; sleep 0.1; done`
+        )
+      }
     } catch (cause) {
       const error: any = new Error('Could not terminate the stale SSH backend.')
       error.kind = 'transient-transport-error'

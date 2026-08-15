@@ -64,8 +64,11 @@ function chatWindowWebPreferences(preloadPath: string) {
 // onboarding overlays and the global session sidebar. `watch=1` marks a
 // spectator window (e.g. a running subagent's session): the renderer resumes it
 // lazily so the gateway never builds an agent just to stream into it.
-function buildSessionWindowUrl(sessionId: string, { devServer, rendererIndexPath, watch }: any = {}) {
-  const query = `?win=secondary${watch ? '&watch=1' : ''}`
+function buildSessionWindowUrl(sessionId: string, { devServer, profile, rendererIndexPath, watch }: any = {}) {
+  const profileKey = typeof profile === 'string' ? profile.trim() : ''
+  const query = `?win=secondary${watch ? '&watch=1' : ''}${
+    profileKey ? `&profile=${encodeURIComponent(profileKey)}` : ''
+  }`
   const route = `#/${encodeURIComponent(sessionId)}`
 
   if (devServer) {
@@ -107,8 +110,15 @@ function instanceWindowBounds(base: { x: number; y: number; width: number; heigh
 function createSessionWindowRegistry() {
   const windows = new Map()
 
-  function openOrFocus(sessionId, factory) {
-    const key = typeof sessionId === 'string' ? sessionId.trim() : ''
+  function registryKey(sessionId, scopeId = 'primary') {
+    const session = typeof sessionId === 'string' ? sessionId.trim() : ''
+    const scope = typeof scopeId === 'string' && scopeId.trim() ? scopeId.trim() : 'primary'
+
+    return session ? JSON.stringify([scope, session]) : ''
+  }
+
+  function openOrFocus(sessionId, factory, { scopeId = 'primary' }: any = {}) {
+    const key = registryKey(sessionId, scopeId)
 
     if (!key) {
       return null
@@ -131,7 +141,8 @@ function createSessionWindowRegistry() {
       return existing
     }
 
-    const win = factory(key)
+    const normalizedSessionId = typeof sessionId === 'string' ? sessionId.trim() : ''
+    const win = factory(normalizedSessionId)
 
     if (!win) {
       return null
@@ -151,8 +162,8 @@ function createSessionWindowRegistry() {
 
   return {
     openOrFocus,
-    get: key => windows.get(key),
-    has: key => windows.has(key),
+    get: (sessionId, options: any = {}) => windows.get(registryKey(sessionId, options.scopeId)),
+    has: (sessionId, options: any = {}) => windows.has(registryKey(sessionId, options.scopeId)),
     get size() {
       return windows.size
     }

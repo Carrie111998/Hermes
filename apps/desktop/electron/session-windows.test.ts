@@ -88,6 +88,24 @@ test('buildSessionWindowUrl adds the watch flag for spectator windows, before th
   assert.equal(url, 'http://localhost:5173/?win=secondary&watch=1#/abc')
 })
 
+
+
+test('buildSessionWindowUrl carries the owning profile before the hash', () => {
+  const url = buildSessionWindowUrl('abc', {
+    devServer: 'http://localhost:5173',
+    profile: ' research-lab ',
+    watch: true
+  })
+
+  assert.equal(url, 'http://localhost:5173/?win=secondary&watch=1&profile=research-lab#/abc')
+})
+
+test('buildSessionWindowUrl omits a blank profile hint', () => {
+  const url = buildSessionWindowUrl('abc', { devServer: 'http://localhost:5173', profile: '   ' })
+
+  assert.equal(url, 'http://localhost:5173/?win=secondary#/abc')
+})
+
 test('instanceWindowBounds cascades a new window off its source bounds', () => {
   const bounds = instanceWindowBounds({ x: 100, y: 120, width: 1400, height: 900 }, { width: 1, height: 1 })
 
@@ -118,6 +136,49 @@ test('registry opens one window per session and focuses on re-open', () => {
   assert.equal(first, second)
   assert.equal(registry.size, 1)
   assert.equal(win.calls.focus, 1, 'second open focuses the existing window')
+})
+
+test('registry keeps identical session ids separate across backend target scopes', () => {
+  const registry = createSessionWindowRegistry()
+  const configured = makeFakeWindow()
+  const forcedLocal = makeFakeWindow()
+
+  const first = registry.openOrFocus('s1', () => configured, { scopeId: 'configured-profile:worker' })
+  const second = registry.openOrFocus('s1', () => forcedLocal, { scopeId: 'forced-local-profile:worker' })
+
+  assert.equal(first, configured)
+  assert.equal(second, forcedLocal)
+  assert.equal(registry.size, 2)
+  assert.equal(configured.calls.focus, 0)
+})
+
+test('registry still focuses duplicate session ids within the same target scope', () => {
+  const registry = createSessionWindowRegistry()
+  const win = makeFakeWindow()
+
+  registry.openOrFocus('s1', () => win, { scopeId: 'configured-profile:worker' })
+  const duplicate = registry.openOrFocus('s1', () => makeFakeWindow(), { scopeId: 'configured-profile:worker' })
+
+  assert.equal(duplicate, win)
+  assert.equal(win.calls.focus, 1)
+  assert.equal(registry.size, 1)
+})
+
+
+
+test('registry tuple keys do not collide when scope and session contain delimiter text', () => {
+  const registry = createSessionWindowRegistry()
+  let built = 0
+  const factory = () => {
+    built += 1
+    return makeFakeWindow()
+  }
+
+  registry.openOrFocus('b\u0000c', factory, { scopeId: 'a' })
+  registry.openOrFocus('c', factory, { scopeId: 'a\u0000b' })
+
+  assert.equal(built, 2)
+  assert.equal(registry.size, 2)
 })
 
 test('registry restores + shows a minimized/hidden window on re-open', () => {

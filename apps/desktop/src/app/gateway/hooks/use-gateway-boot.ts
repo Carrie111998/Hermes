@@ -6,6 +6,7 @@ import { HermesGateway } from '@/hermes'
 import { translateNow } from '@/i18n'
 import { desktopDefaultCwd } from '@/lib/desktop-fs'
 import { reconnectBackoffDelayMs } from '@/lib/reconnect-backoff'
+import { resolveWindowBackendProfile } from '@/lib/window-backend-profile'
 import {
   $desktopBoot,
   applyDesktopBootProgress,
@@ -94,7 +95,15 @@ export function useGatewayBoot({
 
   useEffect(() => {
     let cancelled = false
+    let primaryConnection: HermesConnection | null = null
     const desktop = window.hermesDesktop
+    const profileOverride = windowProfileOverride()
+
+    // Main already bound this helper renderer to the transcript owner's target.
+    // Publish the URL owner now only so session lookup is scoped before `open`.
+    if (profileOverride) {
+      $activeGatewayProfile.set(profileOverride)
+    }
 
     const publish = (next: HermesConnection | null) => {
       callbacksRef.current.onConnectionReady(next)
@@ -161,12 +170,13 @@ export function useGatewayBoot({
         // "Starting Hermes…". The probe is a no-op for a healthy or local backend.
         await desktop.revalidateConnection?.().catch(() => undefined)
 
-        const conn = await desktop.getConnection($activeGatewayProfile.get())
+        const conn = await desktop.getConnection()
 
         if (cancelled) {
           return
         }
 
+        await adoptPrimaryProfile(conn)
         publish(conn)
         // Re-mint the WS URL before reconnecting. OAuth tickets are single-use
         // with a short TTL, so the ticket baked into the cached conn.wsUrl is
@@ -251,28 +261,24 @@ export function useGatewayBoot({
       }
     }
 
-    // Adopt the profile the primary (window) backend booted as, so same-profile
-    // resumes are no-op swaps and reconnects target the right backend.
-    // Best-effort: a missing preference means "default". Shared by boot + soft
-    // switch.
-    //
-    // Helper windows (the HUD) can carry an explicit profile override in their
-    // URL: the HUD is opened ON a conversation, and when that conversation
-    // belongs to a non-primary profile, adopting the primary here resolves the
-    // session id against the wrong backend — the HUD then falls back to the
-    // default profile's last session (#82285). The override wins over the
-    // stored preference; absent, behavior is unchanged.
-    async function adoptPrimaryProfile() {
-      const override = windowProfileOverride()
+    // Adopt the profile for the main-owned target this window booted against,
+    // so same-profile resumes are no-op swaps and reconnects stay on target.
+    // Best-effort: a missing target profile and preference mean "default".
+    async function adoptPrimaryProfile(connection: HermesConnection) {
+      primaryConnection = connection
 
       try {
-        const profileKey = override ?? (await desktop.profile?.get?.())?.profile ?? ''
-        const key = normalizeProfileKey(profileKey)
-        $activeGatewayProfile.set(key)
-        setPrimaryGateway(gateway, key)
-        void ensureGatewayForProfile(key)
+        const pref = await desktop.profile?.get?.()
+        const profileKey = resolveWindowBackendProfile(connection.profile, profileOverride ?? pref?.profile)
+
+        sourceProfile = profileKey
+        $activeGatewayProfile.set(profileKey)
+        setPrimaryGateway(gateway, profileKey)
+        void ensureGatewayForProfile(profileKey)
       } catch {
-        $activeGatewayProfile.set(normalizeProfileKey(override))
+        sourceProfile = resolveWindowBackendProfile(connection.profile, null)
+        $activeGatewayProfile.set(sourceProfile)
+        setPrimaryGateway(gateway, sourceProfile)
       }
     }
 
@@ -308,14 +314,13 @@ export function useGatewayBoot({
         gateway.close()
         closeSecondaryGateways()
 
-        // Same override rule as boot(): a profile-pinned helper window stays
-        // on its pinned profile's backend across a soft switch.
-        const conn = await desktop.getConnection(windowProfileOverride() ?? undefined)
+        const conn = await desktop.getConnection()
 
         if (cancelled) {
           return
         }
 
+        await adoptPrimaryProfile(conn)
         publish(conn)
         const wsUrl = await resolveGatewayWsUrl(desktop, conn)
         await gateway.connect(wsUrl)
@@ -326,7 +331,6 @@ export function useGatewayBoot({
 
         // Same shape as boot(): profile first (session scope depends on it),
         // then the independent fetches concurrently.
-        await adoptPrimaryProfile()
         await Promise.all([
           seedDefaultCwd(),
           callbacksRef.current.refreshHermesConfig().catch(() => undefined),
@@ -390,9 +394,10 @@ export function useGatewayBoot({
     }
 
     const gateway = adoptedFromHmr ? survivor!.gateway : new HermesGateway()
+    let sourceProfile = survivor?.profile ?? profileOverride ?? normalizeProfileKey($activeGatewayProfile.get())
 
     callbacksRef.current.onGatewayReady(gateway)
-    setPrimaryGateway(gateway, survivor?.profile ?? normalizeProfileKey($activeGatewayProfile.get()))
+    setPrimaryGateway(gateway, sourceProfile)
     // Secondary (background-profile) sockets funnel into the same handler.
     configureGatewayRegistry({ onEvent: event => callbacksRef.current.handleGatewayEvent(event) })
 
@@ -422,8 +427,6 @@ export function useGatewayBoot({
         scheduleReconnect()
       }
     })
-
-    const sourceProfile = normalizeProfileKey($activeGatewayProfile.get())
 
     const offEvent = gateway.onEvent(event =>
       callbacksRef.current.handleGatewayEvent({ ...event, profile: sourceProfile })
@@ -500,15 +503,15 @@ export function useGatewayBoot({
 
     async function boot() {
       try {
-        // A profile-pinned helper window (the HUD) dials its target profile's
-        // backend directly — ensureBackend spawns/reuses it from the pool.
-        // Everything else keeps dialing the primary.
-        const conn = await desktop.getConnection(windowProfileOverride() ?? undefined)
+        // Main resolves this renderer's opaque target and spawns/reuses its
+        // backend from the appropriate pool.
+        const conn = await desktop.getConnection()
 
         if (cancelled) {
           return
         }
 
+        await adoptPrimaryProfile(conn)
         setDesktopBootStep({
           phase: 'renderer.gateway.connect',
           message: translateNow('boot.steps.connectingGateway'),
@@ -541,13 +544,9 @@ export function useGatewayBoot({
           return
         }
 
-        // Profile adoption must land first: refreshSessions scopes its fetch by
-        // $profileScope ← $activeGatewayProfile. The remaining three fetches
-        // (cwd seed, config, sessions) are independent REST calls — running
-        // them serially added their sum to time-to-populated-sidebar when only
-        // the max is needed.
-        await adoptPrimaryProfile()
-
+        // Profile adoption already landed before the gateway connected, so
+        // refreshSessions is scoped to the bound target. The remaining fetches
+        // are independent and can run concurrently.
         setDesktopBootStep({
           phase: 'renderer.config',
           message: translateNow('boot.steps.loadingSettings'),
@@ -597,8 +596,10 @@ export function useGatewayBoot({
       bootCompleted = true
       completeDesktopBoot()
 
-      if (survivor?.connection) {
-        publish(survivor.connection)
+      primaryConnection = survivor?.connection ?? primaryConnection
+
+      if (primaryConnection) {
+        publish(primaryConnection)
       }
 
       const profile = survivor?.profile ?? $activeGatewayProfile.get()
@@ -652,8 +653,8 @@ export function useGatewayBoot({
       if (import.meta.hot && gateway.connectionState === 'open') {
         stashGatewaySurvivor({
           gateway,
-          profile: survivor?.profile ?? $activeGatewayProfile.get(),
-          connection: $connection.get()
+          profile: sourceProfile,
+          connection: primaryConnection
         })
 
         return

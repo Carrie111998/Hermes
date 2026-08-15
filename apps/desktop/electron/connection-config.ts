@@ -219,6 +219,37 @@ function normAuthMode(mode) {
   return mode === 'oauth' ? 'oauth' : 'token'
 }
 
+/**
+ * Reuse a saved static bearer only when the edited connection still names the
+ * same credential binding. Scope is enforced by the caller selecting the
+ * existing block for that profile before calling this helper.
+ *
+ * Global local mode intentionally keeps its last remote block as an inactive
+ * draft, so local -> remote may restore that exact binding. Cloud provenance
+ * is never interchangeable with a user-entered remote connection.
+ */
+function inheritedRemoteToken(existing: any = {}, next: any = {}) {
+  if (!existing.token || normAuthMode(existing.authMode) !== 'token' || normAuthMode(next.authMode) !== 'token') {
+    return undefined
+  }
+
+  const sameProvenance = existing.mode === next.mode || (existing.mode === 'local' && next.mode === 'remote')
+
+  if (!sameProvenance) {
+    return undefined
+  }
+
+  try {
+    if (normalizeRemoteBaseUrl(existing.url) !== normalizeRemoteBaseUrl(next.url)) {
+      return undefined
+    }
+  } catch {
+    return undefined
+  }
+
+  return existing.token
+}
+
 // True for connection modes that resolve to a REMOTE backend. 'cloud' is a
 // Hermes Cloud connection (cloud-auto-discovery Q3/Q6): it carries a
 // remote-shaped block and reuses the entire remote connect/probe/reconnect
@@ -441,6 +472,16 @@ function resolveProfileBackendRoute(profile, opts: ProfileRouteOptions = {}): Pr
   return { backend: 'pool', descriptorProfile: null, scopePath: false }
 }
 
+/** Stamp the desktop profile scope on a backend connection descriptor. */
+function profileScopedConnection(connection, effectiveProfile, route: ProfileBackendRoute) {
+  const profile = connectionScopeKey(route.descriptorProfile) || connectionScopeKey(effectiveProfile) || 'default'
+
+  // `scopePath` means this profile is only a request alias on the shared
+  // primary backend (global SSH/remote). The renderer must NOT dial a second
+  // WebSocket — over SSH that second dial fails and poisons the live gateway.
+  return route.scopePath ? { ...connection, profile, sharedPrimary: true } : { ...connection, profile }
+}
+
 /**
  * Add renderer-side `request.profile` to a REST path when the route says the
  * serving backend is not already scoped to that profile.
@@ -600,6 +641,7 @@ export {
   gatewayTicketFailure,
   gatewayWsUrlIpcResult,
   hostLabelFromBaseUrl,
+  inheritedRemoteToken,
   isGatewayAuthRejection,
   localProfileEntry,
   modeIsRemoteLike,
@@ -611,6 +653,7 @@ export {
   PRIVY_SESSION_COOKIE_VARIANTS,
   profileHasRemoteConnection,
   profileRemoteOverride,
+  profileScopedConnection,
   profileSshOverride,
   resolveAuthMode,
   resolveProfileBackendRoute,

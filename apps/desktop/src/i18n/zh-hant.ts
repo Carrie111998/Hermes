@@ -2190,6 +2190,34 @@ export const zhHant = defineLocale({
     addProvider: '新增提供方…'
   },
 
+  windowBackend: {
+    openWithBackend: '使用指定後端開啟新視窗…',
+    newWindowPolicy: {
+      title: '新視窗後端',
+      description: '選擇一般新視窗決定後端的方式。「使用指定後端開啟新視窗…」仍可用於單次選擇。',
+      inherit: '與目前視窗相同',
+      primary: '主要後端',
+      ask: '每次詢問'
+    },
+    title: '選擇後端',
+    description: '新視窗將連線至你選擇的後端。',
+    search: '搜尋後端…',
+    current: '目前',
+    loading: '正在載入後端選項…',
+    loadFailed: '無法載入後端選項。',
+    empty: '尚未設定後端選項。',
+    noMatch: '沒有符合搜尋的後端。',
+    primary: { label: '目前後端', description: '使用應用程式目前的主要後端。' },
+    configuredProfile: {
+      label: profile => `已設定 — ${profile}`,
+      description: profile => `使用為 ${profile} 設定的後端路由。`
+    },
+    forcedLocalProfile: {
+      label: profile => `本機 — ${profile}`,
+      description: profile => `在此電腦上執行 ${profile} 設定檔。`
+    }
+  },
+
   shell: {
     windowControls: '視窗控制項',
     paneControls: '窗格控制項',

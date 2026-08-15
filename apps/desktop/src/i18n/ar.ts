@@ -2041,6 +2041,34 @@ export const ar = defineLocale({
     noAuthenticatedProviders: 'لا يوجد مزوّدون مصادق عليهم.',
     addProvider: 'إضافة مزوّد…'
   },
+  windowBackend: {
+    openWithBackend: 'نافذة جديدة مع واجهة خلفية…',
+    newWindowPolicy: {
+      title: 'واجهة النوافذ الجديدة',
+      description: 'اختر طريقة تحديد الواجهة الخلفية للنوافذ الجديدة العادية. يظل خيار «نافذة جديدة مع واجهة خلفية…» متاحًا للاختيار لمرة واحدة.',
+      inherit: 'مثل النافذة الحالية',
+      primary: 'الواجهة الخلفية الأساسية',
+      ask: 'السؤال في كل مرة'
+    },
+    title: 'اختر واجهة خلفية',
+    description: 'ستتصل النافذة الجديدة بالواجهة الخلفية التي تختارها.',
+    search: 'البحث في الواجهات الخلفية…',
+    current: 'الحالية',
+    loading: 'جارٍ تحميل خيارات الواجهة الخلفية…',
+    loadFailed: 'تعذّر تحميل خيارات الواجهة الخلفية.',
+    empty: 'لا توجد خيارات واجهة خلفية مضبوطة.',
+    noMatch: 'لا توجد واجهات خلفية تطابق البحث.',
+    primary: { label: 'الواجهة الخلفية الحالية', description: 'استخدام الواجهة الخلفية الأساسية الحالية للتطبيق.' },
+    configuredProfile: {
+      label: profile => `مضبوطة — ${profile}`,
+      description: profile => `استخدام مسار الواجهة الخلفية المضبوط للملف ${profile}.`
+    },
+    forcedLocalProfile: {
+      label: profile => `محلية — ${profile}`,
+      description: profile => `تشغيل الملف ${profile} على هذا الكمبيوتر.`
+    }
+  },
+
   shell: {
     windowControls: 'تحكم النافذة',
     paneControls: 'تحكم اللوحات',

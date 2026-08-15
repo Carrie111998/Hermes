@@ -24,6 +24,7 @@ from typing import Any, Dict, List, Optional, Tuple  # noqa: F401
 
 from fastapi import APIRouter, HTTPException, Query  # noqa: F401
 
+from hermes_constants import get_process_hermes_home
 from hermes_cli.web_deps import late
 from hermes_cli.web_models import (
     ProfileCreate,
@@ -231,6 +232,7 @@ def get_profiles_sessions(
 
 @sessions_router.get("/api/profiles/sessions/sidebar")
 def get_profiles_sessions_sidebar(
+    current_only: bool = False,
     recents_profile: str = "all",
     recents_limit: int = 20,
     recents_exclude: str = None,
@@ -268,10 +270,22 @@ def get_profiles_sessions_sidebar(
     except Exception:
         _log.exception("GET /api/profiles/sessions/sidebar: list_profiles failed")
         targets = []
-    if not targets:
+    current_profile = ""
+    if current_only:
+        current_home = get_process_hermes_home()
+        current_profile = next(
+            (
+                name
+                for name, home in targets
+                if home.resolve() == current_home.resolve()
+            ),
+            "default" if current_home.name == ".hermes" else current_home.name,
+        )
+        targets = [(current_profile, current_home)]
+    elif not targets:
         targets.append(("default", profiles_mod.get_profile_dir("default")))
 
-    recents_scope = (recents_profile or "all").strip() or "all"
+    recents_scope = current_profile or (recents_profile or "all").strip() or "all"
     recents_exclude_list = [s for s in (recents_exclude or "").split(",") if s.strip()]
     messaging_exclude_list = [s for s in (messaging_exclude or "").split(",") if s.strip()]
 

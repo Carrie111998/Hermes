@@ -476,6 +476,42 @@ class TestWebServerEndpoints:
             "sidebar-stale"
         ]
 
+    def test_profiles_sidebar_profile_scope_confines_every_slice(self, monkeypatch, tmp_path):
+        from types import SimpleNamespace
+
+        from hermes_cli import profiles as profiles_mod
+        from hermes_state import SessionDB
+
+        infos = []
+        for name in ("worker", "coder"):
+            home = tmp_path / name
+            home.mkdir()
+            db = SessionDB(db_path=home / "state.db")
+            try:
+                db.create_session(f"{name}-chat", source="desktop")
+                db.append_message(f"{name}-chat", role="user", content="hello")
+                db.create_session(f"{name}-cron", source="cron")
+                db.append_message(f"{name}-cron", role="user", content="scheduled")
+            finally:
+                db.close()
+            infos.append(SimpleNamespace(name=name, path=home))
+
+        monkeypatch.setattr(profiles_mod, "list_profiles", lambda: infos)
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "worker"))
+
+        response = self.client.get("/api/profiles/sessions/sidebar?current_only=true&recents_profile=all")
+
+        assert response.status_code == 200
+        payload = response.json()
+        rows = [
+            *payload["recents"]["sessions"],
+            *payload["cron"]["sessions"],
+            *payload["messaging"]["sessions"],
+        ]
+        assert rows
+        assert {row["profile"] for row in rows} == {"worker"}
+        assert all(not row["id"].startswith("coder-") for row in rows)
+
     def test_startup_eager_reconcile_heals_stale_store(self):
         """The lifespan's eager reconcile brings a stale store current.
 

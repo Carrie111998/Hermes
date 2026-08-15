@@ -1,3 +1,5 @@
+import { normalizeDesktopProfile } from '@/lib/profile-name'
+
 import { notifyError } from './notifications'
 
 // Window flag set by the Electron main process when it opens a standalone
@@ -93,7 +95,9 @@ export const isAuxiliaryWindow = (): boolean => isSecondaryWindow() || isHudWind
 // keeps it honest under test.
 export function windowProfileOverride(): null | string {
   try {
-    return new URLSearchParams(window.location.search).get('profile')?.trim() || null
+    const profile = new URLSearchParams(window.location.search).get('profile')?.trim() ?? ''
+
+    return normalizeDesktopProfile(profile)
   } catch {
     return null
   }
@@ -121,22 +125,31 @@ type WindowOpenResult = { ok: boolean; error?: string } | undefined
 
 // Run a window-open bridge call, surfacing any failure as a toast. Shared by the
 // session pop-out and the new-window opener.
-async function runWindowOpen(call: () => Promise<WindowOpenResult>, failMessage: string): Promise<void> {
+async function runWindowOpen(call: () => Promise<WindowOpenResult>, failMessage: string): Promise<boolean> {
   try {
     const result = await call()
 
     if (!result?.ok) {
       notifyError(new Error(result?.error || 'unknown error'), failMessage)
+
+      return false
     }
+
+    return true
   } catch (err) {
     notifyError(err, failMessage)
+
+    return false
   }
 }
 
 // Open (or focus) a standalone OS window for a single chat session. No-ops
 // gracefully outside Electron so callers can wire it unconditionally.
 // `watch: true` opens a spectator window (lazy resume, live-mirror stream).
-export async function openSessionInNewWindow(sessionId: string, opts?: { watch?: boolean }): Promise<void> {
+export async function openSessionInNewWindow(
+  sessionId: string,
+  opts?: { profile?: null | string; watch?: boolean }
+): Promise<void> {
   if (!sessionId || !canOpenSessionWindow()) {
     return
   }
@@ -149,12 +162,20 @@ export async function openSessionInNewWindow(sessionId: string, opts?: { watch?:
 
 // Open a new full-chrome app window — a peer instance of the primary that
 // renders the complete app against the shared backend. No-ops outside Electron.
-export async function openNewWindow(): Promise<void> {
+export async function openNewWindow(targetId?: string): Promise<boolean> {
   if (!canOpenNewWindow()) {
-    return
+    return false
   }
 
-  await runWindowOpen(() => window.hermesDesktop.openWindow(), 'Could not open a new window')
+  return runWindowOpen(() => window.hermesDesktop.openWindow(targetId), 'Could not open a new window')
+}
+
+export async function listWindowBackendTargets(): Promise<WindowBackendTargetChoice[]> {
+  if (typeof window === 'undefined' || typeof window.hermesDesktop?.listWindowBackendTargets !== 'function') {
+    return []
+  }
+
+  return window.hermesDesktop.listWindowBackendTargets()
 }
 
 // Resume a session in the user's own terminal emulator, running the TUI there.

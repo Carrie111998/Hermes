@@ -15,6 +15,7 @@ function startupOptions(overrides: Record<string, unknown> = {}) {
   return {
     connectRemote: vi.fn(async remote => ({ baseUrl: remote.baseUrl, mode: 'remote' as const })),
     ensureLocalRuntime: vi.fn(async backend => ({ ...backend, command: 'hermes' })),
+    ensureCurrent: vi.fn(() => {}),
     prepareLocalBackend: vi.fn(async () => bootstrapBackend),
     resolveRemote: vi.fn(async () => null),
     waitForDecision: vi.fn(async () => 'continue-local' as const),
@@ -22,6 +23,62 @@ function startupOptions(overrides: Record<string, unknown> = {}) {
     ...overrides
   }
 }
+
+test('an invalidated attempt cannot return a delayed remote connection', async () => {
+  const savedRemote = { baseUrl: 'https://gateway.example.com/hermes' }
+  let current = true
+  let releaseConnect!: () => void
+
+  const connectGate = new Promise<void>(resolve => {
+    releaseConnect = resolve
+  })
+
+  const options = startupOptions({
+    connectRemote: vi.fn(async remote => {
+      await connectGate
+
+      return { baseUrl: remote.baseUrl, mode: 'remote' as const }
+    }),
+    ensureCurrent: vi.fn(() => {
+      if (!current) {
+        throw new Error('superseded')
+      }
+    }),
+    resolveRemote: vi.fn(async () => savedRemote)
+  })
+
+  const pending = runPrimaryBackendStartup(options)
+  current = false
+  releaseConnect()
+
+  await assert.rejects(pending, /superseded/)
+})
+
+test('an invalidated local attempt stops before ensuring the runtime', async () => {
+  let current = true
+  let releaseLocalStart!: () => void
+
+  const localStartGate = new Promise<void>(resolve => {
+    releaseLocalStart = resolve
+  })
+
+  const options = startupOptions({
+    ensureCurrent: vi.fn(() => {
+      if (!current) {
+        throw new Error('superseded')
+      }
+    }),
+    waitForLocalStart: vi.fn(async () => localStartGate)
+  })
+
+  const pending = runPrimaryBackendStartup(options)
+  current = false
+  releaseLocalStart()
+
+  await assert.rejects(pending, /superseded/)
+  assert.equal(options.prepareLocalBackend.mock.calls.length, 0)
+  assert.equal(options.ensureLocalRuntime.mock.calls.length, 0)
+})
 
 test('remote apply re-resolves the saved connection without ensuring a local runtime', async () => {
   const gate = createFirstRunSetupGate({ stuckAfterMs: 0 })

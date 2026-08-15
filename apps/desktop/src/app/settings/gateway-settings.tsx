@@ -29,6 +29,7 @@ import { notify, notifyError, readableError } from '@/store/notifications'
 import { $profiles, refreshActiveProfile } from '@/store/profile'
 
 import { CONTROL_TEXT } from './constants'
+import { NewWindowBackendSetting } from './new-window-backend-setting'
 import { EmptyState, ListRow, Pill, SettingsContent, SettingsSkeleton } from './primitives'
 import { enrichSelectedSshHost, selectSshHost } from './ssh-host-selection'
 
@@ -1069,6 +1070,12 @@ export function GatewaySettings({ embedded = false }: { embedded?: boolean } = {
           <p className="mt-2 max-w-2xl text-[length:var(--conversation-caption-font-size)] leading-(--conversation-caption-line-height) text-(--ui-text-tertiary)">
             {g.intro}
           </p>
+        </div>
+      )}
+
+      {embedded ? null : (
+        <div className="mb-5 grid gap-1">
+          <NewWindowBackendSetting />
         </div>
       )}
 

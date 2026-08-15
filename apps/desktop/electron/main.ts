@@ -32,9 +32,10 @@ import {
 import nodePty from 'node-pty'
 
 import { classifyActiveRuntime } from './active-runtime-state'
+import { type AsyncLimiter, createAsyncLimiter } from './async-limit'
 import { stopBackendChild as stopBackendChildImpl, stopBackendTreesForUpdate } from './backend-child'
-import { dashboardFallbackArgs, sourceDeclaresServe } from './backend-command'
-import { createBackendConnectionState } from './backend-connection-state'
+import { dashboardFallbackArgs, serveBackendArgs, sourceDeclaresServe } from './backend-command'
+import { createBackendConnectionState, invalidateAndStopBackendAttempt } from './backend-connection-state'
 import { buildDesktopBackendEnv, hermesManagedNodePathEntries, normalizeHermesHomeRoot } from './backend-env'
 import { isReauthRequiredError, waitForHermesReady } from './backend-health'
 import { backendCommandMatches, createBackendOwnership, createBackendShutdownCoordinator } from './backend-ownership'
@@ -47,6 +48,8 @@ import {
 } from './backend-probes'
 import { waitForDashboardPortAnnouncement } from './backend-ready'
 import { shouldLatchBackendStartFailure, shouldLatchRemoteReauthFailure } from './backend-start-failure'
+import { type BackendTarget, canonicalTargetKey, makeBackendTarget } from './backend-target'
+import { buildBackendTargetChoices, classifyOpenInstanceRequest } from './backend-target-choices'
 import {
   detectRemoteDisplay,
   isWindowsBinaryPathInWsl,
@@ -55,7 +58,13 @@ import {
 } from './bootstrap-platform'
 import { decideBootstrapRepair } from './bootstrap-repair-guard'
 import { runBootstrap } from './bootstrap-runner'
-import { applyConnectionChange, resolveTerminalConnection } from './connection-apply'
+import {
+  applyConnectionChange,
+  applySshConnectionTeardown,
+  replacePublishedSshConnection,
+  resolveTerminalConnection,
+  terminalProfileForTarget
+} from './connection-apply'
 import {
   authModeFromStatus,
   buildGatewayWsUrl,
@@ -68,6 +77,7 @@ import {
   gatewayTicketFailure,
   gatewayWsUrlIpcResult,
   hostLabelFromBaseUrl,
+  inheritedRemoteToken,
   localProfileEntry,
   modeIsRemoteLike,
   normalizeRemoteBaseUrl,
@@ -76,6 +86,7 @@ import {
   pathWithGlobalRemoteProfile,
   profileHasRemoteConnection,
   profileRemoteOverride,
+  profileScopedConnection,
   profileSshOverride,
   resolveAuthMode,
   resolveProfileBackendRoute,
@@ -188,15 +199,41 @@ import {
 import { runNativeLogin } from './native-oauth-login'
 import { loadNativeTokenSet, type NativeTokenStoreIo, persistNativeTokenSet } from './native-token-store'
 import { serializeJsonBody, setJsonRequestHeaders } from './oauth-net-request'
+import { configuredPoolKey, poolKeyForTarget, poolKeysForProfile, poolRouteForTarget } from './pool-keys'
 import { createKeepAwake } from './power-save'
 import { FirstRunSetupResetError, runPrimaryBackendStartup } from './primary-backend-startup'
 import { rehomePrimaryConnection } from './primary-connection-rehome'
-import { decideProfileDeleteAction, profileNameFromDeleteRequest, resolveRouteProfile } from './profile-delete-routing'
+import {
+  createPrimaryProfileOwner,
+  parseDesktopProfilePreference,
+  resolveEffectivePrimaryProfile
+} from './primary-profile'
+import {
+  applyProfileDeleteLifecycle,
+  applyProfileRenameLifecycle,
+  assertProfileNotRevoked,
+  createProfileRevocationGuard,
+  decideProfileDeleteAction,
+  type ProfileMutationToken,
+  profileNameFromCreateRequest,
+  profileNameFromDeleteRequest,
+  type ProfileRename,
+  profileRenameFromRequest,
+  removeProfileConnectionOverride,
+  renameProfileConnectionOverride,
+  resolveRouteTarget,
+  runProfileMutationPreflight
+} from './profile-delete-routing'
+import { normalizeDesktopProfile, PROFILE_NAME_RE } from './profile-name'
 import {
   fetchPrimaryProfileSessions,
   fetchRemoteProfileSessions,
   mergeProfileSessionWindow
 } from './profile-session-routing'
+import {
+  configuredProfileExistsOnSharedRemote,
+  isProfileTargetAvailable
+} from './profile-target-availability'
 import { createQuickEntryShortcut, quickEntryWindowBounds, sanitizeQuickEntrySettings } from './quick-entry'
 import { type ActiveWork, mergeActiveWork, normalizeActiveWork, quitPromptFor } from './quit-guard'
 import * as remoteLifecycle from './remote-lifecycle'
@@ -208,6 +245,14 @@ import {
 } from './remote-liveness'
 import { missingRendererAssets } from './renderer-bundle'
 import { attachRendererConsoleCapture, formatRendererBoundaryReport } from './renderer-log'
+import {
+  decideProfileSessionsRoute,
+  resolveSenderRequestTarget,
+  resolveSenderTarget,
+  resolveSessionOwnerTarget,
+  scopedSidebarPathForTarget,
+  scopeSidebarResponseForTarget
+} from './sender-target-routing'
 import {
   buildSessionWindowUrl,
   chatWindowWebPreferences,
@@ -227,6 +272,7 @@ import {
   SshConnection
 } from './ssh-connection'
 import { createStreamThrottle } from './stream-throttle'
+import { parseTargetId, serializeTargetId } from './target-id'
 import { nativeOverlayWidth as computeNativeOverlayWidth, macTitleBarOverlayHeight } from './titlebar-overlay-width'
 import {
   compareApiUrl,
@@ -263,6 +309,11 @@ import {
   MIN_HEIGHT as WINDOW_MIN_HEIGHT,
   MIN_WIDTH as WINDOW_MIN_WIDTH
 } from './window-state'
+import {
+  createWindowTargetRegistry,
+  destroyRevokedWindows,
+  type WindowTargetRegistry
+} from './window-target-registry'
 import { hiddenWindowsChildOptions } from './windows-child-options'
 import {
   buildPathExtCandidates,
@@ -684,9 +735,9 @@ const DESKTOP_BACKEND_OWNERSHIP_PATH = path.join(app.getPath('userData'), 'backe
 // ~/.hermes/active_profile file. Unset (null) preserves the legacy behavior:
 // no --profile flag, so the backend honors active_profile / default.
 const DESKTOP_PROFILE_CONFIG_PATH = path.join(app.getPath('userData'), 'active-profile.json')
-// Mirrors hermes_cli.profiles._PROFILE_ID_RE so we never hand the backend a
-// value its profile resolver would reject and exit on.
-const PROFILE_NAME_RE = /^[a-z0-9][a-z0-9_-]{0,63}$/
+// Profile-name validation uses the shared PROFILE_NAME_RE imported from
+// ./profile-name, which mirrors hermes_cli.profiles._PROFILE_ID_RE so we never
+// hand the backend a value its profile resolver would reject and exit on.
 // Branch we track for self-update. The GUI work has merged to main, so this
 // tracks main. User can also override at runtime via
 // hermesDesktop.updates.setBranch().
@@ -1123,16 +1174,24 @@ let mainWindow = null
 const backendConnectionState = createBackendConnectionState<ReturnType<typeof spawn>, any>()
 const remoteLiveness = new RemoteLivenessTracker()
 const remoteRevalidation = new RemoteRevalidationCoordinator()
+const profileRevocations = createProfileRevocationGuard()
+
+function desktopProfileAvailable(profile: string): boolean {
+  const profiles = readDesktopConnectionConfig().profiles || {}
+
+  return Object.hasOwn(profiles, profile) || isProfileTargetAvailable(profile, HERMES_HOME)
+}
+
 // True while connection-config:apply soft-rehomes the primary — suppresses the
 // backend-exit toast so an intentional kill doesn't look like a crash.
 let softRehomeInProgress = false
-// Additional per-profile backends, keyed by profile name. The PRIMARY backend
+// Additional per-target backends, keyed by canonical pool identity. The PRIMARY backend
 // (the desktop's launch profile) stays managed by backendConnectionState +
 // startHermes(); this pool only holds EXTRA profile
 // backends spawned lazily when a session belongs to a different profile. A user
 // with no named profiles never populates this map, so their experience is
 // byte-for-byte the single-backend behavior.
-const backendPool = new Map() // profile -> { process, port, token, connectionPromise, lastActiveAt }
+const backendPool = new Map() // pool key -> { process, port, token, connectionPromise, lastActiveAt }
 // Keep the pool light: cap concurrent profile backends (LRU eviction) and reap
 // idle ones. A user idles at exactly the primary backend; pool backends only
 // exist while a non-primary profile is actively being chatted through.
@@ -1144,6 +1203,24 @@ const POOL_IDLE_MS = Math.max(60_000, Number(process.env.HERMES_DESKTOP_POOL_IDL
 // killing one to honor the soft cap would abort a running agent.
 const POOL_KEEPALIVE_FRESH_MS = 90_000
 let poolIdleReaper = null
+
+// Per-window backend target registry. Each BrowserWindow's webContents.id is
+// mapped to the BackendTarget its gateway connection should route to. Owned by
+// main; the renderer only ever receives derived, non-secret hints, never the
+// target model. An unbound window resolves to the primary target, so the
+// default (no binding) is byte-equivalent to the legacy single-backend path.
+const windowTargets: WindowTargetRegistry = createWindowTargetRegistry({
+  resolvePrimaryTarget: () => makeBackendTarget({ kind: 'primary' })
+})
+
+function activeWindowTarget(webContentsId: number): BackendTarget {
+  if (windowTargets.isRevoked(webContentsId)) {
+    throw new Error('window-backend-target-revoked')
+  }
+
+  return windowTargets.lookup(webContentsId)
+}
+
 let backendOrphanReapPromise = null
 // Auto-reload budget for renderer crashes, shared by EVERY window (primary,
 // secondary session, instance) so a crash loop anywhere is suppressed after
@@ -5578,6 +5655,22 @@ function sendOpenFolderRequested() {
   webContents.send('hermes:open-folder-requested')
 }
 
+function sendNewWindowRequested(targetWindow) {
+  const target = targetWindow && !targetWindow.isDestroyed() ? targetWindow : mainWindow
+
+  if (!target || target.isDestroyed()) {
+    return
+  }
+
+  const { webContents } = target
+
+  if (!webContents || webContents.isDestroyed()) {
+    return
+  }
+
+  webContents.send('hermes:new-window-requested')
+}
+
 // Tell the renderer the machine just woke. Sleep silently drops the
 // renderer's WebSocket to the local backend; the renderer reconnects on this
 // signal so the chat composer doesn't stay stuck on "Starting Hermes...".
@@ -5722,7 +5815,10 @@ function buildApplicationMenu() {
       // No accelerator: ⌘⇧N is a rebindable renderer keybind (session.newWindow);
       // a menu accelerator would fight the rebind panel and (on macOS) be
       // swallowed before the renderer sees it. Here purely for discoverability.
-      { click: () => createInstanceWindow(), label: 'New Window' },
+      {
+        click: (_menuItem, browserWindow) => sendNewWindowRequested(browserWindow),
+        label: 'New Window'
+      },
       // Same no-accelerator rationale: ⌘O is the rebindable renderer keybind
       // (workspace.openFolder). Clicking runs the same open-folder-as-project
       // flow through the renderer.
@@ -6829,6 +6925,21 @@ async function freshGatewayWsUrl(profile) {
   // legacy callers and single-profile users are unchanged.
   const connection = await ensureBackend(profile)
 
+  return freshWsUrlForConnection(connection)
+}
+
+// Target-aware variant: derives the backend from a per-window BackendTarget
+// (resolved from event.sender), not a renderer-supplied profile. The
+// hermes:gateway:ws-url IPC handler uses this so a bound window mints its WS
+// ticket against its own backend, not the primary.
+async function freshGatewayWsUrlForTarget(target: BackendTarget) {
+  const connection = await ensureBackendForTarget(target)
+
+  return freshWsUrlForConnection(connection)
+}
+
+// Shared WS-URL minting for a resolved connection descriptor.
+async function freshWsUrlForConnection(connection) {
   if (connection.authMode === 'oauth') {
     const ticket = await mintGatewayWsTicket(connection.baseUrl)
 
@@ -7712,31 +7823,28 @@ function saveRegistryConnection(input: any = {}) {
 // preference" and preserves the legacy launch (no --profile flag).
 function readActiveDesktopProfile() {
   try {
-    const raw = fs.readFileSync(DESKTOP_PROFILE_CONFIG_PATH, 'utf8')
-    const parsed = JSON.parse(raw)
-    const name = parsed && typeof parsed.profile === 'string' ? parsed.profile.trim() : ''
-
-    if (name && (name === 'default' || PROFILE_NAME_RE.test(name))) {
-      return name
+    return parseDesktopProfilePreference(fs.readFileSync(DESKTOP_PROFILE_CONFIG_PATH, 'utf8'))
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException)?.code === 'ENOENT') {
+      return null
     }
-  } catch {
-    // Missing or malformed → no preference.
-  }
 
-  return null
+    throw error
+  }
 }
 
 function writeActiveDesktopProfile(name) {
   const value = typeof name === 'string' ? name.trim() : ''
+  const profile = value ? normalizeDesktopProfile(value) : null
 
-  if (value && value !== 'default' && !PROFILE_NAME_RE.test(value)) {
+  if (value && !profile) {
     throw new Error(`Invalid profile name: ${value}`)
   }
 
   fs.mkdirSync(path.dirname(DESKTOP_PROFILE_CONFIG_PATH), { recursive: true })
-  writeFileAtomic(DESKTOP_PROFILE_CONFIG_PATH, JSON.stringify({ profile: value || null }, null, 2))
+  writeFileAtomic(DESKTOP_PROFILE_CONFIG_PATH, JSON.stringify({ profile }, null, 2))
 
-  return value || null
+  return profile
 }
 
 // Sanitize a connection config into the renderer-facing shape. With no
@@ -7877,15 +7985,15 @@ function coerceDesktopConnectionConfig(input: any = {}, existing = readDesktopCo
   const cloudOrg = mode === 'cloud' ? String(input.cloudOrg ?? existingBlock.org ?? '').trim() : ''
   const incomingToken = typeof input.remoteToken === 'string' ? input.remoteToken.trim() : ''
 
-  // Persist decision lives in hardening.resolvePersistedRemoteToken so the
-  // IPC-propagation seam (allowPlainTextToken → encryptDesktopSecret opt-in) is
-  // covered by a focused regression test. Pass allowPlainText through RAW — the
-  // helper coerces with `=== true`, so a truthy-non-true value never enables
-  // plain-text storage, and that strictness is asserted in exactly one place.
+  // Keep upstream's strict persistence/encryption decision while filtering
+  // inherited credentials through the origin-bound connection identity.
   const nextToken = resolvePersistedRemoteToken({
     incomingToken,
     persistToken,
-    existingToken: existingBlock.token,
+    existingToken: inheritedRemoteToken(
+      { ...existingBlock, mode: existingMode },
+      { authMode, mode, url: remoteUrl }
+    ),
     allowPlainText: input.allowPlainTextToken,
     encryptSecret: encryptDesktopSecret
   })
@@ -8102,8 +8210,7 @@ async function sshProbeReuseProof(baseUrl, token, spawnNonce) {
   }
 }
 
-async function teardownSshConnection(profile) {
-  const scope = sshScopeKey(profile)
+async function closePublishedSshConnection(scope) {
   const state = sshConnections.get(scope)
 
   if (!state) {
@@ -8133,12 +8240,27 @@ async function teardownSshConnection(profile) {
   }
 }
 
+async function teardownSshConnection(profile) {
+  const scope = sshScopeKey(profile)
+
+  await applySshConnectionTeardown({
+    closePublishedConnection: closePublishedSshConnection,
+    retireAndRun: (retiredScope, operation) => sshBootstrapCoordinator.retireAndRun(retiredScope, operation),
+    scope
+  })
+}
+
 // CRITICAL: this must mirror resolveRemoteBackend's precedence, not just return
 // any cached SSH state. A per-profile token/OAuth override wins over a global
 // SSH connection — so if the active profile resolves to a NON-SSH backend, the
 // terminal must NOT fall through to a global SSH host.
-function activeSshTerminalTarget() {
-  const profile = primaryProfileKey()
+function activeSshTerminalTarget(target: BackendTarget) {
+  const profile = terminalProfileForTarget(target, primaryProfileKey())
+
+  if (!profile) {
+    return null
+  }
+
   const config = readDesktopConnectionConfig()
 
   if (profileSshOverride(config, profile)) {
@@ -8203,9 +8325,12 @@ async function bootstrapSshConnectionInner(profile, sshConfig, reuseToken, sourc
   const hostLabel = sshConfig.user ? `${sshConfig.user}@${sshConfig.host}` : sshConfig.host
   const existing = sshConnections.get(scope)
 
-  if (existing && existing.fingerprint !== fingerprint) {
-    await teardownSshConnection(profile)
-  }
+  await replacePublishedSshConnection({
+    closePublishedConnection: closePublishedSshConnection,
+    existingFingerprint: existing?.fingerprint,
+    fingerprint,
+    scope
+  })
 
   let ssh = sshConnections.get(scope)?.ssh
 
@@ -8349,6 +8474,8 @@ function persistSshConnectionToken(profile, source, token) {
 // A null/empty profile resolves the env/global remote, so legacy callers and
 // the connection test (which pass no profile) are unchanged.
 async function resolveRemoteBackend(profile) {
+  assertProfileNotRevoked(profile, candidate => profileRevocations.isRevoked(candidate))
+
   const config = readDesktopConnectionConfig()
 
   // 1. Per-profile override — "a profile with its own remote host". Wins even
@@ -8434,7 +8561,9 @@ function profileHasRemoteOverride(profile) {
 function configuredRemoteProfileNames() {
   const config = readDesktopConnectionConfig()
 
-  return Object.keys(config.profiles || {}).filter(name => profileHasRemoteConnection(config, name))
+  return Object.keys(config.profiles || {}).filter(
+    name => !profileRevocations.isRevoked(name) && profileHasRemoteConnection(config, name)
+  )
 }
 
 // True when the app is in app-global remote mode (Settings → "All profiles" →
@@ -8469,6 +8598,17 @@ async function fetchJsonForProfile(profile, path) {
 // Issue an arbitrary method against a profile's resolved backend, parsed JSON.
 async function requestJsonForProfile(profile: string, path: string, method: string, body?: string) {
   const conn = await ensureBackend(profile)
+
+  return requestJsonForConnection(conn, path, method, body)
+}
+
+async function requestJsonForTarget(target: BackendTarget, path: string, method: string, body?: string) {
+  const conn = await ensureBackendForTarget(target)
+
+  return requestJsonForConnection(conn, path, method, body)
+}
+
+async function requestJsonForConnection(conn, path: string, method: string, body?: string) {
   const url = `${conn.baseUrl}${path}`
   const opts = { method, body, timeoutMs: DEFAULT_FETCH_TIMEOUT_MS }
 
@@ -8719,6 +8859,12 @@ function stopBackendChild(child) {
   stopBackendChildImpl(child, { forceKillProcessTree, isWindows: IS_WINDOWS })
 }
 
+// Freeze the effective primary profile for one backend lifetime. Legacy
+// active_profile is launch input, not a live routing signal.
+const primaryProfileOwner = createPrimaryProfileOwner(() =>
+  resolveEffectivePrimaryProfile({ desktopProfile: readActiveDesktopProfile(), hermesHome: HERMES_HOME })
+)
+
 // Soft gateway-mode apply: tear down the primary without resetting boot UI or
 // reloading the renderer. The shell stays up; the renderer wipes session lists
 // (so skeletons retrigger) and re-dials. Distinct from hard re-home (profile
@@ -8727,12 +8873,15 @@ function resetHermesConnection({ soft = false } = {}) {
   backendStartFailure = null
   remoteReauthFailure = null
   remoteLiveness.clear()
-  const hermesProcess = backendConnectionState.invalidate()
-  stopBackendChild(hermesProcess)
+  primaryProfileOwner.reset()
+  const snapshot = backendConnectionState.invalidateSnapshot()
+  stopBackendChild(snapshot.process)
 
   if (!soft) {
     resetBootProgressForReconnect()
   }
+
+  return snapshot
 }
 
 // Re-home the primary backend: reset connection state, then wait for the live
@@ -8740,17 +8889,15 @@ function resetHermesConnection({ soft = false } = {}) {
 // startHermes() spawns fresh instead of racing the dying one. Shared by the
 // connection-config and profile switch flows.
 async function teardownPrimaryBackendAndWait({ soft = false } = {}) {
-  // Capture the reference before resetHermesConnection() invalidates it.
-  const hermesProcess = backendConnectionState.getProcess()
-  const dying = hermesProcess && !hermesProcess.killed ? hermesProcess : null
-
   if (soft) {
     softRehomeInProgress = true
   }
 
   try {
-    resetHermesConnection({ soft })
-    await waitForBackendExit(dying)
+    const snapshot = resetHermesConnection({ soft })
+    const dying = snapshot.process && !snapshot.process.killed ? snapshot.process : null
+
+    await Promise.all([waitForBackendExit(dying), Promise.resolve(snapshot.promise).catch(() => undefined)])
   } finally {
     if (soft) {
       softRehomeInProgress = false
@@ -8821,11 +8968,10 @@ async function waitForBackendExit(child, timeoutMs = 5000) {
   await wait(1000)
 }
 
-// The profile the primary (window) backend runs as. readActiveDesktopProfile()
-// returns the desktop's stored preference, or null when unset (legacy launch
-// that defers to active_profile / default).
+// The profile the primary backend actually runs as. The result stays frozen
+// until resetHermesConnection tears that backend down.
 function primaryProfileKey() {
-  return readActiveDesktopProfile() || 'default'
+  return primaryProfileOwner.get()
 }
 
 // Options describing the current connection setup for `resolveProfileBackendRoute`.
@@ -8840,23 +8986,26 @@ function profileRouteOptions(profile) {
 // Resolve a backend connection for the given profile, per the routing table in
 // resolveProfileBackendRoute(). An empty / unknown profile resolves to the
 // primary, so legacy callers are unchanged.
+//
+// This is the configured-profile route: the profile may resolve to the primary
+// (when it is the active primary or inherits a global remote) or to a pool
+// backend (when it has its own remote override or is a local profile). The pool
+// key is `configured-profile:<name>` so it is distinct from a forced-local
+// route for the same profile.
 async function ensureBackend(profile) {
-  const key = profile && String(profile).trim() ? String(profile).trim() : primaryProfileKey()
+  const key = normalizeDesktopProfile(profile) ?? primaryProfileKey()
   const route = resolveProfileBackendRoute(key, profileRouteOptions(key))
 
   if (route.backend === 'primary') {
     const connection = await startHermes()
 
-    // A shared backend still owes the caller its profile scope, so renderer-side
-    // WebSocket, filesystem, and cache routing target the selected profile.
-    // `sharedPrimary` marks this as the shared-primary route: pooled backends
-    // also carry `profile`, so only this descriptor gets the flag.
-    return route.descriptorProfile
-      ? { ...connection, profile: route.descriptorProfile, sharedPrimary: true }
-      : connection
+    // Every connection descriptor carries the effective window profile, even
+    // when several profiles share the primary remote transport.
+    return profileScopedConnection(connection, key, route)
   }
 
-  const existing = backendPool.get(key)
+  const poolKey = configuredPoolKey(key)
+  const existing = backendPool.get(poolKey)
 
   if (existing) {
     existing.lastActiveAt = Date.now()
@@ -8867,39 +9016,147 @@ async function ensureBackend(profile) {
   evictLruPoolBackends(POOL_MAX_BACKENDS - 1)
 
   const entry = {
+    poolKey,
+    profile: key,
     process: null,
     port: null,
     token: null,
     connectionPromise: null,
     lastActiveAt: Date.now(),
-    remoteBaseUrl: null
+    remoteBaseUrl: null,
+    lifecycle: createBackendConnectionState<any, any>()
   }
 
-  entry.connectionPromise = spawnPoolBackend(key, entry).catch(async error => {
-    if (backendPool.get(key) === entry) {
-      backendPool.delete(key)
-    }
+  const attempt = entry.lifecycle.startAttempt()
+  entry.connectionPromise = spawnPoolBackend(key, entry, {}, attempt).catch(error => {
+    const failed = invalidateAndStopBackendAttempt(entry.lifecycle, attempt, stopBackendChild)
 
-    stopBackendChild(entry.process)
-    await waitForBackendExit(entry.process)
+    if (failed && backendPool.get(poolKey) === entry) {
+      backendPool.delete(poolKey)
+    }
     throw error
   })
-  backendPool.set(key, entry)
+  entry.lifecycle.setPromise(attempt, entry.connectionPromise)
+  backendPool.set(poolKey, entry)
   startPoolIdleReaper()
 
   return entry.connectionPromise
 }
 
-// Mark a pool profile as recently used so the idle reaper spares it. The
-// renderer calls this when it opens a profile's chat WS and periodically while
-// streaming, since the main process can't see the direct renderer↔backend WS.
-function touchPoolBackend(profile) {
-  const key = profile && String(profile).trim() ? String(profile).trim() : null
+// Resolve a backend connection for a per-window BackendTarget. This is the
+// target-aware entry point used by the hermes:connection and
+// hermes:gateway:ws-url IPC handlers, which derive the target from
+// event.sender (the window's webContents) rather than a renderer-supplied
+// profile argument.
+//
+// Route modes:
+//   - primary            → startHermes() (the shared window backend).
+//   - configured-profile  → ensureBackend(profile) — the existing routing
+//                           table, which may resolve remotely.
+//   - forced-local        → bypass global/profile remote resolution and spawn
+//                           a local profile process, pool-keyed distinctly so
+//                           it never shares a configured-route entry.
+//
+// entry.profile stays the real profile name so the backend's own ?profile=
+// scoping and the descriptor handed to the renderer keep working. The pool
+// key carries the route mode.
+async function ensureBackendForTarget(target: BackendTarget) {
+  if (target.kind !== 'primary' && profileRevocations.isRevoked(target.profile)) {
+    throw new Error(`Profile "${target.profile}" has been deleted and must be recreated before it can be opened.`)
+  }
 
-  if (!key) {
+  if (target.kind !== 'primary' && !desktopProfileAvailable(target.profile)) {
+    // Global SSH/remote: named profiles live on the remote host. A local-dir
+    // miss must not reject them or getConnection() throws, sharedPrimary never
+    // lands, and the renderer dials a second SSH socket that poisons the gateway.
+    const remoteOnly =
+      target.kind === 'configured-profile' &&
+      configuredProfileExistsOnSharedRemote(target.profile, globalRemoteActive())
+
+    if (!remoteOnly) {
+      throw new Error(`Profile "${target.profile}" does not exist and cannot be opened.`)
+    }
+  }
+
+  const decision = poolRouteForTarget(target)
+
+  if (decision.route === 'primary') {
+    return startHermes()
+  }
+
+  if (decision.route === 'configured') {
+    // The configured route follows the existing ensureBackend(profile) path,
+    // which may resolve to the primary (shared) or a pooled remote/local
+    // backend. ensureBackend keys by the profile name internally; the
+    // route-mode key is a superset identity that the pool operator derives
+    // via poolKeyForTarget when it needs to stop/touch/revalidate.
+    return ensureBackend(decision.profile)
+  }
+
+  // forced-local: bypass resolveRemoteBackend entirely and spawn a local
+  // profile process. The pool key is `forced-local-profile:<name>` so it is
+  // distinct from any configured-profile entry for the same profile.
+  const poolKey = decision.key
+  const profile = decision.profile as string
+
+  const existing = backendPool.get(poolKey)
+
+  if (existing) {
+    existing.lastActiveAt = Date.now()
+
+    return existing.connectionPromise
+  }
+
+  evictLruPoolBackends(POOL_MAX_BACKENDS - 1)
+
+  const entry = {
+    poolKey,
+    profile,
+    process: null,
+    port: null,
+    token: null,
+    connectionPromise: null,
+    lastActiveAt: Date.now(),
+    remoteBaseUrl: null,
+    lifecycle: createBackendConnectionState<any, any>()
+  }
+
+  const attempt = entry.lifecycle.startAttempt()
+  entry.connectionPromise = spawnForcedLocalPoolBackend(profile, entry, attempt).catch(error => {
+    const failed = invalidateAndStopBackendAttempt(entry.lifecycle, attempt, stopBackendChild)
+
+    if (failed && backendPool.get(poolKey) === entry) {
+      backendPool.delete(poolKey)
+    }
+
+    throw error
+  })
+  entry.lifecycle.setPromise(attempt, entry.connectionPromise)
+  backendPool.set(poolKey, entry)
+  startPoolIdleReaper()
+
+  return entry.connectionPromise
+}
+
+// Spawn a local profile backend with `--profile <name>`, bypassing
+// resolveRemoteBackend so a forced-local target always spawns a local process
+// even when a global or per-profile remote override is active. Delegates to
+// spawnPoolBackend with forceLocal=true, which skips the remote leg.
+async function spawnForcedLocalPoolBackend(profile: string, entry, attempt) {
+  return spawnPoolBackend(profile, entry, { forceLocal: true }, attempt)
+}
+
+// Target-aware touch: marks the pool entry for a per-window BackendTarget as
+// recently used. The pool key is route-mode-aware (configured-profile vs
+// forced-local-profile), so the touch lands on the correct entry. Primary
+// targets have no pool entry (they use the shared startHermes() backend), so
+// touching them is a no-op.
+function touchPoolBackendForTarget(target: BackendTarget) {
+  if (target.kind === 'primary') {
     return
   }
 
+  const key = poolKeyForTarget(target)
   const entry = backendPool.get(key)
 
   if (entry) {
@@ -8964,18 +9221,31 @@ function startPoolIdleReaper() {
 // Spawn an additional dashboard backend pinned to a named profile. Mirrors the
 // local-spawn portion of startHermes() but without the boot-progress UI,
 // bootstrap, or remote handling (those belong to the primary backend only).
-async function spawnPoolBackend(profile, entry) {
+//
+// When `opts.forceLocal` is true, skips the remote-resolution leg entirely so
+// a forced-local target always spawns a local profile process even when a
+// global or per-profile remote override is active.
+async function spawnPoolBackend(profile, entry, opts: { forceLocal?: boolean } = {}, attempt) {
   await reapOrphanedBackendsOnce()
-  // A profile may point at its OWN remote backend (connection.json
-  // `profiles[name]`), or inherit the app-wide remote (env / global settings).
-  // In either case there is no local child to spawn — we just verify the
-  // remote is reachable and hand back its connection descriptor. The pool
-  // entry keeps `entry.process === null`, which stopPoolBackend/evict already
-  // tolerate.
-  const remote = await resolveRemoteBackend(profile)
+  const assertCurrent = () => {
+    if (!entry.lifecycle.isCurrentAttempt(attempt) || backendPool.get(entry.poolKey) !== entry) {
+      throw new Error(`Pool backend startup for profile "${profile}" was cancelled.`)
+    }
+  }
 
-  if (remote) {
-    await waitForHermes(remote.baseUrl, remote.token, undefined, remote.authMode)
+  if (!opts?.forceLocal) {
+    // A profile may point at its OWN remote backend (connection.json
+    // `profiles[name]`), or inherit the app-wide remote (env / global settings).
+    // In either case there is no local child to spawn — we just verify the
+    // remote is reachable and hand back its connection descriptor. The pool
+    // entry keeps `entry.process === null`, which stopPoolBackend/evict already
+    // tolerate.
+    const remote = await resolveRemoteBackend(profile)
+    assertCurrent()
+
+    if (remote) {
+      await waitForHermes(remote.baseUrl, remote.token, undefined, remote.authMode)
+      assertCurrent()
 
     // Recorded on the entry so revalidation can probe this descriptor without
     // awaiting connectionPromise, which may still be pending for a sibling.
@@ -8986,6 +9256,7 @@ async function spawnPoolBackend(profile, entry) {
       profile,
       logs: hermesLog.slice(-80),
       ...getWindowState()
+    }
     }
   }
 
@@ -9009,6 +9280,7 @@ async function spawnPoolBackend(profile, entry) {
       pollMs: UPDATE_WAIT_POLL_MS,
       timeoutMs: UPDATE_WAIT_TIMEOUT_MS
     })
+    assertCurrent()
   }
 
   // --profile wins over the inherited HERMES_HOME env (see _apply_profile_override
@@ -9016,6 +9288,7 @@ async function spawnPoolBackend(profile, entry) {
   // --port 0: the OS assigns an ephemeral port; the child announces it on stdout.
   const backendArgs = ['--profile', profile, 'serve', '--host', '127.0.0.1', '--port', '0']
   const backend = await ensureRuntime(resolveHermesBackend(backendArgs))
+  assertCurrent()
   // Route old runtimes (no `serve`) through the legacy `dashboard --no-open`.
   backend.args = getBackendArgsForRuntime(backend)
   const hermesCwd = resolveHermesCwd()
@@ -9057,6 +9330,13 @@ async function spawnPoolBackend(profile, entry) {
     })
   )
 
+  const processOwner = entry.lifecycle.attachProcess(attempt, child)
+
+  if (!processOwner || backendPool.get(entry.poolKey) !== entry) {
+    stopBackendChild(child)
+    throw new Error(`Pool backend startup for profile "${profile}" was cancelled.`)
+  }
+
   entry.process = child
   entry.token = token
   await claimBackendChild(child, `${backend.command} ${backend.args.join(' ')}`, profile, backendNonce)
@@ -9074,13 +9354,17 @@ async function spawnPoolBackend(profile, entry) {
   child.once('error', error => {
     rememberLog(`Hermes backend for profile "${profile}" failed to start: ${error.message}`)
     releaseBackendChild(child)
-    backendPool.delete(profile)
+    if (entry.lifecycle.clearForCurrentProcess(processOwner) && backendPool.get(entry.poolKey) === entry) {
+      backendPool.delete(entry.poolKey)
+    }
     rejectStart?.(error)
   })
   child.once('exit', (code, signal) => {
     rememberLog(`Hermes backend for profile "${profile}" exited (${signal || code})`)
     releaseBackendChild(child)
-    backendPool.delete(profile)
+    if (entry.lifecycle.clearForCurrentProcess(processOwner) && backendPool.get(entry.poolKey) === entry) {
+      backendPool.delete(entry.poolKey)
+    }
 
     if (!ready) {
       rejectStart?.(
@@ -9091,6 +9375,7 @@ async function spawnPoolBackend(profile, entry) {
 
   // Discover the ephemeral port the child bound to
   const port = await Promise.race([waitForDashboardPortAnnouncement(child, { readyFile }), startFailed])
+  assertCurrent()
 
   if (readyFile) {
     fs.unlink(readyFile, () => {})
@@ -9100,6 +9385,7 @@ async function spawnPoolBackend(profile, entry) {
 
   const baseUrl = `http://127.0.0.1:${port}`
   await Promise.race([waitForHermes(baseUrl, token), startFailed])
+  assertCurrent()
   ready = true
 
   const authToken = await adoptServedDashboardToken(baseUrl, token, {
@@ -9108,12 +9394,15 @@ async function spawnPoolBackend(profile, entry) {
     rememberLog
   })
 
+  assertCurrent()
+
   entry.token = authToken
 
   // Verify the WebSocket session token before declaring backend ready.
   // HTTP /api/status can pass while WS auth fails (separate transport, separate guards).
   const wsUrl = `ws://127.0.0.1:${port}/api/ws?token=${encodeURIComponent(authToken)}`
   const wsProbe = await probeGatewayWebSocket(wsUrl, { WebSocketImpl: globalThis.WebSocket })
+  assertCurrent()
 
   if (!wsProbe.ok) {
     throw new Error(
@@ -9141,8 +9430,9 @@ function stopPoolBackend(profile) {
     return
   }
 
+  const process = entry.lifecycle.invalidate() || entry.process
   backendPool.delete(profile)
-  stopBackendChild(entry.process)
+  stopBackendChild(process)
 }
 
 async function teardownPoolBackendAndWait(profile) {
@@ -9152,11 +9442,29 @@ async function teardownPoolBackendAndWait(profile) {
     return
   }
 
+  const process = entry.lifecycle.invalidate() || entry.process
   backendPool.delete(profile)
 
-  stopBackendChild(entry.process)
+  stopBackendChild(process)
 
-  await waitForBackendExit(entry.process)
+  await Promise.all([waitForBackendExit(process), Promise.resolve(entry.connectionPromise).catch(() => undefined)])
+}
+
+async function teardownPoolBackendsForProfile(profile) {
+  const keys = poolKeysForProfile(backendPool.entries(), profile)
+
+  await Promise.all(keys.map(key => teardownPoolBackendAndWait(key)))
+}
+
+async function teardownProfileBackendsAndSsh(profile) {
+  const scope = sshScopeKey(profile)
+
+  await applySshConnectionTeardown({
+    closePublishedConnection: closePublishedSshConnection,
+    retireAndRun: (retiredScope, operation) => sshBootstrapCoordinator.retireAndRun(retiredScope, operation),
+    scope,
+    teardownRelatedState: () => teardownPoolBackendsForProfile(profile)
+  })
 }
 
 function stopAllPoolBackends() {
@@ -9199,24 +9507,81 @@ async function prepareProfileDeleteRequest(request) {
 
   const decision = decideProfileDeleteAction(profile, {
     isDefaultProfile: p => p === 'default',
-    isValidProfileName: p => PROFILE_NAME_RE.test(p),
+    isValidProfileName: p => PROFILE_NAME_RE.test(p) && desktopProfileAvailable(p),
     primaryProfileKey
   })
 
-  if (decision.action === 'noop') {
-    return null
+  return applyProfileDeleteLifecycle<ProfileMutationToken>(decision, {
+    destroyRevokedWindows: webContentsIds => destroyRevokedWindows(webContentsIds, BrowserWindow.getAllWindows()),
+    failRevocation: mutation => profileRevocations.completeMutation({ mutation, succeeded: false }),
+    revokeProfile: deletedProfile => profileRevocations.revoke(deletedProfile),
+    revokeWindowTargets: deletedProfile => windowTargets.revokeProfile(deletedProfile),
+    teardownPrimary: () => teardownPrimaryBackendAndWait(),
+    teardownProfileBackends: teardownProfileBackendsAndSsh,
+    writeActiveProfile: deletedProfile => writeActiveDesktopProfile(deletedProfile)
+  })
+}
+
+async function completeProfileMutation<T>(
+  mutation,
+  operation: () => Promise<T>,
+  rename: ProfileRename | null = null
+): Promise<T> {
+  try {
+    const result = await operation()
+
+    if (mutation) {
+      let retireSucceeded = true
+
+      if (mutation.kind === 'delete' && profileRevocations.isCurrent(mutation)) {
+        const current = readDesktopConnectionConfig()
+
+        if (Object.hasOwn(current.profiles || {}, mutation.profile)) {
+          writeDesktopConnectionConfig(removeProfileConnectionOverride(current, mutation.profile))
+        }
+
+        retireSucceeded = !desktopProfileAvailable(mutation.profile)
+      }
+
+      profileRevocations.completeMutation({ mutation, retireSucceeded, succeeded: true })
+    }
+
+    if (rename) {
+      await applyProfileRenameLifecycle<ProfileMutationToken>(rename, primaryProfileKey(), {
+        completeRevocation: renameMutation => {
+          profileRevocations.completeMutation({
+            mutation: renameMutation,
+            retireSucceeded: !desktopProfileAvailable(renameMutation.profile),
+            succeeded: true
+          })
+        },
+        destroyRevokedWindows: webContentsIds =>
+          destroyRevokedWindows(webContentsIds, BrowserWindow.getAllWindows()),
+        failRevocation: renameMutation =>
+          profileRevocations.completeMutation({ mutation: renameMutation, succeeded: false }),
+        migrateConnectionOverride: (from, to) => {
+          const current = readDesktopConnectionConfig()
+
+          if (Object.hasOwn(current.profiles || {}, from)) {
+            writeDesktopConnectionConfig(renameProfileConnectionOverride(current, from, to))
+          }
+        },
+        revokeProfile: profile => profileRevocations.revoke(profile),
+        revokeWindowTargets: profile => windowTargets.revokeProfile(profile),
+        teardownPrimary: () => teardownPrimaryBackendAndWait(),
+        teardownProfilePools: teardownProfileBackendsAndSsh,
+        writeActiveProfile: profile => writeActiveDesktopProfile(profile)
+      })
+    }
+
+    return result
+  } catch (error) {
+    if (mutation) {
+      profileRevocations.completeMutation({ mutation, succeeded: false })
+    }
+
+    throw error
   }
-
-  if (decision.action === 'teardown-primary') {
-    writeActiveDesktopProfile('default')
-    await teardownPrimaryBackendAndWait()
-
-    return decision.profile
-  }
-
-  await teardownPoolBackendAndWait(decision.profile)
-
-  return decision.profile
 }
 
 async function startHermes() {
@@ -9297,22 +9662,19 @@ async function startHermes() {
     // Resolve for the desktop's primary profile so a per-profile remote
     // override on the active profile is honored (falls back to env / global).
     const token = crypto.randomBytes(32).toString('base64url')
-    // --port 0: the OS assigns an ephemeral port; the child announces it on stdout.
-    const backendArgs = ['serve', '--host', '127.0.0.1', '--port', '0']
-    // Pin the desktop's chosen profile via the global --profile flag. This is
-    // deterministic (it wins over the sticky ~/.hermes/active_profile file) and
-    // resolves HERMES_HOME the same way `hermes -p <name>` does on the CLI. An
-    // unset preference keeps the legacy launch so existing installs are
-    // unaffected.
-    const activeProfile = readActiveDesktopProfile()
-
-    if (activeProfile) {
-      backendArgs.unshift('--profile', activeProfile)
-    }
+    // Pin local launch argv to the same frozen owner used for routing and
+    // descriptors. This prevents a changed legacy active_profile file from
+    // relabeling a respawned backend underneath live windows.
+    const backendArgs = serveBackendArgs(primaryProfileKey())
 
     const setup = await runPrimaryBackendStartup({
       connectRemote,
       ensureLocalRuntime: ensureRuntime,
+      ensureCurrent: () => {
+        if (!backendConnectionState.isCurrentAttempt(connectionAttempt)) {
+          throw new Error('Hermes backend start was superseded by a newer connection attempt.')
+        }
+      },
       prepareLocalBackend: async () => {
         await advanceBootProgress('backend.runtime', 'Resolving Hermes runtime', 28)
 
@@ -9330,6 +9692,10 @@ async function startHermes() {
       // return before this waiter; local starts park until the updater exits.
       waitForLocalStart: waitForUpdateToFinish
     })
+
+    if (!backendConnectionState.isCurrentAttempt(connectionAttempt)) {
+      throw new Error('Hermes backend start was superseded by a newer connection attempt.')
+    }
 
     if (setup.kind === 'remote') {
       return setup.connection
@@ -9657,7 +10023,12 @@ function focusWindow(win) {
   win.focus()
 }
 
-function spawnSecondaryWindow({ sessionId, watch }: { sessionId?: string; watch?: boolean } = {}) {
+function spawnSecondaryWindow({
+  profile,
+  sessionId,
+  target,
+  watch
+}: { profile: string; sessionId?: string; target: BackendTarget; watch?: boolean }) {
   const icon = getAppIconPath()
 
   const win = new BrowserWindow({
@@ -9713,10 +10084,27 @@ function spawnSecondaryWindow({ sessionId, watch }: { sessionId?: string; watch?
     recentReloadTimesRef: rendererReloadTimesRef
   })
 
+  // Main selected this target from the validated transcript owner before the
+  // helper renderer exists. Bind it once here; later renderer IPC can only use
+  // this target and cannot retarget the window with a profile argument.
+  const webContentsId = win.webContents.id
+
+  if (target.kind !== 'primary') {
+    windowTargets.bind(webContentsId, target)
+  }
+
+  // Clean the binding when the window closes so the webContents.id does not
+  // leak a stale target (lookup on a recycled id would otherwise hit the
+  // inherited binding).
+  win.on('closed', () => {
+    windowTargets.cleanup(webContentsId)
+  })
+
   loadWindowUrl(
     win,
     buildSessionWindowUrl(sessionId, {
       devServer: DEV_SERVER,
+      profile,
       rendererIndexPath: DEV_SERVER ? undefined : resolveRendererIndex(),
       watch
     }),
@@ -9727,8 +10115,26 @@ function spawnSecondaryWindow({ sessionId, watch }: { sessionId?: string; watch?
 }
 
 // Open (or focus) a standalone window for a single chat session.
-function createSessionWindow(sessionId, { watch = false } = {}) {
-  return sessionWindows.openOrFocus(sessionId, () => spawnSecondaryWindow({ sessionId, watch }))
+function createSessionWindow(
+  sessionId,
+  {
+    openerWebContentsId,
+    ownerProfile,
+    watch = false
+  }: { openerWebContentsId?: number; ownerProfile?: null | string; watch?: boolean } = {}
+) {
+  const openerTarget = Number.isInteger(openerWebContentsId)
+    ? activeWindowTarget(openerWebContentsId as number)
+    : makeBackendTarget({ kind: 'primary' })
+  const target = resolveSessionOwnerTarget(openerTarget, ownerProfile, primaryProfileKey())
+  const profile = normalizeDesktopProfile(ownerProfile) ?? (target.kind === 'primary' ? primaryProfileKey() : target.profile)
+  const scopeId = serializeTargetId(target)
+
+  return sessionWindows.openOrFocus(
+    sessionId,
+    () => spawnSecondaryWindow({ profile, sessionId, target, watch }),
+    { scopeId }
+  )
 }
 
 // Additional full "instance" windows — peers of the primary that render the
@@ -9758,7 +10164,13 @@ function nextInstanceBounds() {
 // primary: it never overwrites the mainWindow global, doesn't start the backend
 // (the renderer's getConnection() joins the already-running one), and loads the
 // plain renderer URL so the full app renders.
-function createInstanceWindow() {
+//
+// When `targetId` is a main-validated opaque target id (from
+// listWindowBackendTargets), the new window is bound to that BackendTarget so
+// its gateway connection routes to the chosen backend. With no explicit target,
+// an opener id inherits that exact window's binding; otherwise the registry
+// resolves an unbound window to the primary.
+function createInstanceWindow(targetId: null | string = null, openerWebContentsId: null | number = null) {
   const icon = getAppIconPath()
 
   const win = new BrowserWindow({
@@ -9793,6 +10205,25 @@ function createInstanceWindow() {
   streamThrottle.register(win)
   wireCommonWindowHandlers(win, zoomWiringForWindowKind('chat'))
 
+  // Bind the window to a validated BackendTarget when a target id was
+  // supplied. The id was already validated by the openInstance IPC handler
+  // (parseTargetId + validateOpenInstanceTargetId), so this bind is
+  // authoritative; the registry re-validates at the boundary. Without an
+  // explicit id, an opener binding is inherited when supplied; otherwise the
+  // unbound window resolves to the live primary.
+  if (targetId && targetId.trim() && targetId.trim() !== 'primary') {
+    const parsed = parseTargetId(targetId)
+
+    if (parsed.ok) {
+      windowTargets.bind(win.webContents.id, parsed.target)
+    }
+    // A non-ok parse is a no-op here: the IPC handler already rejected it
+    // before calling createInstanceWindow, so this branch only fires when a
+    // caller invoked the function directly with a valid id.
+  } else if (Number.isInteger(openerWebContentsId)) {
+    windowTargets.inheritFromOpener(win.webContents.id, openerWebContentsId)
+  }
+
   // Renderer lifecycle diagnostics + recovery (#81290), same policy as the
   // primary and session windows: a crashed instance renderer logs with its
   // window kind and reloads under the shared crash-loop budget.
@@ -9811,6 +10242,7 @@ function createInstanceWindow() {
 
   win.on('closed', () => {
     instanceWindows.delete(win)
+    windowTargets.cleanup(win.webContents.id)
   })
 
   attachRendererConsoleCapture(win, 'instance', rememberLog)
@@ -10003,12 +10435,6 @@ let hudRestoreMainWindow = false
 // the id and hands it over in the close broadcast.
 let hudSessionId = null
 
-// The profile the live HUD renderer booted against (rides hudUrl's query
-// string). A renderer adopts its backend once at boot, so a retarget onto a
-// session from a DIFFERENT profile cannot be a same-window `goto` — the HUD
-// must be respawned against the new profile's backend (see openHudWindow).
-let hudProfile = null
-
 // A wide, short bar parked near the bottom of the active display — the shape
 // of a game chat frame, and where one belongs. Defaults only: once the user
 // moves or resizes the HUD, hud-state.json wins (same pattern as the main
@@ -10183,15 +10609,10 @@ function hudBounds() {
   }
 }
 
-function hudUrl(sessionId, profile) {
-  // The profile rides the query string next to `win=hud` (BEFORE the '#', so
-  // HashRouter never sees it). The HUD renderer's gateway boot reads it and
-  // adopts that backend instead of the primary — without it, a HUD opened on a
-  // non-primary profile's conversation resolves the session id against the
-  // wrong backend and falls back to the default profile's last session.
+function hudUrl(sessionId, target: BackendTarget) {
   return buildHudWindowUrl(sessionId, {
     devServer: DEV_SERVER,
-    profile,
+    profile: target.kind === 'primary' ? null : target.profile,
     rendererIndexPath: DEV_SERVER ? undefined : resolveRendererIndex()
   })
 }
@@ -10210,7 +10631,7 @@ function broadcastHudState(open) {
   }
 }
 
-function spawnHudWindow(sessionId, profile) {
+function spawnHudWindow(sessionId, target: BackendTarget) {
   const win = new BrowserWindow({
     ...hudBounds(),
     minWidth: 380,
@@ -10272,6 +10693,12 @@ function spawnHudWindow(sessionId, profile) {
   streamThrottle.register(win)
   wireCommonWindowHandlers(win, zoomWiringForWindowKind('chat'))
 
+  const webContentsId = win.webContents.id
+
+  if (target.kind !== 'primary') {
+    windowTargets.bind(webContentsId, target)
+  }
+
   // Remember where the user parks and sizes it (debounced — these fire many
   // times mid-drag).
   bindGeometryPersistence(win, schedulePersistHudState)
@@ -10292,6 +10719,8 @@ function spawnHudWindow(sessionId, profile) {
   })
 
   win.on('closed', () => {
+    windowTargets.cleanup(webContentsId)
+
     if (hudWindow === win) {
       hudWindow = null
     }
@@ -10306,7 +10735,7 @@ function spawnHudWindow(sessionId, profile) {
   // Log-only lifecycle (#81290): the HUD is a compact auxiliary surface the
   // user can re-toggle; a dead renderer should be diagnosable, not resurrected.
   installWindowRendererLifecycle(win, { kind: 'hud', callbacks: { log: rememberLog } })
-  loadWindowUrl(win, hudUrl(sessionId, profile), 'HUD')
+  loadWindowUrl(win, hudUrl(sessionId, target), 'HUD')
 
   return win
 }
@@ -10324,49 +10753,32 @@ function restoreMainWindowFromHud() {
   }
 }
 
-function openHudWindow(sessionId, profile) {
-  const profileKey = typeof profile === 'string' && profile.trim() ? profile.trim() : null
-
+function openHudWindow(sessionId, target: BackendTarget) {
   if (hudWindow && !hudWindow.isDestroyed()) {
-    // Pointed at another PROFILE: the live renderer is bound to the old
-    // profile's backend, and a renderer adopts its backend exactly once at
-    // boot — an in-place goto would resolve the id against the wrong backend
-    // (the #82285 fallback). Respawn against the right one.
-    if (profileKey && hudProfile !== profileKey) {
-      const win = hudWindow
-      hudWindow = null
-      win.removeAllListeners('closed')
-      win.destroy()
+    const sameTarget = canonicalTargetKey(windowTargets.lookup(hudWindow.webContents.id)) === canonicalTargetKey(target)
 
-      hudSessionId = sessionId || null
-      hudProfile = profileKey
-      hudWindow = spawnHudWindow(sessionId, profileKey)
-      broadcastHudState(true)
-      registerHudSnapShortcut()
+    if (sameTarget) {
+      // Already up on this backend, but pointed somewhere else — switch it
+      // rather than just raising it.
+      if (sessionId && sessionId !== hudSessionId) {
+        hudSessionId = sessionId
+        hudWindow.webContents.send('hermes:hud:goto', sessionId)
+        broadcastHudState(true)
+      }
+
+      focusWindow(hudWindow)
 
       return hudWindow
     }
 
-    // Already up, but pointed somewhere else — switch it rather than just
-    // raising it. Asking for HUD mode from another tab means "put THIS
-    // conversation in the HUD", and a plain focus leaves the wrong one there.
-    if (sessionId && sessionId !== hudSessionId) {
-      hudSessionId = sessionId
-      hudWindow.webContents.send('hermes:hud:goto', sessionId)
-      // Keep every window's idea of where the HUD is pointed in step, so the
-      // toggle keeps reading "switch" vs "dismiss" correctly.
-      broadcastHudState(true)
-    }
-
-    focusWindow(hudWindow)
-
-    return hudWindow
+    // The singleton is connected to another backend. Recreate it rather than
+    // rebinding the registry underneath an already-running renderer gateway.
+    closeHudWindow()
   }
 
   hudRestoreMainWindow = Boolean(mainWindow && !mainWindow.isDestroyed() && mainWindow.isVisible())
   hudSessionId = sessionId || null
-  hudProfile = profileKey
-  hudWindow = spawnHudWindow(sessionId, profileKey)
+  hudWindow = spawnHudWindow(sessionId, target)
   broadcastHudState(true)
   registerHudSnapShortcut()
 
@@ -10380,6 +10792,7 @@ function closeHudWindow() {
   hudWindow = null
 
   if (win && !win.isDestroyed()) {
+    windowTargets.cleanup(win.webContents.id)
     // Null'd first so the 'closed' handler doesn't broadcast a second time.
     win.removeAllListeners('closed')
     win.close()
@@ -10811,7 +11224,21 @@ function createWindow() {
   })
 }
 
-ipcMain.handle('hermes:connection', async (_event, profile) => ensureBackend(profile))
+// hermes:connection derives the backend target from event.sender (the window's
+// webContents), not from a renderer-supplied profile argument. A bound target
+// overrides getConnection when the renderer omits profile or asks for that
+// target's profile; an explicit request for a different profile preserves the
+// existing ensureBackend(profile) behavior.
+ipcMain.handle('hermes:connection', async (event, profile) => {
+  const boundTarget = activeWindowTarget(event.sender.id)
+  const { conflict, target } = resolveSenderTarget(boundTarget, profile)
+
+  if (conflict) {
+    throw new Error('profile-conflicts-with-window-target')
+  }
+
+  return ensureBackendForTarget(target)
+})
 // Reconnect-after-wake recovery. A REMOTE primary backend has no child process,
 // so the 'exit'/'error' handlers that would clear a dead connection promise never
 // fire — once the remote becomes unreachable across a sleep/wake the renderer
@@ -10820,12 +11247,11 @@ ipcMain.handle('hermes:connection', async (_event, profile) => ensureBackend(pro
 // to confirm the cached PRIMARY backend is still reachable; if a remote one is
 // not, we drop the cache so the next getConnection() rebuilds it. Local backends
 // self-heal via their child 'exit' handler, so we never touch them here.
-ipcMain.handle('hermes:connection:revalidate', async () => {
+
+async function revalidatePrimaryConnection() {
   const connectionPromise = backendConnectionState.getPromise()
 
   if (!connectionPromise) {
-    await revalidatePool()
-
     return { ok: true, rebuilt: false }
   }
 
@@ -10833,17 +11259,14 @@ ipcMain.handle('hermes:connection:revalidate', async () => {
   // share this primary connection. Coalesce simultaneous requests so one outage
   // produces one failure observation rather than exhausting the whole streak.
   return remoteRevalidation.run(connectionPromise, async () => {
-    const [result] = await Promise.all([
-      revalidateRemoteConnection({
-        connectionPromise,
-        currentConnectionPromise: () => backendConnectionState.getPromise(),
-        log: rememberLog,
-        probe: fetchPublicJson,
-        resetConnection: resetHermesConnection,
-        tracker: remoteLiveness
-      }),
-      revalidatePool()
-    ])
+    const result = await revalidateRemoteConnection({
+      connectionPromise,
+      currentConnectionPromise: () => backendConnectionState.getPromise(),
+      log: rememberLog,
+      probe: fetchPublicJson,
+      resetConnection: resetHermesConnection,
+      tracker: remoteLiveness
+    })
 
     // A rebuilt SSH connection must also tear down its tunnel/master before the
     // renderer re-dials (which only happens after this handler resolves), so the
@@ -10860,42 +11283,136 @@ ipcMain.handle('hermes:connection:revalidate', async () => {
 
     return result
   })
-})
+}
 
-// Pooled remote descriptors get the same treatment as the primary: they have no
-// child process to signal their host's death, and the renderer's keepalive touch
-// spares them from the idle reaper, so nothing else can retire a dead one.
-function revalidatePool() {
-  return revalidatePooledRemoteBackends({
-    entries: backendPool.entries(),
-    log: rememberLog,
-    probe: fetchPublicJson,
-    stopBackend: stopPoolBackend,
-    tracker: remoteLiveness
+async function revalidateTargetConnection(target: BackendTarget) {
+  if (target.kind === 'primary') {
+    return revalidatePrimaryConnection()
+  }
+
+  if (target.kind === 'forced-local-profile') {
+    return { ok: true, rebuilt: false }
+  }
+
+  const key = poolKeyForTarget(target)
+  const entry = backendPool.get(key)
+
+  if (!entry) {
+    const route = resolveProfileBackendRoute(target.profile, profileRouteOptions(target.profile))
+
+    return route.backend === 'primary' ? revalidatePrimaryConnection() : { ok: true, rebuilt: false }
+  }
+
+  if (entry.process || !entry.remoteBaseUrl) {
+    return { ok: true, rebuilt: false }
+  }
+
+  return remoteRevalidation.run(entry.connectionPromise, async () => {
+    const result = await revalidatePooledRemoteBackends({
+      entries: [[key, entry]],
+      log: rememberLog,
+      probe: fetchPublicJson,
+      stopBackend: stopPoolBackend,
+      tracker: remoteLiveness
+    })
+
+    return { ok: true, rebuilt: result.dropped.includes(key) }
   })
 }
 
-ipcMain.handle('hermes:backend:touch', async (_event, profile) => {
-  touchPoolBackend(profile)
+ipcMain.handle('hermes:connection:revalidate', async event =>
+  revalidateTargetConnection(activeWindowTarget(event.sender.id))
+)
+
+// hermes:backend:touch must target the same backend as the window's bound
+// target. The renderer calls this to keep a pool backend alive while its chat
+// is active; deriving from event.sender ensures the touch lands on the correct
+// pool entry (configured vs forced-local) for this window.
+ipcMain.handle('hermes:backend:touch', async (event, profile) => {
+  const boundTarget = activeWindowTarget(event.sender.id)
+  const { conflict, target } = resolveSenderTarget(boundTarget, profile)
+
+  if (conflict) {
+    throw new Error('profile-conflicts-with-window-target')
+  }
+
+  touchPoolBackendForTarget(target)
 
   return { ok: true }
 })
-ipcMain.handle('hermes:gateway:ws-url', async (_event, profile) => {
-  return gatewayWsUrlIpcResult(() => freshGatewayWsUrl(profile))
+// hermes:gateway:ws-url derives the target from event.sender so a bound window
+// mints its WS ticket against its own backend, not the primary.
+ipcMain.handle('hermes:gateway:ws-url', async (event, profile) => {
+  const boundTarget = activeWindowTarget(event.sender.id)
+  const { conflict, target } = resolveSenderTarget(boundTarget, profile)
+
+  if (conflict) {
+    throw new Error('profile-conflicts-with-window-target')
+  }
+
+  return gatewayWsUrlIpcResult(() => freshGatewayWsUrlForTarget(target))
 })
-ipcMain.handle('hermes:window:openSession', async (_event, sessionId, opts) => {
+ipcMain.handle('hermes:window:openSession', async (event, sessionId, opts) => {
   if (typeof sessionId !== 'string' || !sessionId.trim()) {
     return { ok: false, error: 'invalid-session-id' }
   }
 
-  createSessionWindow(sessionId.trim(), { watch: opts?.watch === true })
+  const requestedProfile = typeof opts?.profile === 'string' ? opts.profile.trim() : ''
+  const ownerProfile = requestedProfile ? normalizeDesktopProfile(requestedProfile) : null
+
+  if (requestedProfile && !ownerProfile) {
+    return { ok: false, error: 'invalid-profile' }
+  }
+
+  createSessionWindow(sessionId.trim(), {
+    openerWebContentsId: event.sender.id,
+    ownerProfile,
+    watch: opts?.watch === true
+  })
 
   return { ok: true }
 })
-ipcMain.handle('hermes:window:openInstance', async () => {
-  createInstanceWindow()
+// hermes:window:openInstance accepts one of the currently-valid backend
+// target ids from listWindowBackendTargets. An omitted id inherits from the
+// exact IPC sender; null/empty/'primary' explicitly opens the primary. An
+// invalid or stale id returns { ok: false, error: 'invalid-target' } so the
+// renderer can surface the error without an exception crossing the bridge.
+ipcMain.handle('hermes:window:openInstance', async (event, targetId: null | string | undefined) => {
+  const choices = buildBackendTargetChoices({
+    activePrimaryProfile: primaryProfileKey(),
+    currentTargetId: serializeTargetId(activeWindowTarget(event.sender.id)),
+    configuredProfiles: readDesktopConnectionConfig().profiles || {},
+    isProfileAvailable: desktopProfileAvailable,
+    isProfileRevoked: profile => profileRevocations.isRevoked(profile)
+  })
+
+  const request = classifyOpenInstanceRequest(targetId, choices)
+
+  if (!request.ok) {
+    return { ok: false, error: 'invalid-target' }
+  }
+
+  if (request.mode === 'inherit') {
+    createInstanceWindow(null, event.sender.id)
+  } else if (request.mode === 'primary') {
+    createInstanceWindow()
+  } else {
+    createInstanceWindow(request.id)
+  }
 
   return { ok: true }
+})
+// hermes:window:listBackendTargets returns the non-secret catalog of backend
+// target choices the renderer can pass to openInstance. Only {id, label,
+// description, current} — no URLs, tokens, or descriptors.
+ipcMain.handle('hermes:window:listBackendTargets', async event => {
+  return buildBackendTargetChoices({
+    activePrimaryProfile: primaryProfileKey(),
+    currentTargetId: serializeTargetId(activeWindowTarget(event.sender.id)),
+    configuredProfiles: readDesktopConnectionConfig().profiles || {},
+    isProfileAvailable: desktopProfileAvailable,
+    isProfileRevoked: profile => profileRevocations.isRevoked(profile)
+  })
 })
 
 // Hand a session to the user's OWN terminal emulator, running the TUI against
@@ -11111,11 +11628,17 @@ ipcMain.on('hermes:pet-overlay:control', (_event, payload) => {
 })
 
 // --- HUD mode (chrome-free floating chat) -----------------------------------
-ipcMain.handle('hermes:hud:open', async (_event, request) => {
-  openHudWindow(
-    typeof request?.sessionId === 'string' ? request.sessionId : null,
-    typeof request?.profile === 'string' ? request.profile : null
-  )
+ipcMain.handle('hermes:hud:open', async (event, request) => {
+  const requestedProfile = typeof request?.profile === 'string' ? request.profile.trim() : ''
+  const ownerProfile = requestedProfile ? normalizeDesktopProfile(requestedProfile) : null
+
+  if (requestedProfile && !ownerProfile) {
+    return { ok: false, error: 'invalid-profile' }
+  }
+
+  const target = resolveSessionOwnerTarget(activeWindowTarget(event.sender.id), ownerProfile, primaryProfileKey())
+
+  openHudWindow(typeof request?.sessionId === 'string' ? request.sessionId : null, target)
 
   return { ok: true }
 })
@@ -11581,7 +12104,7 @@ ipcMain.handle('hermes:connection-config:apply', async (_event, payload) => {
       }),
     scope,
     sendApplied: sendConnectionApplied,
-    stopPool: stopPoolBackend,
+    stopProfilePool: teardownPoolBackendsForProfile,
     teardownPrimary: () => teardownPrimaryBackendAndWait({ soft: true }),
     teardownSsh: value => teardownSshConnection(value || null)
   })
@@ -11642,7 +12165,11 @@ ipcMain.handle('hermes:window:readBelow', async event => {
 //   GET    /api/sessions/{id}[/messages] → read from remote
 //   DELETE /api/sessions/{id}            → delete on remote
 //   PATCH  /api/sessions/{id}            → rename/archive on remote
-async function interceptSessionRequestForRemote(request) {
+async function interceptSessionRequestForRemote(
+  request,
+  target: BackendTarget,
+  boundTarget: BackendTarget
+) {
   if (typeof request?.path !== 'string') {
     return undefined
   }
@@ -11661,15 +12188,14 @@ async function interceptSessionRequestForRemote(request) {
 
   if (method === 'GET' && pathname === '/api/profiles/sessions') {
     const remoteProfiles = configuredRemoteProfileNames()
+    const route = decideProfileSessionsRoute(target, boundTarget, remoteProfiles, profileHasRemoteOverride)
 
-    if (remoteProfiles.length === 0) {
+    if (route.kind === 'local-fast-path') {
       return undefined // no remote profiles → local fast path
     }
 
-    const requested = (searchParams.get('profile') || 'all').trim() || 'all'
-
-    if (requested !== 'all') {
-      return profileHasRemoteOverride(requested) ? remoteSessionList(requested, searchParams) : undefined
+    if (route.kind === 'target') {
+      return remoteSessionList(route.profile, searchParams, target)
     }
 
     return mergeRemoteProfileSessions(searchParams, remoteProfiles)
@@ -11682,9 +12208,17 @@ async function interceptSessionRequestForRemote(request) {
   // reassemble; local profiles fall back to three primary reads there, but
   // remote correctness is preserved.
   if (method === 'GET' && pathname === '/api/profiles/sessions/sidebar') {
+    const scopedPath = scopedSidebarPathForTarget(target, request.path)
+
+    if (scopedPath) {
+      const response = await requestJsonForTarget(target, scopedPath, 'GET')
+
+      return scopeSidebarResponseForTarget(target, response)
+    }
+
     const remoteProfiles = configuredRemoteProfileNames()
 
-    if (remoteProfiles.length === 0) {
+    if (remoteProfiles.length === 0 && boundTarget.kind === 'primary') {
       return undefined // local fast path → batched endpoint's single DB open
     }
 
@@ -11719,10 +12253,13 @@ async function interceptSessionRequestForRemote(request) {
       messagingSp.set('exclude_sources', messagingExclude)
     }
 
+    const aggregateTarget = boundTarget.kind === 'primary' ? undefined : target
+    const remoteRequestLimit = createAsyncLimiter(4)
+
     const [recents, cron, messaging] = await Promise.all([
-      fetchProfilesSessionSlice(recentsSp, remoteProfiles),
-      fetchProfilesSessionSlice(cronSp, remoteProfiles),
-      fetchProfilesSessionSlice(messagingSp, remoteProfiles)
+      fetchProfilesSessionSlice(recentsSp, remoteProfiles, aggregateTarget, remoteRequestLimit),
+      fetchProfilesSessionSlice(cronSp, remoteProfiles, aggregateTarget, remoteRequestLimit),
+      fetchProfilesSessionSlice(messagingSp, remoteProfiles, aggregateTarget, remoteRequestLimit)
     ])
 
     return {
@@ -11738,6 +12275,10 @@ async function interceptSessionRequestForRemote(request) {
       },
       errors: []
     }
+  }
+
+  if (target.kind === 'forced-local-profile') {
+    return undefined
   }
 
   // Per-session read/mutation. Owner is in ?profile= (reads) or request.profile
@@ -11762,7 +12303,7 @@ async function interceptSessionRequestForRemote(request) {
 
     if (profileHasRemoteOverride(profile)) {
       if (method === 'GET') {
-        return fetchJsonForProfile(profile, passthroughQuery ? `${pathname}?${passthroughQuery}` : pathname)
+        return requestJsonForTarget(target, passthroughQuery ? `${pathname}?${passthroughQuery}` : pathname, 'GET')
       }
 
       const body = request.body && typeof request.body === 'object' ? { ...request.body } : request.body
@@ -11771,7 +12312,7 @@ async function interceptSessionRequestForRemote(request) {
         delete body.profile
       }
 
-      return requestJsonForProfile(profile, pathname, method, body)
+      return requestJsonForTarget(target, pathname, method, body)
     }
 
     if (globalRemoteActive()) {
@@ -11780,12 +12321,12 @@ async function interceptSessionRequestForRemote(request) {
       const path = `${pathname}?${passthroughParams.toString()}`
 
       if (method === 'GET') {
-        return fetchJsonForProfile(null, path)
+        return requestJsonForTarget(target, path, 'GET')
       }
 
       const body = request.body && typeof request.body === 'object' ? { ...request.body, profile } : { profile }
 
-      return requestJsonForProfile(null, path, method, body)
+      return requestJsonForTarget(target, path, method, body)
     }
 
     return undefined
@@ -11798,8 +12339,11 @@ const rowsOf = data => (Array.isArray(data?.sessions) ? data.sessions : [])
 
 // A remote profile's session list, read from its remote host and tagged with the
 // desktop-facing profile name (the remote's /api/sessions doesn't know it).
-async function remoteSessionList(profile, searchParams) {
-  const data = await fetchRemoteProfileSessions(profile, searchParams, fetchJsonForProfile)
+async function remoteSessionList(profile, searchParams, target?: BackendTarget) {
+  const resolved = target || makeBackendTarget({ kind: 'configured-profile', profile })
+  const data = await fetchRemoteProfileSessions(profile, searchParams, async (_profile, path) =>
+    requestJsonForTarget(resolved, path, 'GET')
+  )
 
   for (const s of rowsOf(data)) {
     s.profile = profile
@@ -11814,10 +12358,21 @@ async function remoteSessionList(profile, searchParams) {
 // returns data (never `undefined`) so a batched caller can compose slices. A
 // specific local profile reads from the local primary; a remote-override profile
 // reads from its remote; 'all' merges every remote into the primary aggregate.
-async function fetchProfilesSessionSlice(searchParams, remoteProfiles) {
-  const requested = (searchParams.get('profile') || 'all').trim() || 'all'
+async function fetchProfilesSessionSlice(
+  searchParams,
+  remoteProfiles,
+  target?: BackendTarget,
+  remoteRequestLimit?: AsyncLimiter
+) {
+  const requested = target && target.kind !== 'primary'
+    ? target.profile
+    : (searchParams.get('profile') || 'all').trim() || 'all'
 
   if (requested !== 'all') {
+    if (target) {
+      return remoteSessionList(requested, searchParams, target)
+    }
+
     if (profileHasRemoteOverride(requested)) {
       return remoteSessionList(requested, searchParams)
     }
@@ -11825,14 +12380,14 @@ async function fetchProfilesSessionSlice(searchParams, remoteProfiles) {
     return fetchPrimaryProfileSessions(searchParams, fetchJsonForProfile)
   }
 
-  return mergeRemoteProfileSessions(searchParams, remoteProfiles)
+  return mergeRemoteProfileSessions(searchParams, remoteProfiles, remoteRequestLimit)
 }
 
 // Unified list: primary's local aggregate, with each remote profile's stale local
 // rows/totals swapped for the remote's real ones, re-sorted by recency and
 // re-windowed to the requested page. A dead remote contributes nothing rather
 // than breaking the sidebar.
-async function mergeRemoteProfileSessions(searchParams, remoteProfiles) {
+async function mergeRemoteProfileSessions(searchParams, remoteProfiles, remoteRequestLimit?: AsyncLimiter) {
   const limit = Math.max(1, Number(searchParams.get('limit')) || 20)
   const offset = Math.max(0, Number(searchParams.get('offset')) || 0)
   const order = searchParams.get('order') === 'created' ? 'started_at' : 'last_active'
@@ -11851,8 +12406,9 @@ async function mergeRemoteProfileSessions(searchParams, remoteProfiles) {
   let total = (Number(base.total) || 0) - remoteProfiles.reduce((n, p) => n + (profileTotals[p] || 0), 0)
 
   // Swap each remote profile's stale local rows/total for the remote's real ones.
+  const limitRemote = remoteRequestLimit || createAsyncLimiter(4)
   await Promise.all(
-    remoteProfiles.map(async name => {
+    remoteProfiles.map(name => limitRemote(async () => {
       const list = await remoteSessionList(name, remoteParams).catch(() => null)
 
       if (!list) {
@@ -11865,7 +12421,7 @@ async function mergeRemoteProfileSessions(searchParams, remoteProfiles) {
       merged.push(...rows)
       profileTotals[name] = Number(list.total) || rows.length
       total += profileTotals[name]
-    })
+    }))
   )
 
   const recency = s => s?.[order] ?? s?.started_at ?? 0
@@ -11879,75 +12435,119 @@ async function mergeRemoteProfileSessions(searchParams, remoteProfiles) {
   }
 }
 
-ipcMain.handle('hermes:api', async (_event, request) => {
-  // Remote-profile session requests would otherwise hit the local primary off
-  // each profile's on-disk state.db — fine for local profiles, but a remote
-  // profile's sessions live on its remote host, so the UI's IDs 404 (or mutations
-  // no-op) the moment they run there. Route reads + mutations to the remote.
-  const rerouted = await interceptSessionRequestForRemote(request)
+ipcMain.handle('hermes:api', async (event, request) => {
+  const boundTarget = activeWindowTarget(event.sender.id)
+  const initialResolution = resolveSenderRequestTarget(boundTarget, request)
 
-  if (rerouted !== undefined) {
-    return rerouted
+  if (initialResolution.conflict) {
+    throw new Error('profile-conflicts-with-window-target')
   }
 
-  const tornDownProfile = await prepareProfileDeleteRequest(request)
+  const initialTarget = initialResolution.target
+  const createdProfile = profileNameFromCreateRequest(request)
+  const renamedProfile = profileRenameFromRequest(request)
+  const creationMutation = createdProfile ? profileRevocations.startCreation(createdProfile) : null
 
-  const profile = request?.profile
-  // After tearing down a backend for profile deletion, route to the primary
-  // backend instead of spawning a fresh pool backend.  A freshly spawned
-  // backend calls ensure_hermes_home() which recreates the profile directory,
-  // defeating the deletion and leaving a zombie process.
-  const routeProfile = resolveRouteProfile(tornDownProfile, profile)
-  const connection = await ensureBackend(routeProfile)
-  const timeoutMs = resolveTimeoutMs(request?.timeoutMs, DEFAULT_FETCH_TIMEOUT_MS)
+  return runProfileMutationPreflight(
+    creationMutation,
+    async (handoff, track) => {
+      const deletion = await prepareProfileDeleteRequest(request)
 
-  const requestPath = pathWithGlobalRemoteProfile(request.path, profile, profileRouteOptions(profile))
+      if (deletion.mutation) {
+        track(deletion.mutation)
+      }
 
-  const url = `${connection.baseUrl}${requestPath}`
+      const tornDownProfile = deletion.profile
+      const profileMutation = deletion.mutation || creationMutation
 
-  // OAuth gateways authenticate REST via EITHER a native bearer token
-  // (cookieless RFC 8252 flow) OR the HttpOnly session cookie held in the OAuth
-  // partition. Prefer the native bearer when present (mirroring
-  // mintGatewayWsTicket): the native flow never sets a cookie, so routing an
-  // oauth-mode REST call through the cookie-only path returns 401 no_cookie even
-  // though a valid bearer is held. Cookie mode rides Electron's net stack bound
-  // to the OAuth partition so the cookie attaches automatically. Token/local
-  // modes keep using the static session-token header.
-  if (connection.authMode === 'oauth') {
-    // The OAuth path rides electron.net with JSON headers; multipart isn't
-    // wired there. Fail loudly rather than corrupting the upload.
-    if (request?.upload) {
-      throw new Error('File uploads are not supported against OAuth-gated remote backends yet.')
-    }
+      // Remote-profile session requests would otherwise hit the local primary off
+      // each profile's on-disk state.db — fine for local profiles, but a remote
+      // profile's sessions live on its remote host, so the UI's IDs 404 (or mutations
+      // no-op) the moment they run there. Route reads + mutations to the remote.
+      const rerouted = await interceptSessionRequestForRemote(request, initialTarget, boundTarget)
 
-    // Native bearer first (cookieless). ensureNativeAccessToken transparently
-    // refreshes a near-expiry AT via /auth/native/refresh; a null return means
-    // no native session (resolveOauthRestAuth then selects the cookie path).
-    const nativeAt = await ensureNativeAccessToken(connection.baseUrl).catch(() => null)
-    const restAuth = resolveOauthRestAuth(nativeAt)
+      if (rerouted !== undefined) {
+        return rerouted
+      }
 
-    if (restAuth.kind === 'bearer') {
-      return fetchJson(url, null, {
-        method: request?.method,
-        body: request?.body,
-        timeoutMs,
-        bearer: restAuth.token
-      })
-    }
+      // After tearing down a backend for profile deletion, route to the primary
+      // backend instead of spawning a fresh pool backend.  A freshly spawned
+      // backend calls ensure_hermes_home() which recreates the profile directory,
+      // defeating the deletion and leaving a zombie process.
+      const target = resolveRouteTarget(tornDownProfile, initialTarget)
+      const profile = target.kind === 'configured-profile' ? target.profile : request?.profile
 
-    return fetchJsonViaOauthSession(url, {
-      method: request?.method,
-      body: request?.body,
-      timeoutMs
-    })
-  }
+      const connection = await ensureBackendForTarget(target)
+      const timeoutMs = resolveTimeoutMs(request?.timeoutMs, DEFAULT_FETCH_TIMEOUT_MS)
 
-  return fetchJson(url, connection.token, {
-    method: request?.method,
-    body: request?.body,
-    upload: request?.upload,
-    timeoutMs
-  })
+      const requestPath = target.kind === 'forced-local-profile'
+        ? request.path
+        : pathWithGlobalRemoteProfile(request.path, profile, profileRouteOptions(profile))
+
+      const url = `${connection.baseUrl}${requestPath}`
+
+      // OAuth gateways authenticate REST via EITHER a native bearer token
+      // (cookieless RFC 8252 flow) OR the HttpOnly session cookie held in the OAuth
+      // partition. Prefer the native bearer when present (mirroring
+      // mintGatewayWsTicket): the native flow never sets a cookie, so routing an
+      // oauth-mode REST call through the cookie-only path returns 401 no_cookie even
+      // though a valid bearer is held. Cookie mode rides Electron's net stack bound
+      // to the OAuth partition so the cookie attaches automatically. Token/local
+      // modes keep using the static session-token header.
+      if (connection.authMode === 'oauth') {
+        // The OAuth path rides electron.net with JSON headers; multipart isn't
+        // wired there. Fail loudly rather than corrupting the upload.
+        if (request?.upload) {
+          throw new Error('File uploads are not supported against OAuth-gated remote backends yet.')
+        }
+
+        // Native bearer first (cookieless). ensureNativeAccessToken transparently
+        // refreshes a near-expiry AT via /auth/native/refresh; a null return means
+        // no native session (resolveOauthRestAuth then selects the cookie path).
+        const nativeAt = await ensureNativeAccessToken(connection.baseUrl).catch(() => null)
+        const restAuth = resolveOauthRestAuth(nativeAt)
+
+        handoff()
+
+        if (restAuth.kind === 'bearer') {
+          return completeProfileMutation(
+            profileMutation,
+            () => fetchJson(url, null, {
+              method: request?.method,
+              body: request?.body,
+              timeoutMs,
+              bearer: restAuth.token
+            }),
+            renamedProfile
+          )
+        }
+
+        return completeProfileMutation(
+          profileMutation,
+          () => fetchJsonViaOauthSession(url, {
+            method: request?.method,
+            body: request?.body,
+            timeoutMs
+          }),
+          renamedProfile
+        )
+      }
+
+      handoff()
+
+      return completeProfileMutation(
+        profileMutation,
+        () => fetchJson(url, connection.token, {
+          method: request?.method,
+          body: request?.body,
+          upload: request?.upload,
+          timeoutMs
+        }),
+        renamedProfile
+      )
+    },
+    (mutation, succeeded) => profileRevocations.completeMutation({ mutation, succeeded })
+  )
 })
 
 // One deduper per cross-window cue — the choke point every window shares. Main
@@ -12982,7 +13582,13 @@ ipcMain.handle('hermes:terminal:start', async (event, payload = {}) => {
   const cols = Math.max(2, Number.parseInt(String(payload?.cols || 80), 10) || 80)
   const rows = Math.max(2, Number.parseInt(String(payload?.rows || 24), 10) || 24)
 
-  const sshTarget = await resolveTerminalConnection(activeSshTerminalTarget, () => ensureBackend(primaryProfileKey()))
+  const target = activeWindowTarget(event.sender.id)
+
+  const sshTarget = await resolveTerminalConnection(
+    () => activeSshTerminalTarget(target),
+    () => ensureBackendForTarget(target)
+  )
+
   const remote = Boolean(sshTarget)
   const remoteState = remote ? sshConnections.get(sshTarget.scope) : null
 

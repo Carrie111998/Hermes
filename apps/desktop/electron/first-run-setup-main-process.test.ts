@@ -47,6 +47,7 @@ test('a first-run bootstrap-needed remote apply connects without ensuring or boo
   const pendingConnection = runPrimaryBackendStartup({
     connectRemote,
     ensureLocalRuntime,
+    ensureCurrent: () => {},
     prepareLocalBackend,
     resolveRemote,
     waitForDecision: gate.wait,
@@ -72,7 +73,7 @@ test('a first-run bootstrap-needed remote apply connects without ensuring or boo
       }),
     scope: '',
     sendApplied: notifyConnectionApplied,
-    stopPool: vi.fn(),
+    stopProfilePool: vi.fn(),
     teardownPrimary: teardownPrimaryBackend,
     teardownSsh
   })

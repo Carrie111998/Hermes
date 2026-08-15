@@ -12,6 +12,13 @@ import type { QuickEntryStatePush, QuickEntryStatus, QuickEntrySubmitPayload } f
 export {}
 
 declare global {
+  interface WindowBackendTargetChoice {
+    current: boolean
+    description: string
+    id: string
+    label: string
+  }
+
   interface Window {
     hermesDesktop: {
       // Resolve a backend connection. Omit `profile` (or pass the primary) for
@@ -31,10 +38,14 @@ declare global {
       getGatewayWsUrl: (profile?: null | string) => Promise<GatewayWsUrlResult>
       // Open (or focus) a standalone OS window for a single chat session so
       // the user can work with multiple chats side by side. Returns ok:false
-      // with an error code when the sessionId is empty/invalid. `watch` opens
-      // a spectator window (lazy resume — no agent build) for live-streaming
-      // a running subagent's session.
-      openSessionWindow: (sessionId: string, opts?: { watch?: boolean }) => Promise<{ ok: boolean; error?: string }>
+      // with an error code when the sessionId or profile is invalid. `watch`
+      // opens a spectator window (lazy resume — no agent build) for
+      // live-streaming a running subagent's session. `profile` selects the
+      // owning backend before the auxiliary renderer's first gateway dial.
+      openSessionWindow: (
+        sessionId: string,
+        opts?: { profile?: null | string; watch?: boolean }
+      ) => Promise<{ ok: boolean; error?: string }>
       // Resume this session in the user's own terminal emulator (`hermes --tui
       // --resume <id>`) — the external terminal, not the in-app pane.
       openSessionInTerminal: (
@@ -44,7 +55,8 @@ declare global {
       // Open a new full-chrome app window — a peer instance of the primary that
       // renders the complete app against the shared backend, so the user can run
       // multiple GUI windows at once.
-      openWindow: () => Promise<{ ok: boolean; error?: string }>
+      listWindowBackendTargets: () => Promise<WindowBackendTargetChoice[]>
+      openWindow: (targetId?: string) => Promise<{ ok: boolean; error?: string }>
       // Claim a one-shot cross-window ambient cue (turn-end sound / spoken
       // reply). Resolves true for the first window to claim a key, false for
       // peers — so N open windows don't all fire the same cue.
@@ -319,6 +331,7 @@ declare global {
         write: (id: string, data: string) => Promise<boolean>
       }
       onClosePreviewRequested?: (callback: () => void) => () => void
+      onNewWindowRequested?: (callback: () => void) => () => void
       onOpenFolderRequested?: (callback: () => void) => () => void
       onOpenUpdatesRequested?: (callback: () => void) => () => void
       onDeepLink?: (

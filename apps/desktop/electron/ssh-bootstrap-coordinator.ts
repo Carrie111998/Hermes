@@ -23,8 +23,21 @@ function createBootstrapCoordinator() {
   const pending = new Map<string, any>()
   const generations = new Map<string, number>()
   const drains = new Map<string, Promise<void>>()
+  const retirements = new Map<string, number>()
+
+  function scopeError(kind, message) {
+    const error: any = new Error(message)
+
+    error.kind = kind
+
+    return error
+  }
 
   function start(scope, fingerprint, run) {
+    if (retirements.has(scope)) {
+      return Promise.reject(scopeError('retired', 'SSH connection scope is being retired.'))
+    }
+
     const current = pending.get(scope)
 
     if (current?.fingerprint === fingerprint) {
@@ -110,6 +123,29 @@ function createBootstrapCoordinator() {
     }
   }
 
+  async function retireAndRun(scope, operation) {
+    retirements.set(scope, (retirements.get(scope) || 0) + 1)
+    const entries = [...active].filter(entry => entry.scope === scope)
+
+    for (const entry of entries) {
+      entry.controller.abort()
+    }
+
+    try {
+      await Promise.allSettled(entries.map(entry => entry.promise))
+
+      return await operation()
+    } finally {
+      const remaining = (retirements.get(scope) || 1) - 1
+
+      if (remaining > 0) {
+        retirements.set(scope, remaining)
+      } else {
+        retirements.delete(scope)
+      }
+    }
+  }
+
   function cancelAll() {
     for (const entry of active) {
       entry.controller.abort()
@@ -125,7 +161,18 @@ function createBootstrapCoordinator() {
     return [...active].map(entry => entry.promise)
   }
 
-  return { active, cancel, cancelAll, cancelAndWait, forceCleanupAll, pending, promises, start }
+  return {
+    active,
+    cancel,
+    cancelAll,
+    cancelAndWait,
+    forceCleanupAll,
+    pending,
+    promises,
+    retireAndRun,
+    retirements,
+    start
+  }
 }
 
 export { createBootstrapCoordinator, sshConfigFingerprint }

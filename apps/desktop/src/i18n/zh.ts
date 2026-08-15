@@ -2697,6 +2697,34 @@ export const zh: Translations = {
     addProvider: '添加提供方…'
   },
 
+  windowBackend: {
+    openWithBackend: '使用指定后端打开新窗口…',
+    newWindowPolicy: {
+      title: '新窗口后端',
+      description: '选择普通新窗口确定后端的方式。“使用指定后端打开新窗口…”仍可用于单次选择。',
+      inherit: '与当前窗口相同',
+      primary: '主后端',
+      ask: '每次询问'
+    },
+    title: '选择后端',
+    description: '新窗口将连接到你选择的后端。',
+    search: '搜索后端…',
+    current: '当前',
+    loading: '正在加载后端选项…',
+    loadFailed: '无法加载后端选项。',
+    empty: '尚未配置后端选项。',
+    noMatch: '没有与搜索匹配的后端。',
+    primary: { label: '当前后端', description: '使用应用当前的主后端。' },
+    configuredProfile: {
+      label: profile => `已配置 — ${profile}`,
+      description: profile => `使用为 ${profile} 配置的后端路由。`
+    },
+    forcedLocalProfile: {
+      label: profile => `本地 — ${profile}`,
+      description: profile => `在此计算机上运行 ${profile} 配置文件。`
+    }
+  },
+
   shell: {
     windowControls: '窗口控件',
     paneControls: '面板控件',

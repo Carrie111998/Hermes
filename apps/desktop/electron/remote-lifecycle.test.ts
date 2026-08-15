@@ -1,4 +1,10 @@
 import assert from 'node:assert/strict'
+import { execFile as execFileCallback, spawn } from 'node:child_process'
+import { once } from 'node:events'
+import { chmod, copyFile, mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { promisify } from 'node:util'
 
 import { test } from 'vitest'
 
@@ -31,6 +37,7 @@ import {
 
 const OWNERSHIP_ID = '0123456789abcdef0123456789abcdef'
 const SPAWN_NONCE = '0123456789abcdef'
+const execFile = promisify(execFileCallback)
 
 function ownedLock(over: any = {}) {
   return {
@@ -72,6 +79,10 @@ function fakeSsh(rules: any[] = []) {
 
           return out
         }
+      }
+
+      if (cmd.includes('print("PROCESS_PATH="+process_path)')) {
+        return 'PROCESS_PATH=/x/hermes\n'
       }
 
       return ''
@@ -268,6 +279,271 @@ test('pidIsOurDashboard requires the exact serve ownership nonce', async () => {
   assert.equal(await pidIsOurDashboard(fakeSsh([[/print\("OWNED"/, 'FOREIGN\n']]), 5, SPAWN_NONCE, '/x/hermes'), false)
 })
 
+test('pidIsOurDashboard proves the effective entrypoint behind an installer wrapper', async () => {
+  const wrapperPath = '/home/u/.local/bin/hermes'
+  const entrypointPath = '/home/u/.hermes/hermes-agent/hermes'
+
+  const ssh = fakeSsh([
+    [/print\("PROCESS_PATH="/, `PROCESS_PATH=${entrypointPath}\n`],
+    [
+      /print\("OWNED"/,
+      command =>
+        command.includes(entrypointPath) && !command.includes(`expected='${wrapperPath}'`) ? 'OWNED\n' : 'FOREIGN\n'
+    ]
+  ])
+
+  assert.equal(await pidIsOurDashboard(ssh, 5, SPAWN_NONCE, wrapperPath), true)
+  assert.equal(ssh.calls.length, 2)
+})
+
+test.runIf(process.platform !== 'win32')('pidIsOurDashboard treats the Hermes path as data in remote Python', async () => {
+  const hermesPath = `/tmp/x');__import__("pathlib").Path("/tmp/injected").touch();#`
+  let resolverCommand = ''
+
+  const ssh = {
+    async exec(command: string) {
+      resolverCommand = command
+      throw new Error('stop after command capture')
+    }
+  }
+
+  await assert.rejects(() => pidIsOurDashboard(ssh, 5, SPAWN_NONCE, hermesPath))
+
+  const { stdout } = await execFile('python3', [
+    '-c',
+    'import json,shlex,sys;print(json.dumps(shlex.split(sys.argv[1])))',
+    resolverCommand
+  ])
+
+  const argv = JSON.parse(stdout)
+
+  assert.equal(argv.length, 4)
+  assert.equal(argv[3], hermesPath)
+  assert.ok(!argv[2].includes(hermesPath))
+})
+
+test.runIf(process.platform !== 'win32')('pidIsOurDashboard treats ownership proof values as remote Python argv', async () => {
+  const processPath = `/tmp/x');__import__("pathlib").Path("/tmp/injected").touch();#`
+  let ownershipCommand = ''
+
+  const ssh = fakeSsh([
+    [/print\("PROCESS_PATH="/, `PROCESS_PATH=${processPath}\n`],
+    [
+      /print\("OWNED"/,
+      command => {
+        ownershipCommand = command
+        throw new Error('stop after command capture')
+      }
+    ]
+  ])
+
+  await assert.rejects(() => pidIsOurDashboard(ssh, 5, SPAWN_NONCE, '/x/hermes'))
+
+  const { stdout } = await execFile('python3', [
+    '-c',
+    'import json,shlex,sys;print(json.dumps(shlex.split(sys.argv[1])))',
+    ownershipCommand
+  ])
+
+  const argv = JSON.parse(stdout)
+
+  assert.deepEqual(argv.slice(3), ['5', processPath, SPAWN_NONCE])
+  assert.ok(!argv[2].includes(processPath))
+  assert.ok(!argv[2].includes(SPAWN_NONCE))
+})
+
+test('pidIsOurDashboard fails closed on malformed ownership-path output', async () => {
+  const ssh = fakeSsh([
+    [/print\("PROCESS_PATH="/, 'not-a-process-path\n'],
+    [/print\("OWNED"/, 'OWNED\n']
+  ])
+
+  assert.equal(await pidIsOurDashboard(ssh, 5, SPAWN_NONCE, '/x/hermes'), false)
+  assert.equal(ssh.calls.length, 1)
+})
+
+test.runIf(process.platform !== 'win32')('pidIsOurDashboard does not trust a textual exec in a noncanonical wrapper', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'hermes-ownership-wrapper-'))
+  const wrapperPath = join(directory, 'hermes')
+  const trustedEntrypoint = join(directory, 'trusted-entrypoint')
+  const actualEntrypoint = join(directory, 'actual-entrypoint')
+  const pythonPath = join(directory, 'python3')
+  const calls: string[] = []
+
+  try {
+    for (const path of [trustedEntrypoint, actualEntrypoint, pythonPath]) {
+      await writeFile(path, '')
+      await chmod(path, 0o700)
+    }
+
+    await writeFile(
+      wrapperPath,
+      [
+        '#!/usr/bin/env bash',
+        'if false; then',
+        `  exec "${pythonPath}" "${trustedEntrypoint}" "$@"`,
+        'fi',
+        `exec "${pythonPath}" "${actualEntrypoint}" "$@"`,
+        ''
+      ].join('\n')
+    )
+    await chmod(wrapperPath, 0o700)
+
+    const ssh = {
+      calls,
+      async exec(command: string) {
+        calls.push(command)
+
+        if (command.includes('PROCESS_PATH=')) {
+          return (await execFile('/bin/sh', ['-c', command])).stdout
+        }
+
+        return command.includes(trustedEntrypoint) ? 'OWNED\n' : 'FOREIGN\n'
+      }
+    }
+
+    assert.equal(await pidIsOurDashboard(ssh, 5, SPAWN_NONCE, wrapperPath), false)
+  } finally {
+    await rm(directory, { recursive: true, force: true })
+  }
+})
+
+test.runIf(process.platform !== 'win32')('pidIsOurDashboard rejects a group-writable direct-wrapper entrypoint', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'hermes-ownership-direct-wrapper-'))
+  const entrypoint = join(directory, 'hermes-entrypoint')
+  const wrapperPath = join(directory, 'hermes')
+  let ownershipChecks = 0
+
+  try {
+    await writeFile(entrypoint, '')
+    await chmod(entrypoint, 0o755)
+    await writeFile(
+      wrapperPath,
+      [
+        '#!/usr/bin/env bash',
+        'unset PYTHONPATH',
+        'unset PYTHONHOME',
+        `exec "${entrypoint}" "$@"`
+      ].join('\n')
+    )
+    await chmod(wrapperPath, 0o700)
+
+    const ssh = {
+      async exec(command: string) {
+        if (command.includes('PROCESS_PATH=')) {
+          return (await execFile('/bin/sh', ['-c', command])).stdout
+        }
+
+        ownershipChecks += 1
+
+        return 'FOREIGN\n'
+      }
+    }
+
+    assert.equal(await pidIsOurDashboard(ssh, 5, SPAWN_NONCE, wrapperPath), false)
+    assert.equal(ownershipChecks, 1)
+
+    await chmod(entrypoint, 0o775)
+    ownershipChecks = 0
+
+    assert.equal(await pidIsOurDashboard(ssh, 5, SPAWN_NONCE, wrapperPath), false)
+    assert.equal(ownershipChecks, 0)
+  } finally {
+    await rm(directory, { recursive: true, force: true })
+  }
+})
+
+test.runIf(process.platform !== 'win32')('pidIsOurDashboard accepts a canonical wrapper using a uv-venv Python symlink', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'hermes-ownership-uv-venv-'))
+  const venvPath = join(directory, '.venv')
+  const pythonPath = join(venvPath, 'bin', 'python')
+  const entrypoint = join(directory, 'hermes-entrypoint')
+  const wrapperPath = join(directory, 'hermes')
+  let child: ReturnType<typeof spawn> | null = null
+
+  try {
+    const { stdout: pythonExecutable } = await execFile('python3', [
+      '-c',
+      'import os,sys;print(os.path.realpath(sys.executable))'
+    ])
+    const ownedPython = join(directory, 'python')
+    await copyFile(pythonExecutable.trim(), ownedPython)
+    await chmod(ownedPython, 0o700)
+    await mkdir(join(venvPath, 'bin'), { recursive: true })
+    await symlink(ownedPython, pythonPath)
+
+    await writeFile(entrypoint, 'import time\nprint("READY", flush=True)\ntime.sleep(30)\n')
+    await chmod(entrypoint, 0o700)
+    await writeFile(
+      wrapperPath,
+      [
+        '#!/usr/bin/env bash',
+        'unset PYTHONPATH',
+        'unset PYTHONHOME',
+        `exec "${pythonPath}" "${entrypoint}" "$@"`
+      ].join('\n')
+    )
+    await chmod(wrapperPath, 0o700)
+
+    child = spawn(wrapperPath, ['serve', '--isolated', '--ssh-owner-nonce', SPAWN_NONCE])
+
+    const ready = await Promise.race([
+      once(child.stdout!, 'data'),
+      once(child, 'error').then(([error]) => Promise.reject(error)),
+      once(child, 'exit').then(([code, signal]) =>
+        Promise.reject(new Error(`uv-venv ownership child exited before readiness (code=${code}, signal=${signal})`))
+      )
+    ])
+    assert.match(String(ready[0]), /READY/)
+
+    const ssh = {
+      async exec(command: string) {
+        return (await execFile('/bin/sh', ['-c', command])).stdout
+      }
+    }
+
+    assert.equal(await pidIsOurDashboard(ssh, child.pid, SPAWN_NONCE, wrapperPath), true)
+  } finally {
+    child?.kill('SIGKILL')
+    await rm(directory, { recursive: true, force: true })
+  }
+})
+
+test.runIf(process.platform !== 'win32')('pidIsOurDashboard rejects a process with duplicate owner nonce options', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'hermes-ownership-nonce-'))
+  const entrypoint = join(directory, 'hermes-entrypoint')
+  const otherNonce = 'fedcba9876543210'
+
+  try {
+    await writeFile(entrypoint, 'import time\ntime.sleep(30)\n')
+    await chmod(entrypoint, 0o700)
+
+    const child = spawn('python3', [
+      entrypoint,
+      'serve',
+      '--isolated',
+      '--ssh-owner-nonce',
+      SPAWN_NONCE,
+      '--ssh-owner-nonce',
+      otherNonce
+    ])
+
+    try {
+      const ssh = {
+        async exec(command: string) {
+          return (await execFile('/bin/sh', ['-c', command])).stdout
+        }
+      }
+
+      assert.equal(await pidIsOurDashboard(ssh, child.pid, SPAWN_NONCE, entrypoint), false)
+    } finally {
+      child.kill('SIGKILL')
+    }
+  } finally {
+    await rm(directory, { recursive: true, force: true })
+  }
+})
+
 test('cleanupStale kills ONLY a provably-ours pid, always drops the lockfile', async () => {
   const notOurs = fakeSsh([[/print\("OWNED"/, 'FOREIGN\n']])
   await cleanupStale(notOurs, OWNERSHIP_ID, {
@@ -288,6 +564,52 @@ test('cleanupStale kills ONLY a provably-ours pid, always drops the lockfile', a
   })
   assert.ok(ours.calls.some(c => /kill 9\b/.test(c)))
   assert.ok(ours.calls.some(c => /rm -f/.test(c)))
+})
+
+test('cleanupStale force-kills a TERM-wedged backend only after ownership is revalidated', async () => {
+  let ownershipProofs = 0
+
+  const ssh = fakeSsh([
+    [
+      /print\("OWNED"/,
+      () => {
+        ownershipProofs++
+
+        return 'OWNED\n'
+      }
+    ],
+    [command => /^kill 333\b/.test(command) && !command.includes('kill -KILL'), 'STILL_RUNNING\n'],
+    [/kill -KILL 333\b/, '']
+  ])
+
+  await cleanupStale(ssh, OWNERSHIP_ID, ownedLock())
+
+  assert.equal(ownershipProofs, 2)
+  assert.ok(ssh.calls.some(command => /kill -KILL 333\b/.test(command)))
+  assert.ok(ssh.calls.some(command => /rm -f .*backend\.lock\.json/.test(command)))
+})
+
+test('cleanupStale preserves the lock when ownership changes after TERM', async () => {
+  let ownershipProofs = 0
+
+  const ssh = fakeSsh([
+    [
+      /print\("OWNED"/,
+      () => {
+        ownershipProofs++
+
+        return ownershipProofs === 1 ? 'OWNED\n' : 'FOREIGN\n'
+      }
+    ],
+    [command => /^kill 333\b/.test(command) && !command.includes('kill -KILL'), 'STILL_RUNNING\n']
+  ])
+
+  await assert.rejects(
+    () => cleanupStale(ssh, OWNERSHIP_ID, ownedLock()),
+    (error: any) => error.kind === 'transient-transport-error'
+  )
+  assert.ok(!ssh.calls.some(command => /kill -KILL 333\b/.test(command)))
+  assert.ok(!ssh.calls.some(command => /rm -f .*backend\.lock\.json/.test(command)))
 })
 
 test('buildSpawnCommand is headless serve, detached, token not in argv', () => {
@@ -1077,7 +1399,6 @@ test('connect replaces an exact-owned backend only after authenticated stale pro
     [/kill -0 333/, 'ALIVE'],
     [/print\("OWNED"/, 'OWNED\n'],
     [/grep -q ssh-session-token-file/, 'YES\n'],
-    [/python3 -c/, ''],
     [/setsid/, '999\n'],
     [/kill -0 999/, 'ALIVE'],
     [/cat .*\.log/, 'HERMES_DASHBOARD_READY port=43000\n']

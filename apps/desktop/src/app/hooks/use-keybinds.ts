@@ -58,7 +58,7 @@ import {
   switcherJustClosed
 } from '@/store/session-switcher'
 import { toggleStatusbarVisible } from '@/store/statusbar-prefs'
-import { openNewWindow } from '@/store/windows'
+import { requestNewWindow } from '@/store/window-backend-picker'
 import { useTheme } from '@/themes/context'
 
 import { requestComposerFocus, requestModelMenuToggle, requestVoiceToggle } from '../chat/composer/focus'
@@ -205,7 +205,7 @@ export function useKeybinds(deps: KeybindRuntimeDeps): void {
       window.dispatchEvent(new CustomEvent('hermes:new-session-shortcut'))
     },
     'session.newTab': () => deps.openNewSessionTab(),
-    'session.newWindow': () => void openNewWindow(),
+    'session.newWindow': () => void requestNewWindow(),
     'session.next': () => cycleTab(1),
     'session.prev': () => cycleTab(-1),
     ...sessionSlotHandlers,

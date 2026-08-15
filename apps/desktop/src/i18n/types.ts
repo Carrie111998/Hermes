@@ -2111,6 +2111,37 @@ export interface Translations {
     addProvider: string
   }
 
+  windowBackend: {
+    openWithBackend: string
+    newWindowPolicy: {
+      title: string
+      description: string
+      inherit: string
+      primary: string
+      ask: string
+    }
+    title: string
+    description: string
+    search: string
+    current: string
+    loading: string
+    loadFailed: string
+    empty: string
+    noMatch: string
+    primary: {
+      label: string
+      description: string
+    }
+    configuredProfile: {
+      label: (profile: string) => string
+      description: (profile: string) => string
+    }
+    forcedLocalProfile: {
+      label: (profile: string) => string
+      description: (profile: string) => string
+    }
+  }
+
   shell: {
     windowControls: string
     paneControls: string

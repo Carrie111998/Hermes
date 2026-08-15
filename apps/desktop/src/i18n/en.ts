@@ -2522,6 +2522,38 @@ export const en: Translations = {
     addProvider: 'Add provider…'
   },
 
+  windowBackend: {
+    openWithBackend: 'New window with backend…',
+    newWindowPolicy: {
+      title: 'New window backend',
+      description:
+        'Choose how ordinary new windows select a backend. “New window with backend…” remains available for one-off choices.',
+      inherit: 'Same as current window',
+      primary: 'Primary backend',
+      ask: 'Ask every time'
+    },
+    title: 'Choose a backend',
+    description: 'The new window will connect to the backend you select.',
+    search: 'Search backends…',
+    current: 'Current',
+    loading: 'Loading backend choices…',
+    loadFailed: 'Could not load backend choices.',
+    empty: 'No backend choices are configured.',
+    noMatch: 'No backends match your search.',
+    primary: {
+      label: 'Current backend',
+      description: 'Use the app’s current primary backend.'
+    },
+    configuredProfile: {
+      label: profile => `Configured — ${profile}`,
+      description: profile => `Use the configured backend route for ${profile}.`
+    },
+    forcedLocalProfile: {
+      label: profile => `Local — ${profile}`,
+      description: profile => `Run the ${profile} profile on this computer.`
+    }
+  },
+
   shell: {
     windowControls: 'Window controls',
     paneControls: 'Pane controls',

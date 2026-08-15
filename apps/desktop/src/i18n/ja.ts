@@ -2267,6 +2267,34 @@ export const ja = defineLocale({
     addProvider: 'プロバイダーを追加…'
   },
 
+  windowBackend: {
+    openWithBackend: 'バックエンドを選んで新しいウィンドウ…',
+    newWindowPolicy: {
+      title: '新しいウィンドウのバックエンド',
+      description: '通常の新しいウィンドウでバックエンドを選ぶ方法を指定します。「バックエンドを選んで新しいウィンドウ…」は一回限りの選択に引き続き使用できます。',
+      inherit: '現在のウィンドウと同じ',
+      primary: 'プライマリバックエンド',
+      ask: '毎回確認する'
+    },
+    title: 'バックエンドを選択',
+    description: '新しいウィンドウは選択したバックエンドに接続します。',
+    search: 'バックエンドを検索…',
+    current: '現在',
+    loading: 'バックエンドを読み込み中…',
+    loadFailed: 'バックエンドを読み込めませんでした。',
+    empty: '設定済みのバックエンドがありません。',
+    noMatch: '検索に一致するバックエンドがありません。',
+    primary: { label: '現在のバックエンド', description: 'アプリの現在のプライマリバックエンドを使用します。' },
+    configuredProfile: {
+      label: profile => `設定済み — ${profile}`,
+      description: profile => `${profile} に設定されたバックエンド経路を使用します。`
+    },
+    forcedLocalProfile: {
+      label: profile => `ローカル — ${profile}`,
+      description: profile => `このコンピューターで ${profile} プロファイルを実行します。`
+    }
+  },
+
   shell: {
     windowControls: 'ウィンドウコントロール',
     paneControls: 'ペインコントロール',
