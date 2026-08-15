@@ -64,43 +64,30 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from hermes_constants import get_hermes_home
+from hermes_cli.kanban_runtime.dispatcher import (
+    _pool_may_recover_from_rate_limit,
+    _qwen_portal_headers,
+    _routermint_headers,
+)
 
+from hermes_cli.kanban_runtime.entrance import (
+    main,
+)
 
-def _launch_cwd_for_session(source: str) -> Optional[str]:
-    """Working directory to stamp on a new session row, or None.
+from hermes_cli.kanban_runtime.events import (
+    _StreamErrorEvent,
+)
 
-    Only local CLI sessions get a recorded cwd: the directory the process was
-    launched from is meaningful for ``hermes -c`` / ``--resume`` (relaunch
-    where you left off). Gateway/cron/remote-backend sessions have no stable
-    host cwd to restore, so they record nothing.
+from hermes_cli.kanban_runtime.paths import (
+    _launch_cwd_for_session,
+    _safe_session_filename_component,
+    _session_source_for_agent,
+)
 
-    ``TERMINAL_ENV`` is set by the CLI's config bridge (``load_cli_config``);
-    a non-"local" backend (docker/ssh/modal/...) means the host cwd is
-    irrelevant to the agent's tools, so we skip it there too.
-    """
-    if source != "cli":
-        return None
-    backend = (os.environ.get("TERMINAL_ENV") or "local").strip().lower()
-    if backend and backend != "local":
-        return None
-    try:
-        return os.getcwd()
-    except OSError:
-        # cwd was unlinked out from under us — nothing meaningful to record.
-        return None
+from hermes_cli.kanban_runtime.scaffolding import (
+    _is_ephemeral_scaffolding,
+)
 
-
-def _session_source_for_agent(platform: Optional[str]) -> str:
-    try:
-        from gateway.session_context import get_session_env
-
-        source = get_session_env("HERMES_SESSION_SOURCE", "")
-    except Exception:
-        source = os.environ.get("HERMES_SESSION_SOURCE", "")
-    source = str(source or "").strip()
-    if source:
-        return source
-    return platform or "cli"
 
 
 # OpenAI lazy proxy + safe stdio + proxy URL helpers — see agent/process_bootstrap.py.
@@ -254,14 +241,6 @@ _EPHEMERAL_SCAFFOLDING_FLAGS = (
 )
 
 
-def _is_ephemeral_scaffolding(msg: Any) -> bool:
-    """Return True when ``msg`` is internal recovery scaffolding that must never
-    be persisted to the durable transcript (SQLite session store or JSON log)."""
-    return isinstance(msg, dict) and any(
-        msg.get(flag) for flag in _EPHEMERAL_SCAFFOLDING_FLAGS
-    )
-
-
 _MAX_TOOL_WORKERS = 8
 
 # Intrinsic marker stamped on a message dict once it has been written to the
@@ -296,117 +275,6 @@ _openrouter_prewarm_done = threading.Event()
 # _apply_client_headers_for_base_url can share it.
 # =========================================================================
 _QWEN_CODE_VERSION = "0.14.1"
-
-
-def _routermint_headers() -> dict:
-    """Return the User-Agent RouterMint needs to avoid Cloudflare 1010 blocks."""
-    from hermes_cli import __version__ as _HERMES_VERSION
-
-    return {
-        "User-Agent": f"HermesAgent/{_HERMES_VERSION}",
-    }
-
-
-def _pool_may_recover_from_rate_limit(pool) -> bool:
-    """Decide whether to wait for credential-pool rotation instead of falling back.
-
-    The existing pool-rotation path requires the pool to (1) exist and (2) have
-    at least one entry not currently in exhaustion cooldown.  But rotation is
-    only meaningful when the pool has more than one entry.
-
-    With a single-credential pool (common for Vertex service accounts and any
-    "one personal key" configuration), the primary entry just 429'd and there
-    is nothing to rotate to.  Waiting for the pool cooldown to expire means
-    retrying against the same exhausted quota — the daily-quota 429 will recur
-    immediately, and the retry budget is burned.
-
-    In that case we must fall back to the configured ``fallback_model``
-    instead.  Returns True only when rotation has somewhere to go.
-
-    See issues #11314 and #13636.
-    """
-    if pool is None:
-        return False
-    if not pool.has_available():
-        return False
-    return len(pool.entries()) > 1
-
-
-def _qwen_portal_headers() -> dict:
-    """Return default HTTP headers required by Qwen Portal API."""
-    import platform as _plat
-
-    _ua = f"QwenCode/{_QWEN_CODE_VERSION} ({_plat.system().lower()}; {_plat.machine()})"
-    return {
-        "User-Agent": _ua,
-        "X-DashScope-CacheControl": "enable",
-        "X-DashScope-UserAgent": _ua,
-        "X-DashScope-AuthType": "qwen-oauth",
-    }
-
-
-def _safe_session_filename_component(session_id: str) -> str:
-    """Return a stable, path-safe filename component for a session ID.
-
-    Session IDs can originate from untrusted input (e.g. the
-    ``X-Hermes-Session-Id`` API header) and are otherwise interpolated raw
-    into on-disk artifact filenames under ``~/.hermes/sessions/``.  Without
-    sanitization, a traversal-shaped ID such as ``../../../../etc/pwned``
-    would let a caller write the session snapshot / request dump outside the
-    sessions directory.  This collapses every non ``[A-Za-z0-9_-]`` character
-    to ``_`` (so no path separators or ``.`` survive), caps the length, and —
-    when sanitization changed the string — appends a short content hash so two
-    distinct IDs that sanitize to the same component don't collide.  The
-    result is always a single, traversal-free path segment.
-    """
-    raw = str(session_id or "").strip()
-    sanitized = re.sub(r"[^\w-]", "_", raw).strip("._")
-    sanitized = sanitized[:96] or "session"
-    if raw and sanitized == raw:
-        return sanitized
-    digest = hashlib.sha256(
-        raw.encode("utf-8", errors="surrogatepass")
-    ).hexdigest()[:12]
-    return f"{sanitized}_{digest}"
-
-
-class _StreamErrorEvent(Exception):
-    """Synthesized provider error surfaced from a Responses ``error`` SSE frame.
-
-    Some Codex-style Responses backends (xAI for subscription/quota
-    failures, custom relays under malformed-tool-call conditions) emit a
-    standalone ``type=error`` frame instead of routing the failure
-    through ``response.failed`` or returning an HTTP 4xx.  The fallback
-    streaming path raises this exception so ``_summarize_api_error`` and
-    ``_extract_api_error_context`` see a familiar ``.body`` /
-    ``.status_code`` shape and the entitlement detector can match the
-    underlying provider message ("do not have an active Grok
-    subscription", etc.).
-    """
-
-    def __init__(
-        self,
-        message: str,
-        *,
-        code: Optional[str] = None,
-        param: Optional[str] = None,
-        status_code: Optional[int] = None,
-    ) -> None:
-        super().__init__(message)
-        self.message = message
-        self.code = code
-        self.param = param
-        self.status_code = status_code
-        # OpenAI SDK-shaped body so _extract_api_error_context /
-        # _summarize_api_error / classify_api_error all pick it up.
-        self.body: Dict[str, Any] = {
-            "error": {
-                "message": message,
-                "code": code,
-                "param": param,
-                "type": "error",
-            }
-        }
 
 
 class AIAgent:
@@ -8532,219 +8400,6 @@ class AIAgent:
         """Forwarder — see ``agent.codex_runtime.run_codex_app_server_turn``."""
         from agent.codex_runtime import run_codex_app_server_turn
         return run_codex_app_server_turn(self, user_message=user_message, original_user_message=original_user_message, messages=messages, effective_task_id=effective_task_id, should_review_memory=should_review_memory)
-
-def main(
-    query: str = None,
-    model: str = "",
-    api_key: str = None,
-    base_url: str = "",
-    max_turns: int = 10,
-    enabled_toolsets: str = None,
-    disabled_toolsets: str = None,
-    list_tools: bool = False,
-    save_trajectories: bool = False,
-    save_sample: bool = False,
-    verbose: bool = False,
-    log_prefix_chars: int = 20
-):
-    """
-    Main function for running the agent directly.
-
-    Args:
-        query (str): Natural language query for the agent. Defaults to Python 3.13 example.
-        model (str): Model name to use (OpenRouter format: provider/model). Defaults to anthropic/claude-sonnet-4.6.
-        api_key (str): API key for authentication. Uses OPENROUTER_API_KEY env var if not provided.
-        base_url (str): Base URL for the model API. Defaults to https://openrouter.ai/api/v1
-        max_turns (int): Maximum number of API call iterations. Defaults to 10.
-        enabled_toolsets (str): Comma-separated list of toolsets to enable. Supports predefined
-                              toolsets (e.g., "research", "development", "safe").
-                              Multiple toolsets can be combined: "web,vision"
-        disabled_toolsets (str): Comma-separated list of toolsets to disable (e.g., "terminal")
-        list_tools (bool): Just list available tools and exit
-        save_trajectories (bool): Save conversation trajectories to JSONL files (appends to trajectory_samples.jsonl). Defaults to False.
-        save_sample (bool): Save a single trajectory sample to a UUID-named JSONL file for inspection. Defaults to False.
-        verbose (bool): Enable verbose logging for debugging. Defaults to False.
-        log_prefix_chars (int): Number of characters to show in log previews for tool calls/responses. Defaults to 20.
-
-    Toolset Examples:
-        - "research": Web search, extract, crawl + vision tools
-    """
-    print("🤖 AI Agent with Tool Calling")
-    print("=" * 50)
-    
-    # Handle tool listing
-    if list_tools:
-        from model_tools import get_all_tool_names, get_available_toolsets
-        from toolsets import get_all_toolsets, get_toolset_info
-        
-        print("📋 Available Tools & Toolsets:")
-        print("-" * 50)
-        
-        # Show new toolsets system
-        print("\n🎯 Predefined Toolsets (New System):")
-        print("-" * 40)
-        all_toolsets = get_all_toolsets()
-        
-        # Group by category
-        basic_toolsets = []
-        composite_toolsets = []
-        scenario_toolsets = []
-        
-        for name, toolset in all_toolsets.items():
-            info = get_toolset_info(name)
-            if info:
-                entry = (name, info)
-                if name in {"web", "terminal", "vision", "creative", "reasoning"}:
-                    basic_toolsets.append(entry)
-                elif name in {"research", "development", "analysis", "content_creation", "full_stack"}:
-                    composite_toolsets.append(entry)
-                else:
-                    scenario_toolsets.append(entry)
-        
-        # Print basic toolsets
-        print("\n📌 Basic Toolsets:")
-        for name, info in basic_toolsets:
-            tools_str = ', '.join(info['resolved_tools']) if info['resolved_tools'] else 'none'
-            print(f"  • {name:15} - {info['description']}")
-            print(f"    Tools: {tools_str}")
-        
-        # Print composite toolsets
-        print("\n📂 Composite Toolsets (built from other toolsets):")
-        for name, info in composite_toolsets:
-            includes_str = ', '.join(info['includes']) if info['includes'] else 'none'
-            print(f"  • {name:15} - {info['description']}")
-            print(f"    Includes: {includes_str}")
-            print(f"    Total tools: {info['tool_count']}")
-        
-        # Print scenario-specific toolsets
-        print("\n🎭 Scenario-Specific Toolsets:")
-        for name, info in scenario_toolsets:
-            print(f"  • {name:20} - {info['description']}")
-            print(f"    Total tools: {info['tool_count']}")
-        
-        
-        # Show legacy toolset compatibility
-        print("\n📦 Legacy Toolsets (for backward compatibility):")
-        legacy_toolsets = get_available_toolsets()
-        for name, info in legacy_toolsets.items():
-            status = "✅" if info["available"] else "❌"
-            print(f"  {status} {name}: {info['description']}")
-            if not info["available"]:
-                print(f"    Requirements: {', '.join(info['requirements'])}")
-        
-        # Show individual tools
-        all_tools = get_all_tool_names()
-        print(f"\n🔧 Individual Tools ({len(all_tools)} available):")
-        for tool_name in sorted(all_tools):
-            toolset = get_toolset_for_tool(tool_name)
-            print(f"  📌 {tool_name} (from {toolset})")
-        
-        print("\n💡 Usage Examples:")
-        print("  # Use predefined toolsets")
-        print("  python run_agent.py --enabled_toolsets=research --query='search for Python news'")
-        print("  python run_agent.py --enabled_toolsets=development --query='debug this code'")
-        print("  python run_agent.py --enabled_toolsets=safe --query='analyze without terminal'")
-        print("  ")
-        print("  # Combine multiple toolsets")
-        print("  python run_agent.py --enabled_toolsets=web,vision --query='analyze website'")
-        print("  ")
-        print("  # Disable toolsets")
-        print("  python run_agent.py --disabled_toolsets=terminal --query='no command execution'")
-        print("  ")
-        print("  # Run with trajectory saving enabled")
-        print("  python run_agent.py --save_trajectories --query='your question here'")
-        return
-    
-    # Parse toolset selection arguments
-    enabled_toolsets_list = None
-    disabled_toolsets_list = None
-    
-    if enabled_toolsets:
-        enabled_toolsets_list = [t.strip() for t in enabled_toolsets.split(",")]
-        print(f"🎯 Enabled toolsets: {enabled_toolsets_list}")
-    
-    if disabled_toolsets:
-        disabled_toolsets_list = [t.strip() for t in disabled_toolsets.split(",")]
-        print(f"🚫 Disabled toolsets: {disabled_toolsets_list}")
-    
-    if save_trajectories:
-        print("💾 Trajectory saving: ENABLED")
-        print("   - Successful conversations → trajectory_samples.jsonl")
-        print("   - Failed conversations → failed_trajectories.jsonl")
-    
-    # Initialize agent with provided parameters
-    try:
-        agent = AIAgent(
-            base_url=base_url,
-            model=model,
-            api_key=api_key,
-            max_iterations=max_turns,
-            enabled_toolsets=enabled_toolsets_list,
-            disabled_toolsets=disabled_toolsets_list,
-            save_trajectories=save_trajectories,
-            verbose_logging=verbose,
-            log_prefix_chars=log_prefix_chars
-        )
-    except RuntimeError as e:
-        print(f"❌ Failed to initialize agent: {e}")
-        return
-    
-    # Use provided query or default to Python 3.13 example
-    if query is None:
-        user_query = (
-            "Tell me about the latest developments in Python 3.13 and what new features "
-            "developers should know about. Please search for current information and try it out."
-        )
-    else:
-        user_query = query
-    
-    print(f"\n📝 User Query: {user_query}")
-    print("\n" + "=" * 50)
-    
-    # Run conversation
-    result = agent.run_conversation(user_query)
-    
-    print("\n" + "=" * 50)
-    print("📋 CONVERSATION SUMMARY")
-    print("=" * 50)
-    print(f"✅ Completed: {result['completed']}")
-    print(f"📞 API Calls: {result['api_calls']}")
-    print(f"💬 Messages: {len(result['messages'])}")
-    
-    if result['final_response']:
-        print("\n🎯 FINAL RESPONSE:")
-        print("-" * 30)
-        print(result['final_response'])
-    
-    # Save sample trajectory to UUID-named file if requested
-    if save_sample:
-        sample_id = str(uuid.uuid4())[:8]
-        sample_filename = f"sample_{sample_id}.json"
-        
-        # Convert messages to trajectory format (same as batch_runner)
-        trajectory = agent._convert_to_trajectory_format(
-            result['messages'], 
-            user_query, 
-            result['completed']
-        )
-        
-        entry = {
-            "conversations": trajectory,
-            "timestamp": datetime.now().isoformat(),
-            "model": model,
-            "completed": result['completed'],
-            "query": user_query
-        }
-        
-        try:
-            with open(sample_filename, "w", encoding="utf-8") as f:
-                # Pretty-print JSON with indent for readability
-                f.write(json.dumps(entry, ensure_ascii=False, indent=2))
-            print(f"\n💾 Sample trajectory saved to: {sample_filename}")
-        except Exception as e:
-            print(f"\n⚠️ Failed to save sample: {e}")
-    
-    print("\n👋 Agent execution completed!")
 
 
 if __name__ == "__main__":
