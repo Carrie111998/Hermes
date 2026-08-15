@@ -48,7 +48,11 @@ import {
   truncateSubmitParams
 } from '../session/hooks/use-prompt-actions/rewind'
 import { useSubmitPrompt } from '../session/hooks/use-prompt-actions/submit'
-import { type SubmitTextOptions } from '../session/hooks/use-prompt-actions/utils'
+import {
+  markSessionRecentlyInterrupted,
+  shouldInterruptBeforeRewind,
+  type SubmitTextOptions
+} from '../session/hooks/use-prompt-actions/utils'
 import { upsertOptimisticSession } from '../session/hooks/use-session-actions/utils'
 
 import type { ComposerScope } from './composer/scope'
@@ -107,6 +111,11 @@ export function useSessionTileActions({ runtimeId, scope, storedSessionId }: Ses
   runtimeIdRef.current = runtimeId
   const storedIdRef = useRef(storedSessionId)
   storedIdRef.current = storedSessionId
+  // A tile IS its session (see the comment on the useSubmitPrompt call below)
+  // A tile owns one stable stored/runtime pair, so seed the shared ownership
+  // cache explicitly rather than relying on the primary route cache.
+  const runtimeIdByStoredSessionIdRef = useRef(new Map([[storedSessionId, runtimeId]]))
+  runtimeIdByStoredSessionIdRef.current.set(storedSessionId, runtimeId)
 
   // Tile busy tracks the SESSION state, never the global $busy — and it must
   // read LIVE. A render-time snapshot goes stale (this hook's host doesn't
@@ -219,6 +228,7 @@ export function useSessionTileActions({ runtimeId, scope, storedSessionId }: Ses
     // token is a stable constant (the guard never trips for a tile).
     getRouteToken: () => runtimeId,
     requestGateway,
+    runtimeIdByStoredSessionIdRef,
     // Tile ids are always bound before this hook mounts, so routed recovery is
     // unreachable here; keep the shared submit contract explicit.
     resumeStoredSession: () => undefined,
@@ -257,6 +267,9 @@ export function useSessionTileActions({ runtimeId, scope, storedSessionId }: Ses
 
   const cancelRun = useCallback(async () => {
     const sessionId = runtimeIdRef.current
+
+    // Frontend busy clears immediately; gateway wind-down can lag (#83855).
+    markSessionRecentlyInterrupted(sessionId)
 
     update(state => ({
       ...state,
@@ -456,13 +469,16 @@ export function useSessionTileActions({ runtimeId, scope, storedSessionId }: Ses
       resetSessionBackground(sessionId)
       clearPreviewArtifacts(sessionId)
 
-      const wasBusy = readState()?.busy ?? false
+      const interruptFirst = shouldInterruptBeforeRewind({
+        busy: readState()?.busy ?? false,
+        sessionId
+      })
 
       update(state => applyRewindOptimistic(state, plan.sourceIndex))
 
       try {
         applySurvivorRowIds(
-          await submitRewind(plan.text, plan.truncateOrdinal, wasBusy, plan.truncateMessageId, plan.truncateRowId)
+          await submitRewind(plan.text, plan.truncateOrdinal, interruptFirst, plan.truncateMessageId, plan.truncateRowId)
         )
       } catch (err) {
         update(state => ({ ...state, busy: false, awaitingResponse: false, messages }))
@@ -487,13 +503,16 @@ export function useSessionTileActions({ runtimeId, scope, storedSessionId }: Ses
       resetSessionBackground(sessionId)
       clearPreviewArtifacts(sessionId)
 
-      const wasBusy = readState()?.busy ?? false
+      const interruptFirst = shouldInterruptBeforeRewind({
+        busy: readState()?.busy ?? false,
+        sessionId
+      })
 
       update(state => applyRewindOptimistic(state, plan.sourceIndex, plan.editedMessage))
 
       try {
         applySurvivorRowIds(
-          await submitRewind(plan.text, plan.truncateOrdinal, wasBusy, plan.truncateMessageId, plan.truncateRowId)
+          await submitRewind(plan.text, plan.truncateOrdinal, interruptFirst, plan.truncateMessageId, plan.truncateRowId)
         )
       } catch (err) {
         update(state => ({ ...state, busy: false, awaitingResponse: false, messages }))

@@ -616,6 +616,26 @@ export interface SessionResumeResponse {
   queued?: null | {
     user?: string
   }
+  // The oldest gateway approval still waiting for a response. This is returned
+  // on resume so a reconnect can restore a prompt whose original event was
+  // emitted while the client transport was detached.
+  pending_approval?: {
+    allow_permanent?: boolean
+    choices?: string[]
+    command?: string
+    description?: string
+    request_id?: string
+    smart_denied?: boolean
+  }
+  // The clarify question still blocking this session, if any. Same replay
+  // class as pending_approval: emitted-while-detached prompts are restored
+  // from the resume snapshot instead of being lost until server-side timeout.
+  pending_clarify?: {
+    choices?: null | string[]
+    multi_select?: boolean
+    question?: string
+    request_id?: string
+  }
   info?: SessionRuntimeInfo
   message_count: number
   messages: SessionMessage[]

@@ -70,8 +70,10 @@ import {
   friendlyRemoteAttachError,
   type GatewayRequest,
   inlineErrorMessage,
+  markSessionRecentlyInterrupted,
   readFileDataUrlForAttach,
   readImageForRemoteAttach,
+  shouldInterruptBeforeRewind,
   type SubmitTextOptions,
   withSessionNotFoundResume
 } from './utils'
@@ -233,6 +235,7 @@ interface PromptActionsOptions {
   refreshSessions: () => Promise<void>
   requestGateway: <T>(method: string, params?: Record<string, unknown>, timeoutMs?: number) => Promise<T>
   resumeStoredSession: (storedSessionId: string) => Promise<void> | void
+  runtimeIdByStoredSessionIdRef: MutableRefObject<Map<string, string>>
   selectedStoredSessionIdRef: MutableRefObject<string | null>
   startFreshSessionDraft: () => void
   sttEnabled: boolean
@@ -264,6 +267,7 @@ export function usePromptActions({
   refreshSessions,
   requestGateway,
   resumeStoredSession,
+  runtimeIdByStoredSessionIdRef,
   selectedStoredSessionIdRef,
   startFreshSessionDraft,
   sttEnabled,
@@ -480,6 +484,7 @@ export function usePromptActions({
     getRuntimeIdForStoredSession,
     getRouteToken,
     requestGateway,
+    runtimeIdByStoredSessionIdRef,
     resumeStoredSession,
     selectedStoredSessionIdRef,
     syncAttachmentsForSubmit,
@@ -648,6 +653,10 @@ export function usePromptActions({
 
       return
     }
+
+    // Frontend busy clears immediately; gateway wind-down can lag. Mark so a
+    // fast edit/resend still interrupt-first instead of racing 4009 (#83855).
+    markSessionRecentlyInterrupted(sessionId)
 
     updateSessionState(sessionId, state => {
       const streamId = state.streamId
@@ -908,6 +917,13 @@ export function usePromptActions({
       resetSessionBackground(sessionId)
       clearPreviewArtifacts(sessionId)
 
+      // Capture before optimistic busy=true — otherwise interruptFirst is always
+      // true and idle restores wrongly interrupt (and Stop→edit misses cooldown).
+      const interruptFirst = shouldInterruptBeforeRewind({
+        busy: busyRef.current || $busy.get(),
+        sessionId
+      })
+
       clearNotifications()
       setMutableRef(busyRef, true)
       setBusy(true)
@@ -920,7 +936,7 @@ export function usePromptActions({
           plan.text,
           plan.truncateOrdinal,
           plan.truncateMessageId,
-          busyRef.current || $busy.get(),
+          interruptFirst,
           plan.truncateRowId
         )
 
@@ -965,6 +981,12 @@ export function usePromptActions({
       resetSessionBackground(sessionId)
       clearPreviewArtifacts(sessionId)
 
+      // Before optimistic busy=true — see restoreToMessage (#83855).
+      const interruptFirst = shouldInterruptBeforeRewind({
+        busy: busyRef.current || $busy.get(),
+        sessionId
+      })
+
       clearNotifications()
       setMutableRef(busyRef, true)
       setBusy(true)
@@ -977,7 +999,7 @@ export function usePromptActions({
           plan.text,
           plan.truncateOrdinal,
           plan.truncateMessageId,
-          busyRef.current || $busy.get(),
+          interruptFirst,
           plan.truncateRowId
         )
 
