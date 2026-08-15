@@ -406,24 +406,22 @@ async function pidIsOurDashboard(ssh, pid, spawnNonce, hermesPath = '') {
   }
 }
 
-// Kill the stale dashboard ONLY if provably ours, then drop the lockfile.
+// Best-effort: SIGTERM, then SIGKILL. Never fail reconnect — a wedged leftover
+// after sleep must not block a new tunnel. Lockfile is always dropped.
 async function cleanupStale(ssh, ownershipId, lock, pidAlive = true) {
   if (pidAlive && lock && (await pidIsOurDashboard(ssh, lock.pid, lock.spawnNonce, lock.hermesPath))) {
-    try {
-      const result = (
-        await ssh.exec(
-          `kill ${Number(lock.pid)} && ` +
-            `i=0; while kill -0 ${Number(lock.pid)} 2>/dev/null; do ` +
-            `i=$((i+1)); [ "$i" -ge 50 ] && exit 1; sleep 0.1; done`
-        )
-      ).trim()
+    const pid = Number(lock.pid)
 
-      void result
-    } catch (cause) {
-      const error: any = new Error('Could not terminate the stale SSH backend.')
-      error.kind = 'transient-transport-error'
-      error.cause = cause
-      throw error
+    try {
+      await ssh.exec(
+        `kill ${pid} 2>/dev/null || true; ` +
+          `i=0; while kill -0 ${pid} 2>/dev/null; do ` +
+          `i=$((i+1)); ` +
+          `if [ "$i" -eq 20 ]; then kill -KILL ${pid} 2>/dev/null || true; fi; ` +
+          `[ "$i" -ge 40 ] && break; sleep 0.1; done`
+      )
+    } catch {
+      void 0
     }
   }
 

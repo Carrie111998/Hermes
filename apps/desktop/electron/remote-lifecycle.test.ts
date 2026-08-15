@@ -303,6 +303,46 @@ test('cleanupStale kills ONLY a provably-ours pid, always drops the lockfile', a
   assert.ok(ours.calls.some(c => /rm -f/.test(c)))
 })
 
+test('cleanupStale still drops the lockfile when kill fails', async () => {
+  const ssh = fakeSsh([
+    [/print\("OWNED"/, 'OWNED\n'],
+    [/kill 9\b/, new Error('kill: No such process')]
+  ])
+
+  await cleanupStale(ssh, OWNERSHIP_ID, {
+    pid: 9,
+    spawnNonce: SPAWN_NONCE,
+    hermesPath: '/x/hermes',
+    logPath: spawnLogPath(OWNERSHIP_ID, SPAWN_NONCE)
+  })
+  assert.ok(ssh.calls.some(command => /kill 9\b/.test(command)))
+  assert.ok(ssh.calls.some(command => /rm -f/.test(command)))
+})
+
+test('connect respawns after a leftover dashboard refuses to die', async () => {
+  const lock = ownedLock()
+  const ssh = fakeSsh([
+    [/uname/, 'Linux\nx86_64'],
+    [/\[ -x/, 'OK'],
+    [/cat .*lock\.json/, JSON.stringify(lock)],
+    [/kill -0 333/, 'ALIVE'],
+    [/print\("OWNED"/, 'OWNED\n'],
+    [/kill 333\b/, new Error('Operation timed out')],
+    [/grep -q ssh-session-token-file/, 'YES\n'],
+    [/python3 -c/, ''],
+    [/setsid/, '890\n'],
+    [/kill -0 890/, 'ALIVE'],
+    [/cat .*\.log/, 'HERMES_DASHBOARD_READY port=52050\n']
+  ])
+
+  const result = await connect(connectDeps(ssh, { adoptServedToken: async () => 'fresh' }))
+
+  assert.equal(result.reused, false)
+  assert.equal(result.pid, 890)
+  assert.ok(ssh.calls.some(command => /setsid/.test(command)))
+})
+
+
 test('buildSpawnCommand is headless serve, detached, token not in argv', () => {
   const cmd = buildSpawnCommand('/x/hermes', 'work', { logPath: spawnLogPath(OWNERSHIP_ID, SPAWN_NONCE) })
   assert.match(cmd, /serve --isolated/)
