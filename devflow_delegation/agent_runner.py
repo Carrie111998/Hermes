@@ -32,6 +32,12 @@ from devflow_delegation.agent_tools import (
     write_file,
 )
 from devflow_delegation.allowlist import TargetConfig, load_allowlist, path_allowed, resolve_target
+# The executor owns the canonical request-metadata filename; importing it here
+# (rather than re-declaring the literal) means a rename in executor.py cannot
+# silently desync the runner's own changed-path exclusion (D5). executor.py
+# does not import this module (directly or transitively), so this introduces
+# no import cycle.
+from devflow_delegation.executor import _METADATA_RELATIVE_PATH
 
 _SYSTEM_PROMPT = """You are a bounded software-fixing agent working inside an \
 isolated git worktree.
@@ -88,7 +94,7 @@ def dispatch_tool(name: str, args: Dict[str, Any], *, worktree: Path, target: Ta
         if name == "read_file":
             return read_file(worktree, target, str(args.get("path", "")))
         if name == "list_files":
-            return "\n".join(list_files(worktree, str(args.get("pattern") or "**/*")))
+            return "\n".join(list_files(worktree, target, str(args.get("pattern") or "**/*")))
         if name == "write_file":
             return write_file(worktree, target, str(args.get("path", "")), str(args.get("content", "")))
         if name == "run_tests":
@@ -207,9 +213,6 @@ def run_agent(
 # straight through that check. self_check closes that gap by scanning diff
 # content for credential material before the executor ever looks at the
 # worktree.
-
-_METADATA_RELATIVE_PATH = ".ddp_request.json"
-
 
 def _git_output(argv: List[str], worktree: Path) -> str:
     completed = subprocess.run(

@@ -9,12 +9,11 @@ from __future__ import annotations
 
 import os
 import subprocess
-from fnmatch import fnmatch
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 
 from devflow_delegation.agent_policy import scrubbed_env
-from devflow_delegation.allowlist import TargetConfig, path_allowed
+from devflow_delegation.allowlist import TargetConfig, _glob_matches, path_allowed
 
 MAX_READ_CHARS = 100_000
 MAX_TEST_OUTPUT_CHARS = 20_000
@@ -46,10 +45,10 @@ def _relative(worktree: Path, path: str) -> str:
 
 
 def _denied(target: TargetConfig, rel: str) -> bool:
-    return any(
-        fnmatch(rel, glob) or (glob.startswith("**/") and fnmatch(rel, glob[3:]))
-        for glob in target.denied_globs
-    )
+    # Delegates to allowlist._glob_matches (the same helper path_allowed uses)
+    # rather than re-deriving the "**/"-root-form match locally, so the two
+    # can never silently drift out of agreement (D3).
+    return any(_glob_matches(rel, glob) for glob in target.denied_globs)
 
 
 def read_file(worktree: Path, target: TargetConfig, path: str) -> str:
@@ -65,7 +64,7 @@ def read_file(worktree: Path, target: TargetConfig, path: str) -> str:
     return body
 
 
-def list_files(worktree: Path, pattern: str = "**/*") -> List[str]:
+def list_files(worktree: Path, target: TargetConfig, pattern: str = "**/*") -> List[str]:
     root = Path(worktree).resolve()
     results = []
     for item in sorted(root.glob(str(pattern or "**/*"))):
@@ -80,7 +79,12 @@ def list_files(worktree: Path, pattern: str = "**/*") -> List[str]:
             rel = item.resolve().relative_to(root)
         except ValueError:
             continue
-        results.append(rel.as_posix())
+        rel_str = rel.as_posix()
+        # read_file and write_file both refuse denied_globs; listing must not
+        # leak those filenames either, even though it never exposes content (D4).
+        if _denied(target, rel_str):
+            continue
+        results.append(rel_str)
     if len(results) > MAX_LIST_FILES_ENTRIES:
         total = len(results)
         results = results[:MAX_LIST_FILES_ENTRIES]
@@ -110,15 +114,24 @@ def write_file(worktree: Path, target: TargetConfig, path: str, content: str) ->
     return f"wrote {rel} ({len(str(content))} chars)"
 
 
-def run_tests(worktree: Path, target: TargetConfig, *, timeout_seconds: int = 600) -> str:
+def run_tests(worktree: Path, target: TargetConfig, *, timeout_seconds: Optional[int] = None) -> str:
     """Run ONLY the target's allowlisted ``test_commands``.
 
     Takes no arguments from the model: this is what makes "fix it and make the
     tests pass" possible without ever handing the agent a shell.
+
+    ``timeout_seconds`` defaults to the target's own ``command_timeout_seconds``
+    (D2) rather than a value hard-coded here, so a target's configured ceiling
+    is actually honored. An explicit ``timeout_seconds`` argument still wins
+    over the target's value -- callers that need a different bound (tests,
+    a future caller with its own policy) are not overridden by the target.
     """
     commands = [cmd for cmd in target.test_commands if cmd]
     if not commands:
         raise ToolError("this target has no configured test commands")
+    effective_timeout = (
+        target.command_timeout_seconds if timeout_seconds is None else timeout_seconds
+    )
     env = scrubbed_env(dict(os.environ))
     chunks: List[str] = []
     for command in commands:
@@ -128,10 +141,10 @@ def run_tests(worktree: Path, target: TargetConfig, *, timeout_seconds: int = 60
         try:
             completed = subprocess.run(
                 argv, cwd=str(worktree), env=env, shell=False, capture_output=True,
-                text=True, encoding="utf-8", errors="replace", timeout=timeout_seconds,
+                text=True, encoding="utf-8", errors="replace", timeout=effective_timeout,
             )
         except subprocess.TimeoutExpired:
-            raise ToolError(f"test command timed out after {timeout_seconds}s: {' '.join(argv)}")
+            raise ToolError(f"test command timed out after {effective_timeout}s: {' '.join(argv)}")
         except OSError as exc:
             raise ToolError(f"test command could not start: {exc}") from exc
         status = "PASSED" if completed.returncode == 0 else "FAILED"

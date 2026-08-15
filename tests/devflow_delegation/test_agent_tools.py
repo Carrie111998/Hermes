@@ -59,10 +59,10 @@ def test_list_files_is_confined_to_the_worktree(tmp_path_factory):
     (worktree_dir / "inside.py").write_text("inside\n", encoding="utf-8")
     (root / "outside.py").write_text("outside\n", encoding="utf-8")
 
-    assert list_files(worktree_dir, "../*.py") == []
+    assert list_files(worktree_dir, _target(), "../*.py") == []
 
     # Normal in-scope globbing still returns the expected file.
-    assert list_files(worktree_dir, "**/*.py") == ["inside.py"]
+    assert list_files(worktree_dir, _target(), "**/*.py") == ["inside.py"]
 
 
 def test_write_file_creates_a_file_inside_allowed_globs(worktree):
@@ -168,6 +168,79 @@ def test_run_tests_rejects_shell_string_commands(worktree):
         run_tests(worktree, _target(test_commands=("python -c \"print(1)\"",)))
 
 
+# --- D1: the timeout and "command could not start" branches raise ToolError
+# (an infra problem, not a code-bug the agent should try to fix) -- previously
+# untested, so a regression turning either into a returned "FAILED" string
+# would silently blur the misuse/information split for exactly these two cases.
+
+
+def test_run_tests_raises_tool_error_on_timeout(worktree):
+    target = _target(
+        test_commands=(("python", "-c", "import time; time.sleep(5)"),),
+    )
+    with pytest.raises(ToolError, match="timed out"):
+        run_tests(worktree, target, timeout_seconds=1)
+
+
+def test_run_tests_raises_tool_error_when_the_command_cannot_start(worktree):
+    target = _target(test_commands=(("definitely-not-a-real-executable-xyz123",),))
+    with pytest.raises(ToolError, match="could not start"):
+        run_tests(worktree, target)
+
+
+# --- D2: a target's own command_timeout_seconds must be the effective default,
+# not the hard-coded 600s the signature previously carried. An explicit
+# caller-supplied timeout_seconds must still win over the target's value.
+
+
+def test_run_tests_defaults_to_the_targets_command_timeout_seconds(worktree):
+    # command_timeout_seconds=1 on the target, no explicit timeout_seconds
+    # argument: the target's own ceiling must be what trips.
+    target = _target(
+        test_commands=(("python", "-c", "import time; time.sleep(5)"),),
+        command_timeout_seconds=1,
+    )
+    with pytest.raises(ToolError, match="timed out after 1s"):
+        run_tests(worktree, target)
+
+
+def test_run_tests_explicit_timeout_seconds_overrides_the_targets_value(worktree):
+    # The target's command_timeout_seconds is short enough to trip immediately,
+    # but an explicit, larger timeout_seconds argument must win, so the command
+    # is allowed to finish instead of being killed.
+    target = _target(
+        test_commands=(("python", "-c", "print('tests passed')"),),
+        command_timeout_seconds=1,
+    )
+    result = run_tests(worktree, target, timeout_seconds=60)
+    assert "tests passed" in result
+
+
+# --- D3: _denied must agree with allowlist.path_allowed's glob semantics
+# (including the "**/"-root-form quirk), because it is derived from the same
+# shared helper rather than a hand-rolled duplicate that could silently drift.
+
+
+def test_denied_agrees_with_the_shared_glob_helper_on_the_root_form(worktree):
+    from devflow_delegation.agent_tools import _denied
+    from devflow_delegation.allowlist import _glob_matches
+
+    target = _target(denied_globs=("**/.env",))
+    assert _denied(target, ".env") is True
+    assert _denied(target, ".env") == _glob_matches(".env", "**/.env")
+
+
+# --- D4: list_files must not leak filenames under a denied path. read_file and
+# write_file both already refuse denied_globs; list_files silently didn't.
+
+
+def test_list_files_excludes_denied_paths(worktree):
+    result = list_files(worktree, _target(), "**/*")
+    assert "src/app.py" in result
+    assert "secrets/token.txt" not in result
+    assert ".env" not in result
+
+
 def test_tool_schemas_cover_exactly_the_four_bounded_tools():
     names = {schema["function"]["name"] for schema in TOOL_SCHEMAS}
     assert names == {"read_file", "list_files", "write_file", "run_tests"}
@@ -187,7 +260,7 @@ def test_list_files_caps_the_number_of_entries_returned(tmp_path):
     for index in range(many):
         (tmp_path / f"f{index:05d}.txt").write_text("x", encoding="utf-8")
 
-    result = list_files(tmp_path, "*.txt")
+    result = list_files(tmp_path, _target(), "*.txt")
 
     # One extra entry for the truncation marker; the count must not just grow
     # with the number of files on disk.
@@ -197,7 +270,7 @@ def test_list_files_caps_the_number_of_entries_returned(tmp_path):
 
 
 def test_list_files_does_not_truncate_when_under_the_cap(worktree):
-    result = list_files(worktree, "**/*.py")
+    result = list_files(worktree, _target(), "**/*.py")
     assert result == ["src/app.py"]
     assert not any("truncated" in entry for entry in result)
 

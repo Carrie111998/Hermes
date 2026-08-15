@@ -279,6 +279,18 @@ import subprocess
 from devflow_delegation.agent_runner import changed_paths, main, self_check
 
 
+# --- D5: the request-metadata filename must not silently desync between the
+# runner (which excludes it from the agent's changed-path set) and the
+# executor (which writes it and applies the same exclusion). agent_runner now
+# imports the executor's constant directly rather than re-declaring the
+# literal, so this is belt-and-suspenders: it still pins the invariant even if
+# a future edit reintroduces a local duplicate.
+def test_metadata_relative_path_matches_the_executors_constant():
+    from devflow_delegation import agent_runner, executor
+
+    assert agent_runner._METADATA_RELATIVE_PATH == executor._METADATA_RELATIVE_PATH
+
+
 def _git(args, cwd):
     subprocess.run(args, cwd=str(cwd), check=True, capture_output=True, text=True)
 
