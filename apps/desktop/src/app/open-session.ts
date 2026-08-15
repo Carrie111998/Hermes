@@ -102,6 +102,7 @@ export function openSession(
   // IS fair game while it's only a blank draft, and an already-open blank draft
   // tab is spent before a new one is stacked.
   let spendBlankDraft = false
+  const frontNewTile = resolved === 'stack'
 
   if (resolved === 'stack') {
     spendBlankDraft = mainChatOccupied($activeSessionId.get(), $selectedStoredSessionId.get())
@@ -124,6 +125,10 @@ export function openSession(
     }
 
     openSessionTile(storedSessionId, 'center')
+
+    if (frontNewTile) {
+      focusOpenSession(storedSessionId)
+    }
 
     return
   }
