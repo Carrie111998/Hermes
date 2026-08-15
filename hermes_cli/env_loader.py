@@ -482,6 +482,34 @@ def load_hermes_dotenv(
     """
     loaded: list[Path] = []
 
+    # The Kanban dispatcher pins task ownership and execution location in the
+    # child process before profile startup. User/profile .env files normally
+    # override stale shell values, but these values are process authority, not
+    # configuration. Snapshot the complete pinned set (including absent keys)
+    # so dotenv, managed scope, secret sources, and config bridges cannot alter
+    # it during startup.
+    from hermes_cli.kanban_worker_scope import (
+        PINNED_WORKER_ENV_KEYS,
+        WORKER_SCOPE_ENV,
+    )
+
+    pinned_worker_env: dict[str, str | None] | None = None
+    dispatcher_worker = bool(os.environ.get("HERMES_KANBAN_TASK"))
+    scoped_worker = dispatcher_worker and bool(os.environ.get(WORKER_SCOPE_ENV))
+    if dispatcher_worker:
+        pinned_worker_env = {
+            key: os.environ.get(key) for key in PINNED_WORKER_ENV_KEYS
+        }
+
+    def restore_pinned_worker_env() -> None:
+        if pinned_worker_env is None:
+            return
+        for key, value in pinned_worker_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
     home_path = Path(hermes_home or os.getenv("HERMES_HOME", Path.home() / ".hermes"))
     user_env = home_path / ".env"
     project_env_path = Path(project_env) if project_env else None
@@ -492,30 +520,33 @@ def load_hermes_dotenv(
     if project_env_path and project_env_path.exists():
         _sanitize_env_file_if_needed(project_env_path)
 
-    if user_env.exists():
-        _load_dotenv_with_fallback(user_env, override=True)
-        loaded.append(user_env)
-        # Mirror reload_env() known-key cleanup so inherited Hermes keys
-        # absent from this profile's .env do not leak into the runtime.
-        _clear_known_keys_missing_from_dotenv(user_env)
+    try:
+        if user_env.exists():
+            _load_dotenv_with_fallback(user_env, override=True)
+            loaded.append(user_env)
+            # Mirror reload_env() known-key cleanup so inherited Hermes keys
+            # absent from this profile's .env do not leak into the runtime.
+            _clear_known_keys_missing_from_dotenv(user_env)
 
-    # Load .op.env AFTER .env so that .env values win, but the bootstrap
-    # token (OP_SERVICE_ACCOUNT_TOKEN) becomes available for
-    # apply_onepassword_secrets() even in cron / subprocess environments
-    # that inherit no shell state (no systemd EnvironmentFile, no op run).
-    # .op.env is gitignored — the service-account token never enters the
-    # committed .env file.
-    # Users on systemd can alternatively use:
-    #   EnvironmentFile=-/path/to/.hermes/.op.env
-    # in their gateway unit, which takes precedence (override=False below
-    # ensures .op.env never clobbers a token already in the environment).
-    op_env = home_path / ".op.env"
-    if op_env.exists() and not os.environ.get("OP_SERVICE_ACCOUNT_TOKEN"):
-        _load_dotenv_with_fallback(op_env, override=False)
+        # Load .op.env AFTER .env so that .env values win, but the bootstrap
+        # token (OP_SERVICE_ACCOUNT_TOKEN) becomes available for
+        # apply_onepassword_secrets() even in cron / subprocess environments
+        # that inherit no shell state (no systemd EnvironmentFile, no op run).
+        # .op.env is gitignored — the service-account token never enters the
+        # committed .env file.
+        # Users on systemd can alternatively use:
+        #   EnvironmentFile=-/path/to/.hermes/.op.env
+        # in their gateway unit, which takes precedence (override=False below
+        # ensures .op.env never clobbers a token already in the environment).
+        op_env = home_path / ".op.env"
+        if op_env.exists() and not os.environ.get("OP_SERVICE_ACCOUNT_TOKEN"):
+            _load_dotenv_with_fallback(op_env, override=False)
 
-    if project_env_path and project_env_path.exists():
-        _load_dotenv_with_fallback(project_env_path, override=not loaded)
-        loaded.append(project_env_path)
+        if project_env_path and project_env_path.exists():
+            _load_dotenv_with_fallback(project_env_path, override=not loaded)
+            loaded.append(project_env_path)
+    finally:
+        restore_pinned_worker_env()
 
     # A fresh ``hermes update`` retry may have completed a deferred dependency
     # install before importing this module.  Do not remap native secret-source
@@ -524,9 +555,19 @@ def load_hermes_dotenv(
     # only external source resolution is unnecessary for the updater.
     from hermes_cli import _early_recovery
 
-    if not _early_recovery._should_skip_external_secret_sources():
-        _apply_external_secret_sources(home_path)
-    _apply_managed_env()
+    # Dispatcher-pinned workers must reach the first turn without executing
+    # profile-configured command/plugin secret sources. Their profile carries
+    # the provider credentials needed for the run; external source discovery is
+    # an extension surface, not part of lifecycle execution.
+    try:
+        if (
+            not scoped_worker
+            and not _early_recovery._should_skip_external_secret_sources()
+        ):
+            _apply_external_secret_sources(home_path)
+        _apply_managed_env()
+    finally:
+        restore_pinned_worker_env()
 
     # config.yaml is the documented source of truth for terminal.* settings,
     # but the dotenv loads above run with override=True — so a stale
@@ -540,7 +581,10 @@ def load_hermes_dotenv(
     # the documented config path always wins. Runs after _apply_managed_env()
     # so the merged config (which already carries the managed overlay) is
     # what lands in the env.
-    _reapply_terminal_config_bridge(home_path)
+    try:
+        _reapply_terminal_config_bridge(home_path)
+    finally:
+        restore_pinned_worker_env()
 
     return loaded
 

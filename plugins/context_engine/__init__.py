@@ -30,6 +30,19 @@ logger = logging.getLogger(__name__)
 _CONTEXT_ENGINE_PLUGINS_DIR = Path(__file__).parent
 
 
+def _context_engine_extensions_disabled_for_scoped_worker() -> bool:
+    """Keep configurable engine code outside dispatcher-scoped workers."""
+    try:
+        from hermes_cli.kanban_worker_scope import is_lifecycle_only_worker
+
+        return is_lifecycle_only_worker()
+    except (ImportError, ValueError):
+        # An unavailable scope guard and unknown dispatcher scopes must not
+        # fall through to an extension loader that executes Python before the
+        # first agent turn.
+        return True
+
+
 def discover_context_engines() -> List[Tuple[str, str, bool]]:
     """Scan plugins/context_engine/ for available engines.
 
@@ -37,6 +50,9 @@ def discover_context_engines() -> List[Tuple[str, str, bool]]:
     Does NOT import the engines — just reads plugin.yaml for metadata
     and does a lightweight availability check.
     """
+    if _context_engine_extensions_disabled_for_scoped_worker():
+        return []
+
     results = []
     if not _CONTEXT_ENGINE_PLUGINS_DIR.is_dir():
         return results
@@ -81,6 +97,9 @@ def load_context_engine(name: str) -> Optional["ContextEngine"]:
 
     Returns None if the engine is not found or fails to load.
     """
+    if _context_engine_extensions_disabled_for_scoped_worker():
+        return None
+
     engine_dir = _CONTEXT_ENGINE_PLUGINS_DIR / name
     if not engine_dir.is_dir():
         logger.debug("Context engine '%s' not found in %s", name, _CONTEXT_ENGINE_PLUGINS_DIR)
@@ -104,6 +123,9 @@ def _load_engine_from_dir(engine_dir: Path) -> Optional["ContextEngine"]:
     - A register(ctx) function (plugin-style) — we simulate a ctx
     - A top-level class that extends ContextEngine — we instantiate it
     """
+    if _context_engine_extensions_disabled_for_scoped_worker():
+        return None
+
     name = engine_dir.name
     module_name = f"plugins.context_engine.{name}"
     init_file = engine_dir / "__init__.py"

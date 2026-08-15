@@ -35,6 +35,7 @@ from typing import Any, Optional
 
 from agent.redact import redact_sensitive_text
 from hermes_cli.goals import judge_goal
+from hermes_cli.kanban_worker_scope import is_lifecycle_only_worker
 from tools.registry import registry, tool_error
 from hermes_cli.config import cfg_get, load_config
 
@@ -224,6 +225,18 @@ def _connect(board: Optional[str] = None):
     the env-pinned active board without restarting Hermes.
     """
     from hermes_cli import kanban_db as kb
+
+    if os.environ.get("HERMES_KANBAN_TASK"):
+        pinned_raw = str(os.environ.get("HERMES_KANBAN_BOARD") or "").strip()
+        if board is not None and pinned_raw:
+            requested = kb._normalize_board_slug(board)
+            pinned = kb._normalize_board_slug(pinned_raw)
+            if requested != pinned:
+                raise ValueError(
+                    f"worker is pinned to board {pinned}; refusing board override {requested}"
+                )
+        if pinned_raw:
+            board = pinned_raw
     return kb, kb.connect(board=board)
 
 
@@ -522,6 +535,10 @@ def _handle_show(args: dict, **kw) -> str:
         return tool_error(
             "task_id is required (or set HERMES_KANBAN_TASK in the env)"
         )
+    if is_lifecycle_only_worker():
+        ownership_err = _enforce_worker_task_ownership(tid)
+        if ownership_err:
+            return ownership_err
     board = args.get("board")
     try:
         kb, conn = _connect(board=board)
@@ -665,6 +682,14 @@ def _handle_complete(args: dict, **kw) -> str:
     ownership_err = _enforce_worker_task_ownership(tid)
     if ownership_err:
         return ownership_err
+    lifecycle_only = is_lifecycle_only_worker()
+    if lifecycle_only and any(
+        key in args for key in ("task_id", "board", "created_cards", "artifacts")
+    ):
+        return tool_error(
+            "task_id, board, created_cards, and artifacts are unavailable "
+            "in lifecycle-only worker posture"
+        )
     summary = args.get("summary")
     metadata = args.get("metadata")
     result = args.get("result")
@@ -673,6 +698,10 @@ def _handle_complete(args: dict, **kw) -> str:
     if result:
         result = redact_sensitive_text(str(result), force=True)
     if metadata is not None and isinstance(metadata, dict):
+        if lifecycle_only and "artifacts" in metadata:
+            return tool_error(
+                "metadata.artifacts is unavailable in lifecycle-only worker posture"
+            )
         meta_json = json.dumps(metadata)
         meta_json = redact_sensitive_text(meta_json, force=True)
         try:
@@ -771,6 +800,7 @@ def _handle_complete(args: dict, **kw) -> str:
                     result=result, summary=summary, metadata=metadata,
                     created_cards=created_cards,
                     expected_run_id=_worker_run_id(tid),
+                    allow_artifacts=not lifecycle_only,
                 )
             except kb.ArtifactPreservationError as artifact_err:
                 return tool_error(

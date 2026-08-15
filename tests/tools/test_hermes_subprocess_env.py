@@ -149,6 +149,7 @@ class TestDelegatedChildMarker:
             {
                 **_SAFE_SAMPLE,
                 "HERMES_KANBAN_TASK": "t_parent",
+                "HERMES_KANBAN_WORKER_SCOPE": "lifecycle-only",
                 "HERMES_KANBAN_RUN_ID": "123",
                 "HERMES_KANBAN_DB": "/tmp/parent-kanban.db",
                 "HERMES_KANBAN_WORKSPACE": "/tmp/parent-workspace",
@@ -160,6 +161,7 @@ class TestDelegatedChildMarker:
 
         assert env["HERMES_DELEGATED_CHILD_CONTEXT"] == "1"
         assert "HERMES_KANBAN_TASK" not in env
+        assert "HERMES_KANBAN_WORKER_SCOPE" not in env
         assert "HERMES_KANBAN_RUN_ID" not in env
         assert "HERMES_KANBAN_DB" not in env
         assert "HERMES_KANBAN_WORKSPACE" not in env

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import subprocess
 
+import pytest
+
 
 def _make_task(kb, *, assignee: str):
     return kb.Task(
@@ -83,6 +85,8 @@ agent:
     assert pid == 4242
     assert captured["env"]["HERMES_HOME"] == str(profile)
     assert captured["env"]["HERMES_KANBAN_TASK"] == "t_spawn_tools"
+    assert "HERMES_KANBAN_WORKER_SCOPE" not in captured["env"]
+    assert "--accept-hooks" in captured["cmd"]
     assert "--toolsets" in captured["cmd"]
     pinned = captured["cmd"][captured["cmd"].index("--toolsets") + 1].split(",")
     for required in ("terminal", "web", "file", "skills", "code_execution", "delegation"):
@@ -161,3 +165,171 @@ toolsets:
     assert "web" in resolved
     assert "kanban" in resolved  # recovered worker lifecycle surface
     assert resolved != ["kanban"]
+
+
+def test_lifecycle_only_worker_surface_excludes_broader_kanban_tools(monkeypatch):
+    """A minimal worker profile must not be widened back to the full Kanban API."""
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_lifecycle_only")
+    monkeypatch.setenv("HERMES_KANBAN_WORKER_SCOPE", "lifecycle-only")
+
+    from model_tools import _clear_tool_defs_cache, get_tool_definitions
+
+    _clear_tool_defs_cache()
+    try:
+        definitions = get_tool_definitions(
+            enabled_toolsets=["kanban_lifecycle"],
+            disabled_toolsets=[],
+            quiet_mode=True,
+        )
+        by_name = {
+            item.get("function", {}).get("name"): item.get("function", {})
+            for item in definitions
+            if item.get("function", {}).get("name")
+        }
+        names = set(by_name)
+        assert names == {
+            "kanban_show",
+            "kanban_complete",
+            "kanban_block",
+            "kanban_heartbeat",
+        }
+        assert set(by_name["kanban_show"]["parameters"]["properties"]) == set()
+        assert set(by_name["kanban_complete"]["parameters"]["properties"]) == {
+            "summary", "metadata", "result",
+        }
+        assert set(by_name["kanban_block"]["parameters"]["properties"]) == {
+            "reason", "kind",
+        }
+        assert set(by_name["kanban_heartbeat"]["parameters"]["properties"]) == {
+            "note",
+        }
+    finally:
+        _clear_tool_defs_cache()
+
+
+def test_resolve_worker_cli_toolsets_preserves_lifecycle_only_profile(monkeypatch, tmp_path):
+    root = tmp_path / ".hermes"
+    profile = root / "profiles" / "dashboardcontrol"
+    profile.mkdir(parents=True)
+    root.joinpath("config.yaml").write_text("{}\n", encoding="utf-8")
+    profile.joinpath("config.yaml").write_text(
+        """
+platform_toolsets:
+  cli:
+    - kanban_lifecycle
+toolsets:
+  - kanban_lifecycle
+agent:
+  disabled_toolsets: []
+""".lstrip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(root))
+
+    from hermes_cli import kanban_db as kb
+
+    resolved = kb._resolve_worker_cli_toolsets(str(profile))
+
+    assert resolved == ["kanban_lifecycle"]
+
+
+def test_resolve_worker_cli_toolsets_fails_closed_on_config_error(
+    monkeypatch, tmp_path
+):
+    profile = tmp_path / "profile"
+    profile.mkdir()
+
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import config as hermes_config
+
+    monkeypatch.setattr(
+        hermes_config,
+        "load_config",
+        lambda: (_ for _ in ()).throw(ValueError("invalid profile config")),
+    )
+
+    with pytest.raises(RuntimeError, match="refusing spawn"):
+        kb._resolve_worker_cli_toolsets(str(profile))
+
+
+def test_default_spawn_does_not_start_process_when_toolset_resolution_fails(
+    monkeypatch, tmp_path
+):
+    root = tmp_path / ".hermes"
+    profile = root / "profiles" / "dashboardcontrol"
+    profile.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(root))
+
+    from hermes_cli import kanban_db as kb
+
+    monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["hermes"])
+    monkeypatch.setattr(
+        kb,
+        "_resolve_worker_cli_toolsets",
+        lambda _home: (_ for _ in ()).throw(RuntimeError("resolution failed")),
+    )
+    monkeypatch.setattr(
+        subprocess,
+        "Popen",
+        lambda *_args, **_kwargs: pytest.fail("worker process must not start"),
+    )
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    with pytest.raises(RuntimeError, match="resolution failed"):
+        kb._default_spawn(
+            _make_task(kb, assignee="dashboardcontrol"),
+            str(workspace),
+        )
+
+
+def test_default_spawn_pins_lifecycle_process_scope_and_suppresses_hooks(
+    monkeypatch, tmp_path
+):
+    root = tmp_path / ".hermes"
+    profile = root / "profiles" / "dashboardcontrol"
+    profile.mkdir(parents=True)
+    root.joinpath("config.yaml").write_text("{}\n", encoding="utf-8")
+    profile.joinpath("config.yaml").write_text(
+        """
+platform_toolsets:
+  cli:
+    - kanban_lifecycle
+toolsets:
+  - kanban_lifecycle
+""".lstrip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(root))
+    monkeypatch.setenv("HERMES_ACCEPT_HOOKS", "1")
+    monkeypatch.setenv("HERMES_TUI", "1")
+    monkeypatch.setenv("HERMES_TENANT", "stale-parent-tenant")
+    monkeypatch.setenv("HERMES_KANBAN_WORKER_SCOPE", "inherited-invalid")
+
+    from hermes_cli import kanban_db as kb
+
+    monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["hermes"])
+    captured = {}
+
+    class FakeProc:
+        pid = 4246
+
+    def fake_popen(cmd, *args, **kwargs):
+        captured["cmd"] = list(cmd)
+        captured["env"] = dict(kwargs.get("env") or {})
+        return FakeProc()
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    assert kb._default_spawn(
+        _make_task(kb, assignee="dashboardcontrol"), str(workspace)
+    ) == 4246
+    assert captured["env"]["HERMES_KANBAN_WORKER_SCOPE"] == "lifecycle-only"
+    assert "HERMES_ACCEPT_HOOKS" not in captured["env"]
+    assert "HERMES_TUI" not in captured["env"]
+    assert "HERMES_TENANT" not in captured["env"]
+    assert "--accept-hooks" not in captured["cmd"]
+    pinned = captured["cmd"][captured["cmd"].index("--toolsets") + 1]
+    assert pinned == "kanban_lifecycle"

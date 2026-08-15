@@ -1011,6 +1011,10 @@ def _prepare_deferred_agent_startup() -> None:
     if os.environ.get("HERMES_DEFER_AGENT_STARTUP") != "1":
         return
     _deferred_agent_startup_done = True
+    from hermes_cli.kanban_worker_scope import is_lifecycle_only_worker
+
+    if is_lifecycle_only_worker():
+        return
     _accept_hooks = os.environ.get("HERMES_ACCEPT_HOOKS", "").lower() in {
         "1",
         "true",

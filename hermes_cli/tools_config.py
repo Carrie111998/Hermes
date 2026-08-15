@@ -2456,6 +2456,17 @@ def _get_platform_tools(
     skip = configurable_keys | plugin_ts_keys | platform_default_keys
     skip |= {k for k in TOOLSETS if k.startswith("hermes-")}
     skip |= set(_DEFAULT_OFF_TOOLSETS) - {platform}
+    # This security boundary is opt-in by profile and must never be inferred
+    # merely because its four tools are a subset of the broader Kanban surface.
+    # Otherwise every normal worker profile that includes Kanban gets silently
+    # collapsed to lifecycle-only by the dispatcher.
+    skip.add("kanban_lifecycle")
+    # A deliberately minimal worker profile satisfies lifecycle requirements
+    # with ``kanban_lifecycle``. Recovering the broader ``kanban`` toolset here
+    # would silently re-enable child creation, attachments, and URL fetching.
+    if "kanban_lifecycle" in toolset_names:
+        enabled_toolsets.add("kanban_lifecycle")
+        skip.add("kanban")
     for ts_key, ts_def in TOOLSETS.items():
         if ts_key in skip:
             continue

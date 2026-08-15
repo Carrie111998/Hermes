@@ -179,6 +179,17 @@ def _discover_entry_point_providers() -> None:
     ``register_provider()`` — a pip package cannot hijack a first-party
     provider name.
     """
+    # Pip entry points execute third-party code during ``load()``. A
+    # dispatcher-scoped lifecycle worker must reach its first model turn
+    # without touching that extension surface; unknown scopes fail closed.
+    try:
+        from hermes_cli.kanban_worker_scope import is_lifecycle_only_worker
+
+        if is_lifecycle_only_worker():
+            return
+    except (ImportError, ValueError):
+        return
+
     try:
         import importlib.metadata as _md
     except Exception:  # pragma: no cover — importlib.metadata always present ≥3.8
@@ -308,9 +319,18 @@ def _discover_providers() -> None:
             _import_plugin_dir(child, "bundled")
 
     # 2. User plugins — under $HERMES_HOME/plugins/model-providers/<name>/.
-    #    These can override any bundled profile of the same name (last-writer-wins
-    #    in register_provider()).
-    user_dir = _user_plugins_dir()
+    #    These can override any bundled profile of the same name for normal
+    #    agents. Dispatcher-scoped lifecycle workers must not execute profile
+    #    extension code; unknown pinned scopes fail closed as well.
+    allow_user_plugins = True
+    try:
+        from hermes_cli.kanban_worker_scope import is_lifecycle_only_worker
+
+        allow_user_plugins = not is_lifecycle_only_worker()
+    except (ImportError, ValueError):
+        allow_user_plugins = False
+
+    user_dir = _user_plugins_dir() if allow_user_plugins else None
     if user_dir is not None:
         for child in sorted(user_dir.iterdir()):
             if not child.is_dir() or child.name.startswith(("_", ".")):
@@ -318,25 +338,26 @@ def _discover_providers() -> None:
             _import_plugin_dir(child, "user")
 
     # 3. Legacy single-file profiles at providers/<name>.py. Kept for
-    #    back-compat — if someone drops a ``providers/foo.py`` into an
-    #    editable install, it still works without the plugin layout.
-    try:
-        import pkgutil
+    #    back-compat for normal agents. In an editable install these files are
+    #    another user-extension surface, so scoped workers skip them together
+    #    with $HERMES_HOME provider plugins.
+    if allow_user_plugins:
+        try:
+            import pkgutil
 
-        import providers as _pkg
+            import providers as _pkg
 
-        for _importer, modname, _ispkg in pkgutil.iter_modules(_pkg.__path__):
-            if modname.startswith("_") or modname == "base":
-                continue
-            try:
-                importlib.import_module(f"providers.{modname}")
-            except ImportError as exc:
-                logger.warning(
-                    "Failed to import legacy provider module %s: %s", modname, exc
-                )
-    except Exception:
-        pass
+            for _importer, modname, _ispkg in pkgutil.iter_modules(_pkg.__path__):
+                if modname.startswith("_") or modname == "base":
+                    continue
+                try:
+                    importlib.import_module(f"providers.{modname}")
+                except ImportError as exc:
+                    logger.warning(
+                        "Failed to import legacy provider module %s: %s", modname, exc
+                    )
+        except Exception:
+            pass
 
-    # (Pip entry-point providers are discovered in step 0, before the
-    # filesystem plugins, so first-party profiles always win on name
-    # collision — see _discover_entry_point_providers.)
+    # Pip entry-point providers are discovered in step 0, before filesystem
+    # plugins, so first-party profiles always win on name collision.

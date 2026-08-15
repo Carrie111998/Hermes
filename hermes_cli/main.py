@@ -11167,6 +11167,11 @@ def _prepare_agent_startup(args) -> None:
     ):
         return
 
+    from hermes_cli.kanban_worker_scope import is_lifecycle_only_worker
+
+    if is_lifecycle_only_worker():
+        return
+
     _accept_hooks = bool(getattr(args, "accept_hooks", False))
     if not _is_tui_chat_launch(args):
         # The TUI backend process does its own plugin discovery; the launcher

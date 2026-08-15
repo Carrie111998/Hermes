@@ -3773,6 +3773,11 @@ class PluginManager:
         sessions without requiring a full agent restart.
         """
         with self._discovery_lock, _plugin_home_scope(self.home_path):
+            from hermes_cli.kanban_worker_scope import is_lifecycle_only_worker
+
+            if is_lifecycle_only_worker():
+                self._discovered = True
+                return
             if self._discovered and not force:
                 return
             if force:

@@ -372,6 +372,16 @@ def _load_provider_from_entry_point(
     register_skills: bool = True,
 ) -> Optional["MemoryProvider"]:
     """Import a provider entry point and extract the MemoryProvider instance."""
+    # ``entry_point.load()`` executes third-party package code. Keep the same
+    # fail-closed boundary as directory providers, including unknown scopes.
+    try:
+        from hermes_cli.kanban_worker_scope import is_lifecycle_only_worker
+
+        if is_lifecycle_only_worker():
+            return None
+    except (ImportError, ValueError):
+        return None
+
     from agent.memory_provider import MemoryProvider
 
     loaded = entry_point.load()
@@ -427,6 +437,18 @@ def _load_provider_from_dir(
     - A register(ctx) function (plugin-style) — we simulate a ctx
     - A top-level class that extends MemoryProvider — we instantiate it
     """
+    # This is the single import/exec chokepoint for bundled and user-installed
+    # memory providers. Lifecycle-only workers must not execute extension code
+    # before (or lazily after) their first model turn. Unknown pinned scopes also
+    # fail closed here.
+    try:
+        from hermes_cli.kanban_worker_scope import is_lifecycle_only_worker
+
+        if is_lifecycle_only_worker():
+            return None
+    except (ImportError, ValueError):
+        return None
+
     name = provider_dir.name
     # Use a separate namespace for user-installed plugins so they don't
     # collide with bundled providers in sys.modules.
@@ -697,6 +719,14 @@ def discover_plugin_cli_commands() -> List[dict]:
     any provider is loaded.
     """
     results: List[dict] = []
+    try:
+        from hermes_cli.kanban_worker_scope import is_lifecycle_only_worker
+
+        if is_lifecycle_only_worker():
+            return results
+    except (ImportError, ValueError):
+        return results
+
     if not _MEMORY_PLUGINS_DIR.is_dir():
         return results
 
