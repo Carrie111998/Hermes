@@ -89,6 +89,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Optional
 
+from hermes_cli._subprocess_compat import noninteractive_git_env
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
 from toolsets import get_toolset_names
 
@@ -7508,6 +7509,81 @@ def _git_branch_exists(repo_root: Path, branch_name: str) -> bool:
     return result.returncode == 0
 
 
+def _worktree_base_ref(repo_root: Path) -> str:
+    """Return a freshly fetched remote base for a new task branch."""
+    env = noninteractive_git_env()
+    try:
+        fetched = subprocess.run(
+            ["git", "-C", str(repo_root), "fetch", "--prune", "origin"],
+            capture_output=True,
+            text=True, encoding="utf-8", errors="replace",
+            timeout=60,
+            check=False,
+            stdin=subprocess.DEVNULL,
+            env=env,
+        )
+    except Exception as exc:
+        _log.debug("kanban worktree base fetch failed: %s", exc)
+        return "HEAD"
+    if fetched.returncode != 0:
+        _log.debug(
+            "kanban worktree base fetch failed: %s",
+            (fetched.stderr or fetched.stdout or "").strip(),
+        )
+        return "HEAD"
+
+    candidates = ["refs/remotes/origin/main"]
+    try:
+        symbolic = subprocess.run(
+            [
+                "git", "-C", str(repo_root), "symbolic-ref", "--quiet",
+                "refs/remotes/origin/HEAD",
+            ],
+            capture_output=True,
+            text=True, encoding="utf-8", errors="replace",
+            timeout=30,
+            check=False,
+        )
+        if symbolic.returncode == 0 and symbolic.stdout.strip():
+            candidates.append(symbolic.stdout.strip())
+        else:
+            remote_head = subprocess.run(
+                [
+                    "git", "-C", str(repo_root), "ls-remote", "--symref",
+                    "origin", "HEAD",
+                ],
+                capture_output=True,
+                text=True, encoding="utf-8", errors="replace",
+                timeout=30,
+                check=False,
+                stdin=subprocess.DEVNULL,
+                env=env,
+            )
+            if remote_head.returncode == 0:
+                for line in remote_head.stdout.splitlines():
+                    if line.startswith("ref: refs/heads/") and line.endswith("\tHEAD"):
+                        branch = line.removeprefix("ref: refs/heads/").removesuffix("\tHEAD")
+                        candidates.append(f"refs/remotes/origin/{branch}")
+                        break
+    except Exception as exc:
+        _log.debug("kanban remote default resolution failed: %s", exc)
+
+    for candidate in candidates:
+        verified = subprocess.run(
+            [
+                "git", "-C", str(repo_root), "rev-parse", "--verify", "--quiet",
+                f"{candidate}^{{commit}}",
+            ],
+            capture_output=True,
+            text=True, encoding="utf-8", errors="replace",
+            timeout=30,
+            check=False,
+        )
+        if verified.returncode == 0:
+            return candidate
+    return "HEAD"
+
+
 def _git_common_dir(path: Path) -> Optional[Path]:
     try:
         result = subprocess.run(
@@ -7601,9 +7677,10 @@ def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> Non
     if _git_branch_exists(repo_root, branch_name):
         cmd = ["git", "-C", str(repo_root), "worktree", "add", str(target), branch_name]
     else:
+        base_ref = _worktree_base_ref(repo_root)
         cmd = [
             "git", "-C", str(repo_root), "worktree", "add", "-b", branch_name,
-            str(target), "HEAD",
+            str(target), base_ref,
         ]
     result = subprocess.run(
         cmd,
