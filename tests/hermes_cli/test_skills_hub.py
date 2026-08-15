@@ -365,6 +365,33 @@ def test_scan_source_scrubs_reserved_identifier_from_non_optional_adapter():
     ) == "hermes-index"
 
 
+@pytest.mark.parametrize("prefix", ("skills-sh/", "skills.sh/", "skils-sh/", "skils.sh/"))
+@pytest.mark.parametrize("reserved", ("official", "agent-created"))
+def test_scan_source_scrubs_prefixed_reserved_aliases(prefix, reserved):
+    from hermes_cli.skills_hub import (
+        _scan_source_for_install,
+        _scan_source_for_lock_entry,
+    )
+    from tools.skills_guard import _resolve_trust_level
+
+    class _HermesIndexLike:
+        def source_id(self):
+            return "hermes-index"
+
+    alias = f"{prefix}{reserved}"
+    scan_source = _scan_source_for_install(
+        _bundle(alias), _meta(alias), alias, _HermesIndexLike()
+    )
+    lock_source = _scan_source_for_lock_entry(
+        {"identifier": alias, "source": "hermes-index"}
+    )
+
+    assert scan_source == "hermes-index"
+    assert lock_source == "hermes-index"
+    assert _resolve_trust_level(scan_source) == "community"
+    assert _resolve_trust_level(lock_source) == "community"
+
+
 def test_stamped_official_blocks_dangerous_install_policy():
     """Index-stamped official must not unlock builtin dangerous allowance."""
     from hermes_cli.skills_hub import _scan_source_for_install

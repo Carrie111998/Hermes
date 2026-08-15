@@ -169,6 +169,21 @@ def _is_official_optional_adapter(matched_source) -> bool:
 
 
 _RESERVED_SCAN_PROVENANCE = frozenset({"official", "agent-created"})
+_SCAN_PROVENANCE_PREFIX_ALIASES = (
+    "skills-sh/",
+    "skills.sh/",
+    "skils-sh/",
+    "skils.sh/",
+)
+
+
+def _is_reserved_scan_provenance(candidate: str) -> bool:
+    normalized = candidate
+    for prefix in _SCAN_PROVENANCE_PREFIX_ALIASES:
+        if normalized.startswith(prefix):
+            normalized = normalized[len(prefix):]
+            break
+    return normalized in _RESERVED_SCAN_PROVENANCE
 
 
 def _scrub_reserved_scan_provenance(candidate: str, matched_source=None) -> str:
@@ -178,14 +193,14 @@ def _scrub_reserved_scan_provenance(candidate: str, matched_source=None) -> str:
     Never honor them from unsigned index metadata, lock identifiers, or any
     non-optional adapter (e.g. hermes-index echoing identifier="official").
     """
-    if candidate not in _RESERVED_SCAN_PROVENANCE:
+    if not _is_reserved_scan_provenance(candidate):
         return candidate
     if _is_official_optional_adapter(matched_source):
         return candidate
     source_id = getattr(matched_source, "source_id", None)
     if callable(source_id):
         sid = source_id()
-        if sid and sid not in _RESERVED_SCAN_PROVENANCE:
+        if sid and not _is_reserved_scan_provenance(sid):
             return sid
     return "community"
 
@@ -206,9 +221,9 @@ def _scan_source_for_install(bundle, meta, identifier: str, matched_source) -> s
 def _scan_source_for_lock_entry(entry: dict) -> str:
     """Choose scanner trust identity for an already-installed hub lock entry."""
     candidate = entry.get("identifier") or entry.get("source") or "community"
-    if candidate in _RESERVED_SCAN_PROVENANCE:
+    if _is_reserved_scan_provenance(candidate):
         alt = entry.get("source") or ""
-        if alt and alt not in _RESERVED_SCAN_PROVENANCE:
+        if alt and not _is_reserved_scan_provenance(alt):
             return alt
         return "community"
     return candidate
