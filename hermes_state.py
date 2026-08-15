@@ -6091,18 +6091,44 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         Imported rows carry no owner: the legacy format never recorded one, so
         any process may retire them. A row already present also wins; it was
         written by a live process and is newer than anything being imported.
+
+        An entry the legacy file left unusable is dropped rather than imported
+        half-formed. Only the total is returned, so each drop is logged at
+        debug with its key and reason: a caller that renames the file aside on
+        success has no second chance to see what did not come across.
         """
         pending = []
         for session_id, entry in records:
             if not session_id or not isinstance(entry, Mapping):
+                logger.debug(
+                    "import_interrupted_turns: skipping %r, unusable entry "
+                    "of type %s",
+                    session_id,
+                    type(entry).__name__,
+                )
                 continue
             text = str(entry.get("prompt") or "")
             if not text.strip():
+                logger.debug(
+                    "import_interrupted_turns: skipping %r, empty prompt",
+                    session_id,
+                )
                 continue
+            raw_attempts = raw_started = None
             try:
-                attempt_count = max(0, int(entry.get("attempts") or 0))
-                started = float(entry.get("started_at") or 0)
-            except (TypeError, ValueError):
+                raw_attempts = entry.get("attempts")
+                raw_started = entry.get("started_at")
+                attempt_count = max(0, int(raw_attempts or 0))
+                started = float(raw_started or 0)
+            except (TypeError, ValueError) as exc:
+                logger.debug(
+                    "import_interrupted_turns: skipping %r, "
+                    "attempts=%r started_at=%r not numeric: %s",
+                    session_id,
+                    raw_attempts,
+                    raw_started,
+                    exc,
+                )
                 continue
             pending.append(
                 (
