@@ -30,6 +30,10 @@ from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
 
+# GitHub release publication remains here; isolated filesystem snapshots and
+# their canonical .hermes-release-sha marker are built by
+# scripts/release_snapshot.py.
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 VERSION_FILE = REPO_ROOT / "hermes_cli" / "__init__.py"
 PYPROJECT_FILE = REPO_ROOT / "pyproject.toml"

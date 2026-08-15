@@ -1,0 +1,11 @@
+[Unit]
+Description=Hermes gateway calendar-guard recovery timer
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+Persistent=true
+Unit=hermes-gateway-recovery.service
+
+[Install]
+WantedBy=timers.target

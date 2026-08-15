@@ -5,6 +5,8 @@ crash; these prove the guard that turns it into a clear "restart the gateway"
 message before a model switch can hit it.
 """
 
+import json
+
 import pytest
 
 from gateway import code_skew
@@ -57,7 +59,29 @@ class TestDetectCodeSkew:
         monkeypatch.setattr(hermes_constants, "get_hermes_home", lambda: tmp_path)
         code_skew.record_boot_fingerprint()
 
-        assert (tmp_path / "gateway_boot_fingerprint").read_text() == "git:refs/heads/main:abc1234567890\n"
+        record = json.loads((tmp_path / "gateway_boot_fingerprint").read_text())
+        assert record["schema"] == 1
+        assert record["fingerprint"] == "git:refs/heads/main:abc1234567890"
+
+    def test_read_boot_record_accepts_legacy_one_line_format(self, tmp_path):
+        (tmp_path / "gateway_boot_fingerprint").write_text(
+            "git:refs/heads/main:abc1234567890\n"
+        )
+        assert code_skew.read_boot_record(tmp_path) == {
+            "schema": 0,
+            "fingerprint": "git:refs/heads/main:abc1234567890",
+            "release_path": None,
+        }
+
+    def test_unresolved_fingerprint_does_not_write_boot_record(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(code_skew, "_fingerprint", lambda: None)
+
+        import hermes_constants
+
+        monkeypatch.setattr(hermes_constants, "get_hermes_home", lambda: tmp_path)
+        code_skew.record_boot_fingerprint()
+
+        assert not (tmp_path / "gateway_boot_fingerprint").exists()
 
 
 class TestShort:

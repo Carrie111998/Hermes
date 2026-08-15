@@ -17,37 +17,62 @@ stays ``None`` and skew detection no-ops — it never produces a false positive.
 
 from __future__ import annotations
 
+import json
+import logging
+import os
+import tempfile
+import time
 from pathlib import Path
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 _boot_fingerprint: str | None = None
+_log = logging.getLogger(__name__)
 
 
 def _fingerprint() -> str | None:
-    """Current checkout fingerprint, reusing the CLI's git-rev reader.
-
-    ``hermes_cli.main`` is always already imported in a gateway process (it's
-    the entry point), so this import is free and avoids duplicating the
-    worktree-aware ref resolution.
-    """
+    """Return the identity of the code tree containing this module."""
     try:
-        from hermes_cli.main import _read_git_revision_fingerprint
+        from hermes_cli.gateway_identity import identity_from_project
 
-        return _read_git_revision_fingerprint(_PROJECT_ROOT)
+        return identity_from_project(_PROJECT_ROOT).fingerprint
     except Exception:
         return None
 
 
 def _write_boot_fingerprint_file(fingerprint: str | None) -> None:
-    if not fingerprint:
+    if fingerprint is None:
         return
     try:
         from hermes_constants import get_hermes_home
 
         path = Path(get_hermes_home()) / "gateway_boot_fingerprint"
-        path.write_text(fingerprint + "\n")
-    except Exception:
-        pass
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if not isinstance(fingerprint, str) or not fingerprint:
+            return
+        record = {
+            "schema": 1,
+            "fingerprint": fingerprint,
+            "release_path": str(_PROJECT_ROOT) if fingerprint.startswith("release:") else None,
+            "pid": os.getpid(),
+            "timestamp": time.time(),
+        }
+        fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(record, handle, sort_keys=True)
+                handle.write("\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp_name, path)
+        finally:
+            try:
+                os.unlink(temp_name)
+            except FileNotFoundError:
+                pass
+    except Exception as exc:
+        # Startup must remain non-fatal on non-git or read-only installs, but
+        # an operator should still be able to see why the boot record is absent.
+        _log.warning("could not write gateway boot fingerprint: %s", exc)
 
 
 def record_boot_fingerprint() -> None:
@@ -55,7 +80,31 @@ def record_boot_fingerprint() -> None:
     global _boot_fingerprint
     if _boot_fingerprint is None:
         _boot_fingerprint = _fingerprint()
+    if _boot_fingerprint is None:
+        return
     _write_boot_fingerprint_file(_boot_fingerprint)
+
+
+def read_boot_record(home: Path | None = None) -> dict[str, object] | None:
+    """Read the atomic boot record, accepting the legacy one-line format."""
+    try:
+        if home is None:
+            from hermes_constants import get_hermes_home
+
+            home = Path(get_hermes_home())
+        path = Path(home) / "gateway_boot_fingerprint"
+        raw = path.read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeError):
+        return None
+    if not raw:
+        return None
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError:
+        return {"schema": 0, "fingerprint": raw, "release_path": None}
+    if not isinstance(value, dict) or not isinstance(value.get("fingerprint"), str):
+        return None
+    return value
 
 
 def _short(fingerprint: str) -> str:
