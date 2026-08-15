@@ -2429,3 +2429,125 @@ class TestGatewayStopGraceBudget:
             "the CLI would force-kill before launchd's own escalation"
         )
         assert exit_timeout >= self.MIN_PLATFORM_STOP_BUDGET
+
+
+class TestStartsRefuseToStackOnASurvivingGateway:
+    """No start/restart path may bring a second gateway up over a live one.
+
+    ``_wait_for_gateway_exit`` returns False only once it has already sent
+    SIGKILL and watched the PID outlive the deadline, and it says exactly
+    what is at stake: "still running after Ns -- restart may fail". The
+    start/restart callers discarded that bool and printed "Starting
+    gateway..." anyway.
+
+    Starting is the worse branch. gateway/run.py writes gateway.pid at
+    startup, so the replacement takes over the survivor's record and the
+    survivor becomes the orphan ``stop_profile_gateway`` has to sweep for
+    afterwards (#75936) -- invisible to ``hermes gateway stop`` and still
+    holding the webhook port (#51325). ``launchd_uninstall`` already refuses
+    to proceed on this same signal.
+
+    Every case is parametrized on the wait's verdict so the guard is pinned
+    in both directions: a fix that simply always aborted would fail the
+    ``exited=True`` half.
+    """
+
+    def _no_service_manager(self, monkeypatch):
+        """Drive the paths that fall through to the CLI's own start."""
+        monkeypatch.delenv("_HERMES_GATEWAY", raising=False)
+        monkeypatch.setattr(gateway_cli, "is_termux", lambda: False)
+        monkeypatch.setattr(gateway_cli, "is_macos", lambda: False)
+        monkeypatch.setattr(gateway_cli, "is_windows", lambda: False)
+        monkeypatch.setattr(gateway_cli, "supports_systemd_services", lambda: False)
+        monkeypatch.setattr(
+            gateway_cli,
+            "_dispatch_via_service_manager_if_s6",
+            lambda *_a, **_k: False,
+        )
+        monkeypatch.setattr(
+            gateway_cli,
+            "_dispatch_all_via_service_manager_if_s6",
+            lambda *_a, **_k: False,
+        )
+
+    @staticmethod
+    def _record_starts(monkeypatch):
+        started = []
+        monkeypatch.setattr(
+            gateway_cli, "run_gateway", lambda **_k: started.append("foreground")
+        )
+        monkeypatch.setattr(
+            gateway_cli, "systemd_start", lambda system=False: started.append("systemd")
+        )
+        monkeypatch.setattr(
+            gateway_cli, "launchd_start", lambda: started.append("launchd")
+        )
+        return started
+
+    @pytest.mark.parametrize("exited", [True, False])
+    def test_restart_all_starts_only_once_every_profile_is_down(
+        self, monkeypatch, capsys, exited
+    ):
+        """`gateway restart --all` stops across profiles, then starts one.
+
+        The stop is a best-effort broadcast: the service stop and
+        kill_gateway_processes() both only signal. When the wait then reports
+        the PID still alive, the "Starting gateway..." underneath it stacks a
+        second instance on the first.
+        """
+        self._no_service_manager(monkeypatch)
+        started = self._record_starts(monkeypatch)
+        monkeypatch.setattr(gateway_cli, "kill_gateway_processes", lambda **_k: 1)
+        monkeypatch.setattr(
+            gateway_cli, "_wait_for_gateway_exit", lambda **_k: exited
+        )
+
+        args = SimpleNamespace(gateway_command="restart", all=True, system=False)
+        if exited:
+            gateway_cli.gateway_command(args)
+        else:
+            with pytest.raises(SystemExit) as excinfo:
+                gateway_cli.gateway_command(args)
+            assert excinfo.value.code == 1, "a refused restart must exit non-zero"
+
+        out = capsys.readouterr().out
+        assert ("Starting gateway..." in out) is exited
+        assert (started == ["foreground"]) is exited, (
+            "a second gateway was started over the surviving one"
+            if not exited
+            else "a cleared restart must still start the replacement"
+        )
+
+    @pytest.mark.parametrize("exited", [True, False])
+    def test_manual_restart_starts_only_once_the_old_gateway_is_gone(
+        self, monkeypatch, capsys, exited
+    ):
+        """The no-service fallback is the sharper of the two restart sites.
+
+        systemd and launchd at least have their own view of what is already
+        running; here nothing supervises either process, so run_gateway()
+        brings the replacement up in the foreground of this very shell while
+        the survivor still holds the port.
+        """
+        self._no_service_manager(monkeypatch)
+        started = self._record_starts(monkeypatch)
+        monkeypatch.setattr(gateway_cli, "stop_profile_gateway", lambda: True)
+        monkeypatch.setattr(
+            gateway_cli, "_wait_for_gateway_exit", lambda **_k: exited
+        )
+
+        args = SimpleNamespace(gateway_command="restart", all=False, system=False)
+        if exited:
+            gateway_cli.gateway_command(args)
+        else:
+            with pytest.raises(SystemExit) as excinfo:
+                gateway_cli.gateway_command(args)
+            assert excinfo.value.code == 1, "a refused restart must exit non-zero"
+
+        out = capsys.readouterr().out
+        assert ("Starting gateway..." in out) is exited
+        assert (started == ["foreground"]) is exited, (
+            "run_gateway() brought a second gateway up over the survivor"
+            if not exited
+            else "a cleared restart must still start the replacement"
+        )
