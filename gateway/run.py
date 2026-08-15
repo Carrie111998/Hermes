@@ -67,6 +67,9 @@ from agent.turn_context import (
 )
 from hermes_cli.config import _is_ssh_remote_tilde_cwd, cfg_get
 from hermes_cli.fallback_config import get_fallback_chain
+from gateway.session_health import (
+    combine_session_health_trailing as _combine_session_health_trailing,
+)
 
 # --- Agent cache tuning ---------------------------------------------------
 # Bounds the per-session AIAgent cache to prevent unbounded growth in
@@ -21128,34 +21131,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         await self._deliver_media_from_response(
                             response, event, _media_adapter,
                         )
-                # Streaming already delivered the body text, but the footer was
-                # intentionally held back (see the `not already_sent` gate above).
-                # Send it now as a small trailing message so Telegram/Discord/etc.
-                # still surface the runtime metadata on the final reply.
-                if _footer_line:
+                # Streaming already delivered the body text. Both the runtime
+                # footer and session-health advice were intentionally held back;
+                # coalesce them so the final metadata arrives in one notification.
+                _streamed_trailing = _combine_session_health_trailing(
+                    _footer_line, _session_health_trailing
+                )
+                if _streamed_trailing:
                     try:
-                        _foot_adapter = self._adapter_for_source(source)
-                        if _foot_adapter:
-                            await _foot_adapter.send(
+                        _trailing_adapter = self._adapter_for_source(source)
+                        if _trailing_adapter:
+                            await _trailing_adapter.send(
                                 source.chat_id,
-                                _footer_line,
-                                metadata=self._thread_metadata_for_source(source, self._reply_anchor_for_event(event)),
-                            )
-                    except Exception as _e:
-                        logger.debug("trailing footer send failed: %s", _e)
-                if _session_health_trailing:
-                    try:
-                        _health_adapter = self._adapter_for_source(source)
-                        if _health_adapter:
-                            await _health_adapter.send(
-                                source.chat_id,
-                                _session_health_trailing,
+                                _streamed_trailing,
                                 metadata=self._thread_metadata_for_source(
                                     source, self._reply_anchor_for_event(event)
                                 ),
                             )
                     except Exception as _e:
-                        logger.debug("trailing session health send failed: %s", _e)
+                        logger.debug("combined trailing message send failed: %s", _e)
                 # This branch returns None so the adapter does not send the
                 # body twice. /loop and /goal hooks in _handle_message read
                 # the return value, so stash the delivered text on the event

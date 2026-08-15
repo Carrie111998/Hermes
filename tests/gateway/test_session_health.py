@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from gateway.session_health import (
+    combine_session_health_trailing,
     count_session_activity,
     evaluate_session_health,
     plan_session_health_delivery,
@@ -369,6 +370,16 @@ def test_delivery_plan_appends_only_for_non_streamed_reply():
     assert normal.trailing_message == ""
     assert streamed.response == "Finished."
     assert streamed.trailing_message == "Use /new."
+
+
+def test_streamed_footer_and_health_advice_form_one_trailing_payload():
+    assert (
+        combine_session_health_trailing("runtime metadata", "Use /new.")
+        == "runtime metadata\n\nUse /new."
+    )
+    assert combine_session_health_trailing("runtime metadata", "") == "runtime metadata"
+    assert combine_session_health_trailing("", "Use /new.") == "Use /new."
+    assert combine_session_health_trailing("", "") == ""
 
 
 def test_delivery_plan_suppresses_advice_without_visible_response():

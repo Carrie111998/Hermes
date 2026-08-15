@@ -53,6 +53,12 @@ def session_health_can_deliver(
     return not intentional_silence and bool(response or already_sent)
 
 
+def combine_session_health_trailing(footer: str, advice: str) -> str:
+    """Combine optional streamed footer and advice into one trailing message."""
+
+    return "\n\n".join(part for part in (footer, advice) if part)
+
+
 def plan_session_health_delivery(
     *, response: str, advice: str, already_sent: bool
 ) -> SessionHealthDelivery:
