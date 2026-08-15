@@ -143,6 +143,11 @@ logger = logging.getLogger(__name__)
 
 _MATRIX_VOICE_WAVEFORM_BINS = 30
 
+# How long to wait before re-requesting a missing megolm room key for the
+# same (room, session). Guards against a request loop when the sender never
+# answers the m.room_key_request (see _dispatch_sync).
+_ROOM_KEY_REQUEST_TTL = 5 * 60
+
 
 def _matrix_voice_metadata_for_file(path: Path) -> Dict[str, Any]:
     """Return best-effort Matrix voice metadata for an audio file.
@@ -1182,6 +1187,10 @@ class MatrixAdapter(BasePlatformAdapter):
         self._crypto_db: Any = None  # mautrix.util.async_db.Database
         self._sync_task: Optional[asyncio.Task] = None
         self._sas_verification: Any = None  # verification.SasVerificationHandler
+        # TTL cache for room-key requests: (room_id, session_id) -> timestamp.
+        # Prevents re-requesting the same missing megolm session on every sync
+        # cycle when the sender never answers (request-loop guard).
+        self._room_key_requested: Dict[tuple, float] = {}
         self._invite_join_tasks: Dict[str, asyncio.Task] = {}
         self._closing = False
         self._startup_ts: float = 0.0
@@ -3116,8 +3125,10 @@ class MatrixAdapter(BasePlatformAdapter):
         if not client or not hasattr(client, "handle_sync"):
             return
         # Dedupe m.room_key_request (missing megolm sessions): send at most
-        # ONE request per (room, session), even when several events of the
-        # same session appear within one sync response.
+        # ONE request per (room, session) per TTL window, even when several
+        # events of the same session appear within one sync response — and
+        # don't re-request on every sync cycle if the sender never answers.
+        _now = time.time()
         _requested_keys: set = set()
         # --- Missing megolm session: actively request room keys ---
         # Element X encrypts in-room verification (MSC 2241) as megolm room
@@ -3150,8 +3161,17 @@ class MatrixAdapter(BasePlatformAdapter):
                             )
                             if _has:
                                 continue
-                            # Keys missing -> request them (fire-and-forget, timeout=0)
+                            # Keys missing -> request them (fire-and-forget,
+                            # timeout=0). Backoff: skip if we already asked
+                            # within the TTL window (default 5 min) so a
+                            # non-answering sender doesn't trigger a request
+                            # loop on every sync cycle.
+                            _last_req = self._room_key_requested.get(_dup_key, 0.0)
+                            if _now - _last_req < _ROOM_KEY_REQUEST_TTL:
+                                _requested_keys.add(_dup_key)
+                                continue
                             _requested_keys.add(_dup_key)
+                            self._room_key_requested[_dup_key] = _now
                             _devs = await crypto.crypto_store.get_devices(_sender) or {}
                             try:
                                 await crypto.request_room_key(
@@ -3225,7 +3245,9 @@ class MatrixAdapter(BasePlatformAdapter):
         if inspect.isawaitable(tasks):
             tasks = await tasks
         if _all_tasks:
-            tasks = list(tasks) + _all_tasks
+            # handle_sync may return None when there is nothing to dispatch;
+            # never let list(None) abort the whole sync dispatch.
+            tasks = list(tasks or []) + _all_tasks
         if tasks:
             # return_exceptions=True so one failing event handler doesn't abort
             # the whole gather and silently drop the SIBLING events in the same
@@ -3621,22 +3643,22 @@ class MatrixAdapter(BasePlatformAdapter):
                 if started:
                     await self._send_simple_message(
                         room_id,
-                        "🔐 **Geräteverifikation gestartet!**\n\n"
-                        "Schau in deinem Element-Client nach — es sollte eine "
-                        "Verifizierungsanfrage erscheinen. Wähle **Emoji-Vergleich** "
-                        "und bestätige, wenn die Emojis übereinstimmen.",
+                        "🔐 **Device verification started!**\n\n"
+                        "Check your Element client — a verification request "
+                        "should appear. Choose **Emoji comparison** and confirm "
+                        "when the emojis match.",
                         "m.notice",
                     )
                 else:
                     await self._send_simple_message(
                         room_id,
-                        "Verifikation konnte nicht gestartet werden (kein DM-Raum gefunden).",
+                        "Verification could not be started (no DM room found).",
                         "m.notice",
                     )
             except Exception as exc:
                 logger.warning("Matrix: !verify failed: %s", exc)
                 await self._send_simple_message(
-                    room_id, f"Verifikation fehlgeschlagen: {exc}", "m.notice"
+                    room_id, f"Verification failed: {exc}", "m.notice"
                 )
             return
 

@@ -1049,10 +1049,10 @@ class SasVerificationHandler:
         emoji_chars = " ".join(e for e, _ in emojis)
         descriptions = ", ".join(f"{e} = {d}" for e, d in emojis)
         text = (
-            "🔐 **Geräteverifikation (SAS)**\n\n"
-            "Vergleiche diese Emojis mit denen auf deinem Bildschirm. "
-            "Wenn sie **in dieser Reihenfolge übereinstimmen**, bestätige die "
-            "Verifikation in deinem Client.\n\n"
+            "🔐 **Device verification (SAS)**\n\n"
+            "Compare these emojis with the ones on your screen. "
+            "If they **match in this order**, confirm the "
+            "verification in your client.\n\n"
             f"{emoji_chars}\n\n"
             f"({descriptions})"
         )
@@ -1120,8 +1120,8 @@ class SasVerificationHandler:
             try:
                 await self._adapter.send(
                     room_id,
-                    "✅ Verifikation erfolgreich! Das Gerät ist jetzt als "
-                    "verifiziert markiert.",
+                    "✅ Verification successful! The device is now marked as "
+                    "verified.",
                 )
             except Exception as exc:
                 logger.debug("Matrix: success notification failed: %s", exc)
