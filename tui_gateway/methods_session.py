@@ -2589,6 +2589,45 @@ def _(rid, params: dict) -> dict:
     )
 
 
+@method("session.append_message")
+def _(rid, params: dict) -> dict:
+    """Persist a user/assistant line without starting a turn.
+
+    Plugins use this to print a teammate ask/answer into the origin chat
+    so a later session.activate REST refresh does not wipe it.
+    """
+    session, err = _sess_nowait(params, rid)
+    if err:
+        return err
+    role = "user" if str(params.get("role") or "").strip().lower() == "user" else "assistant"
+    content = str(params.get("content") or params.get("text") or "").strip()
+    if not content:
+        return _err(rid, 4000, "empty message")
+    entry = {"role": role, "content": content}
+    lock = session.get("history_lock")
+    if lock is not None:
+        with lock:
+            session.setdefault("history", []).append(entry)
+            session["history_version"] = int(session.get("history_version", 0)) + 1
+    else:
+        session.setdefault("history", []).append(entry)
+        session["history_version"] = int(session.get("history_version", 0)) + 1
+    try:
+        key = session.get("session_key")
+        _ensure_session_db_row(session)
+        with _session_db(session) as db:
+            if db is not None and key:
+                db.append_message(
+                    session_id=key,
+                    role=role,
+                    content=content,
+                    observed=bool(params.get("observed", True)),
+                )
+    except Exception:
+        pass
+    return _ok(rid, {"ok": True, "role": role})
+
+
 @method("session.undo")
 def _(rid, params: dict) -> dict:
     session, err = _sess(params, rid)
