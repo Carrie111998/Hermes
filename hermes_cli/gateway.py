@@ -1525,6 +1525,49 @@ def kill_gateway_processes(
     return killed
 
 
+def _reaper_candidate_is_supervisor_owned(pid: int) -> bool:
+    """True when ``pid`` is a gateway process owned by a platform supervisor.
+
+    Backstop for the orphan reaper: a supervised gateway must never be killed,
+    even if its pidfile is missing. On Windows ``_get_service_pids()`` is empty
+    (no systemd/launchd query) and a Scheduled-Task gateway may have lost
+    ``gateway.pid`` — yet it is still alive and supervised. Walking the parent
+    chain to the supervisor process catches it without depending on the
+    pidfile:
+
+    * macOS   — launchd (PID 1),
+    * Linux   — systemd / init (PID 1),
+    * Windows — a descendant of services.exe (the Task Scheduler launches tasks
+               under the services tree; the gateway's bootstrap is its child).
+
+    Bounded to a few levels so a wedged parent chain can never loop. Any error
+    (process gone, psutil unavailable) is treated as "not owned" so a genuine
+    orphan is still reaped.
+    """
+    try:
+        import psutil  # type: ignore
+
+        proc = psutil.Process(pid)
+        parent = proc.parent()
+        seen = 0
+        while parent is not None and seen < 12:
+            seen += 1
+            try:
+                name = (parent.name() or "").lower()
+            except Exception:
+                name = ""
+            if is_macos() and name == "launchd":
+                return True
+            if (not is_macos()) and not is_windows() and name in ("systemd", "init"):
+                return True
+            if is_windows() and name == "services.exe":
+                return True
+            parent = parent.parent()
+    except Exception:
+        pass
+    return False
+
+
 def _reap_unsupervised_gateway_orphans(extra_exclude: set | None = None) -> bool:
     """Kill no-supervisor gateway orphans the pidfile/runtime record can't see.
 
@@ -1555,20 +1598,54 @@ def _reap_unsupervised_gateway_orphans(extra_exclude: set | None = None) -> bool
     own = {os.getpid()}
     if extra_exclude:
         own |= extra_exclude
-    # On macOS, exclude the launchd-managed gateway PID so the orphan reaper
-    # doesn't kill a supervised gateway when Hermes Desktop opens (the serve
-    # process calls this on startup).  supports_systemd_services() returns
-    # False on macOS, so without this the launchd gateway looks like an
-    # unsupervised orphan and gets SIGTERM'd, causing launchd to restart it.
-    if is_macos():
-        try:
-            own |= _get_service_pids()
-        except Exception:
-            pass
+
+    # Service-managed gateways are not orphans — never reap them.  Covers macOS
+    # launchd and any systemd unit reachable from a host that got past the gate
+    # above (#83683, #85344).  On Windows _get_service_pids() is empty (no
+    # systemd/launchd query), so Windows relies on the recorded-PID and
+    # supervisor-owned backstops below.
+    try:
+        own |= _get_service_pids()
+    except Exception:
+        pass
+
+    # The recorded healthy gateway PID is, by definition, not an orphan "the
+    # pidfile/runtime record can't see" — spare it (#83683, #86098).  Its
+    # supervisor bootstrap (whose argv matches the gateway scan) is spared too,
+    # so killing the bootstrap can't take the detached gateway down with it.
+    # Bounded to the immediate parent: we only need to skip the bootstrap, not
+    # walk the whole chain to PID 1.
+    try:
+        from gateway.status import get_running_pid
+
+        recorded = get_running_pid()
+        if recorded and recorded > 0:
+            own.add(recorded)
+            try:
+                import psutil  # type: ignore
+
+                _parent = psutil.Process(recorded).parent()
+                if _parent is not None:
+                    own.add(_parent.pid)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
     try:
         # find_gateway_pids() includes no-supervisor `gateway restart` runtimes
-        # for the current profile when no systemd supervisor is present.
-        orphans = [p for p in find_gateway_pids(exclude_pids=own) if p and p > 0]
+        # for the current profile when no systemd supervisor is present.  Drop
+        # any candidate a platform supervisor actually owns (launchd / systemd
+        # / the Windows Scheduled Task) — even when its pidfile is missing,
+        # which _get_service_pids() can't see on Windows and get_running_pid()
+        # can't return.  A supervised gateway is never an orphan the reaper
+        # should kill.  The recorded-PID exclusion above already handles the
+        # common case; this backstop closes the pidfile-less gap.
+        orphans = [
+            p
+            for p in find_gateway_pids(exclude_pids=own)
+            if p and p > 0 and not _reaper_candidate_is_supervisor_owned(p)
+        ]
     except Exception:
         return False
     if not orphans:
