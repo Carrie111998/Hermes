@@ -1393,21 +1393,56 @@ EOF
         # current venv. Only pin when the target is not already an ancestor of
         # HEAD; a fresh clone has no such ancestry and pins normally.
         if ! git cat-file -e "$INSTALL_COMMIT^{commit}" 2>/dev/null; then
-            git fetch origin "$INSTALL_COMMIT" || true
+            # The shallow clone only carries the branch tip, so an explicit pin
+            # target usually has to be fetched by sha. GitHub refuses to serve
+            # an abbreviated sha ("couldn't find remote ref"), and swallowing
+            # that with `|| true` let the later `git checkout --detach` misparse
+            # the unknown name as a pathspec and the install finish exit-0 on
+            # unpinned "$BRANCH" -- the user believed they were pinned (#87268).
+            # Reject a non-full sha early, and fail hard if the fetch is refused.
+            case "$INSTALL_COMMIT" in
+                *[!0-9a-fA-F]* | "")
+                    _bad_sha=true ;;
+                *)
+                    [ "${#INSTALL_COMMIT}" -eq 40 ] && _bad_sha=false || _bad_sha=true ;;
+            esac
+            if [ "$_bad_sha" = true ]; then
+                log_error "--commit must be a full 40-character commit sha; got '$INSTALL_COMMIT'."
+                log_error "Abbreviated shas cannot be fetched by name and would silently leave you on unpinned $BRANCH."
+                exit 1
+            fi
+            if ! git fetch origin "$INSTALL_COMMIT" 2>/dev/null; then
+                log_error "Could not fetch commit $INSTALL_COMMIT from origin."
+                log_error "Refusing to continue: pinning failed and the install would otherwise run unpinned $BRANCH."
+                exit 1
+            fi
+        fi
+        # The object must resolve locally now; otherwise the checkout below
+        # would misparse the sha as a pathspec and the install would proceed
+        # unpinned. Fail closed instead (#87268).
+        if ! git cat-file -e "$INSTALL_COMMIT^{commit}" 2>/dev/null; then
+            log_error "Commit $INSTALL_COMMIT is not available after fetch -- refusing to run unpinned $BRANCH."
+            exit 1
         fi
         if git rev-parse --verify --quiet HEAD >/dev/null 2>&1 \
            && git merge-base --is-ancestor "$INSTALL_COMMIT" HEAD 2>/dev/null \
            && [ "$(git rev-parse "$INSTALL_COMMIT^{commit}" 2>/dev/null)" != "$(git rev-parse HEAD)" ]; then
             if [ "$FORCE_COMMIT" = true ]; then
                 log_warn "--force-commit: rolling this install back to $INSTALL_COMMIT."
-                git checkout --detach "$INSTALL_COMMIT"
+                if ! git checkout --detach "$INSTALL_COMMIT"; then
+                    log_error "Failed to check out pinned commit $INSTALL_COMMIT -- refusing to run unpinned $BRANCH."
+                    exit 1
+                fi
             else
                 log_warn "Ignoring --commit $INSTALL_COMMIT: the checkout is already newer."
                 log_warn "Pinning to it would roll this install back. Pass --force-commit to override."
             fi
         else
             log_info "Pinning checkout to commit $INSTALL_COMMIT..."
-            git checkout --detach "$INSTALL_COMMIT"
+            if ! git checkout --detach "$INSTALL_COMMIT"; then
+                log_error "Failed to check out pinned commit $INSTALL_COMMIT -- refusing to run unpinned $BRANCH."
+                exit 1
+            fi
         fi
     fi
 
