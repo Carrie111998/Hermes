@@ -4371,13 +4371,77 @@ def normalize_copilot_model_id(
     return raw
 
 
+def _resolve_copilot_catalog_api_key() -> str:
+    """Best-effort Copilot token for catalog-backed capability lookups.
+
+    ``github_model_reasoning_efforts`` is called from WebUI and the agent
+    gates without an explicit ``api_key``. Without a token the live
+    ``/models`` catalog is unreachable and every non-GPT Copilot model
+    silently falls through to the static table. Resolve the same token the
+    rest of the Copilot stack already uses, and never raise — a missing
+    credential must degrade to the offline fallback, not break the picker.
+    """
+    try:
+        from hermes_cli.copilot_auth import get_copilot_api_token, resolve_copilot_token
+    except Exception:
+        return ""
+    try:
+        raw, _source = resolve_copilot_token()
+    except Exception:
+        return ""
+    if not raw:
+        return ""
+    try:
+        api_token, _base_url = get_copilot_api_token(raw)
+    except Exception:
+        return raw
+    return str(api_token or raw).strip()
+
+
+def _copilot_claude_supports_reasoning_effort(bare_model: str) -> bool:
+    """True for Copilot-hosted Claude models that advertise an effort ladder.
+
+    Live catalog (2026-08): opus/sonnet 4.6+ and unversioned 5.x expose
+    ``reasoning_effort``; 3.x and 4.0–4.5 (including haiku-4.5) do not.
+    """
+    raw = (bare_model or "").strip().lower()
+    if "claude" not in raw:
+        return False
+    if re.search(r"claude-3\b", raw) or re.search(r"claude-3[.\-]", raw):
+        return False
+    match = re.search(r"(\d+)[.\-](\d{1,2})(?!\d)", raw)
+    if match:
+        return (int(match.group(1)), int(match.group(2))) >= (4, 6)
+    major_only = re.search(r"[-.](\d+)(?:[-.]\d{6,})?(?:\b|-)", raw)
+    if major_only:
+        return int(major_only.group(1)) >= 5
+    return True
+
+
 def _github_reasoning_efforts_for_model_id(model_id: str) -> list[str]:
+    """Offline fallback when the live Copilot catalog is unavailable.
+
+    Conservative intersection of what Copilot currently accepts: GPT-5 /
+    o-series keep their existing ladders; Claude 4.6+, Gemini 3+, Grok 4.5+
+    and MAI-Code get low/medium/high. Catalog-backed lookups remain
+    authoritative and may advertise extra levels (xhigh/max) or deny a
+    family entirely (haiku-4.5).
+    """
     raw = (model_id or "").strip().lower()
     if raw.startswith(("openai/o1", "openai/o3", "openai/o4", "o1", "o3", "o4")):
         return list(COPILOT_REASONING_EFFORTS_O_SERIES)
     normalized = normalize_copilot_model_id(model_id).lower()
-    if normalized.startswith("gpt-5"):
+    bare = normalized.rsplit("/", 1)[-1]
+    if bare.startswith("gpt-5"):
         return list(COPILOT_REASONING_EFFORTS_GPT5)
+    if "claude" in bare:
+        return ["low", "medium", "high"] if _copilot_claude_supports_reasoning_effort(bare) else []
+    if re.match(r"gemini-(?:3|[4-9]|2\.[5-9])", bare):
+        return ["low", "medium", "high"]
+    if re.match(r"grok-(?:4\.[5-9]|[5-9])", bare):
+        return ["low", "medium", "high"]
+    if bare.startswith("mai-code"):
+        return ["low", "medium", "high"]
     return []
 
 
@@ -4592,7 +4656,23 @@ def github_model_reasoning_efforts(
     catalog: Optional[list[dict[str, Any]]] = None,
     api_key: Optional[str] = None,
 ) -> list[str]:
-    """Return supported reasoning-effort levels for a Copilot-visible model."""
+    """Return supported reasoning-effort levels for a Copilot-visible model.
+
+    The live ``/models`` catalog is authoritative: Claude, Gemini, Grok and
+    MAI-Code all advertise ``capabilities.supports.reasoning_effort`` there,
+    but the static offline table historically only knew GPT-5 / o-series.
+    Callers (WebUI chip, agent send gates) usually pass neither ``catalog``
+    nor ``api_key``, so resolve a Copilot token automatically and fetch the
+    cached catalog. An explicit catalog still wins and skips auth.
+    """
+    if catalog is None and not api_key:
+        resolved = _resolve_copilot_catalog_api_key()
+        if resolved:
+            api_key = resolved
+
+    if catalog is None and api_key:
+        catalog = fetch_github_model_catalog(api_key=api_key)
+
     normalized = normalize_copilot_model_id(model_id, catalog=catalog, api_key=api_key)
     if not normalized:
         return []
@@ -4600,10 +4680,6 @@ def github_model_reasoning_efforts(
     catalog_entry = None
     if catalog is not None:
         catalog_entry = next((item for item in catalog if item.get("id") == normalized), None)
-    elif api_key:
-        fetched_catalog = fetch_github_model_catalog(api_key=api_key)
-        if fetched_catalog:
-            catalog_entry = next((item for item in fetched_catalog if item.get("id") == normalized), None)
 
     if catalog_entry is not None:
         capabilities = catalog_entry.get("capabilities")

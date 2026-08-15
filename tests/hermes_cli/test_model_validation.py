@@ -233,6 +233,110 @@ class TestGithubReasoningEfforts:
             "high",
         ]
 
+    def test_explicit_catalog_is_authoritative_for_non_gpt_families(self):
+        catalog = [
+            {
+                "id": "claude-opus-5",
+                "capabilities": {
+                    "type": "chat",
+                    "supports": {"reasoning_effort": ["low", "medium", "high", "xhigh", "max"]},
+                },
+            },
+            {
+                "id": "gemini-3.6-flash",
+                "capabilities": {
+                    "type": "chat",
+                    "supports": {"reasoning_effort": ["minimal", "low", "medium", "high"]},
+                },
+            },
+            {
+                "id": "grok-4.6",
+                "capabilities": {
+                    "type": "chat",
+                    "supports": {"reasoning_effort": ["low", "medium", "high", "xhigh"]},
+                },
+            },
+            {
+                "id": "claude-haiku-4.5",
+                "capabilities": {"type": "chat", "supports": {}},
+            },
+        ]
+        assert github_model_reasoning_efforts("claude-opus-5", catalog=catalog) == [
+            "low", "medium", "high", "xhigh", "max",
+        ]
+        assert github_model_reasoning_efforts("gemini-3.6-flash", catalog=catalog) == [
+            "minimal", "low", "medium", "high",
+        ]
+        assert github_model_reasoning_efforts("grok-4.6", catalog=catalog) == [
+            "low", "medium", "high", "xhigh",
+        ]
+        assert github_model_reasoning_efforts("claude-haiku-4.5", catalog=catalog) == []
+
+    def test_missing_catalog_auto_resolves_token_and_uses_live_catalog(self):
+        catalog = [{
+            "id": "claude-opus-5",
+            "capabilities": {
+                "type": "chat",
+                "supports": {"reasoning_effort": ["low", "medium", "high", "xhigh", "max"]},
+            },
+        }]
+        with patch(
+            "hermes_cli.models._resolve_copilot_catalog_api_key",
+            return_value="tok",
+        ) as mock_key, patch(
+            "hermes_cli.models.fetch_github_model_catalog",
+            return_value=catalog,
+        ) as mock_fetch:
+            assert github_model_reasoning_efforts("claude-opus-5") == [
+                "low", "medium", "high", "xhigh", "max",
+            ]
+        mock_key.assert_called_once()
+        mock_fetch.assert_called_once()
+
+    def test_explicit_catalog_skips_token_resolve(self):
+        catalog = [{
+            "id": "claude-opus-5",
+            "capabilities": {
+                "type": "chat",
+                "supports": {"reasoning_effort": ["low", "medium", "high"]},
+            },
+        }]
+        with patch(
+            "hermes_cli.models._resolve_copilot_catalog_api_key",
+            return_value="tok",
+        ) as mock_key:
+            assert github_model_reasoning_efforts(
+                "claude-opus-5", catalog=catalog
+            ) == ["low", "medium", "high"]
+        mock_key.assert_not_called()
+
+    def test_offline_fallback_covers_known_copilot_reasoning_families(self):
+        with patch(
+            "hermes_cli.models._resolve_copilot_catalog_api_key",
+            return_value="",
+        ), patch(
+            "hermes_cli.models.fetch_github_model_catalog",
+            return_value=None,
+        ):
+            for model_id in (
+                "claude-opus-5",
+                "claude-opus-4.6",
+                "claude-sonnet-4.6",
+                "claude-sonnet-5",
+                "gemini-3.6-flash",
+                "gemini-3.7-flash",
+                "grok-4.5",
+                "grok-4.6",
+                "mai-code-1.1-flash",
+            ):
+                efforts = github_model_reasoning_efforts(model_id)
+                assert "medium" in efforts, model_id
+                assert "high" in efforts, model_id
+            assert github_model_reasoning_efforts("claude-haiku-4.5") == []
+            assert github_model_reasoning_efforts("gpt-5.5") == [
+                "minimal", "low", "medium", "high",
+            ]
+
 
 class TestCopilotNormalization:
 
