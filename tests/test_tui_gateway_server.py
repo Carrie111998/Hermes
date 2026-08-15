@@ -19484,7 +19484,7 @@ def test_null_profile_still_uses_launch(monkeypatch, tmp_path):
     resp = server.handle_request(
         {"id": "t2", "method": "session.list", "params": {"profile": None}}
     )
-    assert resp.get("error", {}).get("code") != -32602
+    assert resp["result"]["sessions"] == []
 
 
 def test_profile_home_regular_file_is_not_a_profile(monkeypatch, tmp_path):
