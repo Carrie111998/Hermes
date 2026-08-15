@@ -1,6 +1,13 @@
 """Engineering domain models."""
 
 from .evidence import Evidence, EvidenceKind, EvidenceStatus
+from .review import (
+    ReviewCategory,
+    ReviewFinding,
+    ReviewResult,
+    ReviewSeverity,
+    ReviewVerdict,
+)
 from .verification import (
     InvalidVerificationResult,
     VerificationCheckKind,
@@ -28,6 +35,11 @@ __all__ = [
     "EvidenceStatus",
     "InvalidWorkflowTransition",
     "InvalidVerificationResult",
+    "ReviewCategory",
+    "ReviewFinding",
+    "ReviewResult",
+    "ReviewSeverity",
+    "ReviewVerdict",
     "VerificationCheckKind",
     "VerificationCheckResult",
     "VerificationCheckStatus",
