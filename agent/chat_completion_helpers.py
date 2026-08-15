@@ -578,6 +578,24 @@ def _provider_preferences_for_agent(agent) -> Dict[str, Any]:
     return preferences
 
 
+def _prompt_cache_scope_for_agent(agent) -> "str | None":
+    """Rotation-stable logical cache scope for *agent*, or None.
+
+    Guarded-import wrapper over the never-raising
+    ``agent.prompt_cache_scope.resolve_prompt_cache_scope_safe`` — the
+    transports treat a None/empty value as "fall back to the physical
+    session_id", so any resolution failure degrades to pre-#79017 behavior
+    instead of blocking the request build.
+    """
+    try:
+        from agent.prompt_cache_scope import resolve_prompt_cache_scope_safe
+
+        return resolve_prompt_cache_scope_safe(agent)
+    except Exception:
+        logger.debug("prompt-cache scope resolution failed", exc_info=True)
+        return None
+
+
 def _merge_nous_portal_messages_extra_body(agent, anthropic_kwargs: dict) -> dict:
     """Merge Portal ``tags`` / ``session_id`` onto an Anthropic Messages kwargs dict.
 
@@ -1815,6 +1833,12 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
             guardrail_config=guardrail,
         )
 
+    # Rotation-stable logical cache scope, shared by every OpenAI-wire branch
+    # below (codex + both chat_completions paths). Memoized on the agent —
+    # cheap after the first call. Resolved after the anthropic/bedrock early
+    # returns above, which don't use prompt_cache_key.
+    _cache_scope_id = _prompt_cache_scope_for_agent(agent)
+
     if agent.api_mode == "codex_responses":
         _ct = agent._get_transport()
         is_github_responses = (
@@ -1880,6 +1904,7 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
             tools=tools_for_api,
             reasoning_config=agent.reasoning_config,
             session_id=getattr(agent, "session_id", None),
+            cache_scope_id=_cache_scope_id,
             base_url=agent.base_url,
             max_tokens=agent.max_tokens,
             timeout=agent._resolved_api_call_timeout(),
@@ -1989,6 +2014,7 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
             reasoning_config=agent.reasoning_config,
             request_overrides=agent.request_overrides,
             session_id=getattr(agent, "session_id", None),
+            cache_scope_id=_cache_scope_id,
             provider_profile=_profile,
             ollama_num_ctx=agent._ollama_num_ctx,
             # Context forwarded to profile hooks:
@@ -2021,6 +2047,7 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
         reasoning_config=agent.reasoning_config,
         request_overrides=agent.request_overrides,
         session_id=getattr(agent, "session_id", None),
+        cache_scope_id=_cache_scope_id,
         model_lower=(agent.model or "").lower(),
         is_openrouter=_is_or,
         is_nous=_is_nous,
