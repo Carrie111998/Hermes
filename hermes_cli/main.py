@@ -5194,7 +5194,9 @@ from hermes_cli.update_cmd import (  # noqa: F401
     _cmd_update_impl,
     _cold_start_windows_gateway_after_update,
     _count_commits_between,
+    _detect_self_loaded_native_modules,
     _detect_venv_python_processes,
+    _defer_update_for_self_lock,
     _discard_lockfile_churn,
     _discard_stashed_changes,
     _ensure_acp_launcher,
@@ -5234,6 +5236,7 @@ from hermes_cli.update_cmd import (  # noqa: F401
     _reload_updated_runtime_modules,
     _resolve_pre_update_backup_mode,
     _resolve_stash_selector,
+    _restart_phase_failure_is_incomplete,
     _restore_stashed_changes,
     _resume_windows_gateways_after_update,
     _run_logged_subprocess,
@@ -5242,6 +5245,7 @@ from hermes_cli.update_cmd import (  # noqa: F401
     _stash_apply_failed_only_on_existing_untracked,
     _stash_local_changes_if_needed,
     _stop_process_trees,
+    _surviving_gateway_pids_after_failed_restart,
     _sync_fork_with_upstream,
     _sync_with_upstream_if_needed,
     _update_node_dependencies,
@@ -5252,6 +5256,7 @@ from hermes_cli.update_cmd import (  # noqa: F401
     _venv_core_imports_healthy,
     _venv_launcher_ancestors,
     _wait_for_windows_update_gateway_exit,
+    _warn_gateway_restart_phase_aborted,
     _warn_incomplete_gateway_fleet_restart,
     _web_build_toolchain_ready,
     _web_toolchain_roots,
@@ -8183,36 +8188,21 @@ def _recover_core_update_marker_locked() -> None:
         _repair_venv_via_import_probes(install_prefix, env=install_env)
 
     try:
+        from hermes_cli import _install_repair as _ir
+
+        # ensure_uv bootstraps the installer itself when missing (the early
+        # pass's stdlib-only lookup cannot); keeping it here means the late
+        # path still self-heals a venv whose uv vanished mid-update.
         from hermes_cli.managed_uv import ensure_uv
 
-        # Always bootstrap pip first: a killed install can leave the venv with
-        # no pip module at all, and uv may also be gone. ensurepip restores a
-        # known-good pip so at least the plain-pip path below can proceed.
-        try:
-            subprocess.run(
-                [sys.executable, "-m", "ensurepip", "--upgrade", "--default-pip"],
-                cwd=PROJECT_ROOT,
-                capture_output=True,
-            )
-        except Exception as exc:
-            logger.debug("ensurepip during install recovery failed: %s", exc)
+        ensure_uv()
 
-        uv_bin = ensure_uv()
-        if uv_bin:
-            uv_env = {**os.environ, "VIRTUAL_ENV": str(PROJECT_ROOT / "venv")}
-            if _is_termux_env(uv_env):
-                uv_env.pop("PYTHONPATH", None)
-                uv_env.pop("PYTHONHOME", None)
-            _install_python_dependencies_with_optional_fallback(
-                [uv_bin, "pip"],
-                env=uv_env,
-                group="termux-all" if _is_termux_env(uv_env) else "all",
-            )
-        else:
-            _install_python_dependencies_with_optional_fallback(
-                [sys.executable, "-m", "pip"],
-                group="termux-all" if _is_termux_env() else "all",
-            )
+        # Delegate the install itself to the shared stdlib executor so both
+        # this late path and the pre-import early pass run exactly the same
+        # reinstall.  Called inside the same stdout→stderr redirect already
+        # established by _recover_from_interrupted_install, so
+        # run_core_install's own redirect nests harmlessly.
+        _ir.run_core_install(PROJECT_ROOT)
 
         _clear_update_incomplete_marker()
         print("✓ Dependency installation recovered — your install is healthy again.")
