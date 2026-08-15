@@ -102,6 +102,65 @@ class TestPlanCacheSectionsThreadsTtlAndPrefix:
             "Qwen's 5-minute-only context cache must clamp a configured 1h"
         )
 
+    def test_litellm_openai_wire_destination_gets_envelope_markers(self):
+        """#84506 sibling path: MoA/auxiliary destinations resolve the same
+        policy, so a LiteLLM OpenAI-wire destination must receive envelope
+        cache_control markers here too — not fall through to (False, False)
+        and re-bill the full prompt every turn."""
+        from agent.agent_runtime_helpers import plan_cache_sections_for_destination
+
+        messages = [
+            {"role": "system", "content": "You are helpful."},
+            {"role": "user", "content": "hello"},
+        ]
+        out_msgs, _ = plan_cache_sections_for_destination(
+            messages,
+            None,
+            provider="custom:litellm",
+            base_url="https://litellm.example.com/v1",
+            api_mode="chat_completions",
+            model="claude-sonnet-4-6",
+            cache_disabled=False,
+            cache_ttl="5m",
+        )
+        markers = _collect_cache_controls(out_msgs)
+        assert markers, (
+            "LiteLLM OpenAI-wire Claude must receive cache_control markers "
+            "on the MoA/auxiliary destination path"
+        )
+        # Envelope layout: markers live on content parts (system content is
+        # split into text blocks), never a top-level tool message marker.
+        system = out_msgs[0]
+        assert isinstance(system.get("content"), list) and any(
+            isinstance(part, dict) and "cache_control" in part
+            for part in system["content"]
+        ), "envelope layout marks the system content part, not the message envelope"
+
+    def test_litellm_non_claude_destination_stays_unmarked(self):
+        """#84506 sibling path: a non-Claude model routed through the same
+        LiteLLM proxy must not receive Anthropic markers on the
+        MoA/auxiliary destination path (strict relays reject the block
+        format, cf. #77217)."""
+        from agent.agent_runtime_helpers import plan_cache_sections_for_destination
+
+        messages = [
+            {"role": "system", "content": "You are helpful."},
+            {"role": "user", "content": "hello"},
+        ]
+        out_msgs, _ = plan_cache_sections_for_destination(
+            messages,
+            None,
+            provider="custom:litellm",
+            base_url="https://litellm.example.com/v1",
+            api_mode="chat_completions",
+            model="openai/gpt-5.4",
+            cache_disabled=False,
+            cache_ttl="5m",
+        )
+        assert not _collect_cache_controls(out_msgs), (
+            "non-Claude on LiteLLM must stay marker-free on the destination path"
+        )
+
 
 class TestMoACacheControlThreadsTtl:
     def test_moa_decoration_uses_threaded_1h(self):

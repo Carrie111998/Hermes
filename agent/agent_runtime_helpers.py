@@ -2171,6 +2171,13 @@ def anthropic_prompt_cache_policy(
     gateway implements the Anthropic cache_control contract
     (MiniMax, Zhipu GLM, LiteLLM's Anthropic proxy mode all do).
 
+    LiteLLM proxies exposing the OpenAI-compatible surface instead
+    (``/v1/chat/completions`` — e.g. ``provider: custom:litellm``)
+    also honour Anthropic-style ``cache_control`` markers when serving
+    a Claude model, and get the envelope layout (native_anthropic=False)
+    like OpenRouter.  Without this grant they serve zero cache hits,
+    re-billing the full prompt on every turn.
+
     Qwen / Alibaba-family models on OpenCode, OpenCode Go, and direct
     Alibaba (DashScope) also honour Anthropic-style ``cache_control``
     markers on OpenAI-wire chat completions. Upstream pi-mono #3392 /
@@ -2346,6 +2353,45 @@ def anthropic_prompt_cache_policy(
     # Docs: https://platform.minimax.io/docs/api-reference/anthropic-api-compatible-cache
     if is_anthropic_wire and is_minimax_route:
         return True, True
+
+    # LiteLLM proxies exposing the OpenAI-compatible surface (e.g.
+    # ``provider: custom:litellm`` with /v1/chat/completions — /v1/messages
+    # returns 404) serve Claude models and honour Anthropic-style
+    # cache_control markers on the OpenAI wire, exactly like OpenRouter.
+    # Without this branch the OpenAI-wire LiteLLM route matches no grant
+    # branch and falls through to (False, False) — zero cache hits, the
+    # full prompt re-billed on every turn (the same silent failure class
+    # the Qwen branch below addresses). LiteLLM's Anthropic-native route
+    # (/v1/messages) is already covered by the third-party-gateway branch
+    # above, which returns the native layout.
+    #
+    # Gated on the Claude family only: a Gemini/GPT/Qwen/DeepSeek route
+    # through the same proxy must not receive markers — some strict
+    # OpenAI-wire relays reject the cache_control block format (cf. the
+    # DeepSeek/OpenCode exclusion, #77217).  The calling format is a
+    # property of the *model*, not the endpoint.
+    #
+    # Envelope layout (native_anthropic=False), not native: this is an
+    # OpenAI-wire chat.completions route — "Envelope layout is an
+    # OpenAI-wire construct" (see the OpenRouter branch above), and the
+    # issue reporter's verified repro used exactly the envelope shape
+    # (system as content list + cache_control → real cache hits).
+    #
+    # Detection mirrors the MiniMax provider-or-host pattern: a
+    # ``litellm`` substring in the provider id (``custom:litellm``,
+    # ``litellm``) or in the base URL host (self-hosted proxies
+    # registered as bare ``custom``).  The host check is host-only via
+    # ``base_url_hostname`` so a ``litellm`` path segment on an
+    # unrelated host (e.g. ``https://api.corp.com/v1/litellm``) does not
+    # grant cache_control to a provider that may reject the marker with
+    # HTTP 400.
+    litellm_host = base_url_hostname(eff_base_url)
+    is_litellm = (
+        "litellm" in provider_lower
+        or "litellm" in litellm_host
+    )
+    if is_litellm and is_claude and not is_anthropic_wire:
+        return True, False
 
     # Qwen/Alibaba on OpenCode (Zen/Go) and native DashScope: OpenAI-wire
     # transport that accepts Anthropic-style cache_control markers and
