@@ -17,7 +17,7 @@
 
 | Reference | Current evidence | Meaning |
 |---|---|---|
-| origin/main | 77bcb5d0717ed4b31daec8a9ef701057528e08ae | Canonical Hermes mainline after HERMES-TELEGRAM-TRANSPORT-001 merge (PR #19). |
+| origin/main | 4c5b93701810c4f870a59ffab5ed570c911fcf50 | Canonical Hermes mainline after HERMES-TELEGRAM-TRANSPORT-001 merge (PR #19). |
 | origin/ticket/T0127-v2026.8.3-merged | release staging branch | DGX release input; not the ARCH merge target. |
 | live DGX checkout | /home/cwliao/.hermes/hermes-agent | Claude-owned; do not edit or reset. |
 | live DGX deployed commit | 77bcb5d0717ed4b31daec8a9ef701057528e08ae | Release snapshot deployed; gateway active after restart, Telegram polling progress not observed. |

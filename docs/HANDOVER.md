@@ -13,7 +13,7 @@
 - **Working checkout:** `D:/PROJECT/Hermes/.worktrees/hermes-auth-002`.
 - **Canonical remote:** `origin` -> `git@github.com:cwliao/hermes-agent.git`.
 - **Canonical mainline:** `origin/main` at
-  `826349ccbfe165ef9f2f7f47f72ed53226c13603`.
+  `4c5b93701810c4f870a59ffab5ed570c911fcf50`.
 - **Current checkout branch:** `ticket/hermes-telegram-transport-001`.
 - **Current checkout HEAD at implementation handoff:** `6bb24ec25`.
 - **DGX runtime:** configured target, checkout
@@ -26,14 +26,15 @@
 
 ## 2. Goal and roadmap
 
-- **Current goal:** Complete implementation review and CI for
-  `HERMES-TELEGRAM-TRANSPORT-001`; keep merge and deployment separately
-  authorized.
+- **Current goal:** Diagnose the DGX Telegram initial connection/network path or
+  execute the documented rollback trigger for
+  `HERMES-TELEGRAM-TRANSPORT-001`; do not claim inbound readiness without direct
+  evidence.
 - **Completed and verified:** HERMES-AUTH-001 merged as PR #14 at
   `63bcd7ac` after main CI run `31791195033` passed all required checks,
   including the Windows wrapper job.
 - **Completed and deployed:** HERMES-CALENDAR-GUARD-001 merged through PR #17
-  and correction PR #18; `main` is `1b3d444955...`, and DGX runs immutable
+  and correction PR #18; the merged historical release is `1b3d444955...`, and DGX runs immutable
   release snapshot
   `v2026.8.15-hermes-calendar-guard-1b3d444955`.
 - **Telegram evidence:** direct outbound verification through the merged
@@ -52,7 +53,7 @@
 - **Mainline versus deployed code:** mainline and deployed code are
   `77bcb5d0717ed4b31daec8a9ef701057528e08ae`; DGX uses
   `/home/cwliao/.hermes/releases/v2026.8.15-hermes-telegram-transport-77bcb5d0717e`
-  selected through `29-hermes-calendar-guard-1b3d444955.conf`. The live source
+  selected through `30-hermes-telegram-transport-77bcb5d0717e.conf`. The live source
   checkout remains untouched.
 - **DGX service evidence:** the configured DGX target;
   `hermes-gateway.service` is active/running with MainPID `3504674`, exit
