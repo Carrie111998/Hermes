@@ -337,6 +337,87 @@ def test_registered_project_uses_canonical_path_and_survives_reopening_state(tmp
     assert project_path(reopened, "mycoolapp") == project.resolve()
 
 
+def test_register_project_resolves_exact_short_name_under_injected_projects_root(tmp_path):
+    projects_root = tmp_path / "projects"
+    projects_root.mkdir()
+    project = _make_project(projects_root, "trinity-water")
+    db = SessionDB(db_path=tmp_path / "state.db")
+
+    registered = register_project(db, "trinity-water", projects_root=projects_root)
+
+    assert registered.key == "trinitywater"
+    assert registered.path == project.resolve()
+    assert project_path(db, "trinitywater") == project.resolve()
+
+
+def test_register_project_accepts_absolute_path_with_injected_projects_root(tmp_path):
+    projects_root = tmp_path / "projects"
+    projects_root.mkdir()
+    project = _make_project(tmp_path, "outside-project")
+    db = SessionDB(db_path=tmp_path / "state.db")
+
+    registered = register_project(db, str(project / "."), projects_root=projects_root)
+
+    assert registered.path == project.resolve()
+
+
+@pytest.mark.parametrize("short_name", ["trinity", "trin*"])
+def test_register_project_rejects_nonexistent_short_name(tmp_path, short_name):
+    projects_root = tmp_path / "projects"
+    projects_root.mkdir()
+    db = SessionDB(db_path=tmp_path / "state.db")
+
+    with pytest.raises(ValueError, match="project path does not exist"):
+        register_project(db, short_name, projects_root=projects_root)
+
+
+@pytest.mark.parametrize("relative_path", ["../outside-project", "foo/../../../outside-project"])
+def test_register_project_rejects_relative_path_that_escapes_projects_root(tmp_path, relative_path):
+    projects_root = tmp_path / "projects"
+    projects_root.mkdir()
+    escaped_project = _make_project(tmp_path, "outside-project")
+    db = SessionDB(db_path=tmp_path / "state.db")
+
+    with pytest.raises(ValueError, match="must remain beneath projects root"):
+        register_project(db, relative_path, projects_root=projects_root)
+
+    assert project_path(db, "outsideproject") is None
+    assert (escaped_project / "README.md").read_text() == "# Test project\n"
+
+
+def test_register_project_supports_exact_nested_relative_path(tmp_path):
+    projects_root = tmp_path / "projects"
+    nested_root = projects_root / "experiments"
+    nested_root.mkdir(parents=True)
+    project = _make_project(nested_root, "my-app")
+    db = SessionDB(db_path=tmp_path / "state.db")
+
+    registered = register_project(db, "experiments/my-app", projects_root=projects_root)
+
+    assert registered.key == "myapp"
+    assert registered.path == project.resolve()
+
+
+@pytest.mark.asyncio
+async def test_project_add_resolves_short_name_from_default_projects_root(tmp_path, monkeypatch):
+    import gateway.project_router as project_router
+
+    projects_root = tmp_path / "projects"
+    projects_root.mkdir()
+    project = _make_project(projects_root, "trinity-water", agents=False)
+    monkeypatch.setattr(project_router, "DEFAULT_PROJECTS_ROOT", projects_root)
+    runner = _runner(tmp_path)
+    runner._handle_message_with_agent = AsyncMock()
+
+    response = await runner._handle_message(_event("!project add trinity-water"))
+
+    assert response.startswith(
+        f"Project registered: trinitywater\nPath: {project.resolve()}\n\nContext:\n"
+    )
+    assert project_path(runner._session_db._db, "trinitywater") == project.resolve()
+    assert (project / "README.md").read_text() == "# Test project\n"
+
+
 def test_register_project_rejects_duplicate_keys_and_paths(tmp_path):
     db = SessionDB(db_path=tmp_path / "state.db")
     first = _make_project(tmp_path, "first")

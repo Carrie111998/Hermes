@@ -14,6 +14,9 @@ _BOOTSTRAP_PROJECTS = {
 _META_PREFIX = "matrix_project_router:"
 _REGISTRY_META_KEY = "matrix_project_router:registry"
 _REGISTRY_VERSION = 1
+# Relative `!project add` references are resolved only beneath this root.
+# Keep this in one place so a future gateway configuration can override it.
+DEFAULT_PROJECTS_ROOT = Path("/home/rle/projects")
 _PROJECT_MARKERS = (
     "pyproject.toml",
     "setup.py",
@@ -122,16 +125,42 @@ def _appears_to_be_project(path: Path) -> bool:
     return (path / ".git").exists() or any((path / marker).is_file() for marker in _PROJECT_MARKERS)
 
 
-def register_project(db, raw_path: str, *, key: str | None = None) -> RegisteredProject:
-    """Validate and persist a project without modifying its repository files."""
-    candidate = Path((raw_path or "").strip())
-    if not candidate.is_absolute():
-        raise ValueError("project path must be absolute")
-    if not candidate.exists():
-        raise ValueError(f"project path does not exist: {candidate}")
-    if not candidate.is_dir():
-        raise ValueError(f"project path is not a directory: {candidate}")
-    path = candidate.resolve()
+def _resolve_project_path(raw_path: str, projects_root: Path) -> Path:
+    """Resolve an absolute path or an exact relative path beneath projects_root."""
+    value = (raw_path or "").strip()
+    if not value:
+        raise ValueError("project path must not be empty")
+
+    candidate = Path(value)
+    if candidate.is_absolute():
+        path = candidate.resolve()
+    else:
+        root = Path(projects_root).resolve()
+        path = (root / candidate).resolve()
+        try:
+            path.relative_to(root)
+        except ValueError as exc:
+            raise ValueError(
+                f"relative project path must remain beneath projects root: {root}"
+            ) from exc
+
+    if not path.exists():
+        raise ValueError(f"project path does not exist: {path}")
+    if not path.is_dir():
+        raise ValueError(f"project path is not a directory: {path}")
+    return path
+
+
+def register_project(
+    db, raw_path: str, *, key: str | None = None, projects_root: Path | None = None
+) -> RegisteredProject:
+    """Validate and persist a project without modifying its repository files.
+
+    Absolute paths retain their existing behavior. Relative paths are exact,
+    potentially nested references beneath projects_root (the default projects root
+    in production), and cannot escape it after canonicalization.
+    """
+    path = _resolve_project_path(raw_path, projects_root or DEFAULT_PROJECTS_ROOT)
     if not _appears_to_be_project(path):
         raise ValueError(f"project path does not appear to be a project or repository: {path}")
 
