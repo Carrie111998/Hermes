@@ -232,6 +232,24 @@ def cmd_sessions(args, sessions_parser=None):
         print("  Do not install it. Review the JSON report for partial data or errors.")
         return 1
 
+    if action == "recover-compression":
+        from hermes_cli.compression_recovery import recover_stuck_compression
+        from hermes_state import SessionDB
+
+        db = SessionDB()
+        try:
+            report = recover_stuck_compression(
+                db,
+                args.session_id,
+                apply=bool(getattr(args, "apply", False)),
+                backup=not bool(getattr(args, "no_backup", False)),
+                backup_path=getattr(args, "backup_path", None),
+            )
+        finally:
+            db.close()
+        print(_json.dumps(report, indent=2, sort_keys=True))
+        return 1 if report.get("error") else 0
+
     try:
         from hermes_state import SessionDB
 
