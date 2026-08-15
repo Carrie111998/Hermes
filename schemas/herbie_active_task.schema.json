@@ -40,22 +40,14 @@
     "spec_sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
     "status": {
       "type": "string",
-      "enum": [
-        "RECEIVED",
-        "PREFLIGHT",
-        "ACTIVE",
-        "BLOCKED",
-        "WAITING_OWNER",
-        "READY_FOR_INDEPENDENT_REVIEW",
-        "COMPLETE",
-        "ABORTED",
-        "QUEUED"
-      ]
+      "enum": ["RECEIVED", "PREFLIGHT", "ACTIVE", "BLOCKED", "WAITING_OWNER", "READY_FOR_INDEPENDENT_REVIEW", "COMPLETE", "ABORTED", "QUEUED"]
     },
     "created_at": { "type": "string" },
     "started_at": { "type": ["string", "null"] },
     "last_progress_at": { "type": ["string", "null"] },
     "last_owner_update_at": { "type": ["string", "null"] },
+    "last_owner_notification_attempt_at": { "type": ["string", "null"] },
+    "last_owner_notification_delivered_at": { "type": ["string", "null"] },
     "next_required_owner_update_at": { "type": ["string", "null"] },
     "current_step": { "type": ["string", "null"] },
     "next_step": { "type": ["string", "null"] },
@@ -65,7 +57,10 @@
     "checkpoint_commit": { "type": ["string", "null"] },
     "checkpoint_artifact_path": { "type": ["string", "null"] },
     "tool_budget_risk": { "type": ["string", "null"] },
-    "owner_notification_state": { "type": ["string", "null"] },
+    "owner_notification_state": {
+      "type": ["string", "null"],
+      "enum": [null, "pending", "pending_queued_notice", "pending_task_accepted_preflight", "attempted_pending_transport", "failed_retryable", "delivered"]
+    },
     "internal_nudge_state": { "type": ["object", "null"] },
     "completion_artifact": { "type": ["string", "null"] },
     "closed_at": { "type": ["string", "null"] }

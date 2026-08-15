@@ -2,19 +2,63 @@
 
 ## Purpose
 
-The Active Task Supervisor is a deterministic control plane for consequential owner-assigned tasks. Its goal is to ensure a task cannot silently disappear while Herbie is blocked, stale, out of tool budget, or ready for review.
+The Active Task Supervisor is a deterministic control plane for consequential owner-assigned tasks. It prevents silent disappearance while Herbie is unacknowledged, blocked, waiting for Steve, stale, out of tool budget, queued behind another task, ready for review, complete, or aborted.
 
-The Herbie Execution Operating Charter remains authoritative for execution discipline. This SOP describes the runtime state, watchdog behavior, and review/activation process.
+The Herbie Execution Operating Charter remains authoritative for execution discipline. This SOP describes the runtime state, watchdog behavior, review/activation process, rollback, and recovery lifecycle.
 
 ## Runtime storage
 
 Default private state location:
 
-- Ledger: `$HERMES_HOME/task-supervisor/active_task.json`
+- Canonical task store: `$HERMES_HOME/task-supervisor/tasks.json`
+- Legacy active-task mirror: `$HERMES_HOME/task-supervisor/active_task.json`
 - Event log: `$HERMES_HOME/task-supervisor/events.jsonl`
-- Notification dedupe: `$HERMES_HOME/task-supervisor/dedupe_state.json`
+- Notification outbox: `$HERMES_HOME/task-supervisor/notification_outbox.json`
+- Incident/blocker lifecycle state: `$HERMES_HOME/task-supervisor/dedupe_state.json`
+- Watchdog lock: `$HERMES_HOME/task-supervisor/.watchdog.lock`
 
-The runtime directory is private operational state and must not be committed to public repositories. Do not place secrets, Steve's private contact details, race-director emails, prospect data, or customer data in the ledger.
+`tasks.json` preserves every task:
+
+```json
+{
+  "active_task_id": "...",
+  "tasks": { "<task_id>": { } },
+  "queue": ["<queued_task_id>"]
+}
+```
+
+Queued task insertion must never overwrite the active task. Queue promotion is deterministic and owner-controlled unless a later reviewed policy explicitly permits automatic promotion.
+
+The runtime directory is private operational state and must not be committed to public repositories. Do not place secrets, race-director emails, prospect data, customer data, or production payloads in the ledger.
+
+## Task ingestion
+
+Ordinary chat is not automatically supervised. Consequential work must enter through the supervised task-ingestion path.
+
+Entrypoint:
+
+```bash
+python3 scripts/herbie_task_supervisor_task.py start \
+  --task-id HERBIE-YYYYMMDD-HHMM-slug \
+  --title "Task title" \
+  --owner Steve \
+  --spec-path /absolute/path/to/spec.md \
+  --spec-version "version label"
+```
+
+The entrypoint:
+
+1. computes and records spec SHA-256;
+2. creates a task ID supplied by the caller;
+3. preserves any active task;
+4. safely queues a second task unless `--parallel-authorized` is supplied;
+5. records RECEIVED/QUEUED state and event history.
+
+Owner-controlled queue promotion:
+
+```bash
+python3 scripts/herbie_task_supervisor_task.py promote-next
+```
 
 ## Schemas
 
@@ -37,63 +81,64 @@ Fixed task states:
 
 A task may not stop while still `ACTIVE`. Before stopping, transition to `BLOCKED`, `WAITING_OWNER`, `READY_FOR_INDEPENDENT_REVIEW`, `COMPLETE`, or `ABORTED`.
 
-## One active owner task by default
-
-Only one consequential Steve-assigned task may be `ACTIVE` by default. If another consequential assignment arrives while an existing task is `ACTIVE`, `BLOCKED`, or `WAITING_OWNER`, record the new task as `QUEUED`, notify Steve, and do not interleave the work unless Steve explicitly authorizes parallel execution.
-
-## Manual task start procedure
-
-1. Read the authoritative specification in full.
-2. Compute and record the spec SHA-256 when a file is supplied.
-3. Create a ledger entry in `$HERMES_HOME/task-supervisor/active_task.json` with status `PREFLIGHT`.
-4. Append a `state_transition` event to `events.jsonl`.
-5. Send Steve a `TASK ACCEPTED` preflight acknowledgement within 5 minutes.
-6. Transition to exactly one of:
-   - `ACTIVE` and continue implementation;
-   - `BLOCKED` and immediately notify Steve;
-   - `WAITING_OWNER` and ask the required decision question.
-
-Preflight cannot end silently.
-
 ## Communication SLA
 
-- Assignment acknowledgement: within 5 minutes.
+- Assignment acknowledgement/preflight transition: within 5 minutes of `RECEIVED`.
 - Blocker notification target: within 5 minutes of blocker detection.
+- `WAITING_OWNER`: immediate actionable owner-decision message.
 - Active task heartbeat/milestone: at least every 45 minutes while `ACTIVE`.
-- Completion/review notification: immediately when `READY_FOR_INDEPENDENT_REVIEW` or `COMPLETE`.
+- Critical stale: one owner attention alert when an active task has no progress for 60 minutes.
+- Ready/complete/aborted closeout: exactly one transport-confirmed closeout/review message.
+- Queued task: exactly one queue notice identifying queued task, active task, reason, and owner action.
 
 ## Watchdog
 
 Script entrypoint:
 
 ```bash
-python3 scripts/herbie_task_supervisor_watchdog.py
+python3 scripts/herbie_task_supervisor_watchdog.py --transport send-message --owner-target telegram:8285712655
 ```
 
-Recommended disabled cron manifest:
+Disabled cron manifest:
 
 - Schedule: `*/15 * * * *`
 - Mode: `no_agent: true`
-- Delivery: `origin`
-- Script: `herbie_task_supervisor_watchdog.py`
+- Delivery: `local`
+- Script: absolute reviewed script path plus `--transport send-message --owner-target telegram`
+- Workdir: exact reviewed runtime checkout
+- State: disabled/paused until Steve + independent review approval
 
-Healthy/no-change runs print nothing and exit 0. Script-only cron delivery sends non-empty stdout to the configured owner destination. Non-zero exit surfaces through scheduler failure handling.
+Healthy/no-change runs print nothing and exit 0. Successful owner notifications are sent by the deterministic transport adapter, not by cron stdout, so cron delivery is local to avoid duplicate messages. Non-zero exit surfaces transport or state failure.
+
+## Transport-confirmed delivery
+
+The watchdog uses a durable outbox record per incident key:
+
+- notification created;
+- notification attempted;
+- notification delivered;
+- notification failed/retryable.
+
+The incident is not permanently deduped until the owner transport returns success. On transport failure the outbox remains pending/failed-retryable, task `last_owner_notification_attempt_at` may update, `last_owner_update_at` does **not** update, and a later run retries. Successful delivery updates `last_owner_update_at` and `last_owner_notification_delivered_at`.
+
+Approved V1 transport is Hermes' reviewed `send_message` path, pinned to Steve's Telegram owner path by `--owner-target telegram` unless activation review approves a more specific target. Stdout-confirmed transport is only for tests/manual local validation and is not the recurring cron transport.
 
 ## Watchdog behavior
 
-Each run:
+Each run under a process lock:
 
-1. reads the active task ledger;
-2. exits silently if no monitored task exists;
+1. reads `tasks.json`, outbox, dedupe/blocker lifecycle state;
+2. exits silently if no tasks exist;
 3. validates fixed state and required provenance fields;
-4. detects stale `PREFLIGHT` tasks;
+4. handles `RECEIVED`, `PREFLIGHT`, `ACTIVE`, `BLOCKED`, `WAITING_OWNER`, `READY_FOR_INDEPENDENT_REVIEW`, `COMPLETE`, `ABORTED`, and `QUEUED`;
 5. records one internal nudge event for `ACTIVE` tasks stale for 30 minutes;
-6. emits an owner heartbeat when `ACTIVE` has no owner update for 45 minutes;
+6. emits owner heartbeat only after confirmed delivery, then updates the 45-minute owner clock;
 7. emits one critical stale alert when an `ACTIVE` task is stale for 60 minutes;
-8. emits one blocked alert for `BLOCKED` tasks that have not been marked delivered;
-9. emits one recovery notice when a previously blocked task returns to `ACTIVE`;
-10. emits one review/complete notice for `READY_FOR_INDEPENDENT_REVIEW` or `COMPLETE`;
-11. dedupes repeated incidents by task/status/fingerprint.
+8. maintains blocker episode lifecycle: opened, delivered, resolved, recovery delivered;
+9. emits exactly one recovery notice per resolved blocker episode;
+10. retries failed transport attempts without duplicate successful deliveries.
+
+Malformed JSON/state fails closed and exits nonzero. Event appends are append-only and protected by the watchdog transaction lock.
 
 ## Internal nudge capability
 
@@ -101,11 +146,12 @@ The code records deterministic internal nudge events and the exact nudge text:
 
 `TASK SUPERVISOR: update task state, checkpoint progress, and continue or declare BLOCKED.`
 
-No reliable approved non-LLM auto-resume transport is assumed in this implementation. If one is later configured, invoke the watchdog with `--internal-nudge-command-available` and wire the approved command outside this public-safe implementation. Until then, stale-owner alerting remains the backstop.
+V1 does not auto-resume Herbie. The runtime records:
 
-## Notification delivery state
+- `internal_nudge_recorded`
+- `auto_resume_status = NOT_CONFIGURED`
 
-The watchdog's default transport is stdout so Hermes script-only cron can deliver through the existing scheduler. The script records `owner_notification_emitted` and sets task notification state to `emitted_pending_transport`. It does not mark `delivered` unless an external transport-success callback or manual closeout records a delivered event after successful delivery. This avoids faking delivery success.
+Owner heartbeat/stale notification is the V1 backstop. Automatic resumption is a future enhancement.
 
 ## Tool-budget/session-limit stop
 
@@ -113,7 +159,7 @@ If execution cannot safely continue because of tool/session limits:
 
 1. export diff/state and checkpoint any work;
 2. update the task ledger to `BLOCKED` or `READY_FOR_INDEPENDENT_REVIEW`;
-3. record the checkpoint commit/artifact path;
+3. record checkpoint commit/artifact path;
 4. notify Steve immediately;
 5. do not leave the task `ACTIVE`.
 
@@ -121,12 +167,12 @@ If execution cannot safely continue because of tool/session limits:
 
 Do not activate before review. After approval:
 
-1. Ensure the reviewed code is merged/deployed.
-2. Install or expose `scripts/herbie_task_supervisor_watchdog.py` in the runtime checkout used by Hermes cron.
-3. Create the scheduler job from `cron-manifests/herbie_active_task_supervisor.disabled.json` with `enabled: true` only after Steve approval.
-4. Confirm the job appears as scheduled and remains script-only/no-agent.
-5. Run one no-task smoke: it must exit 0 silently.
-6. Create a synthetic blocked-task fixture in a temporary ledger directory and verify stdout shape without touching production ledger.
+1. Use the exact reviewed local/fork commit.
+2. Ensure `cron-manifests/herbie_active_task_supervisor.disabled.json` has `reviewed_commit` set to that exact commit, a clean reviewed `workdir`, and an absolute reviewed script path.
+3. Create the scheduler job only after Steve approval.
+4. Confirm `no_agent: true`, schedule `*/15 * * * *`, `deliver: local`, and `--transport send-message`.
+5. Run no-task smoke: exit 0 silently.
+6. Run temporary synthetic owner-transport validation with messages labeled `HERBIE TASK SUPERVISOR TEST — No action required`.
 7. Record activation evidence in the private event log.
 
 ## Rollback
@@ -134,8 +180,8 @@ Do not activate before review. After approval:
 1. Pause or remove only the Active Task Supervisor cron job.
 2. Do not modify the StartLine audit-request watcher.
 3. Do not modify the StartLine Phase 3B-1 transaction reconciliation monitor.
-4. Preserve `$HERMES_HOME/task-supervisor/active_task.json`, `events.jsonl`, and `dedupe_state.json` for forensic review.
-5. If rollback is due to false alerts, archive the dedupe state with a timestamp before restarting.
+4. Preserve `$HERMES_HOME/task-supervisor/*` for forensic review.
+5. If rollback is due to false alerts, archive `notification_outbox.json` and `dedupe_state.json` with a timestamp before restarting.
 
 ## Explicit non-goals
 

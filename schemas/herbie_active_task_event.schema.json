@@ -11,18 +11,23 @@
       "type": "string",
       "enum": [
         "state_transition",
-        "owner_notification_emitted",
+        "owner_notification_created",
+        "owner_notification_attempted",
+        "owner_notification_failed",
         "owner_notification_delivered",
         "internal_nudge_recorded",
         "checkpoint_recorded",
         "watchdog_failure",
-        "manual_update"
+        "manual_update",
+        "queue_promoted"
       ]
     },
     "from": { "type": ["string", "null"] },
     "to": { "type": ["string", "null"] },
     "kind": { "type": ["string", "null"] },
     "incident_key": { "type": ["string", "null"] },
+    "transport": { "type": ["string", "null"] },
+    "provider_id": { "type": ["string", "null"] },
     "detail": { "type": ["string", "null"] }
   }
 }
