@@ -32,10 +32,10 @@ except ModuleNotFoundError:
     pass
 
 import json
-from collections import Counter
 import logging
 import os
 import time
+from collections import Counter
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple
 from datetime import datetime
@@ -733,19 +733,11 @@ class BatchRunner:
             atomic_json_write(self.checkpoint_file, checkpoint_data)
     
     def _scan_completed_prompts_by_content(self) -> Counter:
-        """
-        Scan all batch files and extract completed prompts by their actual content.
+        """Count finished prompt texts from batch_*.jsonl files.
 
-        This provides a more robust resume mechanism that matches on prompt text
-        rather than indices, allowing recovery even if indices don't match.
-
-        A Counter (not a set) is used so each distinct prompt text is tracked by
-        the number of times it was actually completed. When the dataset contains
-        duplicate prompt texts, resume must skip only as many copies as were
-        finished — the remaining duplicates still need to run.
-
-        Returns:
-            Counter: Mapping of prompt text -> completed occurrence count
+        Returns a Counter, not a set. A set would collapse duplicates, so
+        --resume would treat every copy of a prompt as done after the first
+        one finished. The count is how many copies we are allowed to skip.
         """
         completed_prompts = Counter()
         batch_files = sorted(self.output_dir.glob("batch_*.jsonl"))
@@ -782,19 +774,10 @@ class BatchRunner:
         return completed_prompts
     
     def _filter_dataset_by_completed(self, completed_prompts: Counter) -> Tuple[List[Dict], List[int]]:
-        """
-        Filter the dataset to exclude prompts that have already been completed.
+        """Drop already-finished rows using counts, not set membership.
 
-        Matching is count-based: a prompt text that was completed N times is
-        skipped for the first N occurrences in the dataset, but any further
-        occurrences are kept so duplicate prompts still run to completion.
-        A mutable copy of the counter is decremented as each match is consumed.
-
-        Args:
-            completed_prompts: Counter of prompt text -> completed occurrence count
-
-        Returns:
-            Tuple of (filtered_dataset, skipped_indices)
+        If "hello" finished twice, skip the first two "hello" rows and keep
+        any later copies. Copy the Counter so the caller is not mutated.
         """
         filtered_dataset = []
         skipped_indices = []

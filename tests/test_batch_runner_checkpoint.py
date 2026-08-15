@@ -243,17 +243,15 @@ class TestFinalCheckpointNoDuplicates:
 
 
 class TestResumeCountBasedDedup:
-    """Regression: --resume used a set for completed prompts, so duplicate
-    prompts in the dataset were all marked "completed" after the first one
-    finished — the rest were silently skipped on resume.
+    """--resume used to store completed prompt texts in a set.
 
-    Fix: _scan_completed_prompts_by_content returns a Counter (count per
-    text), and _filter_dataset_by_completed skips only that many rows per
-    text, not every row with a matching text.
+    After one copy of a duplicated prompt finished, every remaining copy
+    was treated as done and silently dropped. These tests pin the
+    count-based behavior: skip N rows only if N copies actually finished.
     """
 
     def _make_runner(self, tmp_path, dataset):
-        """Build a BatchRunner with output_dir and dataset set up."""
+        """Minimal BatchRunner: only the fields scan/filter need."""
         r = BatchRunner.__new__(BatchRunner)
         r.run_name = "test_run"
         r.output_dir = tmp_path
@@ -263,33 +261,80 @@ class TestResumeCountBasedDedup:
         r.dataset = dataset
         return r
 
+    def _write_completed(self, tmp_path, prompt, n=1, failed=False):
+        """Write n trajectory lines in the format scan() actually reads."""
+        lines = []
+        for _ in range(n):
+            lines.append(json.dumps({
+                "failed": failed,
+                "conversations": [{"from": "human", "value": prompt}],
+            }))
+        (tmp_path / "batch_0.jsonl").write_text("\n".join(lines) + "\n")
+
     def test_duplicate_prompts_survive_resume(self, tmp_path):
-        """Dataset has 3 copies of the same prompt. One completes. On
-        resume, the remaining 2 must NOT be skipped."""
+        """3 identical rows, 1 finished → skip 1, keep 2."""
         prompt = "What is 2+2?"
-        dataset = [
-            {"prompt": prompt},
-            {"prompt": prompt},
-            {"prompt": prompt},
-        ]
-        runner = self._make_runner(tmp_path, dataset)
+        runner = self._make_runner(tmp_path, [{"prompt": prompt}] * 3)
+        self._write_completed(tmp_path, prompt, n=1)
 
-        # Simulate: one trajectory already written to a batch file
-        batch_file = tmp_path / "batch_0.jsonl"
-        entry = {
-            "failed": False,
-            "conversations": [{"from": "human", "value": prompt}],
-        }
-        batch_file.write_text(json.dumps(entry) + "\n")
-
-        # Scan completed prompts
         completed = runner._scan_completed_prompts_by_content()
-
-        # Counter should report 1 completion for this prompt
         assert isinstance(completed, Counter)
         assert completed[prompt] == 1
 
-        # Filter should skip only 1 of the 3 duplicates
         filtered, skipped = runner._filter_dataset_by_completed(completed)
-        assert len(skipped) == 1
+        assert skipped == [0]
+        assert len(filtered) == 2
+        # Remaining rows still carry their original dataset indices.
+        assert [idx for idx, _ in filtered] == [1, 2]
+
+    def test_two_of_three_completed_keeps_the_last(self, tmp_path):
+        """2 finished copies → only the last duplicate is still due."""
+        prompt = "repeat me"
+        runner = self._make_runner(tmp_path, [{"prompt": prompt}] * 3)
+        self._write_completed(tmp_path, prompt, n=2)
+
+        completed = runner._scan_completed_prompts_by_content()
+        filtered, skipped = runner._filter_dataset_by_completed(completed)
+        assert completed[prompt] == 2
+        assert skipped == [0, 1]
+        assert [idx for idx, _ in filtered] == [2]
+
+    def test_unique_prompts_still_skip_as_before(self, tmp_path):
+        """Unrelated texts must not leak skip-budget onto each other."""
+        runner = self._make_runner(tmp_path, [
+            {"prompt": "alpha"},
+            {"prompt": "beta"},
+            {"prompt": "gamma"},
+        ])
+        self._write_completed(tmp_path, "beta", n=1)
+
+        filtered, skipped = runner._filter_dataset_by_completed(
+            runner._scan_completed_prompts_by_content()
+        )
+        assert skipped == [1]
+        assert [idx for idx, _ in filtered] == [0, 2]
+
+    def test_failed_trajectory_is_not_counted(self, tmp_path):
+        """Failed rows are retried, so they must not consume skip-budget."""
+        prompt = "flaky"
+        runner = self._make_runner(tmp_path, [{"prompt": prompt}] * 2)
+        self._write_completed(tmp_path, prompt, n=1, failed=True)
+
+        completed = runner._scan_completed_prompts_by_content()
+        assert completed[prompt] == 0
+        filtered, skipped = runner._filter_dataset_by_completed(completed)
+        assert skipped == []
+        assert len(filtered) == 2
+
+    def test_filter_does_not_mutate_the_counter(self, tmp_path):
+        """Filter decrements a copy so a second call sees the same counts."""
+        prompt = "stable"
+        runner = self._make_runner(tmp_path, [{"prompt": prompt}] * 3)
+        self._write_completed(tmp_path, prompt, n=1)
+        completed = runner._scan_completed_prompts_by_content()
+
+        runner._filter_dataset_by_completed(completed)
+        filtered, skipped = runner._filter_dataset_by_completed(completed)
+        assert completed[prompt] == 1
+        assert skipped == [0]
         assert len(filtered) == 2
