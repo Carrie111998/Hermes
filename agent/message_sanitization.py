@@ -709,6 +709,14 @@ def replays_reasoning_content(provider: Any, model: Any, base_url: Any) -> bool:
     continuity).  This classification is disjoint from
     ``reasoning_echo_family`` by construction: require-side hosts are public
     API domains, soft-replay hosts are loopback only.
+
+    Boundary: a REMOTE self-hosted endpoint (e.g. a vLLM box on the LAN or
+    a rented GPU box over Tailscale) that accepts-and-attends the field is
+    deliberately classified strict here and gets the strip path — loopback
+    is the only host shape we can auto-detect without false positives on
+    aggregators that silently drop the field.  A config override for
+    non-loopback endpoints can layer on the tri-state introduced by this
+    family (see PR #87123 discussion).
     """
     from utils import base_url_hostname
 

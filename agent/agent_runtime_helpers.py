@@ -3806,7 +3806,7 @@ def replays_reasoning_content_for_agent(agent) -> bool:
     replays_reasoning_content`` (loopback-host table).
     """
     cached = getattr(agent, "_soft_replay_cache", None)
-    key = (agent.provider, getattr(agent, "_base_url_lower", agent.base_url))
+    key = (agent.provider, agent.model, getattr(agent, "_base_url_lower", agent.base_url))
     if cached is not None and cached[0] == key:
         return cached[1]
     from agent.message_sanitization import replays_reasoning_content
