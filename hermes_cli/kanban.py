@@ -1483,7 +1483,12 @@ def _cmd_init(args: argparse.Namespace) -> int:
     except Exception:
         kanban_cfg = {}
 
-    dispatch_enabled = bool(kanban_cfg.get("dispatch_in_gateway", True))
+    env_dispatch_override = os.environ.get(
+        "HERMES_KANBAN_DISPATCH_IN_GATEWAY", ""
+    ).strip().lower()
+    dispatch_enabled = bool(kanban_cfg.get("dispatch_in_gateway", True)) and (
+        env_dispatch_override not in {"0", "false", "no", "off"}
+    )
     review_dispatch = bool(kanban_cfg.get("review_dispatch", True))
     auto_decompose = bool(kanban_cfg.get("auto_decompose", True))
     print()
@@ -1495,36 +1500,57 @@ def _cmd_init(args: argparse.Namespace) -> int:
             f"{claimable_statuses} and starts one OS worker process per claim."
         )
     else:
-        print(
-            "  Gateway dispatch: disabled — Ready and Review tasks wait for a "
-            "manual dispatch pass."
-        )
-    if auto_decompose:
+        if review_dispatch:
+            print(
+                "  Gateway dispatch: disabled — Ready and Review tasks wait for a "
+                "manual dispatch pass."
+            )
+        else:
+            print(
+                "  Gateway dispatch: disabled — Ready tasks wait for a manual "
+                "dispatch pass; Review tasks remain parked for human review."
+            )
+    if auto_decompose and dispatch_enabled:
         print(
             "  Triage orchestration: automatic when the dispatcher runs — it "
             "auto-decomposes Triage tasks into child tasks."
         )
+    elif auto_decompose:
+        print(
+            "  Triage orchestration: configured but inactive while gateway dispatch "
+            "is disabled; Triage tasks stay parked until you decompose them manually."
+        )
     else:
         print("  Triage orchestration: manual — Triage tasks stay parked until you act.")
 
-    cap_specs = (
-        ("host", "max_concurrent_workers"),
+    def _positive_int(value):
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            return None
+        return parsed if parsed >= 1 else None
+
+    running_cap_specs = (
         ("board", "max_in_progress"),
         ("per-profile", "max_in_progress_per_profile"),
-        ("dispatcher", "max_spawn"),
     )
-    caps = []
-    for label, key in cap_specs:
-        raw = kanban_cfg.get(key)
-        if isinstance(raw, int) and not isinstance(raw, bool) and raw > 0:
-            caps.append(f"{label}={raw}")
-    if caps:
-        print(f"  Worker concurrency caps: {', '.join(caps)}")
+    running_caps = []
+    for label, key in running_cap_specs:
+        value = _positive_int(kanban_cfg.get(key))
+        if value is not None:
+            running_caps.append(f"{label}={value}")
+    if running_caps:
+        print(f"  Running-worker concurrency caps: {', '.join(running_caps)}")
     else:
         print(
             "  No worker concurrency cap is configured; every claimable task may "
             "start a worker."
         )
+    max_spawn = _positive_int(kanban_cfg.get("max_spawn"))
+    if max_spawn is not None:
+        print(f"  Per-tick spawn limit: {max_spawn} (not a running-worker cap)")
+    else:
+        print("  No per-tick spawn limit is configured.")
     print(
         "  Workers run as the assignee profile with that profile's enabled tools "
         "and approval policy. Review task descriptions and profile authority "
