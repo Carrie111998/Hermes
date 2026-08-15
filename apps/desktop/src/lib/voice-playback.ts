@@ -444,6 +444,8 @@ export async function playSpeechText(text: string, options: VoicePlaybackOptions
     return false
   }
 
+  markTextSpoken(text)
+
   const ownSequence = sequence
   const isCurrent = () => ownSequence === sequence
 
@@ -492,6 +494,24 @@ export async function playSpeechText(text: string, options: VoicePlaybackOptions
 
 export function isVoicePlaybackActive() {
   return $voicePlayback.get().status !== 'idle'
+}
+
+// ---------------------------------------------------------------------------
+// Spoken-text fingerprint — read-aloud and auto-speak both funnel through
+// playSpeechText, so marking it here (rather than in each caller's own ref)
+// survives the live→committed message-id rewrite (#86601): the row id changes
+// across that transition and across the manual Read Aloud button, but the
+// spoken text doesn't.
+// ---------------------------------------------------------------------------
+
+let lastSpokenText: string | null = null
+
+export function markTextSpoken(text: string): void {
+  lastSpokenText = text.trim()
+}
+
+export function wasTextAlreadySpoken(text: string): boolean {
+  return lastSpokenText !== null && lastSpokenText === text.trim()
 }
 
 // ---------------------------------------------------------------------------
