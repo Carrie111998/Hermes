@@ -8,6 +8,7 @@ import tomllib
 
 import pytest
 
+from ares_runtime import local_runtime
 from ares_runtime.local_runtime import AresLocalPaths, AresLocalRuntime, AresLocalRuntimeError, _parser
 
 
@@ -225,6 +226,41 @@ def test_upstream_candidate_conflict_never_publishes_a_release(tmp_path: Path, m
         )
 
     assert not runtime.paths.releases_dir.exists() or not any(runtime.paths.releases_dir.iterdir())
+
+
+def test_upstream_change_is_not_masked_by_staging_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    upstream = _repository(tmp_path / "upstream")
+    (upstream / "base.txt").write_text("base\n", encoding="utf-8")
+    stale_revision = _commit(upstream, "base")
+    (upstream / "new.txt").write_text("new upstream revision\n", encoding="utf-8")
+    _commit(upstream, "upstream update")
+
+    downstream = tmp_path / "downstream"
+    subprocess.run(["git", "clone", str(upstream), str(downstream)], check=True)
+    downstream_revision = _git(downstream, "rev-parse", "HEAD")
+    runtime = _runtime(tmp_path)
+    cleanup_options: list[bool] = []
+
+    def _rmtree_that_can_only_ignore_errors(_path: Path, *, ignore_errors: bool = False) -> None:
+        cleanup_options.append(ignore_errors)
+        if not ignore_errors:
+            raise OSError("simulated cleanup race")
+
+    monkeypatch.setattr(local_runtime.shutil, "rmtree", _rmtree_that_can_only_ignore_errors)
+
+    with pytest.raises(AresLocalRuntimeError, match="upstream changed"):
+        runtime._materialize_upstream_candidate(
+            downstream_remote=str(downstream),
+            downstream_revision=downstream_revision,
+            upstream_remote=str(upstream),
+            upstream_branch="main",
+            upstream_revision=stale_revision,
+            desktop=False,
+        )
+
+    assert cleanup_options == [True]
 
 
 def test_launcher_resolves_the_selected_runtime_dynamically(tmp_path: Path) -> None:

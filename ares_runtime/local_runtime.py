@@ -681,7 +681,11 @@ if (config or {}).get('context', {}).get('engine') == 'ri-context-governor':
             return candidate_revision
         except Exception:
             if staging.exists():
-                shutil.rmtree(staging)
+                # Candidate cleanup must never hide the original failure (for
+                # example, a remote revision moving during the fetch).  A
+                # later invocation uses a distinct staging directory and can
+                # safely retry from immutable revisions.
+                shutil.rmtree(staging, ignore_errors=True)
             raise
 
     def _install_launcher(self) -> None:
