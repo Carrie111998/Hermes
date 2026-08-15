@@ -178,7 +178,34 @@ def _run_install_cmd(cmd: list[str], *, env: dict | None, root: Path) -> None:
 
     Raises CalledProcessError on install failure (callers implement the
     per-extra fallback ladder).
+
+    Every install routed through here is forced to wheels-only. This repair
+    path runs unattended -- it fires on plain module import when a previous
+    update was interrupted -- and on server installs it runs as root. A source
+    distribution executes its PEP 517 build backend (or legacy ``setup.py``) at
+    install time, so resolving even one sdist from the registry is arbitrary
+    code execution from a maintainer account we do not control, on a host that
+    holds unrelated credentials. ``--only-binary=:all:`` removes that step
+    outright; hash or version pinning would not, because pinning constrains
+    WHICH artifact is fetched, not whether that artifact's build hooks run.
+
+    Measured before being made the default: the entire ``.[all]`` closure --
+    every optional extra this project declares -- resolves under the
+    constraint with zero exceptions, so nothing here depends on an sdist. The
+    constraint is enforced (``PyYAML==3.10``, which publishes no wheel, is
+    refused with "no usable wheels" and exit 1, while the same pin without the
+    flag succeeds) and it exempts local paths, so the project's own editable
+    ``-e .`` still builds. Both uv and pip accept it alongside ``-e .``.
+
+    If a future dependency genuinely ships no wheel, this raises rather than
+    silently falling back to a source build. That is deliberate: a loud failure
+    naming the package is a decision for a human, whereas a quiet fallback
+    would re-open install-time execution exactly when nobody is watching.
     """
+    if "install" in cmd and "--only-binary=:all:" not in cmd:
+        at = cmd.index("install") + 1
+        cmd = [*cmd[:at], "--only-binary=:all:", *cmd[at:]]
+
     scripts_dir = _venv_scripts_dir(root) if _is_windows() else None
     moved = _quarantine_running_hermes_exe(scripts_dir) if scripts_dir else []
     try:
