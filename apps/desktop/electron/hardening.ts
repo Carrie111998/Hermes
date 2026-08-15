@@ -62,6 +62,7 @@ interface SecretFileOptions {
   encoding?: BufferEncoding
   fs?: SecretFileFs
   platform?: string
+  getuid?: () => number | undefined
 }
 
 /**
@@ -91,6 +92,7 @@ interface SecretFileOptions {
 function tightenSecretFileMode(filePath, options: SecretFileOptions = {}) {
   const fsImpl = options.fs || fs
   const platform = options.platform || process.platform
+  const currentUid = options.getuid?.() ?? (typeof process.getuid === 'function' ? process.getuid() : undefined)
 
   if (platform === 'win32') {
     return true
@@ -103,7 +105,7 @@ function tightenSecretFileMode(filePath, options: SecretFileOptions = {}) {
       return false
     }
 
-    if (typeof process.getuid === 'function' && stat.uid !== process.getuid()) {
+    if (currentUid !== undefined && stat.uid !== currentUid) {
       return false
     }
 

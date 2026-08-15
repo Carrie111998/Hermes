@@ -10,8 +10,18 @@ import PACKAGE_JSON from '../package.json' with { type: 'json' }
 const MODE = process.argv[2] || 'help'
 const ARCH = process.arch === 'arm64' ? 'arm64' : 'x64'
 const DESKTOP_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
-const RELEASE_ROOT = path.join(DESKTOP_ROOT, 'release')
 const PLATFORM = process.platform
+const LIVE_RELEASE_ROOT = path.join(DESKTOP_ROOT, 'release')
+// The canonical `all` verification must not collide with files loaded by a
+// running Hermes Desktop. Keep its package output outside the live release
+// tree; explicit installer/open modes continue to use the normal artifacts.
+const RELEASE_ROOT =
+  MODE === 'all' && PLATFORM === 'win32'
+    ? path.resolve(
+        process.env.HERMES_DESKTOP_TEST_RELEASE_ROOT ||
+          path.join(os.tmpdir(), 'hermes-desktop-test-release')
+      )
+    : LIVE_RELEASE_ROOT
 
 // Platform-specific packaged-app layout. The thin installer ships an Electron
 // app shell plus extraResources (install-stamp.json + native-deps/) -- it
@@ -173,6 +183,18 @@ function ensureNsis() {
     die('NSIS mode is win32-only; on macOS use the `dmg` mode instead.')
   }
   if (process.env.HERMES_DESKTOP_SKIP_BUILD === '1' && resolveNsisPath()) {
+    return
+  }
+  if (RELEASE_ROOT !== LIVE_RELEASE_ROOT) {
+    run('npm', ['run', 'build'])
+    run('npm', [
+      'run',
+      'builder',
+      '--',
+      '--win',
+      'nsis',
+      `--config.directories.output=${RELEASE_ROOT}`
+    ])
     return
   }
   run('npm', ['run', 'dist:win:nsis'])

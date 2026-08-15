@@ -1,3 +1,5 @@
+import path from 'node:path'
+
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import {
@@ -31,10 +33,10 @@ describe('terminalSetup helpers', () => {
   })
 
   it('computes VS Code style config dirs cross-platform', () => {
-    expect(getVSCodeStyleConfigDir('Code', 'darwin', {} as NodeJS.ProcessEnv, '/home/me')).toBe(
+    expect(getVSCodeStyleConfigDir('Code', 'darwin', {} as NodeJS.ProcessEnv, '/home/me', path.posix)).toBe(
       '/home/me/Library/Application Support/Code/User'
     )
-    expect(getVSCodeStyleConfigDir('Code', 'linux', {} as NodeJS.ProcessEnv, '/home/me')).toBe(
+    expect(getVSCodeStyleConfigDir('Code', 'linux', {} as NodeJS.ProcessEnv, '/home/me', path.posix)).toBe(
       '/home/me/.config/Code/User'
     )
     expect(
@@ -42,7 +44,8 @@ describe('terminalSetup helpers', () => {
         'Code',
         'win32',
         { APPDATA: 'C:/Users/me/AppData/Roaming' } as NodeJS.ProcessEnv,
-        '/home/me'
+        '/home/me',
+        path.posix
       )
     ).toBe('C:/Users/me/AppData/Roaming/Code/User')
   })
@@ -336,7 +339,9 @@ describe('configureTerminalKeybindings', () => {
     await expect(
       shouldPromptForTerminalSetup({
         env: { TERM_PROGRAM: 'vscode' } as NodeJS.ProcessEnv,
-        fileOps: { readFile: readMissing }
+        fileOps: { readFile: readMissing },
+        homeDir: '/Users/me',
+        platform: 'darwin'
       })
     ).resolves.toBe(true)
 
@@ -384,7 +389,9 @@ describe('configureTerminalKeybindings', () => {
     await expect(
       shouldPromptForTerminalSetup({
         env: { TERM_PROGRAM: 'vscode' } as NodeJS.ProcessEnv,
-        fileOps: { readFile: readComplete }
+        fileOps: { readFile: readComplete },
+        homeDir: '/Users/me',
+        platform: 'darwin'
       })
     ).resolves.toBe(false)
   })
