@@ -190,7 +190,15 @@ class TestContentDeduplication:
 
         mirror = tmp_path / "mirror"
         mirror.mkdir()
-        (mirror / "AGENTS.md").symlink_to(real / "AGENTS.md")
+        try:
+            (mirror / "AGENTS.md").symlink_to(real / "AGENTS.md")
+        except OSError as exc:
+            # Windows requires Developer Mode or SeCreateSymbolicLinkPrivilege.
+            # Skip only that environmental limitation; unexpected symlink
+            # errors must still fail the test.
+            if getattr(exc, "winerror", None) == 1314:
+                pytest.skip("Windows symlink privilege is unavailable")
+            raise
 
         tracker = SubdirectoryHintTracker(working_dir=str(tmp_path))
         first = tracker.check_tool_call("read_file", {"path": str(real / "x.py")})

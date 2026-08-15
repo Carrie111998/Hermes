@@ -204,7 +204,12 @@ def _compile() -> None:
 _compile()
 
 
-def scan_for_threats(content: str, scope: str = "context") -> List[str]:
+def scan_for_threats(
+    content: str,
+    scope: str = "context",
+    *,
+    max_chars: Optional[int] = MAX_SCAN_CHARS,
+) -> List[str]:
     """Return a list of matched pattern IDs in ``content`` at the given scope.
 
     ``scope`` selects which pattern set to apply:
@@ -220,13 +225,18 @@ def scan_for_threats(content: str, scope: str = "context") -> List[str]:
     Also checks for invisible unicode characters (returned as
     ``"invisible_unicode_U+XXXX"`` so the caller can surface the offending
     codepoint in a log line).
+
+    ``max_chars`` keeps the shared scanner bounded by default. Trusted callers
+    that have already bounded the exact prompt payload may pass ``None`` to
+    scan that complete payload without a chunk-boundary bypass.
     """
     if not content:
         return []
 
     findings: List[str] = []
 
-    content = content[:MAX_SCAN_CHARS]
+    if max_chars is not None:
+        content = content[:max_chars]
 
     # Invisible unicode — single pass through the content set, not 17
     # ``in`` lookups.  Run this on the RAW content before NFKC normalisation,

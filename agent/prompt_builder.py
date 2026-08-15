@@ -55,10 +55,10 @@ logger = logging.getLogger(__name__)
 # placeholder; the actual content never reaches the system prompt).
 # ---------------------------------------------------------------------------
 
-from tools.threat_patterns import scan_for_threats as _scan_for_threats
+from tools.threat_patterns import MAX_SCAN_CHARS, scan_for_threats as _scan_for_threats
 
 
-def _scan_context_content(content: str, filename: str) -> str:
+def _scan_context_content(content: str, filename: str, *, complete: bool = False) -> str:
     """Scan context file content for injection. Returns sanitized content.
 
     Uses the "context" scope from the shared threat-pattern library, which
@@ -68,6 +68,10 @@ def _scan_context_content(content: str, filename: str) -> str:
     cloned repo (security research, infra docs).  Content matching is
     BLOCKED at this layer because the file would otherwise enter the
     system prompt verbatim and the user has no chance to intervene.
+    ``complete`` is used only after the caller has bounded the exact prompt
+    payload. It disables the shared scanner's historical first-window cap so a
+    matching phrase cannot straddle a chunk boundary or hide in retained tail
+    content.
     """
     # Editors (Windows Notepad, PowerShell Out-File without -Encoding
     # utf8NoBOM, some VS Code profiles) prefix a UTF-8 BOM as an encoding
@@ -77,7 +81,11 @@ def _scan_context_content(content: str, filename: str) -> str:
     if content.startswith("\ufeff"):
         content = content[1:]
 
-    findings = _scan_for_threats(content, scope="context")
+    findings = _scan_for_threats(
+        content,
+        scope="context",
+        max_chars=None if complete else MAX_SCAN_CHARS,
+    )
     if findings:
         logger.warning("Context file %s blocked: %s", filename, ", ".join(findings))
         return f"[BLOCKED: {filename} contained potential prompt injection ({', '.join(findings)}). Content not loaded.]"
@@ -2147,7 +2155,10 @@ def _truncate_content(
     if max_chars is None:
         max_chars = _get_context_file_max_chars(context_length)
     if len(content) <= max_chars:
-        return content
+        # Even without truncation, a configured large cap can exceed the
+        # threat scanner's default work window. This is still the exact text
+        # destined for the prompt, so scan all of it in bounded chunks.
+        return _scan_context_content(content, filename, complete=True)
     target = read_path or filename
     msg = (
         f"⚠️  Context file {filename} TRUNCATED: "
@@ -2167,7 +2178,11 @@ def _truncate_content(
         f"instructions, read the complete file with the read_file tool: "
         f"{target}]\n\n"
     )
-    return head + marker + tail
+    # The initial scan runs on the source file, but its bounded threat scanner
+    # intentionally only examines the first window. Re-scan exactly the
+    # head+tail representation we are about to inject so an attack placed in
+    # the retained tail cannot bypass that bound and reach the system prompt.
+    return _scan_context_content(head + marker + tail, filename, complete=True)
 
 
 def load_soul_md(
