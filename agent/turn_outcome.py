@@ -324,10 +324,26 @@ def evaluate_turn_outcome(
         run_mode = str(cfg.get("run") or "auto")
 
         # ── Mechanical layer first ──────────────────────────────────────────
+        # Aggregate ceiling across ALL verifier subprocesses this turn: each
+        # verifier has its own timeout_seconds (default 30, capped at 300) and
+        # an applicability probe adds up to 10 more, so without a turn-level
+        # budget a skill-heavy turn could hold finalization for minutes. Once
+        # the budget is exhausted, remaining skills record as ``skip`` so the
+        # downstream has_residue handling stays correct.
+        import time as _time
+
+        total_budget = float(cfg.get("total_verify_budget_seconds") or 60)
+        _started = _time.monotonic()
         skill_dirs = _resolve_skill_dirs(skills_used_this_turn)
-        verdicts = {
-            name: _run_skill_verifier(name, d, cwd) for name, d in skill_dirs
-        }
+        verdicts = {}
+        for name, d in skill_dirs:
+            if _time.monotonic() - _started >= total_budget:
+                logger.debug(
+                    "turn_outcome: verify budget exhausted — skipping %s", name
+                )
+                verdicts[name] = ("skip", "")
+                continue
+            verdicts[name] = _run_skill_verifier(name, d, cwd)
         fail_verdicts = [(n, r) for n, (v, r) in verdicts.items() if v == "fail"]
         pass_names = [n for n, (v, r) in verdicts.items() if v == "pass"]
         skip_names = {n for n, (v, r) in verdicts.items() if v == "skip"}

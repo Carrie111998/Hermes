@@ -504,6 +504,15 @@ def test_disarm_turn_skill_accumulator_clears_and_resets(skills_home):
     disarm_turn_skill_accumulator(foreign_token)
     assert _turn_skill_accumulator.get() is None
 
+    # A REUSED token (reset twice — ContextVar raises RuntimeError
+    # "Token has already been used") must also fall through to the
+    # current-context clear instead of propagating.
+    armed = set()
+    token2 = arm_turn_skill_accumulator(armed)
+    disarm_turn_skill_accumulator(token2)
+    disarm_turn_skill_accumulator(token2)  # second reset — RuntimeError path
+    assert _turn_skill_accumulator.get() is None
+
     # None token — the unarmed/no-acc-at-finalize case — is a safe no-op.
     disarm_turn_skill_accumulator(None)
     assert _turn_skill_accumulator.get() is None

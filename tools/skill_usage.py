@@ -75,9 +75,11 @@ def disarm_turn_skill_accumulator(token: Optional[Token]) -> None:
         try:
             _turn_skill_accumulator.reset(token)
             return
-        except (ValueError, TypeError):
+        except (ValueError, TypeError, RuntimeError):
             # The token belongs to a different context (a copy_context boundary
-            # between arm and disarm) — fall through to a current-context clear.
+            # between arm and disarm), or it was already reset (a reused
+            # token raises RuntimeError "Token has already been used") — fall
+            # through to a current-context clear in both cases.
             pass
     try:
         _turn_skill_accumulator.set(None)

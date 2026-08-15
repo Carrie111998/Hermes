@@ -95,6 +95,22 @@ def _eval(**kwargs):
     return lambda _prompt: kwargs
 
 
+def _raise_if_called(called: list):
+    """Aux-eval seam that fails loudly if invoked.
+
+    Used where the test's property is "the signal gate returns before the
+    aux seam is invoked": if the gate regresses and the seam runs, it
+    raises instead of silently yielding a function object that
+    ``evaluate_turn_outcome`` would treat as "no verdict".
+    """
+
+    def _seam(_prompt: str) -> dict:
+        called.append(_prompt)
+        raise AssertionError("aux eval invoked although the signal gate should have returned early")
+
+    return _seam
+
+
 def test_no_signal_skips_aux_but_records_verifier_pass(turn_env):
     """All used skills verified clean, no residue, run=auto ⇒ no aux call.
 
@@ -115,9 +131,7 @@ def test_no_signal_skips_aux_but_records_verifier_pass(turn_env):
     outcome = evaluate_turn_outcome(
         skills_used_this_turn={"golden": d},
         outcome_config={"enabled": True, "run": "auto"},
-        _aux_eval=lambda p: called.append(p) or _eval(
-            task_succeeded=True, confidence=0.9, failure_points=[], reason="ok"
-        ),
+        _aux_eval=_raise_if_called(called),
     )
     assert outcome is None
     assert called == []
@@ -435,14 +449,16 @@ def test_mechanical_pass_recovers_a_flagged_skill_without_eval(turn_env):
 
     # Five clean verifier-pass turns — each recorded even though no eval runs.
     # 4 fails + 5 passes = 4/9 ≈ 0.44 < 0.5 threshold → flag clears.
+    # The aux seam must never be invoked: a gate regression raises loudly
+    # instead of silently yielding a callable treated as "no verdict".
+    called = []
     for _ in range(5):
         evaluate_turn_outcome(
             skills_used_this_turn={"recover": d},
             outcome_config={"enabled": True, "run": "auto"},
-            _aux_eval=lambda p: _eval(
-                task_succeeded=True, confidence=0.9, failure_points=[], reason="ok"
-            ),
+            _aux_eval=_raise_if_called(called),
         )
+    assert called == []
     rec = get_record("recover")
     assert rec["recent_outcomes"][-5:] == [True, True, True, True, True]
     assert rec["needs_review"] is False
@@ -519,6 +535,50 @@ def test_verifier_runs_in_agent_cwd_not_process_cwd(turn_env):
         clear_session_cwd()
     assert (session_cwd / "ran-here").exists()
     assert not (Path.cwd() / "ran-here").exists()
+
+
+def test_verify_budget_exhausted_skips_remaining_verifiers(turn_env):
+    """An aggregate verify budget caps the mechanical layer: once elapsed time
+    passes ``total_verify_budget_seconds``, remaining skills record ``skip``
+    instead of launching more subprocesses."""
+    from agent.turn_outcome import evaluate_turn_outcome
+    from tools.skill_usage import get_record, set_verify_enabled
+
+    skills = turn_env / "skills"
+    slow = _write_skill_with_verify(skills, "slow", _verify_script(True, "ok"))
+    # The fast skill's verifier drops a sentinel if it ever runs.
+    sentinel = turn_env / "fast-ran"
+    fast = _write_skill_with_verify(
+        skills,
+        "fast",
+        "from pathlib import Path\n"
+        f"Path({str(sentinel)!r}).write_text('ran')\n"
+        + _verify_script(True, "ok"),
+    )
+    set_verify_enabled("slow", True)
+    set_verify_enabled("fast", True)
+    # Give the first verifier real work to burn the budget; the second must
+    # never launch.
+    (slow / "scripts" / "verify.py").write_text(
+        "import time\ntime.sleep(0.3)\n" + _verify_script(True, "ok"),
+        encoding="utf-8",
+    )
+
+    outcome = evaluate_turn_outcome(
+        skills_used_this_turn={"slow": slow, "fast": fast},
+        outcome_config={
+            "enabled": True,
+            "run": "always",
+            "total_verify_budget_seconds": 0.05,
+        },
+        _aux_eval=_eval(task_succeeded=True, confidence=0.9, failure_points=[], reason="ok"),
+    )
+    assert outcome is not None
+    assert not sentinel.exists(), "budget-exhausted skill's verifier must not run"
+    # The fast skill was skipped at the mechanical layer — its verifier never
+    # ran, so it can't bank a pass; on the confident eval success it records
+    # a NEUTRAL sample (unverified residue), never a pass.
+    assert get_record("fast")["recent_outcomes"] == [None]
 
 
 def test_eval_attribution_respects_curation_eligibility(turn_env):

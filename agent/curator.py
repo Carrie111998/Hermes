@@ -475,12 +475,12 @@ CURATOR_REVIEW_PROMPT = (
     "candidate list (recent failure rate at or above the needs-review "
     "threshold, `fr=` shown) is a PRIORITY candidate, ahead of activity-based "
     "consolidation: its outcome history says its procedure drifted from its "
-    "own contract. When its `reason=` names a deterministic check (commit "
-    "message format, schema validation, linter, file creation/existence), "
-    "treat it as the strongest possible drift signal — inspect that procedure "
-    "and patch it (or fold the fix into an umbrella via absorbed_into) rather "
-    "than leaving the skill flagged. A low-use skill with a failing outcome "
-    "history is MORE suspicious than a zero-use skill, not less.\n\n"
+    "own contract. When its `fail=` count is high (explicit failures in the "
+    "recent window, shown as `fail=N`), treat it as the strongest possible "
+    "drift signal — inspect that procedure and patch it (or fold the fix "
+    "into an umbrella via absorbed_into) rather than leaving the skill "
+    "flagged. A low-use skill with a failing outcome history is MORE "
+    "suspicious than a zero-use skill, not less.\n\n"
     "How to work — not optional:\n"
     "1. Scan the full candidate list. Identify PREFIX CLUSTERS (skills "
     "sharing a first word or domain keyword). Examples you are likely "
@@ -1494,11 +1494,17 @@ def _render_candidate_list() -> str:
 
     Each row gains an outcome-quality tail when the signal exists: ``fr=``
     (recent-window failure rate, only when there are enough samples),
-    ``review=yes`` (the skill is flagged needs-review), ``no_signal=`` (how
-    many recent outcomes were neutral — the skill ran unverified, no per-skill
-    evidence either way), and ``reason=`` (the latest verifier/eval failure
-    reason). Rows with no outcome signal stay compact — the tail is purely
-    additive to the activity stats.
+    ``review=yes`` (the skill is flagged needs-review), ``fail=`` (count of
+    explicit failures in the recent window), and ``no_signal=`` (how many
+    recent outcomes were neutral — the skill ran unverified, no per-skill
+    evidence either way). Rows with no outcome signal stay compact — the tail
+    is purely additive to the activity stats.
+
+    The tail carries ONLY trusted structured signals derived from the
+    ``recent_outcomes`` window. Raw ``reason`` text (verifier/evaluator
+    output persisted by ``bump_outcome``) is deliberately NOT rendered here:
+    that text is repository-controlled and could carry prompt-injection
+    instructions into an LLM prompt that has skill-management tools.
     """
     rows = skill_usage.curated_report()
     if not rows:
@@ -1515,9 +1521,11 @@ def _render_candidate_list() -> str:
         unk = r.get("recent_unknown_count") or 0
         if unk:
             tail.append(f"no_signal={unk}")
-        reason = r.get("recent_failure_reason") or ""
-        if reason:
-            tail.append(f'reason="{_clip(reason)}"')
+        outcomes = r.get("recent_outcomes")
+        if isinstance(outcomes, list) and outcomes:
+            fails = sum(1 for o in outcomes if o is False)
+            if fails:
+                tail.append(f"fail={fails}")
         tail_str = ("  " + "  ".join(tail)) if tail else ""
         lines.append(
             f"- {r['name']}  "
@@ -1533,12 +1541,6 @@ def _render_candidate_list() -> str:
             f"{tail_str}"
         )
     return "\n".join(lines)
-
-
-def _clip(text: str, limit: int = 120) -> str:
-    """Single-line truncation for embedding arbitrary reason text in a row."""
-    text = " ".join(str(text).split())
-    return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
 def run_curator_review(

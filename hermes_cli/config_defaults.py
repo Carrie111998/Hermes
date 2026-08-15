@@ -947,9 +947,6 @@ DEFAULT_CONFIG = {
             "timeout": 360,        # seconds (6min) — per-attempt LLM summarization timeout; increase for slow local models
             "extra_body": {},
             "reasoning_effort": "",  # per-task thinking level: none|minimal|low|medium|high|xhigh|max|ultra (empty = provider default)
-            "max_tokens": 1000,      # judge output budget; reasoning models
-                                     # need ≥~800 or they burn everything on
-                                     # thinking and return empty content
         },
         "compression": {
             "provider": "auto",
@@ -1090,6 +1087,12 @@ DEFAULT_CONFIG = {
             "timeout": 30,
             "extra_body": {},
             "reasoning_effort": "",  # per-task thinking level: none|minimal|low|medium|high|xhigh|max|ultra (empty = provider default)
+            "max_tokens": 1000,      # judge output budget; reasoning models
+                                     # need ≥~800 or they burn everything on
+                                     # thinking and return empty content
+            "total_verify_budget_seconds": 60,  # aggregate ceiling for ALL
+                                     # verifier subprocesses this turn; after
+                                     # it, remaining skills record as skip
         },
         # Curator — skill-usage review fork. Timeout is generous because the
         # review pass can take several minutes on reasoning models (umbrella
