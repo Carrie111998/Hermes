@@ -11,11 +11,11 @@ Uses slack-bolt (Python) with Socket Mode for:
 import asyncio
 import contextvars
 import inspect
-import itertools
 import json
 import logging
 import os
 import re
+import secrets
 import time
 import unicodedata
 from dataclasses import dataclass, field
@@ -995,8 +995,7 @@ class SlackAdapter(BasePlatformAdapter):
         # request_id). Block Kit button values carry only the token, never the
         # session key; the request id binds the token to the exact queued
         # request so a stale button cannot advance a different one.
-        self._approval_state: Dict[int, tuple] = {}
-        self._approval_counter = itertools.count(1)
+        self._approval_state: Dict[str, tuple] = {}
         # Same server-side indirection for slash-command confirmations.
         self._slash_confirm_state: Dict[str, str] = {}
         # Same guard for clarify prompts (interactive multiple-choice
@@ -6913,15 +6912,14 @@ class SlackAdapter(BasePlatformAdapter):
             budget = 3000 - len(header) - len(reason) - len("``````\n") - len("...")
             cmd_preview = command[:budget] + "..." if len(command) > budget else command
 
-            # Mint an opaque approval token; the button value carries only this
-            # id. The real (session_key, entry id) pair is resolved server-side
-            # on click, binding the token to the exact queued request.
-            approval_id = next(self._approval_counter)
-            self._approval_state[approval_id] = (session_key, request_id or "")
+            # Mint an unguessable approval token; the button value carries
+            # only this id. The real (session_key, entry id) pair is resolved
+            # server-side on click, binding the token to the exact queued request.
+            token = secrets.token_urlsafe(16)
+            self._approval_state[token] = (session_key, request_id or "")
             self._trim_oldest_dict_entries(
                 self._approval_state, self._APPROVAL_RESOLVED_MAX
             )
-            token = str(approval_id)
 
             actions = [
                 {
@@ -7453,12 +7451,10 @@ class SlackAdapter(BasePlatformAdapter):
         # Resolve the opaque token to the real session_key server-side. A
         # missing/stale token means the approval was already resolved or is
         # forged; fail closed.
-        try:
-            approval_id = int(token)
-        except (ValueError, TypeError):
+        if not isinstance(token, str) or not token:
             logger.warning("[Slack] Invalid approval token: %r", token)
             return
-        stored = self._approval_state.pop(approval_id, None)
+        stored = self._approval_state.pop(token, None)
         if not stored:
             logger.warning("[Slack] Approval token %s already resolved or unknown", token)
             return

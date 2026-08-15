@@ -117,13 +117,23 @@ class TestSlackExecApproval:
         assert "hermes_approve_session" in action_ids
         assert "hermes_approve_always" in action_ids
         assert "hermes_deny" in action_ids
-        # Each button now carries an opaque numeric token, not the session key.
+        # Each button carries an unguessable token, not the session key.
         token = elements[0]["value"]
         assert token != "agent:main:slack:group:C1:1111"
-        assert token.isdigit()
-        assert adapter._approval_state[int(token)] == ("agent:main:slack:group:C1:1111", "")
+        assert not token.isdigit()
+        assert adapter._approval_state[token] == ("agent:main:slack:group:C1:1111", "")
         for e in elements:
             assert e["value"] == token
+
+        second = await adapter.send_exec_approval(
+            chat_id="C1",
+            command="echo other",
+            session_key="agent:main:slack:group:C1:1111",
+        )
+        assert second.success is True
+        other = mock_client.chat_postMessage.call_args_list[1].kwargs["blocks"][1]["elements"][0]["value"]
+        assert other != token
+        assert not other.isdigit()
 
     @pytest.mark.asyncio
     async def test_smart_deny_owner_override_hides_persistent_buttons(self):
@@ -158,7 +168,7 @@ class TestSlackApprovalAction:
         adapter = _make_adapter()
         _attach_auth_runner(adapter)
         adapter._approval_resolved["1.2"] = False
-        adapter._approval_state[1] = ("session-key", "")
+        adapter._approval_state["tok-1"] = ("session-key", "")
 
         # Simulate Slack re-escaping: original was ~2990 chars, but & → &amp;
         # etc. inflates it past 3000.
@@ -172,7 +182,7 @@ class TestSlackApprovalAction:
             "channel": {"id": "C1"},
             "user": {"name": "alice", "id": "U_ALICE"},
         }
-        action = {"action_id": "hermes_approve_once", "value": "1"}
+        action = {"action_id": "hermes_approve_once", "value": "tok-1"}
 
         mock_client = adapter._team_clients["T1"]
         mock_client.chat_update = AsyncMock()
@@ -241,7 +251,7 @@ class TestSlackApprovalAction:
         adapter = _make_adapter()
         _attach_auth_runner(adapter)
         adapter._approval_resolved["1234.5678"] = False
-        adapter._approval_state[1] = ("session-key", "req-abc")
+        adapter._approval_state["tok-abc"] = ("session-key", "req-abc")
 
         ack = AsyncMock()
         body = {
@@ -249,7 +259,7 @@ class TestSlackApprovalAction:
             "channel": {"id": "C1"},
             "user": {"name": "owner", "id": "U_OWNER"},
         }
-        action = {"action_id": "hermes_approve_once", "value": "1"}
+        action = {"action_id": "hermes_approve_once", "value": "tok-abc"}
         mock_client = adapter._team_clients["T1"]
         mock_client.chat_update = AsyncMock()
 
@@ -267,7 +277,7 @@ class TestSlackApprovalAction:
         adapter = _make_adapter()
         _attach_auth_runner(adapter)
         adapter._approval_resolved["1234.5678"] = False
-        adapter._approval_state[1] = ("session-key", "req-abc")
+        adapter._approval_state["tok-abc"] = ("session-key", "req-abc")
 
         ack = AsyncMock()
         body = {
@@ -275,7 +285,7 @@ class TestSlackApprovalAction:
             "channel": {"id": "C1"},
             "user": {"name": "owner", "id": "U_OWNER"},
         }
-        action = {"action_id": "hermes_approve_once", "value": "1"}
+        action = {"action_id": "hermes_approve_once", "value": "tok-abc"}
         mock_client = adapter._team_clients["T1"]
         mock_client.chat_update = AsyncMock()
 
