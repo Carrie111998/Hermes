@@ -10242,7 +10242,23 @@ function createWindow() {
   // colors immediately instead of leaving the stale native frame visible.
   // applyTitleBarOverlay already no-ops safely on platforms/builds where
   // this isn't applicable.
-  mainWindow.on('focus', () => applyTitleBarOverlay(mainWindow))
+  //
+  // Debounced: Electron fires 'focus' multiple times during a window's own
+  // startup/show sequence (creation, internal focus transitions between
+  // helper windows), not just on later refocus. Without debouncing, this
+  // handler repainted the titlebar strip 3-4x in a burst right at launch --
+  // more visible flicker than the bug it was meant to fix. Collapsing to
+  // at most one repaint per second keeps the later-refocus fix intact
+  // while eliminating the launch-time burst.
+  let lastTitleBarRepaint = 0
+  mainWindow.on('focus', () => {
+    const now = Date.now()
+    if (now - lastTitleBarRepaint < 1000) {
+      return
+    }
+    lastTitleBarRepaint = now
+    applyTitleBarOverlay(mainWindow)
+  })
 
   // Reopen where the user left off. close is the backstop, flushed
   // synchronously before the window is gone.
