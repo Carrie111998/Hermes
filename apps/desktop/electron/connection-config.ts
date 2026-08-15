@@ -462,7 +462,10 @@ function resolveProfileBackendRoute(profile, opts: ProfileRouteOptions = {}): Pr
 function profileScopedConnection(connection, effectiveProfile, route: ProfileBackendRoute) {
   const profile = connectionScopeKey(route.descriptorProfile) || connectionScopeKey(effectiveProfile) || 'default'
 
-  return { ...connection, profile }
+  // `scopePath` means this profile is only a request alias on the shared
+  // primary backend (global SSH/remote). The renderer must NOT dial a second
+  // WebSocket — over SSH that second dial fails and poisons the live gateway.
+  return route.scopePath ? { ...connection, profile, sharedPrimary: true } : { ...connection, profile }
 }
 
 /**

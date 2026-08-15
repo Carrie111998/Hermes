@@ -338,6 +338,7 @@ test('profileScopedConnection preserves a shared-backend alias over the effectiv
   })
 
   assert.equal(scoped.profile, 'life')
+  assert.equal(scoped.sharedPrimary, true)
 })
 
 // --- pathWithGlobalRemoteProfile ---

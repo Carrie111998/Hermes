@@ -208,7 +208,10 @@ import {
 } from './profile-delete-routing'
 import { normalizeDesktopProfile, PROFILE_NAME_RE } from './profile-name'
 import { fetchPrimaryProfileSessions } from './profile-session-routing'
-import { isProfileTargetAvailable } from './profile-target-availability'
+import {
+  configuredProfileExistsOnSharedRemote,
+  isProfileTargetAvailable
+} from './profile-target-availability'
 import { createQuickEntryShortcut, quickEntryWindowBounds, sanitizeQuickEntrySettings } from './quick-entry'
 import { type ActiveWork, mergeActiveWork, normalizeActiveWork, quitPromptFor } from './quit-guard'
 import * as remoteLifecycle from './remote-lifecycle'
@@ -8205,7 +8208,16 @@ async function ensureBackendForTarget(target: BackendTarget) {
   }
 
   if (target.kind !== 'primary' && !desktopProfileAvailable(target.profile)) {
-    throw new Error(`Profile "${target.profile}" does not exist and cannot be opened.`)
+    // Global SSH/remote: named profiles live on the remote host. A local-dir
+    // miss must not reject them or getConnection() throws, sharedPrimary never
+    // lands, and the renderer dials a second SSH socket that poisons the gateway.
+    const remoteOnly =
+      target.kind === 'configured-profile' &&
+      configuredProfileExistsOnSharedRemote(target.profile, globalRemoteActive())
+
+    if (!remoteOnly) {
+      throw new Error(`Profile "${target.profile}" does not exist and cannot be opened.`)
+    }
   }
 
   const decision = poolRouteForTarget(target)
