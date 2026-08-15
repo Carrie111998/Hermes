@@ -279,12 +279,24 @@ class AresLocalRuntime:
             self._atomic_link(self.paths.previous_link, current[1])
         self._atomic_link(self.paths.current_link, target)
 
-    @staticmethod
-    def _build_environment(source: Path) -> dict[str, str]:
+    def _build_environment(self, source: Path) -> dict[str, str]:
+        """Return a clean build environment scoped to this Ares installation."""
+
         environment = os.environ.copy()
         for name in ("PYTHONHOME", "PYTHONPATH", "VIRTUAL_ENV", "UV_PROJECT_ENVIRONMENT"):
             environment.pop(name, None)
+        # Builds run before the candidate has become the active release.  Set
+        # this explicitly instead of inheriting a terminal's Hermes profile so
+        # managed tools and configuration remain private to Ares throughout
+        # candidate construction.
+        environment["HERMES_HOME"] = str(self.paths.agent_home)
         environment["UV_PROJECT_ENVIRONMENT"] = str(source / ".venv")
+        node_dirs = [self.paths.agent_home / "node" / "bin", self.paths.agent_home / "node"]
+        existing_path = environment.get("PATH", "")
+        environment["PATH"] = os.pathsep.join(
+            [str(directory) for directory in node_dirs if directory.is_dir()]
+            + ([existing_path] if existing_path else [])
+        )
         return environment
 
     def _agent_environment(self) -> dict[str, str]:
@@ -293,6 +305,21 @@ class AresLocalRuntime:
         environment = os.environ.copy()
         environment["HERMES_HOME"] = str(self.paths.agent_home)
         return environment
+
+    def _managed_npm(self) -> str | None:
+        """Resolve (or provision) npm in Ares's private managed Node tree."""
+
+        from hermes_constants import (
+            bootstrap_hermes_managed_node,
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+
+        token = set_hermes_home_override(self.paths.agent_home)
+        try:
+            return bootstrap_hermes_managed_node()
+        finally:
+            reset_hermes_home_override(token)
 
     def _seed_agent_home(self, source_home: Path) -> bool:
         """Create an independent Ares home from the useful Hermes settings once.
@@ -355,14 +382,12 @@ class AresLocalRuntime:
         if not python.is_file():
             raise AresLocalRuntimeError("stable Ares Python is missing during Context Governor setup")
         program = """
-from pathlib import Path
 import shutil
-import yaml
+from hermes_cli.config import load_config_readonly
 from hermes_constants import get_hermes_home
 from plugins.context_engine._context_governor.key_state import ContextGovernorKeyError, ContextGovernorKeyState
 
-config_path = Path(get_hermes_home()) / 'config.yaml'
-config = yaml.safe_load(config_path.read_text(encoding='utf-8')) if config_path.is_file() else {}
+config = load_config_readonly()
 if (config or {}).get('context', {}).get('engine') == 'ri-context-governor':
     binary = shutil.which('context-governor')
     if not binary:
@@ -383,12 +408,14 @@ if (config or {}).get('context', {}).get('engine') == 'ri-context-governor':
         )
 
     def _build_runtime(self, source: Path, *, desktop: bool) -> None:
-        uv = shutil.which("uv")
-        if uv is None:
+        from hermes_cli.managed_uv import ensure_uv
+
+        uv = ensure_uv()
+        if not uv:
             raise AresLocalRuntimeError("`uv` is required to build the stable Ares runtime")
         environment = self._build_environment(source)
         self._run(
-            [uv, "sync", "--locked", "--extra", "all", "--no-dev", "--no-editable"],
+            [str(uv), "sync", "--locked", "--extra", "all", "--no-dev", "--no-editable"],
             cwd=source,
             env=environment,
         )
@@ -401,11 +428,14 @@ if (config or {}).get('context', {}).get('engine') == 'ri-context-governor':
             env=self._build_environment(source),
         )
         if desktop:
-            npm = shutil.which("npm")
+            npm = self._managed_npm()
             if npm is None:
-                raise AresLocalRuntimeError("`npm` is required to build the Ares Desktop application")
-            self._run([npm, "ci"], cwd=source, env=self._build_environment(source))
-            self._run([npm, "run", "pack"], cwd=source / "apps" / "desktop", env=self._build_environment(source))
+                raise AresLocalRuntimeError(
+                    "Ares could not provision its managed npm for the Desktop build"
+                )
+            desktop_environment = self._build_environment(source)
+            self._run([npm, "ci"], cwd=source, env=desktop_environment)
+            self._run([npm, "run", "pack"], cwd=source / "apps" / "desktop", env=desktop_environment)
             if self._desktop_binary(source) is None:
                 raise AresLocalRuntimeError("Ares Desktop build completed without an executable")
 
@@ -611,6 +641,7 @@ if (config or {}).get('context', {}).get('engine') == 'ri-context-governor':
             "#!/usr/bin/env bash\n"
             "set -euo pipefail\n"
             f"export ARES_HOME={str(self.paths.agent_home)!r}\n"
+            f"export HERMES_HOME={str(self.paths.agent_home)!r}\n"
             f"export ARES_BIN_DIR={str(self.paths.launcher_path.parent)!r}\n"
             f"runtime_root={str(self.paths.current_link)!r}\n"
             "python=\"$runtime_root/.venv/bin/python\"\n"
@@ -835,13 +866,10 @@ if (config or {}).get('context', {}).get('engine') == 'ri-context-governor':
                 ("Ares runtime imports", probe.returncode == 0, (probe.stderr or "ok").strip())
             )
         context_probe = """
-from pathlib import Path
 import json
-import yaml
-from hermes_constants import get_hermes_home
+from hermes_cli.config import load_config_readonly
 
-config_path = Path(get_hermes_home()) / 'config.yaml'
-config = yaml.safe_load(config_path.read_text(encoding='utf-8')) if config_path.is_file() else {}
+config = load_config_readonly()
 engine = (config or {}).get('context', {}).get('engine', 'compressor')
 if engine == 'ri-context-governor':
     from plugins.context_engine._context_governor import ContextGovernorEngine

@@ -1,57 +1,73 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
-import { $gateway } from './gateway'
-import { $goalsBySession, clearSessionGoal, refreshSessionGoal } from './goals'
+import { $goalsBySession, applyGoalStatusText, clearSessionGoal } from './goals'
 
-describe('goal projection store', () => {
+describe('goal store', () => {
   afterEach(() => {
-    $gateway.set(null)
+    vi.useRealTimers()
     $goalsBySession.set({})
-    vi.restoreAllMocks()
   })
 
-  it('hydrates only from the typed goal.status projection', async () => {
-    const request = vi.fn(async () => ({
-      exists: true,
-      goal: 'ship typed projection',
-      goal_id: 'goal-1',
-      status: 'active',
-      outcome: 'CONTINUATION_REQUIRED',
-      turns_used: 3,
-      max_turns: 20,
-      next_action: 'continue',
-      last_stop_reason: 'provider failure',
-      continuation_pending: true,
-      checkpoint_revision: 4,
-      updated_at: 123
-    }))
-    $gateway.set({ request } as never)
+  it('stores active goals from /goal output', () => {
+    applyGoalStatusText('s1', '⊙ Goal set (20-turn budget): ship the feature')
 
-    await refreshSessionGoal('runtime-session')
-
-    expect(request).toHaveBeenCalledWith('goal.status', { session_id: 'runtime-session' })
-    expect($goalsBySession.get()['runtime-session']).toEqual({
-      goalId: 'goal-1',
-      goal: 'ship typed projection',
+    expect($goalsBySession.get().s1).toMatchObject({
       status: 'active',
-      outcome: 'CONTINUATION_REQUIRED',
-      turnsUsed: 3,
-      maxTurns: 20,
-      nextAction: 'continue',
-      lastStopReason: 'provider failure',
-      continuationPending: true,
-      checkpointRevision: 4,
-      updatedAt: 123
+      title: 'ship the feature'
     })
   })
 
-  it('clears the rebuildable projection when canonical state does not exist', async () => {
-    $goalsBySession.set({ s1: { goalId: 'old', goal: 'old', status: 'paused', outcome: 'GOAL_PAUSED', turnsUsed: 1, maxTurns: 20, continuationPending: false, checkpointRevision: 1, updatedAt: 1 } })
-    $gateway.set({ request: vi.fn(async () => ({ exists: false })) } as never)
+  it('keeps the current title for continuation and pause messages', () => {
+    applyGoalStatusText('s1', '⊙ Goal set (20-turn budget): ship the feature')
+    applyGoalStatusText('s1', '↻ Continuing toward goal (1/20): next step is tests')
 
-    await refreshSessionGoal('s1')
+    expect($goalsBySession.get().s1).toMatchObject({
+      detail: 'Continuing toward goal (1/20): next step is tests',
+      status: 'active',
+      title: 'ship the feature'
+    })
+
+    applyGoalStatusText('s1', '⏸ Goal paused — 20/20 turns used. Use /goal resume to keep going.')
+
+    expect($goalsBySession.get().s1).toMatchObject({
+      status: 'paused',
+      title: 'ship the feature'
+    })
+  })
+
+  it('lingers done goals before clearing them', () => {
+    vi.useFakeTimers()
+
+    applyGoalStatusText('s1', '⊙ Goal set (20-turn budget): ship the feature')
+    applyGoalStatusText('s1', '✓ Goal achieved: tests pass')
+
+    expect($goalsBySession.get().s1).toMatchObject({ status: 'done' })
+
+    vi.advanceTimersByTime(7_999)
+    expect($goalsBySession.get().s1).toBeTruthy()
+
+    vi.advanceTimersByTime(1)
+    expect($goalsBySession.get().s1).toBeUndefined()
+  })
+
+  it('clears on no-goal output', () => {
+    applyGoalStatusText('s1', '⊙ Goal set (20-turn budget): ship another feature')
+    applyGoalStatusText('s1', 'No active goal. Set one with /goal <text>.')
 
     expect($goalsBySession.get().s1).toBeUndefined()
+  })
+
+  it('cancels pending done clears when replacing a goal', () => {
+    vi.useFakeTimers()
+
+    applyGoalStatusText('s1', '⊙ Goal set: first')
+    applyGoalStatusText('s1', '✓ Goal achieved: first done')
+    applyGoalStatusText('s1', '⊙ Goal set: second')
+
+    vi.advanceTimersByTime(8_000)
+
+    expect($goalsBySession.get().s1).toMatchObject({ status: 'active', title: 'second' })
+
     clearSessionGoal('s1')
   })
 })

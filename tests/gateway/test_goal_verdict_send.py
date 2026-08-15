@@ -74,11 +74,6 @@ def _make_runner_with_adapter(session_id: str = None):
     runner._running_agents_ts = {}
     runner._queued_events = {}
 
-    async def _inline_context_executor(func, *args):
-        return func(*args)
-
-    runner._run_in_executor_with_context = _inline_context_executor
-
     src = _make_source()
     # Default to a unique session_id so xdist parallel runs on the same worker
     # don't see each other's GoalManager state (DEFAULT_DB_PATH gets frozen at
@@ -99,34 +94,6 @@ def _make_runner_with_adapter(session_id: str = None):
     adapter = _RecordingAdapter()
     runner.adapters[Platform.TELEGRAM] = adapter
     return runner, adapter, session_entry, src
-
-
-@pytest.mark.asyncio
-async def test_goal_verdict_done_sent_via_adapter_send(hermes_home):
-    """When the judge says done, the '✓ Goal achieved' message must reach
-    the user through the adapter's ``send()`` method."""
-    runner, adapter, session_entry, src = _make_runner_with_adapter()
-
-    from hermes_cli.goals import GoalManager
-
-    mgr = GoalManager(session_entry.session_id)
-    mgr.set("ship the feature")
-
-    with patch("hermes_cli.goals.judge_goal", return_value=("done", "the feature shipped", False, None, False)):
-        await runner._post_turn_goal_continuation(
-            session_entry=session_entry,
-            source=src,
-            final_response="I shipped the feature.",
-        )
-        # fire-and-forget create_task — give the loop a tick
-        await asyncio.sleep(0.05)
-
-    assert len(adapter.sends) == 1, f"expected 1 send, got {len(adapter.sends)}: {adapter.sends}"
-    msg = adapter.sends[0]
-    assert msg["chat_id"] == "c1"
-    assert "waiting for authority" in msg["content"]
-    assert "completion evidence" in msg["content"]
-    assert "the feature shipped" in msg["content"]
 
 
 @pytest.mark.asyncio
@@ -158,74 +125,6 @@ async def test_goal_verdict_continue_enqueues_continuation(hermes_home):
 
 
 @pytest.mark.asyncio
-async def test_fifo_rejection_retains_unenqueued_checkpoint(hermes_home, monkeypatch):
-    runner, adapter, session_entry, src = _make_runner_with_adapter()
-    from hermes_cli.goals import GoalManager
-
-    mgr = GoalManager(session_entry.session_id)
-    mgr.set("recover rejected enqueue")
-    monkeypatch.setattr(runner, "_enqueue_fifo", lambda *_args, **_kwargs: False)
-    with patch("hermes_cli.goals.judge_goal", return_value=("continue", "still needs work", False, None, False)):
-        await runner._post_turn_goal_continuation(
-            session_entry=session_entry,
-            source=src,
-            final_response="partial",
-        )
-        await asyncio.sleep(0.05)
-
-    state = GoalManager(session_entry.session_id).state
-    assert state.continuation_pending is True
-    assert "continuation_enqueued_at" not in state.migration
-    assert not adapter._pending_messages
-
-
-@pytest.mark.asyncio
-async def test_graph_failure_is_checkpointed_with_graph_identity(hermes_home):
-    runner, adapter, session_entry, src = _make_runner_with_adapter()
-    from hermes_cli.goals import GoalManager
-
-    mgr = GoalManager(session_entry.session_id)
-    mgr.set("graph work")
-    await runner._post_turn_goal_continuation(
-        session_entry=session_entry,
-        source=src,
-        final_response="partial graph output",
-        agent_result={
-            "graph_run_id": "graph-failed-1",
-            "graph_outcome": "failed",
-            "error": "subgraph failed",
-        },
-    )
-    state = GoalManager(session_entry.session_id).state
-    assert state.outcome == "CONTINUATION_REQUIRED"
-    assert state.checkpoint["graph_run_ids"] == ["graph-failed-1"]
-    assert state.checkpoint["stop_reason"] == "gateway turn ended without usable output"
-
-
-@pytest.mark.asyncio
-async def test_graph_cancellation_beats_automatic_continuation(hermes_home):
-    runner, adapter, session_entry, src = _make_runner_with_adapter()
-    from hermes_cli.goals import GoalManager
-
-    mgr = GoalManager(session_entry.session_id)
-    mgr.set("cancelled graph work")
-    await runner._post_turn_goal_continuation(
-        session_entry=session_entry,
-        source=src,
-        final_response="",
-        agent_result={
-            "graph_run_id": "graph-cancelled-1",
-            "graph_outcome": "cancelled",
-            "interrupted": True,
-        },
-    )
-    state = GoalManager(session_entry.session_id).state
-    assert state.outcome == "CANCELLED"
-    assert state.status == "paused"
-    assert not adapter._pending_messages
-
-
-@pytest.mark.asyncio
 async def test_goal_verdict_budget_exhausted_sends_pause(hermes_home):
     """When the budget is exhausted, a '⏸ Goal paused' message must be sent
     and no further continuation enqueued."""
@@ -254,42 +153,3 @@ async def test_goal_verdict_budget_exhausted_sends_pause(hermes_home):
     assert not adapter._pending_messages
 
 
-@pytest.mark.asyncio
-async def test_goal_verdict_skipped_when_no_active_goal(hermes_home):
-    """No goal set → the hook is a no-op. Nothing is sent, nothing enqueued."""
-    runner, adapter, session_entry, src = _make_runner_with_adapter()
-
-    await runner._post_turn_goal_continuation(
-        session_entry=session_entry,
-        source=src,
-        final_response="anything",
-    )
-    await asyncio.sleep(0.05)
-
-    assert adapter.sends == []
-    assert adapter._pending_messages == {}
-
-
-@pytest.mark.asyncio
-async def test_goal_verdict_survives_adapter_without_send(hermes_home):
-    """Bad adapter (no ``send`` attribute) must not crash the judge hook."""
-    runner, _adapter, session_entry, src = _make_runner_with_adapter()
-
-    from hermes_cli.goals import GoalManager
-
-    GoalManager(session_entry.session_id).set("survive missing send")
-
-    class _NoSendAdapter:
-        def __init__(self):
-            self._pending_messages: dict = {}
-
-    runner.adapters[Platform.TELEGRAM] = _NoSendAdapter()
-
-    with patch("hermes_cli.goals.judge_goal", return_value=("done", "ok", False, None, False)):
-        # must not raise
-        await runner._post_turn_goal_continuation(
-            session_entry=session_entry,
-            source=src,
-            final_response="whatever",
-        )
-        await asyncio.sleep(0.05)

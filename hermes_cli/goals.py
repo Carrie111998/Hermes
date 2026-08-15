@@ -431,6 +431,8 @@ def run_gate(gate: GoalGate, *, cwd: Optional[str] = None) -> Tuple[bool, int, s
             shell=True,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=max(1, int(gate.timeout_seconds)),
             cwd=cwd or None,
         )
@@ -1318,7 +1320,8 @@ class GoalManager:
         turns = f"{s.turns_used}/{s.max_turns} turns"
         sub = f", {len(s.subgoals)} subgoal{'s' if len(s.subgoals) != 1 else ''}" if s.subgoals else ""
         con = ", contract" if self.has_contract() else ""
-        meta = f"{turns}{sub}{con}"
+        gat = f", {len(s.gates)} gate{'s' if len(s.gates) != 1 else ''}" if s.gates else ""
+        meta = f"{turns}{sub}{con}{gat}"
         if s.status == "active":
             if s.waiting_on_session and _session_waiting(s.waiting_on_session):
                 wr = s.waiting_reason or f"session {s.waiting_on_session}"
@@ -1786,7 +1789,10 @@ class GoalManager:
             return {
                 "status": "active", "should_continue": True, "continuation_prompt": prompt,
                 "verdict": "gate_failed", "reason": f"gate failed (exit {exit_code}): $ {gate.command}",
-                "message": f"✗ Quality gate failed: $ {gate.command}",
+                "message": (
+                    f"✗ Quality gate failed: $ {gate.command}"
+                    + (" (workspace unchanged; reusing prior failure)" if unchanged else "")
+                ),
             }
         if not save_goal(self.session_id, state):
             return self._persistence_failure("quality-gate success could not be saved")
@@ -2117,7 +2123,7 @@ class GoalManager:
             if gate_decision.get("should_continue") and state.turns_used >= state.max_turns:
                 state.status = "paused"
                 state.outcome = TURN_BUDGET_EXHAUSTED
-                state.paused_reason = f"turn budget exhausted ({state.turns_used}/{state.max_turns}) while a quality gate failed"
+                state.paused_reason = f"turn budget exhausted ({state.turns_used}/{state.max_turns} turns used) while a quality gate failed"
                 state.last_stop_reason = "TURN_BUDGET_EXHAUSTED_WITH_GATE_FAILURE"
                 if not save_goal(self.session_id, state):
                     return self._persistence_failure("gate budget stop could not be saved")
@@ -2449,6 +2455,12 @@ def run_kanban_goal_loop(
         if status == "blocked":
             _log(f"kanban goal loop: task {task_id} blocked by worker after {turns_used} turn(s)")
             return {"outcome": "blocked_by_worker", "turns_used": turns_used, "reason": "worker blocked the task"}
+        if status == "review":
+            _log(f"kanban goal loop: task {task_id} handed off for review by worker after {turns_used} turn(s)")
+            return {"outcome": "review_requested_by_worker", "turns_used": turns_used, "reason": "worker requested review"}
+        if status == "changes_requested":
+            _log(f"kanban goal loop: reviewer returned task {task_id} for changes after {turns_used} turn(s)")
+            return {"outcome": "changes_requested_by_reviewer", "turns_used": turns_used, "reason": "reviewer requested changes"}
         if status not in ("running", "ready"):
             # Reclaimed / archived / unexpected — let the dispatcher own it.
             _log(f"kanban goal loop: task {task_id} status={status!r}; stopping")

@@ -1,4 +1,9 @@
 export {
+  backendScopeKey,
+  backendScopePrefix,
+  LOCAL_CONNECTION_ID
+} from './backend-scope'
+export {
   BILLING_REFUSAL_POLICY,
   type BillingRecovery,
   type BillingRefusalPolicy,
@@ -6,12 +11,14 @@ export {
 } from './billing-policy'
 export type {
   BillingAutoReload,
+  BillingBlock,
   BillingCardInfo,
   BillingChargeResponse,
   BillingChargeStatusResponse,
   BillingErrorPayload,
   BillingMonthlyCap,
   BillingMutationResponse,
+  BillingPaymentMethod,
   BillingRefusalCode,
   BillingStateResponse,
   ChargeFailureReason,
@@ -33,6 +40,11 @@ export {
   type SettlementOutcome
 } from './charge-settlement'
 export {
+  createCronTriggerController,
+  type CronTriggerController,
+  type CronTriggerRunResult
+} from './cron-trigger-controller'
+export {
   type ConnectionState,
   type GatewayClientOptions,
   type GatewayEvent,
@@ -42,6 +54,7 @@ export {
   JsonRpcGatewayClient,
   type WebSocketLike
 } from './json-rpc-gateway'
+export { skillInvocationText } from './skill-scaffold'
 export {
   type HermesSkin,
   SKIN_BRANDING_TOKENS,

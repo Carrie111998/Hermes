@@ -40,6 +40,12 @@ Ares is **not** a claim of autonomous production operations, a replacement for o
 
 The Ares bootstrap targets Unix-like shells (Linux, macOS, and WSL). The standard Hermes package and CLI remain the compatibility interface; the bootstrap adds the `ares` launcher.
 
+Windows users should note that [`scripts/install.ps1`](scripts/install.ps1) is
+the upstream Hermes installer included for compatibility testing; it is not an
+Ares-isolated installer and therefore does not replace the Ares bootstrap
+above. Use WSL for a supported Ares installation until an Ares-specific
+PowerShell bootstrap is released.
+
 ### Install from this fork
 
 Review the installer before executing it, then clone and run it locally:
