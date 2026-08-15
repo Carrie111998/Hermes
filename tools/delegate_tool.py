@@ -120,6 +120,7 @@ def _get_subagent_approval_callback():
 # — the model has no toolsets argument. Subagents inherit the parent's toolsets.
 
 _DEFAULT_MAX_CONCURRENT_CHILDREN = 3
+_DEFAULT_PROFILE_REAL_CHILD_CEILING = 15
 # One-shot guard: the high-concurrency cost advisory is emitted at most once
 # per process. _get_max_concurrent_children() runs on every get_definitions()
 # schema rebuild (via _build_top_level_description / _build_tasks_param_description),
@@ -814,6 +815,24 @@ def _get_max_async_children() -> int:
             "delegations too. Remove the stale key from config.yaml."
         )
     return _get_max_concurrent_children()
+
+
+def _get_profile_real_child_ceiling() -> int:
+    """Read the profile-wide cap on actual delegated child agents."""
+    cfg = _load_config()
+    value = cfg.get(
+        "profile_real_child_ceiling",
+        _DEFAULT_PROFILE_REAL_CHILD_CEILING,
+    )
+    try:
+        return max(1, int(value))
+    except (TypeError, ValueError):
+        logger.warning(
+            "delegation.profile_real_child_ceiling=%r is invalid; using %d",
+            value,
+            _DEFAULT_PROFILE_REAL_CHILD_CEILING,
+        )
+        return _DEFAULT_PROFILE_REAL_CHILD_CEILING
 
 
 def _get_child_timeout() -> Optional[float]:
@@ -3843,6 +3862,42 @@ def delegate_task(
             combined["live_transcripts"] = list(live_paths)
         return combined
 
+    def _close_unstarted_children() -> None:
+        """Release resources for children built before admission was rejected."""
+        for _, _, child in children:
+            if hasattr(parent_agent, "_active_children"):
+                try:
+                    lock = getattr(parent_agent, "_active_children_lock", None)
+                    if lock:
+                        with lock:
+                            parent_agent._active_children.remove(child)
+                    else:
+                        parent_agent._active_children.remove(child)
+                except (ValueError, UnboundLocalError):
+                    pass
+            try:
+                child.close()
+            except Exception:
+                logger.debug("Failed to close unstarted child after capacity rejection")
+
+    def _execute_with_admission(*, honor_parent_interrupt: bool = True):
+        from tools.delegation_admission import release as release_children
+        from tools.delegation_admission import try_acquire as try_acquire_children
+
+        admission = try_acquire_children(
+            real_children=n_tasks,
+            ceiling=_get_profile_real_child_ceiling(),
+        )
+        if not admission.accepted:
+            _close_unstarted_children()
+            return None, admission.error
+        try:
+            return _execute_and_aggregate(
+                honor_parent_interrupt=honor_parent_interrupt
+            ), None
+        finally:
+            release_children(admission.lease_id)
+
     # ----- Background dispatch: run the WHOLE batch as one async unit -----
     # When background is true, the entire fan-out runs on the daemon executor
     # via a single async delegation. _execute_and_aggregate() joins on every
@@ -3894,7 +3949,9 @@ def delegate_task(
                 "delegate_task: async delivery unsupported on this session "
                 "runtime; running the batch synchronously instead."
             )
-            _sync_result = _execute_and_aggregate()
+            _sync_result, _sync_error = _execute_with_admission()
+            if _sync_error:
+                return tool_error(_sync_error)
             if isinstance(_sync_result, dict):
                 _sync_result["note"] = (
                     "background=true is not available in this session — it cannot "
@@ -4022,6 +4079,7 @@ def delegate_task(
             runner=_batch_runner,
             interrupt_fn=_batch_interrupt,
             max_async_children=_get_max_async_children(),
+            profile_real_child_ceiling=_get_profile_real_child_ceiling(),
             # Reuse the live-transcript directory's id (when created) so the
             # returned delegation_id matches cache/delegation/live/<id>/.
             delegation_id=live_deleg_id,
@@ -4072,27 +4130,20 @@ def delegate_task(
                 )
             return json.dumps(payload, ensure_ascii=False)
 
-        # Pool at capacity / schedule failure — children are still attached
-        # (we detach above only on the parent list, but the async unit was
-        # never accepted, so re-attaching isn't needed: we just run inline).
+        # Capacity rejection must not fall back inline: doing so would bypass
+        # the profile-wide real-child ceiling that rejected this dispatch.
         logger.info(
-            "delegate_task: async pool at capacity (%s); running the whole "
-            "batch synchronously instead.",
+            "delegate_task: background delegation rejected (%s).",
             dispatch.get("error", "rejected"),
         )
-        _cap_result = _execute_and_aggregate()
-        if isinstance(_cap_result, dict):
-            _cap_result["note"] = (
-                "The background delegation pool was at capacity "
-                "(delegation.max_concurrent_children), so the subagent(s) ran "
-                "SYNCHRONOUSLY and the result is included above. Raise "
-                "delegation.max_concurrent_children in config.yaml to allow "
-                "more concurrent background delegations."
-            )
-        return json.dumps(_cap_result, ensure_ascii=False)
+        _close_unstarted_children()
+        return tool_error(str(dispatch.get("error") or "Delegation capacity reached."))
 
     # ----- Synchronous path -----
-    return json.dumps(_execute_and_aggregate(), ensure_ascii=False)
+    _sync_result, _sync_error = _execute_with_admission()
+    if _sync_error:
+        return tool_error(_sync_error)
+    return json.dumps(_sync_result, ensure_ascii=False)
 
 
 def _resolve_child_credential_pool(

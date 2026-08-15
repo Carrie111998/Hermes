@@ -1020,11 +1020,16 @@ def _try_dispatch_background_run(
         return result
 
     try:
-        from tools.delegate_tool import _get_max_async_children
+        from tools.delegate_tool import (
+            _get_max_async_children,
+            _get_profile_real_child_ceiling,
+        )
 
         max_async = _get_max_async_children()
+        profile_real_child_ceiling = _get_profile_real_child_ceiling()
     except Exception:
         max_async = 3
+        profile_real_child_ceiling = 15
 
     started_at = time.time()
     deliver = job.get("deliver", "local")
@@ -1073,6 +1078,7 @@ def _try_dispatch_background_run(
         origin_ui_session_id=origin_ui_session_id,
         origin_session_id=origin_session_id,
         max_async_children=max_async,
+        profile_real_child_ceiling=profile_real_child_ceiling,
     )
 
     if dispatch.get("status") == "dispatched":

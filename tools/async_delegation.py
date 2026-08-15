@@ -764,6 +764,7 @@ def dispatch_async_delegation(
     origin_session_id: str = "",
     interrupt_fn: Optional[Callable[[], None]] = None,
     max_async_children: int = _DEFAULT_MAX_ASYNC_CHILDREN,
+    profile_real_child_ceiling: int = 15,
     progress_fn: Optional[Callable[[], tuple]] = None,
 ) -> Dict[str, Any]:
     """Spawn ``runner`` on the daemon executor and return a handle immediately.
@@ -808,6 +809,15 @@ def dispatch_async_delegation(
         ``{"status": "dispatched", "delegation_id": ...}`` on success, or
         ``{"status": "rejected", "error": ...}`` when at capacity.
     """
+    from tools.delegation_admission import try_acquire as try_acquire_children
+
+    admission = try_acquire_children(
+        real_children=1,
+        ceiling=profile_real_child_ceiling,
+    )
+    if not admission.accepted:
+        return {"status": "rejected", "error": admission.error}
+
     delegation_id = _new_delegation_id()
     dispatched_at = time.time()
     record: Dict[str, Any] = {
@@ -831,6 +841,8 @@ def dispatch_async_delegation(
         "_progress_token": None,
         "_progress_ts": dispatched_at,
         "_interrupted_at": None,
+        "real_children": 1,
+        "admission_lease_id": admission.lease_id,
     }
     # Capacity check and record insert under ONE lock hold — checking
     # active_count() separately would let two concurrent dispatches (e.g.
@@ -841,6 +853,8 @@ def dispatch_async_delegation(
             if r.get("status") in ("running", "stalling")
         )
         if running >= max_async_children:
+            from tools.delegation_admission import release as release_children
+            release_children(admission.lease_id)
             return {
                 "status": "rejected",
                 "error": (
@@ -883,6 +897,8 @@ def dispatch_async_delegation(
         with _records_lock:
             _records.pop(delegation_id, None)
         _delete_durable_delegation(delegation_id)
+        from tools.delegation_admission import release as release_children
+        release_children(admission.lease_id)
         return {
             "status": "rejected",
             "error": f"Failed to schedule async delegation: {exc}",
@@ -929,12 +945,39 @@ def _begin_finalization(
     return event_record, interrupt_fn
 
 
-def _finish_finalization(delegation_id: str, status: str) -> None:
+def _finish_finalization(
+    delegation_id: str,
+    status: str,
+    *,
+    release_admission: bool = True,
+) -> None:
+    admission_lease_id = ""
     with _records_lock:
         record = _records.get(delegation_id)
         if record is not None:
             record["status"] = status
+            admission_lease_id = str(record.get("admission_lease_id") or "")
         _prune_completed_locked()
+    if release_admission and admission_lease_id:
+        from tools.delegation_admission import release as release_children
+        release_children(admission_lease_id)
+
+
+def _release_admission_for_runner_exit(delegation_id: str) -> None:
+    """Release a lease after a force-finalized runner actually returns.
+
+    A stalled completion is terminal for delivery, but the daemon runner may
+    still be executing after ignoring interruption. Its real-child permits
+    must remain held until that execution ends.
+    """
+    admission_lease_id = ""
+    with _records_lock:
+        record = _records.get(delegation_id)
+        if record is not None:
+            admission_lease_id = str(record.get("admission_lease_id") or "")
+    if admission_lease_id:
+        from tools.delegation_admission import release as release_children
+        release_children(admission_lease_id)
 
 
 def _push_completion_event(
@@ -1026,6 +1069,7 @@ def dispatch_async_delegation_batch(
     origin_session_id: str = "",
     interrupt_fn: Optional[Callable[[], None]] = None,
     max_async_children: int = _DEFAULT_MAX_ASYNC_CHILDREN,
+    profile_real_child_ceiling: int = 15,
     delegation_id: Optional[str] = None,
     progress_fn: Optional[Callable[[], tuple]] = None,
 ) -> Dict[str, Any]:
@@ -1049,9 +1093,18 @@ def dispatch_async_delegation_batch(
     ``{"status": "rejected", "error": ...}`` when the async pool is at
     capacity.
     """
+    from tools.delegation_admission import try_acquire as try_acquire_children
+
+    n = len(goals)
+    admission = try_acquire_children(
+        real_children=n,
+        ceiling=profile_real_child_ceiling,
+    )
+    if not admission.accepted:
+        return {"status": "rejected", "error": admission.error}
+
     delegation_id = delegation_id or _new_delegation_id()
     dispatched_at = time.time()
-    n = len(goals)
     # A combined goal label for status listings / the completion header.
     combined_goal = (
         goals[0] if n == 1 else f"{n} parallel subagents: " + "; ".join(g[:40] for g in goals)
@@ -1078,6 +1131,8 @@ def dispatch_async_delegation_batch(
         "_progress_token": None,
         "_progress_ts": dispatched_at,
         "_interrupted_at": None,
+        "real_children": n,
+        "admission_lease_id": admission.lease_id,
     }
     with _records_lock:
         running = sum(
@@ -1085,6 +1140,8 @@ def dispatch_async_delegation_batch(
             if r.get("status") in ("running", "stalling")
         )
         if running >= max_async_children:
+            from tools.delegation_admission import release as release_children
+            release_children(admission.lease_id)
             return {
                 "status": "rejected",
                 "error": (
@@ -1123,6 +1180,7 @@ def dispatch_async_delegation_batch(
             status = "error"
         finally:
             _finalize_batch(delegation_id, combined, status)
+            _release_admission_for_runner_exit(delegation_id)
 
     try:
         # Propagate the dispatching profile to the detached batch children.
@@ -1131,6 +1189,8 @@ def dispatch_async_delegation_batch(
         with _records_lock:
             _records.pop(delegation_id, None)
         _delete_durable_delegation(delegation_id)
+        from tools.delegation_admission import release as release_children
+        release_children(admission.lease_id)
         return {
             "status": "rejected",
             "error": f"Failed to schedule async delegation batch: {exc}",
@@ -1405,7 +1465,9 @@ def _finalize_stalled(delegation_id: str) -> None:
             },
             "stalled",
         )
-    _finish_finalization(delegation_id, "stalled")
+    # Delivery is terminal, but the daemon runner may still be executing after
+    # ignoring its interrupt. Keep real-child permits until its worker exits.
+    _finish_finalization(delegation_id, "stalled", release_admission=False)
 
 
 def _children_activity_from_token(token: Any, now: float) -> Optional[List]:
@@ -1601,3 +1663,5 @@ def _reset_for_tests() -> None:
         thread.join(timeout=2)
     with _records_lock:
         _records.clear()
+    from tools.delegation_admission import _reset_for_tests as reset_admission
+    reset_admission()
