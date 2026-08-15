@@ -396,12 +396,21 @@ def test_ensure_tui_cached_bundle_uses_root_lockfile_and_workspace_install(
     build_dir = tmp_path / "home" / "cache" / "tui-bundle-build"
     monkeypatch.setattr(main_mod, "_tui_cached_bundle_dir", lambda: cache_dir)
     monkeypatch.setattr(main_mod, "_tui_cached_build_dir", lambda: build_dir)
+    monkeypatch.setattr(
+        "hermes_constants.with_hermes_node_path",
+        lambda env=None: {"PATH": "/managed-node/bin"},
+    )
     monkeypatch.setenv("HERMES_QUIET", "1")
 
     calls = []
+    colliding_tmp = build_dir.with_name(f"{build_dir.name}.{os.getpid()}.tmp")
+    colliding_tmp.mkdir(parents=True)
+    collision_marker = colliding_tmp / "belongs-to-another-writer"
+    collision_marker.write_text("keep", encoding="utf-8")
 
-    def fake_run(cmd, cwd=None, **_kwargs):
+    def fake_run(cmd, cwd=None, **kwargs):
         calls.append((cmd, Path(cwd) if cwd else None))
+        assert kwargs["env"]["PATH"] == "/managed-node/bin"
         if cmd[:2] == ["npm", "install"]:
             assert cwd == str(build_dir)
             root_manifest = (build_dir / "package.json").read_text(encoding="utf-8")
@@ -441,6 +450,7 @@ def test_ensure_tui_cached_bundle_uses_root_lockfile_and_workspace_install(
         "--progress=false",
     ]
     assert calls[1][0] == ["npm", "run", "build", "--workspace", "ui-tui"]
+    assert collision_marker.read_text(encoding="utf-8") == "keep"
 
 
 def test_tui_cached_bundle_stamps_the_staged_copy(main_mod, tmp_path, monkeypatch):
@@ -462,7 +472,9 @@ def test_tui_cached_bundle_stamps_the_staged_copy(main_mod, tmp_path, monkeypatc
     source_file.write_text("export const version = 'before'\n", encoding="utf-8")
 
     cache_root = tmp_path / "home" / "cache" / "tui-bundle"
+    build_dir = tmp_path / "home" / "cache" / "tui-bundle-build"
     monkeypatch.setattr(main_mod, "_tui_cached_bundle_dir", lambda: cache_root)
+    monkeypatch.setattr(main_mod, "_tui_cached_build_dir", lambda: build_dir)
     monkeypatch.setattr(main_mod, "_tui_workspace_writable", lambda _path: False)
     monkeypatch.setattr(main_mod, "_resolve_node_runtime_npm", lambda: "/usr/bin/npm")
 
@@ -697,3 +709,186 @@ def test_tui_cached_bundle_rejects_symlinked_cache_root(main_mod, tmp_path):
 
     assert main_mod._tui_cached_generations_dir(cache_root, create=True) is None
     assert not (outside / "generations").exists()
+
+
+def test_make_tui_argv_uses_managed_npm_outside_path(
+    monkeypatch, main_mod, tmp_path
+):
+    tui_dir = tmp_path / "readonly-install" / "ui-tui"
+    tui_dir.mkdir(parents=True)
+    cache_dir = tmp_path / "home" / "cache" / "tui-bundle"
+    cache_entry = cache_dir / "dist" / "entry.js"
+    cache_entry.parent.mkdir(parents=True)
+    cache_entry.write_text("console.log('cached')\n", encoding="utf-8")
+    calls = []
+
+    monkeypatch.delenv("HERMES_TUI_DIR", raising=False)
+    monkeypatch.setattr(main_mod, "_ensure_tui_node", lambda: None)
+    monkeypatch.setattr(main_mod, "_find_bundled_tui", lambda: None)
+    monkeypatch.setattr(main_mod, "_tui_workspace_writable", lambda _path: False)
+    monkeypatch.setattr(main_mod, "_resolve_node_runtime_npm", lambda: "/managed/npm")
+    monkeypatch.setattr(main_mod.shutil, "which", lambda _name: None)
+    monkeypatch.setattr(
+        "hermes_constants.find_node_executable",
+        lambda name: f"/managed/{name}",
+    )
+    monkeypatch.setattr(
+        main_mod,
+        "_ensure_tui_cached_bundle",
+        lambda path, *, node, npm=None: calls.append((path, node, npm)) or cache_dir,
+    )
+
+    argv, cwd = main_mod._make_tui_argv(tui_dir, tui_dev=False)
+
+    assert calls == [(tui_dir, "/managed/node", "/managed/npm")]
+    assert argv == ["/managed/node", "--expose-gc", str(cache_entry)]
+    assert cwd == cache_dir
+
+
+def test_tui_cache_refresh_uses_managed_node_and_npm(
+    monkeypatch, main_mod, tmp_path
+):
+    tui_dir = tmp_path / "readonly-install" / "ui-tui"
+    tui_dir.mkdir(parents=True)
+    cache_root = tmp_path / "home" / "cache" / "tui-bundle"
+    cache_root.mkdir(parents=True)
+    calls = []
+
+    monkeypatch.setattr(main_mod, "_tui_cached_bundle_dir", lambda: cache_root)
+    monkeypatch.setattr(main_mod, "_resolve_node_runtime_npm", lambda: "/managed/npm")
+    monkeypatch.setattr(main_mod.shutil, "which", lambda _name: None)
+    monkeypatch.setattr(
+        "hermes_constants.find_node_executable",
+        lambda name: f"/managed/{name}",
+    )
+    monkeypatch.setattr(
+        main_mod,
+        "_ensure_tui_cached_bundle",
+        lambda path, *, node, npm=None: calls.append((path, node, npm)) or cache_root,
+    )
+
+    main_mod._refresh_tui_cached_bundle_after_update(tui_dir)
+
+    assert calls == [(tui_dir, "/managed/node", "/managed/npm")]
+
+
+def test_tui_workspace_writable_preserves_colliding_probe(
+    monkeypatch, main_mod, tmp_path
+):
+    tui_dir = tmp_path / "ui-tui"
+    tui_dir.mkdir()
+    (tui_dir / "package-lock.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(main_mod.os, "getpid", lambda: 424242)
+    probe = tui_dir / ".hermes-tui-write-test-424242"
+    probe.write_text("belongs-to-someone-else", encoding="utf-8")
+
+    assert main_mod._tui_workspace_writable(tui_dir) is True
+    assert probe.read_text(encoding="utf-8") == "belongs-to-someone-else"
+
+
+def test_tui_cache_rejects_symlinked_ancestor(main_mod, tmp_path):
+    home = tmp_path / "home"
+    outside = tmp_path / "outside"
+    home.mkdir()
+    outside.mkdir()
+    (home / "cache").symlink_to(outside, target_is_directory=True)
+    cache_root = home / "cache" / "tui-bundle"
+
+    assert main_mod._tui_cached_generations_dir(cache_root, create=True) is None
+    assert not (outside / "tui-bundle" / "generations").exists()
+
+
+def test_tui_cache_rejects_junction_in_ancestor(
+    monkeypatch, main_mod, tmp_path
+):
+    home = tmp_path / "home"
+    cache_parent = home / "cache"
+    cache_parent.mkdir(parents=True)
+    cache_root = cache_parent / "tui-bundle"
+    monkeypatch.setattr(
+        Path,
+        "is_junction",
+        lambda self: self == cache_parent,
+        raising=False,
+    )
+
+    assert main_mod._tui_cached_generations_dir(cache_root, create=True) is None
+    assert not (cache_root / "generations").exists()
+
+
+def test_tui_workspace_inputs_reject_junction_ancestor(
+    monkeypatch, main_mod, tmp_path
+):
+    workspace = tmp_path / "ui-tui"
+    junction = workspace / "src" / "junction"
+    junction.mkdir(parents=True)
+    (junction / "outside.ts").write_text(
+        "export const outside = true\n", encoding="utf-8"
+    )
+    monkeypatch.setattr(
+        Path,
+        "is_junction",
+        lambda self: self == junction,
+        raising=False,
+    )
+
+    with pytest.raises(RuntimeError, match="redirect|junction"):
+        list(main_mod._iter_tui_workspace_inputs(Path("ui-tui"), workspace))
+
+
+def test_tui_redirect_detection_supports_python311_reparse_attributes(main_mod):
+    class ReparsePath:
+        @staticmethod
+        def is_symlink():
+            return False
+
+        @staticmethod
+        def lstat():
+            return types.SimpleNamespace(st_file_attributes=0x400)
+
+    assert main_mod._tui_path_is_redirect(ReparsePath()) is True
+
+
+@pytest.mark.skipif(os.name == "nt", reason="dir_fd hardening is POSIX-only")
+def test_tui_cache_root_creation_resists_parent_swap(
+    monkeypatch, main_mod, tmp_path
+):
+    home = tmp_path / "home"
+    cache_parent = home / "cache"
+    displaced_cache = home / "cache-original"
+    outside = tmp_path / "outside"
+    cache_parent.mkdir(parents=True, mode=0o700)
+    outside.mkdir()
+    cache_root = cache_parent / "tui-bundle"
+    original_mkdir = main_mod.os.mkdir
+    swapped = False
+
+    def swap_before_cache_root_create(path, mode=0o777, *, dir_fd=None):
+        nonlocal swapped
+        if path == "tui-bundle" and dir_fd is not None and not swapped:
+            cache_parent.rename(displaced_cache)
+            cache_parent.symlink_to(outside, target_is_directory=True)
+            swapped = True
+        return original_mkdir(path, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(main_mod.os, "mkdir", swap_before_cache_root_create)
+
+    with pytest.raises(RuntimeError, match="unsafe TUI cache"):
+        main_mod._prepare_tui_cache_root(cache_root)
+
+    assert swapped is True
+    assert not (outside / "tui-bundle").exists()
+    assert (displaced_cache / "tui-bundle").is_dir()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX ownership/mode gate")
+def test_tui_cache_root_rejects_group_writable_home(main_mod, tmp_path):
+    home = tmp_path / "home"
+    home.mkdir(mode=0o770)
+    home.chmod(0o770)
+    cache_root = home / "cache" / "tui-bundle"
+
+    with pytest.raises(RuntimeError, match="private|unsafe"):
+        main_mod._prepare_tui_cache_root(cache_root)
+
+    assert not cache_root.exists()
