@@ -213,19 +213,28 @@ export function useMessageStream({
 
         queue.delete(id)
 
-        if (queued.assistant) {
-          mutateStream(
-            id,
-            parts => dedupeGeneratedImageEchoesInParts(appendAssistantTextPart(parts, queued.assistant)),
-            () => [assistantTextPart(queued.assistant)]
-          )
-        }
-
+        // Reasoning before assistant text. One flush window can straddle the
+        // reasoning→answer boundary (the model stops thinking and starts
+        // answering inside the same batch), and whichever kind is applied
+        // first seeds/opens its part first. Applying the answer first put the
+        // text block above the Thinking block for the rest of the turn, until
+        // message.complete rebuilt the bubble via mergeFinalAssistantText —
+        // which always re-appends the final text last — and the two visibly
+        // swapped on settle. Once both parts exist, order no longer matters:
+        // appendStreamPart merges into the existing block either way.
         if (queued.reasoning) {
           mutateStream(
             id,
             parts => appendReasoningPart(parts, queued.reasoning),
             () => [reasoningPart(queued.reasoning)]
+          )
+        }
+
+        if (queued.assistant) {
+          mutateStream(
+            id,
+            parts => dedupeGeneratedImageEchoesInParts(appendAssistantTextPart(parts, queued.assistant)),
+            () => [assistantTextPart(queued.assistant)]
           )
         }
       }
