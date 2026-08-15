@@ -628,9 +628,32 @@ if (config or {}).get('context', {}).get('engine') == 'ri-context-governor':
             checks.append(
                 ("Ares and Hermes imports", probe.returncode == 0, (probe.stderr or "ok").strip())
             )
-        context_governor = shutil.which("context-governor")
-        checks.append(
-            ("Context Governor binary", context_governor is not None, context_governor or "not found"))
+        context_probe = """
+from pathlib import Path
+import json
+import yaml
+from hermes_constants import get_hermes_home
+
+config_path = Path(get_hermes_home()) / 'config.yaml'
+config = yaml.safe_load(config_path.read_text(encoding='utf-8')) if config_path.is_file() else {}
+engine = (config or {}).get('context', {}).get('engine', 'compressor')
+if engine == 'ri-context-governor':
+    from plugins.context_engine._context_governor import ContextGovernorEngine
+    capabilities = ContextGovernorEngine().probe_activation()
+    print(json.dumps({'engine': capabilities['engine'], 'strict_probe': 'passed'}))
+else:
+    print(json.dumps({'engine': engine, 'strict_probe': 'not configured'}))
+"""
+        try:
+            probe = self._run(
+                [python, "-c", context_probe],
+                cwd=source,
+                capture=True,
+                env=self._agent_environment(),
+            )
+            checks.append(("Context Governor strict probe", True, probe.stdout.strip()))
+        except AresLocalRuntimeError as exc:
+            checks.append(("Context Governor strict probe", False, str(exc)))
         gateway_active = self._systemctl("is-active", "--quiet", "ares-gateway.service", required=False)
         checks.append(("Ares gateway", gateway_active, "active" if gateway_active else "inactive"))
         return checks

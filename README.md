@@ -125,6 +125,8 @@ This is different from treating a chat summary as proof. Ares can expose a path 
 
 Ares preserves the Hermes-compatible configuration format but owns `~/.ares` as an independent agent home. The `ares` launcher sets the runtime process to that home only; Hermes and Ares can therefore use different providers, skills, plugins, sessions, and gateway lifecycles on the same machine without mutating one another.
 
+The first-run migration preserves any explicitly configured external service paths so that existing Semantic Memory, AgentGraph, and other integrations continue to work. Those optional services remain shared until their endpoint and storage configuration is deliberately changed in the Ares home; the runtime launcher itself does not silently fall back to Hermes state.
+
 Do not copy structured configuration blindly between homes. In particular:
 
 - keep provider secrets in the local secret mechanism, never in this repository or in shell history;

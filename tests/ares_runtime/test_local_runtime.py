@@ -142,3 +142,12 @@ def test_chat_command_leaves_hermes_options_for_the_runtime() -> None:
 
     assert args.command == "chat"
     assert passthrough == ["--oneshot", "Reply with exactly ARES_RUNTIME_OK"]
+
+
+def test_doctor_uses_the_strict_context_governor_probe() -> None:
+    source = Path(__file__).parents[2] / "ares_runtime" / "local_runtime.py"
+
+    implementation = source.read_text(encoding="utf-8")
+
+    assert "Context Governor strict probe" in implementation
+    assert "ContextGovernorEngine().probe_activation()" in implementation
