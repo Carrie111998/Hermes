@@ -545,7 +545,7 @@ class TestUpscaleOptIn:
         monkeypatch.setattr(image_tool, "_resolve_managed_fal_gateway", lambda: None)
         monkeypatch.setattr(
             image_tool, "_submit_fal_request",
-            lambda endpoint, arguments=None: _FakeHandle(
+            lambda endpoint, arguments=None, **kwargs: _FakeHandle(
                 {"images": [{"url": "https://fal/native.png", "width": 1024, "height": 768}]}
             ),
         )
@@ -596,7 +596,7 @@ class TestUpscaleOptIn:
         monkeypatch.setattr(image_tool, "_resolve_managed_fal_gateway", lambda: None)
         monkeypatch.setattr(
             image_tool, "_submit_fal_request",
-            lambda endpoint, arguments=None: _FakeHandle(
+            lambda endpoint, arguments=None, **kwargs: _FakeHandle(
                 {"images": [{"url": "https://fal/native.png"}]}
             ),
         )
