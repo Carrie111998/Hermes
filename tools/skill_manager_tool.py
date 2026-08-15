@@ -1409,6 +1409,24 @@ def _apply_skill_write_gate(action, name, **payload_kwargs):
     if _skill_gate_bypass.get():
         return None
 
+    # Defense in depth against the autonomy fork: even if a background-review /
+    # curator agent reaches the write tool, a governed run without explicit
+    # SELF_IMPROVEMENT authorization is refused here (second choke point, after
+    # the spawn guard). Fail closed — never mutate on an unauthorized review.
+    try:
+        from tools.skill_provenance import is_background_review
+        from tools.self_improvement_guard import guard_skill_write
+
+        if is_background_review():
+            refusal = guard_skill_write(action, name)
+            if refusal is not None:
+                return json.dumps(
+                    {"success": False, "error": refusal, "_fail_closed": True},
+                    ensure_ascii=False,
+                )
+    except Exception:  # noqa: BLE001 - never let the guard itself break a legit write
+        pass
+
     try:
         from tools import write_approval as wa
     except Exception:

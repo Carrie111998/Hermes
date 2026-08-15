@@ -1074,6 +1074,31 @@ def memory_tool(
     if target not in {"memory", "user"}:
         return tool_error(f"Invalid target '{target}'. Use 'memory' or 'user'.", success=False)
 
+    # Defense in depth: a governed run must not mutate memory autonomously
+    # without explicit SELF_IMPROVEMENT authorization. Covers BOTH batch and
+    # single-op writes from the autonomy fork. Twin of the skill write guard.
+    try:
+        from tools.skill_provenance import is_background_review
+        from tools.self_improvement_guard import self_improvement_authorized
+
+        if is_background_review() and not self_improvement_authorized():
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": (
+                        "Self-improvement is DISABLED for this governed run: "
+                        "autonomous memory mutation requires an explicit "
+                        "SELF_IMPROVEMENT authorization (env HERMES_SELF_IMPROVEMENT=1 "
+                        "or profile config self_improvement.enabled=true). "
+                        "Refusing the write. No memory change was made."
+                    ),
+                    "_fail_closed": True,
+                },
+                ensure_ascii=False,
+            )
+    except Exception:  # noqa: BLE001 - never let the guard break a legit write
+        pass
+
     # --- Batch path -------------------------------------------------------
     if operations:
         if not isinstance(operations, list):

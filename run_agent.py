@@ -1739,6 +1739,24 @@ class AIAgent:
         here so existing tests that patch ``run_agent.threading.Thread``
         keep working.
         """
+        # Hard gate for governed/orchestrator runs: never spawn the autonomous
+        # self-improvement fork unless an explicit SELF_IMPROVEMENT auth is
+        # present. A governed run must not mutate SKILL.md/references/memory on
+        # its own; this stops the fork before any inference or write.
+        try:
+            from tools.self_improvement_guard import spawn_allowed
+
+            if not spawn_allowed():
+                logger.info(
+                    "Self-improvement fork suppressed: governed run without "
+                    "HERMES_SELF_IMPROVEMENT authorization (review_skills=%s, "
+                    "review_memory=%s). No SKILL.md/memory mutation occurred.",
+                    review_skills,
+                    review_memory,
+                )
+                return
+        except Exception:  # noqa: BLE001 - never let the guard break the review path
+            pass
         from agent.background_review import spawn_background_review_thread
         from tools.thread_context import propagate_context_to_thread
         target, _prompt = spawn_background_review_thread(
