@@ -52,13 +52,23 @@ from typing import Optional, Dict, Any, List
 from utils import env_var_enabled
 
 logger = logging.getLogger(__name__)
+from tools.terminal_tool_helpers import (
+    _check_all_guards,
+    _docker_has_host_access,
+    _docker_volume_uses_host_path,
+    _get_approval_callback,
+    _get_cached_sudo_password,
+    _get_sudo_password_callback,
+    _is_safe_workdir_char,
+    _is_supported_vercel_runtime,
+    _redact_terminal_error_text,
+    _reset_cached_sudo_passwords,
+    _set_cached_sudo_password,
+    _sudo_wrong_password_failure,
+    set_approval_callback,
+    set_sudo_password_callback,
+)
 
-
-def _redact_terminal_error_text(value: Any) -> str:
-    """Force-redact text before serializing a terminal error envelope."""
-    from agent.redact import redact_sensitive_text
-
-    return redact_sensitive_text("" if value is None else str(value), force=True)
 
 
 # ---------------------------------------------------------------------------
@@ -133,10 +143,6 @@ DISK_USAGE_WARNING_THRESHOLD_GB = _safe_parse_import_env(
 )
 _VERCEL_SANDBOX_DEFAULT_CWD = "/vercel/sandbox"
 _SUPPORTED_VERCEL_RUNTIMES = ("node24", "node22", "python3.13")
-
-
-def _is_supported_vercel_runtime(runtime: str) -> bool:
-    return not runtime or runtime in _SUPPORTED_VERCEL_RUNTIMES
 
 
 def _check_vercel_sandbox_requirements(config: dict[str, Any]) -> bool:
@@ -268,33 +274,6 @@ _sudo_password_cache_lock = threading.Lock()
 _callback_tls = threading.local()
 
 
-def _get_sudo_password_callback():
-    return getattr(_callback_tls, "sudo_password", None)
-
-
-def _get_approval_callback():
-    return getattr(_callback_tls, "approval", None)
-
-
-def set_sudo_password_callback(cb):
-    """Register a callback for sudo password prompts (used by CLI).
-
-    Per-thread scope — ACP sessions that run concurrently in a
-    ThreadPoolExecutor each have their own callback slot.
-    """
-    _callback_tls.sudo_password = cb
-
-
-def set_approval_callback(cb):
-    """Register a callback for dangerous command approval prompts.
-
-    Per-thread scope — ACP sessions that run concurrently in a
-    ThreadPoolExecutor each have their own callback slot. See
-    GHSA-qg5c-hvr5-hjgr.
-    """
-    _callback_tls.approval = cb
-
-
 def _get_sudo_password_cache_scope() -> str:
     """Return the cache scope for interactive sudo passwords."""
     try:
@@ -316,32 +295,6 @@ def _get_sudo_password_cache_scope() -> str:
 
     return f"thread:{threading.get_ident()}"
 
-
-def _get_cached_sudo_password() -> str:
-    """Return the cached sudo password for the current scope."""
-    scope = _get_sudo_password_cache_scope()
-    with _sudo_password_cache_lock:
-        return _sudo_password_cache.get(scope, "")
-
-
-def _set_cached_sudo_password(password: str) -> None:
-    """Persist a sudo password for the current scope."""
-    scope = _get_sudo_password_cache_scope()
-    with _sudo_password_cache_lock:
-        if password:
-            _sudo_password_cache[scope] = password
-        else:
-            _sudo_password_cache.pop(scope, None)
-
-
-def _reset_cached_sudo_passwords() -> None:
-    """Clear all cached sudo passwords.
-
-    Internal helper for tests and process teardown paths.
-    """
-    with _sudo_password_cache_lock:
-        _sudo_password_cache.clear()
-
 # =============================================================================
 # Dangerous Command Approval System
 # =============================================================================
@@ -350,35 +303,6 @@ def _reset_cached_sudo_passwords() -> None:
 from tools.approval import (
     check_all_command_guards as _check_all_guards_impl,
 )
-
-
-def _docker_volume_uses_host_path(volume_spec: str) -> bool:
-    """Return True when a docker volume spec bind-mounts a host path."""
-    if not isinstance(volume_spec, str):
-        return False
-
-    vol = volume_spec.strip()
-    return bool(vol) and (
-        vol.startswith(("/", "~", "./", "../")) or
-        (len(vol) >= 3 and vol[1] == ":" and vol[2] in ("/", "\\"))
-    )
-
-
-def _docker_has_host_access(config: Dict[str, Any]) -> bool:
-    """Return True when a Docker sandbox exposes host paths through bind mounts."""
-    if config.get("env_type") != "docker":
-        return False
-    if config.get("host_cwd") and config.get("docker_mount_cwd_to_workspace"):
-        return True
-    return any(_docker_volume_uses_host_path(vol) for vol in config.get("docker_volumes", []))
-
-
-def _check_all_guards(command: str, env_type: str,
-                      has_host_access: bool = False) -> dict:
-    """Delegate to consolidated guard (tirith + dangerous cmd) with CLI callback."""
-    return _check_all_guards_impl(command, env_type,
-                                  approval_callback=_get_approval_callback(),
-                                  has_host_access=has_host_access)
 
 
 # Allowlist: characters that can legitimately appear in directory paths.
@@ -390,16 +314,6 @@ def _check_all_guards(command: str, env_type: str,
 # (the cwd is additionally shlex-quoted before it reaches the shell; this
 # allowlist is defense-in-depth).
 _WORKDIR_SAFE_ASCII_CHARS = frozenset('/\\:_-.~ +@=,')
-
-
-def _is_safe_workdir_char(ch: str) -> bool:
-    if not ch:
-        return False
-    # Reject control characters (including newlines/tabs) and NUL bytes before
-    # considering Unicode categories.
-    if ord(ch) < 32 or ord(ch) == 127:
-        return False
-    return ch.isalnum() or ch in _WORKDIR_SAFE_ASCII_CHARS
 
 
 def _validate_workdir(workdir: str) -> str | None:
@@ -454,14 +368,6 @@ _SUDO_WRONG_PASSWORD_MARKERS = (
     "sudo: maximum 3 incorrect authentication attempts",
     "sudo: 3 incorrect password attempts",
 )
-
-
-def _sudo_wrong_password_failure(output: str) -> bool:
-    """Return True when sudo rejected a piped password."""
-    if not output:
-        return False
-    lowered = output.lower()
-    return any(marker in lowered for marker in _SUDO_WRONG_PASSWORD_MARKERS)
 
 
 def _invalidate_cached_sudo_on_auth_failure(

@@ -151,13 +151,23 @@ _BLOCKED_DEVICE_PATHS = frozenset({
     # fd aliases
     "/dev/fd/0", "/dev/fd/1", "/dev/fd/2",
 })
+from tools.file_tools_helpers import (
+    _configured_terminal_cwd,
+    _file_ops_uses_host_paths,
+    _get_hermes_config_resolved,
+    _get_real_hermes_home,
+    _is_expected_write_exception,
+    _is_internal_file_tool_content,
+    _normalize_without_host_deref,
+    _record_not_found,
+    _record_patch_failure,
+    _reset_patch_failures,
+    _resolve_path,
+    _search_result_read_block_error,
+    _sentinel_free_abs_cwd,
+    _uses_container_paths,
+)
 
-
-def _resolve_path(filepath: str, task_id: str = "default") -> Path | PurePosixPath:
-    """Resolve a path relative to TERMINAL_CWD (the worktree base directory)
-    instead of the main repository root.
-    """
-    return _resolve_path_for_task(filepath, task_id)
 
 
 # Sentinel ``TERMINAL_CWD`` values that mean "not configured", NOT a literal
@@ -206,53 +216,6 @@ def _terminal_env_type_for_task(task_id: str = "default") -> str:
         return str(cfg.get("env_type") or os.getenv("TERMINAL_ENV") or "local").lower()
     except Exception:
         return str(os.getenv("TERMINAL_ENV") or "local").lower()
-
-
-def _uses_container_paths(task_id: str = "default") -> bool:
-    try:
-        from tools.terminal_tool import _CONTAINER_BACKENDS
-        container_backends = _CONTAINER_BACKENDS
-    except Exception:
-        container_backends = _CONTAINER_PATH_BACKENDS_FALLBACK
-    return _terminal_env_type_for_task(task_id) in container_backends
-
-
-def _normalize_without_host_deref(path: str | Path | PurePosixPath) -> PurePosixPath:
-    """Normalize path syntax without following host symlinks.
-
-    Container backends use paths that are meaningful inside the sandbox. Calling
-    ``Path.resolve()`` on the host can dereference a host-side symlink such as
-    ``/workspace`` and rewrite the path before Docker sees it.
-    """
-    return PurePosixPath(posixpath.normpath(str(path)))
-
-
-def _sentinel_free_abs_cwd(raw: str | None) -> str | None:
-    """Normalize a cwd candidate to an absolute, sentinel-free anchor.
-
-    Returns the expanded path only when *raw* is non-empty, not a sentinel (see
-    ``_TERMINAL_CWD_SENTINELS``), and absolute. A relative anchor is meaningless
-    without knowing which cwd it is relative to — exactly the ambiguity that
-    misroutes worktree edits — so relative/sentinel/empty values yield ``None``.
-    """
-    raw = str(raw or "").strip()
-    if raw.lower() in _TERMINAL_CWD_SENTINELS:
-        return None
-    expanded = _expand_tilde(raw)
-    if not os.path.isabs(expanded):
-        return None
-    return expanded
-
-
-def _configured_terminal_cwd() -> str | None:
-    """Return ``$TERMINAL_CWD`` only when it names a real directory anchor.
-
-    Sentinel values (see ``_TERMINAL_CWD_SENTINELS``) and relative paths are
-    rejected — a relative anchor is meaningless without knowing which cwd it is
-    relative to, which is exactly the ambiguity that misroutes worktree edits.
-    Only an absolute, sentinel-free value is honored.
-    """
-    return _sentinel_free_abs_cwd(os.environ.get("TERMINAL_CWD"))
 
 
 def _registered_task_cwd_override(task_id: str = "default") -> str | None:
@@ -444,23 +407,6 @@ def _path_resolution_warning(filepath: str, resolved: Path, task_id: str = "defa
         return None
 
 
-def _file_ops_uses_host_paths(file_ops) -> bool:
-    """Return True when *file_ops* targets the same host filesystem as Hermes.
-
-    Only then may we rewrite V4A header paths to resolved host-absolute
-    paths: a container/remote backend has its own filesystem namespace where
-    a host-absolute path would be meaningless.
-    """
-    env = getattr(file_ops, "env", None)
-    if env is None:
-        return True
-    try:
-        from tools.environments.local import LocalEnvironment
-    except ImportError:
-        return True
-    return isinstance(env, LocalEnvironment)
-
-
 def _rewrite_v4a_patch_paths_for_host(
     patch: str,
     path_to_resolved: dict,
@@ -593,21 +539,6 @@ def _is_blocked_device(filepath: str, base_dir: str | Path | None = None) -> boo
     return False
 
 
-def _search_result_read_block_error(path: str, task_id: str = "default") -> str | None:
-    """Return the read-safety error for a search result path.
-
-    Search backends may return paths relative to the task cwd, while
-    ``get_read_block_error`` expects an already-resolved path when the task cwd
-    can differ from the Python process cwd. Mirror ``read_file_tool``'s path
-    resolution before applying the shared read guard.
-    """
-    try:
-        resolved = _resolve_path_for_task(path, task_id)
-    except (OSError, ValueError, RuntimeError):
-        return get_read_block_error(path)
-    return get_read_block_error(str(resolved))
-
-
 def _filter_read_blocked_search_results(result, task_id: str = "default") -> int:
     """Remove credential/cache/env paths from a SearchResult in-place."""
     omitted = 0
@@ -658,23 +589,6 @@ _SENSITIVE_EXACT_PATHS = {"/var/run/docker.sock", "/run/docker.sock"}
 
 _hermes_config_resolved: str | None = None
 _hermes_config_resolved_loaded = False
-
-
-def _get_hermes_config_resolved() -> str | None:
-    """Return the resolved absolute path of the Hermes config file (cached)."""
-    global _hermes_config_resolved, _hermes_config_resolved_loaded
-    if _hermes_config_resolved_loaded:
-        return _hermes_config_resolved
-    _hermes_config_resolved_loaded = True
-    try:
-        from hermes_cli.config import get_config_path
-        _hermes_config_resolved = str(get_config_path().resolve())
-    except Exception:
-        try:
-            _hermes_config_resolved = str(Path(_expand_tilde("~/.hermes/config.yaml")).resolve())
-        except Exception:
-            _hermes_config_resolved = None
-    return _hermes_config_resolved
 
 
 def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None:
@@ -735,23 +649,6 @@ _PROTECTED_INSTRUCTION_BASENAMES = frozenset({
 
 _real_hermes_home_cached: str | None = None
 _real_hermes_home_loaded = False
-
-
-def _get_real_hermes_home() -> str | None:
-    """Return the realpath of the authoritative Hermes home (cached)."""
-    global _real_hermes_home_cached, _real_hermes_home_loaded
-    if _real_hermes_home_loaded:
-        return _real_hermes_home_cached
-    _real_hermes_home_loaded = True
-    try:
-        from hermes_constants import get_hermes_home
-        _real_hermes_home_cached = os.path.realpath(str(get_hermes_home()))
-    except Exception:
-        try:
-            _real_hermes_home_cached = os.path.realpath(_expand_tilde("~/.hermes"))
-        except Exception:
-            _real_hermes_home_cached = None
-    return _real_hermes_home_cached
 
 
 def _protected_instruction_config() -> tuple[bool, list[str]]:
@@ -1113,15 +1010,6 @@ def _check_cross_profile_path(filepath: str, task_id: str = "default") -> str | 
     )
 
 
-def _is_expected_write_exception(exc: Exception) -> bool:
-    """Return True for expected write denials that should not hit error logs."""
-    if isinstance(exc, PermissionError):
-        return True
-    if isinstance(exc, OSError) and exc.errno in _EXPECTED_WRITE_ERRNOS:
-        return True
-    return False
-
-
 _file_ops_lock = threading.Lock()
 _file_ops_cache: dict = {}
 
@@ -1150,35 +1038,6 @@ _read_tracker: dict = {}
 # attempt).  Reset on a successful patch to that path.
 _patch_failure_lock = threading.Lock()
 _patch_failure_tracker: dict = {}  # {task_id: {resolved_path: count}}
-
-
-def _record_patch_failure(task_id: str, resolved_path: str) -> int:
-    """Increment and return the consecutive-failure count for this path."""
-    with _patch_failure_lock:
-        task_failures = _patch_failure_tracker.setdefault(task_id, {})
-        # Cap dict size per task to avoid unbounded growth in long sessions
-        # where the agent fails on many distinct files.  64 distinct
-        # failing files per task is generous; older entries get evicted.
-        if len(task_failures) >= 64 and resolved_path not in task_failures:
-            try:
-                first_key = next(iter(task_failures))
-                del task_failures[first_key]
-            except StopIteration:
-                pass
-        task_failures[resolved_path] = task_failures.get(resolved_path, 0) + 1
-        return task_failures[resolved_path]
-
-
-def _reset_patch_failures(task_id: str, resolved_paths: list) -> None:
-    """Clear consecutive-failure counts for the given paths."""
-    if not resolved_paths:
-        return
-    with _patch_failure_lock:
-        task_failures = _patch_failure_tracker.get(task_id)
-        if not task_failures:
-            return
-        for rp in resolved_paths:
-            task_failures.pop(rp, None)
 
 # Per-task bounds for the containers inside each _read_tracker[task_id].
 # A CLI session uses one stable task_id for its lifetime; without these
@@ -1308,20 +1167,6 @@ def _check_not_found_cache(op: str, resolved_str: str, task_id: str) -> str | No
     return cached_json
 
 
-def _record_not_found(op: str, resolved_str: str, task_id: str, error_json: str) -> None:
-    """Cache a not-found error so the next *op* call for *resolved_str* skips I/O."""
-    import time
-    with _read_tracker_lock:
-        task_data = _read_tracker.setdefault(task_id, {
-            "last_key": None, "consecutive": 0,
-            "read_history": set(), "dedup": {},
-            "dedup_hits": {}, "read_timestamps": {},
-        })
-        nf = task_data.setdefault("not_found", {})
-        nf[(op, resolved_str)] = (time.monotonic(), error_json)
-        _cap_read_tracker_data(task_data)
-
-
 def _is_internal_file_status_text(content: str) -> bool:
     """Return True when content looks like an internal file-tool status, not real file bytes.
 
@@ -1386,14 +1231,6 @@ def _looks_like_read_file_line_numbered_content(content: str) -> bool:
         if current == prev + 1
     )
     return consecutive_pairs >= len(numbered) - 1
-
-
-def _is_internal_file_tool_content(content: str) -> bool:
-    """Return True when content is file-tool display text, not intended file bytes."""
-    return (
-        _is_internal_file_status_text(content)
-        or _looks_like_read_file_line_numbered_content(content)
-    )
 
 
 def _get_file_ops(task_id: str = "default") -> ShellFileOperations:

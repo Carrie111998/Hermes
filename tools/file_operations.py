@@ -59,23 +59,23 @@ WRITE_DENIED_PREFIXES = build_write_denied_prefixes(_HOME)
 
 _OSC_SEQUENCE_RE = re.compile(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
 _FENCE_MARKER_RE = re.compile(r"'?\x07?__HERMES_FENCE_[A-Za-z0-9]+__\x07?'?")
+from tools.file_operations_helpers import (
+    ExecuteResult,
+    LintResult,
+    SearchMatch,
+    _has_bom,
+    _is_write_denied,
+    _lint_json_inproc,
+    _lint_toml_inproc,
+    _looks_like_linter_unusable,
+    _normalize_line_endings,
+    _search_stdout_and_limit,
+    _strip_bom,
+    _strip_terminal_fence_leaks,
+    describe_binary_file,
+    identify_binary_bytes,
+)
 
-
-def _strip_terminal_fence_leaks(text: str) -> str:
-    """Strip leaked terminal fence wrappers from file read output."""
-    if not text:
-        return text
-
-    cleaned_lines: List[str] = []
-    for line in text.splitlines(keepends=True):
-        had_terminal_wrapper = "__HERMES_FENCE_" in line or "\x1b]" in line
-        cleaned = _OSC_SEQUENCE_RE.sub("", line)
-        cleaned = _FENCE_MARKER_RE.sub("", cleaned)
-        cleaned = cleaned.replace("\x07", "")
-        if had_terminal_wrapper and cleaned.strip("'\r\n\t ") == "":
-            continue
-        cleaned_lines.append(cleaned)
-    return "".join(cleaned_lines)
 
 
 def _detect_line_ending(sample: str) -> Optional[str]:
@@ -100,24 +100,6 @@ def _detect_line_ending(sample: str) -> Optional[str]:
     return None
 
 
-def _normalize_line_endings(text: str, target: str) -> str:
-    """Convert all line endings in ``text`` to ``target`` (``\\n`` or ``\\r\\n``).
-
-    Idempotent: ``_normalize_line_endings(_normalize_line_endings(x, "\\r\\n"), "\\r\\n") == _normalize_line_endings(x, "\\r\\n")``.
-    Strips lone ``\\r`` characters as well, so mixed-ending content is
-    homogenized in a single pass.
-    """
-    # First collapse to LF (handle CRLF and lone CR), then expand if target
-    # is CRLF.  Order matters: doing the replacements separately would
-    # double-convert a CRLF -> LFLF.
-    lf_normalized = text.replace("\r\n", "\n").replace("\r", "\n")
-    if target == "\n":
-        return lf_normalized
-    if target == "\r\n":
-        return lf_normalized.replace("\n", "\r\n")
-    return text
-
-
 # UTF-8 byte order mark. Some Windows editors (Notepad, older Visual Studio,
 # some PowerShell redirects) prepend this invisible 3-byte marker
 # (EF BB BF == U+FEFF) to UTF-8 text files. It renders as nothing but is a
@@ -130,27 +112,6 @@ def _normalize_line_endings(text: str, target: str) -> str:
 # write when the original file had one — exactly mirroring the line-ending
 # preservation above (detect on disk, preserve across the edit).
 _UTF8_BOM = "\ufeff"
-
-
-def _strip_bom(text: str) -> tuple[str, bool]:
-    """Return (text-without-leading-BOM, had_bom).
-
-    Only a single leading BOM is stripped; a BOM appearing mid-content is
-    left alone (it's legitimate data there, not a file marker).
-    """
-    if text and text.startswith(_UTF8_BOM):
-        return text[len(_UTF8_BOM):], True
-    return text, False
-
-
-def _has_bom(text: Optional[str]) -> bool:
-    """True if ``text`` begins with a UTF-8 BOM."""
-    return bool(text) and text.startswith(_UTF8_BOM)
-
-
-def _is_write_denied(path: str) -> bool:
-    """Return True if path is on the write deny list."""
-    return _shared_is_write_denied(path)
 
 
 # =============================================================================
@@ -244,15 +205,6 @@ class PatchResult:
 
 
 @dataclass
-class SearchMatch:
-    """A single search match."""
-    path: str
-    line_number: int
-    content: str
-    mtime: float = 0.0  # Modification time for sorting
-
-
-@dataclass
 class SearchResult:
     """Result from searching."""
     matches: List[SearchMatch] = field(default_factory=list)
@@ -329,38 +281,7 @@ class SearchResult:
         return result
 
 
-@dataclass
-class LintResult:
-    """Result from linting a file."""
-    success: bool = True
-    skipped: bool = False
-    output: str = ""
-    message: str = ""
-    
-    def to_dict(self) -> dict:
-        if self.skipped:
-            return {"status": "skipped", "message": self.message}
-        result = {"status": "ok" if self.success else "error", "output": self.output}
-        if self.message:
-            result["message"] = self.message
-        return result
-
-
-@dataclass
-class ExecuteResult:
-    """Result from executing a shell command."""
-    stdout: str = ""
-    exit_code: int = 0
-
-
 _SEARCH_TIMEOUT_MARKER_RE = re.compile(r"\n?\[Command timed out after \d+s\]\s*$")
-
-
-def _search_stdout_and_limit(result: ExecuteResult) -> tuple[str, Optional[str]]:
-    """Return stdout cleaned for parsing and a limit reason for search timeouts."""
-    if result.exit_code == 124:
-        return _SEARCH_TIMEOUT_MARKER_RE.sub("", result.stdout), "search_timeout"
-    return result.stdout, None
 
 
 def _split_tool_diagnostics(output: str) -> tuple[str, str]:
@@ -477,40 +398,6 @@ _MAGIC_SIGNATURES: tuple = (
     (b"II*\x00", "TIFF image data (little-endian)"),
     (b"MM\x00*", "TIFF image data (big-endian)"),
 )
-
-
-def identify_binary_bytes(sample: bytes) -> str:
-    """Best-effort human name for binary content from its magic bytes.
-
-    Returns e.g. ``"PNG image data"`` or ``"unknown binary"``. Never raises.
-    The ISO-media entry additionally checks for ``ftyp`` at offset 4, since
-    the leading size field alone (three NULs) is too weak a signature.
-    """
-    if not sample:
-        return "unknown binary"
-    for prefix, name in _MAGIC_SIGNATURES:
-        if sample.startswith(prefix):
-            if name.startswith("ISO media") and sample[4:8] != b"ftyp":
-                continue
-            return name
-    return "unknown binary"
-
-
-def describe_binary_file(sample: Optional[bytes], file_size: int) -> str:
-    """One-line answer for the binary-file refusal.
-
-    Naming the dead end: "Binary file" alone sends the model hunting for
-    'appropriate tools' that may not exist in its toolset. Naming the TYPE
-    ("PNG image data, 4.1 KB") answers what-is-this in a single read.
-    """
-    kind = identify_binary_bytes(sample or b"")
-    if file_size >= 1024 * 1024:
-        size = f"{file_size / (1024 * 1024):.1f} MB"
-    elif file_size >= 1024:
-        size = f"{file_size / 1024:.1f} KB"
-    else:
-        size = f"{file_size} bytes"
-    return f"Binary file ({kind}, {size}) — cannot display as text."
 
 
 class FileOperations(ABC):
@@ -670,34 +557,6 @@ _LINTER_UNUSABLE_PATTERNS = {
 }
 
 
-def _looks_like_linter_unusable(base_cmd: str, output: str) -> bool:
-    """Return True iff ``output`` from ``base_cmd`` indicates the linter
-    itself couldn't run (a tooling gap), as opposed to a real lint error
-    in the file being checked.
-
-    ``base_cmd`` is the first word of the linter command line (``npx``,
-    ``rustfmt``, ``go``, ...).  ``output`` is the stdout/stderr captured
-    from running it.
-    """
-    patterns = _LINTER_UNUSABLE_PATTERNS.get(base_cmd)
-    if not patterns:
-        return False
-    lower = output.lower()
-    return any(p in lower for p in patterns)
-
-
-def _lint_json_inproc(content: str) -> tuple[bool, str]:
-    """In-process JSON syntax check.  Returns (ok, error_message)."""
-    import json as _json
-    try:
-        _json.loads(content)
-        return True, ""
-    except _json.JSONDecodeError as e:
-        return False, f"JSONDecodeError: {e.msg} (line {e.lineno}, column {e.colno})"
-    except Exception as e:  # noqa: BLE001 — any parse failure is a lint failure
-        return False, f"{type(e).__name__}: {e}"
-
-
 def _lint_yaml_inproc(content: str) -> tuple[bool, str]:
     """In-process YAML syntax check.  Returns (ok, error_message).
 
@@ -727,17 +586,6 @@ def _lint_yaml_inproc(content: str) -> tuple[bool, str]:
     except _yaml.YAMLError as e:
         return False, f"YAMLError: {e}"
     except Exception as e:  # noqa: BLE001
-        return False, f"{type(e).__name__}: {e}"
-
-
-def _lint_toml_inproc(content: str) -> tuple[bool, str]:
-    """In-process TOML syntax check (stdlib tomllib, Python 3.11+)."""
-    import tomllib as _toml
-
-    try:
-        _toml.loads(content)
-        return True, ""
-    except Exception as e:  # tomllib raises TOMLDecodeError, a ValueError subclass
         return False, f"{type(e).__name__}: {e}"
 
 
