@@ -2,6 +2,7 @@
 
 import asyncio
 import threading
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -47,6 +48,7 @@ def _create_session_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_patch("/api/sessions/{session_id}", adapter._handle_patch_session)
     app.router.add_delete("/api/sessions/{session_id}", adapter._handle_delete_session)
     app.router.add_get("/api/sessions/{session_id}/messages", adapter._handle_session_messages)
+    app.router.add_get("/api/sessions/{session_id}/context", adapter._handle_session_context)
     app.router.add_post("/api/sessions/{session_id}/fork", adapter._handle_fork_session)
     app.router.add_post("/api/sessions/{session_id}/chat", adapter._handle_session_chat)
     app.router.add_post("/api/sessions/{session_id}/chat/stream", adapter._handle_session_chat_stream)
@@ -65,6 +67,8 @@ async def test_capabilities_advertises_session_control_surface(adapter):
     assert features["session_resources"] is True
     assert features["session_chat"] is True
     assert features["session_chat_streaming"] is True
+    assert features["session_context_usage"] is True
+    assert features["session_compaction_events"] is True
     assert features["session_fork"] is True
     assert features["run_steer"] is True
     assert features["admin_config_rw"] is False
@@ -76,10 +80,118 @@ async def test_capabilities_advertises_session_control_surface(adapter):
         "method": "POST",
         "path": "/api/sessions/{session_id}/chat/stream",
     }
+    assert data["endpoints"]["session_context"] == {
+        "method": "GET",
+        "path": "/api/sessions/{session_id}/context",
+    }
     assert data["endpoints"]["run_steer"] == {
         "method": "POST",
         "path": "/v1/runs/{run_id}/steer",
     }
+
+
+@pytest.mark.asyncio
+async def test_session_context_endpoint_returns_persisted_gauge(adapter, session_db):
+    session_id = session_db.create_session("context-gauge", "api_server")
+    session_db.update_session_context_usage(
+        session_id,
+        used_tokens=62_000,
+        context_window_tokens=200_000,
+        compression_threshold_tokens=100_000,
+        compression_count=2,
+        compression_enabled=True,
+        compacted=False,
+        updated_at=1234.5,
+    )
+
+    app = _create_session_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        resp = await cli.get(f"/api/sessions/{session_id}/context")
+        assert resp.status == 200
+        payload = await resp.json()
+
+    assert payload == {
+        "object": "hermes.session.context",
+        "session_id": session_id,
+        "context": {
+            "used_tokens": 62_000,
+            "context_window_tokens": 200_000,
+            "usage_percent": 31.0,
+            "compression_threshold_tokens": 100_000,
+            "compression_threshold_percent": 50.0,
+            "compression_progress_percent": 62.0,
+            "tokens_until_compression": 38_000,
+            "compression_count": 2,
+            "compression_enabled": True,
+            "compacted": False,
+            "updated_at": 1234.5,
+        },
+    }
+
+
+@pytest.mark.asyncio
+async def test_run_agent_persists_live_context_usage(adapter, session_db, monkeypatch):
+    session_id = session_db.create_session("live-context", "api_server")
+
+    class FakeAgent:
+        session_prompt_tokens = 10
+        session_completion_tokens = 2
+        session_total_tokens = 12
+        compression_enabled = True
+
+        def __init__(self):
+            self.session_id = session_id
+            self.context_compressor = SimpleNamespace(
+                last_prompt_tokens=62_000,
+                context_length=200_000,
+                threshold_tokens=100_000,
+                compression_count=3,
+            )
+
+        def run_conversation(self, **_kwargs):
+            return {"final_response": "ok"}
+
+    monkeypatch.setattr(adapter, "_create_agent", lambda **_kwargs: FakeAgent())
+
+    result, usage = await adapter._run_agent(
+        user_message="hello",
+        conversation_history=[],
+        session_id=session_id,
+    )
+
+    assert result["context"] == usage["context"]
+    assert usage["context"]["compression_progress_percent"] == 62.0
+    row = session_db.get_session(session_id)
+    assert row["context_used_tokens"] == 62_000
+    assert row["context_window_tokens"] == 200_000
+    assert row["compression_threshold_tokens"] == 100_000
+    assert row["compression_count"] == 3
+
+
+@pytest.mark.asyncio
+async def test_session_chat_stream_emits_compaction_status_event(adapter, session_db):
+    session_id = session_db.create_session("context-events", "api_server")
+
+    async def fake_run(**kwargs):
+        kwargs["status_callback"]("lifecycle", "Compacting context before continuing")
+        return (
+            {"final_response": "done", "session_id": session_id, "messages": []},
+            {"context": {"compression_count": 1}},
+        )
+
+    app = _create_session_app(adapter)
+    with patch.object(adapter, "_run_agent", side_effect=fake_run):
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                f"/api/sessions/{session_id}/chat/stream",
+                json={"message": "continue"},
+            )
+            assert resp.status == 200
+            body = await resp.text()
+
+    assert "event: context.compaction" in body
+    assert '"message": "Compacting context before continuing"' in body
+    assert '"context": {"compression_count": 1}' in body
 
 
 @pytest.mark.asyncio
@@ -201,7 +313,12 @@ async def test_run_agent_registers_active_run_id_for_steering(adapter, monkeypat
     )
 
     assert result["session_id"] == "request-session"
-    assert usage == {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+    assert {key: usage[key] for key in ("input_tokens", "output_tokens", "total_tokens")} == {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "total_tokens": 0,
+    }
+    assert usage["context"]["used_tokens"] is None
     assert observed == {"registered": True, "task_id": "request-session"}
     assert "run_steer_test" not in adapter._active_run_agents
 
