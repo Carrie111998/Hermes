@@ -1,12 +1,35 @@
-import { describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it } from 'vitest'
+
+import { setRuntimeI18nLocale } from '@/i18n'
 
 import { sanitizeTextForSpeech } from './speech-text'
 
 describe('sanitizeTextForSpeech', () => {
+  afterEach(() => {
+    setRuntimeI18nLocale('en')
+  })
+
   it('summarizes fenced code blocks instead of reading them literally', () => {
     expect(sanitizeTextForSpeech('Here is code:\n```ts\nconst x = 1\n```\nDone.')).toBe(
       'Here is code: code block omitted Done.'
     )
+  })
+
+  it('speaks code blocks, links, and omitted tables in the active locale', () => {
+    setRuntimeI18nLocale('zh')
+
+    expect(sanitizeTextForSpeech('Here is code:\n```ts\nconst x = 1\n```\nDone.')).toBe('Here is code: 代码块已省略 Done.')
+    expect(sanitizeTextForSpeech('See https://example.com for details.')).toBe('See 链接 for details.')
+
+    const text = `Before the table.
+
+| Item | Value |
+| --- | ---: |
+| Example A | 10 |
+
+After the table.`
+
+    expect(sanitizeTextForSpeech(text)).toBe('Before the table. 表格已省略. After the table.')
   })
 
   it('still keeps normal prose and inline code readable', () => {
@@ -24,7 +47,7 @@ describe('sanitizeTextForSpeech', () => {
 Full detail stays visible on screen.`
 
     expect(sanitizeTextForSpeech(text)).toBe(
-      'Here is the quick takeaway: the totals remain unchanged. Full detail stays visible on screen.'
+      'Here is the quick takeaway: the totals remain unchanged. table omitted. Full detail stays visible on screen.'
     )
   })
 
@@ -60,7 +83,7 @@ Example B | 20
 
 Done.`
 
-    expect(sanitizeTextForSpeech(text)).toBe('Main takeaway: total is unchanged. Done.')
+    expect(sanitizeTextForSpeech(text)).toBe('Main takeaway: total is unchanged. table omitted. Done.')
   })
 
   it('skips markdown tables nested inside blockquotes', () => {
@@ -73,7 +96,7 @@ Done.`
 
 After the table.`
 
-    expect(sanitizeTextForSpeech(text)).toBe('Before the table. After the table.')
+    expect(sanitizeTextForSpeech(text)).toBe('Before the table. table omitted. After the table.')
   })
 
   it('allows marker padding plus three spaces in blockquoted tables', () => {
@@ -85,7 +108,7 @@ After the table.`
 
 After the table.`
 
-    expect(sanitizeTextForSpeech(text)).toBe('Before the table. After the table.')
+    expect(sanitizeTextForSpeech(text)).toBe('Before the table. table omitted. After the table.')
   })
 
   it('skips explicit single-column markdown tables', () => {
@@ -97,7 +120,7 @@ After the table.`
 
 After the table.`
 
-    expect(sanitizeTextForSpeech(text)).toBe('Before the table. After the table.')
+    expect(sanitizeTextForSpeech(text)).toBe('Before the table. table omitted. After the table.')
   })
 
   it('preserves rows outside a table blockquote', () => {
@@ -106,7 +129,7 @@ After the table.`
 > | Example A | 10 |
 Outside | prose`
 
-    expect(sanitizeTextForSpeech(text)).toBe('Outside | prose')
+    expect(sanitizeTextForSpeech(text)).toBe('table omitted Outside | prose')
   })
 
   it('preserves malformed tables with mismatched column counts', () => {
@@ -127,7 +150,7 @@ Keep this prose.`
 
 After the table.`
 
-    expect(sanitizeTextForSpeech(text)).toBe('Before the table. After the table.')
+    expect(sanitizeTextForSpeech(text)).toBe('Before the table. table omitted. After the table.')
   })
 
   it('skips tables containing escaped pipe characters', () => {
@@ -139,7 +162,7 @@ After the table.`
 
 After the table.`
 
-    expect(sanitizeTextForSpeech(text)).toBe('Before the table. After the table.')
+    expect(sanitizeTextForSpeech(text)).toBe('Before the table. table omitted. After the table.')
   })
 
   it('preserves indented code that resembles a table', () => {
