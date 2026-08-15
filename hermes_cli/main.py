@@ -134,11 +134,8 @@ def _exit_after_oneshot(rc: object) -> None:
 _oneshot_cleanup_done = False
 
 
-def _apply_in_dir(in_dir: object) -> None:
-    """Validate and enter an explicit workspace."""
-    if not in_dir:
-        return
-
+def _resolve_in_dir(in_dir: object) -> str:
+    """Validate ``--in`` and return its absolute path without changing cwd."""
     # Git Bash / MSYS hands the CLI POSIX-style paths (`--in ~` expands to
     # `/c/Users/x` before Python ever sees it; MSYS2's path conversion is
     # disabled for native executables). Translate the MSYS/Cygwin/WSL
@@ -151,6 +148,15 @@ def _apply_in_dir(in_dir: object) -> None:
     if not os.path.isdir(target_dir):
         print(f"Error: --in directory not found: {in_dir}")
         sys.exit(1)
+    return target_dir
+
+
+def _apply_in_dir(in_dir: object) -> None:
+    """Validate and enter an explicit workspace."""
+    if not in_dir:
+        return
+
+    target_dir = _resolve_in_dir(in_dir)
     try:
         os.chdir(target_dir)
     except OSError as exc:
@@ -207,10 +213,7 @@ def _run_and_exit_oneshot(
     in_dir: object = None,
 ) -> None:
     try:
-        target_dir = None
-        if in_dir:
-            _apply_in_dir(in_dir)
-            target_dir = os.getcwd()
+        target_dir = _resolve_in_dir(in_dir) if in_dir else None
         from hermes_cli.oneshot import run_oneshot
 
         rc = run_oneshot(

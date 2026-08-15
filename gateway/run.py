@@ -1873,7 +1873,11 @@ _ensure_ssl_certs()
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 # Resolve Hermes home directory (respects HERMES_HOME override)
-from hermes_constants import get_hermes_home, get_hermes_home_override
+from hermes_constants import (
+    explicit_cwd_pin_active,
+    get_hermes_home,
+    get_hermes_home_override,
+)
 from utils import atomic_json_write, is_truthy_value
 _hermes_home = get_hermes_home()
 
@@ -2177,10 +2181,7 @@ if _config_path.exists():
             }
             for _cfg_key, _env_var in _terminal_env_map.items():
                 if _cfg_key in _terminal_cfg:
-                    if (
-                        _cfg_key == "cwd"
-                        and os.environ.get("HERMES_EXPLICIT_CWD_PIN") == "1"
-                    ):
+                    if _cfg_key == "cwd" and explicit_cwd_pin_active():
                         continue
                     _val = _terminal_cfg[_cfg_key]
                     # Skip cwd placeholder values (".", "auto", "cwd") — the

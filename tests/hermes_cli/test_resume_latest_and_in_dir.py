@@ -11,6 +11,8 @@ from argparse import Namespace
 
 import pytest
 
+from hermes_constants import HERMES_EXPLICIT_CWD_PIN, HERMES_EXPLICIT_CWD_PIN_VALUE
+
 
 def _args(**overrides):
     base = {
@@ -327,4 +329,245 @@ def test_oneshot_in_dir_respects_terminal_backend(
     else:
         assert seen["terminal_cwd"] == configured_cwd
         assert seen["tool_cwd"] == configured_cwd
-    assert "HERMES_EXPLICIT_CWD_PIN" not in os.environ
+    assert HERMES_EXPLICIT_CWD_PIN not in os.environ
+
+
+def _stub_oneshot_hard_exit(main_mod, monkeypatch):
+    monkeypatch.setattr(main_mod, "_cleanup_oneshot_runtime", lambda: None)
+
+    def fake_exit(rc):
+        raise SystemExit(0 if rc is None else rc)
+
+    monkeypatch.setattr(main_mod, "_exit_after_oneshot", fake_exit)
+
+
+def test_oneshot_explicit_cwd_resolves_backend_before_chdir(monkeypatch, tmp_path):
+    import os
+
+    from hermes_cli.oneshot import _oneshot_explicit_cwd
+    from tools import terminal_tool
+
+    target = tmp_path / "requested"
+    target.mkdir()
+    hermes_home = tmp_path / "hermes-home"
+    hermes_home.mkdir()
+    (hermes_home / "config.yaml").write_text(
+        "terminal:\n  backend: local\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.delenv(HERMES_EXPLICIT_CWD_PIN, raising=False)
+    monkeypatch.setattr(terminal_tool, "_terminal_config_bridge_attempted", False)
+
+    start = os.getcwd()
+    seen = {}
+    real_get = terminal_tool._get_env_config
+
+    def spy_get():
+        seen["cwd_at_resolve"] = os.getcwd()
+        return real_get()
+
+    monkeypatch.setattr(terminal_tool, "_get_env_config", spy_get)
+
+    try:
+        with _oneshot_explicit_cwd(str(target), "oneshot:test"):
+            seen["cwd_inside"] = os.getcwd()
+            assert os.environ.get(HERMES_EXPLICIT_CWD_PIN) == HERMES_EXPLICIT_CWD_PIN_VALUE
+    finally:
+        os.chdir(start)
+
+    assert seen["cwd_at_resolve"] == start
+    assert seen["cwd_inside"] == str(target.resolve())
+    assert HERMES_EXPLICIT_CWD_PIN not in os.environ
+
+
+def test_oneshot_explicit_cwd_preserves_config_error(monkeypatch, tmp_path):
+    import os
+
+    from hermes_cli.oneshot import _oneshot_explicit_cwd
+    from tools import terminal_tool
+
+    target = tmp_path / "requested"
+    target.mkdir()
+    start = os.getcwd()
+    monkeypatch.delenv(HERMES_EXPLICIT_CWD_PIN, raising=False)
+    def boom():
+        raise ValueError("bad terminal config")
+
+    monkeypatch.setattr(terminal_tool, "_get_env_config", boom)
+
+    try:
+        with pytest.raises(ValueError, match="bad terminal config"):
+            with _oneshot_explicit_cwd(str(target), "oneshot:test"):
+                pytest.fail("must not enter after a config error")
+    finally:
+        os.chdir(start)
+
+    assert os.getcwd() == start
+    assert HERMES_EXPLICIT_CWD_PIN not in os.environ
+
+
+def test_oneshot_explicit_cwd_restores_pin_if_record_raises(monkeypatch, tmp_path):
+    import os
+
+    from hermes_cli.oneshot import _oneshot_explicit_cwd
+    from tools import terminal_tool
+
+    target = tmp_path / "requested"
+    target.mkdir()
+    hermes_home = tmp_path / "hermes-home"
+    hermes_home.mkdir()
+    (hermes_home / "config.yaml").write_text(
+        "terminal:\n  backend: local\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.delenv(HERMES_EXPLICIT_CWD_PIN, raising=False)
+    monkeypatch.setattr(terminal_tool, "_terminal_config_bridge_attempted", False)
+
+    def boom(_task_id, _cwd):
+        raise RuntimeError("record boom")
+
+    monkeypatch.setattr(terminal_tool, "record_session_cwd", boom)
+    start = os.getcwd()
+
+    try:
+        with pytest.raises(RuntimeError, match="record boom"):
+            with _oneshot_explicit_cwd(str(target), "oneshot:test"):
+                pytest.fail("must not enter after a record failure")
+    finally:
+        os.chdir(start)
+
+    assert HERMES_EXPLICIT_CWD_PIN not in os.environ
+
+
+def test_oneshot_explicit_cwd_restores_pin_if_cleanup_raises(monkeypatch, tmp_path):
+    import os
+
+    from hermes_cli.oneshot import _oneshot_explicit_cwd
+    from tools import terminal_tool
+
+    target = tmp_path / "requested"
+    target.mkdir()
+    hermes_home = tmp_path / "hermes-home"
+    hermes_home.mkdir()
+    (hermes_home / "config.yaml").write_text(
+        "terminal:\n  backend: local\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.delenv(HERMES_EXPLICIT_CWD_PIN, raising=False)
+    monkeypatch.setattr(terminal_tool, "_terminal_config_bridge_attempted", False)
+
+    def boom(_task_id):
+        raise RuntimeError("cleanup boom")
+
+    monkeypatch.setattr(terminal_tool, "clear_task_env_overrides", boom)
+    start = os.getcwd()
+
+    try:
+        with _oneshot_explicit_cwd(str(target), "oneshot:test"):
+            assert os.environ.get(HERMES_EXPLICIT_CWD_PIN) == HERMES_EXPLICIT_CWD_PIN_VALUE
+    finally:
+        os.chdir(start)
+
+    assert HERMES_EXPLICIT_CWD_PIN not in os.environ
+
+
+def test_oneshot_explicit_cwd_preserves_body_error_if_cleanup_raises(monkeypatch, tmp_path):
+    import os
+
+    from hermes_cli.oneshot import _oneshot_explicit_cwd
+    from tools import terminal_tool
+
+    target = tmp_path / "requested"
+    target.mkdir()
+    hermes_home = tmp_path / "hermes-home"
+    hermes_home.mkdir()
+    (hermes_home / "config.yaml").write_text(
+        "terminal:\n  backend: local\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.delenv(HERMES_EXPLICIT_CWD_PIN, raising=False)
+    monkeypatch.setattr(terminal_tool, "_terminal_config_bridge_attempted", False)
+
+    def boom(_task_id):
+        raise RuntimeError("cleanup boom")
+
+    monkeypatch.setattr(terminal_tool, "clear_task_env_overrides", boom)
+    start = os.getcwd()
+
+    try:
+        with pytest.raises(RuntimeError, match="agent boom"):
+            with _oneshot_explicit_cwd(str(target), "oneshot:test"):
+                raise RuntimeError("agent boom")
+    finally:
+        os.chdir(start)
+
+    assert HERMES_EXPLICIT_CWD_PIN not in os.environ
+
+
+def test_oneshot_dispatch_validates_in_dir_without_chdir(main_mod, monkeypatch, tmp_path):
+    import os
+
+    target = tmp_path / "proj"
+    target.mkdir()
+    start = os.getcwd()
+    seen = {}
+
+    def fake_run_oneshot(*_args, **kwargs):
+        seen["cwd"] = os.getcwd()
+        seen["in_dir"] = kwargs.get("in_dir")
+        return 0
+
+    monkeypatch.setattr("hermes_cli.oneshot.run_oneshot", fake_run_oneshot)
+    _stub_oneshot_hard_exit(main_mod, monkeypatch)
+
+    try:
+        with pytest.raises(SystemExit) as exc:
+            main_mod._run_and_exit_oneshot("hi", in_dir=str(target))
+    finally:
+        os.chdir(start)
+
+    assert exc.value.code == 0
+    assert seen["cwd"] == start
+    assert seen["in_dir"] == str(target.resolve())
+
+
+def test_oneshot_dispatch_missing_in_dir_exits(main_mod, monkeypatch, tmp_path, capsys):
+    _stub_oneshot_hard_exit(main_mod, monkeypatch)
+
+    with pytest.raises(SystemExit) as exc:
+        main_mod._run_and_exit_oneshot("hi", in_dir=str(tmp_path / "nope"))
+
+    assert exc.value.code == 1
+    assert "--in directory not found" in capsys.readouterr().out
+
+
+def test_oneshot_dispatch_expands_user_home(main_mod, monkeypatch, tmp_path):
+    import os
+
+    home = tmp_path / "home"
+    (home / "proj").mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    start = os.getcwd()
+    seen = {}
+
+    def fake_run_oneshot(*_args, **kwargs):
+        seen["cwd"] = os.getcwd()
+        seen["in_dir"] = kwargs.get("in_dir")
+        return 0
+
+    monkeypatch.setattr("hermes_cli.oneshot.run_oneshot", fake_run_oneshot)
+    _stub_oneshot_hard_exit(main_mod, monkeypatch)
+
+    try:
+        with pytest.raises(SystemExit) as exc:
+            main_mod._run_and_exit_oneshot("hi", in_dir="~/proj")
+    finally:
+        os.chdir(start)
+
+    assert exc.value.code == 0
+    assert seen["cwd"] == start
+    assert seen["in_dir"] == str((home / "proj").resolve())
