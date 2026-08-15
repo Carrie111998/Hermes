@@ -72,7 +72,7 @@ The description is the **single most important line** in the skill. It is not a 
 
 ### How to write it
 
-1. **Start with "Use when"** — front-load the trigger within the first 57 chars (that's all the system prompt index shows).
+1. **Front-load trigger terms within the first 57 chars** (that's all the system prompt index shows). A literal "Use when" prefix is fine when it helps, but never required — don't let it crowd out routing information.
 2. **Write in user language** — use the words a frustrated user would type: "babysit PR," "watch CI," "cherry-pick prod fix." Not "monitors pull request status and retries failed checks."
 3. **Be dense and terse** — ~100 tokens per skill is the index budget, paid every session.
 4. **Include trigger keywords** — if users say "deploy," include "deploy" in the description.
@@ -90,6 +90,23 @@ The description is the **single most important line** in the skill. It is not a 
 Adding a skill with a description that overlaps an existing skill's domain causes **routing confusion** — the model loads the wrong skill or loads both, wasting context. Before merging, check: does the new description compete with any existing skill for the same queries?
 
 ## Writing the Body
+
+### Body structure (modern section order)
+
+The body follows the canonical modern section order from `AGENTS.md` (HARDLINE):
+
+```
+# <Skill> Skill          — title + 2-3 sentence intro (what it does and doesn't do)
+## When to Use           — bulleted triggers (+ "Don't use for:" counter-triggers)
+## Prerequisites         — exact env vars, installs, API key sourcing
+## How to Run            — canonical invocation through the `terminal` tool
+## Quick Reference       — flat command list, no narration
+## Procedure             — numbered steps, each with a checkable completion criterion
+## Pitfalls              — known limits, things that look broken but aren't
+## Verification          — how to prove the skill worked
+```
+
+Not every section applies to every skill (a pure-procedure task skill may have no Quick Reference), but `When to Use` + actionable body + `Pitfalls` + `Verification` are the minimum. Cut marketing intros and re-explanations of env vars already in `Prerequisites`.
 
 ### Skip the obvious
 
@@ -254,7 +271,7 @@ Apply to every sentence in the skill:
 4. **Does it railroad?** — Replace rigid command sequences with intent-based instructions.
 5. **Is it duplicated?** — Keep each meaning in one source of truth. If it exists elsewhere, reference, don't copy.
 
-## Common Pitfalls
+## Pitfalls
 
 1. **Using `skill_manage(action='create')` for an in-repo skill.** It writes to `~/.hermes/skills/`, not the repo tree. Use `write_file` for in-repo creation.
 
@@ -278,7 +295,7 @@ Apply to every sentence in the skill:
 
 11. **Self-generating skills without human input.** LLM-generated skills that merely summarize what the model already knows provide no benefit. Real value comes from failure cases, gotchas, and human expertise not in training data.
 
-## Verification Checklist
+## Verification
 
 - [ ] Decision test passed: "Would the agent get this wrong without this skill?" → Yes
 - [ ] Description starts with "Use when" and front-loads trigger within 57 chars
