@@ -381,7 +381,7 @@ describe('createGatewayEventHandler', () => {
     }
   })
 
-  it('ignores late thinking.delta after the turn has already completed', () => {
+  it('ignores late thinking.delta after the turn has already completed', async () => {
     vi.useFakeTimers()
     const appended: Msg[] = []
     const onEvent = createGatewayEventHandler(buildCtx(appended))
@@ -389,6 +389,10 @@ describe('createGatewayEventHandler', () => {
     try {
       onEvent({ payload: {}, type: 'message.start' } as any)
       onEvent({ payload: { text: 'final answer' }, type: 'message.complete' } as any)
+      // recordMessageComplete defers idle()/busy=false to the next microtask
+      // so the streaming block stays rendered for the commit that appends the
+      // committed message (#55425). Flush that microtask before asserting.
+      await Promise.resolve()
       expect(getUiState().busy).toBe(false)
       expect(getUiState().status).toBe('ready')
 
@@ -1615,7 +1619,7 @@ describe('createGatewayEventHandler', () => {
       })
     })
 
-    it('holds a notice arriving mid-turn (busy) and flushes it at message.complete', () => {
+    it('holds a notice arriving mid-turn (busy) and flushes it at message.complete', async () => {
       const onEvent = createGatewayEventHandler(buildCtx([]))
 
       onEvent({ payload: {}, type: 'message.start' } as any)
@@ -1630,6 +1634,11 @@ describe('createGatewayEventHandler', () => {
       expect(getUiState().notice).toBeNull()
 
       onEvent({ payload: { text: 'done' }, type: 'message.complete' } as any)
+
+      // recordMessageComplete defers idle()/flushPendingNotice() to the next
+      // microtask so the streaming block stays rendered for the commit that
+      // appends the committed message (#55425). Flush it before asserting.
+      await Promise.resolve()
 
       // Turn end flushes the held notice.
       expect(getUiState().notice).toMatchObject({ key: 'credits.90', text: '⚠ 90% used' })
@@ -1680,7 +1689,7 @@ describe('createGatewayEventHandler', () => {
       expect(getUiState().notice).toMatchObject({ key: 'credits.90', text: '⚠ 90% used' })
     })
 
-    it('latest-wins: a second mid-turn notice replaces the first held one', () => {
+    it('latest-wins: a second mid-turn notice replaces the first held one', async () => {
       const onEvent = createGatewayEventHandler(buildCtx([]))
 
       onEvent({ payload: {}, type: 'message.start' } as any)
@@ -1694,6 +1703,11 @@ describe('createGatewayEventHandler', () => {
       } as any)
 
       onEvent({ payload: { text: 'done' }, type: 'message.complete' } as any)
+
+      // recordMessageComplete defers idle()/flushPendingNotice() to the next
+      // microtask so the streaming block stays rendered for the commit that
+      // appends the committed message (#55425). Flush it before asserting.
+      await Promise.resolve()
 
       // Only the latest held notice surfaces.
       expect(getUiState().notice).toMatchObject({ key: 'credits.depleted', text: '✕ exhausted' })
@@ -1794,7 +1808,7 @@ describe('createGatewayEventHandler', () => {
       }
     })
 
-    it('starts the ttl clock when the notice becomes VISIBLE (at turn end), not on arrival', () => {
+    it('starts the ttl clock when the notice becomes VISIBLE (at turn end), not on arrival', async () => {
       vi.useFakeTimers()
 
       try {
@@ -1811,6 +1825,10 @@ describe('createGatewayEventHandler', () => {
         expect(getUiState().notice).toBeNull()
 
         onEvent({ payload: { text: 'done' }, type: 'message.complete' } as any)
+        // recordMessageComplete defers idle()/flushPendingNotice() to the next
+        // microtask so the streaming block stays rendered for the commit that
+        // appends the committed message (#55425). Flush it before asserting.
+        await Promise.resolve()
         expect(getUiState().notice).toMatchObject({ key: 'credits.restored' })
 
         // Full 8s starts now (on apply), so it survives nearly that long.
