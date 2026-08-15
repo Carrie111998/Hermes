@@ -66,6 +66,10 @@ function currentState(
 
 export interface VoicePlaybackOptions {
   messageId?: string | null
+  /** Scopes the spoken-text fingerprint (see wasTextAlreadySpoken) to one
+   *  session/tile, so two unrelated composers never suppress each other's
+   *  replies just because the text happens to match. */
+  sessionId?: string | null
   source: VoicePlaybackSource
 }
 
@@ -444,7 +448,7 @@ export async function playSpeechText(text: string, options: VoicePlaybackOptions
     return false
   }
 
-  markTextSpoken(text)
+  markTextSpoken(text, options.sessionId)
 
   const ownSequence = sequence
   const isCurrent = () => ownSequence === sequence
@@ -501,17 +505,21 @@ export function isVoicePlaybackActive() {
 // playSpeechText, so marking it here (rather than in each caller's own ref)
 // survives the live→committed message-id rewrite (#86601): the row id changes
 // across that transition and across the manual Read Aloud button, but the
-// spoken text doesn't.
+// spoken text doesn't. Keyed per sessionId — like lastSpokenIdRef, which is
+// scoped per useComposerVoice() instance — so two open tiles (or two turns in
+// different sessions) that happen to produce identical short text never
+// suppress each other; only a genuine same-session repeat is deduped.
 // ---------------------------------------------------------------------------
 
-let lastSpokenText: string | null = null
+const NO_SESSION_KEY = ''
+const lastSpokenTextBySession = new Map<string, string>()
 
-export function markTextSpoken(text: string): void {
-  lastSpokenText = text.trim()
+export function markTextSpoken(text: string, sessionId?: string | null): void {
+  lastSpokenTextBySession.set(sessionId ?? NO_SESSION_KEY, text.trim())
 }
 
-export function wasTextAlreadySpoken(text: string): boolean {
-  return lastSpokenText !== null && lastSpokenText === text.trim()
+export function wasTextAlreadySpoken(text: string, sessionId?: string | null): boolean {
+  return lastSpokenTextBySession.get(sessionId ?? NO_SESSION_KEY) === text.trim()
 }
 
 // ---------------------------------------------------------------------------

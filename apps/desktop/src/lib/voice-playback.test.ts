@@ -19,4 +19,20 @@ describe('wasTextAlreadySpoken', () => {
 
     expect(wasTextAlreadySpoken('second reply')).toBe(false)
   })
+
+  it('does not leak across sessions when the same text is spoken in one but not the other', () => {
+    markTextSpoken('Done.', 'session-a')
+
+    expect(wasTextAlreadySpoken('Done.', 'session-a')).toBe(true)
+    expect(wasTextAlreadySpoken('Done.', 'session-b')).toBe(false)
+  })
+
+  it('dedupes independently per session', () => {
+    markTextSpoken('Fixed.', 'session-a')
+    markTextSpoken('Yes.', 'session-b')
+
+    expect(wasTextAlreadySpoken('Fixed.', 'session-a')).toBe(true)
+    expect(wasTextAlreadySpoken('Fixed.', 'session-b')).toBe(false)
+    expect(wasTextAlreadySpoken('Yes.', 'session-b')).toBe(true)
+  })
 })

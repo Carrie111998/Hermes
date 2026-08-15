@@ -85,7 +85,7 @@ export function useComposerVoice({
 
     const text = chatMessageText(last).trim()
 
-    if (!text || wasTextAlreadySpoken(text)) {
+    if (!text || wasTextAlreadySpoken(text, sessionId)) {
       return null
     }
 
@@ -150,7 +150,8 @@ export function useComposerVoice({
     pendingResponse: pendingTurnResponse,
     // Before the conversation opens the mic, wait for any in-flight wake.pause
     // to finish releasing the capture device (see wakePauseBarrierRef).
-    beforeMicOpen: () => wakePauseBarrierRef.current ?? undefined
+    beforeMicOpen: () => wakePauseBarrierRef.current ?? undefined,
+    sessionId
   })
 
   // eslint-disable-next-line no-restricted-syntax -- ownership token used only by unmount cleanup
