@@ -12,6 +12,17 @@ source: https://github.com/sweetrb/apple-photos-mcp
 # needed (transport.command IS the install, per the npm/uvx note). Pinned to
 # the exact version validated on macOS per catalog policy (no auto-update;
 # auditable); bump the pin via PR after validating a new release.
+#
+# How this pin was validated (catalog policy: "version validated on macOS").
+# On macOS, `npx -y apple-photos-mcp@2.1.11`:
+#   - completes an MCP `initialize` handshake reporting serverInfo.version
+#     2.1.11 — i.e. the bytes npx resolved are the bytes pinned here;
+#   - returns a full `tools/list` of 21 tools, every one carrying a description;
+#   - resolves all 13 `tools.default_enabled` entries below against that
+#     list, so no allow-listed name went stale across the bump.
+# Tools added since the previous pin are deliberately left OUT of
+# default_enabled — widening the default surface is the maintainers' call.
+# Re-run all three checks before moving this pin.
 transport:
   type: stdio
   command: "npx"

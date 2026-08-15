@@ -12,6 +12,17 @@ source: https://github.com/sweetrb/apple-notes-mcp
 # needed (transport.command IS the install, per the npm/uvx note). Pinned to
 # the exact version validated on macOS per catalog policy (no auto-update;
 # auditable); bump the pin via PR after validating a new release.
+#
+# How this pin was validated (catalog policy: "version validated on macOS").
+# On macOS, `npx -y apple-notes-mcp@2.7.5`:
+#   - completes an MCP `initialize` handshake reporting serverInfo.version
+#     2.7.5 — i.e. the bytes npx resolved are the bytes pinned here;
+#   - returns a full `tools/list` of 36 tools, every one carrying a description;
+#   - resolves all 20 `tools.default_enabled` entries below against that
+#     list, so no allow-listed name went stale across the bump.
+# Tools added since the previous pin are deliberately left OUT of
+# default_enabled — widening the default surface is the maintainers' call.
+# Re-run all three checks before moving this pin.
 transport:
   type: stdio
   command: "npx"
@@ -28,6 +39,13 @@ auth:
 # (single and batch), folder mutation, and attachment-export tools stay
 # disabled unless the user enables them at install time — so a failed tool
 # probe or a non-TTY install still yields a safe, non-mutating surface.
+#
+# `export-notes-json` is enabled despite the name: it takes NO path argument
+# and writes NOTHING — it returns the library as JSON in the tool response,
+# and is declared read-only by the server. That is why it is treated
+# differently from apple-photos' `export`, which does take a destination and
+# write files, and is therefore disabled by default there. The distinction is
+# writes-to-disk, not the word "export".
 tools:
   default_enabled:
     - doctor
