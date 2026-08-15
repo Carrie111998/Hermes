@@ -5327,8 +5327,31 @@ def save_config(config: Dict[str, Any]):
         _LAST_EXPANDED_CONFIG_BY_PATH[str(config_path)] = copy.deepcopy(current_normalized)
 
 
+def _resolve_env_files() -> list:
+    """Return extra env file paths declared in config.yaml:env_files.
+
+    Reads the raw config (mtime-cached) and returns a list of absolute
+    path strings. Missing keys or unparseable config degrade to [].
+    """
+    try:
+        cfg = read_raw_config()
+        if isinstance(cfg, dict):
+            ef = cfg.get("env_files")
+            if isinstance(ef, list):
+                return [str(Path(p)) for p in ef if p]
+    except Exception:
+        pass
+    return []
+
+
 def load_env() -> Dict[str, str]:
     """Load environment variables from ~/.hermes/.env.
+
+    Also merges any additional env files declared in config.yaml under
+    the top-level ``env_files`` list (external secret files such as
+    provider key files). Values from ``env_files`` override values from
+    ~/.hermes/.env; the process environment still wins because
+    ``get_env_value()`` consults ``os.environ`` first.
 
     Sanitizes lines before parsing so that corrupted files (e.g.
     concatenated KEY=VALUE pairs on a single line) are handled
@@ -5346,12 +5369,27 @@ def load_env() -> Dict[str, str]:
     global _env_cache
     env_path = get_env_path()
 
+    # Resolve any additional env files declared in config.yaml under the
+    # top-level `env_files` list. These let operators keep provider
+    # secrets in external files (e.g. /home/deploy/.lah-secrets/x.env)
+    # without duplicating values into ~/.hermes/.env.
+    extra_files = _resolve_env_files()
+
+    # Composite cache key: primary ~/.hermes/.env + every extra file's
+    # (mtime, size) so the memo invalidates when any watched file changes.
     try:
-        mtime = env_path.stat().st_mtime
-        size = env_path.stat().st_size
-        cache_key = (str(env_path), mtime, size)
-    except FileNotFoundError:
-        cache_key = (str(env_path), None, None)
+        items = []
+        if env_path.exists():
+            items.append((str(env_path), env_path.stat().st_mtime, env_path.stat().st_size))
+        else:
+            items.append((str(env_path), None, None))
+        for ef in extra_files:
+            p = Path(ef)
+            if p.exists():
+                items.append((str(p), p.stat().st_mtime, p.stat().st_size))
+            else:
+                items.append((str(p), None, None))
+        cache_key = tuple(items)
     except Exception:
         cache_key = None
 
@@ -5362,21 +5400,34 @@ def load_env() -> Dict[str, str]:
 
     env_vars: Dict[str, str] = {}
 
-    if env_path.exists():
-        # On Windows, open() defaults to the system locale (cp1252) which can
-        # fail on UTF-8 .env files. Always use explicit UTF-8; tolerate BOM
-        # via utf-8-sig since users may edit .env in Notepad which adds one.
+    def _read_file_lines(path: Path) -> list:
+        if not path.exists():
+            return []
         open_kw = {"encoding": "utf-8-sig", "errors": "replace"}
-        with open(env_path, **open_kw) as f:
+        with open(path, **open_kw) as f:
             raw_lines = f.readlines()
-        # Sanitize before parsing: split concatenated lines & drop stale
-        # placeholders so corrupted .env files don't produce invalid tokens.
-        lines = _sanitize_env_lines(raw_lines)
+        return _sanitize_env_lines(raw_lines)
+
+    def _merge_lines(lines: list) -> None:
         for line in lines:
-            line = line.strip()
-            if line and not line.startswith('#') and '=' in line:
-                key, _, value = line.partition('=')
+            s = line.strip()
+            if s and not s.startswith('#') and '=' in s:
+                key, _, value = s.partition('=')
                 env_vars[key.strip()] = value.strip().strip('"\'')
+
+    # Precedence (lowest → highest):
+    #   ~/.hermes/.env  <  config.yaml:env_files  <  process os.environ
+    # (process env wins because get_env_value() consults os.environ first.)
+    _merge_lines(_read_file_lines(env_path))
+
+    # env_files override ~/.hermes/.env values; a missing or unreadable
+    # extra file is non-fatal and treated as absent (Hermes convention:
+    # optional overrides must not break unrelated providers).
+    for ef in extra_files:
+        try:
+            _merge_lines(_read_file_lines(Path(ef)))
+        except Exception:
+            continue
 
     if cache_key is not None:
         _env_cache = (cache_key, dict(env_vars))
