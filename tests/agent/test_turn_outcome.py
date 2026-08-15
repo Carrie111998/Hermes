@@ -406,6 +406,53 @@ def test_unverified_skill_on_confident_eval_success_records_neutral(turn_env):
     assert get_record("open")["needs_review"] is False
 
 
+def test_stringified_false_verdict_is_a_failure_not_a_pass(turn_env):
+    """The judge LLM frequently returns ``"task_succeeded": "false"`` as a
+    string. ``bool("false")`` is True — the classic Python trap — so the
+    coercion must handle string booleans explicitly, or a judged FAIL would
+    be recorded as a PASS and the needs-review signal would never fire."""
+    from agent.turn_outcome import evaluate_turn_outcome
+    from tools.skill_usage import bump_outcome, get_record
+
+    d = _write_plain_skill(turn_env / "skills", "strflag")
+
+    # Seed prior failures so the string "false" verdict crosses the
+    # needs-review sample floor (_OUTCOME_MIN_SAMPLES = 4).
+    for _ in range(3):
+        bump_outcome("strflag", False)
+
+    outcome = evaluate_turn_outcome(
+        skills_used_this_turn={"strflag": d},
+        outcome_config={"enabled": True},
+        _aux_eval=_eval(
+            task_succeeded="false", confidence=0.9, failure_points=["strflag"],
+            reason="verifier: schema violated",
+        ),
+    )
+    assert outcome is not None
+    assert outcome.task_succeeded is False
+    assert get_record("strflag")["recent_outcomes"][-1] is False
+    assert get_record("strflag")["needs_review"] is True
+
+
+def test_stringified_true_verdict_is_a_success(turn_env):
+    """A string ``"true"`` from the judge must also coerce correctly — the
+    coercion is symmetric, not just the failure arm."""
+    from agent.turn_outcome import evaluate_turn_outcome
+
+    d = _write_plain_skill(turn_env / "skills", "strtrue")
+
+    outcome = evaluate_turn_outcome(
+        skills_used_this_turn={"strtrue": d},
+        outcome_config={"enabled": True},
+        _aux_eval=_eval(
+            task_succeeded="true", confidence=0.9, failure_points=[], reason="ok"
+        ),
+    )
+    assert outcome is not None
+    assert outcome.task_succeeded is True
+
+
 def test_verifier_pass_survives_eval_success_alongside_unverified_neutral(turn_env):
     """On the same eval success: the verifier-backed skill gets the pass, the
     unverified sibling gets a neutral — per-skill evidence decides, not the

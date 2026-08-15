@@ -395,7 +395,13 @@ def evaluate_turn_outcome(
         eval_reason = ""
         if isinstance(aux_data, dict):
             if "task_succeeded" in aux_data:
-                eval_succeeded = bool(aux_data.get("task_succeeded"))
+                v = aux_data.get("task_succeeded")
+                if isinstance(v, bool):
+                    eval_succeeded = v
+                elif v in ("true", "false"):
+                    # The judge frequently stringifies booleans ("false") —
+                    # bool("false") is True, so coerce strings explicitly.
+                    eval_succeeded = v == "true"
             conf = aux_data.get("confidence")
             if isinstance(conf, (int, float)):
                 eval_confidence = float(min(max(conf, 0.0), 1.0))
