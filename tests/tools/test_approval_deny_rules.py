@@ -103,6 +103,59 @@ class TestMatchUserDenyRule:
         deny_config(["git status"])
         assert mod._match_user_deny_rule(command) == "git status"
 
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "for item in a b; do git push --force origin main; done",
+            "while true; do git push --force origin main; done",
+            "until false; do git push --force origin main; done",
+            "if true; then git push --force origin main; fi",
+            (
+                "if false; then true; elif true; then "
+                "git push --force origin main; else true; fi"
+            ),
+            "if false; then true; else git push --force origin main; fi",
+            "select item in a b; do git push --force origin main; done",
+            'case "$kind" in deploy) git push --force origin main ;; esac',
+            (
+                'case "$kind" in noop) true ;; deploy|force) '
+                "git push --force origin main ;; esac"
+            ),
+            (
+                "if true; then case x in deploy) "
+                "git push --force origin main ;; esac; fi"
+            ),
+            (
+                "case x in outer) case y in inner) "
+                "git push --force origin main ;; esac ;; esac"
+            ),
+            (
+                "case x in outer) case y in inner) true ;; esac ;; "
+                "fallback) git push --force origin main ;; esac"
+            ),
+            "if git push --force origin main; then true; fi",
+        ],
+    )
+    def test_matches_after_reserved_word_transitions(
+            self, deny_config, command):
+        deny_config(["git push --force*"])
+        assert mod._match_user_deny_rule(command) == "git push --force*"
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            'echo "then git push --force origin main"',
+            "printf 'do git push --force origin main'",
+            'printf "case x in x) git push --force origin main ;; esac"',
+            'command "then" git push --force origin main',
+            '"case" x in y) git push --force origin main ;; esac',
+        ],
+    )
+    def test_quoted_reserved_word_prose_does_not_match(
+            self, deny_config, command):
+        deny_config(["git push --force*"])
+        assert mod._match_user_deny_rule(command) is None
+
 
 class TestDenyBeatsYolo:
     def test_deny_blocks_under_yolo_env(self, deny_config, clean_env, monkeypatch):
@@ -129,6 +182,16 @@ class TestDenyBeatsYolo:
 
         result = mod.check_dangerous_command(
             "cd repo && git push --force origin main", "local")
+        assert result["approved"] is False
+        assert result.get("user_deny") is True
+
+    def test_reserved_word_body_deny_blocks_under_yolo_env(
+            self, deny_config, clean_env, monkeypatch):
+        deny_config(["git push --force*"])
+        monkeypatch.setattr(mod, "_YOLO_MODE_FROZEN", True)
+
+        result = mod.check_dangerous_command(
+            "for item in a b; do git push --force origin main; done", "local")
         assert result["approved"] is False
         assert result.get("user_deny") is True
 
