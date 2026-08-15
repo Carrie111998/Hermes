@@ -2,6 +2,7 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 
 import pytest
 
@@ -34,13 +35,43 @@ def git_bash_path(path: Path) -> str:
     return f"/{drive.lower()}{remainder}"
 
 
-def run_shell_wrapper(tmp_path: Path, mode: str, *args: str) -> subprocess.CompletedProcess[str]:
+def write_config(tmp_path: Path, config_text: str | None = None) -> None:
+    if config_text is None:
+        config_text = "dgx_ssh:\n  host: review-host\n  user: review_user\n"
+    (tmp_path / "config.yaml").write_text(config_text, encoding="utf-8", newline="\n")
+
+
+def resolver_stub_result(
+    config_text: str | None,
+    write_config_file: bool,
+) -> tuple[int, str]:
+    """Return the resolver result needed by the hermetic shell harness."""
+    if not write_config_file:
+        return 78, "CONFIG_ERROR:config_missing"
+    if config_text == "not: [valid":
+        return 78, "CONFIG_ERROR:config_malformed"
+    if config_text == "dgx_ssh:\n  host: review-host\n":
+        return 78, "CONFIG_ERROR:target_incomplete"
+    if config_text == "dgx_ssh:\n  host: review-host\n  user: bad user\n":
+        return 78, "CONFIG_ERROR:user_invalid"
+    return 0, "review_user@review-host"
+
+
+def run_shell_wrapper(
+    tmp_path: Path,
+    mode: str,
+    *args: str,
+    config_text: str | None = None,
+    write_config_file: bool = True,
+) -> subprocess.CompletedProcess[str]:
     wsl = usable_wsl()
     bash = shutil.which("bash")
     if wsl is None and bash is None:
         pytest.skip("bash or an operational Ubuntu WSL distro is required for wrapper behavior tests")
 
     fake_ssh = tmp_path / "ssh"
+    if write_config_file:
+        write_config(tmp_path, config_text)
     fake_ssh_content = """#!/usr/bin/env bash
 set -u
 if [[ -n "${FAKE_SSH_LOG:-}" ]]; then
@@ -59,7 +90,7 @@ case "${FAKE_SSH_MODE:-success}" in
         if [[ "${@: -1}" == "true" ]]; then
             exit 0
         fi
-        printf '%s\\n' 'SSH_OK' 'dgx-test' 'cwliao'
+        printf '%s\\n' 'SSH_OK' 'dgx-test' 'review_user'
         exit 0
         ;;
     remote-75)
@@ -95,6 +126,30 @@ esac
             encoding="utf-8",
             newline="",
         )
+    if wsl is None:
+        resolver_status, resolver_output = resolver_stub_result(
+            config_text,
+            write_config_file,
+        )
+        resolver_script = tmp_path / "resolver-script"
+        resolver_script.write_text(
+            "#!/usr/bin/env bash\n"
+            f"printf '%s\\n' '{resolver_output}' "
+            f"{'>&2' if resolver_status else ''}\n"
+            f"exit {resolver_status}\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        resolver_script.chmod(0o755)
+        for interpreter in ("python3", "python"):
+            fake_python = tmp_path / interpreter
+            fake_python.write_text(
+                "#!/usr/bin/env bash\n"
+                f'exec "{git_bash_path(resolver_script)}"\n',
+                encoding="utf-8",
+                newline="\n",
+            )
+            fake_python.chmod(0o755)
     bash_env = tmp_path / "bash-env"
     bash_env.write_text(
         f'ssh() {{ bash "{git_bash_path(fake_ssh)}" "$@"; }}\n'
@@ -134,6 +189,7 @@ esac
                 "env",
                 f"PATH={wsl_tmp}:{wsl_env}",
                 f"HOME={wsl_tmp}",
+                f"HERMES_HOME={wsl_tmp}",
                 f"XDG_RUNTIME_DIR={wsl_tmp}",
                 f"FAKE_SSH_MODE={mode}",
                 f"FAKE_SSH_LOG={wsl_log}",
@@ -151,6 +207,7 @@ esac
     bash_log = git_bash_path(log_path)
     env["PATH"] = f"{bash_tmp}:/usr/bin:/bin"
     env["HOME"] = bash_tmp
+    env["HERMES_HOME"] = bash_tmp
     env["XDG_RUNTIME_DIR"] = "/tmp" if wsl is None else str(tmp_path)
     env["BASH_ENV"] = git_bash_path(bash_env)
     env["FAKE_SSH_MODE"] = mode
@@ -168,7 +225,13 @@ esac
 def test_dgx_wrapper_is_fail_closed_and_does_not_store_credentials():
     text = SH_WRAPPER.read_text(encoding="utf-8")
 
-    assert 'readonly DGX_HOST="140.96.58.171"' in text
+    assert 'DGX_HOST=' not in text
+    assert 'DGX_USER=' not in text
+    resolver = (ROOT / "scripts" / "dgx_target.py").read_text(encoding="utf-8")
+    assert "get_hermes_home" in resolver
+    assert "fast_safe_load" in resolver
+    assert "CONFIG_ERROR:" in resolver
+    assert "return CONFIG_ERROR" in resolver
     assert "StrictHostKeyChecking=yes" in text
     assert "ssh-copy-id" in text
     assert "-o StrictHostKeyChecking=yes" in text
@@ -198,6 +261,7 @@ def test_windows_entrypoint_delegates_to_one_wsl_policy():
     assert "REAUTH_REQUIRED" in text
     assert "Get-SshFailureStatus" in text
     assert "host key verification failed" in text
+    assert "if ($wslStatus -eq 78)" in text
     assert "if ($wslStatus -ne 75)" in text
     assert "both WSL and native Windows SSH routes failed" in text
     assert '"-o" "BatchMode=yes"' in text
@@ -207,6 +271,55 @@ def test_windows_entrypoint_delegates_to_one_wsl_policy():
     assert ".Status" in text
     assert ".Output" in text
     assert "BLOCKED_WSL_UNAVAILABLE" in text
+
+
+def test_resolver_uses_configured_target(tmp_path):
+    pytest.importorskip("yaml")
+    write_config(tmp_path)
+    env = os.environ.copy()
+    env["HERMES_HOME"] = str(tmp_path)
+    result = subprocess.run(
+        [sys.executable, str(ROOT / "scripts" / "dgx_target.py")],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0
+    assert result.stdout.strip() == "review_user@review-host"
+    assert result.stderr == ""
+
+
+@pytest.mark.parametrize(
+    "config_text,reason",
+    [
+        (None, "config_missing"),
+        ("not: [valid", "config_malformed"),
+        ("[]\n", "config_not_mapping"),
+        ("dgx_ssh: []\n", "target_not_mapping"),
+        ("dgx_ssh:\n  host: review-host\n", "target_incomplete"),
+        ("dgx_ssh:\n  host: '-bad'\n  user: review_user\n", "host_invalid"),
+        ("dgx_ssh:\n  host: review-host\n  user: 'bad user'\n", "user_invalid"),
+    ],
+)
+def test_resolver_fails_closed_for_invalid_config(tmp_path, config_text, reason):
+    pytest.importorskip("yaml")
+    env = os.environ.copy()
+    env["HERMES_HOME"] = str(tmp_path)
+    if config_text is not None:
+        write_config(tmp_path, config_text)
+    result = subprocess.run(
+        [sys.executable, str(ROOT / "scripts" / "dgx_target.py")],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 78
+    assert result.stdout == ""
+    assert result.stderr.strip() == f"CONFIG_ERROR:{reason}"
 
 
 def test_shell_probe_classifies_permission_denied_as_reauthentication(tmp_path):
@@ -233,6 +346,38 @@ def test_shell_exec_forwards_remote_command_arguments(tmp_path):
     assert "<hello>" in log
 
 
+def test_shell_exec_uses_configured_target_and_only_then_calls_ssh(tmp_path):
+    result = run_shell_wrapper(tmp_path, "success", "exec", "hostname")
+    log = (tmp_path / "ssh-args.log").read_text(encoding="utf-8")
+
+    assert result.returncode == 0
+    assert "<review_user@review-host>" in log
+
+
+@pytest.mark.parametrize(
+    "config_text,reason,write_config_file",
+    [
+        (None, "config_missing", False),
+        ("not: [valid", "config_malformed", True),
+        ("dgx_ssh:\n  host: review-host\n", "target_incomplete", True),
+        ("dgx_ssh:\n  host: review-host\n  user: bad user\n", "user_invalid", True),
+    ],
+)
+def test_shell_config_errors_do_not_invoke_ssh(tmp_path, config_text, reason, write_config_file):
+    result = run_shell_wrapper(
+        tmp_path,
+        "success",
+        "probe",
+        config_text=config_text,
+        write_config_file=write_config_file,
+    )
+
+    assert result.returncode == 78
+    assert result.stdout == ""
+    assert f"CONFIG_ERROR:{reason}" in result.stderr
+    assert not (tmp_path / "ssh-args.log").exists()
+
+
 def test_shell_exec_preserves_remote_exit_75_without_reclassification(tmp_path):
     result = run_shell_wrapper(tmp_path, "remote-75", "exec", "remote-command")
 
@@ -252,7 +397,7 @@ def test_windows_probe_falls_back_without_polluting_output_or_losing_identity(tm
         ">>\"%FAKE_SSH_LOG%\" echo %*\r\n"
         "echo SSH_OK\r\n"
         "echo dgx-test\r\n"
-        "echo cwliao\r\n"
+        "echo review_user\r\n"
         "exit /b 0\r\n",
         encoding="utf-8",
         newline="",
@@ -260,8 +405,20 @@ def test_windows_probe_falls_back_without_polluting_output_or_losing_identity(tm
     identity = tmp_path / "configured id"
     identity.write_text("test-only-placeholder", encoding="utf-8")
     log_path = tmp_path / "native-ssh.log"
+    config_text = "dgx_ssh:\n  host: review-host\n  user: review_user\n"
+    (tmp_path / "config.yaml").write_text(config_text, encoding="utf-8", newline="\n")
+    fake_python = tmp_path / "fake-python.cmd"
+    fake_python.write_text(
+        "@echo off\r\n"
+        "if \"%FAKE_RESOLVER_MODE%\"==\"missing\" (echo CONFIG_ERROR:config_missing 1>&2 & exit /b 78)\r\n"
+        "echo review_user@review-host\r\n"
+        "exit /b 0\r\n",
+        encoding="utf-8",
+        newline="",
+    )
     wrapper_copy = tmp_path / "dgx_ssh.ps1"
     (tmp_path / "dgx_ssh.sh").write_text("#!/usr/bin/env bash\n", encoding="utf-8", newline="\n")
+    (tmp_path / "dgx_target.py").write_text("# fake resolver supplied by the test harness\n", encoding="utf-8", newline="\n")
     original_assignment = '$sshExe = Join-Path $env:WINDIR "System32\\OpenSSH\\ssh.exe"'
     replacement_assignment = f'$sshExe = "{fake_ssh}"'
     wrapper_copy.write_text(
@@ -290,6 +447,13 @@ def test_windows_probe_falls_back_without_polluting_output_or_losing_identity(tm
         "    $global:LASTEXITCODE = 75\n"
         "    Write-Output 'WSL_REAUTH_REQUIRED'\n"
         "}\n"
+        "function global:Get-Command {\n"
+        "    param([string]$Name)\n"
+        "    if ($env:FAKE_NO_PYTHON -eq '1' -and ($Name -eq 'python.exe' -or $Name -eq 'py.exe')) { return $null }\n"
+        "    if ($Name -eq 'python.exe' -and $env:FAKE_NO_PYTHON -ne '1') { return [pscustomobject]@{ Source = $env:FAKE_PYTHON } }\n"
+        "    if ($Name -eq 'py.exe' -and $env:FAKE_NO_PYTHON -ne '1') { return $null }\n"
+        "    return Microsoft.PowerShell.Core\\Get-Command @PSBoundParameters\n"
+        "}\n"
         "$mode = if ([string]::IsNullOrWhiteSpace($env:FAKE_MODE)) { 'probe' } else { $env:FAKE_MODE }\n"
         f'if ($mode -eq "exec") {{ '
             f'if ($env:FAKE_MULTIWORD -eq "1") {{ & "{wrapper_copy}" -Mode exec bash -c "\'echo hi there\'" }} '
@@ -303,6 +467,9 @@ def test_windows_probe_falls_back_without_polluting_output_or_losing_identity(tm
     )
     env = os.environ.copy()
     env["FAKE_SSH_LOG"] = str(log_path)
+    env["FAKE_PYTHON"] = str(fake_python)
+    env["FAKE_RESOLVER_MODE"] = "success"
+    env["FAKE_NO_PYTHON"] = "0"
     env["FAKE_WSL_MODE"] = "auth-failure"
     env["HERMES_DGX_IDENTITY"] = str(identity)
     env["FAKE_MODE"] = "probe"
@@ -318,6 +485,7 @@ def test_windows_probe_falls_back_without_polluting_output_or_losing_identity(tm
     assert first.stdout.count("SSH_OK") == 1
     assert "WSL_REAUTH_REQUIRED" not in first.stdout
     assert str(identity) in log_path.read_text(encoding="utf-8")
+    assert "review_user@review-host" in log_path.read_text(encoding="utf-8")
 
     env["FAKE_WSL_MODE"] = "path-failure"
     second = subprocess.run(
@@ -384,6 +552,33 @@ def test_windows_probe_falls_back_without_polluting_output_or_losing_identity(tm
 
     assert fifth.returncode == 75
     assert "HERMES_DGX_REMOTE_EXIT_STATUS=75" not in fifth.stdout
+    assert log_path.read_text(encoding="utf-8") == before_remote_75
+
+    env["FAKE_RESOLVER_MODE"] = "missing"
+    env["FAKE_MODE"] = "probe"
+    env["FAKE_WSL_MODE"] = "path-failure"
+    blocked = subprocess.run(
+        [powershell, "-NoProfile", "-File", str(helper)],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert blocked.returncode == 78
+    assert "CONFIG_ERROR:config_missing" in blocked.stdout
+    assert log_path.read_text(encoding="utf-8") == before_remote_75
+
+    env["FAKE_RESOLVER_MODE"] = "success"
+    env["FAKE_NO_PYTHON"] = "1"
+    no_runtime = subprocess.run(
+        [powershell, "-NoProfile", "-File", str(helper)],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert no_runtime.returncode == 78
+    assert "CONFIG_ERROR:resolver_runtime_unavailable" in no_runtime.stdout
     assert log_path.read_text(encoding="utf-8") == before_remote_75
 
 

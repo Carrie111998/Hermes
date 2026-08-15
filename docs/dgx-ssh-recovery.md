@@ -24,6 +24,20 @@ bash scripts/dgx_ssh.sh probe
 bash scripts/dgx_ssh.sh exec hostname
 ```
 
+Before either wrapper attempts SSH, configure the target in the existing
+user-owned Hermes config. The resolver reads the platform-native Hermes home
+(`$HERMES_HOME` when set, otherwise the normal Hermes default):
+
+```yaml
+dgx_ssh:
+  host: "<configured-hostname-or-ipv4>"
+  user: "<configured-ssh-user>"
+```
+
+Missing, unreadable, malformed, partial, or unsafe target configuration fails
+closed with `CONFIG_ERROR:<reason>` and exit code `78`; no SSH process is
+started. A missing resolver Python runtime has the same result.
+
 If a non-interactive probe cannot authenticate, it exits with code `75` and
 prints `REAUTH_REQUIRED`. Run one of these only in a real interactive terminal:
 

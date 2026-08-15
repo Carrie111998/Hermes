@@ -5,14 +5,49 @@ set -u
 # This file contains connection policy only. It must never contain a password,
 # MFA code, private key, token, or host-key bypass.
 
-readonly DGX_HOST="140.96.58.171"
-readonly DGX_USER="cwliao"
-readonly DGX_TARGET="${DGX_USER}@${DGX_HOST}"
 readonly MODE="${1:-probe}"
 
 if [[ $# -gt 0 ]]; then
     shift
 fi
+
+readonly SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+readonly TARGET_RESOLVER="${SCRIPT_DIR}/dgx_target.py"
+DGX_TARGET=""
+
+resolve_target() {
+    local interpreter output status
+
+    if [[ ! -f "${TARGET_RESOLVER}" ]]; then
+        printf '%s\n' "CONFIG_ERROR:resolver_missing" >&2
+        return 78
+    fi
+
+    for interpreter in python3 python; do
+        if ! command -v "${interpreter}" >/dev/null 2>&1; then
+            continue
+        fi
+        output=$("${interpreter}" "${TARGET_RESOLVER}" 2>&1)
+        status=$?
+        if ((status != 0)); then
+            if [[ "${status}" -eq 78 && "${output}" == CONFIG_ERROR:* && "${output}" != *$'\n'* ]]; then
+                printf '%s\n' "${output}" >&2
+            else
+                printf '%s\n' "CONFIG_ERROR:resolver_failed" >&2
+            fi
+            return 78
+        fi
+        if [[ "${output}" =~ ^[A-Za-z_][A-Za-z0-9._-]{0,31}@[A-Za-z0-9][A-Za-z0-9.-]{0,252}$ ]]; then
+            DGX_TARGET="${output}"
+            return 0
+        fi
+        printf '%s\n' "CONFIG_ERROR:resolver_protocol" >&2
+        return 78
+    done
+
+    printf '%s\n' "CONFIG_ERROR:resolver_runtime_unavailable" >&2
+    return 78
+}
 
 identity="${HERMES_DGX_IDENTITY:-${HOME}/.ssh/id_ed25519}"
 runtime_dir="${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}"
@@ -167,6 +202,17 @@ exec_remote() {
 }
 
 case "${MODE}" in
+    probe|auth|bootstrap|exec)
+        ;;
+    *)
+        printf '%s\n' "USAGE: scripts/dgx_ssh.sh {probe|auth|bootstrap|exec} [command...]" >&2
+        exit 64
+        ;;
+esac
+
+resolve_target || exit $?
+
+case "${MODE}" in
     probe)
         probe "$@"
         ;;
@@ -178,9 +224,5 @@ case "${MODE}" in
         ;;
     exec)
         exec_remote "$@"
-        ;;
-    *)
-        printf '%s\n' "USAGE: scripts/dgx_ssh.sh {probe|auth|bootstrap|exec} [command...]" >&2
-        exit 64
         ;;
 esac

@@ -24,6 +24,9 @@ separately authorized deployment or user-environment installation.
 
 ## Observed failure and verified recovery
 
+The following raw output is historical diagnostic evidence only; it is not an
+active target configuration and must not be copied into operational commands.
+
 The Windows OpenSSH route returned `Permission denied (publickey,password)`.
 A bounded WSL route subsequently succeeded:
 
