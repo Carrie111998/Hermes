@@ -5700,6 +5700,7 @@ def _run_npm_install_deterministic(
     extra_args: tuple[str, ...] = (),
     capture_output: bool = True,
     env: dict[str, str] | None = None,
+    allow_install_scripts: bool = False,
 ) -> subprocess.CompletedProcess:
     """Run a deterministic npm install that does not mutate ``package-lock.json``.
 
@@ -5728,6 +5729,35 @@ def _run_npm_install_deterministic(
     committed lockfile and makes every future ``npm ci`` fail — a
     self-reinforcing cycle where web devDeps never install and a stale dist
     is served on every update (PR #65595).
+
+    ``--ignore-scripts`` is the DEFAULT here, and it is a security control
+    rather than a performance one.  npm lifecycle scripts (``preinstall`` /
+    ``install`` / ``postinstall``) execute arbitrary code from the full
+    transitive closure of the registry, and ``hermes update`` runs as root on
+    hosts that also hold unrelated credentials.  The trust boundary is not
+    "npm" but every maintainer account behind every transitive dependency, and
+    that set changes without our involvement.  Skipping lifecycle scripts
+    removes install-time code execution outright, which no amount of version
+    or hash pinning does — pinning prevents substitution, not execution.
+
+    It is safe to default because it was measured, not assumed.  Of the ten
+    packages this lockfile marks ``hasInstallScript``, only three are reachable
+    from the scoped workspace install the updater performs, and none of the
+    three is load-bearing: the root script is a bare ``echo``;
+    ``unicode-animations`` already no-ops under ``CI=1`` (set below); and
+    ``esbuild``'s binary ships prebuilt in the ``@esbuild/<platform>``
+    optionalDependency, so it is present with scripts disabled — and Vite 8
+    bundles through Rolldown, which does not invoke it at all.  The remaining
+    seven (``electron``, ``electron-winstaller``, ``node-pty``, three
+    ``fsevents`` copies, ``get-windows``) are either platform-specific
+    no-ops here or exclusive to the desktop workspace.
+
+    ``allow_install_scripts=True`` is therefore the narrow, deliberate
+    exception for the desktop/Electron build, which installs the *whole* root
+    (not the update path's scoped subset) and genuinely needs those scripts:
+    Electron downloads its runtime binary and ``node-pty`` compiles a native
+    module.  Pass it only where a build has been shown to require it, and say
+    why at the call site — a silent opt-out re-opens the hole this closes.
     """
     # unicode-animations' postinstall animates to /dev/tty (bypasses
     # --silent/capture_output). It no-ops when CI is set — same as the TUI
@@ -5742,15 +5772,24 @@ def _run_npm_install_deterministic(
             capture_output=capture_output,
         )
 
+    # Applied to BOTH branches below. The `npm install` fallback is the one
+    # that actually matters: it is reached precisely when `npm ci` refused
+    # (lockfile out of sync), i.e. when npm is resolving versions the lockfile
+    # never vouched for. Hardening only the `ci` branch would leave scripts
+    # enabled on the one path where the dependency set is least verified.
+    script_args: tuple[str, ...] = () if allow_install_scripts else ("--ignore-scripts",)
+
     def _attempt(npm_exe: str) -> subprocess.CompletedProcess:
         lockfile = cwd / "package-lock.json"
         if lockfile.exists():
-            ci_result = _run([npm_exe, "ci", "--include=dev", *extra_args])
+            ci_result = _run([npm_exe, "ci", "--include=dev", *script_args, *extra_args])
             if ci_result.returncode == 0:
                 return ci_result
             # Fall through to `npm install` — lockfile may be out of sync on a
             # WIP fork/branch, or `npm ci` may not be available on very old npm.
-        return _run([npm_exe, "install", "--no-save", "--include=dev", *extra_args])
+        return _run(
+            [npm_exe, "install", "--no-save", "--include=dev", *script_args, *extra_args]
+        )
 
     result = _attempt(npm)
     if result.returncode == 0:
@@ -7489,7 +7528,21 @@ def cmd_gui(args: argparse.Namespace):
             # NixOS build env keeps its PYTHON hint while restoring managed Node
             # ahead of a bare PATH (same idiom as the `hermes update` path).
             nixos_env = with_hermes_node_path(_nixos_build_env())
-            install_result = _run_npm_install_deterministic(npm, PROJECT_ROOT, capture_output=False, env=nixos_env)
+            # The one deliberate exception to the default `--ignore-scripts`
+            # (see _run_npm_install_deterministic). Unlike the update path's
+            # scoped `--workspace ui-tui --workspace web` install, this installs
+            # the entire root, which pulls in the desktop workspace: Electron
+            # fetches its runtime binary from a postinstall script and node-pty
+            # compiles a native module. Both are install-script-only, so the
+            # desktop build cannot complete without them. This runs on an
+            # explicit desktop build, not on the unattended update path.
+            install_result = _run_npm_install_deterministic(
+                npm,
+                PROJECT_ROOT,
+                capture_output=False,
+                env=nixos_env,
+                allow_install_scripts=True,
+            )
             if install_result.returncode != 0:
                 if not _electron_pkg_staged_missing_dist(PROJECT_ROOT):
                     print("✗ Desktop dependency install failed")
@@ -8660,7 +8713,32 @@ def _run_package_only_install(
     ``pip install --upgrade pip`` and ``--force-reinstall <pkg>`` do not
     rewrite ``hermes.exe``. The editable-install quarantine path would rename
     shims without uv recreating them on Windows (#57828).
+
+    Wheels-only, for the same reason as the sibling injection in
+    ``hermes_cli/_install_repair.py::_run_install_cmd`` — see that docstring for
+    the full argument. Briefly: a source distribution runs its PEP 517 backend
+    at install time, and ``hermes update`` runs unattended and as root, so an
+    sdist from the registry is arbitrary code execution from a maintainer
+    account we do not control. Pinning does not help; it constrains which
+    artifact is fetched, not whether that artifact's build hooks run.
+
+    This is a SECOND chokepoint, deliberately hardened separately. The two
+    Python install call sites in ``update_cmd.py`` (the pip self-upgrade, and
+    the Hermes Tools dependency restore loop) route through here and NOT
+    through ``_run_install_cmd``, so hardening only the repair path would have
+    left the normal update route installing registry sdists as root — while
+    the finding read as closed.
+
+    Not applied to ``_run_install_with_heartbeat`` itself: its other caller is
+    the Termux psutil path, which deliberately builds a patched LOCAL sdist.
+    That would in fact still work (``--only-binary`` exempts local paths), but
+    narrowing the injection to the registry-install wrapper keeps the exemption
+    obvious rather than incidental.
     """
+    if "install" in cmd and "--only-binary=:all:" not in cmd:
+        at = cmd.index("install") + 1
+        cmd = [*cmd[:at], "--only-binary=:all:", *cmd[at:]]
+
     _run_install_with_heartbeat(cmd, env=env)
 
 

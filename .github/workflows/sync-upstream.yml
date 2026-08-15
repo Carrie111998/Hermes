@@ -1,0 +1,139 @@
+name: sync-upstream
+
+# Keep this fork current with NousResearch/hermes-agent.
+#
+# WHY IT OPENS A PR AND NEVER PUSHES TO main
+# ------------------------------------------
+# The usual "sync fork" recipe is `git reset --hard upstream/main` followed by a
+# force push. That is precisely the operation that destroyed a production fix on
+# this repo's consumer: on 2026-08-14 the local `hermes update` did
+# `reset --hard origin/main` and wiped an uncommitted event-loop patch that both
+# qenex-hermes-dashboard and hermes-gateway depended on. A sync that force-pushes
+# would institutionalise that failure at the source instead of the consumer.
+#
+# So: merge into a branch, open a pull request, and let a human merge it. main
+# moves only on review. Nothing this workflow does is destructive on its own.
+#
+# A CORRECTION, KEPT BECAUSE IT NEARLY SHIPPED
+# --------------------------------------------
+# The first version of this file passed --allow-unrelated-histories and claimed
+# the fork had no merge base with upstream. That was wrong. Every number behind
+# it came from /root/hermes-src, a SHALLOW clone with one commit of history,
+# where git cannot find a merge base and therefore reports "refusing to merge
+# unrelated histories", "20386 commits behind" and "121 files differ" - all
+# artifacts of the clone, none of them facts about this repo.
+#
+# Measured from a full clone (22,389 commits): merge base 4d6f4a6fe7 exists,
+# git merge-tree is clean with NO flag, and the real divergence is 16 ahead /
+# 5 behind over 19 files - exactly what GitHub's fork banner reports. Never
+# measure divergence in a shallow clone; check
+# `git rev-parse --is-shallow-repository` first.
+#
+# WHAT THE FORK ACTUALLY OWNS
+# ---------------------------
+# Two files upstream does not have: .github/CODEOWNERS and this workflow. Of
+# the 16 commits ahead, 14 are prior "Merge branch NousResearch:main" syncs
+# carrying no unique content. The verify step below fails the run if either
+# owned file disappears - this one included, since it is what a future sync
+# would have to remove to disable the safety net.
+
+on:
+  schedule:
+    # 04:17 UTC. Off the hour deliberately: the estate's own timers cluster at
+    # :00 and :30, and a scheduled GitHub job that collides with them competes
+    # for the same review attention when both report.
+    - cron: "17 4 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  # A second run while the first is mid-merge would push a half-built branch.
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout fork with full history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fetch upstream
+        run: |
+          set -euo pipefail
+          git remote add upstream https://github.com/NousResearch/hermes-agent.git 2>/dev/null || true
+          git fetch upstream --no-tags --prune
+          git config user.name  "qenex-sync[bot]"
+          git config user.email "sync@qenex.ai"
+
+      - name: Report drift before changing anything
+        run: |
+          set -euo pipefail
+          # Count commits BEHIND, not a two-way file diff. The diff also counts
+          # the fork's OWN files (CODEOWNERS, this workflow), so it never
+          # reaches zero and the already-in-sync exit can never fire. The timer
+          # version of this ran 183 times with 0 no-ops for exactly that
+          # reason, 99 of them failing to open a PR with no commits in it.
+          echo "behind upstream: $(git rev-list --count origin/main..upstream/main) commits"
+          echo "only here:       $(git diff --name-status upstream/main origin/main | grep -c '^A' || true) fork-owned files"
+          if [ "$(git rev-list --count origin/main..upstream/main)" -eq 0 ]; then
+            echo "ALREADY_IN_SYNC=1" >> "$GITHUB_ENV"
+          fi
+
+      - name: Merge upstream into a sync branch
+        if: env.ALREADY_IN_SYNC != '1'
+        id: merge
+        run: |
+          set -euo pipefail
+          git checkout -B sync/upstream origin/main
+          # --no-ff so the PR always shows a reviewable merge commit.
+          # A conflict must STOP here: resolving it
+          # automatically in favour of either side is how local work gets
+          # thrown away without anyone reading the diff.
+          if ! git merge --no-ff --no-edit upstream/main; then
+            git merge --abort || true
+            echo "CONFLICTED=1" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          git push --force-with-lease origin sync/upstream
+
+      - name: Verify the fork's own files survived
+        if: env.ALREADY_IN_SYNC != '1' && env.CONFLICTED != '1'
+        run: |
+          set -euo pipefail
+          # The two files this fork has that upstream does not. If a merge
+          # removes either, the sync has become a reset and the run must fail.
+          for owned in .github/CODEOWNERS .github/workflows/sync-upstream.yml; do
+            test -f "$owned" || { echo "::error::$owned disappeared - refusing to proceed"; exit 1; }
+          done
+
+      - name: Open or update the sync PR
+        if: env.ALREADY_IN_SYNC != '1' && env.CONFLICTED != '1'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # --state open is load-bearing: `gh pr view <branch>` also finds a
+          # MERGED or CLOSED PR, so without it this reports "already open" once
+          # the first sync PR is merged and never opens another.
+          OPEN_PR=$(gh pr list --state open --head sync/upstream --json number --jq '.[0].number // empty')
+          if [ -n "$OPEN_PR" ]; then
+            echo "existing sync PR #$OPEN_PR updated by the branch push"
+          else
+            gh pr create --base main --head sync/upstream \
+              --title "sync: merge upstream NousResearch/hermes-agent" \
+              --body "Automated upstream sync. A plain merge of upstream/main into a branch off origin/main; main is never reset or force-pushed. The fork owns .github/CODEOWNERS and this workflow, and a verify step fails the run if a merge removes either."
+          fi
+
+      - name: Fail loudly on conflict
+        if: env.CONFLICTED == '1'
+        run: |
+          echo "::error::Upstream merge conflicts — resolve by hand on branch sync/upstream."
+          echo "Deliberately NOT auto-resolved: picking a side without review is how a"
+          echo "local fix gets discarded, which is the failure this workflow exists to avoid."
+          exit 1
