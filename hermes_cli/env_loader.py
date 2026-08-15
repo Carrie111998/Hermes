@@ -494,7 +494,9 @@ def load_hermes_dotenv(
     )
 
     pinned_worker_env: dict[str, str | None] | None = None
-    if os.environ.get("HERMES_KANBAN_TASK") and os.environ.get(WORKER_SCOPE_ENV):
+    dispatcher_worker = bool(os.environ.get("HERMES_KANBAN_TASK"))
+    scoped_worker = dispatcher_worker and bool(os.environ.get(WORKER_SCOPE_ENV))
+    if dispatcher_worker:
         pinned_worker_env = {
             key: os.environ.get(key) for key in PINNED_WORKER_ENV_KEYS
         }
@@ -559,7 +561,7 @@ def load_hermes_dotenv(
     # an extension surface, not part of lifecycle execution.
     try:
         if (
-            pinned_worker_env is None
+            not scoped_worker
             and not _early_recovery._should_skip_external_secret_sources()
         ):
             _apply_external_secret_sources(home_path)
