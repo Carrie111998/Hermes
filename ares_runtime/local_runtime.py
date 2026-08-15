@@ -388,11 +388,11 @@ if (config or {}).get('context', {}).get('engine') == 'ri-context-governor':
     @staticmethod
     def _desktop_binary(source: Path) -> Path | None:
         if sys.platform == "darwin":
-            candidate = source / "apps" / "desktop" / "release" / "mac" / "Hermes.app" / "Contents" / "MacOS" / "Hermes"
+            candidate = source / "apps" / "desktop" / "release" / "mac" / "Ares.app" / "Contents" / "MacOS" / "Ares"
         elif os.name == "nt":
-            candidate = source / "apps" / "desktop" / "release" / "win-unpacked" / "Hermes.exe"
+            candidate = source / "apps" / "desktop" / "release" / "win-unpacked" / "Ares.exe"
         else:
-            candidate = source / "apps" / "desktop" / "release" / "linux-unpacked" / "Hermes"
+            candidate = source / "apps" / "desktop" / "release" / "linux-unpacked" / "Ares"
         return candidate if candidate.is_file() else None
 
     def _materialize(self, source_spec: str, revision: str, *, desktop: bool) -> None:
@@ -444,7 +444,7 @@ if (config or {}).get('context', {}).get('engine') == 'ri-context-governor':
         self.paths.unit_path.parent.mkdir(parents=True, exist_ok=True)
         content = (
             "[Unit]\n"
-            "Description=Ares stable Hermes gateway\n"
+            "Description=Ares stable gateway\n"
             "After=network-online.target\n"
             "Wants=network-online.target\n\n"
             "[Service]\n"
@@ -626,7 +626,7 @@ if (config or {}).get('context', {}).get('engine') == 'ri-context-governor':
                 check=False,
             )
             checks.append(
-                ("Ares and Hermes imports", probe.returncode == 0, (probe.stderr or "ok").strip())
+                ("Ares runtime imports", probe.returncode == 0, (probe.stderr or "ok").strip())
             )
         context_probe = """
 from pathlib import Path
@@ -750,7 +750,7 @@ def _parser() -> argparse.ArgumentParser:
     desktop = subparsers.add_parser("desktop", help="Launch the selected Ares Desktop application")
     desktop.add_argument("--rebuild", action="store_true", help="Build Desktop in the selected stable runtime first")
     subparsers.add_parser("tui", help="Launch the selected TUI")
-    subparsers.add_parser("chat", help="Launch the selected Hermes-compatible CLI")
+    subparsers.add_parser("chat", help="Launch the selected Ares CLI")
     gateway = subparsers.add_parser("gateway", help="Manage the selected Ares gateway service")
     gateway.add_argument("action", choices=("start", "stop", "restart", "status", "foreground"))
     parser.add_argument("--version", action="store_true", help="Print the selected stable runtime revision")

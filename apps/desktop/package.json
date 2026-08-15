@@ -1,9 +1,9 @@
 {
   "name": "hermes",
-  "productName": "Hermes",
+  "productName": "Ares",
   "private": true,
   "version": "0.17.0",
-  "description": "Native desktop shell for Hermes Agent.",
+  "description": "Native desktop shell for Ares.",
   "author": "Nous Research",
   "type": "module",
   "main": "dist/electron-main.mjs",
@@ -161,18 +161,18 @@
   },
   "build": {
     "electronVersion": "40.10.2",
-    "appId": "com.nousresearch.hermes",
-    "productName": "Hermes",
-    "executableName": "Hermes",
+    "appId": "com.recursiveintell.ares",
+    "productName": "Ares",
+    "executableName": "Ares",
     "protocols": [
       {
-        "name": "Hermes Protocol",
+        "name": "Ares Protocol",
         "schemes": [
-          "hermes"
+          "ares"
         ]
       }
     ],
-    "artifactName": "Hermes-${version}-${os}-${arch}.${ext}",
+    "artifactName": "Ares-${version}-${os}-${arch}.${ext}",
     "icon": "assets/icon",
     "directories": {
       "output": "release"
@@ -208,11 +208,11 @@
       "entitlements": "electron/entitlements.mac.plist",
       "entitlementsInherit": "electron/entitlements.mac.inherit.plist",
       "extendInfo": {
-        "CFBundleDisplayName": "Hermes",
-        "CFBundleExecutable": "Hermes",
-        "CFBundleName": "Hermes",
-        "NSAudioCaptureUsageDescription": "Hermes uses audio capture for voice conversations.",
-        "NSMicrophoneUsageDescription": "Hermes uses the microphone for voice input and voice conversations."
+        "CFBundleDisplayName": "Ares",
+        "CFBundleExecutable": "Ares",
+        "CFBundleName": "Ares",
+        "NSAudioCaptureUsageDescription": "Ares uses audio capture for voice conversations.",
+        "NSMicrophoneUsageDescription": "Ares uses the microphone for voice input and voice conversations."
       },
       "gatekeeperAssess": false,
       "hardenedRuntime": true,
@@ -222,7 +222,7 @@
       ]
     },
     "dmg": {
-      "title": "Install Hermes",
+      "title": "Install Ares",
       "backgroundColor": "#f5f5f7",
       "iconSize": 96,
       "window": {
@@ -244,7 +244,7 @@
       ]
     },
     "win": {
-      "legalTrademarks": "Hermes",
+      "legalTrademarks": "Ares",
       "target": [
         "nsis",
         "msi"
@@ -254,7 +254,7 @@
     "linux": {
       "category": "Development",
       "maintainer": "Nous Research <support@nousresearch.com>",
-      "synopsis": "Native desktop shell for Hermes Agent.",
+      "synopsis": "Native desktop shell for Ares.",
       "target": [
         "AppImage",
         "deb",
@@ -265,8 +265,8 @@
       "oneClick": false,
       "allowToChangeInstallationDirectory": true,
       "perMachine": false,
-      "shortcutName": "Hermes",
-      "uninstallDisplayName": "Hermes",
+      "shortcutName": "Ares",
+      "uninstallDisplayName": "Ares",
       "warningsAsErrors": false
     }
   }
