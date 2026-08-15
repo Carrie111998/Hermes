@@ -2464,12 +2464,22 @@ class HindsightMemoryProvider(MemoryProvider):
         with self._prefetch_lock:
             self._prefetch_result = ""
             self._prefetch_count = 0
+            prefetch_alive = bool(
+                self._prefetch_thread and self._prefetch_thread.is_alive()
+            )
             if new_id == self._session_id:
                 # Rewind/in-place compression invalidates every result owned by
-                # this session's previous transcript generation.
+                # this session's previous transcript generation. A live worker
+                # cannot be cancelled, so queue its latest requested key to run
+                # again after the stale generation is rejected.
+                retry_key = (
+                    self._opportunistic_pending or self._opportunistic_inflight
+                    if prefetch_alive
+                    else None
+                )
                 self._opportunistic_generation += 1
                 self._opportunistic_ready.clear()
-                self._opportunistic_pending = None
+                self._opportunistic_pending = retry_key
             else:
                 # /new publishes the agent's new session id before its deferred
                 # provider boundary completes. Preserve work that a prompt has
@@ -2492,7 +2502,7 @@ class HindsightMemoryProvider(MemoryProvider):
                     and self._opportunistic_inflight[0] != new_id
                 ):
                     self._opportunistic_generation += 1
-            if not (self._prefetch_thread and self._prefetch_thread.is_alive()):
+            if not prefetch_alive:
                 self._opportunistic_inflight = None
 
         # 3. Now rotate to the new session.
