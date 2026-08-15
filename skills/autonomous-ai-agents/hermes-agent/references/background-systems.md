@@ -88,9 +88,10 @@ sessions still have zero `kanban_*` schema footprint unless configured.
   `kanban_link`; profiles that explicitly enable the `kanban` toolset
   outside a dispatcher-spawned task also get `kanban_list` and
   `kanban_unblock` for board routing.
-- **Dispatcher** runs inside the gateway by default
+- **Dispatcher** runs inside the gateway only after explicit opt-in
   (`kanban.dispatch_in_gateway: true`) — reclaims stale claims,
   promotes ready tasks, atomically claims, spawns assigned profiles.
+  A host-wide `kanban.max_concurrent_workers` cap defaults to 3.
   Auto-blocks a task after `failure_limit` consecutive spawn failures
   (default 2; configurable via `kanban.failure_limit` or per-task
   `max_retries`).

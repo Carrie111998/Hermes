@@ -7,8 +7,8 @@ to platform APIs and delivers messages for its profile's subscribers.
 ## Single-dispatcher posture
 
 Only one gateway owns the kanban dispatcher. The owning gateway keeps
-`kanban.dispatch_in_gateway: true` (the default); every other gateway sets it
-to `false`.
+`kanban.dispatch_in_gateway: true`; the setting defaults to `false`, so every
+other gateway remains notification-only without extra configuration.
 
 **Why this matters:** dispatching is single-owner so multiple gateways do not
 race to spawn the same work. Notification delivery is profile-owned instead:
@@ -18,12 +18,13 @@ processes.
 
 ## Configuration
 
-On the dispatch-owning gateway (typically the `default` profile), no change is
-needed. On every other profile gateway, add to `~/.hermes/config.yaml`:
+On the dispatch-owning gateway (typically the `default` profile), add to
+`~/.hermes/config.yaml`:
 
 ```yaml
 kanban:
-  dispatch_in_gateway: false
+  dispatch_in_gateway: true
+  max_concurrent_workers: 3
 ```
 
 Or set the env var: `HERMES_KANBAN_DISPATCH_IN_GATEWAY=false`

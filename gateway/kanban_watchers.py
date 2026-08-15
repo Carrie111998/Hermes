@@ -1182,7 +1182,7 @@ class GatewayKanbanWatchersMixin:
     async def _kanban_dispatcher_watcher(self) -> None:
         """Embedded kanban dispatcher — one tick every `dispatch_interval_seconds`.
 
-        Gated by `kanban.dispatch_in_gateway` in config.yaml (default True).
+        Gated by `kanban.dispatch_in_gateway` in config.yaml (default False).
         When true, the gateway hosts the single dispatcher for this profile:
         no separate `hermes kanban daemon` process needed. When false, the
         loop exits immediately and an external daemon is expected.
@@ -1217,7 +1217,7 @@ class GatewayKanbanWatchersMixin:
             logger.warning("kanban dispatcher: cannot load config (%s); disabled", exc)
             return
         kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
-        if not kanban_cfg.get("dispatch_in_gateway", True):
+        if not kanban_cfg.get("dispatch_in_gateway", False):
             logger.info(
                 "kanban dispatcher: disabled via config kanban.dispatch_in_gateway=false"
             )
@@ -1268,6 +1268,26 @@ class GatewayKanbanWatchersMixin:
         max_spawn = kanban_cfg.get("max_spawn", None)
         if max_spawn is not None:
             logger.info("kanban dispatcher: max_spawn=%s", max_spawn)
+
+        raw_max_concurrent_workers = kanban_cfg.get("max_concurrent_workers", 3)
+        try:
+            max_concurrent_workers = int(raw_max_concurrent_workers)
+        except (TypeError, ValueError):
+            logger.warning(
+                "kanban dispatcher: invalid kanban.max_concurrent_workers=%r; using 3",
+                raw_max_concurrent_workers,
+            )
+            max_concurrent_workers = 3
+        if max_concurrent_workers < 1:
+            logger.warning(
+                "kanban dispatcher: kanban.max_concurrent_workers=%r is below 1; using 3",
+                raw_max_concurrent_workers,
+            )
+            max_concurrent_workers = 3
+        logger.info(
+            "kanban dispatcher: max_concurrent_workers=%d",
+            max_concurrent_workers,
+        )
 
         # Cap the number of simultaneously running tasks so slow workers
         # (local LLMs, resource-constrained hosts) don't pile up and time
@@ -1461,6 +1481,7 @@ class GatewayKanbanWatchersMixin:
                     conn,
                     board=slug,
                     max_spawn=max_spawn,
+                    max_concurrent_workers=max_concurrent_workers,
                     max_in_progress=max_in_progress,
                     failure_limit=failure_limit,
                     stale_timeout_seconds=stale_timeout_seconds,

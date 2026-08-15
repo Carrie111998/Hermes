@@ -9519,6 +9519,62 @@ def review_dispatch_enabled() -> bool:
         return True
 
 
+def _count_running_workers_across_boards(
+    current_conn: sqlite3.Connection,
+    current_db_path: Path,
+) -> int:
+    """Count running tasks across every active board on this host.
+
+    Sibling boards are opened read-only so a capacity check neither creates a
+    missing database nor runs schema migrations. Unreadable boards raise and
+    let the caller fail closed instead of risking an unbounded worker burst.
+    """
+    current_path = current_db_path.resolve()
+    try:
+        paths = [
+            kanban_db_path(board=meta.get("slug") or DEFAULT_BOARD)
+            for meta in list_boards(include_archived=False)
+        ]
+    except Exception as exc:
+        raise RuntimeError("could not enumerate kanban boards") from exc
+    if all(path.resolve() != current_path for path in paths):
+        paths.append(current_path)
+
+    total = 0
+    seen: set[Path] = set()
+    for path in paths:
+        resolved = path.resolve()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        if resolved == current_path:
+            total += int(
+                current_conn.execute(
+                    "SELECT COUNT(*) FROM tasks "
+                    "WHERE status = 'running' AND worker_pid IS NOT NULL"
+                ).fetchone()[0]
+            )
+            continue
+        if not resolved.is_file():
+            continue
+        try:
+            sibling = sqlite3.connect(
+                resolved.as_uri() + "?mode=ro", uri=True, timeout=1.0
+            )
+            try:
+                total += int(
+                    sibling.execute(
+                        "SELECT COUNT(*) FROM tasks "
+                        "WHERE status = 'running' AND worker_pid IS NOT NULL"
+                    ).fetchone()[0]
+                )
+            finally:
+                sibling.close()
+        except Exception as exc:
+            raise RuntimeError(f"could not read worker count from {resolved}") from exc
+    return total
+
+
 def dispatch_once(
     conn: sqlite3.Connection,
     *,
@@ -9526,6 +9582,7 @@ def dispatch_once(
     ttl_seconds: Optional[int] = None,
     dry_run: bool = False,
     max_spawn: Optional[int] = None,
+    max_concurrent_workers: Optional[int] = None,
     max_in_progress: Optional[int] = None,
     failure_limit: int = DEFAULT_SPAWN_FAILURE_LIMIT,
     stale_timeout_seconds: int = 0,
@@ -9545,9 +9602,10 @@ def dispatch_once(
     ``DispatchResult`` with ``skipped_locked=True`` and does no DB writes;
     the holder is already making progress on the same board.
 
-    The lock is keyed off the board's resolved DB path, so unrelated
-    boards tick in parallel. See :func:`_dispatch_tick_lock` for the
-    cross-process / cross-platform mechanics.
+    When ``max_concurrent_workers`` is set, a second machine-global dispatch
+    lock serializes the count-and-spawn decision across boards and processes.
+    The host-wide budget composes with the per-board and per-profile caps;
+    the strictest limit wins.
     """
     try:
         db_path = kanban_db_path(board=board)
@@ -9571,17 +9629,18 @@ def dispatch_once(
         )
         _fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
         return result
-    with _dispatch_tick_lock(db_path) as held:
-        if not held:
-            result = DispatchResult(skipped_locked=True)
-        else:
-            result = _dispatch_once_locked(
+
+    def _run_board_tick(effective_max_in_progress: Optional[int]) -> DispatchResult:
+        with _dispatch_tick_lock(db_path) as held:
+            if not held:
+                return DispatchResult(skipped_locked=True)
+            board_result = _dispatch_once_locked(
                 conn,
                 spawn_fn=spawn_fn,
                 ttl_seconds=ttl_seconds,
                 dry_run=dry_run,
                 max_spawn=max_spawn,
-                max_in_progress=max_in_progress,
+                max_in_progress=effective_max_in_progress,
                 failure_limit=failure_limit,
                 stale_timeout_seconds=stale_timeout_seconds,
                 board=board,
@@ -9593,7 +9652,42 @@ def dispatch_once(
             # checkpoint (see _maybe_checkpoint_wal; the -wal file size is
             # bounded by journal_size_limit on the writer's natural reset).
             _maybe_checkpoint_wal(conn, db_path)
-    # The dispatch lock has been released here. Fire the tick observer
+            return board_result
+
+    if isinstance(max_concurrent_workers, int) and max_concurrent_workers > 0:
+        global_lock_path = kanban_home() / "kanban" / ".worker-capacity"
+        with _dispatch_tick_lock(global_lock_path) as global_held:
+            if not global_held:
+                result = DispatchResult(skipped_locked=True)
+            else:
+                current_running = int(
+                    conn.execute(
+                        "SELECT COUNT(*) FROM tasks "
+                        "WHERE status = 'running' AND worker_pid IS NOT NULL"
+                    ).fetchone()[0]
+                )
+                try:
+                    global_running = _count_running_workers_across_boards(
+                        conn, db_path
+                    )
+                except Exception as exc:
+                    _log.warning(
+                        "kanban dispatch: host-wide worker count failed (%s); "
+                        "failing closed at max_concurrent_workers=%d",
+                        exc,
+                        max_concurrent_workers,
+                    )
+                    global_running = max_concurrent_workers
+                available = max(0, max_concurrent_workers - global_running)
+                host_board_limit = current_running + available
+                effective_max = host_board_limit
+                if max_in_progress is not None:
+                    effective_max = min(effective_max, max_in_progress)
+                result = _run_board_tick(effective_max)
+    else:
+        result = _run_board_tick(max_in_progress)
+
+    # Both dispatch locks have been released here. Fire the tick observer
     # strictly OUTSIDE the single-writer critical section (#56066 sweeper
     # finding / #64231 disposition): a slow subscriber must never extend
     # the lock hold and stall a sibling dispatcher's tick.
@@ -10561,6 +10655,7 @@ def run_daemon(
     *,
     interval: float = 60.0,
     max_spawn: Optional[int] = None,
+    max_concurrent_workers: Optional[int] = 3,
     failure_limit: int = DEFAULT_SPAWN_FAILURE_LIMIT,
     stop_event=None,
     on_tick=None,
@@ -10598,6 +10693,7 @@ def run_daemon(
                 res = dispatch_once(
                     conn,
                     max_spawn=max_spawn,
+                    max_concurrent_workers=max_concurrent_workers,
                     failure_limit=failure_limit,
                 )
             if on_tick is not None:

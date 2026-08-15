@@ -40,6 +40,7 @@ def test_cli_dispatch_passes_max_in_progress_from_config(isolated_kanban_home, m
     fake_config = {
         "kanban": {
             "max_in_progress": 3,
+            "max_concurrent_workers": 4,
             "max_spawn": 5,
             "default_assignee": "default",
             "max_in_progress_per_profile": 2,
@@ -64,6 +65,7 @@ def test_cli_dispatch_passes_max_in_progress_from_config(isolated_kanban_home, m
     assert captured.get("max_in_progress") == 3, (
         f"CLI must pass kanban.max_in_progress from config; got {captured.get('max_in_progress')!r}"
     )
+    assert captured.get("max_concurrent_workers") == 4
     assert captured.get("max_spawn") == 5, (
         f"CLI must pass kanban.max_spawn from config when --max is not provided; got {captured.get('max_spawn')!r}"
     )
