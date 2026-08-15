@@ -135,6 +135,22 @@ def test_new_worktree_branch_uses_non_main_remote_default(tmp_path):
     assert _git_output(target, "rev-parse", "HEAD") == remote_head
 
 
+def test_new_worktree_branch_prefers_non_main_default_when_main_exists(tmp_path):
+    repo, seed = _make_remote_backed_repo(tmp_path, default_branch="trunk")
+    _git(seed, "switch", "-c", "main")
+    main_head = _commit_file(seed, "main.txt", "main\n", "create main")
+    _git(seed, "push", "origin", "main")
+    _git(seed, "switch", "trunk")
+    remote_head = _commit_file(seed, "remote.txt", "remote\n", "advance trunk")
+    _git(seed, "push", "origin", "trunk")
+    target = repo / ".worktrees" / "new-task"
+
+    kb._ensure_git_worktree(repo, target, "project/new-task")
+
+    assert _git_output(target, "rev-parse", "HEAD") == remote_head
+    assert remote_head != main_head
+
+
 def test_new_worktree_branch_refreshes_dangling_origin_head(tmp_path):
     repo, seed = _make_remote_backed_repo(tmp_path, default_branch="master")
     remote = Path(_git_output(repo, "remote", "get-url", "origin"))

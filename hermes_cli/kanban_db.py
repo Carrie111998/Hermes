@@ -7549,7 +7549,7 @@ def _worktree_base_ref(repo_root: Path) -> str:
         )
         return "HEAD"
 
-    candidates = ["refs/remotes/origin/main"]
+    candidates = []
     try:
         symbolic = subprocess.run(
             [
@@ -7590,6 +7590,7 @@ def _worktree_base_ref(repo_root: Path) -> str:
     except Exception as exc:
         _log.debug("kanban remote default resolution failed: %s", exc)
 
+    candidates.append("refs/remotes/origin/main")
     for candidate in candidates:
         if _is_commit(candidate):
             return candidate
