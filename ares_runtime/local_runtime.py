@@ -304,6 +304,7 @@ class AresLocalRuntime:
 
         environment = os.environ.copy()
         environment["HERMES_HOME"] = str(self.paths.agent_home)
+        environment["ARES_MANAGED_RUNTIME"] = "1"
         return environment
 
     def _managed_npm(self) -> str | None:
@@ -690,6 +691,7 @@ if (config or {}).get('context', {}).get('engine') == 'ri-context-governor':
             "set -euo pipefail\n"
             f"export ARES_HOME={str(self.paths.agent_home)!r}\n"
             f"export HERMES_HOME={str(self.paths.agent_home)!r}\n"
+            "export ARES_MANAGED_RUNTIME=1\n"
             f"export ARES_BIN_DIR={str(self.paths.launcher_path.parent)!r}\n"
             f"runtime_root={str(self.paths.current_link)!r}\n"
             "python=\"$runtime_root/.venv/bin/python\"\n"
@@ -714,6 +716,7 @@ if (config or {}).get('context', {}).get('engine') == 'ri-context-governor':
             "[Service]\n"
             "Type=simple\n"
             f"Environment=HERMES_HOME={self.paths.agent_home}\n"
+            "Environment=ARES_MANAGED_RUNTIME=1\n"
             f"ExecStart={self.paths.launcher_path} gateway foreground\n"
             "Restart=on-failure\n"
             "RestartSec=3\n\n"

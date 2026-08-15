@@ -236,6 +236,7 @@ def test_launcher_resolves_the_selected_runtime_dynamically(tmp_path: Path) -> N
     assert str(runtime.paths.current_link) in launcher
     assert "-m ares_runtime.local_runtime" in launcher
     assert f"export HERMES_HOME={str(runtime.paths.agent_home)!r}" in launcher
+    assert "export ARES_MANAGED_RUNTIME=1" in launcher
     assert "Coding" not in launcher
 
 
@@ -245,6 +246,7 @@ def test_build_environment_is_scoped_to_the_ares_agent_home(tmp_path: Path) -> N
 
     assert environment["HERMES_HOME"] == str(runtime.paths.agent_home)
     assert environment["UV_PROJECT_ENVIRONMENT"] == str(tmp_path / "candidate" / ".venv")
+    assert runtime._agent_environment()["ARES_MANAGED_RUNTIME"] == "1"
 
 
 def test_runtime_build_uses_supported_editable_source_install(
@@ -279,6 +281,7 @@ def test_gateway_unit_uses_the_explicit_foreground_action(tmp_path: Path) -> Non
     unit = runtime.paths.unit_path.read_text(encoding="utf-8")
 
     assert f"ExecStart={runtime.paths.launcher_path} gateway foreground" in unit
+    assert "Environment=ARES_MANAGED_RUNTIME=1" in unit
     assert "TimeoutStopSec=210" in unit
 
 
