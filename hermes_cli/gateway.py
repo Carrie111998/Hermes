@@ -8017,10 +8017,15 @@ def _gateway_command_inner(args):
             # stop_profile_gateway() sends SIGTERM and polls for ~10s; keep
             # escalating no earlier than the service manager's own budget so a
             # slow drain finishes its teardown instead of being SIGKILLed.
-            _wait_for_gateway_exit(
+            # Nothing supervises this path, so an unheeded False here is worse
+            # than on the service branches: run_gateway() below runs the
+            # replacement in the foreground of this very shell.
+            exited = _wait_for_gateway_exit(
                 timeout=_GATEWAY_STOP_WAIT_SECONDS,
                 force_after=_GATEWAY_STOP_GRACE_SECONDS,
             )
+            if not exited:
+                _abort_on_surviving_gateway("restart")
 
             # Start fresh
             print("Starting gateway...")
