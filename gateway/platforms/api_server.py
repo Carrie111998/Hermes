@@ -7452,9 +7452,18 @@ class APIServerAdapter(BasePlatformAdapter):
                         f"different value, then `/platform resume api_server`.",
                         retryable=False,
                     )
+                elif getattr(exc, "errno", None) == errno.EADDRNOTAVAIL:
+                    self._set_fatal_error(
+                        "api_server_address_unavailable",
+                        f"Address {self._host} is not available on this host. Set "
+                        f"platforms.api_server.host in config.yaml to a local "
+                        f"address, then `/platform resume api_server`.",
+                        retryable=False,
+                    )
                 logger.error(
-                    "[%s] Could not bind %s:%d: %s. Set a different port in "
-                    "config.yaml: platforms.api_server.port",
+                    "[%s] Could not bind %s:%d: %s. Check the bind host and "
+                    "port in config.yaml: platforms.api_server.host and "
+                    "platforms.api_server.port",
                     self.name, self._host, self._port, exc,
                 )
                 return False

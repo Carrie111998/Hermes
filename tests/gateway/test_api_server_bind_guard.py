@@ -4,6 +4,7 @@ Validates that is_network_accessible() correctly classifies addresses and
 that connect() refuses to start without API_SERVER_KEY.
 """
 
+import errno
 import socket
 from unittest.mock import patch
 
@@ -111,11 +112,11 @@ class TestBindMechanics:
 
     _KEY = "sk-test-strong-key-0123456789"
 
-    def _make_adapter(self, port: int) -> APIServerAdapter:
+    def _make_adapter(self, port: int, host: str = "127.0.0.1") -> APIServerAdapter:
         return APIServerAdapter(
             PlatformConfig(
                 enabled=True,
-                extra={"host": "127.0.0.1", "port": port, "key": self._KEY},
+                extra={"host": host, "port": port, "key": self._KEY},
             )
         )
 
@@ -170,3 +171,23 @@ class TestBindMechanics:
         finally:
             await first.disconnect()
             await second.disconnect()
+
+    @pytest.mark.asyncio
+    async def test_unavailable_bind_address_sets_non_retryable_fatal_error(self):
+        """An unavailable configured address must not retry forever."""
+        adapter = self._make_adapter(self._free_port(), host="192.168.64.1")
+        try:
+            with patch(
+                "gateway.platforms.api_server.web.TCPSite.start",
+                side_effect=OSError(
+                    errno.EADDRNOTAVAIL, "Cannot assign requested address"
+                ),
+            ):
+                result = await adapter.connect()
+            assert result is False
+            assert adapter.has_fatal_error is True
+            assert adapter.fatal_error_retryable is False
+            assert adapter.fatal_error_code == "api_server_address_unavailable"
+            assert "192.168.64.1" in (adapter.fatal_error_message or "")
+        finally:
+            await adapter.disconnect()
