@@ -95,6 +95,32 @@ def _warn_memory_provider_unavailable(name: str, reason: str = "") -> None:
     )
 
 
+def _external_prefetch_timeout_from_config(mem_config: Any) -> float | None:
+    """Return the optional external-memory recall wait bound from config.
+
+    A malformed profile value must not disable the external-memory provider;
+    returning ``None`` delegates to ``MemoryManager``'s documented default.
+    """
+    if not isinstance(mem_config, dict):
+        return None
+    raw = mem_config.get("external_prefetch_timeout")
+    if raw is None:
+        return None
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        logger.warning(
+            "Ignoring invalid memory.external_prefetch_timeout=%r; using default", raw
+        )
+        return None
+    if value <= 0:
+        logger.warning(
+            "Ignoring non-positive memory.external_prefetch_timeout=%r; using default", raw
+        )
+        return None
+    return value
+
+
 def _ra():
     """Lazy reference to ``run_agent`` so callers can patch
     ``run_agent.OpenAI`` / ``run_agent.cleanup_vm`` / ... and have those
@@ -1751,9 +1777,9 @@ def init_agent(
     # So the built-in store is created unless memory is globally disabled, while
     # the external-provider block below stays gated on skip_memory.
     _memory_toolset_requested = "memory" in (agent.enabled_toolsets or [])
+    mem_config = _agent_cfg.get("memory", {})
     if not skip_memory or _memory_toolset_requested:
         try:
-            mem_config = _agent_cfg.get("memory", {})
             agent._memory_enabled = mem_config.get("memory_enabled", False)
             agent._user_profile_enabled = mem_config.get("user_profile_enabled", False)
             agent._memory_nudge_interval = int(mem_config.get("nudge_interval", 10))
@@ -1779,7 +1805,11 @@ def init_agent(
             if _mem_provider_name and _mem_provider_name.strip():
                 from agent.memory_manager import MemoryManager as _MemoryManager
                 from plugins.memory import load_memory_provider as _load_mem
-                agent._memory_manager = _MemoryManager()
+                agent._memory_manager = _MemoryManager(
+                    external_prefetch_timeout=_external_prefetch_timeout_from_config(
+                        mem_config
+                    )
+                )
                 _mp = _load_mem(_mem_provider_name)
                 if _mp and _mp.is_available():
                     agent._memory_manager.add_provider(_mp)
