@@ -2549,6 +2549,10 @@ def _get_platform_tools(
     # last so it overrides everything above.
     agent_cfg = config.get("agent") or {}
     disabled_toolsets = agent_cfg.get("disabled_toolsets") or []
+    if isinstance(disabled_toolsets, str):
+        from agent.skill_utils import _coerce_list_shaped_string
+
+        disabled_toolsets = _coerce_list_shaped_string(disabled_toolsets)
     if disabled_toolsets:
         disabled_set = {str(ts) for ts in disabled_toolsets}
         enabled_toolsets -= disabled_set

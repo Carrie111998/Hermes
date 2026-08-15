@@ -73,6 +73,112 @@ skills:
     assert parse_count == 1
 
 
+class TestNormalizeStringSetListShapedString:
+    """Regression for issue #86661: a JSON-array or Python-list-shaped
+    string (from `hermes config set` or a JSON-mode editor save, which
+    store the value verbatim rather than as a proper YAML list) was
+    wrapped whole as a single garbage entry instead of parsed, silently
+    disabling nothing."""
+
+    def test_json_double_quote_string_form_is_parsed(self, tmp_path, monkeypatch):
+        """The exact reported repro: skills.disabled: '["browser","web"]'."""
+        from agent import skill_utils
+
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        config_path = hermes_home / "config.yaml"
+        config_path.write_text(
+            'skills:\n  disabled: \'["browser","web"]\'\n',
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        skill_utils._external_dirs_cache_clear()
+        getattr(skill_utils, "_raw_config_cache_clear", lambda: None)()
+
+        assert skill_utils.get_disabled_skill_names() == {"browser", "web"}
+
+    def test_python_single_quote_string_form_is_parsed(self):
+        """The exact reported disabled_toolsets repro shape:
+        "['memory']" -- single-quoted, not valid JSON, but a real Python
+        list literal. ast.literal_eval (not json.loads) is needed here."""
+        from agent.skill_utils import _normalize_string_set
+
+        assert _normalize_string_set("['memory']") == {"memory"}
+
+    def test_plain_scalar_name_still_wraps_as_single_entry(self):
+        """Sanity: the documented single-scalar-means-one-name contract
+        (#13026) must be unchanged for a name that doesn't look like a
+        list."""
+        from agent.skill_utils import _normalize_string_set
+
+        assert _normalize_string_set("my-skill") == {"my-skill"}
+        assert _normalize_string_set("category/my-skill") == {"category/my-skill"}
+
+    def test_empty_list_string_form_disables_nothing_cleanly(self):
+        """The reported "[]" truthiness trap: an empty-list-shaped string
+        must resolve to an actually-empty set, not a truthy garbage
+        single-character-ish entry."""
+        from agent.skill_utils import _normalize_string_set
+
+        assert _normalize_string_set("[]") == set()
+
+    def test_malformed_bracket_string_falls_back_to_single_entry(self):
+        """A string that merely starts with '[' but isn't valid list
+        syntax must not raise -- falls back to the safe single-name
+        wrap, same as before this fix for non-list-shaped strings."""
+        from agent.skill_utils import _normalize_string_set
+
+        assert _normalize_string_set("[not valid python") == {"[not valid python"}
+
+    def test_real_list_input_unaffected(self):
+        """Sanity: the normal, correct YAML-list case (already written
+        by every first-party config writer) is completely unchanged."""
+        from agent.skill_utils import _normalize_string_set
+
+        assert _normalize_string_set(["a", "b"]) == {"a", "b"}
+
+    def test_none_input_unaffected(self):
+        from agent.skill_utils import _normalize_string_set
+
+        assert _normalize_string_set(None) == set()
+
+
+class TestDisabledToolsetsStringForm:
+    """Regression for issue #86661's second stacked bug:
+    agent.disabled_toolsets had no string normalization at all, so a
+    string value was iterated character-by-character into a set of
+    single characters, matching no real toolset name."""
+
+    def test_json_string_form_correctly_disables_toolset(self, tmp_path, monkeypatch):
+        from hermes_cli import tools_config
+
+        config = {
+            "agent": {"disabled_toolsets": '["memory"]'},
+        }
+        enabled = {"memory", "terminal", "browser"}
+        # Exercise the same normalization the real read site now applies.
+        disabled_toolsets = config["agent"].get("disabled_toolsets") or []
+        if isinstance(disabled_toolsets, str):
+            from agent.skill_utils import _coerce_list_shaped_string
+
+            disabled_toolsets = _coerce_list_shaped_string(disabled_toolsets)
+        if disabled_toolsets:
+            enabled -= {str(ts) for ts in disabled_toolsets}
+
+        assert "memory" not in enabled
+        assert enabled == {"terminal", "browser"}
+
+    def test_empty_bracket_string_form_disables_nothing(self):
+        """The reported "[]" truthiness trap for disabled_toolsets
+        specifically: must not silently pass the `if disabled_toolsets:`
+        guard as a non-empty character set."""
+        from agent.skill_utils import _coerce_list_shaped_string
+
+        parsed = _coerce_list_shaped_string("[]")
+        assert parsed == []
+        assert not parsed  # falsy, correctly skips the disable step
+
+
 
 
 
