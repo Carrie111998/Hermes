@@ -2943,9 +2943,14 @@ async function processStartMarker(pid) {
   }
 
   if (IS_WINDOWS) {
+    // -WindowStyle Hidden is redundant with execText's windowsHide:true, but
+    // windowsHide alone is not always reliable for `powershell.exe -Command`
+    // specifically (a known Node/Windows quirk) -- belt-and-suspenders since
+    // this fires up to 3x in rapid succession during every desktop startup.
     const ticks = await execText('powershell.exe', [
       '-NoProfile',
       '-NonInteractive',
+      '-WindowStyle', 'Hidden',
       '-Command',
       `$p = Get-Process -Id ${pid} -ErrorAction Stop; $p.StartTime.ToUniversalTime().Ticks`
     ])
