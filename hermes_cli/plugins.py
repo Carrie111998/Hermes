@@ -2927,6 +2927,60 @@ class PluginContext:
         )
         return handle
 
+    # -- telegram callback handler registration --------------------------------
+
+    def register_telegram_callback_handler(
+        self,
+        prefix: str,
+        callback: Callable,
+    ) -> PluginRegistration:
+        """Register a Telegram inline-button callback handler from a plugin.
+
+        The callback is invoked when ``callback_query.data`` starts with
+        ``prefix``. Handlers may be sync or async and should return a
+        :class:`hermes_cli.plugin_interactions.PluginCallbackResult`,
+        a plain string answer, or ``None``.
+        """
+        if not callable(callback):
+            raise ValueError(
+                f"Plugin '{self.manifest.name}' tried to register a Telegram "
+                f"callback handler with a non-callable callback."
+            )
+        clean_prefix = (prefix or "").strip()
+        if not clean_prefix:
+            raise ValueError(
+                f"Plugin '{self.manifest.name}' tried to register a Telegram "
+                f"callback handler with an empty prefix."
+            )
+        from hermes_cli.plugin_interactions import (
+            RESERVED_TELEGRAM_CALLBACK_PREFIXES,
+            is_reserved_telegram_callback,
+        )
+
+        if is_reserved_telegram_callback(clean_prefix) or any(
+            reserved.startswith(clean_prefix)
+            for reserved in RESERVED_TELEGRAM_CALLBACK_PREFIXES
+        ):
+            raise ValueError(
+                f"Plugin '{self.manifest.name}' cannot register Telegram callback "
+                f"prefix {clean_prefix!r} — reserved for core gateway callbacks."
+            )
+        entry = (clean_prefix, callback, self.manifest.name)
+        self._manager._telegram_callback_handlers.append(entry)
+        handle = self._track(
+            "telegram_callback_handler",
+            clean_prefix,
+            lambda: self._manager._remove_identity(
+                self._manager._telegram_callback_handlers, entry
+            ),
+        )
+        logger.debug(
+            "Plugin %s registered Telegram callback handler: %s",
+            self.manifest.name,
+            clean_prefix,
+        )
+        return handle
+
     # -- hook registration --------------------------------------------------
 
     # -- auxiliary task registration ---------------------------------------
@@ -3437,6 +3491,10 @@ class PluginManager:
         # ``re.Pattern``, or a constraint dict); ``callback`` is an async
         # function with the slack_bolt signature ``(ack, body, action)``.
         self._slack_action_handlers: List[tuple] = []
+        # Telegram inline-button callbacks registered by plugins. Each entry is
+        # (prefix, callback, plugin_name). The Telegram adapter dispatches
+        # callback_query data to the first matching prefix at runtime.
+        self._telegram_callback_handlers: List[tuple] = []
         # Registration handles are kept both per plugin (ownership lookup) and
         # globally (reverse-order teardown for overrides spanning plugins).
         #
@@ -3717,6 +3775,7 @@ class PluginManager:
             self._system_prompt_sections.clear()
             self._approval_transports.clear()
             self._slack_action_handlers.clear()
+            self._telegram_callback_handlers.clear()
             self._context_engine = None
             self._discovered = False
         else:
@@ -5289,6 +5348,27 @@ class PluginManager:
         :meth:`PluginContext.register_slack_action_handler`.
         """
         return list(self._slack_action_handlers)
+
+    def get_telegram_callback_handlers(self) -> List[tuple]:
+        """Return plugin-registered Telegram callback handlers.
+
+        Each entry is a ``(prefix, callback, plugin_name)`` tuple.
+        """
+        return list(self._telegram_callback_handlers)
+
+    async def dispatch_telegram_callback(self, data: str, **kwargs: Any) -> Any:
+        """Dispatch *data* to the first plugin handler with a matching prefix."""
+        from hermes_cli.plugin_interactions import is_reserved_telegram_callback
+
+        if is_reserved_telegram_callback(data):
+            return None
+        for prefix, callback, _plugin_name in self._telegram_callback_handlers:
+            if data.startswith(prefix):
+                result = callback(data, **kwargs)
+                if inspect.isawaitable(result):
+                    result = await result
+                return result
+        return None
 
     # -----------------------------------------------------------------------
     # Introspection

@@ -11273,6 +11273,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     get_plugin_command_handler,
                     resolve_plugin_command_result,
                 )
+                from hermes_cli.plugin_interactions import coerce_plugin_command_text
                 plugin_handler = get_plugin_command_handler(base_cmd.lstrip("/"))
                 if plugin_handler:
                     user_args = cmd_original[len(base_cmd):].strip()
@@ -11280,8 +11281,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                         result = resolve_plugin_command_result(
                             plugin_handler(user_args)
                         )
-                        if result:
-                            _cprint(str(result))
+                        text = coerce_plugin_command_text(result)
+                        if text:
+                            _cprint(text)
                     except Exception as e:
                         _cprint(f"\033[1;31mPlugin command error: {e}{_RST}")
             # Skill bundles take precedence over individual skills — /<bundle>
