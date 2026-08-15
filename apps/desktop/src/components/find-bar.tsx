@@ -90,8 +90,7 @@ export function FindBar() {
     let rafId: null | number = null
     let observedAside: Element | null = null
 
-    const resizeObserver =
-      typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(() => scheduleMeasure())
+    const resizeObserver = typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(() => scheduleMeasure())
 
     const measure = () => {
       rafId = null
@@ -239,10 +238,7 @@ export function FindBar() {
 
   const matchLabel = formatMatchLabel(query, matchOrdinal, matchCount)
 
-  const barStyle =
-    filesPaneRight != null
-      ? { right: `calc(${filesPaneRight}px + 0.75rem)` }
-      : undefined
+  const barStyle = filesPaneRight != null ? { right: `calc(${filesPaneRight}px + 0.75rem)` } : undefined
 
   return (
     <div
