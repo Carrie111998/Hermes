@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import re
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -78,6 +79,19 @@ class ProjectSetupPlan:
     recommendations: tuple[SetupRecommendation, ...]
     not_needed: tuple[str, ...]
     authoritative_sources: tuple[tuple[str, str], ...]
+
+
+@dataclass(frozen=True)
+class ProjectSetupApplyResult:
+    """Result of an explicit apply based only on a freshly analyzed plan."""
+
+    key: str
+    path: Path
+    recommended_count: int
+    created: tuple[str, ...]
+    skipped: tuple[tuple[str, str], ...]
+    had_unrelated_changes: bool
+    plan: ProjectSetupPlan
 
 
 def normalize_project_key(value: str) -> str:
@@ -317,6 +331,157 @@ def render_project_setup_plan(plan: ProjectSetupPlan) -> str:
             ]
         )
     lines.extend(["", "No repository files were changed."])
+    return "\n".join(lines)
+
+
+def _agents_content(plan: ProjectSetupPlan) -> str:
+    """Render compact instructions derived only from the current static plan."""
+    sources = [f"- {source} — {role}" for source, role in plan.authoritative_sources]
+    manifests = [
+        item
+        for item in plan.found
+        if item in {"package.json", "pyproject.toml", "Cargo.toml", "go.mod"}
+        or item.startswith("requirements")
+    ]
+    lines = ["# Agent Instructions", "", "## Project context"]
+    if sources:
+        lines.extend(sources)
+    else:
+        lines.append("- Confirm the repository's authoritative sources before making changes.")
+    if manifests:
+        lines.extend(["", "## Static project evidence", *(f"- {item}" for item in manifests)])
+    lines.extend(
+        [
+            "",
+            "## Working rules",
+            "- Read the listed authoritative sources before changing repository behavior.",
+            "- Keep changes scoped to the requested work and preserve existing conventions.",
+            "",
+            "## Validation",
+            "- Validation commands must be confirmed from repository documentation or manifests before running them.",
+            "",
+            "## Safety",
+            "- Do not overwrite existing repository context files without explicit approval.",
+            "- Do not create branches, commit, or push unless explicitly requested.",
+            "",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _status_content(plan: ProjectSetupPlan) -> str:
+    """Render a static-evidence status note without inferring project state."""
+    evidence = [item for item in plan.found if item not in {"docs/", "docs/STATUS.md"}]
+    lines = [
+        "# Current Status",
+        "",
+        "This snapshot records only static repository context observed during setup.",
+        "Confirm current behavior, priorities, and validation before treating it as project status.",
+    ]
+    if evidence:
+        lines.extend(["", "## Static evidence", *(f"- {item} is present." for item in evidence)])
+    lines.append("")
+    return "\n".join(lines)
+
+
+def _decision_readme_content() -> str:
+    return (
+        "# Decision Records\n\n"
+        "Use this directory for durable technical decisions when the repository needs them.\n"
+        "No decision records were created automatically.\n"
+    )
+
+
+def _write_new_file(path: Path, content: str) -> None:
+    """Atomically create a UTF-8 file without replacing an existing target."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("x", encoding="utf-8") as handle:
+        handle.write(content)
+
+
+def _recommended_writes(plan: ProjectSetupPlan) -> tuple[tuple[str, Path, str], ...]:
+    """Map only known recommended actions to their v1 create-only file targets."""
+    writes: list[tuple[str, Path, str]] = []
+    for recommendation in plan.recommendations:
+        if recommendation.category != "recommended":
+            continue
+        if recommendation.action != "create":
+            raise ValueError(f"unsupported recommended setup action: {recommendation.action}")
+        if recommendation.target == "AGENTS.md":
+            writes.append(("AGENTS.md", plan.path / "AGENTS.md", _agents_content(plan)))
+        elif recommendation.target == "docs/STATUS.md":
+            writes.append(("docs/STATUS.md", plan.path / "docs" / "STATUS.md", _status_content(plan)))
+        elif recommendation.target == "docs/decisions/":
+            writes.append(
+                (
+                    "docs/decisions/README.md",
+                    plan.path / "docs" / "decisions" / "README.md",
+                    _decision_readme_content(),
+                )
+            )
+        else:
+            raise ValueError(f"unsupported recommended setup target: {recommendation.target}")
+    return tuple(writes)
+
+
+def _has_unrelated_worktree_changes(path: Path) -> bool:
+    """Inspect Git status read-only; non-Git directories simply report false."""
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(path), "status", "--porcelain"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        return False
+    return result.returncode == 0 and bool(result.stdout.strip())
+
+
+def apply_project_setup(db, key: str) -> ProjectSetupApplyResult:
+    """Apply the current create-only recommendations without relying on saved plans."""
+    current_plan = analyze_project_setup(db, key)
+    had_unrelated_changes = _has_unrelated_worktree_changes(current_plan.path)
+    writes = _recommended_writes(current_plan)
+    created: list[str] = []
+    skipped: list[tuple[str, str]] = []
+    for label, target, content in writes:
+        try:
+            _write_new_file(target, content)
+        except FileExistsError:
+            skipped.append((label, "target already exists"))
+        else:
+            created.append(label)
+    post_write_plan = analyze_project_setup(db, key)
+    return ProjectSetupApplyResult(
+        key=current_plan.key,
+        path=current_plan.path,
+        recommended_count=len(writes),
+        created=tuple(created),
+        skipped=tuple(skipped),
+        had_unrelated_changes=had_unrelated_changes,
+        plan=post_write_plan,
+    )
+
+
+def render_project_setup_apply_result(result: ProjectSetupApplyResult) -> str:
+    """Render deterministic, explicit output for an authorized setup apply."""
+    if not result.recommended_count:
+        return (
+            f"Project setup analysis: {result.key}\n\n"
+            "No setup changes are currently recommended.\nNothing to apply.\n\n"
+            "No repository files were changed."
+        )
+    lines = [f"Project setup applied: {result.key}", "", "Created:"]
+    lines.extend(f"- {target}" for target in result.created) if result.created else lines.append("- none")
+    lines.extend(["", "Skipped:"])
+    lines.extend(f"- {target} — {reason}" for target, reason in result.skipped)
+    if not result.skipped:
+        lines.append("- none")
+    lines.extend(["", "No existing files were overwritten."])
+    if result.had_unrelated_changes:
+        lines.append("Unrelated working-tree changes already existed and were preserved.")
+    lines.append("Changes remain uncommitted for review.")
     return "\n".join(lines)
 
 

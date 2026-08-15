@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from pathlib import Path
+import subprocess
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, call
 
@@ -14,8 +15,11 @@ from agent.prompt_builder import build_context_files_prompt
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import MessageEvent, MessageType
 from gateway.project_router import (
+    ProjectSetupPlan,
+    SetupRecommendation,
     active_project_path,
     analyze_project_setup,
+    apply_project_setup,
     bootstrap_registry,
     project_keys,
     project_path,
@@ -625,3 +629,201 @@ def test_setup_analysis_detects_readme_variants_and_claude_instruction_conventio
         ("README.rst", "project overview"),
         ("CLAUDE.md", "repository agent instructions"),
     )
+
+
+def test_setup_apply_with_no_recommendations_does_not_mutate(tmp_path):
+    db = SessionDB(db_path=tmp_path / "state.db")
+    project = _make_project(tmp_path, "complete")
+    (project / "docs" / "decisions").mkdir(parents=True)
+    (project / "docs" / "STATUS.md").write_text("# Status\n")
+    register_project(db, str(project))
+    before = _repository_snapshot(project)
+
+    result = apply_project_setup(db, "complete")
+
+    assert result.created == ()
+    assert result.skipped == ()
+    assert result.plan.recommendations == ()
+    assert _repository_snapshot(project) == before
+
+
+@pytest.mark.asyncio
+async def test_project_setup_apply_reports_no_changes_for_empty_current_plan(tmp_path):
+    runner = _runner(tmp_path)
+    runner._handle_message_with_agent = AsyncMock()
+    project = _make_project(tmp_path, "Complete App")
+    (project / "docs" / "decisions").mkdir(parents=True)
+    (project / "docs" / "STATUS.md").write_text("# Status\n")
+    register_project(runner._session_db._db, str(project))
+
+    response = await runner._handle_message(_event("!project setup completeapp --apply"))
+
+    assert response == (
+        "Project setup analysis: completeapp\n\n"
+        "No setup changes are currently recommended.\nNothing to apply.\n\n"
+        "No repository files were changed."
+    )
+
+
+@pytest.mark.asyncio
+async def test_project_setup_apply_renders_deterministic_created_and_skipped_sections(tmp_path):
+    runner = _runner(tmp_path)
+    runner._handle_message_with_agent = AsyncMock()
+    project = _make_project(tmp_path, "Apply App", agents=False)
+    register_project(runner._session_db._db, str(project))
+
+    response = await runner._handle_message(_event("!project setup applyapp --apply"))
+
+    assert response == (
+        "Project setup applied: applyapp\n\nCreated:\n- AGENTS.md\n\nSkipped:\n- none\n\n"
+        "No existing files were overwritten.\nChanges remain uncommitted for review."
+    )
+    assert (project / "AGENTS.md").is_file()
+
+
+def test_setup_apply_creates_recommended_agents_from_static_evidence_without_scripts(tmp_path):
+    db = SessionDB(db_path=tmp_path / "state.db")
+    project = _make_project(tmp_path, "minimal", agents=False)
+    (project / "package.json").write_text('{"scripts":{"prepare":"touch executed"}}\n')
+    register_project(db, str(project))
+
+    result = apply_project_setup(db, "minimal")
+
+    assert result.created == ("AGENTS.md",)
+    assert result.skipped == ()
+    content = (project / "AGENTS.md").read_text()
+    assert "# Agent Instructions" in content
+    assert "README.md" in content
+    assert "package.json" in content
+    assert "must be confirmed" in content
+    assert not (project / "executed").exists()
+    assert all(item.target != "AGENTS.md" for item in result.plan.recommendations)
+
+
+def test_setup_apply_reanalyzes_and_never_overwrites_agents_created_after_a_stale_plan(tmp_path):
+    db = SessionDB(db_path=tmp_path / "state.db")
+    project = _make_project(tmp_path, "stale", agents=False)
+    register_project(db, str(project))
+    stale_plan = analyze_project_setup(db, "stale")
+    assert any(item.target == "AGENTS.md" for item in stale_plan.recommendations)
+    agents = project / "AGENTS.md"
+    agents.write_text("# Existing instructions\n")
+
+    result = apply_project_setup(db, "stale")
+
+    assert result.created == ()
+    assert agents.read_text() == "# Existing instructions\n"
+    assert result.plan.recommendations == ()
+
+
+def test_setup_apply_creates_only_recommended_status_file(tmp_path):
+    db = SessionDB(db_path=tmp_path / "state.db")
+    project = _make_project(tmp_path, "status")
+    (project / "docs").mkdir()
+    register_project(db, str(project))
+
+    result = apply_project_setup(db, "status")
+
+    assert result.created == ("docs/STATUS.md",)
+    assert (project / "docs" / "STATUS.md").read_text().startswith("# Current Status\n")
+    assert not (project / "docs" / "decisions").exists()
+    assert all(item.target != "docs/STATUS.md" for item in result.plan.recommendations)
+
+
+def test_setup_apply_creates_decision_scaffold_only_when_recommended(tmp_path):
+    db = SessionDB(db_path=tmp_path / "state.db")
+    project = _make_project(tmp_path, "decisions")
+    (project / "CONTRIBUTING.md").write_text("# Contributing\n")
+    (project / "package.json").write_text("{}\n")
+    (project / "docs").mkdir()
+    register_project(db, str(project))
+
+    result = apply_project_setup(db, "decisions")
+
+    assert result.created == ("docs/STATUS.md", "docs/decisions/README.md")
+    assert (project / "docs" / "decisions" / "README.md").is_file()
+    assert not list((project / "docs" / "decisions").glob("[0-9]*"))
+    assert result.plan.recommendations == ()
+
+
+def test_setup_apply_refuses_a_target_that_appears_after_current_analysis(tmp_path, monkeypatch):
+    import gateway.project_router as project_router
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    project = _make_project(tmp_path, "race", agents=False)
+    register_project(db, str(project))
+    original_write = project_router._write_new_file
+
+    def create_conflict(path, content):
+        if path.name == "AGENTS.md":
+            path.write_text("# Concurrent instructions\n")
+        return original_write(path, content)
+
+    monkeypatch.setattr(project_router, "_write_new_file", create_conflict)
+    result = apply_project_setup(db, "race")
+
+    assert result.created == ()
+    assert result.skipped == (("AGENTS.md", "target already exists"),)
+    assert (project / "AGENTS.md").read_text() == "# Concurrent instructions\n"
+
+
+def test_setup_apply_never_applies_non_recommended_items(tmp_path, monkeypatch):
+    import gateway.project_router as project_router
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    project = _make_project(tmp_path, "categories", agents=False)
+    register_project(db, str(project))
+    plan = ProjectSetupPlan(
+        key="categories",
+        path=project,
+        found=(),
+        recommendations=(
+            SetupRecommendation("create", "AGENTS.md", "not selected", "optional"),
+            SetupRecommendation("create", "docs/STATUS.md", "not selected", "found"),
+        ),
+        not_needed=(),
+        authoritative_sources=(),
+    )
+    monkeypatch.setattr(project_router, "analyze_project_setup", lambda _db, _key: plan)
+
+    result = apply_project_setup(db, "categories")
+
+    assert result.created == ()
+    assert not (project / "AGENTS.md").exists()
+    assert not (project / "docs").exists()
+
+
+def test_setup_apply_preserves_unrelated_existing_repository_changes(tmp_path):
+    db = SessionDB(db_path=tmp_path / "state.db")
+    project = _make_project(tmp_path, "unrelated", agents=False)
+    unrelated = project / "notes.txt"
+    unrelated.write_text("uncommitted local note\n")
+    register_project(db, str(project))
+
+    result = apply_project_setup(db, "unrelated")
+
+    assert result.created == ("AGENTS.md",)
+    assert unrelated.read_text() == "uncommitted local note\n"
+
+
+def test_setup_apply_preserves_unrelated_git_changes_without_staging_or_branch_mutation(tmp_path):
+    db = SessionDB(db_path=tmp_path / "state.db")
+    project = _make_project(tmp_path, "git-unrelated", agents=False)
+    subprocess.run(["git", "init", "-q"], cwd=project, check=True)
+    subprocess.run(["git", "config", "user.email", "tests@example.invalid"], cwd=project, check=True)
+    subprocess.run(["git", "config", "user.name", "Test User"], cwd=project, check=True)
+    subprocess.run(["git", "add", "README.md"], cwd=project, check=True)
+    subprocess.run(["git", "commit", "-qm", "initial"], cwd=project, check=True)
+    unrelated = project / "local-note.txt"
+    unrelated.write_text("preserve me\n")
+    branch_before = subprocess.check_output(["git", "branch", "--show-current"], cwd=project, text=True)
+    head_before = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=project, text=True)
+    register_project(db, str(project))
+
+    result = apply_project_setup(db, "gitunrelated")
+
+    assert result.had_unrelated_changes is True
+    assert unrelated.read_text() == "preserve me\n"
+    assert subprocess.check_output(["git", "branch", "--show-current"], cwd=project, text=True) == branch_before
+    assert subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=project, text=True) == head_before
+    assert subprocess.run(["git", "diff", "--cached", "--quiet"], cwd=project).returncode == 0

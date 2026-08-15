@@ -16168,10 +16168,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             from gateway.project_router import (
                 active_project,
                 analyze_project_setup,
+                apply_project_setup,
                 clear_project,
                 project_keys,
                 project_path,
                 register_project,
+                render_project_setup_apply_result,
                 render_project_setup_plan,
                 select_project,
             )
@@ -16198,11 +16200,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 return "\n".join(lines)
             if action == "setup":
-                try:
-                    plan = analyze_project_setup(self._session_db._db, remainder.strip())
-                except ValueError as exc:
-                    return f"Project setup failed: {exc}"
-                return render_project_setup_plan(plan)
+                setup_args = remainder.split()
+                if len(setup_args) == 1:
+                    try:
+                        plan = analyze_project_setup(self._session_db._db, setup_args[0])
+                    except ValueError as exc:
+                        return f"Project setup failed: {exc}"
+                    return render_project_setup_plan(plan)
+                if len(setup_args) == 2 and setup_args[1] == "--apply":
+                    try:
+                        result = apply_project_setup(self._session_db._db, setup_args[0])
+                    except ValueError as exc:
+                        return f"Project setup failed: {exc}"
+                    return render_project_setup_apply_result(result)
+                return "Project setup failed: usage: !project setup <key> [--apply]"
             if action == "add":
                 try:
                     project = register_project(self._session_db._db, remainder.strip())
