@@ -41,6 +41,9 @@ const STATUS_LABEL: Record<string, string> = {
 const CTRL_OFFSET = 96
 
 const SOURCE_LABEL_WIDTH = 6
+// Rendered in an 8-wide Box below — the extra 2 chars are the same
+// inter-column gap the other fixed-width columns in this table use, not a
+// truncation mismatch.
 
 const shortModel = (model = '') => model.replace(/^.*\//, '') || 'model?'
 const ctrlChar = (letter: string) => String.fromCharCode(letter.charCodeAt(0) - CTRL_OFFSET)
