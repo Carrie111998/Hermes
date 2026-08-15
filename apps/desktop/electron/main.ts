@@ -6077,9 +6077,11 @@ function installContextMenu(window, { composerEnabled = true }: { composerEnable
         {
           canCompose: composerEnabled,
           isEditable,
-          selectionText: params.selectionText
+          selectionText: params.selectionText,
+          x: params.x,
+          y: params.y
         },
-        text => window.webContents.send('hermes:composer:append-selection', text),
+        payload => window.webContents.send('hermes:composer:append-selection', payload),
         message => rememberLog(`composer append-selection send failed: ${message}`)
       )
 
@@ -9851,7 +9853,11 @@ const wakeIndicatorController = createWakeIndicatorWindowController({
   log: rememberLog,
   preloadPath: PRELOAD_PATH,
   rendererIndex: resolveRendererIndex,
-  wireWindow: window => wireCommonWindowHandlers(window, zoomWiringForWindowKind('wakeIndicator'))
+  wireWindow: window =>
+    wireCommonWindowHandlers(window, {
+      ...zoomWiringForWindowKind('wakeIndicator'),
+      composerEnabled: false
+    })
 })
 
 // The pet overlay: a single transparent, frameless, always-on-top window that

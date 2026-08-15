@@ -10,6 +10,7 @@ import { useStore } from '@nanostores/react'
 import { type FC, useCallback, useMemo, useState } from 'react'
 
 import { insertMessageReply } from '@/app/chat/composer/message-reply'
+import { useComposerScope } from '@/app/chat/composer/scope'
 import { ChangedFilesCard } from '@/components/assistant-ui/thread/changed-files-card'
 import {
   contentHasVisibleText,
@@ -28,7 +29,16 @@ import { Codicon } from '@/components/ui/codicon'
 import { CopyButton } from '@/components/ui/copy-button'
 import { useI18n } from '@/i18n'
 import { triggerHaptic } from '@/lib/haptics'
-import { AudioLines, GitForkIcon, Loader2Icon, RefreshCwIcon, SmilePlusIcon, VolumeXIcon, XIcon } from '@/lib/icons'
+import {
+  AudioLines,
+  GitForkIcon,
+  Loader2Icon,
+  MessageReplyIcon,
+  RefreshCwIcon,
+  SmilePlusIcon,
+  VolumeXIcon,
+  XIcon
+} from '@/lib/icons'
 import { extractPreviewTargets } from '@/lib/preview-targets'
 import { formatAgo } from '@/lib/time'
 import { useEnterAnimation } from '@/lib/use-enter-animation'
@@ -237,6 +247,7 @@ export const AssistantMessage: FC<{
 const AssistantActionBar: FC<MessageActionProps> = ({ messageId, getMessageText, onBranchInNewChat }) => {
   const { t } = useI18n()
   const copy = t.assistant.thread
+  const { target } = useComposerScope()
 
   const [pickerOpen, setPickerOpen] = useState(false)
   const { enabled: reactionsEnabled, react, reactions: shownReactions } = useMessageReactions(messageId, 'assistant')
@@ -250,10 +261,10 @@ const AssistantActionBar: FC<MessageActionProps> = ({ messageId, getMessageText,
   )
 
   const reply = useCallback(() => {
-    if (insertMessageReply(getMessageText())) {
+    if (insertMessageReply(getMessageText(), { target })) {
       triggerHaptic('selection')
     }
-  }, [getMessageText])
+  }, [getMessageText, target])
 
   return (
     <div className="relative flex w-full shrink-0 items-center justify-end gap-1.5">
@@ -285,7 +296,7 @@ const AssistantActionBar: FC<MessageActionProps> = ({ messageId, getMessageText,
         <CopyButton appearance="icon" buttonSize="icon" label={copy.copy} text={getMessageText} />
         {!isWatchWindow() && (
           <TooltipIconButton onClick={reply} tooltip={copy.reply}>
-            <Codicon name="reply" />
+            <MessageReplyIcon />
           </TooltipIconButton>
         )}
         <ReadAloudButton getText={getMessageText} messageId={messageId} />
