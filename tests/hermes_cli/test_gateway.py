@@ -13,6 +13,20 @@ import pytest
 import hermes_cli.gateway as gateway
 
 
+def _isolate_reaper_runtime(monkeypatch, kill, *, monotonic=lambda: 1.0):
+    """Patch gateway process primitives without mutating shared stdlib modules."""
+    monkeypatch.setattr(
+        gateway,
+        "os",
+        SimpleNamespace(getpid=os.getpid, kill=kill),
+    )
+    monkeypatch.setattr(
+        gateway,
+        "time",
+        SimpleNamespace(sleep=lambda _: None, monotonic=monotonic),
+    )
+
+
 def _install_fake_gateway_run(monkeypatch, start_gateway):
     module = ModuleType("gateway.run")
     module.start_gateway = start_gateway
@@ -606,11 +620,11 @@ class TestReapUnsupervisedGatewayOrphansWindows:
         )
 
         killed_pids = []
-        monkeypatch.setattr(gateway.os, "kill", lambda pid, sig: killed_pids.append((pid, sig)))
+        _isolate_reaper_runtime(
+            monkeypatch, lambda pid, sig: killed_pids.append((pid, sig))
+        )
         monkeypatch.setattr("gateway.status._pid_exists", lambda pid: False)
         monkeypatch.setattr("gateway.status.write_planned_stop_marker", lambda pid: None)
-        monkeypatch.setattr("time.sleep", lambda _: None)
-        monkeypatch.setattr("time.monotonic", lambda: 1.0)
 
         result = gateway._reap_unsupervised_gateway_orphans()
 
@@ -649,7 +663,9 @@ class TestReapUnsupervisedGatewayOrphansWindows:
         )
 
         killed_pids = []
-        monkeypatch.setattr(gateway.os, "kill", lambda pid, sig: killed_pids.append((pid, sig)))
+        _isolate_reaper_runtime(
+            monkeypatch, lambda pid, sig: killed_pids.append((pid, sig))
+        )
 
         result = gateway._reap_unsupervised_gateway_orphans()
 
@@ -714,11 +730,11 @@ class TestReaperCandidateIsSupervisorOwned:
         )
 
         killed_pids = []
-        monkeypatch.setattr(gateway.os, "kill", lambda pid, sig: killed_pids.append((pid, sig)))
+        _isolate_reaper_runtime(
+            monkeypatch, lambda pid, sig: killed_pids.append((pid, sig))
+        )
         monkeypatch.setattr("gateway.status._pid_exists", lambda pid: False)
         monkeypatch.setattr("gateway.status.write_planned_stop_marker", lambda pid: None)
-        monkeypatch.setattr("time.sleep", lambda _: None)
-        monkeypatch.setattr("time.monotonic", lambda: 1.0)
 
         result = gateway._reap_unsupervised_gateway_orphans()
 
@@ -754,11 +770,11 @@ class TestReaperCandidateIsSupervisorOwned:
         )
 
         killed_pids = []
-        monkeypatch.setattr(gateway.os, "kill", lambda pid, sig: killed_pids.append((pid, sig)))
+        _isolate_reaper_runtime(
+            monkeypatch, lambda pid, sig: killed_pids.append((pid, sig))
+        )
         monkeypatch.setattr("gateway.status._pid_exists", lambda pid: False)
         monkeypatch.setattr("gateway.status.write_planned_stop_marker", lambda pid: None)
-        monkeypatch.setattr("time.sleep", lambda _: None)
-        monkeypatch.setattr("time.monotonic", lambda: 1.0)
 
         result = gateway._reap_unsupervised_gateway_orphans()
 
@@ -837,7 +853,9 @@ class TestWindowsScheduledTaskSupervisorGuard:
 
         monkeypatch.setattr(gateway, "find_gateway_pids", _boom_find_gateway_pids)
         killed_pids = []
-        monkeypatch.setattr(gateway.os, "kill", lambda pid, sig: killed_pids.append((pid, sig)))
+        _isolate_reaper_runtime(
+            monkeypatch, lambda pid, sig: killed_pids.append((pid, sig))
+        )
 
         result = gateway._reap_unsupervised_gateway_orphans()
 
@@ -865,11 +883,11 @@ class TestWindowsScheduledTaskSupervisorGuard:
             ],
         )
         killed_pids = []
-        monkeypatch.setattr(gateway.os, "kill", lambda pid, sig: killed_pids.append((pid, sig)))
+        _isolate_reaper_runtime(
+            monkeypatch, lambda pid, sig: killed_pids.append((pid, sig))
+        )
         monkeypatch.setattr("gateway.status._pid_exists", lambda pid: False)
         monkeypatch.setattr("gateway.status.write_planned_stop_marker", lambda pid: None)
-        monkeypatch.setattr("time.sleep", lambda _: None)
-        monkeypatch.setattr("time.monotonic", lambda: 1.0)
 
         result = gateway._reap_unsupervised_gateway_orphans()
 
