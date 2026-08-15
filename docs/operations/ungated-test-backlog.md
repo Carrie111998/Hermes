@@ -49,11 +49,39 @@ Terminal exception per failing file:
 
 Cross-cut by signature, the themes that actually matter:
 
-* **~39 files — Windows path/separator handling.** The largest single theme,
-  and the same family as the `shlex.split` POSIX-mode bug fixed in `ee2475a98b`
-  (backslashes eaten, so a Windows path silently becomes a different string).
-  This is where real production bugs are most likely to be hiding, not just
-  test-portability noise.
+* **The bulk — POSIX-only tests running on Windows.** Corrected 2026-08-14
+  after sampling the real failures rather than pattern-matching the log. A
+  first pass guessed "~39 files, Windows path/separator handling, most likely
+  to hide real production bugs". Re-running `tests/hermes_cli` and reading the
+  actual assertions says otherwise — the dominant failures are POSIX
+  assumptions the platform cannot satisfy:
+
+      ModuleNotFoundError: No module named 'pwd'
+      assert mode & stat.S_IRUSR        # Unix permission bits
+      assert not (33206 & 32)           # 0o100666
+      ✗ error: [WinError 193] %1 is not a valid Win32 application   # .sh hook
+
+  In every one of those the production code is behaving correctly and the test
+  cannot express Windows semantics. `test_hooks_cli.py` is the clearest case:
+  it installs `.sh` hooks, and Windows rightly refuses to execute them.
+  The fix for these is a platform skip, not a code change — and the suite
+  already has that convention (26 files use a `skipif` on `os.name`/
+  `sys.platform`, 10 of them inside `tests/hermes_cli` itself).
+
+  Method note: two different regex signatures over the same log produced "39
+  files" and then "81 files". Neither number was trustworthy. Cluster counts
+  mined out of a log are a hypothesis; run the tests and read the assertions
+  before believing one.
+
+* **One confirmed production bug, found this way — see `atomic_replace`.**
+  The cluster was still worth mining: `utils.py::atomic_replace` handled only
+  `EXDEV`/`EBUSY` and propagated Windows' `EACCES` (WinError 5), so
+  `atomic_json_write` was **not atomic under concurrency on Windows** — 3 of 10
+  concurrent writers lost their write. Exposed callers are ordinary runtime
+  paths (`hermes_cli/main.py`, `hermes_cli/web_server.py`,
+  `events/cluster_detector.py`, `gateway/channel_directory.py`,
+  `gateway/drain_control.py`). Fixed with a bounded, Windows-only retry.
+  Ratio so far: one real defect per ~40 files inspected.
 * **13 files — live network calls.** Tests reaching real sockets;
   `tests/agent/test_verification_stop_caching.py` hangs in `sock.connect`
   through `detect_local_server_type` → `httpx` when no local LLM server is up.
@@ -67,9 +95,15 @@ Cross-cut by signature, the themes that actually matter:
 
 ## Before fixing any of it
 
-1. **Freeze a baseline.** Re-run the command above and commit the failing-file
-   list. Without it there is no way to tell a fix from a reshuffle, and no way
-   to detect new breakage in this set.
+1. **Freeze a baseline.** Done — `ungated-test-baseline-20260814.tsv`
+   (135 files / 397 tests at `035802cd67`). Regenerate and diff to tell a fix
+   from a reshuffle.
+
+   **Read per-file counts as approximate.** They are harness- and
+   order-dependent, because the harness omits `-p no:randomly`.
+   `tests/test_atomic_replace_symlinks.py` is recorded as 1 there and reports 5
+   under a direct run — with and without any local change, verified by
+   reverting. Treat the *file list* as the signal and the counts as a hint.
 2. **Decide whether to gate it.** These stay invisible until something watches
    them. Widening `_pytest_argv` is the obvious move but not a free one — read
    its docstring first: the gate already lives inside a tuned budget, and the
