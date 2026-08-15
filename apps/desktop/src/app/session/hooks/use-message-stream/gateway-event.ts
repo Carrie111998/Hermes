@@ -555,8 +555,12 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
                 }
               }
 
-              if (state.awaitingResponse && !state.sawAssistantPayload) {
-                return state.needsInput ? { ...state, needsInput: false } : state
+              // A running=false snapshot can race ahead of a freshly submitted
+              // turn, so keep waiting until the first assistant payload. A
+              // blocking prompt is itself proof that the turn advanced; once
+              // that prompt's terminal edge arrives, settle the whole runtime.
+              if (state.awaitingResponse && !state.sawAssistantPayload && !state.needsInput) {
+                return state
               }
 
               return {

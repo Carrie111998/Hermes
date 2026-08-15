@@ -147,6 +147,8 @@ describe('turn end without message.complete (session.info running=false)', () =>
 
     expect(sessionApprovalRequest(SID).get()).toBeNull()
     expect(sessionApprovalRequest(OTHER_SID).get()?.command).toBe('rm other')
+    expect(states.get(SID)?.awaitingResponse).toBe(false)
+    expect(states.get(SID)?.busy).toBe(false)
     expect(states.get(SID)?.needsInput).toBe(false)
   })
 })
