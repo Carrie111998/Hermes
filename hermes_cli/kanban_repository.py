@@ -16,12 +16,14 @@ import shutil
 import subprocess
 import tempfile
 import time
+import urllib.error
+import urllib.request
 import uuid
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
 from types import MappingProxyType
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 
 FULL_SHA = re.compile(r"[0-9a-f]{40}")
@@ -1797,6 +1799,138 @@ def observe_target_heads(
         remote_name=remote_name,
         remote_available=remote_available,
     )
+
+
+def _http_observe_get(url: str, *, timeout: int = 30) -> dict[str, object] | None:
+    """Run one bounded, strictly read-only HTTP GET observation.
+
+    This seam exists so CI-observation tests can substitute a fake
+    transport and prove that the observation path never issues a write
+    verb (GET only, no POST/PATCH/DELETE/PUT).  Returns the parsed JSON
+    dict or ``None`` on any failure (timeout, non-200, malformed JSON,
+    network error) — callers treat ``None`` as "unavailable".
+    """
+
+    try:
+        req = urllib.request.Request(
+            url,
+            method="GET",
+            headers={"Accept": "application/vnd.github+json"},
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            if resp.status != 200:
+                return None
+            raw = resp.read()
+            data = json.loads(raw.decode("utf-8"))
+    except (OSError, urllib.error.URLError, ValueError, LookupError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    return cast(dict[str, object], data)
+
+
+def observe_ci_workflow_runs(
+    repo_root: Path,
+    *,
+    base_ref: str,
+    workflows: tuple[str, ...],
+    head_sha: str,
+) -> dict[str, str | None] | None:
+    """Observe the latest GitHub Actions run conclusion for each required
+    workflow at an exact head SHA.
+
+    The GitHub repository owner and name are derived from the configured
+    remote URL via ``git remote get-url`` — strictly read-only; no remote
+    write verb is ever issued.  Each workflow name is matched against the
+    ``workflow_runs`` returned by the GET to
+    ``/repos/{owner}/{repo}/actions/runs?head_sha=<sha>`` and the latest
+    run's ``conclusion`` is returned (``success``, ``failure``,
+    ``cancelled``, ``timed_out``, ``None`` for queued/in_progress, or
+    the key is absent when no run exists for that workflow).
+
+    Returns ``None`` (not a dict) when the remote URL or CI provider
+    cannot be reached — callers treat this as "unavailable".
+    """
+
+    root = Path(repo_root).expanduser().resolve(strict=False)
+    if not isinstance(head_sha, str) or FULL_SHA.fullmatch(head_sha) is None:
+        raise _error("malformed_head_sha")
+    if (
+        not isinstance(base_ref, str)
+        or not base_ref.startswith("refs/remotes/")
+        or base_ref != base_ref.strip()
+        or "\x00" in base_ref
+    ):
+        raise _error("malformed_base_ref")
+    remote_path = base_ref[len("refs/remotes/") :]
+    if (
+        not remote_path
+        or "/" not in remote_path
+        or remote_path.split("/", 1)[0] in {"", "."}
+    ):
+        raise _error("malformed_base_ref")
+
+    remote_name = remote_path.split("/", 1)[0]
+    remote_url: str | None = None
+    result = _remote_observe_git(root, "remote", "get-url", remote_name)
+    if result is not None and result.returncode == 0:
+        url_text = (result.stdout or "").strip()
+        if url_text:
+            remote_url = url_text
+
+    if remote_url is None:
+        return None
+
+    owner: str | None = None
+    repo: str | None = None
+    # Parse GitHub URLs: git@github.com:owner/repo.git or https://github.com/owner/repo
+    ssh_match = re.match(r"^git@github\.com:([^/]+)/([^/\s]+?)(\.git)?$", remote_url)
+    https_match = re.match(
+        r"^https://github\.com/([^/]+)/([^/\s]+?)(\.git)?$", remote_url
+    )
+    if ssh_match:
+        owner = ssh_match.group(1)
+        repo = ssh_match.group(2)
+    elif https_match:
+        owner = https_match.group(1)
+        repo = https_match.group(2)
+
+    if not owner or not repo:
+        return None
+
+    api_url = (
+        f"https://api.github.com/repos/{owner}/{repo}/actions/runs"
+        f"?head_sha={head_sha}&per_page=100"
+    )
+    data = _http_observe_get(api_url)
+    if data is None:
+        return None
+
+    workflow_runs = data.get("workflow_runs")
+    if not isinstance(workflow_runs, list):
+        return None
+
+    conclusions: dict[str, str | None] = {}
+    for workflow in workflows:
+        if not workflow or not isinstance(workflow, str):
+            continue
+        # The API returns runs newest-first, so the first name match is the
+        # latest run for that workflow.  An absent workflow keeps ``None``
+        # (treated by callers as queued/no-run, i.e. still pending).
+        latest: dict[str, object] | None = None
+        for run in workflow_runs:
+            if isinstance(run, dict) and run.get("name") == workflow:
+                latest = run
+                break
+        if latest is None:
+            conclusions[workflow] = None
+        else:
+            conclusion = latest.get("conclusion")
+            conclusions[workflow] = (
+                str(conclusion) if isinstance(conclusion, str) else None
+            )
+
+    return conclusions
 
 
 def _refresh_git(

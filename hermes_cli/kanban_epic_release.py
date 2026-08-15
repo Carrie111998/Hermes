@@ -64,6 +64,15 @@ class EpicReleaseHandoffError(RuntimeError):
         super().__init__(self.code)
 
 
+class EpicReleaseCIObservationError(RuntimeError):
+    """Typed refusal while observing CI for an Epic release snapshot."""
+
+    def __init__(self, code: str, evidence: Mapping[str, object] | None = None):
+        self.code = str(code)
+        self.evidence = dict(evidence or {})
+        super().__init__(self.code)
+
+
 @dataclass(frozen=True)
 class EpicReleaseSnapshot:
     id: int
@@ -129,6 +138,52 @@ class EpicReleaseHandoff:
     remote_name: str
     action: str
     checked_at: int
+
+
+@dataclass(frozen=True)
+class EpicReleaseCIObservation:
+    """Typed outcome of one bounded, read-only exact-SHA CI observation.
+
+    ``kind`` is one of:
+
+    * ``released`` — the exact ``release_candidate_sha`` is confirmed on
+      the remote target and every required workflow passed: the snapshot
+      row was atomically flipped to ``released`` with typed audit
+      evidence, then the exact release-candidate ref was deleted only
+      when it still pinned the recorded SHA.
+    * ``ci_pending`` — the candidate is not yet pushed (``pushed_sha`` is
+      absent) or its workflows are still queued/running; the snapshot is
+      preserved untouched.
+    * ``ci_failed`` — the exact candidate is pushed but a required
+      workflow failed, was cancelled, or timed out; the snapshot is
+      preserved and manual recovery stays available.  A later same-SHA
+      observation where every workflow passes releases.
+    * ``invalidated`` — proven authority drift or a remote head that
+      moved away from the recorded candidate SHA: the snapshot was
+      atomically marked ``invalidated`` with typed audit evidence and the
+      exact release-candidate ref was deleted when it still pinned the
+      recorded SHA.
+    * ``missing`` — no active snapshot exists for the epic; nothing to do.
+    * ``unavailable`` — the remote target or CI provider cannot be
+      observed right now; the snapshot is preserved untouched.
+
+    Every path is strictly read-only against the CI provider (HTTP GET
+    only) and against Git (``rev-parse``/``ls-remote`` only): no rerun,
+    cancel, merge, push, or update-remote primitive is ever issued.
+    """
+
+    kind: Literal[
+        "released",
+        "ci_pending",
+        "ci_failed",
+        "invalidated",
+        "missing",
+        "unavailable",
+    ]
+    snapshot: EpicReleaseSnapshot | None
+    evidence: Mapping[str, object]
+    candidate_ref_deleted: bool
+    pushed_sha: str | None
 
 
 @dataclass(frozen=True)

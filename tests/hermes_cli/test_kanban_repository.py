@@ -28,6 +28,7 @@ from hermes_cli.kanban_repository import (
     inspect_evidence_workspace,
     inspect_prepared_candidate_ref,
     load_repository_contract,
+    observe_ci_workflow_runs,
     observe_target_heads,
     refresh_story_branch,
     resolve_commit,
@@ -1658,3 +1659,214 @@ def test_observe_target_heads_rejects_malformed_target_branch_and_base_ref(
         )
 
     assert exc_info.value.code == code
+
+
+# ---------------------------------------------------------------------------
+# E06B — Read-only exact-SHA CI observation (workflow runs)
+# ---------------------------------------------------------------------------
+
+
+def test_observe_ci_workflow_runs_read_only_get_maps_latest_run_conclusions(
+    repository: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    local_sha = _git(repository, "rev-parse", "HEAD")
+    git_calls: list[tuple[str, ...]] = []
+    get_urls: list[str] = []
+
+    def fake_observe(path: Path, *args: str):
+        git_calls.append(args)
+        assert args == ("remote", "get-url", "origin")
+        return subprocess.CompletedProcess(
+            ["git", *args], 0, "git@github.com:acme/widgets.git\n", ""
+        )
+
+    def fake_get(url: str, *, timeout: int = 30):
+        get_urls.append(url)
+        return {
+            "workflow_runs": [
+                # Newest-first ordering: the first name match is the latest.
+                {"name": "CI", "conclusion": "success"},
+                {"name": "Deploy Test", "conclusion": "failure"},
+                {"name": "CI", "conclusion": "failure"},
+            ]
+        }
+
+    monkeypatch.setattr(repository_module, "_remote_observe_git", fake_observe)
+    monkeypatch.setattr(repository_module, "_http_observe_get", fake_get)
+
+    conclusions = observe_ci_workflow_runs(
+        repository,
+        base_ref="refs/remotes/origin/main",
+        workflows=("CI", "Deploy Test"),
+        head_sha=local_sha,
+    )
+
+    assert conclusions == {"CI": "success", "Deploy Test": "failure"}
+    assert git_calls == [("remote", "get-url", "origin")]
+    assert get_urls == [
+        "https://api.github.com/repos/acme/widgets/actions/runs"
+        f"?head_sha={local_sha}&per_page=100"
+    ]
+
+
+def test_observe_ci_workflow_runs_read_only_fake_transport_refuses_every_write_primitive(
+    repository: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    """The CI observation path never issues a write verb before subprocess.
+
+    A fake transport stands in for both boundaries (Git and HTTP): any
+    push/fetch/merge/update-ref/checkout/tag/worktree Git verb or any
+    rerun/cancel/dispatch URL primitive raises immediately, proving the
+    production path never even attempts one.  The observation completes
+    with one read-only ``remote get-url`` and one GET.
+    """
+
+    local_sha = _git(repository, "rev-parse", "HEAD")
+    forbidden_git = (
+        "push",
+        "fetch",
+        "pull",
+        "update-ref",
+        "merge",
+        "reset",
+        "clean",
+        "checkout",
+        "switch",
+        "branch",
+        "tag",
+        "worktree",
+        "stash",
+        "gc",
+        "prune",
+        "clone",
+    )
+    forbidden_url = ("rerun", "cancel", "dispatches", "/merge", "/push")
+
+    def fake_observe(path: Path, *args: str):
+        assert not any(verb in args for verb in forbidden_git), (
+            f"git write verb attempted before subprocess: {args}"
+        )
+        if args[:2] == ("remote", "get-url"):
+            return subprocess.CompletedProcess(
+                ["git", *args], 0, "https://github.com/acme/widgets.git\n", ""
+            )
+        raise AssertionError(f"unexpected Git observation: {args}")
+
+    def fake_get(url: str, *, timeout: int = 30):
+        assert not any(verb in url for verb in forbidden_url), (
+            f"CI write primitive attempted before subprocess: {url}"
+        )
+        assert "actions/runs" in url
+        assert f"head_sha={local_sha}" in url
+        return {"workflow_runs": []}
+
+    monkeypatch.setattr(repository_module, "_remote_observe_git", fake_observe)
+    monkeypatch.setattr(repository_module, "_http_observe_get", fake_get)
+
+    conclusions = observe_ci_workflow_runs(
+        repository,
+        base_ref="refs/remotes/origin/main",
+        workflows=("CI",),
+        head_sha=local_sha,
+    )
+
+    assert conclusions == {"CI": None}
+
+
+def test_observe_ci_workflow_runs_returns_none_when_remote_unobservable(
+    repository: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    local_sha = _git(repository, "rev-parse", "HEAD")
+
+    def fail_transport(path: Path, *args: str):
+        return None  # remote get-url fails -> unavailable
+
+    monkeypatch.setattr(repository_module, "_remote_observe_git", fail_transport)
+
+    conclusions = observe_ci_workflow_runs(
+        repository,
+        base_ref="refs/remotes/origin/main",
+        workflows=("CI",),
+        head_sha=local_sha,
+    )
+
+    assert conclusions is None
+
+
+def test_observe_ci_workflow_runs_returns_none_when_provider_unreachable(
+    repository: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    local_sha = _git(repository, "rev-parse", "HEAD")
+
+    def fake_observe(path: Path, *args: str):
+        if args[:2] == ("remote", "get-url"):
+            return subprocess.CompletedProcess(
+                ["git", *args], 0, "git@github.com:acme/widgets.git\n", ""
+            )
+        raise AssertionError(f"unexpected Git observation: {args}")
+
+    def fail_get(url: str, *, timeout: int = 30):
+        return None  # HTTP GET fails -> unavailable
+
+    monkeypatch.setattr(repository_module, "_remote_observe_git", fake_observe)
+    monkeypatch.setattr(repository_module, "_http_observe_get", fail_get)
+
+    conclusions = observe_ci_workflow_runs(
+        repository,
+        base_ref="refs/remotes/origin/main",
+        workflows=("CI",),
+        head_sha=local_sha,
+    )
+
+    assert conclusions is None
+
+
+def test_observe_ci_workflow_runs_rejects_malformed_head_sha(
+    repository: Path,
+):
+    with pytest.raises(RepositoryConfigurationError) as exc_info:
+        observe_ci_workflow_runs(
+            repository,
+            base_ref="refs/remotes/origin/main",
+            workflows=("CI",),
+            head_sha="not-a-full-sha",
+        )
+
+    assert exc_info.value.code == "malformed_head_sha"
+
+
+def test_http_observe_get_seam_is_strictly_get_only(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """The real HTTP seam builds a GET request — never any write method."""
+
+    requests: list = []
+
+    class FakeResponse:
+        status = 200
+
+        def read(self) -> bytes:
+            return b'{"workflow_runs": []}'
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc_info) -> bool:
+            return False
+
+    def fake_urlopen(req, timeout=None):
+        requests.append(req)
+        assert req.method == "GET"
+        assert req.full_url.startswith("https://api.github.com/")
+        return FakeResponse()
+
+    monkeypatch.setattr(repository_module.urllib.request, "urlopen", fake_urlopen)
+
+    data = repository_module._http_observe_get(
+        "https://api.github.com/repos/acme/widgets/actions/runs?head_sha=x"
+    )
+
+    assert data == {"workflow_runs": []}
+    assert len(requests) == 1
+    assert requests[0].method == "GET"
+    assert requests[0].headers["Accept"] == "application/vnd.github+json"

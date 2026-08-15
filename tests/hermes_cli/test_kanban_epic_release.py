@@ -13,6 +13,8 @@ from hermes_cli import kanban_db as kb
 from hermes_cli.kanban_epic_release import (
     EpicReadiness,
     EpicReadinessMember,
+    EpicReleaseCIObservation,
+    EpicReleaseCIObservationError,
     EpicReleaseHandoff,
     EpicReleaseHandoffError,
     EpicReleaseInvalidation,
@@ -1506,3 +1508,354 @@ def test_build_release_handoff_refuses_on_ungoverned_board(tmp_path, monkeypatch
             kb.build_epic_release_handoff(conn, epic_id, board="release-board")
 
     assert exc_info.value.code == "not_governed_epic"
+
+
+# ---------------------------------------------------------------------------
+# E06B — Read-only exact-SHA CI observation
+# ---------------------------------------------------------------------------
+
+
+def _ci_observe(
+    monkeypatch,
+    *,
+    remote_head: str | None = None,
+    remote_available: bool = True,
+    remote_name: str = "origin",
+):
+    def observe(_repo_root, *, target_branch, base_ref):
+        return TargetHeadsObservation(
+            local_head=TARGET_SHA,
+            remote_head=remote_head,
+            remote_name=remote_name,
+            remote_available=remote_available,
+        )
+
+    monkeypatch.setattr(kb, "observe_target_heads", observe)
+
+
+def _ci_workflows(monkeypatch, conclusions):
+    calls: list = []
+
+    def observe_runs(_repo_root, *, base_ref, workflows, head_sha):
+        calls.append((base_ref, workflows, head_sha))
+        return conclusions
+
+    monkeypatch.setattr(kb, "observe_ci_workflow_runs", observe_runs)
+    return calls
+
+
+def _ci_delete_calls(monkeypatch):
+    calls: list = []
+
+    def wrap_delete(repo_root, *, candidate_ref, candidate_sha):
+        calls.append((repo_root, candidate_ref, candidate_sha))
+        return True
+
+    monkeypatch.setattr(kb, "delete_release_candidate_ref", wrap_delete)
+    return calls
+
+
+def test_observe_epic_release_ci_not_yet_pushed_returns_ci_pending_preserved(
+    tmp_path, monkeypatch,
+):
+    _ci_observe(monkeypatch, remote_head=TARGET_SHA)
+    run_calls = _ci_workflows(monkeypatch, {})
+    delete_calls = _ci_delete_calls(monkeypatch)
+
+    with kb.connect(tmp_path / "ci-not-pushed.db") as conn:
+        ctx = _prepare_exact_snapshot(conn, monkeypatch, tmp_path)
+        result = kb.observe_epic_release_ci(
+            conn, ctx.epic_id, board="release-board", board_meta=ctx.board_meta,
+        )
+        row = conn.execute(
+            "SELECT status, pushed_sha FROM epic_release_snapshots WHERE id=?",
+            (ctx.prepared.id,),
+        ).fetchone()
+
+    assert result.kind == "ci_pending"
+    assert result.snapshot == ctx.prepared
+    assert result.pushed_sha is None
+    assert result.candidate_ref_deleted is False
+    assert result.evidence["not_yet_pushed"] is True
+    assert row["status"] == "awaiting_push"
+    assert row["pushed_sha"] is None
+    assert run_calls == []  # CI is never queried until the exact SHA is pushed
+    assert delete_calls == []
+
+
+def test_observe_epic_release_ci_exact_sha_all_workflows_pass_released_and_ref_deleted(
+    tmp_path, monkeypatch,
+):
+    _ci_observe(monkeypatch, remote_head=AGGREGATE_CANDIDATE_SHA)
+    run_calls = _ci_workflows(
+        monkeypatch, {"CI": "success", "Deploy Test": "success"}
+    )
+    delete_calls = _ci_delete_calls(monkeypatch)
+
+    with kb.connect(tmp_path / "ci-released.db") as conn:
+        ctx = _prepare_exact_snapshot(conn, monkeypatch, tmp_path)
+        result = kb.observe_epic_release_ci(
+            conn, ctx.epic_id, board="release-board", board_meta=ctx.board_meta,
+        )
+        row = conn.execute(
+            "SELECT status, pushed_sha FROM epic_release_snapshots WHERE id=?",
+            (ctx.prepared.id,),
+        ).fetchone()
+        kinds = [
+            row["kind"]
+            for row in conn.execute(
+                "SELECT kind FROM task_events WHERE task_id=? ORDER BY id",
+                (ctx.epic_id,),
+            ).fetchall()
+        ]
+
+    assert result.kind == "released"
+    assert result.snapshot is not None
+    assert result.snapshot.status == "released"
+    assert result.pushed_sha == AGGREGATE_CANDIDATE_SHA
+    assert result.candidate_ref_deleted is True
+    assert row["status"] == "released"
+    assert row["pushed_sha"] == AGGREGATE_CANDIDATE_SHA
+    # CI is observed for the exact release-candidate SHA only.
+    assert run_calls == [
+        ("refs/remotes/origin/main", ("CI", "Deploy Test"), AGGREGATE_CANDIDATE_SHA)
+    ]
+    # Released transition exact-deletes only the snapshot's ref+SHA.
+    assert delete_calls == [
+        (ctx.contract.repo_root, ctx.prepared.candidate_ref, AGGREGATE_CANDIDATE_SHA)
+    ]
+    assert "epic_release_released" in kinds
+    assert "epic_release_invalidated" not in kinds
+
+
+def test_observe_epic_release_ci_failure_marks_ci_failed_then_same_sha_later_pass_releases(
+    tmp_path, monkeypatch,
+):
+    _ci_observe(monkeypatch, remote_head=AGGREGATE_CANDIDATE_SHA)
+    _ci_workflows(monkeypatch, {"CI": "failure", "Deploy Test": "success"})
+    delete_calls = _ci_delete_calls(monkeypatch)
+
+    with kb.connect(tmp_path / "ci-failed.db") as conn:
+        ctx = _prepare_exact_snapshot(conn, monkeypatch, tmp_path)
+        first = kb.observe_epic_release_ci(
+            conn, ctx.epic_id, board="release-board", board_meta=ctx.board_meta,
+        )
+        row = conn.execute(
+            "SELECT status, pushed_sha FROM epic_release_snapshots WHERE id=?",
+            (ctx.prepared.id,),
+        ).fetchone()
+        # Manual recovery is retained: the snapshot stays active and the
+        # candidate ref is preserved.
+        assert first.kind == "ci_failed"
+        assert first.candidate_ref_deleted is False
+        assert row["status"] == "ci_failed"
+        assert row["pushed_sha"] == AGGREGATE_CANDIDATE_SHA
+        assert delete_calls == []
+
+        # Same SHA, later observation: every workflow now passes.
+        _ci_workflows(monkeypatch, {"CI": "success", "Deploy Test": "success"})
+        second = kb.observe_epic_release_ci(
+            conn, ctx.epic_id, board="release-board", board_meta=ctx.board_meta,
+        )
+        row2 = conn.execute(
+            "SELECT status FROM epic_release_snapshots WHERE id=?",
+            (ctx.prepared.id,),
+        ).fetchone()
+
+    assert second.kind == "released"
+    assert second.pushed_sha == AGGREGATE_CANDIDATE_SHA
+    assert row2["status"] == "released"
+    assert delete_calls == [
+        (ctx.contract.repo_root, ctx.prepared.candidate_ref, AGGREGATE_CANDIDATE_SHA)
+    ]
+
+
+def test_observe_epic_release_ci_different_sha_after_pinned_push_invalidates(
+    tmp_path, monkeypatch,
+):
+    moved = "f" * 40
+    _ci_observe(monkeypatch, remote_head=AGGREGATE_CANDIDATE_SHA)
+    _ci_workflows(monkeypatch, {"CI": None, "Deploy Test": None})
+    delete_calls = _ci_delete_calls(monkeypatch)
+
+    with kb.connect(tmp_path / "ci-moved.db") as conn:
+        ctx = _prepare_exact_snapshot(conn, monkeypatch, tmp_path)
+        first = kb.observe_epic_release_ci(
+            conn, ctx.epic_id, board="release-board", board_meta=ctx.board_meta,
+        )
+        assert first.kind == "ci_pending"
+        assert delete_calls == []
+
+        # The remote moves to a different SHA after the candidate was
+        # pinned pushed: durable invalidation with exact-SHA ref cleanup.
+        _ci_observe(monkeypatch, remote_head=moved)
+        second = kb.observe_epic_release_ci(
+            conn, ctx.epic_id, board="release-board", board_meta=ctx.board_meta,
+        )
+        row = conn.execute(
+            "SELECT status FROM epic_release_snapshots WHERE id=?",
+            (ctx.prepared.id,),
+        ).fetchone()
+
+    assert second.kind == "invalidated"
+    assert second.evidence["remote_head"] == moved
+    assert row["status"] == "invalidated"
+    assert delete_calls == [
+        (ctx.contract.repo_root, ctx.prepared.candidate_ref, AGGREGATE_CANDIDATE_SHA)
+    ]
+
+
+def test_observe_epic_release_ci_running_workflow_stays_ci_pending(
+    tmp_path, monkeypatch,
+):
+    _ci_observe(monkeypatch, remote_head=AGGREGATE_CANDIDATE_SHA)
+    _ci_workflows(monkeypatch, {"CI": None, "Deploy Test": None})
+    delete_calls = _ci_delete_calls(monkeypatch)
+
+    with kb.connect(tmp_path / "ci-running.db") as conn:
+        ctx = _prepare_exact_snapshot(conn, monkeypatch, tmp_path)
+        result = kb.observe_epic_release_ci(
+            conn, ctx.epic_id, board="release-board", board_meta=ctx.board_meta,
+        )
+        row = conn.execute(
+            "SELECT status, pushed_sha FROM epic_release_snapshots WHERE id=?",
+            (ctx.prepared.id,),
+        ).fetchone()
+
+    assert result.kind == "ci_pending"
+    assert result.pushed_sha == AGGREGATE_CANDIDATE_SHA
+    assert result.candidate_ref_deleted is False
+    assert row["status"] == "ci_pending"
+    assert row["pushed_sha"] == AGGREGATE_CANDIDATE_SHA
+    assert delete_calls == []
+
+
+def test_observe_epic_release_ci_remote_unavailable_preserves_snapshot(
+    tmp_path, monkeypatch,
+):
+    _ci_observe(monkeypatch, remote_head=None, remote_available=False)
+    run_calls = _ci_workflows(monkeypatch, {})
+    delete_calls = _ci_delete_calls(monkeypatch)
+
+    with kb.connect(tmp_path / "ci-remote-unavail.db") as conn:
+        ctx = _prepare_exact_snapshot(conn, monkeypatch, tmp_path)
+        result = kb.observe_epic_release_ci(
+            conn, ctx.epic_id, board="release-board", board_meta=ctx.board_meta,
+        )
+        row = conn.execute(
+            "SELECT status FROM epic_release_snapshots WHERE id=?",
+            (ctx.prepared.id,),
+        ).fetchone()
+
+    assert result.kind == "unavailable"
+    assert result.snapshot == ctx.prepared
+    assert row["status"] == "awaiting_push"
+    assert run_calls == []
+    assert delete_calls == []
+
+
+def test_observe_epic_release_ci_provider_unavailable_preserves_snapshot(
+    tmp_path, monkeypatch,
+):
+    _ci_observe(monkeypatch, remote_head=AGGREGATE_CANDIDATE_SHA)
+    _ci_workflows(monkeypatch, None)
+    delete_calls = _ci_delete_calls(monkeypatch)
+
+    with kb.connect(tmp_path / "ci-provider-unavail.db") as conn:
+        ctx = _prepare_exact_snapshot(conn, monkeypatch, tmp_path)
+        result = kb.observe_epic_release_ci(
+            conn, ctx.epic_id, board="release-board", board_meta=ctx.board_meta,
+        )
+        row = conn.execute(
+            "SELECT status, pushed_sha FROM epic_release_snapshots WHERE id=?",
+            (ctx.prepared.id,),
+        ).fetchone()
+
+    assert result.kind == "unavailable"
+    assert result.pushed_sha == AGGREGATE_CANDIDATE_SHA
+    assert row["status"] == "ci_pending"  # push was pinned; CI unknown
+    assert delete_calls == []
+
+
+def test_observe_epic_release_ci_authority_drift_invalidates_exactly(
+    tmp_path, monkeypatch,
+):
+    _ci_observe(monkeypatch, remote_head=AGGREGATE_CANDIDATE_SHA)
+    _ci_workflows(monkeypatch, {"CI": "success", "Deploy Test": "success"})
+    delete_calls = _ci_delete_calls(monkeypatch)
+
+    with kb.connect(tmp_path / "ci-drift.db") as conn:
+        ctx = _prepare_exact_snapshot(conn, monkeypatch, tmp_path)
+        _drift_epic_tip(ctx, conn, monkeypatch)
+        result = kb.observe_epic_release_ci(
+            conn, ctx.epic_id, board="release-board", board_meta=ctx.board_meta,
+        )
+        row = conn.execute(
+            "SELECT status FROM epic_release_snapshots WHERE id=?",
+            (ctx.prepared.id,),
+        ).fetchone()
+
+    assert result.kind == "invalidated"
+    assert result.snapshot is not None
+    assert result.snapshot.status == "invalidated"
+    assert row["status"] == "invalidated"
+    assert delete_calls == [
+        (ctx.contract.repo_root, ctx.prepared.candidate_ref, AGGREGATE_CANDIDATE_SHA)
+    ]
+
+
+def test_observe_epic_release_ci_without_active_snapshot_returns_missing(
+    tmp_path, monkeypatch,
+):
+    _ci_observe(monkeypatch)
+    _ci_workflows(monkeypatch, {})
+    with kb.connect(tmp_path / "ci-missing.db") as conn:
+        _fixture_epic_id, _fixture_story_id, board_meta, _contract, readiness, _candidate = (
+            _release_prepare_fixture(tmp_path, monkeypatch)
+        )
+        epic_id = kb.create_task(conn, title="Epic", work_item_kind="epic")
+        story_id = kb.create_task(conn, title="Story")
+        kb.add_epic_membership(conn, epic_id=epic_id, task_id=story_id)
+        readiness = replace(
+            readiness, epic_id=epic_id,
+            members=(replace(readiness.members[0], story_id=story_id),),
+        )
+        monkeypatch.setattr(kb, "epic_readiness", lambda *_a, **_k: readiness)
+        result = kb.observe_epic_release_ci(
+            conn, epic_id, board="release-board", board_meta=board_meta,
+        )
+
+    assert result.kind == "missing"
+    assert result.snapshot is None
+    assert result.pushed_sha is None
+
+
+def test_observe_epic_release_ci_refuses_on_ungoverned_board(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setattr(kb, "product_board_metadata", lambda _board=None: None)
+    with kb.connect(tmp_path / "ci-ungov.db") as conn:
+        epic_id = kb.create_task(conn, title="Epic", work_item_kind="epic")
+        with pytest.raises(EpicReleaseCIObservationError) as exc_info:
+            kb.observe_epic_release_ci(conn, epic_id, board="release-board")
+
+    assert exc_info.value.code == "not_governed_epic"
+
+
+def test_observe_epic_release_ci_refuses_inside_active_transaction(
+    tmp_path, monkeypatch,
+):
+    with kb.connect(tmp_path / "ci-txn.db") as conn:
+        ctx = _prepare_exact_snapshot(conn, monkeypatch, tmp_path)
+        conn.execute("BEGIN IMMEDIATE")
+        assert conn.in_transaction is True
+        try:
+            with pytest.raises(EpicReleaseCIObservationError) as exc_info:
+                kb.observe_epic_release_ci(
+                    conn, ctx.epic_id, board="release-board",
+                    board_meta=ctx.board_meta,
+                )
+        finally:
+            conn.execute("ROLLBACK")
+
+    assert exc_info.value.code == "active_transaction"

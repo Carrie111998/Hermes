@@ -113,6 +113,7 @@ from hermes_cli.kanban_repository import (
     delete_release_candidate_ref,
     inspect_evidence_workspace,
     load_repository_contract,
+    observe_ci_workflow_runs,
     observe_target_heads,
     refresh_story_branch,
     resolve_commit,
@@ -125,6 +126,8 @@ from hermes_cli.kanban_repository import (
 )
 from hermes_cli.kanban_epic_release import (
     EpicReadiness,
+    EpicReleaseCIObservation,
+    EpicReleaseCIObservationError,
     EpicReleaseHandoff,
     EpicReleaseHandoffError,
     EpicReleaseInvalidation,
@@ -15916,6 +15919,355 @@ def build_epic_release_handoff(
         remote_name=observation.remote_name,
         action=action,
         checked_at=int(time.time()),
+    )
+
+
+def _epic_release_record_pushed(
+    conn: sqlite3.Connection,
+    *,
+    epic_id: str,
+    snapshot: EpicReleaseSnapshot,
+    pushed_sha: str,
+) -> None:
+    """Atomically pin ``pushed_sha`` for the exact active snapshot.
+
+    Re-checks that the active row is still the same snapshot inside the
+    IMMEDIATE transaction (a concurrent observation may have won), then
+    records the push with a typed event.  A status transition from
+    ``awaiting_push`` to ``ci_pending`` happens here as well.
+    """
+
+    now = int(time.time())
+    with authorized_governance_write(), write_txn(conn):
+        locked_row = _epic_release_active_row(conn, epic_id)
+        if locked_row is None or int(locked_row["id"]) != snapshot.id:
+            raise EpicReleaseCIObservationError(
+                "active_snapshot_changed",
+                {"epic_id": epic_id, "snapshot_id": snapshot.id},
+            )
+        conn.execute(
+            "UPDATE epic_release_snapshots SET pushed_sha=?, status='ci_pending', "
+            "updated_at=? WHERE id=? AND status IN ('awaiting_push', 'ci_pending')",
+            (pushed_sha, now, snapshot.id),
+        )
+        _append_event(
+            conn,
+            epic_id,
+            "epic_release_ci_pending",
+            {
+                "epic_id": epic_id,
+                "snapshot_id": snapshot.id,
+                "pushed_sha": pushed_sha,
+                "release_candidate_sha": snapshot.release_candidate_sha,
+                "observed_at": now,
+            },
+        )
+
+
+def _epic_release_record_ci_failed(
+    conn: sqlite3.Connection,
+    *,
+    epic_id: str,
+    snapshot: EpicReleaseSnapshot,
+    conclusions: Mapping[str, str | None],
+) -> None:
+    """Atomically mark the exact active snapshot ``ci_failed``.
+
+    Manual recovery is retained: the snapshot stays active, and a later
+    same-SHA observation where every workflow passes still releases it.
+    """
+
+    now = int(time.time())
+    with authorized_governance_write(), write_txn(conn):
+        locked_row = _epic_release_active_row(conn, epic_id)
+        if locked_row is None or int(locked_row["id"]) != snapshot.id:
+            raise EpicReleaseCIObservationError(
+                "active_snapshot_changed",
+                {"epic_id": epic_id, "snapshot_id": snapshot.id},
+            )
+        conn.execute(
+            "UPDATE epic_release_snapshots SET status='ci_failed', updated_at=? "
+            "WHERE id=? AND status IN ('awaiting_push', 'ci_pending', 'ci_failed')",
+            (now, snapshot.id),
+        )
+        _append_event(
+            conn,
+            epic_id,
+            "epic_release_ci_failed",
+            {
+                "epic_id": epic_id,
+                "snapshot_id": snapshot.id,
+                "pushed_sha": snapshot.release_candidate_sha,
+                "release_candidate_sha": snapshot.release_candidate_sha,
+                "conclusions": dict(conclusions),
+                "observed_at": now,
+            },
+        )
+
+
+def _epic_release_record_released(
+    conn: sqlite3.Connection,
+    *,
+    epic_id: str,
+    snapshot: EpicReleaseSnapshot,
+    conclusions: Mapping[str, str | None],
+) -> None:
+    """Atomically flip the exact active snapshot to ``released``."""
+
+    now = int(time.time())
+    with authorized_governance_write(), write_txn(conn):
+        locked_row = _epic_release_active_row(conn, epic_id)
+        if locked_row is None or int(locked_row["id"]) != snapshot.id:
+            raise EpicReleaseCIObservationError(
+                "active_snapshot_changed",
+                {"epic_id": epic_id, "snapshot_id": snapshot.id},
+            )
+        conn.execute(
+            "UPDATE epic_release_snapshots SET status='released', updated_at=? "
+            "WHERE id=? AND status IN ('awaiting_push', 'ci_pending', 'ci_failed')",
+            (now, snapshot.id),
+        )
+        _append_event(
+            conn,
+            epic_id,
+            "epic_release_released",
+            {
+                "epic_id": epic_id,
+                "snapshot_id": snapshot.id,
+                "pushed_sha": snapshot.release_candidate_sha,
+                "release_candidate_sha": snapshot.release_candidate_sha,
+                "candidate_ref": snapshot.candidate_ref,
+                "conclusions": dict(conclusions),
+                "released_at": now,
+            },
+        )
+
+
+def observe_epic_release_ci(
+    conn: sqlite3.Connection,
+    epic_id: str,
+    *,
+    board: Optional[str] = None,
+    board_meta: Optional[dict] = None,
+) -> EpicReleaseCIObservation:
+    """Observe the exact active Epic release snapshot's CI state, read-only.
+
+    The observation is strictly read-only against the CI provider (HTTP
+    GET only) and against Git (``rev-parse``/``ls-remote`` only): no
+    rerun, cancel, merge, push, or update-remote primitive is ever issued.
+    Outcomes:
+
+    * Proven durable-authority drift, or a remote target head that moved
+      away from the recorded candidate after it was pinned pushed, marks
+      only the exact snapshot ``invalidated`` and exact-deletes the
+      candidate ref (when it still pins the recorded SHA).
+    * A remote head equal to ``target_pre_sha`` (not yet pushed) leaves
+      the snapshot ``ci_pending``.
+    * Only ``pushed_sha == release_candidate_sha`` plus every required
+      workflow ``success`` releases; a failure/cancel/timeout preserves
+      the snapshot as ``ci_failed`` (manual recovery retained), running or
+      queued stays ``ci_pending``, and a later same-SHA all-pass releases.
+    * An unobservable remote or CI provider preserves the snapshot
+      ``unavailable`` — drift cannot be proven, so nothing changes.
+    """
+
+    if conn.in_transaction:
+        raise EpicReleaseCIObservationError("active_transaction", {"epic_id": epic_id})
+
+    meta = board_meta if board_meta is not None else product_board_metadata(board)
+    if meta is None or not _handoff_v2_enabled(meta) or not _is_epic_task(conn, epic_id):
+        raise EpicReleaseCIObservationError("not_governed_epic", {"epic_id": epic_id})
+    try:
+        contract = repository_contract_for_metadata(meta)
+    except (RepositoryConfigurationError, OSError, ValueError) as exc:
+        raise EpicReleaseCIObservationError(
+            "repository_unavailable", {"epic_id": epic_id, "error": str(exc)}
+        ) from exc
+    if contract is None:
+        raise EpicReleaseCIObservationError(
+            "missing_repository_contract", {"epic_id": epic_id}
+        )
+    if "epic_release" not in contract.verification:
+        raise EpicReleaseCIObservationError(
+            "missing_epic_release_profile", {"epic_id": epic_id}
+        )
+
+    row = _epic_release_active_row(conn, epic_id)
+    if row is None:
+        return EpicReleaseCIObservation("missing", None, {}, False, None)
+    try:
+        snapshot = epic_release_snapshot_from_row(row)
+    except ValueError as exc:
+        raise EpicReleaseCIObservationError(
+            "invalid_active_snapshot",
+            {"epic_id": epic_id, "snapshot_id": row["id"], "error": str(exc)},
+        ) from exc
+
+    # --- Recheck current durable authority. ---------------------------------
+    try:
+        inputs, _contract, _branch = _epic_release_inputs(
+            conn, epic_id, board=board, board_meta=meta
+        )
+    except EpicReleasePreparationError as exc:
+        if exc.code in ("not_ready", "readiness_tip_mismatch"):
+            drift = {"inputs_error": exc.code, **exc.evidence}
+        else:
+            raise EpicReleaseCIObservationError(
+                exc.code, {"epic_id": epic_id, **exc.evidence}
+            ) from exc
+    else:
+        drift = _epic_release_snapshot_mismatch_evidence(
+            conn, snapshot, epic_id=epic_id, inputs=inputs
+        )
+    if drift:
+        _epic_release_invalidate_durably(
+            conn, epic_id=epic_id, snapshot=snapshot, evidence=drift
+        )
+        deleted = _epic_release_delete_candidate_and_record(
+            conn, epic_id=epic_id, snapshot=snapshot, contract=contract
+        )
+        invalidated = replace(
+            snapshot, status="invalidated", updated_at=int(time.time())
+        )
+        return EpicReleaseCIObservation(
+            "invalidated", invalidated, drift, bool(deleted), snapshot.pushed_sha
+        )
+
+    # --- Observe the remote target head (read-only). ------------------------
+    try:
+        observation = observe_target_heads(
+            contract.repo_root,
+            target_branch=contract.target_branch,
+            base_ref=contract.base_ref,
+        )
+    except RepositoryConfigurationError as exc:
+        raise EpicReleaseCIObservationError(
+            "repository_unavailable", {"epic_id": epic_id, "error": exc.code}
+        ) from exc
+    if not observation.remote_available or observation.remote_head is None:
+        return EpicReleaseCIObservation(
+            "unavailable",
+            snapshot,
+            {"remote_name": observation.remote_name},
+            False,
+            snapshot.pushed_sha,
+        )
+
+    if observation.remote_head != snapshot.release_candidate_sha:
+        if snapshot.pushed_sha == snapshot.release_candidate_sha:
+            # The candidate was pinned pushed but the remote moved on to a
+            # different SHA: durable invalidation with exact-SHA cleanup.
+            evidence = {
+                "target_pre_sha": {
+                    "snapshot": snapshot.target_pre_sha,
+                    "remote_head": observation.remote_head,
+                },
+                "remote_head": observation.remote_head,
+                "release_candidate_sha": snapshot.release_candidate_sha,
+            }
+            _epic_release_invalidate_durably(
+                conn, epic_id=epic_id, snapshot=snapshot, evidence=evidence
+            )
+            deleted = _epic_release_delete_candidate_and_record(
+                conn, epic_id=epic_id, snapshot=snapshot, contract=contract
+            )
+            invalidated = replace(
+                snapshot, status="invalidated", updated_at=int(time.time())
+            )
+            return EpicReleaseCIObservation(
+                "invalidated", invalidated, evidence, bool(deleted), snapshot.pushed_sha
+            )
+        # Not yet pushed: the remote is still at (or not at) the target
+        # pre-image and we have never pinned a push.  Preserve as pending.
+        return EpicReleaseCIObservation(
+            "ci_pending",
+            snapshot,
+            {
+                "remote_head": observation.remote_head,
+                "release_candidate_sha": snapshot.release_candidate_sha,
+                "not_yet_pushed": True,
+            },
+            False,
+            snapshot.pushed_sha,
+        )
+
+    # The exact candidate is confirmed on the remote target head.
+    if snapshot.pushed_sha != snapshot.release_candidate_sha:
+        _epic_release_record_pushed(
+            conn,
+            epic_id=epic_id,
+            snapshot=snapshot,
+            pushed_sha=snapshot.release_candidate_sha,
+        )
+
+    # --- Observe CI (HTTP GET only) for the exact candidate SHA. -----------
+    try:
+        conclusions = observe_ci_workflow_runs(
+            contract.repo_root,
+            base_ref=contract.base_ref,
+            workflows=tuple(contract.ci_workflows),
+            head_sha=snapshot.release_candidate_sha,
+        )
+    except RepositoryConfigurationError as exc:
+        raise EpicReleaseCIObservationError(
+            "repository_unavailable", {"epic_id": epic_id, "error": exc.code}
+        ) from exc
+    if conclusions is None:
+        return EpicReleaseCIObservation(
+            "unavailable",
+            snapshot,
+            {"ci_provider": "unavailable"},
+            False,
+            snapshot.release_candidate_sha,
+        )
+
+    statuses = [conclusions.get(wf) for wf in contract.ci_workflows]
+    if all(status == "success" for status in statuses):
+        _epic_release_record_released(
+            conn,
+            epic_id=epic_id,
+            snapshot=snapshot,
+            conclusions=conclusions,
+        )
+        deleted = delete_release_candidate_ref(
+            contract.repo_root,
+            candidate_ref=snapshot.candidate_ref,
+            candidate_sha=snapshot.release_candidate_sha,
+        )
+        released = replace(
+            snapshot, status="released", updated_at=int(time.time())
+        )
+        return EpicReleaseCIObservation(
+            "released",
+            released,
+            {"conclusions": dict(conclusions)},
+            bool(deleted),
+            snapshot.release_candidate_sha,
+        )
+    if any(status in ("failure", "cancelled", "timed_out") for status in statuses):
+        _epic_release_record_ci_failed(
+            conn,
+            epic_id=epic_id,
+            snapshot=snapshot,
+            conclusions=conclusions,
+        )
+        failed = replace(
+            snapshot, status="ci_failed", updated_at=int(time.time())
+        )
+        return EpicReleaseCIObservation(
+            "ci_failed",
+            failed,
+            {"conclusions": dict(conclusions)},
+            False,
+            snapshot.release_candidate_sha,
+        )
+    # Running / queued / no run yet.
+    return EpicReleaseCIObservation(
+        "ci_pending",
+        snapshot,
+        {"conclusions": dict(conclusions)},
+        False,
+        snapshot.release_candidate_sha,
     )
 
 
