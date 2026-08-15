@@ -2470,11 +2470,12 @@ class HindsightMemoryProvider(MemoryProvider):
             if new_id == self._session_id:
                 # Rewind/in-place compression invalidates every result owned by
                 # this session's previous transcript generation. A live worker
-                # cannot be cancelled, so queue its latest requested key to run
-                # again after the stale generation is rejected.
+                # cannot be cancelled. Compression still owns the current turn,
+                # so queue its latest requested key to run again after the stale
+                # generation is rejected; rewind/reset boundaries must drop it.
                 retry_key = (
                     self._opportunistic_pending or self._opportunistic_inflight
-                    if prefetch_alive
+                    if prefetch_alive and kwargs.get("reason") == "compression"
                     else None
                 )
                 self._opportunistic_generation += 1

@@ -671,7 +671,7 @@ class TestPrefetch:
         real_join = worker.join
         worker.join = lambda timeout=None: None
 
-        p.on_session_switch("test-session")
+        p.on_session_switch("test-session", reason="compression")
         p.start_prefetch("current query", session_id="test-session", turn_number=1)
         release_first.set()
         real_join(timeout=2.0)
@@ -680,6 +680,34 @@ class TestPrefetch:
         assert "current query" in p.prefetch(
             "current query", session_id="test-session"
         )
+
+    def test_recall_async_drops_inflight_after_same_session_rewind(
+        self, provider_with_config
+    ):
+        p = provider_with_config(recall_async=True)
+        recall_started = threading.Event()
+        release_recall = threading.Event()
+        queries = []
+
+        async def _recall(**kwargs):
+            queries.append(kwargs["query"])
+            recall_started.set()
+            release_recall.wait(timeout=2.0)
+            return SimpleNamespace(results=[SimpleNamespace(text=kwargs["query"])])
+
+        p._client.arecall = AsyncMock(side_effect=_recall)
+        p.start_prefetch("removed query", session_id="test-session", turn_number=1)
+        assert recall_started.wait(timeout=2.0)
+        worker = p._prefetch_thread
+        real_join = worker.join
+        worker.join = lambda timeout=None: None
+
+        p.on_session_switch("test-session", rewound=True)
+        release_recall.set()
+        real_join(timeout=2.0)
+
+        assert queries == ["removed query"]
+        assert p.prefetch("next query", session_id="test-session") == ""
 
     def test_recall_async_never_waits_and_carries_late_result(self, provider_with_config):
         p = provider_with_config(recall_async=True)
