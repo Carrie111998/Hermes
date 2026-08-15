@@ -150,7 +150,9 @@ def test_a_foreign_process_cannot_retire_a_live_record(turn_db, marker_home):
     A second process that submits on a busy conversation waits for the turn
     lease, times out, and emits a terminal error frame — and the frame path
     retires the record as it goes. Before the owner check that deleted the
-    running turn's only durable trace.
+    scheduler's only durable pointer to the running turn: the prompt row
+    itself survives in the session DB, so what it cost was the automatic
+    resume, not the data.
     """
     _record(turn_db, "session-key", "the turn that is actually running")
 
@@ -390,7 +392,13 @@ def test_exhausted_attempts_break_the_loop(schedule_env, turn_db):
 
 
 def test_disabled_by_config(schedule_env, turn_db, monkeypatch):
-    _record(turn_db, "session-key", "prompt")
+    """Disabled here says nothing about a record another process owns.
+
+    ``enabled`` is this process's config, and the process that wrote the
+    record may be running with auto-continue on — so declining to continue is
+    not licence to retire someone else's live record.
+    """
+    _record(turn_db, "session-key", "the turn that is actually running")
     monkeypatch.setattr(
         server,
         "_load_cfg",
@@ -401,6 +409,27 @@ def test_disabled_by_config(schedule_env, turn_db, monkeypatch):
 
     assert result is None
     assert not schedule_env
+    survivor = _read(turn_db, "session-key")
+    assert survivor is not None
+    assert survivor["prompt"] == "the turn that is actually running"
+
+
+def test_disabled_by_config_still_clears_own_record(schedule_env, turn_db, monkeypatch):
+    """Its own record is retired: this process will never continue that turn."""
+    session = _session()
+    server._record_interrupted_turn(session, "session-key", "own turn")
+    assert _read(turn_db, "session-key") is not None
+    monkeypatch.setattr(
+        server,
+        "_load_cfg",
+        lambda: {"desktop": {"auto_continue": {"enabled": False}}},
+    )
+
+    result = server._maybe_schedule_auto_continue("sid", session, "session-key")
+
+    assert result is None
+    assert not schedule_env
+    assert _read(turn_db, "session-key") is None
 
 
 def test_no_marker_means_no_continuation(schedule_env, turn_db):

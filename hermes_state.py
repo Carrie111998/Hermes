@@ -6189,7 +6189,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         record, and a legacy record that carries no owner, and nothing else:
         without that check a process that merely tried to take the conversation
         and gave up can delete the record of a turn still running elsewhere,
-        and a crash of that turn then recovers nothing.
+        and nothing then resumes that turn automatically.
 
         ``force`` retires regardless of owner and exists for the scheduler's
         policy deletions. A record past its freshness window or its attempt

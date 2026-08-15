@@ -7766,12 +7766,18 @@ def _maybe_schedule_auto_continue(sid: str, session: dict, session_key: str) -> 
         return None
     enabled, freshness_secs, max_attempts = _auto_continue_config()
     age = time.time() - marker["started_at"]
-    if not enabled or age > freshness_secs or marker["attempts"] >= max_attempts:
-        # Stale, disabled, or crash-looping: stop trying. The journal/partial
-        # transcript still shows what happened; a manual message continues it.
-        # Retired regardless of owner — the record is past a window every
-        # process reads the same way, so it is actionable by none of them.
+    if age > freshness_secs or marker["attempts"] >= max_attempts:
+        # Stale or crash-looping: a policy retirement, so it is taken
+        # regardless of owner. The journal/partial transcript still shows what
+        # happened; a manual message continues it.
         _clear_interrupted_turn(session, session_key, force=True)
+        return None
+    if not enabled:
+        # Disabled is a local policy state, not a fact about the record:
+        # another process may run with auto-continue on, and this one may be
+        # re-enabled later. Retire only what this process owns (plus ownerless
+        # legacy imports) and leave a foreign owner's live record alone.
+        _clear_interrupted_turn(session, session_key)
         return None
     if session.get("_auto_continue_scheduled"):
         return None
