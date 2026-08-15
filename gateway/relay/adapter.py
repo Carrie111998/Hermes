@@ -285,6 +285,15 @@ class RelayAdapter(BasePlatformAdapter):
         """
         return "task_card" in (self.descriptor.supported_ops or ())
 
+    def native_task_cards_enabled(self) -> bool:
+        """TurnRunner opt-in probe (gateway/run.py) — the card lane calls
+        THIS name (same contract as the native Slack adapter's opt-in);
+        ``supports_native_task_cards`` is the descriptor-level capability.
+        Live-canary finding: without this alias the lane silently stays
+        text-mode (hasattr probe fails) even though the connector
+        advertises task_card."""
+        return self.supports_native_task_cards()
+
     async def send_draft(
         self,
         chat_id: str,
