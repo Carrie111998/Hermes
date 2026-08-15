@@ -373,12 +373,18 @@ class MemoryManager:
         self._providers: List[MemoryProvider] = []
         self._tool_to_provider: Dict[str, MemoryProvider] = {}
         self._has_external: bool = False  # True once a non-builtin provider is added
-        self._external_prefetch_timeout = (
-            _EXTERNAL_PREFETCH_TIMEOUT_S
-            if external_prefetch_timeout is None
-            else float(external_prefetch_timeout)
-        )
-        if not math.isfinite(self._external_prefetch_timeout) or self._external_prefetch_timeout <= 0:
+        try:
+            self._external_prefetch_timeout = (
+                _EXTERNAL_PREFETCH_TIMEOUT_S
+                if external_prefetch_timeout is None
+                else float(external_prefetch_timeout)
+            )
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("external_prefetch_timeout must be finite and positive") from exc
+        if (
+            not math.isfinite(self._external_prefetch_timeout)
+            or self._external_prefetch_timeout <= 0
+        ):
             raise ValueError("external_prefetch_timeout must be finite and positive")
         self._external_prefetch_threads: Dict[str, threading.Thread] = {}
         self._external_prefetch_lock = threading.Lock()

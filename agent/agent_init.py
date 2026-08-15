@@ -114,7 +114,7 @@ def _external_prefetch_timeout_from_config(mem_config: Any) -> float | None:
         return None
     try:
         value = float(raw)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         logger.warning(
             "Ignoring invalid memory.external_prefetch_timeout=%r; using default", raw
         )

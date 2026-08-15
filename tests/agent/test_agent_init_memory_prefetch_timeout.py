@@ -9,6 +9,8 @@ from agent.agent_init import _external_prefetch_timeout_from_config
 from agent.memory_manager import MemoryManager
 from tests.agent.test_memory_provider import BlockingPrefetchProvider
 
+HUGE_INT = int("1" + "0" * 309)
+
 
 def test_configured_external_prefetch_timeout_is_parsed():
     assert (
@@ -18,7 +20,8 @@ def test_configured_external_prefetch_timeout_is_parsed():
 
 
 @pytest.mark.parametrize(
-    "raw", [True, -1, math.nan, math.inf, -math.inf, "nan", "inf", "1e999"]
+    "raw",
+    [True, -1, HUGE_INT, math.nan, math.inf, -math.inf, "nan", "inf", "1e999"],
 )
 def test_malformed_or_nonfinite_timeout_uses_manager_default(raw):
     assert (
@@ -27,8 +30,8 @@ def test_malformed_or_nonfinite_timeout_uses_manager_default(raw):
     )
 
 
-@pytest.mark.parametrize("raw", [math.nan, math.inf, -math.inf])
-def test_memory_manager_rejects_direct_nonfinite_timeouts(raw):
+@pytest.mark.parametrize("raw", [HUGE_INT, math.nan, math.inf, -math.inf])
+def test_memory_manager_rejects_direct_invalid_timeouts(raw):
     with pytest.raises(ValueError, match="finite and positive"):
         MemoryManager(external_prefetch_timeout=raw)
 
