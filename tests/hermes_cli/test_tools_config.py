@@ -132,6 +132,42 @@ def test_discord_toolsets_do_not_leak_to_other_platforms():
     assert "discord_admin" not in enabled
 
 
+def test_disabled_toolsets_json_array_string_is_parsed():
+    """agent.disabled_toolsets as a JSON-array string ('["memory"]', as written
+    by `hermes config set` or a JSON-mode editor) must disable the toolset.
+    Before #86661 the string was iterated into a set of characters, matching
+    nothing, so the toolset stayed enabled."""
+    config = {
+        "agent": {"disabled_toolsets": '["memory"]'},
+        "platform_toolsets": {"cli": ["memory", "file"]},
+    }
+    enabled = _get_platform_tools(config, "cli")
+    assert "memory" not in enabled
+
+
+def test_disabled_toolsets_python_list_literal_string_is_parsed():
+    """The issue's exact repro: disabled_toolsets: "['memory']" (single-quoted
+    Python list literal) must also disable the toolset."""
+    config = {
+        "agent": {"disabled_toolsets": "['memory']"},
+        "platform_toolsets": {"cli": ["memory", "file"]},
+    }
+    enabled = _get_platform_tools(config, "cli")
+    assert "memory" not in enabled
+
+
+def test_disabled_toolsets_bare_scalar_disables_one_toolset():
+    """A scalar value disables exactly that one toolset (#13026 semantics) —
+    never a set of its characters."""
+    config = {
+        "agent": {"disabled_toolsets": "memory"},
+        "platform_toolsets": {"cli": ["memory", "file"]},
+    }
+    enabled = _get_platform_tools(config, "cli")
+    assert "memory" not in enabled
+    assert "file" in enabled
+
+
 
 
 

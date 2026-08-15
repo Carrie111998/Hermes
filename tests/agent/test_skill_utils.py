@@ -302,3 +302,69 @@ class TestBOMToleranceSiblingSites:
         assert fm is not None
         assert fm.get("name") == "bp"
 
+
+# ---------------------------------------------------------------------------
+# _normalize_string_set / get_disabled_skill_names — JSON-array strings (#86661)
+# ---------------------------------------------------------------------------
+
+class TestNormalizeStringSetJsonString:
+    """`skills.disabled: '["skill-a","skill-b"]'` must be parsed, not wrapped
+    as a single garbage name that silently filters nothing (#86661)."""
+
+    def test_json_array_string_is_parsed(self):
+        from agent.skill_utils import _normalize_string_set
+
+        assert _normalize_string_set('["skill-a","skill-b"]') == {
+            "skill-a",
+            "skill-b",
+        }
+
+    def test_json_array_string_empty_list(self):
+        from agent.skill_utils import _normalize_string_set
+
+        assert _normalize_string_set("[]") == set()
+
+    def test_json_array_string_single_quote_inner(self):
+        # YAML single-quoted scalar with double-quoted JSON entries
+        from agent.skill_utils import _normalize_string_set
+
+        assert _normalize_string_set("['memory']") == {"memory"}
+
+    def test_bare_scalar_stays_single_name(self):
+        # #13026: scalar means ONE name, never a char set
+        from agent.skill_utils import _normalize_string_set
+
+        assert _normalize_string_set("hidden-skill") == {"hidden-skill"}
+
+    def test_none_and_real_list(self):
+        from agent.skill_utils import _normalize_string_set
+
+        assert _normalize_string_set(None) == set()
+        assert _normalize_string_set(["a", " b "]) == {"a", "b"}
+
+    def test_malformed_json_list_warns_and_falls_back_to_scalar(self, caplog):
+        from agent.skill_utils import _normalize_string_set
+
+        with caplog.at_level("WARNING", logger="agent.skill_utils"):
+            result = _normalize_string_set('["broken')
+        assert result == {'["broken'}
+        assert any("#86661" in r.getMessage() for r in caplog.records)
+
+    def test_get_disabled_skill_names_parses_json_string_config(self, tmp_path, monkeypatch):
+        """End-to-end: a JSON-array string in config.yaml now disables the skills."""
+        from agent import skill_utils
+
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        config_path = hermes_home / "config.yaml"
+        config_path.write_text(
+            """
+skills:
+  disabled: '["hidden-skill","other-skill"]'
+""".strip(),
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        skill_utils._raw_config_cache_clear()
+        assert get_disabled_skill_names() == {"hidden-skill", "other-skill"}
+

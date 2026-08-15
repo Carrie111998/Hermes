@@ -5,6 +5,8 @@ heavy dependency chain.  It is safe to import at module level without triggering
 tool registration or provider resolution.
 """
 
+import ast
+import json
 import logging
 import os
 import re
@@ -456,11 +458,55 @@ def get_disabled_skill_names(platform: str | None = None) -> Set[str]:
 
 
 def _normalize_string_set(values) -> Set[str]:
+    """Normalize a config value into a set of names.
+
+    ``None`` (YAML null) means empty, a bare scalar (``disabled: my-skill``)
+    means a single-item set — NOT a set of its characters (#13026). A
+    JSON-array string (``disabled: '["skill-a","skill-b"]'``, e.g. written by
+    ``hermes config set`` or a JSON-mode editor save) is parsed into its
+    entries instead of being wrapped as one garbage name that filters nothing
+    (#86661). If the JSON-looking string fails to parse, it falls back to the
+    scalar single-name behavior with a warning — never a silent no-op.
+    """
     if values is None:
         return set()
     if isinstance(values, str):
-        values = [values]
+        stripped = values.strip()
+        if stripped.startswith("["):
+            raw = values
+            parsed = _try_parse_list_literal(stripped)
+            if isinstance(parsed, list):
+                values = parsed
+            else:
+                values = [values]
+                if parsed is None:
+                    logger.warning(
+                        "config value %r looks like a JSON array but failed to parse; "
+                        "treating it as a single literal name (it will likely match "
+                        "nothing). Use a real YAML list or a valid JSON/Python array "
+                        "literal. (#86661)",
+                        raw,
+                    )
+        else:
+            values = [values]
     return {str(v).strip() for v in values if str(v).strip()}
+
+
+def _try_parse_list_literal(text: str):
+    """Parse a list-literal config string, or return None if it is not one.
+
+    Accepts both strict JSON arrays (``'["a","b"]'``) and Python-style
+    single-quoted literals (``"['a','b']"``, see #86661).  ``ast.literal_eval``
+    is safe: it only evaluates literal syntax and never executes code.
+    """
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+    try:
+        return ast.literal_eval(text)
+    except (ValueError, SyntaxError, TypeError):
+        return None
 
 
 # ── External skills directories ──────────────────────────────────────────

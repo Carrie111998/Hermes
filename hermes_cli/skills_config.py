@@ -29,14 +29,13 @@ def _normalize_skill_names(values) -> Set[str]:
 
     Mirrors ``agent.skill_utils._normalize_string_set``: ``None`` (YAML null)
     means empty, a bare scalar (``disabled: my-skill``) means a single-item
-    list — NOT a set of its characters (#13026).
+    list — NOT a set of its characters (#13026). JSON-array strings
+    (``disabled: '["skill-a"]'``) are parsed into their entries (#86661).
     """
-    if values is None:
-        return set()
-    if isinstance(values, str):
-        values = [values]
+    from agent.skill_utils import _normalize_string_set
+
     try:
-        return {str(v).strip() for v in values if str(v).strip()}
+        return _normalize_string_set(values)
     except TypeError:
         return set()
 

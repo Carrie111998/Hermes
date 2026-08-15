@@ -2487,7 +2487,13 @@ def _get_platform_tools(
     agent_cfg = config.get("agent") or {}
     disabled_toolsets = agent_cfg.get("disabled_toolsets") or []
     if disabled_toolsets:
-        disabled_set = {str(ts) for ts in disabled_toolsets}
+        # Normalize like skills.disabled: a JSON-array string (e.g. written by
+        # `hermes config set` or a JSON-mode editor save) must be parsed into
+        # its entries — iterating a bare str would produce a set of characters
+        # that matches nothing, silently re-enabling every toolset (#86661).
+        from agent.skill_utils import _normalize_string_set
+
+        disabled_set = _normalize_string_set(disabled_toolsets)
         enabled_toolsets -= disabled_set
 
     # #38798: if this platform was explicitly configured but every toolset name
