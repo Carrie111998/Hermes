@@ -85,6 +85,20 @@ def test_explicit_config_key_overrides_matching_env_value(monkeypatch):
     assert config["docker_image"] == "config/image:1"
 
 
+def test_explicit_cwd_pin_survives_config_bridge(monkeypatch, tmp_path):
+    """A one-shot ``--in`` workspace is stronger than persisted terminal.cwd."""
+    requested = tmp_path / "requested"
+    requested.mkdir()
+    _write_config(f"terminal:\n  backend: local\n  cwd: {tmp_path / 'persisted'}\n")
+    monkeypatch.setenv("TERMINAL_CWD", str(requested))
+    monkeypatch.setenv("HERMES_EXPLICIT_CWD_PIN", "1")
+
+    config = terminal_tool._get_env_config()
+
+    assert config["cwd"] == str(requested)
+    assert os.environ["TERMINAL_CWD"] == str(requested)
+
+
 def test_ssh_config_preserves_remote_tilde_cwd(monkeypatch):
     """SSH ``~`` belongs to the remote user, not the Hermes host/container."""
     _write_config("terminal:\n  backend: ssh\n  cwd: '~'\n")

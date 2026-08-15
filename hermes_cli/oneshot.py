@@ -24,6 +24,7 @@ from __future__ import annotations
 import logging
 import os
 import sys
+import uuid
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from typing import Optional
@@ -422,6 +423,8 @@ def _run_agent(
         single_query=True,
     )
 
+    oneshot_task_id = f"oneshot:{uuid.uuid4()}"
+    previous_cwd_pin = None
     if in_dir:
         from tools.terminal_tool import (
             _get_env_config,
@@ -434,8 +437,10 @@ def _run_agent(
         terminal_config = _get_env_config()
         os.chdir(in_dir)
         if terminal_config["env_type"] == "local":
+            previous_cwd_pin = os.environ.get("HERMES_EXPLICIT_CWD_PIN")
             os.environ["TERMINAL_CWD"] = in_dir
-            record_session_cwd("default", in_dir)
+            os.environ["HERMES_EXPLICIT_CWD_PIN"] = "1"
+            record_session_cwd(oneshot_task_id, in_dir)
 
     session_db = _create_session_db_for_oneshot()
     # The try spans agent construction (not just ``chat``) so the SQLite store
@@ -482,7 +487,7 @@ def _run_agent(
         agent.stream_delta_callback = None
         agent.tool_gen_callback = None
 
-        result = agent.run_conversation(prompt)
+        result = agent.run_conversation(prompt, task_id=oneshot_task_id)
         return (result.get("final_response") or "", result)
     finally:
         # Ordering deliberately mirrors gateway/run.py:_cleanup_agent_resources,
@@ -509,6 +514,14 @@ def _run_agent(
                 session_db.close()
             except Exception:
                 logging.debug("oneshot session store cleanup failed", exc_info=True)
+        if in_dir and terminal_config["env_type"] == "local":
+            from tools.terminal_tool import clear_task_env_overrides
+
+            clear_task_env_overrides(oneshot_task_id)
+            if previous_cwd_pin is None:
+                os.environ.pop("HERMES_EXPLICIT_CWD_PIN", None)
+            else:
+                os.environ["HERMES_EXPLICIT_CWD_PIN"] = previous_cwd_pin
 
 
 def _oneshot_clarify_callback(question: str, choices=None, multi_select=False) -> str:

@@ -2177,6 +2177,11 @@ if _config_path.exists():
             }
             for _cfg_key, _env_var in _terminal_env_map.items():
                 if _cfg_key in _terminal_cfg:
+                    if (
+                        _cfg_key == "cwd"
+                        and os.environ.get("HERMES_EXPLICIT_CWD_PIN") == "1"
+                    ):
+                        continue
                     _val = _terminal_cfg[_cfg_key]
                     # Skip cwd placeholder values (".", "auto", "cwd") — the
                     # gateway resolves these to Path.home() later (line ~255).

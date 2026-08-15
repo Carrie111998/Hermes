@@ -264,13 +264,15 @@ def test_oneshot_in_dir_respects_terminal_backend(
     class FakeAgent:
         def __init__(self, **_kwargs):
             seen["cwd"] = os.getcwd()
+            import gateway.run  # noqa: F401  -- a real lazy import re-bridges terminal config
             seen["terminal_cwd"] = os.environ.get("TERMINAL_CWD")
             seen["tool_cwd"] = terminal_tool._get_env_config()["cwd"]
             self.suppress_status_output = False
             self.stream_delta_callback = object()
             self.tool_gen_callback = object()
 
-        def run_conversation(self, _prompt):
+        def run_conversation(self, _prompt, task_id=None):
+            seen["task_id"] = task_id
             return {"final_response": "ok", "failed": False, "partial": False}
 
         def shutdown_memory_provider(self):
@@ -317,9 +319,12 @@ def test_oneshot_in_dir_respects_terminal_backend(
     assert response == "ok"
     assert result["failed"] is False
     assert seen["cwd"] == str(target.resolve())
+    assert seen["task_id"].startswith("oneshot:")
+    assert terminal_tool.get_session_cwd(seen["task_id"]) is None
     if backend == "local":
         assert seen["terminal_cwd"] == str(target.resolve())
         assert seen["tool_cwd"] == str(target.resolve())
     else:
         assert seen["terminal_cwd"] == configured_cwd
         assert seen["tool_cwd"] == configured_cwd
+    assert "HERMES_EXPLICIT_CWD_PIN" not in os.environ
