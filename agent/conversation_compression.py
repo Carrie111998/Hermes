@@ -2503,7 +2503,7 @@ def compress_context(
         commit_fence.finish_lock_setup()
 
     if _lock_db is not None and _lock_sid:
-        _lock_holder = _compression_lock_holder(agent)
+        _lock_holder = "admission:" + _compression_lock_holder(agent)
         if _lock_lookup_error is not None:
             # Attribute lookup itself failed for a reason other than a missing
             # lock API. It is unsafe to proceed without a lock in that case.
@@ -3415,6 +3415,32 @@ def compress_context(
                     from agent.context_compressor import (
                         PROACTIVE_PRUNE_REARM_MODEL_CONFIG_KEY,
                     )
+                    from hermes_state import SessionCompressionInProgressError
+
+                    max_snapshot_id = None
+                    if messages:
+                        ids = [int(m["id"]) for m in messages if isinstance(m, dict) and m.get("id") is not None]
+                        if ids:
+                            max_snapshot_id = max(ids)
+
+                    # Upgrade lease to exclusive mode for the short commit transaction
+                    if _lock_holder is not None:
+                        if _lock_refresher is not None:
+                            try:
+                                _lock_refresher.stop()
+                            except Exception:
+                                pass
+                            _lock_refresher = None
+                        exclusive_holder = _lock_holder.replace("admission:", "exclusive:", 1)
+                        upgraded = agent._session_db.upgrade_compression_lock_to_exclusive(
+                            agent.session_id, _lock_holder, exclusive_holder
+                        )
+                        if not upgraded:
+                            raise SessionCompressionInProgressError(
+                                f"Lease lost before commit for session {agent.session_id!r}"
+                            )
+                        _lock_holder = exclusive_holder
+                        agent._active_compression_lock_holder = _lock_holder
 
                     agent._session_db.archive_and_compact(
                         agent.session_id,
@@ -3422,6 +3448,8 @@ def compress_context(
                         model_config_patch={
                             PROACTIVE_PRUNE_REARM_MODEL_CONFIG_KEY: None,
                         },
+                        compression_lock_holder=_lock_holder,
+                        max_snapshot_id=max_snapshot_id,
                     )
                     split_status = "in_place_committed"
                     # Reset the flush identity set so the next turn's appends are

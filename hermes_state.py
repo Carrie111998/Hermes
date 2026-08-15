@@ -6305,6 +6305,42 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 session_id, exc,
             )
 
+    def upgrade_compression_lock_to_exclusive(
+        self, session_id: str, admission_holder: str, exclusive_holder: str
+    ) -> bool:
+        """Upgrade the lock from admission mode to exclusive mode, holder-qualified."""
+        if not session_id or not admission_holder or not exclusive_holder:
+            return False
+
+        def _do(conn):
+            now = time.time()
+            row = conn.execute(
+                "SELECT holder, expires_at FROM compression_locks WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+            if row is None:
+                return False
+            # Verify the lock is still held by admission_placeholder and is not expired
+            current_holder = row["holder"] if isinstance(row, sqlite3.Row) else row[0]
+            current_expires_at = row["expires_at"] if isinstance(row, sqlite3.Row) else row[1]
+            if current_holder != admission_holder or float(current_expires_at) <= now:
+                return False
+            # Update to exclusive holder
+            conn.execute(
+                "UPDATE compression_locks SET holder = ? WHERE session_id = ? AND holder = ?",
+                (exclusive_holder, session_id, admission_holder),
+            )
+            return True
+
+        try:
+            return bool(self._execute_write(_do))
+        except sqlite3.Error as exc:
+            logger.warning(
+                "upgrade_compression_lock_to_exclusive(%s) failed: %s",
+                session_id, exc,
+            )
+            return False
+
     def _session_turn_lease_key_on_conn(self, conn, session_id: str) -> str:
         """Walk compression parents on ``conn`` to the conversation lease key.
 
@@ -8881,13 +8917,15 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             "WHERE session_id = ? AND expires_at > ?",
             (session_id, time.time()),
         ).fetchone()
-        if (
-            active_lock is not None
-            and active_lock["holder"] != compression_lock_holder
-        ):
-            raise SessionCompressionInProgressError(
-                f"Session {session_id!r} is being compressed by another writer"
-            )
+        if active_lock is not None:
+            active_holder = active_lock["holder"] if isinstance(active_lock, sqlite3.Row) else active_lock[0]
+            if active_holder.startswith("admission:") and compression_lock_holder is None:
+                # Ordinary append during admission mode: ALLOWED
+                pass
+            elif active_holder != compression_lock_holder:
+                raise SessionCompressionInProgressError(
+                    f"Session {session_id!r} is being compressed by another writer"
+                )
         if turn_lease_holder:
             conversation_id = self._session_turn_lease_key_on_conn(conn, session_id)
             lease = conn.execute(
@@ -9576,6 +9614,15 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         active_clause = " AND active = 1" if active_only else ""
 
         def _do(conn):
+            active_lock = conn.execute(
+                "SELECT holder FROM compression_locks "
+                "WHERE session_id = ? AND expires_at > ?",
+                (session_id, time.time()),
+            ).fetchone()
+            if active_lock is not None:
+                raise SessionCompressionInProgressError(
+                    f"Session {session_id!r} is currently locked for compression"
+                )
             session = conn.execute(
                 "SELECT ended_at, end_reason FROM sessions WHERE id = ?",
                 (session_id,),
@@ -9636,34 +9683,33 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         session_id: str,
         compacted_messages: List[Dict[str, Any]],
         model_config_patch: Optional[Dict[str, Any]] = None,
+        compression_lock_holder: Optional[str] = None,
+        max_snapshot_id: Optional[int] = None,
     ) -> int:
         """Non-destructive in-place compaction for a single durable session id.
 
         Soft-archives every currently-active message (``active = 0``) and
         inserts *compacted_messages* as fresh active rows — atomically, in one
         write transaction. The conversation keeps ONE session id for life
-        (#38763) WITHOUT destroying history:
-
-        - The live-context load (:meth:`get_messages_as_conversation`,
-          :meth:`get_messages`) filters ``active = 1`` by default, so the model
-          reloads ONLY the compacted set.
-        - The archived pre-compaction turns stay on disk (active=0) and stay
-          DISCOVERABLE: they are marked compacted=1, and search_messages()
-          includes compacted=1 rows by default — so session_search still finds
-          them, unlike rewind/undo rows (active=0, compacted=0) which stay
-          hidden. They remain in the FTS index (the messages_fts* triggers
-          index on INSERT / drop on DELETE and don't key on active/compacted;
-          flipping to active=0 is a content-preserving UPDATE) and are
-          recoverable via get_messages(..., include_inactive=True).
-
-        This is the durability-preserving alternative to :meth:`replace_messages`
-        for compaction. ``message_count`` is set to the ACTIVE (compacted) count,
-        matching what the live load returns. ``model_config_patch`` is merged
-        into the session's JSON config in the same transaction; a ``None``
-        value removes that key. Returns the new active count.
+        (#38763) WITHOUT destroying history.
         """
 
         def _do(conn):
+            # Verify the compression lock holder if provided
+            if compression_lock_holder is not None:
+                lock_row = conn.execute(
+                    "SELECT holder, expires_at FROM compression_locks WHERE session_id = ?",
+                    (session_id,),
+                ).fetchone()
+                if (
+                    lock_row is None
+                    or lock_row["holder"] != compression_lock_holder
+                    or float(lock_row["expires_at"]) <= time.time()
+                ):
+                    raise SessionCompressionInProgressError(
+                        f"Compression lease lost before publication: {session_id}"
+                    )
+
             patched_model_config = None
             if model_config_patch is not None:
                 # on_missing="raise": a prune/compaction must not commit
@@ -9675,19 +9721,58 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 )
 
             # Soft-archive the live turns: active=0 hides them from the live
-            # context load, compacted=1 marks them as "summarized away" (vs
-            # rewind/undo's active=0+compacted=0, which means "user took it
-            # back"). search_messages includes compacted=1 rows by default so
-            # the pre-compaction transcript stays discoverable; live-context
-            # loads (active=1 only) still exclude them.
-            conn.execute(
-                "UPDATE messages SET active = 0, compacted = 1 "
-                "WHERE session_id = ? AND active = 1",
-                (session_id,),
-            )
-            inserted, tool_calls_total = self._insert_message_rows(
-                conn, session_id, compacted_messages
-            )
+            # context load, compacted=1 marks them as "summarized away".
+            if max_snapshot_id is None:
+                conn.execute(
+                    "UPDATE messages SET active = 0, compacted = 1 "
+                    "WHERE session_id = ? AND active = 1",
+                    (session_id,),
+                )
+                inserted, tool_calls_total = self._insert_message_rows(
+                    conn, session_id, compacted_messages
+                )
+            else:
+                tail_cursor = conn.execute(
+                    "SELECT * FROM messages WHERE session_id = ? AND active = 1 AND id > ? ORDER BY id ASC",
+                    (session_id, max_snapshot_id),
+                )
+                tail_rows = tail_cursor.fetchall()
+                tail_messages = []
+                for r in tail_rows:
+                    msg_dict = dict(r)
+                    if "content" in msg_dict and msg_dict["content"] is not None:
+                        msg_dict["content"] = self._decode_content(msg_dict["content"])
+                    if msg_dict.get("display_metadata") is not None:
+                        msg_dict["display_metadata"] = self._decode_display_metadata(msg_dict["display_metadata"])
+                    if msg_dict.get("tool_calls"):
+                        try:
+                            msg_dict["tool_calls"] = json.loads(msg_dict["tool_calls"])
+                        except Exception:
+                            pass
+                    tail_messages.append(msg_dict)
+
+                # Archive all messages in the snapshot
+                conn.execute(
+                    "UPDATE messages SET active = 0, compacted = 1 "
+                    "WHERE session_id = ? AND active = 1 AND id <= ?",
+                    (session_id, max_snapshot_id),
+                )
+                # Delete the original tail messages (they will be reinserted after new summary)
+                conn.execute(
+                    "DELETE FROM messages WHERE session_id = ? AND active = 1 AND id > ?",
+                    (session_id, max_snapshot_id),
+                )
+                # Insert the compacted messages (the summary)
+                inserted_summary, tool_calls_summary = self._insert_message_rows(
+                    conn, session_id, compacted_messages
+                )
+                # Re-insert the tail messages chronologically after the summary
+                inserted_tail, tool_calls_tail = self._insert_message_rows(
+                    conn, session_id, tail_messages
+                )
+                inserted = inserted_summary + inserted_tail
+                tool_calls_total = tool_calls_summary + tool_calls_tail
+
             # message_count / tool_call_count reflect the LIVE (active) set —
             # the archived rows are still on disk but not part of the live count.
             if model_config_patch is None:
