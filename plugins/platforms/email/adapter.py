@@ -110,6 +110,10 @@ _AUTOMATED_HEADERS = {
 MAX_MESSAGE_LENGTH = 50_000
 
 SMTP_CONNECT_TIMEOUT = 30
+# ``imaplib`` applies its timeout to individual socket operations. Keep an
+# independent wall-clock bound around the whole executor job so a worker that
+# stops making progress cannot pin the poll loop indefinitely.
+IMAP_FETCH_WATCHDOG_TIMEOUT = 120.0
 
 
 def _close_imap(imap: "imaplib.IMAP4") -> None:
@@ -825,7 +829,23 @@ class EmailAdapter(BasePlatformAdapter):
         """Check INBOX for unseen messages and dispatch them."""
         # Run IMAP operations in a thread to avoid blocking the event loop
         loop = asyncio.get_running_loop()
-        messages = await loop.run_in_executor(None, self._fetch_new_messages)
+        try:
+            fetch_future = loop.run_in_executor(None, self._fetch_new_messages)
+            messages = await asyncio.wait_for(
+                asyncio.shield(fetch_future),
+                timeout=IMAP_FETCH_WATCHDOG_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            message = (
+                "IMAP fetch exceeded "
+                f"{IMAP_FETCH_WATCHDOG_TIMEOUT:g}s without completing"
+            )
+            logger.error("[Email] %s", message)
+            self._set_fatal_error(
+                "email_imap_fetch_timeout", message, retryable=True
+            )
+            await self._notify_fatal_error()
+            return
         # Dispatch whatever the fetch managed to return BEFORE escalating a
         # failure: on a mid-batch exception _fetch_new_messages returns the
         # partial results, and dropping them here would lose those messages
