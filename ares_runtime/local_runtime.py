@@ -503,6 +503,47 @@ if (config or {}).get('context', {}).get('engine') == 'ri-context-governor':
             return {}
         return payload if isinstance(payload, dict) else {}
 
+    def _matching_release_candidate(
+        self,
+        *,
+        downstream_revision: str,
+        upstream_remote: str,
+        upstream_branch: str,
+        upstream_revision: str,
+    ) -> str | None:
+        """Return the newest fully materialized candidate for this update tuple.
+
+        A candidate is moved into ``releases`` only after all its build gates
+        pass.  Reusing one after a gateway-handoff failure lets a retry remain
+        an atomic promotion rather than repeating an expensive, already
+        verified build.
+        """
+
+        if not self.paths.releases_dir.is_dir():
+            return None
+        matches: list[tuple[int, str]] = []
+        for directory in self.paths.releases_dir.iterdir():
+            if not directory.is_dir():
+                continue
+            try:
+                revision = self._require_revision(directory.name)
+            except AresLocalRuntimeError:
+                continue
+            metadata = self._release_metadata(revision)
+            if (
+                metadata.get("downstream_revision") == downstream_revision
+                and metadata.get("upstream_revision") == upstream_revision
+                and metadata.get("upstream_remote") == upstream_remote
+                and metadata.get("upstream_branch") == upstream_branch
+            ):
+                try:
+                    self._release_source(revision)
+                except AresLocalRuntimeError:
+                    continue
+                installed_at = metadata.get("installed_at", 0)
+                matches.append((installed_at if isinstance(installed_at, int) else 0, revision))
+        return max(matches, default=(0, ""))[1] or None
+
     def _materialize_upstream_candidate(
         self,
         *,
@@ -804,14 +845,21 @@ if (config or {}).get('context', {}).get('engine') == 'ri-context-governor':
                 ):
                     return current[0], False
             old_active = current
-            revision = self._materialize_upstream_candidate(
-                downstream_remote=remote,
+            revision = self._matching_release_candidate(
                 downstream_revision=downstream_revision,
                 upstream_remote=upstream_remote,
                 upstream_branch=upstream_branch,
                 upstream_revision=upstream_revision,
-                desktop=desktop,
             )
+            if revision is None:
+                revision = self._materialize_upstream_candidate(
+                    downstream_remote=remote,
+                    downstream_revision=downstream_revision,
+                    upstream_remote=upstream_remote,
+                    upstream_branch=upstream_branch,
+                    upstream_revision=upstream_revision,
+                    desktop=desktop,
+                )
             self._activate(revision)
             if self.paths.unit_path.exists():
                 try:

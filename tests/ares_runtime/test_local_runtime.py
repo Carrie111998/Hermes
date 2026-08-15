@@ -183,6 +183,17 @@ def test_update_activates_only_the_verified_upstream_candidate(tmp_path: Path, m
     )
     assert runtime.update(desktop=False) == (candidate_revision, False)
 
+    # A successful build remains a retryable candidate if its gateway handoff
+    # failed.  The next attempt must promote it without rebuilding a second
+    # candidate from the same revisions.
+    runtime.paths.current_link.unlink()
+    monkeypatch.setattr(
+        runtime,
+        "_materialize_upstream_candidate",
+        lambda **_kwargs: pytest.fail("rebuilt an already verified candidate"),
+    )
+    assert runtime.update(desktop=False) == (candidate_revision, True)
+
 
 def test_upstream_candidate_conflict_never_publishes_a_release(tmp_path: Path, monkeypatch) -> None:
     upstream = _repository(tmp_path / "upstream")
