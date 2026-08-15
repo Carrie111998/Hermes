@@ -687,6 +687,104 @@ def test_complete_task_stages_dir_artifact_on_connection_board(
     assert not kb.task_attachments_dir(task_id, board="default").exists()
 
 
+def test_complete_task_does_not_clobber_existing_durable_artifact(
+    kanban_home,
+    tmp_path,
+):
+    """Descriptor-relative collision handling must remain append-only."""
+    workspace = tmp_path / "collision-project"
+    workspace.mkdir()
+    artifact = workspace / "report.pdf"
+    artifact.write_bytes(b"new report")
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="collision-safe staging",
+            workspace_kind="dir",
+            workspace_path=str(workspace),
+        )
+        destination = kb.task_attachments_dir(task_id)
+        destination.mkdir(parents=True)
+        existing = destination / artifact.name
+        existing.write_bytes(b"existing report")
+
+        assert kb.complete_task(
+            conn,
+            task_id,
+            result="done",
+            metadata={"artifacts": [str(artifact)]},
+        )
+        completed = [
+            event for event in kb.list_events(conn, task_id)
+            if event.kind == "completed"
+        ][-1]
+        persisted = Path(completed.payload["artifacts"][0])
+
+    assert existing.read_bytes() == b"existing report"
+    assert persisted.name == "report_1.pdf"
+    assert persisted.read_bytes() == b"new report"
+
+
+@pytest.mark.parametrize("board", ["default", "other"])
+@pytest.mark.parametrize("force_path_fallback", [False, True])
+@pytest.mark.parametrize("symlink_level", ["attachments-root", "task-dir"])
+def test_complete_task_rejects_symlinked_destination_directory(
+    kanban_home,
+    tmp_path,
+    monkeypatch,
+    board,
+    force_path_fallback,
+    symlink_level,
+):
+    """A pre-planted task attachment symlink must not redirect durable output."""
+    if force_path_fallback:
+        monkeypatch.setattr(kb, "_attachment_dir_fd_supported", lambda: False)
+    if board != "default":
+        kb.create_board(board)
+
+    workspace = tmp_path / f"{board}-project"
+    workspace.mkdir()
+    artifact = workspace / "report.pdf"
+    artifact.write_bytes(b"expected report")
+
+    with kb.connect(board=board) as conn:
+        task_id = kb.create_task(
+            conn,
+            title=f"{board} destination confinement",
+            workspace_kind="dir",
+            workspace_path=str(workspace),
+        )
+        destination = kb.task_attachments_dir(task_id, board=board)
+        outside = tmp_path / f"{board}-outside"
+        outside.mkdir()
+        if symlink_level == "attachments-root":
+            symlink = destination.parent
+        else:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            symlink = destination
+        symlink.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            symlink.symlink_to(outside, target_is_directory=True)
+        except OSError as exc:
+            pytest.skip(f"directory symlinks unavailable: {exc}")
+
+        with pytest.raises(kb.ArtifactPreservationError):
+            kb.complete_task(
+                conn,
+                task_id,
+                result="done",
+                metadata={"artifacts": [str(artifact)]},
+            )
+
+        assert kb.get_task(conn, task_id).status == "ready"
+        assert kb.list_attachments(conn, task_id) == []
+        assert all(event.kind != "completed" for event in kb.list_events(conn, task_id))
+
+    assert list(outside.iterdir()) == []
+    assert artifact.read_bytes() == b"expected report"
+
+
 @pytest.mark.parametrize("via_workspace_symlink", [False, True])
 def test_complete_task_rejects_artifacts_outside_scratch_workspace(
     kanban_home,

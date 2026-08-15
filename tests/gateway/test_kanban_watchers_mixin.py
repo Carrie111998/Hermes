@@ -12,6 +12,8 @@ import inspect
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from gateway.kanban_watchers import GatewayKanbanWatchersMixin
 
 KANBAN_METHODS = [
@@ -105,6 +107,49 @@ def test_durable_task_attachment_remains_deliverable(
     )
 
     assert adapter.documents == [str(stored.resolve())]
+
+
+def test_notifier_rejects_symlinked_task_attachment_root(
+    tmp_path,
+    monkeypatch,
+):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    from hermes_cli import kanban_db as kb
+
+    task_id = "t_symlinked_root"
+    stored_dir = kb.task_attachments_dir(task_id, board="default")
+    stored_dir.parent.mkdir(parents=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    external = outside / "report.pdf"
+    external.write_bytes(b"host secret")
+    try:
+        stored_dir.symlink_to(outside, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"directory symlinks unavailable: {exc}")
+
+    adapter = _ArtifactAdapter()
+    task = SimpleNamespace(
+        id=task_id,
+        workspace_path=str(tmp_path / "workspace"),
+        result=None,
+    )
+
+    asyncio.run(
+        GatewayKanbanWatchersMixin()._deliver_kanban_artifacts(
+            adapter=adapter,
+            chat_id="chat",
+            metadata={},
+            event_payload={"artifacts": [str(stored_dir / external.name)]},
+            task=task,
+            board="default",
+        )
+    )
+
+    assert adapter.documents == []
 
 
 def test_notifier_never_hands_mutable_workspace_path_to_adapter(tmp_path):

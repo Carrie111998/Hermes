@@ -5744,6 +5744,8 @@ def _persist_completion_artifacts(
     raw_artifacts = metadata.get("artifacts")
     if not isinstance(raw_artifacts, (list, tuple)):
         return
+    if not raw_artifacts:
+        return
 
     row = conn.execute(
         "SELECT workspace_path FROM tasks WHERE id = ?",
@@ -5754,6 +5756,14 @@ def _persist_completion_artifacts(
 
     workspace = Path(row["workspace_path"]).expanduser()
     board = _connection_board(conn)
+    if (
+        not task_id
+        or task_id in {".", ".."}
+        or "/" in task_id
+        or "\\" in task_id
+        or Path(task_id).name != task_id
+    ):
+        raise ArtifactPreservationError("task id cannot name an attachment directory")
 
     try:
         workspace_root = workspace.resolve(strict=True)
@@ -5767,116 +5777,135 @@ def _persist_completion_artifacts(
     used_destinations: set[Path] = set()
     changed = False
 
-    def _discard_copies() -> None:
-        for copied in used_destinations:
-            try:
-                copied.unlink(missing_ok=True)
-            except OSError:
-                pass
-        try:
-            attachment_dir.rmdir()
-        except OSError:
-            pass
+    try:
+        with _open_pinned_attachment_directory(attachment_dir) as (
+            pinned_attachment_dir,
+            attachment_dir_fd,
+        ):
+            def _discard_copies() -> None:
+                for copied in used_destinations:
+                    try:
+                        if attachment_dir_fd is None:
+                            copied.unlink(missing_ok=True)
+                        else:
+                            os.unlink(copied.name, dir_fd=attachment_dir_fd)
+                    except OSError:
+                        pass
 
-    for item in raw_artifacts:
-        artifact = str(item).strip() if isinstance(item, str) else ""
-        if not artifact:
-            continue
-        src = Path(artifact).expanduser()
-        try:
-            resolved_src = src.resolve(strict=True)
-        except OSError as exc:
-            _discard_copies()
-            raise ArtifactPreservationError(
-                f"declared completion artifact is unavailable: {artifact}"
-            ) from exc
-
-        if not resolved_src.is_relative_to(workspace_root):
-            _discard_copies()
-            raise ArtifactPreservationError(
-                f"declared artifact is outside its task workspace: {artifact}"
-            )
-
-        try:
-            expected_stat = os.stat(resolved_src, follow_symlinks=False)
-        except OSError as exc:
-            _discard_copies()
-            raise ArtifactPreservationError(
-                f"declared completion artifact is unavailable or not a regular file: {artifact}"
-            ) from exc
-        if not stat.S_ISREG(expected_stat.st_mode):
-            _discard_copies()
-            raise ArtifactPreservationError(
-                f"declared completion artifact is unavailable or not a regular file: {artifact}"
-            )
-        if expected_stat.st_size > KANBAN_ATTACHMENT_MAX_BYTES:
-            _discard_copies()
-            raise ArtifactPreservationError(
-                f"declared completion artifact exceeds the "
-                f"{KANBAN_ATTACHMENT_MAX_BYTES}-byte limit: {artifact}"
-            )
-
-        dest: Optional[Path] = None
-        try:
-            attachment_dir.mkdir(parents=True, exist_ok=True)
-            dest = _unique_attachment_path(attachment_dir, resolved_src.name, used_destinations)
-            source_flags = (
-                os.O_RDONLY
-                | getattr(os, "O_BINARY", 0)
-                | getattr(os, "O_NOFOLLOW", 0)
-            )
-            source_fd = os.open(resolved_src, source_flags)
-            with (
-                os.fdopen(source_fd, "rb") as source_file,
-                dest.open("xb") as destination_file,
-            ):
-                opened_stat = os.fstat(source_file.fileno())
-                if not stat.S_ISREG(opened_stat.st_mode):
+            for item in raw_artifacts:
+                artifact = str(item).strip() if isinstance(item, str) else ""
+                if not artifact:
+                    continue
+                src = Path(artifact).expanduser()
+                try:
+                    resolved_src = src.resolve(strict=True)
+                except OSError as exc:
+                    _discard_copies()
                     raise ArtifactPreservationError(
-                        f"declared completion artifact is not a regular file: {artifact}"
-                    )
-                if (
-                    opened_stat.st_dev != expected_stat.st_dev
-                    or opened_stat.st_ino != expected_stat.st_ino
-                ):
+                        f"declared completion artifact is unavailable: {artifact}"
+                    ) from exc
+
+                if not resolved_src.is_relative_to(workspace_root):
+                    _discard_copies()
                     raise ArtifactPreservationError(
-                        f"declared completion artifact changed before it could be copied: {artifact}"
+                        f"declared artifact is outside its task workspace: {artifact}"
                     )
-                if opened_stat.st_size > KANBAN_ATTACHMENT_MAX_BYTES:
+
+                try:
+                    expected_stat = os.stat(resolved_src, follow_symlinks=False)
+                except OSError as exc:
+                    _discard_copies()
+                    raise ArtifactPreservationError(
+                        f"declared completion artifact is unavailable or not a regular file: {artifact}"
+                    ) from exc
+                if not stat.S_ISREG(expected_stat.st_mode):
+                    _discard_copies()
+                    raise ArtifactPreservationError(
+                        f"declared completion artifact is unavailable or not a regular file: {artifact}"
+                    )
+                if expected_stat.st_size > KANBAN_ATTACHMENT_MAX_BYTES:
+                    _discard_copies()
                     raise ArtifactPreservationError(
                         f"declared completion artifact exceeds the "
                         f"{KANBAN_ATTACHMENT_MAX_BYTES}-byte limit: {artifact}"
                     )
-                copied = 0
-                while chunk := source_file.read(1024 * 1024):
-                    copied += len(chunk)
-                    if copied > KANBAN_ATTACHMENT_MAX_BYTES:
-                        raise ArtifactPreservationError(
-                            f"declared completion artifact grew beyond the size limit: {artifact}"
-                        )
-                    destination_file.write(chunk)
-        except Exception as exc:
-            if dest is not None:
-                try:
-                    dest.unlink(missing_ok=True)
-                except OSError:
-                    pass
-            _discard_copies()
-            if isinstance(exc, ArtifactPreservationError):
-                raise
-            raise ArtifactPreservationError(
-                f"could not preserve declared completion artifact {artifact}: {exc}"
-            ) from exc
 
-        used_destinations.add(dest)
-        persisted.append(str(dest.resolve()))
-        changed = True
+                dest: Optional[Path] = None
+                destination_fd: Optional[int] = None
+                try:
+                    dest, destination_fd = _open_unique_attachment_file(
+                        pinned_attachment_dir,
+                        attachment_dir_fd,
+                        resolved_src.name,
+                        used_destinations,
+                    )
+                    source_flags = (
+                        os.O_RDONLY
+                        | getattr(os, "O_BINARY", 0)
+                        | getattr(os, "O_NOFOLLOW", 0)
+                    )
+                    source_fd = os.open(resolved_src, source_flags)
+                    with (
+                        os.fdopen(source_fd, "rb") as source_file,
+                        os.fdopen(destination_fd, "wb") as destination_file,
+                    ):
+                        opened_stat = os.fstat(source_file.fileno())
+                        if not stat.S_ISREG(opened_stat.st_mode):
+                            raise ArtifactPreservationError(
+                                f"declared completion artifact is not a regular file: {artifact}"
+                            )
+                        if (
+                            opened_stat.st_dev != expected_stat.st_dev
+                            or opened_stat.st_ino != expected_stat.st_ino
+                        ):
+                            raise ArtifactPreservationError(
+                                f"declared completion artifact changed before it could be copied: {artifact}"
+                            )
+                        if opened_stat.st_size > KANBAN_ATTACHMENT_MAX_BYTES:
+                            raise ArtifactPreservationError(
+                                f"declared completion artifact exceeds the "
+                                f"{KANBAN_ATTACHMENT_MAX_BYTES}-byte limit: {artifact}"
+                            )
+                        copied = 0
+                        while chunk := source_file.read(1024 * 1024):
+                            copied += len(chunk)
+                            if copied > KANBAN_ATTACHMENT_MAX_BYTES:
+                                raise ArtifactPreservationError(
+                                    f"declared completion artifact grew beyond the size limit: {artifact}"
+                                )
+                            destination_file.write(chunk)
+                except Exception as exc:
+                    if destination_fd is not None:
+                        with contextlib.suppress(OSError):
+                            os.close(destination_fd)
+                    if dest is not None:
+                        try:
+                            if attachment_dir_fd is None:
+                                dest.unlink(missing_ok=True)
+                            else:
+                                os.unlink(dest.name, dir_fd=attachment_dir_fd)
+                        except OSError:
+                            pass
+                    _discard_copies()
+                    if isinstance(exc, ArtifactPreservationError):
+                        raise
+                    raise ArtifactPreservationError(
+                        f"could not preserve declared completion artifact {artifact}: {exc}"
+                    ) from exc
+
+                used_destinations.add(dest)
+                persisted.append(str(dest))
+                changed = True
+    except ArtifactPreservationError:
+        raise
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise ArtifactPreservationError(
+            f"could not prepare the durable artifact directory: {exc}"
+        ) from exc
 
     if changed:
         metadata["artifacts"] = persisted
-        metadata["_staged_artifacts"] = [
-            path for path in persisted if path.startswith(str(attachment_dir.resolve()))
-        ]
+        metadata["_staged_artifacts"] = list(persisted)
 
 
 def _insert_completion_attachment(
@@ -5904,10 +5933,10 @@ def _insert_completion_attachment(
 
 
 def _unique_attachment_path(directory: Path, filename: str, used: set[Path]) -> Path:
-    """Return a non-conflicting path under ``directory`` for ``filename``."""
+    """Return the next candidate path under ``directory`` for ``filename``."""
     safe_name = Path(filename).name or "artifact"
     candidate = directory / safe_name
-    if candidate not in used and not candidate.exists():
+    if candidate not in used:
         return candidate
 
     stem = Path(safe_name).stem or "artifact"
@@ -5915,9 +5944,113 @@ def _unique_attachment_path(directory: Path, filename: str, used: set[Path]) -> 
     idx = 1
     while True:
         candidate = directory / f"{stem}_{idx}{suffix}"
-        if candidate not in used and not candidate.exists():
+        if candidate not in used:
             return candidate
         idx += 1
+
+
+def _attachment_dir_fd_supported() -> bool:
+    """Return whether this platform supports descriptor-relative directory IO."""
+    supported = getattr(os, "supports_dir_fd", set())
+    return (
+        hasattr(os, "O_DIRECTORY")
+        and hasattr(os, "O_NOFOLLOW")
+        and all(fn in supported for fn in (os.open, os.mkdir, os.unlink))
+    )
+
+
+@contextlib.contextmanager
+def _open_pinned_attachment_directory(directory: Path):
+    """Create and pin every destination component without following symlinks.
+
+    On POSIX, every component is opened relative to its already-pinned parent
+    using ``O_NOFOLLOW``. The returned descriptor remains the authority for
+    file creation and cleanup even if the visible pathname is swapped later.
+    Platforms without descriptor-relative IO still reject every symlink via
+    ``lstat`` before opening the leaf; file creation remains ``O_EXCL`` and
+    ``O_NOFOLLOW`` where available.
+    """
+    absolute = Path(os.path.abspath(os.fspath(directory.expanduser())))
+    if not absolute.is_absolute() or not absolute.anchor:
+        raise ValueError("attachment directory must resolve to an absolute path")
+
+    if not _attachment_dir_fd_supported():
+        current = Path(absolute.anchor)
+        for component in absolute.parts[1:]:
+            current /= component
+            try:
+                os.mkdir(current, mode=0o700)
+            except FileExistsError:
+                pass
+            info = os.lstat(current)
+            if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+                raise OSError(f"unsafe attachment directory component: {current}")
+        yield absolute, None
+        return
+
+    directory_flags = (
+        os.O_RDONLY
+        | os.O_DIRECTORY
+        | os.O_NOFOLLOW
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    current_fd = os.open(absolute.anchor, directory_flags)
+    try:
+        for component in absolute.parts[1:]:
+            try:
+                os.mkdir(component, mode=0o700, dir_fd=current_fd)
+            except FileExistsError:
+                pass
+            next_fd = os.open(component, directory_flags, dir_fd=current_fd)
+            try:
+                if not stat.S_ISDIR(os.fstat(next_fd).st_mode):
+                    raise NotADirectoryError(component)
+            except Exception:
+                os.close(next_fd)
+                raise
+            previous_fd = current_fd
+            current_fd = next_fd
+            os.close(previous_fd)
+        yield absolute, current_fd
+    finally:
+        os.close(current_fd)
+
+
+def _open_unique_attachment_file(
+    directory: Path,
+    directory_fd: Optional[int],
+    filename: str,
+    used: set[Path],
+) -> tuple[Path, int]:
+    """Atomically create a collision-free regular file in a pinned directory."""
+    unavailable: set[Path] = set()
+    flags = (
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_BINARY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    while True:
+        destination = _unique_attachment_path(
+            directory,
+            filename,
+            used | unavailable,
+        )
+        try:
+            if directory_fd is None:
+                fd = os.open(destination, flags, 0o600)
+            else:
+                fd = os.open(destination.name, flags, 0o600, dir_fd=directory_fd)
+        except FileExistsError:
+            unavailable.add(destination)
+            continue
+        opened = os.fstat(fd)
+        if not stat.S_ISREG(opened.st_mode):
+            os.close(fd)
+            raise OSError(f"attachment destination is not a regular file: {destination}")
+        return destination, fd
 
 
 def _managed_scratch_path_info(p: Path) -> tuple[bool, Optional[str]]:

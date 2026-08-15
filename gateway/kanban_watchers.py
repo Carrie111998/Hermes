@@ -1151,11 +1151,21 @@ class GatewayKanbanWatchersMixin:
             try:
                 from hermes_cli import kanban_db as _kb
 
-                allowed_roots.append(
-                    _kb.task_attachments_dir(str(task_id), board=board).resolve(
-                        strict=False
+                declared_root = _kb.task_attachments_dir(
+                    str(task_id), board=board
+                ).expanduser()
+                lexical_root = _Path(os.path.abspath(os.fspath(declared_root)))
+                resolved_root = declared_root.resolve(strict=True)
+                # The durable root is an authority boundary, not just a
+                # containment hint. Refuse any symlinked component instead of
+                # resolving it into an attacker-selected external directory.
+                if lexical_root == resolved_root and resolved_root.is_dir():
+                    allowed_roots.append(resolved_root)
+                else:
+                    logger.warning(
+                        "kanban notifier: refusing unsafe task attachment root: %s",
+                        declared_root,
                     )
-                )
             except (OSError, RuntimeError, ValueError):
                 pass
 
