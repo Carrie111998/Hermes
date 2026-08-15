@@ -402,6 +402,37 @@ class TestRestore:
         assert late.read_text() == "must survive\n"
         assert [row["hash"] for row in mgr.list_checkpoints(str(work_dir))] == before_hashes
 
+    def test_restore_removes_pin_when_worktree_disappears_during_snapshot(
+        self, checkpoint_base, monkeypatch, tmp_path,
+    ):
+        monkeypatch.setattr("tools.checkpoint_manager.CHECKPOINT_BASE", checkpoint_base)
+        manager = CheckpointManager(enabled=True, max_snapshots=5)
+        project = tmp_path / "vanishing-worktree"
+        project.mkdir()
+        (project / "main.py").write_text("baseline\n")
+        assert manager.ensure_checkpoint(str(project), "baseline") is True
+        baseline = manager.list_checkpoints(str(project))[0]
+
+        def remove_worktree_and_fail(*_args, **_kwargs):
+            shutil.rmtree(project)
+            return False
+
+        monkeypatch.setattr(manager, "_take", remove_worktree_and_fail)
+
+        result = manager.restore(str(project), baseline["hash"])
+        assert result["success"] is False
+        assert "pre-rollback" in result["error"].lower()
+        assert project.exists() is False
+
+        store = _store_path(checkpoint_base)
+        ok, pins, err = _run_git(
+            ["for-each-ref", "--format=%(refname)", "refs/restore-pins/hermes"],
+            store,
+            str(checkpoint_base),
+        )
+        assert ok is True, err
+        assert pins == ""
+
     def test_restore_aborts_when_forced_snapshot_omits_oversize_tracked_file(
         self, checkpoint_base, monkeypatch, tmp_path,
     ):

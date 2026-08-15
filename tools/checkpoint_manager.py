@@ -1091,8 +1091,12 @@ class CheckpointManager:
                 result["file"] = file_path
             return result
         finally:
+            # Pin deletion only mutates the shared checkpoint store.  Use its
+            # stable parent as the subprocess cwd/work-tree so cleanup still
+            # runs if the restored worktree disappears or becomes inaccessible
+            # after the pin was created.
             cleanup_ok, _, cleanup_err = _run_git(
-                ["update-ref", "-d", pin_ref], store, abs_dir,
+                ["update-ref", "-d", pin_ref], store, str(store.parent),
             )
             if not cleanup_ok:
                 logger.warning(
