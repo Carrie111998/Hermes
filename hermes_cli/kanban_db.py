@@ -10397,6 +10397,8 @@ def _default_spawn(
         # This only happens in test fixtures where the isolated
         # HERMES_HOME never had profiles created.
         pass
+    # A tenantless task must not inherit a stale tenant from the dispatcher.
+    env.pop("HERMES_TENANT", None)
     if task.tenant:
         env["HERMES_TENANT"] = task.tenant
     env["HERMES_KANBAN_TASK"] = task.id

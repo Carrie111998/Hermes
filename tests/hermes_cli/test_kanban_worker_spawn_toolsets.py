@@ -250,6 +250,8 @@ toolsets:
     )
     monkeypatch.setenv("HERMES_HOME", str(root))
     monkeypatch.setenv("HERMES_ACCEPT_HOOKS", "1")
+    monkeypatch.setenv("HERMES_TUI", "1")
+    monkeypatch.setenv("HERMES_TENANT", "stale-parent-tenant")
     monkeypatch.setenv("HERMES_KANBAN_WORKER_SCOPE", "inherited-invalid")
 
     from hermes_cli import kanban_db as kb
@@ -274,6 +276,8 @@ toolsets:
     ) == 4246
     assert captured["env"]["HERMES_KANBAN_WORKER_SCOPE"] == "lifecycle-only"
     assert "HERMES_ACCEPT_HOOKS" not in captured["env"]
+    assert "HERMES_TUI" not in captured["env"]
+    assert "HERMES_TENANT" not in captured["env"]
     assert "--accept-hooks" not in captured["cmd"]
     pinned = captured["cmd"][captured["cmd"].index("--toolsets") + 1]
     assert pinned == "kanban_lifecycle"

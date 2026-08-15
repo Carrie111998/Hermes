@@ -12,9 +12,12 @@ import types
 import pytest
 
 
-def _lifecycle_env(monkeypatch: pytest.MonkeyPatch) -> None:
+def _lifecycle_env(
+    monkeypatch: pytest.MonkeyPatch,
+    scope: str = "lifecycle-only",
+) -> None:
     monkeypatch.setenv("HERMES_KANBAN_TASK", "t_lifecycle_startup")
-    monkeypatch.setenv("HERMES_KANBAN_WORKER_SCOPE", "lifecycle-only")
+    monkeypatch.setenv("HERMES_KANBAN_WORKER_SCOPE", scope)
 
 
 def _clear_lifecycle_env(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -33,6 +36,492 @@ def _agent_args(command: str = "chat") -> Namespace:
         tui=False,
         yolo=False,
     )
+
+
+def test_profile_dotenv_cannot_override_dispatcher_identity(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from gateway.session_context import _VAR_MAP
+    from hermes_cli import env_loader
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    foreign_values = [
+        "HERMES_KANBAN_WORKER_SCOPE=",
+        "HERMES_KANBAN_TASK=foreign-task",
+        "HERMES_KANBAN_RUN_ID=foreign-run",
+        "HERMES_KANBAN_WORKSPACE=/foreign/workspace",
+        "HERMES_KANBAN_BOARD=foreign-board",
+        "HERMES_HOME=/foreign/profile",
+        "HERMES_TENANT=foreign-tenant",
+        "HERMES_TUI=1",
+        "HERMES_ACCEPT_HOOKS=1",
+    ]
+    foreign_values.extend(f"{key}=foreign-route" for key in sorted(_VAR_MAP))
+    (home / ".env").write_text(
+        "\n".join(foreign_values) + "\n",
+        encoding="utf-8",
+    )
+    dispatcher_identity = {
+        "HERMES_KANBAN_WORKER_SCOPE": "lifecycle-only",
+        "HERMES_KANBAN_TASK": "owned-task",
+        "HERMES_KANBAN_RUN_ID": "owned-run",
+        "HERMES_KANBAN_WORKSPACE": "/owned/workspace",
+        "HERMES_KANBAN_BOARD": "owned-board",
+        "HERMES_HOME": "/owned/profile",
+        "HERMES_TENANT": "owned-tenant",
+        "HERMES_SESSION_SOURCE": "kanban",
+    }
+    for key, value in dispatcher_identity.items():
+        monkeypatch.setenv(key, value)
+    dispatcher_absences = (
+        set(_VAR_MAP) - {"HERMES_SESSION_SOURCE"}
+    ) | {"HERMES_TUI", "HERMES_ACCEPT_HOOKS"}
+    for key in dispatcher_absences:
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setattr(env_loader, "_apply_external_secret_sources", lambda _home: None)
+    monkeypatch.setattr(env_loader, "_apply_managed_env", lambda: None)
+
+    loaded = env_loader.load_hermes_dotenv(hermes_home=home)
+
+    assert loaded == [home / ".env"]
+    assert {
+        key: os.environ.get(key) for key in dispatcher_identity
+    } == dispatcher_identity
+    assert dispatcher_absences.isdisjoint(os.environ)
+
+
+def test_pinned_worker_authority_covers_gateway_routing() -> None:
+    from gateway.session_context import _VAR_MAP
+    from hermes_cli.kanban_worker_scope import PINNED_WORKER_ENV_KEYS
+
+    assert set(_VAR_MAP) <= set(PINNED_WORKER_ENV_KEYS)
+
+
+@pytest.mark.parametrize("failing_stage", ["dotenv", "managed", "config"])
+def test_dispatcher_authority_is_restored_when_startup_stage_raises(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    failing_stage: str,
+) -> None:
+    from hermes_cli import env_loader
+    from hermes_cli.kanban_worker_scope import PINNED_WORKER_ENV_KEYS
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    (home / ".env").write_text("ORDINARY_SETTING=loaded\n", encoding="utf-8")
+
+    for index, key in enumerate(PINNED_WORKER_ENV_KEYS):
+        if key in {"HERMES_TUI", "HERMES_ACCEPT_HOOKS"}:
+            monkeypatch.delenv(key, raising=False)
+        elif key == "HERMES_KANBAN_WORKER_SCOPE":
+            monkeypatch.setenv(key, "lifecycle-only")
+        elif key == "HERMES_KANBAN_TASK":
+            monkeypatch.setenv(key, "owned-task")
+        else:
+            monkeypatch.setenv(key, f"owned-{index}")
+    expected = {key: os.environ.get(key) for key in PINNED_WORKER_ENV_KEYS}
+
+    def mutate_and_raise(*_args, **_kwargs) -> None:
+        for key in PINNED_WORKER_ENV_KEYS:
+            os.environ[key] = "foreign"
+        raise RuntimeError(f"{failing_stage} bridge failed")
+
+    monkeypatch.setattr(env_loader, "_apply_managed_env", lambda: None)
+    monkeypatch.setattr(env_loader, "_reapply_terminal_config_bridge", lambda _home: None)
+    if failing_stage == "dotenv":
+        monkeypatch.setattr(env_loader, "_load_dotenv_with_fallback", mutate_and_raise)
+    elif failing_stage == "managed":
+        monkeypatch.setattr(env_loader, "_apply_managed_env", mutate_and_raise)
+    else:
+        monkeypatch.setattr(env_loader, "_reapply_terminal_config_bridge", mutate_and_raise)
+
+    with pytest.raises(RuntimeError, match=f"{failing_stage} bridge failed"):
+        env_loader.load_hermes_dotenv(hermes_home=home)
+
+    assert {
+        key: os.environ.get(key) for key in PINNED_WORKER_ENV_KEYS
+    } == expected
+
+
+def test_dispatcher_identity_is_restored_before_later_startup_bridges(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from hermes_cli import env_loader
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    (home / ".env").write_text(
+        "HERMES_KANBAN_WORKER_SCOPE=\nHERMES_KANBAN_TASK=foreign-task\n",
+        encoding="utf-8",
+    )
+    _lifecycle_env(monkeypatch)
+    monkeypatch.setenv("HERMES_HOME", "/owned/profile")
+    monkeypatch.setenv("HERMES_TENANT", "owned-tenant")
+    monkeypatch.delenv("HERMES_TUI", raising=False)
+    monkeypatch.delenv("HERMES_ACCEPT_HOOKS", raising=False)
+    observations: list[tuple[str | None, ...]] = []
+
+    def observe() -> tuple[str | None, ...]:
+        return tuple(
+            os.environ.get(key)
+            for key in (
+                "HERMES_KANBAN_WORKER_SCOPE",
+                "HERMES_KANBAN_TASK",
+                "HERMES_HOME",
+                "HERMES_TENANT",
+                "HERMES_TUI",
+                "HERMES_ACCEPT_HOOKS",
+            )
+        )
+
+    def managed_bridge() -> None:
+        observations.append(observe())
+        os.environ["HERMES_KANBAN_TASK"] = "managed-task"
+        os.environ["HERMES_HOME"] = "/managed/profile"
+        os.environ["HERMES_TENANT"] = "managed-tenant"
+        os.environ["HERMES_TUI"] = "1"
+        os.environ["HERMES_ACCEPT_HOOKS"] = "1"
+
+    def terminal_bridge(_home: Path) -> None:
+        observations.append(observe())
+        os.environ["HERMES_KANBAN_TASK"] = "terminal-task"
+        os.environ["HERMES_HOME"] = "/terminal/profile"
+        os.environ["HERMES_TENANT"] = "terminal-tenant"
+        os.environ["HERMES_TUI"] = "1"
+        os.environ["HERMES_ACCEPT_HOOKS"] = "1"
+
+    monkeypatch.setattr(env_loader, "_apply_managed_env", managed_bridge)
+    monkeypatch.setattr(env_loader, "_reapply_terminal_config_bridge", terminal_bridge)
+    monkeypatch.setattr(
+        env_loader,
+        "_apply_external_secret_sources",
+        lambda _home: pytest.fail("scoped worker must skip external secret sources"),
+    )
+
+    env_loader.load_hermes_dotenv(hermes_home=home)
+
+    assert observations == [
+        (
+            "lifecycle-only",
+            "t_lifecycle_startup",
+            "/owned/profile",
+            "owned-tenant",
+            None,
+            None,
+        ),
+        (
+            "lifecycle-only",
+            "t_lifecycle_startup",
+            "/owned/profile",
+            "owned-tenant",
+            None,
+            None,
+        ),
+    ]
+    assert observe() == (
+        "lifecycle-only",
+        "t_lifecycle_startup",
+        "/owned/profile",
+        "owned-tenant",
+        None,
+        None,
+    )
+
+
+@pytest.mark.parametrize("scope", ["lifecycle-only", "future-worker-scope"])
+def test_scoped_worker_skips_external_secret_sources(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    scope: str,
+) -> None:
+    from hermes_cli import env_loader
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    _lifecycle_env(monkeypatch, scope)
+    calls: list[Path] = []
+    monkeypatch.setattr(
+        env_loader,
+        "_apply_external_secret_sources",
+        lambda resolved_home: calls.append(resolved_home),
+    )
+    monkeypatch.setattr(env_loader, "_apply_managed_env", lambda: None)
+
+    env_loader.load_hermes_dotenv(hermes_home=home)
+
+    assert calls == []
+
+
+def test_normal_worker_runs_external_secret_sources(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from hermes_cli import env_loader
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    _clear_lifecycle_env(monkeypatch)
+    calls: list[Path] = []
+    monkeypatch.setattr(
+        env_loader,
+        "_apply_external_secret_sources",
+        lambda resolved_home: calls.append(resolved_home),
+    )
+    monkeypatch.setattr(env_loader, "_apply_managed_env", lambda: None)
+
+    env_loader.load_hermes_dotenv(hermes_home=home)
+
+    assert calls == [home]
+
+
+def test_normal_dispatcher_worker_keeps_authority_and_runs_secret_sources(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from hermes_cli import env_loader
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    (home / ".env").write_text(
+        "HERMES_KANBAN_TASK=foreign-task\n"
+        "HERMES_KANBAN_BOARD=foreign-board\n"
+        "HERMES_SESSION_SOURCE=telegram\n"
+        "HERMES_SESSION_CHAT_ID=foreign-chat\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "owned-task")
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "owned-board")
+    monkeypatch.setenv("HERMES_SESSION_SOURCE", "kanban")
+    monkeypatch.delenv("HERMES_KANBAN_WORKER_SCOPE", raising=False)
+    monkeypatch.delenv("HERMES_SESSION_CHAT_ID", raising=False)
+    calls: list[Path] = []
+    monkeypatch.setattr(
+        env_loader,
+        "_apply_external_secret_sources",
+        lambda resolved_home: calls.append(resolved_home),
+    )
+    monkeypatch.setattr(env_loader, "_apply_managed_env", lambda: None)
+
+    env_loader.load_hermes_dotenv(hermes_home=home)
+
+    assert os.environ["HERMES_KANBAN_TASK"] == "owned-task"
+    assert os.environ["HERMES_KANBAN_BOARD"] == "owned-board"
+    assert os.environ["HERMES_SESSION_SOURCE"] == "kanban"
+    assert "HERMES_SESSION_CHAT_ID" not in os.environ
+    assert calls == [home]
+
+
+@pytest.mark.parametrize("scope", ["lifecycle-only", "future-worker-scope"])
+def test_scoped_worker_does_not_execute_user_memory_provider(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    scope: str,
+) -> None:
+    _lifecycle_env(monkeypatch, scope)
+    marker = tmp_path / "memory-provider-executed"
+    plugins_dir = tmp_path / "plugins"
+    provider_dir = plugins_dir / "adversarial_probe"
+    provider_dir.mkdir(parents=True)
+    (provider_dir / "__init__.py").write_text(
+        "\n".join(
+            [
+                "from pathlib import Path",
+                f"Path({str(marker)!r}).write_text('executed', encoding='utf-8')",
+                "class MemoryProvider:",
+                "    pass",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    from plugins import memory as memory_plugins
+
+    monkeypatch.setattr(memory_plugins, "_get_user_plugins_dir", lambda: plugins_dir)
+    module_name = "_hermes_user_memory.adversarial_probe"
+    sys.modules.pop(module_name, None)
+    try:
+        assert memory_plugins.load_memory_provider("adversarial_probe") is None
+    finally:
+        sys.modules.pop(module_name, None)
+
+    assert not marker.exists()
+
+
+@pytest.mark.parametrize("scope", ["lifecycle-only", "future-worker-scope"])
+def test_scoped_worker_does_not_execute_memory_provider_cli(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    scope: str,
+) -> None:
+    _lifecycle_env(monkeypatch, scope)
+    marker = tmp_path / "memory-provider-cli-executed"
+    plugins_dir = tmp_path / "plugins"
+    provider_dir = plugins_dir / "adversarial_cli"
+    provider_dir.mkdir(parents=True)
+    (provider_dir / "__init__.py").write_text(
+        "# MemoryProvider plugin probe\n",
+        encoding="utf-8",
+    )
+    (provider_dir / "cli.py").write_text(
+        "from pathlib import Path\n"
+        f"Path({str(marker)!r}).write_text('executed', encoding='utf-8')\n"
+        "def register_cli(_parser):\n"
+        "    return None\n",
+        encoding="utf-8",
+    )
+
+    from plugins import memory as memory_plugins
+
+    monkeypatch.setattr(memory_plugins, "_get_user_plugins_dir", lambda: plugins_dir)
+    monkeypatch.setattr(
+        memory_plugins,
+        "_get_active_memory_provider",
+        lambda: "adversarial_cli",
+    )
+    module_name = "_hermes_user_memory.adversarial_cli.cli"
+    sys.modules.pop(module_name, None)
+    try:
+        assert memory_plugins.discover_plugin_cli_commands() == []
+    finally:
+        sys.modules.pop(module_name, None)
+        sys.modules.pop("_hermes_user_memory.adversarial_cli", None)
+
+    assert not marker.exists()
+
+
+@pytest.mark.parametrize("scope", ["lifecycle-only", "future-worker-scope"])
+def test_scoped_worker_does_not_execute_user_model_provider(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    scope: str,
+) -> None:
+    _lifecycle_env(monkeypatch, scope)
+    marker = tmp_path / "model-provider-executed"
+    plugins_dir = tmp_path / "model-providers"
+    provider_dir = plugins_dir / "adversarial_probe"
+    provider_dir.mkdir(parents=True)
+    (provider_dir / "__init__.py").write_text(
+        "from pathlib import Path\n"
+        f"Path({str(marker)!r}).write_text('executed', encoding='utf-8')\n",
+        encoding="utf-8",
+    )
+
+    import pkgutil
+    import providers
+
+    monkeypatch.setattr(providers, "_discovered", False)
+    monkeypatch.setattr(providers, "_REGISTRY", {})
+    monkeypatch.setattr(providers, "_ALIASES", {})
+    monkeypatch.setattr(providers, "_PROVIDER_LIST_CACHE", None)
+    monkeypatch.setattr(providers, "_BUNDLED_PLUGINS_DIR", tmp_path / "bundled")
+    monkeypatch.setattr(providers, "_user_plugins_dir", lambda: plugins_dir)
+    monkeypatch.setattr(pkgutil, "iter_modules", lambda *_args, **_kwargs: [])
+    module_name = "_hermes_user_provider_adversarial_probe"
+    sys.modules.pop(module_name, None)
+    try:
+        assert providers.list_providers() == []
+    finally:
+        sys.modules.pop(module_name, None)
+
+    assert not marker.exists()
+
+
+@pytest.mark.parametrize("scope", ["lifecycle-only", "future-worker-scope"])
+def test_scoped_worker_does_not_import_legacy_provider_extensions(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    scope: str,
+) -> None:
+    _lifecycle_env(monkeypatch, scope)
+
+    import pkgutil
+    import providers
+
+    monkeypatch.setattr(providers, "_discovered", False)
+    monkeypatch.setattr(providers, "_REGISTRY", {})
+    monkeypatch.setattr(providers, "_ALIASES", {})
+    monkeypatch.setattr(providers, "_PROVIDER_LIST_CACHE", None)
+    monkeypatch.setattr(providers, "_BUNDLED_PLUGINS_DIR", tmp_path / "bundled")
+    monkeypatch.setattr(providers, "_user_plugins_dir", lambda: None)
+    monkeypatch.setattr(
+        pkgutil,
+        "iter_modules",
+        lambda *_args, **_kwargs: [(None, "adversarial_legacy", False)],
+    )
+    imported: list[str] = []
+    monkeypatch.setattr(
+        providers.importlib,
+        "import_module",
+        lambda name: imported.append(name),
+    )
+
+    assert providers.list_providers() == []
+    assert imported == []
+
+
+@pytest.mark.parametrize(
+    ("scope", "should_execute"),
+    [
+        ("lifecycle-only", False),
+        ("future-worker-scope", False),
+        (None, True),
+    ],
+)
+def test_legacy_provider_execution_boundary_in_fresh_process(
+    tmp_path: Path,
+    scope: str | None,
+    should_execute: bool,
+) -> None:
+    marker = tmp_path / "legacy-provider-executed"
+    legacy_dir = tmp_path / "providers"
+    legacy_dir.mkdir()
+    (legacy_dir / "adversarial_legacy.py").write_text(
+        "from pathlib import Path\n"
+        f"Path({str(marker)!r}).write_text('executed', encoding='utf-8')\n",
+        encoding="utf-8",
+    )
+    code = """
+import os
+from pathlib import Path
+import providers
+providers.__path__ = [os.environ["LEGACY_PROVIDER_DIR"]]
+providers._BUNDLED_PLUGINS_DIR = Path(os.environ["EMPTY_BUNDLED_DIR"])
+providers._REGISTRY.clear()
+providers._ALIASES.clear()
+providers._PROVIDER_LIST_CACHE = None
+providers._discovered = False
+providers.list_providers()
+print("MARKER=" + str(Path(os.environ["LEGACY_MARKER"]).exists()))
+"""
+    env = os.environ.copy()
+    env.update(
+        {
+            "LEGACY_PROVIDER_DIR": str(legacy_dir),
+            "EMPTY_BUNDLED_DIR": str(tmp_path / "bundled"),
+            "LEGACY_MARKER": str(marker),
+        }
+    )
+    env.pop("HERMES_KANBAN_TASK", None)
+    env.pop("HERMES_KANBAN_WORKER_SCOPE", None)
+    if scope is not None:
+        env["HERMES_KANBAN_TASK"] = "t_legacy_probe"
+        env["HERMES_KANBAN_WORKER_SCOPE"] = scope
+
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=Path(__file__).resolve().parents[2],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=True,
+    )
+
+    assert f"MARKER={should_execute}" in result.stdout
 
 
 def _install_startup_spies(monkeypatch: pytest.MonkeyPatch) -> dict[str, int]:
