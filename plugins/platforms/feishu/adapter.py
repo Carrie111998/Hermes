@@ -1694,7 +1694,7 @@ class FeishuAdapter(BasePlatformAdapter):
             allow_bots=allow_bots,
             allow_all_dm=allow_all_dm,
             require_mention=_to_boolean(
-                extra.get("require_mention", os.getenv("FEISHU_REQUIRE_MENTION", "true"))
+                extra.get("require_mention", _get_scoped_secret("FEISHU_REQUIRE_MENTION", "true"))
             ),
         )
 
@@ -3192,7 +3192,7 @@ class FeishuAdapter(BasePlatformAdapter):
     # =========================================================================
 
     def _reactions_enabled(self) -> bool:
-        return os.getenv("FEISHU_REACTIONS", "true").strip().lower() not in {"false", "0", "no"}
+        return _get_scoped_secret("FEISHU_REACTIONS", "true").strip().lower() not in {"false", "0", "no"}
 
     async def _add_reaction(self, message_id: str, emoji_type: str) -> Optional[str]:
         """Return the reaction_id on success, else None. The id is needed later for deletion."""

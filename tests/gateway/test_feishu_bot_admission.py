@@ -671,3 +671,28 @@ def test_allow_all_dm_falls_back_to_os_environ_when_unscoped(monkeypatch):
     adapter = object.__new__(FeishuAdapter)
     adapter._apply_settings(settings)
     assert adapter._admit(make_sender(open_id="ou_anyone"), make_message(chat_type="p2p")) is None
+
+
+def test_require_mention_resolves_from_profile_scope(tmp_path, monkeypatch):
+    """FEISHU_REQUIRE_MENTION is a per-profile admission gate: a secondary
+    profile's .env value must win over the default profile's os.environ."""
+    import agent.secret_scope as ss
+    from plugins.platforms.feishu.adapter import FeishuAdapter
+
+    monkeypatch.setenv("FEISHU_APP_ID", "cli_test")
+    monkeypatch.setenv("FEISHU_APP_SECRET", "secret_test")
+    monkeypatch.setenv("FEISHU_REQUIRE_MENTION", "true")  # default profile
+    (tmp_path / ".env").write_text(
+        "FEISHU_APP_ID=cli_test\nFEISHU_APP_SECRET=secret_test\n"
+        "FEISHU_REQUIRE_MENTION=false\n",
+        encoding="utf-8",
+    )
+
+    ss.set_multiplex_active(True)
+    tok = ss.set_secret_scope(ss.build_profile_secret_scope(tmp_path))
+    try:
+        settings = FeishuAdapter._load_settings(extra={})
+        assert settings.require_mention is False
+    finally:
+        ss.reset_secret_scope(tok)
+        ss.set_multiplex_active(False)
