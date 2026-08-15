@@ -2311,7 +2311,17 @@ class ContextCompressor(ContextEngine):
         if carried:
             self._origin_anchor_text = carried
             return
-        for msg in messages:
+        # A handoff summary embedded in ``messages`` marks where a PRIOR
+        # compaction already decided the pre-boundary turns may decay.
+        # Scanning from index 0 would resurrect that decayed request as
+        # the permanent anchor. Only consider turns after the newest
+        # embedded handoff, mirroring how the rest of the compressor
+        # treats that boundary as the effective start of the session.
+        handoff_idx, _ = self._find_latest_context_summary(
+            messages, 0, len(messages)
+        )
+        scan_from = handoff_idx + 1 if handoff_idx is not None else 0
+        for msg in messages[scan_from:]:
             if not self._is_actionable_user_turn(msg):
                 continue
             content = msg.get("content")
