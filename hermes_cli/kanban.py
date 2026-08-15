@@ -1475,6 +1475,62 @@ def _cmd_init(args: argparse.Namespace) -> int:
     path = kb.init_db()
     print(f"Kanban DB initialized at {path}")
 
+    try:
+        from hermes_cli.config import load_config
+
+        loaded = load_config()
+        kanban_cfg = loaded.get("kanban", {}) if isinstance(loaded, dict) else {}
+    except Exception:
+        kanban_cfg = {}
+
+    dispatch_enabled = bool(kanban_cfg.get("dispatch_in_gateway", True))
+    review_dispatch = bool(kanban_cfg.get("review_dispatch", True))
+    auto_decompose = bool(kanban_cfg.get("auto_decompose", True))
+    print()
+    print("Operational contract (effective config):")
+    if dispatch_enabled:
+        claimable_statuses = "Ready and Review tasks" if review_dispatch else "Ready tasks"
+        print(
+            "  Gateway dispatch: enabled — a running gateway automatically claims "
+            f"{claimable_statuses} and starts one OS worker process per claim."
+        )
+    else:
+        print(
+            "  Gateway dispatch: disabled — Ready and Review tasks wait for a "
+            "manual dispatch pass."
+        )
+    if auto_decompose:
+        print(
+            "  Triage orchestration: automatic when the dispatcher runs — it "
+            "auto-decomposes Triage tasks into child tasks."
+        )
+    else:
+        print("  Triage orchestration: manual — Triage tasks stay parked until you act.")
+
+    cap_specs = (
+        ("host", "max_concurrent_workers"),
+        ("board", "max_in_progress"),
+        ("per-profile", "max_in_progress_per_profile"),
+        ("dispatcher", "max_spawn"),
+    )
+    caps = []
+    for label, key in cap_specs:
+        raw = kanban_cfg.get(key)
+        if isinstance(raw, int) and not isinstance(raw, bool) and raw > 0:
+            caps.append(f"{label}={raw}")
+    if caps:
+        print(f"  Worker concurrency caps: {', '.join(caps)}")
+    else:
+        print(
+            "  No worker concurrency cap is configured; every claimable task may "
+            "start a worker."
+        )
+    print(
+        "  Workers run as the assignee profile with that profile's enabled tools "
+        "and approval policy. Review task descriptions and profile authority "
+        "before enabling automatic dispatch."
+    )
+
     print()
     # Enumerate profiles on disk so the user knows what assignees are
     # already addressable. Multica does this auto-detection on its
@@ -1494,14 +1550,19 @@ def _cmd_init(args: argparse.Namespace) -> int:
         print("No profiles found under ~/.hermes/profiles/.")
         print("Create one with `hermes -p <name> setup` before assigning tasks.")
     print()
-    print("Next step: start the gateway so ready tasks actually get picked up.")
-    print("  hermes gateway start")
-    print()
-    print(
-        "The gateway hosts an embedded dispatcher that ticks every 60 seconds\n"
-        "by default (config: kanban.dispatch_interval_seconds). Without a\n"
-        "running gateway, tasks stay in 'ready' forever."
-    )
+    if dispatch_enabled:
+        print("Next step: start the gateway so ready tasks actually get picked up.")
+        print("  hermes gateway start")
+        print()
+        print(
+            "The gateway hosts an embedded dispatcher that ticks every 60 seconds\n"
+            "by default (config: kanban.dispatch_interval_seconds). Without a\n"
+            "running gateway, tasks stay in 'ready' forever."
+        )
+    else:
+        print("Automatic dispatch is off. Ready tasks remain parked.")
+        print("Run `hermes kanban dispatch` for a manual pass, or explicitly set")
+        print("`kanban.dispatch_in_gateway: true` before starting the gateway.")
     return 0
 
 
