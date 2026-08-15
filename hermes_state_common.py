@@ -250,6 +250,16 @@ def is_automatic_end_reason(reason) -> bool:
     """
     return isinstance(reason, str) and reason in _AUTOMATIC_END_REASONS
 
+# Listing projection follows these parent end_reasons to the live tip.
+# Compression is the original chain. Reset /new /idle/daily/etc. also
+# chain via parent_session_id but were left out of the CTE, so the
+# session list kept showing the stale root (#84870). CLI /new writes
+# ``new_session`` (not in the gateway reset set).
+_CONTINUATION_PARENT_REASONS = ("compression",) + _RESET_END_REASONS + ("new_session",)
+_CONTINUATION_PARENT_REASONS_SQL = ", ".join(
+    f"'{reason}'" for reason in _CONTINUATION_PARENT_REASONS
+)
+
 
 def _legacy_reset_child_sql(alias: str, reasons_sql: str) -> str:
     """Pre-marker reset-continuation heuristic.
