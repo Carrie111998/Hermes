@@ -217,11 +217,21 @@ class FactRetriever:
         for row in rows:
             fact = dict(row)
             fv = hrr.bytes_to_phases(fact.pop("hrr_vector"), dim=self.hrr_dim)
-            # HRR structural score: proximity of residual to content role
+            # HRR structural score: proximity of residual to content role.
+            # reason() has AND semantics, so ALL supplied entities must
+            # contribute; aggregate across every probe key and use the weakest
+            # (min) entity match so the structural score is entity-order-
+            # invariant and cannot be gamed by listing a matched entity first.
             hrr_sim = 0.5
             if hrr._HAS_NUMPY and self.hrr_weight > 0:
-                residual = hrr.unbind(fv, probe_keys[0])
-                hrr_sim = (hrr.similarity(residual, role_content) + 1.0) / 2.0
+                entity_hrr_scores = []
+                for probe_key in probe_keys:
+                    residual = hrr.unbind(fv, probe_key)
+                    entity_hrr_scores.append(
+                        (hrr.similarity(residual, role_content) + 1.0) / 2.0
+                    )
+                hrr_sim = min(entity_hrr_scores)
+
             # Lexical relevance: Jaccard between query entities and fact
             ft = self._tokenize(fact["content"]) | self._tokenize(fact.get("tags", ""))
             jac = self._jaccard_similarity(query_tokens, ft)
