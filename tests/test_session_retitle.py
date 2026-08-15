@@ -158,24 +158,32 @@ class TestCandidateSelection:
         assert [c["id"] for c in cands] == ["e1"]
         assert cands[0]["kind"] == "generate"
 
-    def test_truncated_title_pre_provenance_left_alone_by_default(self, db):
+    def test_truncated_title_pre_provenance_repaired_by_default(self, db):
         # Old installs: title is the first message cut off, no title_source.
-        # Official provenance treats NULL as user — not repaired unless the
-        # user explicitly opts in with include_legacy_truncated.
+        # Full-authority repair is the default: legacy truncated titles are
+        # candidates (--no-legacy-truncated opts out).
         fm = "we need to review the quarterly budget report before the meeting"
         _mk(db, "t1", title=fm[:40], source=None, msg=fm)
         cands = list(iter_missing_title_candidates(db))
-        assert cands == []
-
-    def test_truncated_title_pre_provenance_repaired_with_opt_in(self, db):
-        fm = "we need to review the quarterly budget report before the meeting"
-        _mk(db, "t1", title=fm[:40], source=None, msg=fm)
-        cands = list(iter_missing_title_candidates(
-            db, include_legacy_truncated=True
-        ))
         assert [c["id"] for c in cands] == ["t1"]
         assert cands[0]["kind"] == "generate"
         assert cands[0].get("legacy") is True
+
+    def test_truncated_title_pre_provenance_skipped_with_no_legacy(self, db):
+        fm = "we need to review the quarterly budget report before the meeting"
+        _mk(db, "t1", title=fm[:40], source=None, msg=fm)
+        cands = list(iter_missing_title_candidates(
+            db, include_legacy_truncated=False
+        ))
+        assert cands == []
+
+    def test_empty_string_title_is_candidate(self, db):
+        # Real-world quirk: some rows carry title='' (empty string, NOT NULL).
+        # These are placeholders and must be candidates too.
+        _mk(db, "e1", title="", source=None, msg="what is the plan")
+        cands = list(iter_missing_title_candidates(db))
+        assert [c["id"] for c in cands] == ["e1"]
+        assert cands[0]["kind"] == "generate"
 
     def test_plausible_title_pre_provenance_left_alone(self, db):
         _mk(db, "p1", title="Review Q3 budget", source=None, msg="we need to review the quarterly budget")
@@ -332,8 +340,8 @@ class TestRunner:
         """Simulate a real post-migration DB with mixed storage generations.
 
         * root1: user-titled (untouchable)
-        * root2: old pre-provenance truncated title — NOT repaired by
-          default (official provenance treats NULL as user)
+        * root2: old pre-provenance truncated title — repaired by default
+          (full-authority repair is the default; --no-legacy-truncated opts out)
         * root3: empty title (generate)
         * seg under root2: empty chain segment (inherit + dedupe)
         * seg under root3: empty chain segment (inherit)
@@ -352,18 +360,19 @@ class TestRunner:
 
         stats = retitle_missing(db, generate=stub, apply_changes=True)
 
-        assert stats["generated"] == 1  # r3 only (r2 needs opt-in)
+        assert stats["generated"] == 2  # r2 (legacy, now default) + r3
         assert stats["inherited"] == 2  # s2, s3
         # r1 untouched
         assert db.get_session("r1")["title"] == "My manual title"
-        # r2 left alone by default (NULL provenance treated as user)
-        assert db.get_session("r2")["title"] == fm2[:40]
+        # r2 repaired at user level (pre-provenance row)
+        assert db.get_session("r2")["title"] == "Budget review"
+        assert db.get_session("r2")["title_source"] == "user"
         # r3 generated
         assert db.get_session("r3")["title"] == "Deploy API to staging"
         assert db.get_session("r3")["title_source"] == "llm"
-        # segments inherited: s2 = "Budget review #2" from r2's OLD title
-        # (r2 still has truncated title), s3 = "Deploy API to staging #2"
-        assert db.get_session("s2")["title"] == f"{fm2[:40]} #2"
+        # segments inherited: s2 = "Budget review #2" (from repaired r2),
+        # s3 = "Deploy API to staging #2"
+        assert db.get_session("s2")["title"] == "Budget review #2"
         assert db.get_session("s2")["title_source"] == "derived"
         assert db.get_session("s3")["title"] == "Deploy API to staging #2"
 
@@ -384,6 +393,103 @@ class TestRunner:
         assert stats["generated"] == 1
         assert db.get_session("r2")["title"] == "Budget review"
         assert db.get_session("s2")["title"] == "Budget review #2"
+
+    def test_empty_string_title_repaired_at_user_level(self, db):
+        # title='' (empty string, NOT NULL) is a placeholder the official
+        # set_auto_title refuses to clobber ('' counts as an existing title),
+        # so the repair must write at user level.
+        _mk(db, "e1", title="", source=None, msg="what is the plan")
+        stub = _generate_stub({"what is the plan": "Plan discussion"})
+
+        stats = retitle_missing(db, generate=stub, apply_changes=True)
+
+        assert stats["generated"] == 1
+        row = db.get_session("e1")
+        assert row["title"] == "Plan discussion"
+        assert row["title_source"] == "user"
+
+    def test_confirm_callback_filters_rows(self, db):
+        _mk(db, "a1", msg="msg 0")
+        _mk(db, "a2", msg="msg 1")
+        _mk(db, "a3", msg="msg 2")
+        stub = _generate_stub({"msg 0": "T0", "msg 1": "T1", "msg 2": "T2"})
+
+        def confirm(items, title):
+            # only the first row
+            return {0}
+
+        stats = retitle_missing(
+            db, generate=stub, apply_changes=True, confirm=confirm
+        )
+
+        assert stats["generated"] == 1
+        assert db.get_session("a1")["title"] == "T0"
+        assert db.get_session("a2")["title"] is None
+        assert db.get_session("a3")["title"] is None
+        assert stats["backup_path"] is not None
+
+
+class TestDescribeTitleModel:
+    def test_cloud_provider_flags_cost(self, monkeypatch):
+        import hermes_cli.config as config_mod
+        from hermes_cli.session_migration import _describe_title_model
+
+        monkeypatch.setattr(
+            config_mod, "load_config_readonly",
+            lambda: {
+                "model": {"provider": "deepseek", "model": "deepseek-chat"},
+                "auxiliary": {
+                    "title_generation": {
+                        "provider": "deepseek",
+                        "model": "deepseek-chat",
+                        "api_key": "sk-test",
+                    }
+                },
+            },
+        )
+        desc = _describe_title_model()
+        assert "provider       : deepseek" in desc
+        assert "deepseek-chat" in desc
+        assert "云端 API（可能产生资费）" in desc
+        assert "api_key        : ***已配置***" in desc
+
+    def test_local_provider_no_cost(self, monkeypatch):
+        import hermes_cli.config as config_mod
+        from hermes_cli.session_migration import _describe_title_model
+
+        monkeypatch.setattr(
+            config_mod, "load_config_readonly",
+            lambda: {
+                "model": {"provider": "deepseek", "model": "deepseek-chat"},
+                "auxiliary": {
+                    "title_generation": {
+                        "provider": "lmstudio",
+                        "model": "qwen3-27b",
+                        "base_url": "http://127.0.0.1:1234/v1",
+                        "api_key": "",
+                    }
+                },
+            },
+        )
+        desc = _describe_title_model()
+        assert "provider       : lmstudio" in desc
+        assert "qwen3-27b" in desc
+        assert "本地模型（无资费）" in desc
+
+    def test_auto_falls_back_to_main_model(self, monkeypatch):
+        import hermes_cli.config as config_mod
+        from hermes_cli.session_migration import _describe_title_model
+
+        monkeypatch.setattr(
+            config_mod, "load_config_readonly",
+            lambda: {
+                "model": {"provider": "deepseek", "model": "deepseek-chat"},
+                "auxiliary": {"title_generation": {"provider": "auto"}},
+            },
+        )
+        desc = _describe_title_model()
+        assert "provider       : auto" in desc
+        assert "主模型 deepseek / deepseek-chat" in desc
 
 
 # ---------------------------------------------------------------------------
@@ -457,6 +563,118 @@ class TestRepairChains:
             "SELECT parent_session_id FROM sessions WHERE id='r2'"
         ).fetchone()
         assert r2["parent_session_id"] is None
+
+    def test_apply_weak_signal_relinks_when_user_checks_it(self, db):
+        # Same-title-only group is weak signal (skipped by default) but the
+        # interactive checklist lists it (unchecked) and the user may check
+        # it to force the relink.
+        _mk(db, "r1", title="Plan review", source="llm", msg="first")
+        _mk(db, "r2", title="Plan review #2", source="llm", msg="second")
+
+        captured = {}
+
+        def confirm(items, title, **kw):
+            captured["items"] = items
+            # user checks row 0 (the weak-signal group)
+            return {0}
+
+        stats = repair_chains(db, apply_changes=True, confirm=confirm)
+
+        assert stats["relinked"] == 1
+        assert stats["skipped"] == 0
+        r2 = db._conn.execute(
+            "SELECT parent_session_id FROM sessions WHERE id='r2'"
+        ).fetchone()
+        assert r2["parent_session_id"] == "r1"
+
+    def test_apply_weak_signal_unchecked_stays_skipped(self, db):
+        # Weak-signal group listed but NOT checked by the user: skipped.
+        _mk(db, "r1", title="Plan review", source="llm", msg="first")
+        _mk(db, "r2", title="Plan review #2", source="llm", msg="second")
+
+        def confirm(items, title, **kw):
+            # user confirms with nothing checked
+            return set()
+
+        stats = repair_chains(db, apply_changes=True, confirm=confirm)
+
+        assert stats["relinked"] == 0
+        assert stats["skipped"] == 0  # unchecked rows are simply not selected
+        r2 = db._conn.execute(
+            "SELECT parent_session_id FROM sessions WHERE id='r2'"
+        ).fetchone()
+        assert r2["parent_session_id"] is None
+
+    def test_confirm_menu_labels_weak_signal_warning(self, db):
+        # The interactive menu must label weak-signal groups so the user is
+        # not misled into thinking a title match proves one conversation.
+        _mk(db, "r1", title="Plan review", source="llm", msg="first")
+        _mk(db, "r2", title="Plan review #2", source="llm", msg="second")
+
+        captured = {}
+
+        def confirm(items, title, **kw):
+            captured["items"] = items
+            captured["selected"] = kw.get("selected")
+            return set()
+
+        repair_chains(db, apply_changes=True, confirm=confirm)
+
+        assert any("仅标题相同" in it for it in captured["items"])
+        # weak-signal group is NOT pre-checked
+        assert captured["selected"] == set()
+
+    def test_confirm_menu_prechecks_strong_signal(self, db):
+        self._mk_handoff(db, "r1", "Plan review")
+        _mk(db, "r2", title="Plan review #2", source="llm", msg="second")
+
+        captured = {}
+
+        def confirm(items, title, **kw):
+            captured["items"] = items
+            captured["selected"] = kw.get("selected")
+            return {0}
+
+        repair_chains(db, apply_changes=True, confirm=confirm)
+
+        # strong-signal group carries the evidence label and is pre-checked
+        assert any("压缩交接证据" in it for it in captured["items"])
+        assert captured["selected"] == {0}
+
+    def test_esc_cancel_does_nothing_even_with_preselected(self, db):
+        # ESC must not fall back to the pre-checked rows: a strong-signal
+        # group is pre-checked, but if the user cancels (empty set returned)
+        # NOTHING may be relinked — the checked set is the exact contract.
+        self._mk_handoff(db, "r1", "Plan review")
+        _mk(db, "r2", title="Plan review #2", source="llm", msg="second")
+
+        def confirm(items, title, **kw):
+            # ESC → empty selection, even though strong groups were pre-checked
+            return set()
+
+        stats = repair_chains(db, apply_changes=True, confirm=confirm)
+
+        assert stats["relinked"] == 0
+        assert stats["backup_path"] is None  # no backup either
+        r2 = db._conn.execute(
+            "SELECT parent_session_id FROM sessions WHERE id='r2'"
+        ).fetchone()
+        assert r2["parent_session_id"] is None
+
+    def test_esc_cancel_retitle_no_backup(self, db):
+        _mk(db, "e1", msg="what is the plan")
+        stub = _generate_stub({"what is the plan": "Plan discussion"})
+
+        def confirm(items, title, **kw):
+            return set()  # ESC → nothing selected
+
+        stats = retitle_missing(
+            db, generate=stub, apply_changes=True, confirm=confirm
+        )
+
+        assert stats["generated"] == 0
+        assert stats["backup_path"] is None
+        assert db.get_session("e1")["title"] is None
 
     def test_no_groups_when_single_root(self, db):
         _mk(db, "r1", title="Alpha", source="llm", msg="first")

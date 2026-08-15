@@ -1150,28 +1150,42 @@ def cmd_sessions(args, sessions_parser=None):
             print(f"✓ Re-titled {changed} session(s).")
 
     elif action == "repair-chains":
-        from hermes_cli.session_migration import repair_chains
+        from hermes_cli.session_migration import (
+            _confirm_candidates,
+            repair_chains,
+        )
 
         apply_changes = bool(getattr(args, "apply", False))
 
         if not apply_changes:
             print("Dry run — pass --apply to write. Rows the user titled are never touched.")
-        stats = repair_chains(db, apply_changes=apply_changes, progress=_log)
+        stats = repair_chains(
+            db,
+            apply_changes=apply_changes,
+            progress=_log,
+            confirm=_confirm_candidates if apply_changes else None,
+        )
         print()
         print(
             f"✓ orphaned_chain_groups={stats['orphaned_chain_groups']} "
             f"relinked={stats['relinked']} "
             f"skipped={stats['skipped']}"
         )
+        if stats.get("backup_path"):
+            print(f"  backup: {stats['backup_path']}")
         if not apply_changes:
             print("Dry run — nothing written.")
 
     elif action == "retitle-missing":
-        from hermes_cli.session_migration import retitle_missing
+        from hermes_cli.session_migration import (
+            _confirm_candidates,
+            _describe_title_model,
+            retitle_missing,
+        )
 
         apply_changes = bool(getattr(args, "apply", False))
         include_chain = not bool(getattr(args, "no_chain_inherit", False))
-        include_legacy = bool(getattr(args, "include_legacy_truncated", False))
+        include_legacy = not bool(getattr(args, "no_legacy_truncated", False))
         limit = max(1, int(getattr(args, "limit", 500) or 500))
 
         def _generate(fm):
@@ -1181,6 +1195,16 @@ def cmd_sessions(args, sessions_parser=None):
 
         if not apply_changes:
             print("Dry run — pass --apply to write. Rows the user titled are never touched.")
+        else:
+            # Before any LLM spend, show which model will generate titles and
+            # let the user confirm (or abort) — cloud endpoints may incur cost.
+            print(_describe_title_model())
+            print()
+            ok = _confirm_prompt("Use this model to generate titles?")
+            if not ok:
+                print("Cancelled — nothing written.")
+                return
+            print()
         stats = retitle_missing(
             db,
             generate=_generate,
@@ -1189,6 +1213,7 @@ def cmd_sessions(args, sessions_parser=None):
             include_legacy_truncated=include_legacy,
             limit=limit,
             progress=_log,
+            confirm=_confirm_candidates if apply_changes else None,
         )
         print()
         print(
@@ -1199,11 +1224,16 @@ def cmd_sessions(args, sessions_parser=None):
             f"failed={stats['failed']} "
             f"up_to_date={stats['up_to_date']}"
         )
+        if stats.get("backup_path"):
+            print(f"  backup: {stats['backup_path']}")
         if not apply_changes:
             print("Dry run — nothing written.")
 
     elif action == "merge-chains":
-        from hermes_cli.session_migration import merge_compression_chains
+        from hermes_cli.session_migration import (
+            _confirm_candidates,
+            merge_compression_chains,
+        )
 
         apply_changes = bool(getattr(args, "apply", False))
 
@@ -1216,6 +1246,7 @@ def cmd_sessions(args, sessions_parser=None):
             apply_changes=apply_changes,
             backup=apply_changes,
             progress=_log,
+            confirm=_confirm_candidates if apply_changes else None,
         )
         print()
         print(

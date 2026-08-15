@@ -286,7 +286,7 @@ def iter_missing_title_candidates(
     db,
     *,
     include_chain_segments: bool = True,
-    include_legacy_truncated: bool = False,
+    include_legacy_truncated: bool = True,
     limit: int = 500,
 ) -> Iterable[dict]:
     """Yield candidate rows needing a title.
@@ -297,8 +297,9 @@ def iter_missing_title_candidates(
       first message → regenerate via the LLM generator.
     * Pre-provenance rows (``title_source IS NULL``): official provenance
       treats NULL as ``user`` (a manual /title from that era is
-      indistinguishable), so a non-empty legacy title is only repaired with
-      ``include_legacy_truncated`` (explicit opt-in).
+      indistinguishable), so a non-empty legacy title is only repaired at
+      user level — the default, because running this command is itself an
+      explicit repair (``include_legacy_truncated=False`` opts out).
     """
     rows = db._conn.execute(
         """
@@ -380,6 +381,7 @@ def repair_chains(
     *,
     apply_changes: bool = False,
     progress: Optional[Callable[[str], None]] = None,
+    confirm: Optional[Callable[..., Optional[set[int]]]] = None,
 ) -> dict:
     """Detect and repair orphaned compression chains. Returns a stats dict.
 
@@ -395,24 +397,88 @@ def repair_chains(
     repeated tasks (e.g. kanban subtasks), so without a handoff there is no
     evidence the roots are one conversation. Delegate/branch/tool children
     are always excluded.
+
+    With ``apply_changes``, groups are confirmed via an interactive
+    checklist (``confirm``) and a timestamped state.db snapshot is taken
+    before any write. Strong-signal groups are pre-checked; weak-signal
+    groups (``same-title`` / ``handoff``) are listed unchecked with a
+    warning that the title match alone is not proof they are one
+    conversation — the user may still check them to force the relink.
     """
     stats = {
         "orphaned_chain_groups": 0,
         "relinked": 0,
         "skipped": 0,
+        "backup_path": None,
     }
     log = progress or (lambda msg: None)
 
     orphan_groups = find_orphaned_chain_candidates(db)
     stats["orphaned_chain_groups"] = len(orphan_groups)
-    if apply_changes and any(
-        g["signal"] == "both" for g in orphan_groups
-    ):
+
+    # Interactive confirmation before any write (only with --apply).
+    chosen: Optional[set[int]] = None
+    if apply_changes and confirm is not None and orphan_groups:
+        strong = {
+            i for i, g in enumerate(orphan_groups) if g["signal"] == "both"
+        }
+        items = []
+        for i, g in enumerate(orphan_groups):
+            if g["signal"] == "both":
+                note = "压缩交接证据"
+            elif g["signal"] == "same-title":
+                note = "⚠ 仅标题相同，可能非同一对话"
+            else:  # "handoff"
+                note = "⚠ 仅单侧交接提示，可能非同一对话"
+            items.append(
+                f"{note}  {g['title'][:40]!r}  "
+                f"({len(g['sessions'])} roots: "
+                + ", ".join(s["id"][:10] for s in g["sessions"]) + ")"
+            )
+        # Pre-check only strong-signal groups; weak-signal groups are listed
+        # unchecked but the user may toggle them on to force the relink.
+        chosen = confirm(
+            items,
+            "Select orphan-chain groups to relink (SPACE toggle, ENTER confirm)",
+            selected=strong,
+        )
+        if not chosen:
+            # None (cancelled/EOF) or an empty set (ESC / nothing checked):
+            # do NOTHING — the checked set is the exact list to process.
+            log("Cancelled — nothing written.")
+            return stats
+
+    # Snapshot + transaction only if at least one group will actually be
+    # relinked (a strong-signal group by default, or a weak-signal group the
+    # user explicitly checked).
+    def _will_relink(i: int) -> bool:
+        if not apply_changes:
+            return False
+        if chosen is not None and i not in chosen:
+            return False
+        g = orphan_groups[i]
+        if g["signal"] != "both" and chosen is None:
+            # No interactive confirm: weak-signal groups are never auto-
+            # relinked (safe default).
+            return False
+        return True
+
+    if any(_will_relink(i) for i in range(len(orphan_groups))):
+        # Snapshot before any write.
+        try:
+            backup_path = _backup_before_mutation(db, "repair-chains")
+            stats["backup_path"] = str(backup_path)
+            log(f"✓ backup: {backup_path}")
+        except Exception as exc:  # noqa: BLE001 — backup refusal is a HARD STOP
+            log(f"✗ automatic backup failed: {exc}")
+            raise RuntimeError(
+                f"automatic backup failed ({exc}); refusing to relink without a backup"
+            ) from exc
         # Batch the relinks in one transaction (SessionDB is autocommit;
         # without BEGIN each UPDATE would be durable independently).
         db._conn.execute("BEGIN IMMEDIATE")
     try:
-        for g in orphan_groups:
+        for i, g in enumerate(orphan_groups):
             ids = ", ".join(s["id"][:10] for s in g["sessions"])
             log(
                 f"⚠ {len(g['sessions'])} roots share title {g['title']!r} "
@@ -420,11 +486,19 @@ def repair_chains(
             )
             if not apply_changes:
                 continue
-            if g["signal"] != "both":
-                # Same-title-only (or single-handoff) group: no hard evidence
-                # these are one conversation — report, do not relink.
-                stats["skipped"] += 1
+            if chosen is not None and i not in chosen:
                 continue
+            if g["signal"] != "both":
+                # Weak-signal group: no hard evidence these are one
+                # conversation. Skipped unless the user explicitly checked it
+                # in the interactive confirm (forced relink).
+                if chosen is None or i not in chosen:
+                    stats["skipped"] += 1
+                    continue
+                log(
+                    f"  ↳ user forced relink of weak-signal group "
+                    f"(title match only — may not be the same conversation)"
+                )
             head_id = g["sessions"][0]["id"]
             # A relinked child is only surfaced by the official list/chain
             # readers when the parent carries end_reason='compression' (the
@@ -442,7 +516,7 @@ def repair_chains(
                     (head_id, s["id"]),
                 )
                 stats["relinked"] += 1
-        if apply_changes:
+        if any(_will_relink(i) for i in range(len(orphan_groups))):
             db._conn.commit()
     except Exception:
         if apply_changes:
@@ -457,9 +531,10 @@ def retitle_missing(
     generate: Callable[[str], Optional[str]],
     apply_changes: bool = False,
     include_chain_segments: bool = True,
-    include_legacy_truncated: bool = False,
+    include_legacy_truncated: bool = True,
     limit: int = 500,
     progress: Optional[Callable[[str], None]] = None,
+    confirm: Optional[Callable[[list[str], str], Optional[set[int]]]] = None,
 ) -> dict:
     """Regenerate missing/truncated session titles. Returns a stats dict.
 
@@ -468,6 +543,10 @@ def retitle_missing(
     here; tests inject a stub. Roots get LLM-generated titles; empty chain
     segments inherit the nearest ancestor title (deduped with #N via
     ``get_next_title_in_lineage``). Never overwrites a user-titled row.
+
+    With ``apply_changes``, candidates are presented as an interactive
+    checklist (``confirm``) before any write; only checked rows are
+    processed, and a timestamped state.db snapshot is taken first.
     """
     stats = {
         "scanned": 0,
@@ -476,6 +555,7 @@ def retitle_missing(
         "skipped_untouchable": 0,
         "failed": 0,
         "up_to_date": 0,
+        "backup_path": None,
     }
     log = progress or (lambda msg: None)
 
@@ -489,70 +569,110 @@ def retitle_missing(
         candidates = candidates[:limit]
     stats["scanned"] = len(candidates)
 
-    for i, cand in enumerate(candidates, 1):
-        sid = cand["id"]
-        kind = cand["kind"]
+    if not candidates:
+        return stats
 
-        if kind == "inherit":
-            anc_id, anc_title = _chain_ancestor_title(db, sid)
-            if not anc_title:
+    # Interactive confirmation before any write (only with --apply).
+    chosen: Optional[set[int]] = None
+    if apply_changes and confirm is not None:
+        items = [
+            f"{c['id'][:8]}  {c.get('title') or '(no title)'}  ({c['kind']})"
+            for c in candidates
+        ]
+        chosen = confirm(items, "Select sessions to re-title (SPACE toggle, ENTER confirm)")
+        if not chosen:
+            # None (cancelled/EOF) or an empty set (ESC / nothing checked):
+            # do NOTHING — no backup, no writes.
+            log("Cancelled — nothing written.")
+            return stats
+
+    # Snapshot before any write.
+    if apply_changes:
+        try:
+            backup_path = _backup_before_mutation(db, "retitle-missing")
+            stats["backup_path"] = str(backup_path)
+            log(f"✓ backup: {backup_path}")
+        except Exception as exc:  # noqa: BLE001 — backup refusal is a HARD STOP
+            log(f"✗ automatic backup failed: {exc}")
+            raise RuntimeError(
+                f"automatic backup failed ({exc}); refusing to re-title without a backup"
+            ) from exc
+
+    db._conn.commit()  # commit any pending state before the loop
+    try:
+        for i, cand in enumerate(candidates, 1):
+            if chosen is not None and (i - 1) not in chosen:
+                continue
+            sid = cand["id"]
+            kind = cand["kind"]
+
+            if kind == "inherit":
+                anc_id, anc_title = _chain_ancestor_title(db, sid)
+                if not anc_title:
+                    stats["skipped_untouchable"] += 1
+                    continue
+                try:
+                    deduped = db.get_next_title_in_lineage(anc_title)
+                    log(f"[{i}/{len(candidates)}] {sid[:8]} ← inherit {anc_title!r} → {deduped!r}")
+                    if apply_changes:
+                        ok = db.set_auto_title(sid, deduped, source="derived")
+                        if ok:
+                            stats["inherited"] += 1
+                        else:
+                            stats["skipped_untouchable"] += 1
+                    else:
+                        stats["inherited"] += 1
+                except Exception as e:  # noqa: BLE001 — repair should never crash
+                    log(f"  ✗ {sid[:8]} inherit failed: {e}")
+                    stats["failed"] += 1
+                continue
+
+            # kind == "generate"
+            fm = _first_user_message(db, sid)
+            if not fm:
                 stats["skipped_untouchable"] += 1
                 continue
+            log(f"[{i}/{len(candidates)}] {sid[:8]} generating…")
             try:
-                deduped = db.get_next_title_in_lineage(anc_title)
-                log(f"[{i}/{len(candidates)}] {sid[:8]} ← inherit {anc_title!r} → {deduped!r}")
-                if apply_changes:
-                    ok = db.set_auto_title(sid, deduped, source="derived")
+                new_title = generate(fm)
+            except Exception as e:  # noqa: BLE001
+                log(f"  ✗ {sid[:8]} generation error: {e}")
+                stats["failed"] += 1
+                continue
+            if not new_title:
+                stats["failed"] += 1
+                continue
+            if new_title == cand["title"]:
+                stats["up_to_date"] += 1
+                continue
+            log(f"  {cand['title']!r} → {new_title!r}")
+            if apply_changes:
+                try:
+                    # A literal empty-string title (NOT NULL) is a quirk the
+                    # official set_auto_title refuses to clobber ('' counts as
+                    # an existing title), so write at user level — an explicit
+                    # repair, not an auto-titler overwrite. title=NULL rows
+                    # are fine through set_auto_title (it fills them).
+                    if cand.get("legacy") or cand.get("title") == "":
+                        ok = db.set_session_title(sid, new_title)
+                    else:
+                        ok = db.set_auto_title(sid, new_title, source="llm")
                     if ok:
-                        stats["inherited"] += 1
+                        stats["generated"] += 1
                     else:
                         stats["skipped_untouchable"] += 1
-                else:
-                    stats["inherited"] += 1
-            except Exception as e:  # noqa: BLE001 — repair should never crash
-                log(f"  ✗ {sid[:8]} inherit failed: {e}")
-                stats["failed"] += 1
-            continue
+                except Exception as e:  # noqa: BLE001
+                    log(f"  ✗ {sid[:8]} write failed: {e}")
+                    stats["failed"] += 1
+            else:
+                stats["generated"] += 1
 
-        # kind == "generate"
-        fm = _first_user_message(db, sid)
-        if not fm:
-            stats["skipped_untouchable"] += 1
-            continue
-        log(f"[{i}/{len(candidates)}] {sid[:8]} generating…")
+    except Exception:
         try:
-            new_title = generate(fm)
-        except Exception as e:  # noqa: BLE001
-            log(f"  ✗ {sid[:8]} generation error: {e}")
-            stats["failed"] += 1
-            continue
-        if not new_title:
-            stats["failed"] += 1
-            continue
-        if new_title == cand["title"]:
-            stats["up_to_date"] += 1
-            continue
-        log(f"  {cand['title']!r} → {new_title!r}")
-        if apply_changes:
-            try:
-                if cand.get("legacy"):
-                    # Pre-provenance row: official auto-title refuses to
-                    # overwrite (NULL treated as user). The user opted in
-                    # with --include-legacy-truncated, so write at user
-                    # level — an explicit repair, not an auto-titler
-                    # overwrite.
-                    ok = db.set_session_title(sid, new_title)
-                else:
-                    ok = db.set_auto_title(sid, new_title, source="llm")
-                if ok:
-                    stats["generated"] += 1
-                else:
-                    stats["skipped_untouchable"] += 1
-            except Exception as e:  # noqa: BLE001
-                log(f"  ✗ {sid[:8]} write failed: {e}")
-                stats["failed"] += 1
-        else:
-            stats["generated"] += 1
+            db._conn.execute("ROLLBACK")
+        except Exception:  # noqa: BLE001 — no active transaction in autocommit
+            pass
+        raise
 
     return stats
 
@@ -716,12 +836,128 @@ def _backup_before_merge(db) -> Optional[Path]:
     return dest
 
 
+def _backup_before_mutation(db, label: str) -> Optional[Path]:
+    """Timestamped full state.db snapshot before any destructive command.
+
+    All ``--apply`` paths take a snapshot first so a mistake is always
+    recoverable. Returns the snapshot path (or None if the DB path is not
+    writable/absent, in which case callers decide whether to abort).
+    """
+    import datetime
+
+    stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    dest = db.db_path.with_name(f"{db.db_path.name}.pre-{label}-{stamp}")
+    db._conn.execute("VACUUM INTO ?", (str(dest),))
+    return dest
+
+
+def _describe_title_model() -> str:
+    """Human-readable description of the model used for title generation.
+
+    Mirrors the official ``title_generation`` auxiliary routing: an explicit
+    per-task config wins; ``provider: auto`` falls back to the user's main
+    model. Used to confirm with the user (before any LLM spend) which model
+    will generate titles — and whether that is a local or cloud endpoint.
+    """
+    from hermes_cli.config import load_config_readonly
+
+    config = load_config_readonly()
+    aux = (config.get("auxiliary") or {}).get("title_generation") or {}
+    model_cfg = config.get("model") or {}
+
+    provider = str(aux.get("provider") or "").strip() or "auto"
+    model = str(aux.get("model") or "").strip()
+    base_url = str(aux.get("base_url") or "").strip()
+    api_key = str(aux.get("api_key") or "").strip()
+    enabled = aux.get("enabled", True)
+    prefer_fast = bool(aux.get("prefer_fast_model", False))
+    timeout = aux.get("timeout", 30)
+    reasoning_effort = str(aux.get("reasoning_effort") or "").strip()
+
+    lines = ["命名用模型 (auxiliary.title_generation):"]
+    lines.append(f"  enabled        : {enabled}")
+    lines.append(f"  provider       : {provider}")
+
+    if provider == "auto":
+        main_provider = str(model_cfg.get("provider") or "").strip() or "(未配置)"
+        main_model = str(model_cfg.get("model") or "").strip() or "(未配置)"
+        lines.append(f"  ↳ auto 回退     : 主模型 {main_provider} / {main_model}")
+        if model:
+            lines.append(f"  model          : {model} (显式覆盖)")
+    else:
+        lines.append(f"  model          : {model or '(跟随 provider 默认)'}")
+
+    if base_url:
+        lines.append(f"  base_url       : {base_url}")
+    if api_key:
+        lines.append(f"  api_key        : {'***已配置***' if api_key else '(空)'}")
+    lines.append(f"  prefer_fast    : {prefer_fast}")
+    if reasoning_effort:
+        lines.append(f"  reasoning      : {reasoning_effort}")
+    lines.append(f"  timeout        : {timeout}s")
+
+    # Cost/endpoint classification for the confirmation prompt.
+    import urllib.parse
+
+    def _is_local_url(url: str) -> bool:
+        host = (urllib.parse.urlparse(url).hostname or "").lower()
+        return host in ("127.0.0.1", "localhost", "::1", "0.0.0.0")
+
+    if api_key or (base_url and not _is_local_url(base_url)):
+        endpoint = "云端 API（可能产生资费）"
+    else:
+        endpoint = "本地模型（无资费）"
+    lines.append(f"  endpoint       : {endpoint}")
+
+    return "\n".join(lines)
+
+
+def _confirm_candidates(
+    items: list[str],
+    title: str,
+    *,
+    selected: Optional[set[int]] = None,
+    status_fn: Optional[Callable[[set[int]], str]] = None,
+) -> Optional[set[int]]:
+    """Interactive checklist confirmation for destructive edits.
+
+    Renders ``items`` as a curses multi-select checklist (SPACE to toggle,
+    ENTER to confirm, ESC to cancel). By default every row is pre-selected;
+    pass ``selected`` to pre-check only those indices (e.g. strong-signal
+    candidates) and leave the rest unchecked-but-selectable. Non-TTY
+    environments fall back to a numbered toggle prompt; a non-interactive
+    EOF returns ``None`` (caller aborts).
+
+    Returns the set of selected indices, or ``None`` when cancelled. ESC and
+    an empty selection both mean "do nothing": the caller must treat the
+    returned set as the *exact* rows to process — nothing more, nothing less.
+    """
+    from hermes_cli.curses_ui import curses_checklist
+
+    pre = set(range(len(items))) if selected is None else set(selected)
+    try:
+        chosen = curses_checklist(
+            title,
+            items,
+            pre,
+            # ESC must NOT fall back to the pre-selected rows (the official
+            # default) — for destructive commands cancel means "do nothing",
+            # otherwise pressing ESC would still process the pre-checks.
+            cancel_returns=set(),
+            status_fn=status_fn,
+        )
+    except (EOFError, KeyboardInterrupt):
+        return None
+    return chosen
+
+
 def merge_compression_chains(
     db,
     *,
     apply_changes: bool = False,
     backup: bool = True,
     progress: Optional[Callable[[str], None]] = None,
+    confirm: Optional[Callable[[list[str], str], Optional[set[int]]]] = None,
 ) -> dict:
     """Flatten fork compression chains into single in-place sessions.
 
@@ -731,6 +967,10 @@ def merge_compression_chains(
     redirects orphaned children (reset/branch sessions whose parent was a
     removed segment) to the head, accumulates token/cost counters and gateway
     origin columns onto the head, then deletes the segment rows.
+
+    With ``apply_changes``, chains are confirmed via an interactive
+    checklist (``confirm``) before any write; a timestamped state.db
+    snapshot is taken first (unless ``backup=False``).
 
     Returns a stats dict:
     ``{"chains": int, "segments": int, "messages_moved": int,
@@ -763,6 +1003,23 @@ def merge_compression_chains(
     if not apply_changes:
         return stats
 
+    # Interactive confirmation before any write.
+    chosen: Optional[set[int]] = None
+    if confirm is not None:
+        items = [
+            f"{c['head'][:10]} «{c['head_title'] or '(untitled)'}» — "
+            f"{len(c['segments'])} segment(s), {c['message_count']} messages"
+            for c in candidates
+        ]
+        chosen = confirm(items, "Select chains to merge (SPACE toggle, ENTER confirm)")
+        if not chosen:
+            # None (cancelled/EOF) or an empty set (ESC / nothing checked):
+            # do NOTHING — no backup, no writes.
+            log("Cancelled — nothing written.")
+            return stats
+    else:
+        chosen = set(range(len(candidates)))
+
     # Automatic backup before any write.
     if backup:
         try:
@@ -782,7 +1039,9 @@ def merge_compression_chains(
     # (mirrors the official write path) so the batch is all-or-nothing.
     db._conn.execute("BEGIN IMMEDIATE")
     try:
-        for c in candidates:
+        for ci, c in enumerate(candidates):
+            if ci not in chosen:
+                continue
             head = c["head"]
             segs = c["segments"]
             placeholders = ",".join("?" * len(segs))
@@ -923,12 +1182,16 @@ def merge_compression_chains(
         raise
 
     # --- Post-write file-level verification ---
-    # Compare message/session/usage counts before vs after. The only
-    # legitimate delta is the number of deleted segment rows and (because a
-    # live gateway may append messages mid-merge) any concurrent writes.
-    before_msgs = sum(c["message_count"] for c in candidates)
+    # Compare message/session/usage counts before vs after for the chains
+    # actually merged. The only legitimate delta is the number of deleted
+    # segment rows and (because a live gateway may append messages
+    # mid-merge) any concurrent writes.
+    merged_candidates = [
+        c for i, c in enumerate(candidates) if i in chosen
+    ]
+    before_msgs = sum(c["message_count"] for c in merged_candidates)
     after_msgs = 0
-    for c in candidates:
+    for c in merged_candidates:
         row = db._conn.execute(
             "SELECT COUNT(*) c FROM messages WHERE session_id = ?",
             (c["head"],),
@@ -942,7 +1205,7 @@ def merge_compression_chains(
         "messages_before": before_msgs,
         "messages_after": after_msgs,
         "delta": after_msgs - before_msgs,
-        "segments_deleted": stats["segments"],
+        "segments_deleted": sum(len(c["segments"]) for c in merged_candidates),
         "usage_orphans": orphan_rows,
     }
     # Messages are only re-homed (session_id changed), never copied or

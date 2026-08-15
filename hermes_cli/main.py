@@ -13371,35 +13371,45 @@ def main():
             "Finds root sessions that look like orphaned compression "
             "continuations (old builds wrote them as independent roots, no "
             "parent_session_id link) and, with --apply, relinks them under "
-            "the oldest root of each group. Relinking only happens for "
+            "the oldest root of each group. Relinking happens by default for "
             "strong-signal groups where a root's first message is a "
-            "compaction handoff; same-title-only groups are reported but "
-            "never auto-relinked (repeated kanban tasks legitimately share "
-            "titles). Detection only by default; delegate/branch/tool "
+            "compaction handoff; same-title-only groups are weak signals "
+            "(repeated kanban tasks legitimately share titles) and are "
+            "listed unchecked with a warning — you may check one to force "
+            "the relink. --apply shows an interactive checklist to pick "
+            "which groups to fix and takes a state.db snapshot before "
+            "writing. Detection only by default; delegate/branch/tool "
             "children are always excluded."
         ),
     )
     sessions_repair_chains.add_argument(
         "--apply",
         action="store_true",
-        help="Write the relinks (default: dry run, detection reported only)",
+        help="Write the relinks (default: dry run; interactive confirm + backup)",
     )
 
     sessions_retitle_missing = sessions_subparsers.add_parser(
         "retitle-missing",
         help="Regenerate missing/truncated session titles",
         description=(
-            "Scans for rows whose title is missing or a bare first-message "
-            "truncation, regenerates root titles with the LLM generator, and "
-            "inherits titles down compression chains (deduped with #N). "
-            "Never overwrites a title the user typed (title_source='user'). "
-            "Lists what it would change unless --apply is passed."
+            "Scans for rows whose title is missing, an empty string, or a "
+            "bare first-message truncation, regenerates root titles with the "
+            "LLM generator, and inherits titles down compression chains "
+            "(deduped with #N). Never overwrites a title the user typed "
+            "(title_source='user'); pre-provenance rows (title_source IS "
+            "NULL) and empty-string titles are treated as user-titled and "
+            "repaired at user level by default — pass --no-legacy-truncated "
+            "to skip them. Lists what it would change unless --apply is "
+            "passed; --apply first shows the configured title-generation "
+            "model (with a cloud-cost warning when it hits a remote API) for "
+            "confirmation, then an interactive checklist of candidates, and "
+            "takes a state.db snapshot before writing."
         ),
     )
     sessions_retitle_missing.add_argument(
         "--apply",
         action="store_true",
-        help="Write the changes (default: dry run)",
+        help="Write the changes (default: dry run; interactive confirm + backup)",
     )
     sessions_retitle_missing.add_argument(
         "--no-chain-inherit",
@@ -13407,13 +13417,12 @@ def main():
         help="Skip chain-segment title inheritance (only LLM-regenerate broken roots)",
     )
     sessions_retitle_missing.add_argument(
-        "--include-legacy-truncated",
+        "--no-legacy-truncated",
         action="store_true",
         help=(
-            "Also repair pre-provenance rows (title_source IS NULL) whose "
-            "title is a bare first-message truncation. Off by default: "
-            "official provenance treats those as user-titled. "
-            "Writes at user level — explicit opt-in."
+            "Skip pre-provenance rows (title_source IS NULL) whose title is "
+            "a bare first-message truncation. Default: repair them too (at "
+            "user level — the user explicitly ran the repair)."
         ),
     )
     sessions_retitle_missing.add_argument(
@@ -13432,14 +13441,15 @@ def main():
             "head and deletes the segment rows, leaving one in-place session "
             "per conversation (like in-place compression). A timestamped "
             "state.db snapshot is taken (pre-merge-chains-<timestamp>) before "
-            "any write, and message totals are verified after. Dry run lists "
-            "candidate chains without writing."
+            "any write, and message totals are verified after. --apply shows "
+            "an interactive checklist to pick which chains to merge. Dry run "
+            "lists candidate chains without writing."
         ),
     )
     sessions_merge_chains.add_argument(
         "--apply",
         action="store_true",
-        help="Write the changes (default: dry run; automatic backup taken first)",
+        help="Write the changes (default: dry run; interactive confirm + automatic backup)",
     )
 
     sessions_browse = sessions_subparsers.add_parser(
