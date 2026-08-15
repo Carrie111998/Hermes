@@ -31,6 +31,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import sqlite3
 from typing import Any, Optional
 
 from agent.redact import redact_sensitive_text
@@ -800,8 +801,25 @@ def _handle_complete(args: dict, **kw) -> str:
                     f"created_cards=[] to skip the card-claim check entirely."
                 )
             if not ok:
+                recovery_note = ""
+                try:
+                    recovery_event = conn.execute(
+                        "SELECT payload FROM task_events WHERE task_id = ? "
+                        "AND kind = 'review_recovery_blocked' ORDER BY id DESC LIMIT 1",
+                        (tid,),
+                    ).fetchone()
+                    if recovery_event and recovery_event["payload"]:
+                        recovery_payload = json.loads(recovery_event["payload"])
+                        if isinstance(recovery_payload, dict) and recovery_payload.get("diagnostic"):
+                            recovery_note = (
+                                f"; blocked review recovery: "
+                                f"{recovery_payload['diagnostic']}"
+                            )
+                except (TypeError, json.JSONDecodeError, sqlite3.Error):
+                    pass
                 return tool_error(
-                    f"could not complete {tid} (unknown id or already terminal)"
+                    f"could not complete {tid} (unknown id, already terminal, "
+                    f"or still blocked){recovery_note}"
                 )
             run = kb.latest_run(conn, tid)
             return _ok(task_id=tid, run_id=run.id if run else None)
@@ -832,6 +850,11 @@ def _handle_block(args: dict, **kw) -> str:
         return tool_error("reason is required — explain what input you need")
     reason = redact_sensitive_text(str(reason), force=True)
     kind = args.get("kind")
+    metadata = args.get("metadata")
+    if metadata is not None and not isinstance(metadata, dict):
+        return tool_error(
+            f"metadata must be an object/dict, got {type(metadata).__name__}"
+        )
     board = args.get("board")
     try:
         kb, conn = _connect(board=board)
@@ -870,6 +893,7 @@ def _handle_block(args: dict, **kw) -> str:
                 reason=reason,
                 kind=kind,
                 expected_run_id=_worker_run_id(tid),
+                metadata=metadata,
             )
             if not ok:
                 return tool_error(
@@ -1765,7 +1789,9 @@ KANBAN_COMPLETE_SCHEMA = {
     "name": "kanban_complete",
     "description": (
         "Mark your current task done with a structured handoff for "
-        "downstream workers and humans. Prefer ``summary`` for a "
+        "downstream workers and humans. A task already in ``blocked`` must "
+        "instead carry verified ``review_evidence`` and is routed to review; "
+        "it is never silently marked done. Prefer ``summary`` for a "
         "human-readable 1-3 sentence description of what you did; put "
         "machine-readable facts in ``metadata`` (changed_files, "
         "tests_run, decisions, findings, etc). At least one of "
@@ -1893,6 +1919,18 @@ KANBAN_BLOCK_SCHEMA = {
                     "resumes automatically; the others surface to a human. "
                     "Omit only if none apply."
                 ),
+            },
+            "metadata": {
+                "type": "object",
+                "description": (
+                    "Optional structured recovery evidence. When a blocked "
+                    "implementation later has a pull request, include "
+                    "review_evidence with provider=github, repository, "
+                    "branch, immutable 40-character head_sha, pr_url, and "
+                    "pr_number. The dispatcher verifies live open/non-draft "
+                    "exact-head green checks before routing review."
+                ),
+                "additionalProperties": True,
             },
             "board": _board_schema_prop(),
         },

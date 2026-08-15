@@ -2485,6 +2485,9 @@ DEFAULT_CONFIG = {
         # the assigned profile with the bundled sdlc-review skill. Disable for
         # boards where every review is performed manually from the dashboard.
         "review_dispatch": True,
+        # Independent profile used when a blocked implementation recovers to
+        # same-card review and the handoff did not name a reviewer.
+        "review_reviewer": "hermes-review",
         # Seconds between dispatcher ticks (idle or not). Lower = snappier
         # pickup of newly-ready tasks; higher = less SQL pressure.
         "dispatch_interval_seconds": 60,

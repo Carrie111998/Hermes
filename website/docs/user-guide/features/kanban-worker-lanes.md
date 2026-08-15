@@ -74,10 +74,44 @@ The injected `KANBAN_GUIDANCE` covers both graph shapes, `kanban_complete`, the 
 The dispatcher writes per-task worker stdout/stderr to `<board-root>/logs/<task_id>.log`. Logs are auditable from kanban metadata:
 
 - `task_runs` rows carry the `log_path`, exit code (where available), summary, and metadata.
-- `task_events` rows carry every state transition (`promoted`, `claimed`, `heartbeat`, `completed`, `blocked`, `review_requested`, `changes_requested`, `review_reopened`, `gave_up`, `crashed`, `timed_out`, `reclaimed`, `claim_extended`).
+- `task_events` rows carry every state transition (`promoted`, `claimed`, `heartbeat`, `completed`, `blocked`, `review_requested`, `review_recovery_routed`, `review_recovery_blocked`, `changes_requested`, `review_reopened`, `gave_up`, `crashed`, `timed_out`, `reclaimed`, `claim_extended`).
 - `kanban_show` returns both, so a reviewer (or a follow-up worker) reading the task gets the full history without needing dashboard access.
 
 The dashboard renders run history with summaries, metadata blocks, and exit-status badges. CLI users can run `hermes kanban tail <task_id>` to follow live, or `hermes kanban runs <task_id>` for the historical attempt list.
+
+### Recovering a blocked implementation on a PR
+
+If an implementation worker blocks after it has produced a PR, do not manually
+unblock the implementation card and assign it to the reviewer. That path is
+still protected by the duplicate-PR `active_pr` guard. Instead, finish the
+handoff with structured evidence (either on the late `kanban_complete` call or
+on `kanban_block`):
+
+```json
+{
+  "review_evidence": {
+    "provider": "github",
+    "repository": "owner/repository",
+    "branch": "wt/task-branch",
+    "head_sha": "<40-character immutable commit SHA>",
+    "pr_url": "https://github.com/owner/repository/pull/123",
+    "pr_number": 123,
+    "base_branch": "main"
+  },
+  "reviewer": "hermes-review"
+}
+```
+
+The dispatcher queries the provider live and routes only an open, non-draft
+PR whose branch and exact head still match and whose exact-head checks are
+green. Missing, draft, closed, diverged, red, pending, or unavailable state
+leaves the card blocked and records `review_recovery_blocked` with the reason.
+Successful routing records `review_recovery_routed`: same-card graphs enter
+`review` for `hermes-review`; graphs with a pre-created review child complete
+the implementation parent and release that one child. No review card is
+created automatically, and the two lanes are never combined. `hermes kanban
+dispatch --json` exposes `review_recovered` and `review_recovery_blocked` for
+operator automation.
 
 ## Existing lane shapes
 

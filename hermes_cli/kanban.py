@@ -2300,7 +2300,26 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                 expected_run_id=_worker_run_id_for(tid),
             ):
                 failed.append(tid)
-                print(f"cannot complete {tid} (unknown id or terminal state)", file=sys.stderr)
+                recovery_detail = ""
+                for event in reversed(kb.list_events(conn, tid)):
+                    if event.kind != "review_recovery_blocked":
+                        continue
+                    try:
+                        payload = (
+                            json.loads(event.payload)
+                            if isinstance(event.payload, str)
+                            else event.payload
+                        )
+                    except (TypeError, json.JSONDecodeError):
+                        payload = {}
+                    if isinstance(payload, dict) and payload.get("diagnostic"):
+                        recovery_detail = f"; review recovery blocked: {payload['diagnostic']}"
+                    break
+                print(
+                    f"cannot complete {tid} (unknown id, terminal state, or still blocked)"
+                    f"{recovery_detail}",
+                    file=sys.stderr,
+                )
             else:
                 print(f"Completed {tid}")
     return 0 if not failed else 1
@@ -2672,6 +2691,14 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             "stale": res.stale,
             "auto_blocked": res.auto_blocked,
             "promoted": res.promoted,
+            "review_recovered": [
+                {"task_id": tid, "lane": lane}
+                for (tid, lane) in res.review_recovered
+            ],
+            "review_recovery_blocked": [
+                {"task_id": tid, "diagnostic": diagnostic}
+                for (tid, diagnostic) in res.review_recovery_blocked
+            ],
             "spawned": [
                 {"task_id": tid, "assignee": who, "workspace": ws}
                 for (tid, who, ws) in res.spawned
@@ -2699,6 +2726,12 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
     if res.auto_blocked:
         print(f"  {', '.join(res.auto_blocked)}")
     print(f"Promoted:     {res.promoted}")
+    if res.review_recovered:
+        for tid, lane in res.review_recovered:
+            print(f"Review recovery: {tid} -> {lane}")
+    if res.review_recovery_blocked:
+        for tid, diagnostic in res.review_recovery_blocked:
+            print(f"Review recovery blocked: {tid}: {diagnostic}")
     print(f"Spawned:      {len(res.spawned)}")
     for tid, who, ws in res.spawned:
         tag = " (dry)" if args.dry_run else ""
