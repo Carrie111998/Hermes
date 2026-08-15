@@ -1,12 +1,12 @@
 # Hermes static-message catalog -- Czech
 # Source: locales/en.yaml. Keep keys and placeholders in sync.
 approval:
-  dangerous_header: '⚠️ DANGEROUS COMMAND: {description}'
+  dangerous_header: '⚠️ NEBEZPEČNÝ PŘÍKAZ: {description}'
   choose_long: '[o]jednou |  [s]session |  [a]vždy |  [d]eny'
   choose_short: '[o]jednou |  [s]session |  [d]eny'
   prompt_long: 'Volba [o/s/a/D]:'
   prompt_short: 'Volba [o/s/D]:'
-  timeout: ⏱ Timeout - odmítnutí příkazu
+  timeout: ⏱ Časový limit - odmítnutí příkazu
   allowed_once: ✓ Povoleno jednou
   allowed_session: ✓ Povoleno pro tuto relaci
   allowed_always: ✓ Přidáno do trvalého seznamu povolených
