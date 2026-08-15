@@ -427,6 +427,14 @@ def _resolve_script_directory(script_path: str) -> Optional[str]:
 
 def _read_referenced_script(path: Path) -> tuple[Optional[str], bool]:
     """Return ``(text, unsafe)`` using bounded, regular-file-only reads."""
+    # Windows refuses to open directories with ``os.open`` before ``fstat``
+    # can classify them. Preserve the fail-closed non-regular-file contract
+    # across platforms while keeping missing paths as "nothing to scan".
+    try:
+        if path.exists() and not path.is_file():
+            return None, True
+    except (OSError, ValueError):
+        pass
     flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
     try:
         descriptor = os.open(path, flags)
