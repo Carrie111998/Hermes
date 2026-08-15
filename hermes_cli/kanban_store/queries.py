@@ -73,6 +73,8 @@ import sqlite3
 import time
 from typing import Optional
 
+from hermes_cli.kanban_store.models import Task
+
 def board_stats(conn: sqlite3.Connection) -> dict:
     """Per-status + per-assignee counts, plus the oldest ``ready`` age in
     seconds (the clearest staleness signal for a router or HUD).

@@ -6,6 +6,8 @@ import sqlite3
 import time
 from typing import Optional
 
+from hermes_cli.kanban_store.models import Task
+
 def claim_task(
     conn: sqlite3.Connection,
     task_id: str,
