@@ -21,7 +21,13 @@ test('serializeTargetId maps a forced-local profile to "forced-local-profile:<na
 })
 
 test('serializeTargetId is the inverse of parseTargetId for valid ids', () => {
-  for (const id of ['primary', 'configured-profile:worker', 'forced-local-profile:coder']) {
+  for (const id of [
+    'primary',
+    'configured-profile:worker',
+    'forced-local-profile:coder',
+    'configured-connection:local',
+    'configured-connection:atrium-agents'
+  ]) {
     const parsed = parseTargetId(id)
 
     assert.equal(parsed.ok, true, `expected ok for "${id}"`)
@@ -73,6 +79,39 @@ test('parseTargetId accepts "configured-profile:default"', () => {
 
   if (result.ok) {
     assert.deepEqual(result.target, { kind: 'configured-profile', profile: 'default' })
+  }
+})
+
+test('parseTargetId accepts configured-connection:local', () => {
+  const result = parseTargetId('configured-connection:local')
+
+  assert.equal(result.ok, true)
+
+  if (result.ok) {
+    assert.deepEqual(result.target, { kind: 'configured-connection', connection: 'local' })
+  }
+})
+
+test('parseTargetId accepts a kebab registry connection id', () => {
+  const result = parseTargetId('configured-connection:atrium-agents')
+
+  assert.equal(result.ok, true)
+
+  if (result.ok) {
+    assert.deepEqual(result.target, { kind: 'configured-connection', connection: 'atrium-agents' })
+  }
+})
+
+test('parseTargetId rejects a connection id that is a URL or path', () => {
+  for (const id of [
+    'configured-connection:https://evil.example',
+    'configured-connection:../escape',
+    'configured-connection:foo/bar',
+    'configured-connection:'
+  ]) {
+    const result = parseTargetId(id)
+
+    assert.equal(result.ok, false, `expected reject for "${id}"`)
   }
 })
 

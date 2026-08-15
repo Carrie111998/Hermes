@@ -79,6 +79,24 @@ test('makeBackendTarget rejects an unknown kind', () => {
   )
 })
 
+test('makeBackendTarget builds a configured-connection target', () => {
+  assert.deepEqual(makeBackendTarget({ kind: 'configured-connection', connection: 'atrium-agents' }), {
+    kind: 'configured-connection',
+    connection: 'atrium-agents'
+  })
+})
+
+test('makeBackendTarget rejects a connection id that is a path or URL', () => {
+  assert.throws(
+    () => makeBackendTarget({ kind: 'configured-connection', connection: '../escape' }),
+    /Invalid connection id/
+  )
+  assert.throws(
+    () => makeBackendTarget({ kind: 'configured-connection', connection: 'https://evil.example' }),
+    /Invalid connection id/
+  )
+})
+
 // ---------------------------------------------------------------------------
 // canonicalTargetKey — equivalent targets share pool identity
 // ---------------------------------------------------------------------------

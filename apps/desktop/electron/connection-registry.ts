@@ -39,6 +39,23 @@ export const REGISTRY_VERSION = 2
 
 export const LOCAL_CONNECTION_ID = 'local'
 
+/** Registry connection ids: `local` or a kebab slug. Not profile names. */
+const CONNECTION_ID_RE = /^(local|[a-z0-9]+(?:-[a-z0-9]+)*)$/
+
+const CONNECTION_ID_MAX = 64
+
+/** True when `id` is a legal registry connection id (never a URL or path). */
+export function isValidConnectionId(id: string): boolean {
+  return typeof id === 'string' && id.length > 0 && id.length <= CONNECTION_ID_MAX && CONNECTION_ID_RE.test(id)
+}
+
+/** Throw when `id` is not a legal registry connection id. */
+export function assertValidConnectionId(id: string): void {
+  if (!isValidConnectionId(id)) {
+    throw new Error(`Invalid connection id: ${String(id)}`)
+  }
+}
+
 /** Connection kinds. 'cloud' is remote-shaped (see modeIsRemoteLike) but keeps
  * its provenance so the UI can render the right card and updates can skip
  * platform-managed instances. */

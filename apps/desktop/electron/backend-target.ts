@@ -24,6 +24,7 @@
 // while the same profile forced local must use a different pool entry. Window
 // ids and scopes never enter the key — only the target does.
 
+import { assertValidConnectionId } from './connection-registry'
 import { assertValidProfileName } from './profile-name'
 
 /**
@@ -54,7 +55,17 @@ export interface ForcedLocalProfileBackendTarget {
 }
 
 /**
- * Closed sum of the three legal backend target identities. There is no
+ * A v2 registry connection (this computer, a saved SSH host, Cloud, or
+ * token/OAuth remote). Distinct from configured-profile: the id is a
+ * connection slug, not a Hermes profile name. No URL/token lives here.
+ */
+export interface ConfiguredConnectionBackendTarget {
+  kind: 'configured-connection'
+  connection: string
+}
+
+/**
+ * Closed sum of the legal backend target identities. There is no
  * variant carrying a URL, token, or raw backend descriptor — those are
  * connection/transport concerns, not target identity.
  */
@@ -62,6 +73,7 @@ export type BackendTarget =
   | PrimaryBackendTarget
   | ConfiguredProfileBackendTarget
   | ForcedLocalProfileBackendTarget
+  | ConfiguredConnectionBackendTarget
 
 /**
  * Constructor input for makeBackendTarget. The kind discriminates the variant;
@@ -97,6 +109,11 @@ export function makeBackendTarget(input: BackendTargetInput): BackendTarget {
 
       return { kind: 'forced-local-profile', profile: input.profile }
 
+    case 'configured-connection':
+      assertValidConnectionId(input.connection)
+
+      return { kind: 'configured-connection', connection: input.connection }
+
     default:
       throw new Error(`Unknown target kind: ${kind}`)
   }
@@ -128,6 +145,9 @@ export function canonicalTargetKey(target: BackendTarget): string {
     case 'forced-local-profile':
       return `forced-local-profile:${target.profile}`
 
+    case 'configured-connection':
+      return `configured-connection:${target.connection}`
+
     default:
       // Unreachable for a validated target. The discriminated union narrows
       // to `never` here, which is the compile-time proof the switch is
@@ -135,4 +155,9 @@ export function canonicalTargetKey(target: BackendTarget): string {
       // objects that bypassed makeBackendTarget().
       throw new Error('Unknown target kind')
   }
+}
+
+/** Profile name when the target carries one; null for primary/connection. */
+export function targetProfile(target: BackendTarget): null | string {
+  return target.kind === 'configured-profile' || target.kind === 'forced-local-profile' ? target.profile : null
 }

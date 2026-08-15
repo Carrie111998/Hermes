@@ -106,6 +106,26 @@ test('poolRouteForTarget keeps configured and forced-local keys distinct for the
   assert.equal(configured.profile, forced.profile)
 })
 
+test('poolRouteForTarget maps configured-connection:local onto the forced-local default pool', () => {
+  const route = poolRouteForTarget(makeBackendTarget({ kind: 'configured-connection', connection: 'local' }))
+
+  assert.deepEqual(route, {
+    route: 'forced-local',
+    profile: 'default',
+    key: 'forced-local-profile:default'
+  })
+})
+
+test('poolRouteForTarget keeps a remote registry connection on its own key', () => {
+  const route = poolRouteForTarget(makeBackendTarget({ kind: 'configured-connection', connection: 'atrium-agents' }))
+
+  assert.deepEqual(route, {
+    route: 'connection',
+    profile: null,
+    key: 'configured-connection:atrium-agents'
+  })
+})
+
 // ---------------------------------------------------------------------------
 // isForcedLocalTarget — whether the pool operator must bypass remote
 // resolution for this target and spawn a local profile process.

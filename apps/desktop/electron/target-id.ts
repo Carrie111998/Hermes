@@ -25,13 +25,17 @@
 // serialize to the same id.
 
 import { type BackendTarget, canonicalTargetKey } from './backend-target'
+import { isValidConnectionId } from './connection-registry'
 import { isValidProfileName } from './profile-name'
 
 /** The closed set of kind prefixes a target id may carry. */
-const KNOWN_KINDS = new Set(['primary', 'configured-profile', 'forced-local-profile'])
+const KNOWN_KINDS = new Set(['primary', 'configured-profile', 'forced-local-profile', 'configured-connection'])
 
 /** Profile-carrying kinds — they require a `:<name>` segment. */
 const PROFILE_KINDS = new Set(['configured-profile', 'forced-local-profile'])
+
+/** Registry-connection kinds — they require a `:<connection-id>` segment. */
+const CONNECTION_KINDS = new Set(['configured-connection'])
 
 /** A loose ceiling on the id string length so a runaway input fails fast. */
 const MAX_TARGET_ID_LENGTH = 128
@@ -79,16 +83,28 @@ export function parseTargetId(id: string): TargetIdParseResult {
     return { ok: false, reason: `unknown target kind: ${kind}` }
   }
 
+  // Exactly one `:` — a second colon makes the shape ambiguous (and is how a
+  // URL would sneak in). Reject rather than silently truncate.
+  if (rest.includes(':')) {
+    return { ok: false, reason: `malformed: extra segment in id` }
+  }
+
+  if (CONNECTION_KINDS.has(kind)) {
+    if (!rest) {
+      return { ok: false, reason: `malformed: missing connection id for ${kind}` }
+    }
+
+    if (!isValidConnectionId(rest)) {
+      return { ok: false, reason: `invalid connection id: ${rest}` }
+    }
+
+    return { ok: true, target: { kind: 'configured-connection', connection: rest } }
+  }
+
   if (!PROFILE_KINDS.has(kind)) {
     // `primary` was handled above; any other non-profile kind with a `:` is
     // malformed (e.g. "primary:extra").
     return { ok: false, reason: `malformed: unexpected segment for ${kind}` }
-  }
-
-  // A profile-carrying id has exactly one `:` — a second colon makes the shape
-  // ambiguous and is rejected rather than silently truncated.
-  if (rest.includes(':')) {
-    return { ok: false, reason: `malformed: extra segment in id` }
   }
 
   if (!rest) {

@@ -81,6 +81,10 @@ function terminalProfileForTarget(target, primaryProfile) {
     return null
   }
 
+  if (target.kind === 'configured-connection') {
+    return target.connection === 'local' ? null : primaryProfile
+  }
+
   return target.kind === 'primary' ? primaryProfile : target.profile
 }
 

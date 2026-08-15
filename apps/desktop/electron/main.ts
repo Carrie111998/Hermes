@@ -48,7 +48,7 @@ import {
 } from './backend-probes'
 import { waitForDashboardPortAnnouncement } from './backend-ready'
 import { shouldLatchBackendStartFailure, shouldLatchRemoteReauthFailure } from './backend-start-failure'
-import { type BackendTarget, canonicalTargetKey, makeBackendTarget } from './backend-target'
+import { type BackendTarget, canonicalTargetKey, makeBackendTarget, targetProfile } from './backend-target'
 import { buildBackendTargetChoices, classifyOpenInstanceRequest } from './backend-target-choices'
 import {
   detectRemoteDisplay,
@@ -95,6 +95,8 @@ import {
   tokenPreview
 } from './connection-config'
 import {
+  agentHandle,
+  LOCAL_CONNECTION_ID,
   mergeConnectionInput,
   migrateV1ToRegistry,
   normalizeConnectionInput,
@@ -9056,25 +9058,98 @@ async function ensureBackend(profile) {
 //   - forced-local        → bypass global/profile remote resolution and spawn
 //                           a local profile process, pool-keyed distinctly so
 //                           it never shares a configured-route entry.
+//   - connection          → a v2 registry source that is not the current
+//                           primary. The live global SSH/cloud/remote is
+//                           reused (sharedPrimary). A saved SSH while the
+//                           app is local bootstraps that host without
+//                           flipping connection.json mode.
 //
 // entry.profile stays the real profile name so the backend's own ?profile=
 // scoping and the descriptor handed to the renderer keep working. The pool
 // key carries the route mode.
-async function ensureBackendForTarget(target: BackendTarget) {
-  if (target.kind !== 'primary' && profileRevocations.isRevoked(target.profile)) {
-    throw new Error(`Profile "${target.profile}" has been deleted and must be recreated before it can be opened.`)
+
+function registryConnectionIsCurrentGlobalRemote(entry) {
+  const config = readDesktopConnectionConfig()
+
+  if (!entry || entry.kind === 'local') {
+    return false
   }
 
-  if (target.kind !== 'primary' && !desktopProfileAvailable(target.profile)) {
+  if (entry.kind === 'ssh' && config.mode === 'ssh') {
+    const ssh = normalizeSshConfig({ mode: 'ssh', ...(config.remote || {}) })
+
+    return Boolean(ssh && ssh.host === entry.host && (ssh.user || '') === (entry.user || ''))
+  }
+
+  if (modeIsRemoteLike(config.mode) && (entry.kind === 'remote' || entry.kind === 'cloud')) {
+    return normalizeRemoteBaseUrl(config.remote?.url) === normalizeRemoteBaseUrl(entry.url)
+  }
+
+  return false
+}
+
+async function ensureRegistryConnectionBackend(target: BackendTarget) {
+  if (target.kind !== 'configured-connection') {
+    throw new Error('ensureRegistryConnectionBackend requires a configured-connection target')
+  }
+
+  if (target.connection === LOCAL_CONNECTION_ID) {
+    return ensureBackendForTarget(makeBackendTarget({ kind: 'forced-local-profile', profile: 'default' }))
+  }
+
+  const registry = readDesktopConnectionsRegistry()
+  const entry = registry.connections.find(candidate => candidate.id === target.connection)
+
+  if (!entry || entry.kind === 'local') {
+    throw new Error(`No connection with id "${target.connection}".`)
+  }
+
+  // Same host as the app-global remote: reuse the live primary tunnel.
+  // Do not dial a second SSH WebSocket.
+  if (registry.primary === entry.id || registryConnectionIsCurrentGlobalRemote(entry)) {
+    return startHermes()
+  }
+
+  if (entry.kind === 'ssh') {
+    const ssh = normalizeSshConfig({ ...entry, mode: 'ssh' })
+
+    if (!ssh) {
+      throw new Error(`SSH connection "${entry.label}" has no host.`)
+    }
+
+    return bootstrapSshConnection(null, ssh, decryptDesktopSecret(entry.token), 'settings')
+  }
+
+  const authMode = normAuthMode(entry.authMode)
+  const token = authMode === 'oauth' ? null : decryptDesktopSecret(entry.token)
+
+  return buildRemoteConnection(
+    entry.url,
+    authMode,
+    token,
+    'settings',
+    undefined,
+    entry.kind === 'cloud' ? 'cloud' : 'url'
+  )
+}
+
+async function ensureBackendForTarget(target: BackendTarget) {
+  const profileName = targetProfile(target)
+
+  if (profileName && profileRevocations.isRevoked(profileName)) {
+    throw new Error(`Profile "${profileName}" has been deleted and must be recreated before it can be opened.`)
+  }
+
+  if (profileName && !desktopProfileAvailable(profileName)) {
     // Global SSH/remote: named profiles live on the remote host. A local-dir
     // miss must not reject them or getConnection() throws, sharedPrimary never
     // lands, and the renderer dials a second SSH socket that poisons the gateway.
     const remoteOnly =
       target.kind === 'configured-profile' &&
-      configuredProfileExistsOnSharedRemote(target.profile, globalRemoteActive())
+      configuredProfileExistsOnSharedRemote(profileName, globalRemoteActive())
 
     if (!remoteOnly) {
-      throw new Error(`Profile "${target.profile}" does not exist and cannot be opened.`)
+      throw new Error(`Profile "${profileName}" does not exist and cannot be opened.`)
     }
   }
 
@@ -9091,6 +9166,10 @@ async function ensureBackendForTarget(target: BackendTarget) {
     // route-mode key is a superset identity that the pool operator derives
     // via poolKeyForTarget when it needs to stop/touch/revalidate.
     return ensureBackend(decision.profile)
+  }
+
+  if (decision.route === 'connection') {
+    return ensureRegistryConnectionBackend(target)
   }
 
   // forced-local: bypass resolveRemoteBackend entirely and spawn a local
@@ -10127,7 +10206,7 @@ function createSessionWindow(
     ? activeWindowTarget(openerWebContentsId as number)
     : makeBackendTarget({ kind: 'primary' })
   const target = resolveSessionOwnerTarget(openerTarget, ownerProfile, primaryProfileKey())
-  const profile = normalizeDesktopProfile(ownerProfile) ?? (target.kind === 'primary' ? primaryProfileKey() : target.profile)
+  const profile = normalizeDesktopProfile(ownerProfile) ?? (targetProfile(target) || primaryProfileKey())
   const scopeId = serializeTargetId(target)
 
   return sessionWindows.openOrFocus(
@@ -10612,7 +10691,7 @@ function hudBounds() {
 function hudUrl(sessionId, target: BackendTarget) {
   return buildHudWindowUrl(sessionId, {
     devServer: DEV_SERVER,
-    profile: target.kind === 'primary' ? null : target.profile,
+    profile: targetProfile(target),
     rendererIndexPath: DEV_SERVER ? undefined : resolveRendererIndex()
   })
 }
@@ -11298,7 +11377,13 @@ async function revalidateTargetConnection(target: BackendTarget) {
   const entry = backendPool.get(key)
 
   if (!entry) {
-    const route = resolveProfileBackendRoute(target.profile, profileRouteOptions(target.profile))
+    const profileName = targetProfile(target)
+
+    if (!profileName) {
+      return revalidatePrimaryConnection()
+    }
+
+    const route = resolveProfileBackendRoute(profileName, profileRouteOptions(profileName))
 
     return route.backend === 'primary' ? revalidatePrimaryConnection() : { ok: true, rebuilt: false }
   }
@@ -11377,14 +11462,31 @@ ipcMain.handle('hermes:window:openSession', async (event, sessionId, opts) => {
 // exact IPC sender; null/empty/'primary' explicitly opens the primary. An
 // invalid or stale id returns { ok: false, error: 'invalid-target' } so the
 // renderer can surface the error without an exception crossing the bridge.
-ipcMain.handle('hermes:window:openInstance', async (event, targetId: null | string | undefined) => {
-  const choices = buildBackendTargetChoices({
+function listWindowBackendTargetChoices(senderId: number) {
+  const registry = readDesktopConnectionsRegistry()
+
+  return buildBackendTargetChoices({
     activePrimaryProfile: primaryProfileKey(),
-    currentTargetId: serializeTargetId(activeWindowTarget(event.sender.id)),
+    currentTargetId: serializeTargetId(activeWindowTarget(senderId)),
     configuredProfiles: readDesktopConnectionConfig().profiles || {},
     isProfileAvailable: desktopProfileAvailable,
-    isProfileRevoked: profile => profileRevocations.isRevoked(profile)
+    isProfileRevoked: profile => profileRevocations.isRevoked(profile),
+    connections: registry.connections.map(entry => ({
+      id: entry.id,
+      kind: entry.kind,
+      label: entry.label
+    })),
+    primaryConnectionId: registry.primary
   })
+}
+
+// hermes:window:openInstance accepts one of the currently-valid backend
+// target ids from listWindowBackendTargets. An omitted id inherits from the
+// exact IPC sender; null/empty/'primary' explicitly opens the primary. An
+// invalid or stale id returns { ok: false, error: 'invalid-target' } so the
+// renderer can surface the error without an exception crossing the bridge.
+ipcMain.handle('hermes:window:openInstance', async (event, targetId: null | string | undefined) => {
+  const choices = listWindowBackendTargetChoices(event.sender.id)
 
   const request = classifyOpenInstanceRequest(targetId, choices)
 
@@ -11406,13 +11508,7 @@ ipcMain.handle('hermes:window:openInstance', async (event, targetId: null | stri
 // target choices the renderer can pass to openInstance. Only {id, label,
 // description, current} — no URLs, tokens, or descriptors.
 ipcMain.handle('hermes:window:listBackendTargets', async event => {
-  return buildBackendTargetChoices({
-    activePrimaryProfile: primaryProfileKey(),
-    currentTargetId: serializeTargetId(activeWindowTarget(event.sender.id)),
-    configuredProfiles: readDesktopConnectionConfig().profiles || {},
-    isProfileAvailable: desktopProfileAvailable,
-    isProfileRevoked: profile => profileRevocations.isRevoked(profile)
-  })
+  return listWindowBackendTargetChoices(event.sender.id)
 })
 
 // Hand a session to the user's OWN terminal emulator, running the TUI against
@@ -12191,6 +12287,12 @@ async function interceptSessionRequestForRemote(
     const route = decideProfileSessionsRoute(target, boundTarget, remoteProfiles, profileHasRemoteOverride)
 
     if (route.kind === 'local-fast-path') {
+      // Global SSH/cloud with no named profile overrides used to take this
+      // path and hide this computer's sessions. Merge them in instead.
+      if (boundTarget.kind === 'primary' && globalRemoteActive()) {
+        return mergeRemoteProfileSessions(searchParams, remoteProfiles)
+      }
+
       return undefined // no remote profiles → local fast path
     }
 
@@ -12218,7 +12320,7 @@ async function interceptSessionRequestForRemote(
 
     const remoteProfiles = configuredRemoteProfileNames()
 
-    if (remoteProfiles.length === 0 && boundTarget.kind === 'primary') {
+    if (remoteProfiles.length === 0 && boundTarget.kind === 'primary' && !globalRemoteActive()) {
       return undefined // local fast path → batched endpoint's single DB open
     }
 
@@ -12288,7 +12390,34 @@ async function interceptSessionRequestForRemote(
   //  - global remote mode: ONE backend serves every profile via ?profile=, so
   //    route there and KEEP the profile param so it opens the right state.db.
   if (/^\/api\/sessions\/[^/]+(\/messages)?$/.test(pathname)) {
+    const sessionId = sessionIdFromRequestPath(pathname)
     const profile = (searchParams.get('profile') || request.profile || '').trim()
+    const localHandle = localSourceHandle()
+    const wantsLocal =
+      (sessionId && localSidebarSessionIds.has(sessionId)) ||
+      profile === localHandle ||
+      profile === LOCAL_CONNECTION_ID ||
+      request?.body && typeof request.body === 'object' && (request.body as { connection_id?: string }).connection_id === LOCAL_CONNECTION_ID
+
+    if (wantsLocal) {
+      const passthroughParams = new URLSearchParams(searchParams)
+
+      passthroughParams.delete('profile')
+      const passthroughQuery = passthroughParams.toString()
+      const localPath = passthroughQuery ? `${pathname}?${passthroughQuery}` : pathname
+
+      if (method === 'GET') {
+        return requestJsonForTarget(localConnectionTarget(), localPath, 'GET')
+      }
+
+      const body = request.body && typeof request.body === 'object' ? { ...request.body } : request.body
+
+      if (body && typeof body === 'object') {
+        delete (body as { profile?: string }).profile
+      }
+
+      return requestJsonForTarget(localConnectionTarget(), pathname, method, body)
+    }
 
     if (!profile) {
       return undefined
@@ -12364,8 +12493,8 @@ async function fetchProfilesSessionSlice(
   target?: BackendTarget,
   remoteRequestLimit?: AsyncLimiter
 ) {
-  const requested = target && target.kind !== 'primary'
-    ? target.profile
+  const requested = target && targetProfile(target)
+    ? targetProfile(target)
     : (searchParams.get('profile') || 'all').trim() || 'all'
 
   if (requested !== 'all') {
@@ -12383,10 +12512,61 @@ async function fetchProfilesSessionSlice(
   return mergeRemoteProfileSessions(searchParams, remoteProfiles, remoteRequestLimit)
 }
 
+// Session ids last seen on this computer's local gateway. Used so a click on a
+// merged local row from an SSH-primary window does not hit the SSH socket.
+const localSidebarSessionIds = new Set<string>()
+
+function localConnectionTarget(): BackendTarget {
+  return makeBackendTarget({ kind: 'configured-connection', connection: LOCAL_CONNECTION_ID })
+}
+
+function localSourceHandle(): string {
+  const local = readDesktopConnectionsRegistry().connections.find(entry => entry.kind === 'local')
+
+  return agentHandle('default', local?.label || 'This device', true)
+}
+
+function stampLocalSessionRows(rows: unknown[]): string {
+  const handle = localSourceHandle()
+
+  for (const row of rows) {
+    if (!row || typeof row !== 'object') {
+      continue
+    }
+
+    const session = row as { connection_id?: string; id?: string; is_default_profile?: boolean; profile?: string }
+
+    session.connection_id = LOCAL_CONNECTION_ID
+    session.is_default_profile = false
+    session.profile = handle
+
+    if (typeof session.id === 'string' && session.id) {
+      localSidebarSessionIds.add(session.id)
+    }
+  }
+
+  return handle
+}
+
+function sessionIdFromRequestPath(pathname: string): null | string {
+  const match = pathname.match(/^\/api\/sessions\/([^/]+)(?:\/messages)?$/)
+
+  return match ? decodeURIComponent(match[1]) : null
+}
+
+async function fetchLocalDefaultSessions(searchParams: URLSearchParams) {
+  const localTarget = localConnectionTarget()
+
+  return fetchRemoteProfileSessions('default', searchParams, async (_profile, path) =>
+    requestJsonForTarget(localTarget, path, 'GET')
+  )
+}
+
 // Unified list: primary's local aggregate, with each remote profile's stale local
 // rows/totals swapped for the remote's real ones, re-sorted by recency and
 // re-windowed to the requested page. A dead remote contributes nothing rather
-// than breaking the sidebar.
+// than breaking the sidebar. When the app-global backend is SSH/cloud/remote,
+// this computer's default sessions are spliced in under a distinct handle.
 async function mergeRemoteProfileSessions(searchParams, remoteProfiles, remoteRequestLimit?: AsyncLimiter) {
   const limit = Math.max(1, Number(searchParams.get('limit')) || 20)
   const offset = Math.max(0, Number(searchParams.get('offset')) || 0)
@@ -12424,6 +12604,19 @@ async function mergeRemoteProfileSessions(searchParams, remoteProfiles, remoteRe
     }))
   )
 
+  if (globalRemoteActive()) {
+    const localList = await fetchLocalDefaultSessions(remoteParams).catch(() => null)
+
+    if (localList) {
+      const rows = rowsOf(localList)
+      const handle = stampLocalSessionRows(rows)
+
+      merged.push(...rows)
+      profileTotals[handle] = Number(localList.total) || rows.length
+      total += profileTotals[handle]
+    }
+  }
+
   const recency = s => s?.[order] ?? s?.started_at ?? 0
   merged.sort((a, b) => recency(b) - recency(a))
 
@@ -12443,7 +12636,11 @@ ipcMain.handle('hermes:api', async (event, request) => {
     throw new Error('profile-conflicts-with-window-target')
   }
 
-  const initialTarget = initialResolution.target
+  const initialTarget =
+    initialResolution.target.kind === 'configured-profile' &&
+    initialResolution.target.profile === localSourceHandle()
+      ? localConnectionTarget()
+      : initialResolution.target
   const createdProfile = profileNameFromCreateRequest(request)
   const renamedProfile = profileRenameFromRequest(request)
   const creationMutation = createdProfile ? profileRevocations.startCreation(createdProfile) : null
@@ -12480,7 +12677,8 @@ ipcMain.handle('hermes:api', async (event, request) => {
       const connection = await ensureBackendForTarget(target)
       const timeoutMs = resolveTimeoutMs(request?.timeoutMs, DEFAULT_FETCH_TIMEOUT_MS)
 
-      const requestPath = target.kind === 'forced-local-profile'
+      const requestPath = target.kind === 'forced-local-profile' ||
+        (target.kind === 'configured-connection' && target.connection === LOCAL_CONNECTION_ID)
         ? request.path
         : pathWithGlobalRemoteProfile(request.path, profile, profileRouteOptions(profile))
 

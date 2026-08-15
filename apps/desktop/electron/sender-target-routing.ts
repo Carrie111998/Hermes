@@ -54,9 +54,16 @@ export function resolveSenderTarget(
 
   // 1. Renderer omitted profile → use the bound target. A primary-bound
   //    window is the default (no binding), so it is NOT an override; a
-  //    profile-bound window IS overriding the (absent) renderer request.
+  //    profile-bound or connection-bound window IS overriding the (absent)
+  //    renderer request.
   if (!arg) {
     return { target: boundTarget, overridden: boundTarget.kind !== 'primary', conflict: false }
+  }
+
+  // A connection-bound window stays on that connection. A renderer profile
+  // name is an alias *on* the connection (?profile=), not a different target.
+  if (boundTarget.kind === 'configured-connection') {
+    return { target: boundTarget, overridden: true, conflict: false }
   }
 
   // 2. Renderer asked for the bound target's own profile → use the bound
@@ -92,6 +99,10 @@ export function resolveSessionOwnerTarget(
   const owner = typeof ownerProfile === 'string' ? ownerProfile.trim() : ''
 
   if (!owner) {
+    return openerTarget
+  }
+
+  if (openerTarget.kind === 'configured-connection') {
     return openerTarget
   }
 
@@ -169,7 +180,11 @@ export function resolveSenderRequestTarget(
 
 /** Derive list routing only from the already-authorized main-owned target. */
 export function sessionProfileForTarget(target: BackendTarget): string {
-  return target.kind === 'primary' ? 'all' : target.profile
+  if (target.kind === 'primary' || target.kind === 'configured-connection') {
+    return 'all'
+  }
+
+  return target.profile
 }
 
 export type ProfileSessionsRoute =
@@ -204,6 +219,11 @@ export function decideProfileSessionsRoute(
 /** Return one main-authoritative batched sidebar path for a bound target. */
 export function scopedSidebarPathForTarget(target: BackendTarget, requestPath: string): null | string {
   if (target.kind === 'primary') {
+    return null
+  }
+
+  // Local connection uses the local batched endpoint (same as primary-on-local).
+  if (target.kind === 'configured-connection' && target.connection === 'local') {
     return null
   }
 
@@ -244,7 +264,7 @@ export interface SidebarResponse {
 export function scopeSidebarResponseForTarget(target: BackendTarget, data: unknown): SidebarResponse {
   const response = data as SidebarResponse
 
-  if (target.kind === 'primary') {
+  if (target.kind === 'primary' || target.kind === 'configured-connection') {
     return response
   }
 

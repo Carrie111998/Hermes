@@ -10,6 +10,11 @@
 //                                         profile with a remote-like mode
 //   - forced-local-profile:<name>          one for the active primary profile
 //                                         and one per configured profile
+//   - configured-connection:<id>           one per v2 registry connection
+//                                         that is not already the primary
+//                                         (This computer when primary is
+//                                         remote; each saved SSH/Cloud/OAuth
+//                                         when primary is local)
 //
 // `current` marks the choice the primary window currently resolves to. When
 // the active primary profile is the default (or has no remote route), primary
@@ -23,6 +28,7 @@
 // without an exception crossing the bridge.
 
 import { modeIsRemoteLike } from './connection-config'
+import { isValidConnectionId, LOCAL_CONNECTION_ID } from './connection-registry'
 import { isValidProfileName } from './profile-name'
 import { parseTargetId } from './target-id'
 
@@ -45,6 +51,13 @@ export interface SanitizedProfileEntry {
   [key: string]: unknown
 }
 
+/** A sanitized, non-secret registry connection used to build picker rows. */
+export interface RegistryConnectionChoice {
+  id: string
+  kind: 'cloud' | 'local' | 'remote' | 'ssh'
+  label: string
+}
+
 export interface BackendTargetChoicesInput {
   /** The profile name the primary backend runs (e.g. 'default', 'worker'). */
   activePrimaryProfile: string
@@ -56,6 +69,13 @@ export interface BackendTargetChoicesInput {
   isProfileRevoked?: (profile: string) => boolean
   /** Main-owned local profile existence predicate. Missing profiles are omitted. */
   isProfileAvailable?: (profile: string) => boolean
+  /**
+   * v2 registry connections (no tokens/URLs). When omitted, the catalog
+   * falls back to the profile-only list so existing callers keep working.
+   */
+  connections?: RegistryConnectionChoice[]
+  /** Registry primary connection id. Defaults to `local`. */
+  primaryConnectionId?: string
 }
 
 /**
@@ -90,16 +110,68 @@ export function buildBackendTargetChoices(input: BackendTargetChoicesInput): Bac
   }
 
   const currentTargetId = typeof input.currentTargetId === 'string' ? input.currentTargetId : 'primary'
+  const connections = Array.isArray(input.connections) ? input.connections : []
+  const primaryConnectionId =
+    typeof input.primaryConnectionId === 'string' && isValidConnectionId(input.primaryConnectionId)
+      ? input.primaryConnectionId
+      : LOCAL_CONNECTION_ID
+  const hasLocalConnection = connections.some(entry => entry && entry.kind === 'local')
 
   const choices: BackendTargetChoice[] = []
+
+  const primaryConnection = connections.find(entry => entry && entry.id === primaryConnectionId)
+  const primaryLabel =
+    primaryConnection && typeof primaryConnection.label === 'string' && primaryConnection.label.trim()
+      ? primaryConnection.label.trim()
+      : 'Primary backend'
+  const primaryDescription =
+    primaryConnection?.kind === 'local'
+      ? 'Use this computer.'
+      : primaryConnection
+        ? `Use the app’s current primary backend (${primaryLabel}).`
+        : 'The default window backend for this profile.'
 
   // 1. Primary — always first.
   choices.push({
     id: 'primary',
-    label: 'Primary backend',
-    description: 'The default window backend for this profile.',
+    label: connections.length > 0 ? primaryLabel : 'Primary backend',
+    description: primaryDescription,
     current: currentTargetId === 'primary'
   })
+
+  // 1b. Registry connections that are not already the primary.
+  //     Local primary → each saved SSH/Cloud/OAuth. SSH primary → This computer.
+  for (const entry of connections) {
+    if (!entry || typeof entry !== 'object') {
+      continue
+    }
+
+    if (!isValidConnectionId(entry.id)) {
+      continue
+    }
+
+    if (entry.id === primaryConnectionId) {
+      continue
+    }
+
+    const label =
+      typeof entry.label === 'string' && entry.label.trim()
+        ? entry.label.trim()
+        : entry.kind === 'local'
+          ? 'This computer'
+          : entry.id
+    const description =
+      entry.kind === 'local'
+        ? 'Run on this computer.'
+        : `Use the saved ${entry.kind} connection “${label}”.`
+
+    choices.push({
+      id: `configured-connection:${entry.id}`,
+      label,
+      description,
+      current: currentTargetId === `configured-connection:${entry.id}`
+    })
+  }
 
   // 2. Configured (remote) routes.
   for (const name of remoteProfiles.sort()) {
@@ -113,12 +185,21 @@ export function buildBackendTargetChoices(input: BackendTargetChoicesInput): Bac
 
   // 3. Forced-local for the active primary profile.
   //    The active primary is always eligible for forced-local (it can spawn
-  //    a local process even when its route is remote).
-  const forcedLocalNames = new Set<string>([activeProfile])
+  //    a local process even when its route is remote) — unless the registry
+  //    already exposes This computer as configured-connection:local.
+  const forcedLocalNames = new Set<string>()
+
+  if (!(hasLocalConnection && activeProfile === 'default')) {
+    forcedLocalNames.add(activeProfile)
+  }
 
   // And for every configured profile (remote or local-mode — any saved profile
   // can be forced local).
   for (const name of allProfileNames.sort()) {
+    if (hasLocalConnection && name === 'default') {
+      continue
+    }
+
     forcedLocalNames.add(name)
   }
 

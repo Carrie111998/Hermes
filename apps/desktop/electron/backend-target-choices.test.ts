@@ -271,3 +271,68 @@ test('classifyOpenInstanceRequest validates an opaque target against the live ca
     reason: 'invalid-target'
   })
 })
+
+const registryPair = {
+  connections: [
+    { id: 'local', kind: 'local' as const, label: 'This device' },
+    { id: 'atrium-agents', kind: 'ssh' as const, label: 'atrium-agents' }
+  ]
+}
+
+test('local primary + global saved SSH lists This computer as primary and the SSH host', () => {
+  const choices = buildBackendTargetChoices(makeDeps({
+    activePrimaryProfile: 'default',
+    currentTargetId: 'primary',
+    configuredProfiles: {},
+    ...registryPair,
+    primaryConnectionId: 'local'
+  }))
+
+  assert.equal(choices.filter(c => c.id === 'primary' || c.id === 'configured-connection:local').length, 1)
+  assert.equal(choices[0].id, 'primary')
+  assert.equal(choices[0].current, true)
+  assert.match(choices[0].label, /this device/i)
+  assert.equal(choices.some(c => c.id === 'configured-connection:atrium-agents'), true)
+  assert.equal(choices.some(c => c.id === 'forced-local-profile:default'), false)
+  assert.match(choices.find(c => c.id === 'configured-connection:atrium-agents')!.label, /atrium/i)
+})
+
+test('SSH primary + empty profiles lists This computer', () => {
+  const choices = buildBackendTargetChoices(makeDeps({
+    currentTargetId: 'primary',
+    configuredProfiles: {},
+    ...registryPair,
+    primaryConnectionId: 'atrium-agents'
+  }))
+
+  assert.equal(choices.some(c => c.id === 'configured-connection:local'), true)
+  assert.equal(choices.find(c => c.id === 'primary')?.current, true)
+  assert.equal(choices.some(c => c.id === 'configured-connection:atrium-agents'), false)
+  assert.match(choices.find(c => c.id === 'configured-connection:local')!.label, /this device|this computer/i)
+})
+
+test('registry connection ids that look like URLs or paths are dropped', () => {
+  const choices = buildBackendTargetChoices(makeDeps({
+    configuredProfiles: {},
+    connections: [
+      { id: 'local', kind: 'local', label: 'This device' },
+      { id: '../escape', kind: 'ssh', label: 'bad' },
+      { id: 'https', kind: 'remote', label: 'also-bad-if-colon' }
+    ],
+    primaryConnectionId: 'local'
+  }))
+
+  assert.equal(choices.some(c => c.id.includes('escape')), false)
+  assert.equal(choices.some(c => c.id.includes('://')), false)
+})
+
+test('validateOpenInstanceTargetId accepts a live configured-connection id', () => {
+  const choices = buildBackendTargetChoices(makeDeps({
+    configuredProfiles: {},
+    ...registryPair,
+    primaryConnectionId: 'local'
+  }))
+
+  assert.equal(validateOpenInstanceTargetId('configured-connection:atrium-agents', choices).ok, true)
+  assert.equal(validateOpenInstanceTargetId('configured-connection:missing-host', choices).ok, false)
+})

@@ -133,7 +133,10 @@ export function createWindowTargetRegistry(deps: WindowTargetRegistryDeps): Wind
       const revoked: number[] = []
 
       for (const [webContentsId, target] of bindings) {
-        if (target.kind !== 'primary' && target.profile === profile) {
+        if (
+          (target.kind === 'configured-profile' || target.kind === 'forced-local-profile') &&
+          target.profile === profile
+        ) {
           revokedBindings.add(webContentsId)
           revoked.push(webContentsId)
         }

@@ -30,6 +30,10 @@ import { type BackendTarget, canonicalTargetKey, makeBackendTarget } from './bac
 
 /** The canonical pool key for a target. Equivalent windows share it. */
 export function poolKeyForTarget(target: BackendTarget): string {
+  if (target.kind === 'configured-connection' && target.connection === 'local') {
+    return canonicalTargetKey(makeBackendTarget({ kind: 'forced-local-profile', profile: 'default' }))
+  }
+
   return canonicalTargetKey(target)
 }
 
@@ -55,14 +59,15 @@ export function poolKeysForProfile(
 }
 
 /** Which routing branch the pool operator should take for this target. */
-export type PoolRoute = 'primary' | 'configured' | 'forced-local'
+export type PoolRoute = 'primary' | 'configured' | 'forced-local' | 'connection'
 
 export interface PoolRouteDecision {
   /** Which backend branch to take. */
   route: PoolRoute
   /**
    * The real profile name to keep on the pool entry (entry.profile) and hand
-   * to the backend. Null for primary, which has no per-profile scope.
+   * to the backend. Null for primary and for a non-local registry connection
+   * (those are scoped with ?profile= at request time, not by pool identity).
    */
   profile: null | string
   /** The canonical pool key. */
@@ -73,19 +78,29 @@ export interface PoolRouteDecision {
  * Derive the pool routing decision for a target. The route tells the pool
  * operator which branch to take; the key is the pool identity; the profile is
  * the real profile name kept on the entry (never the key).
+ *
+ * `configured-connection:local` shares the forced-local default pool so a
+ * "This computer" window does not spawn a second local gateway.
  */
 export function poolRouteForTarget(target: BackendTarget): PoolRouteDecision {
-  const key = canonicalTargetKey(target)
-
   switch (target.kind) {
     case 'primary':
-      return { route: 'primary', profile: null, key }
+      return { route: 'primary', profile: null, key: canonicalTargetKey(target) }
 
     case 'configured-profile':
-      return { route: 'configured', profile: target.profile, key }
+      return { route: 'configured', profile: target.profile, key: canonicalTargetKey(target) }
 
     case 'forced-local-profile':
-      return { route: 'forced-local', profile: target.profile, key }
+      return { route: 'forced-local', profile: target.profile, key: canonicalTargetKey(target) }
+
+    case 'configured-connection':
+      if (target.connection === 'local') {
+        const localDefault = makeBackendTarget({ kind: 'forced-local-profile', profile: 'default' })
+
+        return { route: 'forced-local', profile: 'default', key: canonicalTargetKey(localDefault) }
+      }
+
+      return { route: 'connection', profile: null, key: canonicalTargetKey(target) }
 
     default:
       // Unreachable for a validated target; the discriminated union narrows
@@ -98,9 +113,13 @@ export function poolRouteForTarget(target: BackendTarget): PoolRouteDecision {
 /**
  * True when the pool operator must bypass global/profile remote resolution for
  * this target and spawn a local profile process. Only forced-local targets
- * do this; primary and configured-profile targets follow the existing
- * ensureBackend(profile) path, which may resolve remotely.
+ * (including the local registry connection) do this; primary and configured
+ * targets follow the existing ensureBackend(profile) path, which may resolve
+ * remotely.
  */
 export function isForcedLocalTarget(target: BackendTarget): boolean {
-  return target.kind === 'forced-local-profile'
+  return (
+    target.kind === 'forced-local-profile' ||
+    (target.kind === 'configured-connection' && target.connection === 'local')
+  )
 }

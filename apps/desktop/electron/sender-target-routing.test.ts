@@ -401,3 +401,28 @@ test('scopeSidebarResponseForTarget retags a remote backend to the local target 
   assert.equal(scoped.recents.sessions[0].is_default_profile, false)
   assert.equal(response.recents.sessions[0].profile, 'remote-name')
 })
+
+test('connection-bound window stays on that connection for any profile arg', () => {
+  const bound = makeBackendTarget({ kind: 'configured-connection', connection: 'atrium-agents' })
+
+  const omitted = resolveSenderTarget(bound, null)
+  const named = resolveSenderTarget(bound, 'life')
+
+  assert.deepEqual(omitted.target, bound)
+  assert.equal(omitted.overridden, true)
+  assert.equal(omitted.conflict, false)
+  assert.deepEqual(named.target, bound)
+  assert.equal(named.conflict, false)
+  assert.equal(sessionProfileForTarget(bound), 'all')
+})
+
+test('scoped sidebar path is skipped for the local registry connection', () => {
+  const local = makeBackendTarget({ kind: 'configured-connection', connection: 'local' })
+  const ssh = makeBackendTarget({ kind: 'configured-connection', connection: 'atrium-agents' })
+
+  assert.equal(scopedSidebarPathForTarget(local, '/api/profiles/sessions/sidebar?recents_profile=all'), null)
+  assert.match(
+    scopedSidebarPathForTarget(ssh, '/api/profiles/sessions/sidebar?recents_profile=all') || '',
+    /current_only=true/
+  )
+})
