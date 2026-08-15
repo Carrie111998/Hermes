@@ -163,6 +163,48 @@ class WorkflowRun:
         self._attempt = 1
         self._max_attempts = max_attempts
 
+    @classmethod
+    def restore(
+        cls,
+        *,
+        workflow_run_id: str,
+        state: WorkflowState,
+        created_at: datetime,
+        updated_at: datetime,
+        attempt: int,
+        max_attempts: int,
+    ) -> "WorkflowRun":
+        """Reconstruct a validated workflow snapshot from durable facts."""
+
+        if not isinstance(workflow_run_id, str) or not workflow_run_id.strip():
+            raise ValueError("workflow_run_id must be a non-empty string")
+        if not isinstance(state, WorkflowState):
+            raise TypeError("state must be a WorkflowState")
+        if type(max_attempts) is not int or max_attempts < 1:
+            raise ValueError("max_attempts must be an integer greater than zero")
+        if type(attempt) is not int or attempt < 1:
+            raise ValueError("attempt must be an integer greater than zero")
+        if attempt > max_attempts:
+            raise ValueError("attempt cannot exceed max_attempts")
+        for name, timestamp in (
+            ("created_at", created_at),
+            ("updated_at", updated_at),
+        ):
+            if not isinstance(timestamp, datetime):
+                raise TypeError(f"{name} must be a datetime")
+            if timestamp.tzinfo is None or timestamp.utcoffset() is None:
+                raise ValueError(f"{name} must be timezone-aware")
+        if updated_at < created_at:
+            raise ValueError("updated_at cannot be earlier than created_at")
+
+        run = cls(max_attempts=max_attempts)
+        run._workflow_run_id = workflow_run_id
+        run._state = state
+        run._created_at = created_at
+        run._updated_at = updated_at
+        run._attempt = attempt
+        return run
+
     @property
     def workflow_run_id(self) -> str:
         return self._workflow_run_id
