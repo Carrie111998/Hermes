@@ -1142,6 +1142,24 @@ def run_conversation(
     agent._last_compression_attempt_recorded = False
     agent._last_compression_attempt_in_place = None
 
+    # ── Phase 4 TWO-STAGE LIVE ROUTING (governed PGF missions only) ──
+    # Stage A: PRE-INVOCATION ROUTING GATE. Runs BEFORE the first provider
+    # invocation of this task/turn. For an explicitly-marked governed PGF
+    # mission the gate classifies the task, refreshes live quotas, runs the
+    # RoutingPolicyEngine + CostGate, and assigns Brain/Executor so the legacy
+    # default (e.g. DeepSeek/OpenRouter) is never invoked first and "corrected"
+    # later. Stage C (mission-boundary replan): running here at every task
+    # boundary re-reads live quotas and does not inherit the previous session's
+    # provider blindly. Non-governed agents (normal chat, holding-hossein) are
+    # untouched — gate_active() is False and this block is a no-op.
+    try:
+        from agent.pgf_routing_gate import gate_active, route_pre_invocation
+
+        if gate_active(agent):
+            route_pre_invocation(agent, user_message, task_id=task_id)
+    except Exception:  # noqa: BLE001 - pre-invocation gate must never break a turn
+        logger.exception("Phase4 pre-invocation gate error; proceeding")
+
     # ── Per-turn setup (the prologue) ──
     # All once-per-turn setup — stdio guarding, retry-counter resets, user
     # message sanitization, todo/nudge hydration, system-prompt restore-or-

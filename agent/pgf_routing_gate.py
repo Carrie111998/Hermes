@@ -40,6 +40,7 @@ import logging
 import os
 import subprocess
 from pathlib import Path
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -244,6 +245,194 @@ def _persist_decision(plan: dict, failed_provider: str, reason: str) -> str | No
         records.mkdir(parents=True, exist_ok=True)
         path = records / f"routing-{_ts()}.json"
         payload = {"failed_provider": failed_provider, "failure_reason": reason, "selection": plan}
+        path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+        return str(path)
+    except OSError:
+        return None
+
+
+# --- Stage A: deterministic task classification ------------------------------
+
+#: Deterministic keyword -> task-class heuristics. High-value reasoning classes
+#: are matched first so an ambiguous message defaults to Claude for reasoning
+#: rather than a cheap executor. Cheap/rote keywords (grep, test, lint, format)
+#: map to mechanical/test classes -> free/cheap workers. No LLM is involved.
+_TASK_KEYWORDS: dict[str, list[str]] = {
+    "CRITICAL_REASONING": [
+        "production", "incident", "outage", "security", "reliability", "risk",
+        "critical", "conflict", "rollback", "data loss", "urgent", "prod",
+        "authorization", "credential",
+    ],
+    "ARCHITECTURE": [
+        "architecture", "design", "proposal", "schema", "roadmap", "refactor plan",
+        "system design", "api design", "adr", "tech design",
+    ],
+    "COMPLEX_DEBUGGING": [
+        "debug", "root cause", "stack trace", "crash", "hang", "deadlock",
+        "fix why", "investigate", "why is", "segment fault", "race condition",
+    ],
+    "CODE_REVIEW": ["review", "code review", "pr", "pull request", "audit", "lint pass"],
+    "TEST_VALIDATION": [
+        "run tests", "pytest", "test suite", "regression", "verification",
+        "quality gate", "lint", "format check",
+    ],
+    "MECHANICAL_EXECUTION": [
+        "grep", "search", "git status", "polling", "wait for", "ls ",
+        "find ", "rename", "mechanical", "draft", "status update", "move file",
+        "cp ", "mv ", "sed", "apply patch", "backport", "telemetry",
+    ],
+    "SUMMARIZATION": ["summarize", "summary", "digest", "tldr", "recap", "notes"],
+}
+
+
+def classify_task(user_message: Any, task_id: str | None = None) -> str:
+    """Deterministic task classification for a governed PGF task.
+
+    Returns a `TaskClass` value string. High-value reasoning keywords are
+    matched first (and win on ties toward reasoning), rote/cheap keywords map
+    to mechanical/test classes for free workers. Defaults to NORMAL_CODING.
+    """
+    text = ""
+    if isinstance(user_message, str):
+        text = user_message
+    elif user_message is not None:
+        try:
+            text = str(user_message)
+        except Exception:  # noqa: BLE001
+            text = ""
+    low = text.lower()
+
+    # High-value reasoning classes checked first (order matters: earlier wins).
+    for klass in ("CRITICAL_REASONING", "ARCHITECTURE", "COMPLEX_DEBUGGING", "CODE_REVIEW"):
+        if any(kw in low for kw in _TASK_KEYWORDS[klass]):
+            return klass
+
+    for klass in ("TEST_VALIDATION", "MECHANICAL_EXECUTION", "SUMMARIZATION"):
+        if any(kw in low for kw in _TASK_KEYWORDS[klass]):
+            return klass
+
+    return "NORMAL_CODING"
+
+
+_PRE_INVOCATION = "PRE_INVOCATION_GATE"
+_FAILURE_REPLAN = "FAILURE_REPLAN_GATE"
+
+
+def route_pre_invocation(agent, user_message: Any = None, task_id: str | None = None) -> dict | None:
+    """Stage A: pre-invocation routing gate (runs before the first provider call).
+
+    For a governed PGF mission: classify the task, collect live quotas, run the
+    RoutingPolicyEngine + CostGate, assign Brain/Executor onto the agent, and
+    persist an audit record (task class, quota snapshot, brain, executor,
+    reasoning, expected billing class). This ensures the legacy/default provider
+    (e.g. DeepSeek) is NOT invoked first and corrected later.
+
+    Stage C (mission-boundary replan): this runs at every task/mission boundary
+    (from `run_conversation`), so it re-reads live quotas and never inherits the
+    previous session's provider blindly.
+
+    Free/cheap workers are never promoted to Brain for critical reasoning (the
+    runtime orchestration Brain-capability gate enforces this).
+
+    Returns a dict describing the decision, or None when there is nothing to
+    decide / the gate is inactive.
+    """
+    if not gate_active(agent):
+        return None
+
+    classified = classify_task(user_message, task_id)
+    try:
+        import sys
+
+        sys.path.insert(0, str(_PGF_REPO_ROOT))
+        from internal.control_panel.costgate import PaygGateConfig, evaluate_cost_gate
+        from internal.control_panel.orchestration import (_BRAIN_CAPABLE, build_plan)
+        from internal.control_panel.quota import collect_all_budgets
+        from internal.control_panel.routing import TaskClass
+
+        task_class = TaskClass(classified)
+        budgets = collect_all_budgets()
+        plan = build_plan(task_class, budgets, failed_provider=None, failure_reason="pre-invocation")
+        plan_dict = plan.to_dict() if hasattr(plan, "to_dict") else {}
+
+        brain = plan_dict.get("brain")
+        # A free/cheap worker must never be promoted to Brain (defense in depth).
+        if brain is not None and brain not in _BRAIN_CAPABLE:
+            brain = None
+
+        expected_billing = ""
+        status = plan_dict.get("status", "")
+        if status in ("INCLUDED", "FREE"):
+            expected_billing = "INCLUDED" if status == "INCLUDED" else "FREE"
+        elif status == "PAYG_AUTO":
+            expected_billing = "PAYG_AUTO"
+        elif status == "PAYG_ESCALATION":
+            expected_billing = "PAYG (cost gate)"
+
+        # Persist full audit: task class, quota snapshot, brain, executor,
+        # reasoning, expected billing class.
+        _persist_pre_invocation(classified, plan_dict, expected_billing, task_id, budgets)
+
+        # Record gate status flags on the agent for the Control Center display.
+        try:
+            agent._pgf_pre_invocation_gate = "ACTIVE"
+            agent._pgf_failure_replan_gate = "ACTIVE"
+            agent._pgf_task_class = classified
+            agent._pgf_governed_brain = brain if brain is not None else getattr(agent, "_pgf_governed_brain", None)
+        except Exception:  # noqa: BLE001
+            pass
+
+        # Apply decision: annotate WITHOUT hot-swapping mid-critical-step. The
+        # invocation loop reads the assigned Brain when it builds kwargs. A
+        # cheap/free executor is never applied as Brain here.
+        if plan_dict:
+            agent._pgf_governed_selection = plan_dict
+
+        logger.info(
+            "pgf_routing_gate: PRE_INVOCATION task=%s class=%s status=%s brain=%s billing=%s",
+            task_id or "-",
+            classified,
+            status,
+            brain,
+            expected_billing,
+        )
+        return {
+            "task_class": classified,
+            "brain": brain,
+            "executor": plan_dict.get("executor"),
+            "status": status,
+            "expected_billing": expected_billing,
+            "reason": plan_dict.get("reason"),
+        }
+    except Exception as exc:  # noqa: BLE001 - gate must never break the turn
+        logger.warning("pgf_routing_gate: pre-invocation gate failed: %s", exc)
+        return None
+
+
+def _persist_pre_invocation(task_class: str, plan: dict, billing: str, task_id: str | None, budgets) -> str | None:
+    try:
+        records = _PGF_REPO_ROOT / ".pgf" / "control-plane" / "orchestration-decisions"
+        records.mkdir(parents=True, exist_ok=True)
+        path = records / f"pre-invocation-{_ts()}.json"
+        snapshot = []
+        for b in (budgets or ()):
+            try:
+                snapshot.append(
+                    {"provider": b.provider, "billing_class": getattr(b.billing_class, "value", None),
+                     "available": b.available,
+                     "short_remaining_pct": b.short_window_remaining_pct,
+                     "weekly_remaining_pct": b.weekly_remaining_pct}
+                )
+            except Exception:  # noqa: BLE001
+                continue
+        payload = {
+            "task_id": task_id,
+            "task_class": task_class,
+            "stage": "pre-invocation",
+            "expected_billing": billing,
+            "selection": plan,
+            "quota_snapshot": snapshot,
+        }
         path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
         return str(path)
     except OSError:

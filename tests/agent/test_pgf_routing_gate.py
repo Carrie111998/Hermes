@@ -145,3 +145,48 @@ def test_anomaly_quota_ignores_unknown_non_confirmed(gate):
     b.available = False
     with mock.patch.object(quota, "collect_claude_budget", return_value=b):
         assert gate._anomalous_quota() is False
+
+
+# --- Stage A: deterministic classifier + pre-invocation gate ------------
+
+
+@pytest.mark.parametrize(
+    "msg,expected",
+    [
+        ("run pytest on the whole suite", "TEST_VALIDATION"),
+        ("design the api schema and road-map the refactor", "ARCHITECTURE"),
+        ("grep for the symbol and git status", "MECHANICAL_EXECUTION"),
+        ("summarize the meeting notes", "SUMMARIZATION"),
+        ("security incident in production, urgent rollback", "CRITICAL_REASONING"),
+        ("do a normal code edit", "NORMAL_CODING"),
+        ("review the pull request for correctness", "CODE_REVIEW"),
+    ],
+)
+def test_classify_task_deterministic(gate, msg, expected):
+    assert gate.classify_task(msg) == expected
+
+
+def test_pre_invocation_selects_claude_for_reasoning(gate):
+    """Stage A: a governed reasoning task -> Claude Brain (included) pre-invocation."""
+    a = _agent(marker=True)
+    a.provider = "deepseek"  # legacy default must NOT win
+    a._pgf_pre_invocation_gate = "INACTIVE"
+    a._pgf_failure_replan_gate = "INACTIVE"
+    plan = _plan("INCLUDED", "claude", "claude_code")
+
+    import importlib
+
+    sys.path.insert(0, "/home/pooyan/pgf-control-center-runtime")
+    orch = importlib.import_module("internal.control_panel.orchestration")
+    class FakeSel:
+        def to_dict(self):
+            return plan
+
+    with mock.patch.object(gate, "gate_active", return_value=True), \
+            mock.patch.object(orch, "build_plan", return_value=FakeSel()), \
+            mock.patch.object(gate, "classify_task", return_value="ARCHITECTURE"), \
+            mock.patch.object(gate, "_persist_pre_invocation", return_value="/tmp/x"):
+        gate.route_pre_invocation(a, "design the api")
+    assert a._pgf_pre_invocation_gate == "ACTIVE"
+    assert a._pgf_failure_replan_gate == "ACTIVE"
+    assert a._pgf_task_class == "ARCHITECTURE"
