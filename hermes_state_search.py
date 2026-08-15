@@ -1552,12 +1552,22 @@ class SessionSearchMixin:
     def _append_session_group_filter(
         where: List[str], params: List[Any], session_group_id: Optional[str]
     ) -> None:
-        """Push session-group membership into a message query before LIMIT."""
+        """Push lineage-aware session-group membership before LIMIT."""
         if not session_group_id:
             return
         where.append(
-            "m.session_id IN (SELECT session_id FROM session_group_members "
-            "WHERE group_id = ?)"
+            "EXISTS ("
+            " WITH RECURSIVE lineage(id, parent_id) AS ("
+            "   SELECT s.id, s.parent_session_id FROM sessions s"
+            "   WHERE s.id = m.session_id"
+            "   UNION"
+            "   SELECT p.id, p.parent_session_id FROM sessions p"
+            "   JOIN lineage l ON p.id = l.parent_id"
+            " )"
+            " SELECT 1 FROM lineage l"
+            " JOIN session_group_members gm ON gm.session_id = l.id"
+            " WHERE gm.group_id = ?"
+            ")"
         )
         params.append(session_group_id)
 

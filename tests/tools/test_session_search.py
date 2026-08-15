@@ -237,6 +237,22 @@ class TestDiscoveryShape:
 
         assert [row["session_id"] for row in result["results"]] == ["grouped-old"]
 
+    def test_group_discovery_includes_matches_from_member_lineage(self, db):
+        db.create_session("grouped-root", source="cli")
+        db.create_session(
+            "continuation", source="cli", parent_session_id="grouped-root"
+        )
+        db.append_message("continuation", role="user", content="lineage needle")
+        db.create_session_group("Project")
+        db.assign_sessions_to_group("Project", ["grouped-root"])
+
+        result = json.loads(
+            session_search(query="lineage", db=db, group="Project", limit=3)
+        )
+
+        assert [row["session_id"] for row in result["results"]] == ["continuation"]
+        assert result["results"][0]["parent_session_id"] == "grouped-root"
+
     def test_unknown_group_is_an_error(self, db):
         result = json.loads(session_search(query="anything", db=db, group="missing"))
 
