@@ -81,13 +81,15 @@ try:
         install_cmd_backspace_alias,
         install_ctrl_enter_alias,
         install_ignored_terminal_sequences,
+        install_numlock_cursor_aliases,
         install_shift_enter_alias,
     )
     install_shift_enter_alias()
     install_ctrl_enter_alias()
     install_cmd_backspace_alias()
     install_ignored_terminal_sequences()
-    del install_shift_enter_alias, install_ctrl_enter_alias, install_cmd_backspace_alias, install_ignored_terminal_sequences
+    install_numlock_cursor_aliases()
+    del install_shift_enter_alias, install_ctrl_enter_alias, install_cmd_backspace_alias, install_ignored_terminal_sequences, install_numlock_cursor_aliases
 except Exception:
     pass
 import threading
@@ -5366,8 +5368,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         per ``min_interval`` seconds.
         """
         now = time.monotonic()
-        last = getattr(self, "_last_focus_regain_redraw", 0.0)
-        if now - last < min_interval:
+        # None, not 0.0: monotonic() is uptime, so on a fresh CI/VM it can be
+        # less than min_interval and a 0.0 sentinel would skip the first redraw.
+        last = getattr(self, "_last_focus_regain_redraw", None)
+        if last is not None and now - last < min_interval:
             return
         self._last_focus_regain_redraw = now
         self._force_full_redraw()

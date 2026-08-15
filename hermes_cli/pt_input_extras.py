@@ -161,3 +161,69 @@ def install_ignored_terminal_sequences() -> int:
             ANSI_SEQUENCES[seq] = Keys.Ignore
             changed += 1
     return changed
+
+
+# xterm/kitty CSI modifier bit 8. When NumLock is on, cursor keys arrive as
+# ``ESC [ 1 ; (base_mod + 128) A`` instead of the un-modified / low-mod form
+# stock prompt_toolkit tables. See https://sw.kovidgoyal.net/kitty/keyboard-protocol/#modifiers
+_NUMLOCK_MOD_BIT = 128
+
+
+def install_numlock_cursor_aliases() -> int:
+    """Map CSI cursor keys that include the NumLock modifier bit.
+
+    Kitty (and other xterm-style terminals once the keyboard protocol or
+    modifyOtherKeys is active) encode NumLock as bit 8 of the CSI modifier
+    parameter. A plain Up then arrives as ``ESC [ 1 ; 129 A`` instead of
+    ``ESC [ A``. Stock prompt_toolkit only tables modifiers 2–9, so the
+    sequence fails to match: Escape is consumed and ``[1;129A`` is inserted
+    as literal text in the classic CLI prompt.
+
+    Also maps the disambiguated unmodified form ``ESC [ 1 ; 1 A`` (kitty
+    keyboard protocol flag 1) to the same unmodified keys, and copies every
+    already-tabled ``ESC [ 1 ; mod X`` binding to ``mod + 128`` so Shift/Ctrl
+    arrows keep working with NumLock on.
+
+    Returns the number of sequences whose mapping was changed.
+    """
+    try:
+        from prompt_toolkit.input.ansi_escape_sequences import ANSI_SEQUENCES
+        from prompt_toolkit.keys import Keys
+    except Exception:
+        return 0
+
+    unmodified = {
+        "A": Keys.Up,
+        "B": Keys.Down,
+        "C": Keys.Right,
+        "D": Keys.Left,
+        "H": Keys.Home,
+        "F": Keys.End,
+    }
+    changed = 0
+
+    def _set(seq: str, key: object) -> None:
+        nonlocal changed
+        if ANSI_SEQUENCES.get(seq) != key:
+            ANSI_SEQUENCES[seq] = key
+            changed += 1
+
+    for letter, key in unmodified.items():
+        _set(f"\x1b[1;1{letter}", key)
+        _set(f"\x1b[1;{1 + _NUMLOCK_MOD_BIT}{letter}", key)
+
+    for seq, key in list(ANSI_SEQUENCES.items()):
+        if not seq.startswith("\x1b[1;") or len(seq) < 6:
+            continue
+        letter = seq[-1]
+        if letter not in unmodified:
+            continue
+        try:
+            mod = int(seq[4:-1])
+        except ValueError:
+            continue
+        if mod & _NUMLOCK_MOD_BIT:
+            continue
+        _set(f"\x1b[1;{mod + _NUMLOCK_MOD_BIT}{letter}", key)
+
+    return changed
