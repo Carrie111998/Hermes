@@ -83,3 +83,23 @@ def test_init_honors_gateway_dispatch_environment_override(
     assert "Ready tasks wait for a manual dispatch pass" in output
     assert "Review tasks remain parked for human review" in output
     assert "configured but inactive while gateway dispatch is disabled" in output
+
+
+def test_init_does_not_claim_dispatch_is_enabled_when_config_load_fails(
+    monkeypatch, capsys, tmp_path: Path
+):
+    monkeypatch.setattr(kanban_cli.kb, "init_db", lambda: tmp_path / "kanban.db")
+    monkeypatch.setattr(kanban_cli.kb, "list_profiles_on_disk", lambda: [])
+
+    def fail_config_load():
+        raise RuntimeError("cannot read config")
+
+    monkeypatch.setattr("hermes_cli.config.load_config", fail_config_load)
+
+    assert kanban_cli._cmd_init(Namespace()) == 0
+
+    output = capsys.readouterr().out
+    assert "Operational contract unavailable" in output
+    assert "gateway dispatcher will remain disabled" in output
+    assert "Resolve the config error before starting the gateway dispatcher" in output
+    assert "Gateway dispatch: enabled" not in output
