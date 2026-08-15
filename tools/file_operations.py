@@ -882,6 +882,24 @@ class ShellFileOperations(FileOperations):
             self._command_cache[cmd] = result.stdout.strip() == 'yes'
         return self._command_cache[cmd]
     
+    # Extensions whose content is known to be human-readable text.
+    # When a file carries one of these extensions we trust the extension
+    # over the heuristic ``�`` sample check, because ``head -c 1000``
+    # can land in the middle of a multi-byte UTF-8 sequence (CJK chars are
+    # 3 bytes), producing a spurious replacement character that would
+    # otherwise trigger a false-positive binary classification.
+    _TEXT_EXTENSIONS = frozenset({
+        ".md", ".txt", ".py", ".json", ".yaml", ".yml", ".toml",
+        ".js", ".ts", ".jsx", ".tsx", ".html", ".htm", ".css",
+        ".sh", ".bash", ".zsh", ".fish", ".bat", ".cmd", ".ps1",
+        ".rb", ".go", ".rs", ".java", ".c", ".h", ".cpp", ".hpp",
+        ".cs", ".swift", ".kt", ".scala", ".lua", ".r", ".m",
+        ".sql", ".xml", ".csv", ".tsv", ".ini", ".cfg", ".conf",
+        ".env", ".gitignore", ".dockerignore", ".editorconfig",
+        ".rst", ".adoc", ".tex", ".bib", ".log", ".diff", ".patch",
+        ".makefile", ".cmake", ".gradle", ".sbt", ".proto",
+    })
+
     def _is_likely_binary(self, path: str, content_sample: str = None) -> bool:
         """
         Check if a file is likely binary.
@@ -903,7 +921,15 @@ class ShellFileOperations(FileOperations):
             # sample carries the replacement char as binary (read-only) so the
             # agent can't corrupt it. Legitimate UTF-8 text effectively never
             # contains U+FFFD.
-            if "\ufffd" in content_sample[:1000]:
+            #
+            # HOWEVER: when the sample is produced by `head -c 1000`, the
+            # byte boundary can land in the middle of a multi-byte UTF-8
+            # sequence (e.g. a 3-byte CJK character).  The terminal decoder
+            # then emits U+FFFD for the incomplete sequence even though the
+            # underlying file is perfectly valid UTF-8.  For files with a
+            # known text extension we skip the replacement-char guard so
+            # these false positives don't block reading.
+            if "\ufffd" in content_sample[:1000] and ext not in self._TEXT_EXTENSIONS:
                 return True
             non_printable = sum(1 for c in content_sample[:1000]
                                if ord(c) < 32 and c not in '\n\r\t')
