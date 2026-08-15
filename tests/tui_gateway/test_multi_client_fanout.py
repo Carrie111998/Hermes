@@ -220,6 +220,72 @@ def test_live_transport_predicates_ignore_stdio_and_the_drop_sentinel():
     )
 
 
+def test_steer_authority_recognizes_the_exact_client_inside_a_fanout():
+    """Wrapping attached peers must not revoke the commissioning peer's authority."""
+    owner, watcher, stranger = (
+        _FakeClient("owner"),
+        _FakeClient("watcher"),
+        _FakeClient("stranger"),
+    )
+    session = _session(transport=FanoutTransport(owner, watcher))
+    server._sessions["sid"] = session
+    try:
+        token = server.bind_transport(owner)
+        try:
+            assert server._current_session_steer_authority("sid") == (owner, session)
+        finally:
+            server.reset_transport(token)
+
+        token = server.bind_transport(stranger)
+        try:
+            assert server._current_session_steer_authority("sid") == (None, None)
+        finally:
+            server.reset_transport(token)
+    finally:
+        server._sessions.pop("sid", None)
+
+
+def test_steer_authority_is_granted_to_an_attached_watcher():
+    """A client that attached to watch a session may also steer its subagents.
+
+    This is INTENTIONAL and wider than the pre-fan-out rule, which admitted only
+    whichever client happened to hold the transport slot. A mirrored session has
+    no single owner in that slot, so authority is membership in it. Narrowing
+    this back to the commissioning peer would need a per-subagent record of who
+    commissioned it, which this change does not add; the widening is stated in
+    the pull request description, and this test pins it so it cannot be changed
+    silently in either direction.
+    """
+    owner, watcher, stranger = (
+        _FakeClient("owner"),
+        _FakeClient("watcher"),
+        _FakeClient("stranger"),
+    )
+    session = _session(transport=owner)
+    server._attach_session_transport(session, watcher)
+    solo = _session(transport=owner)
+    server._sessions["sid"] = session
+    server._sessions["solo"] = solo
+    try:
+        token = server.bind_transport(watcher)
+        try:
+            assert server._current_session_steer_authority("sid") == (watcher, session)
+            # Control: on a single-client session the same watcher is a stranger,
+            # so the widening reaches attached clients and nobody else.
+            assert server._current_session_steer_authority("solo") == (None, None)
+        finally:
+            server.reset_transport(token)
+
+        token = server.bind_transport(stranger)
+        try:
+            assert server._current_session_steer_authority("sid") == (None, None)
+        finally:
+            server.reset_transport(token)
+    finally:
+        server._sessions.pop("sid", None)
+        server._sessions.pop("solo", None)
+
+
 # ── event delivery ─────────────────────────────────────────────────────────
 
 

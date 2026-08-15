@@ -2211,10 +2211,10 @@ def _current_session_steer_authority(
 ) -> tuple[Transport | None, dict | None]:
     """Resolve unforgeable steering authority for this exact RPC context.
 
-    The public session id is only a lookup hint. Authority is the identity of
-    both the request's ContextVar-bound transport and the live in-memory
-    session record currently stored under that id. Session transport rebinding,
-    removal, or id reuse therefore invalidates an earlier generation.
+    The public session id is only a lookup hint. Authority requires the
+    request's ContextVar-bound transport to be attached to the live in-memory
+    session record currently stored under that id. Transport detachment,
+    session removal, or id reuse therefore invalidates an earlier generation.
     """
     transport = current_transport()
     if transport is None or not session_id:
@@ -2225,7 +2225,12 @@ def _current_session_steer_authority(
         if (
             session is None
             or (expected_session is not None and session is not expected_session)
-            or session.get("transport") is not transport
+            # A mirrored session stores a FanoutTransport in the slot, so slot
+            # identity alone would reject every client, the peer that
+            # commissioned the subagent included. Authority is membership in
+            # the slot, which also grants it to any client attached to mirror
+            # the session (see tests/tui_gateway/test_multi_client_fanout.py).
+            or not _session_transport_contains(session, transport)
         ):
             return None, None
         return transport, session
