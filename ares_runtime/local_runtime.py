@@ -412,6 +412,23 @@ class AresLocalRuntime:
         temporary.write_text(content, encoding="utf-8")
         os.replace(temporary, self.paths.unit_path)
 
+    @staticmethod
+    def _systemd_environment() -> dict[str, str]:
+        """Resolve the normal user bus when Ares starts outside a login shell."""
+
+        environment = os.environ.copy()
+        runtime_dir = environment.get("XDG_RUNTIME_DIR")
+        if not runtime_dir:
+            candidate = Path("/run/user") / str(os.getuid())
+            if candidate.is_dir():
+                runtime_dir = str(candidate)
+                environment["XDG_RUNTIME_DIR"] = runtime_dir
+        if runtime_dir and not environment.get("DBUS_SESSION_BUS_ADDRESS"):
+            bus = Path(runtime_dir) / "bus"
+            if bus.exists():
+                environment["DBUS_SESSION_BUS_ADDRESS"] = f"unix:path={bus}"
+        return environment
+
     def _systemctl(self, *args: str, required: bool = True) -> bool:
         if shutil.which("systemctl") is None:
             if required:
@@ -422,6 +439,7 @@ class AresLocalRuntime:
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            env=self._systemd_environment(),
             check=False,
         )
         if completed.returncode and required:

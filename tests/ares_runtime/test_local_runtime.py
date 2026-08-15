@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 from ares_runtime.local_runtime import AresLocalPaths, AresLocalRuntime
@@ -76,3 +77,14 @@ def test_launcher_resolves_the_selected_runtime_dynamically(tmp_path: Path) -> N
     assert str(runtime.paths.current_link) in launcher
     assert "-m ares_runtime.local_runtime" in launcher
     assert "Coding" not in launcher
+
+
+def test_systemd_environment_preserves_an_existing_session_bus(monkeypatch) -> None:
+    monkeypatch.setenv("XDG_RUNTIME_DIR", "/existing/runtime")
+    monkeypatch.setenv("DBUS_SESSION_BUS_ADDRESS", "unix:path=/existing/runtime/bus")
+
+    environment = AresLocalRuntime._systemd_environment()
+
+    assert environment["XDG_RUNTIME_DIR"] == "/existing/runtime"
+    assert environment["DBUS_SESSION_BUS_ADDRESS"] == "unix:path=/existing/runtime/bus"
+    assert environment["PATH"] == os.environ["PATH"]
