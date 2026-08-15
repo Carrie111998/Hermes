@@ -246,6 +246,21 @@ def _stub_runtime_main():
 
 
 class TestPrologueStamping:
+    def test_pre_llm_hook_receives_authoritative_task_cwd(self, tmp_path):
+        agent = _FakeAgent()
+        task_id = "pre-llm-cwd-task"
+        from tools.terminal_tool import clear_session_cwd, record_session_cwd
+
+        record_session_cwd(task_id, str(tmp_path))
+        try:
+            with patch("hermes_cli.plugins.invoke_hook", return_value=[]) as hook:
+                _build(agent, task_id=task_id)
+        finally:
+            clear_session_cwd(task_id)
+
+        pre_call = next(c for c in hook.call_args_list if c.args == ("pre_llm_call",))
+        assert pre_call.kwargs["cwd"] == str(tmp_path)
+
     def test_stamps_api_content_from_plugin_context(self):
         agent = _FakeAgent()
         with patch(

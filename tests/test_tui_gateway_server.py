@@ -4173,7 +4173,7 @@ def test_session_close_commits_memory_and_fires_finalize_hook(monkeypatch):
     monkeypatch.setattr(
         server,
         "_notify_session_boundary",
-        lambda event, session_id, *_args: calls["hooks"].append((event, session_id)),
+        lambda event, session_id, *_args, **_kwargs: calls["hooks"].append((event, session_id)),
     )
 
     try:
@@ -4185,6 +4185,63 @@ def test_session_close_commits_memory_and_fires_finalize_hook(monkeypatch):
         assert ("on_session_finalize", "session-key") in calls["hooks"]
     finally:
         server._sessions.pop("sid", None)
+
+
+def test_explicit_session_rotation_emits_transition_and_cwd(monkeypatch, tmp_path):
+    calls = []
+    monkeypatch.setattr(
+        server,
+        "_notify_session_boundary",
+        lambda event, session_id, platform=None, **kwargs: calls.append(
+            (event, session_id, platform, kwargs)
+        ),
+    )
+    old_agent = types.SimpleNamespace(session_id="stored-old", commit_memory_session=lambda _: None)
+    server._sessions["old-runtime"] = _session(
+        agent=old_agent,
+        session_key="stored-old",
+        source="tui",
+        cwd=str(tmp_path),
+        explicit_cwd=True,
+    )
+    new_runtime = ""
+    try:
+        created = server._methods["session.create"](
+            "create",
+            {
+                "cols": 80,
+                "old_session_id": "old-runtime",
+                "reason": "new_session",
+            },
+        )["result"]
+        new_runtime = created["session_id"]
+        new_stored = created["stored_session_id"]
+        closed = server._methods["session.close"](
+            "close",
+            {
+                "session_id": "old-runtime",
+                "new_session_id": new_stored,
+                "reason": "new_session",
+            },
+        )
+        assert closed["result"]["closed"] is True
+        assert [c[0] for c in calls] == [
+            "on_session_finalize",
+            "on_session_reset",
+        ]
+        finalize = next(c for c in calls if c[0] == "on_session_finalize")
+        assert finalize[1] == "stored-old"
+        assert finalize[3] == {
+            "reason": "new_session",
+            "old_session_id": "stored-old",
+            "new_session_id": new_stored,
+            "cwd": str(tmp_path),
+        }
+        reset = next(c for c in calls if c[0] == "on_session_reset")
+        assert reset[1] == new_stored
+        assert reset[3] == finalize[3]
+    finally:
+        server._sessions.pop(new_runtime, None)
 
 
 def test_session_close_releases_resume_lock_before_slow_teardown(monkeypatch):
@@ -4574,7 +4631,7 @@ def test_init_session_fires_reset_hook(monkeypatch):
     monkeypatch.setattr(
         server,
         "_notify_session_boundary",
-        lambda event, session_id, *_args: hooks.append((event, session_id)),
+        lambda event, session_id, *_args, **_kwargs: hooks.append((event, session_id)),
     )
 
     import tools.approval as _approval

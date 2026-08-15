@@ -29,6 +29,9 @@ def test_session_finalize_on_reset(mock_finalize_session, mock_invoke_hook):
         not c.args
         and c.kwargs["session_id"] == "test-session-id"
         and c.kwargs["platform"] == "cli"
+        and c.kwargs["old_session_id"] == "test-session-id"
+        and c.kwargs["new_session_id"] == cli.session_id
+        and c.kwargs["reason"] == "new_session"
         for c in mock_finalize_session.call_args_list
     )
     # Check if on_session_reset was called for the new session
@@ -36,6 +39,9 @@ def test_session_finalize_on_reset(mock_finalize_session, mock_invoke_hook):
         c.args == ("on_session_reset",)
         and c.kwargs["session_id"] == cli.session_id
         and c.kwargs["platform"] == "cli"
+        and c.kwargs["old_session_id"] == "test-session-id"
+        and c.kwargs["new_session_id"] == cli.session_id
+        and c.kwargs["reason"] == "new_session"
         for c in mock_invoke_hook.call_args_list
     )
 

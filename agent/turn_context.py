@@ -1171,11 +1171,13 @@ def build_turn_context(
     # Plugin hook: pre_llm_call (context injected into user message, not system prompt).
     plugin_user_context = ""
     try:
+        from agent.runtime_cwd import authoritative_session_cwd
         from hermes_cli.lifecycle import invoke_hook as _invoke_hook
         _pre_results = _invoke_hook(
             "pre_llm_call",
             session_id=agent.session_id,
             task_id=effective_task_id,
+            cwd=authoritative_session_cwd(effective_task_id),
             turn_id=turn_id,
             user_message=original_user_message,
             conversation_history=list(messages),

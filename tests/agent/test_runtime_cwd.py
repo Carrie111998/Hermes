@@ -7,11 +7,33 @@ import pytest
 
 import agent.runtime_cwd as rt
 from agent.runtime_cwd import (
+    authoritative_session_cwd,
     clear_session_cwd,
     resolve_agent_cwd,
     resolve_context_cwd,
     set_session_cwd,
 )
+
+
+def test_authoritative_session_cwd_never_uses_process_cwd(monkeypatch, tmp_path):
+    monkeypatch.setenv("TERMINAL_CWD", str(tmp_path / "stale-session"))
+    monkeypatch.chdir(tmp_path)
+    rt._SESSION_CWD.set(rt._UNSET)
+
+    assert authoritative_session_cwd("missing-task") == ""
+
+
+def test_authoritative_session_cwd_prefers_task_record(monkeypatch, tmp_path):
+    from tools.terminal_tool import clear_session_cwd as clear_record
+    from tools.terminal_tool import record_session_cwd
+
+    task_id = "hook-task-cwd"
+    monkeypatch.setenv("TERMINAL_CWD", "fallback")
+    record_session_cwd(task_id, str(tmp_path))
+    try:
+        assert authoritative_session_cwd(task_id) == str(tmp_path)
+    finally:
+        clear_record(task_id)
 
 
 def _raise_oserror(*args, **kwargs):

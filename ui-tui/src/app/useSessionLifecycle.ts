@@ -195,17 +195,23 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
       }
 
       const previousSid = getUiState().sid
-
-      if (!keepCurrent) {
-        await closeSession(previousSid)
-      }
-
-      const r = await rpc<SessionCreateResponse>('session.create', { cols: colsRef.current })
+      const r = await rpc<SessionCreateResponse>('session.create', {
+        cols: colsRef.current,
+        ...(keepCurrent || !previousSid ? {} : { old_session_id: previousSid, reason: 'new_session' })
+      })
 
       if (!r) {
         patchUiState({ status: 'ready' })
 
         return null
+      }
+
+      if (!keepCurrent && previousSid) {
+        await rpc('session.close', {
+          session_id: previousSid,
+          new_session_id: r.stored_session_id,
+          reason: 'new_session'
+        })
       }
 
       const info = r.info ?? null

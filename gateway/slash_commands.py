@@ -246,6 +246,13 @@ class GatewaySlashCommandsMixin:
 
         _old_sid = old_entry.session_id if old_entry else None
 
+        try:
+            from agent.runtime_cwd import authoritative_session_cwd
+
+            _session_cwd = authoritative_session_cwd(_old_sid)
+        except Exception:
+            _session_cwd = ""
+
         # Fire plugin on_session_finalize hook (session boundary)
         try:
             from hermes_cli.lifecycle import finalize_session
@@ -255,6 +262,7 @@ class GatewaySlashCommandsMixin:
                 reason="new_session",
                 old_session_id=_old_sid,
                 new_session_id=new_entry.session_id if new_entry else None,
+                cwd=_session_cwd,
             )
         except Exception:
             pass
@@ -335,6 +343,7 @@ class GatewaySlashCommandsMixin:
                 reason="new_session",
                 old_session_id=_old_sid,
                 new_session_id=_new_sid,
+                cwd=_session_cwd,
             )
         except Exception:
             pass

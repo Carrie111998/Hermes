@@ -70,11 +70,26 @@ def _(rid, params: dict) -> dict:
             "priority" if is_truthy_value(params.get("fast")) else ""
         )
 
+    boundary_old_session_id = str(params.get("old_session_id") or "")
+    boundary_cwd = ""
+    old_session = None
+
     ready = threading.Event()
     now = time.time()
     lease = None  # claimed lazily on the first turn (_ensure_active_session_slot)
 
     with _sessions_lock:
+        if boundary_old_session_id:
+            old_session = _sessions.get(boundary_old_session_id)
+            if old_session is not None:
+                boundary_cwd = _persisted_session_cwd(old_session) or ""
+                boundary_old_session_id = (
+                    getattr(old_session.get("agent"), "session_id", None)
+                    or old_session.get("session_key")
+                    or boundary_old_session_id
+                )
+            else:
+                boundary_old_session_id = ""
         _sessions[sid] = {
             "agent": None,
             "agent_error": None,
@@ -108,7 +123,17 @@ def _(rid, params: dict) -> dict:
             "tool_progress_mode": _load_tool_progress_mode(),
             "tool_started_at": {},
             "transport": current_transport() or _stdio_transport,
+            "boundary_old_session_id": boundary_old_session_id or None,
+            "boundary_reason": str(params.get("reason") or "") or None,
+            "boundary_cwd": boundary_cwd,
+            "boundary_reset_pending": bool(boundary_old_session_id),
         }
+        if old_session is not None:
+            old_session["boundary_old_session_id"] = boundary_old_session_id
+            old_session["boundary_new_session_id"] = key
+            old_session["boundary_reason"] = str(
+                params.get("reason") or "new_session"
+            )
         _register_session_cwd(_sessions[sid])
 
     # NOTE: we intentionally do NOT persist a DB row here. Every TUI/desktop
@@ -2797,6 +2822,13 @@ def _(rid, params: dict) -> dict:
     # keep every unrelated session.resume waiting behind it.
     with _session_resume_lock:
         session = _pop_session_by_id(sid)
+        if session is not None and params.get("new_session_id"):
+            session["boundary_old_session_id"] = (
+                getattr(session.get("agent"), "session_id", None)
+                or session.get("session_key")
+            )
+            session["boundary_new_session_id"] = str(params["new_session_id"])
+            session["boundary_reason"] = str(params.get("reason") or "new_session")
     closed = _teardown_popped_session(session, end_reason="tui_close")
     return _ok(rid, {"closed": closed})
 

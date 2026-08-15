@@ -9104,24 +9104,43 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         flush_tool_summary()
         _cli_visible_print()
     
-    def _notify_session_boundary(self, event_type: str) -> None:
+    def _notify_session_boundary(
+        self,
+        event_type: str,
+        *,
+        reason: str | None = None,
+        old_session_id: str | None = None,
+        new_session_id: str | None = None,
+    ) -> None:
         """Fire a session-boundary plugin hook (on_session_finalize or on_session_reset).
 
         Non-blocking — errors are caught and logged.  Safe to call from any
         lifecycle point (shutdown, /new, /reset).
         """
         try:
+            from agent.runtime_cwd import authoritative_session_cwd
             from hermes_cli.lifecycle import finalize_session, invoke_hook
 
+            session_id = old_session_id if event_type == "on_session_finalize" else new_session_id
+            if session_id is None:
+                session_id = self.agent.session_id if self.agent else None
             context = {
-                "session_id": self.agent.session_id if self.agent else None,
+                "session_id": session_id,
                 "platform": getattr(self, "platform", None) or "cli",
-                "reason": (
+                "reason": reason or (
                     "new_session"
                     if event_type == "on_session_reset"
                     else "session_boundary"
                 ),
+                "cwd": authoritative_session_cwd(
+                    getattr(self.agent, "_current_task_id", None) if self.agent else None
+                ),
             }
+            if old_session_id is not None or new_session_id is not None:
+                context.update(
+                    old_session_id=old_session_id,
+                    new_session_id=new_session_id,
+                )
             if event_type == "on_session_finalize":
                 finalize_session(**context)
             else:
@@ -9205,7 +9224,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
     def new_session(self, silent=False, title=None):
         """Start a fresh session with a new session ID and cleared agent state."""
-        old_session_id = self.session_id
+        old_session_id = (
+            getattr(self.agent, "session_id", None) if self.agent else None
+        ) or self.session_id
+        session_start = datetime.now()
+        timestamp_str = session_start.strftime("%Y%m%d_%H%M%S")
+        new_session_id = f"{timestamp_str}_{uuid.uuid4().hex[:6]}"
         _boundary_snapshot = None
         if self.agent and self.conversation_history:
             # Deliver the context-engine boundary synchronously and get back
@@ -9216,10 +9240,20 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 list(self.conversation_history),
                 session_id=old_session_id,
             )
-            self._notify_session_boundary("on_session_finalize")
+            self._notify_session_boundary(
+                "on_session_finalize",
+                reason="new_session",
+                old_session_id=old_session_id,
+                new_session_id=new_session_id,
+            )
         elif self.agent:
             # First session or empty history — still finalize the old session
-            self._notify_session_boundary("on_session_finalize")
+            self._notify_session_boundary(
+                "on_session_finalize",
+                reason="new_session",
+                old_session_id=old_session_id,
+                new_session_id=new_session_id,
+            )
 
         if self._session_db and old_session_id:
             # Flush any un-persisted messages from the current turn to the
@@ -9243,10 +9277,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             # /resume and `hermes sessions list` (gemini-cli#27770 port).
             self._discard_session_if_empty(old_session_id)
 
-        self.session_start = datetime.now()
-        timestamp_str = self.session_start.strftime("%Y%m%d_%H%M%S")
-        short_uuid = uuid.uuid4().hex[:6]
-        self.session_id = f"{timestamp_str}_{short_uuid}"
+        self.session_start = session_start
+        self.session_id = new_session_id
         self.conversation_history = []
         self._pending_title = None
         self._resumed = False
@@ -9402,7 +9434,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                         )
             except Exception:
                 pass
-            self._notify_session_boundary("on_session_reset")
+            self._notify_session_boundary(
+                "on_session_reset",
+                reason="new_session",
+                old_session_id=old_session_id,
+                new_session_id=new_session_id,
+            )
 
         if not silent:
             if title:

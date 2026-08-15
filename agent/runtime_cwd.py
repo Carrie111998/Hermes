@@ -57,6 +57,22 @@ def _session_cwd_override() -> str:
     return str(value).strip()
 
 
+def authoritative_session_cwd(task_id: str | None = None) -> str:
+    """Return a proven session/task cwd without a process-cwd fallback."""
+    if task_id:
+        try:
+            from tools.terminal_tool import get_session_cwd
+
+            if recorded := get_session_cwd(task_id):
+                return str(recorded).strip()
+        except Exception:
+            pass
+    override = _SESSION_CWD.get()
+    if override is not _UNSET:
+        return str(override or "").strip()
+    return ""
+
+
 def resolve_agent_cwd() -> Path:
     override = _session_cwd_override()
     if override:
