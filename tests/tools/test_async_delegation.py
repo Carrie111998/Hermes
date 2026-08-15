@@ -283,6 +283,25 @@ def test_completion_event_lands_on_shared_queue_with_session_key():
     assert evt["session_key"] == "agent:main:cli:dm:local"
     assert evt["parent_session_id"] == "20260703_parent_sid"
     assert evt["delegation_id"] == res["delegation_id"]
+    assert evt.get("api_async_resume") is False
+
+
+def test_completion_event_stamps_api_async_resume_from_session_context(monkeypatch):
+    from gateway import session_context as sc
+
+    monkeypatch.setattr(sc, "api_async_resume_enabled", lambda: True)
+
+    def runner():
+        return {"status": "completed", "summary": "done"}
+
+    res = ad.dispatch_async_delegation(
+        goal="resume stamp", context=None, toolsets=None, role="leaf",
+        model="m", session_key="", runner=runner, max_async_children=3,
+    )
+    assert res["status"] == "dispatched"
+    evt = _drain_one()
+    assert evt is not None
+    assert evt["api_async_resume"] is True
 
 
 def test_rich_reinjection_block_is_self_contained():

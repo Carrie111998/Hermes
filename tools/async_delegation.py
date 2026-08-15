@@ -826,6 +826,16 @@ def _current_origin_session_id() -> str:
         return ""
 
 
+def _current_api_async_resume() -> bool:
+    """Capture the request's X-Hermes-Async-Resume opt-in for durable wake."""
+    try:
+        from gateway.session_context import api_async_resume_enabled
+
+        return bool(api_async_resume_enabled())
+    except Exception:
+        return False
+
+
 def dispatch_async_delegation(
     *,
     goal: str,
@@ -897,6 +907,7 @@ def dispatch_async_delegation(
         "origin_ui_session_id": origin_ui_session_id,
         "origin_session_id": origin_session_id,
         "parent_session_id": parent_session_id,
+        "api_async_resume": _current_api_async_resume(),
         **_capture_routing_origin(),
         "status": "running",
         "dispatched_at": dispatched_at,
@@ -1045,6 +1056,7 @@ def _push_completion_event(
         "origin_ui_session_id": record.get("origin_ui_session_id", ""),
         "origin_session_id": record.get("origin_session_id", ""),
         "parent_session_id": record.get("parent_session_id"),
+        "api_async_resume": bool(record.get("api_async_resume")),
         "goal": record.get("goal", ""),
         "context": record.get("context"),
         "toolsets": record.get("toolsets"),
@@ -1144,6 +1156,7 @@ def dispatch_async_delegation_batch(
         "origin_ui_session_id": origin_ui_session_id,
         "origin_session_id": origin_session_id,
         "parent_session_id": parent_session_id,
+        "api_async_resume": _current_api_async_resume(),
         **_capture_routing_origin(),
         "status": "running",
         "dispatched_at": dispatched_at,
@@ -1257,6 +1270,7 @@ def _push_batch_completion_event(
         "origin_ui_session_id": event_record.get("origin_ui_session_id", ""),
         "origin_session_id": event_record.get("origin_session_id", ""),
         "parent_session_id": event_record.get("parent_session_id"),
+        "api_async_resume": bool(event_record.get("api_async_resume")),
         "goal": event_record.get("goal", ""),
         "goals": event_record.get("goals"),
         "context": event_record.get("context"),
