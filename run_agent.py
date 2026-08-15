@@ -4873,7 +4873,11 @@ class AIAgent:
         seen: set = set()
         unique: list = []
         for tc in tool_calls:
-            key = (tc.function.name, tc.function.arguments)
+            try:
+                normalized_args = json.dumps(json.loads(tc.function.arguments), sort_keys=True)
+            except (TypeError, ValueError):
+                normalized_args = tc.function.arguments
+            key = (tc.function.name, normalized_args)
             if key not in seen:
                 seen.add(key)
                 unique.append(tc)
