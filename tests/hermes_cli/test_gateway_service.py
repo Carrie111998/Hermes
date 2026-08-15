@@ -2551,3 +2551,41 @@ class TestStartsRefuseToStackOnASurvivingGateway:
             if not exited
             else "a cleared restart must still start the replacement"
         )
+
+    @pytest.mark.parametrize("exited", [True, False])
+    def test_start_all_starts_only_once_the_stale_process_is_gone(
+        self, monkeypatch, capsys, exited
+    ):
+        """`gateway start --all` sweeps stale processes, then starts one.
+
+        The wait is scoped to the current profile's pid record, so a False
+        here means the very profile about to be started is the one still
+        running -- the case where starting bootstraps the second instance
+        against the same bot token and port that launchd_uninstall() keeps
+        its plist to avoid.
+        """
+        monkeypatch.delenv("_HERMES_GATEWAY", raising=False)
+        started = self._record_starts(monkeypatch)
+        monkeypatch.setattr(gateway_cli, "kill_gateway_processes", lambda **_k: 2)
+        monkeypatch.setattr(gateway_cli, "is_termux", lambda: False)
+        monkeypatch.setattr(gateway_cli, "supports_systemd_services", lambda: True)
+        monkeypatch.setattr(
+            gateway_cli, "_wait_for_gateway_exit", lambda **_k: exited
+        )
+
+        args = SimpleNamespace(gateway_command="start", all=True)
+        if exited:
+            gateway_cli.gateway_command(args)
+        else:
+            with pytest.raises(SystemExit) as excinfo:
+                gateway_cli.gateway_command(args)
+            assert excinfo.value.code == 1, "a refused start must exit non-zero"
+
+        assert (started == ["systemd"]) is exited, (
+            "a second gateway was started over the stale one"
+            if not exited
+            else "a cleared sweep must still start the service"
+        )
+        if not exited:
+            out = capsys.readouterr().out
+            assert "still running" in out, "the operator needs to know why"
