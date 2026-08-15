@@ -95,6 +95,7 @@ CreateImageRequest = None  # type: ignore[assignment]
 CreateImageRequestBody = None  # type: ignore[assignment]
 CreateMessageRequest = None  # type: ignore[assignment]
 CreateMessageRequestBody = None  # type: ignore[assignment]
+DeleteMessageRequest = None  # type: ignore[assignment]
 GetChatRequest = None  # type: ignore[assignment]
 GetMessageRequest = None  # type: ignore[assignment]
 GetMessageResourceRequest = None  # type: ignore[assignment]
@@ -1400,6 +1401,7 @@ def _load_lark_oapi() -> bool:
                 CreateFileRequest, CreateFileRequestBody,
                 CreateImageRequest, CreateImageRequestBody,
                 CreateMessageRequest, CreateMessageRequestBody,
+                DeleteMessageRequest,
                 GetChatRequest, GetMessageRequest, GetMessageResourceRequest,
                 P2ImMessageMessageReadV1,
                 ReplyMessageRequest, ReplyMessageRequestBody,
@@ -1425,6 +1427,7 @@ def _load_lark_oapi() -> bool:
             "CreateImageRequestBody": CreateImageRequestBody,
             "CreateMessageRequest": CreateMessageRequest,
             "CreateMessageRequestBody": CreateMessageRequestBody,
+            "DeleteMessageRequest": DeleteMessageRequest,
             "GetChatRequest": GetChatRequest,
             "GetMessageRequest": GetMessageRequest,
             "GetMessageResourceRequest": GetMessageResourceRequest,
@@ -2046,6 +2049,29 @@ class FeishuAdapter(BasePlatformAdapter):
         except Exception as exc:
             logger.error("[Feishu] Failed to edit message %s: %s", message_id, exc, exc_info=True)
             return SendResult(success=False, error=str(exc))
+
+    async def delete_message(self, chat_id: str, message_id: str) -> bool:
+        """Delete a previously sent Feishu message.
+
+        Feishu message IDs are globally unique, so ``chat_id`` is accepted
+        for interface compatibility but unused.  Used by the stream
+        consumer's fresh-final cleanup path and the ``cleanup_progress``
+        display setting to remove progress/status bubbles after the final
+        response lands.  The bot can only delete its own messages and only
+        within a rolling window; failures are non-fatal — callers leave the
+        bubble in place and log at debug level.
+        """
+        if not self._client:
+            return False
+        try:
+            if DeleteMessageRequest is None:
+                return False
+            request = DeleteMessageRequest.builder().message_id(message_id).build()
+            response = await self._run_blocking(self._client.im.v1.message.delete, request)
+            return self._response_succeeded(response)
+        except Exception as exc:
+            logger.debug("[Feishu] Failed to delete message %s: %s", message_id, exc)
+            return False
 
     # Template attrs for the shared _format_exec_approval core. The card
     # header carries the title, so the text core starts at the code fence.

@@ -285,6 +285,103 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
             json.dumps({"text": "可以用 粗体 和 斜体。"}, ensure_ascii=False),
         )
 
+    @patch.dict(os.environ, {}, clear=True)
+    def test_delete_message_builds_request_and_returns_success(self):
+        from gateway.config import PlatformConfig
+        from plugins.platforms.feishu.adapter import FeishuAdapter, _load_lark_oapi
+        if not _HAS_LARK_OAPI:
+            self.skipTest("lark_oapi not installed")
+        self.assertTrue(_load_lark_oapi(), "lark_oapi must load for delete_message")
+
+        adapter = FeishuAdapter(PlatformConfig())
+        captured = {}
+
+        class _MessageAPI:
+            def delete(self, request):
+                captured["request"] = request
+                return SimpleNamespace(success=lambda: True)
+
+        adapter._client = SimpleNamespace(
+            im=SimpleNamespace(v1=SimpleNamespace(message=_MessageAPI()))
+        )
+
+        async def _run_blocking_fake(func, *args):
+            return func(*args)
+
+        with patch.object(adapter, "_run_blocking", new=_run_blocking_fake):
+            result = asyncio.run(
+                adapter.delete_message(chat_id="oc_chat", message_id="om_progress")
+            )
+
+        self.assertTrue(result)
+        self.assertEqual(captured["request"].message_id, "om_progress")
+
+    def test_delete_message_returns_false_when_api_reports_failure(self):
+        from gateway.config import PlatformConfig
+        from plugins.platforms.feishu.adapter import FeishuAdapter, _load_lark_oapi
+        if not _HAS_LARK_OAPI:
+            self.skipTest("lark_oapi not installed")
+        self.assertTrue(_load_lark_oapi())
+
+        adapter = FeishuAdapter(PlatformConfig())
+
+        class _MessageAPI:
+            def delete(self, request):
+                return SimpleNamespace(success=lambda: False, code=99999, msg="forbidden")
+
+        adapter._client = SimpleNamespace(
+            im=SimpleNamespace(v1=SimpleNamespace(message=_MessageAPI()))
+        )
+
+        async def _run_blocking_fake(func, *args):
+            return func(*args)
+
+        with patch.object(adapter, "_run_blocking", new=_run_blocking_fake):
+            result = asyncio.run(
+                adapter.delete_message(chat_id="oc_chat", message_id="om_progress")
+            )
+
+        self.assertFalse(result)
+
+    def test_delete_message_returns_false_when_sdk_raises(self):
+        from gateway.config import PlatformConfig
+        from plugins.platforms.feishu.adapter import FeishuAdapter, _load_lark_oapi
+        if not _HAS_LARK_OAPI:
+            self.skipTest("lark_oapi not installed")
+        self.assertTrue(_load_lark_oapi())
+
+        adapter = FeishuAdapter(PlatformConfig())
+
+        class _MessageAPI:
+            def delete(self, request):
+                raise RuntimeError("sdk boom")
+
+        adapter._client = SimpleNamespace(
+            im=SimpleNamespace(v1=SimpleNamespace(message=_MessageAPI()))
+        )
+
+        async def _run_blocking_fake(func, *args):
+            return func(*args)
+
+        with patch.object(adapter, "_run_blocking", new=_run_blocking_fake):
+            result = asyncio.run(
+                adapter.delete_message(chat_id="oc_chat", message_id="om_progress")
+            )
+
+        self.assertFalse(result)
+
+    def test_delete_message_returns_false_when_client_missing(self):
+        from gateway.config import PlatformConfig
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        adapter._client = None
+
+        result = asyncio.run(
+            adapter.delete_message(chat_id="oc_chat", message_id="om_progress")
+        )
+        self.assertFalse(result)
+
 
 class TestAdapterModule(unittest.TestCase):
     def test_load_settings_uses_sdk_defaults_for_invalid_ws_reconnect_values(self):
