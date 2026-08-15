@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import importlib
 import os
+from pathlib import Path
+import subprocess
 import sys
 from unittest.mock import patch, MagicMock
 
@@ -159,6 +161,7 @@ class TestKillStaleDashboardPosix:
 
 
 
+    @pytest.mark.linux_only
     def test_user_scope_restart_never_falls_back_to_system_or_sudo(self, capsys):
         """A user unit is discovered and restarted through ``systemctl --user``."""
         calls: list[list[str]] = []
@@ -190,6 +193,429 @@ class TestKillStaleDashboardPosix:
         find_pids.assert_not_called()
         kill.assert_not_called()
         assert "✓ restarted hermes-dashboard.service" in capsys.readouterr().out
+
+    @pytest.mark.macos_only
+    def test_launchctl_missing_response_requires_exact_label(self):
+        """A named-profile error must not prove the default job is absent."""
+        live = sys.modules["hermes_cli.main"]
+        label = "ai.hermes.dashboard"
+        other_profile = subprocess.CompletedProcess(
+            ["launchctl", "print", f"gui/501/{label}"],
+            113,
+            "",
+            (
+                'Could not find service "ai.hermes.dashboard-work" '
+                "in domain for user gui: 501"
+            ),
+        )
+
+        assert not live._launchctl_dashboard_job_missing(other_profile, label)
+
+    @pytest.mark.macos_only
+    def test_launchd_managed_dashboard_restarts_without_detached_respawn(
+        self, tmp_path, capsys
+    ):
+        """A loaded LaunchAgent is restarted through launchctl, never raw-killed."""
+        live = sys.modules["hermes_cli.main"]
+        launch_agents = tmp_path / "Library" / "LaunchAgents"
+        calls: list[list[str]] = []
+
+        def fake_run(args, *a, **kw):
+            calls.append(list(args))
+            if args == ["launchctl", "print", "gui/501/ai.hermes.dashboard"]:
+                return MagicMock(returncode=0, stdout="state = running\n", stderr="")
+            if args == [
+                "launchctl", "kickstart", "-k", "gui/501/ai.hermes.dashboard"
+            ]:
+                return MagicMock(returncode=0, stdout="", stderr="")
+            raise AssertionError(f"unexpected subprocess.run call: {args}")
+
+        with patch.object(live.os, "getuid", return_value=501), \
+             patch.object(
+                 live,
+                 "_dashboard_launchd_label",
+                 return_value="ai.hermes.dashboard",
+                 create=True,
+             ), \
+             patch.object(
+                 live,
+                 "_dashboard_launchd_plist_path",
+                 side_effect=lambda label: launch_agents / f"{label}.plist",
+             ), \
+             patch.object(live.subprocess, "run", side_effect=fake_run), \
+             patch.object(live, "_find_stale_dashboard_pids") as find_pids, \
+             patch.object(live, "_respawn_dashboard_processes") as respawn, \
+             patch.object(live.os, "kill") as kill:
+            result = _kill_stale_dashboard_processes(restart_managed=True)
+
+        assert result == {"matched": [], "killed": [], "failed": []}
+        assert calls == [
+            ["launchctl", "print", "gui/501/ai.hermes.dashboard"],
+            ["launchctl", "kickstart", "-k", "gui/501/ai.hermes.dashboard"],
+        ]
+        find_pids.assert_not_called()
+        respawn.assert_not_called()
+        kill.assert_not_called()
+        assert "✓ restarted ai.hermes.dashboard" in capsys.readouterr().out
+
+    @pytest.mark.macos_only
+    def test_launchd_update_finds_default_job_from_named_profile(
+        self, tmp_path, capsys
+    ):
+        """A source update must not raw-kill a default job from another profile."""
+        live = sys.modules["hermes_cli.main"]
+        launch_agents = tmp_path / "Library" / "LaunchAgents"
+        launch_agents.mkdir(parents=True)
+        default_plist = launch_agents / "ai.hermes.dashboard.plist"
+        default_plist.write_text("<plist/>", encoding="utf-8")
+        calls: list[list[str]] = []
+
+        def plist_path(label: str) -> Path:
+            return launch_agents / f"{label}.plist"
+
+        def fake_run(args, *a, **kw):
+            calls.append(list(args))
+            target = args[-1]
+            if args[:2] == ["launchctl", "print"]:
+                if target == "gui/501/ai.hermes.dashboard":
+                    return MagicMock(returncode=0, stdout="state = running\n", stderr="")
+                label = target.rsplit("/", 1)[-1]
+                return MagicMock(
+                    returncode=113,
+                    stdout="",
+                    stderr=(
+                        f'Could not find service "{label}" '
+                        "in domain for user gui: 501"
+                    ),
+                )
+            if args == [
+                "launchctl", "kickstart", "-k", "gui/501/ai.hermes.dashboard"
+            ]:
+                return MagicMock(returncode=0, stdout="", stderr="")
+            raise AssertionError(f"unexpected subprocess.run call: {args}")
+
+        with patch.object(live.os, "getuid", return_value=501), \
+             patch.object(
+                 live,
+                 "_dashboard_launchd_label",
+                 return_value="ai.hermes.dashboard-work",
+             ), \
+             patch.object(
+                 live,
+                 "_dashboard_launchd_plist_path",
+                 side_effect=plist_path,
+             ), \
+             patch.object(live.subprocess, "run", side_effect=fake_run), \
+             patch.object(live, "_find_stale_dashboard_pids") as find_pids, \
+             patch.object(live, "_respawn_dashboard_processes") as respawn, \
+             patch.object(live.os, "kill") as kill:
+            result = _kill_stale_dashboard_processes(restart_managed=True)
+
+        assert not result["matched"]
+        assert [
+            "launchctl", "kickstart", "-k", "gui/501/ai.hermes.dashboard"
+        ] in calls
+        find_pids.assert_not_called()
+        respawn.assert_not_called()
+        kill.assert_not_called()
+        assert "✓ restarted ai.hermes.dashboard" in capsys.readouterr().out
+
+    @pytest.mark.macos_only
+    def test_launchd_update_restarts_all_loaded_profile_jobs(self, tmp_path, capsys):
+        """Every conventional loaded Dashboard job sharing the source is restarted."""
+        live = sys.modules["hermes_cli.main"]
+        launch_agents = tmp_path / "Library" / "LaunchAgents"
+        launch_agents.mkdir(parents=True)
+        labels = ("ai.hermes.dashboard", "ai.hermes.dashboard-work")
+        for label in labels:
+            (launch_agents / f"{label}.plist").write_text(
+                "<plist/>", encoding="utf-8"
+            )
+        calls: list[list[str]] = []
+
+        def plist_path(label: str) -> Path:
+            return launch_agents / f"{label}.plist"
+
+        def fake_run(args, *a, **kw):
+            calls.append(list(args))
+            target = args[-1]
+            if args[:2] == ["launchctl", "print"] and target in {
+                f"gui/501/{label}" for label in labels
+            }:
+                return MagicMock(returncode=0, stdout="state = running\n", stderr="")
+            if args[:3] == ["launchctl", "kickstart", "-k"] and target in {
+                f"gui/501/{label}" for label in labels
+            }:
+                return MagicMock(returncode=0, stdout="", stderr="")
+            raise AssertionError(f"unexpected subprocess.run call: {args}")
+
+        with patch.object(live.os, "getuid", return_value=501), \
+             patch.object(
+                 live,
+                 "_dashboard_launchd_label",
+                 return_value="ai.hermes.dashboard-work",
+             ), \
+             patch.object(
+                 live,
+                 "_dashboard_launchd_plist_path",
+                 side_effect=plist_path,
+             ), \
+             patch.object(live.subprocess, "run", side_effect=fake_run), \
+             patch.object(live, "_find_stale_dashboard_pids") as find_pids, \
+             patch.object(live, "_respawn_dashboard_processes") as respawn, \
+             patch.object(live.os, "kill") as kill:
+            result = _kill_stale_dashboard_processes(restart_managed=True)
+
+        assert result == {"matched": [], "killed": [], "failed": []}
+        assert {
+            tuple(["launchctl", "kickstart", "-k", f"gui/501/{label}"])
+            for label in labels
+        } <= {tuple(call) for call in calls}
+        find_pids.assert_not_called()
+        respawn.assert_not_called()
+        kill.assert_not_called()
+        output = capsys.readouterr().out
+        assert "✓ restarted ai.hermes.dashboard" in output
+        assert "✓ restarted ai.hermes.dashboard-work" in output
+
+    @pytest.mark.macos_only
+    def test_launchd_profile_probe_is_all_or_nothing(self, tmp_path, capsys):
+        """A later ambiguous profile probe prevents every supervisor mutation."""
+        live = sys.modules["hermes_cli.main"]
+        launch_agents = tmp_path / "Library" / "LaunchAgents"
+        launch_agents.mkdir(parents=True)
+        labels = ("ai.hermes.dashboard", "ai.hermes.dashboard-work")
+        for label in labels:
+            (launch_agents / f"{label}.plist").write_text(
+                "<plist/>", encoding="utf-8"
+            )
+        calls: list[list[str]] = []
+
+        def plist_path(label: str) -> Path:
+            return launch_agents / f"{label}.plist"
+
+        def fake_run(args, *a, **kw):
+            calls.append(list(args))
+            target = args[-1]
+            if args == ["launchctl", "print", "gui/501/ai.hermes.dashboard"]:
+                return MagicMock(returncode=0, stdout="state = running\n", stderr="")
+            if args == ["launchctl", "print", "gui/501/ai.hermes.dashboard-work"]:
+                raise subprocess.TimeoutExpired(args, 10)
+            raise AssertionError(f"unexpected subprocess.run call: {args}")
+
+        with patch.object(live.os, "getuid", return_value=501), \
+             patch.object(
+                 live,
+                 "_dashboard_launchd_label",
+                 return_value="ai.hermes.dashboard-work",
+             ), \
+             patch.object(
+                 live,
+                 "_dashboard_launchd_plist_path",
+                 side_effect=plist_path,
+             ), \
+             patch.object(live.subprocess, "run", side_effect=fake_run), \
+             patch.object(live, "_find_stale_dashboard_pids") as find_pids, \
+             patch.object(live, "_respawn_dashboard_processes") as respawn, \
+             patch.object(live.os, "kill") as kill:
+            result = _kill_stale_dashboard_processes(restart_managed=True)
+
+        assert result == {"matched": [], "killed": [], "failed": []}
+        assert not any(call[:3] == ["launchctl", "kickstart", "-k"] for call in calls)
+        find_pids.assert_not_called()
+        respawn.assert_not_called()
+        kill.assert_not_called()
+        assert "ownership is unknown" in capsys.readouterr().out
+
+    @pytest.mark.macos_only
+    def test_launchd_profile_restart_failure_never_uses_detached_fallback(
+        self, tmp_path, capsys
+    ):
+        """One failed profile restart is reported while other loaded jobs continue."""
+        live = sys.modules["hermes_cli.main"]
+        launch_agents = tmp_path / "Library" / "LaunchAgents"
+        launch_agents.mkdir(parents=True)
+        labels = ("ai.hermes.dashboard", "ai.hermes.dashboard-work")
+        for label in labels:
+            (launch_agents / f"{label}.plist").write_text(
+                "<plist/>", encoding="utf-8"
+            )
+        calls: list[list[str]] = []
+
+        def plist_path(label: str) -> Path:
+            return launch_agents / f"{label}.plist"
+
+        def fake_run(args, *a, **kw):
+            calls.append(list(args))
+            target = args[-1]
+            if args[:2] == ["launchctl", "print"] and target in {
+                f"gui/501/{label}" for label in labels
+            }:
+                return MagicMock(returncode=0, stdout="state = running\n", stderr="")
+            if args == [
+                "launchctl", "kickstart", "-k", "gui/501/ai.hermes.dashboard"
+            ]:
+                return MagicMock(returncode=5, stdout="", stderr="not permitted")
+            if args == [
+                "launchctl", "kickstart", "-k", "gui/501/ai.hermes.dashboard-work"
+            ]:
+                return MagicMock(returncode=0, stdout="", stderr="")
+            raise AssertionError(f"unexpected subprocess.run call: {args}")
+
+        with patch.object(live.os, "getuid", return_value=501), \
+             patch.object(
+                 live,
+                 "_dashboard_launchd_label",
+                 return_value="ai.hermes.dashboard-work",
+             ), \
+             patch.object(
+                 live,
+                 "_dashboard_launchd_plist_path",
+                 side_effect=plist_path,
+             ), \
+             patch.object(live.subprocess, "run", side_effect=fake_run), \
+             patch.object(live, "_find_stale_dashboard_pids") as find_pids, \
+             patch.object(live, "_respawn_dashboard_processes") as respawn, \
+             patch.object(live.os, "kill") as kill:
+            result = _kill_stale_dashboard_processes(restart_managed=True)
+
+        assert result == {"matched": [], "killed": [], "failed": []}
+        for label in labels:
+            assert [
+                "launchctl", "kickstart", "-k", f"gui/501/{label}"
+            ] in calls
+        find_pids.assert_not_called()
+        respawn.assert_not_called()
+        kill.assert_not_called()
+        output = capsys.readouterr().out
+        assert "failed to restart ai.hermes.dashboard: not permitted" in output
+        assert "✓ restarted ai.hermes.dashboard-work" in output
+        assert "refusing detached fallback" in output
+
+    @pytest.mark.macos_only
+    def test_launchd_ambiguous_probe_failure_refuses_detached_fallback(
+        self, tmp_path, capsys
+    ):
+        """Unknown launchd ownership must not degrade to PID kill and respawn."""
+        live = sys.modules["hermes_cli.main"]
+        launch_agents = tmp_path / "Library" / "LaunchAgents"
+
+        with patch.object(live.os, "getuid", return_value=501), \
+             patch.object(
+                 live,
+                 "_dashboard_launchd_label",
+                 return_value="ai.hermes.dashboard",
+                 create=True,
+             ), \
+             patch.object(
+                 live,
+                 "_dashboard_launchd_plist_path",
+                 side_effect=lambda label: launch_agents / f"{label}.plist",
+             ), \
+             patch.object(
+                 live.subprocess,
+                 "run",
+                 side_effect=subprocess.TimeoutExpired(["launchctl", "print"], 10),
+             ), \
+             patch.object(live, "_find_stale_dashboard_pids") as find_pids, \
+             patch.object(live, "_respawn_dashboard_processes") as respawn, \
+             patch.object(live.os, "kill") as kill:
+            result = _kill_stale_dashboard_processes(restart_managed=True)
+
+        assert result == {"matched": [], "killed": [], "failed": []}
+        find_pids.assert_not_called()
+        respawn.assert_not_called()
+        kill.assert_not_called()
+        assert "refusing detached fallback" in capsys.readouterr().out
+
+    @pytest.mark.macos_only
+    def test_launchd_missing_job_with_plist_refuses_detached_fallback(
+        self, tmp_path, capsys
+    ):
+        """An installed but unloaded LaunchAgent stays supervisor-owned."""
+        live = sys.modules["hermes_cli.main"]
+        plist = tmp_path / "Library" / "LaunchAgents" / "ai.hermes.dashboard.plist"
+        plist.parent.mkdir(parents=True)
+        plist.write_text("<plist/>", encoding="utf-8")
+        missing = MagicMock(
+            returncode=113,
+            stdout="",
+            stderr=(
+                'Could not find service "ai.hermes.dashboard" '
+                "in domain for user gui: 501"
+            ),
+        )
+
+        with patch.object(live.os, "getuid", return_value=501), \
+             patch.object(
+                 live,
+                 "_dashboard_launchd_label",
+                 return_value="ai.hermes.dashboard",
+                 create=True,
+             ), \
+             patch.object(
+                 live,
+                 "_dashboard_launchd_plist_path",
+                 return_value=plist,
+                 create=True,
+             ), \
+             patch.object(live.subprocess, "run", return_value=missing), \
+             patch.object(live, "_find_stale_dashboard_pids") as find_pids, \
+             patch.object(live, "_respawn_dashboard_processes") as respawn, \
+             patch.object(live.os, "kill") as kill:
+            result = _kill_stale_dashboard_processes(restart_managed=True)
+
+        assert result == {"matched": [], "killed": [], "failed": []}
+        find_pids.assert_not_called()
+        respawn.assert_not_called()
+        kill.assert_not_called()
+        assert "configured but not loaded" in capsys.readouterr().out
+
+    @pytest.mark.macos_only
+    def test_launchd_missing_job_without_plist_keeps_manual_respawn(
+        self, tmp_path, capsys
+    ):
+        """Definitively unmanaged macOS dashboards retain the existing update path."""
+        live = sys.modules["hermes_cli.main"]
+        argv = ["hermes", "dashboard", "--port", "8300"]
+        missing = MagicMock(
+            returncode=113,
+            stdout="",
+            stderr=(
+                'Could not find service "ai.hermes.dashboard" '
+                "in domain for user gui: 501"
+            ),
+        )
+        plist = tmp_path / "Library" / "LaunchAgents" / "ai.hermes.dashboard.plist"
+
+        with patch.object(live.os, "getuid", return_value=501), \
+             patch.object(
+                 live,
+                 "_dashboard_launchd_label",
+                 return_value="ai.hermes.dashboard",
+                 create=True,
+             ), \
+             patch.object(
+                 live,
+                 "_dashboard_launchd_plist_path",
+                 return_value=plist,
+                 create=True,
+             ), \
+             patch.object(live.subprocess, "run", return_value=missing), \
+             patch.object(live, "_find_stale_dashboard_pids", return_value=[6001]), \
+             patch.object(live, "_get_pid_cgroup_path", return_value=None), \
+             patch.object(live, "_get_systemd_service_for_pid", return_value=None), \
+             patch.object(live, "_dashboard_cmdline_for_pid", return_value=argv), \
+             patch("hermes_cli.dashboard_procs._hermes_home_for_pid", return_value=None), \
+             patch.object(live, "_respawn_dashboard_processes", return_value=[]) as respawn, \
+             patch.object(live.os, "kill"), \
+             patch("gateway.status._pid_exists", return_value=False), \
+             patch("time.sleep"):
+            result = _kill_stale_dashboard_processes(restart_managed=True)
+
+        assert result["killed"] == [6001]
+        respawn.assert_called_once_with([argv])
+        assert "refusing detached fallback" not in capsys.readouterr().out
 
 
 
