@@ -23,6 +23,9 @@ keep the exact logger name (``"agent.conversation_loop"``).
 from __future__ import annotations
 
 import os
+import hashlib
+from pathlib import Path
+import json
 
 from agent.codex_responses_adapter import _summarize_user_message_for_log
 from agent.message_content import flatten_message_text
@@ -53,6 +56,81 @@ _VERIFICATION_CONTINUATION_FLAGS = (
     "_verification_stop_synthetic",
     "_pre_verify_synthetic",
 )
+
+
+def _terminalize_budget_exhausted_worker(
+    agent,
+    *,
+    task_id: str,
+    api_call_count: int,
+    original_exit_reason: str,
+    messages: list,
+    logger,
+) -> bool:
+    """Fail closed with one native block when a worker exhausts its budget.
+
+    This is the runner-owned terminal fallback.  It uses the worker's run-id
+    CAS, so a timeout/reclaim/superseding run wins safely and this call becomes
+    a no-op rather than blocking a newer attempt.  The receipt is deliberately
+    bounded and stored with the closed run/event for post-mortem diagnosis.
+    """
+    try:
+        from hermes_cli import kanban_db as kb
+
+        raw_run_id = os.environ.get("HERMES_KANBAN_RUN_ID", "").strip()
+        if not raw_run_id.isdigit():
+            logger.warning("runner fallback skipped: missing HERMES_KANBAN_RUN_ID task=%s", task_id)
+            return False
+        run_id = int(raw_run_id)
+        runner_sha = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+
+        def _safe(value, limit=160):
+            text = str(value or "").replace("\x00", " ").replace("\n", " ").strip()
+            return text[:limit]
+
+        tool_names = []
+        for message in messages or []:
+            if isinstance(message, dict) and message.get("role") == "assistant":
+                for call in message.get("tool_calls") or []:
+                    if isinstance(call, dict):
+                        name = ((call.get("function") or {}).get("name") or "").strip()
+                        if name and name not in tool_names:
+                            tool_names.append(name)
+        receipt = {
+            "schema": "tnmc.runner_terminal_fallback.v1",
+            "observed_at": int(__import__("time").time()),
+            "provider": _safe(getattr(agent, "provider", "")),
+            "model": _safe(getattr(agent, "model", "")),
+            "finish_category": "iteration_budget_exhausted",
+            "runner_module_sha256": runner_sha,
+            "tool_result_outcome": "no_accepted_native_terminal_transition",
+            "validation_outcome": "terminal_tool_missing_after_budget_fallback",
+            "fallback_reason": _safe(original_exit_reason, 220),
+            "api_calls": int(api_call_count),
+            "max_iterations": int(getattr(agent, "max_iterations", 0) or 0),
+            "tool_names_seen": tool_names[:12],
+        }
+        conn = kb.connect()
+        try:
+            task = kb.get_task(conn, task_id)
+            if task is None or task.status != "running":
+                logger.info("runner fallback no-op: task not running task=%s status=%s", task_id, getattr(task, "status", None))
+                return False
+            blocked = kb.block_task(
+                conn,
+                task_id,
+                reason="runner terminal fallback: iteration budget exhausted",
+                kind="capability",
+                expected_run_id=run_id,
+                metadata=receipt,
+            )
+            logger.info("runner terminal fallback task=%s run=%s blocked=%s receipt=%s", task_id, run_id, blocked, json.dumps(receipt, separators=(",", ":")))
+            return bool(blocked)
+        finally:
+            conn.close()
+    except Exception:
+        logger.warning("runner terminal fallback failed task=%s", task_id, exc_info=True)
+        return False
 
 
 def _drop_verification_continuation_scaffolding(messages) -> None:
@@ -144,53 +222,19 @@ def finalize_turn(
         iteration_limit_fallback = True
 
     if iteration_limit_fallback:
-        # If running as a kanban worker, signal the dispatcher that the
-        # worker could not complete (rather than treating it as a
-        # protocol violation). This applies whether the user-facing fallback
-        # came from the summary call or an explicitly pending continuation;
-        # both exhausted the task budget and must advance the failure circuit.
-        #
-        # We route through ``_record_task_failure(outcome="timed_out")``
-        # rather than ``kanban_block`` so this counts toward the dispatcher's
-        # consecutive-failure circuit breaker (#29747 gap 2).
+        # A worker that exhausts its turn budget must close its own task with
+        # one native block, carrying a bounded receipt. The run-id CAS makes
+        # this a no-op if timeout/reclaim already superseded the worker.
         _kanban_task = os.environ.get("HERMES_KANBAN_TASK")
         if _kanban_task:
-            try:
-                from hermes_cli import kanban_db as _kb
-                _conn = _kb.connect()
-                try:
-                    _kb._record_task_failure(
-                        _conn,
-                        _kanban_task,
-                        error=(
-                            f"Iteration budget exhausted "
-                            f"({api_call_count}/{agent.max_iterations}) — "
-                            "task could not complete within the allowed "
-                            "iterations"
-                        ),
-                        outcome="timed_out",
-                        release_claim=True,
-                        end_run=True,
-                        event_payload_extra={
-                            "budget_used": api_call_count,
-                            "budget_max": agent.max_iterations,
-                        },
-                    )
-                    logger.info(
-                        "recorded budget-exhausted failure for task %s (%d/%d)",
-                        _kanban_task, api_call_count, agent.max_iterations,
-                    )
-                finally:
-                    try:
-                        _conn.close()
-                    except Exception:
-                        pass
-            except Exception:
-                logger.warning(
-                    "Failed to record budget-exhausted failure for task %s",
-                    _kanban_task,
-                    exc_info=True,
-                )
+            _terminalize_budget_exhausted_worker(
+                agent,
+                task_id=_kanban_task,
+                api_call_count=api_call_count,
+                original_exit_reason=str(_turn_exit_reason),
+                messages=messages,
+                logger=logger,
+            )
 
     # Determine if conversation completed successfully
     normal_text_response = str(_turn_exit_reason).startswith("text_response(")
