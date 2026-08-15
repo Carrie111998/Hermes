@@ -805,11 +805,21 @@ def resolve_idle_refresh_interval() -> float:
     agent event (_on_thinking, tool start/complete, notices) explicitly calls
     ``_invalidate`` — we only suppress the *periodic* redraw while busy.
     See #48309 / #70031.
+
+    A missing key falls back to the deliberate configuration default
+    (``display.cli_refresh_interval = 1.0`` in ``hermes_cli.config``),
+    not to "disabled" — an explicit ``0`` opts out.
     """
     try:
-        raw = float(CLI_CONFIG.get("display", {}).get("cli_refresh_interval", 0) or 0)
+        from hermes_cli.config import DEFAULT_CONFIG
+
+        fallback = float(DEFAULT_CONFIG.get("display", {}).get("cli_refresh_interval", 1.0))
+    except Exception:
+        fallback = 1.0
+    try:
+        raw = float(CLI_CONFIG.get("display", {}).get("cli_refresh_interval", fallback))
     except (TypeError, ValueError):
-        raw = 0.0
+        raw = fallback
     return max(0.0, min(raw, 30.0))
 
 
@@ -6228,9 +6238,19 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         return 0 if self._use_minimal_tui_chrome(width=width) else 1
 
     def _agent_spacer_height(self, width: Optional[int] = None) -> int:
-        """Return the spacer height shown above the status bar while the agent runs."""
-        if not getattr(self, "_agent_running", False):
-            return 0
+        """Return the spacer height shown above the status bar.
+
+        The spacer row is RESERVED at 1 (when not in minimal-chrome mode)
+        whether or not the agent is running. This spacer and the spinner row
+        (_spinner_widget_height) are part of the same bottom-chrome canvas:
+        if either grows from 0 (idle) to 1 (turn started,
+        ``_agent_running`` becomes true) the canvas gets taller than the
+        previous frame, and prompt_toolkit's non-fullscreen renderer answers
+        a height increase by scrolling the old chrome into scrollback —
+        stacking repeated status frames mid-turn (#70031). Reserving both
+        rows keeps the total canvas height constant across idle/active
+        transitions so the chrome repaints in place.
+        """
         return 0 if self._use_minimal_tui_chrome(width=width) else 1
 
     def _spinner_widget_height(self, width: Optional[int] = None) -> int:

@@ -200,6 +200,43 @@ class TestCLIStatusBar:
         cli_obj._spinner_text = "你" * 40
         assert cli_obj._spinner_widget_height(width=64) == 1
 
+    def test_bottom_chrome_canvas_height_constant_across_turn_lifecycle(self):
+        # #70031 review feedback on #73241: reserving only the spinner row is
+        # incomplete — the agent spacer (_agent_spacer_height) is part of the
+        # same bottom layout and previously flipped 0 -> 1 when the turn
+        # started, scrolling the old chrome into scrollback. Both rows must
+        # be reserved so total canvas height never changes idle -> active.
+        cli_obj = _make_cli()
+        cli_obj._tool_start_time = 0
+        for running in (False, True):
+            cli_obj._agent_running = running
+            idle_total = cli_obj._agent_spacer_height(width=64) + cli_obj._spinner_widget_height(width=64)
+            assert idle_total == 2, f"canvas height changed with _agent_running={running}"
+            assert cli_obj._agent_spacer_height(width=64) == 1
+        # Minimal (narrow) chrome drops both rows consistently.
+        cli_obj._agent_running = True
+        assert cli_obj._agent_spacer_height(width=40) == 0
+        assert cli_obj._spinner_widget_height(width=40) == 0
+
+    def test_classic_cli_application_pins_refresh_interval_zero(self):
+        # #70031 review feedback on #73241: a regression of the
+        # Application(refresh_interval=0.0) pin must be caught. The classic
+        # CLI Application is constructed deep inside the interactive run
+        # loop (not unit-instantiable without a real TTY), so pin the
+        # construction site in source alongside the behavioral cadence
+        # split covered by test_spinner_loop_branch_* above.
+        import inspect
+
+        source = inspect.getsource(cli_mod)
+        assert "refresh_interval=0.0" in source, (
+            "classic-CLI Application must pin refresh_interval=0.0 (#70031): "
+            "prompt_toolkit's timer fires regardless of agent state and "
+            "stacks chrome mid-turn"
+        )
+        # The configured cadence must be read via resolve_idle_refresh_interval
+        # (idle-only), never handed straight back to the Application.
+        assert "refresh_interval=float(CLI_CONFIG" not in source
+
     def test_spinner_loop_branch_never_repaints_while_agent_runs(self):
         # #70031 invariant: while the agent runs (no child command) the
         # background loop must NOT issue periodic repaints.
@@ -210,13 +247,21 @@ class TestCLIStatusBar:
         assert cli_mod.spinner_loop_branch(False, False, 0.0) == "idle_stable"
 
     def test_resolve_idle_refresh_interval_clamps_and_defaults(self):
-        assert cli_mod.resolve_idle_refresh_interval() == 0.0
+        from hermes_cli.config import DEFAULT_CONFIG
+
+        deliberate = float(DEFAULT_CONFIG["display"]["cli_refresh_interval"])
+        assert deliberate == 1.0  # config deliberately defaults to 1.0
+        # Missing key / junk falls back to the deliberate default, not 0.
+        with patch.object(cli_mod, "CLI_CONFIG", {}):
+            assert cli_mod.resolve_idle_refresh_interval() == deliberate
+        with patch.object(cli_mod, "CLI_CONFIG", {"display": {"cli_refresh_interval": "junk"}}):
+            assert cli_mod.resolve_idle_refresh_interval() == deliberate
         with patch.object(cli_mod, "CLI_CONFIG", {"display": {"cli_refresh_interval": 2.0}}):
             assert cli_mod.resolve_idle_refresh_interval() == 2.0
         with patch.object(cli_mod, "CLI_CONFIG", {"display": {"cli_refresh_interval": 99}}):
             assert cli_mod.resolve_idle_refresh_interval() == 30.0
-        with patch.object(cli_mod, "CLI_CONFIG", {"display": {"cli_refresh_interval": "junk"}}):
-            assert cli_mod.resolve_idle_refresh_interval() == 0.0
+        with patch.object(cli_mod, "CLI_CONFIG", {"display": {"cli_refresh_interval": 0}}):
+            assert cli_mod.resolve_idle_refresh_interval() == 0.0  # explicit opt-out
 
 
     def test_voice_status_bar_compacts_on_narrow_terminals(self):
