@@ -144,6 +144,7 @@ def test_delegate_child_execute_code_env_bridges_contextvar_and_scrubs_kanban(
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setenv("HERMES_KANBAN_TASK", "t_parent")
+    monkeypatch.setenv("HERMES_KANBAN_WORKER_SCOPE", "lifecycle-only")
     monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "123")
     monkeypatch.setenv("HERMES_KANBAN_DB", str(home / "kanban.db"))
     monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", str(tmp_path / "parent-workspace"))
@@ -164,6 +165,7 @@ def test_delegate_child_execute_code_env_bridges_contextvar_and_scrubs_kanban(
     assert env["HERMES_HOME"] == str(home)
     assert env["HERMES_DELEGATED_CHILD_CONTEXT"] == "1"
     assert "HERMES_KANBAN_TASK" not in env
+    assert "HERMES_KANBAN_WORKER_SCOPE" not in env
     assert "HERMES_KANBAN_RUN_ID" not in env
     assert "HERMES_KANBAN_DB" not in env
     assert "HERMES_KANBAN_WORKSPACE" not in env
