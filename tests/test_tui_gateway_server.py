@@ -12869,6 +12869,154 @@ def test_session_history_uses_session_profile_db(monkeypatch, tmp_path):
         server._sessions.pop("sid", None)
 
 
+def test_session_history_rejects_runaway_transcript_keeps_live_history(monkeypatch):
+    """A lineage that has grown past the safe resume limit since this session
+    went live must not be loaded unbounded by session.history — it should
+    fall back to the session's own in-memory history instead of materializing
+    the full transcript (mirrors session.resume's assert_resume_safe guard,
+    see test_session_resume_rejects_runaway_transcript_before_history_load).
+    """
+    from hermes_state import SessionResumeTooLargeError
+
+    calls: list = []
+
+    class _DB:
+        def assert_resume_safe(self, _sid):
+            raise SessionResumeTooLargeError(50_000, 20_000)
+
+        def get_messages_as_conversation(self, *_args, **_kwargs):
+            # If the guard didn't block this call, prove it by returning
+            # something the in-memory fallback would never contain.
+            calls.append(1)
+            return [{"role": "user", "content": "loaded whole lineage"}]
+
+    server._sessions["sid"] = {
+        "session_key": "runaway-sess",
+        "history": [{"role": "user", "content": "still here"}],
+        "history_lock": __import__("threading").Lock(),
+        "running": False,
+        "agent": None,
+        "created_at": 1.0,
+        "last_active": 1.0,
+    }
+    monkeypatch.setattr(server, "_get_db", lambda: _DB())
+    try:
+        resp = server.handle_request(
+            {"id": "1", "method": "session.history", "params": {"session_id": "sid"}}
+        )
+        assert "result" in resp, resp
+        assert calls == [], "get_messages_as_conversation must not run past a failed guard"
+        assert resp["result"]["count"] == 1
+        texts = [str(m) for m in resp["result"]["messages"]]
+        assert any("still here" in t for t in texts)
+        assert not any("loaded whole lineage" in t for t in texts)
+    finally:
+        server._sessions.pop("sid", None)
+
+
+def test_session_activate_rejects_runaway_transcript_keeps_live_history(monkeypatch):
+    """Sibling of the session.history guard above: session.activate's default
+    payload (omit_messages unset) reaches the same unbounded lineage read via
+    _live_visible_history. Any already-live session can be re-attached to at
+    any time, and can have grown past the resume limit since it went live —
+    the same guard is needed here, not just at session.resume's initial open.
+    """
+    from hermes_state import SessionResumeTooLargeError
+
+    calls: list = []
+
+    class _DB:
+        def assert_resume_safe(self, _sid):
+            raise SessionResumeTooLargeError(50_000, 20_000)
+
+        def get_messages_as_conversation(self, *_args, **_kwargs):
+            calls.append(1)
+            return [{"role": "user", "content": "loaded whole lineage"}]
+
+    server._sessions["sid"] = {
+        "session_key": "runaway-sess",
+        "history": [{"role": "user", "content": "still here"}],
+        "history_lock": __import__("threading").Lock(),
+        "running": False,
+        "agent": None,
+        "created_at": 1.0,
+        "last_active": 1.0,
+    }
+    monkeypatch.setattr(server, "_get_db", lambda: _DB())
+    try:
+        resp = server.handle_request(
+            {"id": "1", "method": "session.activate", "params": {"session_id": "sid"}}
+        )
+        assert "result" in resp, resp
+        assert calls == [], "get_messages_as_conversation must not run past a failed guard"
+        texts = [str(m) for m in resp["result"]["messages"]]
+        assert any("still here" in t for t in texts)
+        assert not any("loaded whole lineage" in t for t in texts)
+    finally:
+        server._sessions.pop("sid", None)
+
+
+def test_live_history_command_rejects_runaway_transcript_keeps_live_history(monkeypatch):
+    """Sibling of the session.history guard above, for the /history direct
+    slash command (_format_live_history_output) — reachable anytime on an
+    already-live session outside the RPC path."""
+    from hermes_state import SessionResumeTooLargeError
+
+    calls: list = []
+
+    class _DB:
+        def assert_resume_safe(self, _sid):
+            raise SessionResumeTooLargeError(50_000, 20_000)
+
+        def get_messages_as_conversation(self, *_args, **_kwargs):
+            calls.append(1)
+            return [{"role": "user", "content": "loaded whole lineage"}]
+
+    session = {
+        "session_key": "runaway-sess",
+        "history": [{"role": "user", "content": "still here"}],
+        "history_lock": __import__("threading").Lock(),
+    }
+    monkeypatch.setattr(server, "_get_db", lambda: _DB())
+    output = server._format_live_history_output(session)
+    assert calls == [], "get_messages_as_conversation must not run past a failed guard"
+    assert "still here" in output
+    assert "loaded whole lineage" not in output
+
+
+def test_live_context_command_rejects_runaway_transcript_keeps_live_history(monkeypatch):
+    """Same guard, for the /context direct slash command
+    (_format_live_context_output). The summary doesn't echo message text, so
+    the fake DB response is distinguished by count instead: 3 rows if the
+    unbounded read ran, 1 (the in-memory fallback) if the guard blocked it.
+    """
+    from hermes_state import SessionResumeTooLargeError
+
+    calls: list = []
+
+    class _DB:
+        def assert_resume_safe(self, _sid):
+            raise SessionResumeTooLargeError(50_000, 20_000)
+
+        def get_messages_as_conversation(self, *_args, **_kwargs):
+            calls.append(1)
+            return [
+                {"role": "user", "content": "a"},
+                {"role": "user", "content": "b"},
+                {"role": "user", "content": "c"},
+            ]
+
+    session = {
+        "session_key": "runaway-sess",
+        "history": [{"role": "user", "content": "still here"}],
+        "history_lock": __import__("threading").Lock(),
+    }
+    monkeypatch.setattr(server, "_get_db", lambda: _DB())
+    output = server._format_live_context_output(session)
+    assert calls == [], "get_messages_as_conversation must not run past a failed guard"
+    assert "Conversation: 1 messages" in output
+
+
 def test_session_status_uses_session_profile_db(monkeypatch, tmp_path):
     """session.status must load meta from the session profile state.db."""
     profile_home = tmp_path / "profiles" / "mlperf"

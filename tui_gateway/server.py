@@ -8523,6 +8523,15 @@ def _live_visible_history(session: dict, db, in_memory_fallback: list[dict]) -> 
     key = session.get("session_key")
     if db is not None and key:
         try:
+            # session.resume bounds this same lineage read with
+            # assert_resume_safe before a session goes live, but this helper
+            # is also reached anytime afterward (session.activate's default
+            # payload, and session.resume's own lazy-reattach path) on a
+            # session that can have grown past the limit since — same guard,
+            # same fail-open-to-in-memory-history on over-limit/transient.
+            safety_check = getattr(db, "assert_resume_safe", None)
+            if callable(safety_check):
+                safety_check(key)
             display = db.get_messages_as_conversation(key, include_ancestors=True, include_row_ids=True)
             return _reconcile_display_with_live(display, in_memory_fallback)
         except Exception:
@@ -13382,6 +13391,14 @@ def _format_live_history_output(session: dict) -> str:
     db = _get_db()
     if db is not None and session.get("session_key"):
         try:
+            # Same bound as session.history's RPC guard (and
+            # _live_visible_history above) — the /history direct command is
+            # callable anytime on an already-live session, so a lineage that
+            # grew past the limit since resume must fall back to the
+            # in-memory history above instead of loading unbounded.
+            safety_check = getattr(db, "assert_resume_safe", None)
+            if callable(safety_check):
+                safety_check(session["session_key"])
             history = db.get_messages_as_conversation(
                 session["session_key"], include_ancestors=True, include_row_ids=True
             )
@@ -13422,6 +13439,13 @@ def _format_live_context_output(session: dict) -> str:
     db = _get_db()
     if db is not None and session.get("session_key"):
         try:
+            # Same unbounded-lineage class as _format_live_history_output
+            # above — /context is also callable anytime on an already-live
+            # session, so bound it the same way and fall back to the
+            # in-memory history below on over-limit/transient guard failure.
+            safety_check = getattr(db, "assert_resume_safe", None)
+            if callable(safety_check):
+                safety_check(session["session_key"])
             messages = _history_to_messages(
                 db.get_messages_as_conversation(
                     session["session_key"], include_ancestors=True, include_row_ids=True
