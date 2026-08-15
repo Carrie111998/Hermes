@@ -29,7 +29,7 @@ from hermes_cli.auth import (
     resolve_external_process_provider_credentials,
     has_usable_secret,
 )
-from hermes_cli.config import get_compatible_custom_providers, load_config
+from hermes_cli.config import get_compatible_custom_providers, get_env_value, load_config
 from hermes_constants import OPENROUTER_BASE_URL
 from utils import base_url_host_matches, base_url_hostname, env_int
 
@@ -154,7 +154,7 @@ def _host_derived_api_key(base_url: str) -> str:
     if sanitized in ("OPENAI", "OPENROUTER", "OLLAMA"):
         return ""
     env_name = f"{sanitized}_API_KEY"
-    return (os.getenv(env_name, "") or "").strip()
+    return (get_env_value(env_name) or "").strip()
 
 
 def _auto_detect_local_model(base_url: str) -> str:
@@ -526,9 +526,13 @@ def _get_named_custom_provider(requested_provider: str) -> Optional[Dict[str, An
                 continue
             # Match exact name or normalized name
             name_norm = _normalize_custom_provider_name(ep_name)
-            # Resolve the API key from the env var name stored in key_env
+            # Resolve the API key from the env var name stored in key_env.
+            # get_env_value() checks the process environment first, then
+            # ~/.hermes/.env and config.yaml:env_files — so custom provider
+            # keys declared in external env files resolve natively.
             key_env = str(entry.get("key_env", "") or "").strip()
-            resolved_api_key = os.getenv(key_env, "").strip() if key_env else ""
+            resolved_api_key = get_env_value(key_env) if key_env else None
+            resolved_api_key = (resolved_api_key or "").strip()
             # Fall back to inline api_key when key_env is absent or unresolvable
             if not resolved_api_key:
                 resolved_api_key = str(entry.get("api_key", "") or "").strip()
@@ -732,7 +736,7 @@ def _resolve_named_custom_runtime(
     api_key_candidates = [
         (explicit_api_key or "").strip(),
         str(custom_provider.get("api_key", "") or "").strip(),
-        os.getenv(str(custom_provider.get("key_env", "") or "").strip(), "").strip(),
+        (get_env_value(str(custom_provider.get("key_env", "") or "").strip()) or "").strip(),
         # Gate provider env keys on their authoritative hosts — sending
         # OPENAI_API_KEY to a local-llm endpoint leaks credentials (#28660).
         (os.getenv("OPENAI_API_KEY", "").strip()     if _cp_is_openai_url  else ""),
