@@ -356,6 +356,65 @@ def test_sanitize_drops_empty_tool_calls_array():
     assert assistant["content"] == "answer"
 
 
+def test_retry_loop_rederivation_resanitizes_empty_tool_calls():
+    """#6545 long tool-loop case: every retry attempt re-derives
+    api_messages through ``_redecorate_prompt_cache_for_provider`` (fresh
+    shallow copies that preserve the source list's ``tool_calls`` state).
+    The copies still carry an empty ``tool_calls: []`` array, so the retry
+    loop must re-run ``sanitize_api_messages`` before building kwargs —
+    otherwise a strict provider (DeepSeek v4) 400s the retry with
+    "Invalid 'messages[N].tool_calls': empty array" even though the
+    pre-loop sanitizer already ran once."""
+    from unittest.mock import MagicMock
+
+    from agent.agent_runtime_helpers import sanitize_api_messages
+    from agent.conversation_loop import _redecorate_prompt_cache_for_provider
+
+    agent = MagicMock()
+    agent._use_prompt_caching = False
+    agent.provider = "deepseek"
+    agent.tools = []
+
+    messages = [
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": "answer", "tool_calls": []},
+    ]
+    # Re-decoration per retry attempt: shallow copies, empty array preserved.
+    rederived, _prepared, *_tools = _redecorate_prompt_cache_for_provider(
+        agent, messages, tools_for_api=None,
+    )
+    assert any(
+        m.get("role") == "assistant" and m.get("tool_calls") == []
+        for m in rederived
+    )
+
+    # The retry loop re-runs the sanitizer before _build_api_kwargs → dropped,
+    # while content survives.
+    out = sanitize_api_messages(rederived)
+    assistant = [m for m in out if m.get("role") == "assistant"][0]
+    assert "tool_calls" not in assistant
+    assert assistant["content"] == "answer"
+
+
+def test_retry_loop_resanitizes_before_build_kwargs():
+    """Ordering invariant: the conversation retry loop must re-run the
+    pre-API sanitizer on the re-derived ``api_messages`` BEFORE building
+    request kwargs, so every retry payload is clean (DeepSeek ``tool_calls:
+    []`` HTTP 400 class, #6545). Locked against regression by source order,
+    mirroring test_prompt_caching.py's ordering tests."""
+    import inspect
+
+    from agent import conversation_loop
+
+    src = inspect.getsource(conversation_loop)
+    anchor = src.index("while retry_count < max_retries:")
+    build = src.index("api_kwargs = agent._build_api_kwargs(api_messages)", anchor)
+    sanitize = src.rindex("_sanitize_api_messages(api_messages)", anchor, build)
+    assert sanitize < build, (
+        "retry loop must re-sanitize api_messages before building api_kwargs"
+    )
+
+
 
 
 
