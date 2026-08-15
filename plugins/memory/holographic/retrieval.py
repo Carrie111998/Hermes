@@ -7,6 +7,7 @@ Jaccard similarity reranking and trust-weighted scoring.
 from __future__ import annotations
 
 import math
+import re
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
@@ -506,40 +507,73 @@ class FactRetriever:
         """
         conn = self.store._conn
 
-        # Build query - FTS5 rank is negative (lower = better match)
-        # We need to join facts_fts with facts to get all columns
-        params: list = []
-        where_clauses = ["facts_fts MATCH ?"]
-        # FTS5 defaults to AND-between-tokens, which kills recall on
-        # natural-language queries ("what happened with the deployment
-        # rollback"). Sanitize: drop stopwords, OR-join content tokens, so
-        # any significant term can match.
-        params.append(self._sanitize_fts_query(query))
+        # ---- CJK-aware routing -------------------------------------------
+        # A trigram index can never match a sub-3-char CJK run (Chinese
+        # given names are typically 2 chars), so:
+        #   - CJK runs >= 3 chars  -> FTS5 MATCH phrase literals
+        #   - CJK runs <  3 chars  -> per-run LIKE fallback
+        # Both arms may run for a mixed query; results merge in Python.
+        cjk_runs = self._CJK_RE.findall(query)
+        short_runs = [r for r in cjk_runs if len(r) < 3]
+        long_runs = [r for r in cjk_runs if len(r) >= 3]
 
+        # Shared tail filters (category + trust floor) for every SQL shape.
+        tail_clauses: list[str] = ["f.trust_score >= ?"]
+        tail_params: list = [min_trust]
         if category:
-            where_clauses.append("f.category = ?")
-            params.append(category)
+            tail_clauses.insert(0, "f.category = ?")
+            tail_params.insert(0, category)
+        tail_sql = " AND ".join(tail_clauses)
 
-        where_clauses.append("f.trust_score >= ?")
-        params.append(min_trust)
+        rows: list = []
 
-        where_sql = " AND ".join(where_clauses)
+        # Arm 1: FTS MATCH (English queries, or CJK runs >= 3 chars).
+        if long_runs or not cjk_runs:
+            match_expr = self._sanitize_fts_query(query)
+            # FTS5 defaults to AND-between-tokens, which kills recall on
+            # natural-language queries; _sanitize_fts_query OR-joins tokens.
+            sql_match = f"""
+                SELECT f.*, facts_fts.rank as fts_rank_raw
+                FROM facts_fts
+                JOIN facts f ON f.fact_id = facts_fts.rowid
+                WHERE facts_fts MATCH ? AND {tail_sql}
+                ORDER BY facts_fts.rank
+                LIMIT ?
+            """
+            try:
+                rows = conn.execute(
+                    sql_match, [match_expr] + tail_params + [limit]
+                ).fetchall()
+            except Exception:
+                # FTS5 MATCH can fail on malformed queries — try LIKE arm.
+                rows = []
 
-        sql = f"""
-            SELECT f.*, facts_fts.rank as fts_rank_raw
-            FROM facts_fts
-            JOIN facts f ON f.fact_id = facts_fts.rowid
-            WHERE {where_sql}
-            ORDER BY facts_fts.rank
-            LIMIT ?
-        """
-        params.append(limit)
-
-        try:
-            rows = conn.execute(sql, params).fetchall()
-        except Exception:
-            # FTS5 MATCH can fail on malformed queries — fall back to empty
-            return []
+        # Arm 2: per-run LIKE for short CJK runs (adds to, not replaces,
+        # the MATCH arm so mixed queries get full recall).
+        if short_runs:
+            like_clauses = []
+            like_params: list = []
+            for run in short_runs:
+                like_clauses.append("(f.content LIKE ? OR f.tags LIKE ?)")
+                pat = f"%{run}%"
+                like_params.extend([pat, pat])
+            sql_like = f"""
+                SELECT f.*, 0.0 as fts_rank_raw
+                FROM facts f
+                WHERE ({" OR ".join(like_clauses)}) AND {tail_sql}
+                ORDER BY f.trust_score DESC, f.updated_at DESC
+                LIMIT ?
+            """
+            try:
+                like_rows = conn.execute(
+                    sql_like, like_params + tail_params + [limit]
+                ).fetchall()
+            except Exception:
+                like_rows = []
+            seen = {r["fact_id"] for r in rows}
+            rows = list(rows) + [
+                r for r in like_rows if r["fact_id"] not in seen
+            ]
 
         if not rows:
             return []
@@ -564,15 +598,30 @@ class FactRetriever:
         """Simple whitespace tokenization with lowercasing.
 
         Strips common punctuation. No stemming/lemmatization (Phase 1).
+        CJK-aware: unspaced CJK runs are split into character bigrams so
+        Chinese queries and Chinese facts share token overlap (otherwise
+        Jaccard reranking is structurally 0 for Chinese).
         """
         if not text:
             return set()
-        # Split on whitespace, lowercase, strip punctuation
-        tokens = set()
-        for word in text.lower().split():
-            cleaned = word.strip(".,;:!?\"'()[]{}#@<>")
-            if cleaned:
-                tokens.add(cleaned)
+        tokens: set[str] = set()
+        # Split out CJK runs, bigram them (keep the full run too so an
+        # exact phrase still overlaps with itself).
+        for seg in re.split(r'([\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]+)', text.lower()):
+            if not seg:
+                continue
+            if re.fullmatch(r'[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]+', seg):
+                if len(seg) >= 3:
+                    tokens.add(seg)
+                for i in range(len(seg) - 1):
+                    tokens.add(seg[i:i+2])
+                if len(seg) == 1:
+                    tokens.add(seg)
+            else:
+                for word in seg.split():
+                    cleaned = word.strip(".,;:!?\"'()[]{}#@<>")
+                    if cleaned:
+                        tokens.add(cleaned)
         return tokens
 
     # Stopwords dropped before FTS5 OR-expansion. Short English function
@@ -596,6 +645,59 @@ class FactRetriever:
         "you", "your", "yours", "yourself", "yourselves",
     })
 
+    # CJK-aware retrieval: an FTS5 trigram index cannot match a sub-3-char
+    # CJK query (Chinese given names are typically 2 chars), and OR-joined
+    # phrase literals of bigrams are no better than LIKE at that point.
+    # Detect a short CJK run and flag the caller to use LIKE instead.
+    _CJK_RE = re.compile(r'[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]+')
+
+    @classmethod
+    def _is_short_cjk_query(cls, query: str) -> bool:
+        """True when the query's only meaningful tokens are short (<3 char)
+        CJK runs — e.g. a bare Chinese name like "王坤". Such queries can
+        never match a trigram index, so the caller must fall back to LIKE.
+        """
+        import re as _re
+        cjk_runs = cls._CJK_RE.findall(query)
+        if not cjk_runs:
+            return False
+        non_cjk = _re.sub(cls._CJK_RE.pattern, ' ', query)
+        # If there are meaningful non-CJK tokens, trigram can still work.
+        if any(len(t) >= 2 for t in non_cjk.split()):
+            return False
+        return all(len(run) < 3 for run in cjk_runs)
+
+    @classmethod
+    def _cjk_fts_query(cls, query: str) -> str:
+        """CJK-aware FTS5 query builder.
+
+        For queries containing CJK runs >= 3 chars, emit phrase literals for
+        each run (the trigram index can match those). For shorter CJK runs,
+        emit a LIKE clause via the caller's fallback path (_is_short_cjk_query).
+        Non-CJK tokens are handled by the base _sanitize_fts_query logic.
+        """
+        tokens: list[str] = []
+        import re as _re
+        for seg in _re.split(r'([\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]+)', query):
+            if not seg:
+                continue
+            if cls._CJK_RE.fullmatch(seg):
+                if len(seg) >= 3:
+                    tokens.append(f'"{seg}"')
+                # runs < 3 chars: skipped here; caller falls back to LIKE
+                # via _is_short_cjk_query() when this is the only token class
+            else:
+                for word in seg.lower().split():
+                    cleaned = word.strip('.,;:!?()[]{}#@<>\"\'').translate(
+                        str.maketrans('', '', '"()*^:-+')
+                    )
+                    if len(cleaned) < 2 or cleaned in cls._FTS_STOPWORDS:
+                        continue
+                    tokens.append(f'"{cleaned}"')
+        if not tokens:
+            return query  # fallback: raw query
+        return " OR ".join(tokens)
+
     @classmethod
     def _sanitize_fts_query(cls, query: str) -> str:
         """Convert a natural-language query to an FTS5-safe OR expression.
@@ -609,9 +711,16 @@ class FactRetriever:
 
         If nothing remains (pathological query), falls back to the raw
         query so the caller sees zero results instead of a SQL error.
+
+        CJK note: delegates to _cjk_fts_query when the query contains CJK
+        runs, so Chinese queries keep trigram-matchable phrase literals.
         """
         if not query:
             return ""
+        # CJK-aware path: Chinese runs need phrase literals per run
+        # (trigram-matchable) instead of the whitespace-split logic below.
+        if cls._CJK_RE.search(query):
+            return cls._cjk_fts_query(query)
         # Strip FTS5 operator characters from EACH token to avoid
         # accidentally creating a malformed query.
         _FTS_SPECIAL = '"()*^:-+'
