@@ -4958,7 +4958,9 @@ def launchd_stop():
         # rather than returning early and reporting a stop that has not
         # happened. Mirrors launchd_restart(), which likewise passes
         # force_after=None.
-        _wait_for_gateway_exit(timeout=_GATEWAY_STOP_WAIT_SECONDS, force_after=None)
+        exited = _wait_for_gateway_exit(
+            timeout=_GATEWAY_STOP_WAIT_SECONDS, force_after=None
+        )
     else:
         # Nothing is supervising this process — launchd never took the job, or
         # the domain is unmanageable and the gateway is a detached fallback
@@ -4972,10 +4974,22 @@ def launchd_stop():
                 terminate_pid(pid, force=False)
             except (ProcessLookupError, PermissionError, OSError):
                 pass
-        _wait_for_gateway_exit(
+        exited = _wait_for_gateway_exit(
             timeout=_GATEWAY_STOP_WAIT_SECONDS,
             force_after=_GATEWAY_STOP_GRACE_SECONDS,
         )
+    if not exited:
+        # The wait has already named the surviving PID ("still running after
+        # Ns — restart may fail"); following that with "✓ Service stopped"
+        # tells the operator the opposite of what just happened. Report the
+        # stop we actually observed instead. Mirrors systemd_stop(), which
+        # returns with "still stopping after 90s" rather than its ✓ line, and
+        # launchd_restart(), which already branches on this same result.
+        print(
+            f"⚠ Gateway is still running after {_GATEWAY_STOP_WAIT_SECONDS:.0f}s; "
+            "check `hermes gateway status` or logs for final shutdown state."
+        )
+        return
     print("✓ Service stopped")
 
 
