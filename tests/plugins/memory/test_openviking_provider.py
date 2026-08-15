@@ -338,6 +338,36 @@ def test_direct_mcp_uses_default_local_identity_without_api_key():
     assert entry["headers"]["X-OpenViking-Actor-Peer"] == "hermes"
 
 
+@pytest.mark.parametrize("enabled", [False, "false", "no", "off", "0"])
+def test_direct_mcp_preserves_boolean_like_disabled_policy(enabled):
+    config = {"mcp_servers": {"openviking": {"enabled": enabled}}}
+
+    openviking_module._configure_openviking_mcp(config, {
+        "endpoint": "http://127.0.0.1:1933",
+        "api_key": "",
+        "account": "",
+        "user": "",
+        "agent": "hermes",
+    })
+
+    assert config["mcp_servers"]["openviking"]["enabled"] is False
+
+
+@pytest.mark.parametrize("enabled", [True, "true", "yes", "on", "1", 0])
+def test_direct_mcp_defaults_other_boolean_like_policy_to_enabled(enabled):
+    config = {"mcp_servers": {"openviking": {"enabled": enabled}}}
+
+    openviking_module._configure_openviking_mcp(config, {
+        "endpoint": "http://127.0.0.1:1933",
+        "api_key": "",
+        "account": "",
+        "user": "",
+        "agent": "hermes",
+    })
+
+    assert config["mcp_servers"]["openviking"]["enabled"] is True
+
+
 def test_post_setup_existing_profile_picker_validates_and_imports_saved_profile(tmp_path, monkeypatch):
     _clear_openviking_env(monkeypatch)
     hermes_home = tmp_path / "hermes"
@@ -834,7 +864,15 @@ def test_initialize_autostarts_local_openviking_in_background_when_runtime_healt
     [
         ({}, "missing"),
         ({"mcp_servers": {"openviking": {"enabled": False}}}, "disabled"),
+        ({"mcp_servers": {"openviking": {"enabled": "false"}}}, "disabled"),
+        ({"mcp_servers": {"openviking": {"enabled": "no"}}}, "disabled"),
+        ({"mcp_servers": {"openviking": {"enabled": "off"}}}, "disabled"),
+        ({"mcp_servers": {"openviking": {"enabled": "0"}}}, "disabled"),
         ({"mcp_servers": {"openviking": {"url": ""}}}, "missing"),
+        (
+            {"mcp_servers": {"openviking": {"enabled": 0, "command": "openviking-mcp"}}},
+            "configured",
+        ),
         ({"mcp_servers": {"openviking": {"command": "openviking-mcp"}}}, "configured"),
         (
             {"mcp_servers": {"openviking": {"url": "http://127.0.0.1:1933/mcp"}}},

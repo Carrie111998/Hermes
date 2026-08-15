@@ -817,6 +817,21 @@ def _load_hermes_openviking_config() -> dict:
         return {}
 
 
+def _mcp_server_enabled(value: Any = True) -> bool:
+    """Match the MCP loader's boolean-like ``enabled`` semantics."""
+    if value is None:
+        return True
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"true", "1", "yes", "on"}:
+            return True
+        if normalized in {"false", "0", "no", "off"}:
+            return False
+    return True
+
+
 def _openviking_mcp_tools_state() -> str:
     """Return ``configured``, ``disabled``, ``missing``, or ``unknown``."""
     try:
@@ -827,7 +842,7 @@ def _openviking_mcp_tools_state() -> str:
         entry = servers.get(_OPENVIKING_MCP_SERVER_NAME) if isinstance(servers, dict) else None
         if not isinstance(entry, dict):
             return "missing"
-        if entry.get("enabled", True) is False:
+        if not _mcp_server_enabled(entry.get("enabled", True)):
             return "disabled"
         has_transport = bool(
             _clean_config_value(entry.get("url"))
@@ -1789,7 +1804,7 @@ def _configure_openviking_mcp(config: dict, values: dict) -> None:
     if user:
         headers["X-OpenViking-User"] = user
 
-    entry["enabled"] = entry.get("enabled", True) is not False
+    entry["enabled"] = _mcp_server_enabled(entry.get("enabled", True))
     entry.update({
         "url": f"{endpoint.rstrip('/')}/mcp",
         "headers": headers,
