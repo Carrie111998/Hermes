@@ -190,3 +190,79 @@ def test_pre_invocation_selects_claude_for_reasoning(gate):
     assert a._pgf_pre_invocation_gate == "ACTIVE"
     assert a._pgf_failure_replan_gate == "ACTIVE"
     assert a._pgf_task_class == "ARCHITECTURE"
+
+
+# --- F1: real provider replan -------------------------------------------
+
+
+def test_f1_replan_actually_switches_runtime_provider(gate):
+    """Provider A fails -> RoutingPolicyEngine picks B -> the ACTUAL next
+    invocation targets B (agent.provider/model swapped), not merely bookkeeping.
+    A is not retried; static fallback does not silently override."""
+    a = _agent(marker=True)
+    a.provider = "openai-codex"  # provider A (failed)
+    a.model = "gpt-5.6-sol"
+    a.requested_provider = "openai-codex"
+    a._config_context_length = 999999  # stale cached value must be cleared
+    a._transport_cache = {"client": "cached"}  # must be cleared too
+
+    plan = _plan("INCLUDED", "claude", "claude_code")
+    with mock.patch.object(gate, "gate_active", return_value=True), \
+            mock.patch.object(gate, "_run_plan", return_value=plan), \
+            mock.patch.object(gate, "_anomalous_quota", return_value=False), \
+            mock.patch.object(gate, "_persist_replan_activation", return_value="/tmp/r"):
+        took = gate.route_governed_fallback(a, reason="codex exhausted")
+
+    assert took is True
+    # The ACTUAL next invocation target is Claude (provider=anthropic).
+    assert a.provider == "anthropic"
+    assert a.model == "claude-sonnet-5"
+    assert a.requested_provider == "anthropic"
+    # Stale cached state cleared so the retry resolves Claude (not A).
+    assert a._config_context_length is None
+    assert a._transport_cache == {}
+
+
+def test_f1_replan_unknown_brain_fails_closed(gate):
+    """An unmapped brain must NOT silently 'handled' — route_governed_fallback
+    returns False so the legacy static chain is preserved (fail closed)."""
+    a = _agent(marker=True)
+    a.provider = "openai-codex"
+    a.model = "gpt-5.6-sol"
+
+    plan = _plan("INCLUDED", "not_a_real_brain", "whatever")
+    with mock.patch.object(gate, "gate_active", return_value=True), \
+            mock.patch.object(gate, "_run_plan", return_value=plan), \
+            mock.patch.object(gate, "_anomalous_quota", return_value=False), \
+            mock.patch.object(gate, "_persist_replan_activation", return_value="/tmp/r"):
+        took = gate.route_governed_fallback(a, reason="codex exhausted")
+
+    assert took is False  # fail closed -> static chain runs
+    # Provider NOT switched (still A) — legacy path may retry/fall over it.
+    assert a.provider == "openai-codex"
+    assert a.model == "gpt-5.6-sol"
+
+
+def test_f1_replan_activation_persisted(gate):
+    """The replan must persist failed provider, selected replacement,
+    activation result, and retry provider/model."""
+    a = _agent(marker=True)
+    a.provider = "openai-codex"
+    a.model = "gpt-5.6-sol"
+
+    plan = _plan("INCLUDED", "claude", "claude_code")
+    with mock.patch.object(gate, "gate_active", return_value=True), \
+            mock.patch.object(gate, "_run_plan", return_value=plan), \
+            mock.patch.object(gate, "_anomalous_quota", return_value=False), \
+            mock.patch.object(gate, "_persist_replan_activation") as p:
+        p.return_value = "/tmp/r"
+        took = gate.route_governed_fallback(a, reason="codex exhausted")
+
+    assert took is True
+    p.assert_called_once()
+    call = p.call_args
+    assert call.kwargs["failed_provider"] == "openai-codex"
+    assert call.kwargs["selected_brain"] == "claude"
+    assert call.kwargs["activation_result"] == "activated"
+    assert call.kwargs["retry_provider"] == "anthropic"
+    assert call.kwargs["retry_model"] == "claude-sonnet-5"

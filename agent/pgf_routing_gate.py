@@ -45,6 +45,16 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 _PGF_REPO_ROOT = Path(os.environ.get("PGF_CONTROL_CENTER_REPO_ROOT", "/home/pooyan/pgf-control-center-runtime"))
+#: Brand-level brain name -> concrete hermes provider slug + model. Kept as the
+#: single deterministic mapping so a governed routing decision can be translated
+#: into an actually-invocable provider/model. Extend when new brains are added.
+_BRAIN_TO_RUNTIME: dict[str, tuple[str, str]] = {
+    "claude": ("anthropic", "claude-sonnet-5"),
+    "openai_codex": ("openai-codex", "gpt-5.6-sol"),
+    "openai_gpt": ("openai", "gpt-5.6-sol"),
+    "openrouter": ("openrouter", "deepseek/deepseek-v4-flash"),
+    "deepseek": ("openrouter", "deepseek/deepseek-v4-flash"),
+}
 _PYTHON = "/usr/bin/python3"
 _PLAN_TIMEOUT_S = 15.0
 
@@ -179,9 +189,23 @@ def route_governed_fallback(agent, reason=None) -> bool:
         return False  # do not promote to a PAYG fallback without approval
 
     if status in {"INCLUDED", "PAYG_AUTO"} and brain:
-        # Apply the decided Brain+Executor assignment.
-        agent._pgf_governed_selection = {"status": status, "brain": brain, "executor": executor}
-        _apply_selection(agent, brain)
+        # F1: the selected Brain/provider/model must become the ACTUAL next
+        # invocation target. route_governed_fallback returns success only after
+        # the executable provider state is correctly switched. If the swap
+        # cannot be applied, fail closed (return False) so the caller falls
+        # through to the untouched legacy static chain rather than suppressing
+        # it while leaving the failed provider still active.
+        selection = {"status": status, "brain": brain, "executor": executor}
+        agent._pgf_governed_selection = selection
+        switched = _apply_selection(agent, brain, failed_provider=failed, plan=plan)
+        if not switched:
+            logger.warning(
+                "pgf_routing_gate: replan chose brain=%s but could not activate it; "
+                "failing closed (legacy fallback path preserved)",
+                brain,
+            )
+            agent._pgf_governed_selection = selection
+            return False
         return True
 
     if status == "WAIT":
@@ -191,19 +215,109 @@ def route_governed_fallback(agent, reason=None) -> bool:
     return False
 
 
-def _apply_selection(agent, brain: str) -> None:
-    """Best-effort apply the decided provider to the agent's runtime.
+def _resolve_brain_runtime(brain: str) -> tuple[str | None, str | None]:
+    """Map a policy brain name to a concrete (provider_slug, model). Returns
+    (None, None) when the brain is unknown so the caller can fail closed."""
+    pair = _BRAIN_TO_RUNTIME.get(brain)
+    if pair is None:
+        return None, None
+    return pair
 
-    The static chain is left untouched so a later re-entry still works. We only
-    record the selection for the caller; the actual provider swap is performed
-    by the existing runtime path using the recorded brain when the chain allows.
+
+def _apply_selection(agent, brain: str, *, failed_provider: str | None = None, plan: dict | None = None) -> bool:
+    """F1: actually switch the agent to the selected Brain/provider/model.
+
+    Mirrors the runtime provider-swap performed by ``try_activate_fallback``:
+    resolves the brain to a concrete provider+model, sets ``agent.provider`` /
+    ``agent.model`` / ``requested_provider``, clears the transport/credential
+    cache and config-context-length so the swap is not defeated by stale cached
+    state, and records the activation for audit.
+
+    Returns True only when the executable provider state was switched. On any
+    failure (unknown brain, missing model, exception) returns False so the
+    caller fails closed and the legacy static chain is preserved. The static
+    ``fallback_providers`` chain is left untouched for rollback.
     """
+    prev_provider = getattr(agent, "provider", None)
+    prev_model = getattr(agent, "model", None)
     try:
+        provider, model = _resolve_brain_runtime(brain)
+        if not provider or not model:
+            logger.warning("pgf_routing_gate: brain=%r has no runtime mapping", brain)
+            return False
+
+        # Actually switch the invocation target.
         agent._pgf_governed_brain = brain
-        logger.info("pgf_routing_gate: governed mission assigned Brain=%s executor=%s",
-                    brain, getattr(agent, "_pgf_governed_selection", {}).get("executor"))
-    except Exception:  # noqa: BLE001
-        pass
+        agent.provider = provider
+        agent.model = model
+        agent.requested_provider = provider
+        # Clear cached transport / context-length so the retry resolves the new
+        # provider's window and client, matching try_activate_fallback (#22387).
+        agent._config_context_length = None
+        if hasattr(agent, "_transport_cache"):
+            try:
+                agent._transport_cache.clear()
+            except Exception:  # noqa: BLE001
+                pass
+
+        # Persist: failed provider, selected replacement, activation result,
+        # concrete retry provider/model.
+        _persist_replan_activation(
+            failed_provider=failed_provider,
+            selected_brain=brain,
+            executor=(plan or {}).get("executor"),
+            activation_result="activated",
+            retry_provider=provider,
+            retry_model=model,
+        )
+        logger.info(
+            "pgf_routing_gate: replan activated brain=%s -> provider=%s model=%s "
+            "(replacing failed %s)", brain, provider, model, failed_provider or "unknown",
+        )
+        return True
+    except Exception as exc:  # noqa: BLE001 - never let the gate crash routing
+        logger.warning("pgf_routing_gate: _apply_selection failed: %s", exc)
+        # Restore previous state and fail closed.
+        try:
+            if prev_provider is not None:
+                agent.provider = prev_provider
+            if prev_model is not None:
+                agent.model = prev_model
+        except Exception:  # noqa: BLE001
+            pass
+        _persist_replan_activation(
+            failed_provider=failed_provider,
+            selected_brain=brain,
+            executor=(plan or {}).get("executor"),
+            activation_result="failed",
+            retry_provider=None,
+            retry_model=None,
+        )
+        return False
+
+
+def _persist_replan_activation(
+    *, failed_provider: str | None, selected_brain: str | None,
+    executor: str | None, activation_result: str,
+    retry_provider: str | None, retry_model: str | None,
+) -> str | None:
+    """Persist the F1 failure/replan activation audit record."""
+    try:
+        records = _PGF_REPO_ROOT / ".pgf" / "control-plane" / "orchestration-decisions"
+        records.mkdir(parents=True, exist_ok=True)
+        path = records / f"replan-activation-{_ts()}.json"
+        payload = {
+            "failed_provider": failed_provider,
+            "selected_brain": selected_brain,
+            "executor": executor,
+            "activation_result": activation_result,
+            "retry_provider": retry_provider,
+            "retry_model": retry_model,
+        }
+        path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+        return str(path)
+    except OSError:
+        return None
 
 
 def _anomalous_quota() -> bool:
