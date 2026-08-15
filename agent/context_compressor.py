@@ -1054,8 +1054,21 @@ def _estimate_msg_budget_tokens(msg: dict, charge_stale_thinking: bool = True) -
         tokens += _serialized_length_for_budget(msg.get(key)) // _CHARS_PER_TOKEN
     if not charge_stale_thinking:
         return tokens
-    for key in _NEWEST_TURN_ONLY_BUDGET_KEYS:
-        tokens += _serialized_length_for_budget(msg.get(key)) // _CHARS_PER_TOKEN
+    # Persisted assistant messages carry the same thinking text under BOTH
+    # 'reasoning' (internal trajectory key) and 'reasoning_content'
+    # (write-time promotion in chat_completion_helpers).  Only one of the
+    # two ships on any transport — summing both double-charges the turn,
+    # which for replay-all providers (require-side echo families and
+    # soft-replay loopback endpoints, where every turn's thinking is now
+    # charged) would recreate the #73624 overcharge this walk fixed.
+    # Charge the larger payload once.
+    tokens += max(
+        (
+            _serialized_length_for_budget(msg.get(key))
+            for key in _NEWEST_TURN_ONLY_BUDGET_KEYS
+        ),
+        default=0,
+    ) // _CHARS_PER_TOKEN
     # reasoning_details: charge only the thinking TEXT, never the signed /
     # base64 envelope (#73298 second site; mirrors the preflight estimator's
     # exclusion in model_metadata).  When the same thinking text already rides

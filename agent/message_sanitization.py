@@ -680,9 +680,24 @@ _REASONING_ECHO_RULES: tuple = (
 # nothing public changes behavior.
 _SOFT_REASONING_REPLAY_HOSTS = (
     "localhost",
-    "127.0.0.1",
     "::1",
 )
+
+
+def _is_loopback_host(host: str) -> bool:
+    """True for loopback host forms: localhost, any 127.0.0.0/8 address,
+    IPv4-mapped loopback (::ffff:127.x.x.x), and unspecified 0.0.0.0 / ::
+    (llama-server binds 0.0.0.0 and clients sometimes address it that way)."""
+    import ipaddress
+
+    if not host:
+        return False
+    if host == "localhost" or host.endswith(".localhost"):
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback or host == "0.0.0.0"
+    except ValueError:
+        return False
 
 
 def replays_reasoning_content(provider: Any, model: Any, base_url: Any) -> bool:
@@ -697,8 +712,7 @@ def replays_reasoning_content(provider: Any, model: Any, base_url: Any) -> bool:
     """
     from utils import base_url_hostname
 
-    host = base_url_hostname(base_url)
-    return host in _SOFT_REASONING_REPLAY_HOSTS
+    return _is_loopback_host(base_url_hostname(base_url))
 
 
 def _family_rule(family: str) -> tuple:

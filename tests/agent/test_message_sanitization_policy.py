@@ -306,7 +306,10 @@ class TestSoftReplayClassification:
     @pytest.mark.parametrize("base_url", [
         "http://localhost:8081/v1",
         "http://127.0.0.1:8080/v1",
+        "http://127.8.9.10:8080/v1",           # any 127.0.0.0/8
         "http://[::1]:8080/v1",
+        "http://[::ffff:127.0.0.1]:8080/v1",   # IPv4-mapped loopback
+        "http://0.0.0.0:8080/v1",              # unspecified bind form
         "localhost:8081",
     ])
     def test_loopback_hosts_match(self, base_url):
@@ -318,6 +321,7 @@ class TestSoftReplayClassification:
         "https://qwen.example.com/v1",        # model-name-ish host: no match
         "http://localhost.evil.example/v1",   # loopback as subdomain: no match
         "https://my-localhost.demo/v1",
+        "http://192.168.1.5:8080/v1",         # LAN address: not loopback
         None,
     ])
     def test_non_loopback_no_match(self, base_url):
