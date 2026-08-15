@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { ClientSessionState } from '@/app/types'
 import { createClientSessionState } from '@/lib/chat-runtime'
+import { clearAllPrompts, sessionApprovalRequest, setApprovalRequest } from '@/store/prompts'
 import { $sessionStates, publishSessionState } from '@/store/session-states'
 import type { RpcEvent } from '@/types/hermes'
 
@@ -66,11 +67,13 @@ beforeEach(() => {
   handleEvent = null
   queryClient = new QueryClient()
   $sessionStates.set({})
+  clearAllPrompts()
 })
 
 afterEach(() => {
   cleanup()
   $sessionStates.set({})
+  clearAllPrompts()
   vi.restoreAllMocks()
 })
 
@@ -96,6 +99,17 @@ describe('session.reclaimed', () => {
     // only the survivor would pass with no handler at all.
     expect($sessionStates.get()['live-gone']).toBeUndefined()
     expect($sessionStates.get()['live-kept']).toBeDefined()
+  })
+
+  it('retires only the reclaimed runtime approval', async () => {
+    await mountStream()
+    setApprovalRequest({ command: 'rm stale', description: 'stale request', sessionId: 'live-gone' })
+    setApprovalRequest({ command: 'rm kept', description: 'kept request', sessionId: 'live-kept' })
+
+    reclaim('live-gone')
+
+    expect(sessionApprovalRequest('live-gone').get()).toBeNull()
+    expect(sessionApprovalRequest('live-kept').get()?.command).toBe('rm kept')
   })
 
   it('ignores a payload with no runtime id instead of clearing everything', async () => {

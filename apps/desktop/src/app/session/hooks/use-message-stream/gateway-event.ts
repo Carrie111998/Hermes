@@ -88,6 +88,11 @@ function firstBillingLine(text: string): string {
   return (text || '').split('\n')[0]?.trim() ?? ''
 }
 
+function clearTurnPrompts(sessionId: string): void {
+  clearAllPrompts(sessionId)
+  clearClarifyRequest(undefined, sessionId)
+}
+
 /**
  * Whether a `session.info` payload's `stored_session_id` may be treated as the
  * selected conversation's, so its cwd can be claimed for it (#71254).
@@ -387,6 +392,7 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
         const reclaimedRuntimeId = String((payload as { session_id?: string } | undefined)?.session_id ?? '')
 
         if (reclaimedRuntimeId) {
+          clearTurnPrompts(reclaimedRuntimeId)
           dropSessionState(reclaimedRuntimeId)
         }
 
@@ -515,6 +521,14 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
         // mutates the per-runtime cache entry, and syncSessionStateToView
         // guards the view publish to the active session, so this is safe.
         if (runningChanged && sessionId) {
+          // The agent loop's finally block emits running=false even when a
+          // reconnect gap or timeout swallowed message.complete. Treat it as
+          // the authoritative turn-end edge for prompt state too, otherwise
+          // the sidebar becomes idle while a stale approval remains actionable.
+          if (!payload!.running) {
+            clearTurnPrompts(sessionId)
+          }
+
           updateSessionState(
             sessionId,
             state => {
@@ -760,8 +774,7 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
         // (e.g. interrupted, or the approval already resolved). Scoped to the
         // session so a background turn finishing can't wipe the active chat's
         // prompt, and vice versa.
-        clearAllPrompts(sessionId)
-        clearClarifyRequest(undefined, sessionId)
+        clearTurnPrompts(sessionId)
         // Turn ended without a final `todo` update — drop a still-unfinished
         // list so "Tasks N/M" doesn't stay pinned above the composer with the
         // last item stuck pending/in_progress. Finished lists keep their linger.
@@ -1295,8 +1308,7 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
         // for this session so an approval/sudo/secret overlay can't linger past
         // the failed turn (same intent as the message.complete clear).
         if (sessionId) {
-          clearAllPrompts(sessionId)
-          clearClarifyRequest(undefined, sessionId)
+          clearTurnPrompts(sessionId)
           clearActiveSessionTodos(sessionId)
           setSessionCompacting(sessionId, false)
           compactedTurnRef.current.delete(sessionId)
