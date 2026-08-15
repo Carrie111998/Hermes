@@ -104,6 +104,7 @@ function Harness({
   requestGateway,
   resumeStoredSession,
   seedMessages,
+  seedStreamId,
   selectedStoredSessionIdRef: selectedStoredSessionIdRefProp,
   storedSessionId,
   activeSessionId,
@@ -126,6 +127,7 @@ function Harness({
   requestGateway: <T>(method: string, params?: Record<string, unknown>, timeoutMs?: number) => Promise<T>
   resumeStoredSession?: (storedSessionId: string) => Promise<void> | void
   seedMessages?: unknown[]
+  seedStreamId?: null | string
   selectedStoredSessionIdRef?: MutableRefObject<string | null>
   storedSessionId?: null | string
   activeSessionId?: null | string
@@ -147,7 +149,9 @@ function Harness({
     messages: seedMessages ?? [],
     busy: false,
     awaitingResponse: false,
-    interrupted: true
+    interrupted: true,
+    streamId: seedStreamId ?? null,
+    interimBoundaryPending: false
   } as never)
 
   const actions = usePromptActions({
@@ -2174,6 +2178,82 @@ describe('usePromptActions redirectPrompt', () => {
 
     expect(await handle!.redirectPrompt('   ')).toBe(false)
     expect(requestGateway).not.toHaveBeenCalled()
+  })
+
+  it('records the correction AFTER the assistant output that predates it (#73793, #83151)', async () => {
+    const requestGateway = vi.fn(async () => ({ status: 'redirected' }) as never)
+
+    let handle: HarnessHandle | null = null
+    const capturedStates: Record<string, unknown>[] = []
+    await actRender(
+      <Harness
+        onReady={h => (handle = h)}
+        onSeedState={state => capturedStates.push(state)}
+        refreshSessions={async () => undefined}
+        requestGateway={requestGateway}
+        seedMessages={[
+          { id: 'user-1', role: 'user', parts: [{ type: 'text', text: 'long task' }] },
+          {
+            id: 'assistant-stream-1',
+            role: 'assistant',
+            parts: [{ type: 'text', text: 'two screens of already-read output' }],
+            pending: true
+          }
+        ]}
+        seedStreamId="assistant-stream-1"
+      />
+    )
+
+    expect(await handle!.redirectPrompt('urgently')).toBe(true)
+
+    const messages = capturedStates.at(-1)?.messages as { id: string; interim?: boolean; pending?: boolean }[]
+
+    // Arrival order: the correction lands BELOW the streamed output the user
+    // had already read, never spliced above it.
+    expect(messages.map(message => message.id)).toEqual([
+      'user-1',
+      'assistant-stream-1',
+      expect.stringMatching(/^user-/)
+    ])
+    expect(messages[1]).toMatchObject({ pending: false, interim: true })
+    // streamId cleared: the post-redirect deltas seed a fresh bubble below.
+    expect(capturedStates.at(-1)?.streamId).toBeNull()
+  })
+
+  it('appends at the tail — never mid-thread — when the stream id is stale (#83151)', async () => {
+    const requestGateway = vi.fn(async () => ({ status: 'redirected' }) as never)
+
+    let handle: HarnessHandle | null = null
+    const capturedStates: Record<string, unknown>[] = []
+    await actRender(
+      <Harness
+        onReady={h => (handle = h)}
+        onSeedState={state => capturedStates.push(state)}
+        refreshSessions={async () => undefined}
+        requestGateway={requestGateway}
+        seedMessages={[
+          { id: 'user-1', role: 'user', parts: [{ type: 'text', text: 'old prompt' }] },
+          { id: 'assistant-1', role: 'assistant', parts: [{ type: 'text', text: 'old committed reply' }] },
+          { id: 'user-2', role: 'user', parts: [{ type: 'text', text: 'newer prompt' }] },
+          { id: 'assistant-2', role: 'assistant', parts: [{ type: 'text', text: 'newer committed reply' }] }
+        ]}
+        seedStreamId="assistant-stream-gone"
+      />
+    )
+
+    expect(await handle!.redirectPrompt('mid-turn note')).toBe(true)
+
+    const messages = capturedStates.at(-1)?.messages as { id: string }[]
+
+    // The retired fallback spliced this before 'assistant-2' — halfway up the
+    // chat. It must be the last row.
+    expect(messages.map(message => message.id)).toEqual([
+      'user-1',
+      'assistant-1',
+      'user-2',
+      'assistant-2',
+      expect.stringMatching(/^user-/)
+    ])
   })
 
   it('accepts a queued redirect during the agent-build window and records the correction', async () => {
