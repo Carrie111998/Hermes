@@ -371,6 +371,67 @@ class TestHandleResumeCommand:
         assert "Lobby Work" not in result
         db.close()
 
+    @pytest.mark.asyncio
+    async def test_resume_console_uses_destructive_switch(self, tmp_path):
+        """Console-platform /resume keeps the destructive switch: the outgoing
+        console session ends, so the Sessions list shows exactly ONE open
+        session after a card click (the resumed one). The still_referenced
+        guard inside switch_session protects foreign-platform sessions a
+        second resume would otherwise kill."""
+        from hermes_state import SessionDB
+
+        db = SessionDB(db_path=tmp_path / "state.db")
+        db.create_session("target_session_console", "console", user_id="console", chat_id="console")
+        db.create_session("current_session_001", "console", user_id="console", chat_id="console")
+
+        console_platform = SimpleNamespace(value="console")
+        event = _make_event(
+            text="/resume target_session_console --all",
+            platform=console_platform,
+            user_id="console",
+            chat_id="console",
+        )
+        runner = _make_runner(
+            session_db=db,
+            current_session_id="current_session_001",
+            event=event,
+        )
+        result = await runner._handle_resume_command(event)
+
+        assert "Resumed" in result
+        runner.session_store.switch_session.assert_called_once()
+        call_args = runner.session_store.switch_session.call_args
+        # No end_outgoing override: the switch is destructive (default True),
+        # so the outgoing console session row is ended — one open session.
+        assert call_args.kwargs.get("end_outgoing", True) is True
+        assert call_args[0][1] == "target_session_console"
+        db.close()
+
+    @pytest.mark.asyncio
+    async def test_resume_telegram_keeps_destructive_default(self, tmp_path):
+        """Non-console /resume keeps the historical destructive switch
+        (no end_outgoing override): the old session ends, like /reset."""
+        from hermes_state import SessionDB
+
+        db = SessionDB(db_path=tmp_path / "state.db")
+        db.create_session("target_session_tg", "telegram", user_id="12345", chat_id="67890")
+        db.create_session("current_session_001", "telegram", user_id="12345", chat_id="67890")
+
+        event = _make_event(text="/resume target_session_tg")
+        runner = _make_runner(
+            session_db=db,
+            current_session_id="current_session_001",
+            event=event,
+        )
+        result = await runner._handle_resume_command(event)
+
+        assert "Resumed" in result
+        runner.session_store.switch_session.assert_called_once()
+        call_args = runner.session_store.switch_session.call_args
+        # No end_outgoing override (or explicit True) — destructive for non-console.
+        assert call_args.kwargs.get("end_outgoing", True) is True
+        db.close()
+
 
 class TestHandleSessionsCommand:
     """Tests for GatewayRunner._handle_sessions_command."""

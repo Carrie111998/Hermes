@@ -3361,7 +3361,11 @@ class SessionStore:
             self._save()
             return entry
 
-    def switch_session(self, session_key: str, target_session_id: str) -> Optional[SessionEntry]:
+    def switch_session(
+        self,
+        session_key: str,
+        target_session_id: str,
+    ) -> Optional[SessionEntry]:
         """Switch a session key to point at an existing session ID.
 
         Used by ``/resume`` to restore a previously-named session.
@@ -3369,6 +3373,15 @@ class SessionStore:
         generating a fresh session ID, re-uses ``target_session_id`` so the
         old transcript is loaded on the next message. If the target session was
         previously ended, re-open it so gateway resume semantics match the CLI.
+
+        The switch is destructive for the outgoing session (its row is ended,
+        so the Sessions list shows exactly one open session after the switch)
+        EXCEPT when another live routing key still references it — the console
+        adapter's shared key can be re-pointed onto a foreign-platform session
+        via /resume, and a second resume must not end that session while its
+        own platform key (e.g. agent:main:telegram:dm:...) still routes
+        through it, or a live cross-platform conversation dies mid-turn and
+        forces the #54878 stale-route self-heal.
         """
         db_end_session_id = None
         new_entry = None
@@ -3387,6 +3400,18 @@ class SessionStore:
 
             db_end_session_id = old_entry.session_id
 
+            # Only end the outgoing session row when no other live routing
+            # key still points at it (the console adapter's shared key can be
+            # re-pointed onto a foreign-platform session via /resume; a second
+            # resume would then end that session even though its own platform
+            # key (e.g. agent:main:telegram:dm:...) still routes through it —
+            # killing a live cross-platform conversation mid-turn and forcing
+            # the #54878 stale-route self-heal).
+            still_referenced = any(
+                key != session_key and entry.session_id == db_end_session_id
+                for key, entry in self._entries.items()
+            )
+
             now = _now()
             new_entry = SessionEntry(
                 session_key=session_key,
@@ -3402,7 +3427,11 @@ class SessionStore:
             self._entries[session_key] = new_entry
             self._save()
 
-        if self._db and db_end_session_id:
+        if self._db and db_end_session_id and not still_referenced:
+            # Destructive switch: always end the outgoing session, like /reset.
+            # The console hub relies on this — a session-card click re-points
+            # the key AND finishes the previous console session, so the
+            # Sessions list shows exactly one open session after switching.
             try:
                 # Promote (not plain end_session): a stale agent_close /
                 # ws_orphan_reap end on the outgoing session must be upgraded

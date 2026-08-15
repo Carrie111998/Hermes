@@ -491,6 +491,163 @@ class TestSessionStoreSwitchSession:
         assert resumed["end_reason"] is None
         db.close()
 
+    def test_switch_does_not_end_session_still_referenced_by_other_key(self, tmp_path):
+        """Regression: a second /resume must not end a session another live
+        routing key still points at.
+
+        Live case (2026-08-15): the console adapter's shared key was re-pointed
+        onto the Telegram session by the first /resume (console key AND the
+        telegram key both -> session B). A second /resume 12s later ended B in
+        state.db while the telegram route still used it — the session row was
+        stamped ended_at mid-turn, messages kept flowing into the ended row,
+        and the gateway had to self-heal the stale route (#54878). The console
+        Sessions list then dropped the live Telegram conversation from
+        "active". The guard: only end the outgoing session when no OTHER key
+        references it.
+        """
+        from hermes_state import SessionDB
+
+        config = GatewayConfig()
+        with patch("gateway.session.SessionStore._ensure_loaded"):
+            store = SessionStore(sessions_dir=tmp_path / "sessions", config=config)
+        db = SessionDB(db_path=tmp_path / "state.db")
+        store._db = db
+        store._loaded = True
+
+        def _source(chat_id: str) -> SessionSource:
+            return SessionSource(
+                platform=Platform.FEISHU,
+                chat_id=chat_id,
+                chat_type="dm",
+                user_id="user-1",
+                user_name="tester",
+            )
+
+        # Two live routing keys, each with its own session.
+        console_key_entry = store.get_or_create_session(_source("chat-console"))
+        console_key = console_key_entry.session_key
+        telegram_key_entry = store.get_or_create_session(_source("chat-telegram"))
+        telegram_key = telegram_key_entry.session_key
+        telegram_session_id = telegram_key_entry.session_id
+
+        # First /resume: re-point the console key onto the telegram session.
+        # The console's own row is ended (no other key references it) — correct.
+        switched = store.switch_session(console_key, telegram_session_id)
+        assert switched.session_id == telegram_session_id
+        assert db.get_session(console_key_entry.session_id)["end_reason"] == "session_switch"
+        assert db.get_session(telegram_session_id)["ended_at"] is None
+
+        # Second /resume to a NEW target: the outgoing session (telegram) is
+        # still referenced by the telegram key — it must NOT be ended.
+        third_target = "target_session_xyz"
+        db.create_session(third_target, source="feishu", user_id="user-1")
+        switched2 = store.switch_session(console_key, third_target)
+        assert switched2 is not None
+        assert switched2.session_id == third_target
+
+        # The telegram session survives — still open, still live.
+        telegram_row = db.get_session(telegram_session_id)
+        assert telegram_row["ended_at"] is None
+        assert telegram_row["end_reason"] is None
+        db.close()
+
+    def test_switch_ends_outgoing_session_leaving_one_open(self, tmp_path):
+        """The switch is destructive: the outgoing console session row is ended,
+        so the Sessions list shows exactly ONE open session after a card click.
+
+        Regression for the 2026-08-15 live bug: a non-destructive switch left
+        every navigated-away console session open, and the console Sessions
+        list accumulated open rows with every card click. The spec is one open
+        session — switching finishes the previous console session (like /reset);
+        only the resumed target stays open.
+        """
+        from hermes_state import SessionDB
+
+        config = GatewayConfig()
+        with patch("gateway.session.SessionStore._ensure_loaded"):
+            store = SessionStore(sessions_dir=tmp_path / "sessions", config=config)
+        db = SessionDB(db_path=tmp_path / "state.db")
+        store._db = db
+        store._loaded = True
+
+        source = SessionSource(
+            platform=Platform.FEISHU,
+            chat_id="chat-1",
+            chat_type="dm",
+            user_id="user-1",
+            user_name="tester",
+        )
+        current_entry = store.get_or_create_session(source)
+        current_session_id = current_entry.session_id
+        # A REAL conversation (has content) — even so, switching ends it.
+        db.append_message(current_session_id, role="user", content="hello")
+
+        target_session_id = "old_session_abc"
+        db.create_session(target_session_id, source="feishu", user_id="user-1")
+        db.end_session(target_session_id, end_reason="user_exit")
+
+        switched = store.switch_session(
+            current_entry.session_key,
+            target_session_id,
+        )
+
+        assert switched is not None
+        assert switched.session_id == target_session_id
+        # Destructive: the outgoing console session is ended.
+        outgoing = db.get_session(current_session_id)
+        assert outgoing["ended_at"] is not None
+        assert outgoing["end_reason"] == "session_switch"
+        # The target is still reopened so the next message continues its transcript.
+        resumed = db.get_session(target_session_id)
+        assert resumed["ended_at"] is None
+        db.close()
+
+    def test_switch_ends_empty_stub_outgoing_session(self, tmp_path):
+        """A 0-message stub outgoing session is ended by the destructive switch.
+
+        A console card click right after a gateway restart creates a fresh
+        0-message session row via get_or_create_session (the console key has
+        no entry yet), then /resume re-points the key. The destructive switch
+        ends that stub too — navigation never spawns empty sessions in the
+        console "Active" list.
+        """
+        from hermes_state import SessionDB
+
+        config = GatewayConfig()
+        with patch("gateway.session.SessionStore._ensure_loaded"):
+            store = SessionStore(sessions_dir=tmp_path / "sessions", config=config)
+        db = SessionDB(db_path=tmp_path / "state.db")
+        store._db = db
+        store._loaded = True
+
+        source = SessionSource(
+            platform=Platform.FEISHU,
+            chat_id="chat-1",
+            chat_type="dm",
+            user_id="user-1",
+            user_name="tester",
+        )
+        current_entry = store.get_or_create_session(source)
+        current_session_id = current_entry.session_id
+        # NOTE: no message appended — this is the 0-message stub.
+
+        target_session_id = "old_session_abc"
+        db.create_session(target_session_id, source="feishu", user_id="user-1")
+        db.end_session(target_session_id, end_reason="user_exit")
+
+        switched = store.switch_session(
+            current_entry.session_key,
+            target_session_id,
+        )
+
+        assert switched is not None
+        assert switched.session_id == target_session_id
+        # The empty stub is ended, not left open.
+        stub = db.get_session(current_session_id)
+        assert stub["ended_at"] is not None
+        assert stub["end_reason"] == "session_switch"
+        db.close()
+
     def test_switch_session_rebinds_full_compression_lineage(self, tmp_path):
         from hermes_state import SessionDB
 
