@@ -8730,7 +8730,10 @@ async function resolveRemoteBackend(profile) {
     authMode,
     token,
     'settings',
-    undefined, undefined, profile
+    undefined,
+    config.mode === 'cloud' ? 'cloud' : 'url',
+    undefined,
+    profile
   )
 }
 
@@ -9307,7 +9310,9 @@ async function connectRegistryBackend(source, profile, key, poolEntry) {
     token,
     `registry:${source.id}`,
     undefined,
-    source.kind === 'cloud' ? 'cloud' : 'url'
+    source.kind === 'cloud' ? 'cloud' : 'url',
+    undefined,
+    profileKey
   )
 
   await waitForHermes(connection.baseUrl, connection.token, undefined, connection.authMode)
