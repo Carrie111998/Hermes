@@ -3725,6 +3725,106 @@ def _preflight_job_config(job: dict, cfg: dict) -> Optional[str]:
     return None
 
 
+# Billing/quota-exhaustion signals that mean the PINNED model is dead (HTTP
+# 402 / credit exhaustion), not merely transiently rate-limited. Mirrors the
+# billing buckets in agent/error_classifier.py so the cron layer recognizes
+# the same failure class the agent loop does (#85215).
+_DEAD_MODEL_BILLING_PATTERNS = (
+    "http 402", "payment required", "insufficient credits", "insufficient_quota",
+    "insufficient balance", "credit balance", "credits exhausted",
+    "credits have been exhausted", "no usable credits", "top up your credits",
+    "billing hard limit", "exceeded your current quota", "plan does not include",
+    "out of funds", "run out of funds", "balance_depleted", "usage limit",
+    "token plan", "quota",
+)
+
+# Usage-limit messages that also carry a transient signal ("try again in 5
+# minutes") are a periodic quota that resets, NOT a dead model — same
+# disambiguation the classifier applies to HTTP 402 (see
+# agent/error_classifier.py::_classify_402).
+_DEAD_MODEL_USAGE_LIMIT_MARKERS = ("usage limit", "quota", "limit exceeded")
+_DEAD_MODEL_TRANSIENT_SIGNALS = (
+    "try again", "retry", "resets at", "reset in", "wait",
+    "requests remaining", "periodic",
+)
+
+
+def _is_dead_model_billing_error(exc_or_text) -> bool:
+    """True when ``exc_or_text`` is a billing/402 dead-model failure.
+
+    A cron job that PINNED a model whose quota/plan died must walk
+    ``fallback_providers`` instead of failing forever with HTTP 402 (#85215).
+    Detection is cause-chain aware (bounded) so SDK-wrapped errors
+    (litellm.APIError, httpx.HTTPStatusError, ...) still classify: checks the
+    ``status_code`` attribute when present and the message text for the same
+    billing signals the agent classifier uses. Deliberately excludes transient
+    usage-limit messages (quota that resets) — those are rate limits, not a
+    dead model, and the agent loop already retries/falls back for them.
+    """
+    seen: set[int] = set()
+    cur = exc_or_text
+    depth = 0
+    while cur is not None and depth < 12:
+        ident = id(cur)
+        if ident in seen:
+            break
+        seen.add(ident)
+        depth += 1
+        if getattr(cur, "status_code", None) == 402:
+            return True
+        low = str(cur).lower()
+        transient = (
+            any(m in low for m in _DEAD_MODEL_USAGE_LIMIT_MARKERS)
+            and any(m in low for m in _DEAD_MODEL_TRANSIENT_SIGNALS)
+        )
+        if not transient and any(p in low for p in _DEAD_MODEL_BILLING_PATTERNS):
+            return True
+        cur = getattr(cur, "__cause__", None) or getattr(cur, "__context__", None)
+    return False
+
+
+def _resolve_fallback_runtime(_cfg: dict, job_id: str):
+    """Walk the bounded ``fallback_providers`` chain after a primary failure.
+
+    Returns the first usable ``(runtime, model)`` pair, or ``(None, None)``
+    when every rung fails. The chain is a finite config list, so the walk is
+    inherently bounded — a dead primary can never loop forever.
+    """
+    from hermes_cli.runtime_provider import resolve_runtime_provider
+
+    for entry in get_fallback_chain(_cfg):
+        if not isinstance(entry, dict):
+            continue
+        fb_provider = str(entry.get("provider") or "").strip()
+        fb_model = str(entry.get("model") or "").strip()
+        if not fb_provider or not fb_model:
+            continue
+        try:
+            from hermes_cli.fallback_config import resolve_entry_api_key
+
+            fb_kwargs = {
+                "requested": fb_provider,
+                "target_model": fb_model,
+            }
+            if entry.get("base_url"):
+                fb_kwargs["explicit_base_url"] = entry["base_url"]
+            fb_api_key = resolve_entry_api_key(entry)
+            if fb_api_key:
+                fb_kwargs["explicit_api_key"] = fb_api_key
+            runtime = resolve_runtime_provider(**fb_kwargs)
+            logger.info(
+                "Job '%s': fallback resolved to %s model %s",
+                job_id,
+                runtime.get("provider"),
+                fb_model,
+            )
+            return runtime, fb_model
+        except Exception as fb_exc:
+            logger.debug("Job '%s': fallback %s failed: %s", job_id, fb_provider, fb_exc)
+    return None, None
+
+
+
 def run_job(
     job: dict, *, defer_agent_teardown: Optional[list] = None,
     extra_prompt: Optional[str] = None,
@@ -4486,38 +4586,7 @@ def run_job(
                 or primary_provider_for_drift
             )
             logger.warning("Job '%s': primary auth failed (%s), trying fallback", job_id, auth_exc)
-            fb_list = get_fallback_chain(_cfg)
-            runtime = None
-            for entry in fb_list:
-                if not isinstance(entry, dict):
-                    continue
-                fb_provider = str(entry.get("provider") or "").strip()
-                fb_model = str(entry.get("model") or "").strip()
-                if not fb_provider or not fb_model:
-                    continue
-                try:
-                    from hermes_cli.fallback_config import resolve_entry_api_key
-
-                    fb_kwargs = {
-                        "requested": fb_provider,
-                        "target_model": fb_model,
-                    }
-                    if entry.get("base_url"):
-                        fb_kwargs["explicit_base_url"] = entry["base_url"]
-                    fb_api_key = resolve_entry_api_key(entry)
-                    if fb_api_key:
-                        fb_kwargs["explicit_api_key"] = fb_api_key
-                    runtime = resolve_runtime_provider(**fb_kwargs)
-                    model = fb_model
-                    logger.info(
-                        "Job '%s': fallback resolved to %s model %s",
-                        job_id,
-                        runtime.get("provider"),
-                        fb_model,
-                    )
-                    break
-                except Exception as fb_exc:
-                    logger.debug("Job '%s': fallback %s failed: %s", job_id, fb_provider, fb_exc)
+            runtime, model = _resolve_fallback_runtime(_cfg, job_id)
             if runtime is None:
                 raise RuntimeError(format_runtime_provider_error(auth_exc)) from auth_exc
         except Exception as exc:
@@ -4662,199 +4731,248 @@ def run_job(
                 job_id, _mcp_exc,
             )
 
-        agent = AIAgent(
-            model=model,
-            api_key=runtime.get("api_key"),
-            base_url=runtime.get("base_url"),
-            provider=runtime.get("provider"),
-            requested_provider=runtime.get("requested_provider"),
-            api_mode=runtime.get("api_mode"),
-            acp_command=runtime.get("command"),
-            acp_args=runtime.get("args"),
-            max_iterations=max_iterations,
-            reasoning_config=reasoning_config,
-            prefill_messages=prefill_messages,
-            fallback_model=fallback_model,
-            credential_pool=credential_pool,
-            providers_allowed=pr.get("only"),
-            providers_ignored=pr.get("ignore"),
-            providers_order=pr.get("order"),
-            provider_sort=pr.get("sort"),
-            openrouter_min_coding_score=(_cfg.get("openrouter") or {}).get("min_coding_score"),
-            enabled_toolsets=_resolve_cron_enabled_toolsets(job, _cfg),
-            disabled_toolsets=_resolve_cron_disabled_toolsets(_cfg),
-            quiet_mode=True,
-            # Cron jobs should always inherit the user's SOUL.md identity from
-            # HERMES_HOME. When a workdir is configured, also inject project
-            # context files (AGENTS.md / CLAUDE.md / .cursorrules) from there.
-            # Without a workdir, keep cwd context discovery disabled.
-            skip_context_files=not bool(_job_workdir),
-            load_soul_identity=True,
-            skip_memory=True,  # Cron system prompts would corrupt user representations
-            skip_background_review=True,  # Cron has no human-in-the-loop need for skill/memory review forks (~30K tok/event)
-            platform="cron",
-            session_id=_cron_session_id,
-            session_db=_session_db,
-        )
-        
-        # Run the agent with an *inactivity*-based timeout: the job can run
-        # for hours if it's actively calling tools / receiving stream tokens,
-        # but a hung API call or stuck tool with no activity for the configured
-        # duration is caught and killed.  Default 600s (10 min inactivity);
-        # override via HERMES_CRON_TIMEOUT env var.  0 = unlimited.
-        #
-        # Uses the agent's built-in activity tracker (updated by
-        # _touch_activity() on every tool call, API call, and stream delta).
-        _cron_timeout = _cron_inactivity_seconds()
-        _cron_inactivity_limit = _cron_timeout if _cron_timeout > 0 else None
-        _POLL_INTERVAL = 5.0
-        # Keep the one-shot run_claim fresh while the run is alive (#62002):
-        # the claim TTL is a dead-owner detector, but without a heartbeat a
-        # run that legitimately outlives it (stream stall, laptop asleep
-        # mid-run) is indistinguishable from a dead tick — another process
-        # re-dispatches it and get_due_jobs stale-removes the job record out
-        # from under the live run. Refreshing the claim from this monitor
-        # keeps "expired claim" meaning "owner died".
-        _job_schedule = job.get("schedule")
-        _is_oneshot = (
-            isinstance(_job_schedule, dict) and _job_schedule.get("kind") == "once"
-        )
-        _run_claim = job.get("run_claim")
-        _run_claim_owner = (
-            str(_run_claim.get("by") or "") if isinstance(_run_claim, dict) else ""
-        )
-        _last_claim_heartbeat = time.monotonic()
-
-        def _heartbeat_run_claim_if_due():
-            nonlocal _last_claim_heartbeat
-            if not _is_oneshot or not _run_claim_owner:
-                return
-            _mono = time.monotonic()
-            if _mono - _last_claim_heartbeat < _RUN_CLAIM_HEARTBEAT_SECONDS:
-                return
-            _last_claim_heartbeat = _mono
-            try:
-                heartbeat_run_claim(job_id, expected_owner=_run_claim_owner)
-            except Exception:
-                logger.debug(
-                    "Job '%s': run_claim heartbeat failed", job_name, exc_info=True
-                )
-
-        _cron_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-        # Preserve scheduler-scoped ContextVar state (for example skill-declared
-        # env passthrough registrations) when the cron run hops into the worker
-        # thread used for inactivity timeout monitoring.
-        _cron_context = contextvars.copy_context()
-        # Tag this fire and time the run_conversation call for the usage_audit.jsonl entry.
+        # ── Bounded dead-model re-run (#85215) ─────────────────────────
+        # A job that PINNED a now-dead model (HTTP 402 / credit exhaustion)
+        # must not fail forever: when this tick's first run fails with a
+        # billing/402 error and a fallback_providers chain is configured,
+        # re-run ONCE on the first usable rung (scheduler-level, mirroring
+        # the AuthError fallback above). Bounded: at most one re-run per
+        # tick, and the chain walk is a finite config list — a dead model
+        # can never loop.
         _audit_fire_id = uuid.uuid4().hex
         _audit_t_start = time.monotonic()
-        _cron_future = _cron_pool.submit(_cron_context.run, agent.run_conversation, prompt)
-        _inactivity_timeout = False
-        try:
-            if _cron_inactivity_limit is None:
-                # Unlimited — no inactivity watchdog, but a one-shot still
-                # needs its run_claim heartbeat, so poll instead of blocking.
-                if _is_oneshot:
-                    result = None
-                    while True:
-                        done, _ = concurrent.futures.wait(
-                            {_cron_future}, timeout=_POLL_INTERVAL,
+        agent = None
+        _run_attempt = 0
+        while True:
+            _run_attempt += 1
+            try:
+                agent = AIAgent(
+                    model=model,
+                    api_key=runtime.get("api_key"),
+                    base_url=runtime.get("base_url"),
+                    provider=runtime.get("provider"),
+                    requested_provider=runtime.get("requested_provider"),
+                    api_mode=runtime.get("api_mode"),
+                    acp_command=runtime.get("command"),
+                    acp_args=runtime.get("args"),
+                    max_iterations=max_iterations,
+                    reasoning_config=reasoning_config,
+                    prefill_messages=prefill_messages,
+                    fallback_model=fallback_model,
+                    credential_pool=credential_pool,
+                    providers_allowed=pr.get("only"),
+                    providers_ignored=pr.get("ignore"),
+                    providers_order=pr.get("order"),
+                    provider_sort=pr.get("sort"),
+                    openrouter_min_coding_score=(_cfg.get("openrouter") or {}).get("min_coding_score"),
+                    enabled_toolsets=_resolve_cron_enabled_toolsets(job, _cfg),
+                    disabled_toolsets=_resolve_cron_disabled_toolsets(_cfg),
+                    quiet_mode=True,
+                    # Cron jobs should always inherit the user's SOUL.md identity from
+                    # HERMES_HOME. When a workdir is configured, also inject project
+                    # context files (AGENTS.md / CLAUDE.md / .cursorrules) from there.
+                    # Without a workdir, keep cwd context discovery disabled.
+                    skip_context_files=not bool(_job_workdir),
+                    load_soul_identity=True,
+                    skip_memory=True,  # Cron system prompts would corrupt user representations
+                    skip_background_review=True,  # Cron has no human-in-the-loop need for skill/memory review forks (~30K tok/event)
+                    platform="cron",
+                    session_id=_cron_session_id,
+                    session_db=_session_db,
+                )
+    
+                # Run the agent with an *inactivity*-based timeout: the job can run
+                # for hours if it's actively calling tools / receiving stream tokens,
+                # but a hung API call or stuck tool with no activity for the configured
+                # duration is caught and killed.  Default 600s (10 min inactivity);
+                # override via HERMES_CRON_TIMEOUT env var.  0 = unlimited.
+                #
+                # Uses the agent's built-in activity tracker (updated by
+                # _touch_activity() on every tool call, API call, and stream delta).
+                _cron_timeout = _cron_inactivity_seconds()
+                _cron_inactivity_limit = _cron_timeout if _cron_timeout > 0 else None
+                _POLL_INTERVAL = 5.0
+                # Keep the one-shot run_claim fresh while the run is alive (#62002):
+                # the claim TTL is a dead-owner detector, but without a heartbeat a
+                # run that legitimately outlives it (stream stall, laptop asleep
+                # mid-run) is indistinguishable from a dead tick — another process
+                # re-dispatches it and get_due_jobs stale-removes the job record out
+                # from under the live run. Refreshing the claim from this monitor
+                # keeps "expired claim" meaning "owner died".
+                _job_schedule = job.get("schedule")
+                _is_oneshot = (
+                    isinstance(_job_schedule, dict) and _job_schedule.get("kind") == "once"
+                )
+                _run_claim = job.get("run_claim")
+                _run_claim_owner = (
+                    str(_run_claim.get("by") or "") if isinstance(_run_claim, dict) else ""
+                )
+                _last_claim_heartbeat = time.monotonic()
+    
+                def _heartbeat_run_claim_if_due():
+                    nonlocal _last_claim_heartbeat
+                    if not _is_oneshot or not _run_claim_owner:
+                        return
+                    _mono = time.monotonic()
+                    if _mono - _last_claim_heartbeat < _RUN_CLAIM_HEARTBEAT_SECONDS:
+                        return
+                    _last_claim_heartbeat = _mono
+                    try:
+                        heartbeat_run_claim(job_id, expected_owner=_run_claim_owner)
+                    except Exception:
+                        logger.debug(
+                            "Job '%s': run_claim heartbeat failed", job_name, exc_info=True
                         )
-                        if done:
+    
+                _cron_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+                # Preserve scheduler-scoped ContextVar state (for example skill-declared
+                # env passthrough registrations) when the cron run hops into the worker
+                # thread used for inactivity timeout monitoring.
+                _cron_context = contextvars.copy_context()
+                # Tag this fire and time the run_conversation call for the usage_audit.jsonl entry.
+                _cron_future = _cron_pool.submit(_cron_context.run, agent.run_conversation, prompt)
+                _inactivity_timeout = False
+                try:
+                    if _cron_inactivity_limit is None:
+                        # Unlimited — no inactivity watchdog, but a one-shot still
+                        # needs its run_claim heartbeat, so poll instead of blocking.
+                        if _is_oneshot:
+                            result = None
+                            while True:
+                                done, _ = concurrent.futures.wait(
+                                    {_cron_future}, timeout=_POLL_INTERVAL,
+                                )
+                                if done:
+                                    result = _cron_future.result()
+                                    break
+                                _heartbeat_run_claim_if_due()
+                        else:
                             result = _cron_future.result()
-                            break
-                        _heartbeat_run_claim_if_due()
-                else:
-                    result = _cron_future.result()
-            else:
-                result = None
-                while True:
-                    done, _ = concurrent.futures.wait(
-                        {_cron_future}, timeout=_POLL_INTERVAL,
-                    )
-                    if done:
-                        result = _cron_future.result()
-                        break
-                    _heartbeat_run_claim_if_due()
-                    # Agent still running — check inactivity.
-                    _idle_secs = 0.0
+                    else:
+                        result = None
+                        while True:
+                            done, _ = concurrent.futures.wait(
+                                {_cron_future}, timeout=_POLL_INTERVAL,
+                            )
+                            if done:
+                                result = _cron_future.result()
+                                break
+                            _heartbeat_run_claim_if_due()
+                            # Agent still running — check inactivity.
+                            _idle_secs = 0.0
+                            if hasattr(agent, "get_activity_summary"):
+                                try:
+                                    _act = agent.get_activity_summary()
+                                    _idle_secs = _act.get("seconds_since_activity", 0.0)
+                                except Exception:
+                                    pass
+                            if _idle_secs >= _cron_inactivity_limit:
+                                _inactivity_timeout = True
+                                break
+                except Exception:
+                    _cron_pool.shutdown(wait=False, cancel_futures=True)
+                    raise
+                finally:
+                    _cron_pool.shutdown(wait=False, cancel_futures=True)
+    
+                if _inactivity_timeout:
+                    # Build diagnostic summary from the agent's activity tracker.
+                    _activity = {}
                     if hasattr(agent, "get_activity_summary"):
                         try:
-                            _act = agent.get_activity_summary()
-                            _idle_secs = _act.get("seconds_since_activity", 0.0)
+                            _activity = agent.get_activity_summary()
                         except Exception:
                             pass
-                    if _idle_secs >= _cron_inactivity_limit:
-                        _inactivity_timeout = True
-                        break
-        except Exception:
-            _cron_pool.shutdown(wait=False, cancel_futures=True)
-            raise
-        finally:
-            _cron_pool.shutdown(wait=False, cancel_futures=True)
-
-        if _inactivity_timeout:
-            # Build diagnostic summary from the agent's activity tracker.
-            _activity = {}
-            if hasattr(agent, "get_activity_summary"):
-                try:
-                    _activity = agent.get_activity_summary()
-                except Exception:
-                    pass
-            _last_desc = _activity.get("last_activity_desc", "unknown")
-            _secs_ago = _activity.get("seconds_since_activity", 0)
-            _cur_tool = _activity.get("current_tool")
-            _iter_n = _activity.get("api_call_count", 0)
-            _iter_max = _activity.get("max_iterations", 0)
-
-            logger.error(
-                "Job '%s' idle for %.0fs (inactivity limit %.0fs) "
-                "| last_activity=%s | iteration=%s/%s | tool=%s",
-                job_name, _secs_ago, _cron_inactivity_limit,
-                _last_desc, _iter_n, _iter_max,
-                _cur_tool or "none",
-            )
-            request_hard_interrupt(agent, "Cron job timed out (inactivity)")
-            raise TimeoutError(
-                f"Cron job '{job_name}' idle for "
-                f"{int(_secs_ago)}s (limit {int(_cron_inactivity_limit)}s) "
-                f"— last activity: {_last_desc}"
-            )
-
-        # Guard against non-dict returns from run_conversation under error conditions
-        if not isinstance(result, dict):
-            raise RuntimeError(
-                f"agent.run_conversation returned {type(result).__name__} instead of dict: {result!r}"
-            )
-
-        # If the agent itself reported failure (e.g. all retries exhausted on
-        # API errors, model abort, mid-run interrupt), do not silently mark the
-        # job as successful. run_agent populates `failed=True`/`completed=False`
-        # on these paths and may put the error into `final_response`, which
-        # would otherwise be delivered as if it were the agent's reply and the
-        # job's `last_status` set to "ok". Raise so the except handler below
-        # builds the proper failure tuple. (issue #17855)
-        turn_exit_reason = str(result.get("turn_exit_reason") or "")
-        final_response_text = (result.get("final_response") or "").strip()
-        max_iteration_summary = (
-            result.get("failed") is not True
-            and result.get("completed") is False
-            and turn_exit_reason.startswith("max_iterations_reached(")
-            and bool(final_response_text)
-        )
-        if result.get("failed") is True or (result.get("completed") is False and not max_iteration_summary):
-            _err_text = (
-                result.get("error")
-                or final_response_text
-                or "agent reported failure"
-            )
-            raise RuntimeError(_err_text)
-        if max_iteration_summary:
-            logger.warning(
-                "Job '%s' reached the iteration limit but produced a final fallback response; "
-                "delivering the response instead of failing the cron run",
-                job_name,
-            )
+                    _last_desc = _activity.get("last_activity_desc", "unknown")
+                    _secs_ago = _activity.get("seconds_since_activity", 0)
+                    _cur_tool = _activity.get("current_tool")
+                    _iter_n = _activity.get("api_call_count", 0)
+                    _iter_max = _activity.get("max_iterations", 0)
+    
+                    logger.error(
+                        "Job '%s' idle for %.0fs (inactivity limit %.0fs) "
+                        "| last_activity=%s | iteration=%s/%s | tool=%s",
+                        job_name, _secs_ago, _cron_inactivity_limit,
+                        _last_desc, _iter_n, _iter_max,
+                        _cur_tool or "none",
+                    )
+                    request_hard_interrupt(agent, "Cron job timed out (inactivity)")
+                    raise TimeoutError(
+                        f"Cron job '{job_name}' idle for "
+                        f"{int(_secs_ago)}s (limit {int(_cron_inactivity_limit)}s) "
+                        f"— last activity: {_last_desc}"
+                    )
+    
+                # Guard against non-dict returns from run_conversation under error conditions
+                if not isinstance(result, dict):
+                    raise RuntimeError(
+                        f"agent.run_conversation returned {type(result).__name__} instead of dict: {result!r}"
+                    )
+    
+                # If the agent itself reported failure (e.g. all retries exhausted on
+                # API errors, model abort, mid-run interrupt), do not silently mark the
+                # job as successful. run_agent populates `failed=True`/`completed=False`
+                # on these paths and may put the error into `final_response`, which
+                # would otherwise be delivered as if it were the agent's reply and the
+                # job's `last_status` set to "ok". Raise so the except handler below
+                # builds the proper failure tuple. (issue #17855)
+                turn_exit_reason = str(result.get("turn_exit_reason") or "")
+                final_response_text = (result.get("final_response") or "").strip()
+                max_iteration_summary = (
+                    result.get("failed") is not True
+                    and result.get("completed") is False
+                    and turn_exit_reason.startswith("max_iterations_reached(")
+                    and bool(final_response_text)
+                )
+                if result.get("failed") is True or (result.get("completed") is False and not max_iteration_summary):
+                    _err_text = (
+                        result.get("error")
+                        or final_response_text
+                        or "agent reported failure"
+                    )
+                    raise RuntimeError(_err_text)
+                if max_iteration_summary:
+                    logger.warning(
+                        "Job '%s' reached the iteration limit but produced a final fallback response; "
+                        "delivering the response instead of failing the cron run",
+                        job_name,
+                    )
+            except Exception as _run_exc:
+                if (
+                    _run_attempt == 1
+                    and _is_dead_model_billing_error(_run_exc)
+                    and get_fallback_chain(_cfg)
+                ):
+                    _fb_runtime, _fb_model = _resolve_fallback_runtime(_cfg, job_id)
+                    if _fb_runtime is not None:
+                        logger.warning(
+                            "Job '%s': pinned model dead (billing/402: %s) — "
+                            "re-running once on fallback %s model %s",
+                            job_id,
+                            str(_run_exc)[:200],
+                            _fb_runtime.get("provider"),
+                            _fb_model,
+                        )
+                        _teardown_cron_agent(agent, job_id)
+                        runtime, model = _fb_runtime, _fb_model
+                        # Reload the credential pool for the fallback provider
+                        # so the re-run agent rotates the right keys.
+                        credential_pool = None
+                        _fb_provider = str(_fb_runtime.get("provider") or "").strip().lower()
+                        if _fb_provider:
+                            try:
+                                from agent.credential_pool import load_pool
+                                _fb_pool = load_pool(_fb_provider)
+                                if _fb_pool.has_credentials():
+                                    credential_pool = _fb_pool
+                            except Exception as _pool_exc:
+                                logger.debug(
+                                    "Job '%s': failed to load credential pool for %s: %s",
+                                    job_id, _fb_provider, _pool_exc,
+                                )
+                        continue
+                raise
+            break
 
         final_response = result.get("final_response", "") or ""
         # Strip leaked placeholder text that upstream may inject on empty completions.
