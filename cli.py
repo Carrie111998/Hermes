@@ -4438,9 +4438,9 @@ _skill_bundles = None
 def _ensure_skill_commands() -> dict:
     global _skill_commands
     if _skill_commands is None:
-        from agent.skill_commands import scan_skill_commands
+        from agent.skill_commands import get_discoverable_skill_commands
 
-        _skill_commands = scan_skill_commands()
+        _skill_commands = get_discoverable_skill_commands()
     return _skill_commands
 
 
@@ -4467,6 +4467,12 @@ def get_skill_bundles() -> dict:
 
         _skill_bundles = _impl()
     return _skill_bundles
+
+
+def get_discoverable_skill_bundles() -> dict:
+    from agent.skill_bundles import get_discoverable_skill_bundles as _impl
+
+    return _impl()
 
 
 def build_bundle_invocation_message(*args, **kwargs):
@@ -8811,7 +8817,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     f"    [bold {_accent_hex()}]{cmd:<22}[/] [dim]-[/] {_escape(info['description'])}"
                 )
 
-        _bundles_now = get_skill_bundles()
+        _bundles_now = get_discoverable_skill_bundles()
         if _bundles_now:
             _cprint(f"\n  ▣ {_BOLD}Skill Bundles{_RST} ({len(_bundles_now)} installed):")
             for cmd, info in sorted(_bundles_now.items()):
@@ -11572,6 +11578,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             base_cmd = cmd_lower.split()[0]
             skill_commands = _ensure_skill_commands()
             skill_bundles = get_skill_bundles()
+            discoverable_skill_bundles = get_discoverable_skill_bundles()
             quick_commands = self.config.get("quick_commands", {})
             if base_cmd.lstrip("/") in quick_commands:
                 qcmd = quick_commands[base_cmd.lstrip("/")]
@@ -11637,14 +11644,14 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                         _cprint(f"\033[1;31mPlugin command error: {e}{_RST}")
             # Skill bundles take precedence over individual skills — /<bundle>
             # loads multiple skills at once. Rescans cheaply when files change.
-            elif base_cmd in skill_bundles:
+            elif base_cmd in discoverable_skill_bundles:
                 user_instruction = cmd_original[len(base_cmd):].strip()
                 bundle_result = build_bundle_invocation_message(
                     base_cmd, user_instruction, task_id=self.session_id
                 )
                 if bundle_result:
                     msg, loaded_names, missing = bundle_result
-                    bundle_info = skill_bundles[base_cmd]
+                    bundle_info = discoverable_skill_bundles[base_cmd]
                     print(
                         f"\n⚡ Loading bundle: {bundle_info['name']} "
                         f"({len(loaded_names)} skills)"
@@ -11710,7 +11717,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 # that execution-time resolution agrees with tab-completion.
                 from hermes_cli.commands import COMMANDS
                 typed_base = cmd_lower.split()[0]
-                all_known = set(COMMANDS) | set(skill_commands) | set(skill_bundles)
+                all_known = set(COMMANDS) | set(skill_commands) | set(discoverable_skill_bundles)
                 matches = [c for c in all_known if c.startswith(typed_base)]
                 if len(matches) > 1:
                     # Prefer an exact match (typed the full command name)
@@ -17793,7 +17800,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         _completer = SlashCommandCompleter(
             skill_commands_provider=lambda: get_skill_commands(),
             command_filter=cli_ref._command_available,
-            skill_bundles_provider=lambda: get_skill_bundles(),
+            skill_bundles_provider=lambda: get_discoverable_skill_bundles(),
         )
         input_area = TextArea(
             height=Dimension(min=1, max=8, preferred=1),
