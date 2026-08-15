@@ -633,7 +633,6 @@ class TestSkillDirectoryHeader:
                 ],
                 check=True,
                 capture_output=True,
-                text=True,
             )
 
         with patch("tools.skills_tool.SKILLS_DIR", skills_root):
@@ -670,7 +669,6 @@ class TestSkillDirectoryHeader:
             ],
             check=True,
             capture_output=True,
-            text=True,
         )
 
         loaded = {
