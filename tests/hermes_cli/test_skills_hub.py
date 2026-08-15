@@ -255,6 +255,60 @@ def _install_mocks(monkeypatch, tmp_path, source_factory, category_hint=""):
     return install_calls
 
 
+def test_do_install_prints_installed_path_under_symlinked_skills_dir(monkeypatch, tmp_path):
+    import tools.skills_hub as hub
+    import tools.skills_guard as guard
+
+    real_skills_dir = tmp_path / "real-home" / "skills"
+    real_skills_dir.mkdir(parents=True)
+    linked_skills_dir = tmp_path / "linked-skills"
+    try:
+        linked_skills_dir.symlink_to(real_skills_dir, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlink creation unsupported on this platform")
+
+    q_path = linked_skills_dir / ".hub" / "quarantine" / "pending"
+    q_path.mkdir(parents=True)
+
+    def _install_from_quarantine(q, name, category, bundle, result):
+        install_dir = real_skills_dir / category / name
+        install_dir.mkdir(parents=True)
+        return install_dir
+
+    monkeypatch.setattr(hub, "SKILLS_DIR", linked_skills_dir)
+    monkeypatch.setattr(hub, "ensure_hub_dirs", lambda: None)
+    monkeypatch.setattr(
+        hub,
+        "create_source_router",
+        lambda auth: [_make_url_bundle_fetcher("example-skill", awaiting_name=False)()],
+    )
+    monkeypatch.setattr(hub, "quarantine_bundle", lambda bundle: q_path)
+    monkeypatch.setattr(hub, "install_from_quarantine", _install_from_quarantine)
+    monkeypatch.setattr(
+        hub,
+        "HubLockFile",
+        lambda: type("Lock", (), {"get_installed": lambda self, n: None})(),
+    )
+    monkeypatch.setattr(
+        guard,
+        "scan_skill",
+        lambda skill_path, source="community": guard.ScanResult(
+            skill_name="pending", source=source, trust_level="community", verdict="safe",
+        ),
+    )
+    monkeypatch.setattr(guard, "format_scan_report", lambda result: "scan ok")
+    monkeypatch.setattr(guard, "should_allow_install", lambda result, force=False: (True, "ok"))
+
+    sink = StringIO()
+    console = Console(file=sink, force_terminal=False, color_system=None, width=80)
+
+    do_install("https://example.com/example-skill", category="tools", force=True, console=console)
+
+    out = sink.getvalue()
+    assert "Installed:" in out
+    assert "tools/example-skill" in out
+
+
 
 
 
@@ -312,4 +366,3 @@ def test_do_search_json_flag_emits_full_identifiers(capsys):
     assert payload[0]["source"] == "browse-sh"
     # Table render must be suppressed — sink should be empty (no "Searching for:" header).
     assert "Searching for:" not in sink.getvalue()
-

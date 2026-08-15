@@ -297,6 +297,11 @@ def _resolve_lock_install_path(install_path: str, skill_name: str) -> Path:
     return target
 
 
+def _install_path_relative_to_skills_dir(path: Path) -> str:
+    """Return a lock-file relative path for an installed skill."""
+    return path.resolve().relative_to(_skills_dir().resolve()).as_posix()
+
+
 def _ssrf_safe_http_get(url: str, *, timeout: int = 20) -> httpx.Response:
     """Fetch one URL with connect-time SSRF validation and no automatic redirects."""
     from tools.url_safety import create_ssrf_safe_client
@@ -3999,7 +4004,7 @@ def install_from_quarantine(
         trust_level=bundle.trust_level,
         scan_verdict=scan_result.verdict,
         skill_hash=content_hash(install_dir),
-        install_path=str(install_dir.relative_to(_skills_dir())),
+        install_path=_install_path_relative_to_skills_dir(install_dir),
         files=list(bundle.files.keys()),
         metadata=bundle.metadata,
         scan_provenance=scan_provenance or getattr(scan_result, "scan_provenance", None),
