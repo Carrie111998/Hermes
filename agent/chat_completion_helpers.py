@@ -1887,6 +1887,32 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         old_model = agent.model
         old_provider = agent.provider
 
+        # H1: FAIL-OPEN static-fallback gate. For a governed PGF mission, no
+        # static/legacy fallback may activate a PAYG provider unless Cost Gate
+        # authorization exists FIRST. This fires even when gate_active() is
+        # False/errored (the exact fail-open hole that caused prior ~€5 OpenRouter
+        # PAYG spend). FREE/INCLUDED candidates pass through unchanged; PAYG
+        # requires an AUTHORIZED reservation or is blocked (OPERATOR_REQUIRED /
+        # DENIED / GATE_ERROR all fail closed). Non-governed agents are untouched.
+        if getattr(agent, "_pgf_governed_mission", False):
+            try:
+                from agent.pgf_routing_gate import gate_static_fallback_payg
+                outcome = gate_static_fallback_payg(provider=fb_provider, model=fb_model)
+            except Exception:  # noqa: BLE001 - must never break routing
+                outcome = "GATE_ERROR"
+            if outcome in ("OPERATOR_REQUIRED", "DENIED", "GATE_ERROR"):
+                logger.warning(
+                    "pgf_routing_gate: static fallback to %s/%s BLOCKED by Cost Gate "
+                    "(%s) — not invoking PAYG. Surface operator escalation.",
+                    fb_provider, fb_model, outcome,
+                )
+                unavailable.add(fb_key)
+                try:
+                    agent._pgf_fallback_gate_error = outcome
+                except Exception:  # noqa: BLE001
+                    pass
+                return agent._try_activate_fallback(reason)  # skip this PAYG candidate
+
         # Clear the per-config context_length override so the fallback
         # model's actual context window is resolved instead of inheriting
         # the stale value from the previous model.  See #22387.

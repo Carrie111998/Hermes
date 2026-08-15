@@ -40,6 +40,7 @@ import logging
 import os
 import re
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -241,6 +242,163 @@ def route_governed_fallback(agent, reason=None) -> bool:
         return False
 
     return False
+
+
+#: Explicit provider -> billing-class resolution for STATIC/LEGACY fallback
+#: candidates (H1). Billing must be determined explicitly, NOT inferred from a
+#: provider name heuristic alone. These are the known PAYG-capable providers on
+#: this deployment. Only PAYG candidates require a Cost Gate reservation;
+#: FREE/INCLUDED candidates pass through untouched.
+_PAYG_FALLBACK_PROVIDERS: frozenset[str] = frozenset({
+    "openrouter", "openai", "openai_api", "deepseek", "azure", "bedrock",
+    "powertwo", "cerebras",
+})
+
+
+def _resolve_fallback_billing_class(provider: str, model: str) -> str:
+    """Explicitly resolve a static-fallback candidate's billing class.
+
+    Returns one of ``FREE`` / ``INCLUDED`` / ``PAYG`` / ``UNKNOWN``.
+
+    - A ``*:free`` / ``*:batch`` model slug is FREE regardless of provider.
+    - The ``claude``/``anthropic`` and ``openai_codex``/``openai-codex`` families
+      are INCLUDED (bundled quota).
+    - The explicitly-listed ``_PAYG_FALLBACK_PROVIDERS`` are PAYG.
+    - Everything else is UNKNOWN (caller fails closed -> treat as PAYG and
+      require Cost Gate, never silently allow).
+    """
+    prov = (provider or "").strip().lower()
+    mdl = (model or "").strip().lower()
+    if mdl.endswith(":free") or mdl.endswith(":batch") or ":free" in mdl:
+        return "FREE"
+    if prov in ("claude", "anthropic"):
+        return "INCLUDED"
+    if prov in ("openai_codex", "openai-codex", "codex"):
+        return "INCLUDED"
+    if prov in _PAYG_FALLBACK_PROVIDERS:
+        return "PAYG"
+    # Conservative default: unknown -> PAYG (must pass Cost Gate).
+    return "UNKNOWN"
+
+
+def _persist_fallback_gate_audit(*, provider: str, model: str, billing: str,
+                                 gate_decision: str, decision_id: str | None,
+                                 remaining_budget: float | None, activation: str,
+                                 reason: str = "") -> str | None:
+    """Persist H1 audit evidence for a static-fallback Cost Gate decision."""
+    try:
+        records = _PGF_REPO_ROOT / ".pgf" / "control-plane" / "orchestration-decisions"
+        records.mkdir(parents=True, exist_ok=True)
+        path = records / f"fallback-gate-{_ts()}.json"
+        payload = {
+            "provider": provider, "model": model, "billing_class": billing,
+            "gate_decision": gate_decision, "decision_id": decision_id,
+            "remaining_budget": remaining_budget, "activation": activation,
+            "reason": reason, "timestamp": _ts(),
+        }
+        path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+        return str(path)
+    except OSError:
+        return None
+
+
+def _runtime_records_dir() -> Path:
+    return _PGF_REPO_ROOT / ".pgf" / "control-plane" / "orchestration-decisions"
+
+
+def gate_static_fallback_payg(*, provider: str, model: str) -> str:
+    """H1: gate a STATIC/LEGACY fallback activation for a governed mission.
+
+    Required invariant: NO PAYG provider invocation may occur from any
+    static/legacy fallback path unless Cost Gate authorization exists first.
+
+    Returns an outcome string:
+      ``ALLOWED_FREE`` / ``ALLOWED_INCLUDED`` — non-PAYG candidate, pass through,
+      no reservation.
+      ``AUTHORIZED`` — PAYG candidate covered by an auto cumulative budget; a
+                       reservation is persisted and activation may proceed.
+      ``OPERATOR_REQUIRED`` — PAYG candidate needs operator approval; a Cost
+                       Decision is persisted and the provider MUST NOT be
+                       invoked; caller should surface escalation.
+      ``DENIED`` — PAYG blocked (budget exhausted / no authorization).
+      ``GATE_ERROR`` — CostGate threw/timed out; fail closed (do NOT invoke PAYG).
+
+    Billing class is resolved explicitly (not inferred from provider name alone;
+    see ``_resolve_fallback_billing_class``). Only PAYG/UNKNOWN candidates
+    trigger the Cost Gate; FREE/INCLUDED pass through unchanged.
+    """
+    clazz = _resolve_fallback_billing_class(provider, model)
+    if clazz in ("FREE", "INCLUDED"):
+        _persist_fallback_gate_audit(
+            provider=provider, model=model, billing=clazz,
+            gate_decision="ALLOWED_" + clazz, decision_id=None,
+            remaining_budget=None, activation="proceed_no_reserve")
+        return "ALLOWED_FREE" if clazz == "FREE" else "ALLOWED_INCLUDED"
+
+    # PAYG (or UNKNOWN -> fail conservative toward PAYG). Run the Cost Gate.
+    try:
+        if str(_PGF_REPO_ROOT) not in sys.path:
+            sys.path.insert(0, str(_PGF_REPO_ROOT))
+        from internal.control_panel import quota
+        from internal.control_panel.costgate import (
+            PaygGateConfig,
+            evaluate_cost_gate,
+            persist_cost_decision,
+        )
+        from internal.control_panel.routing import TaskClass, RoutingDecision
+
+        budgets = quota.collect_all_budgets()
+        budget_tuple = tuple(budgets)
+        # Deterministic synthetic routing decision reflecting a PAYG fallback.
+        decision_obj = RoutingDecision(
+            task_class=TaskClass.NORMAL_CODING,
+            selected_brain=provider,
+            selected_executor=model,
+            policy_status="PAYG_FALLBACK",
+            reason=f"static/legacy fallback to {provider}/{model} requires gate",
+            next_preferred_provider=provider,
+            quota_snapshot=budget_tuple,
+        )
+        cfg = PaygGateConfig()
+        # Stable decision_id keyed on the fallback target so a repeated fallback
+        # to the SAME provider/model reuses (verifies) the prior reservation
+        # instead of reserving a second time (requirement 5 / no-double-reserve).
+        stable_id = "static-fallback-" + re.sub(r"[^a-zA-Z0-9_-]", "_",
+                                                f"{provider}/{model}")
+        op = evaluate_cost_gate(
+            decision_obj, budget_tuple, task_class=decision_obj.task_class,
+            task_summary=f"static fallback {provider}/{model}",
+            config=cfg, records_dir=_runtime_records_dir(),
+            decision_id=stable_id,
+        )
+        if op is None:
+            # Nothing to authorize -> not a PAYG request; allow.
+            _persist_fallback_gate_audit(
+                provider=provider, model=model, billing=clazz,
+                gate_decision="AUTHORIZED", decision_id=None,
+                remaining_budget=None, activation="proceed")
+            return "AUTHORIZED"
+        # Persist the OperatorCostDecision (auto-approval or operator-required).
+        persist_cost_decision(op, records_dir=_runtime_records_dir())
+        if getattr(op, "authorization_source", "") == "AUTO_CUMULATIVE_BUDGET":
+            _persist_fallback_gate_audit(
+                provider=provider, model=model, billing=clazz,
+                gate_decision="AUTHORIZED", decision_id=op.decision_id,
+                remaining_budget=op.remaining_budget, activation="proceed")
+            return "AUTHORIZED"
+        _persist_fallback_gate_audit(
+            provider=provider, model=model, billing=clazz,
+            gate_decision="OPERATOR_REQUIRED", decision_id=op.decision_id,
+            remaining_budget=op.remaining_budget, activation="block",
+            reason=str(getattr(op, "operator_choice", "") or "") or "operator escalation required")
+        return "OPERATOR_REQUIRED"
+    except Exception as exc:  # noqa: BLE001 - fail closed on gate error
+        logger.warning("pgf_routing_gate: fallback Cost Gate error -> fail closed: %s", exc)
+        _persist_fallback_gate_audit(
+            provider=provider, model=model, billing=clazz,
+            gate_decision="GATE_ERROR", decision_id=None, remaining_budget=None,
+            activation="blocked", reason=str(exc))
+        return "GATE_ERROR"
 
 
 def _resolve_brain_runtime(brain: str) -> tuple[str | None, str | None]:
