@@ -804,3 +804,163 @@ def test_a_drained_turn_is_the_queuers_even_after_the_queuer_disconnects(monkeyp
     assert session["turn_origin"] == "conn-b"  # but the turn is B's
     assert a.frames[0]["params"]["origin"] == "conn-b"  # not A's, not stale
     assert b.types() == []  # B is gone; nothing was delivered to it
+
+
+# ── wire contract: resume/activate watching ────────────────────────────────
+
+
+class _FakeResumeDB:
+    """Just enough SessionDB for session.resume's live-reuse + cold paths."""
+
+    def __init__(self, session_id: str) -> None:
+        self._id = session_id
+
+    def get_session(self, target):
+        return {"id": self._id} if target == self._id else None
+
+    def get_session_by_title(self, _title):
+        return None
+
+    def reopen_session(self, _target):
+        return None
+
+    def get_ancestor_display_prefix(self, _target):
+        return []
+
+    def get_resume_conversations(self, _session_id):
+        return ([], [])
+
+    def get_messages_as_conversation(self, _target, **_kwargs):
+        return []
+
+
+def _resume(transport, **params):
+    token = server.bind_transport(transport)
+    try:
+        return server.handle_request(
+            {"id": "r1", "method": "session.resume", "params": params}
+        )["result"]
+    finally:
+        server.reset_transport(token)
+
+
+def test_resume_of_a_live_session_attaches_and_reports_watching(monkeypatch):
+    """(b) The second client mirrors the session; it does not steal it."""
+    monkeypatch.setattr(server, "_get_db", lambda: _FakeResumeDB("stored-1"))
+    monkeypatch.setattr(server, "_enable_gateway_prompts", lambda: None)
+
+    owner = _FakeClient("owner")
+    joiner = _FakeClient("joiner")
+    session = _session(session_key="stored-1", transport=owner, created_at=1.0)
+    server._sessions["live"] = session
+    try:
+        result = _resume(joiner, session_id="stored-1")
+
+        assert result["watching"] is True
+        assert result["session_id"] == "live"  # reused, not rebuilt
+        assert isinstance(session["transport"], FanoutTransport)
+        assert session["transport"].transports() == [owner, joiner]
+
+        server._emit("message.delta", "live", {"text": "shared"})
+    finally:
+        server._sessions.pop("live", None)
+
+    assert owner.types() == ["message.delta"]
+    assert joiner.types() == ["message.delta"]
+
+
+def test_resume_ignores_an_unrecognized_param(monkeypatch):
+    """``watching`` is a report, so nothing on the request side selects it.
+
+    The same live-session resume is run twice, once with an extra key no
+    handler reads. Both give the same result shape and the same attach: a
+    client cannot ask for or opt out of mirroring, and a client that sends a
+    hint the gateway does not know is answered as if it had not.
+    """
+    monkeypatch.setattr(server, "_get_db", lambda: _FakeResumeDB("stored-5"))
+    monkeypatch.setattr(server, "_enable_gateway_prompts", lambda: None)
+
+    def _resume_once(**extra) -> tuple[dict, list]:
+        owner = _FakeClient("owner")
+        joiner = _FakeClient("joiner")
+        session = _session(session_key="stored-5", transport=owner, created_at=1.0)
+        server._sessions["live"] = session
+        try:
+            result = _resume(joiner, session_id="stored-5", **extra)
+            return result, session["transport"].transports()
+        finally:
+            server._sessions.pop("live", None)
+
+    plain, plain_peers = _resume_once()
+    extra, extra_peers = _resume_once(watch=True)
+
+    assert set(extra) == set(plain)
+    assert extra["session_id"] == plain["session_id"] == "live"
+    assert extra["resumed"] == plain["resumed"] == "stored-5"
+    assert extra["watching"] is True and plain["watching"] is True
+    assert len(extra_peers) == len(plain_peers) == 2
+
+
+def test_resume_by_the_client_already_attached_is_not_watching(monkeypatch):
+    """Reconnect/refresh by the same client is not "someone else is driving"."""
+    monkeypatch.setattr(server, "_get_db", lambda: _FakeResumeDB("stored-1"))
+    monkeypatch.setattr(server, "_enable_gateway_prompts", lambda: None)
+
+    owner = _FakeClient("owner")
+    server._sessions["live"] = _session(
+        session_key="stored-1", transport=owner, created_at=1.0
+    )
+    try:
+        assert _resume(owner, session_id="stored-1")["watching"] is False
+    finally:
+        server._sessions.pop("live", None)
+
+
+def test_cold_resume_reports_not_watching(monkeypatch):
+    """Nobody was here first — this client owns the session it just registered."""
+    monkeypatch.setattr(server, "_get_db", lambda: _FakeResumeDB("stored-2"))
+    monkeypatch.setattr(server, "_enable_gateway_prompts", lambda: None)
+    monkeypatch.setattr(server, "_schedule_agent_build", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_schedule_session_cap_enforcement", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_maybe_schedule_auto_continue", lambda *a, **k: None)
+
+    client = _FakeClient("solo")
+    result = _resume(client, session_id="stored-2")
+    try:
+        assert result["watching"] is False
+        assert server._sessions[result["session_id"]]["transport"] is client
+    finally:
+        server._sessions.pop(result["session_id"], None)
+
+
+def test_lazy_watch_resume_reports_not_watching(monkeypatch):
+    """A lazy child-watch window registers its own session record."""
+    monkeypatch.setattr(server, "_get_db", lambda: _FakeResumeDB("stored-3"))
+    monkeypatch.setattr(server, "_enable_gateway_prompts", lambda: None)
+    monkeypatch.setattr(server, "_child_run_active", lambda _key: False)
+
+    client = _FakeClient("watch-window")
+    result = _resume(client, session_id="stored-3", lazy=True)
+    try:
+        assert result["watching"] is False
+        assert server._sessions[result["session_id"]]["transport"] is client
+    finally:
+        server._sessions.pop(result["session_id"], None)
+
+
+def test_activate_of_a_live_session_attaches_and_reports_watching():
+    owner = _FakeClient("owner")
+    joiner = _FakeClient("joiner")
+    session = _session(session_key="stored-4", transport=owner, created_at=1.0)
+    server._sessions["live"] = session
+    token = server.bind_transport(joiner)
+    try:
+        result = server.handle_request(
+            {"id": "r1", "method": "session.activate", "params": {"session_id": "live"}}
+        )["result"]
+
+        assert result["watching"] is True
+        assert session["transport"].transports() == [owner, joiner]
+    finally:
+        server.reset_transport(token)
+        server._sessions.pop("live", None)

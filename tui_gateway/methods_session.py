@@ -417,15 +417,21 @@ def _(rid, params: dict) -> dict:
         def _reuse_live_payload(sid: str, session: dict) -> dict:
             # Resuming a session that is already live attaches this client
             # alongside the existing one(s) instead of taking the slot from them.
+            caller = current_transport() or _stdio_transport
+            # Read BEFORE the attach below: "watching" means somebody ELSE was
+            # already on this session when we arrived, i.e. this client joined a
+            # stream in progress rather than taking the session over.
+            watching = _session_has_live_transport(session, excluding=caller)
             payload = _live_session_payload(
                 sid,
                 session,
                 cols=cols,
                 touch=True,
-                transport=current_transport() or _stdio_transport,
+                transport=caller,
                 omit_messages=omit_messages,
             )
             payload["resumed"] = target
+            payload["watching"] = watching
             # A lazy watch session never owns a run loop, so its payload's running
             # flag is always False — overlay the child-run registry so a reconnecting
             # watch window keeps its busy indicator while the child is still mid-run.
@@ -511,6 +517,9 @@ def _(rid, params: dict) -> dict:
                     "session_key": target,
                     "started_at": record["created_at"],
                     "status": "streaming" if child_running else "idle",
+                    # This lazy watch window registered the session itself, so it is
+                    # the only client attached — it is not mirroring anyone.
+                    "watching": False,
                 },
             )
 
@@ -601,6 +610,9 @@ def _(rid, params: dict) -> dict:
                 "session_key": target,
                 "started_at": record["created_at"],
                 "status": "idle",
+                # Cold resume: this client registered the live session, so nobody
+                # else is streaming it.
+                "watching": False,
             }
             if auto_continue is not None:
                 payload["auto_continue"] = auto_continue
@@ -688,15 +700,18 @@ def _(rid, params: dict) -> dict:
                 if lease is not None:
                     lease.release()
                 other_sid, other_session = live
+                caller = current_transport() or _stdio_transport
+                watching = _session_has_live_transport(other_session, excluding=caller)
                 payload = _live_session_payload(
                     other_sid,
                     other_session,
                     cols=cols,
                     touch=True,
-                    transport=current_transport() or _stdio_transport,
+                    transport=caller,
                     omit_messages=omit_messages,
                 )
                 payload["resumed"] = target
+                payload["watching"] = watching
                 return _ok(rid, payload)
             try:
                 init_home_token = (
@@ -806,6 +821,8 @@ def _(rid, params: dict) -> dict:
         "session_key": target,
         "started_at": float(session.get("created_at") or time.time()),
         "status": "idle",
+        # Eager cold resume: this client built and registered the session.
+        "watching": False,
     }
     if auto_continue is not None:
         payload["auto_continue"] = auto_continue
@@ -965,16 +982,19 @@ def _(rid, params: dict) -> dict:
     # _live_session_payload ATTACHES this caller to the session rather than
     # rebinding it, so activating a session someone else is already streaming
     # mirrors it instead of stealing it.
-    return _ok(
-        rid,
-        _live_session_payload(
-            sid,
-            session,
-            touch=True,
-            transport=current_transport() or _stdio_transport,
-            omit_messages=is_truthy_value(params.get("omit_messages", False)),
-        ),
+    caller = current_transport() or _stdio_transport
+    # Read before the attach, same contract as session.resume: True means this
+    # client joined a session another client is already streaming.
+    watching = _session_has_live_transport(session, excluding=caller)
+    payload = _live_session_payload(
+        sid,
+        session,
+        touch=True,
+        transport=caller,
+        omit_messages=is_truthy_value(params.get("omit_messages", False)),
     )
+    payload["watching"] = watching
+    return _ok(rid, payload)
 
 
 @method("session.delete")
