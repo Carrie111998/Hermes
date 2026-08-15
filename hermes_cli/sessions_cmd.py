@@ -1273,6 +1273,7 @@ def cmd_sessions(args, sessions_parser=None):
         print(
             f"✓ scanned={stats['scanned']} "
             f"generated={stats['generated']} "
+            f"would_generate={stats['would_generate']} "
             f"inherited={stats['inherited']} "
             f"skipped={stats['skipped_untouchable']} "
             f"failed={stats['failed']} "

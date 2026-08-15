@@ -691,7 +691,11 @@ Root sessions get a title from the configured title-generation model; empty
 chain segments inherit the nearest titled ancestor (deduped with `#N`).
 Rows titled by the user (`title_source = 'user'`) are **never** touched, and
 legacy/empty-string rows are written at user level so the repair is explicit
-rather than an auto-titler overwrite.
+rather than an auto-titler overwrite. The report mode (no `--apply`) never
+calls the title model — candidates that would need LLM generation are listed
+under `would_generate` in the summary, so a preview costs no tokens. Only
+`--apply` invokes the model, and only after showing the configured model
+(with a cloud-cost warning when it hits a remote API) for confirmation.
 
 ### Merge Fork Compression Chains
 

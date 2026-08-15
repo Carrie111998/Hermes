@@ -266,17 +266,22 @@ class TestLooksTruncated:
 
 
 class TestRunner:
-    def test_dry_run_writes_nothing(self, db):
+    def test_dry_run_writes_nothing_and_skips_llm(self, db):
         _mk(db, "e1", msg="what is the plan")
         _mk(db, "root", title="Root title", source="llm")
         _mk(db, "seg1", parent="root", msg="continuation")
         stub = _generate_stub({"what is the plan": "Plan discussion"})
+        calls = []
+        counting_stub = lambda fm: (calls.append(fm), stub(fm))[1]
 
-        stats = retitle_missing(db, generate=stub, apply_changes=False)
+        stats = retitle_missing(db, generate=counting_stub, apply_changes=False)
 
         row = db.get_session("e1")
         assert row["title"] is None
-        assert stats["generated"] == 1
+        # Dry run must not call the LLM at all — zero token spend.
+        assert calls == []
+        assert stats["generated"] == 0
+        assert stats["would_generate"] == 1
         assert stats["inherited"] == 1
 
     def test_apply_writes_and_marks_provenance(self, db):
@@ -427,6 +432,17 @@ class TestRunner:
         assert db.get_session("a2")["title"] is None
         assert db.get_session("a3")["title"] is None
         assert stats["backup_path"] is not None
+
+    def test_apply_reports_would_generate_zero(self, db):
+        """would_generate is dry-run-only; --apply routes candidates to
+        generated (or failed), never to would_generate."""
+        _mk(db, "e1", msg="what is the plan")
+        stub = _generate_stub({"what is the plan": "Plan discussion"})
+
+        stats = retitle_missing(db, generate=stub, apply_changes=True)
+
+        assert stats["would_generate"] == 0
+        assert stats["generated"] == 1
 
 
 class TestDescribeTitleModel:

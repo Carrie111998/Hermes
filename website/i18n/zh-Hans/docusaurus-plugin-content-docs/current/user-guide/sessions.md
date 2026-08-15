@@ -651,7 +651,7 @@ hermes sessions retitle-missing --apply --no-chain-inherit --no-legacy-truncated
 hermes sessions retitle-missing --apply --limit 100
 ```
 
-根会话从配置的标题生成模型获取标题；空链段继承最近的已命名祖先（通过 `#N` 去重）。用户手动命名的行（`title_source = 'user'`）**永不**触碰，旧版/空字符串行以用户级别写入，使修复明确而非自动覆盖。
+根会话从配置的标题生成模型获取标题；空链段继承最近的已命名祖先（通过 `#N` 去重）。用户手动命名的行（`title_source = 'user'`）**永不**触碰，旧版/空字符串行以用户级别写入，使修复明确而非自动覆盖。报告模式（不带 `--apply`）**永不调用标题模型**——需要 LLM 生成的候选在汇总中列为 `would_generate`，预览不消耗任何 token。只有 `--apply` 才调用模型，且先展示配置的模型（云端端点时显示费用警告）供确认。
 
 ### 合并 fork 压缩链 {#merge-fork-compression-chains}
 

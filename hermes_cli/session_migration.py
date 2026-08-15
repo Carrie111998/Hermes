@@ -566,6 +566,11 @@ def retitle_missing(
     segments inherit the nearest ancestor title (deduped with #N via
     ``get_next_title_in_lineage``). Never overwrites a user-titled row.
 
+    Dry run (``apply_changes=False``) is side-effect free: it never calls
+    ``generate``, and candidates that would need LLM generation are counted
+    under ``would_generate`` in the stats dict. This keeps a preview from
+    spending tokens or hitting the configured model.
+
     With ``apply_changes``, candidates are presented as an interactive
     checklist (``confirm``) before any write; only checked rows are
     processed, and a timestamped state.db snapshot is taken first.
@@ -573,6 +578,7 @@ def retitle_missing(
     stats = {
         "scanned": 0,
         "generated": 0,
+        "would_generate": 0,
         "inherited": 0,
         "skipped_untouchable": 0,
         "failed": 0,
@@ -653,6 +659,13 @@ def retitle_missing(
             fm = _first_user_message(db, sid)
             if not fm:
                 stats["skipped_untouchable"] += 1
+                continue
+            if not apply_changes:
+                # Dry run: do NOT call the LLM — a preview must not spend
+                # tokens or hit the configured model. Count the candidate so
+                # the user knows what --apply would generate.
+                log(f"[{i}/{len(candidates)}] {sid[:8]} would generate a new title (LLM; dry run — not called)")
+                stats["would_generate"] += 1
                 continue
             log(f"[{i}/{len(candidates)}] {sid[:8]} generating…")
             try:
