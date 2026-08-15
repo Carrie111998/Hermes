@@ -7698,21 +7698,215 @@ def _dashboard_probe_host(host: str | None) -> str:
 
 
 _DASHBOARD_SYSTEMD_UNIT = "hermes-dashboard.service"
+_DASHBOARD_LAUNCHD_LABEL = "ai.hermes.dashboard"
+
+
+def _dashboard_launchd_label() -> str:
+    """Return the conventional dashboard LaunchAgent label for this profile."""
+    from hermes_cli.gateway import _profile_suffix
+
+    suffix = _profile_suffix()
+    if suffix:
+        return f"{_DASHBOARD_LAUNCHD_LABEL}-{suffix}"
+    return _DASHBOARD_LAUNCHD_LABEL
+
+
+def _dashboard_launchd_plist_path(label: str) -> Path:
+    """Return the canonical per-user LaunchAgent plist path for *label*."""
+    from hermes_cli.gateway import _launchd_user_home
+
+    return _launchd_user_home() / "Library" / "LaunchAgents" / f"{label}.plist"
+
+
+def _dashboard_launchd_label_from_plist_name(name: str) -> str | None:
+    """Return a conventional Dashboard label encoded by a plist filename."""
+    suffix = ".plist"
+    if not name.endswith(suffix):
+        return None
+    label = name[: -len(suffix)]
+    if label == _DASHBOARD_LAUNCHD_LABEL:
+        return label
+    prefix = f"{_DASHBOARD_LAUNCHD_LABEL}-"
+    if not label.startswith(prefix):
+        return None
+    profile = label[len(prefix):]
+    if not profile or any(
+        char not in "abcdefghijklmnopqrstuvwxyz0123456789_-" for char in profile
+    ):
+        return None
+    return label
+
+
+def _dashboard_launchd_candidates() -> tuple[
+    list[str], dict[str, tuple[Path, int]]
+]:
+    """Discover conventional Dashboard labels and installed plist identities.
+
+    ``hermes update`` refreshes one shared source checkout, so a Dashboard
+    launched under another profile is just as stale as the current profile's
+    process.  Always probe the default and current labels, plus every
+    conventional profile plist in the user's LaunchAgents directory.
+    """
+    current_label = _dashboard_launchd_label()
+    paths = {
+        _DASHBOARD_LAUNCHD_LABEL: _dashboard_launchd_plist_path(
+            _DASHBOARD_LAUNCHD_LABEL
+        ),
+        current_label: _dashboard_launchd_plist_path(current_label),
+    }
+    launch_agents = paths[_DASHBOARD_LAUNCHD_LABEL].parent
+    try:
+        entries = list(launch_agents.iterdir())
+    except FileNotFoundError:
+        entries = []
+
+    for path in entries:
+        label = _dashboard_launchd_label_from_plist_name(path.name)
+        if label is not None:
+            paths.setdefault(label, path)
+
+    configurations: dict[str, tuple[Path, int]] = {}
+    for label, path in paths.items():
+        try:
+            mode = path.lstat().st_mode
+        except FileNotFoundError:
+            continue
+        configurations[label] = (path, mode)
+
+    labels = [_DASHBOARD_LAUNCHD_LABEL]
+    labels.extend(sorted(label for label in paths if label != _DASHBOARD_LAUNCHD_LABEL))
+    return labels, configurations
+
+
+def _launchctl_dashboard_job_missing(
+    result: subprocess.CompletedProcess,
+    label: str,
+) -> bool:
+    """Return True only for launchctl's explicit job-not-found response."""
+    detail = f"{result.stderr or ''}\n{result.stdout or ''}".casefold()
+    quoted_label = re.escape(label.casefold())
+    return (
+        result.returncode in {3, 113}
+        and re.search(
+            rf"could not find service\s+[\"']{quoted_label}[\"'](?:\s|$)",
+            detail,
+        )
+        is not None
+    )
 
 
 def _restart_managed_dashboard_service(
     reason: str,
     unit: str = _DASHBOARD_SYSTEMD_UNIT,
 ) -> bool:
-    """Restart a systemd-managed dashboard instead of raw-killing its PID.
+    """Restart a supervisor-managed dashboard instead of raw-killing its PID.
 
-    Returns True when a dashboard unit was found and handled (successfully or
-    with a printed actionable failure).  Returning True deliberately prevents
-    the caller from falling back to ``os.kill``: systemd treats a direct
-    SIGTERM of the service's main PID as a clean stop, so ``Restart=on-failure``
-    will not bring the dashboard back.
+    Returns True when a systemd unit or macOS LaunchAgent was found and handled
+    (successfully or with a printed actionable failure).  Ambiguous launchd
+    ownership is also treated as handled so an update cannot create a detached
+    duplicate beside a supervisor.  Returning True deliberately prevents the
+    caller from falling back to ``os.kill``.
     """
     if sys.platform == "win32":
+        return False
+
+    if sys.platform == "darwin":
+        try:
+            labels, configurations = _dashboard_launchd_candidates()
+        except (ImportError, KeyError, OSError, ValueError) as exc:
+            print()
+            print(f"    ⚠ could not discover dashboard LaunchAgents: {exc}")
+            print("  launchd ownership is unknown; refusing detached fallback.")
+            return True
+
+        # A non-regular conventional plist makes ownership ambiguous.  Check
+        # every configuration before restarting anything so discovery remains
+        # a fail-closed, all-or-nothing phase.
+        for label, (plist_path, plist_mode) in configurations.items():
+            if not stat.S_ISREG(plist_mode):
+                print()
+                print(f"    ⚠ {plist_path} is not a regular LaunchAgent plist")
+                print("  launchd ownership is unknown; refusing detached fallback.")
+                return True
+
+        uid = os.getuid()
+        loaded_targets: list[tuple[str, str]] = []
+        for label in labels:
+            for domain in (f"gui/{uid}", f"user/{uid}"):
+                target = f"{domain}/{label}"
+                try:
+                    probe = subprocess.run(
+                        ["launchctl", "print", target],
+                        capture_output=True,
+                        text=True, encoding="utf-8", errors="replace",
+                        timeout=10,
+                    )
+                except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as exc:
+                    print()
+                    print(f"    ⚠ could not inspect {target}: {exc}")
+                    print("  launchd ownership is unknown; refusing detached fallback.")
+                    return True
+
+                if probe.returncode == 0:
+                    loaded_targets.append((label, target))
+                    break
+                if _launchctl_dashboard_job_missing(probe, label):
+                    continue
+                detail = (probe.stderr or probe.stdout or "").strip()
+                print()
+                print(
+                    f"    ⚠ could not inspect {target}: "
+                    f"{detail or f'exit {probe.returncode}'}"
+                )
+                print("  launchd ownership is unknown; refusing detached fallback.")
+                return True
+
+        if loaded_targets:
+            print()
+            print(f"⟲ Restarting managed dashboard service(s) ({reason})")
+            failures: list[tuple[str, list[str], str]] = []
+            for label, target in loaded_targets:
+                command = ["launchctl", "kickstart", "-k", target]
+                try:
+                    restarted = subprocess.run(
+                        command,
+                        capture_output=True,
+                        text=True, encoding="utf-8", errors="replace",
+                        timeout=60,
+                    )
+                except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as exc:
+                    failures.append((label, command, str(exc)))
+                    continue
+                if restarted.returncode == 0:
+                    print(f"    ✓ restarted {label}")
+                    continue
+                detail = (restarted.stderr or restarted.stdout or "").strip()
+                failures.append(
+                    (label, command, detail or f"exit {restarted.returncode}")
+                )
+
+            for label, _command, detail in failures:
+                print(f"    ✗ failed to restart {label}: {detail}")
+            if failures:
+                print("  Dashboard is managed by launchd; refusing detached fallback.")
+                for _label, command, _detail in failures:
+                    print(f"  Restart manually: {' '.join(command)}")
+            return True
+
+        # Every conventional launchd job was explicitly absent.  Any canonical
+        # plist still means at least one Dashboard is supervisor-configured;
+        # do not create a detached duplicate while jobs are merely unloaded.
+        if configurations:
+            print()
+            for label in labels:
+                configured = configurations.get(label)
+                if configured is None:
+                    continue
+                plist_path, _plist_mode = configured
+                print(f"    ⚠ {label} is configured but not loaded")
+                print(f"      Inspect or reload manually: {plist_path}")
+            print("  Refusing detached fallback while a LaunchAgent plist exists.")
+            return True
         return False
 
     def _systemctl(*args: str, timeout: int = 10) -> subprocess.CompletedProcess:

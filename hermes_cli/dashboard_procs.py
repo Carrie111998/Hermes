@@ -313,11 +313,12 @@ def _kill_stale_dashboard_processes(
     Manually-started dashboards are not auto-restarted because we don't know
     the original launch args (--host, --port, --insecure, --tui, --no-open).
     When ``restart_managed`` is true (the ``hermes update`` path), a detected
-    ``hermes-dashboard.service`` is restarted through systemd; any OTHER
-    killed PID that was supervised by a systemd unit (custom unit names —
-    e.g. a remote backend's ``hermes-serve.service``) has its owning unit
-    restarted after the kill, because systemd treats our SIGTERM as a clean
-    stop and ``Restart=on-failure`` would never fire (#68934).
+    ``hermes-dashboard.service`` or macOS Dashboard LaunchAgent is restarted
+    through its supervisor.  Any OTHER killed PID that was supervised by a
+    systemd unit (custom unit names — e.g. a remote backend's
+    ``hermes-serve.service``) has its owning unit restarted after the kill,
+    because systemd treats our SIGTERM as a clean stop and
+    ``Restart=on-failure`` would never fire (#68934).
     """
     if restart_managed and _m()._restart_managed_dashboard_service(reason):
         return {"matched": [], "killed": [], "failed": []}
