@@ -23,6 +23,8 @@ import os
 import re
 import smtplib
 import socket
+import threading
+import time
 
 # Profile-scoped secret reader for multiplexing support (PR #50094)
 from agent.secret_scope import UnscopedSecretError as _UnscopedSecretError
@@ -111,8 +113,8 @@ MAX_MESSAGE_LENGTH = 50_000
 
 SMTP_CONNECT_TIMEOUT = 30
 # ``imaplib`` applies its timeout to individual socket operations. Keep an
-# independent wall-clock bound around the whole executor job so a worker that
-# stops making progress cannot pin the poll loop indefinitely.
+# independent inactivity bound around the executor job so one stuck operation
+# cannot pin the poll loop while a healthy large batch may run for longer.
 IMAP_FETCH_WATCHDOG_TIMEOUT = 120.0
 
 
@@ -541,6 +543,8 @@ class EmailAdapter(BasePlatformAdapter):
     # run several email accounts in one process). Same-process only by
     # design — after a full restart the usual mark-all-seen baseline applies.
     _seen_uids_snapshot: Dict[str, set] = {}
+    _active_fetches: Dict[str, object] = {}
+    _active_fetches_lock = threading.Lock()
 
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform.EMAIL)
@@ -600,6 +604,11 @@ class EmailAdapter(BasePlatformAdapter):
         self._seen_uids: set = set()
         self._seen_uids_max: int = 2000   # cap to prevent unbounded memory growth
         self._poll_task: Optional[asyncio.Task] = None
+        self._active_imap: Optional[imaplib.IMAP4] = None
+        self._active_imap_lock = threading.Lock()
+        self._fetch_progress_lock = threading.Lock()
+        self._fetch_last_progress = 0.0
+        self._fetch_dispatch_callback = None
 
         # Track the last IMAP fetch attempt so the poll loop can distinguish
         # "checked, nothing new" from "the check itself failed" (#80016).
@@ -704,6 +713,17 @@ class EmailAdapter(BasePlatformAdapter):
                 "email_missing_configuration", message, retryable=False
             )
             return False
+
+        if is_reconnect:
+            with self._active_fetches_lock:
+                previous_fetch_active = self._address in self._active_fetches
+            if previous_fetch_active:
+                message = "Previous IMAP fetch is still stopping"
+                logger.warning("[Email] %s for %s", message, self._address)
+                self._set_fatal_error(
+                    "email_imap_fetch_still_stopping", message, retryable=True
+                )
+                return False
 
         try:
             # Test IMAP connection. The handle is closed in ``finally`` —
@@ -829,29 +849,73 @@ class EmailAdapter(BasePlatformAdapter):
         """Check INBOX for unseen messages and dispatch them."""
         # Run IMAP operations in a thread to avoid blocking the event loop
         loop = asyncio.get_running_loop()
+        fetch_token = object()
+        with self._active_fetches_lock:
+            if self._address in self._active_fetches:
+                return
+            self._active_fetches[self._address] = fetch_token
+
+        self._record_fetch_progress()
+
+        def dispatch_from_worker(uid: bytes, msg_data: Dict[str, Any]) -> None:
+            dispatch_future = asyncio.run_coroutine_threadsafe(
+                self._dispatch_message(msg_data), loop
+            )
+            dispatch_future.result()
+
+        self._fetch_dispatch_callback = dispatch_from_worker
         try:
             fetch_future = loop.run_in_executor(None, self._fetch_new_messages)
-            messages = await asyncio.wait_for(
-                asyncio.shield(fetch_future),
-                timeout=IMAP_FETCH_WATCHDOG_TIMEOUT,
-            )
-        except asyncio.TimeoutError:
-            message = (
-                "IMAP fetch exceeded "
-                f"{IMAP_FETCH_WATCHDOG_TIMEOUT:g}s without completing"
-            )
-            logger.error("[Email] %s", message)
-            self._set_fatal_error(
-                "email_imap_fetch_timeout", message, retryable=True
-            )
-            await self._notify_fatal_error()
-            return
-        # Dispatch whatever the fetch managed to return BEFORE escalating a
-        # failure: on a mid-batch exception _fetch_new_messages returns the
-        # partial results, and dropping them here would lose those messages
-        # (their processing already marked them seen).
+        except Exception:
+            self._fetch_dispatch_callback = None
+            self._release_active_fetch(fetch_token)
+            raise
+
+        def finish_fetch(done_future: "asyncio.Future[List[Dict[str, Any]]]") -> None:
+            self._release_active_fetch(fetch_token)
+            if self._fetch_dispatch_callback is dispatch_from_worker:
+                self._fetch_dispatch_callback = None
+            if not done_future.cancelled():
+                # Retrieve background exceptions after a timed-out/cancelled
+                # waiter so asyncio does not warn that they were never retrieved.
+                done_future.exception()
+
+        fetch_future.add_done_callback(finish_fetch)
+
+        try:
+            while True:
+                with self._fetch_progress_lock:
+                    inactive_for = time.monotonic() - self._fetch_last_progress
+                remaining = IMAP_FETCH_WATCHDOG_TIMEOUT - inactive_for
+                if remaining <= 0:
+                    self._abort_active_imap()
+                    message = (
+                        "IMAP fetch made no progress for "
+                        f"{IMAP_FETCH_WATCHDOG_TIMEOUT:g}s"
+                    )
+                    logger.error("[Email] %s", message)
+                    self._set_fatal_error(
+                        "email_imap_fetch_timeout", message, retryable=True
+                    )
+                    await self._notify_fatal_error()
+                    return
+                done, _ = await asyncio.wait({fetch_future}, timeout=remaining)
+                if done:
+                    messages = fetch_future.result()
+                    break
+        except asyncio.CancelledError:
+            self._abort_active_imap()
+            raise
+
         for msg_data in messages:
-            await self._dispatch_message(msg_data)
+            uid = msg_data.get("_imap_uid")
+            dispatch_data = dict(msg_data)
+            dispatch_data.pop("_imap_uid", None)
+            await self._dispatch_message(dispatch_data)
+            if uid is not None:
+                self._seen_uids.add(uid)
+                self._trim_seen_uids()
+                self._seen_uids_snapshot[self._address] = set(self._seen_uids)
         if self._last_fetch_failed:
             # The IMAP check itself failed (connect/login/select/search/fetch),
             # not just an empty inbox. Surface it through the fatal-error hook
@@ -868,18 +932,53 @@ class EmailAdapter(BasePlatformAdapter):
             )
             await self._notify_fatal_error()
 
+    def _record_fetch_progress(self) -> None:
+        with self._fetch_progress_lock:
+            self._fetch_last_progress = time.monotonic()
+
+    def _release_active_fetch(self, token: object) -> None:
+        with self._active_fetches_lock:
+            if self._active_fetches.get(self._address) is token:
+                self._active_fetches.pop(self._address, None)
+
+    def _abort_active_imap(self) -> None:
+        """Interrupt the socket owned by the executor worker, if available."""
+        with self._active_imap_lock:
+            imap = self._active_imap
+        if imap is None:
+            return
+        try:
+            imap.shutdown()
+        except Exception:
+            sock = getattr(imap, "sock", None)
+            if sock is not None:
+                try:
+                    sock.shutdown(socket.SHUT_RDWR)
+                except Exception:
+                    pass
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+
     def _fetch_new_messages(self) -> List[Dict[str, Any]]:
         """Fetch new (unseen) messages from IMAP. Runs in executor thread."""
         results = []
         imap: Optional[imaplib.IMAP4] = None
         try:
             imap = imaplib.IMAP4_SSL(self._imap_host, self._imap_port, timeout=30)
+            with self._active_imap_lock:
+                self._active_imap = imap
             try:
                 imap.login(self._address, self._password)
+                self._record_fetch_progress()
                 _send_imap_id(imap)
+                self._record_fetch_progress()
                 imap.select("INBOX")
+                self._record_fetch_progress()
 
                 status, data = imap.uid("search", None, "UNSEEN")
+                self._record_fetch_progress()
                 if status != "OK" or not data or not data[0]:
                     return results
 
@@ -887,24 +986,12 @@ class EmailAdapter(BasePlatformAdapter):
                     if uid in self._seen_uids:
                         continue
 
-                    status, msg_data = imap.uid("fetch", uid, "(RFC822)")
+                    status, msg_data = imap.uid("fetch", uid, "(BODY.PEEK[])")
+                    self._record_fetch_progress()
                     if status != "OK":
                         # Transient per-UID fetch refusal: leave the UID out of
                         # _seen_uids so the next poll retries it.
                         continue
-
-                    # IMAP fetch can return unexpected structures (e.g. a
-                    # single bytes item instead of a list of tuples). Mark the
-                    # UID seen once a response arrived (even a malformed one)
-                    # so a garbage response is skipped once, not retried
-                    # forever — but NOT before the fetch: a connection failure
-                    # above must leave the remaining batch eligible for the
-                    # next poll instead of permanently skipping it (#80032
-                    # review).
-                    self._seen_uids.add(uid)
-                    # Trim periodically to prevent unbounded memory growth
-                    if len(self._seen_uids) > self._seen_uids_max:
-                        self._trim_seen_uids()
 
                     try:
                         raw_email = msg_data[0][1]
@@ -913,11 +1000,13 @@ class EmailAdapter(BasePlatformAdapter):
                             "[Email] Unexpected IMAP response structure for UID %s, skipping",
                             uid,
                         )
+                        self._seen_uids.add(uid)
                         continue
                     if not isinstance(raw_email, (bytes, bytearray)):
                         logger.warning(
                             "[Email] Non-bytes IMAP payload for UID %s, skipping", uid
                         )
+                        self._seen_uids.add(uid)
                         continue
                     # Per-message processing guard: one poison message
                     # (unparseable headers, pathological attachment, DNS
@@ -932,13 +1021,36 @@ class EmailAdapter(BasePlatformAdapter):
                             uid,
                             parse_exc,
                         )
+                        self._seen_uids.add(uid)
                         continue
                     if parsed is not None:
-                        results.append(parsed)
+                        dispatch_callback = self._fetch_dispatch_callback
+                        if dispatch_callback is None:
+                            parsed["_imap_uid"] = uid
+                            results.append(parsed)
+                        else:
+                            # Dispatch on the owning event loop before making
+                            # either the local or server-side seen state
+                            # irreversible. The worker keeps this IMAP session
+                            # alive so the commit does not need a second socket.
+                            dispatch_callback(uid, parsed)
+                            self._seen_uids.add(uid)
+                            self._trim_seen_uids()
+                            self._seen_uids_snapshot[self._address] = set(
+                                self._seen_uids
+                            )
+                            self._record_fetch_progress()
+                            imap.uid("store", uid, "+FLAGS", "(\\Seen)")
+                            self._record_fetch_progress()
+                    else:
+                        self._seen_uids.add(uid)
             finally:
                 # _close_imap guarantees the socket dies even when logout()
                 # raises IMAP4.abort on a broken connection (#79889).
                 _close_imap(imap)
+                with self._active_imap_lock:
+                    if self._active_imap is imap:
+                        self._active_imap = None
         except Exception as e:
             logger.error("[Email] IMAP fetch error: %s", e)
             self._last_fetch_failed = True
