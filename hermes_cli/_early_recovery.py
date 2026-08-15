@@ -515,9 +515,12 @@ def _release_recovery_lock(root: Path) -> None:
 
 def _print_self_lock_manual_escape(root: Path, *, branch: str | None = None) -> None:
     """Print manual git reset + update commands for stuck self-lock users."""
+    # hermes_constants is first-party + stdlib-only — safe here (no 3rd-party).
+    from hermes_constants import venv_python_path
+
     branch_name = (branch or "main").strip() or "main"
-    venv_win = root / "venv" / "Scripts" / "python.exe"
-    venv_posix = root / "venv" / "bin" / "python"
+    venv_win = venv_python_path(root / "venv", windows=True)
+    venv_posix = venv_python_path(root / "venv", windows=False)
     if venv_win.is_file():
         python_exe = str(venv_win)
     elif venv_posix.is_file():

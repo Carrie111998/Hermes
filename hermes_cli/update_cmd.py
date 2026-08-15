@@ -3397,8 +3397,8 @@ def _preferred_update_python_executable() -> str:
         return str(candidate)
     # Fall back to the other platform's layout when detection mismatches.
     for alt in (
-        root / "venv" / "Scripts" / "python.exe",
-        root / "venv" / "bin" / "python",
+        venv_python_path(root / "venv", windows=True),
+        venv_python_path(root / "venv", windows=False),
     ):
         if alt.is_file():
             return str(alt)
