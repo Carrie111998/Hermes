@@ -310,6 +310,36 @@ class TestGithubReasoningEfforts:
             ) == ["low", "medium", "high"]
         mock_key.assert_not_called()
 
+    def test_reuses_the_existing_catalog_token_helper(self):
+        """The reasoning lookup must REUSE the module's existing token helper.
+
+        `_resolve_copilot_catalog_api_key` already existed for the `/model`
+        picker's catalog fetch, and it resolves credentials the Copilot auth
+        helpers alone do not (notably `credential_pool.copilot[]` entries
+        added by `hermes auth add copilot`).
+
+        Defining a second function under the same name would silently shadow
+        it for EVERY caller in this module — the picker included — and drop
+        credential-pool support for users whose only token lives there. Pin
+        both that there is exactly one definition and that it is the
+        pool-aware one.
+        """
+        import inspect
+
+        import hermes_cli.models as models_mod
+
+        source = inspect.getsource(models_mod)
+        definitions = source.count("def _resolve_copilot_catalog_api_key(")
+        assert definitions == 1, (
+            f"expected exactly 1 definition of _resolve_copilot_catalog_api_key, "
+            f"found {definitions} — a duplicate silently shadows the original"
+        )
+
+        helper_source = inspect.getsource(models_mod._resolve_copilot_catalog_api_key)
+        assert "read_credential_pool" in helper_source, (
+            "the surviving helper must be the credential-pool-aware one"
+        )
+
     def test_offline_fallback_covers_known_copilot_reasoning_families(self):
         with patch(
             "hermes_cli.models._resolve_copilot_catalog_api_key",

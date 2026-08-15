@@ -4371,33 +4371,6 @@ def normalize_copilot_model_id(
     return raw
 
 
-def _resolve_copilot_catalog_api_key() -> str:
-    """Best-effort Copilot token for catalog-backed capability lookups.
-
-    ``github_model_reasoning_efforts`` is called from WebUI and the agent
-    gates without an explicit ``api_key``. Without a token the live
-    ``/models`` catalog is unreachable and every non-GPT Copilot model
-    silently falls through to the static table. Resolve the same token the
-    rest of the Copilot stack already uses, and never raise — a missing
-    credential must degrade to the offline fallback, not break the picker.
-    """
-    try:
-        from hermes_cli.copilot_auth import get_copilot_api_token, resolve_copilot_token
-    except Exception:
-        return ""
-    try:
-        raw, _source = resolve_copilot_token()
-    except Exception:
-        return ""
-    if not raw:
-        return ""
-    try:
-        api_token, _base_url = get_copilot_api_token(raw)
-    except Exception:
-        return raw
-    return str(api_token or raw).strip()
-
-
 def _copilot_claude_supports_reasoning_effort(bare_model: str) -> bool:
     """True for Copilot-hosted Claude models that advertise an effort ladder.
 
