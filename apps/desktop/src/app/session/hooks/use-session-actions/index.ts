@@ -6,6 +6,8 @@ import { revealTreePane } from '@/components/pane-shell/tree/store'
 import { deleteSession, getAllSessionMessages, getLatestSessionMessages, setSessionArchived } from '@/hermes'
 import { useI18n } from '@/i18n'
 import { type ChatMessage, preserveLocalAssistantErrors, toChatMessages } from '@/lib/chat-messages'
+import { isDesktopFsRemoteMode } from '@/lib/desktop-fs'
+import { desktopGit } from '@/lib/desktop-git'
 import { isMissingRpcMethod } from '@/lib/gateway-rpc'
 import { recoverInFlightTurnJournal } from '@/lib/inflight-turn-journal'
 import { setSessionYolo } from '@/lib/yolo-session'
@@ -13,11 +15,13 @@ import { normalizeChoices, setClarifyRequest } from '@/store/clarify'
 import { migrateSessionDraft } from '@/store/composer'
 import { clearQueuedPrompts, migrateQueuedPrompts } from '@/store/composer-queue'
 import { $pinnedSessionIds } from '@/store/layout'
+import { type AutomaticSessionWorktree, isolateNewSessionCwd } from '@/store/new-session-worktree'
 import { clearNotifications, notify, notifyError } from '@/store/notifications'
 import { $activeGatewayProfile, $newChatProfile, ensureGatewayProfile, normalizeProfileKey } from '@/store/profile'
 import {
   beginSessionMutation,
   endSessionMutation,
+  refreshWorktrees,
   resolveNewSessionCwd,
   tombstoneSessions,
   untombstoneSessions
@@ -100,6 +104,70 @@ import {
   upsertOptimisticSession
 } from './utils'
 
+async function isolatedNewSessionCwd(
+  cwd: string
+): Promise<{ cwd: string; worktree: AutomaticSessionWorktree | null }> {
+  if (!cwd || isDesktopFsRemoteMode()) {
+    return { cwd, worktree: null }
+  }
+
+  const git = desktopGit()
+
+  if (!git) {
+    return { cwd, worktree: null }
+  }
+
+  let worktree: AutomaticSessionWorktree | null = null
+
+  const isolatedCwd = await isolateNewSessionCwd(cwd, git, undefined, created => {
+    worktree = created
+  })
+
+  if (isolatedCwd !== cwd) {
+    refreshWorktrees()
+  }
+
+  return { cwd: isolatedCwd, worktree }
+}
+
+async function cleanupAutomaticWorktree(worktree: AutomaticSessionWorktree | null): Promise<void> {
+  if (!worktree) {
+    return
+  }
+
+  const git = desktopGit()
+
+  if (!git) {
+    console.warn('[auto-worktree-cleanup-failed]')
+
+    return
+  }
+
+  await git
+    .worktreeRemove(worktree.repoPath, worktree.path, {
+      deleteBranch: { base: worktree.base, branch: worktree.branch },
+      force: false
+    })
+    .then(() => refreshWorktrees())
+    .catch(() => {
+      console.warn('[auto-worktree-cleanup-failed]')
+    })
+}
+
+function requireSessionCreateResponse(value: unknown): SessionCreateResponse {
+  if (!value || typeof value !== 'object') {
+    throw new Error('The backend returned an invalid session.create response.')
+  }
+
+  const response = value as Partial<SessionCreateResponse>
+
+  if (typeof response.session_id !== 'string' || !response.session_id.trim()) {
+    throw new Error('The backend returned an invalid session.create response.')
+  }
+
+  return response as SessionCreateResponse
+}
+
 interface SessionActionsOptions {
   activeSessionId: string | null
   activeSessionIdRef: MutableRefObject<string | null>
@@ -176,20 +244,38 @@ function reconcileAuthoritativeMessages(
 // A no-op for single-profile/local-pooled users (a backend resolves its own launch
 // profile to None). The sticky UI model/effort/fast ride as per-session overrides,
 // never the profile default (that lives in Settings → Model).
-async function desktopSessionCreateParams(cwd: string): Promise<Record<string, unknown>> {
+interface DesktopSessionSelection {
+  effort: string
+  fast: boolean
+  model: string
+  profile: string
+  provider: string
+}
+
+function desktopSessionSelection(): DesktopSessionSelection {
   // Treat Send as the linearization point for the visible selector state. The
   // profile handshake below can yield long enough for background config/model
   // refreshes to finish; reading atoms afterward would silently create the
   // session with a different selection than the one the user submitted.
-  const selection = {
+  return {
     effort: $currentReasoningEffort.get().trim(),
     fast: $currentFastMode.get(),
     model: $currentModel.get().trim(),
+    profile: $newChatProfile.get() ?? normalizeProfileKey($activeGatewayProfile.get()),
     provider: $currentProvider.get().trim()
   }
+}
 
-  const profile = $newChatProfile.get() ?? normalizeProfileKey($activeGatewayProfile.get())
-  await ensureGatewayProfile(profile)
+async function desktopSessionCreateParams(
+  cwd: string,
+  selection = desktopSessionSelection(),
+  profileReady = false
+): Promise<Record<string, unknown>> {
+  const { profile } = selection
+
+  if (!profileReady) {
+    await ensureGatewayProfile(profile)
+  }
 
   return {
     cols: 96,
@@ -428,8 +514,13 @@ export function useSessionActions({
 
   const createBackendSessionForSend = useCallback(
     async (preview: string | null = null): Promise<string | null> => {
+      if (creatingSessionRef.current) {
+        return null
+      }
+
       const startingStoredSessionId = selectedStoredSessionIdRef.current
       const startingRouteToken = getRouteToken()
+      const selection = desktopSessionSelection()
 
       creatingSessionRef.current = true
 
@@ -439,15 +530,93 @@ export function useSessionActions({
         // (resolveNewSessionCwd — a project's new session keeps its repo cwd).
         const workspaceTarget = $newChatWorkspaceTarget.get()
 
-        const cwd =
+        let cwd =
           workspaceTarget === null
             ? ''
             : typeof workspaceTarget === 'string'
               ? workspaceTarget.trim()
               : $currentCwd.get().trim() || resolveNewSessionCwd()
 
-        const params = await desktopSessionCreateParams(cwd)
-        const created = await requestGateway<SessionCreateResponse>('session.create', params)
+        const sourceCwd = cwd
+
+        await ensureGatewayProfile(selection.profile)
+
+        const profileReadyDrift = sessionContextDrift({
+          startRouteToken: startingRouteToken,
+          nowRouteToken: getRouteToken(),
+          startSelectedStoredId: startingStoredSessionId,
+          nowSelectedStoredId: selectedStoredSessionIdRef.current,
+          submitTargetStoredId: null
+        })
+
+        if (profileReadyDrift) {
+          console.warn('[submit-drift-abort]', profileReadyDrift, { phase: 'profile-ready' })
+
+          return null
+        }
+
+        if (!cwd && workspaceTarget !== null && !isDesktopFsRemoteMode()) {
+          const project = await requestGateway<{ cwd?: unknown }>('config.get', { key: 'project' })
+          cwd = typeof project?.cwd === 'string' ? project.cwd.trim() : ''
+
+          if (!cwd) {
+            throw new Error('Cannot isolate a global local session without the backend default cwd.')
+          }
+        }
+
+        const preIsolationDrift = sessionContextDrift({
+          startRouteToken: startingRouteToken,
+          nowRouteToken: getRouteToken(),
+          startSelectedStoredId: startingStoredSessionId,
+          nowSelectedStoredId: selectedStoredSessionIdRef.current,
+          submitTargetStoredId: null
+        })
+
+        if (preIsolationDrift) {
+          console.warn('[submit-drift-abort]', preIsolationDrift, { phase: 'pre-isolation' })
+
+          return null
+        }
+
+        const isolation = await isolatedNewSessionCwd(cwd)
+        const isolatedCwd = isolation.cwd
+
+        const preCreateDrift = sessionContextDrift({
+          startRouteToken: startingRouteToken,
+          nowRouteToken: getRouteToken(),
+          startSelectedStoredId: startingStoredSessionId,
+          nowSelectedStoredId: selectedStoredSessionIdRef.current,
+          submitTargetStoredId: null
+        })
+
+        if (preCreateDrift) {
+          console.warn('[submit-drift-abort]', preCreateDrift, { phase: 'pre-create' })
+          await cleanupAutomaticWorktree(isolation.worktree)
+
+          return null
+        }
+
+        if (isolatedCwd !== cwd) {
+          cwd = isolatedCwd
+          setCurrentCwd(cwd)
+        }
+
+        let created: SessionCreateResponse
+
+        try {
+          const params = await desktopSessionCreateParams(cwd, selection, true)
+
+          created = requireSessionCreateResponse(await requestGateway<SessionCreateResponse>('session.create', params))
+        } catch (error) {
+          await cleanupAutomaticWorktree(isolation.worktree)
+
+          if ($currentCwd.get() === cwd) {
+            setCurrentCwd(sourceCwd)
+          }
+
+          throw error
+        }
+
         const stored = created.stored_session_id ?? null
 
         // Only a genuine move to a DIFFERENT chat mid-create should orphan the
@@ -469,6 +638,11 @@ export function useSessionActions({
         if (drift) {
           console.warn('[submit-drift-abort]', drift, { phase: 'mid-create' })
           await requestGateway('session.close', { session_id: created.session_id }).catch(() => undefined)
+          await cleanupAutomaticWorktree(isolation.worktree)
+
+          if ($currentCwd.get() === cwd) {
+            setCurrentCwd(sourceCwd)
+          }
 
           return null
         }
@@ -559,15 +733,33 @@ export function useSessionActions({
       const listed = options?.listed ?? true
 
       try {
+        const selection = desktopSessionSelection()
+
+        await ensureGatewayProfile(selection.profile)
+
         // Fresh tile → the caller's workspace when one was named (the sidebar
         // "+" on a project/worktree lane), else the resolved new-session cwd
-        // (project scope → configured default).
-        const params = await desktopSessionCreateParams((options?.cwd || resolveNewSessionCwd()).trim())
-        const created = await requestGateway<SessionCreateResponse>('session.create', params)
+        // (project scope → configured default) — never the primary composer's
+        // live cwd.
+        const sourceCwd = (options?.cwd || resolveNewSessionCwd()).trim()
+        const isolation = await isolatedNewSessionCwd(sourceCwd)
+        const cwd = isolation.cwd
+        let created: SessionCreateResponse
+
+        try {
+          const params = await desktopSessionCreateParams(cwd, selection, true)
+
+          created = requireSessionCreateResponse(await requestGateway<SessionCreateResponse>('session.create', params))
+        } catch (error) {
+          await cleanupAutomaticWorktree(isolation.worktree)
+          throw error
+        }
+
         const stored = created.stored_session_id
 
         if (!stored) {
           await requestGateway('session.close', { session_id: created.session_id }).catch(() => undefined)
+          await cleanupAutomaticWorktree(isolation.worktree)
           notify({ kind: 'error', title: copy.sessionUnavailable, message: copy.createSessionFailed })
 
           return
@@ -659,6 +851,7 @@ export function useSessionActions({
       // now-redundant tile so main owns it. Runs before the async awaits below (and
       // before the selection listener homes focus) so the tile is gone the same tick
       // the route takes over; the warm cache/runtime binding survives for main to reuse.
+
       if ($sessionTiles.get().some(t => t.storedSessionId === storedSessionId)) {
         closeSessionTile(storedSessionId)
       }
@@ -668,6 +861,7 @@ export function useSessionActions({
       // must not keep treating it as stranded. It's re-armed below only if THIS
       // attempt fails terminally (RPC reject + REST fallback failure).
       setResumeFailedSessionId(current => (current === storedSessionId ? null : current))
+
       // Also clear the exhausted-latch: a fresh attempt (manual Retry, reconnect,
       // reselect) gives the bounded auto-retry counter a clean cycle, so the
       // chat view drops the error state and shows the loader again.
@@ -1341,6 +1535,7 @@ export function useSessionActions({
       branchCount?: number
     ): Promise<boolean> => {
       creatingSessionRef.current = true
+      let automaticWorktree: AutomaticSessionWorktree | null = null
 
       try {
         // A branch belongs to its parent's OWNING profile. Swapping the live
@@ -1352,20 +1547,27 @@ export function useSessionActions({
         // upsertOptimisticSession's $activeGatewayProfile stamp correct.
         await ensureGatewayProfile(profile)
 
+        const isolation = !sourceSessionId && cwd ? await isolatedNewSessionCwd(cwd) : { cwd: cwd || '', worktree: null }
+        automaticWorktree = isolation.worktree
+
         // No title: the backend auto-names the branch from its parent's lineage.
         const branched = sourceSessionId
           ? await requestGateway<SessionCreateResponse>('session.branch', {
               session_id: sourceSessionId,
               ...(branchCount !== undefined ? { count: branchCount } : {})
             })
-          : await requestGateway<SessionCreateResponse>('session.create', {
-              cols: 96,
-              source: 'desktop',
-              ...(cwd && { cwd }),
-              ...(profile ? { profile } : {}),
-              messages: branchMessages.map(({ content, role }) => ({ content, role })),
-              ...(parentStoredId && { parent_session_id: parentStoredId })
-            })
+          : requireSessionCreateResponse(
+              await requestGateway<SessionCreateResponse>('session.create', {
+                cols: 96,
+                source: 'desktop',
+                ...(isolation.cwd && { cwd: isolation.cwd }),
+                ...(profile ? { profile } : {}),
+                messages: branchMessages.map(({ content, role }) => ({ content, role })),
+                ...(parentStoredId && { parent_session_id: parentStoredId })
+              })
+            )
+
+        automaticWorktree = null
 
         const responseBranchMessages =
           sourceSessionId && branched.messages?.length ? toBranchMessages(toChatMessages(branched.messages)) : []
@@ -1424,6 +1626,7 @@ export function useSessionActions({
 
         return true
       } catch (err) {
+        await cleanupAutomaticWorktree(automaticWorktree)
         notifyError(err, copy.branchFailed)
 
         return false

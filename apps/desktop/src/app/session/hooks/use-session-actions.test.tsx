@@ -7,12 +7,14 @@ import { $terminalTakeover, setTerminalTakeover } from '@/app/right-sidebar/stor
 import { noteActiveTreeGroup, revealTreePane } from '@/components/pane-shell/tree/store'
 import { getAllSessionMessages, getLatestSessionMessages, getSession, type SessionInfo } from '@/hermes'
 import { createClientSessionState } from '@/lib/chat-runtime'
+import * as desktopGitModule from '@/lib/desktop-git'
 import { clearSessionDraft, stashSessionDraft, takeSessionDraft } from '@/store/composer'
 import { $activeGatewayProfile, $newChatProfile, ensureGatewayProfile } from '@/store/profile'
 import { $projectScope, $projectTree, ALL_PROJECTS } from '@/store/projects'
 import {
   $activeSessionId,
   $activeSessionStoredIdRotation,
+  $connection,
   $currentCwd,
   $currentFastMode,
   $currentModel,
@@ -37,7 +39,7 @@ import {
 } from '@/store/session'
 import { $sessionTiles } from '@/store/session-states'
 
-import { sessionRoute } from '../../routes'
+import { NEW_CHAT_ROUTE, sessionRoute } from '../../routes'
 import type { ClientSessionState } from '../../types'
 
 import { useSessionActions } from './use-session-actions'
@@ -78,7 +80,7 @@ function deferred<T>() {
 
 type HarnessHandle = Pick<
   ReturnType<typeof useSessionActions>,
-  'createBackendSessionForSend' | 'selectSidebarItem' | 'startFreshSessionDraft'
+  'createBackendSessionForSend' | 'openNewSessionTile' | 'selectSidebarItem' | 'startFreshSessionDraft'
 >
 
 function storedSession(overrides: Partial<SessionInfo> = {}): SessionInfo {
@@ -101,10 +103,12 @@ function storedSession(overrides: Partial<SessionInfo> = {}): SessionInfo {
 }
 
 function Harness({
+  getRouteToken = () => 'token',
   navigate = vi.fn(),
   onReady,
   requestGateway
 }: {
+  getRouteToken?: () => string
   navigate?: ReturnType<typeof vi.fn>
   onReady: (handle: HarnessHandle) => void
   requestGateway: <T>(method: string, params?: Record<string, unknown>) => Promise<T>
@@ -117,7 +121,7 @@ function Harness({
     busyRef: ref(false),
     creatingSessionRef: ref(false),
     ensureSessionState: () => ({}) as ClientSessionState,
-    getRouteToken: () => 'token',
+    getRouteToken,
     getRoutedStoredSessionId: () => null,
     navigate: navigate as never,
     requestGateway,
@@ -387,6 +391,10 @@ async function createWith(
   let createParams: Record<string, unknown> | undefined
 
   const requestGateway = vi.fn(async (method: string, params?: Record<string, unknown>) => {
+    if (method === 'config.get') {
+      return { branch: '', cwd: '/not-a-repository' } as never
+    }
+
     if (method === 'session.create') {
       createParams = params
 
@@ -463,6 +471,7 @@ describe('startFreshSessionDraft', () => {
 describe('createBackendSessionForSend profile routing', () => {
   afterEach(() => {
     cleanup()
+    $connection.set(null)
     $newChatProfile.set(null)
     $activeGatewayProfile.set('default')
     $projectScope.set(ALL_PROJECTS)
@@ -521,6 +530,473 @@ describe('createBackendSessionForSend profile routing', () => {
     expect(params).toMatchObject({ cwd: '/remote/worktree' })
   })
 
+  it('isolates a new chat from the main checkout before session.create', async () => {
+    vi.spyOn(desktopGitModule, 'desktopGit').mockReturnValue({
+      baseBranchList: vi.fn(async () => [{ isDefault: true, isRemote: true, name: 'origin/main' }]),
+      repoStatus: vi.fn(async () => ({ branch: 'feature/stale', defaultBranch: 'main', detached: false } as never)),
+      worktreeAdd: vi.fn(async () => ({ branch: 'hermes/session-fixed', path: '/repo/.worktrees/session-fixed' })),
+      worktreeList: vi.fn(async () => [
+        { branch: 'feature/stale', detached: false, isMain: true, locked: false, path: '/repo' }
+      ])
+    } as never)
+
+    const params = await createWith(() => {
+      $currentCwd.set('/repo')
+    })
+
+    expect(params).toMatchObject({ cwd: '/repo/.worktrees/session-fixed' })
+  })
+
+  it('isolates the local backend default cwd for a global new chat before session.create', async () => {
+    vi.spyOn(desktopGitModule, 'desktopGit').mockReturnValue({
+      baseBranchList: vi.fn(async () => [{ isDefault: true, isRemote: true, name: 'origin/main' }]),
+      repoStatus: vi.fn(async () => ({ branch: 'main', defaultBranch: 'main', detached: false } as never)),
+      worktreeAdd: vi.fn(async () => ({ branch: 'hermes/session-fixed', path: '/repo/.worktrees/session-fixed' })),
+      worktreeList: vi.fn(async () => [
+        { branch: 'main', detached: false, isMain: true, locked: false, path: '/repo' }
+      ])
+    } as never)
+
+    let createParams: Record<string, unknown> | undefined
+
+    const requestGateway = vi.fn(async (method: string, params?: Record<string, unknown>) => {
+      if (method === 'config.get') {
+        return { branch: 'main', cwd: '/repo' } as never
+      }
+
+      if (method === 'session.create') {
+        createParams = params
+
+        return { session_id: RUNTIME_SESSION_ID, stored_session_id: null } as never
+      }
+
+      return {} as never
+    })
+
+    let handle: HarnessHandle | null = null
+    $currentCwd.set('')
+    setNewChatWorkspaceTarget(undefined)
+    render(<Harness onReady={next => (handle = next)} requestGateway={requestGateway} />)
+    await waitFor(() => expect(handle).not.toBeNull())
+
+    await act(async () => {
+      await handle!.createBackendSessionForSend()
+    })
+
+    expect(requestGateway).toHaveBeenCalledWith('config.get', { key: 'project' })
+    expect(createParams).toMatchObject({ cwd: '/repo/.worktrees/session-fixed' })
+  })
+
+  it('fails closed before session.create when the local backend default cwd is unavailable', async () => {
+    const desktopGitSpy = vi.spyOn(desktopGitModule, 'desktopGit')
+    const requestGateway = vi.fn(async () => ({} as never))
+    let handle: HarnessHandle | null = null
+
+    $currentCwd.set('')
+    setNewChatWorkspaceTarget(undefined)
+    render(<Harness onReady={next => (handle = next)} requestGateway={requestGateway} />)
+    await waitFor(() => expect(handle).not.toBeNull())
+
+    await expect(handle!.createBackendSessionForSend()).rejects.toThrow('backend default cwd')
+    expect(requestGateway).toHaveBeenCalledTimes(1)
+    expect(requestGateway).toHaveBeenCalledWith('config.get', { key: 'project' })
+    expect(requestGateway).not.toHaveBeenCalledWith('session.create', expect.anything())
+    expect(desktopGitSpy).not.toHaveBeenCalled()
+  })
+
+  it('aborts before Git isolation when the route changes while resolving the local default cwd', async () => {
+    const project = deferred<{ branch: string; cwd: string }>()
+    const desktopGitSpy = vi.spyOn(desktopGitModule, 'desktopGit')
+
+    const requestGateway = vi.fn(async (method: string) => {
+      if (method === 'config.get') {
+        return project.promise as never
+      }
+
+      return { session_id: RUNTIME_SESSION_ID, stored_session_id: null } as never
+    })
+
+    let routeToken = `${NEW_CHAT_ROUTE}::`
+    let handle: HarnessHandle | null = null
+
+    $currentCwd.set('')
+    setNewChatWorkspaceTarget(undefined)
+    render(
+      <Harness getRouteToken={() => routeToken} onReady={next => (handle = next)} requestGateway={requestGateway} />
+    )
+    await waitFor(() => expect(handle).not.toBeNull())
+
+    const createPromise = handle!.createBackendSessionForSend()
+
+    await waitFor(() => expect(requestGateway).toHaveBeenCalledWith('config.get', { key: 'project' }))
+    routeToken = `${sessionRoute('stored-other-chat')}::`
+    $currentCwd.set('/other-session')
+    project.resolve({ branch: 'main', cwd: '/repo' })
+
+    await expect(createPromise).resolves.toBeNull()
+    expect(desktopGitSpy).not.toHaveBeenCalled()
+    expect(requestGateway).not.toHaveBeenCalledWith('session.create', expect.anything())
+    expect($currentCwd.get()).toBe('/other-session')
+  })
+
+  it('keeps a cwd-less global new chat remote and never probes local Git or local default cwd', async () => {
+    const desktopGitSpy = vi.spyOn(desktopGitModule, 'desktopGit')
+
+    const requestGateway = vi.fn(async (method: string) => {
+      if (method === 'session.create') {
+        return { session_id: RUNTIME_SESSION_ID, stored_session_id: null } as never
+      }
+
+      return {} as never
+    })
+
+    let handle: HarnessHandle | null = null
+
+    $connection.set({ mode: 'remote', profile: 'default' } as never)
+    $currentCwd.set('')
+    setNewChatWorkspaceTarget(undefined)
+    render(<Harness onReady={next => (handle = next)} requestGateway={requestGateway} />)
+    await waitFor(() => expect(handle).not.toBeNull())
+
+    await act(async () => {
+      await handle!.createBackendSessionForSend()
+    })
+
+    expect(requestGateway.mock.calls.map(([method]) => method)).toEqual(['session.create'])
+    expect(desktopGitSpy).not.toHaveBeenCalled()
+  })
+
+  it('activates an explicit remote profile before resolving the global cwd or probing local Git', async () => {
+    const profileReady = deferred<void>()
+    const desktopGitSpy = vi.spyOn(desktopGitModule, 'desktopGit')
+
+    vi.mocked(ensureGatewayProfile).mockImplementationOnce(async () => {
+      await profileReady.promise
+      $connection.set({ mode: 'remote', profile: 'remote-profile' } as never)
+    })
+
+    const requestGateway = vi.fn(async (method: string, params?: Record<string, unknown>) => {
+      if (method === 'config.get') {
+        return { branch: 'main', cwd: '/old-local-repo' } as never
+      }
+
+      if (method === 'session.create') {
+        return { session_id: RUNTIME_SESSION_ID, stored_session_id: null } as never
+      }
+
+      return params as never
+    })
+
+    let handle: HarnessHandle | null = null
+
+    $connection.set({ mode: 'local', profile: 'default' } as never)
+    $newChatProfile.set('remote-profile')
+    $currentCwd.set('')
+    setNewChatWorkspaceTarget(undefined)
+    render(<Harness onReady={next => (handle = next)} requestGateway={requestGateway} />)
+    await waitFor(() => expect(handle).not.toBeNull())
+
+    const createPromise = handle!.createBackendSessionForSend()
+
+    await waitFor(() => expect(ensureGatewayProfile).toHaveBeenCalledWith('remote-profile'))
+    profileReady.resolve()
+    await expect(createPromise).resolves.toBe(RUNTIME_SESSION_ID)
+
+    expect(requestGateway.mock.calls.map(([method]) => method)).toEqual(['session.create'])
+    expect(requestGateway).toHaveBeenCalledWith(
+      'session.create',
+      expect.objectContaining({ profile: 'remote-profile' })
+    )
+    expect(desktopGitSpy).not.toHaveBeenCalled()
+  })
+
+  it('does not invoke desktop Git while connected to a remote backend', async () => {
+    const git = {
+      baseBranchList: vi.fn(),
+      repoStatus: vi.fn(),
+      worktreeAdd: vi.fn(),
+      worktreeList: vi.fn()
+    }
+
+    const desktopGitSpy = vi.spyOn(desktopGitModule, 'desktopGit').mockReturnValue(git as never)
+
+    $connection.set({ mode: 'remote', profile: 'default' } as never)
+
+    const params = await createWith(() => {
+      $currentCwd.set('/srv/repo')
+    })
+
+    expect(desktopGitSpy).not.toHaveBeenCalled()
+    expect(params).toMatchObject({ cwd: '/srv/repo' })
+  })
+
+  it('isolates a new split session before its eager session.create', async () => {
+    vi.spyOn(desktopGitModule, 'desktopGit').mockReturnValue({
+      baseBranchList: vi.fn(async () => [{ isDefault: true, isRemote: true, name: 'origin/main' }]),
+      repoStatus: vi.fn(async () => ({ branch: 'feature/stale', detached: false } as never)),
+      worktreeAdd: vi.fn(async () => ({ branch: 'hermes/session-fixed', path: '/repo/.worktrees/session-fixed' })),
+      worktreeList: vi.fn(async () => [
+        { branch: 'feature/stale', detached: false, isMain: true, locked: false, path: '/repo' }
+      ])
+    } as never)
+
+    let createParams: Record<string, unknown> | undefined
+
+    const requestGateway = vi.fn(async (method: string, params?: Record<string, unknown>) => {
+      if (method === 'session.create') {
+        createParams = params
+
+        return { session_id: RUNTIME_SESSION_ID, stored_session_id: 'stored-split' } as never
+      }
+
+      return {} as never
+    })
+
+    let handle: HarnessHandle | null = null
+    render(<Harness onReady={next => (handle = next)} requestGateway={requestGateway} />)
+    await waitFor(() => expect(handle).not.toBeNull())
+
+    await act(async () => {
+      await handle!.openNewSessionTile('right', { cwd: '/repo' })
+    })
+
+    expect(createParams).toMatchObject({ cwd: '/repo/.worktrees/session-fixed' })
+  })
+
+  it('activates an explicit remote profile before resolving split-session isolation', async () => {
+    const profileReady = deferred<void>()
+
+    const desktopGitSpy = vi.spyOn(desktopGitModule, 'desktopGit').mockReturnValue({
+      baseBranchList: vi.fn(async () => [{ isDefault: true, isRemote: true, name: 'origin/main' }]),
+      repoStatus: vi.fn(async () => ({ branch: 'main', defaultBranch: 'main', detached: false } as never)),
+      worktreeAdd: vi.fn(async () => ({ branch: 'hermes/session-stale', path: '/repo/.worktrees/session-stale' })),
+      worktreeList: vi.fn(async () => [{ branch: 'main', detached: false, isMain: true, locked: false, path: '/repo' }])
+    } as never)
+
+    $connection.set({ mode: 'local', profile: 'default' } as never)
+    $newChatProfile.set('remote-profile')
+    vi.mocked(ensureGatewayProfile).mockImplementationOnce(async () => {
+      await profileReady.promise
+      $connection.set({ mode: 'remote', profile: 'remote-profile' } as never)
+    })
+
+    const requestGateway = vi.fn(async (method: string, params?: Record<string, unknown>) => {
+      if (method === 'session.create') {
+        return { session_id: RUNTIME_SESSION_ID, stored_session_id: 'stored-remote-split' } as never
+      }
+
+      return params as never
+    })
+
+    let handle: HarnessHandle | null = null
+
+    render(<Harness onReady={next => (handle = next)} requestGateway={requestGateway} />)
+    await waitFor(() => expect(handle).not.toBeNull())
+
+    const createPromise = handle!.openNewSessionTile('right', { cwd: '/repo' })
+
+    await waitFor(() => expect(ensureGatewayProfile).toHaveBeenCalledWith('remote-profile'))
+    expect(desktopGitSpy).not.toHaveBeenCalled()
+    expect(requestGateway).not.toHaveBeenCalled()
+
+    profileReady.resolve()
+    await act(async () => {
+      await createPromise
+    })
+
+    expect(desktopGitSpy).not.toHaveBeenCalled()
+    expect(requestGateway).toHaveBeenCalledWith(
+      'session.create',
+      expect.objectContaining({ cwd: '/repo', profile: 'remote-profile' })
+    )
+  })
+
+  it.each([
+    ['returns null', null],
+    ['omits the stored session id', { session_id: RUNTIME_SESSION_ID, stored_session_id: null }]
+  ])('removes an automatic split worktree when session.create %s', async (_label, response) => {
+    const worktreeRemove = vi.fn(async () => undefined)
+
+    vi.spyOn(desktopGitModule, 'desktopGit').mockReturnValue({
+      baseBranchList: vi.fn(async () => [{ isDefault: true, isRemote: true, name: 'origin/main' }]),
+      repoStatus: vi.fn(async () => ({ branch: 'feature/stale', defaultBranch: 'main', detached: false } as never)),
+      worktreeAdd: vi.fn(async () => ({ branch: 'hermes/session-fixed', path: '/repo/.worktrees/session-fixed' })),
+      worktreeList: vi.fn(async () => [
+        { branch: 'feature/stale', detached: false, isMain: true, locked: false, path: '/repo' }
+      ]),
+      worktreeRemove
+    } as never)
+
+    const requestGateway = vi.fn(async (method: string) => {
+      if (method === 'session.create') {
+        return response as never
+      }
+
+      return {} as never
+    })
+
+    let handle: HarnessHandle | null = null
+
+    render(<Harness onReady={next => (handle = next)} requestGateway={requestGateway} />)
+    await waitFor(() => expect(handle).not.toBeNull())
+
+    await act(async () => {
+      await handle!.openNewSessionTile('right', { cwd: '/repo' })
+    })
+
+    expect(worktreeRemove).toHaveBeenCalledWith('/repo', '/repo/.worktrees/session-fixed', {
+      deleteBranch: { base: 'origin/main', branch: 'hermes/session-fixed' },
+      force: false
+    })
+
+    if (response) {
+      expect(requestGateway).toHaveBeenCalledWith('session.close', { session_id: RUNTIME_SESSION_ID })
+    }
+  })
+
+  it.each([
+    ['rejects', new Error('backend unavailable')],
+    ['returns null', null]
+  ])('removes an unused automatic worktree without force when session.create %s', async (_label, failure) => {
+    const worktreeRemove = vi.fn(async () => undefined)
+
+    vi.spyOn(desktopGitModule, 'desktopGit').mockReturnValue({
+      baseBranchList: vi.fn(async () => [{ isDefault: true, isRemote: true, name: 'origin/main' }]),
+      repoStatus: vi.fn(async () => ({ branch: 'feature/stale', detached: false } as never)),
+      worktreeAdd: vi.fn(async () => ({ branch: 'hermes/session-fixed', path: '/repo/.worktrees/session-fixed' })),
+      worktreeList: vi.fn(async () => [
+        { branch: 'feature/stale', detached: false, isMain: true, locked: false, path: '/repo' }
+      ]),
+      worktreeRemove
+    } as never)
+
+    const requestGateway = vi.fn(async (method: string) => {
+      if (method === 'session.create') {
+        if (failure instanceof Error) {
+          throw failure
+        }
+
+        return failure as never
+      }
+
+      return {} as never
+    })
+
+    let handle: HarnessHandle | null = null
+
+    $currentCwd.set('/repo')
+    render(<Harness onReady={next => (handle = next)} requestGateway={requestGateway} />)
+    await waitFor(() => expect(handle).not.toBeNull())
+
+    await expect(handle!.createBackendSessionForSend()).rejects.toThrow()
+    expect(worktreeRemove).toHaveBeenCalledWith('/repo', '/repo/.worktrees/session-fixed', {
+      deleteBranch: { base: 'origin/main', branch: 'hermes/session-fixed' },
+      force: false
+    })
+    expect($currentCwd.get()).toBe('/repo')
+  })
+
+  it('does not touch local Git when profile readiness fails before isolation', async () => {
+    const worktreeRemove = vi.fn(async () => undefined)
+
+    const desktopGitSpy = vi.spyOn(desktopGitModule, 'desktopGit').mockReturnValue({
+      baseBranchList: vi.fn(async () => [{ isDefault: true, isRemote: true, name: 'origin/main' }]),
+      repoStatus: vi.fn(async () => ({ branch: 'feature/stale', defaultBranch: 'main', detached: false } as never)),
+      worktreeAdd: vi.fn(async () => ({ branch: 'hermes/session-fixed', path: '/repo/.worktrees/session-fixed' })),
+      worktreeList: vi.fn(async () => [
+        { branch: 'feature/stale', detached: false, isMain: true, locked: false, path: '/repo' }
+      ]),
+      worktreeRemove
+    } as never)
+
+    vi.mocked(ensureGatewayProfile).mockRejectedValueOnce(new Error('profile unavailable'))
+
+    const requestGateway = vi.fn()
+    let handle: HarnessHandle | null = null
+
+    $currentCwd.set('/repo')
+    render(<Harness onReady={next => (handle = next)} requestGateway={requestGateway} />)
+    await waitFor(() => expect(handle).not.toBeNull())
+
+    await expect(handle!.createBackendSessionForSend()).rejects.toThrow('profile unavailable')
+    expect(requestGateway).not.toHaveBeenCalled()
+    expect(desktopGitSpy).not.toHaveBeenCalled()
+    expect(worktreeRemove).not.toHaveBeenCalled()
+    expect($currentCwd.get()).toBe('/repo')
+  })
+
+  it('aborts before session.create when the route changes during worktree creation', async () => {
+    const added = deferred<{ branch: string; path: string }>()
+    const worktreeRemove = vi.fn(async () => undefined)
+
+    vi.spyOn(desktopGitModule, 'desktopGit').mockReturnValue({
+      baseBranchList: vi.fn(async () => [{ isDefault: true, isRemote: true, name: 'origin/main' }]),
+      repoStatus: vi.fn(async () => ({ branch: 'feature/stale', detached: false } as never)),
+      worktreeAdd: vi.fn(() => added.promise),
+      worktreeList: vi.fn(async () => [
+        { branch: 'feature/stale', detached: false, isMain: true, locked: false, path: '/repo' }
+      ]),
+      worktreeRemove
+    } as never)
+
+    const requestGateway = vi.fn(async () => ({ session_id: RUNTIME_SESSION_ID, stored_session_id: null }) as never)
+    let routeToken = `${NEW_CHAT_ROUTE}::`
+    let handle: HarnessHandle | null = null
+
+    $currentCwd.set('/repo')
+    render(
+      <Harness getRouteToken={() => routeToken} onReady={next => (handle = next)} requestGateway={requestGateway} />
+    )
+    await waitFor(() => expect(handle).not.toBeNull())
+
+    const createPromise = handle!.createBackendSessionForSend()
+
+    await waitFor(() => expect(desktopGitModule.desktopGit).toHaveBeenCalled())
+    routeToken = `${sessionRoute('stored-other-chat')}::`
+    $currentCwd.set('/other-session')
+    added.resolve({ branch: 'hermes/session-fixed', path: '/repo/.worktrees/session-fixed' })
+
+    await expect(createPromise).resolves.toBeNull()
+    expect(requestGateway).not.toHaveBeenCalledWith('session.create', expect.anything())
+    expect(worktreeRemove).toHaveBeenCalledWith('/repo', '/repo/.worktrees/session-fixed', {
+      deleteBranch: { base: 'origin/main', branch: 'hermes/session-fixed' },
+      force: false
+    })
+    expect($currentCwd.get()).toBe('/other-session')
+  })
+
+  it('serializes duplicate first submits into one worktree and one session', async () => {
+    const added = deferred<{ branch: string; path: string }>()
+    const worktreeAdd = vi.fn(() => added.promise)
+
+    vi.spyOn(desktopGitModule, 'desktopGit').mockReturnValue({
+      baseBranchList: vi.fn(async () => [{ isDefault: true, isRemote: true, name: 'origin/main' }]),
+      repoStatus: vi.fn(async () => ({ branch: 'feature/stale', detached: false } as never)),
+      worktreeAdd,
+      worktreeList: vi.fn(async () => [
+        { branch: 'feature/stale', detached: false, isMain: true, locked: false, path: '/repo' }
+      ])
+    } as never)
+
+    const requestGateway = vi.fn(async () => ({ session_id: RUNTIME_SESSION_ID, stored_session_id: null }) as never)
+    let handle: HarnessHandle | null = null
+
+    $currentCwd.set('/repo')
+    render(<Harness onReady={next => (handle = next)} requestGateway={requestGateway} />)
+    await waitFor(() => expect(handle).not.toBeNull())
+
+    const first = handle!.createBackendSessionForSend()
+    const second = handle!.createBackendSessionForSend()
+
+    await waitFor(() => expect(worktreeAdd).toHaveBeenCalled())
+    added.resolve({ branch: 'hermes/session-fixed', path: '/repo/.worktrees/session-fixed' })
+
+    await expect(second).resolves.toBeNull()
+    await expect(first).resolves.toBe(RUNTIME_SESSION_ID)
+    expect(worktreeAdd).toHaveBeenCalledTimes(1)
+    expect(requestGateway).toHaveBeenCalledTimes(1)
+  })
+
   it('freezes the visible selector state before profile readiness and sends fast: false explicitly', async () => {
     const profileReady = deferred<void>()
     vi.mocked(ensureGatewayProfile).mockReturnValueOnce(profileReady.promise)
@@ -533,6 +1009,10 @@ describe('createBackendSessionForSend profile routing', () => {
     let createParams: Record<string, unknown> | undefined
 
     const requestGateway = vi.fn(async (method: string, params?: Record<string, unknown>) => {
+      if (method === 'config.get') {
+        return { branch: '', cwd: '/not-a-repository' } as never
+      }
+
       if (method === 'session.create') {
         createParams = params
 
@@ -1209,6 +1689,13 @@ describe('branchStoredSession desktop source tagging', () => {
   it('tags desktop branch sessions as desktop sessions', async () => {
     let createParams: Record<string, unknown> | undefined
 
+    vi.spyOn(desktopGitModule, 'desktopGit').mockReturnValue({
+      baseBranchList: vi.fn(async () => [{ isDefault: true, isRemote: true, name: 'origin/main' }]),
+      repoStatus: vi.fn(async () => ({ branch: 'main', defaultBranch: 'main', detached: false } as never)),
+      worktreeAdd: vi.fn(async () => ({ branch: 'hermes/session-branch', path: '/repo/.worktrees/session-branch' })),
+      worktreeList: vi.fn(async () => [{ branch: 'main', detached: false, isMain: true, locked: false, path: '/repo' }])
+    } as never)
+
     const requestGateway = vi.fn(async (method: string, params?: Record<string, unknown>) => {
       if (method === 'session.create') {
         createParams = params
@@ -1219,7 +1706,7 @@ describe('branchStoredSession desktop source tagging', () => {
       return {} as never
     })
 
-    setSessions([storedSession({ id: 'stored-parent', message_count: 1 })])
+    setSessions([storedSession({ cwd: '/repo', id: 'stored-parent', message_count: 1 })])
     vi.mocked(getAllSessionMessages).mockResolvedValue({
       messages: [{ content: 'branch me', role: 'user', timestamp: 1 }],
       session_id: 'stored-parent'
@@ -1232,8 +1719,42 @@ describe('branchStoredSession desktop source tagging', () => {
     await expect(branchStoredSession!('stored-parent')).resolves.toBe(true)
 
     expect(createParams).toMatchObject({
+      cwd: '/repo/.worktrees/session-branch',
       parent_session_id: 'stored-parent',
       source: 'desktop'
+    })
+  })
+
+  it('removes an automatic branch worktree when session.create returns null', async () => {
+    const worktreeRemove = vi.fn(async () => undefined)
+
+    vi.spyOn(desktopGitModule, 'desktopGit').mockReturnValue({
+      baseBranchList: vi.fn(async () => [{ isDefault: true, isRemote: true, name: 'origin/main' }]),
+      repoStatus: vi.fn(async () => ({ branch: 'main', defaultBranch: 'main', detached: false } as never)),
+      worktreeAdd: vi.fn(async () => ({ branch: 'hermes/session-branch', path: '/repo/.worktrees/session-branch' })),
+      worktreeList: vi.fn(async () => [{ branch: 'main', detached: false, isMain: true, locked: false, path: '/repo' }]),
+      worktreeRemove
+    } as never)
+
+    setSessions([storedSession({ cwd: '/repo', id: 'stored-parent', message_count: 1 })])
+    vi.mocked(getAllSessionMessages).mockResolvedValue({
+      messages: [{ content: 'branch me', role: 'user', timestamp: 1 }],
+      session_id: 'stored-parent'
+    } as never)
+
+    let branchStoredSession: ((storedSessionId: string) => Promise<boolean>) | null = null
+    render(
+      <BranchHarness
+        onReady={branch => (branchStoredSession = branch)}
+        requestGateway={vi.fn(async () => null as never)}
+      />
+    )
+    await waitFor(() => expect(branchStoredSession).not.toBeNull())
+
+    await expect(branchStoredSession!('stored-parent')).resolves.toBe(false)
+    expect(worktreeRemove).toHaveBeenCalledWith('/repo', '/repo/.worktrees/session-branch', {
+      deleteBranch: { base: 'origin/main', branch: 'hermes/session-branch' },
+      force: false
     })
   })
 

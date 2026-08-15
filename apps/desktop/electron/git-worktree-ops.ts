@@ -242,6 +242,28 @@ function uniqueDir(base) {
   return dir
 }
 
+async function ensureWorktreesExcluded(gitBin, root) {
+  const gitPath = (await runGit(gitBin, ['rev-parse', '--git-path', 'info/exclude'], root)).trim()
+  const excludePath = path.isAbsolute(gitPath) ? gitPath : path.resolve(root, gitPath)
+  const marker = '/.worktrees/'
+  let existing = ''
+
+  try {
+    existing = fs.readFileSync(excludePath, 'utf8')
+  } catch (error) {
+    if (error.code !== 'ENOENT') {
+      throw error
+    }
+  }
+
+  if (existing.split(/\r?\n/).some(line => line.trim() === marker)) {
+    return
+  }
+
+  fs.mkdirSync(path.dirname(excludePath), { recursive: true })
+  fs.appendFileSync(excludePath, `${existing && !existing.endsWith('\n') ? '\n' : ''}${marker}\n`)
+}
+
 async function addExistingBranchWorktree(gitBin, root, name) {
   const requested = sanitizeBranch(name)
 
@@ -261,6 +283,8 @@ async function addExistingBranchWorktree(gitBin, root, name) {
 
     return { path: root, branch, repoRoot: root }
   }
+
+  await ensureWorktreesExcluded(gitBin, root)
 
   const dir = uniqueDir(path.join(root, '.worktrees', slugify(branch)))
 
@@ -299,6 +323,9 @@ async function addWorktree(repoPath, options, gitBin) {
 
   const slug = slugify(opts.name || `work-${Date.now().toString(36)}`)
   const branch = sanitizeBranch(opts.branch) || `hermes/${slug}`
+
+  await ensureWorktreesExcluded(gitBin, root)
+
   const dir = uniqueDir(path.join(root, '.worktrees', slug))
 
   const args = ['worktree', 'add', '-b', branch, dir]
@@ -359,6 +386,24 @@ async function removeWorktree(repoPath, worktreePath, options, gitBin) {
 
   args.push(resolvedTree)
   await runGit(gitBin, args, root)
+
+  const owned = options && options.deleteBranch
+
+  if (owned) {
+    const branch = String(owned.branch || '')
+    const base = String(owned.base || '')
+
+    if (!branch.startsWith('hermes/session-') || branch !== sanitizeBranch(branch) || !base || base.startsWith('-')) {
+      throw new Error('Invalid automatic worktree branch cleanup request.')
+    }
+
+    const branchOid = (await runGit(gitBin, ['rev-parse', '--verify', `refs/heads/${branch}^{commit}`], root)).trim()
+    const baseOid = (await runGit(gitBin, ['rev-parse', '--verify', `${base}^{commit}`], root)).trim()
+
+    if (branchOid === baseOid) {
+      await runGit(gitBin, ['update-ref', '-d', `refs/heads/${branch}`, branchOid], root)
+    }
+  }
 
   return { removed: resolvedTree }
 }
