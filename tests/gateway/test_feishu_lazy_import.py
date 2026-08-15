@@ -53,3 +53,20 @@ def test_feishu_connect_loads_sdk_on_worker_thread():
         assert asyncio.run(adapter.connect()) is True
 
     to_thread.assert_awaited_once_with(load_sdk)
+
+
+def test_feishu_connect_timeout_exceeds_cold_sdk_import():
+    """First Feishu connect must outlive a cold lark_oapi import (#85564)."""
+    from gateway.config import Platform
+    from gateway.run import (
+        GatewayRunner,
+        _FEISHU_CONNECT_TIMEOUT_SECS_DEFAULT,
+        _PLATFORM_CONNECT_TIMEOUT_SECS_DEFAULT,
+    )
+
+    timeout = GatewayRunner._platform_connect_timeout_secs(
+        GatewayRunner.__new__(GatewayRunner), Platform.FEISHU
+    )
+    assert timeout == _FEISHU_CONNECT_TIMEOUT_SECS_DEFAULT
+    assert timeout > _PLATFORM_CONNECT_TIMEOUT_SECS_DEFAULT
+    assert timeout >= 90.0

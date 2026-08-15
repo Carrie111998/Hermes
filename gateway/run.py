@@ -85,6 +85,12 @@ _PLATFORM_CONNECT_TIMEOUT_SECS_DEFAULT = 30.0
 # returns. Leave enough outer budget for initialize/deleteWebhook/start_polling
 # wall deadlines plus readiness; other platforms retain the 30s isolation bound.
 _TELEGRAM_CONNECT_TIMEOUT_SECS_DEFAULT = 180.0
+# Feishu defers `lark_oapi` until connect(); a cold import is ~24s (#68756)
+# and plus the websocket handshake exceeds the 30s isolation bound, so the
+# first boot after update always times out and the bot stays offline until
+# a later in-process retry (or a manual restart if the updater killed the
+# process first). Same class as Telegram's extra budget (#19776 / #85564).
+_FEISHU_CONNECT_TIMEOUT_SECS_DEFAULT = 90.0
 _ADAPTER_DISCONNECT_TIMEOUT_SECS_DEFAULT = 5.0
 # End reasons that mean the USER deliberately closed this thread of work
 # (/new -> session_reset / new_session, an explicit exit, or a /switch).
@@ -7202,6 +7208,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return max(0.0, timeout)
         if platform == Platform.TELEGRAM:
             return _TELEGRAM_CONNECT_TIMEOUT_SECS_DEFAULT
+        if platform == Platform.FEISHU:
+            return _FEISHU_CONNECT_TIMEOUT_SECS_DEFAULT
         return _PLATFORM_CONNECT_TIMEOUT_SECS_DEFAULT
 
     async def _connect_adapter_with_timeout(
