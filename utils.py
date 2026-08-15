@@ -7,6 +7,7 @@ import os
 import shutil
 import stat
 import tempfile
+import time
 from pathlib import Path
 from typing import Any, Union
 from urllib.parse import urlparse
@@ -88,6 +89,42 @@ def _restore_file_mode(path: Path, mode: "int | None") -> None:
         pass
 
 
+# Windows has no POSIX rename-over-open-file semantics: os.replace fails with
+# EACCES (WinError 5, "Access is denied") whenever ANY handle is open on the
+# target — a concurrent reader mid-read, an antivirus scanner, the search
+# indexer. The condition is transient and the target is not corrupt, so the
+# correct response is to wait and retry rather than to propagate.
+#
+# Without this, atomic_json_write is not actually atomic under concurrency on
+# Windows: it raises and the write is simply lost. Measured with 10 concurrent
+# writers (tests/hermes_cli/test_atomic_json_write.py::
+# test_concurrent_writes_dont_corrupt) — 3 of 10 failed. The exposed callers
+# are ordinary runtime paths: hermes_cli/main.py, hermes_cli/web_server.py,
+# events/cluster_detector.py, gateway/channel_directory.py,
+# gateway/drain_control.py.
+#
+# Deliberately Windows-only. On POSIX, EACCES from rename means a genuine
+# permission problem that retrying cannot fix, and swallowing it for ~1s would
+# turn a clear error into a mysterious stall.
+_REPLACE_RETRY_ATTEMPTS = 10
+_REPLACE_RETRY_BASE_DELAY_S = 0.02
+_REPLACE_RETRY_MAX_DELAY_S = 0.15
+
+
+def _replace_retrying_on_windows_sharing(src: str, dst: str) -> None:
+    """``os.replace`` with a bounded retry for Windows sharing violations."""
+    for attempt in range(_REPLACE_RETRY_ATTEMPTS):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError:
+            last = attempt == _REPLACE_RETRY_ATTEMPTS - 1
+            if os.name != "nt" or last:
+                raise
+            time.sleep(min(_REPLACE_RETRY_BASE_DELAY_S * (attempt + 1),
+                           _REPLACE_RETRY_MAX_DELAY_S))
+
+
 def atomic_replace(tmp_path: Union[str, Path], target: Union[str, Path]) -> str:
     """Atomically move *tmp_path* onto *target*, preserving symlinks.
 
@@ -112,7 +149,7 @@ def atomic_replace(tmp_path: Union[str, Path], target: Union[str, Path]) -> str:
     real_path = os.path.realpath(target_str) if os.path.islink(target_str) else target_str
     tmp_str = str(tmp_path)
     try:
-        os.replace(tmp_str, real_path)
+        _replace_retrying_on_windows_sharing(tmp_str, real_path)
     except OSError as exc:
         if exc.errno not in (errno.EXDEV, errno.EBUSY):
             raise
