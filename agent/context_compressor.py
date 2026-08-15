@@ -605,21 +605,147 @@ def _extract_pruned_skill_names(text: str) -> list[str]:
     return names
 
 
-def _collect_ghosted_skill_names(turns: List[Dict[str, Any]]) -> list[str]:
-    """Skill names whose instructions are about to be lost in compaction.
+# Cap on a single skill's extracted policy digest (#84718). Matches the
+# 1200-char reference point from the earlier prototype (#86267) — big
+# enough to carry a Workflow section plus a handful of MUST/NEVER lines,
+# small enough that the digest can never approach what the raw 5000+-char
+# skill body it replaces would have cost.
+_MAX_SKILL_POLICY_DIGEST_CHARS = 1200
+_SKILL_POLICY_DIGEST_TRUNCATION_MARKER = "\n... [digest truncated]"
+# A level-2 "## Workflow" heading up to (but not including) the next
+# level-2 heading. ``##[^#]`` excludes level-3+ subheadings so a Workflow
+# section that itself uses ### subsections stays intact.
+_SKILL_POLICY_WORKFLOW_HEADING_RE = re.compile(
+    r"^##\s+Workflow\s*$(.*?)(?=^##[^#]|\Z)", re.MULTILINE | re.DOTALL,
+)
+# Bulleted/numbered lines carrying an explicit MUST/NEVER — the codebase's
+# own convention for hard constraints (see SKILLS_GUIDANCE, KANBAN_GUIDANCE
+# in prompt_builder.py). Case-sensitive on purpose: lower-case "must"/
+# "never" inside ordinary prose is not the deliberate-emphasis signal this
+# is meant to isolate.
+_SKILL_POLICY_IMPERATIVE_LINE_RE = re.compile(
+    r"^\s*(?:[-*]|\d+\.)\s+.*\b(?:MUST|NEVER)\b.*$", re.MULTILINE,
+)
+
+
+def _skill_source_markdown_from_tool_content(raw_tool_content: str) -> str:
+    """Extract the rendered SKILL.md body from a ``skill_view`` tool result.
+
+    ``raw_tool_content`` is the JSON string ``skill_view`` returns
+    (``{"success": True, "content": <markdown>, ...}``). Never raises: a
+    malformed or non-JSON result (error path, historical/replayed call)
+    yields "" rather than aborting compression.
+    """
+    if not raw_tool_content:
+        return ""
+    try:
+        payload = json.loads(raw_tool_content)
+    except (json.JSONDecodeError, TypeError):
+        return ""
+    if not isinstance(payload, dict):
+        return ""
+    body = payload.get("content")
+    return body if isinstance(body, str) else ""
+
+
+def _build_skill_policy_digest(skill_markdown: str) -> str:
+    """Extract a small, bounded governance digest from a SKILL.md body.
+
+    Pulls the ``## Workflow`` section (the step-by-step procedure) and any
+    standalone MUST/NEVER imperative lines (the hard constraints authors
+    call out explicitly). This is the policy the tombstone marker alone
+    cannot carry: knowing a skill was pruned tells the model to reload it,
+    but says nothing about what it must do differently *before* the reload
+    completes (#84718). Bounded at ``_MAX_SKILL_POLICY_DIGEST_CHARS`` so a
+    verbose skill can't approach the budget compaction pruned it to save.
+    Returns "" when the skill has neither a Workflow section nor MUST/NEVER
+    lines — most skills don't follow that convention yet, and no digest is
+    better than an empty one.
+    """
+    if not skill_markdown:
+        return ""
+    parts: list[str] = []
+    workflow_match = _SKILL_POLICY_WORKFLOW_HEADING_RE.search(skill_markdown)
+    if workflow_match:
+        workflow_body = workflow_match.group(1).strip()
+        if workflow_body:
+            parts.append("Workflow:\n" + workflow_body)
+    seen_imperatives: set[str] = set()
+    imperative_lines: list[str] = []
+    for line in skill_markdown.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped in seen_imperatives:
+            continue
+        if _SKILL_POLICY_IMPERATIVE_LINE_RE.match(stripped):
+            seen_imperatives.add(stripped)
+            imperative_lines.append("- " + stripped.lstrip("-*0123456789. ").strip())
+    if imperative_lines:
+        parts.append("Rules:\n" + "\n".join(imperative_lines))
+    if not parts:
+        return ""
+    digest = "\n\n".join(parts)
+    if len(digest) > _MAX_SKILL_POLICY_DIGEST_CHARS:
+        keep = _MAX_SKILL_POLICY_DIGEST_CHARS - len(_SKILL_POLICY_DIGEST_TRUNCATION_MARKER)
+        digest = digest[:keep].rstrip() + _SKILL_POLICY_DIGEST_TRUNCATION_MARKER
+    return digest
+
+
+# Bracket-delimited like SKILL_PRUNED_MARKER_PREFIX, but the digest body is
+# multi-line so it needs an explicit close tag rather than a single-line
+# marker. One canonical formatter/extractor pair (below) so the emit side
+# and every re-injection site match on the exact same string — the same
+# discipline ``_skill_pruned_marker`` documents for the tombstone marker.
+_SKILL_POLICY_DIGEST_OPEN = "[SKILL_POLICY_DIGEST:"
+_SKILL_POLICY_DIGEST_CLOSE = "[/SKILL_POLICY_DIGEST]"
+_SKILL_POLICY_DIGEST_RE = re.compile(
+    re.escape(_SKILL_POLICY_DIGEST_OPEN)
+    + r"\s*name='([^']+)'\]\n(.*?)\n"
+    + re.escape(_SKILL_POLICY_DIGEST_CLOSE),
+    re.DOTALL,
+)
+
+
+def _format_skill_policy_digest_block(name: str, digest: str) -> str:
+    """Canonical rendering of a skill's policy digest for embedding/re-injection."""
+    return f"{_SKILL_POLICY_DIGEST_OPEN} name='{name}']\n{digest}\n{_SKILL_POLICY_DIGEST_CLOSE}"
+
+
+def _extract_skill_policy_digests(text: str) -> dict[str, str]:
+    """Return ``{skill_name: digest_text}`` for every digest block in *text*."""
+    digests: dict[str, str] = {}
+    for match in _SKILL_POLICY_DIGEST_RE.finditer(text or ""):
+        name, digest = match.group(1), match.group(2)
+        if name not in digests:
+            digests[name] = digest
+    return digests
+
+
+def _scan_ghosted_skills(
+    turns: List[Dict[str, Any]],
+) -> tuple[list[str], dict[str, str]]:
+    """Single pass collecting both ghosted skill names and their policy digests.
 
     Covers BOTH shapes a compacted middle window can carry:
 
     - a ``skill_view`` result already demoted by Phase-1 pruning — the
-      canonical ``[SKILL_PRUNED: ...]`` marker is in the row content;
+      canonical ``[SKILL_PRUNED: ...]`` marker (and, if the skill body had
+      extractable policy, a ``[SKILL_POLICY_DIGEST: ...]`` block right
+      after it) is in the row content;
     - a RAW ``skill_view`` body that was never demoted (it sat inside the
       protected tail of an earlier prune, then aged into the compression
       window). The summarizer will paraphrase the instructions away, which
-      is exactly the ghost-skill failure — so it needs a marker too.
+      is exactly the ghost-skill failure — so it needs a marker (and, if
+      extractable, a digest) too.
+
+    Digests are derived once, from whichever representation of the skill
+    body is still available at scan time (embedded block, or the raw
+    ``skill_view`` result) — never re-derived later, because by the next
+    compaction the raw body is gone for good.
     """
     names: list[str] = []
+    digests: dict[str, str] = {}
 
-    def _add(name: str) -> None:
+    def _add_name(name: str) -> None:
         if name and name not in names:
             names.append(name)
 
@@ -638,7 +764,9 @@ def _collect_ghosted_skill_names(turns: List[Dict[str, Any]]) -> list[str]:
         content = msg.get("content")
         text = content if isinstance(content, str) else _content_text_for_contains(content)
         for name in _extract_pruned_skill_names(text):
-            _add(name)
+            _add_name(name)
+        for name, digest in _extract_skill_policy_digests(text).items():
+            digests.setdefault(name, digest)
         if (
             msg.get("role") == "tool"
             and isinstance(content, str)
@@ -646,15 +774,56 @@ def _collect_ghosted_skill_names(turns: List[Dict[str, Any]]) -> list[str]:
         ):
             skill = call_id_to_skill.get(str(msg.get("tool_call_id") or ""))
             if skill:
-                _add(skill)
+                _add_name(skill)
+                if skill not in digests:
+                    digest = _build_skill_policy_digest(
+                        _skill_source_markdown_from_tool_content(content)
+                    )
+                    if digest:
+                        digests[skill] = digest
+    return names, digests
+
+
+def _collect_ghosted_skill_names(turns: List[Dict[str, Any]]) -> list[str]:
+    """Skill names whose instructions are about to be lost in compaction.
+
+    Thin wrapper over ``_scan_ghosted_skills`` — see there for the two
+    shapes covered.
+    """
+    names, _ = _scan_ghosted_skills(turns)
     return names
+
+
+def _collect_ghosted_skill_digests(turns: List[Dict[str, Any]]) -> dict[str, str]:
+    """Policy digests for skills about to be lost in compaction.
+
+    Companion to ``_collect_ghosted_skill_names``: same scan, but returns
+    the bounded MUST/NEVER + Workflow digest (``_build_skill_policy_digest``)
+    keyed by skill name, so ``_reinject_pruned_skill_markers`` can restore
+    the policy the summarizer paraphrased away, not just the reload pointer.
+    """
+    _, digests = _scan_ghosted_skills(turns)
+    return digests
 
 
 _PRUNED_SKILLS_SECTION_HEADING = "## Pruned Skills"
 
 
-def _reinject_pruned_skill_markers(summary: str, skill_names: list[str]) -> str:
-    """Deterministically restore prune markers the summarizer dropped.
+# Hard cap on how many digests a single reinjection event will restore,
+# independent of the per-skill char cap (#84718). Pruning this many
+# distinct large skills in one compaction boundary is an extreme edge
+# case, but the cap keeps that edge case from ever growing the summary by
+# more than ~_MAX_REINJECTED_SKILL_DIGESTS * _MAX_SKILL_POLICY_DIGEST_CHARS
+# — bounded regardless of how many skills got pruned this boundary.
+_MAX_REINJECTED_SKILL_DIGESTS = 5
+
+
+def _reinject_pruned_skill_markers(
+    summary: str,
+    skill_names: list[str],
+    skill_digests: dict[str, str] | None = None,
+) -> str:
+    """Deterministically restore prune markers (and policy digests) the summarizer dropped.
 
     ``skill_names`` was extracted from the summarizer INPUT before the LLM
     call. For every skill whose canonical marker (``_skill_pruned_marker``)
@@ -665,6 +834,15 @@ def _reinject_pruned_skill_markers(summary: str, skill_names: list[str]) -> str:
     ``[SKILL_PRUNED]``, which never matches the emitted ``[SKILL_PRUNED:``
     form, so it duplicated markers that HAD survived).
 
+    ``skill_digests`` (#84718) restores the bounded policy digest
+    (``_build_skill_policy_digest``) alongside the marker for skills that
+    have one — checked independently of marker presence, because an LLM
+    summarizer can keep the short marker line while paraphrasing away the
+    multi-line digest block beneath it. Capped at
+    ``_MAX_REINJECTED_SKILL_DIGESTS`` so a boundary that ghosts many
+    skills at once can't blow the compaction budget the digest feature
+    itself depends on staying small.
+
     The appended block is plain body text: it never carries a handoff
     prefix, the merged-summary delimiter, or a start-of-content scaffolding
     marker, so ``classify_summary_content`` / todo-snapshot flag handling
@@ -673,13 +851,21 @@ def _reinject_pruned_skill_markers(summary: str, skill_names: list[str]) -> str:
     """
     if not skill_names:
         return summary
-    missing = [
+    skill_digests = skill_digests or {}
+    missing_markers = [
         name for name in skill_names
         if _skill_pruned_marker(name) not in summary
     ]
-    if not missing:
+    missing_digests = [
+        name for name in skill_names
+        if name in skill_digests
+        and _format_skill_policy_digest_block(name, skill_digests[name]) not in summary
+    ][:_MAX_REINJECTED_SKILL_DIGESTS]
+    if not missing_markers and not missing_digests:
         return summary
-    lines = [_skill_pruned_marker(name) for name in missing]
+    lines = [_skill_pruned_marker(name) for name in missing_markers]
+    for name in missing_digests:
+        lines.append(_format_skill_policy_digest_block(name, skill_digests[name]))
     block = (
         "\n\n" + _PRUNED_SKILLS_SECTION_HEADING + "\n"
         + "\n".join(lines)
@@ -1460,10 +1646,21 @@ def _summarize_tool_result_unguarded(tool_name: str, tool_args: str, tool_conten
             # Ghost-skill defense (#32106): a metadata-only summary makes the
             # model believe the skill is still loaded. The canonical marker
             # tells it the instructions are gone AND how to get them back.
-            return (
+            line = (
                 f"[skill_view] name={name} ({content_len:,} chars) "
                 + _skill_pruned_marker(str(name))
             )
+            # Retention-parity digest (#84718): the marker recovers the
+            # POINTER (reload here) but not the POLICY (what the skill said
+            # to do). Extracted here because this is the only point the raw
+            # body is still available — by the next compaction it's gone,
+            # so the digest must be computed and embedded now to survive.
+            digest = _build_skill_policy_digest(
+                _skill_source_markdown_from_tool_content(content)
+            )
+            if digest:
+                line += "\n" + _format_skill_policy_digest_block(str(name), digest)
+            return line
         return f"[skill_view] name={name} ({content_len:,} chars)"
 
     if tool_name in {"skills_list", "skill_manage"}:
@@ -3812,12 +4009,13 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
         # exactly like the LLM-summary path.
         _pruned_names = _collect_ghosted_skill_names(turns_to_summarize)
         del _pruned_names[_MAX_PRUNED_SKILL_MARKERS:]
+        _pruned_digests = _collect_ghosted_skill_digests(turns_to_summarize)
         summary = self._with_summary_prefix(_redact_compaction_text(body.strip()))
         if len(summary) > _FALLBACK_SUMMARY_MAX_CHARS:
             summary = summary[: _FALLBACK_SUMMARY_MAX_CHARS - 42].rstrip() + "\n...[fallback summary truncated]"
         # Re-inject AFTER the size cap: the markers live at the end of the
         # body, exactly where the truncation above cuts.
-        summary = _reinject_pruned_skill_markers(summary, _pruned_names)
+        summary = _reinject_pruned_skill_markers(summary, _pruned_names, _pruned_digests)
         return summary
 
     @classmethod
@@ -3942,6 +4140,9 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
             if _name not in _pruned_skill_names:
                 _pruned_skill_names.append(_name)
         del _pruned_skill_names[_MAX_PRUNED_SKILL_MARKERS:]
+        _pruned_skill_digests = _collect_ghosted_skill_digests(turns_to_summarize)
+        for _name, _digest in _extract_skill_policy_digests(self._previous_summary or "").items():
+            _pruned_skill_digests.setdefault(_name, _digest)
         content_to_summarize = self._bound_summary_input(content_to_summarize)
         _sanitized_memory_context = sanitize_memory_context(memory_context)
         _serialized_memory_context = json.dumps(
@@ -4284,7 +4485,7 @@ This compaction should PRIORITISE preserving all information related to the focu
             summary = _redact_compaction_text(content.strip())
             # P2 ghost-skill defense (#32106): deterministically restore any
             # [SKILL_PRUNED: ...] marker the summarizer paraphrased away.
-            summary = _reinject_pruned_skill_markers(summary, _pruned_skill_names)
+            summary = _reinject_pruned_skill_markers(summary, _pruned_skill_names, _pruned_skill_digests)
             summary = self._ground_historical_task_snapshot(summary, turns_to_summarize)
             self._validate_summary_user_provenance(summary, has_user_turn)
             # Store for iterative updates on next compaction
