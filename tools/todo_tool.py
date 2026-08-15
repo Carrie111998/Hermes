@@ -30,7 +30,6 @@ VALID_STATUSES = {"pending", "in_progress", "completed", "cancelled"}
 # task description, and active lists are a handful of items, not hundreds.
 MAX_TODO_ID_CHARS = 256
 MAX_TODO_CONTENT_CHARS = 4000
-MAX_TODO_RATIONALE_CHARS = 500
 MAX_TODO_ITEMS = 256
 # The complete snapshot crosses compaction as one synthetic message. Per-item
 # caps alone still let a 256-item plan refill the context with about a million
@@ -58,23 +57,21 @@ LEGACY_TODO_INJECTION_HEADERS = (
     "[Your active task list was preserved across context compression]",
 )
 TODO_INJECTION_HEADERS = (TODO_INJECTION_HEADER, *LEGACY_TODO_INJECTION_HEADERS)
+# Static, one-time guidance appended to the injection block regardless of
+# item count -- zero marginal cost per todo (#84718 proposal 3, per the
+# design direction set in #84808: no per-item schema field, no per-item
+# prose, because that cost lands on every plan write and every legacy item
+# on every long-running session to steer an edge case). Advisory only: it
+# reframes the preserved list as context to reconcile, not a standing order.
 TODO_INJECTION_RECONCILIATION_GUIDANCE = (
-    "Items below are prefixed 'needs reconfirmation after compaction' because "
-    "the reasoning that justified them was compacted away. Reconcile each "
-    "against the preserved ## Key Decisions and ## Completed Actions (a "
-    "completed investigation item — trace/check/verify — can invalidate a "
-    "pending action item) and the latest user message. If still valid, "
-    "rewrite it via the todo tool without the prefix; if invalidated, cancel "
-    "or rewrite it rather than acting on the stale wording."
+    "This plan crossed a context compression boundary, so the reasoning that "
+    "justified each item may have been summarized away. Reconcile each item "
+    "against the preserved ## Key Decisions and ## Completed Actions and the "
+    "latest user message before continuing it -- a completed investigation "
+    "item (trace/check/verify) can invalidate a pending action item. If an "
+    "item no longer holds, cancel or rewrite it via the todo tool rather "
+    "than acting on stale wording."
 )
-# Written into the item's persisted content (not only the synthetic
-# injection block) so the expiry survives beyond one compaction — a later
-# `todo` read/write still sees it, not only this post-compaction message.
-# Kept in `content` rather than a new status value: a new status enum member
-# would need matching changes to the desktop UI's TodoStatus type
-# (apps/desktop/src/lib/todos.ts), which silently drops items whose status
-# it doesn't recognize instead of rendering them.
-NEEDS_RECONFIRMATION_MARKER = "[needs reconfirmation after compaction] "
 
 
 class TodoStore:
@@ -85,7 +82,6 @@ class TodoStore:
       - id: unique string identifier (agent-chosen)
       - content: task description
       - status: pending | in_progress | completed | cancelled
-      - rationale: optional one-line basis that must survive compression
     """
 
     def __init__(self):
@@ -115,28 +111,12 @@ class TodoStore:
 
                 if item_id in existing:
                     # Update only the fields the LLM actually provided
-                    raw_rationale = t.get("rationale")
-                    next_rationale = (
-                        str(raw_rationale).strip()
-                        if raw_rationale is not None
-                        else ""
-                    )
                     if "content" in t and t["content"]:
-                        next_content = self._cap_content(str(t["content"]).strip())
-                        if next_content != existing[item_id]["content"] and not next_rationale:
-                            existing[item_id].pop("rationale", None)
-                        existing[item_id]["content"] = next_content
+                        existing[item_id]["content"] = self._cap_content(str(t["content"]).strip())
                     if "status" in t and t["status"]:
                         status = str(t["status"]).strip().lower()
                         if status in VALID_STATUSES:
                             existing[item_id]["status"] = status
-                    if "rationale" in t:
-                        if next_rationale:
-                            existing[item_id]["rationale"] = self._cap_rationale(
-                                next_rationale
-                            )
-                        else:
-                            existing[item_id].pop("rationale", None)
                 else:
                     # New item -- validate fully and append to end
                     validated = self._validate(t)
@@ -171,14 +151,6 @@ class TodoStore:
         """
         Render the todo list for post-compression injection.
 
-        Side effect: active items crossing the boundary are marked
-        needs-reconfirmation in persisted content (see
-        NEEDS_RECONFIRMATION_MARKER) — the expiry is not just cosmetic to
-        this rendering, it survives in the store past this call (#84718
-        proposal 2). Safe because the sole caller
-        (conversation_compression.py) invokes this exactly once per
-        committed compaction, never speculatively.
-
         Returns a human-readable string to append to the compressed
         message history, or None if the list is empty.
         """
@@ -202,35 +174,19 @@ class TodoStore:
         if not active_items:
             return None
 
-        for item in active_items:
-            if not item["content"].startswith(NEEDS_RECONFIRMATION_MARKER):
-                item["content"] = self._cap_content(
-                    NEEDS_RECONFIRMATION_MARKER + item["content"]
-                )
-
         lines = [TODO_INJECTION_HEADER, TODO_INJECTION_RECONCILIATION_GUIDANCE]
         for index, item in enumerate(active_items):
             marker = markers.get(item["status"], "[?]")
-            item_lines = [f"- {marker} {item['id']}. {item['content']} ({item['status']})"]
-            rationale = item.get("rationale")
-            if rationale:
-                item_lines.append(f"  Basis: {rationale}")
-            else:
-                item_lines.append(
-                    "  Basis was not preserved. Revalidate it before acting."
-                )
+            line = f"- {marker} {item['id']}. {item['content']} ({item['status']})"
             omitted_count = len(active_items) - index
             omission = (
                 f"- … {omitted_count} lower-priority active item(s) omitted; "
                 "higher-priority items were preserved."
             )
-            if (
-                len("\n".join([*lines, *item_lines, omission]))
-                > MAX_TODO_INJECTION_CHARS
-            ):
+            if len("\n".join([*lines, line, omission])) > MAX_TODO_INJECTION_CHARS:
                 lines.append(omission)
                 break
-            lines.extend(item_lines)
+            lines.append(line)
 
         return "\n".join(lines)
 
@@ -243,7 +199,7 @@ class TodoStore:
         return item_id
 
     def _bound_persisted_state(self) -> None:
-        """Keep highest-priority state small enough for history hydration."""
+        """Keep highest-priority items when total size is too large for history hydration."""
         total = 0
         bounded = []
         for item in self._items:
@@ -266,14 +222,6 @@ class TodoStore:
             keep = MAX_TODO_CONTENT_CHARS - len(_TRUNCATION_MARKER)
             return content[:keep] + _TRUNCATION_MARKER
         return content
-
-    @staticmethod
-    def _cap_rationale(rationale: str) -> str:
-        """Keep provenance useful without letting it duplicate large context."""
-        if len(rationale) > MAX_TODO_RATIONALE_CHARS:
-            keep = MAX_TODO_RATIONALE_CHARS - len(_TRUNCATION_MARKER)
-            return rationale[:keep] + _TRUNCATION_MARKER
-        return rationale
 
     @staticmethod
     def _validate(item: Dict[str, Any]) -> Dict[str, str]:
@@ -300,20 +248,15 @@ class TodoStore:
         if status not in VALID_STATUSES:
             status = "pending"
 
-        validated = {"id": item_id, "content": content, "status": status}
-        raw_rationale = item.get("rationale")
-        rationale = str(raw_rationale).strip() if raw_rationale is not None else ""
-        if rationale:
-            validated["rationale"] = TodoStore._cap_rationale(rationale)
-        return validated
+        return {"id": item_id, "content": content, "status": status}
 
     @staticmethod
     def _dedupe_by_id(todos: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Collapse duplicate ids, keeping the last occurrence in its position."""
+        """Collapse duplicate ids, keeping the last occurrence in position."""
         last_index: Dict[str, int] = {}
         for i, item in enumerate(todos):
             if not isinstance(item, dict):
-                # Non-dict items get a synthetic key so _validate can handle them
+                # Non-dict entries are kept as-is so _validate can handle them
                 last_index[f"__invalid_{i}"] = i
                 continue
             item_id = TodoStore._cap_id(str(item.get("id", "")).strip()) or "?"
@@ -322,7 +265,7 @@ class TodoStore:
 
     @staticmethod
     def _normalize_order(items: List[Dict[str, str]]) -> List[Dict[str, str]]:
-        """Lift the active step ahead of any earlier unfinished placeholders."""
+        """Move the active (in_progress) item ahead of unfinished pending placeholders."""
         active_index = next(
             (i for i, item in enumerate(items) if item["status"] == "in_progress"),
             None,
@@ -420,10 +363,7 @@ TODO_SCHEMA = {
         "- merge=false (default): replace the entire list with a fresh plan\n"
         "- merge=true: update existing items by id, add any new ones\n\n"
         "Each item: {id: string, content: string, "
-        "status: pending|in_progress|completed|cancelled, rationale?: string}\n"
-        "For new or materially revised items, include a short rationale that "
-        "records the user request, finding, or decision that justifies the item. "
-        "This basis is preserved with active items across compression.\n"
+        "status: pending|in_progress|completed|cancelled}\n"
         "List order is priority. Only ONE item in_progress at a time.\n"
         "Mark items completed immediately when done. If something fails, "
         "cancel it and add a revised item.\n\n"
@@ -450,13 +390,6 @@ TODO_SCHEMA = {
                             "type": "string",
                             "enum": ["pending", "in_progress", "completed", "cancelled"],
                             "description": "Current status"
-                        },
-                        "rationale": {
-                            "type": "string",
-                            "description": (
-                                "Short basis for the task (user request, finding, or "
-                                "decision), preserved across context compression"
-                            )
                         }
                     },
                     "required": ["id", "content", "status"]

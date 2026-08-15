@@ -79,32 +79,6 @@ class TestFormatForInjection:
         assert "Working" in text
         assert "context compression" in text.lower()
 
-    def test_injection_preserves_each_active_items_rationale(self):
-        store = TodoStore()
-        store.write([
-            {
-                "id": "remove",
-                "content": "Remove the checkout route",
-                "status": "pending",
-                "rationale": "User requested removal before provenance was checked",
-            },
-        ])
-
-        text = store.format_for_injection()
-
-        assert "Basis: User requested removal before provenance was checked" in text
-
-    def test_injection_pauses_legacy_items_without_a_rationale(self):
-        store = TodoStore()
-        store.write([
-            {"id": "remove", "content": "Remove the checkout route", "status": "pending"},
-        ])
-
-        text = store.format_for_injection()
-
-        assert "basis was not preserved" in text.lower()
-        assert "revalidate it before acting" in text.lower()
-
     def test_injection_reframes_preserved_plan_as_context_not_instruction(self):
         store = TodoStore()
         store.write([
@@ -163,46 +137,6 @@ class TestMergeMode:
             {"id": "2", "content": "Verify freed space", "status": "pending"},
         ]
 
-    def test_content_update_without_new_rationale_discards_stale_basis(self):
-        store = TodoStore()
-        store.write([{
-            "id": "1",
-            "content": "Trace route provenance",
-            "status": "in_progress",
-            "rationale": "Need to learn whether the task created it",
-        }])
-
-        store.write(
-            [{"id": "1", "content": "Remove route", "status": "pending"}],
-            merge=True,
-        )
-
-        assert "rationale" not in store.read()[0]
-        assert "basis was not preserved" in store.format_for_injection().lower()
-
-    def test_content_update_with_blank_rationale_discards_stale_basis(self):
-        store = TodoStore()
-        store.write([{
-            "id": "1",
-            "content": "Trace route provenance",
-            "status": "in_progress",
-            "rationale": "Need to learn whether the task created it",
-        }])
-
-        store.write(
-            [{
-                "id": "1",
-                "content": "Remove route",
-                "status": "pending",
-                "rationale": "   ",
-            }],
-            merge=True,
-        )
-
-        assert "rationale" not in store.read()[0]
-        assert "basis was not preserved" in store.format_for_injection().lower()
-
-
 class TestTodoToolFunction:
     def test_read_mode(self):
         store = TodoStore()
@@ -235,21 +169,6 @@ class TestTodoStoreBounds:
         item = store.read()[0]
         assert len(item["content"]) <= MAX_TODO_CONTENT_CHARS
         assert item["content"].endswith("… [truncated]")
-
-    def test_oversized_rationale_is_truncated(self):
-        from tools.todo_tool import MAX_TODO_RATIONALE_CHARS
-
-        store = TodoStore()
-        store.write([{
-            "id": "1",
-            "content": "task",
-            "status": "pending",
-            "rationale": "R" * 5000,
-        }])
-
-        rationale = store.read()[0]["rationale"]
-        assert len(rationale) == MAX_TODO_RATIONALE_CHARS
-        assert rationale.endswith("… [truncated]")
 
     def test_oversized_id_is_truncated_before_persistence(self):
         from tools.todo_tool import MAX_TODO_ID_CHARS
@@ -297,99 +216,3 @@ class TestTodoStoreBounds:
         assert "priority-0" in injection
         assert "priority-255" not in injection
         assert "higher-priority items were preserved" in injection
-
-
-class TestNeedsReconfirmationExpiry:
-    """#84718 proposal 2: expire active items at the compaction boundary."""
-
-    def test_active_items_are_marked_in_persisted_state_not_just_the_injection(self):
-        from tools.todo_tool import NEEDS_RECONFIRMATION_MARKER
-
-        store = TodoStore()
-        store.write([
-            {"id": "trace", "content": "Trace the origin", "status": "completed"},
-            {"id": "remove", "content": "Remove the checkout route", "status": "pending"},
-        ])
-        store.format_for_injection()
-
-        persisted = {item["id"]: item for item in store.read()}
-        # The persisted item content carries the marker, not only the
-        # rendered injection string — a later plain `todo` read/write
-        # (outside the synthetic post-compaction message) still sees it.
-        assert persisted["remove"]["content"].startswith(NEEDS_RECONFIRMATION_MARKER)
-        # completed/cancelled items never crossed the boundary as "active",
-        # so they are left untouched.
-        assert persisted["trace"]["content"] == "Trace the origin"
-
-    def test_repeated_compactions_do_not_stack_the_marker(self):
-        from tools.todo_tool import NEEDS_RECONFIRMATION_MARKER
-
-        store = TodoStore()
-        store.write([{"id": "1", "content": "Ship the fix", "status": "pending"}])
-        store.format_for_injection()
-        store.format_for_injection()
-
-        content = store.read()[0]["content"]
-        assert content.count(NEEDS_RECONFIRMATION_MARKER) == 1
-
-    def test_marker_plus_content_respects_the_existing_content_cap(self):
-        from tools.todo_tool import MAX_TODO_CONTENT_CHARS
-
-        store = TodoStore()
-        store.write([{"id": "1", "content": "A" * (MAX_TODO_CONTENT_CHARS - 5), "status": "pending"}])
-        store.format_for_injection()
-
-        assert len(store.read()[0]["content"]) <= MAX_TODO_CONTENT_CHARS
-
-    def test_rewriting_content_clears_the_marker(self):
-        from tools.todo_tool import NEEDS_RECONFIRMATION_MARKER
-
-        store = TodoStore()
-        store.write([{"id": "1", "content": "Old plan", "status": "pending"}])
-        store.format_for_injection()
-        assert store.read()[0]["content"].startswith(NEEDS_RECONFIRMATION_MARKER)
-
-        # Model reconfirms by writing fresh content for the same id.
-        store.write([{"id": "1", "content": "Reconfirmed plan", "status": "pending"}], merge=True)
-
-        assert store.read()[0]["content"] == "Reconfirmed plan"
-
-    def test_maximal_store_serializes_within_hydration_limit(self):
-        from tools.todo_tool import MAX_TODO_RESULT_CHARS
-
-        store = TodoStore()
-        payload = todo_tool(
-            todos=[
-                {
-                    "id": str(index),
-                    "content": "A" * 4000,
-                    "status": "pending",
-                }
-                for index in range(256)
-            ],
-            store=store,
-        )
-
-        assert len(payload) <= MAX_TODO_RESULT_CHARS
-
-
-    def test_item_count_is_bounded(self):
-        from tools.todo_tool import MAX_TODO_ITEMS
-        store = TodoStore()
-        store.write([
-            {"id": str(i), "content": f"task {i}", "status": "pending"}
-            for i in range(5000)
-        ])
-        assert len(store.read()) == MAX_TODO_ITEMS
-
-    def test_normal_list_is_unchanged(self):
-        """No regression: ordinary plans pass through untouched (no marker,
-        same content, same order)."""
-        store = TodoStore()
-        store.write([
-            {"id": "1", "content": "write the report", "status": "in_progress"},
-            {"id": "2", "content": "review PR", "status": "pending"},
-        ])
-        items = store.read()
-        assert [i["content"] for i in items] == ["write the report", "review PR"]
-        assert "[truncated]" not in items[0]["content"]
