@@ -315,6 +315,7 @@ kanban:
   #   prompt_hint: ""                    # local guidance on when workers should checkpoint
   # workspace_conflict: "allow"          # allow | warn | serialize concurrent same-workspace dispatch
   # default_subscriptions: []            # notify targets added on every task creation, e.g. ["telegram:12345"]
+  # default_subscription_notifier_profile: null  # gateway profile that delivers default subscriptions (null = creating profile)
   # validate_on_create: "warn"           # off | warn | strict creation validation
   # require_explicit_workspace: false    # treat an implicit scratch workspace as a violation
   # deadline_warning_fraction: 0.0       # 0 disables; else nudge workers past this fraction of runtime
