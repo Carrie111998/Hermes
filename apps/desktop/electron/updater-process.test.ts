@@ -11,8 +11,8 @@ import {
   resolvePosixScriptHandoff,
   resolveStagedUpdaterBinary,
   resolveUpdateScriptHandoff,
+  resolveWindowsUpdateTransport,
   sandboxFallbackFromEnv,
-  selectWindowsUpdateHandoff,
   spawnUpdaterProcess,
   stagedUpdaterSupportsPrewrittenMarker,
   wrapHandoffForDetachedConsole
@@ -188,7 +188,7 @@ test('resolveUpdateScriptHandoff prefers the repo script on Windows when present
   assert.deepEqual(handoff.args, ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', expected])
 })
 
-test('resolveUpdateScriptHandoff falls back to the pre-reorg flat path', () => {
+test('resolveUpdateScriptHandoff does not select the legacy flat entry point', () => {
   const root = String.raw`C:\Users\hermes\AppData\Local\hermes\hermes-agent`
   const legacy = path.join(root, 'scripts', 'desktop-update.ps1')
 
@@ -197,8 +197,7 @@ test('resolveUpdateScriptHandoff falls back to the pre-reorg flat path', () => {
     fileExists: candidate => candidate === legacy
   })
 
-  assert.ok(handoff)
-  assert.equal(handoff.scriptPath, legacy)
+  assert.equal(handoff, null)
 })
 
 test('resolveUpdateScriptHandoff returns null when the checkout predates the script', () => {
@@ -219,31 +218,33 @@ test('resolveUpdateScriptHandoff is Windows-only (POSIX updates in place)', () =
   assert.equal(handoff, null)
 })
 
-test('selectWindowsUpdateHandoff prefers the staged installer when both handoffs exist', () => {
-  const scriptHandoff = {
-    command: 'powershell',
-    args: ['-File', String.raw`C:\Hermes\scripts\desktop-update\windows.ps1`],
-    scriptPath: String.raw`C:\Hermes\scripts\desktop-update\windows.ps1`
-  }
+test('ordinary Windows updates select the canonical repo script', () => {
+  const root = String.raw`C:\Users\hermes\AppData\Local\hermes\hermes-agent`
+  const canonical = path.join(root, 'scripts', 'desktop-update', 'windows.ps1')
 
-  assert.deepEqual(selectWindowsUpdateHandoff(String.raw`C:\Hermes\hermes-setup.exe`, scriptHandoff), {
-    kind: 'staged-installer',
-    updater: String.raw`C:\Hermes\hermes-setup.exe`
+  const transport = resolveWindowsUpdateTransport(root, {
+    isWindows: true,
+    fileExists: candidate => candidate === canonical
   })
+
+  assert.equal(transport.kind, 'script')
+
+  if (transport.kind === 'script') {
+    assert.equal(transport.handoff.scriptPath, canonical)
+  }
 })
 
-test('selectWindowsUpdateHandoff keeps the repo script as the no-installer fallback', () => {
-  const scriptHandoff = {
-    command: 'powershell',
-    args: ['-File', String.raw`C:\Hermes\scripts\desktop-update\windows.ps1`],
-    scriptPath: String.raw`C:\Hermes\scripts\desktop-update\windows.ps1`
-  }
+test('ordinary Windows updates refuse staged and legacy-flat fallbacks', () => {
+  const root = String.raw`C:\Users\hermes\AppData\Local\hermes\hermes-agent`
+  const legacy = path.join(root, 'scripts', 'desktop-update.ps1')
+  const staged = String.raw`C:\Users\hermes\AppData\Local\hermes\hermes-setup.exe`
 
-  assert.deepEqual(selectWindowsUpdateHandoff(null, scriptHandoff), {
-    kind: 'repo-script',
-    handoff: scriptHandoff
+  const transport = resolveWindowsUpdateTransport(root, {
+    isWindows: true,
+    fileExists: candidate => candidate === legacy || candidate === staged
   })
-  assert.equal(selectWindowsUpdateHandoff(null, null), null)
+
+  assert.deepEqual(transport, { kind: 'manual' })
 })
 
 test('wrapHandoffForDetachedConsole routes through cmd start with own console', () => {

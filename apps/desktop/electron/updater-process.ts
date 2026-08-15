@@ -20,11 +20,10 @@ export interface UpdateScriptHandoff {
   scriptPath: string
 }
 
-export type WindowsUpdateHandoff =
-  { kind: 'staged-installer'; updater: string } | { kind: 'repo-script'; handoff: UpdateScriptHandoff }
+export type WindowsUpdateTransport = { kind: 'script'; handoff: UpdateScriptHandoff } | { kind: 'manual' }
 
 /**
- * Repo-owned Windows update hand-off for installs without a staged installer.
+ * Canonical repo-owned Windows update hand-off.
  *
  * The staged Tauri `hermes-setup.exe` has no self-update path, so every
  * updater-side fix only reaches users when a new binary is built, signed and
@@ -34,12 +33,12 @@ export type WindowsUpdateHandoff =
  * checkout instead: every `hermes update` refreshes the code that drives the
  * NEXT update, and only PowerShell itself is frozen.
  *
- * Returns the spawn recipe when the script exists in the checkout, or null.
- * The caller combines this candidate with resolveStagedUpdaterBinary through
- * selectWindowsUpdateHandoff; the visible staged installer wins whenever it
- * exists, while this script remains the CLI-install fallback. Windows-only by
- * the same policy as resolveStagedUpdaterBinary: POSIX updates in place via
- * applyUpdatesPosixInApp and needs no hand-off at all.
+ * Returns the spawn recipe when the canonical script exists in the checkout,
+ * or null. Ordinary Desktop updates fail closed when it is absent; the staged
+ * installer remains available only to the separately bounded packaged
+ * bootstrap-recovery path. Windows-only by the same policy as
+ * resolveStagedUpdaterBinary: POSIX updates in place via
+ * applyUpdatesPosixInApp and need no Windows hand-off.
  */
 export function resolveUpdateScriptHandoff(
   updateRoot: string,
@@ -53,44 +52,27 @@ export function resolveUpdateScriptHandoff(
 
   const exists = deps.fileExists ?? stagedFileExists
 
-  // Current layout first, then the pre-reorg flat path — an updated asar can
-  // meet a checkout from either side of the move (the checkout also ships a
-  // forwarder at the legacy path for the inverse skew).
-  for (const candidate of [
-    path.join(updateRoot, 'scripts', 'desktop-update', 'windows.ps1'),
-    path.join(updateRoot, 'scripts', 'desktop-update.ps1')
-  ]) {
-    if (exists(candidate)) {
-      return {
-        command: 'powershell',
-        args: ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', candidate],
-        scriptPath: candidate
-      }
+  const scriptPath = path.join(updateRoot, 'scripts', 'desktop-update', 'windows.ps1')
+
+  if (exists(scriptPath)) {
+    return {
+      command: 'powershell',
+      args: ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', scriptPath],
+      scriptPath
     }
   }
 
   return null
 }
 
-/**
- * Choose the Windows update surface after both independent resolvers run.
- *
- * Centralizes the invariant that a staged installer takes precedence over the
- * repo-script fallback.
- */
-export function selectWindowsUpdateHandoff(
-  stagedUpdater: string | null,
-  scriptHandoff: UpdateScriptHandoff | null
-): WindowsUpdateHandoff | null {
-  if (stagedUpdater) {
-    return { kind: 'staged-installer', updater: stagedUpdater }
-  }
+/** Resolve the only transport allowed for an ordinary Windows update. */
+export function resolveWindowsUpdateTransport(
+  updateRoot: string,
+  deps: ResolveUpdateScriptHandoffDeps = {}
+): WindowsUpdateTransport {
+  const handoff = resolveUpdateScriptHandoff(updateRoot, deps)
 
-  if (scriptHandoff) {
-    return { kind: 'repo-script', handoff: scriptHandoff }
-  }
-
-  return null
+  return handoff ? { kind: 'script', handoff } : { kind: 'manual' }
 }
 
 /**
