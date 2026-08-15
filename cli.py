@@ -16354,6 +16354,17 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
     def run(self):
         """Run the interactive CLI loop with persistent input at bottom."""
+        # Reap orphaned TUI nodes from crashed prior launches before claiming
+        # a session slot. Without this, dead TUI trees left by unclean exits
+        # keep emitting prompt_toolkit chrome to the same terminal surface,
+        # stacking duplicate status frames on top of this session's UI.
+        try:
+            from hermes_cli.dashboard_procs import _reap_orphaned_tui_nodes
+
+            _reap_orphaned_tui_nodes(tui_dir=Path(__file__).resolve().parent / "ui-tui")
+        except Exception:
+            logger.debug("CLI TUI orphan reaper skipped", exc_info=True)
+
         if not self._claim_active_session("cli"):
             return
 

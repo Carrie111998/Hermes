@@ -240,3 +240,43 @@ def test_transfer_under_profile_home_override_targets_acquisition_registry(
     root_registry = root / "runtime" / "active_sessions.json"
     entries = active_sessions._read_entries(root_registry)
     assert [entry["session_id"] for entry in entries] == ["after"]
+
+
+# --- Surface collision / HWND normalization ------------------------------------
+
+
+def test_surfaces_collide_handles_hwnd_and_wt_keys():
+    from hermes_cli.active_sessions import _surfaces_collide
+
+    base = "win32-console:C:\\x\\hermes.exe"
+    # Legacy vs new HWND entries on the same tab must collide.
+    assert _surfaces_collide(f"{base}:hwnd:1704980", f"{base}:hwnd:deadbeef")
+    # Exact match always collides.
+    assert _surfaces_collide(f"{base}:hwnd:1704980", f"{base}:hwnd:1704980")
+    # Two Windows Terminal tabs of the same title have distinct wt GUIDs and
+    # must NOT collide.
+    assert not _surfaces_collide(f"{base}:wt:aaa", f"{base}:wt:bbb")
+    # Same WT tab (same GUID) collides.
+    assert _surfaces_collide(f"{base}:wt:aaa", f"{base}:wt:aaa")
+    # A wt entry and an hwnd entry are different surfaces.
+    assert not _surfaces_collide(f"{base}:wt:aaa", f"{base}:hwnd:1")
+    # Different titles never collide.
+    assert not _surfaces_collide(f"{base}:hwnd:1", "win32-console:other:hwnd:1")
+
+
+def test_pid_fallback_surface_detection_warns(caplog):
+    """Degraded surface ids (empty console title) must warn: the same-surface
+    guard is a silent no-op in that state."""
+    import logging
+    import sys as _sys
+    from unittest.mock import patch
+
+    from hermes_cli import active_sessions as aS
+
+    with patch.object(_sys, "platform", "win32"):
+        with patch("ctypes.windll", create=True) as windll:
+            windll.kernel32.GetConsoleTitleW.return_value = 0
+            with caplog.at_level(logging.WARNING):
+                surface = aS._get_terminal_surface_id()
+    assert surface.startswith("win32-pid:")
+    assert any("duplicate-session guard is ineffective" in r.message for r in caplog.records)
