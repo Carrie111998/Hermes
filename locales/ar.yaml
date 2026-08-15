@@ -189,6 +189,7 @@ gateway:
       crashed:             "تعطّل (خرج العامل)؛ سيعيد المُوزّع المحاولة"
       timed_out:           "انتهت المهلة؛ سيعيد المُوزّع المحاولة"
       blocked:             "محجوبة؛ تحتاج إلى انتباه"
+      missing_exit_signal: "إشارة خروج مفقودة؛ بانتظار المراجعة"
       status_default:      "تغيّرت الحالة"
       status_joiner:       "، "
       message:             "[kanban] المهمة {task_id} {status}.\nالعنوان: {title}\nالمُكلَّف: @{assignee}\nاللوحة: {board}\n\nراجع النتيجة أو قرّر الخطوة التالية."

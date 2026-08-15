@@ -744,3 +744,59 @@ def test_notifier_delivers_block_loop_detected_triage_ping(tmp_path, monkeypatch
     finally:
         conn.close()
     assert remaining == []
+
+
+def test_notifier_delivers_missing_exit_signal_ping(tmp_path, monkeypatch):
+    """A `missing_exit_signal` event must reach the subscriber.
+
+    Regression for PR #70072 finding 1: the new event (emitted when a
+    repeated clean-exit worker is reconciled into `completed_pending_review`)
+    was added to kanban_db but NOT to the notifier's TERMINAL_KINDS set or
+    message formatter, so a subscribed operator was never told the task
+    reached the terminal-but-unaccepted state — silently undermining the
+    reliability signal the PR exists to surface.
+    """
+    db_path = tmp_path / "missing-exit-signal.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="no terminal signal", assignee="worker")
+        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
+        # Mirrors `_reconcile_missing_exit_signal`: task moved to
+        # completed_pending_review + a `missing_exit_signal` event.
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status = 'completed_pending_review' WHERE id = ?",
+                (tid,),
+            )
+            kb._append_event(
+                conn, tid, "missing_exit_signal",
+                {"error": "worker exited rc=0 without terminal signal",
+                 "protocol_violations": 2, "protocol_violation_limit": 3},
+            )
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(adapter.sent) == 1, "missing_exit_signal must produce a notification"
+    text = adapter.sent[0]["text"]
+    assert tid in text
+    assert "pending review" in text
+    assert "missing exit signal" in text
+    assert "rc=0" in text
+    # Cursor advanced: the event is claimed and not re-delivered.
+    conn = kb.connect()
+    try:
+        _, remaining = kb.unseen_events_for_sub(
+            conn, task_id=tid, platform="telegram", chat_id="chat-1",
+            kinds=["missing_exit_signal"],
+        )
+    finally:
+        conn.close()
+    assert remaining == []

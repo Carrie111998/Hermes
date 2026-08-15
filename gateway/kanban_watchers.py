@@ -208,7 +208,7 @@ class GatewayKanbanWatchersMixin:
 
         # "status" covers dashboard drag-drop and `_set_status_direct()`
         # writes — surface those transitions to subscribers too.
-        TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "block_loop_detected")
+        TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "block_loop_detected", "missing_exit_signal")
         # Subscriptions are removed only when the task reaches a truly final
         # status (done / archived). We used to also unsub on any terminal
         # event kind (gave_up / crashed / timed_out / blocked), but that
@@ -520,6 +520,22 @@ class GatewayKanbanWatchersMixin:
                                 f"🛑 {board_tag}{tag}Kanban {sub['task_id']} routed to TRIAGE"
                                 f" — needs a human decision{rc}{reason}"
                             )
+                        elif kind == "missing_exit_signal":
+                            # A repeated clean-exit/no-terminal-signal worker
+                            # was reconciled out of dispatch into
+                            # `completed_pending_review`. The task is
+                            # terminal-but-unaccepted: the operator should be
+                            # told so the card can be closed honestly via
+                            # `kanban_complete`/`kanban_block`. This is exactly
+                            # the reliability signal the PR exists to surface,
+                            # so it must reach subscribers.
+                            err = ""
+                            if ev.payload and ev.payload.get("error"):
+                                err = f": {str(ev.payload['error'])[:160]}"
+                            msg = (
+                                f"⚠️ {board_tag}{tag}Kanban {sub['task_id']} "
+                                f"moved to pending review (missing exit signal){err}"
+                            )
                         else:
                             # archived / unblocked are claimed by TERMINAL_KINDS
                             # (so the cursor advances past them and they can't
@@ -656,7 +672,7 @@ class GatewayKanbanWatchersMixin:
                         #   claim exactly like a failed send() above, so the
                         #   next tick retries.
                         task_terminal = task and task.status in {"done", "archived"}
-                        _WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked")
+                        _WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked", "missing_exit_signal")
                         _wake_kinds = {ev.kind for ev in d["events"] if ev.kind in _WAKE_KINDS}
                         from gateway.wake import adapter_supports_push as _adapter_push_ok
 
@@ -674,6 +690,7 @@ class GatewayKanbanWatchersMixin:
                             if "crashed" in _wake_kinds: _parts.append(t("gateway.kanban.wake.crashed"))
                             if "timed_out" in _wake_kinds: _parts.append(t("gateway.kanban.wake.timed_out"))
                             if "blocked" in _wake_kinds: _parts.append(t("gateway.kanban.wake.blocked"))
+                            if "missing_exit_signal" in _wake_kinds: _parts.append(t("gateway.kanban.wake.missing_exit_signal"))
                             _status = t("gateway.kanban.wake.status_joiner").join(_parts) or t("gateway.kanban.wake.status_default")
                             _synth = t(
                                 "gateway.kanban.wake.message",

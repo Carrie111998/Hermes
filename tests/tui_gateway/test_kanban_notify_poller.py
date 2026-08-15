@@ -114,6 +114,43 @@ class TestCollectKanbanNotifications:
         assert _collect_kanban_notifications({"session_key": None}) == []
         assert len(_sub_rows(tid)) == 1
 
+    def test_delivers_missing_exit_signal_event(self):
+        """A `missing_exit_signal` event must reach the TUI subscriber.
+
+        Regression for PR #70072 finding 1: the event (emitted when a repeated
+        clean-exit worker is reconciled into `completed_pending_review`) was
+        added to kanban_db but NOT to the TUI poller's _KANBAN_NOTIFY_KINDS set
+        or its formatter, so a TUI/desktop session subscribed to the task was
+        never told it reached the terminal-but-unaccepted state.
+        """
+        tid = _create_subscribed_task()
+        conn = kb.connect()
+        try:
+            with kb.write_txn(conn):
+                conn.execute(
+                    "UPDATE tasks SET status = 'completed_pending_review' WHERE id = ?",
+                    (tid,),
+                )
+                kb._append_event(
+                    conn, tid, "missing_exit_signal",
+                    {"error": "worker exited rc=0 without terminal signal",
+                     "protocol_violations": 2, "protocol_violation_limit": 3},
+                )
+        finally:
+            conn.close()
+
+        texts = _collect_kanban_notifications(_session())
+
+        assert len(texts) == 1, "missing_exit_signal must produce a TUI notification"
+        assert tid in texts[0]
+        assert "pending review" in texts[0]
+        assert "missing exit signal" in texts[0]
+        # completed_pending_review is not a truly final status (done/archived),
+        # so the subscription survives for an honest kanban_complete/block.
+        assert len(_sub_rows(tid)) == 1
+        # Cursor advanced: second poll is empty.
+        assert _collect_kanban_notifications(_session()) == []
+
     def test_profile_scoped_session_reads_the_shared_board(self, tmp_path):
         """The kanban board is shared across profiles BY DESIGN (see the
         hermes_cli/kanban_db.py module docstring): ``kanban_home()`` anchors on

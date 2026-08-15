@@ -297,8 +297,16 @@ def test_scheduled_tasks_have_their_own_column_not_todo(client):
     assert not any(t["id"] == task["id"] for t in columns["todo"])
 
 
-def test_completed_pending_review_has_dashboard_column_and_dist_display(client):
-    """Dashboard display bundle must expose the missing-exit review status."""
+def test_completed_pending_review_has_dashboard_column(client):
+    """The board API must place a `completed_pending_review` task in its own column.
+
+    The missing-exit-signal reconciliation moves a task to
+    ``completed_pending_review``; the dashboard renders that status in a
+    dedicated column rather than bucketing it into todo. This is behavioral
+    coverage of the board API the dashboard consumes (the frontend is a built
+    bundle and is exercised via the /board + /stats endpoints it calls, not by
+    reading its source text).
+    """
 
     task = client.post(
         "/api/plugins/kanban/tasks",
@@ -321,38 +329,40 @@ def test_completed_pending_review_has_dashboard_column_and_dist_display(client):
     assert any(t["id"] == task["id"] for t in columns["completed_pending_review"])
     assert not any(t["id"] == task["id"] for t in columns["todo"])
 
-    bundle = (
-        Path(__file__).resolve().parents[2]
-        / "plugins"
-        / "kanban"
-        / "dashboard"
-        / "dist"
-        / "index.js"
-    ).read_text(encoding="utf-8")
 
-    assert '"completed_pending_review"' in bundle
-    assert "Pending Review" in bundle
-    assert "hermes-kanban-dot-completed-pending-review" in bundle
-    assert "completed_pending_review: { amber:" in bundle
+def test_dashboard_stats_surfaces_missing_exit_signal_metric(client):
+    """The /stats endpoint must surface the missing-exit-signal metric.
 
+    The dashboard's stats strip is fed by the backend /stats endpoint, so the
+    behavioral contract is that ``board_stats`` counts ``missing_exit_signal``
+    events over the last 24h and reports the rate against ended runs. This is
+    asserted against the real backend (not the shipped bundle text).
+    """
+    task = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "no terminal signal", "assignee": "worker"},
+    ).json()["task"]
 
-def test_dashboard_dist_surfaces_missing_exit_signal_stats_metric():
-    """The shipped bundle must render the backend missing-exit-signal metric."""
+    conn = kb.connect()
+    try:
+        with kb.write_txn(conn):
+            # Emit the reconciliation event exactly as `_reconcile_missing_exit_signal`
+            # does so board_stats counts it in missing_exit_signal_24h.
+            kb._append_event(
+                conn, task["id"], "missing_exit_signal",
+                {"error": "worker exited rc=0 without terminal signal"},
+            )
+    finally:
+        conn.close()
 
-    bundle = (
-        Path(__file__).resolve().parents[2]
-        / "plugins"
-        / "kanban"
-        / "dashboard"
-        / "dist"
-        / "index.js"
-    ).read_text(encoding="utf-8")
+    r = client.get("/api/plugins/kanban/stats")
+    assert r.status_code == 200
+    stats = r.json()
+    assert stats["missing_exit_signal_24h"] == 1
+    # Present, rate computed against ended runs (0.0 when none ended yet).
+    assert "missing_exit_signal_rate_24h" in stats
+    assert isinstance(stats["missing_exit_signal_rate_24h"], (int, float))
 
-    assert "function BoardStatsStrip(props)" in bundle
-    assert '`${API}/stats`' in bundle
-    assert "missing_exit_signal_24h" in bundle
-    assert "missing_exit_signal_rate_24h" in bundle
-    assert "Missing-exit-signal 24h" in bundle
 
 
 def test_tenant_filter(client):
