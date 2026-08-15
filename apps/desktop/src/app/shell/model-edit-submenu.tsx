@@ -10,7 +10,7 @@ import {
 } from '@/components/ui/dropdown-menu'
 import { Switch } from '@/components/ui/switch'
 import { useI18n } from '@/i18n'
-import { isThinkingEnabled, REASONING_EFFORTS, resolveReasoningEffort } from '@/lib/reasoning-effort'
+import { isThinkingEnabled, REASONING_EFFORTS, type ReasoningEffort, resolveReasoningEffort } from '@/lib/reasoning-effort'
 
 // Hermes' real reasoning levels live in lib/reasoning-effort; `none` is owned
 // by the Thinking toggle, not the radio.
@@ -82,6 +82,9 @@ interface ModelEditSubmenuProps {
   provider: string
   /** Whether this model supports reasoning effort. */
   reasoning: boolean
+  /** Per-model effort enum from the backend capabilities (provider-specific,
+   *  e.g. kimi-k3 → low/high/max). Absent → full 7-level ladder. */
+  efforts?: readonly string[]
 }
 
 export function ModelEditSubmenu(props: ModelEditSubmenuProps) {
@@ -104,12 +107,42 @@ function ModelEditSubmenuBody({
   isActive,
   onSelectModel,
   onSetOptions,
-  reasoning
+  reasoning,
+  efforts
 }: ModelEditSubmenuProps) {
   const { t } = useI18n()
   const copy = t.shell.modelOptions
 
-  const effortValue = resolveReasoningEffort(effort, defaultEffort)
+  // Per-model enum (backend capabilities) narrows the ladder; `none` stays
+  // owned by the Thinking toggle, never the radio. When the enum says thinking
+  // cannot be turned off (e.g. kimi-k3), the toggle itself is hidden.
+  const effortLevels = (efforts ?? REASONING_EFFORTS).filter(level => level !== 'none') as ReasoningEffort[]
+  const canDisableThinking = efforts === undefined || efforts.includes('none')
+
+  const rawEffortValue = resolveReasoningEffort(effort, defaultEffort)
+  // A configured level the model doesn't offer (e.g. medium on kimi-k3, which
+  // the backend maps to high on the wire) must not render as a phantom
+  // selection — clamp the display to the nearest offered level.
+  const ladderIndex = (value: string) => REASONING_EFFORTS.indexOf(value as ReasoningEffort)
+  const clampToOffered = (value: string, levels: ReasoningEffort[]): string => {
+    if (!value || levels.includes(value as ReasoningEffort)) {
+      return value
+    }
+    const target = ladderIndex(value)
+    let best: string = levels[0] ?? value
+    let bestDist = Infinity
+    for (const level of levels) {
+      const dist = Math.abs(ladderIndex(level) - target)
+      // Ties resolve to the HIGHER rung, matching the backend's round-up
+      // mapping (e.g. kimi-k3 sends medium as high).
+      if (dist <= bestDist) {
+        bestDist = dist
+        best = level
+      }
+    }
+    return best
+  }
+  const effortValue = clampToOffered(rawEffortValue, effortLevels)
   const thinkingOn = isThinkingEnabled(effort, defaultEffort)
 
   const setFast = (enabled: boolean) => {
@@ -139,7 +172,7 @@ function ModelEditSubmenuBody({
   ) : (
     <>
       <DropdownMenuLabel className={dropdownMenuSectionLabel}>{copy.options}</DropdownMenuLabel>
-      {reasoning ? (
+      {reasoning && canDisableThinking ? (
         <DropdownMenuItem className={dropdownMenuRow} onSelect={event => event.preventDefault()}>
           {copy.thinking}
           <Switch
@@ -161,7 +194,7 @@ function ModelEditSubmenuBody({
           <DropdownMenuSeparator className="mx-0" />
           <DropdownMenuLabel className={dropdownMenuSectionLabel}>{copy.effort}</DropdownMenuLabel>
           <DropdownMenuRadioGroup onValueChange={value => onSetOptions({ effort: value })} value={effortValue}>
-            {REASONING_EFFORTS.map(value => (
+            {effortLevels.map(value => (
               <DropdownMenuRadioItem
                 className={dropdownMenuRow}
                 key={value}

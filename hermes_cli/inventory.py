@@ -431,10 +431,31 @@ def _apply_capabilities(rows: list[dict]) -> None:
                 except Exception:
                     reasoning = True
 
-            caps[model] = {
+            entry: dict[str, Any] = {
                 "fast": bool(model_supports_fast_mode(model)),
                 "reasoning": reasoning,
             }
+
+            # Providers whose official API documents a narrower
+            # reasoning-effort enum than Hermes' 7-level ladder — advertise
+            # the real scale so pickers can't offer levels the API would
+            # reject with a 400. UIs fold "none" into the Thinking toggle.
+            if slug == "deepseek" and (
+                model.lower().startswith("deepseek-v")
+                and not model.lower().startswith("deepseek-v3")
+            ):
+                entry["efforts"] = ["none", "high", "max"]
+            # Kimi K3: official enum low/high/max (default max); thinking is
+            # always on for K3, so no "none" level is offered.
+            elif slug == "kimi-coding" and model.strip().lower() == "kimi-k3":
+                entry["efforts"] = ["low", "high", "max"]
+            # Xiaomi MiMo v2.5: official reasoning.effort enum is
+            # none/low/medium/high (low/medium/high behave identically for
+            # now — all enable thinking).
+            elif slug == "xiaomi" and model.strip().lower() in ("mimo-v2.5", "mimo-v2.5-pro"):
+                entry["efforts"] = ["none", "low", "medium", "high"]
+
+            caps[model] = entry
 
         row["capabilities"] = caps
 
