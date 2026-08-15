@@ -2530,6 +2530,49 @@ def _resolve_command_cwd(
     return recorded or default_cwd
 
 
+def _truncate_with_overflow_persist(
+    output: str, max_chars: int, env=None, name_hint: str = "",
+) -> str:
+    """Cap *output* at *max_chars*, saving the full text before dropping any.
+
+    The head/tail cap is what keeps a runaway command from flooding the
+    context, and it stays. What changes is that the omitted middle is no
+    longer destroyed: the full output goes to the sandbox result store first
+    and the notice carries the path, so the model can ``read_file`` whatever
+    the cap cut out.
+
+    This has to happen here rather than in the per-result persistence layer.
+    ``maybe_persist_tool_result`` runs in tool_executor after this function
+    returns, and its threshold (``DEFAULT_RESULT_SIZE_CHARS``, 100 000) sits
+    above this cap (``DEFAULT_MAX_BYTES``, 50 000) — so for terminal it can
+    never fire, and by the time it looks the overflow is already gone.
+
+    Falls back to the previous notice when there is no env or the write fails;
+    a command whose output could not be archived still returns its output.
+    """
+    if len(output) <= max_chars:
+        return output
+
+    import hashlib
+
+    from tools.tool_result_storage import persist_overflow_output
+
+    # Hash the command rather than using it as the stem: it is attacker- and
+    # user-controlled text that would otherwise reach a filename.
+    digest = hashlib.sha256((name_hint or "terminal").encode("utf-8", "replace")).hexdigest()[:16]
+    artifact = persist_overflow_output(output, f"terminal_{digest}", env)
+
+    head_chars = int(max_chars * 0.4)  # 40% head (error messages often appear early)
+    tail_chars = max_chars - head_chars  # 60% tail (most recent/relevant output)
+    omitted = len(output) - head_chars - tail_chars
+    location = f" — full output saved to {artifact}" if artifact else ""
+    truncated_notice = (
+        f"\n\n... [OUTPUT TRUNCATED - {omitted} chars omitted "
+        f"out of {len(output)} total{location}] ...\n\n"
+    )
+    return output[:head_chars] + truncated_notice + output[-tail_chars:]
+
+
 def terminal_tool(
     command: str,
     background: bool = False,
@@ -3377,18 +3420,14 @@ def terminal_tool(
             except Exception:
                 pass
             
-            # Truncate output if too long, keeping both head and tail
+            # Truncate output if too long, keeping both head and tail —
+            # persisting the full text first so the omitted middle stays
+            # recoverable (see _truncate_with_overflow_persist).
             from tools.tool_output_limits import get_max_bytes
             MAX_OUTPUT_CHARS = get_max_bytes()
-            if len(output) > MAX_OUTPUT_CHARS:
-                head_chars = int(MAX_OUTPUT_CHARS * 0.4)  # 40% head (error messages often appear early)
-                tail_chars = MAX_OUTPUT_CHARS - head_chars  # 60% tail (most recent/relevant output)
-                omitted = len(output) - head_chars - tail_chars
-                truncated_notice = (
-                    f"\n\n... [OUTPUT TRUNCATED - {omitted} chars omitted "
-                    f"out of {len(output)} total] ...\n\n"
-                )
-                output = output[:head_chars] + truncated_notice + output[-tail_chars:]
+            output = _truncate_with_overflow_persist(
+                output, MAX_OUTPUT_CHARS, env, command,
+            )
 
             # Strip ANSI escape sequences so the model never sees terminal
             # formatting — prevents it from copying escapes into file writes.

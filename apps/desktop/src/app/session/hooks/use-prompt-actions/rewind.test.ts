@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest'
 
 import { type ChatMessage, textPart } from '@/lib/chat-messages'
 
-import { rebindSurvivorRowIds, survivorRowIdsFrom, truncateSubmitParams } from './rewind'
+import { planReload, planRestore, rebindSurvivorRowIds, survivorRowIdsFrom, truncateSubmitParams } from './rewind'
 
 describe('truncateSubmitParams', () => {
   it('omits truncation fields when no ordinal is set', () => {
@@ -124,5 +124,72 @@ describe('rebindSurvivorRowIds', () => {
     const messages = [user('u0', 7)]
 
     expect(rebindSurvivorRowIds(messages, [7])[0]).toBe(messages[0])
+  })
+})
+
+describe('planReload', () => {
+  const user = (id: string, rowId?: number): ChatMessage => ({
+    id,
+    role: 'user',
+    parts: [textPart(`text ${id}`)],
+    ...(rowId !== undefined ? { rowId } : {})
+  })
+
+  const assistant = (id: string, opts?: { branchGroupId?: string; error?: string; rowId?: number }): ChatMessage => ({
+    id,
+    role: 'assistant',
+    parts: [textPart(`reply ${id}`)],
+    ...(opts?.branchGroupId !== undefined ? { branchGroupId: opts.branchGroupId } : {}),
+    ...(opts?.error !== undefined ? { error: opts.error } : {}),
+    ...(opts?.rowId !== undefined ? { rowId: opts.rowId } : {})
+  })
+
+  it('sends ordinal, message id, and row id for a normal (persisted) reload', () => {
+    const messages = [user('u0', 1), assistant('a0', { rowId: 2 })]
+
+    const plan = planReload(messages, null)
+
+    expect(plan?.truncateOrdinal).toBe(0)
+    expect(plan?.truncateMessageId).toBe('u0')
+    expect(plan?.truncateRowId).toBe(1)
+  })
+
+  it('nulls out every truncate field when the target turn failed and was never persisted', () => {
+    // A failed turn's user message has no row id on the gateway, so its client
+    // ordinal is a positional guess that can point at the wrong row (#86573).
+    const messages = [user('u0', 1), assistant('a0', { error: 'boom' })]
+
+    const plan = planReload(messages, null)
+
+    expect(plan?.truncateOrdinal).toBeUndefined()
+    expect(plan?.truncateMessageId).toBeUndefined()
+    expect(plan?.truncateRowId).toBeUndefined()
+  })
+})
+
+describe('planRestore', () => {
+  const user = (id: string, rowId?: number): ChatMessage => ({
+    id,
+    role: 'user',
+    parts: [textPart(`text ${id}`)],
+    ...(rowId !== undefined ? { rowId } : {})
+  })
+
+  const assistant = (id: string, opts?: { error?: string; rowId?: number }): ChatMessage => ({
+    id,
+    role: 'assistant',
+    parts: [textPart(`reply ${id}`)],
+    ...(opts?.error !== undefined ? { error: opts.error } : {}),
+    ...(opts?.rowId !== undefined ? { rowId: opts.rowId } : {})
+  })
+
+  it('nulls out every truncate field when restoring to a failed, never-persisted turn', () => {
+    const messages = [user('u0', 1), assistant('a0', { error: 'boom' })]
+
+    const plan = planRestore(messages, 'u0')
+
+    expect(plan.truncateOrdinal).toBeUndefined()
+    expect(plan.truncateMessageId).toBeUndefined()
+    expect(plan.truncateRowId).toBeUndefined()
   })
 })

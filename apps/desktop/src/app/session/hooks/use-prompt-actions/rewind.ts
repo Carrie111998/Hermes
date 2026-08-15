@@ -216,7 +216,7 @@ export function finalizeInterruptedMessages(messages: ChatMessage[], streamId?: 
 export interface ReloadPlan {
   branchGroupId: string
   text: string
-  truncateOrdinal: number
+  truncateOrdinal: number | undefined
   truncateMessageId?: string
   truncateRowId?: number
   userIndex: number
@@ -246,12 +246,14 @@ export function planReload(messages: ChatMessage[], parentId: null | string): nu
       ? messages[parentIndex]
       : messages.slice(userIndex + 1).find(m => m.role === 'assistant')
 
+  const isFailedTurn = targetAssistant?.role === 'assistant' && Boolean(targetAssistant.error)
+
   return {
     branchGroupId: targetAssistant?.branchGroupId ?? branchGroupForUser(userMessage),
     text,
-    truncateOrdinal: visibleUserOrdinal(messages, userIndex),
-    truncateMessageId: userMessage.id,
-    truncateRowId: userMessage.rowId,
+    truncateOrdinal: isFailedTurn ? undefined : visibleUserOrdinal(messages, userIndex),
+    truncateMessageId: isFailedTurn ? undefined : userMessage.id,
+    truncateRowId: isFailedTurn ? undefined : userMessage.rowId,
     userIndex
   }
 }
@@ -289,7 +291,7 @@ export interface RestoreTarget {
 export interface RestorePlan {
   sourceIndex: number
   text: string
-  truncateOrdinal: number
+  truncateOrdinal: number | undefined
   truncateMessageId?: string
   truncateRowId?: number
 }
@@ -316,12 +318,23 @@ export function planRestore(messages: ChatMessage[], messageId: string, target?:
     throw new Error('Cannot restore an empty message.')
   }
 
+  // Failed turn: the target user msg never reached the gateway, so a
+  // truncate-by-ordinal would mis-aim (#86573) — resubmit plainly instead.
+  const nextMessage = messages[sourceIndex + 1]
+  const isFailedTurn = nextMessage?.role === 'assistant' && Boolean(nextMessage.error)
+
   const truncateOrdinal =
     target?.userOrdinal === null || target?.userOrdinal === undefined
       ? visibleUserOrdinal(messages, sourceIndex)
       : target.userOrdinal
 
-  return { sourceIndex, text, truncateOrdinal, truncateMessageId: source.id, truncateRowId: source.rowId }
+  return {
+    sourceIndex,
+    text,
+    truncateOrdinal: isFailedTurn ? undefined : truncateOrdinal,
+    truncateMessageId: isFailedTurn ? undefined : source.id,
+    truncateRowId: isFailedTurn ? undefined : source.rowId
+  }
 }
 
 // ---------------------------------------------------------------------------
