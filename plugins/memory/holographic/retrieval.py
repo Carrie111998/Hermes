@@ -19,6 +19,17 @@ except ImportError:
     import holographic as hrr  # type: ignore[no-redef]
 
 
+# Ranking policy constants — lexical dominance, HRR as a rerank tiebreak.
+# Kept as module-level constants so the ranking policy is tunable and
+# testable from a single place, rather than inline magic numbers.
+_RELEVANCE_LEX_WEIGHT = 0.55   # lexical (Jaccard) weight in the blend
+_RELEVANCE_HRR_WEIGHT = 0.45   # HRR structural weight in the blend
+_REASON_LEX_WEIGHT = 0.6       # lexical weight in reason()'s AND blend
+_REASON_HRR_WEIGHT = 0.4       # HRR weight in reason()'s AND blend
+_TRUST_NEUTRAL = 0.4           # trust-weighting floor (compression lower bound)
+_TRUST_GAIN = 0.6              # trust-weighting gain (compression span)
+
+
 class FactRetriever:
     """Multi-strategy fact retrieval with trust-weighted scoring."""
 
@@ -165,11 +176,18 @@ class FactRetriever:
         AND intersection of per-entity lexical candidates, then a combined
         relevance score (lexical + HRR when available). This replaces the
         pure-HRR min() heuristic, which produced near-random ranking.
+
+        NOTE: AND semantics depend on HRR being available. When HRR is
+        disabled (no numpy, or hrr_weight <= 0), reason() degrades to a
+        plain search(" ".join(entities)) — an OR-ish union, not an AND
+        intersection. Callers relying on strict AND behavior must ensure
+        HRR is enabled.
         """
         if not entities:
             return []
         if self.hrr_weight <= 0 or not hrr._HAS_NUMPY:
-            # No HRR signal — plain search over the joined terms
+            # No HRR signal — plain search over the joined terms (OR-ish
+            # union, NOT an AND intersection — see docstring note).
             return self.search(" ".join(entities), category=category, limit=limit)
 
         # Lexical candidates per entity, then intersect (AND semantics)
@@ -236,7 +254,7 @@ class FactRetriever:
             ft = self._tokenize(fact["content"]) | self._tokenize(fact.get("tags", ""))
             jac = self._jaccard_similarity(query_tokens, ft)
             # Blend: lexical dominant, HRR as tiebreak (matching search philosophy)
-            relevance = (0.6 * jac + 0.4 * hrr_sim)
+            relevance = (_REASON_LEX_WEIGHT * jac + _REASON_HRR_WEIGHT * hrr_sim)
             fact["score"] = relevance * fact["trust_score"]
             scored.append(fact)
 
@@ -266,7 +284,12 @@ class FactRetriever:
         # Lexical prefilter
         cands = self._fts_candidates(query, category, 0.0, limit * 3)
         if not cands:
-            return []
+            # Fall back to search() — same graceful degradation the old
+            # probe/related paths provided. _fts_candidates and search()
+            # share the same FTS candidate surface, but if they ever
+            # diverge (tokenizer differences, disabled FTS), we degrade
+            # to the full pipeline instead of returning empty.
+            return self.search(query, category=category, limit=limit)
 
         query_tokens = self._tokenize(query)
         role_entity = hrr.encode_atom("__hrr_role_entity__", self.hrr_dim)
@@ -292,9 +315,9 @@ class FactRetriever:
                                hrr.similarity(residual, role_content))
                     hrr_score = (best + 1.0) / 2.0
             # Lexical dominant, HRR as tiebreak — NOT the primary signal
-            relevance = 0.55 * jac + 0.45 * hrr_score
-            # Trust weighting
-            relevance *= 0.4 + 0.6 * fact["trust_score"]
+            relevance = _RELEVANCE_LEX_WEIGHT * jac + _RELEVANCE_HRR_WEIGHT * hrr_score
+            # Trust weighting: linear, same formula as search() and reason()
+            relevance *= fact["trust_score"]
             fact["score"] = relevance
             scored.append(fact)
 
