@@ -160,6 +160,7 @@ import { createHudSnapShortcut } from './hud-snap-shortcut'
 import { buildHudWindowUrl } from './hud-url'
 import { createLinkTitleWindow, guardLinkTitleSession, readLinkTitleWindowTitle } from './link-title-window'
 import { ensureMainWindow } from './main-window-lifecycle'
+import { requireMessagingRequestProfile } from './messaging-request-routing'
 import {
   oauthGuardMayHardFail,
   oauthSessionIsLive,
@@ -11013,9 +11014,8 @@ ipcMain.handle('hermes:api', async (_event, request) => {
     return rerouted
   }
 
+  const profile = requireMessagingRequestProfile(request?.path, request?.profile)
   const tornDownProfile = await prepareProfileDeleteRequest(request)
-
-  const profile = request?.profile
   // After tearing down a backend for profile deletion, route to the primary
   // backend instead of spawning a fresh pool backend.  A freshly spawned
   // backend calls ensure_hermes_home() which recreates the profile directory,

@@ -5,13 +5,16 @@ import {
   getActionStatus,
   getElevenLabsVoices,
   getMemoryProviderConfig,
+  getMessagingPlatforms,
   getStatus,
   restartGateway,
   saveMemoryProviderConfig,
   setApiRequestProfile,
   speakText,
+  testMessagingPlatform,
   transcribeAudio,
-  updateHermes
+  updateHermes,
+  updateMessagingPlatform
 } from './hermes'
 
 // Contract: every backend-targeted action helper must carry the active gateway
@@ -78,6 +81,18 @@ describe('backend action helpers are profile-scoped', () => {
 
     for (const call of api.mock.calls) {
       expect(call[0].profile).toBe('jarvis')
+    }
+  })
+
+  it('forwards the active profile to every messaging action', () => {
+    setApiRequestProfile('specialist')
+
+    void getMessagingPlatforms()
+    void updateMessagingPlatform('telegram', { enabled: true })
+    void testMessagingPlatform('telegram')
+
+    for (const call of api.mock.calls) {
+      expect(call[0].profile).toBe('specialist')
     }
   })
 })
