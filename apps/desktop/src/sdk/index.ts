@@ -24,9 +24,9 @@ import { openSession, type OpenSessionIntent } from '@/app/open-session'
 import { $narrowViewport } from '@/components/pane-shell/tree/store'
 import { onGatewayEvent } from '@/contrib/events'
 import { getLogs, getStatus } from '@/hermes'
-import { $gateway } from '@/store/gateway'
+import { $gateway, openGatewayForProfile } from '@/store/gateway'
 import { notify, notifyError } from '@/store/notifications'
-import { $activeGatewayProfile, ensureGatewayProfile, newSessionInProfile } from '@/store/profile'
+import { $activeGatewayProfile, ensureGatewayProfile, newSessionInProfile, setShowAllProfiles } from '@/store/profile'
 import { $activeSessionId, $currentCwd, $currentModel, $gatewayState } from '@/store/session'
 import { runGatewayRestart } from '@/store/system-actions'
 
@@ -91,15 +91,40 @@ export const host = {
   /** Open a stored session the way core surfaces do (focus an existing
    *  tile/main, else load into main). When `profile` names a non-active
    *  profile, its backend is activated first so the resume routes to the
-   *  right state.db — the same soft profile swap the unified sidebar does. */
+   *  right state.db — the same soft profile swap the unified sidebar does.
+   *  `keepAllProfilesScope` (default true) keeps the Sessions sidebar in the
+   *  unified all-profiles view instead of narrowing it to the target
+   *  profile's sessions — a cross-profile open from a plugin surface is a
+   *  navigation, not a scope choice; pass false to also scope the sidebar. */
+  /** Pre-dial a profile's gateway socket in the background — pool-only, no
+   *  activation, no navigation, no scope change (openGatewayForProfile; it
+   *  already no-ops for shared-remote routes and the primary). Roster UIs
+   *  call this after mount so the FIRST click on an agent doesn't pay the
+   *  whole backend spawn + socket dial latency. Fire-and-forget: failures
+   *  are swallowed — the click path re-runs its own ensure and surfaces
+   *  errors properly. */
+  warmProfile: (profile: string): void => {
+    const name = (profile ?? '').trim()
+
+    if (!name || name === $activeGatewayProfile.get()) {
+      return
+    }
+
+    void openGatewayForProfile(name).catch(() => undefined)
+  },
+
   openSession: async (
     storedSessionId: string,
-    options: { intent?: OpenSessionIntent; profile?: null | string } = {}
+    options: { intent?: OpenSessionIntent; keepAllProfilesScope?: boolean; profile?: null | string } = {}
   ): Promise<void> => {
     const profile = (options.profile ?? '').trim()
 
     if (profile && profile !== $activeGatewayProfile.get()) {
       await ensureGatewayProfile(profile)
+
+      if (options.keepAllProfilesScope !== false) {
+        setShowAllProfiles(true)
+      }
     }
 
     openSession(

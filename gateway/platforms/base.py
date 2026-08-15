@@ -5978,10 +5978,12 @@ class BasePlatformAdapter(ABC):
         if needs_topic_recovery:
             await asyncio.to_thread(self._apply_topic_recovery, event)
 
+        _sk_store = getattr(self, "_session_store", None)
         session_key = build_session_key(
             event.source,
             group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
             thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
+            profile=_sk_store._resolve_profile_for_key(event.source) if _sk_store else None,
         )
         expected_session_key = str(
             (event.metadata or {}).get("gateway_session_key") or ""
@@ -7118,6 +7120,26 @@ class BasePlatformAdapter(ABC):
         - type: "dm", "group", "channel"
         """
         pass
+
+    def toolsets_for_source(self, source: "SessionSource") -> Optional[List[str]]:
+        """Per-source toolset override for agent runs triggered by this adapter.
+
+        Return a list of configurable toolset keys (e.g. ``["terminal",
+        "file", "web"]``) to REPLACE the platform-level toolset resolution
+        for this specific source, or ``None`` to use the normal
+        ``platform_toolsets.<platform>`` resolution (the default).
+
+        The gateway validates the returned list through the same
+        ``_get_platform_tools`` path as platform-level config, so unknown or
+        platform-restricted toolset names are dropped rather than trusted.
+
+        Currently used by the webhook adapter so individual routes can pin
+        their own toolsets (a trusted local monitoring route can get
+        ``terminal`` without widening every webhook route's default-safe
+        toolset). See ``platforms.webhook.extra.routes.<name>.toolsets`` and
+        the ``toolsets`` key in ``webhook_subscriptions.json``.
+        """
+        return None
     
     def format_message(self, content: str) -> str:
         """

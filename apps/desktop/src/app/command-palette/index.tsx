@@ -608,7 +608,7 @@ function CommandPaletteBody({ onExited }: { onExited: () => void }) {
   // reopen paints from cache and revalidates in the background.
   const configQuery = useQuery({
     queryKey: ['command-palette', 'config'],
-    queryFn: getHermesConfigRecord
+    queryFn: () => getHermesConfigRecord()
   })
 
   const sessionsQuery = useQuery({
