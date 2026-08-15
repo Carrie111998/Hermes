@@ -15718,6 +15718,31 @@ def test_shutdown_sessions_spares_a_session_whose_turn_is_running(monkeypatch):
         server._sessions.clear()
 
 
+def test_shutdown_sessions_skips_a_session_the_drain_already_finalized(monkeypatch):
+    """`compute_host.flush_all_sessions` finalizes in place without popping.
+
+    Its sessions therefore reach the atexit sweep with the latch already spent,
+    so a second teardown has nothing left to persist and would only re-announce
+    a reclaim and close an agent on a process that is exiting.
+    """
+    monkeypatch.setattr(server, "_release_gateway_wake_owner", lambda: False)
+    torn = []
+    monkeypatch.setattr(
+        server,
+        "_teardown_session",
+        lambda session, *, end_reason: torn.append(session["_sid"]),
+    )
+    server._sessions.clear()
+    flushed = {"running": False, "_finalized": True}
+    server._sessions["flushed"] = flushed
+    try:
+        server._shutdown_sessions()
+        assert torn == []
+        assert server._sessions.get("flushed") is flushed
+    finally:
+        server._sessions.clear()
+
+
 def _idle_evictable_session(now):
     """A session that satisfies every eviction precondition."""
     ready = threading.Event()
