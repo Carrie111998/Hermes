@@ -26,7 +26,9 @@ from typing import Iterator, Sequence
 
 
 _REVISION_RE = re.compile(r"^[0-9a-f]{40}$")
-_CONFIG_SCHEMA = 1
+_CONFIG_SCHEMA = 2
+_DEFAULT_UPSTREAM_REMOTE = "https://github.com/NousResearch/hermes-agent.git"
+_DEFAULT_UPSTREAM_BRANCH = "main"
 
 
 class AresLocalRuntimeError(RuntimeError):
@@ -70,12 +72,17 @@ class AresLocalPaths:
 
 def _default_paths() -> AresLocalPaths:
     home = Path.home()
-    agent_home = home / ".ares"
+    agent_home = Path(
+        os.environ.get("ARES_HOME", str(home / ".ares"))
+    ).expanduser()
+    launcher_dir = Path(
+        os.environ.get("ARES_BIN_DIR", str(home / ".local" / "bin"))
+    ).expanduser()
     return AresLocalPaths(
         state_root=agent_home / "runtime-state",
         data_root=agent_home / "runtime",
         agent_home=agent_home,
-        launcher_path=home / ".local" / "bin" / "ares",
+        launcher_path=launcher_dir / "ares",
         unit_path=home / ".config" / "systemd" / "user" / "ares-gateway.service",
     )
 
@@ -226,7 +233,7 @@ class AresLocalRuntime:
             raise AresLocalRuntimeError("Ares source configuration is missing; run `ares setup`") from exc
         except json.JSONDecodeError as exc:
             raise AresLocalRuntimeError("Ares source configuration is invalid") from exc
-        if not isinstance(raw, dict) or raw.get("schema_version") != _CONFIG_SCHEMA:
+        if not isinstance(raw, dict) or raw.get("schema_version") not in {1, _CONFIG_SCHEMA}:
             raise AresLocalRuntimeError("Ares source configuration has an unsupported schema")
         remote = raw.get("remote")
         branch = raw.get("branch")
@@ -234,15 +241,32 @@ class AresLocalRuntime:
             raise AresLocalRuntimeError("Ares source configuration has an invalid remote")
         if not isinstance(branch, str) or not branch.strip() or "\n" in branch:
             raise AresLocalRuntimeError("Ares source configuration has an invalid branch")
+        upstream_remote = raw.get("upstream_remote", _DEFAULT_UPSTREAM_REMOTE)
+        upstream_branch = raw.get("upstream_branch", _DEFAULT_UPSTREAM_BRANCH)
+        if not isinstance(upstream_remote, str) or not upstream_remote.strip() or "\n" in upstream_remote:
+            raise AresLocalRuntimeError("Ares source configuration has an invalid upstream remote")
+        if not isinstance(upstream_branch, str) or not upstream_branch.strip() or "\n" in upstream_branch:
+            raise AresLocalRuntimeError("Ares source configuration has an invalid upstream branch")
+        raw["upstream_remote"] = upstream_remote
+        raw["upstream_branch"] = upstream_branch
         return raw
 
-    def _write_config(self, *, remote: str, branch: str) -> None:
+    def _write_config(
+        self,
+        *,
+        remote: str,
+        branch: str,
+        upstream_remote: str = _DEFAULT_UPSTREAM_REMOTE,
+        upstream_branch: str = _DEFAULT_UPSTREAM_BRANCH,
+    ) -> None:
         self._atomic_json(
             self.paths.config_path,
             {
                 "schema_version": _CONFIG_SCHEMA,
                 "remote": remote,
                 "branch": branch,
+                "upstream_remote": upstream_remote,
+                "upstream_branch": upstream_branch,
             },
         )
 
@@ -422,11 +446,172 @@ if (config or {}).get('context', {}).get('engine') == 'ri-context-governor':
                 shutil.rmtree(staging)
             raise
 
+    @staticmethod
+    def _remote_revision(remote: str, branch: str) -> str:
+        """Resolve one remote branch without trusting an ambient checkout."""
+
+        output = AresLocalRuntime._run(
+            ["git", "ls-remote", remote, f"refs/heads/{branch}"], capture=True
+        ).stdout.strip()
+        fields = output.split()
+        if not fields:
+            raise AresLocalRuntimeError(
+                f"remote {remote!r} does not expose branch {branch!r}"
+            )
+        return AresLocalRuntime._require_revision(fields[0])
+
+    def _release_metadata(self, revision: str) -> dict[str, object]:
+        """Read the small release descriptor used only for update short-circuiting."""
+
+        path = self._release_dir(revision) / "release.json"
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, json.JSONDecodeError):
+            return {}
+        return payload if isinstance(payload, dict) else {}
+
+    def _materialize_upstream_candidate(
+        self,
+        *,
+        downstream_remote: str,
+        downstream_revision: str,
+        upstream_remote: str,
+        upstream_branch: str,
+        upstream_revision: str,
+        desktop: bool,
+    ) -> str:
+        """Build one isolated Ares candidate from upstream plus the downstream delta.
+
+        The staging checkout never touches the operator's Ares worktree.  It
+        starts at the immutable upstream revision, applies the exact delta from
+        the common ancestor to the configured Ares revision, and is built
+        before its release directory becomes visible.  A merge or build failure
+        therefore leaves ``current`` unchanged.
+        """
+
+        self._ensure_layout()
+        downstream_revision = self._require_revision(downstream_revision)
+        upstream_revision = self._require_revision(upstream_revision)
+        staging = self.paths.staging_dir / f"candidate.{uuid.uuid4().hex}"
+        source = staging / "source"
+        patch_path = staging / "ares.patch"
+        try:
+            self._run(["git", "clone", "--no-local", downstream_remote, source])
+            self._run(["git", "-C", source, "checkout", "--detach", downstream_revision])
+            self._run(["git", "-C", source, "remote", "add", "ares-upstream", upstream_remote])
+            self._run(
+                ["git", "-C", source, "fetch", "--no-tags", "ares-upstream", upstream_branch]
+            )
+            fetched_upstream = self._require_revision(
+                self._git_output(source, "rev-parse", "FETCH_HEAD")
+            )
+            if fetched_upstream != upstream_revision:
+                raise AresLocalRuntimeError(
+                    "upstream changed while preparing the Ares release candidate"
+                )
+            merge_base = self._require_revision(
+                self._git_output(source, "merge-base", downstream_revision, upstream_revision)
+            )
+            downstream_patch = self._run(
+                [
+                    "git",
+                    "-C",
+                    source,
+                    "diff",
+                    "--binary",
+                    "--full-index",
+                    f"{merge_base}..{downstream_revision}",
+                ],
+                capture=True,
+            ).stdout
+            patch_path.write_text(downstream_patch, encoding="utf-8")
+            self._run(["git", "-C", source, "checkout", "--detach", upstream_revision])
+            if downstream_patch:
+                self._run(["git", "-C", source, "apply", "--index", "--3way", patch_path])
+            cached_diff = subprocess.run(
+                ["git", "-C", str(source), "diff", "--cached", "--quiet"],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            if cached_diff.returncode not in {0, 1}:
+                detail = (cached_diff.stderr or cached_diff.stdout).strip()
+                raise AresLocalRuntimeError(
+                    "could not inspect the staged Ares patch"
+                    + (f": {detail}" if detail else "")
+                )
+            has_downstream_delta = cached_diff.returncode == 1
+            if has_downstream_delta:
+                tree = self._git_output(source, "write-tree")
+                candidate_environment = os.environ.copy()
+                candidate_environment.update(
+                    {
+                        "GIT_AUTHOR_NAME": "Ares Runtime",
+                        "GIT_AUTHOR_EMAIL": "ares-runtime@localhost",
+                        "GIT_COMMITTER_NAME": "Ares Runtime",
+                        "GIT_COMMITTER_EMAIL": "ares-runtime@localhost",
+                    }
+                )
+                candidate_revision = self._require_revision(
+                    self._run(
+                        [
+                            "git",
+                            "-C",
+                            source,
+                            "commit-tree",
+                            tree,
+                            "-p",
+                            upstream_revision,
+                            "-m",
+                            f"Ares release candidate from Hermes {upstream_revision}",
+                        ],
+                        capture=True,
+                        env=candidate_environment,
+                    ).stdout.strip()
+                )
+                self._run(["git", "-C", source, "reset", "--hard", candidate_revision])
+            else:
+                candidate_revision = upstream_revision
+            final_dir = self._release_dir(candidate_revision)
+            if final_dir.exists():
+                existing = self._release_metadata(candidate_revision)
+                if (
+                    existing.get("upstream_revision") != upstream_revision
+                    or existing.get("downstream_revision") != downstream_revision
+                ):
+                    raise AresLocalRuntimeError(
+                        f"release candidate revision collision: {candidate_revision}"
+                    )
+                self._build_runtime(self._release_source(candidate_revision), desktop=desktop)
+                return candidate_revision
+            self._build_runtime(source, desktop=desktop)
+            self._atomic_json(
+                staging / "release.json",
+                {
+                    "revision": candidate_revision,
+                    "source": downstream_remote,
+                    "downstream_revision": downstream_revision,
+                    "upstream_remote": upstream_remote,
+                    "upstream_branch": upstream_branch,
+                    "upstream_revision": upstream_revision,
+                    "installed_at": int(time.time()),
+                },
+            )
+            os.replace(staging, final_dir)
+            return candidate_revision
+        except Exception:
+            if staging.exists():
+                shutil.rmtree(staging)
+            raise
+
     def _install_launcher(self) -> None:
         self.paths.launcher_path.parent.mkdir(parents=True, exist_ok=True)
         content = (
             "#!/usr/bin/env bash\n"
             "set -euo pipefail\n"
+            f"export ARES_HOME={str(self.paths.agent_home)!r}\n"
+            f"export ARES_BIN_DIR={str(self.paths.launcher_path.parent)!r}\n"
             f"runtime_root={str(self.paths.current_link)!r}\n"
             "python=\"$runtime_root/.venv/bin/python\"\n"
             "if [[ ! -x \"$python\" ]]; then\n"
@@ -522,6 +707,8 @@ if (config or {}).get('context', {}).get('engine') == 'ri-context-governor':
         desktop: bool,
         gateway: bool,
         seed_from: Path,
+        upstream_remote: str = _DEFAULT_UPSTREAM_REMOTE,
+        upstream_branch: str = _DEFAULT_UPSTREAM_BRANCH,
     ) -> tuple[str, bool]:
         source = source.expanduser().resolve()
         if not source.is_dir():
@@ -544,7 +731,12 @@ if (config or {}).get('context', {}).get('engine') == 'ri-context-governor':
             seeded = self._seed_agent_home(seed_from)
             self._provision_context_governor_key(self._release_source(revision))
             self._activate(revision)
-            self._write_config(remote=remote, branch=branch)
+            self._write_config(
+                remote=remote,
+                branch=branch,
+                upstream_remote=upstream_remote,
+                upstream_branch=upstream_branch,
+            )
             self._install_launcher()
             if gateway:
                 self._install_gateway_unit()
@@ -563,15 +755,29 @@ if (config or {}).get('context', {}).get('engine') == 'ri-context-governor':
             config = self._read_config()
             remote = str(config["remote"])
             branch = str(config["branch"])
-            revision = self._require_revision(
-                self._run(["git", "ls-remote", remote, f"refs/heads/{branch}"], capture=True)
-                .stdout.split()[0]
-            )
+            upstream_remote = str(config["upstream_remote"])
+            upstream_branch = str(config["upstream_branch"])
+            downstream_revision = self._remote_revision(remote, branch)
+            upstream_revision = self._remote_revision(upstream_remote, upstream_branch)
             current = self._release_from_link(self.paths.current_link, "current")
-            if current is not None and current[0] == revision:
-                return revision, False
+            if current is not None:
+                metadata = self._release_metadata(current[0])
+                if (
+                    metadata.get("downstream_revision") == downstream_revision
+                    and metadata.get("upstream_revision") == upstream_revision
+                    and metadata.get("upstream_remote") == upstream_remote
+                    and metadata.get("upstream_branch") == upstream_branch
+                ):
+                    return current[0], False
             old_active = current
-            self._materialize(remote, revision, desktop=desktop)
+            revision = self._materialize_upstream_candidate(
+                downstream_remote=remote,
+                downstream_revision=downstream_revision,
+                upstream_remote=upstream_remote,
+                upstream_branch=upstream_branch,
+                upstream_revision=upstream_revision,
+                desktop=desktop,
+            )
             self._activate(revision)
             if self.paths.unit_path.exists():
                 try:
@@ -742,6 +948,16 @@ def _parser() -> argparse.ArgumentParser:
     )
     setup.add_argument("--no-desktop", action="store_true", help="Do not build or install Desktop")
     setup.add_argument("--no-gateway", action="store_true", help="Do not install or start the Ares gateway service")
+    setup.add_argument(
+        "--upstream-remote",
+        default=_DEFAULT_UPSTREAM_REMOTE,
+        help="Hermes upstream Git remote used to construct future release candidates",
+    )
+    setup.add_argument(
+        "--upstream-branch",
+        default=_DEFAULT_UPSTREAM_BRANCH,
+        help="Hermes upstream branch used to construct future release candidates",
+    )
     update = subparsers.add_parser("update", help="Build and atomically select the configured remote branch")
     update.add_argument("--no-desktop", action="store_true", help="Do not build Desktop for this release")
     subparsers.add_parser("rollback", help="Return to the previous stable runtime")
@@ -775,6 +991,8 @@ def main(argv: Sequence[str] | None = None) -> None:
                 desktop=not args.no_desktop,
                 gateway=not args.no_gateway,
                 seed_from=args.seed_from,
+                upstream_remote=args.upstream_remote,
+                upstream_branch=args.upstream_branch,
             )
             print(f"Ares stable runtime selected: {revision}")
             if seeded:

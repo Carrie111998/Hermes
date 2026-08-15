@@ -70,7 +70,7 @@ ares --version
 ares doctor
 ```
 
-A successful `ares --version` proves the generated launcher can reach the selected stable Hermes-compatible runtime. `ares doctor` is the next diagnostic gate; provider setup is not complete until you have supplied your own provider credentials through the supported local flow. Use `ares tui`, `ares desktop`, and `ares gateway status` for normal operation. `ares update` builds a new stable release from the configured branch and switches it only after the build succeeds; `ares rollback` returns to the previous release.
+A successful `ares --version` proves the generated launcher can reach the selected stable Hermes-compatible runtime. `ares doctor` is the next diagnostic gate; provider setup is not complete until you have supplied your own provider credentials through the supported local flow. Use `ares tui`, `ares desktop`, and `ares gateway status` for normal operation. `ares update` fetches the configured Hermes upstream into staging, applies the Ares delta there, builds the resulting release candidate, and switches only after that candidate succeeds. If the patch or build fails, the active release is unchanged; `ares rollback` returns to the previous release.
 
 ### Install the Recursive Agent plugin (optional)
 

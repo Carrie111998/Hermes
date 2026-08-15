@@ -3,9 +3,12 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import subprocess
 import tomllib
 
-from ares_runtime.local_runtime import AresLocalPaths, AresLocalRuntime, _parser
+import pytest
+
+from ares_runtime.local_runtime import AresLocalPaths, AresLocalRuntime, AresLocalRuntimeError, _parser
 
 
 def _runtime(tmp_path: Path) -> AresLocalRuntime:
@@ -24,6 +27,29 @@ def _release(runtime: AresLocalRuntime, revision: str) -> Path:
     source = runtime.paths.releases_dir / revision / "source"
     source.mkdir(parents=True)
     return source
+
+
+def _git(directory: Path, *args: str) -> str:
+    return subprocess.run(
+        ["git", "-C", str(directory), *args],
+        check=True,
+        text=True,
+        stdout=subprocess.PIPE,
+    ).stdout.strip()
+
+
+def _commit(directory: Path, message: str) -> str:
+    _git(directory, "add", ".")
+    _git(directory, "commit", "-m", message)
+    return _git(directory, "rev-parse", "HEAD")
+
+
+def _repository(path: Path) -> Path:
+    path.mkdir()
+    _git(path, "init", "--initial-branch", "main")
+    _git(path, "config", "user.name", "Ares Runtime Tests")
+    _git(path, "config", "user.email", "ares-runtime-tests@example.invalid")
+    return path
 
 
 def test_current_link_is_the_only_active_runtime_pointer(tmp_path: Path) -> None:
@@ -65,8 +91,128 @@ def test_config_only_tracks_update_source_not_active_release(tmp_path: Path) -> 
     assert payload == {
         "branch": "main",
         "remote": "https://github.com/RecursiveIntell/Ares.git",
-        "schema_version": 1,
+        "schema_version": 2,
+        "upstream_branch": "main",
+        "upstream_remote": "https://github.com/NousResearch/hermes-agent.git",
     }
+
+
+def test_legacy_update_config_receives_safe_upstream_defaults(tmp_path: Path) -> None:
+    runtime = _runtime(tmp_path)
+    runtime._atomic_json(
+        runtime.paths.config_path,
+        {
+            "schema_version": 1,
+            "remote": "https://github.com/RecursiveIntell/Ares.git",
+            "branch": "main",
+        },
+    )
+
+    config = runtime._read_config()
+
+    assert config["upstream_remote"] == "https://github.com/NousResearch/hermes-agent.git"
+    assert config["upstream_branch"] == "main"
+
+
+def test_upstream_candidate_applies_downstream_delta_in_staging(tmp_path: Path, monkeypatch) -> None:
+    upstream = _repository(tmp_path / "upstream")
+    (upstream / "hermes.txt").write_text("base\n", encoding="utf-8")
+    _commit(upstream, "base")
+
+    downstream = tmp_path / "downstream"
+    subprocess.run(["git", "clone", str(upstream), str(downstream)], check=True)
+    _git(downstream, "config", "user.name", "Ares Runtime Tests")
+    _git(downstream, "config", "user.email", "ares-runtime-tests@example.invalid")
+    (downstream / "ares.txt").write_text("downstream patch\n", encoding="utf-8")
+    downstream_revision = _commit(downstream, "Ares patch")
+
+    (upstream / "upstream.txt").write_text("new Hermes feature\n", encoding="utf-8")
+    upstream_revision = _commit(upstream, "upstream update")
+
+    runtime = _runtime(tmp_path)
+    monkeypatch.setattr(runtime, "_build_runtime", lambda source, *, desktop: None)
+
+    candidate_revision = runtime._materialize_upstream_candidate(
+        downstream_remote=str(downstream),
+        downstream_revision=downstream_revision,
+        upstream_remote=str(upstream),
+        upstream_branch="main",
+        upstream_revision=upstream_revision,
+        desktop=False,
+    )
+
+    candidate = runtime._release_source(candidate_revision)
+    assert (candidate / "upstream.txt").read_text(encoding="utf-8") == "new Hermes feature\n"
+    assert (candidate / "ares.txt").read_text(encoding="utf-8") == "downstream patch\n"
+    assert _git(candidate, "status", "--porcelain") == ""
+    metadata = runtime._release_metadata(candidate_revision)
+    assert metadata["upstream_revision"] == upstream_revision
+    assert metadata["downstream_revision"] == downstream_revision
+
+
+def test_update_activates_only_the_verified_upstream_candidate(tmp_path: Path, monkeypatch) -> None:
+    upstream = _repository(tmp_path / "upstream")
+    (upstream / "hermes.txt").write_text("base\n", encoding="utf-8")
+    _commit(upstream, "base")
+
+    downstream = tmp_path / "downstream"
+    subprocess.run(["git", "clone", str(upstream), str(downstream)], check=True)
+    _git(downstream, "config", "user.name", "Ares Runtime Tests")
+    _git(downstream, "config", "user.email", "ares-runtime-tests@example.invalid")
+    (downstream / "ares.txt").write_text("Ares patch\n", encoding="utf-8")
+    _commit(downstream, "Ares patch")
+
+    (upstream / "upstream.txt").write_text("new Hermes feature\n", encoding="utf-8")
+    _commit(upstream, "upstream update")
+
+    runtime = _runtime(tmp_path)
+    runtime._write_config(
+        remote=str(downstream),
+        branch="main",
+        upstream_remote=str(upstream),
+        upstream_branch="main",
+    )
+    monkeypatch.setattr(runtime, "_build_runtime", lambda source, *, desktop: None)
+
+    candidate_revision, changed = runtime.update(desktop=False)
+
+    assert changed is True
+    assert runtime.active_release()[0] == candidate_revision
+    assert runtime._release_metadata(candidate_revision)["upstream_revision"] == _git(
+        upstream, "rev-parse", "HEAD"
+    )
+    assert runtime.update(desktop=False) == (candidate_revision, False)
+
+
+def test_upstream_candidate_conflict_never_publishes_a_release(tmp_path: Path, monkeypatch) -> None:
+    upstream = _repository(tmp_path / "upstream")
+    (upstream / "shared.txt").write_text("base\n", encoding="utf-8")
+    _commit(upstream, "base")
+
+    downstream = tmp_path / "downstream"
+    subprocess.run(["git", "clone", str(upstream), str(downstream)], check=True)
+    _git(downstream, "config", "user.name", "Ares Runtime Tests")
+    _git(downstream, "config", "user.email", "ares-runtime-tests@example.invalid")
+    (downstream / "shared.txt").write_text("Ares change\n", encoding="utf-8")
+    downstream_revision = _commit(downstream, "Ares patch")
+
+    (upstream / "shared.txt").write_text("Hermes change\n", encoding="utf-8")
+    upstream_revision = _commit(upstream, "upstream update")
+
+    runtime = _runtime(tmp_path)
+    monkeypatch.setattr(runtime, "_build_runtime", lambda source, *, desktop: None)
+
+    with pytest.raises(AresLocalRuntimeError):
+        runtime._materialize_upstream_candidate(
+            downstream_remote=str(downstream),
+            downstream_revision=downstream_revision,
+            upstream_remote=str(upstream),
+            upstream_branch="main",
+            upstream_revision=upstream_revision,
+            desktop=False,
+        )
+
+    assert not runtime.paths.releases_dir.exists() or not any(runtime.paths.releases_dir.iterdir())
 
 
 def test_launcher_resolves_the_selected_runtime_dynamically(tmp_path: Path) -> None:
