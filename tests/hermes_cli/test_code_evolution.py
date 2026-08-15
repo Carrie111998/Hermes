@@ -1628,11 +1628,12 @@ def test_prepare_contract_requires_independent_existing_reviewer(
     tmp_path: Path, profile_home: Path
 ) -> None:
     repo = _make_repo(tmp_path)
+    project = _project_for_repo(repo)
 
     with pytest.raises(ce.CodeEvolutionError, match="must be different"):
         ce.prepare_contract(
             repository=repo,
-            project=_project_for_repo(repo),
+            project=project,
             objective="x",
             evidence="y",
             success_metric="z",
@@ -1645,7 +1646,7 @@ def test_prepare_contract_requires_independent_existing_reviewer(
     with pytest.raises(ce.CodeEvolutionError, match="unknown reviewer profile"):
         ce.prepare_contract(
             repository=repo,
-            project=_project_for_repo(repo),
+            project=project,
             objective="x",
             evidence="y",
             success_metric="z",
