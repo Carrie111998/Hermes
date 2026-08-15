@@ -152,6 +152,30 @@ _active_subagents_lock = threading.Lock()
 # for the lifetime of the run; _run_single_child is the owner.
 _active_subagents: Dict[str, Dict[str, Any]] = {}
 
+# Control-plane waits stay below the runtime's hard tool-call interrupt while
+# still covering a useful period of child work. Repeated waits are cheap: they
+# block in this tool call rather than causing another model turn.
+_MAX_WAIT_TIMEOUT_S = 280.0
+_DEFAULT_WAIT_TIMEOUT_S = 60.0
+_WAIT_POLL_INTERVAL_S = 2.0
+
+# A repeated list result normally repeats transcript paths and other live
+# metadata verbatim. Keep only the last status snapshot per parent so that an
+# accidental model polling loop gets a compact nudge instead.
+#
+# Keyed by the parent_agent object itself via a WeakKeyDictionary rather than
+# id(parent_agent): a plain int-id cache could theoretically alias a *new*
+# parent_agent that the allocator reuses at the same address after the old
+# one is garbage collected, wrongly suppressing that new conversation's first
+# list() call. WeakKeyDictionary keys on object identity directly and drops
+# its entry automatically once parent_agent is collected — no stale hits,
+# no manual cleanup needed.
+LIST_DEDUP_WINDOW_S = 10.0
+_last_list_snapshots_lock = threading.Lock()
+_last_list_snapshots: "weakref.WeakKeyDictionary[Any, tuple[float, frozenset[tuple[Any, Any]]]]" = (
+    weakref.WeakKeyDictionary()
+)
+
 
 def set_spawn_paused(paused: bool) -> bool:
     """Globally block/unblock new delegate_task spawns.
@@ -347,7 +371,25 @@ def _is_descendant_of(child_agent: Any, parent_agent: Any, max_hops: int = 8) ->
 
 # Model-facing control actions accepted by delegate_task(action=...).
 # "spawn" (or omitted) keeps the historical spawn semantics.
-_CONTROL_ACTIONS = frozenset({"list", "steer", "stop"})
+_CONTROL_ACTIONS = frozenset({"list", "steer", "stop", "wait"})
+
+
+def _live_descendant_records(
+    parent_agent: Any,
+    subagent_ids: Optional[List[str]] = None,
+) -> List[Dict[str, Any]]:
+    """Return live descendants owned by *parent_agent*, optionally selected."""
+    selected_ids = None
+    if subagent_ids is not None:
+        selected_ids = {str(sid).strip() for sid in subagent_ids if str(sid).strip()}
+    with _active_subagents_lock:
+        records = list(_active_subagents.values())
+    return [
+        record
+        for record in records
+        if _is_descendant_of(record.get("agent"), parent_agent)
+        and (selected_ids is None or record.get("subagent_id") in selected_ids)
+    ]
 
 
 def _handle_control_action(
@@ -355,21 +397,21 @@ def _handle_control_action(
     subagent_id: Optional[str],
     message: Optional[str],
     parent_agent: Any,
+    *,
+    timeout_s: Optional[float] = None,
+    subagent_ids: Optional[List[str]] = None,
 ) -> str:
-    """Synchronous control plane for delegate_task: list/steer/stop.
+    """Synchronous control plane for delegate_task: list/steer/stop/wait.
 
     Runs in-turn (never backgrounded) and only over subagents descended from
     *parent_agent* — the same registry the TUI overlay drives, but scoped so
     a conversation can only control its own spawn tree.
     """
     if action == "list":
-        with _active_subagents_lock:
-            records = list(_active_subagents.values())
+        records = _live_descendant_records(parent_agent)
         entries = []
         for r in records:
             agent = r.get("agent")
-            if not _is_descendant_of(agent, parent_agent):
-                continue
             started = r.get("started_at")
             entries.append(
                 {
@@ -387,6 +429,35 @@ def _handle_control_action(
                     "live_transcript": getattr(agent, "_live_transcript_path", None),
                 }
             )
+        now = time.time()
+        snapshot = frozenset(
+            (entry.get("subagent_id"), entry.get("status")) for entry in entries
+        )
+        previous = None
+        if parent_agent is not None:
+            with _last_list_snapshots_lock:
+                previous = _last_list_snapshots.get(parent_agent)
+                try:
+                    _last_list_snapshots[parent_agent] = (now, snapshot)
+                except TypeError:
+                    # parent_agent doesn't support weak references (e.g. a
+                    # plain test double) — dedup is best-effort, skip caching.
+                    previous = None
+        if previous is not None and now - previous[0] < LIST_DEDUP_WINDOW_S and previous[1] == snapshot:
+            seconds_ago = max(0, round(now - previous[0], 1))
+            return json.dumps(
+                {
+                    "action": "list",
+                    "status": "unchanged",
+                    "note": (
+                        f"Identical to your last check {seconds_ago:g} seconds ago. "
+                        "Call action='wait' instead of polling — it blocks up to "
+                        "60s server-side at zero extra API cost and returns "
+                        "immediately on completion."
+                    ),
+                },
+                ensure_ascii=False,
+            )
         payload: Dict[str, Any] = {
             "action": "list",
             "count": len(entries),
@@ -399,6 +470,46 @@ def _handle_control_action(
                 "completion messages — there is nothing to steer or stop."
             )
         return json.dumps(payload, ensure_ascii=False)
+
+    if action == "wait":
+        try:
+            effective_timeout_s = (
+                _DEFAULT_WAIT_TIMEOUT_S if timeout_s is None else float(timeout_s)
+            )
+        except (TypeError, ValueError):
+            effective_timeout_s = _DEFAULT_WAIT_TIMEOUT_S
+        effective_timeout_s = min(
+            _MAX_WAIT_TIMEOUT_S, max(0.0, effective_timeout_s)
+        )
+        deadline = time.monotonic() + effective_timeout_s
+        while True:
+            live_records = _live_descendant_records(parent_agent, subagent_ids)
+            if not live_records:
+                return json.dumps(
+                    {
+                        "action": "wait",
+                        "status": "all_finished",
+                        "count": 0,
+                        "note": "All selected live subagents have finished.",
+                    },
+                    ensure_ascii=False,
+                )
+            remaining_s = deadline - time.monotonic()
+            if remaining_s <= 0:
+                return json.dumps(
+                    {
+                        "action": "wait",
+                        "status": "timeout",
+                        "count": len(live_records),
+                        "note": (
+                            "Selected subagents are still running. Call action='wait' "
+                            "again to keep waiting, or action='list' to inspect their "
+                            "current status."
+                        ),
+                    },
+                    ensure_ascii=False,
+                )
+            time.sleep(min(_WAIT_POLL_INTERVAL_S, remaining_s))
 
     # steer / stop need a resolvable, owned target.
     sid = (subagent_id or "").strip()
@@ -467,7 +578,7 @@ def _handle_control_action(
             "message; re-delegate a follow-up task if more work is needed."
         )
 
-    return tool_error(f"Unknown action '{action}'. Use spawn, list, steer, or stop.")
+    return tool_error(f"Unknown action '{action}'. Use spawn, list, steer, stop, or wait.")
 
 
 def _extract_output_tail(
@@ -3436,6 +3547,8 @@ def delegate_task(
     action: Optional[str] = None,
     subagent_id: Optional[str] = None,
     message: Optional[str] = None,
+    timeout_s: Optional[float] = None,
+    subagent_ids: Optional[List[str]] = None,
     parent_agent=None,
 ) -> str:
     """
@@ -3451,6 +3564,8 @@ def delegate_task(
       - action='steer' -> queue course-correction text into a running child
                           (subagent_id + message)
       - action='stop'  -> interrupt a running child early (subagent_id)
+      - action='wait'  -> block for live descendants to finish, for up to
+                          timeout_s seconds (optionally select subagent_ids)
 
     The 'role' parameter controls whether a child can further delegate:
     'leaf' (default) cannot; 'orchestrator' retains the delegation
@@ -3462,17 +3577,22 @@ def delegate_task(
     if parent_agent is None:
         return tool_error("delegate_task requires a parent agent context.")
 
-    # ── Control plane: list/steer/stop run synchronously and return here.
+    # ── Control plane: list/steer/stop/wait run synchronously and return here.
     # They never spawn, so they bypass the pause gate, depth limit, and the
     # async dispatch machinery entirely.
     normalized_action = (action or "").strip().lower()
     if normalized_action in _CONTROL_ACTIONS:
         return _handle_control_action(
-            normalized_action, subagent_id, message, parent_agent
+            normalized_action,
+            subagent_id,
+            message,
+            parent_agent,
+            timeout_s=timeout_s,
+            subagent_ids=subagent_ids,
         )
     if normalized_action and normalized_action != "spawn":
         return tool_error(
-            f"Unknown action '{action}'. Use spawn (default), list, steer, or stop."
+            f"Unknown action '{action}'. Use spawn (default), list, steer, stop, or wait."
         )
 
     # Operator-controlled kill switch — lets the TUI freeze new fan-out
@@ -4420,44 +4540,34 @@ def _build_top_level_description() -> str:
     here, check it is not already stated in a parameter description.
     """
     return (
-        "Spawn subagents in isolated contexts; each gets its own conversation, "
-        "terminal session, and toolset, and only its final summary returns to "
-        "you. Provide 'goal' for a single task or 'tasks' for a parallel batch "
-        "(limits and nesting rules are in the parameter descriptions).\n\n"
-        "Runs in the background: dispatch returns immediately with live "
-        "transcript paths, and the completed result (one consolidated message "
-        "for a batch) re-enters the conversation on its own. Do NOT wait or "
-        "poll; continue other work.\n\n"
-        "LIVE ORCHESTRATION: while children run, this tool also controls "
-        "them — action='list' (live children + ids), action='steer' "
-        "(subagent_id + message, redirect without stopping), action='stop' "
-        "(subagent_id, end early; partial result still returns). Steer when "
-        "a live transcript shows a child drifting.\n\n"
-        "USE FOR: reasoning-heavy subtasks, work that would flood your context "
-        "with intermediate data, or independent parallel workstreams.\n"
-        "DO NOT USE FOR (use these instead):\n"
-        "- Mechanical multi-step work with no reasoning needed -> execute_code\n"
-        "- A single tool call -> call the tool directly\n"
-        "- Tasks needing user interaction -> subagents cannot ask questions\n"
-        "- Durable work that must survive this session -> cronjob or "
-        "terminal(background=True, notify_on_complete=True); /stop, /new, or "
-        "process exit discards running subagents.\n\n"
+        "Spawn isolated subagents. Provide 'goal' for one task or 'tasks' for "
+        "a parallel batch (limits and nesting rules are in parameter descriptions).\n\n"
+        "Dispatch runs in the background: results re-enter this conversation "
+        "when complete. Continue other work. If there is genuinely nothing else "
+        "to do, call action='wait' (blocks server-side up to 60 seconds at no "
+        "extra model-turn/API cost and returns early on completion), or end this "
+        "turn with a short status message so completion opens a new turn. Do not "
+        "wait or poll by looping action='list': every list call resends the "
+        "accumulated conversation context and is expensive.\n\n"
+        "LIVE ORCHESTRATION: use action='list' only to inspect live children, "
+        "action='wait' for all or selected children, action='steer' to redirect, "
+        "or action='stop' to end one early; partial results still return.\n\n"
+        "USE FOR: reasoning-heavy subtasks, context-flooding work, or independent "
+        "parallel workstreams.\n"
+        "DO NOT USE FOR: mechanical work -> execute_code; one tool call -> call it "
+        "directly; user interaction -> children cannot ask questions; durable work "
+        "-> cronjob or terminal(background=True, notify_on_complete=True) (/stop, "
+        "/new, or process exit discards children).\n\n"
         "RULES:\n"
-        "- Children know nothing of this conversation: pass everything needed "
-        "via 'context', including any required output language, tone, or "
-        "style (e.g. \"respond in Chinese\").\n"
-        "- Child summaries are SELF-REPORTS, not verified facts: a child "
-        "claiming \"uploaded successfully\" or \"file written\" may be wrong. "
-        "For external side effects (uploads, remote writes, publishing), "
-        "require a verifiable handle (URL, ID, absolute path) and verify it "
-        "yourself — fetch the URL, stat the file, read back the content — "
-        "before telling the user the operation succeeded.\n"
-        "- Leaf children (the default) cannot call delegate_task, clarify, "
-        "memory, send_message, or cronjob; orchestrators regain only "
-        "delegate_task.\n"
-        "- Children inherit the parent model and fallback chain unless pinned "
-        "globally via delegation.provider / delegation.model in config.yaml. "
-        "Results are returned as an array, one entry per task."
+        "- Pass everything needed via 'context', including language/tone (e.g. "
+        "\"respond in Chinese\").\n"
+        "- Child summaries are SELF-REPORTS. For external effects, require a "
+        "verifiable handle and verify it yourself — fetch the URL, stat the file, "
+        "or read back the content.\n"
+        "- Leaf children cannot call delegate_task, clarify, memory, send_message, "
+        "or cronjob; orchestrators regain only delegate_task.\n"
+        "- Children inherit the parent model/fallback chain unless pinned via "
+        "delegation.provider / delegation.model in config.yaml."
     )
 
 
@@ -4632,17 +4742,20 @@ DELEGATE_TASK_SCHEMA = {
             },
             "action": {
                 "type": "string",
-                "enum": ["spawn", "list", "steer", "stop"],
+                "enum": ["spawn", "list", "steer", "stop", "wait"],
                 "description": (
                     "Default 'spawn' (omit for normal delegation). Live "
                     "orchestration of running subagents: 'list' shows this "
                     "conversation's live children (ids, goals, status, "
-                    "transcript paths); 'steer' queues course-correction text "
-                    "into one child (requires subagent_id + message) without "
-                    "stopping it; 'stop' ends one child early (requires "
-                    "subagent_id) — its partial result still returns as a "
-                    "completion message. Control actions return immediately; "
-                    "goal/tasks are ignored when action is not 'spawn'."
+                    "transcript paths), but never poll it in a loop because each "
+                    "call resends the accumulated conversation context; 'wait' "
+                    "blocks server-side up to 60 seconds (or timeout_s) and returns "
+                    "early when all selected children finish; 'steer' queues "
+                    "course-correction text into one child (requires subagent_id + "
+                    "message) without stopping it; 'stop' ends one child early "
+                    "(requires subagent_id) — its partial result still returns as a "
+                    "completion message. goal/tasks are ignored when action is not "
+                    "'spawn'."
                 ),
             },
             "subagent_id": {
@@ -4660,6 +4773,22 @@ DELEGATE_TASK_SCHEMA = {
                     "and specific — the child sees it appended to its next "
                     "tool result mid-run (e.g. \"Stop exploring X; focus on Y "
                     "and return early results\")."
+                ),
+            },
+            "timeout_s": {
+                "type": "number",
+                "description": (
+                    "For action='wait': maximum server-side blocking time in "
+                    "seconds (default 60; capped at 280). Ignored by other actions."
+                ),
+            },
+            "subagent_ids": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    "For action='wait': optional live child ids to wait for. "
+                    "When omitted, waits for every live descendant in this "
+                    "conversation's spawn tree."
                 ),
             },
         },
@@ -4726,6 +4855,8 @@ registry.register(
         action=args.get("action"),
         subagent_id=args.get("subagent_id"),
         message=args.get("message"),
+        timeout_s=args.get("timeout_s"),
+        subagent_ids=args.get("subagent_ids"),
         parent_agent=kw.get("parent_agent"),
     ),
     check_fn=check_delegate_requirements,
