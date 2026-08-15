@@ -5,7 +5,7 @@ import os
 from pathlib import Path
 import tomllib
 
-from ares_runtime.local_runtime import AresLocalPaths, AresLocalRuntime
+from ares_runtime.local_runtime import AresLocalPaths, AresLocalRuntime, _parser
 
 
 def _runtime(tmp_path: Path) -> AresLocalRuntime:
@@ -105,3 +105,12 @@ def test_ares_runtime_is_included_in_the_noneditable_distribution() -> None:
     data = tomllib.loads(project.read_text(encoding="utf-8"))
 
     assert "ares_runtime" in data["tool"]["setuptools"]["packages"]["find"]["include"]
+
+
+def test_chat_command_leaves_hermes_options_for_the_runtime() -> None:
+    args, passthrough = _parser().parse_known_args(
+        ["chat", "--oneshot", "Reply with exactly ARES_RUNTIME_OK"]
+    )
+
+    assert args.command == "chat"
+    assert passthrough == ["--oneshot", "Reply with exactly ARES_RUNTIME_OK"]

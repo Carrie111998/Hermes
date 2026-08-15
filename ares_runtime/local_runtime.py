@@ -674,10 +674,8 @@ def _parser() -> argparse.ArgumentParser:
     subparsers.add_parser("status", help="Show the selected runtime, remote, and gateway")
     desktop = subparsers.add_parser("desktop", help="Launch the selected Ares Desktop application")
     desktop.add_argument("--rebuild", action="store_true", help="Build Desktop in the selected stable runtime first")
-    tui = subparsers.add_parser("tui", help="Launch the selected TUI")
-    tui.add_argument("arguments", nargs=argparse.REMAINDER)
-    chat = subparsers.add_parser("chat", help="Launch the selected Hermes-compatible CLI")
-    chat.add_argument("arguments", nargs=argparse.REMAINDER)
+    subparsers.add_parser("tui", help="Launch the selected TUI")
+    subparsers.add_parser("chat", help="Launch the selected Hermes-compatible CLI")
     gateway = subparsers.add_parser("gateway", help="Manage the selected Ares gateway service")
     gateway.add_argument("action", choices=("start", "stop", "restart", "status", "foreground"))
     parser.add_argument("--version", action="store_true", help="Print the selected stable runtime revision")
@@ -685,7 +683,12 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Sequence[str] | None = None) -> None:
-    args = _parser().parse_args(argv)
+    parser = _parser()
+    args, passthrough = parser.parse_known_args(argv)
+    if args.command in {"chat", "tui"}:
+        args.arguments = passthrough
+    elif passthrough:
+        parser.error("unrecognized arguments: " + " ".join(passthrough))
     runtime = AresLocalRuntime()
     try:
         if args.version:
