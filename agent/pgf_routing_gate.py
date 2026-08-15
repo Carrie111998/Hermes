@@ -240,6 +240,8 @@ def _apply_selection(agent, brain: str, *, failed_provider: str | None = None, p
     """
     prev_provider = getattr(agent, "provider", None)
     prev_model = getattr(agent, "model", None)
+    prev_requested = getattr(agent, "requested_provider", None)
+    prev_brain = getattr(agent, "_pgf_governed_brain", None)
     try:
         provider, model = _resolve_brain_runtime(brain)
         if not provider or not model:
@@ -277,12 +279,17 @@ def _apply_selection(agent, brain: str, *, failed_provider: str | None = None, p
         return True
     except Exception as exc:  # noqa: BLE001 - never let the gate crash routing
         logger.warning("pgf_routing_gate: _apply_selection failed: %s", exc)
-        # Restore previous state and fail closed.
+        # Restore previous state atomically so a failed activation cannot leave a
+        # provider/requested_provider desync pointing at the rejected brain.
         try:
             if prev_provider is not None:
                 agent.provider = prev_provider
             if prev_model is not None:
                 agent.model = prev_model
+            if prev_requested is not None:
+                agent.requested_provider = prev_requested
+            if prev_brain is not None:
+                agent._pgf_governed_brain = prev_brain
         except Exception:  # noqa: BLE001
             pass
         _persist_replan_activation(
