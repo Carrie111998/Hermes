@@ -38,6 +38,23 @@ test('gitFor accepts an internally resolved git binary path containing spaces', 
   assert.doesNotThrow(() => gitFor(process.cwd(), 'C:\\Program Files\\Git\\cmd\\git.exe'))
 })
 
+test('gitFor suppresses simple-git trusted-binary warning for spaced internal paths', () => {
+  const originalWarn = console.warn
+  const warnings: unknown[][] = []
+
+  console.warn = (...args) => {
+    warnings.push(args)
+  }
+
+  try {
+    assert.doesNotThrow(() => gitFor(process.cwd(), 'C:\\Program Files\\Git\\cmd\\git.exe'))
+  } finally {
+    console.warn = originalWarn
+  }
+
+  assert.deepEqual(warnings, [])
+})
+
 test('gitFor runs git through a spaced binary path', async () => {
   if (process.platform !== 'win32') {
     return

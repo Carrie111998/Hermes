@@ -17,6 +17,8 @@ const COMMIT_CONTEXT_UNTRACKED_MAX = 80
 const REVIEW_FILE_CAP = 2_000
 const UNTRACKED_LINE_COUNT_CONCURRENCY = 16
 const UNTRACKED_LINE_COUNT_MAX_BYTES = 1024 * 1024
+const SIMPLE_GIT_UNSAFE_BINARY_WARNING =
+  'Invalid value supplied for custom binary, restricted characters must be removed or supply the unsafe.allowUnsafeCustomBinary option'
 
 // GUI-launched Electron apps on macOS inherit only a minimal PATH (no
 // /opt/homebrew/bin or /usr/local/bin), so `gh` — and the `git` gh shells out
@@ -43,6 +45,24 @@ function runGh(args, cwd, ghBin): Promise<{ ok: boolean; stdout: string }> {
   })
 }
 
+function withoutTrustedGitBinaryWarning<T>(fn: () => T): T {
+  const originalWarn = console.warn
+
+  console.warn = (...args) => {
+    if (args.length === 1 && String(args[0]) === SIMPLE_GIT_UNSAFE_BINARY_WARNING) {
+      return
+    }
+
+    originalWarn(...args)
+  }
+
+  try {
+    return fn()
+  } finally {
+    console.warn = originalWarn
+  }
+}
+
 function gitFor(cwd, gitBin) {
   // `gitBin` is resolved inside the Electron main process from known install
   // locations or PATH — never renderer/user input. simple-git's custom-binary
@@ -51,12 +71,14 @@ function gitFor(cwd, gitBin) {
   // For spaced paths, opt into simple-git's trusted-binary escape hatch instead
   // of falling back to PATH (often absent in GUI-launched apps, and PATH lookup
   // could resolve a repo-local git.exe).
-  return simpleGit({
-    baseDir: cwd,
-    binary: gitBin || 'git',
-    maxConcurrentProcesses: 4,
-    trimmed: false,
-    ...(gitBin && /\s/.test(gitBin) ? { unsafe: { allowUnsafeCustomBinary: true } } : {})
+  return withoutTrustedGitBinaryWarning(() => {
+    return simpleGit({
+      baseDir: cwd,
+      binary: gitBin || 'git',
+      maxConcurrentProcesses: 4,
+      trimmed: false,
+      ...(gitBin && /\s/.test(gitBin) ? { unsafe: { allowUnsafeCustomBinary: true } } : {})
+    })
   })
 }
 
