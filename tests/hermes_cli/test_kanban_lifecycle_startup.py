@@ -524,6 +524,82 @@ print("MARKER=" + str(Path(os.environ["LEGACY_MARKER"]).exists()))
     assert f"MARKER={should_execute}" in result.stdout
 
 
+@pytest.mark.parametrize("scope", ["lifecycle-only", "future-worker-scope"])
+@pytest.mark.parametrize("operation", ["load", "discover"])
+def test_scoped_worker_does_not_execute_context_engine_extensions(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    scope: str,
+    operation: str,
+) -> None:
+    _lifecycle_env(monkeypatch, scope)
+    marker = tmp_path / "context-engine-executed"
+    plugins_dir = tmp_path / "context_engine"
+    engine_dir = plugins_dir / "adversarial_context"
+    engine_dir.mkdir(parents=True)
+    (engine_dir / "__init__.py").write_text(
+        "from pathlib import Path\n"
+        f"Path({str(marker)!r}).write_text('executed', encoding='utf-8')\n",
+        encoding="utf-8",
+    )
+
+    import plugins.context_engine as context_engine
+
+    monkeypatch.setattr(context_engine, "_CONTEXT_ENGINE_PLUGINS_DIR", plugins_dir)
+    sys.modules.pop("plugins.context_engine.adversarial_context", None)
+    if operation == "load":
+        assert context_engine.load_context_engine("adversarial_context") is None
+    else:
+        assert context_engine.discover_context_engines() == []
+
+    assert not marker.exists()
+
+
+def test_context_engine_guard_fails_closed_when_scope_import_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import builtins
+    import plugins.context_engine as context_engine
+
+    real_import = builtins.__import__
+
+    def fail_scope_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "hermes_cli.kanban_worker_scope":
+            raise ImportError("scope guard unavailable")
+        return real_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", fail_scope_import)
+
+    assert context_engine._context_engine_extensions_disabled_for_scoped_worker()
+
+
+def test_normal_worker_can_execute_configured_context_engine(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _clear_lifecycle_env(monkeypatch)
+    marker = tmp_path / "normal-context-engine-executed"
+    plugins_dir = tmp_path / "context_engine"
+    engine_dir = plugins_dir / "normal_context"
+    engine_dir.mkdir(parents=True)
+    (engine_dir / "__init__.py").write_text(
+        "from pathlib import Path\n"
+        f"Path({str(marker)!r}).write_text('executed', encoding='utf-8')\n",
+        encoding="utf-8",
+    )
+
+    import plugins.context_engine as context_engine
+
+    monkeypatch.setattr(context_engine, "_CONTEXT_ENGINE_PLUGINS_DIR", plugins_dir)
+    sys.modules.pop("plugins.context_engine.normal_context", None)
+    try:
+        assert context_engine.load_context_engine("normal_context") is None
+    finally:
+        sys.modules.pop("plugins.context_engine.normal_context", None)
+
+    assert marker.exists()
+
+
 def _install_startup_spies(monkeypatch: pytest.MonkeyPatch) -> dict[str, int]:
     calls = {"plugin": 0, "mcp_background": 0, "mcp_inline": 0, "hook": 0}
 
