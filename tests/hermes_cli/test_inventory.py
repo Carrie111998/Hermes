@@ -513,3 +513,26 @@ def _apply_featured_with_dates(rows, dates: dict[str, str]):
 
 
 
+
+
+# ─── _apply_capabilities (per-provider effort scales) ──────────────────
+
+
+def test_apply_capabilities_advertises_documented_effort_scales():
+    """Providers with an officially documented effort enum expose it; others
+    keep the default full-ladder behavior (no ``efforts`` key)."""
+    from hermes_cli.inventory import _apply_capabilities
+
+    rows = [
+        {"slug": "deepseek", "models": ["deepseek-v4-flash"]},
+        {"slug": "kimi-coding", "models": ["kimi-k3"]},
+        {"slug": "xiaomi", "models": ["mimo-v2.5"]},
+        {"slug": "openai", "models": ["gpt-5.1"]},
+    ]
+
+    _apply_capabilities(rows)
+
+    assert rows[0]["capabilities"]["deepseek-v4-flash"]["efforts"] == ["none", "high", "max"]
+    assert rows[1]["capabilities"]["kimi-k3"]["efforts"] == ["low", "high", "max"]
+    assert rows[2]["capabilities"]["mimo-v2.5"]["efforts"] == ["none", "low", "medium", "high"]
+    assert "efforts" not in rows[3]["capabilities"]["gpt-5.1"]

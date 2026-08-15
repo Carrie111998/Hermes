@@ -26,6 +26,7 @@ afterEach(() => {
 function renderSubmenu(opts: {
   defaultEffort?: string
   effort?: string
+  efforts?: readonly string[]
   fastControl: FastControl
   isActive?: boolean
   onSelectModel?: (model: string) => void
@@ -40,6 +41,7 @@ function renderSubmenu(opts: {
           <ModelEditSubmenu
             defaultEffort={opts.defaultEffort ?? 'medium'}
             effort={opts.effort ?? 'medium'}
+            efforts={opts.efforts}
             fastControl={opts.fastControl}
             isActive={opts.isActive ?? true}
             model="m1"
@@ -127,5 +129,71 @@ describe('ModelEditSubmenu reports edits without performing them', () => {
     fireEvent.click(screen.getByRole('switch'))
 
     expect(onSelectModel).toHaveBeenCalledWith('m1-fast')
+  })
+})
+
+// The backend may narrow the effort ladder per model (capabilities.efforts) —
+// e.g. kimi-k3 officially accepts only low/high/max. Offering levels the API
+// rejects turns a picker choice into a silent 400, so the submenu must honor
+// the enum when one is provided.
+describe('ModelEditSubmenu per-model effort enum', () => {
+  it('offers only the backend-provided levels', () => {
+    renderSubmenu({
+      effort: 'high',
+      efforts: ['low', 'high', 'max'],
+      fastControl: { kind: 'none' },
+      onSetOptions: vi.fn(),
+      reasoning: true
+    })
+
+    expect(screen.getByRole('menuitemradio', { name: 'Low' })).toBeTruthy()
+    expect(screen.getByRole('menuitemradio', { name: 'High' })).toBeTruthy()
+    expect(screen.getByRole('menuitemradio', { name: 'Max' })).toBeTruthy()
+    expect(screen.queryByRole('menuitemradio', { name: 'Medium' })).toBeNull()
+    expect(screen.queryByRole('menuitemradio', { name: 'Ultra' })).toBeNull()
+  })
+
+  it('hides the Thinking toggle when the enum has no off state', () => {
+    renderSubmenu({
+      efforts: ['low', 'high', 'max'],
+      fastControl: { kind: 'none' },
+      onSetOptions: vi.fn(),
+      reasoning: true
+    })
+
+    expect(screen.queryByRole('switch')).toBeNull()
+  })
+
+  it('keeps the Thinking toggle when the enum offers none', () => {
+    renderSubmenu({
+      efforts: ['none', 'low', 'high'],
+      fastControl: { kind: 'none' },
+      onSetOptions: vi.fn(),
+      reasoning: true
+    })
+
+    expect(screen.getByRole('switch')).toBeTruthy()
+    // `none` itself stays out of the radio — the toggle owns it.
+    expect(screen.queryByRole('menuitemradio', { name: 'none' })).toBeNull()
+  })
+
+  it('clamps a configured level the model does not offer to the nearest enum level', () => {
+    // medium configured; kimi-style enum → nearest ladder rung is high.
+    renderSubmenu({
+      effort: 'medium',
+      efforts: ['low', 'high', 'max'],
+      fastControl: { kind: 'none' },
+      onSetOptions: vi.fn(),
+      reasoning: true
+    })
+
+    expect(screen.getByRole('menuitemradio', { name: 'High', checked: true })).toBeTruthy()
+  })
+
+  it('falls back to the full ladder when no enum is provided', () => {
+    renderSubmenu({ fastControl: { kind: 'none' }, onSetOptions: vi.fn(), reasoning: true })
+
+    expect(screen.getByRole('menuitemradio', { name: 'Ultra' })).toBeTruthy()
+    expect(screen.getByRole('switch')).toBeTruthy()
   })
 })

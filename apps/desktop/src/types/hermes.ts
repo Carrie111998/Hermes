@@ -424,6 +424,10 @@ export interface ModelOptionProvider {
 export interface ModelCapabilities {
   fast: boolean
   reasoning: boolean
+  /** Per-model reasoning-effort enum from the backend (provider-specific).
+   *  Absent → the full 7-level ladder applies. `none` means thinking-off is
+   *  offered (owned by the Thinking toggle, not the effort radio). */
+  efforts?: string[]
 }
 
 export interface ModelOptionsResponse {

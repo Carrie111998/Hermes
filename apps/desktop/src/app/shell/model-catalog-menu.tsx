@@ -461,6 +461,7 @@ export function ModelCatalogMenu({
                           }
                           provider={group.provider.slug}
                           reasoning={caps?.reasoning ?? true}
+                          efforts={caps?.efforts}
                         />
                       </DropdownMenuSub>
                     )
