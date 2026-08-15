@@ -20,80 +20,71 @@ const SYSTEM_MONO =
 
 export const DEFAULT_TYPOGRAPHY: DesktopThemeTypography = { fontSans: SYSTEM_SANS, fontMono: SYSTEM_MONO }
 
-const NOUS_BLUE = '#0053FD'
-const PSYCHE_BLUE = '#1540B1'
-const PSYCHE_WARM = '#FFE6CB'
-
-const nousTint = (pct: number) => `color-mix(in srgb, ${NOUS_BLUE} ${pct}%, #FFFFFF)`
-const nousTintTransparent = (pct: number) => `color-mix(in srgb, ${NOUS_BLUE} ${pct}%, transparent)`
-
-/**
- * Nous — canonical Hermes desktop identity. The palette keeps the current
- * glass geometry neutral, then lets the old bb/gui blue and psyche cream
- * return as accent seeds.
+/** 
+ * Nous — canonical Hermes desktop identity. 
+ * Lyons Command Center brand: navy #05060A, gold #C9A844, gold-light #E8C96A
  */
 export const nousTheme: DesktopTheme = {
   name: 'nous',
   label: 'Nous',
-  description: 'Glass neutrals with Nous blue accents',
+  description: 'Lyons Command Center: navy & gold',
   colors: {
-    background: '#F8FAFF',
-    foreground: '#17171A',
-    card: '#FFFFFF',
-    cardForeground: '#17171A',
-    muted: nousTint(5),
-    mutedForeground: '#666678',
-    popover: '#FFFFFF',
-    popoverForeground: '#17171A',
-    primary: NOUS_BLUE,
-    primaryForeground: '#FCFCFC',
-    secondary: nousTint(7),
-    secondaryForeground: '#242432',
-    accent: nousTint(10),
-    accentForeground: '#202030',
-    border: nousTintTransparent(22),
-    input: nousTintTransparent(30),
-    ring: NOUS_BLUE,
-    midground: NOUS_BLUE,
-    composerRing: NOUS_BLUE,
-    destructive: '#C72E4D',
-    destructiveForeground: '#FFFFFF',
-    sidebarBackground: '#F3F7FF',
-    sidebarBorder: nousTintTransparent(18),
-    userBubble: nousTint(6),
-    userBubbleBorder: nousTintTransparent(24)
+    background: '#05060A',
+    foreground: '#E8C96A',
+    card: '#0A0B0F',
+    cardForeground: '#E8C96A',
+    muted: '#1A1D24',
+    mutedForeground: '#8B7D5A',
+    popover: '#0A0B0F',
+    popoverForeground: '#E8C96A',
+    primary: '#C9A844',
+    primaryForeground: '#05060A',
+    secondary: '#0F1118',
+    secondaryForeground: '#C9A844',
+    accent: '#E8C96A',
+    accentForeground: '#05060A',
+    border: '#1F2330',
+    input: '#0D0F14',
+    ring: '#C9A844',
+    midground: '#C9A844',
+    composerRing: '#C9A844',
+    destructive: '#C75050',
+    destructiveForeground: '#05060A',
+    sidebarBackground: '#0C0E14',
+    sidebarBorder: '#1A1D28',
+    userBubble: '#141720',
+    userBubbleBorder: '#2A2E3A'
   },
   darkColors: {
-    background: '#0D2F86',
-    foreground: PSYCHE_WARM,
-    card: '#12378F',
-    cardForeground: PSYCHE_WARM,
-    muted: '#183F9A',
-    mutedForeground: '#B5C7F3',
-    popover: '#123A96',
-    popoverForeground: PSYCHE_WARM,
-    primary: PSYCHE_WARM,
-    primaryForeground: '#0D2F86',
-    secondary: '#1B45A4',
-    secondaryForeground: '#E0E8FF',
-    accent: PSYCHE_BLUE,
-    accentForeground: '#F0F4FF',
-    border: '#3158AD',
-    input: '#0B2566',
-    ring: PSYCHE_WARM,
-    midground: NOUS_BLUE,
-    composerRing: PSYCHE_WARM,
-    destructive: '#C0473A',
-    destructiveForeground: '#FEF2F2',
-    sidebarBackground: '#09286F',
-    sidebarBorder: '#234A9C',
-    userBubble: '#143B91',
-    userBubbleBorder: '#3A63BD'
+    background: '#05060A',
+    foreground: '#E8C96A',
+    card: '#0A0B0F',
+    cardForeground: '#E8C96A',
+    muted: '#1A1D24',
+    mutedForeground: '#8B7D5A',
+    popover: '#0A0B0F',
+    popoverForeground: '#E8C96A',
+    primary: '#C9A844',
+    primaryForeground: '#05060A',
+    secondary: '#0F1118',
+    secondaryForeground: '#C9A844',
+    accent: '#E8C96A',
+    accentForeground: '#05060A',
+    border: '#1F2330',
+    input: '#0D0F14',
+    ring: '#C9A844',
+    midground: '#C9A844',
+    composerRing: '#E8C96A',
+    destructive: '#C75050',
+    destructiveForeground: '#05060A',
+    sidebarBackground: '#0C0E14',
+    sidebarBorder: '#1A1D28',
+    userBubble: '#141720',
+    userBubbleBorder: '#2A2E3A'
   },
   typography: {
     fontSans: SYSTEM_SANS,
-    fontMono: `"Courier Prime", ${SYSTEM_MONO}`,
-    fontUrl: 'https://fonts.googleapis.com/css2?family=Courier+Prime:wght@400;700&display=swap'
+    fontMono: SYSTEM_MONO
   }
 }
 
@@ -128,126 +119,108 @@ export const midnightTheme: DesktopTheme = {
     userBubble: '#14143a',
     userBubbleBorder: '#242466'
   },
-  typography: {
-    fontMono: `"JetBrains Mono", ${SYSTEM_MONO}`,
-    fontUrl: 'https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&display=swap'
-  }
-}
-
-/** Warm crimson and bronze — forge vibes. Matches the CLI ares skin. */
-export const emberTheme: DesktopTheme = {
-  name: 'ember',
-  label: 'Ember',
-  description: 'Warm crimson and bronze — forge vibes',
-  colors: {
-    background: '#160800',
-    foreground: '#ffd8b0',
-    card: '#1e0e04',
-    cardForeground: '#ffd8b0',
-    muted: '#2a1408',
-    mutedForeground: '#aa7a56',
-    popover: '#221008',
-    popoverForeground: '#ffd8b0',
-    primary: '#ffd8b0',
-    primaryForeground: '#160800',
-    secondary: '#341800',
-    secondaryForeground: '#f0c090',
-    accent: '#301600',
-    accentForeground: '#e8c080',
-    border: '#3a1c08',
-    input: '#3a1c08',
-    ring: '#d97316',
-    midground: '#d97316',
-    destructive: '#c43010',
+  darkColors: {
+    background: '#08081c',
+    foreground: '#ddd6ff',
+    card: '#0d0d28',
+    cardForeground: '#ddd6ff',
+    muted: '#13133a',
+    mutedForeground: '#7c7ab0',
+    popover: '#0f0f2e',
+    popoverForeground: '#ddd6ff',
+    primary: '#ddd6ff',
+    primaryForeground: '#08081c',
+    secondary: '#1a1a4a',
+    secondaryForeground: '#c4bff0',
+    accent: '#1a1a44',
+    accentForeground: '#d0c8ff',
+    border: '#1e1e52',
+    input: '#1e1e52',
+    ring: '#8b80e8',
+    midground: '#8b80e8',
+    destructive: '#b03060',
     destructiveForeground: '#fef2f2',
-    sidebarBackground: '#100600',
-    sidebarBorder: '#2a1004',
-    userBubble: '#2a1000',
-    userBubbleBorder: '#4a2010'
+    sidebarBackground: '#06061a',
+    sidebarBorder: '#12123a',
+    userBubble: '#14143a',
+    userBubbleBorder: '#242466'
   },
   typography: {
-    fontMono: `"IBM Plex Mono", ${SYSTEM_MONO}`,
-    fontUrl: 'https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;700&display=swap'
+    fontSans: SYSTEM_SANS,
+    fontMono: SYSTEM_MONO
   }
 }
 
-/** Clean grayscale. Matches the CLI mono skin and dashboard mono theme. */
+/** Lean monochrome. For terminals, terminals, and terminals. */
 export const monoTheme: DesktopTheme = {
   name: 'mono',
   label: 'Mono',
-  description: 'Clean grayscale — minimal and focused',
+  description: 'Lean monochrome',
   colors: {
-    background: '#0e0e0e',
-    foreground: '#eaeaea',
-    card: '#141414',
-    cardForeground: '#eaeaea',
-    muted: '#1e1e1e',
-    mutedForeground: '#808080',
-    popover: '#181818',
-    popoverForeground: '#eaeaea',
-    primary: '#eaeaea',
-    primaryForeground: '#0e0e0e',
-    secondary: '#262626',
-    secondaryForeground: '#c8c8c8',
-    accent: '#222222',
-    accentForeground: '#d8d8d8',
-    border: '#2a2a2a',
-    input: '#2a2a2a',
-    ring: '#9a9a9a',
-    midground: '#9a9a9a',
-    destructive: '#a84040',
+    background: '#0b0b0b',
+    foreground: '#d4d4d4',
+    card: '#161616',
+    cardForeground: '#d4d4d4',
+    muted: '#2a2a2a',
+    mutedForeground: '#8c8c8c',
+    popover: '#1e1e1e',
+    popoverForeground: '#d4d4d4',
+    primary: '#d4d4d4',
+    primaryForeground: '#0b0b0b',
+    secondary: '#1c1c1c',
+    secondaryForeground: '#a0a0a0',
+    accent: '#373737',
+    accentForeground: '#d4d4d4',
+    border: '#3a3a3a',
+    input: '#1c1c1c',
+    ring: '#d4d4d4',
+    midground: '#3d3d3d',
+    destructive: '#c72e4d',
     destructiveForeground: '#fef2f2',
-    sidebarBackground: '#0a0a0a',
-    sidebarBorder: '#202020',
+    sidebarBackground: '#0d0d0d',
+    sidebarBorder: '#2a2a2a',
     userBubble: '#1a1a1a',
-    userBubbleBorder: '#363636'
-  }
-}
-
-/** Neon green on black. Matches the CLI cyberpunk skin and dashboard theme. */
-export const cyberpunkTheme: DesktopTheme = {
-  name: 'cyberpunk',
-  label: 'Cyberpunk',
-  description: 'Neon green on black — matrix terminal',
-  colors: {
-    background: '#000a00',
-    foreground: '#00ff41',
-    card: '#001200',
-    cardForeground: '#00ff41',
-    muted: '#001a00',
-    mutedForeground: '#1a8a30',
-    popover: '#001000',
-    popoverForeground: '#00ff41',
-    primary: '#00ff41',
-    primaryForeground: '#000a00',
-    secondary: '#002800',
-    secondaryForeground: '#00cc34',
-    accent: '#002000',
-    accentForeground: '#00e038',
-    border: '#003000',
-    input: '#003000',
-    ring: '#00ff41',
-    midground: '#00ff41',
-    destructive: '#ff003c',
-    destructiveForeground: '#000a00',
-    sidebarBackground: '#000600',
-    sidebarBorder: '#001800',
-    userBubble: '#001400',
-    userBubbleBorder: '#004800'
+    userBubbleBorder: '#323232'
+  },
+  darkColors: {
+    background: '#0b0b0b',
+    foreground: '#d4d4d4',
+    card: '#161616',
+    cardForeground: '#d4d4d4',
+    muted: '#2a2a2a',
+    mutedForeground: '#8c8c8c',
+    popover: '#1e1e1e',
+    popoverForeground: '#d4d4d4',
+    primary: '#d4d4d4',
+    primaryForeground: '#0b0b0b',
+    secondary: '#1c1c1c',
+    secondaryForeground: '#a0a0a0',
+    accent: '#373737',
+    accentForeground: '#d4d4d4',
+    border: '#3a3a3a',
+    input: '#1c1c1c',
+    ring: '#d4d4d4',
+    midground: '#3d3d3d',
+    destructive: '#c72e4d',
+    destructiveForeground: '#fef2f2',
+    sidebarBackground: '#0d0d0d',
+    sidebarBorder: '#2a2a2a',
+    userBubble: '#1a1a1a',
+    userBubbleBorder: '#323232'
   },
   typography: {
-    fontMono: `"Courier New", Courier, monospace, ${EMOJI_FALLBACK}`,
-    fontSans: `"Courier New", Courier, monospace, ${EMOJI_FALLBACK}`
+    fontSans: SYSTEM_SANS,
+    fontMono: SYSTEM_MONO
   }
 }
 
-/** Cool slate blue for developers. Matches the CLI slate skin. */
+/** Cool blue developer-focused theme. */
 export const slateTheme: DesktopTheme = {
   name: 'slate',
   label: 'Slate',
-  description: 'Cool slate blue — focused developer theme',
+  description: 'Cool blue developer-focused theme',
   colors: {
-    background: '#0d1117',
+    background: '#0f1117',
     foreground: '#c9d1d9',
     card: '#161b22',
     cardForeground: '#c9d1d9',
@@ -255,40 +228,63 @@ export const slateTheme: DesktopTheme = {
     mutedForeground: '#8b949e',
     popover: '#1c2128',
     popoverForeground: '#c9d1d9',
-    primary: '#c9d1d9',
-    primaryForeground: '#0d1117',
-    secondary: '#2a3038',
-    secondaryForeground: '#adb5bf',
-    accent: '#1e2530',
-    accentForeground: '#c0c8d0',
+    primary: '#58a6ff',
+    primaryForeground: '#000b15',
+    secondary: '#1c2128',
+    secondaryForeground: '#8b949e',
+    accent: '#1f6feb',
+    accentForeground: '#e6edf3',
     border: '#30363d',
-    input: '#30363d',
-    ring: '#58a6ff',
-    midground: '#58a6ff',
-    destructive: '#cf4848',
+    input: '#0d1117',
+    ring: '#388bfd',
+    midground: '#484f58',
+    destructive: '#f85149',
     destructiveForeground: '#fef2f2',
-    sidebarBackground: '#090d13',
-    sidebarBorder: '#1c2228',
-    userBubble: '#1e2a38',
-    userBubbleBorder: '#2e4060'
+    sidebarBackground: '#010101',
+    sidebarBorder: '#21262d',
+    userBubble: '#2d3748',
+    userBubbleBorder: '#444c56'
+  },
+  darkColors: {
+    background: '#0f1117',
+    foreground: '#c9d1d9',
+    card: '#161b22',
+    cardForeground: '#c9d1d9',
+    muted: '#21262d',
+    mutedForeground: '#8b949e',
+    popover: '#1c2128',
+    popoverForeground: '#c9d1d9',
+    primary: '#58a6ff',
+    primaryForeground: '#000b15',
+    secondary: '#1c2128',
+    secondaryForeground: '#8b949e',
+    accent: '#1f6feb',
+    accentForeground: '#e6edf3',
+    border: '#30363d',
+    input: '#0d1117',
+    ring: '#388bfd',
+    midground: '#484f58',
+    destructive: '#f85149',
+    destructiveForeground: '#fef2f2',
+    sidebarBackground: '#010101',
+    sidebarBorder: '#21262d',
+    userBubble: '#2d3748',
+    userBubbleBorder: '#444c56'
   },
   typography: {
-    fontMono: `"JetBrains Mono", ${SYSTEM_MONO}`
+    fontSans: SYSTEM_SANS,
+    fontMono: SYSTEM_MONO
   }
 }
 
 export const BUILTIN_THEMES: Record<string, DesktopTheme> = {
   nous: nousTheme,
   midnight: midnightTheme,
-  ember: emberTheme,
   mono: monoTheme,
-  cyberpunk: cyberpunkTheme,
   slate: slateTheme
 }
 
 export const BUILTIN_THEME_LIST = Object.values(BUILTIN_THEMES)
 
 /** Skin used when nothing is persisted or the persisted name is retired. */
-export const DEFAULT_SKIN_NAME = 'nous'
->>>>>>> 3f912ee1d (fix(desktop): restore BUILTIN_THEMES export to fix white screen)
 export const DEFAULT_SKIN_NAME = 'nous'
