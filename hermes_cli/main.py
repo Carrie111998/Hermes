@@ -1502,7 +1502,7 @@ def _print_tui_exit_summary(
 
     print()
     print("Resume this session with:")
-    print(f"  hermes --tui --resume {target}")
+    print(f"  ares --tui --resume {target}")
     if title:
         print(f'  hermes --tui -c "{title}"')
     print()
