@@ -408,9 +408,12 @@ class TestFocusRegainRedraw:
 
         assert calls == ["redraw"]
 
-    def test_focus_regain_redraw_is_rate_limited(self, bare_cli):
+    def test_focus_regain_redraw_is_rate_limited(self, bare_cli, monkeypatch):
         calls = []
         bare_cli._force_full_redraw = lambda: calls.append("redraw")
+        # Uptime can be < min_interval on a fresh CI runner; pin monotonic
+        # so the first call is a genuine first-fire, not a 0.0-sentinel skip.
+        monkeypatch.setattr(cli_mod.time, "monotonic", lambda: 10.0)
 
         bare_cli._schedule_focus_regain_redraw(min_interval=60.0)
         bare_cli._schedule_focus_regain_redraw(min_interval=60.0)
