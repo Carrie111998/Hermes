@@ -7110,6 +7110,7 @@ def run_conversation(
 
                     _tool_deadline_warning = build_kanban_deadline_warning(
                         issued=getattr(agent, "_kanban_deadline_warning_issued", False),
+                        messages=messages,
                     )
                 except Exception:
                     logger.debug("kanban tool-path deadline-warning check failed", exc_info=True)
@@ -7911,6 +7912,7 @@ def run_conversation(
 
                     _deadline_warning = build_kanban_deadline_warning(
                         issued=getattr(agent, "_kanban_deadline_warning_issued", False),
+                        messages=messages,
                     )
                 except Exception:
                     logger.debug("kanban deadline-warning check failed", exc_info=True)

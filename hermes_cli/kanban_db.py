@@ -1533,6 +1533,8 @@ CREATE TABLE IF NOT EXISTS kanban_notify_retries (
     thread_id     TEXT NOT NULL DEFAULT '',
     event_id      INTEGER NOT NULL,
     created_at    INTEGER NOT NULL,
+    claim_token   TEXT,
+    claim_expires INTEGER,
     PRIMARY KEY (task_id, platform, chat_id, thread_id, event_id)
 );
 
@@ -2787,6 +2789,17 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
                 conn, "kanban_notify_subs", "delivery_metadata", "delivery_metadata TEXT"
             )
 
+    retry_table_exists = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='kanban_notify_retries'"
+    ).fetchone() is not None
+    if retry_table_exists:
+        _add_column_if_missing(
+            conn, "kanban_notify_retries", "claim_token", "claim_token TEXT"
+        )
+        _add_column_if_missing(
+            conn, "kanban_notify_retries", "claim_expires", "claim_expires INTEGER"
+        )
+
     # One-shot backfill: any task that is 'running' before runs existed
     # had its claim_lock / claim_expires / worker_pid on the task row.
     # Synthesize a matching task_runs row so subsequent end-run / heartbeat
@@ -3260,7 +3273,9 @@ def _task_creation_violations(
     try:
         from hermes_cli.config import load_config
 
-        require_explicit_workspace = bool(
+        from hermes_cli.kanban_config import enabled
+
+        require_explicit_workspace = enabled(
             (load_config() or {}).get("kanban", {}).get(
                 "require_explicit_workspace", False,
             )
@@ -3718,7 +3733,11 @@ def create_task(
                 )
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
                 _apply_default_notify_subs(
-                    conn, task_id, default_notify_targets, created_at=now
+                    conn,
+                    task_id,
+                    default_notify_targets,
+                    created_at=now,
+                    notifier_profile=_default_subscription_notifier_profile(created_by),
                 )
             return task_id
         except sqlite3.IntegrityError:
@@ -3824,13 +3843,18 @@ def _default_notify_subscription_targets() -> tuple[tuple[str, str, str], ...]:
             _log.warning("kanban: ignoring non-string default subscription %r", value)
             continue
         platform, separator, remainder = value.strip().partition(":")
-        chat_id, thread_separator, thread_id = remainder.partition(":")
+        # Chat identifiers such as Matrix ``!room:server`` legitimately
+        # contain colons.  The first colon separates platform; a final colon
+        # is a thread only when that final segment is an integer.
+        chat_id, thread_id = remainder, ""
+        if ":" in remainder:
+            possible_chat, possible_thread = remainder.rsplit(":", 1)
+            if possible_thread.strip().isdigit():
+                chat_id, thread_id = possible_chat, possible_thread
         platform = platform.strip().lower()
         chat_id = chat_id.strip()
-        thread_id = thread_id.strip() if thread_separator else ""
-        if not separator or not platform or not chat_id or (
-            thread_separator and not thread_id
-        ):
+        thread_id = thread_id.strip()
+        if not separator or not platform or not chat_id:
             _log.warning(
                 "kanban: ignoring invalid default subscription %r; "
                 "expected platform:chat_id[:thread_id]",
@@ -3843,12 +3867,33 @@ def _default_notify_subscription_targets() -> tuple[tuple[str, str, str], ...]:
     return tuple(targets)
 
 
+def _default_subscription_notifier_profile(created_by: Optional[str]) -> Optional[str]:
+    """Resolve ownership for configured default subscriptions.
+
+    An explicit ``kanban.default_subscription_notifier_profile`` lets an
+    operator designate the gateway profile that owns shared destinations.
+    Otherwise the creating profile owns the row, so a gateway without that
+    adapter cannot consume a notification meant for the creator's gateway.
+    """
+    try:
+        from hermes_cli.config import load_config
+
+        configured = (load_config() or {}).get("kanban", {}).get(
+            "default_subscription_notifier_profile"
+        )
+    except Exception:
+        configured = None
+    profile = str(configured or created_by or "").strip()
+    return profile or None
+
+
 def _apply_default_notify_subs(
     conn: sqlite3.Connection,
     task_id: str,
     targets: Iterable[tuple[str, str, str]],
     *,
     created_at: int,
+    notifier_profile: Optional[str],
 ) -> None:
     """Insert configured task-creation subscriptions without overwriting rows.
 
@@ -3860,9 +3905,9 @@ def _apply_default_notify_subs(
         conn.execute(
             """
             INSERT OR IGNORE INTO kanban_notify_subs
-                (task_id, platform, chat_id, thread_id, chat_type,
+                (task_id, platform, chat_id, thread_id, chat_type, notifier_profile,
                  delivery_mode, created_at, last_event_id)
-            VALUES (?, ?, ?, ?, 'dm', ?, ?,
+            VALUES (?, ?, ?, ?, 'dm', ?, ?, ?,
                     COALESCE((SELECT MAX(id) FROM task_events WHERE task_id = ?), 0))
             """,
             (
@@ -3870,6 +3915,7 @@ def _apply_default_notify_subs(
                 platform,
                 chat_id,
                 thread_id,
+                notifier_profile,
                 "notify+wake" if platform == "api_server" else "notify",
                 created_at,
                 task_id,
@@ -4229,7 +4275,7 @@ def parent_results(conn: sqlite3.Connection, task_id: str) -> list[tuple[str, Op
 # ---------------------------------------------------------------------------
 
 def add_comment(
-    conn: sqlite3.Connection, task_id: str, author: str, body: str
+    conn: sqlite3.Connection, task_id: str, author: str, body: str, *, source: Optional[str] = None,
 ) -> int:
     if not body or not body.strip():
         raise ValueError("comment body is required")
@@ -4248,7 +4294,10 @@ def add_comment(
             "VALUES (?, ?, ?, ?)",
             (task_id, author.strip(), body.strip(), now),
         )
-        _append_event(conn, task_id, "commented", {"author": author, "len": len(body)})
+        payload = {"author": author, "len": len(body)}
+        if source in {"cli", "tool", "dashboard"}:
+            payload["source"] = source
+        _append_event(conn, task_id, "commented", payload)
         return int(cur.lastrowid or 0)
 
 
@@ -5086,6 +5135,45 @@ def claim_review_task(
         return get_task(conn, task_id)
 
 
+def release_claim_without_spawn(
+    conn: sqlite3.Connection,
+    task: Task,
+    *,
+    reason: str,
+) -> bool:
+    """Return a just-claimed task to ready when pre-spawn checks reject it.
+
+    The lock and run guard make this safe against a later owner.  This is not
+    a worker failure: no process was started, so it must not increment the
+    retry circuit breaker.
+    """
+    if task.current_run_id is None or not task.claim_lock:
+        return False
+    with write_txn(conn):
+        cur = conn.execute(
+            "UPDATE tasks SET status = 'ready', claim_lock = NULL, claim_expires = NULL, "
+            "worker_pid = NULL, current_run_id = NULL WHERE id = ? "
+            "AND status = 'running' AND current_run_id = ? AND claim_lock = ?",
+            (task.id, int(task.current_run_id), task.claim_lock),
+        )
+        if cur.rowcount != 1:
+            return False
+        conn.execute(
+            "UPDATE task_runs SET status = 'released', outcome = 'released', "
+            "summary = ?, ended_at = ?, claim_lock = NULL, claim_expires = NULL "
+            "WHERE id = ? AND ended_at IS NULL",
+            (reason[:800], int(time.time()), int(task.current_run_id)),
+        )
+        _append_event(
+            conn,
+            task.id,
+            "claim_released",
+            {"reason": reason[:400]},
+            run_id=int(task.current_run_id),
+        )
+    return True
+
+
 def _retry_status_for_run(
     conn: sqlite3.Connection,
     task_id: str,
@@ -5884,7 +5972,7 @@ def checkpoint_task(
     *,
     summary: str,
     metadata: Optional[dict] = None,
-    expected_run_id: Optional[int] = None,
+    expected_run_id: int,
 ) -> bool:
     """Close the current attempt and requeue the task without releasing its claim.
 
@@ -5912,11 +6000,9 @@ def checkpoint_task(
             and claim["worker_pid"] is None
             else None
         )
-        params: list[Any] = [task_id]
-        run_guard = ""
-        if expected_run_id is not None:
-            run_guard = " AND current_run_id = ?"
-            params.append(int(expected_run_id))
+        if expected_run_id is None:
+            raise ValueError("expected_run_id is required")
+        params: list[Any] = [task_id, int(expected_run_id)]
         cur = conn.execute(
             """
             UPDATE tasks
@@ -5925,7 +6011,7 @@ def checkpoint_task(
                    worker_pid = COALESCE(worker_pid, ?)
              WHERE id = ?
                AND status = 'running'
-            """ + run_guard,
+            """ + " AND current_run_id = ?",
             tuple([fence_pid, *params]),
         )
         if cur.rowcount != 1:
@@ -7929,6 +8015,7 @@ def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
         conn.execute("DELETE FROM task_comments WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM task_events WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM task_runs WHERE task_id = ?", (task_id,))
+        conn.execute("DELETE FROM kanban_notify_retries WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM kanban_notify_subs WHERE task_id = ?", (task_id,))
         cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
         return cur.rowcount == 1
@@ -7952,6 +8039,7 @@ def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
         conn.execute("DELETE FROM task_comments WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM task_events WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM task_runs WHERE task_id = ?", (task_id,))
+        conn.execute("DELETE FROM kanban_notify_retries WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM kanban_notify_subs WHERE task_id = ?", (task_id,))
     recompute_ready(conn)
     return True
@@ -10490,6 +10578,22 @@ def _dispatch_once_locked(
         claimed = claim_task(conn, row["id"], ttl_seconds=ttl_seconds)
         if claimed is None:
             continue
+        if workspace_policy == "serialize":
+            workspace_path, running_task_ids = workspace_conflicts_with_running(
+                conn, claimed, board=board,
+            )
+            if workspace_path is not None and running_task_ids:
+                message = workspace_conflict_message(
+                    claimed.id, workspace_path, running_task_ids,
+                )
+                release_claim_without_spawn(
+                    conn, claimed, reason=f"workspace conflict: {message}",
+                )
+                result.skipped_workspace_conflict.append(
+                    (claimed.id, running_task_ids, str(workspace_path))
+                )
+                _log.info("kanban workspace conflict: released claimed %s", message)
+                continue
         try:
             resolved_branch_name = None
             if claimed.workspace_kind == "worktree":
@@ -10653,6 +10757,22 @@ def _dispatch_once_locked(
         claimed = claim_review_task(conn, row["id"], ttl_seconds=ttl_seconds)
         if claimed is None:
             continue
+        if workspace_policy == "serialize":
+            workspace_path, running_task_ids = workspace_conflicts_with_running(
+                conn, claimed, board=board,
+            )
+            if workspace_path is not None and running_task_ids:
+                message = workspace_conflict_message(
+                    claimed.id, workspace_path, running_task_ids,
+                )
+                release_claim_without_spawn(
+                    conn, claimed, reason=f"workspace conflict: {message}",
+                )
+                result.skipped_workspace_conflict.append(
+                    (claimed.id, running_task_ids, str(workspace_path))
+                )
+                _log.info("kanban workspace conflict: released claimed %s", message)
+                continue
         try:
             resolved_branch_name = None
             if claimed.workspace_kind == "worktree":
@@ -12026,6 +12146,11 @@ def remove_notify_sub(
             "AND platform = ? AND chat_id = ? AND thread_id = ?",
             (task_id, platform, chat_id, thread_id or ""),
         )
+        conn.execute(
+            "DELETE FROM kanban_notify_retries WHERE task_id = ? "
+            "AND platform = ? AND chat_id = ? AND thread_id = ?",
+            (task_id, platform, chat_id, thread_id or ""),
+        )
     return cur.rowcount > 0
 
 
@@ -12060,6 +12185,13 @@ def purge_stale_done_notify_subs(
         return 0
     cutoff = int(time.time()) - days * 86400
     with write_txn(conn):
+        conn.execute(
+            "DELETE FROM kanban_notify_retries WHERE task_id IN ("
+            " SELECT t.id FROM tasks t WHERE t.status = 'done' AND COALESCE("
+            "  (SELECT MAX(e.created_at) FROM task_events e WHERE e.task_id = t.id),"
+            "  t.completed_at, t.created_at, 0) < ?)",
+            (cutoff,),
+        )
         cur = conn.execute(
             "DELETE FROM kanban_notify_subs WHERE task_id IN ("
             " SELECT t.id FROM tasks t"
@@ -12163,12 +12295,33 @@ def claim_unseen_events_for_sub(
             thread_id=thread_id,
             kinds=kinds,
         )
+        # Retry rows are independent of the subscription cursor, so they need
+        # their own short lease.  Without it two notifier processes can both
+        # read the same durable retry row after one lost a cursor CAS and
+        # double-deliver the wake.  Claim before read while holding SQLite's
+        # writer transaction; a crashed claimant naturally expires.
+        retry_claim_token = secrets.token_hex(16)
+        retry_claim_expires = int(time.time()) + 120
+        conn.execute(
+            "UPDATE kanban_notify_retries SET claim_token = ?, claim_expires = ? "
+            "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ? "
+            "AND (claim_expires IS NULL OR claim_expires <= ?)",
+            (
+                retry_claim_token,
+                retry_claim_expires,
+                task_id,
+                platform,
+                chat_id,
+                thread_id or "",
+                int(time.time()),
+            ),
+        )
         retry_rows = conn.execute(
             "SELECT e.* FROM kanban_notify_retries r "
             "JOIN task_events e ON e.id = r.event_id "
             "WHERE r.task_id = ? AND r.platform = ? AND r.chat_id = ? "
-            "AND r.thread_id = ? ORDER BY e.id ASC",
-            (task_id, platform, chat_id, thread_id or ""),
+            "AND r.thread_id = ? AND r.claim_token = ? ORDER BY e.id ASC",
+            (task_id, platform, chat_id, thread_id or "", retry_claim_token),
         ).fetchall()
         retry_events = [
             Event(
@@ -12243,6 +12396,16 @@ def rewind_notify_cursor(
                 int(claimed_cursor),
             ),
         )
+        # The caller will retry immediately after a delivery failure. Release
+        # any retry lease it held rather than making that retry wait for TTL.
+        if claimed_event_ids:
+            event_ids = [int(event_id) for event_id in claimed_event_ids]
+            conn.execute(
+                "UPDATE kanban_notify_retries SET claim_token = NULL, claim_expires = NULL "
+                "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ? "
+                "AND event_id IN (" + ",".join("?" for _ in event_ids) + ")",
+                (task_id, platform, chat_id, thread_id or "", *event_ids),
+            )
         if cur.rowcount == 0 and claimed_event_ids:
             now = int(time.time())
             conn.executemany(
@@ -12270,6 +12433,12 @@ def gc_events(
     history."""
     cutoff = int(time.time()) - int(older_than_seconds)
     with write_txn(conn):
+        conn.execute(
+            "DELETE FROM kanban_notify_retries WHERE event_id IN ("
+            " SELECT id FROM task_events WHERE created_at < ? AND task_id IN "
+            " (SELECT id FROM tasks WHERE status IN ('done', 'archived')))",
+            (cutoff,),
+        )
         cur = conn.execute(
             "DELETE FROM task_events WHERE created_at < ? AND task_id IN "
             "(SELECT id FROM tasks WHERE status IN ('done', 'archived'))",

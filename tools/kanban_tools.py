@@ -893,7 +893,8 @@ def _handle_complete(args: dict, **kw) -> str:
         )
     if _safe_checkpoint_enabled():
         metadata = _canonical_handoff(str(summary or result).strip(), metadata)
-    metadata = _stamp_worker_session_metadata(tid, metadata)
+    if args.get("checkpoint_handoff"):
+        metadata = _stamp_worker_session_metadata(tid, metadata)
     board = args.get("board")
     try:
         kb, conn = _connect(board=board)
@@ -1338,7 +1339,9 @@ def _handle_comment(args: dict, **kw) -> str:
     try:
         kb, conn = _connect(board=board)
         try:
-            cid = kb.add_comment(conn, tid, author=author, body=str(body))
+            cid = kb.add_comment(
+                conn, tid, author=author, body=str(body), source="tool",
+            )
             return _ok(task_id=tid, comment_id=cid)
         finally:
             conn.close()

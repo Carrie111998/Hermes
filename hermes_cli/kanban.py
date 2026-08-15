@@ -184,7 +184,8 @@ def _check_dispatcher_presence(
     try:
         from hermes_cli.config import load_config
         cfg = load_config()
-        dispatch_on = bool(cfg.get("kanban", {}).get("dispatch_in_gateway", True))
+        from hermes_cli.kanban_config import enabled
+        dispatch_on = enabled(cfg.get("kanban", {}).get("dispatch_in_gateway", True))
     except Exception:
         dispatch_on = True  # can't tell — assume default
 
@@ -2133,7 +2134,14 @@ def _cmd_claim(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             return 1
-        workspace = kb.resolve_workspace(task)
+        try:
+            workspace = kb.resolve_workspace(task)
+        except Exception as exc:
+            kb.release_claim_without_spawn(
+                conn, task, reason=f"manual workspace preflight: {exc}",
+            )
+            print(f"cannot claim {args.task_id}: workspace preflight failed: {exc}", file=sys.stderr)
+            return 1
         kb.set_workspace_path(conn, task.id, str(workspace))
     print(f"Claimed {task.id}")
     print(f"Workspace: {workspace}")
@@ -2151,7 +2159,7 @@ def _cmd_comment(args: argparse.Namespace) -> int:
             body = body[: max(0, args.max_len - len(suffix))].rstrip() + suffix
     author = args.author or _profile_author()
     with kb.connect_closing() as conn:
-        kb.add_comment(conn, args.task_id, author, body)
+        kb.add_comment(conn, args.task_id, author, body, source="cli")
     print(f"Comment added to {args.task_id}")
     return 0
 

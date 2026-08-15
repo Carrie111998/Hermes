@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import json
 import os
 import sqlite3
 import subprocess
@@ -339,6 +340,17 @@ def test_checkpoint_claim_releases_only_after_old_worker_exits(kanban_home, monk
         assert kb.claim_task(conn, task_id) is not None
 
 
+def test_checkpoint_requires_a_claim_run_id(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="roll over", assignee="coder")
+        assert kb.claim_task(conn, task_id) is not None
+
+        with pytest.raises(TypeError):
+            kb.checkpoint_task(conn, task_id, summary="missing")
+        with pytest.raises(ValueError, match="expected_run_id is required"):
+            kb.checkpoint_task(conn, task_id, summary="none", expected_run_id=None)
+
+
 def test_remote_checkpoint_claim_releases_only_after_lease_expiry(kanban_home):
     with kb.connect() as conn:
         task_id = kb.create_task(conn, title="remote roll over", assignee="coder")
@@ -438,6 +450,124 @@ def test_failed_rewind_records_durable_retry_after_cursor_race(kanban_home):
         )
         assert conn2.execute("SELECT COUNT(*) FROM kanban_notify_retries").fetchone()[0] == 0
 
+
+def test_retry_row_has_a_single_atomic_notifier_claim(kanban_home):
+    """A retry lease prevents two gateway connections double-delivering it."""
+    with kb.connect() as writer, kb.connect() as first, kb.connect() as second:
+        task_id = kb.create_task(writer, title="notify", assignee="worker")
+        kb.add_notify_sub(writer, task_id=task_id, platform="matrix", chat_id="!room:server")
+        kb.add_comment(writer, task_id, "human", "decision")
+        _old, cursor, events = kb.claim_unseen_events_for_sub(
+            writer, task_id=task_id, platform="matrix", chat_id="!room:server",
+        )
+        kb.advance_notify_cursor(
+            writer, task_id=task_id, platform="matrix", chat_id="!room:server", new_cursor=cursor,
+        )
+        event_id = events[0].id
+        writer.execute(
+            "INSERT INTO kanban_notify_retries (task_id, platform, chat_id, thread_id, event_id, created_at) "
+            "VALUES (?, ?, ?, '', ?, ?)",
+            (task_id, "matrix", "!room:server", event_id, int(time.time())),
+        )
+        writer.commit()
+
+        _old, _cursor, claimed = kb.claim_unseen_events_for_sub(
+            first, task_id=task_id, platform="matrix", chat_id="!room:server",
+        )
+        _old, _cursor, duplicate = kb.claim_unseen_events_for_sub(
+            second, task_id=task_id, platform="matrix", chat_id="!room:server",
+        )
+
+    assert [event.id for event in claimed] == [event_id]
+    assert duplicate == []
+
+
+def test_retry_rows_follow_subscription_task_and_event_lifecycle(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="notify", assignee="worker")
+        kb.add_notify_sub(conn, task_id=task_id, platform="telegram", chat_id="chat")
+        kb.add_comment(conn, task_id, "human", "decision")
+        event_id = conn.execute(
+            "SELECT id FROM task_events WHERE task_id = ? ORDER BY id DESC LIMIT 1", (task_id,),
+        ).fetchone()[0]
+        conn.execute(
+            "INSERT INTO kanban_notify_retries (task_id, platform, chat_id, thread_id, event_id, created_at) "
+            "VALUES (?, 'telegram', 'chat', '', ?, 0)", (task_id, event_id),
+        )
+        conn.commit()
+        assert kb.remove_notify_sub(conn, task_id=task_id, platform="telegram", chat_id="chat")
+        assert conn.execute("SELECT COUNT(*) FROM kanban_notify_retries").fetchone()[0] == 0
+        kb.add_notify_sub(conn, task_id=task_id, platform="telegram", chat_id="chat")
+        conn.execute(
+            "INSERT INTO kanban_notify_retries (task_id, platform, chat_id, thread_id, event_id, created_at) "
+            "VALUES (?, 'telegram', 'chat', '', ?, 0)", (task_id, event_id),
+        )
+        conn.commit()
+        assert kb.delete_task(conn, task_id)
+        assert conn.execute("SELECT COUNT(*) FROM kanban_notify_retries").fetchone()[0] == 0
+
+
+def test_retry_rows_are_removed_by_subscription_and_event_gc(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="old", assignee="worker")
+        task = kb.claim_task(conn, task_id)
+        assert task is not None
+        assert kb.complete_task(conn, task_id, expected_run_id=task.current_run_id)
+        kb.add_notify_sub(conn, task_id=task_id, platform="telegram", chat_id="chat")
+        event_id = conn.execute(
+            "SELECT id FROM task_events WHERE task_id = ? ORDER BY id DESC LIMIT 1", (task_id,),
+        ).fetchone()[0]
+        conn.execute(
+            "INSERT INTO kanban_notify_retries (task_id, platform, chat_id, thread_id, event_id, created_at) "
+            "VALUES (?, 'telegram', 'chat', '', ?, 0)", (task_id, event_id),
+        )
+        conn.execute("UPDATE task_events SET created_at = 0 WHERE task_id = ?", (task_id,))
+        conn.commit()
+
+        assert kb.purge_stale_done_notify_subs(conn, max_age_days=1) == 1
+        assert conn.execute("SELECT COUNT(*) FROM kanban_notify_retries").fetchone()[0] == 0
+
+        kb.add_notify_sub(conn, task_id=task_id, platform="telegram", chat_id="chat")
+        conn.execute(
+            "INSERT INTO kanban_notify_retries (task_id, platform, chat_id, thread_id, event_id, created_at) "
+            "VALUES (?, 'telegram', 'chat', '', ?, 0)", (task_id, event_id),
+        )
+        conn.commit()
+        assert kb.gc_events(conn, older_than_seconds=1) > 0
+        assert conn.execute("SELECT COUNT(*) FROM kanban_notify_retries").fetchone()[0] == 0
+
+
+def test_default_subscription_parses_matrix_ids_and_stamps_creator_profile(
+    kanban_home, monkeypatch,
+):
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"kanban": {"default_subscriptions": ["matrix:!room:server", "matrix:!room:server:42"]}},
+    )
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="matrix", assignee="worker", created_by="creator")
+        rows = conn.execute(
+            "SELECT chat_id, thread_id, notifier_profile FROM kanban_notify_subs WHERE task_id = ? "
+            "ORDER BY thread_id", (task_id,),
+        ).fetchall()
+
+    assert [(row["chat_id"], row["thread_id"], row["notifier_profile"]) for row in rows] == [
+        ("!room:server", "", "creator"),
+        ("!room:server", "42", "creator"),
+    ]
+
+
+@pytest.mark.parametrize("source", ["cli", "tool", "dashboard"])
+def test_comment_events_record_write_surface_provenance(kanban_home, source):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="comment", assignee="worker")
+        kb.add_comment(conn, task_id, "worker", "note", source=source)
+        payload = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'commented' "
+            "ORDER BY id DESC LIMIT 1", (task_id,),
+        ).fetchone()[0]
+
+    assert json.loads(payload)["source"] == source
 
 def test_checkpoint_advertisement_is_config_gated_and_rejects_future_dates(
     kanban_home, monkeypatch,

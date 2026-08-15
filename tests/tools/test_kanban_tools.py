@@ -1115,12 +1115,12 @@ def test_create_dedupes_default_subscription_with_session_auto_subscribe(
     from pathlib import Path
 
     Path(home, "config.yaml").write_text(
-        "kanban:\n  default_subscriptions: [telegram:chat-42:thread-7]\n",
+        "kanban:\n  default_subscriptions: [telegram:chat-42:7]\n",
         encoding="utf-8",
     )
     monkeypatch.setenv("HERMES_SESSION_PLATFORM", "telegram")
     monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "chat-42")
-    monkeypatch.setenv("HERMES_SESSION_THREAD_ID", "thread-7")
+    monkeypatch.setenv("HERMES_SESSION_THREAD_ID", "7")
 
     from tools import kanban_tools as kt
 

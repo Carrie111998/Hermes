@@ -51,7 +51,7 @@ def test_empty_default_subscriptions_leave_task_creation_unchanged(kanban_home):
 def test_default_subscriptions_dedupe_against_inherited_child_subs(kanban_home):
     """Defaults add parentless tasks and never overwrite inherited delivery."""
     (kanban_home / "config.yaml").write_text(
-        "kanban:\n  default_subscriptions: [telegram:ops:topic-1]\n",
+        "kanban:\n  default_subscriptions: [telegram:ops:1]\n",
         encoding="utf-8",
     )
     with kb.connect() as conn:
@@ -61,7 +61,7 @@ def test_default_subscriptions_dedupe_against_inherited_child_subs(kanban_home):
             task_id=parent_id,
             platform="telegram",
             chat_id="ops",
-            thread_id="topic-1",
+            thread_id="1",
             delivery_mode="wake",
         )
         child_id = kb.create_task(
@@ -75,7 +75,7 @@ def test_default_subscriptions_dedupe_against_inherited_child_subs(kanban_home):
     assert len(child_subs) == 1
     assert child_subs[0]["platform"] == "telegram"
     assert child_subs[0]["chat_id"] == "ops"
-    assert child_subs[0]["thread_id"] == "topic-1"
+    assert child_subs[0]["thread_id"] == "1"
     assert child_subs[0]["delivery_mode"] == "wake"
 
 

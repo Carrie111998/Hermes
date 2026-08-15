@@ -217,6 +217,26 @@ def test_workspace_conflict_serialize_applies_to_cli_claim(
         assert kb.get_task(conn, candidate).status == "ready"
 
 
+def test_manual_claim_releases_task_when_workspace_preflight_fails(
+    kanban_home: Path, tmp_path: Path,
+) -> None:
+    missing = tmp_path / "missing"
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn, title="bad workspace", assignee="worker",
+            workspace_kind="dir", workspace_path=str(missing),
+        )
+
+    assert kb_cli._cmd_claim(argparse.Namespace(task_id=task_id, ttl=None)) == 1
+
+    with kb.connect() as conn:
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.status == "ready"
+        assert task.claim_lock is None
+        assert task.current_run_id is None
+
+
 def _init_git_repo(repo: Path) -> None:
     repo.mkdir()
     subprocess.run(["git", "init", "-b", "main", str(repo)], check=True, capture_output=True)

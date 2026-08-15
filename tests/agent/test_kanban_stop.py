@@ -74,7 +74,7 @@ def test_no_nudge_after_kanban_complete(clear_kanban_env):
                 }
             ],
         },
-        {"role": "tool", "name": "kanban_complete", "tool_call_id": "1", "content": "done"},
+        {"role": "tool", "name": "kanban_complete", "tool_call_id": "1", "content": '{"ok": true}'},
     ]
     assert session_called_kanban_terminal(messages) is True
     assert build_kanban_stop_nudge(messages=messages) is None
@@ -90,10 +90,27 @@ def test_no_nudge_after_kanban_checkpoint(clear_kanban_env):
             "type": "function",
             "function": {"name": "kanban_checkpoint", "arguments": "{}"},
         }],
+    }, {
+        "role": "tool", "name": "kanban_checkpoint", "tool_call_id": "1",
+        "content": '{"ok": true}',
     }]
 
     assert session_called_kanban_terminal(messages) is True
     assert build_kanban_stop_nudge(messages=messages) is None
+
+
+@pytest.mark.parametrize("content", [
+    '{"ok": false, "error": "stale run"}',
+    'checkpoint rejected: stale run',
+])
+def test_rejected_checkpoint_does_not_suppress_stop_nudge(clear_kanban_env, content):
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_abc")
+    messages = [{
+        "role": "tool", "name": "kanban_checkpoint", "tool_call_id": "1",
+        "content": content,
+    }]
+    assert session_called_kanban_terminal(messages) is False
+    assert build_kanban_stop_nudge(messages=messages) is not None
 
 
 def test_deadline_warning_is_disabled_by_default(clear_kanban_env, monkeypatch):

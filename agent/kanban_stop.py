@@ -13,6 +13,7 @@ loop continues instead of exiting.
 
 from __future__ import annotations
 
+import json
 import os
 import time
 from typing import Any, Iterable, Optional
@@ -81,6 +82,7 @@ def build_kanban_deadline_warning(
     *,
     issued: bool = False,
     now: Optional[float] = None,
+    messages: Iterable[dict] | None = None,
 ) -> Optional[str]:
     """Return a one-shot checkpoint/finalize nudge near a worker deadline.
 
@@ -88,7 +90,11 @@ def build_kanban_deadline_warning(
     This is deliberately advisory: timeout enforcement remains exclusively in
     the dispatcher.
     """
-    if issued or not _is_dispatcher_kanban_worker():
+    if (
+        issued
+        or session_called_kanban_terminal(messages)
+        or not _is_dispatcher_kanban_worker()
+    ):
         return None
     fraction = _deadline_warning_fraction()
     if fraction == 0.0:
@@ -130,21 +136,24 @@ def _tool_call_name(tc: Any) -> str:
 
 
 def session_called_kanban_terminal(messages: Iterable[dict] | None) -> bool:
-    """True if this conversation already invoked a terminal kanban tool."""
+    """True if a terminal Kanban operation durably succeeded this run."""
     if not messages:
         return False
     for msg in messages:
         if not isinstance(msg, dict):
             continue
         role = msg.get("role")
-        if role == "assistant":
-            for tc in msg.get("tool_calls") or []:
-                if _tool_call_name(tc) in _TERMINAL_KANBAN_TOOLS:
-                    return True
-        elif role == "tool":
+        if role == "tool":
             name = str(msg.get("name") or "")
             if name in _TERMINAL_KANBAN_TOOLS:
-                return True
+                content = msg.get("content")
+                if isinstance(content, str):
+                    try:
+                        result = json.loads(content)
+                    except (TypeError, ValueError):
+                        continue
+                    if isinstance(result, dict) and result.get("ok") is True:
+                        return True
     return False
 
 
