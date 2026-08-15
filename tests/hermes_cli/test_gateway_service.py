@@ -2204,6 +2204,39 @@ class TestGatewayStopGraceBudget:
         assert force_after >= self.MIN_PLATFORM_STOP_BUDGET
         assert timeout > force_after, "the wait must outlast its own escalation"
 
+    @pytest.mark.parametrize("exited", [True, False])
+    def test_cli_owned_stop_claims_success_only_when_the_kill_took(
+        self, monkeypatch, capsys, exited
+    ):
+        """The fall-through branch owes the same honesty as the supervised one.
+
+        Fixing only the launchd-owned branch would leave the worse half
+        unfixed: here nothing is supervising the process, so if the CLI's own
+        SIGTERM -> SIGKILL escalation does not take (an unkillable process
+        wedged in uninterruptible I/O, or a PID the CLI may not signal),
+        nothing else will ever reap it. Reporting "✓ Service stopped" for a
+        detached fallback gateway that is demonstrably still alive is the
+        report an operator is least able to check.
+        """
+        self._stub_launchd_stop(
+            monkeypatch,
+            bootout_error=subprocess.CalledProcessError(
+                5, ["launchctl", "bootout"]
+            ),
+            exit_result=exited,
+        )
+
+        gateway_cli.launchd_stop()
+
+        out = capsys.readouterr().out
+        assert ("✓ Service stopped" in out) is exited, (
+            "the stop reported success without observing the process exit"
+            if not exited
+            else "a clean stop must still report success"
+        )
+        if not exited:
+            assert "still running" in out, "a failed stop must say so"
+
     def test_stop_still_reraises_unexpected_launchctl_failures(self, monkeypatch):
         """Only the unloaded/unmanageable codes fall through to the PID path."""
         self._stub_launchd_stop(
