@@ -319,6 +319,49 @@ def test_autonomous_completion_redacts_real_command_and_output_secrets(monkeypat
     assert "HOME=/home/user" in delivered.text
 
 
+def test_process_watcher_keeps_runtime_ui_owner(monkeypatch):
+    import tools.process_registry as pr_module
+
+    registry = ProcessRegistry()
+    session = ProcessSession(
+        id="proc_runtime_owner",
+        command="printf done",
+        origin_ui_session_id="runtime-session-a",
+        started_at=1234.5,
+        output_buffer="done\n",
+        exited=True,
+        exit_code=0,
+        notify_on_complete=True,
+    )
+    registry._finished[session.id] = session
+    monkeypatch.setattr(pr_module, "process_registry", registry)
+
+    runner = _runner(SimpleNamespace(handle_message=AsyncMock()))
+    runner._enqueue_process_completion_notification = AsyncMock(return_value=True)
+
+    async def _instant_sleep(*_a, **_kw):
+        pass
+
+    monkeypatch.setattr(asyncio, "sleep", _instant_sleep)
+    asyncio.run(
+        runner._run_process_watcher(
+            {
+                "session_id": session.id,
+                "check_interval": 0,
+                "session_key": "pre-compression-key",
+                "origin_ui_session_id": "runtime-session-a",
+                "platform": "telegram",
+                "chat_type": "dm",
+                "chat_id": "123",
+                "notify_on_complete": True,
+            }
+        )
+    )
+
+    completion = runner._enqueue_process_completion_notification.await_args.args[1]
+    assert completion["origin_ui_session_id"] == "runtime-session-a"
+
+
 def test_concurrent_process_watchers_coalesce_one_session_completion_turn(monkeypatch):
     """Concurrent terminal watchers for one session must re-enter the agent once."""
     import tools.process_registry as pr_module
