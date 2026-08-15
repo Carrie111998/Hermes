@@ -1,6 +1,7 @@
 """Tests for batch_runner checkpoint behavior — incremental writes, resume, atomicity."""
 
 import json
+from collections import Counter
 from pathlib import Path
 from threading import Lock
 
@@ -239,3 +240,56 @@ class TestFinalCheckpointNoDuplicates:
             buggy.extend(br.get("completed_prompts", []))
         # Every index appears twice
         assert len(buggy) == 2 * len(set(buggy))
+
+
+class TestResumeCountBasedDedup:
+    """Regression: --resume used a set for completed prompts, so duplicate
+    prompts in the dataset were all marked "completed" after the first one
+    finished — the rest were silently skipped on resume.
+
+    Fix: _scan_completed_prompts_by_content returns a Counter (count per
+    text), and _filter_dataset_by_completed skips only that many rows per
+    text, not every row with a matching text.
+    """
+
+    def _make_runner(self, tmp_path, dataset):
+        """Build a BatchRunner with output_dir and dataset set up."""
+        r = BatchRunner.__new__(BatchRunner)
+        r.run_name = "test_run"
+        r.output_dir = tmp_path
+        r.checkpoint_file = tmp_path / "checkpoint.json"
+        r.output_file = tmp_path / "output.jsonl"
+        r.prompts_file = tmp_path / "prompts.jsonl"
+        r.dataset = dataset
+        return r
+
+    def test_duplicate_prompts_survive_resume(self, tmp_path):
+        """Dataset has 3 copies of the same prompt. One completes. On
+        resume, the remaining 2 must NOT be skipped."""
+        prompt = "What is 2+2?"
+        dataset = [
+            {"prompt": prompt},
+            {"prompt": prompt},
+            {"prompt": prompt},
+        ]
+        runner = self._make_runner(tmp_path, dataset)
+
+        # Simulate: one trajectory already written to a batch file
+        batch_file = tmp_path / "batch_0.jsonl"
+        entry = {
+            "failed": False,
+            "conversations": [{"from": "human", "value": prompt}],
+        }
+        batch_file.write_text(json.dumps(entry) + "\n")
+
+        # Scan completed prompts
+        completed = runner._scan_completed_prompts_by_content()
+
+        # Counter should report 1 completion for this prompt
+        assert isinstance(completed, Counter)
+        assert completed[prompt] == 1
+
+        # Filter should skip only 1 of the 3 duplicates
+        filtered, skipped = runner._filter_dataset_by_completed(completed)
+        assert len(skipped) == 1
+        assert len(filtered) == 2
