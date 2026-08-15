@@ -20844,6 +20844,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             return None
 
+        # Extract profile from session_key so that background-process
+        # notifications (async delegation completions, watch patterns)
+        # are routed through the correct profile's adapter in multiplex
+        # mode.  Without this, completions from non-default profiles
+        # (e.g. CONTENT, CHASE) always fall back to the default adapter
+        # and are delivered through the wrong bot.
+        _derived_profile: Optional[str] = None
+        if session_key:
+            try:
+                # Extract profile namespace from session key.
+                # Keys follow agent:{namespace}:{platform}:... where namespace
+                # is "main" (default) or the profile name (e.g. "content").
+                _parts = str(session_key).split(":")
+                if len(_parts) >= 2 and _parts[0] == "agent":
+                    _ns = _parts[1] or "main"
+                    _derived_profile = None if _ns == "main" else _ns
+            except Exception:
+                pass
+        if _derived_profile == "default":
+            _derived_profile = None
+
         return SessionSource(
             platform=platform,
             chat_id=chat_id,
@@ -20851,6 +20872,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             thread_id=str(evt.get("thread_id") or "").strip() or None,
             user_id=str(evt.get("user_id") or "").strip() or None,
             user_name=str(evt.get("user_name") or "").strip() or None,
+            profile=_derived_profile,
         )
 
     async def _inject_watch_notification(
@@ -20910,11 +20932,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             return None
         platform_name = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
-        adapter = None
-        for p, a in self.adapters.items():
-            if p.value == platform_name:
-                adapter = a
-                break
+        # Use profile-aware adapter resolution so that background-process
+        # notifications (delegation completions, watch patterns) from
+        # non-default profiles are delivered through the correct bot.
+        # _adapter_for_source checks _registered_transport_adapter first,
+        # then _authorization_adapter which uses _profile_adapters for
+        # secondary profiles — matching the same routing path as live
+        # inbound messages.
+        adapter = self._adapter_for_source(source)
+        if adapter is None:
+            # Fallback: try self.adapters (default profile) for platforms
+            # where _adapter_for_source returned None (e.g. relay).
+            for p, a in self.adapters.items():
+                if p.value == platform_name:
+                    adapter = a
+                    break
         if not adapter:
             return None
         from gateway.wake import adapter_supports_push as _wake_push_ok
@@ -21383,11 +21415,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         f"[Background process {session_id} finished with exit code {session.exit_code}~ "
                         f"Here's the final output:\n{new_output}]"
                     )
-                    adapter = None
-                    for p, a in self.adapters.items():
-                        if p.value == platform_name:
-                            adapter = a
-                            break
+                    # Profile-aware adapter resolution for background process
+                    # completion notifications — matches the same routing as
+                    # _inject_watch_notification and live inbound messages.
+                    adapter = self._adapter_for_source(source) if source else None
+                    if adapter is None:
+                        for p, a in self.adapters.items():
+                            if p.value == platform_name:
+                                adapter = a
+                                break
                     if adapter and chat_id:
                         try:
                             send_meta = {"thread_id": thread_id} if thread_id else None
@@ -21413,11 +21449,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     f"[Background process {session_id} is still running~ "
                     f"New output:\n{new_output}]"
                 )
-                adapter = None
-                for p, a in self.adapters.items():
-                    if p.value == platform_name:
-                        adapter = a
-                        break
+                # Profile-aware adapter resolution for running-process updates.
+                adapter = self._adapter_for_source(source) if source else None
+                if adapter is None:
+                    for p, a in self.adapters.items():
+                        if p.value == platform_name:
+                            adapter = a
+                            break
                 if adapter and chat_id:
                     try:
                         send_meta = {"thread_id": thread_id} if thread_id else None

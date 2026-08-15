@@ -1550,8 +1550,28 @@ class SessionStore:
         requested_session_key: str,
         recovered: Dict[str, Any],
     ) -> bool:
-        """Prevent non-multiplexed gateways from reviving another profile's row."""
+        """Prevent non-multiplexed gateways from reviving another profile's row.
+
+        When multiplexing is on, the fallback session-recovery query matches
+        on (source, user_id, chat_id, chat_type, thread_id) WITHOUT a profile
+        namespace filter, so a session created by one profile can be recovered
+        by another.  Guard against this by checking that the recovered row's
+        profile namespace matches the requested key's profile namespace.
+        """
         if getattr(self.config, "multiplex_profiles", False):
+            recovered_key = str(recovered.get("session_key") or "")
+            if recovered_key and recovered_key != requested_session_key:
+                recovered_profile = self._profile_from_session_key(recovered_key)
+                requested_profile = self._profile_from_session_key(requested_session_key)
+                if recovered_profile != requested_profile:
+                    logger.warning(
+                        "Gateway session DB recovery ignored %s for %s because "
+                        "multiplex_profiles is on and profiles don't match "
+                        "(recovered=%s, requested=%s)",
+                        recovered_key, requested_session_key,
+                        recovered_profile, requested_profile,
+                    )
+                    return False
             return True
 
         recovered_key = str(recovered.get("session_key") or "")
