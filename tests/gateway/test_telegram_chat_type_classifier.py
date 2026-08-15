@@ -93,3 +93,62 @@ class TestClassifyTelegramChatType:
 
     def test_uppercase_normalized(self):
         assert TelegramAdapter._classify_telegram_chat_type("SUPERGROUP", is_forum=True) == "forum"
+
+    def test_unknown_type_logs_debug_and_defaults_to_dm(self, caplog):
+        """A future Telegram chat.type must be visible in debug logs, not
+        silently misrouted as a DM."""
+        import logging
+
+        with caplog.at_level(logging.DEBUG, logger="plugins.platforms.telegram.adapter"):
+            assert TelegramAdapter._classify_telegram_chat_type("gigagroup") == "dm"
+        assert "Unknown chat.type 'gigagroup'" in caplog.text
+
+    def test_empty_type_stays_silent(self, caplog):
+        """The None/'' default is a normal call shape, not an upstream change;
+        it must not add debug noise."""
+        import logging
+
+        with caplog.at_level(logging.DEBUG, logger="plugins.platforms.telegram.adapter"):
+            TelegramAdapter._classify_telegram_chat_type(None)
+            TelegramAdapter._classify_telegram_chat_type("")
+        assert "Unknown chat.type" not in caplog.text
+
+
+class TestWidenedGroupForumPromotionDownstream:
+    """Pin the downstream thread_id assignment for the widened group→forum
+    case in _source_from_message_for_auth.
+
+    Pre-refactor, only "supergroup" was promoted, so a plain "group" chat
+    left thread_id None even with a topic + is_forum. The helper now treats
+    group/supergroup identically; this locks the resulting source shape.
+    """
+
+    def _adapter(self):
+        return object.__new__(TelegramAdapter)
+
+    @staticmethod
+    def _group_message(*, chat_type="group", thread_id=42, is_forum=True, is_topic_message=True):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(
+            from_user=SimpleNamespace(id=111, username="alice", full_name="Alice"),
+            chat=SimpleNamespace(id=-100, type=chat_type, is_forum=is_forum),
+            message_thread_id=thread_id,
+            is_topic_message=is_topic_message,
+        )
+
+    def test_plain_group_with_topic_and_forum_assigns_thread_id(self):
+        source = TelegramAdapter._source_from_message_for_auth(
+            self._adapter(), self._group_message()
+        )
+        assert source.chat_type == "forum"
+        assert source.thread_id == "42"
+
+    def test_plain_group_without_thread_keeps_thread_id_none(self):
+        source = TelegramAdapter._source_from_message_for_auth(
+            self._adapter(), self._group_message(thread_id=None, is_forum=True)
+        )
+        # Forum supergroup General-topic shape: no thread_id stays "group"
+        # even when is_forum is set (matches the original AND short-circuit).
+        assert source.chat_type == "group"
+        assert source.thread_id is None

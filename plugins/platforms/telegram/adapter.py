@@ -1038,6 +1038,13 @@ class TelegramAdapter(BasePlatformAdapter):
             return "forum" if is_forum else "group"
         if raw == "channel":
             return "channel"
+        if raw:
+            # Fail-safe routing, but visible: a new Telegram chat.type must
+            # show up in debug logs instead of silently becoming a DM.
+            logger.debug(
+                "[Telegram] Unknown chat.type %r classified as dm",
+                raw,
+            )
         return "dm"
 
     def _source_from_message_for_auth(self, message: Message):
