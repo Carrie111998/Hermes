@@ -330,14 +330,20 @@ export const host = {
 
   /** Persist a user/assistant line via session.append_message and paint
    *  only the target session (never a different chat that happens to be
-   *  on screen). */
+   *  on screen). Role must be user or assistant; unknown values are
+   *  rejected. When a gateway is up, paint only after persist succeeds
+   *  so a later session.activate refresh cannot wipe a ghost line. */
   appendMessage: (opts: { role?: string; sessionId?: null | string; text?: string } = {}): boolean => {
     const body = String(opts.text ?? '').trim()
     if (!body) {
       return false
     }
 
-    const role = opts.role === 'user' ? 'user' : 'assistant'
+    const rawRole = String(opts.role ?? 'assistant').trim().toLowerCase()
+    if (rawRole !== 'user' && rawRole !== 'assistant') {
+      return false
+    }
+    const role = rawRole
     const message: ChatMessage = {
       id: `${role}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
       role,
@@ -346,6 +352,25 @@ export const host = {
 
     const runtimeId = String(opts.sessionId || $activeSessionId.get() || '').trim()
     const activeId = String($activeSessionId.get() || '').trim()
+
+    const paint = () => {
+      if (!runtimeId || runtimeId === activeId) {
+        setMessages(current => [...current, message])
+      }
+
+      if (runtimeId) {
+        const states = $sessionStates.get()
+        const prev = states[runtimeId]
+        if (prev) {
+          $sessionStates.set({
+            ...states,
+            [runtimeId]: { ...prev, messages: [...prev.messages, message] }
+          })
+        }
+      }
+
+      touchSessionActivity(runtimeId || $selectedStoredSessionId.get(), { preview: body })
+    }
 
     if (runtimeId) {
       const gateway = $gateway.get()
@@ -357,26 +382,21 @@ export const host = {
             content: body,
             observed: true
           })
-          .catch(() => undefined)
+          .then((res: { ok?: boolean } | null) => {
+            if (res && res.ok === false) {
+              console.warn('session.append_message failed', res)
+              return
+            }
+            paint()
+          })
+          .catch(err => {
+            console.warn('session.append_message failed', err)
+          })
+        return true
       }
     }
 
-    if (!runtimeId || runtimeId === activeId) {
-      setMessages(current => [...current, message])
-    }
-
-    if (runtimeId) {
-      const states = $sessionStates.get()
-      const prev = states[runtimeId]
-      if (prev) {
-        $sessionStates.set({
-          ...states,
-          [runtimeId]: { ...prev, messages: [...prev.messages, message] }
-        })
-      }
-    }
-
-    touchSessionActivity(runtimeId || $selectedStoredSessionId.get(), { preview: body })
+    paint()
     return true
   },
 
