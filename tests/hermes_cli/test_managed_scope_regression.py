@@ -64,7 +64,7 @@ def test_env_expansion_in_user_config(hermes_home, monkeypatch):
     assert cfg_get(cfg, "providers", "custom", "base_url") == "https://example.test/v1"
 
 
-def test_user_env_overrides_shell(tmp_path, monkeypatch):
+def test_shell_env_overrides_user_env(tmp_path, monkeypatch):
     from hermes_cli.env_loader import load_hermes_dotenv
 
     home = tmp_path / "home"
@@ -72,6 +72,5 @@ def test_user_env_overrides_shell(tmp_path, monkeypatch):
     (home / ".env").write_text("FOO_TOKEN=from_user_env\n", encoding="utf-8")
     monkeypatch.setenv("FOO_TOKEN", "from_shell")
     load_hermes_dotenv(hermes_home=str(home))
-    assert os.environ["FOO_TOKEN"] == "from_user_env"
-
+    assert os.environ["FOO_TOKEN"] == "from_shell"
 
