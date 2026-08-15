@@ -26,6 +26,7 @@ from typing import Any, Literal
 
 FULL_SHA = re.compile(r"[0-9a-f]{40}")
 FULL_DIGEST = re.compile(r"[0-9a-f]{64}")
+RELEASE_CANDIDATE_REF_PREFIX = "refs/hermes/release-candidates/"
 
 _REPOSITORY_KEYS = frozenset(
     {
@@ -1629,6 +1630,44 @@ def delete_prepared_candidate_ref(
         or "\x00" in candidate_ref
     ):
         raise RepositoryConfigurationError("malformed_candidate_ref")
+    if not isinstance(candidate_sha, str) or FULL_SHA.fullmatch(candidate_sha) is None:
+        raise RepositoryConfigurationError("malformed_candidate_sha")
+
+    retained_sha = _prepared_ref_sha(root, candidate_ref)
+    if retained_sha is None:
+        return True
+    if retained_sha != candidate_sha:
+        return False
+    deleted = _prepared_ref_git(
+        root, "update-ref", "-d", candidate_ref, candidate_sha
+    )
+    return deleted.returncode == 0 and _prepared_ref_sha(root, candidate_ref) is None
+
+
+def validate_release_candidate_ref(candidate_ref: str) -> str:
+    """Validate the release-only retained-candidate namespace."""
+
+    if (
+        not isinstance(candidate_ref, str)
+        or not candidate_ref.startswith(RELEASE_CANDIDATE_REF_PREFIX)
+        or candidate_ref != candidate_ref.strip()
+        or "\x00" in candidate_ref
+        or candidate_ref == RELEASE_CANDIDATE_REF_PREFIX
+    ):
+        raise RepositoryConfigurationError("malformed_release_candidate_ref")
+    return candidate_ref
+
+
+def delete_release_candidate_ref(
+    repo_root: Path,
+    *,
+    candidate_ref: str,
+    candidate_sha: str,
+) -> bool:
+    """Delete a release candidate only when the exact old SHA still matches."""
+
+    root = Path(repo_root).expanduser().resolve(strict=False)
+    validate_release_candidate_ref(candidate_ref)
     if not isinstance(candidate_sha, str) or FULL_SHA.fullmatch(candidate_sha) is None:
         raise RepositoryConfigurationError("malformed_candidate_sha")
 

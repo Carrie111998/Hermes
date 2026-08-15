@@ -13,6 +13,7 @@ from hermes_cli.kanban_repository import (
     EvidenceWorkspaceResult,
     PreparedRefCASResult,
     PreparedRefRecoveryResult,
+    RELEASE_CANDIDATE_REF_PREFIX,
     RepositoryConfigurationError,
     RefreshRequest,
     VerificationCommand,
@@ -22,6 +23,7 @@ from hermes_cli.kanban_repository import (
     build_verification_receipt_key,
     commit_contains,
     delete_prepared_candidate_ref,
+    delete_release_candidate_ref,
     inspect_evidence_workspace,
     inspect_prepared_candidate_ref,
     load_repository_contract,
@@ -623,6 +625,41 @@ def test_delete_prepared_candidate_ref_uses_exact_old_value_and_preserves_mismat
     assert [call for call in calls if call[:2] == ("update-ref", "-d")] == [
         ("update-ref", "-d", candidate_ref, candidate_sha)
     ]
+
+
+def test_release_candidate_ref_uses_release_namespace_and_exact_cleanup(
+    repository: Path, monkeypatch: pytest.MonkeyPatch
+):
+    candidate_ref = f"{RELEASE_CANDIDATE_REF_PREFIX}exact"
+    candidate_sha = _git(repository, "rev-parse", "HEAD")
+    _git(repository, "update-ref", candidate_ref, candidate_sha)
+    calls: list[tuple[str, ...]] = []
+    real_git = repository_module._prepared_ref_git
+
+    def capture(path: Path, *args: str):
+        calls.append(args)
+        return real_git(path, *args)
+
+    monkeypatch.setattr(repository_module, "_prepared_ref_git", capture)
+
+    assert delete_release_candidate_ref(
+        repository, candidate_ref=candidate_ref, candidate_sha="f" * 40
+    ) is False
+    assert _git(repository, "rev-parse", candidate_ref) == candidate_sha
+    assert delete_release_candidate_ref(
+        repository, candidate_ref=candidate_ref, candidate_sha=candidate_sha
+    ) is True
+    assert [call for call in calls if call[:2] == ("update-ref", "-d")] == [
+        ("update-ref", "-d", candidate_ref, candidate_sha)
+    ]
+
+    with pytest.raises(RepositoryConfigurationError) as exc_info:
+        delete_release_candidate_ref(
+            repository,
+            candidate_ref="refs/hermes/integration-candidates/not-release",
+            candidate_sha=candidate_sha,
+        )
+    assert exc_info.value.code == "malformed_release_candidate_ref"
 
 
 @pytest.mark.parametrize(

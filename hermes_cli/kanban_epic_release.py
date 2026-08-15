@@ -28,6 +28,15 @@ _FULL_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 Row: TypeAlias = Mapping[str, object] | sqlite3.Row
 
 
+class EpicReleasePreparationError(RuntimeError):
+    """Typed refusal while preparing an immutable Epic release snapshot."""
+
+    def __init__(self, code: str, evidence: Mapping[str, object] | None = None):
+        self.code = str(code)
+        self.evidence = dict(evidence or {})
+        super().__init__(self.code)
+
+
 @dataclass(frozen=True)
 class EpicReleaseSnapshot:
     id: int

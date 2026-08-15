@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
 import sqlite3
 
 import pytest
@@ -10,6 +10,7 @@ import pytest
 from hermes_cli import kanban_db as kb
 from hermes_cli.kanban_epic_release import (
     EpicReadiness,
+    EpicReadinessMember,
     EpicReleaseMember,
     EpicReleaseSnapshot,
     EpicTerminalSource,
@@ -26,6 +27,9 @@ SOURCE_SHA = "4" * 40
 MEMBER_CANDIDATE_SHA = "5" * 40
 PUSHED_SHA = "6" * 40
 CONTRACT_DIGEST = "7" * 64
+GENERATED_POLICY_DIGEST = "8" * 64
+AGGREGATE_CANDIDATE_SHA = "9" * 40
+RELEASE_CANDIDATE_REF = "refs/hermes/release-candidates/exact"
 
 
 def _insert_snapshot(
@@ -495,3 +499,256 @@ def test_fact_derived_readiness_ignores_pruned_story_verification_events(tmp_pat
 
     assert before == after
     assert after.ready is True
+
+
+def _release_prepare_fixture(tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    board_meta = {
+        "preset": "product",
+        "product_workflow": {"handoff_v2": True},
+        "repository": {},
+    }
+    contract = type(
+        "Contract",
+        (),
+        {
+            "repo_root": repo.resolve(),
+            "target_branch": "main",
+            "verification": {"epic_release": object()},
+            "generated_policy_digest": GENERATED_POLICY_DIGEST,
+            "digest": CONTRACT_DIGEST,
+        },
+    )()
+    epic_id = "epic-prepare"
+    story_id = "story-prepare"
+    member = EpicReadinessMember(
+        story_id=story_id,
+        source_sha=SOURCE_SHA,
+        candidate_sha=MEMBER_CANDIDATE_SHA,
+        integrated_at=90,
+    )
+    readiness = EpicReadiness(epic_id, EPIC_SHA, (member,), ())
+    receipt_key = kb.build_verification_receipt_key(
+        None,
+        repo,
+        candidate_sha=AGGREGATE_CANDIDATE_SHA,
+        contract_digest=CONTRACT_DIGEST,
+        generated_policy_digest=GENERATED_POLICY_DIGEST,
+        gate_kind="epic_release",
+        profile_name="epic_release",
+    )
+    verification = kb.VerificationResult(
+        status="passed",
+        source_sha=EPIC_SHA,
+        candidate_sha=AGGREGATE_CANDIDATE_SHA,
+        contract_digest=CONTRACT_DIGEST,
+        profile="epic_release",
+        steps=(),
+        key=receipt_key,
+    )
+    candidate = kb.IntegrationCandidate(
+        pre_sha=TARGET_SHA,
+        candidate_sha=AGGREGATE_CANDIDATE_SHA,
+        source_branch="epic/epic-prepare",
+        source_sha=EPIC_SHA,
+        target_branch="main",
+        target_worktree=None,
+        scratch_worktree=repo / ".worktrees" / "removed",
+        repo_root=repo.resolve(),
+        candidate_ref=RELEASE_CANDIDATE_REF,
+        verification_result=verification,
+    )
+    monkeypatch.setattr(kb, "product_board_metadata", lambda _board=None: board_meta)
+    monkeypatch.setattr(
+        kb, "repository_contract_for_metadata", lambda _metadata: contract
+    )
+    monkeypatch.setattr(kb, "epic_readiness", lambda *_args, **_kwargs: readiness)
+    monkeypatch.setattr(
+        kb,
+        "resolve_commit",
+        lambda _repo, ref: EPIC_SHA if "epic/" in ref else TARGET_SHA,
+    )
+    return epic_id, story_id, board_meta, contract, readiness, candidate
+
+
+def test_prepare_epic_release_snapshot_persists_once_and_replays_without_rebuild(
+    tmp_path, monkeypatch
+):
+    _fixture_epic_id, _fixture_story_id, board_meta, _contract, readiness, candidate = _release_prepare_fixture(
+        tmp_path, monkeypatch
+    )
+    builder_calls = []
+
+    def candidate_builder(*args, **kwargs):
+        builder_calls.append((args, kwargs))
+        return candidate
+
+    with kb.connect(tmp_path / "prepare.db") as conn:
+        epic_id = kb.create_task(conn, title="Epic", work_item_kind="epic")
+        story_id = kb.create_task(conn, title="Story")
+        kb.add_epic_membership(conn, epic_id=epic_id, task_id=story_id)
+        readiness = replace(
+            readiness,
+            epic_id=epic_id,
+            members=(replace(readiness.members[0], story_id=story_id),),
+        )
+        candidate = replace(candidate, source_branch=kb.epic_branch_for(epic_id))
+        monkeypatch.setattr(kb, "epic_readiness", lambda *_args, **_kwargs: readiness)
+        prepared = kb.prepare_epic_release_snapshot(
+            conn,
+            epic_id,
+            board="release-board",
+            board_meta=board_meta,
+            candidate_builder=candidate_builder,
+        )
+        replay = kb.prepare_epic_release_snapshot(
+            conn,
+            epic_id,
+            board="release-board",
+            board_meta=board_meta,
+            candidate_builder=lambda *_args, **_kwargs: pytest.fail(
+                "exact release replay must not rebuild"
+            ),
+        )
+        events = conn.execute(
+            "SELECT id, kind, payload FROM task_events WHERE task_id=? "
+            "AND kind='repository_verification'",
+            (epic_id,),
+        ).fetchall()
+        members = [
+            tuple(row)
+            for row in conn.execute(
+            "SELECT snapshot_id, epic_id, story_id, source_sha, candidate_sha, integrated_at "
+            "FROM epic_release_members"
+            ).fetchall()
+        ]
+
+    assert replay == prepared
+    assert prepared.status == "awaiting_push"
+    assert prepared.epic_tip_sha == EPIC_SHA
+    assert prepared.target_pre_sha == TARGET_SHA
+    assert prepared.release_candidate_sha == AGGREGATE_CANDIDATE_SHA
+    assert prepared.candidate_ref == RELEASE_CANDIDATE_REF
+    assert len(builder_calls) == 1
+    assert len(events) == 1
+    assert events[0]["kind"] == "repository_verification"
+    assert members == [
+        (
+            prepared.id,
+            epic_id,
+            story_id,
+            SOURCE_SHA,
+            MEMBER_CANDIDATE_SHA,
+            90,
+        )
+    ]
+
+
+def test_prepare_epic_release_snapshot_changed_inputs_cleanup_only_new_candidate(
+    tmp_path, monkeypatch
+):
+    _fixture_epic_id, _fixture_story_id, board_meta, _contract, readiness, candidate = _release_prepare_fixture(
+        tmp_path, monkeypatch
+    )
+    cleanup_calls = []
+    monkeypatch.setattr(
+        kb,
+        "delete_release_candidate_ref",
+        lambda repo_root, *, candidate_ref, candidate_sha: cleanup_calls.append(
+            (repo_root, candidate_ref, candidate_sha)
+        ) or True,
+    )
+
+    with kb.connect(tmp_path / "changed.db") as conn:
+        epic_id = kb.create_task(conn, title="Epic", work_item_kind="epic")
+        story_id = kb.create_task(conn, title="Story")
+        kb.add_epic_membership(conn, epic_id=epic_id, task_id=story_id)
+        readiness = replace(
+            readiness,
+            epic_id=epic_id,
+            members=(replace(readiness.members[0], story_id=story_id),),
+        )
+        candidate = replace(candidate, source_branch=kb.epic_branch_for(epic_id))
+        changed = replace(
+            readiness,
+            members=(replace(readiness.members[0], source_sha="a" * 40),),
+        )
+        readiness_calls = 0
+
+        def current_readiness(*_args, **_kwargs):
+            nonlocal readiness_calls
+            readiness_calls += 1
+            return readiness if readiness_calls == 1 else changed
+
+        monkeypatch.setattr(kb, "epic_readiness", current_readiness)
+        with pytest.raises(kb.EpicReleasePreparationError) as exc_info:
+            kb.prepare_epic_release_snapshot(
+                conn,
+                epic_id,
+                board="release-board",
+                board_meta=board_meta,
+                candidate_builder=lambda *_args, **_kwargs: candidate,
+            )
+        snapshot_count = conn.execute(
+            "SELECT COUNT(*) FROM epic_release_snapshots"
+        ).fetchone()[0]
+        event_count = conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id=? "
+            "AND kind='repository_verification'",
+            (epic_id,),
+        ).fetchone()[0]
+
+    assert exc_info.value.code == "inputs_changed"
+    assert cleanup_calls == [
+        (candidate.repo_root, RELEASE_CANDIDATE_REF, AGGREGATE_CANDIDATE_SHA)
+    ]
+    assert snapshot_count == 0
+    assert event_count == 0
+
+
+def test_prepare_epic_release_snapshot_refuses_mismatching_active_snapshot_without_replacement(
+    tmp_path, monkeypatch
+):
+    _fixture_epic_id, _story_id, board_meta, _contract, readiness, candidate = _release_prepare_fixture(
+        tmp_path, monkeypatch
+    )
+    builder = lambda *_args, **_kwargs: pytest.fail(
+        "a mismatching active snapshot must not be rebuilt"
+    )
+
+    with kb.connect(tmp_path / "active-mismatch.db") as conn:
+        epic_id = kb.create_task(conn, title="Epic", work_item_kind="epic")
+        readiness = replace(readiness, epic_id=epic_id)
+        candidate = replace(candidate, source_branch=kb.epic_branch_for(epic_id))
+        monkeypatch.setattr(kb, "epic_readiness", lambda *_args, **_kwargs: readiness)
+        conn.execute(
+            "INSERT INTO epic_release_snapshots ("
+            "epic_id, epic_tip_sha, target_branch, target_pre_sha, "
+            "release_candidate_sha, candidate_ref, aggregate_verification_event_id, "
+            "repository_contract_digest, status, created_at, updated_at"
+            ") VALUES (?, ?, 'main', ?, ?, ?, 71, ?, 'awaiting_push', 100, 100)",
+            (
+                epic_id,
+                "b" * 40,
+                TARGET_SHA,
+                AGGREGATE_CANDIDATE_SHA,
+                RELEASE_CANDIDATE_REF,
+                CONTRACT_DIGEST,
+            ),
+        )
+        with pytest.raises(kb.EpicReleasePreparationError) as exc_info:
+            kb.prepare_epic_release_snapshot(
+                conn,
+                epic_id,
+                board="release-board",
+                board_meta=board_meta,
+                candidate_builder=builder,
+            )
+        snapshot = conn.execute(
+            "SELECT epic_tip_sha, status FROM epic_release_snapshots WHERE epic_id=?",
+            (epic_id,),
+        ).fetchone()
+
+    assert exc_info.value.code == "active_snapshot_mismatch"
+    assert tuple(snapshot) == ("b" * 40, "awaiting_push")
