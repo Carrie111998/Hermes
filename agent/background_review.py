@@ -702,6 +702,7 @@ def _record_review_usage_to_parent(parent_agent: Any, review_agent: Any) -> None
             cache_write_tokens=cache_write,
             reasoning_tokens=reasoning,
             estimated_cost_usd=est_cost,
+            api_call_count=api_calls,
         )
     except Exception as e:
         # Same contract as record_auxiliary_usage itself: accounting loss is
@@ -1043,13 +1044,9 @@ def _run_review_in_thread(
                 )
             finally:
                 clear_thread_tool_whitelist()
-                # Unregister as soon as run_conversation() itself has
-                # returned — that's the only phase making outbound API
-                # calls, i.e. the only phase that can race the parent's
-                # next live turn. Runs on both the success and exception
-                # path (this whole block is inside the try/finally above).
-                _unregister_review_agent(review_agent)
-                # Attribute the review fork's usage to the PARENT session. The
+                # Attribute the review fork's usage to the PARENT session. Runs
+                # BEFORE ``_unregister_review_agent`` below so a teardown failure
+                # there cannot skip the recording. The
                 # fork runs with ``_session_db=None`` (persistence isolation — see
                 # the PERSISTENCE ISOLATION comment above), so its API calls are
                 # billed by the provider but never written to
@@ -1066,6 +1063,12 @@ def _run_review_in_thread(
                 # review thread (its own try/except), and a fork that made no
                 # successful calls no-ops on all-zero counters.
                 _record_review_usage_to_parent(agent, review_agent)
+                # Unregister as soon as run_conversation() itself has
+                # returned — that's the only phase making outbound API
+                # calls, i.e. the only phase that can race the parent's
+                # next live turn. Runs on both the success and exception
+                # path (this whole block is inside the try/finally above).
+                _unregister_review_agent(review_agent)
 
             # Snapshot review actions before teardown. close() is allowed to
             # clean per-session state, but the user-visible self-improvement
