@@ -341,6 +341,7 @@ def _fire_dispatch_tick_hook(
             result.rate_limited,
             result.auto_assigned_default,
             result.respawn_guarded,
+            result.preclaim_guarded,
             result.skipped_per_profile_capped,
             result.skipped_unassigned,
             result.skipped_nonspawnable,
@@ -7943,6 +7944,11 @@ class DispatchResult:
     Reasons: ``"blocker_auth"`` (quota/auth error — also auto-blocked),
     ``"recent_success"`` (completed run within guard window),
     ``"active_pr"`` (GitHub PR URL in a recent comment)."""
+    preclaim_guarded: list[tuple[str, str]] = field(default_factory=list)
+    """Tasks skipped before claim by ``pre_kanban_task_claim``.
+
+    Each ``(task_id, reason)`` entry is non-consuming: the task remains ready
+    or in review, no run is opened, and no failure attempt is charged."""
     rate_limited: list[str] = field(default_factory=list)
     """Task ids whose workers bailed on a provider rate-limit / quota wall
     (EX_TEMPFAIL sentinel exit) and were released back to ``ready`` WITHOUT
@@ -9482,6 +9488,103 @@ def review_dispatch_enabled() -> bool:
         return True
 
 
+def _run_preclaim_gate(
+    *, task_id: str, assignee: str, board: Optional[str], lane: str,
+) -> Optional[str]:
+    """Return a veto reason from the pre-claim plugin gate, if any.
+
+    This is intentionally fail-closed once a subscriber exists. A broken
+    provider/auth preflight must never be indistinguishable from approval.
+    With no subscriber the legacy dispatch behavior is unchanged.
+    """
+    try:
+        from hermes_cli.plugins import get_plugin_manager, has_hook
+        from hermes_cli.profiles import get_active_profile_name
+
+        if not has_hook("pre_kanban_task_claim"):
+            return None
+        manager = get_plugin_manager()
+        try:
+            profile_name = get_active_profile_name()
+        except Exception:
+            profile_name = "default"
+        payload = {
+            "task_id": task_id,
+            "board": board,
+            "assignee": assignee,
+            "lane": lane,
+            "profile_name": profile_name,
+            "telemetry_schema_version": 1,
+        }
+        for callback in manager.iter_hook_callbacks("pre_kanban_task_claim"):
+            try:
+                decision = manager._invoke_hook_callback(callback, payload)
+            except Exception as exc:
+                _log.warning("pre-claim hook failed for %s: %s", task_id, exc)
+                return "preclaim_hook_error"
+            if decision is None:
+                continue
+            if not isinstance(decision, dict):
+                return "preclaim_invalid_result"
+            action = decision.get("action", "allow")
+            if action == "allow":
+                continue
+            if action == "skip":
+                reason = str(decision.get("reason") or "preclaim_denied").strip()
+                return reason[:500]
+            return "preclaim_invalid_action"
+        return None
+    except Exception as exc:
+        _log.warning("pre-claim gate failed for %s: %s", task_id, exc)
+        return "preclaim_gate_error"
+
+
+def _record_preclaim_veto(
+    conn: sqlite3.Connection,
+    result: DispatchResult,
+    task_id: str,
+    reason: str,
+) -> None:
+    result.preclaim_guarded.append((task_id, reason))
+    with write_txn(conn):
+        _append_event(conn, task_id, "preclaim_guarded", {"reason": reason})
+
+
+def _collect_preclaim_decisions(
+    conn: sqlite3.Connection,
+    *,
+    board: Optional[str],
+    default_assignee: Optional[str],
+    dry_run: bool,
+) -> Optional[dict[str, Optional[str]]]:
+    """Run subscribed preflights before the dispatch lock is acquired."""
+    if dry_run:
+        return None
+    try:
+        from hermes_cli.plugins import has_hook
+
+        if not has_hook("pre_kanban_task_claim"):
+            return None
+    except Exception:
+        # Discovery itself failed. Return an active decision map so every
+        # candidate fails closed as not evaluated inside the locked pass.
+        return {}
+    fallback = (default_assignee or "").strip() or None
+    rows = conn.execute(
+        "SELECT id, assignee, status FROM tasks "
+        "WHERE status IN ('ready', 'review') AND claim_lock IS NULL"
+    ).fetchall()
+    return {
+        row["id"]: _run_preclaim_gate(
+            task_id=row["id"],
+            assignee=row["assignee"] or fallback or "",
+            board=board,
+            lane=row["status"],
+        )
+        for row in rows
+    }
+
+
 def dispatch_once(
     conn: sqlite3.Connection,
     *,
@@ -9512,6 +9615,9 @@ def dispatch_once(
     boards tick in parallel. See :func:`_dispatch_tick_lock` for the
     cross-process / cross-platform mechanics.
     """
+    preclaim_decisions = _collect_preclaim_decisions(
+        conn, board=board, default_assignee=default_assignee, dry_run=dry_run,
+    )
     try:
         db_path = kanban_db_path(board=board)
     except Exception:
@@ -9531,6 +9637,7 @@ def dispatch_once(
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
             reconcile_orphans=reconcile_orphans,
+            preclaim_decisions=preclaim_decisions,
         )
         _fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
         return result
@@ -9551,6 +9658,7 @@ def dispatch_once(
                 default_assignee=default_assignee,
                 max_in_progress_per_profile=max_in_progress_per_profile,
                 reconcile_orphans=reconcile_orphans,
+                preclaim_decisions=preclaim_decisions,
             )
             # Still under the dispatch lock: run the periodic PASSIVE WAL
             # checkpoint (see _maybe_checkpoint_wal; the -wal file size is
@@ -9578,6 +9686,7 @@ def _dispatch_once_locked(
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
     reconcile_orphans: bool = True,
+    preclaim_decisions: Optional[dict[str, Optional[str]]] = None,
 ) -> DispatchResult:
     """Run one dispatcher tick.
 
@@ -9822,6 +9931,13 @@ def _dispatch_once_locked(
                     _per_profile_running.get(row_assignee, 0) + 1
                 )
             continue
+        preclaim_reason = (
+            preclaim_decisions.get(row["id"], "preclaim_not_evaluated")
+            if preclaim_decisions is not None else None
+        )
+        if preclaim_reason:
+            _record_preclaim_veto(conn, result, row["id"], preclaim_reason)
+            continue
         claimed = claim_task(conn, row["id"], ttl_seconds=ttl_seconds)
         if claimed is None:
             continue
@@ -9948,6 +10064,13 @@ def _dispatch_once_locked(
                 _per_profile_running[row["assignee"]] = (
                     _per_profile_running.get(row["assignee"], 0) + 1
                 )
+            continue
+        preclaim_reason = (
+            preclaim_decisions.get(row["id"], "preclaim_not_evaluated")
+            if preclaim_decisions is not None else None
+        )
+        if preclaim_reason:
+            _record_preclaim_veto(conn, result, row["id"], preclaim_reason)
             continue
         claimed = claim_review_task(conn, row["id"], ttl_seconds=ttl_seconds)
         if claimed is None:

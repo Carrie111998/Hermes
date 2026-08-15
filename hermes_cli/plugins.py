@@ -278,6 +278,14 @@ VALID_HOOKS: Set[str] = {
     "kanban_task_claimed",
     "kanban_task_completed",
     "kanban_task_blocked",
+    # Fail-closed gate immediately before a dispatcher claims a task. Unlike
+    # the lifecycle observers above, callbacks may veto a claim by returning
+    # ``{"action": "skip", "reason": "..."}``. ``None`` or
+    # ``{"action": "allow"}`` allows it. Callback failures and malformed
+    # non-None results are treated as vetoes by the dispatcher so an auth or
+    # provider preflight cannot accidentally fail open. Kwargs: task_id,
+    # board, assignee, lane ("ready" | "review"), profile_name.
+    "pre_kanban_task_claim",
     # Kanban worker-lifecycle, task-mutation, and dispatcher-tick observers
     # (RFC #58548, accepted as the design basis in the #64231 batch
     # disposition; on_kanban_dispatch_tick is the re-port of PR #56066).
