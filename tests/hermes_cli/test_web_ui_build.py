@@ -150,7 +150,17 @@ class TestBuildWebUISkipsWhenFresh:
         assert result is True
         args, kwargs = mock_run.call_args
         assert "--workspace" not in args[0]
-        assert args[0] == ["/usr/bin/npm", "ci", "--include=dev", "--silent", "--prefer-offline"]
+        # --ignore-scripts is a security control, not incidental argv: npm
+        # lifecycle scripts execute arbitrary code from the whole transitive
+        # closure, and this install can run as root under `hermes update`.
+        # Asserted separately from the exact list so that a future argv change
+        # cannot drop it silently — the list assertion alone would just be
+        # "updated to match" by whoever removed it.
+        assert "--ignore-scripts" in args[0]
+        assert args[0] == [
+            "/usr/bin/npm", "ci", "--include=dev", "--ignore-scripts",
+            "--silent", "--prefer-offline",
+        ]
         assert kwargs["cwd"] == web_dir
 
     def test_workspace_root_install_names_update_closure(self, tmp_path, monkeypatch):
