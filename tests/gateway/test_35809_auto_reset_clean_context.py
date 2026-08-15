@@ -37,9 +37,20 @@ import ast
 import inspect
 
 from gateway import run as gateway_run
+from gateway import runner_lifecycle as gateway_lifecycle
 from gateway.config import GatewayConfig, Platform
 from gateway.session import SessionSource, SessionStore
 from hermes_state import SessionDB
+
+
+def _runner_source() -> str:
+    """Concatenated source of the runner class (run.py + runner_lifecycle.py).
+
+    The god-file decomposition campaign moved the gateway lifecycle methods
+    out of ``gateway/run.py`` into ``gateway/runner_lifecycle.py``; the AST
+    invariant below must scan both files.
+    """
+    return inspect.getsource(gateway_run) + "\n" + inspect.getsource(gateway_lifecycle)
 
 
 # ---------------------------------------------------------------------------
@@ -47,7 +58,7 @@ from hermes_state import SessionDB
 # ---------------------------------------------------------------------------
 def _find_compression_exhausted_reset_block() -> ast.If:
     """Return the ``if agent_result.get('compression_exhausted') ...`` block."""
-    tree = ast.parse(inspect.getsource(gateway_run))
+    tree = ast.parse(_runner_source())
 
     for node in ast.walk(tree):
         if not isinstance(node, ast.If):

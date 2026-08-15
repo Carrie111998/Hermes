@@ -25,7 +25,18 @@ import textwrap
 from unittest.mock import MagicMock, call
 
 from gateway import run as gateway_run
+from gateway import runner_lifecycle as gateway_lifecycle
 from gateway.session_context import set_current_session_id, get_session_env
+
+
+def _runner_source() -> str:
+    """Concatenated source of the runner class (run.py + runner_lifecycle.py).
+
+    The god-file decomposition campaign moved the gateway lifecycle methods
+    out of ``gateway/run.py`` into ``gateway/runner_lifecycle.py``; the AST
+    invariants below must scan both files.
+    """
+    return inspect.getsource(gateway_run) + "\n" + inspect.getsource(gateway_lifecycle)
 
 
 def _session_id_assignments_followed_by_save(source: str) -> list[tuple[int, bool]]:
@@ -108,7 +119,7 @@ def test_every_post_compression_session_id_assignment_persists():
     would compress correctly, the gateway would update its in-memory
     session_id, then drop it on next gateway restart.
     """
-    source = inspect.getsource(gateway_run)
+    source = _runner_source()
     assignments = _session_id_assignments_followed_by_save(source)
     assert assignments, (
         "No ``session_entry.session_id = ...`` assignments found in gateway/run.py — "

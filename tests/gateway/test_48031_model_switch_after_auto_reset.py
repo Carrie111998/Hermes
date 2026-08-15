@@ -24,7 +24,18 @@ import ast
 import inspect
 
 from gateway import run as gateway_run
+from gateway import runner_lifecycle as gateway_lifecycle
 from gateway import slash_commands as gateway_slash
+
+
+def _runner_source() -> str:
+    """Concatenated source of the runner class (run.py + runner_lifecycle.py).
+
+    The god-file decomposition campaign moved the gateway lifecycle methods
+    out of ``gateway/run.py`` into ``gateway/runner_lifecycle.py``; the AST
+    invariant below must scan both files.
+    """
+    return inspect.getsource(gateway_run) + "\n" + inspect.getsource(gateway_lifecycle)
 
 
 def _assigns_false(node: ast.AST, attr: str) -> bool:
@@ -47,7 +58,7 @@ def test_run_consumes_was_auto_reset_in_cleanup_block():
     `session_entry.was_auto_reset = False` so the cleanup (which pops the
     session model/reasoning overrides) cannot re-fire on the next message and
     wipe an override stored between turns (#48031)."""
-    tree = ast.parse(inspect.getsource(gateway_run))
+    tree = ast.parse(_runner_source())
 
     # Find the cleanup branch: an `if <flag>:` block that clears the
     # conversation scope (post-funnel: one _clear_conversation_scope call
