@@ -10310,12 +10310,10 @@ def _resolve_worker_cli_toolsets(hermes_home: Optional[str]) -> Optional[list[st
             reset_hermes_home_override(token)
         return toolsets or None
     except Exception as exc:
-        _log.debug(
-            "kanban worker: could not resolve CLI toolsets for HERMES_HOME=%r (%s)",
-            hermes_home,
-            exc,
-        )
-        return None
+        raise RuntimeError(
+            "kanban worker: refusing spawn because CLI toolsets could not be "
+            f"resolved for HERMES_HOME={hermes_home!r}"
+        ) from exc
 
 
 _retagged_workspace_roots: set[str] = set()

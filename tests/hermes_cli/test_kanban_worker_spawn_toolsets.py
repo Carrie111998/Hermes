@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import subprocess
 
+import pytest
+
 
 def _make_task(kb, *, assignee: str):
     return kb.Task(
@@ -229,6 +231,56 @@ agent:
     resolved = kb._resolve_worker_cli_toolsets(str(profile))
 
     assert resolved == ["kanban_lifecycle"]
+
+
+def test_resolve_worker_cli_toolsets_fails_closed_on_config_error(
+    monkeypatch, tmp_path
+):
+    profile = tmp_path / "profile"
+    profile.mkdir()
+
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import config as hermes_config
+
+    monkeypatch.setattr(
+        hermes_config,
+        "load_config",
+        lambda: (_ for _ in ()).throw(ValueError("invalid profile config")),
+    )
+
+    with pytest.raises(RuntimeError, match="refusing spawn"):
+        kb._resolve_worker_cli_toolsets(str(profile))
+
+
+def test_default_spawn_does_not_start_process_when_toolset_resolution_fails(
+    monkeypatch, tmp_path
+):
+    root = tmp_path / ".hermes"
+    profile = root / "profiles" / "dashboardcontrol"
+    profile.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(root))
+
+    from hermes_cli import kanban_db as kb
+
+    monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["hermes"])
+    monkeypatch.setattr(
+        kb,
+        "_resolve_worker_cli_toolsets",
+        lambda _home: (_ for _ in ()).throw(RuntimeError("resolution failed")),
+    )
+    monkeypatch.setattr(
+        subprocess,
+        "Popen",
+        lambda *_args, **_kwargs: pytest.fail("worker process must not start"),
+    )
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    with pytest.raises(RuntimeError, match="resolution failed"):
+        kb._default_spawn(
+            _make_task(kb, assignee="dashboardcontrol"),
+            str(workspace),
+        )
 
 
 def test_default_spawn_pins_lifecycle_process_scope_and_suppresses_hooks(
