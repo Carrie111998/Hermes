@@ -13,13 +13,29 @@ from agent.runtime_cwd import resolve_agent_cwd, resolve_context_cwd
 from agent.prompt_builder import build_context_files_prompt
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import MessageEvent, MessageType
-from gateway.project_router import PROJECTS, active_project_path, project_path
+from gateway.project_router import (
+    active_project_path,
+    bootstrap_registry,
+    project_keys,
+    project_path,
+    register_project,
+)
 from gateway.session import SessionContext, SessionEntry, SessionSource, build_session_key
 from hermes_state import SessionDB
 
 
-NEWMOON_PATH = PROJECTS["newmoon"]
-FIVEHOURS_PATH = "/home/rle/projects/savefivehours"
+NEWMOON_PATH = Path("/home/rle/projects/NewMoonNailsAndSpa")
+FIVEHOURS_PATH = Path("/home/rle/projects/savefivehours")
+
+
+def _make_project(tmp_path: Path, name: str, *, agents: bool = True) -> Path:
+    project = tmp_path / name
+    project.mkdir()
+    (project / ".git").mkdir()
+    (project / "README.md").write_text("# Test project\n")
+    if agents:
+        (project / "AGENTS.md").write_text("# Agent context\n")
+    return project
 
 
 def _source() -> SessionSource:
@@ -128,7 +144,9 @@ async def test_project_selection_intercepts_persists_and_evicts_cached_agent(tmp
 
     assert response == f"Active project: {key} ({path})"
     assert runner._session_db._db.get_meta("matrix_project_router:" + session_key) == key
-    assert active_project_path(runner._session_db._db, session_key) == project_path(key)
+    assert active_project_path(runner._session_db._db, session_key) == project_path(
+        runner._session_db._db, key
+    )
     runner._evict_cached_agent.assert_called_once_with(session_key)
     runner._handle_message_with_agent.assert_not_awaited()
 
@@ -174,9 +192,12 @@ async def test_project_selection_switches_active_project_and_evicts_each_time(tm
     await runner._handle_message(_event(f"!project {first}"))
     response = await runner._handle_message(_event(f"!project {second}"))
 
-    assert response == f"Active project: {second} ({PROJECTS[second]})"
+    expected_path = FIVEHOURS_PATH if second == "fivehours" else NEWMOON_PATH
+    assert response == f"Active project: {second} ({expected_path})"
     assert runner._session_db._db.get_meta("matrix_project_router:" + session_key) == second
-    assert active_project_path(runner._session_db._db, session_key) == project_path(second)
+    assert active_project_path(runner._session_db._db, session_key) == project_path(
+        runner._session_db._db, second
+    )
     assert runner._evict_cached_agent.call_args_list == [call(session_key), call(session_key)]
     runner._handle_message_with_agent.assert_not_awaited()
 
@@ -287,3 +308,105 @@ async def test_unbound_matrix_session_dispatches_normally(tmp_path):
 
     assert result == expected
     runner._handle_message_with_agent.assert_awaited_once()
+
+
+def test_registry_bootstraps_legacy_projects_once_without_overwriting_additions(tmp_path):
+    db = SessionDB(db_path=tmp_path / "state.db")
+
+    bootstrap_registry(db)
+    assert project_keys(db) == ("fivehours", "newmoon")
+
+    project = _make_project(tmp_path, "custom-project")
+    registered = register_project(db, str(project))
+    assert registered.key == "customproject"
+
+    bootstrap_registry(db)
+    assert project_keys(db) == ("customproject", "fivehours", "newmoon")
+
+
+def test_registered_project_uses_canonical_path_and_survives_reopening_state(tmp_path):
+    db_path = tmp_path / "state.db"
+    project = _make_project(tmp_path, "My Cool App")
+    db = SessionDB(db_path=db_path)
+
+    registered = register_project(db, str(project / "."))
+
+    assert registered.key == "mycoolapp"
+    assert registered.path == project.resolve()
+    reopened = SessionDB(db_path=db_path)
+    assert project_path(reopened, "mycoolapp") == project.resolve()
+
+
+def test_register_project_rejects_duplicate_keys_and_paths(tmp_path):
+    db = SessionDB(db_path=tmp_path / "state.db")
+    first = _make_project(tmp_path, "first")
+    second = _make_project(tmp_path, "second")
+    register_project(db, str(first), key="shared")
+
+    with pytest.raises(ValueError, match="already registered for this path"):
+        register_project(db, str(first), key="shared")
+    with pytest.raises(ValueError, match="key 'shared'.*already registered"):
+        register_project(db, str(second), key="shared")
+    with pytest.raises(ValueError, match="already registered as 'shared'"):
+        register_project(db, str(first), key="other")
+
+
+@pytest.mark.parametrize("raw_path", ["relative-project", "/does/not/exist"])
+def test_register_project_rejects_invalid_paths(tmp_path, raw_path):
+    db = SessionDB(db_path=tmp_path / "state.db")
+
+    with pytest.raises(ValueError):
+        register_project(db, raw_path)
+
+
+def test_register_project_rejects_directory_that_is_not_a_project(tmp_path):
+    db = SessionDB(db_path=tmp_path / "state.db")
+    directory = tmp_path / "not-a-project"
+    directory.mkdir()
+
+    with pytest.raises(ValueError, match="does not appear to be a project or repository"):
+        register_project(db, str(directory))
+
+
+@pytest.mark.asyncio
+async def test_project_add_registers_without_modifying_repository_and_can_be_selected(tmp_path):
+    runner = _runner(tmp_path)
+    runner._handle_message_with_agent = AsyncMock()
+    project = _make_project(tmp_path, "My Cool App", agents=False)
+    readme_before = (project / "README.md").read_text()
+
+    response = await runner._handle_message(_event(f"!project add {project}"))
+
+    assert response == (
+        f"Project registered: mycoolapp\nPath: {project.resolve()}\n\nContext:\n"
+        "- AGENTS.md: missing\n- README*: found\n- CONTRIBUTING.md: missing\n"
+        "- package.json: missing\n- pyproject.toml: missing\n- Cargo.toml: missing\n"
+        "- go.mod: missing\n- docs/: missing\n- docs/STATUS.md: missing\n"
+        "- docs/decisions/: missing\n\n"
+        "Project routing is available, but repository agent context is incomplete."
+    )
+    assert (project / "README.md").read_text() == readme_before
+    assert not (project / "AGENTS.md").exists()
+
+    selected = await runner._handle_message(_event("!project mycoolapp"))
+    assert selected == f"Active project: mycoolapp ({project.resolve()})"
+    runner._handle_message_with_agent.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_project_list_is_deterministic_and_unknown_keys_are_dynamic(tmp_path):
+    runner = _runner(tmp_path)
+    runner._handle_message_with_agent = AsyncMock()
+    project = _make_project(tmp_path, "Zebra App")
+    await runner._handle_message(_event(f"!project add {project}"))
+
+    listed = await runner._handle_message(_event("!project list"))
+    unknown = await runner._handle_message(_event("!project unknown"))
+
+    assert listed == (
+        "Registered projects:\n"
+        "- fivehours → /home/rle/projects/savefivehours\n"
+        "- newmoon → /home/rle/projects/NewMoonNailsAndSpa\n"
+        f"- zebraapp → {project.resolve()}"
+    )
+    assert "Valid projects: fivehours, newmoon, zebraapp" in unknown

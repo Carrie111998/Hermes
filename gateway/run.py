@@ -16162,29 +16162,62 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if _matrix_parts and _matrix_parts[0].lower() == "project":
                     _matrix_project_args = _matrix_parts[1] if len(_matrix_parts) > 1 else ""
         if _matrix_project_args is not None:
-            arg = _matrix_project_args.strip().lower()
-            from gateway.project_router import active_project, clear_project, select_project
+            arg = _matrix_project_args.strip()
+            action, _, remainder = arg.partition(" ")
+            action = action.lower()
+            from gateway.project_router import (
+                active_project,
+                clear_project,
+                project_keys,
+                project_path,
+                register_project,
+                select_project,
+            )
 
             session_key = self._session_key_for_source(source)
-            if arg == "clear":
+            if action == "clear" and not remainder.strip():
                 clear_project(self._session_db._db, session_key)
                 from agent.runtime_cwd import clear_session_cwd
 
                 clear_session_cwd()
                 self._evict_cached_agent(session_key)
                 return "Project context cleared."
-            if arg == "status":
+            if action == "status" and not remainder.strip():
                 project = active_project(self._session_db._db, session_key)
                 if project is None:
                     return "Active project: none"
                 key, path = project
                 return f"Active project: {key}\nPath: {path}"
+            if action == "list" and not remainder.strip():
+                projects = project_keys(self._session_db._db)
+                lines = ["Registered projects:"]
+                lines.extend(
+                    f"- {key} → {project_path(self._session_db._db, key)}" for key in projects
+                )
+                return "\n".join(lines)
+            if action == "add":
+                try:
+                    project = register_project(self._session_db._db, remainder.strip())
+                except ValueError as exc:
+                    return f"Project registration failed: {exc}"
+                context = "\n".join(
+                    f"- {label}: {'found' if found else 'missing'}"
+                    for label, found in project.context
+                )
+                response = (
+                    f"Project registered: {project.key}\nPath: {project.path}\n\nContext:\n{context}"
+                )
+                if not dict(project.context).get("AGENTS.md"):
+                    response += (
+                        "\n\nProject routing is available, but repository agent context is incomplete."
+                    )
+                return response
             try:
                 path = select_project(self._session_db._db, session_key, arg)
             except ValueError as exc:
                 return f"Project selection failed: {exc}"
             self._evict_cached_agent(session_key)
-            return f"Active project: {arg} ({path})"
+            return f"Active project: {action} ({path})"
 
         from hermes_cli.commands import (
             GATEWAY_KNOWN_COMMANDS,
