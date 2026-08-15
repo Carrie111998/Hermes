@@ -15673,7 +15673,7 @@ def test_shutdown_sessions_closes_every_session_via_helper(monkeypatch):
     seen = []
     monkeypatch.setattr(
         server, "_close_session_by_id",
-        lambda sid, *, end_reason: seen.append((sid, end_reason)),
+        lambda sid, *, end_reason, predicate=None: seen.append((sid, end_reason)),
     )
     server._sessions.clear()
     server._sessions["a"] = {}
