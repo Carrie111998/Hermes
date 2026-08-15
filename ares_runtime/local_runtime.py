@@ -453,6 +453,7 @@ if (config or {}).get('context', {}).get('engine') == 'ri-context-governor':
             f"ExecStart={self.paths.launcher_path} gateway foreground\n"
             "Restart=on-failure\n"
             "RestartSec=3\n\n"
+            "TimeoutStopSec=210\n\n"
             "[Install]\n"
             "WantedBy=default.target\n"
         )
@@ -574,6 +575,8 @@ if (config or {}).get('context', {}).get('engine') == 'ri-context-governor':
             self._activate(revision)
             if self.paths.unit_path.exists():
                 try:
+                    self._install_gateway_unit()
+                    self._systemctl("daemon-reload")
                     self._systemctl("restart", "ares-gateway.service")
                     time.sleep(1)
                     if not self._systemctl("is-active", "--quiet", "ares-gateway.service", required=False):

@@ -87,6 +87,7 @@ def test_gateway_unit_uses_the_explicit_foreground_action(tmp_path: Path) -> Non
     unit = runtime.paths.unit_path.read_text(encoding="utf-8")
 
     assert f"ExecStart={runtime.paths.launcher_path} gateway foreground" in unit
+    assert "TimeoutStopSec=210" in unit
 
 
 def test_systemd_environment_preserves_an_existing_session_bus(monkeypatch) -> None:
