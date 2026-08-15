@@ -1,0 +1,11 @@
+{
+  "name": "Exact product and variant",
+  "match_any": [
+    ["manufacturer", "product", "variant"]
+  ],
+  "exclude_any": [
+    "different generation",
+    "different edition",
+    "for parts"
+  ]
+}
