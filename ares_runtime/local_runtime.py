@@ -402,7 +402,7 @@ class AresLocalRuntime:
             "[Service]\n"
             "Type=simple\n"
             f"Environment=HERMES_HOME={self.paths.agent_home}\n"
-            f"ExecStart={self.paths.launcher_path} gateway --foreground\n"
+            f"ExecStart={self.paths.launcher_path} gateway foreground\n"
             "Restart=on-failure\n"
             "RestartSec=3\n\n"
             "[Install]\n"

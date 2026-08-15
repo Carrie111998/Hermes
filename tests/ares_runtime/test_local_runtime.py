@@ -80,6 +80,15 @@ def test_launcher_resolves_the_selected_runtime_dynamically(tmp_path: Path) -> N
     assert "Coding" not in launcher
 
 
+def test_gateway_unit_uses_the_explicit_foreground_action(tmp_path: Path) -> None:
+    runtime = _runtime(tmp_path)
+    runtime._install_gateway_unit()
+
+    unit = runtime.paths.unit_path.read_text(encoding="utf-8")
+
+    assert f"ExecStart={runtime.paths.launcher_path} gateway foreground" in unit
+
+
 def test_systemd_environment_preserves_an_existing_session_bus(monkeypatch) -> None:
     monkeypatch.setenv("XDG_RUNTIME_DIR", "/existing/runtime")
     monkeypatch.setenv("DBUS_SESSION_BUS_ADDRESS", "unix:path=/existing/runtime/bus")
