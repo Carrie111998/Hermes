@@ -265,18 +265,29 @@ class TestFtsEngineIntegrityGate:
             reopened.close()
 
 
+class _FakeConnection:
+    def __init__(self):
+        self.rollbacks = 0
+
+    def rollback(self):
+        self.rollbacks += 1
+
+
 class _FailingCursor:
     """Cursor double for _rebuild_legacy_fts_indexes failure paths: SQL
-    matching a configured prefix raises; everything else succeeds."""
+    containing a configured marker raises; everything else succeeds. The
+    atomic fallback runs as one executescript, so markers match by
+    containment (the fallback script contains no fast-path DELETE)."""
 
     def __init__(self, failures):
         self.failures = failures
         self.executed = []
         self.params = []
+        self.connection = _FakeConnection()
 
     def _maybe_raise(self, sql):
-        for prefix, exc in self.failures.items():
-            if sql.startswith(prefix):
+        for marker, exc in self.failures.items():
+            if marker in sql:
                 raise exc
 
     def execute(self, sql, params=()):
@@ -304,16 +315,19 @@ def _stale_breadcrumb_dropped(cursor):
 
 class TestLegacyRebuildFallbackFailures:
     def test_fallback_own_failure_logs_and_continues(self, caplog):
-        """T7: DELETE fails and the drop-recreate fallback ALSO fails →
-        logger.error with the `hermes sessions repair` hint, the fts_stale
-        breadcrumb is dropped (a possibly-half-recreated table must not be
-        trusted by the next open), and no exception escapes."""
+        """T7: DELETE fails with the malformed class and the atomic recovery
+        script ALSO fails → rollback attempted, logger.error with the
+        `hermes sessions repair` hint, the fts_stale breadcrumb is dropped
+        (a possibly-half-recreated table must not be trusted by the next
+        open), and no exception escapes."""
         cursor = _FailingCursor(
             {
-                "DELETE FROM": sqlite3.DatabaseError(
+                "DELETE FROM messages_fts": sqlite3.DatabaseError(
                     "database disk image is malformed"
                 ),
-                "DROP TABLE": sqlite3.OperationalError("database is locked"),
+                "DROP TABLE IF EXISTS messages_fts;": sqlite3.DatabaseError(
+                    "malformed inverted index for FTS5 table"
+                ),
             }
         )
         with caplog.at_level(logging.ERROR, logger="hermes_state"):
@@ -323,22 +337,26 @@ class TestLegacyRebuildFallbackFailures:
         assert "messages_fts" in errors[0].message
         assert "hermes sessions repair" in errors[0].message
         assert _stale_breadcrumb_dropped(cursor)
-        # the failure happened at the DROP step, before any backfill attempt
-        assert not any(sql.startswith("INSERT INTO messages") for sql in cursor.executed)
+        assert cursor.connection.rollbacks >= 1
+        # the atomic recovery script ran (single BEGIN IMMEDIATE-wrapped
+        # executescript) and failed before any separate backfill execute
+        assert any(sql.startswith("BEGIN IMMEDIATE;") for sql in cursor.executed)
+        assert not any(
+            sql.startswith("INSERT INTO messages_fts(") for sql in cursor.executed
+        )
 
     def test_post_fallback_backfill_failure_does_not_raise(self, caplog):
-        """T8: DELETE fails, drop-recreate succeeds, but the backfill INSERT
-        fails → the failure is contained (error log + repair hint + fts_stale
-        breadcrumb so the next open runs the full recovery — an empty
-        recreated table would otherwise pass 'integrity-check' and freeze a
-        silently-dead index under the stamped marker), and it must NOT
-        escape and fail the open."""
+        """T8: DELETE fails, but the failure inside the atomic recovery
+        script is at the backfill INSERT → rollback + error log + repair
+        hint + fts_stale breadcrumb (an empty recreated table would
+        otherwise pass 'integrity-check' and freeze a silently-dead index
+        under the stamped marker), and nothing escapes to fail the open."""
         cursor = _FailingCursor(
             {
-                "DELETE FROM": sqlite3.DatabaseError(
+                "DELETE FROM messages_fts": sqlite3.DatabaseError(
                     "database disk image is malformed"
                 ),
-                "INSERT INTO messages_fts(": sqlite3.DatabaseError(
+                "INSERT INTO messages_fts(rowid, content)": sqlite3.DatabaseError(
                     "database disk image is malformed"
                 ),
             }
@@ -349,8 +367,32 @@ class TestLegacyRebuildFallbackFailures:
         assert len(errors) == 1
         assert "hermes sessions repair" in errors[0].message
         assert _stale_breadcrumb_dropped(cursor)
-        # the fallback ran its full shape: triggers dropped, table dropped,
-        # legacy DDL re-applied, backfill attempted
-        assert any(sql.startswith("DROP TRIGGER IF EXISTS") for sql in cursor.executed)
-        assert any(sql.startswith("DROP TABLE IF EXISTS") for sql in cursor.executed)
-        assert any("CREATE VIRTUAL TABLE" in sql for sql in cursor.executed)
+        assert cursor.connection.rollbacks >= 1
+        # the recovery ran its full shape inside one atomic script
+        scripts = [s for s in cursor.executed if s.startswith("BEGIN IMMEDIATE;")]
+        assert len(scripts) == 1
+        assert "DROP TRIGGER IF EXISTS messages_fts_insert" in scripts[0]
+        assert "DROP TABLE IF EXISTS messages_fts;" in scripts[0]
+        assert "CREATE VIRTUAL TABLE" in scripts[0]
+        assert "INSERT INTO messages_fts(rowid, content)" in scripts[0]
+        assert scripts[0].rstrip().endswith("COMMIT;")
+
+    def test_transient_delete_error_reraises_without_fallback(self, caplog):
+        """T9: a lock/busy-style DELETE failure is NOT the corruption class
+        — it must re-raise for the open-retry path (pre-fallback behavior)
+        and must not run the drop-recreate script or drop the fts_stale
+        breadcrumb (classification adopted from the #86062 review round)."""
+        cursor = _FailingCursor(
+            {
+                "DELETE FROM messages_fts": sqlite3.OperationalError(
+                    "database is locked"
+                )
+            }
+        )
+        with pytest.raises(sqlite3.OperationalError, match="database is locked"):
+            SessionDB._rebuild_legacy_fts_indexes(cursor, include_trigram=False)
+        assert not any(
+            sql.startswith("BEGIN IMMEDIATE;") for sql in cursor.executed
+        )
+        assert not _stale_breadcrumb_dropped(cursor)
+        assert cursor.connection.rollbacks == 0

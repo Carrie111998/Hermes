@@ -329,13 +329,15 @@ class SessionSchemaMixin:
         'rebuild' source, so we DELETE + reinsert the concatenated content
         the legacy triggers produced. Never touches the v23 shape.
 
-        A DELETE that fails with DatabaseError (the #86027 malformed-index
-        class: the index was written by a different SQLite engine) falls
-        back to dropping and recreating the virtual table from its legacy
-        DDL before backfilling, so the repair never fails the open. A
-        fallback that cannot complete leaves the ``fts_stale`` breadcrumb
-        so the next open performs the full recovery instead of trusting a
-        possibly-empty index.
+        A DELETE that fails with the malformed-index error class (the
+        #86027 corruption: the index was written by a different SQLite
+        engine) falls back to atomically dropping and recreating the
+        virtual table from its legacy DDL before backfilling, so the
+        repair never fails the open. Transient lock/busy/IO errors are
+        re-raised for the outer open-retry path instead (adopted from the
+        #86062 review round). A fallback that cannot complete leaves the
+        ``fts_stale`` breadcrumb so the next open performs the full
+        recovery instead of trusting a possibly-empty index.
         """
         backfill_sql = (
             "INSERT INTO {table}(rowid, content) "
@@ -343,7 +345,7 @@ class SessionSchemaMixin:
             "COALESCE(content, '') || ' ' || "
             "COALESCE(tool_name, '') || ' ' || "
             "COALESCE(tool_calls, '') "
-            "FROM messages"
+            "FROM messages;"
         )
         tables = ("messages_fts",)
         if include_trigram:
@@ -353,30 +355,44 @@ class SessionSchemaMixin:
             try:
                 cursor.execute(f"DELETE FROM {table}")
             except sqlite3.DatabaseError as exc:
+                if not SessionSchemaMixin._is_malformed_fts_index_error(exc):
+                    raise
                 logger.warning(
                     "Cannot clear legacy FTS index %s with DELETE (%s); "
                     "dropping and recreating it instead",
                     table,
                     exc,
                 )
+                recovery_sql = (
+                    "BEGIN IMMEDIATE;"
+                    + "".join(
+                        f"DROP TRIGGER IF EXISTS {trigger};" for trigger in triggers
+                    )
+                    + f"DROP TABLE IF EXISTS {table};"
+                    + ddl
+                    + backfill_sql.format(table=table)
+                    + "COMMIT;"
+                )
                 try:
-                    for trigger in triggers:
-                        cursor.execute(f"DROP TRIGGER IF EXISTS {trigger}")
-                    cursor.execute(f"DROP TABLE IF EXISTS {table}")
-                    cursor.executescript(ddl)
-                    # Backfill inside the same guard: a failure here (e.g.
-                    # messages itself unreadable) must not escape and fail
-                    # the open — this method is a best-effort repair path.
-                    cursor.execute(backfill_sql.format(table=table))
-                except sqlite3.Error as fallback_exc:
-                    # The recreated table may be empty but structurally
-                    # valid, so the engine-integrity gate later in the open
-                    # would pass it and stamp the marker — freezing a
-                    # silently-dead index. Drop the existing fts_stale
-                    # breadcrumb instead: the next open routes through
-                    # _recover_stale_fts (full drop/recreate/backfill), and
-                    # if that still cannot complete, FTS degrades visibly
-                    # instead of staying empty forever.
+                    # One executescript wrapped in BEGIN IMMEDIATE/COMMIT —
+                    # the _recover_stale_fts house pattern — so drop +
+                    # recreate + backfill commit atomically and a concurrent
+                    # writer can never observe a half-dropped index.
+                    cursor.executescript(recovery_sql)
+                except sqlite3.DatabaseError as fallback_exc:
+                    try:
+                        cursor.connection.rollback()
+                    except sqlite3.Error:
+                        pass
+                    # A rolled-back recovery leaves the original malformed
+                    # table intact, but if the script died after CREATE the
+                    # table may exist empty-but-valid: the engine-integrity
+                    # gate later in the open would pass it and stamp the
+                    # marker, freezing a silently-dead index. Drop the
+                    # fts_stale breadcrumb instead: the next open routes
+                    # through _recover_stale_fts (full drop/recreate/
+                    # backfill), and if that still cannot complete, FTS
+                    # degrades visibly instead of staying empty forever.
                     cursor.execute(
                         "INSERT INTO state_meta (key, value) VALUES (?, '1') "
                         "ON CONFLICT(key) DO UPDATE SET value = '1'",
@@ -391,6 +407,30 @@ class SessionSchemaMixin:
                     )
                 continue
             cursor.execute(backfill_sql.format(table=table))
+
+    @staticmethod
+    def _is_malformed_fts_index_error(exc: BaseException) -> bool:
+        """True when *exc* is the corrupt-index class that justifies a
+        drop-and-recreate rebuild, rather than a transient lock/busy/IO
+        error that the open-retry path should handle instead.
+
+        Message-based classification adopted from the #86062 review round
+        (credit @StanleyStetson / @Christopher-Schulze): treating every
+        ``DatabaseError`` as corruption makes a ``database is locked``
+        trigger a redundant rebuild (and, pre-atomicity, an autocommitted
+        DROP TABLE).
+        """
+        if not isinstance(exc, sqlite3.DatabaseError):
+            return False
+        message = str(exc).lower()
+        return any(
+            marker in message
+            for marker in (
+                "malformed inverted index",
+                "database disk image is malformed",
+                "malformed database schema",
+            )
+        )
 
     def _fts_table_probe(self, cursor: sqlite3.Cursor, table_name: str) -> Optional[bool]:
         try:
@@ -458,6 +498,23 @@ class SessionSchemaMixin:
                         f"INSERT INTO {table}({table}) VALUES('integrity-check')"
                     )
                 except sqlite3.DatabaseError as exc:
+                    if not SessionSchemaMixin._is_malformed_fts_index_error(exc):
+                        # Transient (lock/busy/IO) — not the corruption
+                        # class. Leave the marker unstamped so the next
+                        # open re-runs the sweep instead of freezing an
+                        # unverified state (classification adopted from
+                        # the #86062 review round).
+                        verified = False
+                        logger.warning(
+                            "FTS integrity check for %s in %s hit a transient "
+                            "error under SQLite %s (%s); marker left unstamped "
+                            "to retry on next open",
+                            table,
+                            self.db_path,
+                            sqlite3.sqlite_version,
+                            exc,
+                        )
+                        continue
                     try:
                         cursor.execute(
                             f"INSERT INTO {table}({table}) VALUES('rebuild')"
