@@ -324,6 +324,40 @@ class AresLocalRuntime:
         )
         return bool(copied)
 
+    def _provision_context_governor_key(self, source: Path) -> None:
+        """Initialize the Ares-owned key only for the configured strict engine."""
+
+        python = self._python_for(source)
+        if not python.is_file():
+            raise AresLocalRuntimeError("stable Ares Python is missing during Context Governor setup")
+        program = """
+from pathlib import Path
+import shutil
+import yaml
+from hermes_constants import get_hermes_home
+from plugins.context_engine._context_governor.key_state import ContextGovernorKeyError, ContextGovernorKeyState
+
+config_path = Path(get_hermes_home()) / 'config.yaml'
+config = yaml.safe_load(config_path.read_text(encoding='utf-8')) if config_path.is_file() else {}
+if (config or {}).get('context', {}).get('engine') == 'ri-context-governor':
+    binary = shutil.which('context-governor')
+    if not binary:
+        raise RuntimeError('context-governor binary is unavailable')
+    state = ContextGovernorKeyState(get_hermes_home(), binary)
+    try:
+        binding = state.active_binding()
+    except ContextGovernorKeyError as exc:
+        if exc.code != 'MissingGovernedKey':
+            raise
+        binding = state.initialize_first_install()
+    binding.close()
+"""
+        self._run(
+            [python, "-c", program],
+            cwd=source,
+            env=self._agent_environment(),
+        )
+
     def _build_runtime(self, source: Path, *, desktop: bool) -> None:
         uv = shutil.which("uv")
         if uv is None:
@@ -507,6 +541,7 @@ class AresLocalRuntime:
             legacy_active = self._systemctl("is-active", "--quiet", "hermes-gateway.service", required=False)
             self._materialize(str(source), revision, desktop=desktop)
             seeded = self._seed_agent_home(seed_from)
+            self._provision_context_governor_key(self._release_source(revision))
             self._activate(revision)
             self._write_config(remote=remote, branch=branch)
             self._install_launcher()

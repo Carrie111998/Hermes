@@ -117,6 +117,16 @@ def test_seed_adds_missing_auth_without_overwriting_an_ares_home(tmp_path: Path)
     assert (runtime.paths.agent_home / "config.yaml").read_text(encoding="utf-8") == "provider: preserved\n"
 
 
+def test_context_governor_provisioning_uses_the_existing_governed_key_owner() -> None:
+    source = Path(__file__).parents[2] / "ares_runtime" / "local_runtime.py"
+
+    implementation = source.read_text(encoding="utf-8")
+
+    assert "ContextGovernorKeyState" in implementation
+    assert "initialize_first_install" in implementation
+    assert "MissingGovernedKey" in implementation
+
+
 def test_ares_runtime_is_included_in_the_noneditable_distribution() -> None:
     project = Path(__file__).parents[2] / "pyproject.toml"
     data = tomllib.loads(project.read_text(encoding="utf-8"))
