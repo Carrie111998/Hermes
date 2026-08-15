@@ -201,6 +201,24 @@ class TestGatewayHasActiveSupervisor:
         monkeypatch.setattr(gateway, "_probe_launchd_service_running", lambda: True)
         assert gateway._gateway_has_active_supervisor() is True
 
+    def test_launchd_loaded_but_dead_is_not_supervisor(self, monkeypatch):
+        # @yun520-1 / @fluxkapacitor edge: the launchd job is *loaded* (plist
+        # present) but the gateway is actually dead — KeepAlive didn't fire or
+        # it crashed hard — so `launchctl list` returns no PID. The Desktop
+        # reaper MUST distinguish "process gone, launchd will handle it" from
+        # "process gone, I must handle it". Because the guard requires a live
+        # PID (not just a loaded definition), a loaded-but-dead job is NOT
+        # treated as an active supervisor: the reap is not short-circuited and
+        # `_ensure_desktop_gateway_running()` relaunches the missing gateway on
+        # the next desktop (re)start. This is the exact state-reversal hazard
+        # the two-owner framing warns about — and it is already handled.
+        monkeypatch.setattr(gateway, "supports_systemd_services", lambda: False)
+        monkeypatch.setattr(gateway, "is_macos", lambda: True)
+        monkeypatch.setattr(gateway, "is_windows", lambda: False)
+        monkeypatch.setattr(gateway, "get_launchd_plist_path", lambda: _FakePath(True))
+        monkeypatch.setattr(gateway, "_probe_launchd_service_running", lambda: False)
+        assert gateway._gateway_has_active_supervisor() is False
+
     def test_windows_scheduled_task_running(self, monkeypatch):
         monkeypatch.setattr(gateway, "supports_systemd_services", lambda: False)
         monkeypatch.setattr(gateway, "is_macos", lambda: False)
