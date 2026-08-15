@@ -324,8 +324,16 @@ def _(rid, params: dict) -> dict:
     # moved the session transport to stdio — and, since it attaches rather than
     # rebinds, a second client submitting a prompt no longer cuts the first
     # client out of the session it is watching.
+    submit_origin = ""
     if (t := current_transport()) is not None:
         _attach_session_transport(session, t)
+        # CAPTURED here, STAMPED at the claim below. _transport_origin reads the
+        # transport bound to this RPC, which only exists on this thread, so the
+        # value has to be taken now — but attaching is not claiming. A submit
+        # that lands mid-turn redirects, queues, or is refused without ever
+        # starting a turn, and must not repaint the frames of the turn that IS
+        # running with the origin of the client that merely typed over it.
+        submit_origin = _transport_origin(t)
     while True:
         busy_transport = None
         with session["history_lock"]:
@@ -638,6 +646,14 @@ def _(rid, params: dict) -> dict:
                     for i in _history_user_indices(truncated)
                 ]
         session["running"] = True
+        # This client owns the turn it just claimed: every session event the
+        # turn produces is stamped with this connection's origin, so mirrored
+        # peers can render "someone else is driving" instead of mistaking the
+        # stream for their own. Stamped WITH the claim, under the same lock,
+        # the way the queued drain and the auto-continue kickoff stamp theirs.
+        # "" (stdio, internal callers) means unknown and is omitted from the
+        # frames entirely.
+        session["turn_origin"] = submit_origin
         session["_turn_cancel_requested"] = False
         session["last_active"] = time.time()
         _start_inflight_turn(session, text)

@@ -517,6 +517,15 @@ def _detach_transport_from_sessions(transport) -> list[tuple[str, dict]]:
     ]
 
 
+def _transport_origin(transport) -> str:
+    """The opaque per-connection id of *transport*, or ``""`` when it has none.
+
+    Set by ``tui_gateway.ws`` on each accepted WebSocket. stdio and test doubles
+    have none, which is why ``origin`` is omitted rather than emitted empty.
+    """
+    return str(getattr(transport, "transport_id", "") or "")
+
+
 def _prepend_tool_paths(env: dict[str, str]) -> dict[str, str]:
     """Prepend Hermes' managed bin, the venv bin dir, and the user-local
     bin dir to PATH so slash_worker child processes can resolve
@@ -1801,6 +1810,16 @@ def _event_frame(event: str, sid: str, payload: dict | None = None) -> dict:
     params: dict = {"type": event, "session_id": sid}
     if payload is not None:
         params["payload"] = payload
+    # Multi-client fan-out: tell every mirrored client WHICH client started the
+    # turn this frame belongs to — its own connection's ``origin`` (announced in
+    # gateway.ready), a peer's, or "auto_continue" for the crash-recovery
+    # kickoff. Stamped here, at frame creation, so it costs one dict read and
+    # every emitter gets it for free. Purely additive: the key is omitted
+    # whenever the origin is unknown, which is always the case for a stdio TUI
+    # and for a session-less broadcast, so no frame changes shape for a
+    # single-client deployment.
+    if sid and (origin := str((_sessions.get(sid) or {}).get("turn_origin") or "")):
+        params["origin"] = origin
     return {"jsonrpc": "2.0", "method": "event", "params": params}
 
 
@@ -7914,6 +7933,10 @@ def _maybe_schedule_auto_continue(sid: str, session: dict, session_key: str) -> 
             # behind for a racing user turn to inherit.
             session["_auto_continue_attempt"] = attempt
             session["_auto_continue_prompt"] = marker["prompt"]
+            # No client started this turn — the gateway did, recovering a
+            # crash. Mirrored clients see origin "auto_continue" and know the
+            # stream is nobody's typing.
+            session["turn_origin"] = "auto_continue"
         try:
             _emit(
                 "status.update",
@@ -8224,8 +8247,14 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
         # from a second client used to silence the first for the whole drained
         # turn. A peer that disconnected while its prompt sat in the queue is
         # skipped: the prompt still runs, only the dead pin is dropped.
-        if queued_transport is not None and not _transport_is_dead(queued_transport):
-            _attach_session_transport(session, queued_transport)
+        if queued_transport is not None:
+            # The drained turn belongs to whoever QUEUED it, not to whoever
+            # happened to be driving the session when it finally fires. The
+            # dead-peer skip is about the attach only: a queuer that dropped
+            # while its prompt waited still owns the turn that prompt starts.
+            session["turn_origin"] = _transport_origin(queued_transport)
+            if not _transport_is_dead(queued_transport):
+                _attach_session_transport(session, queued_transport)
     use_compute_host = _session_uses_compute_host(session)
     with session["history_lock"]:
         if int(session.get("_queued_prompt_generation", 0)) != queue_generation:
