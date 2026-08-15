@@ -3387,13 +3387,23 @@ class APIServerAdapter(BasePlatformAdapter):
         auth_err = self._check_auth(request)
         if auth_err:
             return auth_err
-        session_id = request.match_info["session_id"]
-        session, err = await self._get_existing_session_or_404(session_id)
+        requested_session_id = request.match_info["session_id"]
+        session, err = await self._get_existing_session_or_404(requested_session_id)
         if err:
             return err
+        db = await self._ensure_session_db_async()
+        resolved_session_id = await asyncio.to_thread(
+            db.resolve_resume_session_id, requested_session_id
+        )
+        if resolved_session_id != requested_session_id:
+            resolved = await asyncio.to_thread(db.get_session, resolved_session_id)
+            if resolved:
+                session = resolved
+            else:
+                resolved_session_id = requested_session_id
         return web.json_response({
             "object": "hermes.session.context",
-            "session_id": session_id,
+            "session_id": resolved_session_id,
             "context": self._context_usage_from_session(session),
         })
 
@@ -3952,11 +3962,17 @@ class APIServerAdapter(BasePlatformAdapter):
                 _enqueue(event_name, {"message_id": message_id, "tool_name": tool_name, "preview": preview, "args": args})
 
         def _status(kind: str, text: str = None) -> None:
+            from agent.context_engine import AutomaticCompactionStatus
+
+            is_compaction = isinstance(text, AutomaticCompactionStatus) or kind in {
+                "compacting",
+                "compacted",
+            }
             message = str(text if text is not None else kind)
             normalized = message.lower()
             event_name = (
                 "context.compaction"
-                if "compact" in normalized or "compress" in normalized
+                if is_compaction or "compact" in normalized or "compress" in normalized
                 else "lifecycle.status"
             )
             _enqueue(event_name, {"kind": str(kind), "message": message})

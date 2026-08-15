@@ -130,6 +130,47 @@ async def test_session_context_endpoint_returns_persisted_gauge(adapter, session
 
 
 @pytest.mark.asyncio
+async def test_session_context_endpoint_follows_compression_rotation(adapter, session_db):
+    parent_id = session_db.create_session("context-parent", "api_server")
+    session_db.update_session_context_usage(
+        parent_id,
+        used_tokens=90_000,
+        context_window_tokens=100_000,
+        compression_threshold_tokens=80_000,
+        compression_count=0,
+        compression_enabled=True,
+        compacted=False,
+        updated_at=100.0,
+    )
+    session_db.end_session(parent_id, "compression")
+    child_id = session_db.create_session(
+        "context-child", "api_server", parent_session_id=parent_id
+    )
+    session_db.append_message(child_id, role="assistant", content="continued")
+    session_db.update_session_context_usage(
+        child_id,
+        used_tokens=20_000,
+        context_window_tokens=100_000,
+        compression_threshold_tokens=80_000,
+        compression_count=1,
+        compression_enabled=True,
+        compacted=True,
+        updated_at=200.0,
+    )
+
+    app = _create_session_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        resp = await cli.get(f"/api/sessions/{parent_id}/context")
+        assert resp.status == 200
+        payload = await resp.json()
+
+    assert payload["session_id"] == child_id
+    assert payload["context"]["used_tokens"] == 20_000
+    assert payload["context"]["compression_count"] == 1
+    assert payload["context"]["compacted"] is True
+
+
+@pytest.mark.asyncio
 async def test_run_agent_persists_live_context_usage(adapter, session_db, monkeypatch):
     session_id = session_db.create_session("live-context", "api_server")
 
@@ -192,6 +233,42 @@ async def test_session_chat_stream_emits_compaction_status_event(adapter, sessio
     assert "event: context.compaction" in body
     assert '"message": "Compacting context before continuing"' in body
     assert '"context": {"compression_count": 1}' in body
+
+
+@pytest.mark.asyncio
+async def test_session_chat_stream_structures_custom_engine_compaction_status(
+    adapter, session_db
+):
+    from agent.context_engine import automatic_compaction_status_message
+
+    session_id = session_db.create_session("custom-context-events", "api_server")
+
+    class CustomEngine:
+        def get_automatic_compaction_status_message(self, **_kwargs):
+            return "Summarizing earlier turns"
+
+    async def fake_run(**kwargs):
+        status = automatic_compaction_status_message(
+            CustomEngine(), phase="compress", default_message="unused"
+        )
+        kwargs["status_callback"]("lifecycle", status)
+        return (
+            {"final_response": "done", "session_id": session_id, "messages": []},
+            {"context": {"compression_count": 1}},
+        )
+
+    app = _create_session_app(adapter)
+    with patch.object(adapter, "_run_agent", side_effect=fake_run):
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                f"/api/sessions/{session_id}/chat/stream",
+                json={"message": "continue"},
+            )
+            assert resp.status == 200
+            body = await resp.text()
+
+    assert "event: context.compaction" in body
+    assert '"message": "Summarizing earlier turns"' in body
 
 
 @pytest.mark.asyncio
