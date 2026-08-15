@@ -182,6 +182,90 @@ async def test_project_selection_switches_active_project_and_evicts_each_time(tm
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("key", "path"),
+    [("newmoon", NEWMOON_PATH), ("fivehours", FIVEHOURS_PATH)],
+)
+async def test_project_status_reports_active_project(tmp_path, key, path):
+    runner = _runner(tmp_path)
+    runner._handle_message_with_agent = AsyncMock()
+
+    await runner._handle_message(_event(f"!project {key}"))
+    runner._evict_cached_agent.reset_mock()
+    response = await runner._handle_message(_event("!project status"))
+
+    assert response == f"Active project: {key}\nPath: {path}"
+    runner._evict_cached_agent.assert_not_called()
+    runner._handle_message_with_agent.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_project_status_reports_none_when_no_project_is_active(tmp_path):
+    runner = _runner(tmp_path)
+    runner._handle_message_with_agent = AsyncMock()
+
+    response = await runner._handle_message(_event("!project status"))
+
+    assert response == "Active project: none"
+    runner._evict_cached_agent.assert_not_called()
+    runner._handle_message_with_agent.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_project_clear_removes_state_evicts_agent_and_unbinds_follow_up(tmp_path):
+    runner = _runner(tmp_path)
+    session_key = build_session_key(_source())
+    expected = {"final_response": "ordinary dispatch", "messages": []}
+    runner._handle_message_with_agent = AsyncMock(return_value=expected)
+
+    await runner._handle_message(_event("!project fivehours"))
+    context = SessionContext(
+        source=_source(), connected_platforms=[], home_channels={}, session_key=session_key
+    )
+    tokens = runner._set_session_env(context)
+    assert resolve_context_cwd() == Path(FIVEHOURS_PATH)
+    runner._evict_cached_agent.reset_mock()
+    response = await runner._handle_message(_event("!project clear"))
+
+    assert response == "Project context cleared."
+    assert runner._session_db._db.get_meta("matrix_project_router:" + session_key) is None
+    assert active_project_path(runner._session_db._db, session_key) is None
+    runner._evict_cached_agent.assert_called_once_with(session_key)
+    try:
+        assert resolve_context_cwd() is None
+        assert resolve_agent_cwd() not in {Path(NEWMOON_PATH), Path(FIVEHOURS_PATH)}
+        prompt = build_context_files_prompt(cwd=None, skip_soul=True)
+        assert "Authoritative context" not in prompt
+        assert "Authoritative sources" not in prompt
+    finally:
+        runner._clear_session_env(tokens)
+
+    result = await runner._handle_message(_event("ordinary Matrix message"))
+    assert result == expected
+    runner._handle_message_with_agent.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_project_selection_works_after_clear(tmp_path):
+    runner = _runner(tmp_path)
+    session_key = build_session_key(_source())
+    runner._handle_message_with_agent = AsyncMock()
+
+    await runner._handle_message(_event("!project newmoon"))
+    await runner._handle_message(_event("!project clear"))
+    response = await runner._handle_message(_event("!project fivehours"))
+
+    assert response == f"Active project: fivehours ({FIVEHOURS_PATH})"
+    assert runner._session_db._db.get_meta("matrix_project_router:" + session_key) == "fivehours"
+    assert runner._evict_cached_agent.call_args_list == [
+        call(session_key),
+        call(session_key),
+        call(session_key),
+    ]
+    runner._handle_message_with_agent.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_unknown_project_does_not_dispatch_and_lists_valid_keys(tmp_path):
     runner = _runner(tmp_path)
     runner._handle_message_with_agent = AsyncMock()

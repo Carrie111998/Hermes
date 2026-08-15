@@ -32,9 +32,18 @@ def select_project(db, session_key: str, key: str) -> Path:
     return path
 
 
-def active_project_path(db, session_key: str) -> Path | None:
-    key = db.get_meta(_META_PREFIX + session_key)
+def clear_project(db, session_key: str) -> None:
+    db.delete_meta(_META_PREFIX + session_key)
+
+
+def active_project(db, session_key: str) -> tuple[str, Path] | None:
+    key = (db.get_meta(_META_PREFIX + session_key) or "").strip().lower()
     if not key:
         return None
     path = project_path(key)
-    return path if path and path.is_dir() else None
+    return (key, path) if path and path.is_dir() else None
+
+
+def active_project_path(db, session_key: str) -> Path | None:
+    project = active_project(db, session_key)
+    return project[1] if project else None

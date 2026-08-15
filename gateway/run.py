@@ -16163,9 +16163,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _matrix_project_args = _matrix_parts[1] if len(_matrix_parts) > 1 else ""
         if _matrix_project_args is not None:
             arg = _matrix_project_args.strip().lower()
-            from gateway.project_router import select_project
+            from gateway.project_router import active_project, clear_project, select_project
 
             session_key = self._session_key_for_source(source)
+            if arg == "clear":
+                clear_project(self._session_db._db, session_key)
+                from agent.runtime_cwd import clear_session_cwd
+
+                clear_session_cwd()
+                self._evict_cached_agent(session_key)
+                return "Project context cleared."
+            if arg == "status":
+                project = active_project(self._session_db._db, session_key)
+                if project is None:
+                    return "Active project: none"
+                key, path = project
+                return f"Active project: {key}\nPath: {path}"
             try:
                 path = select_project(self._session_db._db, session_key, arg)
             except ValueError as exc:
