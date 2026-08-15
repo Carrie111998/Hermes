@@ -177,6 +177,11 @@ function tokenize(
           // 'O' - SS3
           result.state = 'ss3'
           i++
+        } else if (code === C0.CR) {
+          // Legacy terminals encode Alt+Enter as ESC followed by CR. Keep
+          // both bytes in one token so the key parser can preserve Alt.
+          i++
+          emitSequence(data.slice(seqStart, i))
         } else if (isCSIIntermediate(code)) {
           // Intermediate byte (e.g., ESC ( for charset) - continue buffering
           result.state = 'escapeIntermediate'

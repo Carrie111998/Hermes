@@ -3,6 +3,16 @@ import { describe, expect, it } from 'vitest'
 import { INITIAL_STATE, parseMultipleKeypresses } from './parse-keypress.js'
 import { PASTE_END, PASTE_START } from './termio/csi.js'
 
+describe('legacy modified return parsing', () => {
+  it('parses ESC+CR as one Alt+Enter keypress', () => {
+    const [keys] = parseMultipleKeypresses(INITIAL_STATE, '\x1b\r')
+
+    expect(keys).toEqual([
+      expect.objectContaining({ name: 'return', ctrl: false, meta: true, shift: false, sequence: '\x1b\r' })
+    ])
+  })
+})
+
 describe('parseMultipleKeypresses bracketed paste recovery', () => {
   it('emits empty bracketed pastes when the terminal sends both markers', () => {
     const [keys, state] = parseMultipleKeypresses(INITIAL_STATE, PASTE_START + PASTE_END)
