@@ -28,7 +28,7 @@ def _patch_pipeline(monkeypatch, *, success=True, output="out", final="final res
         return f"/tmp/{jid}.txt"
 
     def fake_deliver(job, content, adapters=None, loop=None):
-        calls.append(("deliver", job["id"]))
+        calls.append(("deliver", job["id"], job.get("deliver")))
         return None
 
     def fake_mark(jid, ok, err=None, delivery_error=None, **_kw):
@@ -64,6 +64,48 @@ def test_run_one_job_success_sequence(monkeypatch):
     assert ok is True
     assert [c[0] for c in calls] == ["run_job", "save", "deliver", "mark"]
     assert calls[-1] == ("mark", "j2", True)
+
+
+def test_failed_local_job_uses_configured_failure_delivery(monkeypatch):
+    calls = _patch_pipeline(
+        monkeypatch, success=False, final="", error="script exited 1"
+    )
+    monkeypatch.setattr(
+        s,
+        "load_config",
+        lambda: {"cron": {"delivery": {"failure": "telegram:alerts"}}},
+    )
+
+    assert s.run_one_job({"id": "failed-local", "deliver": None}) is True
+
+    assert ("deliver", "failed-local", "telegram:alerts") in calls
+
+
+def test_null_failure_delivery_keeps_failed_job_local(monkeypatch):
+    calls = _patch_pipeline(
+        monkeypatch, success=False, final="", error="script exited 1"
+    )
+    monkeypatch.setattr(
+        s, "load_config", lambda: {"cron": {"delivery": {"failure": None}}}
+    )
+
+    assert s.run_one_job({"id": "failed-local", "deliver": None}) is True
+
+    assert ("deliver", "failed-local", None) in calls
+
+
+def test_success_and_nonlocal_failure_keep_their_job_delivery(monkeypatch):
+    monkeypatch.setattr(
+        s,
+        "load_config",
+        lambda: {"cron": {"delivery": {"failure": "telegram:alerts"}}},
+    )
+    assert s._job_for_result_delivery(
+        {"id": "success-local", "deliver": "local"}, success=True
+    )["deliver"] == "local"
+    assert s._job_for_result_delivery(
+        {"id": "failed-origin", "deliver": "origin"}, success=False
+    )["deliver"] == "origin"
 
 
 def test_run_one_job_installs_secret_scope_under_multiplex(monkeypatch, tmp_path):

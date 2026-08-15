@@ -2322,6 +2322,12 @@ DEFAULT_CONFIG = {
             # Empty → the fire endpoint refuses all tokens (no unsigned decode).
             "nas_jwks_url": "",
         },
+        # Optional alert route for failed jobs whose normal delivery is local
+        # (including jobs with an omitted/null deliver value). Uses the same
+        # target grammar as a job's deliver field. null keeps failures local.
+        "delivery": {
+            "failure": None,
+        },
         # Wrap delivered cron responses with a header (task name) and footer
         # ("The agent cannot see this message").  Set to false for clean output.
         "wrap_response": True,

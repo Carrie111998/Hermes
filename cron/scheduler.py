@@ -1637,6 +1637,38 @@ def _normalize_deliver_value(deliver) -> str:
     return str(deliver)
 
 
+def _job_for_result_delivery(job: dict, *, success: bool) -> dict:
+    """Select the delivery route without changing the persisted job.
+
+    Failed local-only jobs may use the operator-level ``cron.delivery.failure``
+    route. Successful jobs and jobs with their own non-local route retain their
+    existing delivery semantics. A missing/null/local failure route is disabled.
+    """
+    if success or _normalize_deliver_value(job.get("deliver", "local")) != "local":
+        return job
+
+    try:
+        cron_cfg = (load_config() or {}).get("cron", {})
+        delivery_cfg = cron_cfg.get("delivery", {}) if isinstance(cron_cfg, dict) else {}
+        failure_target = (
+            delivery_cfg.get("failure") if isinstance(delivery_cfg, dict) else None
+        )
+    except Exception:
+        logger.debug(
+            "Job '%s': could not read cron failure delivery config",
+            job.get("id", "?"),
+            exc_info=True,
+        )
+        return job
+
+    if failure_target is None or failure_target == "":
+        return job
+    normalized_target = _normalize_deliver_value(failure_target).strip()
+    if not normalized_target or normalized_target == "local":
+        return job
+    return {**job, "deliver": normalized_target}
+
+
 # Routing intent tokens — resolved at fire time, not create time, so a
 # job created before Telegram was wired up will pick up Telegram once it
 # comes online.  ``all`` expands into the set of connected platforms
@@ -4990,6 +5022,7 @@ def run_one_job(
             if blocked_config_silent or drift_skip_silent:
                 should_deliver = False
             unresolved_origin = False
+            delivery_job = job
             # Cron silence suppression — see _is_cron_silence_response.  Replaces the
             # old `SILENT_MARKER in ...upper()` substring check, which both leaked
             # bracketless near-markers ("SILENT" / "NO_REPLY") and wrongly swallowed
@@ -5001,12 +5034,15 @@ def run_one_job(
                 should_deliver = False
 
             if should_deliver:
+                delivery_job = _job_for_result_delivery(job, success=success)
                 unresolved_origin = (
-                    _normalize_deliver_value(job.get("deliver", "local")) == "origin"
-                    and not _resolve_delivery_targets(job)
+                    _normalize_deliver_value(delivery_job.get("deliver", "local")) == "origin"
+                    and not _resolve_delivery_targets(delivery_job)
                 )
                 try:
-                    delivery_error = _deliver_result(job, deliver_content, adapters=adapters, loop=loop)
+                    delivery_error = _deliver_result(
+                        delivery_job, deliver_content, adapters=adapters, loop=loop
+                    )
                 except Exception as de:
                     delivery_error = str(de)
                     logger.error("Delivery failed for job %s: %s", job["id"], de)
@@ -5032,7 +5068,9 @@ def run_one_job(
                 )
             else:
                 mark_job_run(job["id"], success, error, delivery_error=delivery_error)
-        normalized_deliver = _normalize_deliver_value(job.get("deliver", "local"))
+        normalized_deliver = _normalize_deliver_value(
+            delivery_job.get("deliver", "local")
+        )
         if delivery_error:
             delivery_outcome = "failed"
         elif should_deliver and unresolved_origin:

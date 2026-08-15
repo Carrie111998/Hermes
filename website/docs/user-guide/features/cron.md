@@ -361,6 +361,27 @@ When scheduling jobs, you specify where the output goes:
 
 The agent's final response is automatically delivered to the configured `deliver:` target — the agent does not send messages itself, so there is nothing to call in the cron prompt.
 
+### Failure alerts for local-only jobs
+
+`deliver: local` saves both successful and failed runs without sending a
+message. To keep successful output local while alerting on failures, configure
+one operator-level failure target:
+
+```yaml
+# ~/.hermes/config.yaml
+cron:
+  delivery:
+    failure: "telegram"  # accepts the same targets as a job's deliver field
+```
+
+This fallback is used only when a job fails and its normal delivery resolves to
+`local`. An omitted or null job `deliver` value is local, so it uses the same
+fallback. Successful local runs remain local, and failures from jobs with a
+non-local `deliver` target continue to go only to that job's target.
+
+`cron.delivery.failure` defaults to `null`, which means no failure alert target.
+Set it back to `null` to disable failure alerts without changing any jobs.
+
 ### Routing intent (`all`)
 
 `all` lets you ship one cron job to every messaging channel you have configured, without having to enumerate them by name. It is **resolved at fire time**, so a job created before you wired up Telegram will pick up Telegram on the next tick after you set `TELEGRAM_HOME_CHANNEL`.
