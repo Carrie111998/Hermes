@@ -3,6 +3,7 @@ import { getSession } from '@/hermes'
 import { assistantTextPart, type ChatMessage, chatMessageText, textPart } from '@/lib/chat-messages'
 import { normalizePersonalityValue } from '@/lib/chat-runtime'
 import { embeddedImageUrls, textWithoutEmbeddedImages } from '@/lib/embedded-images'
+import { sessionProviderAdoptableFromCache } from '@/lib/model-options'
 import { reconcileApprovalModeForProfile } from '@/store/approval-mode'
 import { requestDesktopOnboardingForCredentialWarning } from '@/store/onboarding'
 import { $activeGatewayProfile, $profiles, normalizeProfileKey } from '@/store/profile'
@@ -1310,11 +1311,17 @@ interface ApplyRuntimeInfoOptions {
 /** Mirror a session's runtime state into the composer atoms the MAIN pane
  *  renders from. Foreground sessions only — see ApplyRuntimeInfoOptions. */
 function publishRuntimeToComposer(state: SessionRuntimeStatePatch): void {
-  if (state.model !== undefined) {
+  // Same dead-provider guard as syncRuntimeMetadataToView: a session's runtime
+  // may still report a provider whose credentials were removed — never drag it
+  // into the sticky composer selection, or every send fails with a cryptic
+  // auth error ("No xAI OAuth credentials stored...").
+  const adopt = sessionProviderAdoptableFromCache(state.provider ?? '')
+
+  if (adopt && state.model !== undefined) {
     setCurrentModel(state.model)
   }
 
-  if (state.provider !== undefined) {
+  if (adopt && state.provider !== undefined) {
     setCurrentProvider(state.provider)
   }
 

@@ -1,13 +1,22 @@
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { getGlobalModelOptions } from '@/hermes'
+import { $activeGatewayProfile } from '@/store/profile'
 
-import { manualPickRemoved, modelOptionsQueryKey, requestModelOptions } from './model-options'
+import {
+  _resetLastLoadedProvidersForTests,
+  manualPickRemoved,
+  modelOptionsQueryKey,
+  requestModelOptions,
+  sessionProviderAdoptable,
+  sessionProviderAdoptableFromCache
+} from './model-options'
 
 const globalOptions = { model: 'hermes-4', provider: 'nous', providers: [] }
 
 vi.mock('@/hermes', () => ({
-  getGlobalModelOptions: vi.fn(() => Promise.resolve(globalOptions))
+  getGlobalModelOptions: vi.fn(() => Promise.resolve(globalOptions)),
+  setApiRequestProfile: vi.fn()
 }))
 
 describe('requestModelOptions', () => {
@@ -95,5 +104,122 @@ describe('manualPickRemoved', () => {
 
   it('never clobbers when there is no pick', () => {
     expect(manualPickRemoved(providers, '', '')).toBe(false)
+  })
+})
+
+describe('sessionProviderAdoptable', () => {
+  const providers = [
+    { name: 'DeepSeek', slug: 'deepseek', models: ['deepseek-v4-flash'], authenticated: true },
+    // Current-provider skeleton row: present but credentials are gone.
+    { name: 'xAI', slug: 'xai-oauth', models: ['grok-4.20-0309-reasoning'], authenticated: false },
+    // Legacy row without an explicit flag — treat as usable.
+    { name: 'OpenRouter', slug: 'openrouter', models: ['gpt-5.5'] }
+  ]
+
+  it('adopts a provider that is in the loaded catalog with credentials', () => {
+    expect(sessionProviderAdoptable(providers, 'deepseek')).toBe(true)
+  })
+
+  it('adopts a provider whose row carries no explicit authenticated flag', () => {
+    expect(sessionProviderAdoptable(providers, 'openrouter')).toBe(true)
+  })
+
+  it('matches the provider by name as well as slug', () => {
+    expect(sessionProviderAdoptable(providers, 'DeepSeek')).toBe(true)
+  })
+
+  it('blocks a provider explicitly marked unauthenticated (re-auth skeleton)', () => {
+    expect(sessionProviderAdoptable(providers, 'xai-oauth')).toBe(false)
+    expect(sessionProviderAdoptable(providers, 'xAI')).toBe(false)
+  })
+
+  it('blocks a provider absent from a loaded catalog (unconfigured)', () => {
+    expect(sessionProviderAdoptable(providers, 'anthropic')).toBe(false)
+  })
+
+  it('conservatively adopts on a not-yet-loaded catalog or empty provider', () => {
+    expect(sessionProviderAdoptable(undefined, 'xai-oauth')).toBe(true)
+    expect(sessionProviderAdoptable(providers, '')).toBe(true)
+  })
+
+  it('treats an empty loaded catalog as nothing configured (no adoption)', () => {
+    expect(sessionProviderAdoptable([], 'xai-oauth')).toBe(false)
+  })
+})
+
+describe('sessionProviderAdoptableFromCache', () => {
+  const cachedCatalog = [
+    { name: 'DeepSeek', slug: 'deepseek', models: ['deepseek-v4-flash'], authenticated: true },
+    { name: 'xAI', slug: 'xai-oauth', models: ['grok-4.20-0309-reasoning'], authenticated: false }
+  ]
+
+  beforeEach(() => {
+    _resetLastLoadedProvidersForTests()
+    $activeGatewayProfile.set('default')
+  })
+
+  afterEach(() => {
+    $activeGatewayProfile.set('default')
+  })
+
+  it('adopts when no catalog has loaded yet', () => {
+    expect(sessionProviderAdoptableFromCache('xai-oauth')).toBe(true)
+  })
+
+  it('blocks a provider the last loaded catalog proves unauthenticated', async () => {
+    await requestModelOptions({
+      gateway: {
+        request: vi.fn(() =>
+          Promise.resolve({ model: 'deepseek-v4-flash', provider: 'deepseek', providers: cachedCatalog })
+        )
+      } as never,
+      sessionId: null
+    })
+
+    expect(sessionProviderAdoptableFromCache('deepseek')).toBe(true)
+    expect(sessionProviderAdoptableFromCache('xai-oauth')).toBe(false)
+    expect(sessionProviderAdoptableFromCache('anthropic')).toBe(false)
+  })
+
+  it('keys the mirror by profile: another profile catalog never leaks in', async () => {
+    await requestModelOptions({
+      gateway: {
+        request: vi.fn(() =>
+          Promise.resolve({ model: 'deepseek-v4-flash', provider: 'deepseek', providers: cachedCatalog })
+        )
+      } as never,
+      sessionId: null
+    })
+    // Profile 'default' now has a loaded catalog that would block xai-oauth.
+
+    $activeGatewayProfile.set('compass')
+
+    // The active profile has no entry yet — conservative, nothing to prove.
+    expect(sessionProviderAdoptableFromCache('xai-oauth')).toBe(true)
+    expect(sessionProviderAdoptableFromCache('deepseek')).toBe(true)
+
+    // A catalog fetched for 'compass' lands in its own slot and drives its own
+    // decisions while active...
+    await requestModelOptions({
+      gateway: {
+        request: vi.fn(() =>
+          Promise.resolve({
+            model: 'claude-sonnet-4.6',
+            provider: 'anthropic',
+            providers: [{ name: 'Anthropic', slug: 'anthropic', models: ['claude-sonnet-4.6'] }]
+          })
+        )
+      } as never,
+      sessionId: null
+    })
+    expect(sessionProviderAdoptableFromCache('anthropic')).toBe(true)
+    expect(sessionProviderAdoptableFromCache('xai-oauth')).toBe(false)
+
+    // ...while 'default' keeps its own view when re-activated (anthropic is
+    // absent from its catalog, so it must NOT inherit compass's verdict).
+    $activeGatewayProfile.set('default')
+    expect(sessionProviderAdoptableFromCache('anthropic')).toBe(false)
+    expect(sessionProviderAdoptableFromCache('xai-oauth')).toBe(false)
+    expect(sessionProviderAdoptableFromCache('deepseek')).toBe(true)
   })
 })

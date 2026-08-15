@@ -18,6 +18,15 @@ describe('isProviderSetupErrorMessage', () => {
     ).toBe(true)
   })
 
+  it('matches OAuth providers whose stored credentials are gone', () => {
+    expect(
+      isProviderSetupErrorMessage(
+        'No xAI OAuth credentials stored. Select xAI Grok OAuth (SuperGrok / Premium+) in `hermes model`.'
+      )
+    ).toBe(true)
+    expect(isProviderSetupErrorMessage('No Codex credentials stored. Run `hermes auth` to authenticate.')).toBe(true)
+  })
+
   it('does not match bare env var mentions from auxiliary warnings', () => {
     expect(isProviderSetupErrorMessage('OPENROUTER_API_KEY not set')).toBe(false)
     expect(isProviderSetupErrorMessage('Run `hermes setup` or set OPENROUTER_API_KEY.')).toBe(false)
@@ -34,6 +43,9 @@ describe('isProviderSetupErrorMessage', () => {
     expect(
       isProviderSetupErrorMessage('Selected runtime is not available. setup.status reports configured credentials.')
     ).toBe(false)
+    expect(isProviderSetupErrorMessage('Upstream connect error or disconnect/reset before headers.')).toBe(false)
+    expect(isProviderSetupErrorMessage('HTTP 503: the upstream service is unavailable')).toBe(false)
+    expect(isProviderSetupErrorMessage('Session not found')).toBe(false)
   })
 
   it('returns false for empty input', () => {

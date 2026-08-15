@@ -5,6 +5,7 @@ import type { ChatMessage } from '@/lib/chat-messages'
 import { preserveLocalAssistantErrors } from '@/lib/chat-messages'
 import { createClientSessionState } from '@/lib/chat-runtime'
 import { persistInFlightTurnState } from '@/lib/inflight-turn-journal'
+import { sessionProviderAdoptableFromCache } from '@/lib/model-options'
 import { setMutableRef } from '@/lib/mutable-ref'
 import {
   $activeSessionId,
@@ -37,8 +38,17 @@ interface SessionStateCacheOptions {
 }
 
 function syncRuntimeMetadataToView(state: ClientSessionState) {
-  setCurrentModel(state.model ?? '')
-  setCurrentProvider(state.provider ?? '')
+  // A resumed session may still report a provider whose credentials were
+  // removed (OAuth revoked, API key deleted). Adopting it into the sticky
+  // composer state would make the next send fail with a cryptic auth error
+  // ("No xAI OAuth credentials stored..."); keep the user's pick / profile
+  // default instead. The catalog read is the module-level mirror of the last
+  // model-options response — conservative (adopt) when nothing has loaded yet.
+  if (sessionProviderAdoptableFromCache(state.provider ?? '')) {
+    setCurrentModel(state.model ?? '')
+    setCurrentProvider(state.provider ?? '')
+  }
+
   setCurrentReasoningEffort(state.reasoningEffort ?? '')
   setCurrentServiceTier(state.serviceTier ?? '')
   setCurrentFastMode(state.fast ?? false)
