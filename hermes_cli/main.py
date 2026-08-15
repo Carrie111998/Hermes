@@ -4382,6 +4382,7 @@ _LAZY_COMMAND_EXPORTS = {
         "_scan_dashboard_processes",
     ),
     "hermes_cli.update_cmd": (
+        "_abort_dependency_sync_if_self_locked",
         "_add_upstream_remote",
         "_atomic_replace_dir",
         "_capture_active_lazy_features",
@@ -4391,6 +4392,7 @@ _LAZY_COMMAND_EXPORTS = {
         "_cmd_update_impl",
         "_cold_start_windows_gateway_after_update",
         "_count_commits_between",
+        "_dependency_sync_would_rewrite",
         "_detect_self_loaded_native_modules",
         "_detect_venv_python_processes",
         "_defer_update_for_self_lock",
@@ -12682,6 +12684,16 @@ def main():
         "--include-archived",
         action="store_true",
         help="Also delete archived sessions (excluded by default)",
+    )
+    sessions_prune.add_argument(
+        "--never-active",
+        action="store_true",
+        help=(
+            "Instead of ended sessions, delete keyed gateway rows that were "
+            "opened and never used (no messages, tokens, tool calls or title) "
+            "and are older than AGE (default 30 days). Ordinary prune can "
+            "never reach these — it only ever selects ended sessions"
+        ),
     )
 
     sessions_archive = sessions_subparsers.add_parser(

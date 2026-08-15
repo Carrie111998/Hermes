@@ -547,6 +547,11 @@ export interface Translations {
       testFailed: string
       saveFailed: string
       removeFailed: string
+      updateAll: string
+      updateAllRunning: string
+      updateAllDone: string
+      updateAllFailed: string
+      updateSkippedCloud: string
       kindLocal: string
       kindRemote: string
       kindCloud: string
@@ -1867,6 +1872,12 @@ export interface Translations {
       label: (skill: string) => string
       tip: (skill: string) => string
       done: (skill: string) => string
+      doneTip: string
+    }
+    githubSuggestions: {
+      label: string
+      tip: string
+      done: string
       doneTip: string
     }
     repairSuggestions: {

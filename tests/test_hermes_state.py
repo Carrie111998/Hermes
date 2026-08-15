@@ -1056,6 +1056,8 @@ class TestDeleteAndExport:
 
 
 
+    def test_export_nonexistent(self, db):
+        assert db.export_session("nope") is None
 
 
 
