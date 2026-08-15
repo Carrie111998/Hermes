@@ -226,3 +226,10 @@ function clusterId(rows: SidebarListRow[]): string {
 export function reorderableRowIds(rows: SidebarListRow[]): string[] {
   return rows.flatMap(row => (row.kind === 'session' && !row.entry.branchStem ? [row.entry.session.id] : []))
 }
+
+/**
+ * clusterByTopic moved to lib for layering (sidebar order.ts is an app
+ * module; session-branch-tree.ts is a lib module). Re-exported here so
+ * existing app callers and tests keep working unchanged.
+ */
+export { clusterByTopic } from '@/lib/session-topic-cluster'
