@@ -1,0 +1,25 @@
+name: Architecture — 2K Law and KILL LOCK
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  enforce:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Enforce global production ceiling and KILL LOCK
+        run: >-
+          python scripts/check_2k_law.py
+          --baseline .github/godfile-baseline.json
+          --base origin/main
