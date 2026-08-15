@@ -179,6 +179,17 @@ def _discover_entry_point_providers() -> None:
     ``register_provider()`` — a pip package cannot hijack a first-party
     provider name.
     """
+    # Pip entry points execute third-party code during ``load()``. A
+    # dispatcher-scoped lifecycle worker must reach its first model turn
+    # without touching that extension surface; unknown scopes fail closed.
+    try:
+        from hermes_cli.kanban_worker_scope import is_lifecycle_only_worker
+
+        if is_lifecycle_only_worker():
+            return
+    except (ImportError, ValueError):
+        return
+
     try:
         import importlib.metadata as _md
     except Exception:  # pragma: no cover — importlib.metadata always present ≥3.8

@@ -372,6 +372,16 @@ def _load_provider_from_entry_point(
     register_skills: bool = True,
 ) -> Optional["MemoryProvider"]:
     """Import a provider entry point and extract the MemoryProvider instance."""
+    # ``entry_point.load()`` executes third-party package code. Keep the same
+    # fail-closed boundary as directory providers, including unknown scopes.
+    try:
+        from hermes_cli.kanban_worker_scope import is_lifecycle_only_worker
+
+        if is_lifecycle_only_worker():
+            return None
+    except (ImportError, ValueError):
+        return None
+
     from agent.memory_provider import MemoryProvider
 
     loaded = entry_point.load()
@@ -436,7 +446,7 @@ def _load_provider_from_dir(
 
         if is_lifecycle_only_worker():
             return None
-    except ValueError:
+    except (ImportError, ValueError):
         return None
 
     name = provider_dir.name
@@ -714,7 +724,7 @@ def discover_plugin_cli_commands() -> List[dict]:
 
         if is_lifecycle_only_worker():
             return results
-    except ValueError:
+    except (ImportError, ValueError):
         return results
 
     if not _MEMORY_PLUGINS_DIR.is_dir():
