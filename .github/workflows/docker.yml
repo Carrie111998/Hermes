@@ -327,3 +327,11 @@ jobs:
           else
             docker buildx imagetools inspect "${IMAGE_NAME}:main"
           fi
+
+      - name: Make package public
+        run: |
+          curl -s -X PATCH \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/user/packages/container/hermes-agent/visibility \
+            -d '{"visibility":"public"}'
