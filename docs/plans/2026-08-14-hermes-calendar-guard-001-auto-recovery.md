@@ -310,3 +310,16 @@ signals and must not be treated as proof of code skew.
   deselected` for `tests/hermes_cli/test_calendar_guard.py` and
   `tests/test_code_skew.py -k 'not ModelSwitchSkewGuard'`; targeted
   `py_compile` passed; `git diff --check` passed.
+- Deployment correction: the first merged snapshot exposed two installer
+  integration defects before guard rollout was complete. Global placeholder
+  replacement made the rendered wrapper fall back to the live checkout, and
+  `Path.resolve()` collapsed the Hermes venv entry point to its bare base
+  interpreter. The wrapper now checks only rendered-path existence, and the
+  installer preserves the venv path with `Path.absolute()`; an installer
+  regression assertion was added.
+- Correction-set local evidence: calendar guard tests `23 passed`;
+  `py_compile` and `git diff --check` passed. Authenticated DGX Spark Claude
+  Sonnet 5 reviewed the complete correction packet and returned `PASS` with
+  only non-blocking P2/P3 observations. Authenticated WSL AGY reviewed the
+  identical packet with Gemini 3.7 Flash Low and returned `PASS`,
+  `FINDINGS: NONE`, `CORRECTION_SET: NONE`.

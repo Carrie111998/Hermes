@@ -230,6 +230,8 @@ def test_installer_renders_user_units_without_gateway_env(tmp_path):
     wrapper = (home / "scripts" / "hermes_calendar_guard.sh").read_text()
     assert str(release) in wrapper
     assert "@RELEASE_PATH@" not in wrapper
+    assert 'if [[ ! -d "$RELEASE_PATH" ]]; then' in wrapper
+    assert f"ExecStart={Path('/opt/hermes/bin/python').absolute()}" in service
     assert "hermes_cli.calendar_guard --recover" in service
     assert calls[0][0] == ["systemctl", "--user", "daemon-reload"]
 

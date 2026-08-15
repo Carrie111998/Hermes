@@ -36,7 +36,9 @@ def install_user_units(
 ) -> list[Path]:
     hermes_home = hermes_home.resolve()
     release_path = release_path.resolve()
-    python_path = python_path.resolve()
+    # Preserve a venv entry point instead of resolving its symlink to the
+    # base interpreter, which would drop the venv's site-packages at runtime.
+    python_path = python_path.absolute()
     marker = release_path / ".hermes-release-sha"
     if not marker.is_file():
         raise ValueError(f"release_path lacks canonical marker: {marker}")
