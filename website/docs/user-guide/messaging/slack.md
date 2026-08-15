@@ -659,6 +659,13 @@ that endpoint's host alone — `NO_PROXY=slack.com` does not send it direct once
 then post the bytes to the upload URL the endpoint hands out (`files.slack.com`
 unless it rewrites them).
 
+That scoping also narrows **partial** `NO_PROXY` entries on a default
+deployment: `NO_PROXY=files.slack.com` alone no longer sends cron /
+`send_message` Web API calls direct, because they are matched against the API
+host (`slack.com`) only. The in-process bot is unaffected — it still matches any
+of the Slack hosts it uses. Name the API host (`NO_PROXY=slack.com`, or your
+`base_url` host) when out-of-process delivery has to bypass the proxy too.
+
 ### Session Isolation
 
 ```yaml

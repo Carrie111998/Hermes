@@ -871,6 +871,14 @@ def _is_slack_base_url_trusted(url: str, base_url: Optional[str]) -> bool:
     config. With no ``base_url`` configured this always returns False, leaving
     the Slack-CDN allowlist as the only trust source.
 
+    Trusting a subtree means trusting the whole DNS zone below the configured
+    host: any name someone can publish under it — ``evil.slack.internal.corp``
+    for a ``base_url`` of ``https://slack.internal.corp/api/`` — is treated as
+    the endpoint and receives the bot token. That is the same premise the
+    Slack-CDN allowlist makes about ``*.slack.com``, so point ``base_url`` at a
+    host whose zone the operator controls; if it does not, serve file content
+    from the ``base_url`` host itself, which needs no subtree trust.
+
     Callers check the CDN allowlist first: a ``base_url`` on Slack itself
     must not turn CDN links into "configured" ones, which would cost them
     ``is_safe_url`` and the DNS-pinned client.
