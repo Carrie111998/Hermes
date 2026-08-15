@@ -28,10 +28,28 @@ SHIFT_SPACE_SEQUENCES = (
 )
 
 
+_ALL_ALIASED_SEQUENCES = CTRL_K_SEQUENCES + SHIFT_SPACE_SEQUENCES
+
+
 @pytest.fixture(autouse=True)
 def _ensure_aliases_installed():
+    # Capture prior values (including "absent") for every sequence these
+    # aliases touch, and restore them in teardown -- otherwise every other
+    # test file importing prompt_toolkit in the same process would see
+    # these mutated, process-global mappings (review of #86874, point 2).
+    _SENTINEL = object()
+    prior = {seq: ANSI_SEQUENCES.get(seq, _SENTINEL) for seq in _ALL_ALIASED_SEQUENCES}
+
     install_ctrl_k_modify_other_keys_alias()
     install_shift_space_alias()
+
+    yield
+
+    for seq, value in prior.items():
+        if value is _SENTINEL:
+            ANSI_SEQUENCES.pop(seq, None)
+        else:
+            ANSI_SEQUENCES[seq] = value
 
 
 def _parse(byte_seq: str):
@@ -74,19 +92,18 @@ def test_shift_space_key_binding_inserts_an_actual_space():
     on install_shift_space_alias): a direct mapping to a plain space
     character would still self-insert the raw matched CSI prefix rather
     than a space, since Vt100Parser._call_handler passes that prefix as
-    the KeyPress's own `data`. Verify the actual key-binding handler
-    (registered in cli.py for Keys.ControlSpace) inserts a literal space
-    rather than relying on that raw data payload."""
+    the KeyPress's own `data`. Verify the actual shared function cli.py's
+    key binding delegates to (handle_shift_space_key_press) inserts a
+    literal space rather than relying on that raw data payload -- asserts
+    against the real function, not a re-implementation, so a regression
+    that reverts either cli.py's delegation or this function's own body
+    back to echoing raw data is caught (review of #86874, point 1)."""
     from prompt_toolkit.buffer import Buffer
 
+    from hermes_cli.pt_input_extras import handle_shift_space_key_press
+
     buf = Buffer()
-
-    class _FakeEvent:
-        current_buffer = buf
-
-    # Mirror cli.py's handle_shift_space_alias exactly: it must call
-    # insert_text(" ") directly, not echo event.data.
-    _FakeEvent.current_buffer.insert_text(" ")
+    handle_shift_space_key_press(buf)
     assert buf.text == " "
 
 

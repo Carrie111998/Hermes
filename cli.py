@@ -16549,23 +16549,28 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
         from prompt_toolkit.keys import Keys as _ShiftSpaceKeys
 
+        # Keys.ControlSpace is a shared, process-global key namespace (it
+        # is an alias of Keys.ControlAt in prompt_toolkit's own enum). No
+        # other Hermes binding currently uses it (see
+        # test_control_space_key_is_not_used_elsewhere_in_hermes), but a
+        # future binding -- or an external tool/plugin expecting real
+        # Ctrl+Space -- would silently conflict with this eager alias
+        # (review of #86874, point 3).
         @kb.add(_ShiftSpaceKeys.ControlSpace, eager=True)
         def handle_shift_space_alias(event):
             """Insert a literal space for the Shift+Space alias registered by
             install_shift_space_alias() in hermes_cli.pt_input_extras.
 
-            That function maps the Kitty CSI-u / xterm modifyOtherKeys byte
-            sequences for Shift+Space to Keys.ControlSpace (an otherwise
-            unused prompt_toolkit key) at the VT100-parser level. A direct
-            ANSI_SEQUENCES mapping to a plain space character is not
-            sufficient: Vt100Parser._call_handler passes the full raw
-            matched prefix as the resulting KeyPress's `data`, and stock
-            self-insert would echo that raw payload (e.g. "\\x1b[27;2;32~")
-            verbatim rather than a space. This binding sidesteps self-insert
-            entirely and inserts the intended character directly (issue
-            #86866).
+            Delegates to
+            hermes_cli.pt_input_extras.handle_shift_space_key_press() --
+            see that function's docstring for the full rationale (review
+            of #86874, point 1: extracted so a regression that reverts
+            this handler to plain self-insert is caught by a test against
+            the real, shared function rather than a re-implementation).
             """
-            event.current_buffer.insert_text(" ")
+            from hermes_cli.pt_input_extras import handle_shift_space_key_press
+
+            handle_shift_space_key_press(event.current_buffer)
 
         def handle_enter(event):
             """Handle Enter key - submit input.
