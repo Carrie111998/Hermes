@@ -28,20 +28,53 @@ VALID_STATUSES = {"pending", "in_progress", "completed", "cancelled"}
 # replayed from caller-supplied history on the API server) from inflating the
 # re-injection block. Generous relative to real plans — a todo item is a short
 # task description, and active lists are a handful of items, not hundreds.
+MAX_TODO_ID_CHARS = 256
 MAX_TODO_CONTENT_CHARS = 4000
 MAX_TODO_RATIONALE_CHARS = 500
 MAX_TODO_ITEMS = 256
+# The complete snapshot crosses compaction as one synthetic message. Per-item
+# caps alone still let a 256-item plan refill the context with about a million
+# characters. Preserve the priority-ordered head and report omitted items.
+MAX_TODO_INJECTION_CHARS = 16_000
 # Upper bound on a single todo tool-result payload accepted during history
 # hydration. The gateway/API server replays caller-supplied conversation
 # history to rebuild the store, so an oversized forged result is dropped
 # before it is parsed and re-injected (see AIAgent._hydrate_todo_store).
 MAX_TODO_RESULT_CHARS = 512_000
+# The tool result is replayed during gateway/API hydration. Leave JSON and
+# summary overhead below the result cap instead of accepting state that the
+# next fresh agent must reject before restoring it.
+MAX_TODO_STATE_CHARS = 450_000
 _TRUNCATION_MARKER = "… [truncated]"
 # Persisted as ordinary message content. ContextCompressor uses this stable
 # header to distinguish the synthetic post-compaction row from a real user.
+# The framing is deliberately explicit: active todos carry useful continuity,
+# but are not a replacement for a current user instruction after compaction.
 TODO_INJECTION_HEADER = (
-    "[Your active task list was preserved across context compression]"
+    "[Planning state preserved across context compression — not a new user "
+    "request or autonomous instruction]"
 )
+LEGACY_TODO_INJECTION_HEADERS = (
+    "[Your active task list was preserved across context compression]",
+)
+TODO_INJECTION_HEADERS = (TODO_INJECTION_HEADER, *LEGACY_TODO_INJECTION_HEADERS)
+TODO_INJECTION_RECONCILIATION_GUIDANCE = (
+    "Items below are prefixed 'needs reconfirmation after compaction' because "
+    "the reasoning that justified them was compacted away. Reconcile each "
+    "against the preserved ## Key Decisions and ## Completed Actions (a "
+    "completed investigation item — trace/check/verify — can invalidate a "
+    "pending action item) and the latest user message. If still valid, "
+    "rewrite it via the todo tool without the prefix; if invalidated, cancel "
+    "or rewrite it rather than acting on the stale wording."
+)
+# Written into the item's persisted content (not only the synthetic
+# injection block) so the expiry survives beyond one compaction — a later
+# `todo` read/write still sees it, not only this post-compaction message.
+# Kept in `content` rather than a new status value: a new status enum member
+# would need matching changes to the desktop UI's TodoStatus type
+# (apps/desktop/src/lib/todos.ts), which silently drops items whose status
+# it doesn't recognize instead of rendering them.
+NEEDS_RECONFIRMATION_MARKER = "[needs reconfirmation after compaction] "
 
 
 class TodoStore:
@@ -76,7 +109,7 @@ class TodoStore:
             # Merge mode: update existing items by id, append new ones
             existing = {item["id"]: item for item in self._items}
             for t in self._dedupe_by_id(todos):
-                item_id = str(t.get("id", "")).strip()
+                item_id = self._cap_id(str(t.get("id", "")).strip())
                 if not item_id:
                     continue  # Can't merge without an id
 
@@ -123,6 +156,7 @@ class TodoStore:
         # (list order is priority).
         if len(self._items) > MAX_TODO_ITEMS:
             self._items = self._items[:MAX_TODO_ITEMS]
+        self._bound_persisted_state()
         return self.read()
 
     def read(self) -> List[Dict[str, str]]:
@@ -136,6 +170,14 @@ class TodoStore:
     def format_for_injection(self) -> Optional[str]:
         """
         Render the todo list for post-compression injection.
+
+        Side effect: active items crossing the boundary are marked
+        needs-reconfirmation in persisted content (see
+        NEEDS_RECONFIRMATION_MARKER) — the expiry is not just cosmetic to
+        this rendering, it survives in the store past this call (#84718
+        proposal 2). Safe because the sole caller
+        (conversation_compression.py) invokes this exactly once per
+        committed compaction, never speculatively.
 
         Returns a human-readable string to append to the compressed
         message history, or None if the list is empty.
@@ -160,19 +202,57 @@ class TodoStore:
         if not active_items:
             return None
 
-        lines = [TODO_INJECTION_HEADER]
         for item in active_items:
-            marker = markers.get(item["status"], "[?]")
-            lines.append(f"- {marker} {item['id']}. {item['content']} ({item['status']})")
-            rationale = item.get("rationale")
-            if rationale:
-                lines.append(f"  Basis: {rationale}")
-            else:
-                lines.append(
-                    "  Basis was not preserved. Revalidate it before acting."
+            if not item["content"].startswith(NEEDS_RECONFIRMATION_MARKER):
+                item["content"] = self._cap_content(
+                    NEEDS_RECONFIRMATION_MARKER + item["content"]
                 )
 
+        lines = [TODO_INJECTION_HEADER, TODO_INJECTION_RECONCILIATION_GUIDANCE]
+        for index, item in enumerate(active_items):
+            marker = markers.get(item["status"], "[?]")
+            item_lines = [f"- {marker} {item['id']}. {item['content']} ({item['status']})"]
+            rationale = item.get("rationale")
+            if rationale:
+                item_lines.append(f"  Basis: {rationale}")
+            else:
+                item_lines.append(
+                    "  Basis was not preserved. Revalidate it before acting."
+                )
+            omitted_count = len(active_items) - index
+            omission = (
+                f"- … {omitted_count} lower-priority active item(s) omitted; "
+                "higher-priority items were preserved."
+            )
+            if (
+                len("\n".join([*lines, *item_lines, omission]))
+                > MAX_TODO_INJECTION_CHARS
+            ):
+                lines.append(omission)
+                break
+            lines.extend(item_lines)
+
         return "\n".join(lines)
+
+    @staticmethod
+    def _cap_id(item_id: str) -> str:
+        """Keep item identity bounded because it is persisted and re-injected."""
+        if len(item_id) > MAX_TODO_ID_CHARS:
+            keep = MAX_TODO_ID_CHARS - len(_TRUNCATION_MARKER)
+            return item_id[:keep] + _TRUNCATION_MARKER
+        return item_id
+
+    def _bound_persisted_state(self) -> None:
+        """Keep highest-priority state small enough for history hydration."""
+        total = 0
+        bounded = []
+        for item in self._items:
+            item_chars = sum(len(str(value)) for value in item.values())
+            if bounded and total + item_chars > MAX_TODO_STATE_CHARS:
+                break
+            bounded.append(item)
+            total += item_chars
+        self._items = bounded
 
     @staticmethod
     def _cap_content(content: str) -> str:
@@ -206,7 +286,7 @@ class TodoStore:
         if not isinstance(item, dict):
             return {"id": "?", "content": "(invalid item)", "status": "pending"}
 
-        item_id = str(item.get("id", "")).strip()
+        item_id = TodoStore._cap_id(str(item.get("id", "")).strip())
         if not item_id:
             item_id = "?"
 
@@ -236,7 +316,7 @@ class TodoStore:
                 # Non-dict items get a synthetic key so _validate can handle them
                 last_index[f"__invalid_{i}"] = i
                 continue
-            item_id = str(item.get("id", "")).strip() or "?"
+            item_id = TodoStore._cap_id(str(item.get("id", "")).strip()) or "?"
             last_index[item_id] = i
         return [todos[i] for i in sorted(last_index.values())]
 

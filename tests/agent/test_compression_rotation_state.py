@@ -617,6 +617,26 @@ class TestTodoSnapshotMergedNotDuplicated:
 class TestTodoSnapshotScaffoldingTails:
     """Scaffolding tails must never absorb the todo snapshot (#69292)."""
 
+    def test_quoted_todo_header_is_not_stripped_from_user_content(self):
+        from agent.conversation_compression import _strip_stale_todo_snapshot
+        from tools.todo_tool import TODO_INJECTION_HEADER
+
+        content = f"Search the docs for {TODO_INJECTION_HEADER} exactly."
+
+        assert _strip_stale_todo_snapshot(content) == content
+
+    def test_legacy_snapshot_is_stripped_before_reinjection(self):
+        """A renamed header must not stack stale snapshots from persisted sessions."""
+        from agent.conversation_compression import _strip_stale_todo_snapshot
+
+        content = (
+            "please fix the login bug\n\n"
+            "[Your active task list was preserved across context compression]\n"
+            "- [ ] old-task. stale plan (pending)"
+        )
+
+        assert _strip_stale_todo_snapshot(content) == "please fix the login bug"
+
     @staticmethod
     def _agent_with_todo(db: SessionDB, session_id: str, tail: dict):
         db.create_session(session_id, source="cli")

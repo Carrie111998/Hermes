@@ -105,6 +105,21 @@ class TestFormatForInjection:
         assert "basis was not preserved" in text.lower()
         assert "revalidate it before acting" in text.lower()
 
+    def test_injection_reframes_preserved_plan_as_context_not_instruction(self):
+        store = TodoStore()
+        store.write([
+            {"id": "remove", "content": "Remove the checkout route", "status": "pending"},
+        ])
+
+        text = store.format_for_injection()
+
+        assert "not a new user request" in text.lower()
+        assert "or autonomous instruction" in text.lower()
+        assert "reconcile" in text.lower()
+        assert "key decisions" in text.lower()
+        assert "completed actions" in text.lower()
+        assert "cancel or rewrite" in text.lower()
+
 
 class TestMergeMode:
     def test_update_existing_by_id(self):
@@ -236,13 +251,126 @@ class TestTodoStoreBounds:
         assert len(rationale) == MAX_TODO_RATIONALE_CHARS
         assert rationale.endswith("… [truncated]")
 
+    def test_oversized_id_is_truncated_before_persistence(self):
+        from tools.todo_tool import MAX_TODO_ID_CHARS
+
+        store = TodoStore()
+        store.write([{"id": "i" * 10_000, "content": "task", "status": "pending"}])
+
+        item_id = store.read()[0]["id"]
+        assert len(item_id) == MAX_TODO_ID_CHARS
+        assert item_id.endswith("… [truncated]")
+
     def test_injection_block_is_bounded(self):
-        from tools.todo_tool import MAX_TODO_CONTENT_CHARS
+        from tools.todo_tool import (
+            MAX_TODO_CONTENT_CHARS,
+            TODO_INJECTION_HEADER,
+            TODO_INJECTION_RECONCILIATION_GUIDANCE,
+        )
         store = TodoStore()
         store.write([{"id": "1", "content": "A" * 50001, "status": "pending"}])
         inj = store.format_for_injection()
         # Before the fix this was ~50085 chars; now it tracks the cap.
-        assert len(inj) < MAX_TODO_CONTENT_CHARS + 200
+        assert len(inj) <= (
+            MAX_TODO_CONTENT_CHARS
+            + len(TODO_INJECTION_HEADER)
+            + len(TODO_INJECTION_RECONCILIATION_GUIDANCE)
+            + 100
+        )
+
+    def test_injection_has_an_aggregate_cap_and_keeps_priority_head(self):
+        from tools.todo_tool import MAX_TODO_INJECTION_CHARS
+
+        store = TodoStore()
+        store.write([
+            {
+                "id": str(index),
+                "content": f"priority-{index}: " + "A" * 4000,
+                "status": "pending",
+            }
+            for index in range(256)
+        ])
+
+        injection = store.format_for_injection()
+
+        assert len(injection) <= MAX_TODO_INJECTION_CHARS
+        assert "priority-0" in injection
+        assert "priority-255" not in injection
+        assert "higher-priority items were preserved" in injection
+
+
+class TestNeedsReconfirmationExpiry:
+    """#84718 proposal 2: expire active items at the compaction boundary."""
+
+    def test_active_items_are_marked_in_persisted_state_not_just_the_injection(self):
+        from tools.todo_tool import NEEDS_RECONFIRMATION_MARKER
+
+        store = TodoStore()
+        store.write([
+            {"id": "trace", "content": "Trace the origin", "status": "completed"},
+            {"id": "remove", "content": "Remove the checkout route", "status": "pending"},
+        ])
+        store.format_for_injection()
+
+        persisted = {item["id"]: item for item in store.read()}
+        # The persisted item content carries the marker, not only the
+        # rendered injection string — a later plain `todo` read/write
+        # (outside the synthetic post-compaction message) still sees it.
+        assert persisted["remove"]["content"].startswith(NEEDS_RECONFIRMATION_MARKER)
+        # completed/cancelled items never crossed the boundary as "active",
+        # so they are left untouched.
+        assert persisted["trace"]["content"] == "Trace the origin"
+
+    def test_repeated_compactions_do_not_stack_the_marker(self):
+        from tools.todo_tool import NEEDS_RECONFIRMATION_MARKER
+
+        store = TodoStore()
+        store.write([{"id": "1", "content": "Ship the fix", "status": "pending"}])
+        store.format_for_injection()
+        store.format_for_injection()
+
+        content = store.read()[0]["content"]
+        assert content.count(NEEDS_RECONFIRMATION_MARKER) == 1
+
+    def test_marker_plus_content_respects_the_existing_content_cap(self):
+        from tools.todo_tool import MAX_TODO_CONTENT_CHARS
+
+        store = TodoStore()
+        store.write([{"id": "1", "content": "A" * (MAX_TODO_CONTENT_CHARS - 5), "status": "pending"}])
+        store.format_for_injection()
+
+        assert len(store.read()[0]["content"]) <= MAX_TODO_CONTENT_CHARS
+
+    def test_rewriting_content_clears_the_marker(self):
+        from tools.todo_tool import NEEDS_RECONFIRMATION_MARKER
+
+        store = TodoStore()
+        store.write([{"id": "1", "content": "Old plan", "status": "pending"}])
+        store.format_for_injection()
+        assert store.read()[0]["content"].startswith(NEEDS_RECONFIRMATION_MARKER)
+
+        # Model reconfirms by writing fresh content for the same id.
+        store.write([{"id": "1", "content": "Reconfirmed plan", "status": "pending"}], merge=True)
+
+        assert store.read()[0]["content"] == "Reconfirmed plan"
+
+    def test_maximal_store_serializes_within_hydration_limit(self):
+        from tools.todo_tool import MAX_TODO_RESULT_CHARS
+
+        store = TodoStore()
+        payload = todo_tool(
+            todos=[
+                {
+                    "id": str(index),
+                    "content": "A" * 4000,
+                    "status": "pending",
+                }
+                for index in range(256)
+            ],
+            store=store,
+        )
+
+        assert len(payload) <= MAX_TODO_RESULT_CHARS
 
 
     def test_item_count_is_bounded(self):
