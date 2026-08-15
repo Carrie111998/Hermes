@@ -7512,6 +7512,23 @@ def _git_branch_exists(repo_root: Path, branch_name: str) -> bool:
 def _worktree_base_ref(repo_root: Path) -> str:
     """Return a freshly fetched remote base for a new task branch."""
     env = noninteractive_git_env()
+
+    def _is_commit(ref: str) -> bool:
+        try:
+            verified = subprocess.run(
+                [
+                    "git", "-C", str(repo_root), "rev-parse", "--verify", "--quiet",
+                    f"{ref}^{{commit}}",
+                ],
+                capture_output=True,
+                text=True, encoding="utf-8", errors="replace",
+                timeout=30,
+                check=False,
+            )
+        except Exception:
+            return False
+        return verified.returncode == 0
+
     try:
         fetched = subprocess.run(
             ["git", "-C", str(repo_root), "fetch", "--prune", "origin"],
@@ -7544,8 +7561,13 @@ def _worktree_base_ref(repo_root: Path) -> str:
             timeout=30,
             check=False,
         )
-        if symbolic.returncode == 0 and symbolic.stdout.strip():
-            candidates.append(symbolic.stdout.strip())
+        symbolic_target = symbolic.stdout.strip()
+        if (
+            symbolic.returncode == 0
+            and symbolic_target.startswith("refs/remotes/origin/")
+            and _is_commit(symbolic_target)
+        ):
+            candidates.append(symbolic_target)
         else:
             remote_head = subprocess.run(
                 [
@@ -7569,17 +7591,7 @@ def _worktree_base_ref(repo_root: Path) -> str:
         _log.debug("kanban remote default resolution failed: %s", exc)
 
     for candidate in candidates:
-        verified = subprocess.run(
-            [
-                "git", "-C", str(repo_root), "rev-parse", "--verify", "--quiet",
-                f"{candidate}^{{commit}}",
-            ],
-            capture_output=True,
-            text=True, encoding="utf-8", errors="replace",
-            timeout=30,
-            check=False,
-        )
-        if verified.returncode == 0:
+        if _is_commit(candidate):
             return candidate
     return "HEAD"
 
