@@ -2249,6 +2249,89 @@ class TestGatewayStopGraceBudget:
         with pytest.raises(subprocess.CalledProcessError):
             gateway_cli.launchd_stop()
 
+    def _stub_launchd_uninstall(
+        self, monkeypatch, plist_path, *, bootout_returncode=0, exit_result=True
+    ):
+        """Drive launchd_uninstall() with launchctl and the exit wait instrumented.
+
+        ``fake_run`` honours the ``check`` kwarg the way subprocess.run does,
+        so the same stub faithfully models the pre-fix call (``check=False``,
+        which never raises and hands back a returncode nobody reads) and the
+        fixed one (``check=True``, which raises CalledProcessError).
+        """
+        waits = []
+        terminations = []
+
+        monkeypatch.setattr(gateway_cli, "get_launchd_label", lambda: self.LABEL)
+        monkeypatch.setattr(gateway_cli, "_launchd_domain", lambda: self.DOMAIN)
+        monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: plist_path)
+        monkeypatch.setattr(
+            "gateway.status.get_running_pid", lambda *_a, **_k: self.PID
+        )
+        monkeypatch.setattr(
+            "gateway.status.write_planned_stop_marker", lambda *_a, **_k: None
+        )
+
+        def fake_run(cmd, check=False, **_kwargs):
+            assert cmd == ["launchctl", "bootout", f"{self.DOMAIN}/{self.LABEL}"]
+            if bootout_returncode:
+                if check:
+                    raise subprocess.CalledProcessError(bootout_returncode, cmd)
+                return SimpleNamespace(
+                    returncode=bootout_returncode, stdout="", stderr=""
+                )
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
+        monkeypatch.setattr(
+            gateway_cli,
+            "_wait_for_gateway_exit",
+            lambda timeout=None, force_after=None: (
+                waits.append((timeout, force_after)) or exit_result
+            ),
+        )
+        monkeypatch.setattr(
+            gateway_cli,
+            "terminate_pid",
+            lambda pid, force=False: terminations.append((pid, force)),
+        )
+        return waits, terminations
+
+    @pytest.mark.parametrize(
+        "returncode, why",
+        [
+            (3, "job already unloaded"),
+            (5, "domain unmanageable, detached fallback process (#23387)"),
+        ],
+    )
+    def test_uninstall_owns_the_stop_when_launchd_is_not_supervising(
+        self, monkeypatch, tmp_path, returncode, why
+    ):
+        """Uninstall took the same bootout fall-through as stop, sending nothing.
+
+        `launchctl bootout` ran with check=False and its result was discarded,
+        so on the fall-through -- where launchd never took the job and will
+        never signal it -- uninstall removed the service definition without
+        ever asking the process to exit. It must own the stop here exactly as
+        launchd_stop() does: SIGTERM first, then escalate no sooner than the
+        budget launchd itself would have granted.
+        """
+        plist_path = tmp_path / "ai.hermes.gateway.plist"
+        plist_path.write_text("<plist/>")
+        waits, terminations = self._stub_launchd_uninstall(
+            monkeypatch, plist_path, bootout_returncode=returncode
+        )
+
+        gateway_cli.launchd_uninstall()
+
+        assert terminations == [(self.PID, False)], f"expected a SIGTERM ({why})"
+        assert len(waits) == 1
+        timeout, force_after = waits[0]
+        assert force_after >= self.MIN_PLATFORM_STOP_BUDGET, (
+            "force-kill must not land inside the service manager's own budget"
+        )
+        assert timeout > force_after, "the wait must outlast its own escalation"
+
     def test_start_all_waits_out_the_budget_before_force_killing(self, monkeypatch):
         """`gateway start --all` SIGTERMs every stale gateway, then escalates.
 
