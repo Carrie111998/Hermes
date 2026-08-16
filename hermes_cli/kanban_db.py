@@ -5350,7 +5350,11 @@ class ArtifactPreservationError(RuntimeError):
     """Raised when a declared scratch deliverable cannot be preserved."""
 
 
-_REVIEW_CHILD_RE = re.compile(r"\b(review|reviewer|quality|qa|release)\b", re.IGNORECASE)
+# Exact assignee/profile names win. The title/workflow fallback is only
+# ``review`` / ``reviewer`` — words like ``release`` or ``qa`` mis-route
+# implementation children (e.g. "release notes", "release-candidate").
+_REVIEW_CHILD_ASSIGNEES = frozenset({"hermes-review", "reviewer"})
+_REVIEW_CHILD_RE = re.compile(r"\b(review|reviewer)\b", re.IGNORECASE)
 
 
 def _review_metadata_has_candidate(metadata: Any) -> bool:
@@ -5456,10 +5460,9 @@ def _review_child_ids(conn: sqlite3.Connection, task_id: str) -> list[str]:
             str(row[key] or "")
             for key in ("title", "workflow_template_id")
         )
-        assignee = str(row["assignee"] or "").casefold()
+        assignee = str(row["assignee"] or "").casefold().strip()
         if (
-            assignee in {"hermes-review", "reviewer"}
-            or _REVIEW_CHILD_RE.search(assignee)
+            assignee in _REVIEW_CHILD_ASSIGNEES
             or "sdlc-review" in skill_text.casefold()
             or _REVIEW_CHILD_RE.search(graph_text)
         ):
@@ -10020,11 +10023,13 @@ def check_respawn_guard(
             # re-trap the task.
             return None
         ended_at = _parse_finite_int_timestamp(latest_run["ended_at"])
-        if (
-            ended_at is None
-            or ended_at > now
-            or (now - ended_at) < rl_cooldown
-        ):
+        if ended_at is None:
+            # A rate_limited run should always receive ended_at via
+            # ``_end_run``. If it does not, fail open for this guard only:
+            # parking forever on a missing timestamp is worse than one
+            # cheap probe. Future/malformed-but-numeric values stay closed.
+            return None
+        if ended_at > now or (now - ended_at) < rl_cooldown:
             return "rate_limit_cooldown"
         # Cooldown elapsed — allow the respawn. Return early so the
         # blocker_auth check below doesn't catch the rate-limit text we
@@ -10091,10 +10096,15 @@ def check_respawn_guard(
     #    ordering so a fresh task with an existing PR remains guarded.
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
     latest_pr_handoff_at: Optional[int] = None
+    # Bound the hot-path scan to the guard window. Keep NULL / non-integer
+    # created_at rows so malformed provenance still fail-closes as active_pr.
     for c in conn.execute(
         "SELECT body, created_at FROM task_comments "
-        "WHERE task_id = ? ORDER BY id ASC",
-        (task_id,),
+        "WHERE task_id = ? AND ("
+        "created_at IS NULL OR typeof(created_at) != 'integer' "
+        "OR created_at >= ?) "
+        "ORDER BY id ASC",
+        (task_id, pr_cutoff),
     ).fetchall():
         if not c["body"] or not _RESPAWN_GUARD_PR_URL_RE.search(c["body"]):
             continue
