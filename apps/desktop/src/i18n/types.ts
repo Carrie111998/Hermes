@@ -1426,6 +1426,17 @@ export interface Translations {
     emptySoul: string
     saving: string
     saveSoul: string
+    setAvatar: string
+    removeAvatar: string
+    avatarSaved: string
+    avatarRemoved: string
+    avatarUploading: string
+    avatarUploadBatch: string
+    avatarUploadBatchProgress: (done: number, total: number) => string
+    avatarClickToEnlarge: string
+    avatarClosePreview: string
+    avatarInvalidType: string
+    avatarTooLarge: string
     deleteTitle: string
     deleteDescPrefix: string
     deleteDescMid: string
