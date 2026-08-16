@@ -9678,6 +9678,19 @@ def _dispatch_once_locked(
     result.timed_out = enforce_max_runtime(conn)
     result.promoted = recompute_ready(conn, failure_limit=failure_limit)
 
+    # Global emergency stop (`hermes pause`) — enforced HERE, not only in the
+    # gateway watcher, so a CLI `hermes kanban dispatch` from a shell is bound
+    # by the estop too (the watcher-only gate leaves the CLI path unbound).
+    # Housekeeping above already ran; only claiming/spawning is skipped.
+    # Fails open like the watcher gate: an unimportable estop module must not
+    # become a new crash surface for dispatch.
+    try:
+        from agent.estop import check_paused as _estop_check_paused
+        if _estop_check_paused("kanban-cli-dispatch", _log):
+            return result
+    except ImportError:
+        pass
+
     # Both knobs are total in-flight caps. Collapse them before either lane
     # dispatches so ready and review workers consume the same budget without
     # subtracting the already-running count twice.
