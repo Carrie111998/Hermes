@@ -26,7 +26,8 @@ import {
   screen,
   session,
   shell,
-  systemPreferences
+  systemPreferences,
+  Tray
 } from 'electron'
 import nodePty from 'node-pty'
 
@@ -699,6 +700,7 @@ const DESKTOP_CONNECTIONS_REGISTRY_PATH = path.join(app.getPath('userData'), 'co
 const DESKTOP_INSTALLATION_PATH = path.join(app.getPath('userData'), 'desktop-installation.json')
 const DESKTOP_UPDATE_CONFIG_PATH = path.join(app.getPath('userData'), 'updates.json')
 const DESKTOP_WINDOW_STATE_PATH = path.join(app.getPath('userData'), 'window-state.json')
+const DESKTOP_CLOSE_BEHAVIOR_PATH = path.join(app.getPath('userData'), 'close-behavior.json')
 const DESKTOP_BACKEND_OWNERSHIP_PATH = path.join(app.getPath('userData'), 'backend-ownership.json')
 // active-profile.json records which Hermes profile the desktop launches its
 // local backend as. When set, startHermes() passes `hermes --profile <name>
@@ -1137,6 +1139,12 @@ function registerMediaProtocol() {
 }
 
 let mainWindow = null
+// Close-to-tray state: trayIcon is created lazily on the first close-to-tray;
+// isQuitting is set by before-quit so a real quit still closes the window
+// instead of hiding it; trayNotified gates the one-time balloon hint.
+let trayIcon: Electron.Tray | null = null
+let trayNotified = false
+let isQuitting = false
 const backendConnectionState = createBackendConnectionState<ReturnType<typeof spawn>, any>()
 const remoteLiveness = new RemoteLivenessTracker()
 const remoteRevalidation = new RemoteRevalidationCoordinator()
@@ -5718,6 +5726,85 @@ function registerPowerResumeListeners() {
 
 function getAppIconPath() {
   return APP_ICON_PATHS.find(fileExists)
+}
+
+// ─── Close-to-tray (Windows) ──────────────────────────────────────────────
+// When the close button hides the window instead of quitting, the app keeps
+// running in the system tray. The behavior is user-configurable via
+// Settings → Appearance → "Close window": 'tray' (default, hide to tray) or
+// 'quit' (close button quits, the classic behavior). Persisted in
+// userData/close-behavior.json; the tray is created lazily on first use.
+
+export type CloseBehavior = 'tray' | 'quit'
+
+function readCloseBehavior(): CloseBehavior {
+  try {
+    const mode = JSON.parse(fs.readFileSync(DESKTOP_CLOSE_BEHAVIOR_PATH, 'utf8'))?.mode
+
+    return mode === 'quit' ? 'quit' : 'tray'
+  } catch {
+    return 'tray'
+  }
+}
+
+function writeCloseBehavior(mode: CloseBehavior) {
+  try {
+    fs.mkdirSync(path.dirname(DESKTOP_CLOSE_BEHAVIOR_PATH), { recursive: true })
+    writeFileAtomic(DESKTOP_CLOSE_BEHAVIOR_PATH, JSON.stringify({ mode }, null, 2))
+  } catch (err) {
+    rememberLog(`[close-behavior] persist failed: ${err?.message || err}`)
+  }
+}
+
+ipcMain.handle('hermes:close-behavior:get', () => readCloseBehavior())
+ipcMain.handle('hermes:close-behavior:set', (_event, mode: unknown) => {
+  const next: CloseBehavior = mode === 'quit' ? 'quit' : 'tray'
+  writeCloseBehavior(next)
+
+  return next
+})
+
+// The tray is created lazily on the first close-to-tray and offers show/quit
+// actions.
+function ensureHermesTray(): Electron.Tray | null {
+  if (trayIcon && !trayIcon.isDestroyed()) {
+    return trayIcon
+  }
+
+  const iconPath = getAppIconPath()
+
+  if (!iconPath) {
+    return null
+  }
+
+  trayIcon = new Tray(iconPath)
+  trayIcon.setToolTip('Hermes Agent')
+  trayIcon.setContextMenu(
+    Menu.buildFromTemplate([
+      { label: 'Show Hermes', click: () => showMainWindowFromTray() },
+      { type: 'separator' },
+      {
+        label: 'Exit Hermes',
+        click: () => {
+          isQuitting = true
+          app.quit()
+        }
+      }
+    ])
+  )
+  trayIcon.on('click', () => showMainWindowFromTray())
+  trayIcon.on('double-click', () => showMainWindowFromTray())
+
+  return trayIcon
+}
+
+function showMainWindowFromTray() {
+  if (!mainWindow || mainWindow.isDestroyed()) {
+    return
+  }
+
+  mainWindow.show()
+  mainWindow.focus()
 }
 
 function sendOpenUpdatesRequested() {
@@ -11182,7 +11269,33 @@ function createWindow() {
   bindGeometryPersistence(mainWindow, schedulePersistWindowState)
   mainWindow.on('maximize', schedulePersistWindowState)
   mainWindow.on('unmaximize', schedulePersistWindowState)
-  mainWindow.on('close', () => schedulePersistWindowState.flush())
+  mainWindow.on('close', event => {
+    schedulePersistWindowState.flush()
+
+    // On Windows the close button can hide the window to the system tray
+    // instead of quitting — user-configurable via Settings → Appearance →
+    // "Close window". A real quit (tray menu "Exit Hermes", app.quit) still
+    // closes the window; the one-time balloon tells the user where the app
+    // went.
+    if (IS_WINDOWS && !isQuitting && readCloseBehavior() === 'tray') {
+      event.preventDefault()
+      mainWindow.hide()
+      ensureHermesTray()
+
+      if (!trayNotified) {
+        trayNotified = true
+
+        try {
+          trayIcon?.displayBalloon?.({
+            title: 'Hermes',
+            content: 'Hermes minimized to the system tray. Right-click the tray icon to exit.'
+          })
+        } catch {
+          // Balloon is best-effort.
+        }
+      }
+    }
+  })
 
   // the closed wrapper remains truthy, so clear only the window this callback owns.
   mainWindow.on('closed', () => {
@@ -14261,6 +14374,10 @@ function heldQuitForActiveWork(event: Electron.Event): boolean {
       if (response === 1) {
         quitConfirmedWithActiveWork = true
         app.quit()
+      } else {
+        // The quit was cancelled ("Keep Running") — allow the next close-button
+        // click to hide to the tray again.
+        isQuitting = false
       }
     })
     .catch(() => {
@@ -14274,6 +14391,10 @@ function heldQuitForActiveWork(event: Electron.Event): boolean {
 }
 
 app.on('before-quit', event => {
+  // Mark a real quit so the window close handler closes the window instead of
+  // hiding it to the tray.
+  isQuitting = true
+
   // Runs ahead of every teardown below, so "Keep Running" leaves the app
   // exactly as it was.
   if (heldQuitForActiveWork(event)) {
@@ -14320,6 +14441,9 @@ app.on('before-quit', event => {
   // The always-on-top overlay isn't a "real" app window; close it so a stray
   // pet can't keep the process alive or float over a quit app.
   closePetOverlay()
+  // Drop the tray icon on a real quit so it can't linger.
+  trayIcon?.destroy()
+  trayIcon = null
   wakeIndicatorController.close()
 
   // Same for the HUD — an always-on-top panel outliving the app would leave a
