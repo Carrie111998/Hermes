@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1440" height="900" viewBox="0 0 1440 900">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#07080a"/><stop offset="1" stop-color="#10131a"/></linearGradient>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%"><feGaussianBlur stdDeviation="20"/></filter>
+  </defs>
+  <rect width="1440" height="900" fill="#030405"/>
+  <circle cx="1260" cy="120" r="280" fill="#c9ff38" opacity=".08" filter="url(#shadow)"/>
+  <rect x="64" y="48" width="1312" height="804" rx="18" fill="url(#bg)" stroke="#2b3038" stroke-width="2"/>
+  <rect x="64" y="48" width="1312" height="52" rx="18" fill="#0d0f13"/>
+  <path d="M64 82h1312" stroke="#252a31"/>
+  <circle cx="92" cy="74" r="7" fill="#ff6b6b"/><circle cx="116" cy="74" r="7" fill="#ffd166"/><circle cx="140" cy="74" r="7" fill="#c9ff38"/>
+  <text x="720" y="79" text-anchor="middle" fill="#8b929d" font-family="Inter,Arial,sans-serif" font-size="13">herdr  /  MOCKUP — not a real integration</text>
+  <rect x="64" y="100" width="274" height="752" fill="#0b0d10"/>
+  <path d="M338 100v752" stroke="#252a31"/>
+  <text x="94" y="145" fill="#c9ff38" font-family="Inter,Arial,sans-serif" font-size="21" font-weight="700">HERMES</text>
+  <text x="94" y="166" fill="#636b76" font-family="Inter,Arial,sans-serif" font-size="11" letter-spacing="2">AGENT WORKSPACE</text>
+  <rect x="84" y="198" width="234" height="42" rx="8" fill="#c9ff38"/><text x="108" y="224" fill="#10130b" font-family="Inter,Arial,sans-serif" font-size="14" font-weight="700">+ New conversation</text>
+  <text x="96" y="280" fill="#555d68" font-family="Inter,Arial,sans-serif" font-size="11" letter-spacing="1.5">RECENT</text>
+  <rect x="84" y="300" width="234" height="62" rx="8" fill="#191d22" stroke="#30363e"/><circle cx="106" cy="321" r="5" fill="#c9ff38"/><text x="122" y="326" fill="#e7ebef" font-family="Inter,Arial,sans-serif" font-size="13">Vanta Black review</text><text x="122" y="346" fill="#69717c" font-family="Inter,Arial,sans-serif" font-size="11">Today · 14 messages</text>
+  <text x="106" y="398" fill="#87909b" font-family="Inter,Arial,sans-serif" font-size="13">Release checklist</text><text x="106" y="428" fill="#87909b" font-family="Inter,Arial,sans-serif" font-size="13">Research notes</text><text x="106" y="458" fill="#87909b" font-family="Inter,Arial,sans-serif" font-size="13">Scratchpad</text>
+  <path d="M84 772h234" stroke="#252a31"/><circle cx="103" cy="806" r="15" fill="#252b31"/><text x="130" y="811" fill="#dfe4ea" font-family="Inter,Arial,sans-serif" font-size="13">mark</text><text x="130" y="829" fill="#69717c" font-family="Inter,Arial,sans-serif" font-size="10">Local workspace</text>
+  <rect x="338" y="100" width="1038" height="752" fill="#101318"/>
+  <text x="382" y="146" fill="#f0f3f6" font-family="Inter,Arial,sans-serif" font-size="17" font-weight="700">Vanta Black review</text><text x="382" y="168" fill="#737b86" font-family="Inter,Arial,sans-serif" font-size="11">Hermes Agent · default profile</text><circle cx="1328" cy="148" r="5" fill="#c9ff38"/><text x="1242" y="153" fill="#8e979f" font-family="Inter,Arial,sans-serif" font-size="11">ONLINE</text>
+  <path d="M378 190h958" stroke="#252a31"/>
+  <text x="382" y="236" fill="#737b86" font-family="Inter,Arial,sans-serif" font-size="11">YOU · 10:42</text><text x="382" y="265" fill="#e8edf1" font-family="Inter,Arial,sans-serif" font-size="15">Can you turn this palette into a consistent Hermes skin?</text>
+  <rect x="382" y="296" width="886" height="146" rx="10" fill="#171b20" stroke="#2d343c"/><circle cx="408" cy="329" r="14" fill="#c9ff38"/><text x="407" y="334" text-anchor="middle" fill="#12150d" font-family="Arial" font-size="13" font-weight="700">H</text><text x="438" y="330" fill="#c9ff38" font-family="Inter,Arial,sans-serif" font-size="11" font-weight="700">HERMES AGENT · 10:42</text><text x="408" y="367" fill="#dce2e7" font-family="Inter,Arial,sans-serif" font-size="14">Absolutely. I’ll keep the near-black surfaces quiet and let the</text><text x="408" y="391" fill="#dce2e7" font-family="Inter,Arial,sans-serif" font-size="14">acid-lime accent carry focus. The result stays readable in both modes.</text><rect x="408" y="412" width="128" height="18" rx="4" fill="#242b24"/><text x="418" y="425" fill="#a9d74a" font-family="monospace" font-size="10">skin_engine.py</text>
+  <rect x="382" y="486" width="886" height="54" rx="8" fill="#0b0d10" stroke="#303740"/><text x="406" y="519" fill="#606a75" font-family="Inter,Arial,sans-serif" font-size="13">Type a message…</text><rect x="1202" y="497" width="48" height="32" rx="6" fill="#c9ff38"/><text x="1226" y="518" text-anchor="middle" fill="#10130b" font-family="Arial" font-size="16">↑</text>
+  <text x="382" y="581" fill="#626b76" font-family="Inter,Arial,sans-serif" font-size="10" letter-spacing="1.5">TOOLS</text><rect x="382" y="600" width="248" height="42" rx="7" fill="#171b20" stroke="#2d343c"/><circle cx="404" cy="621" r="5" fill="#79a7ff"/><text x="418" y="625" fill="#bbc4ce" font-family="Inter,Arial,sans-serif" font-size="12">read_file</text><text x="544" y="625" fill="#69737e" font-family="monospace" font-size="10">complete</text><rect x="646" y="600" width="248" height="42" rx="7" fill="#171b20" stroke="#2d343c"/><circle cx="668" cy="621" r="5" fill="#c9ff38"/><text x="682" y="625" fill="#bbc4ce" font-family="Inter,Arial,sans-serif" font-size="12">patch</text><text x="810" y="625" fill="#69737e" font-family="monospace" font-size="10">ready</text>
+  <path d="M378 776h958" stroke="#252a31"/><text x="382" y="807" fill="#68717c" font-family="Inter,Arial,sans-serif" font-size="11">MOCKUP · Vanta Black dark variant</text><text x="1336" y="807" text-anchor="end" fill="#68717c" font-family="monospace" font-size="11">tokens: bg / surface / lime</text>
+</svg>
