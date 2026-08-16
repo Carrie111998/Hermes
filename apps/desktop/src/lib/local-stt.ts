@@ -15,10 +15,31 @@ import { atom } from 'nanostores'
  *  sidecar server; overridable via `voice.dictation.local_stt_port`. */
 export const LOCAL_STT_DEFAULT_PORT = 8090
 
-/** Loopback either answers fast or is not there. Waiting longer than this costs
- *  more than the backend roundtrip we fall back to, so dictation stays snappy
- *  even when the local server is dead or oversubscribed. */
-export const LOCAL_STT_TIMEOUT_MS = 2_500
+/** Loopback either answers or is not there: a refused connection returns
+ *  instantly, so this floor only ever elapses for a server that took the socket
+ *  and then stalled. Keeps dictation snappy when the sidecar is dead or wedged. */
+export const LOCAL_STT_MIN_TIMEOUT_MS = 2_500
+
+/** Past this, waiting on the local rung costs more than the backend roundtrip
+ *  it would fall back to. */
+export const LOCAL_STT_MAX_TIMEOUT_MS = 60_000
+
+// Budget derived from clip size, mirroring audioTranscribeRequestTimeoutMs():
+// the base64 data URL's length tracks clip length, and ~0.1ms/char allows ~2s
+// of transcription per 1s of audio. Only the floor and cap differ from the
+// backend rung — a flat timeout would bound the transcription itself, so a
+// genuinely slow-but-alive server would abort on every long clip and "local"
+// would quietly mean "never local" for anything but the shortest takes.
+const LOCAL_STT_TIMEOUT_MS_PER_CHAR = 0.1
+
+export function localSttTimeoutMs(dataUrl: string): number {
+  const estimated = Math.max(
+    LOCAL_STT_MIN_TIMEOUT_MS,
+    Math.ceil(String(dataUrl || '').length * LOCAL_STT_TIMEOUT_MS_PER_CHAR)
+  )
+
+  return Math.min(LOCAL_STT_MAX_TIMEOUT_MS, estimated)
+}
 
 /** OpenAI-compatible servers require a `model` part. whisper.cpp's server and
  *  faster-whisper-server ignore it (the loaded model wins), so this default
@@ -61,8 +82,12 @@ interface DictationConfigShape {
 
 const trimmed = (value: unknown): string => (typeof value === 'string' ? value.trim() : '')
 
+// Both shapes resolve through Number(), not parseInt(): parseInt("1.5") is 1 —
+// a privileged port — and parseInt("9000.5") silently truncates, while the
+// numeric path rejects both as non-integers. Whether a hand-edited port is
+// valid must not depend on whether the user quoted it in config.yaml.
 function sttPort(value: unknown): number {
-  const port = typeof value === 'number' ? value : Number.parseInt(trimmed(value), 10)
+  const port = typeof value === 'number' ? value : Number(trimmed(value))
 
   return Number.isInteger(port) && port > 0 && port < 65_536 ? port : LOCAL_STT_DEFAULT_PORT
 }
@@ -148,7 +173,7 @@ export async function transcribeWithLocalStt(
   settings: LocalSttSettings
 ): Promise<string> {
   const controller = new AbortController()
-  const timer = setTimeout(() => controller.abort(), LOCAL_STT_TIMEOUT_MS)
+  const timer = setTimeout(() => controller.abort(), localSttTimeoutMs(dataUrl))
 
   try {
     const form = new FormData()

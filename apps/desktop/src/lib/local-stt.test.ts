@@ -7,8 +7,11 @@ import {
   LOCAL_STT_DEFAULT_MODEL,
   LOCAL_STT_DEFAULT_PORT,
   LOCAL_STT_DEFAULTS,
+  LOCAL_STT_MAX_TIMEOUT_MS,
+  LOCAL_STT_MIN_TIMEOUT_MS,
   localSttEndpoint,
   localSttSettingsFromConfig,
+  localSttTimeoutMs,
   transcribeWithLocalStt
 } from './local-stt'
 
@@ -51,6 +54,16 @@ describe('localSttSettingsFromConfig', () => {
     expect(localSttSettingsFromConfig({ voice: { dictation: { local_stt_port: ' 9000 ' } } }).port).toBe(9000)
 
     for (const value of [0, -1, 65_536, 1.5, 'abc', '', null, {}]) {
+      expect(localSttSettingsFromConfig({ voice: { dictation: { local_stt_port: value } } }).port, String(value)).toBe(
+        LOCAL_STT_DEFAULT_PORT
+      )
+    }
+  })
+
+  it('validates a quoted port exactly like an unquoted one', () => {
+    // parseInt() would read "1.5" as port 1 (privileged) and "9000.5" as 9000,
+    // so a fractional port would be accepted when quoted and rejected when not.
+    for (const value of [1.5, '1.5', 9000.5, '9000.5', '65536', ' 12 abc', '1e999']) {
       expect(localSttSettingsFromConfig({ voice: { dictation: { local_stt_port: value } } }).port, String(value)).toBe(
         LOCAL_STT_DEFAULT_PORT
       )
@@ -116,6 +129,27 @@ describe('audioFileFromDataUrl', () => {
   it('rejects payloads that are not data URLs', () => {
     expect(() => audioFileFromDataUrl('https://example.com/clip.webm')).toThrow(/unsupported audio payload/i)
     expect(() => audioFileFromDataUrl('data:audio/webm;base64')).toThrow(/unsupported audio payload/i)
+  })
+})
+
+describe('localSttTimeoutMs', () => {
+  it('holds a short clip at the floor so an absent server is detected fast', () => {
+    for (const dataUrl of ['', WEBM_DATA_URL, `data:audio/webm;base64,${'A'.repeat(1_000)}`]) {
+      expect(localSttTimeoutMs(dataUrl)).toBe(LOCAL_STT_MIN_TIMEOUT_MS)
+    }
+  })
+
+  it('grows the budget with clip length so a slow-but-alive server can finish', () => {
+    // A flat floor bounds the transcription itself, so a long clip on a local
+    // server would abort every time and never beat the backend it falls to.
+    const long = localSttTimeoutMs(`data:audio/webm;base64,${'A'.repeat(200_000)}`)
+
+    expect(long).toBeGreaterThan(LOCAL_STT_MIN_TIMEOUT_MS)
+    expect(long).toBeLessThanOrEqual(LOCAL_STT_MAX_TIMEOUT_MS)
+  })
+
+  it('caps the wait so a wedged server never out-costs the backend rung', () => {
+    expect(localSttTimeoutMs(`data:audio/webm;base64,${'A'.repeat(50_000_000)}`)).toBe(LOCAL_STT_MAX_TIMEOUT_MS)
   })
 })
 
@@ -188,6 +222,40 @@ describe('transcribeWithLocalStt', () => {
 
       await vi.advanceTimersByTimeAsync(3_000)
       await assertion
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('lets a long clip transcribe past the short-clip floor', async () => {
+    vi.useFakeTimers()
+
+    try {
+      let settle = (_response: Response) => {}
+
+      const responded = new Promise<Response>(resolve => {
+        settle = resolve
+      })
+
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(
+          (_url: string, init: { signal: AbortSignal }) =>
+            new Promise<Response>((resolve, reject) => {
+              void responded.then(resolve)
+              init.signal.addEventListener('abort', () => reject(new Error('aborted')))
+            })
+        )
+      )
+
+      const longClip = `data:audio/webm;base64,${'A'.repeat(200_000)}`
+      const pending = transcribeWithLocalStt(longClip, 'audio/webm', localSettings())
+
+      // Still alive well past the floor that used to bound the whole roundtrip.
+      await vi.advanceTimersByTimeAsync(LOCAL_STT_MIN_TIMEOUT_MS * 2)
+      settle(jsonResponse({ text: 'a long dictation' }))
+
+      await expect(pending).resolves.toBe('a long dictation')
     } finally {
       vi.useRealTimers()
     }

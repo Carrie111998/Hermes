@@ -1779,8 +1779,8 @@ function backendTranscribeAudio(dataUrl: string, mimeType?: string): Promise<Aud
  * body shape — moves.
  *
  * In `local` mode the loopback Whisper server is tried first and any failure
- * (server absent, non-2xx, junk body, 2.5s timeout) falls through to the
- * backend. The fallback is deliberately invisible: dictation is a foreground
+ * (server absent, non-2xx, junk body, size-derived timeout) falls through to
+ * the backend. The fallback is deliberately invisible: dictation is a foreground
  * interaction, and a toast about a sidecar the user can't fix mid-recording
  * would be noise, not information.
  */
