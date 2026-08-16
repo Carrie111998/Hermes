@@ -49,7 +49,7 @@ class _RoutingClient:
         return _Response(self._payloads[url])
 
 
-def test_fetch_account_usage_codex(monkeypatch):
+def _stub_codex_usage(monkeypatch, payload):
     monkeypatch.setattr(
         "agent.account_usage.resolve_codex_runtime_credentials",
         lambda refresh_if_expiring=True: {
@@ -64,24 +64,29 @@ def test_fetch_account_usage_codex(monkeypatch):
     )
     monkeypatch.setattr(
         "agent.account_usage.httpx.Client",
-        lambda timeout=15.0: _Client(
-            {
-                "plan_type": "pro",
-                "rate_limit": {
-                    "primary_window": {
-                        "used_percent": 15,
-                        "reset_at": 1_900_000_000,
-                        "limit_window_seconds": 18000,
-                    },
-                    "secondary_window": {
-                        "used_percent": 40,
-                        "reset_at": 1_900_500_000,
-                        "limit_window_seconds": 604800,
-                    },
+        lambda timeout=15.0: _Client(payload),
+    )
+
+
+def test_fetch_account_usage_codex(monkeypatch):
+    _stub_codex_usage(
+        monkeypatch,
+        {
+            "plan_type": "pro",
+            "rate_limit": {
+                "primary_window": {
+                    "used_percent": 15,
+                    "reset_at": 1_900_000_000,
+                    "limit_window_seconds": 18000,
                 },
-                "credits": {"has_credits": True, "balance": 12.5},
-            }
-        ),
+                "secondary_window": {
+                    "used_percent": 40,
+                    "reset_at": 1_900_500_000,
+                    "limit_window_seconds": 604800,
+                },
+            },
+            "credits": {"has_credits": True, "balance": 12.5},
+        },
     )
 
     snapshot = fetch_account_usage("openai-codex")
@@ -93,6 +98,55 @@ def test_fetch_account_usage_codex(monkeypatch):
     assert snapshot.windows[0].used_percent == 15.0
     assert snapshot.windows[0].reset_at == datetime.fromtimestamp(1_900_000_000, tz=timezone.utc)
     assert "Credits balance: $12.50" in snapshot.details
+
+
+def test_fetch_account_usage_codex_labels_primary_seven_day_window_as_weekly(monkeypatch):
+    _stub_codex_usage(
+        monkeypatch,
+        {
+            "plan_type": "prolite",
+            "rate_limit": {
+                "primary_window": {
+                    "used_percent": 3,
+                    "reset_at": 1_900_000_000,
+                    "limit_window_seconds": 604800,
+                },
+                "secondary_window": None,
+            },
+            "credits": {"has_credits": False},
+        },
+    )
+
+    snapshot = fetch_account_usage("openai-codex")
+
+    assert snapshot is not None
+    assert len(snapshot.windows) == 1
+    assert snapshot.windows[0].label == "Weekly"
+    assert snapshot.windows[0].used_percent == 3.0
+    assert snapshot.windows[0].reset_at == datetime.fromtimestamp(1_900_000_000, tz=timezone.utc)
+
+
+def test_fetch_account_usage_codex_labels_unknown_duration_neutrally(monkeypatch):
+    _stub_codex_usage(
+        monkeypatch,
+        {
+            "plan_type": "pro",
+            "rate_limit": {
+                "primary_window": {
+                    "used_percent": 9,
+                    "reset_at": 1_900_000_000,
+                    "limit_window_seconds": 86400,
+                }
+            },
+            "credits": {"has_credits": False},
+        },
+    )
+
+    snapshot = fetch_account_usage("openai-codex")
+
+    assert snapshot is not None
+    assert len(snapshot.windows) == 1
+    assert snapshot.windows[0].label == "24-hour window"
 
 
 def test_render_account_usage_lines_includes_reset_and_provider():

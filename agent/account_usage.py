@@ -507,6 +507,30 @@ def _resolve_codex_usage_credentials(
     return entry.runtime_api_key, str(entry.runtime_base_url or base_url or "").strip(), None
 
 
+def _codex_window_label(window_key: str, window_seconds: Any) -> str:
+    if window_seconds == 18000:
+        return "Session"
+    if window_seconds == 604800:
+        return "Weekly"
+    seconds: Optional[int] = None
+    if isinstance(window_seconds, int) and not isinstance(window_seconds, bool):
+        seconds = window_seconds
+    elif isinstance(window_seconds, float) and window_seconds.is_integer():
+        seconds = int(window_seconds)
+    if seconds is not None and seconds > 0:
+        if seconds <= 86400 and seconds % 3600 == 0:
+            hours = seconds // 3600
+            return f"{hours}-hour window"
+        if seconds % 86400 == 0:
+            days = seconds // 86400
+            return f"{days}-day window"
+        if seconds % 60 == 0:
+            minutes = seconds // 60
+            return f"{minutes}-minute window"
+        return f"{seconds}-second window"
+    return "Session" if window_key == "primary_window" else "Weekly"
+
+
 def _fetch_codex_account_usage(
     base_url: Optional[str] = None,
     api_key: Optional[str] = None,
@@ -525,11 +549,13 @@ def _fetch_codex_account_usage(
     payload = response.json() or {}
     rate_limit = payload.get("rate_limit") or {}
     windows: list[AccountUsageWindow] = []
-    for key, label in (("primary_window", "Session"), ("secondary_window", "Weekly")):
+    for key in ("primary_window", "secondary_window"):
         window = rate_limit.get(key) or {}
         used = window.get("used_percent")
         if used is None:
             continue
+        window_seconds = window.get("limit_window_seconds")
+        label = _codex_window_label(key, window_seconds)
         windows.append(
             AccountUsageWindow(
                 label=label,
