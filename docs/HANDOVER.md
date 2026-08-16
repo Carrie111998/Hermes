@@ -1,7 +1,7 @@
 # Project Handover - hermes-agent
 
 **Plan key:** hermes-agent  
-**Last verified:** 2026-08-16 13:27 CST
+**Last verified:** 2026-08-16
 **Handover owner/session:** Codex  
 **Authoritative project log:** `docs/ROADMAP-HERMES-DGX.md`
 
@@ -9,7 +9,7 @@
 
 - **Purpose:** Hermes is a private-first agent gateway and CLI with memory, skills, scheduled jobs, delegated agents, and messaging-platform adapters.
 - **Repository:** <https://github.com/cwliao/hermes-agent>
-- **Canonical mainline:** merged code commit `178c9be1c5e2cc8052d69a0c140131b417a44ee8` (PR #26); handover refreshes are documentation-only commits after deployment.
+- **Canonical mainline:** merged code commit `559bb58097b22b8fccdf56bfc8cbb368ed5ca4b9` (PR #28); handover refreshes are documentation-only commits after deployment.
 - **DGX runtime:** configured target, live source checkout `/home/cwliao/.hermes/hermes-agent`, user service `hermes-gateway.service`.
 - **In scope:** Hermes CLI, gateway, runtime state, platform adapters, CI, skills, documentation, and explicitly ticketed deployment work.
 - **Out of scope by default:** laptop files as handover sources, unrelated DGX services, credentials/tokens, and external marketplace or SkillClaw changes without a separate reviewed ticket.
@@ -26,7 +26,7 @@ The local audit checkout observed during this refresh is `D:/PROJECT/Hermes`, br
 - **Completed and deployed:** managed-CA trust correction, PR #25, squash merge `29d4663bb94cf2d9603d2de9d437a431b5101f14`; authenticated Claude and AGY implementation reviews both PASS, CI run `31918804987` passed, and the new immutable DGX release is active.
 - **Completed through inbound polling gate:** HERMES-TELEGRAM-INBOUND-001, PR #26, merge `178c9be1c5e2cc8052d69a0c140131b417a44ee8`; implementation review, CI, immutable deployment, service health, and qualifying polling progress all passed. User-visible message delivery remains a separate evidence gate.
 - **E2E state:** gateway process/service is healthy, outbound Telegram delivery remains separately proven, and the active release recorded qualifying `telegram_polling_progress` metadata. The bounded verification count increased from 301 to 305 with `telegram_polling_degraded=0`; message content was not inspected.
-- **Deferred:** ARCH-002 remains the next core candidate after the active Telegram transport gate; HERMES-MONITORING-001 remains blocked and does not absorb this transport diagnosis.
+- **Re-sequenced by user:** ARCH-002 is implemented on isolated branch `ticket/arch-002-runtime-state-contract`; its independent design review remains `BLOCKED` because Claude did not issue a verdict, and the user explicitly authorized implementation. HERMES-MONITORING-001 remains blocked and does not absorb this work.
 
 ## 3. Verified runtime and deployment state
 
@@ -45,13 +45,14 @@ The local audit checkout observed during this refresh is `D:/PROJECT/Hermes`, br
 
 ## 4. Ticket and gate state
 
-### Current lane: HERMES-TELEGRAM-INBOUND-001
+### Current lane: ARCH-002
 
-- **Plan:** `docs/plans/2026-08-16-hermes-telegram-inbound-001.md`.
-- **Status:** `MERGED_DEPLOYED_INBOUND_POLLING_PASS`; implementation review, CI, merge, immutable deployment, service health, and qualifying inbound polling progress gates passed. User-visible delivery remains separate.
-- **Parent lane:** HERMES-TELEGRAM-TRANSPORT-001 is `MERGED_DEPLOYED_RUNTIME_DEGRADED`; its service and outbound gates passed, but inbound readiness remains unproven.
-- **Next action:** confirm user-visible response/delivery evidence without exposing message content; keep polling progress and delivery as separate gates.
-- **Do not:** change credentials/allowlists/webhook state, weaken TLS, or claim inbound readiness from service health, outbound delivery, or absent/ambiguous polling evidence.
+- **Plan:** `docs/plans/2026-08-16-arch-002-runtime-state-contract.md`.
+- **Status:** `IMPLEMENTED_USER_OVERRIDE_REVIEW_BLOCKED`; lifecycle transitions are enforced at the CAS boundary, terminal states cannot regress, and same-state retries are idempotent no-ops. Focused tests are `24 passed`; Ruff is `NOT RUN` because it is unavailable in the isolated checkout.
+- **Branch:** `ticket/arch-002-runtime-state-contract`; implementation is not merged or deployed.
+- **Review boundary:** AGY returned advisory `PASS`; Claude did not issue a formal verdict, so consensus remains `BLOCKED`. This was explicitly overridden by the user for isolated implementation only; it is not recorded as review PASS.
+- **Next action:** inspect the isolated diff, commit and push if authorized, then keep CI, review, merge, deployment, and runtime health as separate gates.
+- **Do not:** modify the primary dirty checkout, merge, deploy, migrate DGX runtime state, or claim independent review consensus.
 
 ### Other ticket state
 
@@ -61,18 +62,18 @@ The local audit checkout observed during this refresh is `D:/PROJECT/Hermes`, br
 - `HERMES-CALENDAR-GUARD-001`: `MERGED_DEPLOYED`; PR #17/#18 plus correction PR #24; the actual `hermes-mcp-health-guard.timer` is active/waiting. The old `hermes-calendar-guard.timer` name is not present and requires a separate documentation reconciliation if needed.
 - `Managed CA trust correction`: `MERGED_DEPLOYED`; PR #25, merge `29d4663b...`, CI `31918804987`, release `v2026.8.16-hermes-ca-29d4663bb9`; focused release tests `6 passed`, source/release hashes matched, and service health is active/running.
 - `HERMES-MONITORING-001`: `BLOCKED`; do not infer readiness from this deployment.
-- `ARCH-002`: proposed next core ticket, deferred until the current Telegram transport gate is resolved or explicitly re-sequenced.
+- `ARCH-002`: `IMPLEMENTED_UNMERGED_REVIEW_BLOCKED`; isolated branch implementation is complete with `24 passed` focused tests. Commit/push is the next authorized gate; merge/deploy remain separate.
 
 ### Gate rule
 
-Implementation, tests, independent review, reconciliation, CI, merge, deployment, service health, inbound polling, outbound delivery, and rollback are separate gates. The current lane has merge/deployment/service/outbound evidence but remains blocked on inbound polling evidence.
+Implementation, tests, independent review, reconciliation, CI, merge, deployment, service health, inbound polling, outbound delivery, and rollback are separate gates. ARCH-002 has implementation/test evidence only; its review gate remains blocked and no merge/deploy evidence exists.
 
 ## 5. Safe continuation instructions
 
 1. Read this handover, `docs/ROADMAP-HERMES-DGX.md`, and the current ticket plan before acting.
 2. Verify repository identity, current GitHub `main` SHA, DGX hostname, service, effective drop-ins, release marker, and rollback release.
 3. Preserve the dirty laptop worktree and the DGX live source checkout; do not reset, clean, or overwrite either.
-4. Use bounded, read-only DGX diagnostics for the Telegram network/polling diagnosis before implementation.
+4. Keep ARCH-002 review metadata-only; do not send repository source to external reviewers.
 5. Keep the current release and prior release/drop-in as rollback evidence.
 6. Record direct inbound and outbound evidence separately; service active alone is insufficient.
 7. Refresh this handover only with verified facts and the exact next action.

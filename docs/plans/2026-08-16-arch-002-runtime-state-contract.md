@@ -1,6 +1,6 @@
 ---
 title: "ARCH-002: harden the profile-scoped runtime-state contract"
-status: DESIGN_REVIEW_BLOCKED_CLAUDE_VERDICT_UNAVAILABLE
+status: IMPLEMENTED_USER_OVERRIDE_REVIEW_BLOCKED
 date: 2026-08-16
 type: architecture
 ticket: ARCH-002
@@ -11,10 +11,13 @@ target_repo: hermes-agent
 
 ## Status
 
-DESIGN_REVIEW_BLOCKED_CLAUDE_VERDICT_UNAVAILABLE
+IMPLEMENTED_USER_OVERRIDE_REVIEW_BLOCKED
 
-This is a plan-only ticket. No implementation, merge, deployment, DGX
-mutation, or runtime-state migration is authorized by this plan.
+The independent design-review gate remains blocked because the authenticated
+Claude family did not issue a verdict. The user explicitly directed direct
+implementation, overriding that design-consensus gate for this isolated
+branch only. This status is not a reviewer PASS. Merge, deployment, DGX
+mutation, and runtime-state migration remain separate gates.
 
 ## Context
 
@@ -131,9 +134,20 @@ source edit or implementation branch is authorized.
   verdict. No implementation, commit-to-main, merge, deployment, or DGX
   runtime mutation is authorized.
 
+## Implementation record
+
+- `runtime_state/contract.py` now centralizes lifecycle transition rules at
+  the owner/version CAS boundary. Illegal transitions return the typed
+  `InvalidTransition` result, terminal states have no outgoing transition,
+  and same-state retries with the current owner token are idempotent no-ops.
+- `runtime_state/__init__.py` exports the transition contract and typed error.
+- `tests/runtime_state/test_runtime_state.py` covers idempotent same-state
+  retry and terminal-state immutability.
+- Focused verification: 24 tests passed across the runtime-state and gateway
+  integration suites. Ruff was not installed in the isolated checkout and is
+  recorded as NOT RUN.
+
 ## Current next action
 
-Obtain a valid Claude-family verdict through an approved metadata-only review
-route, or explicitly re-scope the review requirement. Do not send repository
-source to an external reviewer, and do not implement ARCH-002 while this gate
-is blocked.
+Review the isolated diff and test evidence. Do not merge, deploy, mutate DGX,
+or clean the primary dirty worktree without a separate explicit gate.

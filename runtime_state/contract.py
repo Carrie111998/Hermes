@@ -13,6 +13,7 @@ STALE_VERSION = "StaleVersion"
 OWNER_MISMATCH = "OwnerMismatch"
 NOT_FOUND = "NotFound"
 INVALID_PROFILE_REFERENCE = "InvalidProfileReference"
+INVALID_TRANSITION = "InvalidTransition"
 
 OWNED_TABLES = tuple(TABLE_BUSINESS_KEY)
 
@@ -44,6 +45,50 @@ _ALLOWED_UPDATE_COLUMNS = {
     },
     "approval_state": {"approval_status", "breaker_status"},
     "compression_state": {"compression_status"},
+}
+
+# Lifecycle transitions are enforced at the single CAS write boundary.  The
+# self edges make a retry of an already-applied state update an explicit
+# idempotent no-op; terminal states have no outgoing edge to another state.
+STATE_TRANSITIONS = {
+    "session_state": {
+        "active": {"active", "completed", "failed", "degraded", "cancelled"},
+        "completed": {"completed"},
+        "failed": {"failed"},
+        "degraded": {"degraded"},
+        "cancelled": {"cancelled"},
+    },
+    "task_state": {
+        "pending": {"pending", "running", "failed", "blocked", "cancelled", "degraded"},
+        "running": {"running", "succeeded", "failed", "blocked", "cancelled", "degraded"},
+        "succeeded": {"succeeded"},
+        "failed": {"failed"},
+        "blocked": {"blocked"},
+        "cancelled": {"cancelled"},
+        "degraded": {"degraded"},
+    },
+    "approval_state": {
+        "pending": {"pending", "approved", "denied", "expired", "reset_pending"},
+        "reset_pending": {"reset_pending", "pending", "expired"},
+        "approved": {"approved"},
+        "denied": {"denied"},
+        "expired": {"expired"},
+    },
+    "compression_state": {
+        "idle": {"idle", "running", "succeeded", "failed", "degraded", "disabled"},
+        "running": {"running", "succeeded", "failed", "degraded", "disabled"},
+        "succeeded": {"succeeded"},
+        "failed": {"failed"},
+        "degraded": {"degraded"},
+        "disabled": {"disabled"},
+    },
+}
+
+_STATE_COLUMN = {
+    "session_state": "status",
+    "task_state": "status",
+    "approval_state": "approval_status",
+    "compression_state": "compression_status",
 }
 
 
@@ -422,6 +467,50 @@ def cas_update_columns(
             f"allowed: {sorted(allowed)}"
         )
     current_schema = _schema_version(conn)
+    current_owner, current_version, row_schema = _current_owner_state(
+        conn, table, profile_name, business_key_value
+    )
+    if row_schema is None:
+        return CasResult(False, None, 0, NOT_FOUND, None)
+    if current_owner != owner or current_version != expected_version:
+        return _failure_result(
+            conn,
+            table,
+            profile_name,
+            business_key_value,
+            expected_version,
+            expected_owner=owner,
+        )
+
+    state_column = _STATE_COLUMN[table]
+    if state_column in columns:
+        current_state = conn.execute(
+            f"SELECT {state_column} FROM {table} WHERE profile_name = ? "
+            f"AND {_table_and_key(table)} = ?",
+            (profile_name, business_key_value),
+        ).fetchone()[0]
+        next_state = columns[state_column]
+        allowed_states = STATE_TRANSITIONS[table].get(current_state, set())
+        if next_state not in allowed_states:
+            conn.rollback()
+            return CasResult(
+                False,
+                current_owner,
+                current_version,
+                INVALID_TRANSITION,
+                row_schema,
+            )
+        if next_state == current_state and len(columns) == 1:
+            # A retry with the current owner token is safe and does not create
+            # a new version or timestamp-only mutation.
+            conn.commit()
+            return CasResult(
+                True,
+                current_owner,
+                current_version,
+                SUCCESS,
+                row_schema,
+            )
     timestamp = now or _timestamp()
     ordered_columns = sorted(columns)
     assignments = ", ".join(f"{column} = ?" for column in ordered_columns)

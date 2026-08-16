@@ -27,7 +27,7 @@
 ## Core engineering order
 
 1. CI-BASELINE-001 — restore blocking Python CI while preserving behavior. **Complete.**
-2. ARCH-002 — extend the runtime-state contract after the active transport gate is cleared. **Proposed next core ticket.**
+2. ARCH-002 — extend the runtime-state contract. **Implemented on isolated branch; review blocked by missing Claude verdict.**
 3. ARCH-003 — audit/replay integration after the shared state boundary is stable.
 4. ARCH-004 — redaction and SQLite/WAL safeguards after the preceding contracts are accepted.
 
@@ -53,11 +53,11 @@
 | HERMES-AUTH-002 | MERGED_DEPLOYED | Separate target-config ticket; do not conflate it with the Telegram lane. |
 | HERMES-CALENDAR-GUARD-001 | MERGED_DEPLOYED | Actual `hermes-mcp-health-guard.timer` remains active/waiting; the historical calendar-guard unit name is not installed. |
 | HERMES-MONITORING-001 | BLOCKED | No merge or deployment inference from current gateway evidence. |
-| ARCH-002 | PROPOSED | Select after the current Telegram transport gate is resolved or explicitly re-sequenced. |
+| ARCH-002 | IMPLEMENTED_UNMERGED_REVIEW_BLOCKED | Isolated branch `ticket/arch-002-runtime-state-contract`; CAS lifecycle transitions, terminal immutability, and idempotent same-state retry implemented; focused tests `24 passed`; commit/push next, merge/deploy separate. |
 
 ## Current next lane
 
-**HERMES-TELEGRAM-TRANSPORT-001 diagnosis** is the active next lane. First map the DGX primary/fallback Telegram network path and the exact `getUpdates` progress signal. Only then open a narrow correction set. Do not start ARCH-002 implementation or alter Telegram credentials, allowlists, webhook state, or unrelated services as part of this diagnosis.
+**ARCH-002 isolated implementation verification** is the active next lane. Review the bounded diff and focused test evidence, then commit/push if authorized. Do not merge, deploy, migrate DGX runtime state, or alter Telegram credentials, allowlists, webhook state, or unrelated services as part of this lane.
 
 ## Runtime and deployment boundary
 
