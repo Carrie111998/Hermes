@@ -1,6 +1,6 @@
 ---
 title: "HERMES-TELEGRAM-INBOUND-001: restore and prove Telegram inbound polling readiness"
-status: PLAN_ONLY
+status: DESIGN_REVIEW_PASS
 date: 2026-08-16
 type: reliability
 ticket: HERMES-TELEGRAM-INBOUND-001
@@ -100,8 +100,21 @@ independent implementation review -> merge -> immutable deployment -> runtime
 service health -> direct inbound polling evidence -> outbound delivery
 evidence. A green process or CI result does not close inbound readiness.
 
+## Ticket design review evidence
+
+- Packet boundary: metadata-only; no source, credentials, secrets, absolute paths,
+  or generated evidence text.
+- Packet SHA-256: `64a33bd93a4df2fe7dbfb43bca658d48750c29260a20579c8ea511f45ba84870`.
+- Authenticated Claude: DGX Spark `55-0940189-03`, Claude Code `2.1.229`,
+  bounded print review, verdict `PASS`.
+- Authenticated AGY: DGX Spark `55-0940189-03`, AGY `1.1.13`, bounded
+  print review, verdict `PASS`.
+- Consensus: `DESIGN_REVIEW_PASS`; the ticket design gate is complete.
+  Implementation remains a separate, explicitly authorized gate.
+
 ## Current next action
 
-Perform bounded, read-only DGX diagnosis and prepare a metadata-only review
-packet. Do not modify code, credentials, Telegram state, systemd units, or
-the live DGX runtime until this plan reaches review consensus.
+Perform bounded, read-only DGX diagnosis and prepare the implementation
+correction set. Do not modify code, credentials, Telegram state, systemd units,
+or the live DGX runtime until diagnosis, implementation review, tests, CI, and
+deployment gates are separately authorized and complete.
