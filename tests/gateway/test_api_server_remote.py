@@ -101,6 +101,174 @@ def _remote_headers() -> dict[str, str]:
     return {"Authorization": "Bearer remote-test-key"}
 
 
+async def _generate_pairing_code(adapter: APIServerAdapter) -> dict:
+    handler = _route_handler(adapter, "POST", "/api/remote/pair/code")
+    response = await handler(
+        make_mocked_request(
+            "POST", "/api/remote/pair/code", headers=_remote_headers()
+        )
+    )
+    assert response.status == 200
+    return json.loads(response.text)
+
+
+async def _redeem_pairing_code(adapter: APIServerAdapter, code: str):
+    handler = _route_handler(adapter, "POST", "/api/remote/pair")
+    with patch.object(
+        adapter,
+        "_read_json_body",
+        return_value=({"code": code}, None),
+    ):
+        return await handler(
+            make_mocked_request(
+                "POST", "/api/remote/pair", headers=_remote_headers()
+            )
+        )
+
+
+def test_remote_pairing_routes_are_registered():
+    adapter = APIServerAdapter(PlatformConfig(enabled=True))
+    routes = {(method, path) for method, path, _ in adapter._http_route_table()}
+
+    assert ("POST", "/api/remote/pair/code") in routes
+    assert ("POST", "/api/remote/pair") in routes
+
+
+@pytest.mark.asyncio
+async def test_remote_pair_code_generation_returns_single_use_ten_minute_code():
+    adapter = APIServerAdapter(
+        PlatformConfig(enabled=True, extra={"key": "remote-test-key"})
+    )
+
+    payload = await _generate_pairing_code(adapter)
+
+    assert len(payload["code"]) == 6
+    assert payload["code"].isalnum()
+    assert payload["code"] == payload["code"].upper()
+    assert payload["ttl_minutes"] == 10
+    assert datetime.fromisoformat(payload["expires_at"]).tzinfo is not None
+
+
+@pytest.mark.asyncio
+async def test_remote_pair_code_redemption_returns_24_hour_attach_token():
+    adapter = APIServerAdapter(
+        PlatformConfig(enabled=True, extra={"key": "remote-test-key"})
+    )
+    generated = await _generate_pairing_code(adapter)
+
+    response = await _redeem_pairing_code(adapter, generated["code"])
+    payload = json.loads(response.text)
+
+    assert response.status == 200
+    assert payload["token"]
+    assert payload["ttl_hours"] == 24
+    assert datetime.fromisoformat(payload["expires_at"]).tzinfo is not None
+
+    reused = await _redeem_pairing_code(adapter, generated["code"])
+    assert reused.status == 401
+    assert set(json.loads(reused.text)) == {"error"}
+
+
+@pytest.mark.asyncio
+async def test_remote_pair_rejects_wrong_code_with_openai_error():
+    adapter = APIServerAdapter(
+        PlatformConfig(enabled=True, extra={"key": "remote-test-key"})
+    )
+
+    response = await _redeem_pairing_code(adapter, "WRONG1")
+    payload = json.loads(response.text)
+
+    assert response.status == 401
+    assert set(payload) == {"error"}
+    assert payload["error"]["code"] == "invalid_pairing_code"
+
+
+@pytest.mark.asyncio
+async def test_remote_pair_rejects_expired_code():
+    adapter = APIServerAdapter(
+        PlatformConfig(enabled=True, extra={"key": "remote-test-key"})
+    )
+    generated = await _generate_pairing_code(adapter)
+    expired_at = datetime.fromisoformat(generated["expires_at"]).timestamp() + 1
+
+    with patch("gateway.platforms.api_server.time.time", return_value=expired_at):
+        response = await _redeem_pairing_code(adapter, generated["code"])
+    payload = json.loads(response.text)
+
+    assert response.status == 401
+    assert set(payload) == {"error"}
+    assert payload["error"]["code"] == "invalid_pairing_code"
+
+
+@pytest.mark.asyncio
+async def test_remote_attach_token_is_scoped_to_remote_endpoints(
+    session_db, inline_to_thread
+):
+    adapter = APIServerAdapter(
+        PlatformConfig(enabled=True, extra={"key": "remote-test-key"})
+    )
+    adapter._session_db = session_db
+    generated = await _generate_pairing_code(adapter)
+    paired = await _redeem_pairing_code(adapter, generated["code"])
+    token = json.loads(paired.text)["token"]
+    attach_headers = {"Authorization": f"Bearer {token}"}
+
+    remote = await _remote_handler(adapter)(
+        make_mocked_request(
+            "GET", "/api/remote/sessions", headers=attach_headers
+        )
+    )
+    ordinary = await _route_handler(adapter, "GET", "/api/sessions")(
+        make_mocked_request("GET", "/api/sessions", headers=attach_headers)
+    )
+    static_key = await _remote_handler(adapter)(
+        make_mocked_request(
+            "GET", "/api/remote/sessions", headers=_remote_headers()
+        )
+    )
+
+    assert remote.status == 200
+    assert ordinary.status == 401
+    assert static_key.status == 200
+
+
+@pytest.mark.asyncio
+async def test_remote_pairing_code_is_invalidated_after_five_failed_attempts():
+    adapter = APIServerAdapter(
+        PlatformConfig(enabled=True, extra={"key": "remote-test-key"})
+    )
+    generated = await _generate_pairing_code(adapter)
+
+    for attempt in range(5):
+        response = await _redeem_pairing_code(adapter, f"BAD{attempt:03d}")
+        assert response.status == 401
+
+    invalidated = await _redeem_pairing_code(adapter, generated["code"])
+    assert invalidated.status == 401
+
+
+@pytest.mark.asyncio
+async def test_remote_pairing_endpoints_require_static_api_key():
+    adapter = APIServerAdapter(
+        PlatformConfig(enabled=True, extra={"key": "remote-test-key"})
+    )
+
+    code_response = await _route_handler(
+        adapter, "POST", "/api/remote/pair/code"
+    )(make_mocked_request("POST", "/api/remote/pair/code"))
+    with patch.object(
+        adapter,
+        "_read_json_body",
+        return_value=({"code": "ABCDEF"}, None),
+    ):
+        pair_response = await _route_handler(adapter, "POST", "/api/remote/pair")(
+            make_mocked_request("POST", "/api/remote/pair")
+        )
+
+    assert code_response.status == 401
+    assert pair_response.status == 401
+
+
 @pytest.mark.asyncio
 async def test_remote_sessions_returns_host_profile_and_open_sessions(
     session_db, inline_to_thread, monkeypatch

@@ -12,6 +12,8 @@ Exposes an HTTP server with endpoints:
 - GET  /api/remote/sessions        — list open sessions available for remote attach
 - GET  /api/remote/sessions/{session_id}/events — live remote-session SSE events
 - POST /api/remote/sessions/{session_id}/chat — chat with an attached remote session
+- POST /api/remote/pair/code       — generate a short-lived remote pairing code
+- POST /api/remote/pair            — redeem a pairing code for an attach token
 - POST /api/sessions               — create an empty Hermes session
 - GET/PATCH/DELETE /api/sessions/{session_id} — read/update/delete a session
 - GET  /api/sessions/{session_id}/messages — read session message history
@@ -55,12 +57,14 @@ from functools import wraps
 import logging
 import os
 import re
+import secrets
 import socket
 import sqlite3
 import sys
 import threading
 import time
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -74,6 +78,12 @@ _PROFILE_REJECTED = object()
 _api_request_profile: ContextVar[Optional[str]] = ContextVar(
     "api_server_request_profile", default=None
 )
+
+_REMOTE_PAIR_CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+_REMOTE_PAIR_CODE_TTL_SECONDS = 10 * 60
+_REMOTE_ATTACH_TOKEN_TTL_SECONDS = 24 * 60 * 60
+_REMOTE_PAIR_MAX_FAILED_ATTEMPTS = 5
+
 
 def _approval_event_choices(*, smart_denied: bool, allow_permanent: bool) -> list[str]:
     if smart_denied:
@@ -1435,6 +1445,8 @@ class APIServerAdapter(BasePlatformAdapter):
         self._remote_session_subscribers: Dict[
             str, set["asyncio.Queue[Dict[str, Any]]"]
         ] = {}
+        self._remote_pairing_codes: Dict[str, Dict[str, Any]] = {}
+        self._remote_attach_tokens: Dict[str, Dict[str, Any]] = {}
         # Active run agent/task references for stop support
         self._active_run_agents: Dict[str, Any] = {}
         self._active_run_tasks: Dict[str, "asyncio.Task"] = {}
@@ -1841,6 +1853,24 @@ class APIServerAdapter(BasePlatformAdapter):
             status=401,
         )
 
+    def _check_remote_auth(
+        self, request: "web.Request"
+    ) -> Optional["web.Response"]:
+        """Accept the static API key or an unexpired remote attach token."""
+        auth_header = request.headers.get("Authorization", "")
+        if auth_header.startswith("Bearer "):
+            token = auth_header[7:].strip()
+            token_record = self._remote_attach_tokens.get(token)
+            if token_record is not None:
+                if (
+                    token_record.get("scope") == "remote"
+                    and token_record.get("expires_at", 0) > time.time()
+                ):
+                    return None
+                self._remote_attach_tokens.pop(token, None)
+
+        return self._check_auth(request)
+
     @staticmethod
     def _normalize_callback_platform(value: str) -> str:
         normalized = (value or "").strip().lower().replace("-", "_")
@@ -2072,6 +2102,8 @@ class APIServerAdapter(BasePlatformAdapter):
             ("GET", "/v1/capabilities", self._handle_capabilities),
             ("GET", "/v1/skills", self._handle_skills),
             ("GET", "/v1/toolsets", self._handle_toolsets),
+            ("POST", "/api/remote/pair/code", self._handle_remote_pair_code),
+            ("POST", "/api/remote/pair", self._handle_remote_pair),
             ("GET", "/api/remote/sessions", self._handle_remote_sessions),
             (
                 "GET",
@@ -3291,6 +3323,109 @@ class APIServerAdapter(BasePlatformAdapter):
     # /api/remote — remote-attach discovery
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _remote_expiry_iso(expires_at: float) -> str:
+        return datetime.fromtimestamp(expires_at, timezone.utc).isoformat()
+
+    def _prune_remote_credentials(self, now: float) -> None:
+        self._remote_pairing_codes = {
+            code: record
+            for code, record in self._remote_pairing_codes.items()
+            if record.get("expires_at", 0) > now
+        }
+        self._remote_attach_tokens = {
+            token: record
+            for token, record in self._remote_attach_tokens.items()
+            if record.get("expires_at", 0) > now
+        }
+
+    def _record_remote_pair_failure(self, now: float) -> None:
+        """Count a failed guess against each currently redeemable code."""
+        for record in self._remote_pairing_codes.values():
+            if record.get("used") or record.get("expires_at", 0) <= now:
+                continue
+            record["failed_attempts"] = record.get("failed_attempts", 0) + 1
+            if record["failed_attempts"] >= _REMOTE_PAIR_MAX_FAILED_ATTEMPTS:
+                record["used"] = True
+
+    @staticmethod
+    def _invalid_remote_pairing_code_response() -> "web.Response":
+        return web.json_response(
+            _openai_error(
+                "Invalid or expired pairing code", code="invalid_pairing_code"
+            ),
+            status=401,
+        )
+
+    async def _handle_remote_pair_code(
+        self, request: "web.Request"
+    ) -> "web.Response":
+        """POST /api/remote/pair/code — create a single-use ten-minute code."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        now = time.time()
+        self._prune_remote_credentials(now)
+        while True:
+            code = "".join(
+                secrets.choice(_REMOTE_PAIR_CODE_ALPHABET) for _ in range(6)
+            )
+            if code not in self._remote_pairing_codes:
+                break
+        expires_at = now + _REMOTE_PAIR_CODE_TTL_SECONDS
+        self._remote_pairing_codes[code] = {
+            "expires_at": expires_at,
+            "used": False,
+            "failed_attempts": 0,
+        }
+        return web.json_response(
+            {
+                "code": code,
+                "expires_at": self._remote_expiry_iso(expires_at),
+                "ttl_minutes": 10,
+            }
+        )
+
+    async def _handle_remote_pair(self, request: "web.Request") -> "web.Response":
+        """POST /api/remote/pair — redeem a code for a 24-hour attach token."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        body, err = await self._read_json_body(request)
+        if err is not None:
+            return err
+
+        raw_code = body.get("code")
+        code = raw_code.strip().upper() if isinstance(raw_code, str) else ""
+        now = time.time()
+        self._prune_remote_credentials(now)
+        record = self._remote_pairing_codes.get(code)
+        if (
+            len(code) != 6
+            or record is None
+            or record.get("used")
+            or record.get("expires_at", 0) <= now
+        ):
+            self._record_remote_pair_failure(now)
+            return self._invalid_remote_pairing_code_response()
+
+        record["used"] = True
+        token = secrets.token_urlsafe(32)
+        expires_at = now + _REMOTE_ATTACH_TOKEN_TTL_SECONDS
+        self._remote_attach_tokens[token] = {
+            "expires_at": expires_at,
+            "scope": "remote",
+        }
+        return web.json_response(
+            {
+                "token": token,
+                "expires_at": self._remote_expiry_iso(expires_at),
+                "ttl_hours": 24,
+            }
+        )
+
     def _remote_session_is_active(self, session_id: str) -> bool:
         """Return whether either live-agent registry owns this session."""
         agents = list(self._shutdown_interruptible_agents.values())
@@ -3348,7 +3483,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
     async def _handle_remote_sessions(self, request: "web.Request") -> "web.Response":
         """GET /api/remote/sessions — list sessions available for attachment."""
-        auth_err = self._check_auth(request)
+        auth_err = self._check_remote_auth(request)
         if auth_err:
             return auth_err
 
@@ -3404,7 +3539,7 @@ class APIServerAdapter(BasePlatformAdapter):
         self, request: "web.Request"
     ) -> "web.StreamResponse":
         """GET /api/remote/sessions/{session_id}/events — live SSE attachment."""
-        auth_err = self._check_auth(request)
+        auth_err = self._check_remote_auth(request)
         if auth_err:
             return auth_err
 
@@ -3466,7 +3601,7 @@ class APIServerAdapter(BasePlatformAdapter):
         self, request: "web.Request"
     ) -> "web.Response":
         """POST /api/remote/sessions/{session_id}/chat — reuse session chat."""
-        auth_err = self._check_auth(request)
+        auth_err = self._check_remote_auth(request)
         if auth_err:
             return auth_err
         _, err = await self._get_open_remote_session_or_404(
