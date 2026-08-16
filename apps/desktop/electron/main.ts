@@ -2543,23 +2543,57 @@ async function checkUpdates() {
     }
 
     // Direction matters: local commits (unpushed fixes) make HEAD diverge
-    // from origin/main — that is NOT "an update is available". Only report
-    // when HEAD is strictly behind. origin/main ancestor of HEAD → ahead.
+    // from origin/main — that is NOT "an update is available". Distinguish:
+    //   origin ancestor of HEAD (pure local-ahead)          → not behind
+    //   HEAD ancestor of origin (strictly behind)           → behind
+    //   neither (diverged: upstream gained commits while local
+    //   fixes are unpushed)                                 → behind (pullable)
     let ahead = false
+    let diverged = false
+    let fetchedTargetSha = targetSha
     try {
-      await runGit(['fetch', '--quiet', 'origin', branch], { cwd: updateRoot })
-      ahead = (await runGit(['merge-base', '--is-ancestor', `origin/${branch}`, 'HEAD'], { cwd: updateRoot })).code === 0
+      const fetchRes = await runGit(['fetch', '--quiet', 'origin', branch], { cwd: updateRoot })
+      if (fetchRes.code !== 0) {
+        // A failed fetch must not be reported as "update available".
+        return {
+          supported: true,
+          branch,
+          error: 'fetch-failed',
+          message: firstLine(fetchRes.stderr) || 'git fetch failed.',
+          hermesRoot: updateRoot,
+          fetchedAt: Date.now()
+        }
+      }
+      const originRef = `origin/${branch}`
+      const originAheadOfHead = (await runGit(['merge-base', '--is-ancestor', originRef, 'HEAD'], { cwd: updateRoot })).code === 0
+      const headAheadOfOrigin = (await runGit(['merge-base', '--is-ancestor', 'HEAD', originRef], { cwd: updateRoot })).code === 0
+      ahead = originAheadOfHead && !headAheadOfOrigin
+      diverged = !originAheadOfHead && !headAheadOfOrigin
+      // Compare against the freshly-fetched tip, not the pre-fetch ls-remote value.
+      const fresh = await runGit(['rev-parse', originRef], { cwd: updateRoot })
+      if (fresh.code === 0 && fresh.stdout.trim()) {
+        fetchedTargetSha = fresh.stdout.trim()
+      }
     } catch {
-      ahead = false
+      // spawn-level failure (e.g. git binary unavailable) — same third state.
+      return {
+        supported: true,
+        branch,
+        error: 'fetch-failed',
+        message: 'git fetch failed (repository or git binary error).',
+        hermesRoot: updateRoot,
+        fetchedAt: Date.now()
+      }
     }
 
     return {
       supported: true,
       branch,
       currentBranch,
-      behind: currentSha && currentSha === targetSha ? 0 : ahead ? 0 : 1,
+      behind: currentSha && currentSha === fetchedTargetSha ? 0 : ahead || diverged ? 1 : 0,
+      diverged,
       currentSha,
-      targetSha,
+      targetSha: fetchedTargetSha,
       commits: [],
       dirty: dirtyStr.length > 0,
       hermesRoot: updateRoot,
