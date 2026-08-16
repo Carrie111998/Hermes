@@ -660,6 +660,12 @@ def cmd_mcp_remove(args):
         return
     _success(f"Removed '{name}' from config")
 
+    if name in _get_mcp_servers():
+        _warning(
+            f"A portable Agent Plugin also provides '{name}'; it remains "
+            "active and was not removed."
+        )
+
     # Clean up OAuth tokens if they exist — route through MCPOAuthManager so
     # any provider instance cached in the current process (e.g. from an
     # earlier `hermes mcp test` in the same session) is evicted too.

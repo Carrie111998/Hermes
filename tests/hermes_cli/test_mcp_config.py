@@ -168,6 +168,47 @@ class TestMcpRemove:
         cmd_mcp_remove(_make_args(name="oauth-srv"))
         assert not token_file.exists()
 
+    def test_remove_native_warns_when_portable_of_same_name_remains(
+        self, tmp_path, capsys, monkeypatch
+    ):
+        """Native-wins precedence (#87253) means a name can resolve to both a
+        native and a portable entry. Removing the native one must not claim
+        the name is gone — the portable server is still live and resolvable
+        under that name afterward."""
+        import hermes_cli.plugins as plugins_mod
+
+        _seed_config(tmp_path, {
+            "shared": {"url": "https://native.example/mcp"},
+        })
+        monkeypatch.setattr("builtins.input", lambda _: "y")
+        monkeypatch.setattr(plugins_mod, "discover_plugins", lambda force=False: None)
+        monkeypatch.setattr(
+            plugins_mod,
+            "get_plugin_manager",
+            lambda: type(
+                "_Mgr",
+                (),
+                {
+                    "get_portable_mcp_servers": lambda self: {
+                        "shared": {"url": "https://portable.example/mcp"}
+                    }
+                },
+            )(),
+        )
+
+        from hermes_cli.mcp_config import cmd_mcp_remove
+
+        cmd_mcp_remove(_make_args(name="shared"))
+        out = capsys.readouterr().out
+
+        assert "Removed" in out
+        assert "portable Agent Plugin" in out
+
+        from hermes_cli.config import load_config
+
+        config = load_config()
+        assert "shared" not in config.get("mcp_servers", {})
+
 
 # ---------------------------------------------------------------------------
 # Tests: cmd_mcp_add
