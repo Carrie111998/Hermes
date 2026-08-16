@@ -1,6 +1,6 @@
 ---
 title: "ARCH-003: runtime-state audit and replay verification"
-status: DESIGN_REVIEW_REVISE_PENDING
+status: DESIGN_REVIEW_REVISE_V2_PENDING
 date: 2026-08-16
 type: architecture
 ticket: ARCH-003
@@ -11,7 +11,7 @@ target_repo: hermes-agent
 
 ## Status
 
-DESIGN_REVIEW_REVISE_PENDING
+DESIGN_REVIEW_REVISE_V2_PENDING
 
 This ticket is a design gate only. No source implementation, runtime-state
 migration, DGX database inspection, deployment, or automatic repair is
@@ -198,6 +198,31 @@ These corrections must be re-reviewed by the same Claude family before any
 implementation gate. AGY's PASS applies only to the pre-correction packet and
 does not waive the Claude re-review. No source, migration, test, DGX runtime,
 deployment, or repair action is authorized by this reconciliation.
+
+## Design review reconciliation v2
+
+The authenticated Claude re-review of reconciliation v1 returned `REVISE`
+with four bounded residual corrections:
+
+1. Add a non-secret digest-parameter identifier covering key generation and
+   digest algorithm/version. A mismatch or unrecognized identifier returns
+   `UNKNOWN`; define rotation behavior and require a sealed baseline for any
+   comparable post-rotation segment.
+2. Journal emission failure, constraint violation, or rejection aborts the
+   enclosing runtime-state transaction; errors cannot be swallowed. Add this
+   to atomicity tests.
+3. Define sealed baseline contents as lifecycle state, owner-version, and the
+   sealed sequence position. Require first post-baseline sequence continuity;
+   malformed, duplicated, non-contiguous, or unknown-digest baselines return
+   `UNKNOWN`.
+4. Define concurrent sequence allocation behavior: loser retries with a fresh
+   allocation inside the same transaction or aborts, with neither path
+   emitting without a committed mutation or leaving a replay-visible gap.
+
+These corrections remain design-only and must be re-reviewed by the same
+authenticated Claude family, then by AGY on the final corrected packet. No
+implementation, migration, testing, DGX mutation, deployment, or repair is
+authorized.
 
 ## Planned implementation evidence
 
