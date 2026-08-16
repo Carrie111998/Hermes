@@ -190,6 +190,12 @@ _PROMPT_TAG_OPENER_RE = re.compile(
     rf'<(?=/?[A-Za-z_:!?]|\s*/?\s*(?:{_PROMPT_ROLE_TAG_NAME_PATTERN})\b)',
     re.IGNORECASE,
 )
+_REPLAYED_MEMORY_CONTEXT_RE = re.compile(
+    r'(?P<open><\s*memory-context\s*>)'
+    r'(?P<body>[\s\S]*?)'
+    r'(?P<close></\s*memory-context\s*>)',
+    re.IGNORECASE,
+)
 
 
 def sanitize_context(text: str) -> str:
@@ -226,6 +232,27 @@ def _neutralize_prompt_structuring_tokens(text: str) -> str:
     # Encoding the opener is sufficient to keep provider text data-only while
     # preserving ordinary comparisons such as ``2 < 3``.
     return _PROMPT_TAG_OPENER_RE.sub('&lt;', text)
+
+
+def neutralize_replayed_memory_context(sidecar: str) -> str:
+    """Neutralize recalled-memory payloads in a persisted API sidecar.
+
+    Sidecars written before prompt-delimiter hardening may contain raw provider
+    text. Restrict the repair to durable ``memory-context`` blocks so clean
+    user bytes and plugin-owned context outside the fence remain cache-stable.
+    The transform is idempotent for sidecars written by current code.
+    """
+    if not sidecar or "memory-context" not in sidecar.lower():
+        return sidecar
+
+    def _neutralize_block(match: re.Match[str]) -> str:
+        return (
+            match.group("open")
+            + _neutralize_prompt_structuring_tokens(match.group("body"))
+            + match.group("close")
+        )
+
+    return _REPLAYED_MEMORY_CONTEXT_RE.sub(_neutralize_block, sidecar)
 
 
 class StreamingContextScrubber:
