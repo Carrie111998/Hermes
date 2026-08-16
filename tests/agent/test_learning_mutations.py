@@ -35,6 +35,16 @@ def _exclude_wiki_process(home: str, wiki: str, node_id: str, ready, start, resu
     results.put(learning_mutations.delete_node(node_id))
 
 
+def _hold_wiki_exclusion_lock(index: str, acquired, release) -> None:
+    from pathlib import Path
+
+    from agent import learning_mutations
+
+    with learning_mutations._wiki_exclusion_lock(Path(index)):
+        acquired.set()
+        release.wait(10)
+
+
 @pytest.fixture
 def home(monkeypatch):
     base = get_hermes_home()
@@ -89,6 +99,26 @@ def test_wiki_detail_and_edit_resolve_runtime_page(home):
     assert (home / "wiki" / "project.md").read_text(encoding="utf-8") == "# Updated\n"
 
 
+def test_wiki_edit_reports_replace_failure_and_cleans_unique_temp(home, monkeypatch):
+    page = home / "wiki" / "project.md"
+    sources = []
+
+    def fail_replace(source, destination):
+        sources.append((source, destination))
+        raise OSError("replace failed")
+
+    monkeypatch.setattr(os, "replace", fail_replace)
+    result = lm.edit_node("wiki:project.md", "# Updated\n")
+
+    assert not result["ok"]
+    assert result["message"] == "replace failed"
+    assert page.read_text(encoding="utf-8").endswith("Original.")
+    assert len(sources) == 1
+    assert sources[0][0].name != "project.md.tmp"
+    assert sources[0][1] == page
+    assert not list(page.parent.glob("*.tmp"))
+
+
 def test_delete_wiki_hides_node_without_deleting_file(home):
     page = home / "wiki" / "project.md"
     assert lm.delete_node("wiki:project.md")["ok"]
@@ -122,25 +152,61 @@ def test_concurrent_wiki_exclusions_preserve_both_pages(home):
     start = ctx.Event()
     results = ctx.Queue()
     processes = []
-    for node_id in ("wiki:project.md", "wiki:second.md"):
-        ready = ctx.Event()
-        process = ctx.Process(
-            target=_exclude_wiki_process,
-            args=(str(home), str(wiki), node_id, ready, start, results),
-        )
-        process.start()
-        assert ready.wait(5)
-        processes.append(process)
+    try:
+        for node_id in ("wiki:project.md", "wiki:second.md"):
+            ready = ctx.Event()
+            process = ctx.Process(
+                target=_exclude_wiki_process,
+                args=(str(home), str(wiki), node_id, ready, start, results),
+            )
+            process.start()
+            processes.append(process)
+            assert ready.wait(5)
 
-    start.set()
-    for process in processes:
-        process.join(10)
-        assert process.exitcode == 0
-    assert [results.get(timeout=1)["ok"] for _ in processes] == [True, True]
+        start.set()
+        for process in processes:
+            process.join(10)
+            assert process.exitcode == 0
+        assert [results.get(timeout=1)["ok"] for _ in processes] == [True, True]
+    finally:
+        start.set()
+        for process in processes:
+            if process.is_alive():
+                process.terminate()
+            process.join(5)
+        results.close()
+        results.join_thread()
 
     from agent.learning_graph import _wiki_cards
 
     assert _wiki_cards() == []
+    assert not list((home / "journey").glob("*.tmp"))
+
+
+def test_wiki_exclusion_lock_timeout_fails_without_writing(home, monkeypatch):
+    index = home / "journey" / "wiki-excluded.json"
+    ctx = multiprocessing.get_context("spawn")
+    acquired = ctx.Event()
+    release = ctx.Event()
+    holder = ctx.Process(target=_hold_wiki_exclusion_lock, args=(str(index), acquired, release))
+    holder.start()
+    try:
+        assert acquired.wait(5)
+        monkeypatch.setattr(lm, "_WIKI_EXCLUSION_LOCK_TIMEOUT_SECONDS", 0.1)
+
+        result = lm.delete_node("wiki:project.md")
+
+        assert not result["ok"]
+        assert result["message"] == "wiki exclusion index is busy — try again"
+        assert not index.exists()
+        assert not list(index.parent.glob("*.tmp"))
+    finally:
+        release.set()
+        holder.join(5)
+        if holder.is_alive():
+            holder.terminate()
+            holder.join(5)
+    assert holder.exitcode == 0
 
 
 def test_wiki_node_rejects_path_traversal(home):

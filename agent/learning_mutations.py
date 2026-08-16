@@ -292,7 +292,7 @@ def edit_node(node_id: str, content: str) -> dict[str, Any]:
         if kind == "wiki":
             return _edit_wiki(node_id, content)
         return _edit_skill(node_id, content)
-    except (ValueError, IndexError) as exc:
+    except (OSError, ValueError, IndexError) as exc:
         return {"ok": False, "message": str(exc)}
 
 
@@ -327,9 +327,14 @@ def _edit_wiki(node_id: str, content: str) -> dict[str, Any]:
         return {"ok": False, "message": f"wiki page '{relative}' not found"}
     if not content.strip():
         return {"ok": False, "message": "empty wiki page — edit the source file instead"}
-    temp = path.with_suffix(path.suffix + ".tmp")
-    temp.write_text(content, encoding="utf-8")
-    temp.replace(path)
+    fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    temp = Path(temp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(content)
+        os.replace(temp, path)
+    finally:
+        temp.unlink(missing_ok=True)
     return {"ok": True, "message": f"updated wiki page '{relative}'"}
 
 
