@@ -469,27 +469,30 @@ SILENT_MARKER = "[SILENT]"
 
 def _validate_response_contract(job: dict, response: str) -> Optional[str]:
     contract = job.get("response_contract")
-    if not isinstance(contract, dict) or contract.get("on_failure", "fail") != "fail":
+    if contract is None:
         return None
+    if not isinstance(contract, dict) or contract.get("on_failure", "fail") != "fail":
+        return "stored response contract is invalid"
 
     required_patterns = contract.get("required_patterns", [])
     forbidden_patterns = contract.get("forbidden_patterns", [])
     if not isinstance(required_patterns, list) or not isinstance(forbidden_patterns, list):
         return "stored response contract is invalid"
+    if not required_patterns and not forbidden_patterns:
+        return "stored response contract is invalid"
+    if any(
+        not isinstance(pattern, str) or not pattern.strip()
+        for pattern in [*required_patterns, *forbidden_patterns]
+    ):
+        return "stored response contract is invalid"
 
-    missing = [
-        pattern for pattern in required_patterns
-        if isinstance(pattern, str) and pattern not in response
-    ]
-    matched = [
-        pattern for pattern in forbidden_patterns
-        if isinstance(pattern, str) and pattern in response
-    ]
+    missing = [pattern for pattern in required_patterns if pattern not in response]
+    matched = [pattern for pattern in forbidden_patterns if pattern in response]
     details = []
     if missing:
-        details.append("missing required pattern(s): " + ", ".join(repr(p) for p in missing))
+        details.append("required response content is missing")
     if matched:
-        details.append("matched forbidden pattern(s): " + ", ".join(repr(p) for p in matched))
+        details.append("forbidden response content is present")
     return "; ".join(details) or None
 
 # Canonical silence tokens recognized in cron output.  Cron's contract is
@@ -5970,13 +5973,6 @@ def _run_one_job_body(
         response_contract_error = None
         side_effect_ownership_lost = False
         try:
-            with _side_effect_fence() as owns_output:
-                if not owns_output:
-                    raise _FireClaimLostDuringSideEffect
-                output_file = save_job_output(job["id"], output)
-            if verbose:
-                logger.info("Output saved to: %s", output_file)
-
             # If the gateway shutdown killed this job's tool subprocess
             # mid-flight (#60432), the agent may still have produced a
             # plausible-looking final_response from the truncated output --
@@ -5997,9 +5993,18 @@ def _run_one_job_body(
                     success = False
                     error = f"Response contract failed: {response_contract_error}"
 
+            if not response_contract_error:
+                with _side_effect_fence() as owns_output:
+                    if not owns_output:
+                        raise _FireClaimLostDuringSideEffect
+                    output_file = save_job_output(job["id"], output)
+                if verbose:
+                    logger.info("Output saved to: %s", output_file)
+
             # Deliver the final response to the origin/target chat.
-            # If the agent responded with [SILENT], skip delivery (but
-            # output is already saved above).  Failed jobs always deliver.
+            # If the agent responded with [SILENT], skip delivery. Failed jobs
+            # normally deliver a failure alert, except contract failures: their
+            # output is neither saved nor delivered.
             #
             # Exception: a run blocked by pre-dispatch config validation
             # (T1-26) alerts exactly ONCE — the silent marker means the

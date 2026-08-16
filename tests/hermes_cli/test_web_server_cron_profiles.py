@@ -167,6 +167,32 @@ def test_dashboard_create_reports_saved_but_unregistered(
     assert "private callback URL and token" not in str(exc_info.value.detail)
 
 
+def test_dashboard_create_forwards_response_contract(isolated_profiles, monkeypatch):
+    from hermes_cli import web_server
+
+    captured = {}
+    monkeypatch.setattr(
+        web_server,
+        "_call_cron_for_profile",
+        lambda profile, action, **kwargs: captured.update(
+            profile=profile, action=action, **kwargs
+        )
+        or {"id": "contract-job"},
+    )
+
+    job = web_server._create_cron_job_sync(
+        web_server.CronJobCreate(
+            prompt="managed by named profile",
+            schedule="every 1h",
+            response_contract={"required_patterns": ["preview"]},
+        ),
+        profile="worker_alpha",
+    )
+
+    assert job == {"id": "contract-job"}
+    assert captured["response_contract"] == {"required_patterns": ["preview"]}
+
+
 def test_notify_cron_provider_scopes_store_and_runtime_home_together(
     isolated_profiles,
     monkeypatch,

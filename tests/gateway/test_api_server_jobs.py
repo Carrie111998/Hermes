@@ -122,6 +122,7 @@ class TestCreateJob:
                     "name": "test-job",
                     "schedule": "*/5 * * * *",
                     "prompt": "do something",
+                    "response_contract": {"required_patterns": ["preview"]},
                 }, headers={
                     "X-Forwarded-For": "203.0.113.11",
                     "User-Agent": "cron-client",
@@ -138,6 +139,7 @@ class TestCreateJob:
                 assert call_kwargs["origin"]["chat_id"] == "api"
                 assert call_kwargs["origin"]["forwarded_for"] == "203.0.113.11"
                 assert call_kwargs["origin"]["user_agent"] == "cron-client"
+                assert call_kwargs["response_contract"] == {"required_patterns": ["preview"]}
 
 
     @pytest.mark.asyncio
@@ -230,6 +232,7 @@ class TestUpdateJob:
                     f"/api/jobs/{VALID_JOB_ID}",
                     json={
                         "name": "new-name",
+                        "response_contract": {"forbidden_patterns": ["unsafe"]},
                         "evil_field": "malicious",
                         "__proto__": "hack",
                     },
@@ -240,6 +243,7 @@ class TestUpdateJob:
                 assert "name" in sanitized
                 assert "evil_field" not in sanitized
                 assert "__proto__" not in sanitized
+                assert sanitized["response_contract"] == {"forbidden_patterns": ["unsafe"]}
 
 
 # ---------------------------------------------------------------------------
@@ -497,4 +501,3 @@ class TestCronPromptScanParity:
                 data = await resp.json()
                 assert "Blocked" in data["error"] or "threat" in data["error"].lower()
                 mock_create.assert_not_called()
-

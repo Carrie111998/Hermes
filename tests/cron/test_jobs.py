@@ -277,6 +277,17 @@ class TestUpdateJob:
         fetched = get_job(job["id"])
         assert fetched["name"] == "New Name"
 
+    def test_empty_response_contract_clears_existing_contract(self, tmp_cron_dir):
+        job = create_job(
+            prompt="Check server status",
+            schedule="every 1h",
+            response_contract={"required_patterns": ["done"]},
+        )
+
+        updated = update_job(job["id"], {"response_contract": {}})
+
+        assert updated["response_contract"] is None
+
 
 class TestPauseResumeJob:
     def test_pause_sets_state(self, tmp_cron_dir):
@@ -494,8 +505,8 @@ class TestMarkJobRun:
         mark_job_run(
             job["id"],
             success=False,
-            error="Response contract failed: missing required pattern(s)",
-            response_contract_error="missing required pattern(s): 'prepare_actual_sleep_calendar_update'",
+            error="Response contract failed: required response content is missing",
+            response_contract_error="required response content is missing",
             status="response_contract_failed",
         )
 
@@ -507,7 +518,7 @@ class TestMarkJobRun:
         }
         assert updated["last_status"] == "response_contract_failed"
         assert updated["last_response_contract_error"] == (
-            "missing required pattern(s): 'prepare_actual_sleep_calendar_update'"
+            "required response content is missing"
         )
 
 

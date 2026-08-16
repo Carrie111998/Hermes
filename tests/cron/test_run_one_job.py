@@ -78,7 +78,25 @@ def test_run_one_job_success_sequence(monkeypatch):
     assert calls[-1] == ("mark", "j2", True)
 
 
-def test_run_one_job_response_contract_failure_suppresses_delivery(monkeypatch):
+@pytest.mark.parametrize(
+    ("response_contract", "contract_error"),
+    [
+        (
+            {
+                "required_patterns": ["prepare_actual_sleep_calendar_update"],
+                "on_failure": "fail",
+            },
+            "required response content is missing",
+        ),
+        (
+            {"required_patterns": [123], "on_failure": "fail"},
+            "stored response contract is invalid",
+        ),
+    ],
+)
+def test_run_one_job_response_contract_failure_suppresses_delivery(
+    monkeypatch, response_contract, contract_error
+):
     delivered = []
     marked = []
     finished = []
@@ -91,7 +109,12 @@ def test_run_one_job_response_contract_failure_suppresses_delivery(monkeypatch):
         "run_job",
         lambda *_a, **_kw: (True, "raw output", "Calendar update prepared", None),
     )
-    monkeypatch.setattr(s, "save_job_output", lambda jid, out: f"/tmp/{jid}.txt")
+    saved = []
+    monkeypatch.setattr(
+        s,
+        "save_job_output",
+        lambda jid, out: saved.append((jid, out)) or f"/tmp/{jid}.txt",
+    )
     monkeypatch.setattr(
         s,
         "_deliver_result",
@@ -113,28 +136,22 @@ def test_run_one_job_response_contract_failure_suppresses_delivery(monkeypatch):
             "id": "contract-job",
             "name": "weekly plan",
             "deliver": "telegram",
-            "response_contract": {
-                "required_patterns": ["prepare_actual_sleep_calendar_update"],
-                "on_failure": "fail",
-            },
+            "response_contract": response_contract,
         }
     ) is True
 
     assert delivered == []
+    assert saved == []
     assert marked == [
         (
             (
                 "contract-job",
                 False,
-                "Response contract failed: missing required pattern(s): "
-                "'prepare_actual_sleep_calendar_update'",
+                f"Response contract failed: {contract_error}",
             ),
             {
                 "delivery_error": None,
-                "response_contract_error": (
-                    "missing required pattern(s): "
-                    "'prepare_actual_sleep_calendar_update'"
-                ),
+                "response_contract_error": contract_error,
                 "status": "response_contract_failed",
             },
         )
@@ -144,8 +161,7 @@ def test_run_one_job_response_contract_failure_suppresses_delivery(monkeypatch):
             ("exec-contract",),
             {
                 "success": False,
-                "error": "Response contract failed: missing required pattern(s): "
-                "'prepare_actual_sleep_calendar_update'",
+                "error": f"Response contract failed: {contract_error}",
                 "delivery_outcome": "suppressed",
             },
         )
@@ -366,4 +382,3 @@ def test_run_one_job_installs_secret_scope_under_multiplex(monkeypatch, tmp_path
     assert scope_during_run["base_url"] == "https://openrouter.ai/api/v1"
     # And it was torn down after run_one_job returned (no leak).
     assert ss.current_secret_scope() is None
-

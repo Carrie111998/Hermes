@@ -261,8 +261,8 @@ class TestUnifiedCronjobTool:
 
         assert created["success"] is True
         assert created["job"]["response_contract"] == {
-            "required_patterns": ["prepare_actual_sleep_calendar_update"],
-            "forbidden_patterns": ["actual_sleep_context"],
+            "required_pattern_count": 1,
+            "forbidden_pattern_count": 1,
             "on_failure": "fail",
         }
 

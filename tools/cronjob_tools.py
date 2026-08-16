@@ -654,7 +654,12 @@ def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
     if job.get("monitor_state"):
         result["monitor_state"] = job["monitor_state"]
     if job.get("response_contract"):
-        result["response_contract"] = job["response_contract"]
+        contract = job["response_contract"]
+        result["response_contract"] = {
+            "required_pattern_count": len(contract.get("required_patterns", [])),
+            "forbidden_pattern_count": len(contract.get("forbidden_patterns", [])),
+            "on_failure": contract.get("on_failure"),
+        }
     if job.get("no_agent"):
         result["no_agent"] = True
     if job.get("enabled_toolsets"):

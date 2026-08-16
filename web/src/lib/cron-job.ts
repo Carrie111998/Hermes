@@ -14,6 +14,7 @@ export interface CronJobFormState {
   context_from: string;
   enabled_toolsets: string[];
   workdir: string;
+  response_contract: string;
 }
 
 /** Split a comma/newline list (or array) into trimmed, non-empty items. */
@@ -44,6 +45,20 @@ function asString(value: unknown): string {
   return typeof value === "string" ? value : "";
 }
 
+function responseContractToText(value: unknown): string {
+  return value && typeof value === "object" ? JSON.stringify(value, null, 2) : "";
+}
+
+function parseResponseContract(value: string): CronJobMutation["response_contract"] {
+  const text = value.trim();
+  if (!text) return null;
+  const parsed: unknown = JSON.parse(text);
+  if (!parsed || Array.isArray(parsed) || typeof parsed !== "object") {
+    throw new Error("Response contract must be a JSON object");
+  }
+  return parsed as CronJobMutation["response_contract"];
+}
+
 /** Build the create/update payload. Optional fields collapse to null so an
  * update explicitly clears them rather than leaving stale values. */
 export function buildCronJobPayload(form: CronJobFormState): CronJobMutation {
@@ -63,6 +78,7 @@ export function buildCronJobPayload(form: CronJobFormState): CronJobMutation {
     context_from: contextFrom.length > 0 ? contextFrom : null,
     enabled_toolsets: enabledToolsets.length > 0 ? enabledToolsets : null,
     workdir: optionalText(form.workdir),
+    response_contract: parseResponseContract(form.response_contract),
   };
 }
 
@@ -91,5 +107,6 @@ export function cronJobFormFromJob(job: CronJob): CronJobFormState {
     context_from: listToText(job.context_from),
     enabled_toolsets: splitCronList(job.enabled_toolsets),
     workdir: asString(job.workdir),
+    response_contract: responseContractToText(job.response_contract),
   };
 }

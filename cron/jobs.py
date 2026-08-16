@@ -1564,7 +1564,7 @@ def _normalize_job_optional_text(value: Any, *, strip_trailing_slash: bool = Fal
 
 
 def _normalize_response_contract(value: Any) -> Optional[Dict[str, Any]]:
-    if value is None:
+    if value is None or value == {}:
         return None
     if not isinstance(value, dict):
         raise ValueError("response_contract must be an object")
@@ -1580,11 +1580,17 @@ def _normalize_response_contract(value: Any) -> Optional[Dict[str, Any]]:
         raw_patterns = value.get(field, [])
         if not isinstance(raw_patterns, list):
             raise ValueError(f"response_contract.{field} must be a list of strings")
+        if len(raw_patterns) > 32:
+            raise ValueError(f"response_contract.{field} cannot contain more than 32 patterns")
         normalized = []
         for pattern in raw_patterns:
             if not isinstance(pattern, str) or not pattern.strip():
                 raise ValueError(
                     f"response_contract.{field} must contain non-empty strings"
+                )
+            if len(pattern) > 512:
+                raise ValueError(
+                    f"response_contract.{field} patterns cannot exceed 512 characters"
                 )
             normalized.append(pattern.strip())
         return normalized
