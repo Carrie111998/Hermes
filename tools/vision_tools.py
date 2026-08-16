@@ -35,6 +35,7 @@ import json
 from concurrent.futures import ThreadPoolExecutor
 import logging
 import os
+import re
 import uuid
 from pathlib import Path
 from typing import Any, Awaitable, Dict, Optional
@@ -793,6 +794,72 @@ def _build_scale_note(
     return " ".join(parts)
 
 
+# How far into the response a refusal has to appear to count as one. A model
+# that declines leads with the disclaimer; a genuine analysis that mentions
+# not being able to make something out does so partway through, after it has
+# already described what it *can* see.
+_REFUSAL_SCAN_CHARS = 400
+
+# First-person inability → an analysis verb → an image noun, with bounded,
+# sentence-local gaps so the three parts have to belong to one clause.
+_VISION_REFUSAL_RE = re.compile(
+    r"(?:i(?:'m| am)? (?:unable|not able) to"
+    r"|i (?:can'?t|cannot|can not|don'?t|do not)"
+    r"|(?:sorry|unfortunately)[,.]? (?:but )?i (?:can'?t|cannot|am unable to))"
+    r"[^.]{0,60}?"
+    r"(?:describe|analyz|analys|interpret|process|view|see|make out"
+    r"|provide (?:a )?(?:description|analysis)"
+    r"|have the ability to (?:see|view|analyz|analys))"
+    r"[^.]{0,80}?"
+    r"(?:image|picture|photo|crop|visual content|the content)",
+    re.IGNORECASE,
+)
+
+# "I can't see any banding in this crop" is a real observation about the
+# pixels, not a refusal to look at them. The giveaway is that the image noun
+# is a *location* ("in the image") rather than the thing being declined
+# ("of the image"), so drop matches whose span reads that way.
+_REFUSAL_FALSE_POSITIVE_RE = re.compile(
+    r"\b(?:in|within|on|across|near|inside)\s+(?:the|this|that)\s+"
+    r"(?:image|picture|photo|crop)",
+    re.IGNORECASE,
+)
+
+# Blunter forms that never carry an analysis: nothing arrived to look at.
+_NO_IMAGE_RE = re.compile(
+    r"(?:no image (?:was )?(?:provided|attached|received|included)"
+    r"|there (?:is|was) no image"
+    r"|i (?:don'?t|do not) see (?:an|any) image)",
+    re.IGNORECASE,
+)
+
+
+def _is_vision_refusal(analysis: str) -> bool:
+    """Whether the auxiliary vision model declined instead of analyzing.
+
+    A refusal is prose, not an API error, so it arrives on the success path
+    and reads as a normal result to everything downstream. Gates that require
+    an actual visual read (render-defect checks, alt-text grounding) cannot
+    tell it apart from a real description, so it has to be caught here and
+    turned into an explicit failure.
+
+    Deliberately conservative — a false positive blocks a legitimate read, so
+    the match requires a first-person inability, an analysis verb, and an
+    image noun inside one clause near the start of the response.
+    """
+    if not isinstance(analysis, str):
+        return False
+    head = analysis.strip()[:_REFUSAL_SCAN_CHARS]
+    if not head:
+        return False
+    if _NO_IMAGE_RE.search(head):
+        return True
+    match = _VISION_REFUSAL_RE.search(head)
+    if match is None:
+        return False
+    return _REFUSAL_FALSE_POSITIVE_RE.search(match.group(0)) is None
+
+
 def _resize_image_for_vision(image_path: Path, mime_type: Optional[str] = None,
                               max_base64_bytes: int = _RESIZE_TARGET_BYTES,
                               max_dimension: Optional[int] = None,
@@ -1541,21 +1608,59 @@ async def vision_analyze_tool(
             analysis = extract_content_or_reasoning(response)
 
         analysis_length = len(analysis)
-        
+
         logger.info("Image analysis completed (%s characters)", analysis_length)
-        
-        # Prepare successful response
-        analysis = analysis or "There was a problem with the request and the image could not be analyzed."
+
         scale_note = _build_scale_note(
             _scale_info or None, _crop_offset or None,
         )
+
+        # Fail closed on a non-analysis response. An empty completion or a
+        # prose refusal both come back on the success path, and reporting
+        # either as success=True hands callers a green result for an image
+        # nothing ever looked at.
+        if not analysis:
+            refusal_reason = "the vision model returned an empty response"
+        elif _is_vision_refusal(analysis):
+            refusal_reason = "the vision model declined to analyze the image"
+        else:
+            refusal_reason = ""
+
+        if refusal_reason:
+            logger.warning(
+                "Vision analysis failed closed: %s (model=%s)",
+                refusal_reason, model or "auto",
+            )
+            error_msg = (
+                f"Image was not analyzed: {refusal_reason}. This is a tooling "
+                f"failure, not a description of the image — do not treat it as "
+                f"a visual read."
+            )
+            result = {
+                "success": False,
+                "error": error_msg,
+                "refusal": True,
+                "analysis": (
+                    f"[{scale_note}] {analysis}" if scale_note and analysis
+                    else (analysis or error_msg)
+                ),
+            }
+            if scale_note:
+                result["scale_note"] = scale_note
+            debug_call_data["error"] = error_msg
+            debug_call_data["analysis_length"] = analysis_length
+            _debug.log_call("vision_analyze_tool", debug_call_data)
+            _debug.save()
+            return json.dumps(result, indent=2, ensure_ascii=False)
+
+        # Prepare successful response
         result = {
             "success": True,
             "analysis": f"[{scale_note}] {analysis}" if scale_note else analysis,
         }
         if scale_note:
             result["scale_note"] = scale_note
-        
+
         debug_call_data["success"] = True
         debug_call_data["analysis_length"] = analysis_length
         
