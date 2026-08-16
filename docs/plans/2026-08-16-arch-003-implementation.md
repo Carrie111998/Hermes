@@ -1,6 +1,6 @@
 ---
 title: "ARCH-003 implementation plan: runtime-state audit and replay verification"
-status: IMPLEMENTATION_PLAN_REVISE_V30_PENDING
+status: IMPLEMENTATION_PLAN_REVISE_V31_PENDING
 date: 2026-08-16
 type: implementation-plan
 ticket: ARCH-003
@@ -206,8 +206,10 @@ when that epoch is strictly newer than the durable epoch. If lock acquisition or
 startup returns `LOCK_TIMEOUT` before opening or committing SQLite, enters
 process-local `STARTUP_LOCKED` read-only state, writes no durable transition,
 and serves no ordinary or event-only writes until a later successful startup
-transition in that process; it must not serve mutations under an uncleared
-transition.
+transition attempt in that process. While `STARTUP_LOCKED`, every ordinary or
+event-only write entry returns mutation-side `WRITE_ABORT` without opening or
+committing SQLite; Gate 4 asserts that reason code and the absence of a durable
+transition or mode. It must not serve mutations under an uncleared transition.
 A same-epoch restart never advances `current_generation`. A startup observing a durable epoch newer than the running writer acquires the
 exclusive side of the named maintenance RW lock and uses one `BEGIN IMMEDIATE`
 transaction to set the durable global `DOWNGRADE_UNSAFE` mode for the
@@ -236,10 +238,13 @@ metadata inside the same `BEGIN DEFERRED` snapshot as the event stream and
 materialized row.
 
 Add a materialized-row journal-writer generation marker and a monotonic
-`materialized_write_counter`. The counter increments only when a committed
-mutation changes a member of the replay tuple, independently of whether
-journal emission succeeds. Non-replay-tuple-only updates do not increment it
-and remain outside the verifier's `CONSISTENT` claim. A database-level
+`materialized_write_counter`. The counter increments only for a committed mutation that changes a member of
+the replay tuple. In the new writer transaction, the trigger increment/read-back
+and journal emission share atomicity: if that transaction rolls back, neither is
+committed. The database-level trigger still records a replay-tuple change made
+by a prior or unaware writer that emits no journal event, so that rollback or
+legacy path remains observable. Non-replay-tuple-only updates do not increment
+it and remain outside the verifier's `CONSISTENT` claim. A database-level
 trigger restricted to the replay-tuple columns, with a value-change predicate,
 or an equivalent write guard must preserve this increment for any prior writer
 that can mutate those columns. The increment mechanism must be the database-level trigger/write-guard
@@ -455,11 +460,15 @@ Implement a bounded verifier that:
   (`HISTORY_MALFORMED`), digest-parameter identity, schemas, the shared and
   verifier-side closed reason-code subsets, and terminal state;
 - uses a code-level `REPLAY_EVENT_LIMIT = 10000` counted from the effective
-  replay start point. Before status/reason selection, apply this total verifier
-  diagnostic precedence from highest to lowest: `SNAPSHOT_FAILURE`,
-  `UNSUPPORTED_VERSION`, `POST_TERMINAL_EVENT`, `HISTORY_MALFORMED`,
-  `EMPTY_HISTORY`, `MATERIALIZED_STATE_ASYMMETRY`, `GENERATION_MISMATCH`,
-  `KEY_UNAVAILABLE`, `KEY_CHECK_MISMATCH`, `DIGEST_PARAMETER_MISMATCH`,
+  replay start point. Before replay, key availability, key-check,
+  algorithm/truncation parameters, and digest-parameter identity are
+  validated; any applicable `KEY_UNAVAILABLE`, `KEY_CHECK_MISMATCH`, or
+  `DIGEST_PARAMETER_MISMATCH` is returned before replay and before the
+  structural precedence below. After those replay preconditions pass, apply
+  this structural verifier diagnostic precedence from highest to lowest:
+  `SNAPSHOT_FAILURE`, `UNSUPPORTED_VERSION`, `POST_TERMINAL_EVENT`,
+  `HISTORY_MALFORMED`, `EMPTY_HISTORY`,
+  `MATERIALIZED_STATE_ASYMMETRY`, `GENERATION_MISMATCH`,
   `LEGACY_ORIGIN_MISSING`, `SEQUENCE_INVALID`, `BASELINE_INVALID`,
   `WRITE_COUNTER_GAP`, `REPLAY_LIMIT_EXCEEDED`, `DRIFT_DETECTED`,
   `OK`. The first applicable
@@ -529,9 +538,10 @@ Add deterministic tests for:
   startup blocking all profiles/entities and both event-only writers with
   mutation-side `WRITE_ABORT`, newer-epoch/equal-epoch roll-forward clearing
   that mode, startup lock/busy timeout returning `LOCK_TIMEOUT`, asserting no durable
-  mode/transition was written, remaining read-only without mutation retry, and
-  clearing process-local `STARTUP_LOCKED` only after a later explicit startup
-  transition attempt succeeds, baseline refusal across a counter gap returning
+  mode/transition was written, every ordinary or event-only write while
+  `STARTUP_LOCKED` returning `WRITE_ABORT` without mutation retry, remaining
+  read-only, and clearing process-local `STARTUP_LOCKED` only after a later
+  explicit startup transition attempt succeeds, baseline refusal across a counter gap returning
   `WRITE_ABORT`, separately authorized same-epoch re-originating genesis
   restoring mutation ability, atomic concurrent startup advancing exactly once,
   delivery recording of the blocked interval, and concurrent generation
@@ -1066,6 +1076,24 @@ DGX changes, deployment, repair, or event-sourcing. The corrected plan must
 return to the same authenticated Claude reviewer family and then to AGY on the
 identical packet.
 
+## Implementation-plan review reconciliation v30
+
+The v30 authenticated Claude Opus review returned `REVISE` with three bounded
+plan-text corrections. The corrections are incorporated above:
+
+1. `STARTUP_LOCKED` ordinary and event-only write entry has an explicit
+   mutation-side `WRITE_ABORT` contract, with Gate 4 coverage.
+2. The new-writer counter trigger/read-back and journal emission share
+   transaction atomicity, while prior/unaware writers remain observable when
+   they emit no event.
+3. Gate 3 validates key/digest preconditions before replay; only then does the
+   structural diagnostic precedence apply.
+
+These remain plan-only corrections and do not authorize source edits, tests,
+DGX changes, deployment, repair, or event-sourcing. The corrected plan must
+return to the same authenticated Claude reviewer family and then to AGY on the
+identical packet.
+
 ## Acceptance criteria
 
 ARCH-003 implementation is ready for its delivery gates only when:
@@ -1095,7 +1123,7 @@ ARCH-003 implementation is ready for its delivery gates only when:
   retention job; entities beyond the replay limit remain UNKNOWN in this ticket,
   and the 100,000-event/100 MiB per-profile threshold is a documented follow-up
   operational review, not an in-ticket operator gate;
-- reconciliation v1 and v5-v29 items are incorporated into the normative
+- reconciliation v1 and v5-v30 items are incorporated into the normative
   Gates 0-4 text (with v2-v4 explicitly folded into the v1/v4 text), and this
   merged plan revision receives the same-family re-review;
 - all focused and relevant tests pass;
@@ -1163,6 +1191,8 @@ ARCH-003 implementation is ready for its delivery gates only when:
   test deduplication.
 - v29: durable DOWNGRADE_UNSAFE mode-set lock/timeout,
   STARTUP_LOCKED exit trigger, and complete coverage.
+- v30: STARTUP_LOCKED write abort contract, counter/journal transaction
+  atomicity, and key/digest precondition ordering.
 
 
 ## Non-goals
