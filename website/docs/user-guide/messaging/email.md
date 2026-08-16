@@ -148,7 +148,9 @@ platforms:
     sent_folder: "Sent"   # set to "" to disable IMAP archival entirely
 ```
 
-The folder is created automatically if it does not exist. Archival is best-effort: if the `APPEND` fails or returns a non-`OK` status, a warning is logged but the SMTP send is never rolled back.
+The folder is created automatically if it does not exist. `CREATE` is attempted once per process, and a rejection (for instance an account that may not create folders) is warned about once, so you can simply create the folder by hand instead.
+
+Archival is best-effort: if the `APPEND` fails or returns a non-`OK` status, a warning is logged but the SMTP send is never rolled back. A *failed* send is never archived, though: the copy is only written once SMTP reports the message accepted.
 
 ---
 

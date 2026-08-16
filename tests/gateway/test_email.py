@@ -1142,6 +1142,11 @@ class TestSentFolderAppend(unittest.TestCase):
             adapter = EmailAdapter(PlatformConfig(enabled=True, extra=extra or {}))
         return adapter
 
+    def setUp(self):
+        """Drop the process-wide CREATE bookkeeping so tests stay independent."""
+        from plugins.platforms.email import adapter as adapter_mod
+        adapter_mod._SENT_FOLDER_CREATE_ATTEMPTED.clear()
+
     @staticmethod
     def _ok_imap():
         """A mock IMAP connection whose APPEND reports success."""
@@ -1273,6 +1278,95 @@ class TestSentFolderAppend(unittest.TestCase):
         payload_arg = mock_imap.append.call_args[0][3]
         self.assertIsInstance(payload_arg, bytes)
 
+    # ------------------------------------------------------------------
+    # CREATE is issued once, not per outbound mail
+    # ------------------------------------------------------------------
+
+    def test_sent_folder_created_once_across_sends(self):
+        """CREATE runs on the first send only; later sends just APPEND."""
+        import asyncio
+        adapter = self._make_adapter({"sent_folder": "Sent"})
+
+        mock_imap = self._ok_imap()
+
+        with patch("smtplib.SMTP") as mock_smtp, \
+             patch("imaplib.IMAP4_SSL", return_value=mock_imap):
+            mock_smtp.return_value = MagicMock()
+            for _ in range(3):
+                asyncio.run(adapter.send("user@test.com", "Hello!"))
+
+        self.assertEqual(mock_imap.append.call_count, 3)
+        mock_imap.create.assert_called_once_with("Sent")
+
+    def test_sent_folder_create_failure_warns_once(self):
+        """A rejected CREATE is surfaced once instead of being swallowed."""
+        import asyncio
+        adapter = self._make_adapter({"sent_folder": "Sent"})
+
+        mock_imap = self._ok_imap()
+        mock_imap.create.side_effect = Exception("permission denied")
+
+        with patch("smtplib.SMTP") as mock_smtp, \
+             patch("imaplib.IMAP4_SSL", return_value=mock_imap):
+            mock_smtp.return_value = MagicMock()
+            with self.assertLogs("plugins.platforms.email.adapter", level="WARNING") as logs:
+                for _ in range(3):
+                    asyncio.run(adapter.send("user@test.com", "Hello!"))
+
+        create_warnings = [line for line in logs.output if "CREATE Sent folder" in line]
+        self.assertEqual(len(create_warnings), 1, logs.output)
+        # The sends themselves are unaffected — APPEND is still attempted
+        self.assertEqual(mock_imap.append.call_count, 3)
+
+    # ------------------------------------------------------------------
+    # A message that was never sent must never be archived
+    # ------------------------------------------------------------------
+
+    def test_no_append_when_smtp_send_fails(self):
+        """A failed SMTP send must not leave a copy in Sent.
+
+        The SMTP block is ``try/finally`` (the inner ``except`` only guards
+        ``quit()``), so a send failure propagates before the APPEND is
+        reached. Pinned by a test so a later refactor to ``try/except``
+        cannot silently start archiving unsent mail.
+        """
+        import asyncio
+        import tempfile
+        adapter = self._make_adapter({"sent_folder": "Sent"})
+
+        with tempfile.NamedTemporaryFile(suffix=".txt", delete=False) as f:
+            f.write(b"Attachment content")
+            tmp_path = f.name
+
+        def _failing_smtp(*args, **kwargs):
+            smtp = MagicMock()
+            smtp.send_message.side_effect = Exception("550 mailbox unavailable")
+            # quit() also fails, so the inner handler's close() path runs too
+            smtp.quit.side_effect = Exception("connection already closed")
+            return smtp
+
+        try:
+            for label, coro_factory in (
+                ("send", lambda: adapter.send("user@test.com", "Hello!")),
+                (
+                    "send_document",
+                    lambda: adapter.send_document("user@test.com", tmp_path, "See attached"),
+                ),
+                (
+                    "send_multiple_images",
+                    lambda: adapter.send_multiple_images(
+                        "user@test.com", [{"path": tmp_path, "caption": "x"}]
+                    ),
+                ),
+            ):
+                with self.subTest(path=label):
+                    with patch("smtplib.SMTP", side_effect=_failing_smtp), \
+                         patch("imaplib.IMAP4_SSL") as mock_imap_cls:
+                        asyncio.run(coro_factory())
+                    mock_imap_cls.assert_not_called()
+        finally:
+            os.unlink(tmp_path)
+
 
 class TestStandaloneSentFolderAppend(unittest.TestCase):
     """The out-of-process ``_standalone_send`` must mirror to the Sent folder
@@ -1290,6 +1384,11 @@ class TestStandaloneSentFolderAppend(unittest.TestCase):
         "EMAIL_IMAP_HOST": "imap.test.com",
         "EMAIL_IMAP_PORT": "993",
     }
+
+    def setUp(self):
+        """Drop the process-wide CREATE bookkeeping so tests stay independent."""
+        from plugins.platforms.email import adapter as adapter_mod
+        adapter_mod._SENT_FOLDER_CREATE_ATTEMPTED.clear()
 
     def _send(self, extra):
         """Invoke _standalone_send with a SimpleNamespace pconfig."""
@@ -1371,6 +1470,51 @@ class TestStandaloneSentFolderAppend(unittest.TestCase):
 
         self.assertTrue(result["success"])
         self.assertNotIn("error", result)
+
+    @patch.dict(os.environ, _BASE_ENV, clear=False)
+    def test_standalone_send_runs_off_the_event_loop(self):
+        """Neither the SMTP nor the IMAP socket work may run on the loop thread.
+
+        Both are blocking calls with multi-second timeouts; an unreachable
+        server would otherwise stall every other task in the process.
+        """
+        import threading
+
+        main_thread = threading.get_ident()
+        seen = {}
+
+        def _record_smtp(*args, **kwargs):
+            seen["smtp"] = threading.get_ident()
+            return MagicMock()
+
+        def _record_imap(*args, **kwargs):
+            seen["imap"] = threading.get_ident()
+            return self._ok_imap()
+
+        with patch("smtplib.SMTP", side_effect=_record_smtp), \
+             patch("imaplib.IMAP4_SSL", side_effect=_record_imap):
+            result = self._send({"sent_folder": "Sent"})
+
+        self.assertTrue(result["success"])
+        self.assertNotEqual(seen.get("smtp"), main_thread, "SMTP ran on the event loop")
+        self.assertNotEqual(seen.get("imap"), main_thread, "IMAP ran on the event loop")
+
+    @patch.dict(os.environ, _BASE_ENV, clear=False)
+    def test_standalone_send_reports_smtp_failure(self):
+        """A send that fails inside the executor still surfaces as an error dict."""
+        def _failing_smtp(*args, **kwargs):
+            smtp = MagicMock()
+            smtp.send_message.side_effect = Exception("550 mailbox unavailable")
+            return smtp
+
+        with patch("smtplib.SMTP", side_effect=_failing_smtp), \
+             patch("imaplib.IMAP4_SSL") as mock_imap_cls:
+            result = self._send({"sent_folder": "Sent"})
+
+        self.assertNotIn("success", result)
+        self.assertIn("error", result)
+        # Nothing was sent, so nothing may be archived
+        mock_imap_cls.assert_not_called()
 
 
 if __name__ == "__main__":

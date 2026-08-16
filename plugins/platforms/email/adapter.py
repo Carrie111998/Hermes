@@ -219,6 +219,33 @@ def _send_imap_id(imap: "imaplib.IMAP4") -> None:
         logger.debug("[Email] IMAP ID command not accepted: %s", e)
 
 
+# Sent folders a CREATE has already been attempted for, keyed by
+# (host, account, folder).  The APPEND runs once per outbound mail, so
+# without this every single send re-issued CREATE — and a rejection (e.g. a
+# read-only account) was swallowed silently, leaving the operator with no
+# signal beyond a per-send APPEND warning.  Process-scoped on purpose: the
+# helper is shared with the one-shot standalone sender, which has no adapter
+# instance to hang the state off.
+_SENT_FOLDER_CREATE_ATTEMPTED: set = set()
+
+
+def _ensure_sent_folder(imap: "imaplib.IMAP4", key: tuple, sent_folder: str) -> None:
+    """CREATE *sent_folder* once per process, warning once if that fails."""
+    if key in _SENT_FOLDER_CREATE_ATTEMPTED:
+        return
+    _SENT_FOLDER_CREATE_ATTEMPTED.add(key)
+    try:
+        # CREATE is idempotent; most servers return NO on "already exists".
+        imap.create(sent_folder)
+    except Exception as e:  # noqa: BLE001 — never fatal, but no longer silent
+        logger.warning(
+            "[Email] Could not CREATE Sent folder %r: %s. Replies will only be "
+            "archived if the folder already exists.",
+            sent_folder,
+            e,
+        )
+
+
 def _imap_append_to_sent(
     *,
     imap_host: str,
@@ -245,11 +272,7 @@ def _imap_append_to_sent(
         try:
             imap.login(address, password)
             _send_imap_id(imap)
-            # CREATE is idempotent; most servers return NO on "already exists".
-            try:
-                imap.create(sent_folder)
-            except Exception:  # noqa: BLE001 — ignore "already exists" and similar
-                pass
+            _ensure_sent_folder(imap, (imap_host, address, sent_folder), sent_folder)
             # imaplib returns ("NO"/"BAD", ...) on a rejected APPEND WITHOUT
             # raising — inspect the status tuple explicitly so a silent failure
             # isn't logged as success.
@@ -1556,21 +1579,30 @@ async def _standalone_send(
         msg["Subject"] = "Hermes Agent"
         msg["Date"] = formatdate(localtime=True)
 
-        server = smtplib.SMTP(smtp_host, smtp_port)
-        server.starttls(context=_ssl.create_default_context())
-        server.login(address, password)
-        server.send_message(msg)
-        server.quit()
-        # Best-effort Sent-folder mirror — never fails the (already-completed)
-        # SMTP send. Shares the archival helper with EmailAdapter.
-        _imap_append_to_sent(
-            imap_host=imap_host,
-            imap_port=imap_port,
-            address=address,
-            password=password,
-            sent_folder=sent_folder,
-            raw_bytes=msg.as_bytes(),
-        )
+        def _blocking_send() -> None:
+            """SMTP send + Sent-folder mirror. Both are synchronous sockets."""
+            server = smtplib.SMTP(smtp_host, smtp_port)
+            server.starttls(context=_ssl.create_default_context())
+            server.login(address, password)
+            server.send_message(msg)
+            server.quit()
+            # Best-effort Sent-folder mirror — never fails the (already-completed)
+            # SMTP send. Shares the archival helper with EmailAdapter.
+            _imap_append_to_sent(
+                imap_host=imap_host,
+                imap_port=imap_port,
+                address=address,
+                password=password,
+                sent_folder=sent_folder,
+                raw_bytes=msg.as_bytes(),
+            )
+
+        # Off the event loop: this coroutine drives blocking sockets with a
+        # default timeout, so an unreachable SMTP or IMAP server would stall
+        # every other task in the process for the duration. The adapter's own
+        # send paths already run their synchronous senders in an executor.
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, _blocking_send)
         return {"success": True, "platform": "email", "chat_id": chat_id}
     except Exception as e:
         try:
