@@ -87,6 +87,49 @@ _TITLE_PROMPT_TEMPLATE = (
 _LANGUAGE_RULE_MATCH_USER = "- Write the title in the same language as the user's message."
 _LANGUAGE_RULE_PINNED = "- Write the title in {language}."
 
+# Appended to the rule list when auxiliary.title_generation.emoji_prefix is on.
+# A rule line rather than a separate template, so __LANGUAGE_RULE__ above stays
+# the single source of truth for language handling.
+_EMOJI_RULE = (
+    "- Begin with exactly one emoji that fits the topic, then a space, then the "
+    "title. Use one emoji only, and never end the title with one."
+)
+
+# Matches a leading emoji-ish grapheme cluster: pictographic code points plus
+# the modifiers/joiners that combine with them (skin tone, ZWJ sequences,
+# variation selectors, keycaps, regional indicators). Used to detect whether
+# the model already prefixed a title so we never double up.
+_EMOJI_CHAR_CLASS = (
+    r"[\U0001F000-\U0001FAFF\u2600-\u27BF\u2B00-\u2BFF\uFE0F\u20E3\u200D"
+    r"\U0001F1E6-\U0001F1FF\U0001F3FB-\U0001F3FF\u2190-\u21FF\u2300-\u23FF]"
+)
+
+_LEADING_EMOJI_RE = re.compile(
+    "^(?:" + _EMOJI_CHAR_CLASS + r"|[0-9#*]\uFE0F?\u20E3)+"
+)
+
+# Same class anchored at the end, so a model that appends the emoji instead of
+# prefixing it can be normalized rather than discarded.
+_TRAILING_EMOJI_RE = re.compile(
+    r"(?:" + _EMOJI_CHAR_CLASS + r"|[0-9#*]\uFE0F?\u20E3)+\s*$"
+)
+
+# Code points that must stay glued to the emoji they modify when we slice a
+# run of emoji down to its first grapheme cluster.
+#
+# Regional indicators are deliberately NOT in here. They are not modifiers:
+# a flag is a *pair* of them, and a run like "🇯🇵🇺🇸" is two complete flags,
+# not one flag plus modifiers. Treating them as modifiers made the slice
+# consume the whole run, so a two-flag title kept both flags. They get their
+# own exactly-one-pair rule in _first_emoji_grapheme() instead.
+_EMOJI_MODIFIERS = frozenset(
+    "\u200d\ufe0f\ufe0e\u20e3"
+    + "".join(chr(cp) for cp in range(0x1F3FB, 0x1F400))  # skin tone modifiers
+)
+
+# Regional indicator symbols (U+1F1E6–U+1F1FF). Two of them form one flag.
+_REGIONAL_INDICATORS = frozenset(chr(cp) for cp in range(0x1F1E6, 0x1F200))
+
 # JSON schema constraining the response to a single title field. Removes the
 # whole class of "model answered the prompt instead of titling it" failures
 # that produced titles like "<title>...</title>" and "User: Yep, that's the
@@ -157,6 +200,103 @@ def _title_language() -> str:
         ).strip()
     except Exception:
         return ""
+
+
+def _title_emoji_prefix_enabled() -> bool:
+    """Return whether generated titles should start with one topical emoji.
+
+    Off by default: a title is reused verbatim as a Discord thread name, a
+    Telegram topic name, and a session-list row, so opting in is the user's
+    call rather than a silent change to every existing surface.
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+        from utils import is_truthy_value
+
+        config = load_config_readonly()
+        title_config = (config.get("auxiliary") or {}).get("title_generation") or {}
+        return is_truthy_value(title_config.get("emoji_prefix"), default=False)
+    except Exception:
+        logger.debug("Failed to read title_generation.emoji_prefix", exc_info=True)
+        return False
+
+
+def _first_emoji_grapheme(emoji_run: str) -> str:
+    """Return the first emoji grapheme cluster from a run of emoji characters.
+
+    ZWJ sequences (👨‍💻) and skin-tone/variation modifiers must stay glued to
+    their base character, so a naive ``[0]`` slice would corrupt them.
+
+    Flags are the one case that needs counting rather than a modifier check:
+    one flag is *exactly two* regional indicators, so ``🇯🇵🇺🇸`` is two whole
+    flags and only the first pair may survive. A lone trailing indicator (a
+    truncated flag) is kept as-is rather than dropped, so the caller still has
+    a non-empty prefix to work with.
+    """
+    run = str(emoji_run or "").strip()
+    if not run:
+        return run
+
+    if run[0] in _REGIONAL_INDICATORS:
+        # Two indicators = one flag; a single leftover one is a truncated flag.
+        return run[:2] if len(run) > 1 and run[1] in _REGIONAL_INDICATORS else run[:1]
+
+    end = 1
+    while end < len(run):
+        ch = run[end]
+        prev = run[end - 1]
+        # Continue through combining marks and ZWJ-joined segments. A regional
+        # indicator after a non-flag emoji starts a new grapheme, so it stops
+        # the scan instead of extending it.
+        if ch in _EMOJI_MODIFIERS or (prev == "\u200d" and ch not in _REGIONAL_INDICATORS):
+            end += 1
+            continue
+        break
+    return run[:end]
+
+
+def _normalize_emoji_prefix(title: str) -> str:
+    """Normalize an emoji-prefixed title to exactly ``<emoji> <text>``.
+
+    Models honour the prompt loosely: some emit two emoji, some omit the
+    separating space, some append the emoji to the end instead of the front.
+    Normalizing here keeps the stored title stable, which matters because the
+    same string is reused verbatim as a Discord thread name and a Telegram
+    topic name — surfaces where a trailing emoji reads as noise.
+
+    A title with no emoji at all is returned unchanged: we never invent one,
+    so a model that ignores the instruction degrades to today's behaviour
+    rather than to a wrong icon.
+    """
+    cleaned = str(title or "").strip()
+    if not cleaned:
+        return cleaned
+
+    match = _LEADING_EMOJI_RE.match(cleaned)
+    if match:
+        # Keep the first grapheme cluster only, then drop any further leading
+        # emoji runs — models regularly emit "🐛 🐍 Fixing imports", where the
+        # space stops the regex after the first run.
+        emoji = _first_emoji_grapheme(match.group(0))
+        rest = cleaned[match.end():].strip()
+        while rest:
+            extra = _LEADING_EMOJI_RE.match(rest)
+            if not extra:
+                break
+            rest = rest[extra.end():].strip()
+        return f"{emoji} {rest}".strip() if rest else emoji
+
+    # No leading emoji — the model may have appended one instead. Move it to
+    # the front rather than discarding the signal.
+    trailing = _TRAILING_EMOJI_RE.search(cleaned)
+    if trailing:
+        rest = cleaned[: trailing.start()].strip()
+        emoji = _first_emoji_grapheme(trailing.group(0).strip())
+        if rest:
+            return f"{emoji} {rest}"
+        return emoji
+
+    return cleaned
 
 
 def _auto_title_enabled() -> bool:
@@ -385,6 +525,11 @@ def generate_title(
     # Placeholder substitution, not str.format: the prompt embeds literal JSON
     # braces as few-shot examples, which format() would try to interpolate.
     prompt = _TITLE_PROMPT_TEMPLATE.replace("__LANGUAGE_RULE__", language_rule)
+    emoji_prefix = _title_emoji_prefix_enabled()
+    if emoji_prefix:
+        # Appended to the language rule so both stay inside the rule list,
+        # ahead of the few-shot examples.
+        prompt = prompt.replace(language_rule, language_rule + "\n" + _EMOJI_RULE, 1)
 
     messages = [
         {"role": "system", "content": prompt},
@@ -404,7 +549,12 @@ def generate_title(
             extra_body={"response_format": _TITLE_RESPONSE_FORMAT},
         )
         content = response.choices[0].message.content or ""
-        return _clean_title(_extract_title_text(content))
+        title = _clean_title(_extract_title_text(content))
+        # Normalize after _clean_title so the emoji scan only ever sees the
+        # string that will actually be stored.
+        if title and emoji_prefix:
+            title = _normalize_emoji_prefix(title)
+        return title
     except Exception as e:
         # Log at WARNING so this shows up in agent.log without debug mode.
         # Full detail at debug level for operators who need the stack.

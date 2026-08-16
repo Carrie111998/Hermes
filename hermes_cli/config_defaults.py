@@ -1028,6 +1028,7 @@ DEFAULT_CONFIG = {
             "extra_body": {},
             "reasoning_effort": "",  # per-task thinking level: none|minimal|low|medium|high|xhigh|max|ultra (empty = provider default)
             "language": "",
+            "emoji_prefix": False,  # prefix generated titles with one topical emoji
         },
         "memory_query_rewrite": {
             "provider": "auto",

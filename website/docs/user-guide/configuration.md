@@ -1150,6 +1150,19 @@ If you do not want Hermes to auto-generate titles after the first exchange, set
 `auxiliary.title_generation.enabled: false`. Manual titles still work through
 `/title` and `hermes sessions rename`.
 
+To make session lists scannable at a glance, set
+`auxiliary.title_generation.emoji_prefix: true`. Generated titles then start
+with one topical emoji — `🐛 Fix login button on mobile` — which carries through
+to any surface that reuses the title, including Discord thread names and
+Telegram topic names. It rides the existing title request, so there is no extra
+call and no added latency. Off by default. A model that ignores the instruction
+yields today's plain title rather than an invented icon; the model's output is
+normalized to exactly one leading emoji, so a stray second emoji or a trailing
+one is corrected before the title is stored.
+
+Only the model-generated title carries the emoji. The instant title written at
+the start of a turn is a slice of your own words and is left alone.
+
 ### Stream-only endpoints
 
 Some OpenAI-compatible endpoints reject non-streaming chat requests outright (e.g. Tencent Copilot returns HTTP 400 `"Non-stream chat request is currently not supported"`). Interactive chat already streams, but auxiliary tasks (title generation, compression, web extraction) use non-streaming calls and would fail on every attempt. Hermes always treats `copilot.tencent.com` as stream-only; for any other such endpoint, list a URL substring under `auxiliary.stream_only_base_urls`:
@@ -1283,6 +1296,7 @@ auxiliary:
     api_key: ""
     timeout: 30
     language: ""
+    emoji_prefix: false       # prefix each title with one topical emoji
 
   # Skills hub — skill matching and search
   skills_hub:

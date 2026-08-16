@@ -744,6 +744,7 @@ prompt_caching:
 #     model: ""
 #     timeout: 30
 #     language: ""           # empty = match the user's language; or e.g. "English"
+#     emoji_prefix: false    # true = start each title with one topical emoji
 #
 #   # Session search — summarizes matching past sessions
 #   session_search:
