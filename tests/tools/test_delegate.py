@@ -514,6 +514,175 @@ class TestToolNamePreservation(unittest.TestCase):
         self.assertEqual(captured["saved"], expected_tools)
 
 
+class _ControlActionAgent:
+    """Weak-referenceable stand-in for live parent/child agents."""
+
+
+class _DelegateControlActionTestCase(unittest.TestCase):
+    """Isolate the live registry used by delegate_task control actions."""
+
+    def setUp(self):
+        import tools.delegate_tool as delegate_tool
+
+        self.delegate_tool = delegate_tool
+        with delegate_tool._active_subagents_lock:
+            self.saved_records = dict(delegate_tool._active_subagents)
+            delegate_tool._active_subagents.clear()
+        # The new list-dedup cache is intentionally process-global, so each
+        # behavior test needs an independent parent/check history.
+        cache = getattr(delegate_tool, "_last_list_snapshots", None)
+        self.saved_list_snapshots = dict(cache) if isinstance(cache, dict) else None
+        if isinstance(cache, dict):
+            cache.clear()
+
+    def tearDown(self):
+        with self.delegate_tool._active_subagents_lock:
+            self.delegate_tool._active_subagents.clear()
+            self.delegate_tool._active_subagents.update(self.saved_records)
+        cache = getattr(self.delegate_tool, "_last_list_snapshots", None)
+        if isinstance(cache, dict) and self.saved_list_snapshots is not None:
+            cache.clear()
+            cache.update(self.saved_list_snapshots)
+
+    def _parent_and_child(self):
+        parent = _ControlActionAgent()
+        child = _ControlActionAgent()
+        child._delegate_parent_ref = __import__("weakref").ref(parent)
+        return parent, child
+
+    def _register(self, sid, parent, *, status="running"):
+        child = _ControlActionAgent()
+        child._delegate_parent_ref = __import__("weakref").ref(parent)
+        child._live_transcript_path = None
+        self.delegate_tool._register_subagent(
+            {
+                "subagent_id": sid,
+                "agent": child,
+                "status": status,
+                "goal": f"Goal for {sid}",
+                "model": "test-model",
+                "started_at": time.time(),
+            }
+        )
+        return child
+
+
+class TestDelegateWaitAction(_DelegateControlActionTestCase):
+    """Blocking wait control action only observes the caller's descendants."""
+
+    def test_wait_blocks_until_owned_child_finishes(self):
+        parent, _ = self._parent_and_child()
+        child = self._register("owned", parent)
+        result_box = {}
+        real_sleep = time.sleep
+
+        def call_wait():
+            result_box["payload"] = json.loads(
+                self.delegate_tool.delegate_task(
+                    action="wait", timeout_s=1, parent_agent=parent
+                )
+            )
+
+        with patch("tools.delegate_tool.time.sleep", side_effect=lambda _: real_sleep(0.01)):
+            waiter = threading.Thread(target=call_wait)
+            waiter.start()
+            real_sleep(0.03)
+            self.assertTrue(waiter.is_alive(), "wait returned before the child finished")
+            self.delegate_tool._unregister_subagent("owned", agent=child)
+            waiter.join(1)
+
+        self.assertFalse(waiter.is_alive())
+        self.assertEqual(result_box["payload"]["status"], "all_finished")
+        self.assertEqual(result_box["payload"]["count"], 0)
+
+    def test_wait_reports_timeout_with_remaining_child_count(self):
+        parent, _ = self._parent_and_child()
+        self._register("owned", parent)
+        real_sleep = time.sleep
+
+        with patch("tools.delegate_tool.time.sleep", side_effect=lambda _: real_sleep(0.001)):
+            payload = json.loads(
+                self.delegate_tool.delegate_task(
+                    action="wait", timeout_s=0.01, parent_agent=parent
+                )
+            )
+
+        self.assertEqual(payload["status"], "timeout")
+        self.assertEqual(payload["count"], 1)
+        self.assertIn("wait", payload["note"])
+        self.assertIn("list", payload["note"])
+
+    def test_wait_can_target_specific_child_ids(self):
+        parent, _ = self._parent_and_child()
+        selected = self._register("selected", parent)
+        self._register("other", parent)
+        real_sleep = time.sleep
+
+        def finish_selected():
+            real_sleep(0.02)
+            self.delegate_tool._unregister_subagent("selected", agent=selected)
+
+        finisher = threading.Thread(target=finish_selected)
+        with patch("tools.delegate_tool.time.sleep", side_effect=lambda _: real_sleep(0.005)):
+            finisher.start()
+            payload = json.loads(
+                self.delegate_tool.delegate_task(
+                    action="wait", subagent_ids=["selected"], timeout_s=1, parent_agent=parent
+                )
+            )
+            finisher.join(1)
+
+        self.assertEqual(payload["status"], "all_finished")
+        self.assertEqual(payload["count"], 0)
+        self.assertIn("other", self.delegate_tool._active_subagents)
+
+
+class TestDelegateListDedup(_DelegateControlActionTestCase):
+    """Repeated unchanged list calls return a small server-side response."""
+
+    def test_identical_list_within_window_returns_unchanged(self):
+        parent, _ = self._parent_and_child()
+        self._register("owned", parent)
+
+        first = json.loads(self.delegate_tool.delegate_task(action="list", parent_agent=parent))
+        second = json.loads(self.delegate_tool.delegate_task(action="list", parent_agent=parent))
+
+        self.assertEqual(first["count"], 1)
+        self.assertIn("subagents", first)
+        self.assertEqual(second["status"], "unchanged")
+        self.assertNotIn("subagents", second)
+        self.assertIn("action='wait'", second["note"])
+
+    def test_status_change_returns_full_list(self):
+        parent, _ = self._parent_and_child()
+        self._register("owned", parent, status="running")
+
+        json.loads(self.delegate_tool.delegate_task(action="list", parent_agent=parent))
+        with self.delegate_tool._active_subagents_lock:
+            self.delegate_tool._active_subagents["owned"]["status"] = "finishing"
+        changed = json.loads(self.delegate_tool.delegate_task(action="list", parent_agent=parent))
+
+        self.assertEqual(changed["count"], 1)
+        self.assertIn("subagents", changed)
+        self.assertEqual(changed["subagents"][0]["status"], "finishing")
+
+    def test_list_after_dedup_window_returns_full_list(self):
+        parent, _ = self._parent_and_child()
+        self._register("owned", parent)
+        clock = [100.0]
+
+        with patch("tools.delegate_tool.time.time", side_effect=lambda: clock[0]):
+            json.loads(self.delegate_tool.delegate_task(action="list", parent_agent=parent))
+            clock[0] += 11.0
+            after_window = json.loads(
+                self.delegate_tool.delegate_task(action="list", parent_agent=parent)
+            )
+
+        self.assertEqual(after_window["count"], 1)
+        self.assertIn("subagents", after_window)
+        self.assertNotEqual(after_window.get("status"), "unchanged")
+
+
 class TestDelegateObservability(unittest.TestCase):
     """Tests for enriched metadata returned by _run_single_child."""
 
