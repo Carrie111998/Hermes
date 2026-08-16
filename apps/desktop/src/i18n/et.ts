@@ -318,7 +318,7 @@ export const et = defineLocale({
     creating: 'Loomine...',
     createAction: 'Loo profiil',
     renameTitle: 'Nimeta profiil ümber',
-    renameDescPrefix: 'Ümbernimetamine uuendab profiili kausta ja kõiki ümbrisskripte kaustas ',
+    renameDescPrefix: 'Ümbernimetamine uuendab profiili kausta ja kõiki ümbriste skripte kaustas ',
     renameDescSuffix: '.',
     newNameLabel: 'Uus nimi',
     renaming: 'Ümbernimetamine...',
