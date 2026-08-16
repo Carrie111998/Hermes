@@ -29,6 +29,7 @@ import json
 import logging
 import socket
 import threading
+import uuid
 from typing import Any
 
 from tui_gateway import server
@@ -94,6 +95,11 @@ class WSTransport:
         self._loop = loop
         self._peer = peer
         self._closed = False
+        # Opaque per-connection id, minted at accept. Announced to this client
+        # as gateway.ready's ``origin`` and stamped onto the session event
+        # frames of turns this client starts, so a mirrored client can tell its
+        # own turn from a peer's. Never reused across connections.
+        self.transport_id = uuid.uuid4().hex
         # Token-coalescing buffer (CF-2). Streamed token frames land here and a
         # short timer flushes the batch. The lock guards the buffer + the
         # "armed" flag against the worker threads that call write(); the timer
@@ -320,7 +326,20 @@ async def handle_ws(ws: Any) -> None:
                     # change_events: this backend broadcasts pet.changed /
                     # cron.changed / sessions.changed, so clients can demote
                     # their legacy polls to slow backstops.
-                    "payload": {"skin": skin_payload, "change_events": True},
+                    #
+                    # session_mirroring: this backend fans a session's events
+                    # out to every attached client instead of rebinding the
+                    # session to the newest one, so a client may resume or
+                    # activate a session someone else is driving without
+                    # stealing it. origin: this connection's opaque id — a
+                    # session event carrying the same origin belongs to a turn
+                    # THIS client started.
+                    "payload": {
+                        "skin": skin_payload,
+                        "change_events": True,
+                        "session_mirroring": True,
+                        "origin": transport.transport_id,
+                    },
                 },
             }
         )

@@ -44,6 +44,7 @@ from tui_gateway.turn_marker import (
     record_turn_start,
 )
 from tui_gateway.transport import (
+    FanoutTransport,
     StdioTransport,
     Transport,
     bind_transport,
@@ -366,6 +367,163 @@ _stdio_transport = StdioTransport(lambda: _real_stdout, _stdout_lock)
 # the gateway in-process and captures stdout into logs, so stale JSON-RPC frames
 # must not fall through there while the session waits for resume or reap.
 _detached_ws_transport = _DropTransport()
+
+
+# ── multi-client fan-out ─────────────────────────────────────────────────────
+#
+# A session's ``transport`` slot holds either ONE transport — the historical,
+# single-client shape, byte-identical to pre-fan-out behaviour — or a
+# ``FanoutTransport`` wrapping several. Because the fan-out satisfies the same
+# Transport protocol, ``write_json`` and every other reader of the slot are
+# untouched; only the attach/detach ladder below knows the difference.
+#
+# ``_session_transport_lock`` serializes the read-modify-write of that one slot.
+# It is a LEAF lock: nothing under it acquires ``_sessions_lock`` or a session's
+# ``history_lock`` (the fan-out's own lock is likewise a leaf), so it is safe to
+# take while holding either of those.
+_session_transport_lock = threading.Lock()
+
+
+def _transport_is_live_peer(transport) -> bool:
+    """True when *transport* is a real, currently attached client.
+
+    Excluded: the parked drop sentinel (by definition clientless) and stdio,
+    which is the process-wide fallback sink — a standalone ``hermes --tui``
+    writes there, but nothing "attaches" to it and a second client can never
+    share it.
+    """
+    if transport is None:
+        return False
+    if transport is _detached_ws_transport or transport is _stdio_transport:
+        return False
+    if isinstance(transport, (_DropTransport, StdioTransport)):
+        return False
+    return True
+
+
+def _session_transport_contains(session: dict | None, transport) -> bool:
+    """True when *transport* is attached to *session*, directly or via fan-out."""
+    if not session or transport is None:
+        return False
+    existing = session.get("transport")
+    if existing is transport:
+        return True
+    if isinstance(existing, FanoutTransport):
+        return existing.contains(transport)
+    return False
+
+
+def _session_live_transports(session: dict | None) -> list:
+    """Every live client attached to *session* (empty for a parked/stdio slot)."""
+    existing = (session or {}).get("transport")
+    if isinstance(existing, FanoutTransport):
+        return [t for t in existing.transports() if _transport_is_live_peer(t)]
+    return [existing] if _transport_is_live_peer(existing) else []
+
+
+def _session_has_live_transport(session: dict | None, *, excluding=None) -> bool:
+    """True when *session* still has a live client attached, ignoring *excluding*.
+
+    ``excluding`` answers whether another live client remains once one peer is
+    ignored, which is what the detach and orphan paths need: whether anything
+    survives the departing transport.
+    """
+    return any(t is not excluding for t in _session_live_transports(session))
+
+
+def _attach_session_transport(session: dict | None, transport) -> bool:
+    """Attach *transport* to *session* ADDITIVELY — never steal the slot.
+
+    The ladder:
+
+    * same object already in the slot → no-op;
+    * the slot already fans out → attach into it (a fan-out argument is
+      flattened, never nested);
+    * the slot is empty / stdio / the parked drop sentinel → take the slot,
+      which is exactly what the old rebind did;
+    * otherwise → wrap the incumbent and the newcomer in a ``FanoutTransport``
+      so both clients keep streaming.
+
+    A non-peer newcomer (stdio, drop sentinel) never displaces a live client:
+    an activate/resume dispatched without a bound websocket must not silence the
+    socket that owns the session.
+
+    Returns ``True`` when *transport* is attached afterwards.
+    """
+    if not session or transport is None:
+        return False
+    with _session_transport_lock:
+        existing = session.get("transport")
+        if existing is transport:
+            return True
+        if isinstance(existing, FanoutTransport):
+            if isinstance(transport, FanoutTransport):
+                for member in transport.transports():
+                    existing.attach(member)
+            else:
+                existing.attach(transport)
+            return True
+        if not _transport_is_live_peer(transport):
+            if _transport_is_live_peer(existing):
+                return False
+            session["transport"] = transport
+            return True
+        if not _transport_is_live_peer(existing):
+            session["transport"] = transport
+            return True
+        session["transport"] = FanoutTransport(existing, transport)
+        return True
+
+
+def _detach_session_transport(session: dict | None, transport) -> bool:
+    """Detach *transport* from *session*'s slot.
+
+    Returns ``True`` when a live client OTHER than *transport* remains — i.e.
+    the session must keep streaming and must NOT be parked or reaped. A
+    single-client session leaves the departing transport in the slot, exactly as
+    before fan-out existed; its caller parks the drop sentinel over it.
+    """
+    if not session:
+        return False
+    with _session_transport_lock:
+        existing = session.get("transport")
+        if isinstance(existing, FanoutTransport):
+            existing.detach(transport)
+            remaining = existing.transports()
+            if len(remaining) == 1:
+                # Collapse: a session back down to one client is indistinguishable
+                # from one that never fanned out.
+                session["transport"] = remaining[0]
+    return _session_has_live_transport(session, excluding=transport)
+
+
+def _detach_transport_from_sessions(transport) -> list[tuple[str, dict]]:
+    """Detach *transport* from every session holding it.
+
+    Returns the ``(sid, session)`` pairs left with NO live client — the ones the
+    disconnect path must park or reap. Sessions that retain another attached
+    client keep streaming and are not returned.
+    """
+    with _sessions_lock:
+        attached = [
+            (sid, s)
+            for sid, s in _sessions.items()
+            if _session_transport_contains(s, transport)
+        ]
+    return [
+        (sid, session)
+        for sid, session in attached
+        if not _detach_session_transport(session, transport)
+    ]
+
+
+def _transport_origin(transport) -> str:
+    """The opaque per-connection id of *transport*, or ``""`` when it has none.
+
+    Set by ``tui_gateway.ws`` on each accepted WebSocket. stdio and test doubles
+    have none, which is why ``origin`` is omitted rather than emitted empty.
+    """
+    return str(getattr(transport, "transport_id", "") or "")
 
 
 def _prepend_tool_paths(env: dict[str, str]) -> dict[str, str]:
@@ -1015,12 +1173,23 @@ def _ws_session_is_orphaned(session: dict | None) -> bool:
     After ``handle_ws`` detaches a disconnected client it points the session at
     ``_detached_ws_transport``. A session left on that transport (and not
     mid-turn) is genuinely orphaned and safe to reap.
+
+    With multi-client fan-out the question is liveness, not slot identity: a
+    session whose fan-out still holds another client is NOT orphaned even though
+    one client just left.
     """
     if not session or session.get("_finalized"):
         return False
     if session.get("running"):
         return False
-    return session.get("transport") is _detached_ws_transport
+    transport = session.get("transport")
+    if transport is None or transport is _stdio_transport or isinstance(transport, StdioTransport):
+        # Pre-fan-out carve-outs, preserved verbatim: an unbound slot and the
+        # REAL stdio transport of a standalone ``hermes --tui`` were never WS
+        # orphans (mirrors _transport_is_dead's stdio note) and must not become
+        # ones now that this check is liveness-based.
+        return False
+    return not _session_has_live_transport(session)
 
 
 def _session_owns_durable_lifecycle(session_id: str | None) -> bool:
@@ -1154,12 +1323,18 @@ def _close_sessions_for_transport(
     the single WS-disconnect teardown entry point — there is no second
     independent reap loop in ``handle_ws``.
 
+    Multi-client fan-out: the departing transport is DETACHED from every session
+    first. A session that still has another client attached keeps streaming and
+    is neither parked nor reaped — a watcher leaving must not end the turn the
+    remaining client is reading. Only the sessions left clientless take the
+    historical close_on_disconnect / park-sentinel path, so a single-client
+    disconnect behaves exactly as it always has.
+
     Returns ``(reaped, detached)`` counts for disconnect-path observability."""
-    with _sessions_lock:
-        owned = [(sid, s) for sid, s in _sessions.items() if s.get("transport") is transport]
+    clientless = _detach_transport_from_sessions(transport)
     reaped = 0
     detached = 0
-    for sid, session in owned:
+    for sid, session in clientless:
         if session.get("close_on_disconnect"):
             _close_session_by_id(sid, end_reason=end_reason)
             reaped += 1
@@ -1635,6 +1810,16 @@ def _event_frame(event: str, sid: str, payload: dict | None = None) -> dict:
     params: dict = {"type": event, "session_id": sid}
     if payload is not None:
         params["payload"] = payload
+    # Multi-client fan-out: tell every mirrored client WHICH client started the
+    # turn this frame belongs to — its own connection's ``origin`` (announced in
+    # gateway.ready), a peer's, or "auto_continue" for the crash-recovery
+    # kickoff. Stamped here, at frame creation, so it costs one dict read and
+    # every emitter gets it for free. Purely additive: the key is omitted
+    # whenever the origin is unknown, which is always the case for a stdio TUI
+    # and for a session-less broadcast, so no frame changes shape for a
+    # single-client deployment.
+    if sid and (origin := str((_sessions.get(sid) or {}).get("turn_origin") or "")):
+        params["origin"] = origin
     return {"jsonrpc": "2.0", "method": "event", "params": params}
 
 
@@ -2045,10 +2230,10 @@ def _current_session_steer_authority(
 ) -> tuple[Transport | None, dict | None]:
     """Resolve unforgeable steering authority for this exact RPC context.
 
-    The public session id is only a lookup hint. Authority is the identity of
-    both the request's ContextVar-bound transport and the live in-memory
-    session record currently stored under that id. Session transport rebinding,
-    removal, or id reuse therefore invalidates an earlier generation.
+    The public session id is only a lookup hint. Authority requires the
+    request's ContextVar-bound transport to be attached to the live in-memory
+    session record currently stored under that id. Transport detachment,
+    session removal, or id reuse therefore invalidates an earlier generation.
     """
     transport = current_transport()
     if transport is None or not session_id:
@@ -2059,7 +2244,12 @@ def _current_session_steer_authority(
         if (
             session is None
             or (expected_session is not None and session is not expected_session)
-            or session.get("transport") is not transport
+            # A mirrored session stores a FanoutTransport in the slot, so slot
+            # identity alone would reject every client, the peer that
+            # commissioned the subagent included. Authority is membership in
+            # the slot, which also grants it to any client attached to mirror
+            # the session (see tests/tui_gateway/test_multi_client_fanout.py).
+            or not _session_transport_contains(session, transport)
         ):
             return None, None
         return transport, session
@@ -7743,6 +7933,10 @@ def _maybe_schedule_auto_continue(sid: str, session: dict, session_key: str) -> 
             # behind for a racing user turn to inherit.
             session["_auto_continue_attempt"] = attempt
             session["_auto_continue_prompt"] = marker["prompt"]
+            # No client started this turn — the gateway did, recovering a
+            # crash. Mirrored clients see origin "auto_continue" and know the
+            # stream is nobody's typing.
+            session["turn_origin"] = "auto_continue"
         try:
             _emit(
                 "status.update",
@@ -8047,8 +8241,20 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
         if not queued_prompts:
             session.pop("queued_prompts", None)
         session["running"] = True
-        if queued.get("transport") is not None:
-            session["transport"] = queued["transport"]
+        queued_transport = queued.get("transport")
+        # The queuer's transport is pinned so the drained turn reaches the
+        # client that sent it — but ATTACHED, not rebound: a mid-turn prompt
+        # from a second client used to silence the first for the whole drained
+        # turn. A peer that disconnected while its prompt sat in the queue is
+        # skipped: the prompt still runs, only the dead pin is dropped.
+        if queued_transport is not None:
+            # The drained turn belongs to whoever QUEUED it, not to whoever
+            # happened to be driving the session when it finally fires. The
+            # dead-peer skip is about the attach only: a queuer that dropped
+            # while its prompt waited still owns the turn that prompt starts.
+            session["turn_origin"] = _transport_origin(queued_transport)
+            if not _transport_is_dead(queued_transport):
+                _attach_session_transport(session, queued_transport)
     use_compute_host = _session_uses_compute_host(session)
     with session["history_lock"]:
         if int(session.get("_queued_prompt_generation", 0)) != queue_generation:
@@ -8554,7 +8760,10 @@ def _live_session_payload(
         if cols is not None:
             session["cols"] = cols
         if transport is not None:
-            session["transport"] = transport
+            # Resume/activate of a LIVE session attaches the caller alongside
+            # whoever is already streaming instead of rebinding the slot — the
+            # old rebind is what made a second client steal the stream.
+            _attach_session_transport(session, transport)
         if touch:
             session["last_active"] = time.time()
         in_memory_history = list(session.get("display_history_prefix") or []) + list(
