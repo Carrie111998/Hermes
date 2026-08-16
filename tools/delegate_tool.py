@@ -1706,27 +1706,29 @@ def _build_child_agent(
         effective_provider = "copilot-acp"
         effective_api_mode = "chat_completions"
 
-    # Resolve reasoning config: delegation override > parent inherit
+    # Resolve reasoning config (Wave 12, AS-0018):
+    # explicit delegation.reasoning_effort (incl. YAML false = thinking off)
+    # > agent.reasoning_overrides[<effective child model>] — the per-model
+    #   chokepoint, so a flash worker resolves to the flash override while a
+    #   per-task-pinned qwen reviewer child keeps its own override
+    # > agent.reasoning_effort global > parent inherit.
+    # Replaces the old single delegation.reasoning_effort-for-all-children
+    # behavior; an explicit operator pin still wins for ALL children
+    # (backward compatible).
     parent_reasoning = getattr(parent_agent, "reasoning_config", None)
-    child_reasoning = parent_reasoning
     try:
-        # Keep the raw value — ``str(x or "")`` would coerce a YAML boolean
-        # False (``reasoning_effort: false``) to "" and inherit the parent
-        # instead of disabling thinking for children.
-        delegation_effort = delegation_cfg.get("reasoning_effort")
-        if delegation_effort or delegation_effort is False:
-            from hermes_constants import parse_reasoning_effort
+        try:
+            from hermes_cli.config import load_config_readonly
 
-            parsed = parse_reasoning_effort(delegation_effort)
-            if parsed is not None:
-                child_reasoning = parsed
-            else:
-                logger.warning(
-                    "Unknown delegation.reasoning_effort '%s', inheriting parent level",
-                    delegation_effort,
-                )
+            _full_cfg = load_config_readonly()
+        except Exception:
+            _full_cfg = {}
+        child_reasoning = _resolve_child_reasoning(
+            delegation_cfg, _full_cfg, effective_model, parent_reasoning
+        )
     except Exception as exc:
-        logger.debug("Could not load delegation reasoning_effort: %s", exc)
+        logger.debug("Could not load delegation reasoning config: %s", exc)
+        child_reasoning = parent_reasoning
 
     # Inherit the parent's fallback provider chain so subagents can recover
     # from rate-limits and credential exhaustion exactly like the top-level
@@ -3378,6 +3380,38 @@ _TEMPLATE_MARKER_RE = re.compile(
 )
 _MIN_BATCH_GOAL_LEN = 10
 
+# Wave 12 (AS-0018 two-model division of labor): the ONLY models a caller may
+# pin per-task via the optional `model` parameter. Mirrors
+# scripts/model_policy_audit.py ALLOWED_MODELS in the consuming harness. A
+# hardcoded frozenset (not a config key) keeps the core policy-neutral: which
+# models are allowed is a deployment policy the audit already enforces — the
+# core only needs a closed set to reject typos/foreign models loudly instead
+# of silently spawning a child that can never be billed or routed.
+ALLOWED_WORKER_MODELS = frozenset({"qwen3.8-max", "deepseek-v4-flash-0731"})
+
+
+def _validate_worker_model(model: Any) -> Optional[str]:
+    """Validate an optional per-task / top-level `model` override.
+
+    Returns None when the value is absent (no override) or allowed, otherwise
+    an actionable error string. Reject-over-silent-fallback by design: a typo
+    in a model name must fail the whole call before any child is spawned.
+    """
+    if model is None:
+        return None
+    if not isinstance(model, str) or not model.strip():
+        return (
+            f"delegate_task: 'model' must be a non-empty string, got {model!r}. "
+            f"Allowed models: {sorted(ALLOWED_WORKER_MODELS)}."
+        )
+    name = model.strip()
+    if name not in ALLOWED_WORKER_MODELS:
+        return (
+            f"delegate_task: model {name!r} is not allowed. Allowed models: "
+            f"{sorted(ALLOWED_WORKER_MODELS)} (two-model policy, AS-0016/AS-0018)."
+        )
+    return None
+
 
 def _validate_batch_tasks(task_list: List[Dict[str, Any]]) -> Optional[str]:
     """Validate a tasks=[...] batch beyond per-task goal presence.
@@ -3422,6 +3456,11 @@ def _validate_batch_tasks(task_list: List[Dict[str, Any]]) -> Optional[str]:
                 f"{_MIN_BATCH_GOAL_LEN} characters so the subagent knows "
                 "exactly what to do."
             )
+        # Wave 12 (AS-0018): optional per-task model pin — validate against
+        # the two-model allowlist before ANY child is spawned.
+        model_err = _validate_worker_model(task.get("model"))
+        if model_err:
+            return f"Task {i}: {model_err}"
     return None
 
 
@@ -3437,6 +3476,7 @@ def delegate_task(
     subagent_id: Optional[str] = None,
     message: Optional[str] = None,
     parent_agent=None,
+    model: Optional[str] = None,
 ) -> str:
     """
     Spawn one or more child agents to handle delegated tasks, or control
@@ -3444,7 +3484,7 @@ def delegate_task(
 
     Spawn modes (action='spawn' or omitted):
       - Single: provide goal (+ optional context and role)
-      - Batch:  provide tasks array [{goal, context, role}, ...]
+      - Batch:  provide tasks array [{goal, context, role, model}, ...]
 
     Control modes (synchronous, never backgrounded):
       - action='list'  -> live children of this conversation's spawn tree
@@ -3456,6 +3496,11 @@ def delegate_task(
     'leaf' (default) cannot; 'orchestrator' retains the delegation
     toolset and can spawn its own workers, bounded by
     delegation.max_spawn_depth.  Per-task role beats the top-level one.
+
+    The optional 'model' parameter (top-level or per task item, per-task
+    wins) overrides delegation.model for those children only. Restricted
+    to ALLOWED_WORKER_MODELS; invalid values reject the whole call before
+    any child is spawned.
 
     Returns JSON with results array, one entry per task.
     """
@@ -3530,6 +3575,11 @@ def delegate_task(
     # bundle (base_url, api_key, api_mode) via the same runtime provider system
     # used by CLI/gateway startup.  When unconfigured, returns None values so
     # children inherit from the parent.
+    # Wave 12 (AS-0018): validate the optional top-level model pin first — a
+    # foreign model must reject the whole call before any child is spawned.
+    top_model_err = _validate_worker_model(model)
+    if top_model_err:
+        return tool_error(top_model_err)
     try:
         creds = _resolve_delegation_credentials(cfg, parent_agent)
     except ValueError as exc:
@@ -3564,6 +3614,11 @@ def delegate_task(
         single_task: Dict[str, Any] = {"goal": goal, "context": context, "role": top_role}
         if output_schema is not None:
             single_task["output_schema"] = output_schema
+        if model is not None and str(model).strip():
+            # Wave 12 (AS-0018): top-level model applies to the single-goal
+            # form (batch form uses per-task model pins only, matching the
+            # "top-level goal/context/role are ignored" batch semantics).
+            single_task["model"] = str(model).strip()
         task_list = [single_task]
     else:
         return tool_error("Provide either 'goal' (single task) or 'tasks' (batch).")
@@ -3675,7 +3730,10 @@ def delegate_task(
             # Subagents always inherit the parent's toolsets; the model
             # cannot choose or narrow them (no model-facing toolsets arg).
             toolsets=None,
-            model=creds["model"],
+            # Wave 12 (AS-0018): optional per-task model pin (validated in
+            # _validate_batch_tasks / top-level check above) beats the global
+            # delegation.model for this child only. Absent → delegation.model.
+            model=(str(t.get("model")).strip() if t.get("model") else None) or creds["model"],
             max_iterations=effective_max_iter,
             task_count=n_tasks,
             parent_agent=parent_agent,
@@ -4236,7 +4294,55 @@ def _resolve_child_credential_pool(
     return None
 
 
-def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
+def _resolve_child_reasoning(
+    delegation_cfg: dict,
+    full_cfg: dict,
+    effective_model: Optional[str],
+    parent_reasoning: Optional[dict],
+) -> Optional[dict]:
+    """Resolve the reasoning config for a delegation child (Wave 12, AS-0018).
+
+    Priority:
+    1. Explicit ``delegation.reasoning_effort`` (a YAML boolean ``False``
+       means thinking disabled — kept raw so it never silently re-enables;
+       an operator pin wins for ALL children, backward compatible).
+    2. ``agent.reasoning_overrides[<effective child model>]`` via the shared
+       spelling-tolerant chokepoint — flash workers get the flash override,
+       per-task-pinned qwen reviewers keep the max override.
+    3. ``agent.reasoning_effort`` global.
+    4. Parent reasoning config (inherit).
+    """
+    from hermes_constants import (
+        parse_reasoning_effort,
+        resolve_per_model_reasoning_effort,
+    )
+
+    delegation_effort = delegation_cfg.get("reasoning_effort")
+    if delegation_effort or delegation_effort is False:
+        parsed = parse_reasoning_effort(delegation_effort)
+        if parsed is not None:
+            return parsed
+        logger.warning(
+            "Unknown delegation.reasoning_effort '%s', falling back to "
+            "per-model resolution",
+            delegation_effort,
+        )
+    if isinstance(full_cfg, dict):
+        agent_cfg = full_cfg.get("agent")
+        if isinstance(agent_cfg, dict):
+            overrides = agent_cfg.get("reasoning_overrides") or {}
+            per_model = resolve_per_model_reasoning_effort(
+                effective_model or "", overrides
+            )
+            if per_model is not None:
+                return per_model
+            parsed_global = parse_reasoning_effort(agent_cfg.get("reasoning_effort"))
+            if parsed_global is not None:
+                return parsed_global
+    return parent_reasoning
+
+
+def _resolve_delegation_credentials(cfg: dict, parent_agent, model_override: Optional[str] = None) -> dict:
     """Resolve credentials for subagent delegation.
 
     If ``delegation.base_url`` is configured, subagents use that direct
@@ -4258,6 +4364,12 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
     Raises ValueError with a user-friendly message on credential failure.
     """
     configured_model = str(cfg.get("model") or "").strip() or None
+    # Wave 12 (AS-0018): a validated per-task / top-level model pin wins over
+    # delegation.model for the resolved credential bundle. Credentials
+    # (base_url/api_key/api_mode) still come from delegation.* — the two-model
+    # policy keeps both models on the same provider endpoint.
+    if model_override is not None and str(model_override).strip():
+        configured_model = str(model_override).strip()
     configured_provider = str(cfg.get("provider") or "").strip() or None
     configured_base_url = str(cfg.get("base_url") or "").strip() or None
     configured_api_key = str(cfg.get("api_key") or "").strip() or None
@@ -4457,7 +4569,10 @@ def _build_top_level_description() -> str:
         "delegate_task.\n"
         "- Children inherit the parent model and fallback chain unless pinned "
         "globally via delegation.provider / delegation.model in config.yaml. "
-        "Results are returned as an array, one entry per task."
+        "An optional per-call 'model' parameter (single-goal form) or per-task "
+        "'model' field (batch form) overrides the child model for those "
+        "children only — restricted to the configured two-model policy "
+        "allowlist. Results are returned as an array, one entry per task."
     )
 
 
@@ -4597,6 +4712,19 @@ DELEGATE_TASK_SCHEMA = {
                                 "require only fields you will actually read."
                             ),
                         },
+                        "model": {
+                            "type": "string",
+                            "description": (
+                                "Optional model pin for THIS task only — "
+                                "overrides delegation.model for this child. "
+                                "Must be one of the allowed worker models "
+                                "(validated against the two-model policy "
+                                "allowlist); invalid values reject the whole "
+                                "call before any child is spawned. Use to "
+                                "run specific children (e.g. reviewers) on a "
+                                "different model than the worker default."
+                            ),
+                        },
                     },
                     "required": ["goal"],
                 },
@@ -4616,6 +4744,17 @@ DELEGATE_TASK_SCHEMA = {
                     "Optional JSON Schema for the single-goal form — the "
                     "subagent's final answer must validate against it "
                     "(same semantics as tasks[].output_schema)."
+                ),
+            },
+            "model": {
+                "type": "string",
+                "description": (
+                    "Optional model pin for the single-goal form — overrides "
+                    "delegation.model for this child. Must be one of the "
+                    "allowed worker models (two-model policy allowlist); "
+                    "invalid values reject the call. In batch mode use the "
+                    "per-task 'model' field instead (this top-level value is "
+                    "ignored for batches, like goal/context/role)."
                 ),
             },
             "background": {
@@ -4727,6 +4866,7 @@ registry.register(
         subagent_id=args.get("subagent_id"),
         message=args.get("message"),
         parent_agent=kw.get("parent_agent"),
+        model=args.get("model"),
     ),
     check_fn=check_delegate_requirements,
     emoji="🔀",

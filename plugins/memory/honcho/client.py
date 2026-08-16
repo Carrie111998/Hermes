@@ -18,7 +18,7 @@ import os
 import logging
 import hashlib
 import ipaddress
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -499,6 +499,57 @@ class HonchoClientConfig:
         if self.config_path is not None:
             return self.config_path
         return resolve_config_path()
+
+    # --- Display-only secret masking (Wave 13 F4-B3) ---------------------
+    # repr()/str() of this dataclass used to echo ``api_key`` and the full
+    # ``raw`` dict (which mirrors honcho.json, apiKey included) in
+    # cleartext — a log/console leak. Display strings now mask secrets;
+    # the underlying fields are NEVER mutated (oauth_flow.py consumes
+    # cfg.raw at runtime). pickle/json.dumps(asdict(...)) remain leak
+    # surfaces and are documented as out of scope.
+    _SENSITIVE_RAW_KEYS = ("apiKey", "accessToken", "refreshToken")
+
+    @classmethod
+    def _mask_secret(cls, value: object) -> str:
+        """Render a secret for display: '***' or '***<last4>'."""
+        if not isinstance(value, str) or not value:
+            return "***"
+        return f"***{value[-4:]}"
+
+    @classmethod
+    def _redact_raw_for_display(cls, raw: dict) -> dict:
+        """Shallow copy of ``raw`` with known secret keys masked."""
+        redacted = dict(raw)
+        for key in cls._SENSITIVE_RAW_KEYS:
+            if key in redacted:
+                redacted[key] = cls._mask_secret(redacted[key])
+        hosts = redacted.get("hosts")
+        if isinstance(hosts, dict):
+            hosts_copy = {}
+            for host, block in hosts.items():
+                if isinstance(block, dict):
+                    block = dict(block)
+                    for key in cls._SENSITIVE_RAW_KEYS:
+                        if key in block:
+                            block[key] = cls._mask_secret(block[key])
+                hosts_copy[host] = block
+            redacted["hosts"] = hosts_copy
+        return redacted
+
+    def __repr__(self) -> str:
+        parts = []
+        for f in fields(self):
+            value = getattr(self, f.name)
+            if f.name == "api_key":
+                parts.append(f"api_key={self._mask_secret(value)!r}")
+            elif f.name == "raw":
+                parts.append(f"raw={self._redact_raw_for_display(value or {})!r}")
+            else:
+                parts.append(f"{f.name}={value!r}")
+        return f"{type(self).__name__}({', '.join(parts)})"
+
+    def __str__(self) -> str:
+        return self.__repr__()
 
     @classmethod
     def from_env(

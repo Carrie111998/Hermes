@@ -889,12 +889,42 @@ def list_skins() -> List[Dict[str, str]]:
     return result
 
 
+def _resolve_skin_file(skins_path: Path, name: str) -> Optional[Path]:
+    """Map a skin ``name`` to a file strictly inside ``skins_path`` (or None).
+
+    Traversal guard: names with path separators or parent-dir components are
+    rejected outright (treated as a miss so callers fall back to built-ins /
+    default). The candidate is then containment-checked with
+    ``Path.is_relative_to`` after lexical normalization — absolute paths and
+    ``../`` escapes can never read outside the skins directory. The check is
+    on the requested path (not the symlink target), so symlinks a user placed
+    inside their skins dir keep loading.
+    """
+    if not name or name in {".", ".."}:
+        return None
+    if "/" in name or "\\" in name:
+        return None
+    # Pathological-length guard: is_file() raises OSError(ENAMETOOLONG)
+    # past the filesystem name limit (~255 bytes) — treat as a miss.
+    if len(name.encode("utf-8")) > 200:
+        return None
+    candidate = skins_path / f"{name}.yaml"
+    try:
+        normalized = candidate.absolute()
+        base = skins_path.absolute()
+    except (OSError, RuntimeError):
+        return None
+    if not normalized.is_relative_to(base):
+        return None
+    return candidate
+
+
 def load_skin(name: str) -> SkinConfig:
     """Load a skin by name. Checks user skins first, then built-in."""
-    # Check user skins directory
+    # Check user skins directory (traversal-safe: name may not escape it)
     skins_path = _skins_dir()
-    user_file = skins_path / f"{name}.yaml"
-    if user_file.is_file():
+    user_file = _resolve_skin_file(skins_path, name)
+    if user_file is not None and user_file.is_file():
         data = _load_skin_from_yaml(user_file)
         if data:
             return _build_skin_config(data)

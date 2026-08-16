@@ -21,6 +21,7 @@ from tools.delegate_tool import (
     DELEGATE_BLOCKED_TOOLS,
     DELEGATE_TASK_SCHEMA,
     DelegateEvent,
+    _DEFAULT_MAX_CONCURRENT_CHILDREN,
     _get_max_concurrent_children,
     _load_config,
     delegate_task,
@@ -1872,6 +1873,189 @@ class TestFallbackModelInheritance(unittest.TestCase):
 
         _, kwargs = MockAgent.call_args
         self.assertIsNone(kwargs["fallback_model"])
+
+
+class TestTooManyTasksRejection(unittest.TestCase):
+    """GAP F4c: the 'Too many tasks' rejection boundary in delegate_task.
+
+    Rejection fires when len(tasks) > max_concurrent_children, strictly
+    BEFORE any child agent is built or spawned (delegate_tool.py:3268-3276).
+    The boundary is strict ``>`` — a batch of exactly N tasks with
+    max_concurrent_children=N must be accepted.
+    """
+
+    REAL_GOALS = [
+        "Inspect the authentication flow",
+        "Inspect the database schema",
+        "Inspect the rate limiter",
+        "Inspect the webhook handler",
+        "Inspect the retry policy",
+    ]
+
+    def _make_cost_parent(self):
+        parent = _make_mock_parent(depth=0)
+        # Batch cost rollup reads real floats, not MagicMock auto-attrs.
+        parent.session_estimated_cost_usd = 0.0
+        parent.session_cost_status = "unknown"
+        parent.session_cost_source = "none"
+        return parent
+
+    def test_n_plus_one_tasks_rejected_before_any_spawn(self):
+        """N+1 tasks with max_concurrent_children=N -> tool_error JSON naming
+        max_concurrent_children; nothing is built or spawned."""
+        n = 2
+        parent = self._make_cost_parent()
+        tasks = [{"goal": g} for g in self.REAL_GOALS[: n + 1]]
+
+        with (
+            patch(
+                "tools.delegate_tool._get_max_concurrent_children", return_value=n
+            ),
+            patch("run_agent.AIAgent") as MockAgent,
+            patch("tools.delegate_tool._run_single_child") as mock_run,
+        ):
+            result = json.loads(
+                delegate_task(tasks=tasks, parent_agent=parent)
+            )
+
+        # The tool_error is the contract — NOT a spawn side-effect.
+        self.assertIn("error", result)
+        self.assertIn("Too many tasks", result["error"])
+        self.assertIn("max_concurrent_children", result["error"])
+        self.assertIn(str(n + 1), result["error"])
+        self.assertIn(str(n), result["error"])
+        # Rejection happens before child construction/execution: no AIAgent
+        # was built and no child runner was invoked.
+        MockAgent.assert_not_called()
+        mock_run.assert_not_called()
+
+    def test_exact_boundary_n_tasks_accepted(self):
+        """Exactly N tasks with max_concurrent_children=N passes the rejection
+        (strict > boundary) and proceeds to the batch run."""
+        n = 2
+        parent = self._make_cost_parent()
+        tasks = [{"goal": g} for g in self.REAL_GOALS[:n]]
+
+        with (
+            patch(
+                "tools.delegate_tool._get_max_concurrent_children", return_value=n
+            ),
+            patch("run_agent.AIAgent") as MockAgent,
+            patch("tools.delegate_tool._run_single_child") as mock_run,
+        ):
+            MockAgent.return_value = MagicMock()
+            mock_run.side_effect = [
+                {
+                    "task_index": i,
+                    "status": "completed",
+                    "summary": f"done {i}",
+                    "api_calls": 1,
+                    "duration_seconds": 0.1,
+                }
+                for i in range(n)
+            ]
+            result = json.loads(
+                delegate_task(tasks=tasks, parent_agent=parent)
+            )
+
+        # Must NOT hit the 'Too many tasks' rejection.
+        self.assertNotIn("error", result)
+        self.assertIn("results", result)
+        self.assertEqual(len(result["results"]), n)
+        self.assertEqual(mock_run.call_count, n)
+
+
+class TestMaxConcurrentChildrenParsing(unittest.TestCase):
+    """GAP F4c: _get_max_concurrent_children parse edge cases.
+
+    Invalid integer config values hit the TypeError/ValueError branch and
+    fall back to _DEFAULT_MAX_CONCURRENT_CHILDREN; the floor max(1, ...)
+    clamps 0 and negatives to 1.
+    """
+
+    def _call(self, config):
+        with patch(
+            "tools.delegate_tool._load_config", return_value=config
+        ):
+            return _get_max_concurrent_children()
+
+    def test_invalid_int_string_falls_back_to_default(self):
+        self.assertEqual(
+            self._call({"max_concurrent_children": "eight"}),
+            _DEFAULT_MAX_CONCURRENT_CHILDREN,
+        )
+
+    def test_non_integer_numeric_string_falls_back_to_default(self):
+        # '8.5' (a STRING) cannot be parsed by int() -> ValueError branch ->
+        # default. Distinct from a real float value (next test).
+        self.assertEqual(
+            self._call({"max_concurrent_children": "8.5"}),
+            _DEFAULT_MAX_CONCURRENT_CHILDREN,
+        )
+
+    def test_float_value_truncates_not_falls_back(self):
+        # REAL float 8.5 (e.g. YAML numeric) -> int(8.5) == 8, no exception,
+        # no fallback. Trust-review gap: pin the truncation behavior.
+        self.assertEqual(self._call({"max_concurrent_children": 8.5}), 8)
+
+    def test_zero_config_clamped_to_one(self):
+        self.assertEqual(self._call({"max_concurrent_children": 0}), 1)
+
+    def test_negative_config_clamped_to_one(self):
+        self.assertEqual(self._call({"max_concurrent_children": -5}), 1)
+
+    def test_valid_config_value_used(self):
+        self.assertEqual(self._call({"max_concurrent_children": 7}), 7)
+
+
+class TestMaxConcurrentChildrenEnvVar(unittest.TestCase):
+    """GAP F4c: DELEGATION_MAX_CONCURRENT_CHILDREN env-var path.
+
+    With config absent, the env var is applied; invalid env values fall back
+    to the default, and the floor max(1, ...) still clamps env values.
+    """
+
+    def _call_with_env(self, env_value):
+        env = {}
+        if env_value is not None:
+            env["DELEGATION_MAX_CONCURRENT_CHILDREN"] = env_value
+        with (
+            patch("tools.delegate_tool._load_config", return_value={}),
+            patch.dict(os.environ, env, clear=True),
+        ):
+            return _get_max_concurrent_children()
+
+    def test_valid_env_applied_when_config_absent(self):
+        self.assertEqual(self._call_with_env("7"), 7)
+
+    def test_invalid_env_falls_back_to_default(self):
+        self.assertEqual(
+            self._call_with_env("eight"), _DEFAULT_MAX_CONCURRENT_CHILDREN
+        )
+
+    def test_env_zero_clamped_to_one(self):
+        self.assertEqual(self._call_with_env("0"), 1)
+
+    def test_env_negative_clamped_to_one(self):
+        self.assertEqual(self._call_with_env("-3"), 1)
+
+    def test_config_wins_over_env_precedence(self):
+        # Trust-review gap: env is consulted ONLY when the config value is
+        # absent (delegate_tool.py:597-618). With config present, env must
+        # NOT override — config value 4 beats env 7.
+        with (
+            patch(
+                "tools.delegate_tool._load_config",
+                return_value={"max_concurrent_children": 4},
+            ),
+            patch.dict(os.environ, {"DELEGATION_MAX_CONCURRENT_CHILDREN": "7"}, clear=True),
+        ):
+            self.assertEqual(_get_max_concurrent_children(), 4)
+
+    def test_unset_env_uses_default(self):
+        self.assertEqual(
+            self._call_with_env(None), _DEFAULT_MAX_CONCURRENT_CHILDREN
+        )
 
 
 if __name__ == "__main__":
