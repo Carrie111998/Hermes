@@ -489,7 +489,7 @@ def proxy_kwargs_for_bot(proxy_url: str | None) -> dict:
             logger.warning(
                 "aiohttp_socks not installed — SOCKS proxy %s ignored. "
                 "Run: pip install aiohttp-socks",
-                proxy_url,
+                safe_url_for_log(proxy_url),
             )
             return {}
     return {"proxy": proxy_url}
@@ -527,7 +527,7 @@ def proxy_kwargs_for_aiohttp(proxy_url: str | None) -> tuple[dict, dict]:
             logger.warning(
                 "aiohttp_socks not installed — SOCKS proxy %s ignored. "
                 "Run: pip install aiohttp-socks",
-                proxy_url,
+                safe_url_for_log(proxy_url),
             )
             return {}, {}
         return {}, {"proxy": proxy_url}
