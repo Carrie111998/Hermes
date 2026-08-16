@@ -92,6 +92,22 @@ class CLIAgentSetupMixin:
         resolved_acp_command = runtime.get("command")
         resolved_acp_args = list(runtime.get("args") or [])
         resolved_credential_pool = runtime.get("credential_pool")
+        # Match gateway/API-server precedence for custom-provider output caps:
+        # an explicit global model.max_tokens wins, otherwise the resolved
+        # provider's max_output_tokens bounds CLI generations too. Clear a
+        # previously runtime-derived cap before applying a newly resolved route.
+        if getattr(self, "_max_tokens_from_runtime", False):
+            self.max_tokens = None
+            self._max_tokens_from_runtime = False
+        runtime_max_tokens = runtime.get("max_output_tokens")
+        if (
+            self.max_tokens is None
+            and isinstance(runtime_max_tokens, int)
+            and not isinstance(runtime_max_tokens, bool)
+            and runtime_max_tokens > 0
+        ):
+            self.max_tokens = runtime_max_tokens
+            self._max_tokens_from_runtime = True
         # A callable api_key is a bearer-token provider (Azure Foundry
         # Entra ID — ``azure_identity_adapter.build_token_provider``).
         # The OpenAI SDK accepts ``Callable[[], str]`` for ``api_key`` and

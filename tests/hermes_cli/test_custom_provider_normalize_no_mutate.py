@@ -60,3 +60,15 @@ def test_normalized_models_mapping_is_not_shared_with_input():
     assert "injected" not in entry["models"], (
         "normalized models mapping must not alias the caller's dict"
     )
+
+
+def test_normalizer_preserves_provider_output_cap():
+    entry = {
+        "base_url": "https://x.example/v1",
+        "max_output_tokens": 4096,
+    }
+
+    out = _normalize_custom_provider_entry(entry, provider_key="p")
+
+    assert out is not None
+    assert out["max_output_tokens"] == 4096

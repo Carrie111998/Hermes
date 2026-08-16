@@ -96,6 +96,32 @@ class TestCustomReasoningWireShape:
         )
         assert eb.get("think") is not True
 
+    @pytest.mark.parametrize(
+        "base_url",
+        [
+            "https://api.cloudflare.com/client/v4/accounts/account/ai/v1",
+            "https://gateway.ai.cloudflare.com/v1/account/gateway/compat",
+        ],
+    )
+    @pytest.mark.parametrize(
+        "reasoning_config",
+        [
+            {"enabled": False, "effort": "none"},
+            {"enabled": True, "effort": "high"},
+        ],
+    )
+    def test_cloudflare_compat_surfaces_omit_generic_reasoning_controls(
+        self, custom_profile, base_url, reasoning_config
+    ):
+        """Cloudflare's OpenAI-compatible surfaces reject generic controls."""
+        eb, tl = custom_profile.build_api_kwargs_extras(
+            reasoning_config=reasoning_config,
+            model="openai/gpt-5.6-luna",
+            base_url=base_url,
+        )
+        assert eb == {}
+        assert tl == {}
+
 
 class TestCustomReasoningWithNumCtx:
     """Ollama num_ctx and reasoning are independent and compose."""
