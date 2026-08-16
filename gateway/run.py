@@ -3369,11 +3369,20 @@ def _resolve_gateway_model(config: dict | None = None) -> str:
     openai-codex.
     """
     cfg = config if config is not None else _load_gateway_config()
+    # _load_gateway_config() reads raw YAML (bypassing load_config), so
+    # ${VAR} env references inside model.default are NOT expanded there.
+    # Expand here so a profile whose default model is an env ref (e.g.
+    # ${LOCAL_LLM_MODEL}) resolves to the real model name instead of being
+    # sent literally to the provider (404 "no router for requested model").
+    # No-op when the value is already a literal or unset.
+    from typing import cast
+    from hermes_cli.config import _expand_env_vars
     model_cfg = cfg.get("model", {})
     if isinstance(model_cfg, str):
-        return model_cfg
+        return cast(str, _expand_env_vars(model_cfg))
     elif isinstance(model_cfg, dict):
-        return model_cfg.get("default") or model_cfg.get("model") or ""
+        raw = model_cfg.get("default") or model_cfg.get("model") or ""
+        return cast(str, _expand_env_vars(raw))
     return ""
 
 
