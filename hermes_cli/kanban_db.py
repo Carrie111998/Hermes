@@ -7278,9 +7278,16 @@ def specify_triage_task(
 
 
 class DecomposeGraphRejected(ValueError):
-    """Invalid graph whose rejection event committed on the triage root."""
+    """Invalid graph with instance-scoped rejection-event commit metadata."""
 
-    rejection_event_committed = True
+    def __init__(
+        self,
+        reason: str,
+        *,
+        rejection_event_committed: bool = False,
+    ) -> None:
+        super().__init__(reason)
+        self.rejection_event_committed = rejection_event_committed
 
 
 def _validate_decomposed_children(children: list[dict]) -> None:
@@ -7541,7 +7548,10 @@ def decompose_triage_task(
             )
 
     if rejection_reason is not None:
-        raise DecomposeGraphRejected(rejection_reason)
+        raise DecomposeGraphRejected(
+            rejection_reason,
+            rejection_event_committed=True,
+        )
 
     # Outside the write_txn: promote parent-free children to 'ready'
     # so the dispatcher picks them up on its next tick. Same pattern

@@ -442,7 +442,12 @@ def decompose_task(
         if getattr(exc, "rejection_event_committed", False):
             # The DB marks only the exception raised after its transaction
             # durably records one rejection on the still-current triage root.
-            return DecomposeOutcome(task_id, False, f"DB rejected graph: {exc}")
+            return DecomposeOutcome(
+                task_id,
+                False,
+                f"DB rejected graph: {exc}. "
+                "Regenerate the decomposition payload and retry.",
+            )
         logger.exception("decompose: DB validation error on task %s", task_id)
         return DecomposeOutcome(task_id, False, "DB error: ValueError")
     except Exception as exc:

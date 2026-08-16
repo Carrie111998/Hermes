@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json as jsonlib
 import sqlite3
+from enum import IntEnum
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -122,6 +123,17 @@ def test_decompose_with_fanout_creates_children(kanban_home):
     assert c1.assignee == "engineer"
 
 
+def test_decompose_graph_rejection_commit_flag_is_instance_scoped():
+    uncommitted = kb.DecomposeGraphRejected("validation failed")
+    committed = kb.DecomposeGraphRejected(
+        "validation failed",
+        rejection_event_committed=True,
+    )
+
+    assert uncommitted.rejection_event_committed is False
+    assert committed.rejection_event_committed is True
+
+
 @pytest.mark.parametrize(
     "parent_fields",
     [
@@ -132,6 +144,7 @@ def test_decompose_with_fanout_creates_children(kanban_home):
         [{"parents": [0]}],
         [{"parents": [1]}, {"parents": [0]}],
         [{}, {"parents": [False]}],
+        [{"parents": [True]}, {}],
         [{}, {"parents": [0, 0]}],
     ],
     ids=[
@@ -141,7 +154,8 @@ def test_decompose_with_fanout_creates_children(kanban_home):
         "out-of-range",
         "self-reference",
         "cycle",
-        "boolean-index-non-self",
+        "false-index-non-self",
+        "true-index-non-self",
         "duplicate-parent",
     ],
 )
@@ -192,10 +206,43 @@ def test_decompose_rejects_invalid_dependency_graph_without_rewriting(
     payload = rejection_events[0].payload
     assert payload is not None
     assert payload["class"] == "invalid_dependency_graph"
-    assert payload["reason"] == outcome.reason.removeprefix(
-        "DB rejected graph: "
-    )
+    assert f"DB rejected graph: {payload['reason']}" in outcome.reason
+    assert "Regenerate the decomposition payload and retry." in outcome.reason
     assert payload["author"] == "me"
+
+
+def test_decompose_rejects_programmatic_integer_subclass(kanban_home):
+    class ParentIndex(IntEnum):
+        FIRST = 0
+
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="preserve this root", triage=True)
+
+        with pytest.raises(kb.DecomposeGraphRejected) as caught:
+            kb.decompose_triage_task(
+                conn,
+                tid,
+                root_assignee="orchestrator",
+                children=[
+                    {"title": "first"},
+                    {"title": "second", "parents": [ParentIndex.FIRST]},
+                ],
+                author="me",
+            )
+
+        root = kb.get_task(conn, tid)
+        task_ids = [row["id"] for row in conn.execute("SELECT id FROM tasks")]
+        rejection_events = [
+            event for event in kb.list_events(conn, tid)
+            if event.kind == "decompose_rejected"
+        ]
+
+    assert caught.value.rejection_event_committed is True
+    assert "parents[0] is not a valid index" in str(caught.value)
+    assert root is not None
+    assert root.status == "triage"
+    assert task_ids == [tid]
+    assert len(rejection_events) == 1
 
 
 @pytest.mark.parametrize("mutation", ["transition", "delete"])
@@ -308,6 +355,44 @@ def test_decompose_event_write_failure_is_not_reported_as_durable_rejection(
     assert root.status == "triage"
     assert root.title == "preserve this root"
     assert task_ids == [tid]
+    assert rejection_count == 0
+
+
+def test_decompose_uncommitted_graph_rejection_is_reported_as_db_error(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="preserve this root", triage=True)
+
+    llm_payload = jsonlib.dumps({
+        "fanout": True,
+        "rationale": "valid graph",
+        "tasks": [
+            {"title": "child", "body": "work", "assignee": "worker"},
+        ],
+    })
+
+    patches = _patch_list_profiles(["orchestrator", "worker"])
+    for p in patches:
+        p.start()
+    try:
+        with _patch_aux_client(llm_payload), _patch_extra_body(), patch.object(
+            decomp.kb,
+            "decompose_triage_task",
+            side_effect=kb.DecomposeGraphRejected("not durable"),
+        ):
+            outcome = decomp.decompose_task(tid, author="me")
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert outcome.ok is False
+    assert outcome.reason == "DB error: ValueError"
+    with kb.connect() as conn:
+        root = kb.get_task(conn, tid)
+        rejection_count = conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE kind = 'decompose_rejected'"
+        ).fetchone()[0]
+    assert root is not None
+    assert root.status == "triage"
     assert rejection_count == 0
 
 
