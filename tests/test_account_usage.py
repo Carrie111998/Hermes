@@ -250,6 +250,26 @@ def test_anthropic_usage_uses_live_oauth_token_on_official_route(monkeypatch):
     ]
 
 
+def test_anthropic_usage_falls_back_to_profile_token_when_live_key_is_empty(monkeypatch):
+    """A runtime URL without a key must not suppress the configured OAuth token."""
+    client = _RecordingClient({"five_hour": {"utilization": 0.25}})
+    monkeypatch.setattr(
+        "agent.account_usage.resolve_anthropic_token",
+        lambda: "cc-profile-oauth-token",
+    )
+    monkeypatch.setattr("agent.account_usage.httpx.Client", lambda timeout: client)
+
+    snapshot = fetch_account_usage(
+        "anthropic",
+        base_url="https://api.anthropic.com/v1",
+        api_key=None,
+    )
+
+    assert snapshot is not None
+    assert snapshot.available
+    assert client.calls[0][1]["Authorization"] == "Bearer cc-profile-oauth-token"
+
+
 def test_anthropic_usage_omits_custom_route_instead_of_cross_hosting_key(monkeypatch):
     monkeypatch.setattr(
         "agent.account_usage.resolve_anthropic_token",
@@ -358,3 +378,51 @@ def test_supermemory_billing_rejects_split_model_credentials_and_cloud_override(
             {"Authorization": "Bearer self-hosted-key", "Accept": "application/json"},
         )
     ]
+
+
+def test_supermemory_billing_clamps_negative_remaining_credit(monkeypatch):
+    """Overages are rendered as exhausted credit, never a negative remainder."""
+    monkeypatch.setattr(
+        "plugins.memory.supermemory.resolve_supermemory_connection_settings",
+        lambda: {
+            "api_key": "test-key",
+            "base_url": "https://memory.example",
+            "api_timeout": 2.5,
+        },
+    )
+    monkeypatch.setattr(
+        "agent.account_usage.httpx.Client",
+        lambda timeout: _RecordingClient(
+            {
+                "features": {
+                    "usd_credits": {
+                        "usage": 60,
+                        "included_usage": 50,
+                        "balance": -10,
+                    }
+                }
+            }
+        ),
+    )
+
+    snapshot = fetch_account_usage("supermemory")
+
+    assert snapshot is not None
+    assert snapshot.windows[0].used_percent == 120
+    assert snapshot.windows[0].detail == "$0.00 of $50.00 remaining"
+
+
+def test_supermemory_billing_clamps_negative_balance_without_usage_window(monkeypatch):
+    monkeypatch.setattr(
+        "plugins.memory.supermemory.resolve_supermemory_connection_settings",
+        lambda: {"api_key": "test-key", "base_url": "https://memory.example", "api_timeout": 2.5},
+    )
+    monkeypatch.setattr(
+        "agent.account_usage.httpx.Client",
+        lambda timeout: _RecordingClient({"features": {"usd_credits": {"balance": -10}}}),
+    )
+
+    snapshot = fetch_account_usage("supermemory")
+
+    assert snapshot is not None
+    assert snapshot.details == ("Supermemory credits balance: $0.00",)

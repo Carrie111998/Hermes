@@ -16,6 +16,11 @@ async def test_quota_fetch_yields_event_loop_during_delayed_request(monkeypatch)
     ticked = asyncio.Event()
     saw_tick_from_worker: list[bool] = []
 
+    monkeypatch.setattr(
+        "plugins.memory.supermemory.resolve_supermemory_connection_settings",
+        lambda: {"api_key": "test-key", "base_url": "https://api.supermemory.ai", "api_timeout": 10},
+    )
+
     def delayed_fetch(provider, *, base_url=None, api_key=None):
         assert provider == "supermemory"
         time.sleep(0.05)
@@ -65,6 +70,11 @@ async def test_quota_fetch_combines_model_and_supermemory_snapshots(monkeypatch)
     now = datetime(2026, 8, 11, tzinfo=timezone.utc)
     fetched = []
 
+    monkeypatch.setattr(
+        "plugins.memory.supermemory.resolve_supermemory_connection_settings",
+        lambda: {"api_key": "test-key", "base_url": "https://api.supermemory.ai", "api_timeout": 10},
+    )
+
     def fake_fetch(provider, *, base_url=None, api_key=None):
         fetched.append((provider, base_url, api_key))
         if provider == "openai-codex":
@@ -107,6 +117,49 @@ async def test_quota_fetch_combines_model_and_supermemory_snapshots(monkeypatch)
         ("openai-codex", "https://chatgpt.example/codex", "codex-token"),
         ("supermemory", None, None),
     ]
+
+
+@pytest.mark.asyncio
+async def test_quota_fetch_skips_supermemory_without_a_configured_key(monkeypatch):
+    fetched = []
+
+    monkeypatch.setattr(
+        "plugins.memory.supermemory.resolve_supermemory_connection_settings",
+        lambda: {"api_key": "", "base_url": "https://api.supermemory.ai", "api_timeout": 10},
+    )
+
+    def fake_fetch(provider, *, base_url=None, api_key=None):
+        fetched.append((provider, base_url, api_key))
+        return None
+
+    monkeypatch.setattr("agent.account_usage.fetch_account_usage", fake_fetch)
+
+    snapshot = await runtime_footer.fetch_runtime_footer_quota_snapshot("custom-local")
+
+    assert snapshot is None
+    assert fetched == []
+
+
+@pytest.mark.asyncio
+async def test_quota_fetch_timeout_includes_supermemory_config_resolution(monkeypatch):
+    def slow_resolver():
+        time.sleep(0.1)
+        return {"api_key": "", "base_url": "https://api.supermemory.ai", "api_timeout": 10}
+
+    monkeypatch.setattr(
+        "plugins.memory.supermemory.resolve_supermemory_connection_settings",
+        slow_resolver,
+    )
+
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    snapshot = await runtime_footer.fetch_runtime_footer_quota_snapshot(
+        "custom-local",
+        timeout_seconds=0.01,
+    )
+
+    assert snapshot is None
+    assert loop.time() - started < 0.05
 
 
 @pytest.mark.asyncio

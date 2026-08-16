@@ -60,10 +60,6 @@ async def fetch_runtime_footer_quota_snapshot(
     requests: list[tuple[str, str | None, str | None]] = []
     if normalized in {"anthropic", "openai-codex", "openrouter"}:
         requests.append((normalized, base_url, api_key))
-    # With no Supermemory key this returns an unavailable snapshot without a
-    # request. asyncio.to_thread also preserves profile-scoped contextvars.
-    requests.append(("supermemory", None, None))
-
     async def _fetch(
         one_provider: str,
         one_base_url: str | None,
@@ -76,6 +72,14 @@ async def fetch_runtime_footer_quota_snapshot(
             api_key=one_api_key,
         )
 
+    def _fetch_supermemory_if_configured():
+        """Resolve connection + fetch in one worker so footer rendering never blocks."""
+        from plugins.memory.supermemory import resolve_supermemory_connection_settings
+
+        if not str(resolve_supermemory_connection_settings().get("api_key") or "").strip():
+            return None
+        return fetch_account_usage("supermemory")
+
     try:
         results = await asyncio.wait_for(
             asyncio.gather(
@@ -83,6 +87,7 @@ async def fetch_runtime_footer_quota_snapshot(
                     _fetch(name, request_base, request_key)
                     for name, request_base, request_key in requests
                 ),
+                asyncio.to_thread(_fetch_supermemory_if_configured),
                 return_exceptions=True,
             ),
             timeout=max(0.001, float(timeout_seconds)),

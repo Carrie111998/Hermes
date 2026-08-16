@@ -780,9 +780,9 @@ def _fetch_anthropic_account_usage(
                 "custom and proxy routes are not queried."
             ),
         )
-    token = str(api_key or "").strip() if has_live_context else (
-        resolve_anthropic_token() or ""
-    ).strip()
+    token = str(api_key or "").strip()
+    if not token:
+        token = (resolve_anthropic_token() or "").strip()
     if not token:
         return None
     if not _is_oauth_token(token):
@@ -955,7 +955,7 @@ def _fetch_supermemory_account_usage() -> AccountUsageSnapshot:
         used_value = float(used)
         included_value = float(included)
         remaining = (
-            float(balance)
+            max(0.0, float(balance))
             if _is_finite_num(balance)
             else max(0.0, included_value - used_value)
         )
@@ -976,7 +976,7 @@ def _fetch_supermemory_account_usage() -> AccountUsageSnapshot:
             f"Supermemory credits used: ${used_value:.2f} of ${included_value:.2f}"
         )
     elif _is_finite_num(balance):
-        details.append(f"Supermemory credits balance: ${float(balance):.2f}")
+        details.append(f"Supermemory credits balance: ${max(0.0, float(balance)):.2f}")
 
     return AccountUsageSnapshot(
         provider="supermemory",
