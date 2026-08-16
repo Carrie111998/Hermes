@@ -1,4 +1,4 @@
-"""CLI coverage for ``hermes remote pair`` and ``hermes remote attach``."""
+"""CLI coverage for ``hermes remote pair``, ``attach``, and ``sessions``."""
 
 from __future__ import annotations
 
@@ -191,3 +191,237 @@ def test_connection_config_round_trip(tmp_path, monkeypatch):
         "token": "attach-token",
         "expires_at": "2026-08-17T12:00:00+00:00",
     }
+
+
+def _save_remote_connections(connections):
+    save_config({"remote": {"connections": connections}})
+
+
+def test_sessions_lists_saved_connection_sessions(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _save_remote_connections(
+        {
+            "lab": {
+                "host": "host-box",
+                "port": 9000,
+                "token": "lab-token",
+                "expires_at": "2026-08-17T12:00:00+00:00",
+            }
+        }
+    )
+    calls = []
+
+    def fake_request(method, url, **kwargs):
+        calls.append((method, url, kwargs))
+        return {
+            "hostname": "host-box",
+            "profile": "research",
+            "sessions": [
+                {
+                    "id": "20260816_123456_abcdef",
+                    "title": "Active investigation",
+                    "status": "active",
+                    "updated_at": "2026-08-16T12:34:56+00:00",
+                },
+                {
+                    "id": "20260815_221500_fedcba",
+                    "title": "Waiting room",
+                    "status": "idle",
+                    "updated_at": "2026-08-15T22:15:00+00:00",
+                },
+            ],
+        }
+
+    monkeypatch.setattr("hermes_cli.subcommands.remote._request_json", fake_request)
+
+    result = remote_command(_args(["sessions"]))
+
+    assert result == 0
+    assert calls == [
+        (
+            "GET",
+            "http://host-box:9000/api/remote/sessions",
+            {"token": "lab-token"},
+        )
+    ]
+    output = capsys.readouterr().out
+    assert "host-box" in output
+    assert "research" in output
+    assert "Session ID" in output
+    assert "Title" in output
+    assert "Status" in output
+    assert "Updated" in output
+    assert "20260816_123" in output
+    assert "20260816_123456_abcdef" not in output
+    assert "Active investigation" in output
+    assert "active" in output
+    assert "Waiting room" in output
+    assert "idle" in output
+    assert "2026-08-16 12:34" in output
+
+
+def test_sessions_without_saved_connection_has_attach_hint(
+    tmp_path, monkeypatch, capsys
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    save_config({})
+
+    result = remote_command(_args(["sessions"]))
+
+    assert result == 1
+    error = capsys.readouterr().err
+    assert "No saved remote connection" in error
+    assert "hermes remote attach" in error
+
+
+def test_sessions_expired_token_has_reattach_hint(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _save_remote_connections(
+        {
+            "lab": {
+                "host": "host-box",
+                "port": 9000,
+                "token": "expired-token",
+                "expires_at": "2026-08-15T12:00:00+00:00",
+            }
+        }
+    )
+
+    def expired(*_args, **_kwargs):
+        raise RemoteHTTPError(401, "Invalid or expired attach token")
+
+    monkeypatch.setattr("hermes_cli.subcommands.remote._request_json", expired)
+
+    result = remote_command(_args(["sessions"]))
+
+    assert result == 1
+    assert (
+        "Attach token expired or invalid — run `hermes remote attach host-box:9000 "
+        "--code ...` again" in capsys.readouterr().err
+    )
+
+
+def test_sessions_unreachable_host_has_clear_error(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _save_remote_connections(
+        {
+            "offline": {
+                "host": "offline",
+                "port": 9123,
+                "token": "attach-token",
+                "expires_at": "2026-08-17T12:00:00+00:00",
+            }
+        }
+    )
+
+    def unreachable(*_args, **_kwargs):
+        raise RemoteConnectionError("connection refused")
+
+    monkeypatch.setattr("hermes_cli.subcommands.remote._request_json", unreachable)
+
+    result = remote_command(_args(["sessions"]))
+
+    assert result == 1
+    assert "Cannot reach host at http://offline:9123" in capsys.readouterr().err
+
+
+def test_sessions_name_selects_specific_connection(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _save_remote_connections(
+        {
+            "first": {
+                "host": "first-host",
+                "port": 8642,
+                "token": "first-token",
+                "expires_at": "2026-08-17T12:00:00+00:00",
+            },
+            "lab": {
+                "host": "lab-host",
+                "port": 9443,
+                "token": "lab-token",
+                "expires_at": "2026-08-17T12:00:00+00:00",
+            },
+        }
+    )
+    calls = []
+
+    def fake_request(method, url, **kwargs):
+        calls.append((method, url, kwargs))
+        return {"hostname": "lab-host", "profile": "default", "sessions": []}
+
+    monkeypatch.setattr("hermes_cli.subcommands.remote._request_json", fake_request)
+
+    result = remote_command(_args(["sessions", "--name", "lab"]))
+
+    assert result == 0
+    assert calls == [
+        (
+            "GET",
+            "http://lab-host:9443/api/remote/sessions",
+            {"token": "lab-token"},
+        )
+    ]
+    assert "No open sessions." in capsys.readouterr().out
+
+
+def test_sessions_accepts_connection_name_as_positional(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _save_remote_connections(
+        {
+            "lab": {
+                "host": "lab-host",
+                "port": 9443,
+                "token": "lab-token",
+                "expires_at": "2026-08-17T12:00:00+00:00",
+            }
+        }
+    )
+    calls = []
+
+    def fake_request(method, url, **kwargs):
+        calls.append((method, url, kwargs))
+        return {"hostname": "lab-host", "profile": "default", "sessions": []}
+
+    monkeypatch.setattr("hermes_cli.subcommands.remote._request_json", fake_request)
+
+    assert remote_command(_args(["sessions", "lab"])) == 0
+    assert calls[0][1] == "http://lab-host:9443/api/remote/sessions"
+    assert calls[0][2]["token"] == "lab-token"
+
+
+def test_sessions_defaults_to_most_recent_saved_connection(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _save_remote_connections(
+        {
+            "first": {
+                "host": "first-host",
+                "port": 9000,
+                "token": "first-token",
+                "expires_at": "2026-08-17T12:00:00+00:00",
+            },
+            "latest": {
+                "host": "latest-host",
+                "port": 8642,
+                "token": "latest-token",
+                "expires_at": "2026-08-17T13:00:00+00:00",
+            },
+        }
+    )
+    calls = []
+
+    def fake_request(method, url, **kwargs):
+        calls.append((method, url, kwargs))
+        return {"hostname": "latest-host", "profile": "default", "sessions": []}
+
+    monkeypatch.setattr("hermes_cli.subcommands.remote._request_json", fake_request)
+
+    assert remote_command(_args(["sessions"])) == 0
+    assert calls == [
+        (
+            "GET",
+            "http://latest-host:8642/api/remote/sessions",
+            {"token": "latest-token"},
+        )
+    ]

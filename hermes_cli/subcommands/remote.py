@@ -15,6 +15,7 @@ import sys
 import urllib.error
 import urllib.parse
 import urllib.request
+from datetime import datetime
 from typing import Any, Callable
 
 
@@ -82,6 +83,21 @@ def build_remote_parser(subparsers, *, cmd_remote: Callable) -> None:
     )
     attach_parser.add_argument(
         "--name", help="Name used to save this connection (default: host name)"
+    )
+
+    sessions_parser = remote_sub.add_parser(
+        "sessions", help="List sessions on a saved remote connection"
+    )
+    sessions_parser.add_argument(
+        "connection_name",
+        nargs="?",
+        metavar="name",
+        help="Saved connection name (default: most recently saved)",
+    )
+    sessions_parser.add_argument(
+        "--name",
+        dest="selected_name",
+        help="Saved connection name (alternative to the positional name)",
     )
 
     remote_parser.set_defaults(func=cmd_remote)
@@ -234,6 +250,63 @@ def _save_connection(
     save_config(config)
 
 
+def _saved_connections() -> dict[str, dict[str, Any]]:
+    """Return well-shaped saved remote connections from config.yaml."""
+    from hermes_cli.config import load_config
+
+    remote = load_config().get("remote")
+    if not isinstance(remote, dict):
+        return {}
+    connections = remote.get("connections")
+    if not isinstance(connections, dict):
+        return {}
+    return {
+        str(name): connection
+        for name, connection in connections.items()
+        if isinstance(connection, dict)
+    }
+
+
+def _format_updated_at(value: Any) -> str:
+    """Render the server's RFC3339 timestamp compactly for a text table."""
+    raw = str(value or "").strip()
+    if not raw:
+        return "-"
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return raw
+    return parsed.strftime("%Y-%m-%d %H:%M")
+
+
+def _remote_target(host: str, port: int) -> str:
+    rendered_host = f"[{host}]" if ":" in host else host
+    return rendered_host if port == DEFAULT_REMOTE_PORT else f"{rendered_host}:{port}"
+
+
+def _print_sessions_table(result: dict[str, Any], *, fallback_host: str) -> None:
+    hostname = str(result.get("hostname") or fallback_host)
+    profile = str(result.get("profile") or "default")
+    print(f"Remote host: {hostname} (profile: {profile})")
+
+    sessions = result.get("sessions")
+    if not isinstance(sessions, list) or not sessions:
+        print("No open sessions.")
+        return
+
+    print()
+    print(f"  {'Session ID':<12}  {'Title':<40}  {'Status':<8}  Updated")
+    print(f"  {'----------':<12}  {'-----':<40}  {'------':<8}  -------")
+    for session in sessions:
+        if not isinstance(session, dict):
+            continue
+        session_id = str(session.get("id") or "-")[:12]
+        title = " ".join(str(session.get("title") or "(untitled)").split())[:40]
+        status = str(session.get("status") or "-")
+        updated = _format_updated_at(session.get("updated_at"))
+        print(f"  {session_id:<12}  {title:<40}  {status:<8}  {updated}")
+
+
 def _print_request_error(exc: Exception, *, base_url: str, pairing: bool) -> int:
     if isinstance(exc, RemoteHTTPError):
         if exc.status == 401 and pairing:
@@ -360,6 +433,66 @@ def _attach(args) -> int:
     return 0
 
 
+def _sessions(args) -> int:
+    connections = _saved_connections()
+    if not connections:
+        print(
+            "No saved remote connection. Run `hermes remote attach <host>` first.",
+            file=sys.stderr,
+        )
+        return 1
+
+    selected_name = getattr(args, "selected_name", None) or getattr(
+        args, "connection_name", None
+    )
+    if selected_name:
+        connection = connections.get(selected_name)
+        if connection is None:
+            print(
+                f"Saved remote connection {selected_name!r} was not found.",
+                file=sys.stderr,
+            )
+            return 1
+    else:
+        selected_name, connection = next(reversed(connections.items()))
+
+    host = str(connection.get("host") or "").strip()
+    token = str(connection.get("token") or "").strip()
+    try:
+        port = _port(str(connection.get("port", DEFAULT_REMOTE_PORT)))
+    except ValueError:
+        port = 0
+    if not host or not token or not port:
+        print(
+            f"Saved remote connection {selected_name!r} is invalid. "
+            "Run `hermes remote attach <host>` again.",
+            file=sys.stderr,
+        )
+        return 1
+
+    target = _remote_target(host, port)
+    rendered_host = f"[{host}]" if ":" in host else host
+    base_url = f"http://{rendered_host}:{port}"
+    try:
+        result = _request_json(
+            "GET", f"{base_url}/api/remote/sessions", token=token
+        )
+    except RemoteHTTPError as exc:
+        if exc.status == 401:
+            print(
+                "Attach token expired or invalid — run "
+                f"`hermes remote attach {target} --code ...` again",
+                file=sys.stderr,
+            )
+            return 1
+        return _print_request_error(exc, base_url=base_url, pairing=False)
+    except RemoteConnectionError as exc:
+        return _print_request_error(exc, base_url=base_url, pairing=False)
+
+    _print_sessions_table(result, fallback_host=host)
+    return 0
+
+
 def remote_command(args) -> int:
     """Dispatch a ``hermes remote`` action."""
     action = getattr(args, "remote_action", None)
@@ -367,7 +500,9 @@ def remote_command(args) -> int:
         return _pair(args)
     if action == "attach":
         return _attach(args)
-    print("Choose a remote action: pair or attach.", file=sys.stderr)
+    if action == "sessions":
+        return _sessions(args)
+    print("Choose a remote action: pair, attach, or sessions.", file=sys.stderr)
     return 2
 
 
