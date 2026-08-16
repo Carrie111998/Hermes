@@ -429,6 +429,9 @@ py-modules = [
   "hermes_state_search",
   "hermes_time",
   "hermes_logging",
+  "hermes_worker_containment_canonical_bytes_v2",
+  "hermes_strict_no_send_preflight_v2",
+  "hermes_strict_runtime_guard_v2",
   "utils",
   "mcp_serve",
 ]
