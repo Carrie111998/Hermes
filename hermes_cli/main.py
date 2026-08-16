@@ -7818,6 +7818,9 @@ def cmd_gui(args: argparse.Namespace):
                       "(CSC_IDENTITY_AUTO_DISCOVERY=false)")
             npm_build_env = _npm_lifecycle_env(env)
             if not source_mode:
+                # electron-builder treats CI as an implicit request to publish;
+                # local `pack` builds must only produce the unpacked app.
+                npm_build_env.pop("CI", None)
                 # A running desktop instance launched from release/win-unpacked
                 # holds Hermes.exe locked on Windows, so the pack can't replace
                 # it ("Access is denied" / ERR_ELECTRON_BUILDER_CANNOT_EXECUTE).
