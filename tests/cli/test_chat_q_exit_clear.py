@@ -77,6 +77,11 @@ def test_single_query_main_skips_clear_on_exit_summary(monkeypatch):
                 platform="cli",
             )
 
+        def _disable_modal_prompt_callbacks(self):
+            # One-shot mode clears the prompt_toolkit modal callbacks; see
+            # cli._disable_modal_prompt_callbacks.
+            calls.append("disable-modal-callbacks")
+
         def _claim_active_session(self, surface, *, stderr=False):
             calls.append(("claim", surface, stderr))
             return True
@@ -104,6 +109,7 @@ def test_single_query_main_skips_clear_on_exit_summary(monkeypatch):
     cli_mod.main(query="hello", quiet=False, toolsets="terminal")
 
     assert calls == [
+        "disable-modal-callbacks",
         ("claim", "cli", False),
         "query-label",
         "advisories",

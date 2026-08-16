@@ -7848,6 +7848,13 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         """Install tool callbacks that need the live prompt UI."""
         if getattr(self, "_tool_callbacks_installed", False):
             return
+        if getattr(self, "_modal_prompts_disabled", False):
+            # Headless one-shot session (`hermes chat -q`, kanban workers):
+            # there is no prompt_toolkit Application to render a modal into,
+            # so installing these callbacks only manufactures a fake human
+            # channel that always times out. See
+            # _disable_modal_prompt_callbacks().
+            return
         set_sudo_password_callback(self._sudo_password_callback)
         set_approval_callback(self._approval_callback)
         set_secret_capture_callback(self._secret_capture_callback)
@@ -7858,6 +7865,37 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         except ImportError:
             pass
         self._tool_callbacks_installed = True
+
+    def _disable_modal_prompt_callbacks(self) -> None:
+        """Unregister the prompt_toolkit-backed modal callbacks.
+
+        The approval and sudo callbacks render into the live prompt_toolkit
+        layout (``_approval_state`` → ``approval_widget``) and then block on a
+        response queue that only a key binding can fill. In a session that
+        never builds an Application — ``hermes chat -q`` one-shot runs, which
+        is how every kanban worker is spawned — that queue can never be
+        answered, so the prompt silently burned the whole approval timeout and
+        returned ``"timeout"``. Callers then reported "approval prompt timed
+        out without a user response", which reads as a human ignoring a prompt
+        when in fact no prompt was ever rendered anywhere (#t_9691f08d).
+
+        Clearing the callbacks makes headless sessions take the honest
+        no-human-channel branch immediately: gates fail closed with "no
+        interactive user or gateway is present", with no bogus wait.
+        """
+        try:
+            set_approval_callback(None)
+            set_sudo_password_callback(None)
+        except Exception:
+            logger.debug("Failed to clear modal prompt callbacks", exc_info=True)
+        try:
+            from tools.computer_use_tool import set_approval_callback as _set_cu_cb
+
+            _set_cu_cb(None)
+        except Exception:
+            pass
+        self._tool_callbacks_installed = False
+        self._modal_prompts_disabled = True
 
     def _ensure_tirith_security(self) -> None:
         """Check tirith availability once before tools can run terminal commands."""
@@ -19857,6 +19895,15 @@ def main(
         # agent must wait the full MCP cold-start bound before its first
         # (and only) tool snapshot. See #51316.
         cli._single_query_mode = True
+        # One-shot mode never builds a prompt_toolkit Application, so the
+        # modal approval / sudo callbacks installed at construction have no
+        # surface to render into and no key binding that can answer them.
+        # Leaving them registered makes every approval gate burn its full
+        # timeout and then report "the prompt timed out without a user
+        # response" — indistinguishable from a human ignoring a prompt, when
+        # no prompt was ever shown. Clear them so gates take the honest
+        # "no interactive user or gateway is present" branch immediately.
+        cli._disable_modal_prompt_callbacks()
         if not cli._claim_active_session("cli", stderr=bool(quiet)):
             sys.exit(1)
         try:
