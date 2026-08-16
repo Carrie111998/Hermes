@@ -126,6 +126,31 @@ async def _redeem_pairing_code(adapter: APIServerAdapter, code: str):
         )
 
 
+@pytest.mark.asyncio
+async def test_remote_pair_redeems_code_without_api_key():
+    """Client-side redemption must NOT require API_SERVER_KEY — the pairing
+    code is the only credential a remote client possesses."""
+    adapter = APIServerAdapter(
+        PlatformConfig(enabled=True, extra={"key": "remote-test-key"})
+    )
+    generated = await _generate_pairing_code(adapter)
+
+    handler = _route_handler(adapter, "POST", "/api/remote/pair")
+    with patch.object(
+        adapter,
+        "_read_json_body",
+        return_value=({"code": generated["code"]}, None),
+    ):
+        # No Authorization header at all
+        response = await handler(make_mocked_request("POST", "/api/remote/pair"))
+
+    assert response.status == 200
+    payload = json.loads(response.text)
+    assert payload["token"]
+    assert payload["expires_at"]
+    assert payload["ttl_hours"] == 24
+
+
 def test_remote_pairing_routes_are_registered():
     adapter = APIServerAdapter(PlatformConfig(enabled=True))
     routes = {(method, path) for method, path, _ in adapter._http_route_table()}
@@ -248,14 +273,21 @@ async def test_remote_pairing_code_is_invalidated_after_five_failed_attempts():
 
 
 @pytest.mark.asyncio
-async def test_remote_pairing_endpoints_require_static_api_key():
+async def test_remote_pair_code_endpoint_requires_static_api_key():
+    """Code GENERATION (host-side) requires API_SERVER_KEY; code REDEMPTION
+    (client-side) does not — the code itself is the credential."""
     adapter = APIServerAdapter(
         PlatformConfig(enabled=True, extra={"key": "remote-test-key"})
     )
 
+    # Host-side generation: requires the static key
     code_response = await _route_handler(
         adapter, "POST", "/api/remote/pair/code"
     )(make_mocked_request("POST", "/api/remote/pair/code"))
+    assert code_response.status == 401
+
+    # Client-side redemption: NO key required; an unknown code is a 401 but
+    # for a different reason (invalid code), and a valid code succeeds.
     with patch.object(
         adapter,
         "_read_json_body",
@@ -264,8 +296,7 @@ async def test_remote_pairing_endpoints_require_static_api_key():
         pair_response = await _route_handler(adapter, "POST", "/api/remote/pair")(
             make_mocked_request("POST", "/api/remote/pair")
         )
-
-    assert code_response.status == 401
+    # No key, unknown code -> 401 (invalid code path, not auth path)
     assert pair_response.status == 401
 
 

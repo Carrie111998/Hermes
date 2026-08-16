@@ -3388,11 +3388,12 @@ class APIServerAdapter(BasePlatformAdapter):
         )
 
     async def _handle_remote_pair(self, request: "web.Request") -> "web.Response":
-        """POST /api/remote/pair — redeem a code for a 24-hour attach token."""
-        auth_err = self._check_auth(request)
-        if auth_err:
-            return auth_err
+        """POST /api/remote/pair — redeem a code for a 24-hour attach token.
 
+        The pairing code itself is the credential here; no API_SERVER_KEY is
+        required (a remote client only possesses the code). Brute-force
+        protection comes from the per-code failure rate limit below.
+        """
         body, err = await self._read_json_body(request)
         if err is not None:
             return err
