@@ -300,6 +300,12 @@ DEFAULT_CONFIG = {
         # matches a key in this dict.
         # Edit directly in config.yaml (no CLI support due to dots in keys).
         "reasoning_overrides": {},
+
+        # Global reasoning effort: none|minimal|low|medium|high|xhigh|max|ultra.
+        # Empty string = provider default. Per-model reasoning_overrides take
+        # precedence. Set via `hermes config set agent.reasoning_effort <level>`
+        # or `/reasoning <level> --global`.
+        "reasoning_effort": "",
     },
 
     "terminal": {
