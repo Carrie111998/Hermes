@@ -1,12 +1,14 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import {
+  applyWhatsAppOnboarding,
   AUDIO_SPEAK_MAX_REQUEST_TIMEOUT_MS,
   AUDIO_SPEAK_MIN_REQUEST_TIMEOUT_MS,
   AUDIO_TRANSCRIBE_MAX_REQUEST_TIMEOUT_MS,
   AUDIO_TRANSCRIBE_MIN_REQUEST_TIMEOUT_MS,
   audioSpeakRequestTimeoutMs,
   audioTranscribeRequestTimeoutMs,
+  cancelWhatsAppOnboarding,
   getAllSessionMessages,
   getCronJobs,
   getGlobalModelInfo,
@@ -14,10 +16,12 @@ import {
   getHermesConfig,
   getHermesConfigDefaults,
   getLatestSessionMessages,
+  getMessagingPlatforms,
   getOlderSessionMessages,
   getProfiles,
   getSessionMessages,
   getStatus,
+  getWhatsAppOnboardingStatus,
   LATEST_SESSION_MESSAGES_LIMIT,
   listAllProfileSessions,
   listSessions,
@@ -26,8 +30,11 @@ import {
   resetSidebarBatchCapability,
   setApiRequestProfile,
   speakText,
+  startWhatsAppOnboarding,
+  testMessagingPlatform,
   transcribeAudio,
-  triggerCronJob
+  triggerCronJob,
+  updateMessagingPlatform
 } from './hermes'
 import { refreshActiveProfile } from './store/profile'
 import { $transcriptTailBySessionId, transcriptTailState } from './store/transcript-tail'
@@ -66,6 +73,43 @@ describe('Hermes REST helpers', () => {
         timeoutMs: 60_000
       })
     )
+  })
+
+  it('keeps messaging setup and WhatsApp onboarding on the active profile backend', async () => {
+    setApiRequestProfile('work')
+
+    await getMessagingPlatforms()
+    await updateMessagingPlatform('whatsapp', { enabled: true })
+    await testMessagingPlatform('whatsapp')
+    await startWhatsAppOnboarding({ allowed_users: '15551234567', mode: 'bot' }, 'source')
+    await getWhatsAppOnboardingStatus('pair/id', 'source')
+    await applyWhatsAppOnboarding('pair/id', { allowed_users: '15551234567', mode: 'bot' }, 'source')
+    await cancelWhatsAppOnboarding('pair/id', 'source')
+
+    expect(api.mock.calls.map(call => call[0])).toEqual([
+      { path: '/api/messaging/platforms', profile: 'work' },
+      {
+        body: { enabled: true },
+        method: 'PUT',
+        path: '/api/messaging/platforms/whatsapp',
+        profile: 'work'
+      },
+      { method: 'POST', path: '/api/messaging/platforms/whatsapp/test', profile: 'work' },
+      {
+        body: { allowed_users: '15551234567', mode: 'bot' },
+        method: 'POST',
+        path: '/api/messaging/whatsapp/onboarding/start',
+        profile: 'source'
+      },
+      { path: '/api/messaging/whatsapp/onboarding/pair%2Fid', profile: 'source' },
+      {
+        body: { allowed_users: '15551234567', mode: 'bot' },
+        method: 'POST',
+        path: '/api/messaging/whatsapp/onboarding/pair%2Fid/apply',
+        profile: 'source'
+      },
+      { method: 'DELETE', path: '/api/messaging/whatsapp/onboarding/pair%2Fid', profile: 'source' }
+    ])
   })
 
   it('uses a longer timeout for the all-profile session list', async () => {

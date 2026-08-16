@@ -7,17 +7,36 @@ import type { MessagingPlatformInfo } from '@/types/hermes'
 
 const getMessagingPlatforms = vi.fn()
 const updateMessagingPlatform = vi.fn()
+const startWhatsAppOnboarding = vi.fn()
+const getWhatsAppOnboardingStatus = vi.fn()
+const applyWhatsAppOnboarding = vi.fn()
+const cancelWhatsAppOnboarding = vi.fn()
 const getPairing = vi.fn()
 const approvePairing = vi.fn()
 const revokePairing = vi.fn()
 const openExternalLink = vi.fn()
 
 vi.mock('@/hermes', () => ({
+  applyWhatsAppOnboarding: (pairingId: string, body: unknown, profile?: string) =>
+    applyWhatsAppOnboarding(pairingId, body, profile),
   approvePairing: (platformId: string, requestId: string) => approvePairing(platformId, requestId),
-  getMessagingPlatforms: () => getMessagingPlatforms(),
-  getPairing: () => getPairing(),
+  cancelWhatsAppOnboarding: (pairingId: string, profile?: string) => cancelWhatsAppOnboarding(pairingId, profile),
+  getMessagingPlatforms: (profile?: string) => getMessagingPlatforms(profile),
+  getPairing: (profile?: string) => getPairing(profile),
+  getWhatsAppOnboardingStatus: (pairingId: string, profile?: string) => getWhatsAppOnboardingStatus(pairingId, profile),
   revokePairing: (platformId: string, userId: string) => revokePairing(platformId, userId),
+  startWhatsAppOnboarding: (body: unknown, profile?: string) => startWhatsAppOnboarding(body, profile),
   updateMessagingPlatform: (id: string, body: unknown) => updateMessagingPlatform(id, body)
+}))
+
+vi.mock('@/store/profile', async () => {
+  const { atom } = await import('nanostores')
+
+  return { $activeGatewayProfile: atom('default') }
+})
+
+vi.mock('qrcode', () => ({
+  toString: vi.fn().mockResolvedValue('<svg xmlns="http://www.w3.org/2000/svg"><path /></svg>')
 }))
 
 vi.mock('@/lib/external-link', () => ({
@@ -50,6 +69,7 @@ function platform(patch: Partial<MessagingPlatformInfo> = {}): MessagingPlatform
 
 beforeEach(() => {
   updateMessagingPlatform.mockResolvedValue({ ok: true, platform: 'teams' })
+  cancelWhatsAppOnboarding.mockResolvedValue({ ok: true })
   getPairing.mockResolvedValue({ approved: [], pending: [] })
 })
 
@@ -200,5 +220,149 @@ describe('MessagingView pairing', () => {
       $platformsChangeTick.set($platformsChangeTick.get() + 1)
     })
     expect(getPairing).not.toHaveBeenCalled()
+  })
+})
+
+describe('MessagingView WhatsApp onboarding', () => {
+  const whatsapp = platform({
+    id: 'whatsapp',
+    name: 'WhatsApp',
+    whatsapp_setup: { allowed_users_set: false, home_channel_set: false, mode: '' }
+  })
+
+  it('starts pairing and renders the backend QR payload locally', async () => {
+    getMessagingPlatforms.mockResolvedValue({ platforms: [whatsapp] })
+    startWhatsAppOnboarding.mockResolvedValue({
+      allowed_users: '',
+      expires_at: '2099-01-01T00:00:00Z',
+      mode: 'bot',
+      pairing_id: 'wa-pairing-1',
+      qr_payload: 'backend-qr-payload',
+      status: 'waiting'
+    })
+
+    await renderMessaging()
+    await act(async () => {
+      fireEvent.click(await screen.findByRole('button', { name: 'Pair with QR' }))
+    })
+
+    await waitFor(() =>
+      expect(startWhatsAppOnboarding).toHaveBeenCalledWith({ allowed_users: '', mode: 'bot' }, 'default')
+    )
+    expect(await screen.findByRole('img', { name: 'WhatsApp setup QR code' })).toBeTruthy()
+    expect(screen.getByText('Scan with WhatsApp Linked Devices, not the camera app.')).toBeTruthy()
+  })
+
+  it('stops polling and offers a retry when the WhatsApp QR expires', async () => {
+    getMessagingPlatforms.mockResolvedValue({ platforms: [whatsapp] })
+    startWhatsAppOnboarding.mockResolvedValue({
+      allowed_users: '',
+      expires_at: '2099-01-01T00:00:00Z',
+      mode: 'bot',
+      pairing_id: 'wa-expired-pairing',
+      qr_payload: 'backend-qr-payload',
+      status: 'waiting'
+    })
+    getWhatsAppOnboardingStatus.mockRejectedValue(new Error('410 Gone: WhatsApp setup expired.'))
+
+    await renderMessaging()
+    await act(async () => {
+      fireEvent.click(await screen.findByRole('button', { name: 'Pair with QR' }))
+    })
+
+    expect(await screen.findByText('WhatsApp QR setup expired. Start a new QR setup to try again.')).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'Pair with QR' })).toBeTruthy()
+    expect(getWhatsAppOnboardingStatus).toHaveBeenCalledTimes(1)
+  })
+
+  it('clears a pairing superseded by another WhatsApp setup', async () => {
+    getMessagingPlatforms.mockResolvedValue({ platforms: [whatsapp] })
+    startWhatsAppOnboarding.mockResolvedValue({
+      allowed_users: '',
+      expires_at: '2099-01-01T00:00:00Z',
+      mode: 'bot',
+      pairing_id: 'wa-superseded-pairing',
+      qr_payload: 'stale-qr-payload',
+      status: 'waiting'
+    })
+    getWhatsAppOnboardingStatus.mockResolvedValue({
+      allowed_users: '',
+      error: 'WhatsApp setup was replaced by a newer pairing session.',
+      expires_at: '2099-01-01T00:00:00Z',
+      mode: 'bot',
+      pairing_id: 'wa-superseded-pairing',
+      qr_payload: 'stale-qr-payload',
+      status: 'cancelled'
+    })
+
+    await renderMessaging()
+    await act(async () => {
+      fireEvent.click(await screen.findByRole('button', { name: 'Pair with QR' }))
+    })
+
+    expect(await screen.findByText('WhatsApp setup was replaced by a newer pairing session.')).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'Pair with QR' })).toBeTruthy()
+    expect(screen.queryByRole('img', { name: 'WhatsApp setup QR code' })).toBeNull()
+  })
+
+  it('applies an already-linked WhatsApp session and refreshes backend truth', async () => {
+    getMessagingPlatforms.mockResolvedValue({ platforms: [whatsapp] })
+    startWhatsAppOnboarding.mockResolvedValue({
+      account_id: '15551234567:1@s.whatsapp.net',
+      account_phone: '15551234567',
+      allowed_users: '',
+      expires_at: '2099-01-01T00:00:00Z',
+      mode: 'bot',
+      pairing_id: 'wa-pairing-2',
+      qr_payload: null,
+      status: 'connected'
+    })
+    applyWhatsAppOnboarding.mockResolvedValue({ ok: true, platform: 'whatsapp', restart_started: true })
+
+    await renderMessaging()
+    await act(async () => {
+      fireEvent.click(await screen.findByRole('button', { name: 'Pair with QR' }))
+    })
+    getMessagingPlatforms.mockClear()
+    await act(async () => {
+      fireEvent.click(await screen.findByRole('button', { name: 'Save and restart' }))
+    })
+
+    await waitFor(() =>
+      expect(applyWhatsAppOnboarding).toHaveBeenCalledWith(
+        'wa-pairing-2',
+        { allowed_users: '', mode: 'bot' },
+        'default'
+      )
+    )
+    expect(getMessagingPlatforms).toHaveBeenCalledTimes(1)
+  })
+
+  it('cancels pairing on its original profile when the active profile changes', async () => {
+    const { $activeGatewayProfile } = await import('@/store/profile')
+    getMessagingPlatforms.mockResolvedValue({ platforms: [whatsapp] })
+    startWhatsAppOnboarding.mockResolvedValue({
+      allowed_users: '',
+      expires_at: '2099-01-01T00:00:00Z',
+      mode: 'bot',
+      pairing_id: 'wa-profile-pairing',
+      qr_payload: 'backend-qr-payload',
+      status: 'waiting'
+    })
+
+    await renderMessaging()
+    await act(async () => {
+      fireEvent.click(await screen.findByRole('button', { name: 'Pair with QR' }))
+    })
+    await waitFor(() =>
+      expect(startWhatsAppOnboarding).toHaveBeenCalledWith({ allowed_users: '', mode: 'bot' }, 'default')
+    )
+
+    await act(async () => {
+      $activeGatewayProfile.set('work')
+    })
+
+    await waitFor(() => expect(cancelWhatsAppOnboarding).toHaveBeenCalledWith('wa-profile-pairing', 'default'))
+    $activeGatewayProfile.set('default')
   })
 })

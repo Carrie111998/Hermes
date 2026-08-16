@@ -28,6 +28,7 @@ import { normalize } from '@/lib/text'
 import { cn } from '@/lib/utils'
 import { $changeEventsAvailable, $pairingChangeTick, $platformsChangeTick } from '@/store/live-sync'
 import { notify, notifyError } from '@/store/notifications'
+import { $activeGatewayProfile } from '@/store/profile'
 import { runGatewayRestart } from '@/store/system-actions'
 
 import { useRefreshHotkey } from '../hooks/use-refresh-hotkey'
@@ -39,6 +40,7 @@ import { ListRow } from '../settings/primitives'
 import type { SetStatusbarItemGroup } from '../shell/statusbar-controls'
 
 import { PlatformAvatar } from './platform-icon'
+import { WhatsAppOnboarding } from './whatsapp-onboarding'
 
 interface MessagingViewProps extends React.ComponentProps<'section'> {
   setStatusbarItemGroup?: SetStatusbarItemGroup
@@ -126,6 +128,7 @@ function fieldCopy(field: MessagingEnvVarInfo, m: Translations['messaging']) {
 export function MessagingView({ setStatusbarItemGroup: _setStatusbarItemGroup, ...props }: MessagingViewProps) {
   const { t } = useI18n()
   const m = t.messaging
+  const activeProfile = useStore($activeGatewayProfile)
   // Both save/toggle toasts offer the same one-click restart.
   const restartGatewayAction = { label: t.commandCenter.restartGateway, onClick: () => void runGatewayRestart() }
   const [platforms, setPlatforms] = useState<MessagingPlatformInfo[] | null>(null)
@@ -151,7 +154,7 @@ export function MessagingView({ setStatusbarItemGroup: _setStatusbarItemGroup, .
       }
 
       try {
-        const result = await getMessagingPlatforms()
+        const result = await getMessagingPlatforms(activeProfile)
         setPlatforms(result.platforms)
       } catch (err) {
         if (!silent) {
@@ -163,7 +166,7 @@ export function MessagingView({ setStatusbarItemGroup: _setStatusbarItemGroup, .
         }
       }
     },
-    [m]
+    [activeProfile, m]
   )
 
   // Pairing has its own signal. platforms.changed tracks connect/disconnect
@@ -173,12 +176,12 @@ export function MessagingView({ setStatusbarItemGroup: _setStatusbarItemGroup, .
   // should show no rows, not an error banner over a working page.
   const refreshPairing = useCallback(async () => {
     try {
-      const result = await getPairing()
+      const result = await getPairing(activeProfile)
       setPairing({ approved: result.approved ?? [], pending: result.pending ?? [] })
     } catch {
       // Leave the last known rows in place rather than blanking them.
     }
-  }, [])
+  }, [activeProfile])
 
   const refreshAll = useCallback(
     async (silent = false) => {
@@ -457,8 +460,10 @@ export function MessagingView({ setStatusbarItemGroup: _setStatusbarItemGroup, .
                   }))
                 }
                 onRevoke={setPendingRevoke}
+                onWhatsAppChanged={() => refreshPlatforms()}
                 pending={pendingByPlatform[selected.id] ?? []}
                 platform={selected}
+                profile={activeProfile}
                 saving={saving}
               />
             )}
@@ -535,8 +540,10 @@ function PlatformDetail({
   onClear,
   onEdit,
   onRevoke,
+  onWhatsAppChanged,
   pending,
   platform,
+  profile,
   saving
 }: {
   approved: PairingUser[]
@@ -546,8 +553,10 @@ function PlatformDetail({
   onClear: (key: string) => void
   onEdit: (key: string, value: string) => void
   onRevoke: (user: PairingUser) => void
+  onWhatsAppChanged: () => Promise<void>
   pending: PairingUser[]
   platform: MessagingPlatformInfo
+  profile: string
   saving: string | null
 }) {
   const { t } = useI18n()
@@ -579,6 +588,10 @@ function PlatformDetail({
       </header>
 
       {platform.error_message && <ErrorBanner>{platform.error_message}</ErrorBanner>}
+
+      {platform.id === 'whatsapp' && (
+        <WhatsAppOnboarding key={profile} onChanged={onWhatsAppChanged} platform={platform} profile={profile} />
+      )}
 
       {/* Pending pairing requests. Rendered only when someone is actually
           waiting — an empty-state card here would be permanent chrome on a
