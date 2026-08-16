@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -779,3 +780,31 @@ def test_gui_password_store_bridge_is_linux_only(tmp_path, monkeypatch):
     mock_detect.assert_not_called()
     launch_env = mock_run.call_args_list[1].kwargs["env"]
     assert "HERMES_DESKTOP_PASSWORD_STORE" not in launch_env
+
+
+def test_desktop_pack_script_is_explicitly_non_publishing():
+    """Regression #87758: the local desktop pack must never enter
+    electron-builder's implicit publishing path.
+
+    ``hermes desktop`` builds the unpacked app via ``npm run pack``
+    (electron-builder ``--dir``). Since #87440 the build env synthesizes
+    ``CI=1`` (``hermes_cli/main.py::_npm_lifecycle_env``); electron-builder
+    26.x reads that as an implicit publish trigger and aborts while resolving
+    publish metadata — "Cannot detect repository by .git/config" — because
+    ``apps/desktop/package.json`` carries no ``repository`` field.
+
+    The pack script pins ``--publish never`` so the local ``--dir`` build is
+    explicitly non-publishing regardless of the ambient CI variable, matching
+    electron-builder's own advice to pass ``--publish`` explicitly.
+    """
+    repo_root = Path(__file__).resolve().parents[2]
+    desktop_pkg = json.loads(
+        (repo_root / "apps" / "desktop" / "package.json").read_text(encoding="utf-8")
+    )
+    pack = desktop_pkg["scripts"]["pack"]
+    assert "--dir" in pack
+    assert "--publish never" in pack, (
+        f"apps/desktop pack script {pack!r} must pass --publish never: "
+        "hermes desktop synthesizes CI=1 (_npm_lifecycle_env), which "
+        "electron-builder 26.x treats as an implicit publish request (#87758)."
+    )
