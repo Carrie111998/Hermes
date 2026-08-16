@@ -1645,6 +1645,9 @@ export const ar = defineLocale({
     row: {
       pin: 'تثبيت',
       unpin: 'إلغاء التثبيت',
+      markUnread: 'وضع علامة كغير مقروء',
+      markRead: 'وضع علامة كمقروء',
+      unreadFailed: 'تعذر تحديث حالة القراءة',
       copyId: 'نسخ المعرف',
       export: 'تصدير',
       branchFrom: 'فرع',
@@ -2307,6 +2310,7 @@ export const ar = defineLocale({
       thought: 'فكّر',
       thoughtBriefly: 'فكّر قليلاً',
       thoughtFor: duration => `فكّر لمدة ${duration}`,
+      turnDuration: duration => `استغرقت هذه الجولة ${duration}`,
       today: time => `اليوم ${time}`,
       yesterday: time => `أمس ${time}`,
       copy: 'نسخ',

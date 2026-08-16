@@ -642,7 +642,7 @@ export const en: Translations = {
       intro:
         'Register every place your agents live — this device, remote gateways on your network, and Hermes Cloud instances. All of them are stored here.',
       stagedNote:
-        'Side-by-side routing is rolling out in stages: connections are managed here today, while the active connection is still chosen in Settings → Gateway.',
+        'Chats and the agent roster follow the source you pick; the app-managed window backend is still chosen in Settings → Gateway.',
       loadFailed: 'Could not load connections',
       primaryPill: 'Primary',
       managedPill: 'This device',
@@ -658,6 +658,11 @@ export const en: Translations = {
       testFailed: 'Connection test failed',
       saveFailed: 'Could not save the connection',
       removeFailed: 'Could not remove the connection',
+      updateAll: 'Update all instances',
+      updateAllRunning: 'Updating all instances…',
+      updateAllDone: 'Updates dispatched',
+      updateAllFailed: 'Update fan-out failed',
+      updateSkippedCloud: 'Managed by Hermes Cloud',
       kindLocal: 'Local',
       kindRemote: 'Remote gateway',
       kindCloud: 'Hermes Cloud',
@@ -1071,7 +1076,6 @@ export const en: Translations = {
     tabToolsets: 'Tools',
     configuringProfile: 'Configuring:',
     tabMcp: 'MCP',
-    tabHub: 'Browse Hub',
     all: 'All',
     searchSkills: 'Search skills...',
     searchToolsets: 'Search tools...',
@@ -1166,6 +1170,11 @@ export const en: Translations = {
       updateStarted: 'Updating installed skills...',
       actionFailed: 'Skill action failed',
       actionLog: 'Action log',
+      alreadyInstalled: (name: string) => `"${name}" is already installed`,
+      pickerTitle: 'Skills Hub',
+      pickerBrowse: 'Browse the full hub',
+      pickerHide: 'Hide the hub browser',
+      pickerHint: 'Hit "+ Add to this Agent" on any skill — it installs and appears in the list above.',
       loadFailed: 'Skill hub failed to load',
       previewFailed: 'Skill preview failed',
       scanFailed: 'Security scan failed',
@@ -2029,6 +2038,9 @@ export const en: Translations = {
     row: {
       pin: 'Pin',
       unpin: 'Unpin',
+      markUnread: 'Mark as unread',
+      markRead: 'Mark as read',
+      unreadFailed: 'Could not update unread state',
       copyId: 'Copy ID',
       export: 'Export',
       branchFrom: 'Branch',
@@ -2076,7 +2088,8 @@ export const en: Translations = {
     statusDivider: {
       working: 'Working',
       done: 'Done'
-    }
+    },
+    markAllRead: 'Mark all as read'
   },
 
   composer: {
@@ -2213,6 +2226,12 @@ export const en: Translations = {
       tip: skill => `You mentioned “${skill}” — click to lead with that skill`,
       done: skill => `Added /${skill}`,
       doneTip: 'The skill loads when you send'
+    },
+    githubSuggestions: {
+      label: 'Set up GitHub',
+      tip: 'GitHub works through the gh CLI skills here — click to connect your account',
+      done: 'Added /github-auth',
+      doneTip: 'Send the message and the agent walks you through GitHub sign-in'
     },
     repairSuggestions: {
       label: server => `Reconnect ${server}`,
@@ -2863,6 +2882,7 @@ export const en: Translations = {
       thought: 'Thought',
       thoughtBriefly: 'Thought briefly',
       thoughtFor: duration => `Thought for ${duration}`,
+      turnDuration: duration => `This turn took ${duration}`,
       today: time => `Today, ${time}`,
       yesterday: time => `Yesterday, ${time}`,
       copy: 'Copy',

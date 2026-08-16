@@ -547,6 +547,11 @@ export interface Translations {
       testFailed: string
       saveFailed: string
       removeFailed: string
+      updateAll: string
+      updateAllRunning: string
+      updateAllDone: string
+      updateAllFailed: string
+      updateSkippedCloud: string
       kindLocal: string
       kindRemote: string
       kindCloud: string
@@ -929,7 +934,6 @@ export interface Translations {
     tabToolsets: string
     configuringProfile: string
     tabMcp: string
-    tabHub: string
     all: string
     searchSkills: string
     searchToolsets: string
@@ -1014,6 +1018,11 @@ export interface Translations {
       updateStarted: string
       actionFailed: string
       actionLog: string
+      alreadyInstalled: (name: string) => string
+      pickerTitle: string
+      pickerBrowse: string
+      pickerHide: string
+      pickerHint: string
       loadFailed: string
       previewFailed: string
       scanFailed: string
@@ -1711,6 +1720,9 @@ export interface Translations {
     row: {
       pin: string
       unpin: string
+      markUnread: string
+      markRead: string
+      unreadFailed: string
       copyId: string
       export: string
       branchFrom: string
@@ -1759,6 +1771,7 @@ export interface Translations {
       working: string
       done: string
     }
+    markAllRead: string
   }
 
   composer: {
@@ -1863,6 +1876,12 @@ export interface Translations {
       label: (skill: string) => string
       tip: (skill: string) => string
       done: (skill: string) => string
+      doneTip: string
+    }
+    githubSuggestions: {
+      label: string
+      tip: string
+      done: string
       doneTip: string
     }
     repairSuggestions: {
@@ -2443,6 +2462,7 @@ export interface Translations {
       thought: string
       thoughtBriefly: string
       thoughtFor: (duration: string) => string
+      turnDuration: (duration: string) => string
       today: (time: string) => string
       yesterday: (time: string) => string
       copy: string
