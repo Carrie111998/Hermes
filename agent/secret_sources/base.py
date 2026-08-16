@@ -58,6 +58,47 @@ DEFAULT_FETCH_TIMEOUT_SECONDS = 120.0
 # Default timeout for run_secret_cli() subprocess invocations.
 DEFAULT_CLI_TIMEOUT_SECONDS = 30.0
 
+# Windows OS path / machine-identity variables that an allowlisted child env
+# must still carry.  These are not credentials — they are the same well-known
+# OS paths already allowed through by tools/code_execution_tool.py's
+# _WINDOWS_ESSENTIAL_ENV_VARS and devflow_delegation/agent_policy.py's
+# _ENV_ALLOW, and this list is deliberately kept consistent with those two so
+# a future reader comparing them finds one policy, not three.
+#
+# Why an allowlist must not "tidy" these away: Windows stores several
+# known-folder paths in the registry as REG_EXPAND_SZ templates — most
+# visibly ``%SystemDrive%\ProgramData``.  A child whose environment has no
+# SYSTEMDRIVE cannot expand the template, and instead of resolving the real
+# path it creates a *literal* ``%SystemDrive%`` directory tree under whatever
+# working directory it inherited.  Because run_secret_cli() does not pin cwd,
+# that directory lands wherever the user or gateway happened to be.
+# COMSPEC/PATHEXT are included for the same class of reason: without them the
+# CRT cannot resolve a command name to an executable.
+#
+# DEFENSIVE HARDENING, NOT A PROVEN FIX: the process that actually wrote the
+# literal %SystemDrive% tree observed in this checkout has never been
+# identified, and direct repros under stripped environments came back
+# negative.  This closes a mechanism that could produce it; it does not
+# demonstrate that this was the mechanism.
+#
+# Names are uppercase because os.environ on Windows folds keys to uppercase,
+# so an uppercase lookup matches however the var was actually spelled.
+WINDOWS_OS_PATH_ENV_VARS = (
+    "SYSTEMDRIVE",        # C: — expands %SystemDrive% known-folder templates
+    "PROGRAMDATA",        # C:\ProgramData
+    "ALLUSERSPROFILE",    # C:\ProgramData (legacy spelling, still consulted)
+    "WINDIR",
+    "COMSPEC",            # cmd.exe — command resolution
+    "PATHEXT",            # .COM;.EXE;.BAT;... — command resolution
+    "PROGRAMFILES",
+    "PROGRAMFILES(X86)",
+    "PROGRAMW6432",
+    "LOCALAPPDATA",
+    "APPDATA",
+    "HOMEDRIVE",
+    "HOMEPATH",
+)
+
 
 class ErrorKind(str, Enum):
     """Machine-readable failure taxonomy for :class:`FetchResult.error`.
@@ -226,10 +267,12 @@ def run_secret_cli(
 
     * argv list only — never ``shell=True``.  Callers pass user-supplied
       reference strings AFTER a ``--`` option terminator in their argv.
-    * The child gets ``PATH``/``HOME``/locale basics plus only the env
-      vars named in ``allow_env`` (auth/session vars) and ``extra_env``
-      — never a copy of the full post-dotenv ``os.environ``, which by
-      this point holds every credential Hermes knows about.
+    * The child gets ``PATH``/``HOME``/locale basics, the OS path and
+      machine-identity vars in ``WINDOWS_OS_PATH_ENV_VARS`` (paths, not
+      credentials), plus only the env vars named in ``allow_env``
+      (auth/session vars) and ``extra_env`` — never a copy of the full
+      post-dotenv ``os.environ``, which by this point holds every
+      credential Hermes knows about.
     * ``NO_COLOR=1`` is set and stderr/stdout are ANSI-scrubbed so
       helper diagnostics can't smuggle escape sequences into Hermes
       output.
@@ -241,7 +284,11 @@ def run_secret_cli(
     returncode interpretation.
     """
     base_keep = ("PATH", "HOME", "USERPROFILE", "SYSTEMROOT", "TMPDIR", "TEMP",
-                 "LANG", "LC_ALL", "XDG_CONFIG_HOME", "XDG_DATA_HOME")
+                 "LANG", "LC_ALL", "XDG_CONFIG_HOME", "XDG_DATA_HOME",
+                 # OS path/identity vars, not credentials — see the comment on
+                 # WINDOWS_OS_PATH_ENV_VARS.  No-ops on POSIX, where none of
+                 # these exist in os.environ.
+                 *WINDOWS_OS_PATH_ENV_VARS)
     env: Dict[str, str] = {}
     for key in (*base_keep, *allow_env):
         val = os.environ.get(key)

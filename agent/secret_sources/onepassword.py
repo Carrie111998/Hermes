@@ -55,7 +55,11 @@ from agent.secret_sources._cache import (
     FetchResult,
     is_valid_env_name,
 )
-from agent.secret_sources.base import ErrorKind, SecretSource
+from agent.secret_sources.base import (
+    WINDOWS_OS_PATH_ENV_VARS,
+    ErrorKind,
+    SecretSource,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -98,6 +102,11 @@ _OP_ENV_ALLOWLIST = (
     "OP_ACCOUNT",
     "OP_CONNECT_HOST",
     "OP_CONNECT_TOKEN",
+    # OS path/identity vars, not credentials.  Without SYSTEMDRIVE a Windows
+    # child cannot expand %SystemDrive%\ProgramData and writes a literal
+    # "%SystemDrive%" directory under its inherited cwd — see the comment on
+    # WINDOWS_OS_PATH_ENV_VARS in base.py.  No-ops on POSIX.
+    *WINDOWS_OS_PATH_ENV_VARS,
 )
 
 
