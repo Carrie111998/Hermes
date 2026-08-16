@@ -326,9 +326,15 @@ def test_sidebar_reconciliation_proof_schema_is_append_only(tmp_path):
             "trg_sidebar_reconciliation_proofs_no_update",
             "trg_sidebar_reconciliation_proofs_no_delete",
         }
+        # A freshly-opened DB sits at the current version, whatever that is.
+        # This was pinned to the literal 31 (the version this table shipped in),
+        # which turned every LATER unrelated migration into a false failure --
+        # v32 (messages_fts external content) never touches this table, yet it
+        # broke this test. The append-only guarantee is carried by the column
+        # and trigger assertions above, not by the version number.
         assert (
             db._conn.execute("SELECT version FROM schema_version").fetchone()[0]
-            == 31
+            == hermes_state.SCHEMA_VERSION
         )
     finally:
         db.close()
