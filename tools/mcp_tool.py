@@ -4761,18 +4761,36 @@ def _snapshot_child_pids() -> set:
         pass
 
     # Fallback: ps --ppid (works where /proc children data is missing or
-    # empty, including WSL2 kernels that do not maintain that file)
+    # empty, including WSL2 kernels that do not maintain that file).
+    # Spawned via Popen so the ps subprocess's own PID is known: ps lists
+    # itself (its PPID is my_pid), so subtract it from the result — a
+    # snapshot consumer must never see a transient pid that is already
+    # gone by the time it inspects the set.
+    ps_proc = None
     try:
-        out = subprocess.run(
+        ps_proc = subprocess.Popen(
             ["ps", "--ppid", str(my_pid), "-o", "pid="],
-            capture_output=True,
+            stdout=subprocess.PIPE,
             text=True,
-            timeout=5,
         )
-        if out.returncode == 0 and out.stdout.strip():
-            return {int(p) for p in out.stdout.split() if p.strip()}
+        out, _ = ps_proc.communicate(timeout=5)
+        if ps_proc.returncode == 0:
+            # ps lists itself (its PPID is the caller) — subtract the ps
+            # subprocess's own pid.  If nothing remains, fall through to
+            # psutil for a second opinion (matches the pre-fallback
+            # semantics of treating an empty answer as "no data").
+            pids = {int(p) for p in out.split() if p.strip()} - {ps_proc.pid}
+            if pids:
+                return pids
     except Exception:
-        pass
+        # Reap the child on timeout/decode errors so it cannot linger as
+        # a zombie (best-effort; the snapshot itself stays best-effort).
+        if ps_proc is not None:
+            try:
+                ps_proc.kill()
+                ps_proc.communicate(timeout=1)
+            except Exception:
+                pass
 
     # Fallback: psutil
     try:

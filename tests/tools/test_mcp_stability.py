@@ -79,19 +79,23 @@ class TestSnapshotChildPidsFallbacks:
             "builtins.open", fake_open, raising=True
         )
 
-        # 2. Mock the ps fallback to return a known PID set
+        # 2. Mock the ps fallback to return a known PID set.  The mock
+        # mimics the real behavior: ps lists ITSELF (its ppid is the
+        # caller), so stdout contains the child pid plus the ps pid.
         fake_proc = MagicMock()
+        fake_proc.pid = 9999  # pid of the spawned ps itself
         fake_proc.returncode = 0
-        fake_proc.stdout = "4242\n"
+        fake_proc.communicate.return_value = ("4242\n9999\n", None)
         monkeypatch.setattr(
-            mcp_mod.subprocess, "run", lambda *a, **kw: fake_proc
+            mcp_mod.subprocess, "Popen", lambda *a, **kw: fake_proc
         )
 
         result = mcp_mod._snapshot_child_pids()
+        # The ps self-pid must be excluded from the snapshot.
         assert result == {4242}
 
     def test_proc_children_empty_ps_empty_falls_through_to_psutil(self, monkeypatch, tmp_path):
-        """/proc empty AND ps returns nothing → psutil fallback used."""
+        """ps returns only its own pid (no real children) → treated as empty, psutil used."""
         import tools.mcp_tool as mcp_mod
 
         empty_children = tmp_path / "children"
@@ -107,10 +111,11 @@ class TestSnapshotChildPidsFallbacks:
         monkeypatch.setattr("builtins.open", fake_open, raising=True)
 
         fake_proc = MagicMock()
+        fake_proc.pid = 9999
         fake_proc.returncode = 0
-        fake_proc.stdout = ""
+        fake_proc.communicate.return_value = ("9999\n", None)
         monkeypatch.setattr(
-            mcp_mod.subprocess, "run", lambda *a, **kw: fake_proc
+            mcp_mod.subprocess, "Popen", lambda *a, **kw: fake_proc
         )
 
         fake_psutil = MagicMock()
@@ -140,12 +145,44 @@ class TestSnapshotChildPidsFallbacks:
 
         # If the code tried to spawn ps, this would raise (mock returns garbage)
         def boom(*a, **kw):
-            raise AssertionError("subprocess.run must not be called when /proc has data")
+            raise AssertionError("subprocess.Popen must not be called when /proc has data")
 
-        monkeypatch.setattr(mcp_mod.subprocess, "run", boom)
+        monkeypatch.setattr(mcp_mod.subprocess, "Popen", boom)
 
         result = mcp_mod._snapshot_child_pids()
         assert result == {1111, 2222}
+
+    def test_ps_fallback_excludes_ps_own_pid(self, monkeypatch, tmp_path):
+        """ps --ppid lists itself (its PPID is the caller) — the ps subprocess's
+        own pid must never leak into the snapshot (review point on #87367)."""
+        import tools.mcp_tool as mcp_mod
+
+        empty_children = tmp_path / "children"
+        empty_children.write_text("")
+
+        _real_open = open
+
+        def fake_open(path, *args, **kwargs):
+            if str(path).startswith("/proc/") and str(path).endswith("/children"):
+                return _real_open(empty_children, *args, **kwargs)
+            return _real_open(path, *args, **kwargs)
+
+        monkeypatch.setattr("builtins.open", fake_open, raising=True)
+
+        # Real-world shape: stdout lists the actual child AND the ps
+        # process itself.  The self-pid differs per ps invocation (fresh
+        # pid each spawn), so it cannot cancel out across snapshots.
+        fake_proc = MagicMock()
+        fake_proc.pid = 9999
+        fake_proc.returncode = 0
+        fake_proc.communicate.return_value = ("4242\n9999\n", None)
+        monkeypatch.setattr(
+            mcp_mod.subprocess, "Popen", lambda *a, **kw: fake_proc
+        )
+
+        result = mcp_mod._snapshot_child_pids()
+        assert 9999 not in result
+        assert result == {4242}
 
 
 class TestStdioPidTracking:
