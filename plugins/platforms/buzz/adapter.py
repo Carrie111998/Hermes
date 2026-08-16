@@ -25,11 +25,12 @@ Configuration in config.yaml::
             cli_path: ""               # path to the buzz binary (default: PATH, then ~/bin/buzz)
             credentials_file: ""       # JSON file holding the nsec (fallback for BUZZ_PRIVATE_KEY)
             allowed_users: []          # empty = allow all; entries are hex pubkeys or npubs
+            auth_tag: ""              # optional NIP-OA owner-attestation JSON (non-secret)
 
 Or via environment variables (overrides config.yaml):
     BUZZ_RELAY_URL, BUZZ_CHANNELS, BUZZ_HOME_CHANNEL, BUZZ_POLL_INTERVAL,
     BUZZ_CLI_PATH, BUZZ_CREDENTIALS_FILE, BUZZ_ALLOWED_USERS,
-    BUZZ_ALLOW_ALL_USERS
+    BUZZ_ALLOW_ALL_USERS, BUZZ_AUTH_TAG
 
 The only secret is BUZZ_PRIVATE_KEY (nsec or hex) — it belongs in
 ``~/.hermes/.env``.  It is passed to the CLI via the subprocess
@@ -281,6 +282,7 @@ async def _exec_buzz(
     *,
     relay_url: str,
     private_key: str,
+    auth_tag: str = "",
     input_text: Optional[str] = None,
     timeout: float = _CLI_TIMEOUT,
 ) -> Tuple[int, str, str]:
@@ -293,6 +295,8 @@ async def _exec_buzz(
     env = os.environ.copy()
     env["BUZZ_RELAY_URL"] = relay_url
     env["BUZZ_PRIVATE_KEY"] = private_key
+    if auth_tag:
+        env["BUZZ_AUTH_TAG"] = auth_tag
     proc = await asyncio.create_subprocess_exec(
         cli_path,
         *args,
@@ -365,6 +369,9 @@ class BuzzAdapter(BasePlatformAdapter):
         self.relay_url = (os.getenv("BUZZ_RELAY_URL") or extra.get("relay_url", "")).strip()
         self.cli_path = _resolve_cli_path(
             os.getenv("BUZZ_CLI_PATH", "").strip() or str(extra.get("cli_path", "") or "")
+        )
+        self._auth_tag = (
+            os.getenv("BUZZ_AUTH_TAG", "").strip() or str(extra.get("auth_tag", "") or "").strip()
         )
 
         # Channels to watch: env csv > extra list/csv; empty = all joined channels
@@ -451,6 +458,7 @@ class BuzzAdapter(BasePlatformAdapter):
             args,
             relay_url=self.relay_url,
             private_key=self._private_key,
+            auth_tag=self._auth_tag,
             input_text=input_text,
         )
 
@@ -763,7 +771,7 @@ class BuzzAdapter(BasePlatformAdapter):
     async def _authenticate_websocket(self, websocket) -> None:
         """NIP-42: wait for the relay's AUTH challenge, answer with a signed
         kind-22242 event (plus the optional NIP-OA owner-attestation tag from
-        BUZZ_AUTH_TAG), and wait for the OK acknowledgment."""
+        BUZZ_AUTH_TAG / buzz.extra.auth_tag), and wait for the OK acknowledgment."""
         build_auth_event = _load_nostr_auth().build_auth_event
 
         raw = await asyncio.wait_for(websocket.recv(), timeout=_WS_AUTH_TIMEOUT)
@@ -774,7 +782,7 @@ class BuzzAdapter(BasePlatformAdapter):
             private_key=self._private_key,
             challenge=str(message[1]),
             relay_url=self._websocket_url(),
-            auth_tag_json=os.getenv("BUZZ_AUTH_TAG", ""),
+            auth_tag_json=self._auth_tag,
         )
         await websocket.send(json.dumps(["AUTH", event], separators=(",", ":")))
         while True:
@@ -1056,6 +1064,7 @@ class BuzzAdapter(BasePlatformAdapter):
             user_name=await self._resolve_user_name(pubkey),
             message_id=event_id,
             created_at=created_at,
+            thread_id=self._thread_id_from_event(event),
         )
 
     # ── DM classification (issue #68871) ──────────────────────────────────
@@ -1210,6 +1219,32 @@ class BuzzAdapter(BasePlatformAdapter):
             state["seen"][event_id] = None
             self._trim_seen(state)
 
+    @staticmethod
+    def _thread_id_from_event(event: dict) -> Optional[str]:
+        """Return the canonical Buzz thread anchor from Nostr ``e`` tags."""
+        tags = event.get("tags")
+        if not isinstance(tags, list):
+            return None
+
+        root = None
+        reply = None
+        fallback = None
+        for tag in tags:
+            if not isinstance(tag, (list, tuple)) or len(tag) < 2 or tag[0] != "e":
+                continue
+            target = str(tag[1] or "").strip()
+            if not target:
+                continue
+            if fallback is None:
+                fallback = target
+            marker = str(tag[3] or "").strip().lower() if len(tag) > 3 else ""
+            if marker == "root" and root is None:
+                root = target
+            elif marker == "reply" and reply is None:
+                reply = target
+
+        return root or reply or fallback
+
     async def _dispatch_message(
         self,
         text: str,
@@ -1219,6 +1254,7 @@ class BuzzAdapter(BasePlatformAdapter):
         user_name: str,
         message_id: str,
         created_at: int,
+        thread_id: Optional[str] = None,
     ) -> None:
         """Build a MessageEvent and hand it to the base class handler."""
         if not self._message_handler:
@@ -1230,6 +1266,7 @@ class BuzzAdapter(BasePlatformAdapter):
             chat_type=chat_type,
             user_id=user_id,
             user_name=user_name,
+            thread_id=thread_id,
         )
 
         event = MessageEvent(
@@ -1294,6 +1331,7 @@ def _apply_yaml_config(yaml_cfg: dict, buzz_cfg: dict) -> Optional[dict]:
         "cli_path": "BUZZ_CLI_PATH",
         "home_channel": "BUZZ_HOME_CHANNEL",
         "transport": "BUZZ_TRANSPORT",
+        "auth_tag": "BUZZ_AUTH_TAG",
     }
     for src, env in _str_keys.items():
         val = extra.get(src)
@@ -1345,6 +1383,9 @@ def _env_enablement() -> Optional[dict]:
     cli_path = os.getenv("BUZZ_CLI_PATH", "").strip()
     if cli_path:
         seed["cli_path"] = cli_path
+    auth_tag = os.getenv("BUZZ_AUTH_TAG", "").strip()
+    if auth_tag:
+        seed["auth_tag"] = auth_tag
     # Home channel for deliver=buzz cron jobs; defaults to the first watched
     # channel so env-only setups get a sensible target without extra config.
     home = os.getenv("BUZZ_HOME_CHANNEL", "").strip() or (seed.get("channels") or [""])[0]
@@ -1392,7 +1433,12 @@ async def _standalone_send(
         args += ["--file", str(path)]
     try:
         code, out, err = await _exec_buzz(
-            cli_path, args, relay_url=relay, private_key=private_key, input_text=message
+            cli_path,
+            args,
+            relay_url=relay,
+            private_key=private_key,
+            auth_tag=os.getenv("BUZZ_AUTH_TAG", "").strip() or str(extra.get("auth_tag", "") or "").strip(),
+            input_text=message,
         )
     except asyncio.CancelledError:
         raise

@@ -8,6 +8,7 @@ and the assignee-fallback logic.
 from __future__ import annotations
 
 import json as jsonlib
+import threading
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -78,13 +79,32 @@ def _patch_list_profiles(names: list[str]):
 def test_decompose_with_fanout_creates_children(kanban_home):
     with kb.connect() as conn:
         tid = kb.create_task(conn, title="ship a feature", triage=True)
+        repo_anchor = kanban_home.parent / "repo"
+        conn.execute(
+            "UPDATE tasks SET workspace_kind='worktree', workspace_path=? "
+            "WHERE id=?",
+            (str(repo_anchor), tid),
+        )
+        conn.commit()
 
     llm_payload = jsonlib.dumps({
         "fanout": True,
         "rationale": "test split",
         "tasks": [
-            {"title": "research", "body": "look it up", "assignee": "researcher", "parents": []},
-            {"title": "build", "body": "code it", "assignee": "engineer", "parents": [0]},
+            {
+                "title": "research",
+                "body": "look it up",
+                "assignee": "researcher",
+                "parents": [],
+                "workspace_policy": "scratch",
+            },
+            {
+                "title": "build",
+                "body": "code it",
+                "assignee": "engineer",
+                "parents": [0],
+                "workspace_policy": "repo_write",
+            },
         ],
     })
 
@@ -111,6 +131,43 @@ def test_decompose_with_fanout_creates_children(kanban_home):
     assert c1.status == "todo"
     assert c0.assignee == "researcher"
     assert c1.assignee == "engineer"
+    assert c0.workspace_kind == "scratch"
+    assert c0.workspace_path is None
+    assert c1.workspace_kind == "worktree"
+    assert c1.workspace_path == str(repo_anchor / ".worktrees" / c1.id)
+
+
+def test_invalid_workspace_policy_fails_closed_to_scratch(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="audit a repository", triage=True)
+
+    llm_payload = jsonlib.dumps({
+        "fanout": True,
+        "rationale": "one review lane",
+        "tasks": [{
+            "title": "Review the implementation",
+            "body": "Inspect and report; do not modify repository files.",
+            "assignee": "reviewer",
+            "parents": [],
+            "workspace_policy": "shared_root",
+        }],
+    })
+
+    patches = _patch_list_profiles(["orchestrator", "reviewer"])
+    for p in patches:
+        p.start()
+    try:
+        with _patch_aux_client(llm_payload):
+            outcome = decomp.decompose_task(tid, author="me")
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert outcome.ok, outcome.reason
+    with kb.connect() as conn:
+        child = kb.get_task(conn, outcome.child_ids[0])
+    assert child.workspace_kind == "scratch"
+    assert child.workspace_path is None
 
 
 def test_decompose_fanout_false_invalid_llm_assignee_uses_default(kanban_home):
@@ -145,6 +202,433 @@ def test_decompose_fanout_false_invalid_llm_assignee_uses_default(kanban_home):
     assert task.assignee == "fallback"
 
 
+def _escalate_via_block_loop(conn, task_id, kind=None):
+    """Replay the #79738 sequence: block -> unblock -> re-block same cause.
+
+    The unblock-loop breaker routes the second same-cause block to ``triage``
+    (``block_loop_detected`` event) once ``block_recurrences`` reaches
+    ``BLOCK_RECURRENCE_LIMIT``. Returns the task row after escalation.
+    """
+    assert kb.block_task(
+        conn, task_id, reason="review-required: please review", kind=kind,
+    )
+    assert kb.unblock_task(conn, task_id)
+    assert kb.block_task(
+        conn, task_id, reason="review-required: please review", kind=kind,
+    )
+    return kb.get_task(conn, task_id)
+
+
+def test_block_loop_triage_without_kind_is_not_auto_decomposed(kanban_home):
+    """#79738: review-blocked task (kind omitted -> block_kind stays NULL)
+    must not be fed to the auto-decomposer after the block-loop breaker
+    routes it to triage."""
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="ship the widget", body="impl + PR")
+        task = _escalate_via_block_loop(conn, tid, kind=None)
+        assert task.status == "triage"
+        assert task.block_kind is None  # reporter's case: kind was omitted
+        # The auto-decompose feed must exclude block-loop escalations.
+        assert tid not in decomp.list_triage_ids()
+        # decompose_task must refuse before touching the LLM or the spec.
+        with patch("agent.auxiliary_client.call_llm") as call_llm:
+            outcome = decomp.decompose_task(tid, author="auto-decomposer")
+            assert outcome.ok is False
+            call_llm.assert_not_called()
+        task = kb.get_task(conn, tid)
+        assert task.status == "triage"
+        assert task.title == "ship the widget"  # spec must not be rewritten
+
+
+def test_typed_block_loop_triage_is_not_auto_decomposed(kanban_home):
+    """Typed-kind escalation (block_kind preserved) is excluded too."""
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="needs capability")
+        task = _escalate_via_block_loop(conn, tid, kind="capability")
+        assert task.status == "triage"
+        assert task.block_kind == "capability"
+        assert tid not in decomp.list_triage_ids()
+
+
+def test_escalation_recovery_api_is_disabled_without_owner_authority(kanban_home):
+    """A profile/CLI author string is not authenticated owner authority."""
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="needs capability")
+        _escalate_via_block_loop(conn, tid, kind="capability")
+        assert tid not in decomp.list_triage_ids()
+        with pytest.raises(RuntimeError, match="recovery is unavailable"):
+            kb.recover_escalated_triage_task(conn, tid)
+        task = kb.get_task(conn, tid)
+        assert task.block_kind == "capability"
+        assert task.block_recurrences == kb.BLOCK_RECURRENCE_LIMIT
+        assert tid not in decomp.list_triage_ids()
+
+
+def test_fresh_triage_remains_auto_decomposable(kanban_home):
+    """Freshly created triage cards are untouched by the escalation guard."""
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="ship a feature", triage=True)
+        assert tid in decomp.list_triage_ids()
+
+
+def test_unclassified_legacy_triage_fails_closed(kanban_home):
+    """A pre-marker triage row must never enter the automatic feed."""
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="legacy triage", triage=True)
+        with kb.write_txn(conn):
+            conn.execute(
+                "DELETE FROM task_events "
+                "WHERE task_id = ? AND kind = 'triage_fresh_intake'",
+                (tid,),
+            )
+        assert kb.is_auto_decomposable_triage(conn, tid) is False
+        assert tid not in decomp.list_triage_ids()
+
+    with patch("agent.auxiliary_client.call_llm") as call_llm:
+        outcome = decomp.decompose_task(
+            tid, author=decomp.AUTO_DECOMPOSER_AUTHOR,
+        )
+    assert outcome.ok is False
+    assert "provenance is unclassified" in outcome.reason
+    call_llm.assert_not_called()
+
+
+@pytest.mark.parametrize("fanout", [False, True])
+def test_decompose_race_rejects_new_open_child_graph(kanban_home, fanout):
+    """A child linked while the LLM runs must block both spec and fanout."""
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="governed root", triage=True)
+
+    payload = {
+        "fanout": fanout,
+        "rationale": "attempt replacement",
+        "title": "replacement root",
+        "body": "must not land",
+    }
+    if fanout:
+        payload["tasks"] = [
+            {
+                "title": "duplicate work",
+                "body": "must not exist",
+                "assignee": "engineer",
+                "parents": [],
+            },
+        ]
+
+    def link_child_then_reply(**_kwargs):
+        with kb.connect_closing() as conn:
+            kb.create_task(
+                conn,
+                title="existing review lane",
+                assignee="reviewer",
+                parents=(tid,),
+            )
+        return _fake_aux_response(jsonlib.dumps(payload))
+
+    patches = _patch_list_profiles(["orchestrator", "engineer", "reviewer"])
+    for p in patches:
+        p.start()
+    try:
+        with patch(
+            "agent.auxiliary_client.call_llm",
+            side_effect=link_child_then_reply,
+        ):
+            outcome = decomp.decompose_task(tid, author="me")
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert outcome.ok is False
+    assert "open governed child graph" in outcome.reason
+    with kb.connect_closing() as conn:
+        root = kb.get_task(conn, tid)
+        rows = kb.list_tasks(conn, limit=100)
+        assert root.status == "triage"
+        assert root.title == "governed root"
+        assert sorted(task.title for task in rows) == [
+            "existing review lane",
+            "governed root",
+        ]
+
+
+def test_fanout_revalidates_assignees_inside_graph_commit(kanban_home):
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(
+            conn,
+            title="profile race",
+            triage=True,
+            workspace_kind="worktree",
+            workspace_path=str(kanban_home.parent / "repo"),
+        )
+
+    payload = jsonlib.dumps({
+        "fanout": True,
+        "tasks": [{
+            "title": "implement",
+            "body": "write code",
+            "assignee": "engineer",
+            "parents": [],
+            "workspace_policy": "repo_write",
+        }],
+    })
+    patches = _patch_list_profiles(["orchestrator", "engineer"])
+    for p in patches:
+        p.start()
+    try:
+        with _patch_aux_client(payload), patch(
+            "hermes_cli.profiles.profile_exists",
+            side_effect=lambda name: name != "engineer",
+        ):
+            outcome = decomp.decompose_task(tid, author="me")
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert outcome.ok is False
+    assert "profile disappeared before graph commit: engineer" in outcome.reason
+    with kb.connect_closing() as conn:
+        assert kb.get_task(conn, tid).status == "triage"
+        assert len(kb.list_tasks(conn, limit=100)) == 1
+
+
+def test_profile_rename_cannot_race_validated_graph_commit(kanban_home):
+    from hermes_cli import profiles
+
+    profiles_root = kanban_home / "profiles"
+    (profiles_root / "orchestrator").mkdir(parents=True)
+    engineer_dir = profiles_root / "engineer"
+    engineer_dir.mkdir()
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="profile lifecycle race", triage=True)
+
+    validation_started = threading.Event()
+    allow_commit = threading.Event()
+    graph_result: list[object] = []
+    rename_error: list[BaseException] = []
+    original_require = kb._require_current_profiles
+
+    def pause_after_validation(*assignees):
+        original_require(*assignees)
+        validation_started.set()
+        assert allow_commit.wait(5)
+
+    def commit_graph():
+        with kb.connect_closing() as conn:
+            graph_result.append(kb.decompose_triage_task(
+                conn,
+                tid,
+                root_assignee="orchestrator",
+                children=[{
+                    "title": "implementation",
+                    "assignee": "engineer",
+                    "parents": [],
+                    "workspace_policy": "scratch",
+                }],
+            ))
+
+    def rename_engineer():
+        try:
+            profiles.rename_profile("engineer", "engineer-new")
+        except BaseException as exc:
+            rename_error.append(exc)
+
+    with patch.object(kb, "_require_current_profiles", side_effect=pause_after_validation), patch(
+        "hermes_cli.profiles._check_gateway_running", return_value=False,
+    ):
+        graph_thread = threading.Thread(target=commit_graph)
+        rename_thread = threading.Thread(target=rename_engineer)
+        graph_thread.start()
+        assert validation_started.wait(5)
+        rename_thread.start()
+        rename_thread.join(0.2)
+        assert rename_thread.is_alive(), "rename bypassed profile lifecycle lock"
+        allow_commit.set()
+        graph_thread.join(5)
+        rename_thread.join(5)
+
+    assert len(graph_result) == 1
+    assert isinstance(graph_result[0], list)
+    assert len(rename_error) == 1
+    assert "open Kanban assignments" in str(rename_error[0])
+    assert engineer_dir.is_dir()
+    assert not (profiles_root / "engineer-new").exists()
+
+
+def test_single_spec_revalidates_assignee_inside_commit(kanban_home):
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="profile race", triage=True)
+
+    payload = jsonlib.dumps({
+        "fanout": False,
+        "title": "specified",
+        "body": "must not land",
+        "assignee": "engineer",
+    })
+    patches = _patch_list_profiles(["orchestrator", "engineer"])
+    for p in patches:
+        p.start()
+    try:
+        with _patch_aux_client(payload), patch(
+            "hermes_cli.profiles.profile_exists",
+            side_effect=lambda name: name != "engineer",
+        ):
+            outcome = decomp.decompose_task(tid, author="me")
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert outcome.ok is False
+    assert "profile disappeared before graph commit: engineer" in outcome.reason
+    with kb.connect_closing() as conn:
+        task = kb.get_task(conn, tid)
+        assert task.status == "triage"
+        assert task.title == "profile race"
+
+
+def test_manual_decompose_of_escalated_triage_is_not_owner_authority(kanban_home):
+    """Manual CLI execution still fails before an LLM or DB write."""
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="needs capability")
+        _escalate_via_block_loop(conn, tid, kind="capability")
+        assert kb.is_block_loop_escalated(conn, tid) is True
+
+    with patch("agent.auxiliary_client.call_llm") as call_llm:
+        outcome = decomp.decompose_task(tid, author="me")
+    assert outcome.ok is False
+    assert "authenticated owner recovery is unavailable" in outcome.reason
+    call_llm.assert_not_called()
+    with kb.connect_closing() as conn:
+        task = kb.get_task(conn, tid)
+        assert task.status == "triage"
+        assert task.title == "needs capability"
+        assert task.block_kind == "capability"
+        assert kb.is_block_loop_escalated(conn, tid) is True
+        events = kb.list_events(conn, tid)
+        assert not any(e.kind == "triage_escalation_recovered" for e in events)
+
+
+def test_manual_decompose_failure_keeps_escalation(kanban_home):
+    """A FAILED manual decompose must not clear the escalation: the card
+    stays escalated and out of the auto-decompose feed, and the recovery
+    event is only written when an attempt actually succeeds (#81353)."""
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="needs capability")
+        _escalate_via_block_loop(conn, tid, kind="capability")
+        assert kb.is_block_loop_escalated(conn, tid) is True
+
+    # Manual decompose fails at the LLM call (API error).
+    patches = _patch_list_profiles(["orchestrator", "fallback"])
+    for p in patches:
+        p.start()
+    try:
+        with patch(
+            "hermes_cli.kanban_decompose._load_config",
+            return_value={"kanban": {"default_assignee": "fallback"}},
+        ), patch(
+            "agent.auxiliary_client.call_llm",
+            side_effect=RuntimeError("api down"),
+        ):
+            outcome = decomp.decompose_task(tid, author="me")
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert outcome.ok is False
+    with kb.connect_closing() as conn:
+        task = kb.get_task(conn, tid)
+        assert task.status == "triage"
+        assert task.title == "needs capability"  # spec must not be rewritten
+        # Escalation survives the failed attempt...
+        assert kb.is_block_loop_escalated(conn, tid) is True
+        assert tid not in decomp.list_triage_ids()
+        events = kb.list_events(conn, tid)
+        assert not any(e.kind == "triage_escalation_recovered" for e in events)
+    # ...and the auto-decomposer still refuses the card.
+    with patch("agent.auxiliary_client.call_llm") as call_llm:
+        outcome = decomp.decompose_task(tid, author=decomp.AUTO_DECOMPOSER_AUTHOR)
+        assert outcome.ok is False
+        call_llm.assert_not_called()
+
+
+def test_db_spec_recovery_flag_fails_closed(kanban_home):
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="atomic recovery")
+        _escalate_via_block_loop(conn, tid, kind="capability")
+
+    with kb.connect_closing() as conn:
+        with pytest.raises(ValueError, match="owner escalation recovery"):
+            kb.specify_triage_task(
+                conn,
+                tid,
+                title="must not land",
+                recover_escalation=True,
+            )
+        task = kb.get_task(conn, tid)
+        assert task.status == "triage"
+        assert task.title == "atomic recovery"
+        assert task.block_kind == "capability"
+        assert kb.is_block_loop_escalated(conn, tid) is True
+        events = kb.list_events(conn, tid)
+        assert not any(
+            event.kind == "triage_escalation_recovered" for event in events
+        )
+
+
+def test_single_task_decompose_respects_auto_promote_false(kanban_home):
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="manual gate", triage=True)
+
+    llm_payload = jsonlib.dumps({
+        "fanout": False,
+        "rationale": "single unit",
+        "title": "approved later",
+        "body": "stay todo",
+    })
+    patches = _patch_list_profiles(["orchestrator", "fallback"])
+    for p in patches:
+        p.start()
+    try:
+        with _patch_aux_client(llm_payload), patch(
+            "hermes_cli.kanban_decompose._load_config",
+            return_value={
+                "kanban": {
+                    "default_assignee": "fallback",
+                    "auto_promote_children": False,
+                },
+            },
+        ):
+            outcome = decomp.decompose_task(tid, author="me")
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert outcome.ok, outcome.reason
+    with kb.connect_closing() as conn:
+        assert kb.get_task(conn, tid).status == "todo"
+
+
+def test_db_fanout_recovery_flag_fails_closed(kanban_home):
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="needs capability")
+        _escalate_via_block_loop(conn, tid, kind="capability")
+        assert kb.is_block_loop_escalated(conn, tid) is True
+
+    with kb.connect_closing() as conn:
+        with pytest.raises(ValueError, match="owner escalation recovery"):
+            kb.decompose_triage_task(
+                conn,
+                tid,
+                root_assignee="orchestrator",
+                children=[{"title": "duplicate", "assignee": "engineer"}],
+                recover_escalation=True,
+            )
+        root = kb.get_task(conn, tid)
+        assert root.status == "triage"
+        assert root.block_kind == "capability"
+        assert kb.is_block_loop_escalated(conn, tid) is True
+        assert len(kb.list_tasks(conn, limit=100)) == 1
+
+
 def test_decompose_returns_false_when_task_not_triage(kanban_home):
     with kb.connect() as conn:
         tid = kb.create_task(conn, title="x")  # ready, not triage
@@ -159,5 +643,3 @@ def test_decompose_returns_false_when_task_not_triage(kanban_home):
             p.stop()
     assert outcome.ok is False
     assert "not in triage" in outcome.reason
-
-

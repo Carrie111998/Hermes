@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import concurrent.futures
+import hashlib
+import json
 import os
 import sqlite3
 import subprocess
@@ -20,12 +22,29 @@ from hermes_cli import kanban_db as kb
 
 @pytest.fixture
 def kanban_home(tmp_path, monkeypatch):
-    """Isolated HERMES_HOME with an empty kanban DB."""
+    """Pin every Kanban resolver to a throwaway board before opening a DB.
+
+    ``HERMES_HOME`` alone is intentionally insufficient because Kanban boards
+    are shared across profiles.  Keep the DB, board, attachments, and workspace
+    roots explicit so this fixture cannot fall back to an operator board.
+    """
     home = tmp_path / ".hermes"
+    board_root = home
+    db_path = home / "kanban.db"
+    attachments = home / "kanban" / "attachments"
+    workspaces = home / "kanban" / "workspaces"
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(board_root))
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "default")
+    monkeypatch.setenv("HERMES_KANBAN_ATTACHMENTS_ROOT", str(attachments))
+    monkeypatch.setenv("HERMES_KANBAN_WORKSPACES_ROOT", str(workspaces))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     kb.init_db()
+    assert kb.kanban_db_path().resolve() == db_path.resolve()
+    assert kb.attachments_root().resolve() == attachments.resolve()
+    assert kb.workspaces_root().resolve() == workspaces.resolve()
     return home
 
 
@@ -1078,6 +1097,222 @@ def test_add_column_if_missing_is_idempotent_on_race(kanban_home):
     assert added_again is False
 
     conn.close()
+
+
+def test_source_manifest_reader_is_task_scoped_and_digest_pinned(kanban_home):
+    payload = b"sealed source\n"
+    digest = hashlib.sha256(payload).hexdigest()
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="sealed")
+        other_id = kb.create_task(conn, title="other")
+        attachment_id = kb.store_attachment_bytes(
+            conn, task_id, "source.md", payload, content_type="text/markdown", uploaded_by="test"
+        )
+        conn.execute(
+            "UPDATE tasks SET source_manifest = ? WHERE id = ?",
+            (json.dumps([{"source_id": "src_abcdefgh", "attachment_id": attachment_id,
+                          "sha256": digest, "size": len(payload),
+                          "media_type": "text/markdown", "provenance": "task_attachment"}]), task_id),
+        )
+        page = kb.read_task_source(conn, task_id, "src_abcdefgh", limit=6)
+        assert page["bytes"] == b"sealed"
+        assert page["sha256"] == digest
+        with pytest.raises(ValueError):
+            kb.read_task_source(conn, other_id, "src_abcdefgh")
+        conn.execute("UPDATE task_attachments SET task_id = ? WHERE id = ?", (other_id, attachment_id))
+        with pytest.raises(ValueError):
+            kb.read_task_source(conn, task_id, "src_abcdefgh")
+
+
+def test_claim_seals_sources_and_rejects_cursor_tampering(kanban_home):
+    payload = b"sealed source that needs paging"
+    digest = hashlib.sha256(payload).hexdigest()
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="sealed run")
+        attachment_id = kb.store_attachment_bytes(conn, task_id, "source.md", payload, content_type="text/markdown", uploaded_by="test")
+        manifest = [{"source_id": "src_abcdefgh", "attachment_id": attachment_id, "sha256": digest, "size": len(payload), "media_type": "text/markdown", "provenance": "task_attachment"}]
+        conn.execute("UPDATE tasks SET source_manifest = ? WHERE id = ?", (json.dumps(manifest), task_id))
+        claimed = kb.claim_task(conn, task_id)
+        assert claimed is not None and claimed.current_run_id is not None
+        # The receipt is bound to the exact run, its sealed sources, and the
+        # claim lease; it cannot authorize a later run or altered task state.
+        receipt_row = conn.execute("SELECT preclaim_receipt FROM task_runs WHERE id = ?", (claimed.current_run_id,)).fetchone()
+        receipt = json.loads(receipt_row["preclaim_receipt"])
+        assert receipt["run_id"] == claimed.current_run_id
+        assert receipt["task_id"] == task_id
+        assert receipt["source_ids"] == ["src_abcdefgh"]
+        assert receipt["claim_lock"] == kb.get_task(conn, task_id).claim_lock
+        assert receipt["claim_expires"] == kb.get_task(conn, task_id).claim_expires
+        first = kb.read_task_source(conn, task_id, "src_abcdefgh", run_id=claimed.current_run_id, limit=6)
+        assert first["bytes"] == payload[:6]
+        assert first["next_cursor"]
+        second = kb.read_task_source(conn, task_id, "src_abcdefgh", run_id=claimed.current_run_id, offset=6, limit=6, cursor=first["next_cursor"])
+        assert second["bytes"] == payload[6:12]
+        with pytest.raises(ValueError, match="cursor"):
+            kb.read_task_source(conn, task_id, "src_abcdefgh", run_id=claimed.current_run_id, offset=6, limit=6, cursor="forged")
+        # A post-claim task-manifest mutation cannot redirect this run.
+        conn.execute("UPDATE tasks SET source_manifest = '[]' WHERE id = ?", (task_id,))
+        assert kb.read_task_source(conn, task_id, "src_abcdefgh", run_id=claimed.current_run_id, limit=1)["bytes"] == payload[:1]
+
+
+def test_source_reader_rejects_symlink_escape(kanban_home, tmp_path):
+    payload = b"sealed source\n"
+    digest = hashlib.sha256(payload).hexdigest()
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="sealed")
+        attachment_id = kb.store_attachment_bytes(conn, task_id, "source.md", payload, content_type="text/markdown", uploaded_by="test")
+        conn.execute("UPDATE tasks SET source_manifest = ? WHERE id = ?", (json.dumps([{"source_id": "src_abcdefgh", "attachment_id": attachment_id, "sha256": digest, "size": len(payload), "media_type": "text/markdown", "provenance": "task_attachment"}]), task_id))
+        attachment = kb.get_attachment(conn, attachment_id)
+        Path(attachment.stored_path).unlink()
+        Path(attachment.stored_path).symlink_to(tmp_path / "outside")
+        with pytest.raises(ValueError):
+            kb.read_task_source(conn, task_id, "src_abcdefgh")
+
+def test_claim_fails_closed_for_unproven_capability(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="requires authority", required_capabilities=["terminal"])
+        assert kb.claim_task(conn, task_id) is None
+        assert kb.get_task(conn, task_id).status == "ready"
+        event = conn.execute("SELECT kind FROM task_events WHERE task_id = ? ORDER BY id DESC LIMIT 1", (task_id,)).fetchone()
+        assert event["kind"] == "preclaim_denied"
+
+
+
+def test_remote_source_claim_fails_before_run_creation(kanban_home, monkeypatch):
+    """Remote workers may not claim host-sealed sources without a materializer."""
+    payload = b"remote-host-path must not leak"
+    digest = hashlib.sha256(payload).hexdigest()
+    monkeypatch.setattr("hermes_cli.profiles.resolve_profile_env", lambda _profile: "/isolated/profile")
+    monkeypatch.setattr(
+        kb,
+        "_resolve_worker_runtime_contract",
+        lambda _home: {"toolsets": ["kanban"], "requested_toolsets": ["file", "terminal"], "backend": "docker"},
+    )
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn, title="remote sealed", assignee="spec-pm", required_capabilities=["kanban_source_reader"]
+        )
+        attachment_id = kb.store_attachment_bytes(conn, task_id, "source.md", payload, content_type="text/markdown", uploaded_by="test")
+        manifest = [{"source_id": "src_remote", "attachment_id": attachment_id, "sha256": digest, "size": len(payload), "media_type": "text/markdown", "provenance": "task_attachment"}]
+        conn.execute("UPDATE tasks SET source_manifest = ? WHERE id = ?", (json.dumps(manifest), task_id))
+        assert kb.claim_task(conn, task_id) is None
+        assert kb.get_task(conn, task_id).status == "ready"
+        assert conn.execute("SELECT COUNT(*) FROM task_runs WHERE task_id = ?", (task_id,)).fetchone()[0] == 0
+        event = conn.execute("SELECT payload FROM task_events WHERE task_id = ? ORDER BY id DESC LIMIT 1", (task_id,)).fetchone()
+        assert "remote_materialization_unsupported" in event["payload"]
+
+
+
+def test_repo_receipt_rechecks_head_and_fails_closed(kanban_home, tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    sha = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="repo-bound", workspace_path=str(repo), required_repo_sha=sha)
+        claimed = kb.claim_task(conn, task_id)
+        assert claimed is not None and claimed.current_run_id is not None
+        assert kb._run_preclaim_receipt(conn, claimed, claimed.current_run_id) is not None
+        monkeypatch.setattr(kb.subprocess, "check_output", lambda *_args, **_kwargs: "f" * 40)
+        assert kb._run_preclaim_receipt(conn, claimed, claimed.current_run_id) is None
+        def unavailable(*_args, **_kwargs):
+            raise subprocess.CalledProcessError(1, "git")
+        monkeypatch.setattr(kb.subprocess, "check_output", unavailable)
+        assert kb._run_preclaim_receipt(conn, claimed, claimed.current_run_id) is None
+
+
+def test_spec_pm_reader_only_contract_preserves_least_privilege(kanban_home, monkeypatch):
+    monkeypatch.setattr("hermes_cli.profiles.resolve_profile_env", lambda _profile: "/isolated/spec-pm")
+    monkeypatch.setattr(
+        kb,
+        "_resolve_worker_runtime_contract",
+        lambda _home: {"toolsets": ["kanban"], "requested_toolsets": ["kanban", "file", "terminal"], "backend": "local"},
+    )
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="reader-only", assignee="spec-pm", required_capabilities=["kanban_source_reader"])
+        claimed = kb.claim_task(conn, task_id)
+        assert claimed is not None and claimed.current_run_id is not None
+        row = conn.execute("SELECT preclaim_receipt FROM task_runs WHERE id = ?", (claimed.current_run_id,)).fetchone()
+        receipt = json.loads(row["preclaim_receipt"])
+        assert receipt["effective_toolsets"] == ["kanban"]
+        assert receipt["shadowed_toolsets"] == ["file", "terminal"]
+        assert "file" not in receipt["effective_toolsets"]
+        assert "terminal" not in receipt["effective_toolsets"]
+
+
+@pytest.mark.parametrize(
+    ("runtime_contract", "is_valid"),
+    [
+        ({"toolsets": ["file", "kanban"], "requested_toolsets": ["kanban", "file", "terminal"], "backend": "local"}, False),
+        ({"toolsets": ["kanban"], "requested_toolsets": ["kanban", "file", "terminal"], "backend": "docker"}, False),
+        (None, False),
+        ({"toolsets": ["kanban"], "requested_toolsets": ["kanban", "file", "terminal"], "backend": "local"}, True),
+    ],
+    ids=["effective-toolset-drift", "backend-drift", "unresolvable-profile", "unchanged-contract"],
+)
+def test_runtime_receipt_revalidates_pinned_profile_contract(kanban_home, monkeypatch, runtime_contract, is_valid):
+    """Source reads fail closed unless the current profile contract matches the sealed receipt."""
+    monkeypatch.setattr("hermes_cli.profiles.resolve_profile_env", lambda _profile: "/isolated/spec-pm")
+    initial_contract = {
+        "toolsets": ["kanban"],
+        "requested_toolsets": ["kanban", "file", "terminal"],
+        "backend": "local",
+    }
+    monkeypatch.setattr(kb, "_resolve_worker_runtime_contract", lambda _home: initial_contract)
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="runtime contract",
+            assignee="spec-pm",
+            required_capabilities=["kanban_source_reader"],
+        )
+        claimed = kb.claim_task(conn, task_id)
+        assert claimed is not None and claimed.current_run_id is not None
+        monkeypatch.setattr(kb, "_resolve_worker_runtime_contract", lambda _home: runtime_contract)
+        receipt = kb._run_preclaim_receipt(conn, claimed, claimed.current_run_id)
+        assert (receipt is not None) is is_valid
+
+
+def test_spawn_pins_backend_and_toolsets_from_preclaim_receipt(kanban_home, monkeypatch, tmp_path):
+    monkeypatch.setattr("hermes_cli.profiles.resolve_profile_env", lambda _profile: "/isolated/spec-pm")
+    monkeypatch.setattr(
+        kb,
+        "_resolve_worker_runtime_contract",
+        lambda _home: {"toolsets": ["kanban"], "requested_toolsets": ["kanban", "file"], "backend": "local"},
+    )
+    monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["hermes"])
+    monkeypatch.setenv("TERMINAL_ENV", "docker")
+    captured = {}
+
+    class FakeProc:
+        pid = 4242
+
+    def fake_popen(cmd, *args, **kwargs):
+        captured["cmd"] = list(cmd)
+        captured["env"] = dict(kwargs["env"])
+        return FakeProc()
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn, title="pinned launch", assignee="spec-pm", required_capabilities=["kanban_source_reader"]
+        )
+        claimed = kb.claim_task(conn, task_id)
+        assert claimed is not None
+    assert kb._default_spawn(claimed, str(workspace)) == 4242
+    assert captured["env"]["TERMINAL_ENV"] == "local"
+    toolsets = captured["cmd"][captured["cmd"].index("--toolsets") + 1]
+    assert toolsets == "kanban"
+
+
+def test_source_manifest_rejects_unsupported_media_at_creation(kanban_home):
+    with kb.connect() as conn:
+        with pytest.raises(ValueError, match="media_type is not allowed"):
+            kb.create_task(conn, title="image source", source_manifest=[{
+                "source_id": "src_abcdefgh", "attachment_id": 1, "sha256": "a" * 64,
+                "size": 1, "media_type": "image/png", "provenance": "task_attachment",
+            }])
 
 
 def test_migrate_add_optional_columns_tolerates_concurrent_migration(kanban_home):

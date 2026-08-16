@@ -28,6 +28,7 @@ through the board.
 """
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import os
@@ -1302,8 +1303,11 @@ def _handle_attach_url(args: dict, **kw) -> str:
 
 
 def _handle_attachments(args: dict, **kw) -> str:
-    """List a task's attachments (read-only; no ownership restriction)."""
+    """List attachment metadata without exposing host paths to workers."""
     tid = _default_task_id(args.get("task_id"))
+    current_task = os.environ.get("HERMES_KANBAN_TASK", "").strip()
+    if current_task and tid and tid != current_task:
+        return tool_error("kanban_attachments is confined to the current task")
     if not tid:
         return tool_error(
             "task_id is required (or set HERMES_KANBAN_TASK in the env)"
@@ -1325,7 +1329,6 @@ def _handle_attachments(args: dict, **kw) -> str:
                         "content_type": a.content_type,
                         "size": a.size,
                         "uploaded_by": a.uploaded_by,
-                        "stored_path": a.stored_path,
                         "created_at": a.created_at,
                     }
                     for a in atts
@@ -1338,6 +1341,32 @@ def _handle_attachments(args: dict, **kw) -> str:
     except Exception as e:
         logger.exception("kanban_attachments failed")
         return tool_error(f"kanban_attachments: {e}")
+
+
+def _handle_read_source(args: dict, **kw) -> str:
+    """Read only a source manifest entry for the dispatcher's own task/run."""
+    task_id = os.environ.get("HERMES_KANBAN_TASK", "").strip()
+    if not task_id:
+        return tool_error("kanban_read_source is available only to a claimed task worker")
+    try:
+        run_id = int(os.environ.get("HERMES_KANBAN_RUN_ID", ""))
+    except ValueError:
+        return tool_error("kanban_read_source requires a dispatcher-bound run")
+    try:
+        kb, conn = _connect(board=args.get("board"))
+        try:
+            page = kb.read_task_source(conn, task_id, str(args["source_id"]),
+                offset=int(args.get("offset", 0)), limit=int(args.get("limit", 65536)), run_id=run_id,
+                cursor=args.get("cursor"))
+            page["content_base64"] = base64.b64encode(page.pop("bytes")).decode("ascii")
+            return json.dumps({"ok": True, **page})
+        finally:
+            conn.close()
+    except (KeyError, TypeError, ValueError) as exc:
+        return tool_error(f"kanban_read_source: {exc}")
+    except Exception as exc:
+        logger.exception("kanban_read_source failed")
+        return tool_error("kanban_read_source: source unavailable")
 
 
 def _handle_create(args: dict, **kw) -> str:
@@ -2129,6 +2158,18 @@ KANBAN_ATTACHMENTS_SCHEMA = {
     },
 }
 
+KANBAN_READ_SOURCE_SCHEMA = {
+    "name": "kanban_read_source",
+    "description": "Read a bounded page from an opaque source handle bound to the current Kanban task and run. This tool never accepts paths or attachment IDs.",
+    "parameters": {"type": "object", "properties": {
+        "source_id": {"type": "string", "description": "Opaque manifest source handle."},
+        "cursor": {"type": "string", "description": "Signed cursor returned by the prior page; required after offset 0."},
+        "offset": {"type": "integer", "minimum": 0},
+        "limit": {"type": "integer", "minimum": 1, "maximum": 65536},
+        "board": _board_schema_prop(),
+    }, "required": ["source_id"]},
+}
+
 KANBAN_CREATE_SCHEMA = {
     "name": "kanban_create",
     "description": (
@@ -2450,6 +2491,15 @@ registry.register(
     handler=_handle_attachments,
     check_fn=_check_kanban_mode,
     emoji="📎",
+)
+
+registry.register(
+    name="kanban_read_source",
+    toolset="kanban",
+    schema=KANBAN_READ_SOURCE_SCHEMA,
+    handler=_handle_read_source,
+    check_fn=_check_kanban_mode,
+    emoji="📖",
 )
 
 registry.register(

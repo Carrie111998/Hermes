@@ -652,6 +652,29 @@ All actions are also available as a slash command in the gateway (`/kanban …`)
 
 For the full design — comparison with Cline Kanban / Paperclip / NanoClaw / Gemini Enterprise, eight collaboration patterns, four user stories, concurrency correctness proof — see `docs/hermes-kanban-v1-spec.pdf` in the repository or the [Kanban user guide](/user-guide/features/kanban).
 
+## `hermes workspace`
+
+Read-only, fail-closed workspace lifecycle reports. These commands inspect Git
+worktree registrations but do not create a registry entry, mutate a repository,
+or authorize removal.
+
+```bash
+hermes workspace inventory --repo /path/to/repo --json
+hermes workspace classify --repo /path/to/repo --json
+hermes workspace import --repo /path/to/repo --dry-run --json
+hermes workspace manifest --repo /path/to/repo --json
+```
+
+`manifest` binds the exact observed paths, heads, branches, and evidence hashes
+to a single manifest hash for owner review. The manifest is not permission to
+remove anything: V1 has no apply path, and all legacy or unverified work remains
+`blocked_review` or retained. The V1 registry is not yet wired into the live
+dispatcher allocation path; it is report-only evidence authority, not proof
+that every currently dispatched worktree was registry-reserved. Registry
+receipts are accepted only in one SQLite write transaction against the current
+registered observation, and that observation must be no more than five minutes
+old; a receipt never grants apply or removal authority in V1.
+
 ## `hermes egress`
 
 Outbound credential-injection firewall for remote terminal sandboxes. Wraps the [iron-proxy](https://github.com/ironsh/iron-proxy) daemon — a TLS-intercepting proxy that swaps opaque proxy tokens for real upstream API credentials at the network boundary, so sandboxes never hold real keys. Disabled by default; see the full [Egress proxy](../user-guide/egress/iron-proxy.md) page for setup + architecture.
@@ -1632,6 +1655,12 @@ Manage profiles — multiple isolated Hermes instances, each with its own config
 | `install <source> [--name N] [--alias] [--force] [-y]` | Install a profile distribution from a git URL or local directory. |
 | `update <name> [--force-config] [-y]` | Re-pull a distribution; preserves user data (memories, sessions, auth). |
 | `info <name>` | Show a profile's distribution manifest (version, requirements, source). |
+
+Profile deletion and rename fail closed while the profile owns any nonterminal
+Kanban card on a discoverable board. Graph commits and destructive profile
+mutations share one cross-process lifecycle lock, so a rename/delete cannot
+land between assignee validation and the graph write. Finish or reassign those
+cards before changing the profile identity.
 
 Examples:
 

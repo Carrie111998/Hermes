@@ -48,6 +48,12 @@ from hermes_cli import profiles as profiles_mod
 
 logger = logging.getLogger(__name__)
 
+# Author stamp used by the gateway dispatcher's auto-decompose tick
+# (gateway/kanban_watchers.py). decompose_task uses it to distinguish the
+# automated path (which must never re-specify a block-loop-escalated card)
+# from an explicit operator call (which is the human-in-the-loop decision).
+AUTO_DECOMPOSER_AUTHOR = "auto-decomposer"
+
 
 _SYSTEM_PROMPT = """You are the Kanban decomposer for the Hermes Agent board.
 
@@ -70,7 +76,8 @@ Output a single JSON object with this exact shape:
         "title": "<concrete task title, imperative voice, <= 80 chars>",
         "body":  "<detailed spec for the worker on this child task>",
         "assignee": "<profile name from the roster, or null for default>",
-        "parents": [<int>, ...]
+        "parents": [<int>, ...],
+        "workspace_policy": "scratch" | "repo_write"
       },
       ...
     ]
@@ -89,6 +96,11 @@ Rules:
     and the system will route to the default_assignee.
   - Each child task body is what a fresh worker will read with no other
     context — be specific about goal, approach, and acceptance criteria.
+  - Set "workspace_policy" to "repo_write" ONLY when the task's acceptance
+    criteria require modifying repository files. Use "scratch" for research,
+    planning, QA, review, marketing, operations, coordination, or inspection.
+    A repo_write child receives its own isolated worktree and branch; scratch
+    children never inherit the root's checkout.
 
 When the task is genuinely a single unit of work (no useful decomposition),
 return:
@@ -283,12 +295,30 @@ def decompose_task(
     """
     with kb.connect_closing() as conn:
         task = kb.get_task(conn, task_id)
-    if task is None:
-        return DecomposeOutcome(task_id, False, "unknown task id")
-    if task.status != "triage":
-        return DecomposeOutcome(
-            task_id, False, f"task is not in triage (status={task.status!r})"
-        )
+        if task is None:
+            return DecomposeOutcome(task_id, False, "unknown task id")
+        if task.status != "triage":
+            return DecomposeOutcome(
+                task_id, False, f"task is not in triage (status={task.status!r})"
+            )
+        escalated = kb.is_block_loop_escalated(conn, task_id)
+        if not kb.is_auto_decomposable_triage(conn, task_id):
+            if escalated:
+                # There is no authenticated owner-only recovery primitive in
+                # V1. Treat every caller, including the manual CLI, as
+                # untrusted for this transition. The owner must retire the
+                # escalated root and create a newly reviewed intake instead.
+                return DecomposeOutcome(
+                    task_id, False,
+                    "task escalated to triage after repeated blocks; "
+                    "authenticated owner recovery is unavailable — "
+                    "refusing to re-specify",
+                )
+            return DecomposeOutcome(
+                task_id, False,
+                "triage provenance is unclassified; create a newly reviewed "
+                "fresh-intake root",
+            )
 
     cfg = _load_config()
     orchestrator = _resolve_orchestrator_profile(cfg)
@@ -361,14 +391,23 @@ def decompose_task(
             return DecomposeOutcome(
                 task_id, False, "decomposer returned fanout=false with no title/body",
             )
-        with kb.connect_closing() as conn:
-            ok = kb.specify_triage_task(
-                conn,
-                task_id,
-                title=title_val,
-                body=body_val,
-                assignee=assignee_val,
-                author=audit_author,
+        try:
+            with kb.connect_closing() as conn:
+                ok = kb.specify_triage_task(
+                    conn,
+                    task_id,
+                    title=title_val,
+                    body=body_val,
+                    assignee=assignee_val,
+                    author=audit_author,
+                    auto_promote=auto_promote,
+                )
+        except ValueError as exc:
+            return DecomposeOutcome(task_id, False, f"DB rejected spec: {exc}")
+        except Exception as exc:
+            logger.exception("decompose: DB error specifying task %s", task_id)
+            return DecomposeOutcome(
+                task_id, False, f"DB error: {type(exc).__name__}",
             )
         if not ok:
             return DecomposeOutcome(
@@ -422,11 +461,18 @@ def decompose_task(
             parents = []
         # Clean parent indices: drop non-int and out-of-range.
         clean_parents = [p for p in parents if isinstance(p, int) and 0 <= p < len(raw_tasks) and p != idx]
+        workspace_policy = entry.get("workspace_policy")
+        if workspace_policy != "repo_write":
+            # Missing, invalid, or over-broad declarations fail closed. The
+            # DB repeats the enum validation so direct callers cannot smuggle
+            # an unknown policy past this parser.
+            workspace_policy = "scratch"
         children.append({
             "title": title.strip()[:200],
             "body": body.strip(),
             "assignee": chosen,
             "parents": clean_parents,
+            "workspace_policy": workspace_policy,
         })
 
     try:
@@ -449,7 +495,6 @@ def decompose_task(
         return DecomposeOutcome(
             task_id, False, "task moved out of triage before decomposition",
         )
-
     return DecomposeOutcome(
         task_id, True, f"decomposed into {len(child_ids)} children",
         fanout=True, child_ids=child_ids,
@@ -457,12 +502,22 @@ def decompose_task(
 
 
 def list_triage_ids(*, tenant: Optional[str] = None) -> list[str]:
-    """Return task ids currently in the triage column."""
+    """Return auto-decomposable task ids currently in the triage column.
+
+    A durable ``triage_fresh_intake`` marker (or a historical recovery marker)
+    must be newer than any block-loop/decomposition/specification that consumed
+    it. Legacy or otherwise unclassified rows fail closed; V1 does not expose
+    an unauthenticated recovery path.
+    """
+    query = (
+        "SELECT id FROM tasks "
+        "WHERE status = 'triage' AND " + kb._AUTO_DECOMPOSABLE_TRIAGE_SQL
+    )
+    params: list[str] = []
+    if tenant is not None:
+        query += " AND tenant = ?"
+        params.append(tenant)
+    query += " ORDER BY priority DESC, created_at ASC LIMIT 1000"
     with kb.connect_closing() as conn:
-        rows = kb.list_tasks(
-            conn,
-            status="triage",
-            tenant=tenant,
-            limit=1000,
-        )
-    return [row.id for row in rows]
+        rows = conn.execute(query, params).fetchall()
+    return [row["id"] for row in rows]

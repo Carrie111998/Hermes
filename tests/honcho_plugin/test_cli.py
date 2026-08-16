@@ -103,18 +103,31 @@ class TestCmdSetupLocalJwt:
 
 
 class TestCmdStatus:
-    def test_reports_connection_failure_when_session_setup_fails(self, monkeypatch, capsys, tmp_path):
+    def _install_base_status_stubs(self, monkeypatch, tmp_path, fake_config):
         import plugins.memory.honcho.cli as honcho_cli
 
         cfg_path = tmp_path / "honcho.json"
         cfg_path.write_text("{}")
+        monkeypatch.setattr(honcho_cli, "_read_config", lambda: {"apiKey": "***"})
+        monkeypatch.setattr(honcho_cli, "_config_path", lambda: cfg_path)
+        monkeypatch.setattr(honcho_cli, "_local_config_path", lambda: cfg_path)
+        monkeypatch.setattr(honcho_cli, "_active_profile_name", lambda: "default")
+        monkeypatch.setattr(
+            "plugins.memory.honcho.client.HonchoClientConfig.from_global_config",
+            lambda host=None: fake_config,
+        )
+        monkeypatch.setattr(
+            "plugins.memory.honcho.client.get_honcho_client",
+            lambda cfg: object(),
+        )
+        monkeypatch.setitem(__import__("sys").modules, "honcho", SimpleNamespace())
+        return honcho_cli
 
+    @staticmethod
+    def _fake_config(*, enabled=True, api_key="root-key", base_url=None):
         class FakeConfig:
-            enabled = True
-            api_key = "root-key"
             workspace_id = "hermes"
             host = "hermes"
-            base_url = None
             ai_peer = "hermes"
             peer_name = "eri"
             recall_mode = "hybrid"
@@ -128,34 +141,57 @@ class TestCmdStatus:
             dialectic_reasoning_level = "low"
             reasoning_level_cap = "high"
             reasoning_heuristic = True
+            raw = {}
+
+            def __init__(self):
+                self.enabled = enabled
+                self.api_key = api_key
+                self.base_url = base_url
 
             def resolve_session_name(self):
                 return "hermes"
 
-        monkeypatch.setattr(honcho_cli, "_read_config", lambda: {"apiKey": "***"})
-        monkeypatch.setattr(honcho_cli, "_config_path", lambda: cfg_path)
-        monkeypatch.setattr(honcho_cli, "_local_config_path", lambda: cfg_path)
-        monkeypatch.setattr(honcho_cli, "_active_profile_name", lambda: "default")
-        monkeypatch.setattr(
-            "plugins.memory.honcho.client.HonchoClientConfig.from_global_config",
-            lambda host=None: FakeConfig(),
-        )
-        monkeypatch.setattr(
-            "plugins.memory.honcho.client.get_honcho_client",
-            lambda cfg: object(),
-        )
+        return FakeConfig()
+
+    def test_reports_unreachable_when_session_setup_fails(self, monkeypatch, capsys, tmp_path):
+        fake_config = self._fake_config()
+        honcho_cli = self._install_base_status_stubs(monkeypatch, tmp_path, fake_config)
 
         def _boom(hcfg, client):
             raise RuntimeError("Invalid API key")
 
-        monkeypatch.setattr(honcho_cli, "_show_peer_cards", _boom)
-        monkeypatch.setitem(__import__("sys").modules, "honcho", SimpleNamespace())
+        monkeypatch.setattr(honcho_cli, "_load_peer_cards", _boom)
 
         honcho_cli.cmd_status(SimpleNamespace(all=False))
 
         out = capsys.readouterr().out
-        assert "FAILED (Invalid API key)" in out
+        assert "Configured:     True" in out
+        assert "Reachable:      no (Invalid API key)" in out
+        assert "Reachable:      yes" not in out
         assert "Connection... OK" not in out
+
+    def test_reports_reachable_when_peer_probe_succeeds(self, monkeypatch, capsys, tmp_path):
+        fake_config = self._fake_config()
+        honcho_cli = self._install_base_status_stubs(monkeypatch, tmp_path, fake_config)
+        monkeypatch.setattr(honcho_cli, "_load_peer_cards", lambda hcfg, client: (["Fact 1"], "AI summary"))
+
+        honcho_cli.cmd_status(SimpleNamespace(all=False))
+
+        out = capsys.readouterr().out
+        assert "Configured:     True" in out
+        assert "Reachable:      yes" in out
+        assert "User peer card (1 facts):" in out
+        assert "AI peer representation:" in out
+
+    def test_reports_not_checked_when_not_configured(self, monkeypatch, capsys, tmp_path):
+        fake_config = self._fake_config(enabled=False, api_key="")
+        honcho_cli = self._install_base_status_stubs(monkeypatch, tmp_path, fake_config)
+
+        honcho_cli.cmd_status(SimpleNamespace(all=False))
+
+        out = capsys.readouterr().out
+        assert "Configured:     False" in out
+        assert "Reachable:      not checked (disabled)" in out
 
     def test_auth_line_detects_oauth_grant(self, monkeypatch, capsys, tmp_path):
         import plugins.memory.honcho.cli as honcho_cli
@@ -208,7 +244,7 @@ class TestCmdStatus:
             lambda host=None: FakeConfig(),
         )
         monkeypatch.setattr("plugins.memory.honcho.client.get_honcho_client", lambda cfg: object())
-        monkeypatch.setattr(honcho_cli, "_show_peer_cards", lambda hcfg, client: None)
+        monkeypatch.setattr(honcho_cli, "_load_peer_cards", lambda hcfg, client: ([], ""))
         monkeypatch.setitem(__import__("sys").modules, "honcho", SimpleNamespace())
 
         honcho_cli.cmd_status(SimpleNamespace(all=False))
@@ -216,6 +252,138 @@ class TestCmdStatus:
         out = capsys.readouterr().out
         assert "Auth:           OAuth (hermes-agent" in out
         assert "API key:" not in out
+
+
+class TestEnsureAiPeerObservation:
+    """The v3 peer hardening must use the real client-config shape."""
+
+    @staticmethod
+    def _capture_urlopen(monkeypatch, honcho_cli):
+        calls = []
+
+        class _Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        def _urlopen(request, timeout):
+            calls.append((request, timeout))
+            return _Response()
+
+        monkeypatch.setattr(honcho_cli.urllib.request, "urlopen", _urlopen)
+        return calls
+
+    def test_real_config_uses_workspace_id_and_cloud_bearer(self, monkeypatch):
+        import plugins.memory.honcho.cli as honcho_cli
+        from plugins.memory.honcho.client import HonchoClientConfig
+
+        calls = self._capture_urlopen(monkeypatch, honcho_cli)
+        config = HonchoClientConfig(
+            workspace_id="team/space",
+            api_key="cloud-secret",
+            base_url="https://api.honcho.dev",
+            ai_peer="hermes/qa",
+            enabled=True,
+        )
+
+        honcho_cli._ensure_ai_peer_observe_me_disabled(config)
+
+        assert len(calls) == 1
+        request, timeout = calls[0]
+        assert request.full_url == (
+            "https://api.honcho.dev/v3/workspaces/team%2Fspace/peers/hermes%2Fqa"
+        )
+        assert json.loads(request.data) == {
+            "configuration": {"observe_me": False}
+        }
+        assert request.get_header("Authorization") == "Bearer cloud-secret"
+        assert timeout == 10
+
+    def test_local_placeholder_does_not_send_authorization(self, monkeypatch):
+        import plugins.memory.honcho.cli as honcho_cli
+        from plugins.memory.honcho.client import HonchoClientConfig
+
+        calls = self._capture_urlopen(monkeypatch, honcho_cli)
+        config = HonchoClientConfig(
+            workspace_id="fleet",
+            api_key="local",
+            base_url="http://127.0.0.1:8000",
+            ai_peer="hermes-qa",
+            enabled=True,
+        )
+
+        honcho_cli._ensure_ai_peer_observe_me_disabled(config)
+
+        request, _ = calls[0]
+        assert request.get_header("Authorization") is None
+
+    def test_local_server_ignores_unscoped_cloud_key(self, monkeypatch):
+        import plugins.memory.honcho.cli as honcho_cli
+        from plugins.memory.honcho.client import HonchoClientConfig
+
+        calls = self._capture_urlopen(monkeypatch, honcho_cli)
+        config = HonchoClientConfig(
+            workspace_id="fleet",
+            api_key="cloud-secret",
+            base_url="http://127.0.0.1:8000",
+            ai_peer="hermes-qa",
+            enabled=True,
+            raw={"apiKey": "cloud-secret"},
+        )
+
+        honcho_cli._ensure_ai_peer_observe_me_disabled(config)
+
+        request, _ = calls[0]
+        assert request.get_header("Authorization") is None
+
+    def test_local_server_sends_explicit_host_jwt(self, monkeypatch):
+        import plugins.memory.honcho.cli as honcho_cli
+        from plugins.memory.honcho.client import HonchoClientConfig
+
+        calls = self._capture_urlopen(monkeypatch, honcho_cli)
+        config = HonchoClientConfig(
+            workspace_id="fleet",
+            api_key="local-jwt",
+            base_url="http://127.0.0.1:8000",
+            ai_peer="hermes-qa",
+            enabled=True,
+            raw={"hosts": {"hermes": {"apiKey": "local-jwt"}}},
+        )
+
+        honcho_cli._ensure_ai_peer_observe_me_disabled(config)
+
+        request, _ = calls[0]
+        assert request.get_header("Authorization") == "Bearer local-jwt"
+
+    def test_peer_provisioning_remains_nonfatal_on_hardening_failure(self, monkeypatch):
+        import plugins.memory.honcho.cli as honcho_cli
+        from plugins.memory.honcho.client import HonchoClientConfig
+
+        config = HonchoClientConfig(
+            workspace_id="fleet",
+            api_key="local",
+            base_url="http://127.0.0.1:8000",
+            ai_peer="hermes-qa",
+            enabled=True,
+        )
+        client = SimpleNamespace(peer=lambda _peer: object())
+        monkeypatch.setattr(
+            "plugins.memory.honcho.client.HonchoClientConfig.from_global_config",
+            lambda host=None: config,
+        )
+        monkeypatch.setattr(
+            "plugins.memory.honcho.client.get_honcho_client",
+            lambda _config: client,
+        )
+        monkeypatch.setattr(
+            honcho_cli,
+            "_ensure_ai_peer_observe_me_disabled",
+            lambda _config: (_ for _ in ()).throw(OSError("offline")),
+        )
+
+        assert honcho_cli._ensure_peer_exists("hermes_qa") is False
 
 
 class TestCloneHonchoForProfile:
@@ -743,4 +911,3 @@ class TestCmdSetupDeviceFlow:
         )
         assert len(calls) == 1
         assert "apiKey" not in cfg.get("hosts", {}).get("hermes", {})
-

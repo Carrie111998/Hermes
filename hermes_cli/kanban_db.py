@@ -71,12 +71,15 @@ new locking.
 from __future__ import annotations
 
 import contextlib
+import base64
 import hashlib
+import hmac
 import json
 import os
 import re
 import random
 import secrets
+import stat
 import shutil
 import sqlite3
 import subprocess
@@ -133,6 +136,7 @@ VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
 # not dispatcher spawn/crash/timeout failures.
 BLOCK_RECURRENCE_LIMIT = 2
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
+VALID_DECOMPOSE_WORKSPACE_POLICIES = {"scratch", "repo_write"}
 
 
 def normalize_reasoning_effort(effort: Optional[str]) -> Optional[str]:
@@ -1049,6 +1053,17 @@ def remove_board(slug: str, *, archive: bool = True) -> dict:
 # Data classes
 # ---------------------------------------------------------------------------
 
+def _parse_json_list(value: Optional[str]) -> Optional[list]:
+    """Parse persisted list fields without treating corrupt metadata as valid."""
+    if not value:
+        return None
+    try:
+        parsed = json.loads(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if isinstance(parsed, list) else None
+
+
 @dataclass
 class Task:
     """In-memory view of a row from the ``tasks`` table."""
@@ -1141,6 +1156,12 @@ class Task:
     # Unblock-loop counter. See the column comment in SCHEMA_SQL and
     # ``BLOCK_RECURRENCE_LIMIT``. Reset only on successful completion.
     block_recurrences: int = 0
+    # Declarative, machine-readable inputs for fail-closed dispatch. These
+    # fields intentionally remain empty for legacy tasks; prose is never used
+    # as an implicit authority grant.
+    required_capabilities: Optional[list] = None
+    source_manifest: Optional[list] = None
+    required_repo_sha: Optional[str] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -1234,6 +1255,15 @@ class Task:
                 int(row["block_recurrences"])
                 if "block_recurrences" in keys and row["block_recurrences"] is not None
                 else 0
+            ),
+            required_capabilities=_parse_json_list(
+                row["required_capabilities"] if "required_capabilities" in keys else None
+            ),
+            source_manifest=_parse_json_list(
+                row["source_manifest"] if "source_manifest" in keys else None
+            ),
+            required_repo_sha=(
+                row["required_repo_sha"] if "required_repo_sha" in keys else None
             ),
         )
 
@@ -1422,7 +1452,11 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- ``blocked`` so a cron can't spin it forever. Reset to 0 only on a
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
-    block_recurrences    INTEGER NOT NULL DEFAULT 0
+    block_recurrences    INTEGER NOT NULL DEFAULT 0,
+    -- Explicit requirements; NULL means legacy/no pre-claim requirements.
+    required_capabilities TEXT,
+    source_manifest       TEXT,
+    required_repo_sha     TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -1474,7 +1508,11 @@ CREATE TABLE IF NOT EXISTS task_runs (
     --          gave_up | reclaimed | (null while still running)
     summary             TEXT,
     metadata            TEXT,
-    error               TEXT
+    error               TEXT,
+    -- Immutable source/capability receipt captured before this run starts.
+    -- Runtime source reads MUST use this snapshot, never mutable task fields.
+    preclaim_receipt    TEXT,
+    source_snapshot     TEXT
 );
 
 -- Files attached to a task (PDFs, images, source documents). The blob
@@ -1520,6 +1558,7 @@ CREATE INDEX IF NOT EXISTS idx_links_child           ON task_links(child_id);
 CREATE INDEX IF NOT EXISTS idx_links_parent          ON task_links(parent_id);
 CREATE INDEX IF NOT EXISTS idx_comments_task         ON task_comments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_events_task           ON task_events(task_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_events_task_kind      ON task_events(task_id, kind);
 CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, started_at);
 CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
@@ -2678,6 +2717,24 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "block_recurrences",
             "block_recurrences INTEGER NOT NULL DEFAULT 0",
         )
+    if "required_capabilities" not in cols:
+        _add_column_if_missing(conn, "tasks", "required_capabilities", "required_capabilities TEXT")
+    if "source_manifest" not in cols:
+        _add_column_if_missing(conn, "tasks", "source_manifest", "source_manifest TEXT")
+    if "required_repo_sha" not in cols:
+        _add_column_if_missing(conn, "tasks", "required_repo_sha", "required_repo_sha TEXT")
+
+    # Per-run receipts are added separately because fresh databases receive
+    # them from SCHEMA_SQL while legacy boards require additive migration.
+    run_table_exists = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='task_runs'"
+    ).fetchone() is not None
+    if run_table_exists:
+        run_cols = {row["name"] for row in conn.execute("PRAGMA table_info(task_runs)")}
+        if "preclaim_receipt" not in run_cols:
+            _add_column_if_missing(conn, "task_runs", "preclaim_receipt", "preclaim_receipt TEXT")
+        if "source_snapshot" not in run_cols:
+            _add_column_if_missing(conn, "task_runs", "source_snapshot", "source_snapshot TEXT")
 
     # Indexes over additive ``tasks`` columns must be created after the
     # columns exist. Keeping them in SCHEMA_SQL breaks legacy boards: SQLite
@@ -3155,6 +3212,62 @@ def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
     return normalize_profile_name(assignee)
 
 
+def _require_current_profiles(*assignees: Optional[str]) -> None:
+    """Revalidate dispatch identities at the authoritative graph write.
+
+    The decomposer roster is necessarily read before the model call. The
+    caller holds the shared profile lifecycle lock across this check and the
+    graph commit; delete/rename take the same lock and refuse identities that
+    still have nonterminal cards.
+    """
+    from hermes_cli.profiles import profile_exists
+
+    missing = sorted({name for name in assignees if name and not profile_exists(name)})
+    if missing:
+        raise ValueError(
+            "assignee profile disappeared before graph commit: "
+            + ", ".join(missing)
+        )
+def _normalize_required_capabilities(values: Optional[Iterable[str]]) -> Optional[list[str]]:
+    if values is None:
+        return None
+    result = list(dict.fromkeys(str(v).strip() for v in values if str(v).strip()))
+    if any(not re.fullmatch(r"[a-z][a-z0-9_-]{0,63}", v) for v in result):
+        raise ValueError("required_capabilities must contain lowercase capability names")
+    return result
+
+
+def _normalize_source_manifest(values: Optional[Iterable[Mapping[str, Any]]]) -> Optional[list[dict[str, Any]]]:
+    if values is None:
+        return None
+    result: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for raw in values:
+        if not isinstance(raw, Mapping):
+            raise ValueError("source_manifest entries must be objects")
+        source_id = str(raw.get("source_id") or "").strip()
+        attachment_id = raw.get("attachment_id")
+        digest = str(raw.get("sha256") or "").strip().lower()
+        if not re.fullmatch(r"src_[A-Za-z0-9_-]{8,128}", source_id) or source_id in seen:
+            raise ValueError("source_manifest source_id must be unique opaque src_<id>")
+        if not isinstance(attachment_id, int) or attachment_id < 1:
+            raise ValueError("source_manifest attachment_id must be a positive integer")
+        if not re.fullmatch(r"[0-9a-f]{64}", digest):
+            raise ValueError("source_manifest sha256 must be a 64-character lowercase digest")
+        size = raw.get("size")
+        if not isinstance(size, int) or size < 0:
+            raise ValueError("source_manifest size must be a non-negative integer")
+        media_type = str(raw.get("media_type") or "").strip().lower()
+        if media_type not in {"text/plain", "text/markdown", "application/json", "application/yaml"}:
+            raise ValueError("source_manifest media_type is not allowed")
+        seen.add(source_id)
+        result.append({"source_id": source_id, "attachment_id": attachment_id,
+                       "sha256": digest, "size": size, "media_type": media_type,
+                       "provenance": str(raw.get("provenance") or "task_attachment")})
+    return result
+
+
+
 def create_task(
     conn: sqlite3.Connection,
     *,
@@ -3180,6 +3293,9 @@ def create_task(
     goal_max_turns: Optional[int] = None,
     initial_status: str = "running",
     session_id: Optional[str] = None,
+    required_capabilities: Optional[Iterable[str]] = None,
+    source_manifest: Optional[Iterable[Mapping[str, Any]]] = None,
+    required_repo_sha: Optional[str] = None,
     board: Optional[str] = None,
     project_id: Optional[str] = None,
     project_source_task_id: Optional[str] = None,
@@ -3228,6 +3344,11 @@ def create_task(
     reasoning_effort = normalize_reasoning_effort(reasoning_effort)
     if provider_override and not model_override:
         raise ValueError("provider_override requires a model_override")
+    required_capabilities_list = _normalize_required_capabilities(required_capabilities)
+    source_manifest_list = _normalize_source_manifest(source_manifest)
+    required_repo_sha = (required_repo_sha or "").strip() or None
+    if required_repo_sha and not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", required_repo_sha):
+        raise ValueError("required_repo_sha must be a full 40- or 64-character git object SHA")
     assignee = _canonical_assignee(assignee)
     if not title or not title.strip():
         raise ValueError("title is required")
@@ -3497,8 +3618,9 @@ def create_task(
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort,
-                        goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        goal_mode, goal_max_turns, session_id,
+                        required_capabilities, source_manifest, required_repo_sha
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -3524,6 +3646,9 @@ def create_task(
                         1 if goal_mode else 0,
                         int(goal_max_turns) if goal_max_turns is not None else None,
                         session_id,
+                        json.dumps(required_capabilities_list) if required_capabilities_list is not None else None,
+                        json.dumps(source_manifest_list, sort_keys=True, separators=(",", ":")) if source_manifest_list is not None else None,
+                        required_repo_sha,
                     ),
                 )
                 for pid in parents:
@@ -3554,6 +3679,13 @@ def create_task(
                         "provider_override": provider_override,
                     },
                 )
+                if task_status == "triage":
+                    _append_event(
+                        conn,
+                        task_id,
+                        "triage_fresh_intake",
+                        {"source": "create"},
+                    )
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
             return task_id
         except sqlite3.IntegrityError:
@@ -4614,6 +4746,267 @@ def _parents_satisfied(conn: sqlite3.Connection, task_id: str) -> bool:
     ).fetchone() is None
 
 
+def _read_pinned_attachment(conn: sqlite3.Connection, task_id: str, entry: Mapping[str, Any]) -> tuple[bytes, dict[str, Any]]:
+    """Return sealed attachment bytes plus filesystem identity, fail closed.
+
+    ``stored_path`` is database data, not authority. The record must remain a
+    regular, non-symlink file below this task's attachment directory. Opening
+    with O_NOFOLLOW closes the check/open race on platforms that support it.
+    """
+    row = conn.execute("SELECT * FROM task_attachments WHERE id = ? AND task_id = ?", (entry["attachment_id"], task_id)).fetchone()
+    if row is None:
+        raise ValueError("source manifest attachment is unavailable")
+    root = (attachments_root() / task_id).resolve(strict=True)
+    path = Path(row["stored_path"])
+    try:
+        resolved = path.resolve(strict=True)
+        resolved.relative_to(root)
+        lst = os.lstat(path)
+        if stat.S_ISLNK(lst.st_mode) or not stat.S_ISREG(lst.st_mode) or lst.st_nlink != 1:
+            raise ValueError("source manifest attachment is unavailable")
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(path, flags)
+        try:
+            fst = os.fstat(fd)
+            if not stat.S_ISREG(fst.st_mode) or fst.st_nlink != 1:
+                raise ValueError("source manifest attachment is unavailable")
+            with os.fdopen(fd, "rb", closefd=False) as fh:
+                data = fh.read()
+        finally:
+            os.close(fd)
+    except (OSError, ValueError):
+        raise ValueError("source manifest attachment is unavailable")
+    digest = hashlib.sha256(data).hexdigest()
+    if len(data) != entry["size"] or not hmac.compare_digest(digest, str(entry["sha256"])):
+        raise ValueError("source manifest integrity check failed")
+    return data, {"device": fst.st_dev, "inode": fst.st_ino, "mtime_ns": fst.st_mtime_ns, "mode": stat.S_IMODE(fst.st_mode)}
+
+
+def _run_source_snapshot(conn: sqlite3.Connection, task_id: str, run_id: int) -> Optional[dict[str, Any]]:
+    row = conn.execute("SELECT source_snapshot FROM task_runs WHERE id = ? AND task_id = ? AND ended_at IS NULL", (run_id, task_id)).fetchone()
+    if not row or not row["source_snapshot"]:
+        return None
+    try:
+        snapshot = json.loads(row["source_snapshot"])
+    except (TypeError, ValueError):
+        return None
+    return snapshot if isinstance(snapshot, dict) else None
+
+
+def _normalize_runtime_contract(contract: Any) -> Optional[dict[str, Any]]:
+    """Canonicalize the launch-equivalent worker contract for exact comparison."""
+    if not isinstance(contract, Mapping):
+        return None
+    toolsets = contract.get("toolsets")
+    if not isinstance(toolsets, list):
+        return None
+    requested = contract.get("requested_toolsets", [])
+    if not isinstance(requested, list):
+        return None
+    backend = str(contract.get("backend") or "").strip().lower()
+    if not backend:
+        return None
+    effective = sorted({str(item) for item in toolsets if isinstance(item, str) and item})
+    requested_toolsets = sorted({str(item) for item in requested if isinstance(item, str) and item})
+    return {
+        "requested_toolsets": requested_toolsets,
+        "effective_toolsets": effective,
+        "shadowed_toolsets": sorted(set(requested_toolsets) - set(effective)),
+        "backend": backend,
+    }
+
+
+def _resolve_task_runtime_contract(task: Task) -> Optional[dict[str, Any]]:
+    """Resolve the task assignee's CLI contract through the preclaim resolver."""
+    if not task.assignee:
+        return _normalize_runtime_contract({"toolsets": [], "requested_toolsets": [], "backend": "local"})
+    try:
+        from hermes_cli.profiles import resolve_profile_env
+
+        return _normalize_runtime_contract(_resolve_worker_runtime_contract(resolve_profile_env(task.assignee)))
+    except Exception:
+        return None
+
+
+def _receipt_runtime_contract(receipt: Any) -> Optional[dict[str, Any]]:
+    """Return the sealed worker contract only when all persisted fields agree."""
+    if not isinstance(receipt, Mapping):
+        return None
+    effective = receipt.get("effective_toolsets")
+    contract = _normalize_runtime_contract({
+        "toolsets": effective,
+        "requested_toolsets": receipt.get("requested_toolsets"),
+        "backend": receipt.get("backend"),
+    })
+    if contract is None:
+        return None
+    return contract if all(receipt.get(field) == contract[field] for field in contract) else None
+
+
+def _run_preclaim_receipt(conn: sqlite3.Connection, task: Task, run_id: int) -> Optional[dict[str, Any]]:
+    """Return a receipt only when it still authorizes this exact source run."""
+    row = conn.execute(
+        "SELECT preclaim_receipt FROM task_runs WHERE id = ? AND task_id = ? AND ended_at IS NULL",
+        (run_id, task.id),
+    ).fetchone()
+    try:
+        receipt = json.loads(row["preclaim_receipt"]) if row and row["preclaim_receipt"] else None
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(receipt, dict) or receipt.get("version") != 1:
+        return None
+    sealed_contract = _receipt_runtime_contract(receipt)
+    if sealed_contract is None:
+        return None
+    if receipt.get("task_id") != task.id or receipt.get("run_id") != run_id:
+        return None
+    snapshot = _run_source_snapshot(conn, task.id, run_id)
+    expected = sorted(
+        str(e.get("source_id")) for e in ((snapshot or {}).get("sources") or [])
+        if isinstance(e, dict)
+    )
+    if sorted(receipt.get("source_ids") or []) != expected:
+        return None
+    if receipt.get("required_capabilities") != (task.required_capabilities or []):
+        return None
+    if receipt.get("claim_lock") != task.claim_lock or int(receipt.get("claim_expires") or 0) != int(task.claim_expires or 0):
+        return None
+    if int(receipt.get("checked_at") or 0) <= 0 or int(task.claim_expires or 0) < int(time.time()):
+        return None
+    runtime_contract = _resolve_task_runtime_contract(task)
+    if runtime_contract is None:
+        return None
+    if sealed_contract != runtime_contract:
+        return None
+    required_sha = receipt.get("required_repo_sha")
+    binding = receipt.get("repo_binding")
+    if required_sha:
+        if not isinstance(binding, dict) or binding.get("sha") != required_sha:
+            return None
+        workspace = binding.get("workspace")
+        if not isinstance(workspace, str) or not workspace:
+            return None
+        try:
+            actual_sha = subprocess.check_output(
+                ["git", "-C", workspace, "rev-parse", "HEAD"],
+                text=True,
+                stderr=subprocess.DEVNULL,
+            ).strip()
+        except (OSError, subprocess.CalledProcessError):
+            return None
+        if not hmac.compare_digest(actual_sha, str(required_sha)):
+            return None
+    return receipt
+
+
+def _cursor_for(snapshot: Mapping[str, Any], source_id: str, offset: int) -> str:
+    payload = json.dumps({"s": source_id, "o": offset}, sort_keys=True, separators=(",", ":")).encode()
+    mac = hmac.new(str(snapshot["nonce"]).encode(), payload, hashlib.sha256).digest()
+    return base64.urlsafe_b64encode(payload + mac).decode().rstrip("=")
+
+
+def _verify_cursor(snapshot: Mapping[str, Any], cursor: Optional[str], source_id: str, offset: int) -> None:
+    if offset == 0 and cursor is None:
+        return
+    if not cursor:
+        raise ValueError("source cursor is required for a non-initial page")
+    expected = _cursor_for(snapshot, source_id, offset)
+    if not hmac.compare_digest(cursor, expected):
+        raise ValueError("source cursor is invalid")
+
+
+def read_task_source(conn: sqlite3.Connection, task_id: str, source_id: str, *, offset: int = 0, limit: int = 65536, run_id: Optional[int] = None, cursor: Optional[str] = None) -> dict[str, Any]:
+    """Read one bounded page from a task/run-bound opaque source handle."""
+    if offset < 0 or limit < 1 or limit > 65536:
+        raise ValueError("offset must be non-negative and limit must be 1..65536")
+    task = get_task(conn, task_id)
+    if task is None:
+        raise ValueError("source is not available for this task")
+    snapshot = _run_source_snapshot(conn, task_id, run_id) if run_id is not None else None
+    receipt = _run_preclaim_receipt(conn, task, run_id) if run_id is not None else None
+    if run_id is not None and (task.current_run_id != run_id or snapshot is None or receipt is None):
+        raise ValueError("source is not available for this run")
+    entries = snapshot.get("sources", []) if snapshot else (task.source_manifest or [])
+    entry = next((e for e in entries if isinstance(e, dict) and e.get("source_id") == source_id), None)
+    if not entry:
+        raise ValueError("source is not available for this task")
+    if snapshot:
+        _verify_cursor(snapshot, cursor, source_id, offset)
+    data, identity = _read_pinned_attachment(conn, task_id, entry)
+    if snapshot and identity != entry.get("identity"):
+        raise ValueError("source manifest integrity check failed")
+    page = data[offset:offset + limit]
+    next_offset = offset + len(page)
+    return {"source_id": source_id, "media_type": entry["media_type"], "size": len(data), "sha256": entry["sha256"], "provenance": entry["provenance"], "offset": offset, "next_offset": next_offset, "eof": next_offset >= len(data), "next_cursor": (_cursor_for(snapshot, source_id, next_offset) if snapshot and next_offset < len(data) else None), "bytes": page}
+
+
+def _preclaim_source_diagnostics(conn: sqlite3.Connection, task_id: str) -> tuple[list[dict[str, str]], list[dict[str, Any]], Optional[dict[str, Any]]]:
+    task = get_task(conn, task_id)
+    if task is None:
+        return [{"code": "task_missing"}], [], None
+    diagnostics: list[dict[str, str]] = []
+    snapshot: list[dict[str, Any]] = []
+    for entry in task.source_manifest or []:
+        try:
+            _data, identity = _read_pinned_attachment(conn, task_id, entry)
+            snapshot.append({**entry, "identity": identity})
+        except (KeyError, TypeError, ValueError) as exc:
+            diagnostics.append({"code": "source_unreachable", "source_id": str(entry.get("source_id", "")) if isinstance(entry, dict) else "", "detail": str(exc)})
+    if task.required_repo_sha:
+        workspace = task.workspace_path
+        if not workspace or not os.path.isdir(workspace):
+            diagnostics.append({"code": "repository_unavailable"})
+        else:
+            try:
+                actual_sha = subprocess.check_output(
+                    ["git", "-C", workspace, "rev-parse", "HEAD"], text=True, stderr=subprocess.DEVNULL
+                ).strip()
+                if not hmac.compare_digest(actual_sha, task.required_repo_sha):
+                    diagnostics.append({"code": "repository_sha_mismatch"})
+            except (OSError, subprocess.CalledProcessError):
+                diagnostics.append({"code": "repository_unavailable"})
+    # Resolve once and carry the exact launch-time contract into the receipt.
+    # A remote executor cannot safely access host attachment paths or validate
+    # host git state until a version-pinned materializer exists; fail closed.
+    needs_runtime_contract = bool(task.required_capabilities or task.source_manifest or task.required_repo_sha)
+    contract = _resolve_task_runtime_contract(task) if needs_runtime_contract else None
+    if contract is None and not needs_runtime_contract:
+        # Legacy tasks without preclaim requirements still receive an explicit
+        # local receipt so their ordinary lifecycle behavior remains unchanged.
+        contract = _normalize_runtime_contract({"toolsets": [], "requested_toolsets": [], "backend": "local"})
+    if contract is None:
+        diagnostics.append({"code": "capability_unproven", "detail": "runtime_contract"})
+        enabled: set[str] = set()
+        backend = "unknown"
+    else:
+        enabled = set(contract["effective_toolsets"])
+        backend = contract["backend"]
+    if backend != "local" and (task.source_manifest or task.required_repo_sha):
+        diagnostics.append({
+            "code": "remote_materialization_unsupported",
+            "detail": backend,
+        })
+    # kanban_read_source is registered in the kanban toolset; callers may
+    # declare either the concrete tool or an enabled toolset capability.
+    for capability in task.required_capabilities or []:
+        if capability == "kanban_source_reader":
+            if "kanban" not in enabled:
+                diagnostics.append({"code": "capability_unproven", "detail": capability})
+        elif capability not in enabled:
+            diagnostics.append({"code": "capability_unproven", "detail": capability})
+    if contract is not None:
+        requested = sorted(set(str(item) for item in contract.get("requested_toolsets", []) if isinstance(item, str)))
+        effective = sorted(enabled)
+        contract = {
+            **contract,
+            "requested_toolsets": requested,
+            "effective_toolsets": effective,
+            "shadowed_toolsets": sorted(set(requested) - set(effective)),
+            "backend": backend,
+        }
+    return diagnostics, snapshot, contract
+
+
 def claim_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -4654,6 +5047,10 @@ def claim_task(
                 conn, task_id, "claim_rejected",
                 {"reason": "parents_not_done"},
             )
+            return None
+        diagnostics, sealed_sources, contract = _preclaim_source_diagnostics(conn, task_id)
+        if diagnostics:
+            _append_event(conn, task_id, "preclaim_denied", {"diagnostics": diagnostics})
             return None
         # Defensive: if a prior run somehow leaked (invariant violation from
         # an unknown code path), close it as 'reclaimed' so we don't strand
@@ -4697,13 +5094,36 @@ def claim_task(
             "FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
+        claimed_task = get_task(conn, task_id)
+        if claimed_task is None or contract is None:
+            raise RuntimeError("preclaim contract disappeared after claim")
+        receipt = {
+            "version": 1,
+            "task_id": task_id,
+            "required_capabilities": claimed_task.required_capabilities or [],
+            "requested_toolsets": contract["requested_toolsets"],
+            "effective_toolsets": contract["effective_toolsets"],
+            "shadowed_toolsets": contract["shadowed_toolsets"],
+            "source_ids": [s["source_id"] for s in sealed_sources],
+            "required_repo_sha": claimed_task.required_repo_sha,
+            # HEAD-only is the bounded policy. Persist the checked workspace so
+            # runtime validation never guesses from the worker's ambient cwd.
+            "repo_binding": (
+                {"workspace": claimed_task.workspace_path, "sha": claimed_task.required_repo_sha}
+                if claimed_task.required_repo_sha else None
+            ),
+            "backend": contract["backend"],
+            "checked_at": now,
+            "claim_lock": lock,
+            "claim_expires": expires,
+        }
         run_cur = conn.execute(
             """
             INSERT INTO task_runs (
                 task_id, profile, step_key, status,
                 claim_lock, claim_expires, max_runtime_seconds,
-                started_at
-            ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?)
+                started_at, preclaim_receipt, source_snapshot
+            ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?, ?, ?)
             """,
             (
                 task_id,
@@ -4713,9 +5133,16 @@ def claim_task(
                 expires,
                 trow["max_runtime_seconds"] if trow else None,
                 now,
+                json.dumps(receipt, sort_keys=True, separators=(",", ":")),
+                json.dumps({"version": 1, "task_id": task_id, "nonce": secrets.token_urlsafe(32), "sources": sealed_sources}, sort_keys=True, separators=(",", ":")),
             ),
         )
         run_id = run_cur.lastrowid
+        receipt["run_id"] = run_id
+        conn.execute(
+            "UPDATE task_runs SET preclaim_receipt = ? WHERE id = ?",
+            (json.dumps(receipt, sort_keys=True, separators=(",", ":")), run_id),
+        )
         conn.execute(
             "UPDATE tasks SET current_run_id = ? WHERE id = ?",
             (run_id, task_id),
@@ -6806,6 +7233,85 @@ def _landing_status_after_parents(conn: sqlite3.Connection, task_id: str) -> str
     return "todo" if undone_parents else "ready"
 
 
+_BLOCK_LOOP_ESCALATED_SQL = (
+    "EXISTS (SELECT 1 FROM task_events e "
+    "WHERE e.task_id = tasks.id AND e.kind = 'block_loop_detected' "
+    "AND e.id > COALESCE((SELECT MAX(e2.id) FROM task_events e2 "
+    "WHERE e2.task_id = tasks.id "
+    "AND e2.kind = 'triage_escalation_recovered'), 0))"
+)
+
+_AUTO_DECOMPOSABLE_TRIAGE_SQL = (
+    "EXISTS (SELECT 1 FROM task_events marker "
+    "WHERE marker.task_id = tasks.id "
+    "AND marker.kind IN ('triage_fresh_intake', "
+    "'triage_escalation_recovered') "
+    "AND marker.id > COALESCE((SELECT MAX(stop.id) FROM task_events stop "
+    "WHERE stop.task_id = tasks.id "
+    "AND stop.kind IN ('block_loop_detected', 'decomposed', 'specified')), 0))"
+)
+
+
+def is_block_loop_escalated(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Return True when ``task_id`` reached ``triage`` via the unblock-loop
+    breaker and no audited operator recovery has happened since (#79738).
+
+    ``block_task`` routes a task to ``triage`` (instead of ``blocked``) once
+    ``block_recurrences`` hits ``BLOCK_RECURRENCE_LIMIT`` for the same cause,
+    appending a ``block_loop_detected`` event. Such cards are waiting on a
+    human decision — auto-decomposition must never re-specify them. Historical
+    ``triage_escalation_recovered`` markers remain readable for compatibility,
+    but V1 no longer exposes a recovery authority.
+    """
+    row = conn.execute(
+        "SELECT 1 FROM tasks WHERE id = ? AND " + _BLOCK_LOOP_ESCALATED_SQL,
+        (task_id,),
+    ).fetchone()
+    return row is not None
+
+
+def is_auto_decomposable_triage(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Return whether ``task_id`` carries a current automation grant.
+
+    Fresh intake and explicit escalation recovery each append a durable marker.
+    A later block-loop, decomposition, or specification consumes that marker.
+    Legacy/unclassified triage rows therefore fail closed instead of entering
+    the automatic decomposer after an upgrade.
+    """
+    row = conn.execute(
+        "SELECT 1 FROM tasks WHERE id = ? AND status = 'triage' AND "
+        + _AUTO_DECOMPOSABLE_TRIAGE_SQL,
+        (task_id,),
+    ).fetchone()
+    return row is not None
+
+
+def recover_escalated_triage_task(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Fail closed until an authenticated owner-only authority exists."""
+    del conn, task_id
+    raise RuntimeError(
+        "escalation recovery is unavailable; retire the root and create a "
+        "newly reviewed fresh intake"
+    )
+
+
+def _has_open_descendants(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Return whether ``task_id`` already owns non-terminal downstream work."""
+    row = conn.execute(
+        "WITH RECURSIVE descendants(id) AS ("
+        "  SELECT child_id FROM task_links WHERE parent_id = ? "
+        "  UNION "
+        "  SELECT task_links.child_id FROM task_links "
+        "  JOIN descendants ON task_links.parent_id = descendants.id"
+        ") "
+        "SELECT 1 FROM descendants "
+        "JOIN tasks ON tasks.id = descendants.id "
+        "WHERE tasks.status NOT IN ('done', 'archived') LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    return row is not None
+
+
 def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
     """Transition ``blocked``/``scheduled`` to its safe resumable phase.
 
@@ -7113,6 +7619,8 @@ def specify_triage_task(
     body: Optional[str] = None,
     assignee: Optional[str] = None,
     author: Optional[str] = None,
+    auto_promote: bool = True,
+    recover_escalation: bool = False,
 ) -> bool:
     """Flesh out a triage task and promote it to ``todo``.
 
@@ -7129,17 +7637,29 @@ def specify_triage_task(
     ``author`` is recorded on an audit comment only when at least one of
     ``title`` / ``body`` / ``assignee`` actually changed — avoids noisy
     comment spam for status-only promotions.
+
+    ``recover_escalation`` is retained only as a compatibility argument and
+    fails closed: V1 has no authenticated owner recovery authority.
+    Existing open descendants always prevent a spec fallback from replacing a
+    governed graph while the LLM call was in flight.
     """
     if title is not None and not title.strip():
         raise ValueError("title cannot be blank")
     assignee = _canonical_assignee(assignee)
-    with write_txn(conn):
+    from hermes_cli.profile_lifecycle import profile_lifecycle_lock
+
+    with profile_lifecycle_lock(), write_txn(conn):
         existing = conn.execute(
             "SELECT title, body, assignee FROM tasks WHERE id = ? AND status = 'triage'",
             (task_id,),
         ).fetchone()
         if existing is None:
             return False
+        if _has_open_descendants(conn, task_id):
+            raise ValueError("task already has an open governed child graph")
+        if recover_escalation or is_block_loop_escalated(conn, task_id):
+            raise ValueError("authenticated owner escalation recovery is unavailable")
+        _require_current_profiles(assignee or existing["assignee"])
         sets: list[str] = ["status = 'todo'"]
         params: list[Any] = []
         changed_fields: list[str] = []
@@ -7192,7 +7712,8 @@ def specify_triage_task(
     # logic the dispatcher would on its next tick, so a specified task
     # with no open parents flips straight to 'ready' here instead of
     # idling in 'todo' until the next sweep.
-    recompute_ready(conn)
+    if auto_promote:
+        recompute_ready(conn)
     return True
 
 
@@ -7204,6 +7725,7 @@ def decompose_triage_task(
     children: list[dict],
     author: Optional[str] = None,
     auto_promote: bool = True,
+    recover_escalation: bool = False,
 ) -> Optional[list[str]]:
     """Fan a triage task out into child tasks and promote the root to ``todo``.
 
@@ -7219,6 +7741,7 @@ def decompose_triage_task(
             "body": "...",                     # optional
             "assignee": "profile-name",        # optional, None -> default fallback
             "parents": [0, 2],                 # indices into this same children list
+            "workspace_policy": "scratch",     # scratch | repo_write
         }
 
     Returns the list of created child task ids (in input order) on
@@ -7229,7 +7752,8 @@ def decompose_triage_task(
 
     Validation of titles/assignees happens inside the same write_txn as
     the inserts so a malformed entry aborts the whole decomposition
-    cleanly (no orphan children).
+    cleanly (no orphan children). Profile revalidation and the mandatory
+    no-existing-graph check are also inside that transaction.
     """
     if not children:
         return None
@@ -7254,6 +7778,12 @@ def decompose_triage_task(
                 )
             if p == idx:
                 raise ValueError(f"child[{idx}] cannot list itself as a parent")
+        workspace_policy = child.get("workspace_policy", "scratch")
+        if workspace_policy not in VALID_DECOMPOSE_WORKSPACE_POLICIES:
+            raise ValueError(
+                f"child[{idx}].workspace_policy must be one of "
+                f"{sorted(VALID_DECOMPOSE_WORKSPACE_POLICIES)}"
+            )
 
     # Detect cycles in the sibling parent graph (Kahn's topological sort).
     # link_tasks() calls _would_cycle() for every new edge; here we check
@@ -7287,9 +7817,11 @@ def decompose_triage_task(
     # _append_event calls.
     now = int(time.time())
     child_ids: list[str] = []
-    with write_txn(conn):
+    from hermes_cli.profile_lifecycle import profile_lifecycle_lock
+
+    with profile_lifecycle_lock(), write_txn(conn):
         root_row = conn.execute(
-            "SELECT id, status, tenant, workspace_kind, workspace_path "
+            "SELECT id, status, tenant, workspace_kind, workspace_path, project_id "
             "FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
@@ -7297,14 +7829,45 @@ def decompose_triage_task(
             return None
         if root_row["status"] != "triage":
             return None
+        if _has_open_descendants(conn, task_id):
+            raise ValueError("task already has an open governed child graph")
+        if recover_escalation or is_block_loop_escalated(conn, task_id):
+            raise ValueError("authenticated owner escalation recovery is unavailable")
         tenant = root_row["tenant"]
-        # Children inherit the root's workspace by default so a fan-out
-        # of a code-gen task lands in the parent's project dir/worktree
-        # rather than throwaway scratch tmp dirs. A child dict can still
-        # override with its own 'workspace_kind' / 'workspace_path'.
-        root_ws_kind = root_row["workspace_kind"] or "scratch"
-        root_ws_path = root_row["workspace_path"]
+        project_id = root_row["project_id"]
+        canonical_child_assignees = [
+            _canonical_assignee(child.get("assignee")) for child in children
+        ]
+        if root_assignee is None or any(
+            assignee is None for assignee in canonical_child_assignees
+        ):
+            raise ValueError("decomposed graph requires explicit current assignees")
+        _require_current_profiles(root_assignee, *canonical_child_assignees)
 
+        needs_repo_anchor = any(
+            child.get("workspace_policy", "scratch") == "repo_write"
+            and not child.get("workspace_path")
+            and not child.get("workspace_kind")
+            for child in children
+        )
+        repo_anchor: Optional[Path] = None
+        if needs_repo_anchor:
+            root_workspace_path = root_row["workspace_path"]
+            if (
+                root_row["workspace_kind"] not in {"worktree", "dir"}
+                or not root_workspace_path
+            ):
+                raise ValueError(
+                    "repo_write child requires an explicitly repository-bound "
+                    "triage root"
+                )
+            root_path = Path(root_workspace_path).expanduser()
+            if not root_path.is_absolute():
+                raise ValueError("repository-bound triage root path must be absolute")
+            if root_path.name == task_id and root_path.parent.name == ".worktrees":
+                repo_anchor = root_path.parent.parent.resolve(strict=False)
+            else:
+                repo_anchor = root_path.resolve(strict=False)
         # Create children. Status is 'todo' regardless of parents — we
         # link them under the root AFTER creation so the dispatcher
         # sees a coherent state, and recompute_ready() at the end
@@ -7313,33 +7876,45 @@ def decompose_triage_task(
             new_id = _new_task_id()
             title = child["title"].strip()
             body = child.get("body")
-            assignee = _canonical_assignee(child.get("assignee"))
-            # Per-child override wins; otherwise inherit the root's
-            # workspace. A child that sets workspace_kind without a path
-            # falls back to the root path only when kinds match (so a
-            # child can't accidentally point a 'dir' at the root's
-            # worktree path or vice versa).
-            child_ws_kind = child.get("workspace_kind") or root_ws_kind
-            if child.get("workspace_path"):
-                child_ws_path = child.get("workspace_path")
-            elif child_ws_kind == "worktree":
-                # Never share one worktree checkout between siblings: the
-                # root's literal path would put every child in the same
-                # directory on the first-dispatched sibling's branch, with
-                # no lock — siblings can be promoted and dispatched
-                # concurrently. Leave the path unset so dispatch
-                # materializes a fresh <repo>/.worktrees/<child-id> per
-                # child from the board anchor.
+            assignee = canonical_child_assignees[idx]
+            # Workspace authority is capability-based and fail-closed. The
+            # root's workspace is only an anchor; its concrete mutable path is
+            # never inherited. A child receives an isolated worktree only
+            # when the decomposition explicitly declares repository writes.
+            # Missing policy means scratch, so research/QA/review/ops lanes do
+            # not mint branches because a code-producing root happened to use
+            # a worktree. Explicit kind/path values remain a governed API
+            # override for non-LLM callers.
+            explicit_kind = child.get("workspace_kind")
+            explicit_path = child.get("workspace_path")
+            workspace_policy = child.get("workspace_policy", "scratch")
+            if explicit_path:
+                child_ws_kind = explicit_kind or "dir"
+                child_ws_path = explicit_path
+            elif explicit_kind:
+                child_ws_kind = explicit_kind
                 child_ws_path = None
-            elif child_ws_kind == root_ws_kind:
-                child_ws_path = root_ws_path
+            elif workspace_policy == "repo_write":
+                child_ws_kind = "worktree"
+                if repo_anchor is None:
+                    raise ValueError(
+                        "repo_write child requires an explicitly repository-bound "
+                        "triage root"
+                    )
+                child_ws_path = str(repo_anchor / ".worktrees" / new_id)
             else:
+                child_ws_kind = "scratch"
                 child_ws_path = None
+            if child_ws_kind not in VALID_WORKSPACE_KINDS:
+                raise ValueError(
+                    f"child[{idx}].workspace_kind must be one of "
+                    f"{sorted(VALID_WORKSPACE_KINDS)}"
+                )
             conn.execute(
                 "INSERT INTO tasks "
                 "(id, title, body, assignee, status, workspace_kind, "
-                " workspace_path, tenant, created_at, created_by) "
-                "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?)",
+                " workspace_path, project_id, tenant, created_at, created_by) "
+                "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?, ?)",
                 (
                     new_id,
                     title,
@@ -7347,6 +7922,7 @@ def decompose_triage_task(
                     assignee,
                     child_ws_kind,
                     child_ws_path,
+                    project_id,
                     tenant,
                     now,
                     (author or "decomposer"),
@@ -10278,16 +10854,14 @@ def _worker_terminal_timeout_env(
     return str(desired)
 
 
-def _resolve_worker_cli_toolsets(hermes_home: Optional[str]) -> Optional[list[str]]:
-    """Return the assigned profile's effective CLI toolsets for a worker.
+def _resolve_worker_runtime_contract(hermes_home: Optional[str]) -> Optional[dict[str, Any]]:
+    """Resolve the exact CLI capability/backend contract for one worker.
 
-    Dispatcher-spawned workers are launched from a long-lived gateway process,
-    then the child re-enters the CLI with ``-p <assignee>``. Resolve the
-    assignee profile's CLI tool surface at dispatch time and pass it as an
-    explicit ``--toolsets`` pin so worker startup cannot fall back to a stale
-    root/active-profile config or a profile whose top-level ``toolsets`` entry
-    is only the kanban orchestrator surface. ``model_tools`` still appends the
-    task-scoped kanban lifecycle tools when ``HERMES_KANBAN_TASK`` is set.
+    This is deliberately the single resolver used by both preclaim and launch:
+    a preclaim must never approve a capability set different from the one
+    pinned into ``--toolsets``.  Remote terminal backends currently have no
+    immutable attachment/repository materializer, so source-bearing work is
+    denied before a run is created rather than hoping host paths are mounted.
     """
     if not hermes_home:
         return None
@@ -10300,16 +10874,38 @@ def _resolve_worker_cli_toolsets(hermes_home: Optional[str]) -> Optional[list[st
         try:
             cfg = load_config()
             toolsets = sorted(_get_platform_tools(cfg, "cli"))
+            terminal = cfg.get("terminal") or {}
+            backend = str(terminal.get("backend") or "local").strip().lower() if isinstance(terminal, dict) else "local"
+            requested = cfg.get("toolsets")
+            requested_toolsets = [str(item) for item in requested if isinstance(item, str)] if isinstance(requested, list) else []
         finally:
             reset_hermes_home_override(token)
-        return toolsets or None
+        return {"toolsets": toolsets, "requested_toolsets": requested_toolsets, "backend": backend or "local"}
     except Exception as exc:
-        _log.debug(
-            "kanban worker: could not resolve CLI toolsets for HERMES_HOME=%r (%s)",
-            hermes_home,
-            exc,
-        )
+        _log.debug("kanban worker: could not resolve runtime contract for HERMES_HOME=%r (%s)", hermes_home, exc)
         return None
+
+
+def _resolve_worker_cli_toolsets(hermes_home: Optional[str]) -> Optional[list[str]]:
+    """Compatibility wrapper returning the launch-pinned effective toolsets."""
+    contract = _resolve_worker_runtime_contract(hermes_home)
+    return list(contract["toolsets"]) if contract and contract["toolsets"] else None
+
+
+def _pinned_spawn_runtime_contract(task: Task, board: Optional[str]) -> Optional[dict[str, Any]]:
+    """Load a claimed run's persisted contract for launch without ambient guessing."""
+    if task.current_run_id is None:
+        return None
+    try:
+        with connect(board=board) as conn:
+            row = conn.execute(
+                "SELECT preclaim_receipt FROM task_runs WHERE id = ? AND task_id = ? AND ended_at IS NULL",
+                (task.current_run_id, task.id),
+            ).fetchone()
+        receipt = json.loads(row["preclaim_receipt"]) if row and row["preclaim_receipt"] else None
+    except (sqlite3.Error, TypeError, ValueError):
+        return None
+    return _receipt_runtime_contract(receipt)
 
 
 _retagged_workspace_roots: set[str] = set()
@@ -10394,6 +10990,8 @@ def _default_spawn(
     if task.tenant:
         env["HERMES_TENANT"] = task.tenant
     env["HERMES_KANBAN_TASK"] = task.id
+    if task.current_run_id is not None:
+        env["HERMES_KANBAN_RUN_ID"] = str(task.current_run_id)
     env["HERMES_KANBAN_WORKSPACE"] = workspace
     # Tag the worker's session so it lands in state.db as `kanban`, not as an
     # untitled `cli` row. A worker is a dispatcher-owned run whose transcript is
@@ -10462,6 +11060,15 @@ def _default_spawn(
     # attributed correctly regardless of how the child loads config.
     env["HERMES_PROFILE"] = profile_arg
 
+    # A preclaimed run launches from the same persisted capability/backend
+    # contract that its source reader revalidates at runtime. This overwrites
+    # inherited TERMINAL_ENV rather than treating the dispatcher environment as
+    # authority. Legacy/manual spawn callers without a persisted run retain the
+    # existing profile-resolution fallback.
+    pinned_contract = _pinned_spawn_runtime_contract(task, board)
+    if pinned_contract is not None:
+        env["TERMINAL_ENV"] = pinned_contract["backend"]
+
     # A worker must NEVER boot the interactive TUI: an inherited HERMES_TUI=1
     # or a `display.interface: tui` in the profile's config would send the
     # quiet chat run into the Ink TUI, whose no-TTY bail-out exits 0 without
@@ -10502,7 +11109,11 @@ def _default_spawn(
     # branch, not a nested one.
     if task.reasoning_effort:
         cmd.extend(["--reasoning", task.reasoning_effort])
-    worker_toolsets = _resolve_worker_cli_toolsets(env.get("HERMES_HOME"))
+    worker_toolsets = (
+        pinned_contract["effective_toolsets"]
+        if pinned_contract is not None
+        else _resolve_worker_cli_toolsets(env.get("HERMES_HOME"))
+    )
     if worker_toolsets:
         cmd.extend(["--toolsets", ",".join(worker_toolsets)])
     cmd.extend([

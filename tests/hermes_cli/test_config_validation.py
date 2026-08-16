@@ -141,3 +141,25 @@ class TestUnknownTopLevelKeys:
         assert any("base_url" in i.message for i in misplaced)
         assert any("api_key" in i.message for i in misplaced)
 
+
+class TestPlatformToolsetShadowing:
+    def test_explicit_cli_allowlist_warns_about_shadowed_top_level_toolsets(self):
+        issues = validate_config_structure({
+            "toolsets": ["file", "terminal"],
+            "platform_toolsets": {"cli": ["kanban"]},
+        })
+        assert any(
+            issue.severity == "warning"
+            and "platform_toolsets.cli" in issue.message
+            and "file" in issue.message
+            and "terminal" in issue.message
+            for issue in issues
+        )
+
+    def test_platform_allowlist_that_keeps_requested_toolsets_does_not_warn(self):
+        issues = validate_config_structure({
+            "toolsets": ["file", "terminal"],
+            "platform_toolsets": {"cli": ["file", "terminal"]},
+        })
+        assert not any("Top-level toolsets are shadowed" in issue.message for issue in issues)
+

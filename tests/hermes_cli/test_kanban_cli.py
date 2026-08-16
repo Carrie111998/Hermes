@@ -70,6 +70,18 @@ def test_kanban_show_text_renders_graph_with_open_connection(kanban_home):
     assert "Cannot operate on a closed database" not in output
 
 
+def test_unblock_parser_exposes_no_unauthenticated_escalation_recovery():
+    parser = argparse.ArgumentParser(prog="hermes", add_help=False)
+    sub = parser.add_subparsers(dest="command")
+    kc.build_parser(sub)
+
+    with pytest.raises(SystemExit) as exc:
+        parser.parse_args([
+            "kanban", "unblock", "--recover-escalated", "t_example",
+        ])
+    assert exc.value.code == 2
+
+
 def test_board_override_is_isolated_per_concurrent_call(kanban_home, monkeypatch):
     kb.create_board("alpha")
     kb.create_board("beta")
@@ -177,5 +189,4 @@ def test_run_slash_reclaim_running_task(kanban_home):
 # ---------------------------------------------------------------------------
 # /kanban help / no-args / unknown-action UX (issue #21794)
 # ---------------------------------------------------------------------------
-
 

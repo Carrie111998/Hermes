@@ -1,4 +1,4 @@
-"""Regression tests for remaining unredacted Telegram transport-error sites.
+"""Regression tests for Telegram transport and standalone-send redaction.
 
 ``c3ab1424e`` added ``_redact_telegram_error_text()`` (built on
 ``agent.redact``'s bot-token stripping for
@@ -16,6 +16,7 @@ the raw exception:
   lower blast radius, but the same unredacted-exception pattern.
 """
 
+import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -23,7 +24,10 @@ import pytest
 
 from gateway.config import PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter
-from plugins.platforms.telegram.adapter import TelegramAdapter
+from plugins.platforms.telegram.adapter import (
+    TelegramAdapter,
+    _standalone_send_log_payload,
+)
 
 _SECRET_TOKEN = "123456789:AAFakeSecretTelegramBotTokenABCDEFGHIJ"
 _SECRET_URL = f"https://api.telegram.org/bot{_SECRET_TOKEN}/getMe"
@@ -133,6 +137,37 @@ async def test_send_video_failure_redacts_token_in_log(monkeypatch, caplog, tmp_
 
 
 _SECRET_SEND_URL = f"https://api.telegram.org/bot{_SECRET_TOKEN}/sendMessage"
+
+
+def test_standalone_send_log_payload_hashes_routing_and_omits_paths():
+    payload = _standalone_send_log_payload(
+        "private-chat-123",
+        "hello",
+        thread_id="private-thread-456",
+        media_files=[("/private/customer/alice/voice-note.ogg", True)],
+        disable_link_previews=True,
+    )
+
+    encoded = json.dumps(payload, sort_keys=True)
+    assert "private-chat-123" not in encoded
+    assert "private-thread-456" not in encoded
+    assert "/private/customer/alice/voice-note.ogg" not in encoded
+    assert payload["message_chars"] == 5
+    assert payload["media_count"] == 1
+    assert payload["media_types"] == ["voice"]
+    assert payload["disable_link_previews"] is True
+
+
+def test_standalone_send_log_payload_sanitizes_transport_error():
+    payload = _standalone_send_log_payload(
+        "123",
+        "hello",
+        result={"success": False, "error": f"request failed: {_SECRET_SEND_URL}"},
+    )
+
+    encoded = json.dumps(payload, sort_keys=True)
+    assert _SECRET_TOKEN not in encoded
+    assert "***" in payload["error"]
 
 
 @pytest.mark.asyncio
