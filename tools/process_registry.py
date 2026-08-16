@@ -491,6 +491,24 @@ class ProcessRegistry:
         return _pid_exists(pid)
 
     @staticmethod
+    def _pty_is_alive(pty: Any) -> bool:
+        """Best-effort liveness probe for a PTY handle; never raises.
+
+        Both pywinpty's ``PtyProcess`` and POSIX ``ptyprocess.PtyProcess``
+        expose ``isalive()``. A missing method or a backend error is treated
+        as "not known to be alive" so the kill path does not escalate on a
+        false positive. Used by :meth:`kill_process` to decide whether a PTY
+        ``terminate(force=True)`` actually reaped the child.
+        """
+        isalive = getattr(pty, "isalive", None)
+        if not callable(isalive):
+            return False
+        try:
+            return bool(isalive())
+        except Exception:
+            return False
+
+    @staticmethod
     def _safe_host_start_time(pid: Optional[int]) -> Optional[int]:
         """Kernel start ticks for a host PID, or None when unavailable."""
         if not pid:
@@ -1587,12 +1605,37 @@ class ProcessRegistry:
         # Kill via PTY, Popen (local), or env execute (non-local)
         try:
             if session._pty:
-                # PTY process -- terminate via ptyprocess
+                # PTY process -- terminate via ptyprocess.
+                #
+                # pywinpty's terminate(force=True) RETURNS False (it does not
+                # raise) when the child ignores the terminate and survives, so
+                # the except-only os.kill fallback never fires -- yet
+                # kill_process would still mark the session exited and drop its
+                # checkpoint, leaking a live OS process on Windows
+                # (probe-verified 2026-06-11, winpty.PtyProcess). Treat a False
+                # return -- or a handle still reporting alive -- as "terminate
+                # did not reap the child" and escalate to the host-pid
+                # tree-kill (taskkill /PID <pid> /T /F), mirroring the Popen
+                # and detached-session branches below.
+                #
+                # POSIX ptyprocess.terminate(force=True) ends in an
+                # unconditional SIGKILL, so the escalation is gated to Windows
+                # to leave the POSIX path behavior unchanged.
+                reaped = True
                 try:
-                    session._pty.terminate(force=True)
+                    reaped = session._pty.terminate(force=True)
                 except Exception:
+                    reaped = False
                     if session.pid:
                         os.kill(session.pid, signal.SIGTERM)
+                if (
+                    _IS_WINDOWS
+                    and session.pid
+                    and (reaped is False or self._pty_is_alive(session._pty))
+                ):
+                    # host_start_time is passed so _terminate_host_pid can
+                    # refuse a recycled PID, matching the sibling branches.
+                    self._terminate_host_pid(session.pid, session.host_start_time)
             elif session.process:
                 # Local process -- kill the process tree. On Windows this
                 # must be taskkill /T /F; Popen.terminate() only kills the

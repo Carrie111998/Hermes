@@ -65,6 +65,30 @@ def _wait_until(predicate, timeout: float = 5.0, interval: float = 0.05) -> bool
     return False
 
 
+class _FakeKillPty:
+    """Minimal stand-in for a winpty / ptyprocess PtyProcess handle.
+
+    ``terminate_returns`` is what ``terminate(force=...)`` hands back
+    (pywinpty returns ``False`` -- without raising -- when the child
+    survives), and ``alive`` is what the ``isalive()`` recheck reports.
+
+    Named distinctly from the two function-local ``_FakePty`` write-stdin
+    stand-ins below, which model a different surface (``write`` only).
+    """
+
+    def __init__(self, *, terminate_returns, alive=False):
+        self._terminate_returns = terminate_returns
+        self._alive = alive
+        self.terminate_calls = []
+
+    def terminate(self, force=False):
+        self.terminate_calls.append(force)
+        return self._terminate_returns
+
+    def isalive(self):
+        return self._alive
+
+
 def test_write_stdin_uses_str_for_windows_pty(monkeypatch, registry):
     """pywinpty expects str input; bytes raises a PyString conversion error."""
     written = []
@@ -1311,6 +1335,149 @@ class TestKillProcess:
             assert "/F" in args, "Force flag required for console-less children"
         finally:
             registry._running.pop(s.id, None)
+
+    def test_kill_pty_escalates_to_host_pid_when_terminate_returns_false_windows(
+        self, registry, monkeypatch
+    ):
+        """pywinpty's terminate(force=True) returns False (without raising)
+        when the child ignores it and survives. kill_process must then
+        escalate to the host-pid tree-kill (taskkill /T /F) rather than
+        silently marking the session exited and leaking a live process
+        (probe-verified 2026-06-11)."""
+        from tools import process_registry as pr
+
+        s = _make_session(sid="proc_pty_survivor", command="trap '' TERM; sleep 999")
+        s.pid = 555001
+        fake_pty = _FakeKillPty(terminate_returns=False, alive=True)
+        s._pty = fake_pty
+        registry._running[s.id] = s
+
+        run_calls = []
+
+        def fake_run(args, **kwargs):
+            run_calls.append(args)
+            return MagicMock(returncode=0, stderr="", stdout="")
+
+        monkeypatch.setattr(pr, "_IS_WINDOWS", True)
+
+        try:
+            with patch.object(pr.subprocess, "run", fake_run):
+                result = registry.kill_process(s.id)
+
+            assert fake_pty.terminate_calls == [True], "terminate(force=True) attempted first"
+            assert len(run_calls) == 1, "host-pid taskkill fallback must fire on a False return"
+            args = run_calls[0]
+            assert args[0] == "taskkill"
+            assert "/PID" in args and "555001" in args
+            assert "/T" in args, "Tree flag required to reach descendants"
+            assert "/F" in args, "Force flag required for console-less children"
+            assert result["status"] == "killed"
+            assert s.exited is True
+        finally:
+            registry._running.pop(s.id, None)
+            registry._finished.pop(s.id, None)
+
+    def test_kill_pty_does_not_escalate_on_posix_when_terminate_returns_false(
+        self, registry, monkeypatch
+    ):
+        """POSIX ptyprocess.terminate(force=True) ends in an unconditional
+        SIGKILL, so the Windows-only host-pid escalation must NOT fire on
+        POSIX -- the pre-existing PTY kill behavior is left intact."""
+        from tools import process_registry as pr
+
+        s = _make_session(sid="proc_pty_posix", command="sleep 999")
+        s.pid = 555002
+        fake_pty = _FakeKillPty(terminate_returns=False, alive=True)
+        s._pty = fake_pty
+        registry._running[s.id] = s
+
+        run_calls = []
+
+        def fake_run(args, **kwargs):
+            run_calls.append(args)
+            return MagicMock(returncode=0, stderr="", stdout="")
+
+        monkeypatch.setattr(pr, "_IS_WINDOWS", False)
+
+        try:
+            with patch.object(pr.subprocess, "run", fake_run):
+                result = registry.kill_process(s.id)
+
+            assert fake_pty.terminate_calls == [True]
+            assert run_calls == [], "POSIX must not shell out to taskkill"
+            assert result["status"] == "killed"
+            assert s.exited is True
+        finally:
+            registry._running.pop(s.id, None)
+            registry._finished.pop(s.id, None)
+
+    def test_kill_pty_no_escalation_when_terminate_reaps_child_windows(
+        self, registry, monkeypatch
+    ):
+        """Common success path: terminate(force=True) returns True and the
+        handle reports not-alive, so kill_process must NOT shell out to
+        taskkill -- the kill stays a single PTY terminate."""
+        from tools import process_registry as pr
+
+        s = _make_session(sid="proc_pty_clean", command="sleep 1")
+        s.pid = 555003
+        fake_pty = _FakeKillPty(terminate_returns=True, alive=False)
+        s._pty = fake_pty
+        registry._running[s.id] = s
+
+        run_calls = []
+
+        def fake_run(args, **kwargs):
+            run_calls.append(args)
+            return MagicMock(returncode=0, stderr="", stdout="")
+
+        monkeypatch.setattr(pr, "_IS_WINDOWS", True)
+
+        try:
+            with patch.object(pr.subprocess, "run", fake_run):
+                result = registry.kill_process(s.id)
+
+            assert fake_pty.terminate_calls == [True]
+            assert run_calls == [], "no taskkill when the PTY terminate already reaped the child"
+            assert result["status"] == "killed"
+            assert s.exited is True
+        finally:
+            registry._running.pop(s.id, None)
+            registry._finished.pop(s.id, None)
+
+    def test_kill_pty_escalates_when_terminate_true_but_child_alive_windows(
+        self, registry, monkeypatch
+    ):
+        """Defense in depth: if a winpty build returns True (or None) from
+        terminate() while the child is in fact still alive, the isalive()
+        recheck must still trigger the host-pid escalation."""
+        from tools import process_registry as pr
+
+        s = _make_session(sid="proc_pty_linger", command="sleep 999")
+        s.pid = 555004
+        fake_pty = _FakeKillPty(terminate_returns=True, alive=True)
+        s._pty = fake_pty
+        registry._running[s.id] = s
+
+        run_calls = []
+
+        def fake_run(args, **kwargs):
+            run_calls.append(args)
+            return MagicMock(returncode=0, stderr="", stdout="")
+
+        monkeypatch.setattr(pr, "_IS_WINDOWS", True)
+
+        try:
+            with patch.object(pr.subprocess, "run", fake_run):
+                result = registry.kill_process(s.id)
+
+            assert len(run_calls) == 1, "isalive() recheck must escalate a lingering child"
+            assert run_calls[0][0] == "taskkill"
+            assert "555004" in run_calls[0]
+            assert result["status"] == "killed"
+        finally:
+            registry._running.pop(s.id, None)
+            registry._finished.pop(s.id, None)
 
 
 # =========================================================================
