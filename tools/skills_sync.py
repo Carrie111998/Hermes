@@ -252,12 +252,14 @@ def _compute_relative_dest(skill_dir: Path, bundled_dir: Path) -> Path:
 
 
 def _dir_hash(directory: Path) -> str:
-    """Compute a hash of all file contents in a directory for change detection."""
+    """Compute a hash of source files in a directory for change detection."""
     hasher = hashlib.md5()
     try:
         for fpath in sorted(directory.rglob("*")):
             if fpath.is_file():
                 rel = fpath.relative_to(directory)
+                if "__pycache__" in rel.parts or fpath.suffix in {".pyc", ".pyo"}:
+                    continue
                 hasher.update(str(rel).encode("utf-8"))
                 hasher.update(fpath.read_bytes())
     except (OSError, IOError):
