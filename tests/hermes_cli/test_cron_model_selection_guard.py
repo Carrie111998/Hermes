@@ -284,6 +284,41 @@ class TestCronEditPinGuard:
         assert api_calls[0]["model"] == CONTRIBUTOR_MODEL
         assert "TRAINS ON YOUR DATA" in capsys.readouterr().err
 
+    def test_clearing_the_model_while_setting_a_provider_drops_the_old_pin(
+        self, monkeypatch, api_calls, stored_job
+    ):
+        # `--model ""` removes the pin in the same command that sets a
+        # provider, so the guard must judge what the job will run on AFTER the
+        # edit (the fleet default), not the model being taken away.
+        stored_job["model"] = CONTRIBUTOR_MODEL
+        _never_prompts(monkeypatch)
+
+        rc = cron_cli.cron_edit(_edit_args(model="", model_provider="custom"))
+
+        assert rc == 0
+        assert len(api_calls) == 1
+
+    def test_clearing_the_model_falls_through_to_the_cron_fleet_default(
+        self, monkeypatch, api_calls, stored_job
+    ):
+        # The other half of the same rule: once the job's own pin is dropped,
+        # resolution continues down the scheduler's chain, so a guarded
+        # cron.model must still be caught.
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config_readonly",
+            lambda: {
+                "cron": {"model": CONTRIBUTOR_MODEL},
+                "model": {"default": ORDINARY_MODEL},
+            },
+        )
+        stored_job["model"] = ORDINARY_MODEL
+        _answer(monkeypatch, "n")
+
+        rc = cron_cli.cron_edit(_edit_args(model="", model_provider="custom"))
+
+        assert rc == 1
+        assert api_calls == []
+
     def test_clearing_a_pin_is_never_guarded(
         self, monkeypatch, api_calls, stored_job
     ):

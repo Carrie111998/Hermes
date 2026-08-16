@@ -369,8 +369,10 @@ def _confirm_pinned_model(args, existing_job: Optional[dict] = None) -> bool:
     is fail-open: the registry's own contract is that "a misbehaving guard must
     never break model selection", so any failure in here lets the job through.
     """
-    explicit_model = str(getattr(args, "model", None) or "").strip()
-    explicit_provider = str(getattr(args, "model_provider", None) or "").strip()
+    raw_model = getattr(args, "model", None)
+    raw_provider = getattr(args, "model_provider", None)
+    explicit_model = str(raw_model or "").strip()
+    explicit_provider = str(raw_provider or "").strip()
     if not explicit_model and not explicit_provider:
         # Nothing is being pinned on this invocation. This also covers
         # ``--model ""`` / ``--provider ""``, which CLEAR an existing pin —
@@ -399,6 +401,20 @@ def _confirm_pinned_model(args, existing_job: Optional[dict] = None) -> bool:
         cron_cfg = {}
     job = existing_job if isinstance(existing_job, dict) else {}
 
+    # An axis passed as "" is CLEARED by this very command, so the stored row
+    # must not supply it: `cron edit --model "" --provider <p>` leaves the job
+    # following cron.model / model.default, and that is the pair to judge — not
+    # the pin being removed. An axis that was not passed at all (``None``) does
+    # still inherit from the job.
+    job_model = (
+        "" if (raw_model is not None and not explicit_model)
+        else str(job.get("model") or "").strip()
+    )
+    job_provider = (
+        "" if (raw_provider is not None and not explicit_provider)
+        else str(job.get("provider") or "").strip()
+    )
+
     # Mirror the scheduler's documented precedence ("per-job override >
     # cron.model > HERMES_MODEL env > config.yaml ``model:``") so the guard
     # sees the model the job will actually run on when only ``--provider`` is
@@ -408,7 +424,7 @@ def _confirm_pinned_model(args, existing_job: Optional[dict] = None) -> bool:
     # nothing is being pinned here anyway.
     model = (
         explicit_model
-        or str(job.get("model") or "").strip()
+        or job_model
         or str(cron_cfg.get("model") or "").strip()
         or str(model_cfg.get("default") or "").strip()
     )
@@ -416,7 +432,7 @@ def _confirm_pinned_model(args, existing_job: Optional[dict] = None) -> bool:
         return True
     provider = (
         explicit_provider
-        or str(job.get("provider") or "").strip()
+        or job_provider
         or str(cron_cfg.get("model_provider") or "").strip()
         or str(model_cfg.get("provider") or "").strip()
     )
