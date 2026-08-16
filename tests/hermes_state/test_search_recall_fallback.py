@@ -103,6 +103,24 @@ class TestBroadenedRelevance:
         rows = db.search_messages("staging docker gamma")
         assert rows and "docker deployment" in _text(rows[0])
 
+    def test_identifier_term_matches_on_token_boundaries_only(self, db):
+        """'lexer.go' must not count 'mylexer.gone' as a real-signal hit."""
+        db.create_session("s2", source="cli")
+        db.append_message("s2", role="user",
+                          content="renamed the tool to mylexer.gonewild for fun")
+        assert db.search_messages("zzqx lexer.go") == []
+
+    def test_word_term_matches_on_token_boundaries_only(self, db):
+        """'plan' inside 'planet' is not a match toward the 2-term bar."""
+        db.create_session("s3", source="cli")
+        db.append_message("s3", role="user",
+                          content="the planet spins and the star burns brightly")
+        assert db.search_messages("deploy plan star gamma") == []
+
+    def test_stopword_only_query_returns_nothing(self, db):
+        _seed(db)
+        assert db.search_messages("what was that about") == []
+
 
 class TestFallbackRespectsFilters:
     def test_source_exclusion_applies_to_broadened_pass(self, db):
@@ -143,9 +161,10 @@ class TestBroadenHelper:
         assert "what" not in terms and "the" not in terms
         assert "compiler" in terms and '"main.rs"' in terms
 
-    def test_all_stopword_query_still_broadens(self):
-        # Dropping stopwords must never empty the query into a None.
-        assert SessionDB._broaden_fts5_query("what was that about") is not None
+    def test_all_stopword_query_does_not_broaden(self):
+        # An OR over stopwords could only dredge up noise; stopword-only
+        # queries keep their strict-pass emptiness.
+        assert SessionDB._broaden_fts5_query("what was that about") is None
 
     def test_lowercase_or_is_a_plain_word(self):
         # FTS5 booleans are uppercase-only; "cats or dogs" is a plain query

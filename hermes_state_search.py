@@ -1294,6 +1294,17 @@ class SessionSearchMixin:
     )
 
     @classmethod
+    def _broaden_terms(cls, query: str) -> List[str]:
+        """Content terms of a query for the recall fallback: ≥2 chars, not a
+        stopword, deduped in order, capped. The single source of terms for
+        both the broadened query and the relevance filter — if these two
+        drifted apart, a row could be fetched on one term set and judged on
+        another."""
+        terms = [t for t in cls._BROADEN_TERM.findall(query) if len(t) >= 2]
+        terms = [t for t in terms if t.lower() not in cls._BROADEN_STOPWORDS]
+        return list(dict.fromkeys(terms))[: cls._BROADEN_MAX_TERMS]
+
+    @classmethod
     def _broaden_fts5_query(cls, query: str) -> Optional[str]:
         """OR-join a plain multi-word query for the zero-result recall fallback.
 
@@ -1304,21 +1315,15 @@ class SessionSearchMixin:
         OR syntax turns a healthy index into a zero-recall one.
 
         Returns the broadened query, or None when broadening does not apply:
-        single-term queries (nothing to broaden), queries already using
-        explicit FTS5 syntax (quotes, ``*``, uppercase booleans), or queries
-        with no extractable terms. Terms shorter than 2 chars and stopwords
-        are dropped (unless that would empty the query) and the term list is
-        capped at ``_BROADEN_MAX_TERMS``, so the cap spends its slots on the
-        distinctive terms BM25 can actually rank on.
+        queries already using explicit FTS5 syntax (quotes, ``*``, uppercase
+        booleans), and queries with fewer than two content terms — that covers
+        single-term queries (nothing to broaden) and stopword-only queries
+        ("what was that about"), where an OR over stopwords could only ever
+        dredge up noise.
         """
         if not query or cls._EXPLICIT_FTS_SYNTAX.search(query):
             return None
-        terms = [t for t in cls._BROADEN_TERM.findall(query) if len(t) >= 2]
-        content_terms = [t for t in terms if t.lower() not in cls._BROADEN_STOPWORDS]
-        if len(content_terms) >= 2:
-            terms = content_terms
-        # Dedupe preserving order; a repeated term adds nothing under OR.
-        terms = list(dict.fromkeys(terms))[: cls._BROADEN_MAX_TERMS]
+        terms = cls._broaden_terms(query)
         if len(terms) < 2:
             return None
         # Phrase-quote identifier-shaped terms. The sanitizer quotes dotted and
@@ -1347,9 +1352,15 @@ class SessionSearchMixin:
         """
         if not rows:
             return rows
-        terms = [t for t in self._BROADEN_TERM.findall(query) if len(t) >= 2]
+        terms = self._broaden_terms(query)
+        # Token-boundary match, not bare substring: ``lexer.go`` must not hit
+        # inside ``mylexer.gone``, nor ``plan`` inside ``planet``.
+        patterns = {
+            t.lower(): re.compile(r"(?<!\w)" + re.escape(t.lower()) + r"(?!\w)")
+            for t in terms
+        }
         ident_terms = {t.lower() for t in terms if any(c in t for c in "./-")}
-        word_terms = {t.lower() for t in terms} - ident_terms
+        word_terms = set(patterns) - ident_terms
         need = 2 if len(word_terms) >= 3 else 1
         ids = [r["id"] for r in rows]
         placeholders = ",".join("?" for _ in ids)
@@ -1361,12 +1372,17 @@ class SessionSearchMixin:
                     ids,
                 )
             }
+        # Note on pagination: limit/offset were applied by the SQL of the
+        # broadened retry; filtering happens after. A relevant row beyond the
+        # SQL limit is therefore not pulled forward to backfill the page —
+        # pages stay stable across identical calls, at the cost of possibly
+        # under-filled pages. Same trade the strict pass makes implicitly.
         kept = []
         for r in rows:
             text = content_by_id.get(r["id"], "")
-            if any(t in text for t in ident_terms):
+            if any(patterns[t].search(text) for t in ident_terms):
                 kept.append(r)
-            elif sum(t in text for t in word_terms) >= need:
+            elif sum(bool(patterns[t].search(text)) for t in word_terms) >= need:
                 kept.append(r)
         return kept
 
