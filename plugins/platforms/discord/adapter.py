@@ -1384,6 +1384,31 @@ class DiscordAdapter(BasePlatformAdapter):
             async def on_ready():
                 logger.info("[%s] Connected as %s", adapter_self.name, adapter_self._client.user)
 
+                # Set presence/activity ("Playing <X>") when configured.
+                # Sources (first wins): DISCORD_ACTIVITY / DISCORD_ACTIVITY_TYPE
+                # env vars, else config.yaml's discord.activity /
+                # discord.activity_type keys — bridged to those same env vars by
+                # _apply_yaml_config below, so this read is env-only.
+                # change_presence lives in on_ready so the presence re-applies
+                # after every reconnect/RESUME, not just first boot — without a
+                # presence the bot shows as visually offline (#64932).
+                _act = (os.getenv("DISCORD_ACTIVITY", "") or "").strip()
+                if _act:
+                    try:
+                        _atype = (os.getenv("DISCORD_ACTIVITY_TYPE", "") or "playing").strip().lower()
+                        if _atype == "watching":
+                            _activity = discord.Activity(type=discord.ActivityType.watching, name=_act)
+                        elif _atype == "listening":
+                            _activity = discord.Activity(type=discord.ActivityType.listening, name=_act)
+                        elif _atype == "custom":
+                            _activity = discord.CustomActivity(name=_act)
+                        else:
+                            _activity = discord.Game(name=_act)
+                        await adapter_self._client.change_presence(activity=_activity)
+                        logger.info("[%s] Presence set: %s '%s'", adapter_self.name, _atype, _act)
+                    except Exception:
+                        logger.debug("[%s] Failed to set Discord presence", adapter_self.name, exc_info=True)
+
                 # Resolve any usernames in the allowed list to numeric IDs
                 await adapter_self._resolve_allowed_usernames()
                 adapter_self._ready_event.set()
@@ -10339,6 +10364,10 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
     """
     if "require_mention" in discord_cfg and not os.getenv("DISCORD_REQUIRE_MENTION"):
         os.environ["DISCORD_REQUIRE_MENTION"] = str(discord_cfg["require_mention"]).lower()
+    if "activity" in discord_cfg and not os.getenv("DISCORD_ACTIVITY"):
+        os.environ["DISCORD_ACTIVITY"] = str(discord_cfg["activity"])
+    if "activity_type" in discord_cfg and not os.getenv("DISCORD_ACTIVITY_TYPE"):
+        os.environ["DISCORD_ACTIVITY_TYPE"] = str(discord_cfg["activity_type"])
     if "thread_require_mention" in discord_cfg and not os.getenv("DISCORD_THREAD_REQUIRE_MENTION"):
         os.environ["DISCORD_THREAD_REQUIRE_MENTION"] = str(discord_cfg["thread_require_mention"]).lower()
     if "bots_require_inline_mention" in discord_cfg and not os.getenv("DISCORD_BOTS_REQUIRE_INLINE_MENTION"):
