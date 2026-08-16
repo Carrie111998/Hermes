@@ -924,13 +924,22 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
 
         certified_args = self._certified_store_args()
         assert self._key_binding is not None
+        governor_messages = [
+            self._message_to_governor(m, i)
+            for i, m in enumerate(source_messages)
+            if isinstance(m, dict)
+        ]
+        # Ares versions before the durable round-trip fix could archive a
+        # compaction prefix without the provider-facing ``name`` fields.  The
+        # receipt still has the authenticated canonical prefix, while a later
+        # resumed SessionDB projection does not.  Rehydrate only that exact
+        # legacy shape so the Rust owner can perform its normal strict lineage
+        # verification; never paper over an arbitrary transcript divergence.
+        governor_messages = self._rehydrate_legacy_parent_prefix(governor_messages)
+
         request = {
             "session_id": self.session_id or "hermes-session",
-            "messages": [
-                self._message_to_governor(m, i)
-                for i, m in enumerate(source_messages)
-                if isinstance(m, dict)
-            ],
+            "messages": governor_messages,
             "policy": {
                 "target_tokens": target_tokens,
                 "protect_first_n": self.protect_first_n,
@@ -1342,6 +1351,79 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
                     )
                 ]
         return normalized
+
+    def _rehydrate_legacy_parent_prefix(
+        self, governor_messages: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """Restore a verified pre-fix receipt prefix lost by SessionDB.
+
+        Older Ares builds dropped ``name`` while archiving compacted messages.
+        That makes a resumed transcript differ from its authenticated parent
+        receipt even though role, content, tool identity, and metadata all
+        still match.  This is deliberately a narrow compatibility bridge: a
+        candidate is accepted only when removing those known non-durable
+        fields yields an otherwise exact prefix match.  The core subsequently
+        verifies the receipt signature and complete lineage as usual.
+        """
+        if not self.session_id or not governor_messages:
+            return governor_messages
+
+        candidates: list[tuple[int, str, List[Dict[str, Any]]]] = []
+        try:
+            for path in self.store_dir.glob("ctxr_*.json"):
+                try:
+                    payload = json.loads(path.read_text(encoding="utf-8"))
+                    receipt = payload.get("receipt") or {}
+                    compacted = payload.get("compacted_messages") or []
+                    if (
+                        receipt.get("session_id") != self.session_id
+                        or not isinstance(compacted, list)
+                        or not compacted
+                        or any(not isinstance(message, dict) for message in compacted)
+                    ):
+                        continue
+                    candidates.append(
+                        (
+                            int(receipt.get("generation") or 0),
+                            str(receipt.get("created_utc") or ""),
+                            compacted,
+                        )
+                    )
+                except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                    continue
+        except OSError:
+            return governor_messages
+
+        def legacy_projection(message: Dict[str, Any]) -> Dict[str, Any]:
+            projection = copy.deepcopy(message)
+            projection.pop("name", None)
+            # Hermes never had a durable generic message-id column.  The
+            # adapter intentionally retains tool-call identity, but assistant
+            # summary ids from old receipts were not persisted.
+            if projection.get("role") != "tool":
+                projection.pop("id", None)
+            return projection
+
+        for _generation, _created, compacted in sorted(candidates, reverse=True):
+            if len(compacted) > len(governor_messages):
+                continue
+            durable_projection = [
+                self._message_to_governor(self._message_from_governor(message), i)
+                for i, message in enumerate(compacted)
+            ]
+            current_prefix = governor_messages[: len(compacted)]
+            if [legacy_projection(message) for message in durable_projection] != [
+                legacy_projection(message) for message in current_prefix
+            ]:
+                continue
+            if durable_projection == current_prefix:
+                continue
+            logger.info(
+                "context-governor: rehydrated legacy receipt prefix for session %s",
+                self.session_id,
+            )
+            return copy.deepcopy(compacted) + governor_messages[len(compacted) :]
+        return governor_messages
 
     def _message_to_governor(self, msg: Dict[str, Any], idx: int) -> Dict[str, Any]:
         role = msg.get("role") or "assistant"
