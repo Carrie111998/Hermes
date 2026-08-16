@@ -2695,7 +2695,6 @@ def _format_async_delegation(evt: dict) -> str:
     error = evt.get("error")
     api_calls = evt.get("api_calls", 0)
     duration = evt.get("duration_seconds", "?")
-    truncated = evt.get("truncated") or evt.get("exit_reason") == "max_iterations"
     dispatched_at = evt.get("dispatched_at")
     completed_at = evt.get("completed_at") or _time.time()
 
@@ -2736,8 +2735,7 @@ def _format_async_delegation(evt: dict) -> str:
             r_summary = r.get("summary")
             r_error = r.get("error")
             r_goal = goals[idx] if idx < len(goals) else r.get("goal", "")
-            r_truncated = r.get("truncated") or r.get("exit_reason") == "max_iterations"
-            icon = "⚠" if r_truncated else ("✓" if r_status in ("completed", "success") else "✗")
+            icon = "✓" if r_status in ("completed", "success") else "✗"
             lines.append("")
             header = f"--- {icon} TASK {idx + 1}/{n}"
             if r_goal:
@@ -2747,17 +2745,19 @@ def _format_async_delegation(evt: dict) -> str:
                 header += f", api_calls={r['api_calls']}"
             if r.get("duration_seconds") is not None:
                 header += f", {r['duration_seconds']}s"
-            if r_truncated:
-                header += ", TRUNCATED: hit max_iterations — work may be incomplete"
+            # Per-task model override: the batch-level "Model:" line above shows
+            # the configured delegation model, which is wrong for a mixed-tier
+            # batch. Name the override on the task that carries one so the
+            # routing is visible without digging into the billing ledger.
+            if r.get("model_override"):
+                header += f", model={r['model_override']}"
+                if r.get("provider_override"):
+                    header += f"@{r['provider_override']}"
             header += ") ---"
             lines.append(header)
+            if r.get("model_override_error"):
+                lines.append(f"NOTE: {r['model_override_error']}")
             if r_status in ("completed", "success") and r_summary:
-                if r_truncated:
-                    lines.append(
-                        "[TRUNCATED — subagent hit its iteration cap; the "
-                        "summary below may be incomplete. Verify before relying "
-                        "on it, or re-dispatch the unfinished part.]"
-                    )
                 lines.append(r_summary)
             elif r_summary:
                 if r_error:
@@ -2797,16 +2797,9 @@ def _format_async_delegation(evt: dict) -> str:
     if toolsets:
         lines.append(f"Toolsets: {', '.join(toolsets)}")
     lines.append(f"Role: {role}   Model: {model}")
-    _trunc = " [TRUNCATED: hit max_iterations — work may be incomplete]" if truncated else ""
-    lines.append(f"Status: {status}   API calls: {api_calls}   Duration: {duration}s{_trunc}")
+    lines.append(f"Status: {status}   API calls: {api_calls}   Duration: {duration}s")
     lines.append("--- RESULT ---")
     if status in ("completed", "success") and summary:
-        if truncated:
-            lines.append(
-                "[TRUNCATED — subagent hit its iteration cap; the summary below "
-                "may be incomplete. Verify before relying on it, or re-dispatch "
-                "the unfinished part.]"
-            )
         lines.append(summary)
     elif status == "interrupted":
         lines.append(
