@@ -484,6 +484,32 @@ class TestMarkJobRun:
         assert updated["last_error"] is None
         assert updated["last_delivery_error"] == "platform 'telegram' not configured"
 
+    def test_response_contract_failure_has_distinct_status_and_error(self, tmp_cron_dir):
+        job = create_job(
+            prompt="Report",
+            schedule="every 1h",
+            response_contract={"required_patterns": ["prepare_actual_sleep_calendar_update"]},
+        )
+
+        mark_job_run(
+            job["id"],
+            success=False,
+            error="Response contract failed: missing required pattern(s)",
+            response_contract_error="missing required pattern(s): 'prepare_actual_sleep_calendar_update'",
+            status="response_contract_failed",
+        )
+
+        updated = get_job(job["id"])
+        assert updated["response_contract"] == {
+            "required_patterns": ["prepare_actual_sleep_calendar_update"],
+            "forbidden_patterns": [],
+            "on_failure": "fail",
+        }
+        assert updated["last_status"] == "response_contract_failed"
+        assert updated["last_response_contract_error"] == (
+            "missing required pattern(s): 'prepare_actual_sleep_calendar_update'"
+        )
+
 
     def test_recurring_cron_not_disabled_when_croniter_missing(self, tmp_cron_dir, monkeypatch):
         """Regression test for issue #16265.

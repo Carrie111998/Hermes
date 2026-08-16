@@ -638,6 +638,7 @@ def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
         "last_run_at": job.get("last_run_at"),
         "last_status": job.get("last_status"),
         "last_delivery_error": job.get("last_delivery_error"),
+        "last_response_contract_error": job.get("last_response_contract_error"),
         "enabled": job.get("enabled", True),
         # Derive from enabled so half-paused records never render as paused.
         "state": effective_job_state(job),
@@ -652,6 +653,8 @@ def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
         result["monitor_url"] = job["monitor_url"]
     if job.get("monitor_state"):
         result["monitor_state"] = job["monitor_state"]
+    if job.get("response_contract"):
+        result["response_contract"] = job["response_contract"]
     if job.get("no_agent"):
         result["no_agent"] = True
     if job.get("enabled_toolsets"):
@@ -1164,6 +1167,7 @@ def cronjob(
     attach_to_session: Optional[bool] = None,
     monitor_script: Optional[str] = None,
     monitor_url: Optional[str] = None,
+    response_contract: Optional[Dict[str, Any]] = None,
     task_id: str = None,
     session_id: Optional[str] = None,
 ) -> str:
@@ -1254,6 +1258,7 @@ def cronjob(
                     attach_to_session=attach_to_session,
                     monitor_script=_normalize_optional_job_value(monitor_script),
                     monitor_url=_normalize_optional_job_value(monitor_url),
+                    response_contract=response_contract,
                 )
             except CronSchedulerRegistrationError as exc:
                 _partial = exc.to_dict()
@@ -1476,6 +1481,8 @@ def cronjob(
                 updates["monitor_url"] = (
                     _normalize_optional_job_value(monitor_url) if monitor_url else None
                 )
+            if response_contract is not None:
+                updates["response_contract"] = response_contract
             if monitor_script is not None or monitor_url is not None:
                 eff_mon_script = (
                     updates["monitor_script"] if "monitor_script" in updates else job.get("monitor_script")
@@ -1624,6 +1631,28 @@ Scheduling from cron-run sessions is disabled by default and enabled via cron.al
                 "type": "string",
                 "description": "Optional http(s) URL used as the monitor source instead of a script — fetched with a bounded GET (30s timeout, 256KB cap) each tick. Same hash-suppression semantics as monitor_script. Mutually exclusive with monitor_script. On update, pass empty string to clear."
             },
+            "response_contract": {
+                "type": "object",
+                "properties": {
+                    "required_patterns": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Literal strings that must appear in the final response.",
+                    },
+                    "forbidden_patterns": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Literal strings that must not appear in the final response.",
+                    },
+                    "on_failure": {
+                        "type": "string",
+                        "enum": ["fail"],
+                        "default": "fail",
+                    },
+                },
+                "additionalProperties": False,
+                "description": "Optional fail-closed final-response check. A contract failure is stored separately and the invalid response is not delivered.",
+            },
             "no_agent": {
                 "type": "boolean",
                 "default": False,
@@ -1727,6 +1756,7 @@ registry.register(
         no_agent=args.get("no_agent"),
         monitor_script=args.get("monitor_script"),
         monitor_url=args.get("monitor_url"),
+        response_contract=args.get("response_contract"),
         task_id=kw.get("task_id"),
         session_id=kw.get("session_id"),
     ),
