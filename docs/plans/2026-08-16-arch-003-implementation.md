@@ -1,6 +1,6 @@
 ---
 title: "ARCH-003 implementation plan: runtime-state audit and replay verification"
-status: IMPLEMENTATION_PLAN_REVISE_V32_PENDING
+status: IMPLEMENTATION_PLAN_REVISE_V33_PENDING
 date: 2026-08-16
 type: implementation-plan
 ticket: ARCH-003
@@ -113,8 +113,12 @@ prompt construction, legacy `state.db`, or unrelated dirty worktree files.
   must release ownership automatically when its holder dies; if safe
   stale-holder recovery cannot be proven, stop preflight. Exclusive baseline
   acquisition may fail and be retried only by its out-of-band caller.
-- The single-writer branch proves one ordinary mutation connection and
-  defensive abort; the multi-writer branch requires the cross-process RW lock.
+- The named cross-process maintenance RW lock is required in both the
+  single-writer and multi-writer branches. The single-writer branch additionally
+  proves one ordinary mutation connection and defensive abort; the multi-writer
+  branch additionally proves cross-process writer coordination. Ordinary
+  shared-side paths and privileged/startup exclusive-side paths use this lock
+  in both branches.
   Mutation/genesis transactions use `BEGIN IMMEDIATE` or equivalent
   write-lock-first discipline before sequence allocation. Since the write lock
   is held through commit, sequence collisions are not a retry path; any
@@ -190,10 +194,14 @@ Add a versioned runtime-state-owned journal table with:
 Within the same migration transaction, add the non-null
 `materialized_write_counter` column to every runtime-state materialized row
 with deterministic default `0`, backfill all pre-existing rows to `0`, and
-install the database-level replay-tuple trigger/write-guard before the
-migration commits. No row may be observable with a missing counter or without
-the guard. Migration compatibility tests must verify the column, default,
-backfill, and guard survive prior-version startup and rollback.
+install the database-level replay-tuple trigger/write-guard for INSERT and
+replay-tuple-changing UPDATE before the migration commits. The INSERT guard
+treats row creation as a replay-tuple change: it starts from the deterministic
+default counter `0` and persists an after-counter of `1`; the UPDATE guard
+advances the counter only when a replay-tuple member changes. No row may be
+observable with a missing counter or without the guard. Migration compatibility
+tests must verify the column, default, backfill, INSERT/UPDATE guard, and guard
+survival through prior-version startup and rollback.
 
 Add a durable database-level current-generation record:
 `runtime_state_journal_meta.current_generation`, owned by the runtime-state
@@ -386,11 +394,18 @@ Migration compatibility tests must assert this posture.
   cross-process maintenance RW lock before opening the SQLite WAL transaction;
   use `BEGIN IMMEDIATE` or equivalent before sequence allocation; release the
   shared lock only after commit or rollback.
-- Inside that write transaction, compare the materialized row's counter with
-  the latest journaled after-counter (or baseline sealed counter). For a
-  same-epoch ordinary mutation, a mismatch is a persisted counter gap:
-  abort with mutation-side `WRITE_ABORT` before changing replay state or
-  emitting an event. A genesis for an entity with no current-epoch history
+- Inside that write transaction, compare an existing materialized row's counter
+  with the latest journaled after-counter (or baseline sealed counter). For a
+  row-creating mutation, no prior materialized counter or journaled
+  after-counter exists: the INSERT trigger/write-guard starts at counter `0`
+  and persists `1`, the mutation emits `NEW_ENTITY_GENESIS` with
+  before-counter `0` and after-counter `1`, and the in-transaction gap
+  comparison is explicitly exempt. A prior or unaware writer's row INSERT
+  receives the same guard treatment and is therefore counter-observable even
+  when it emits no event. For a same-epoch ordinary mutation on an existing
+  row, a mismatch is a persisted counter gap: abort with mutation-side
+  `WRITE_ABORT` before changing replay state or emitting an event. A genesis
+  for an existing entity with no current-epoch history
   (legacy/pre-journal, post-rotation, or first post-migration entity) is also
   exempt: it adopts the observed materialized counter as its before-counter
   and starts a new counter-continuity epoch. A strictly newer writer-epoch
@@ -1119,6 +1134,24 @@ DGX changes, deployment, repair, or event-sourcing. The corrected plan must
 return to the same authenticated Claude reviewer family and then to AGY on the
 identical packet.
 
+## Implementation-plan review reconciliation v32
+
+The v32 authenticated Claude Opus review returned `REVISE` with two bounded
+plan-text corrections. The corrections are incorporated above:
+
+1. The named maintenance RW lock is mandatory in both single-writer and
+   multi-writer branches; the branch-specific difference is the ordinary
+   connection/coordination invariant, not lock applicability.
+2. The INSERT trigger/write-guard behavior and `NEW_ENTITY_GENESIS`
+   counter semantics are explicit: before-counter `0`, after-counter `1`,
+   with a row-creation exemption from existing-row gap comparison and
+   prior/unaware INSERT observability.
+
+These remain plan-only corrections and do not authorize source edits, tests,
+DGX changes, deployment, repair, or event-sourcing. The corrected plan must
+return to the same authenticated Claude reviewer family and then to AGY on the
+identical packet.
+
 ## Acceptance criteria
 
 ARCH-003 implementation is ready for its delivery gates only when:
@@ -1148,7 +1181,7 @@ ARCH-003 implementation is ready for its delivery gates only when:
   retention job; entities beyond the replay limit remain UNKNOWN in this ticket,
   and the 100,000-event/100 MiB per-profile threshold is a documented follow-up
   operational review, not an in-ticket operator gate;
-- reconciliation v1 and v5-v31 items are incorporated into the normative
+- reconciliation v1 and v5-v32 items are incorporated into the normative
   Gates 0-4 text (with v2-v4 explicitly folded into the v1/v4 text), and this
   merged plan revision receives the same-family re-review;
 - all focused and relevant tests pass;
@@ -1220,6 +1253,8 @@ ARCH-003 implementation is ready for its delivery gates only when:
   atomicity, and key/digest precondition ordering.
 - v31: snapshot-failure precedence, deterministic pre-replay reason order,
   and bounded caller contracts for all mutation-surface refusal codes.
+- v32: maintenance RW-lock applicability in both writer branches and explicit
+  INSERT/NEW_ENTITY_GENESIS counter semantics.
 
 
 ## Non-goals
