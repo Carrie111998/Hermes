@@ -137,6 +137,18 @@ def test_save_auth_store_first_write_inherits_parent_owner(tmp_path, monkeypatch
 
 
 @pytest.mark.skipif(not hasattr(os, "fchown"), reason="fchown is unavailable on Windows")
+def test_save_auth_store_skips_fchown_for_current_owner(tmp_path, monkeypatch):
+    """A same-user rewrite must not depend on a needless ownership syscall."""
+    from hermes_cli import auth as auth_mod
+
+    auth_path = tmp_path / "auth.json"
+    auth_path.write_text('{"providers": {}}\n')
+    monkeypatch.setattr(auth_mod.os, "fchown", lambda *_args: pytest.fail("unexpected fchown"))
+
+    auth_mod._save_auth_store({"providers": {}}, target_path=auth_path)
+
+
+@pytest.mark.skipif(not hasattr(os, "fchown"), reason="fchown is unavailable on Windows")
 def test_save_auth_store_does_not_replace_when_owner_transfer_fails(tmp_path, monkeypatch):
     """A failed fchown must leave the old credential store untouched."""
     from hermes_cli import auth as auth_mod
