@@ -2407,6 +2407,11 @@ export interface Translations {
       unreachableDescription: string
       openTarget: (url: string) => string
       fallbackTitle: string
+      goBack: string
+      goForward: string
+      reload: string
+      address: string
+      navigate: string
     }
   }
 
