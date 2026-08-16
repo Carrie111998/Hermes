@@ -46,6 +46,7 @@ import {
   uploadAttachment
 } from './api'
 import { ModelOverrideField, overridePatch } from './model-override'
+import { runKanbanTaskAction, taskActionContext, useKanbanTaskActions } from './task-actions'
 import {
   type Diagnostic,
   type DiagnosticAction,
@@ -538,11 +539,13 @@ function EstimateSection({ id }: { id: string }) {
 }
 
 export function TaskDrawer({
+  board,
   columns,
   id,
   onClose,
   onOpen
 }: {
+  board: string
   columns: string[]
   id: null | string
   onClose: () => void
@@ -551,6 +554,7 @@ export function TaskDrawer({
   const k = useKanban()
   const qc = useQueryClient()
   const slug = useValue($boardSlug)
+  const taskActions = useKanbanTaskActions('drawer-menu')
 
   // Socket-invalidated (bindApi); the interval is only the socketless heartbeat.
   const { data: detail, error } = useQuery({
@@ -718,6 +722,15 @@ export function TaskDrawer({
                     <Codicon name="copy" size="0.85rem" />
                     {k.copyTitle}
                   </DropdownMenuItem>
+                  {taskActions.map(action => (
+                    <DropdownMenuItem
+                      key={action.id}
+                      onSelect={() => void runKanbanTaskAction(action, taskActionContext(board, 'drawer-menu', task))}
+                    >
+                      <Codicon name={action.codicon || 'comment-discussion'} size="0.85rem" />
+                      {action.label}
+                    </DropdownMenuItem>
+                  ))}
                   <DropdownMenuSeparator />
                   <DropdownMenuItem onSelect={mutate(() => patchTask(task.id, { status: 'archived' }), onClose)}>
                     <Codicon name="archive" size="0.85rem" />
