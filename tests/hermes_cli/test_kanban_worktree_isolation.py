@@ -244,6 +244,22 @@ def test_new_worktree_branch_rejects_unreachable_origin(tmp_path):
     assert not target.exists()
 
 
+def test_new_worktree_branch_rejects_origin_without_url(tmp_path):
+    repo = _make_repo(tmp_path)
+    _git(
+        repo,
+        "config",
+        "remote.origin.fetch",
+        "+refs/heads/*:refs/remotes/origin/*",
+    )
+    target = repo / ".worktrees" / "new-task"
+
+    with pytest.raises(RuntimeError, match="could not fetch origin"):
+        kb._ensure_git_worktree(repo, target, "project/new-task")
+
+    assert not target.exists()
+
+
 def test_decompose_worktree_children_get_own_workspace(kanban_home):
     with kb.connect() as conn:
         root = kb.create_task(conn, title="build the feature", triage=True)
