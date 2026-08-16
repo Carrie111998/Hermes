@@ -346,6 +346,7 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "glm-5",
         "glm-4.7",
         "glm-4.5",
+        "glm-4.5-air",
     ],
     "xai": _xai_curated_models(),
     "nvidia": [

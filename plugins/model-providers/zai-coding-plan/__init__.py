@@ -33,6 +33,13 @@ profile; on this wire the Anthropic adapter builds the request shape
 (thinking blocks, tool_use) natively.
 """
 
+# NOTE: this import deliberately targets the BUNDLED zai plugin module.
+# Discovery loads bundled plugins under their canonical
+# ``plugins.model_providers.*`` names; any user-plugin override of ``zai``
+# later registers under a ``_hermes_user_provider_*`` module name instead,
+# so this path can never bind a user override. If the plugin loader ever
+# changes that namespace contract, update this import (and the
+# test_bundled_import_binds_bundled_zai_profile pin) accordingly.
 from plugins.model_providers.zai import ZaiProfile
 from providers import register_provider
 
@@ -48,7 +55,7 @@ zai_coding_plan = ZaiProfile(
         "ZAI_API_KEY",
     ),
     base_url="https://api.z.ai/api/anthropic",
-    default_aux_model="glm-4.5-flash",
+    default_aux_model="glm-4.5-air",
 )
 
 register_provider(zai_coding_plan)

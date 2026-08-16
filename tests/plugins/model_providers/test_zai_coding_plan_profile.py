@@ -69,6 +69,41 @@ class TestZaiCodingPlanProfile:
         assert top_level == {"reasoning_effort": "high"}
         assert extra_body.get("thinking") == {"type": "enabled"}
 
+    def test_default_aux_model_in_curated_list(self, coding_profile):
+        """The profile's default aux model must resolve against the
+        provider's own curated list — aux-task resolution (curator,
+        vision, title generation) validates against it, so a mismatch
+        fails to resolve or shows an unlisted model in the picker
+        (review point on PR #86560).  glm-4.5-air: the live Anthropic
+        wire serves no glm-4.5-flash (models-list probe 2026-08-17:
+        glm-4.5, glm-4.5-air, glm-4.6, glm-4.7, glm-5, glm-5-turbo,
+        glm-5.1, glm-5.2, glm-5.3), and air is the cheapest tier there."""
+        from hermes_cli.models import _PROVIDER_MODELS
+
+        assert coding_profile.default_aux_model == "glm-4.5-air"
+        assert coding_profile.default_aux_model in _PROVIDER_MODELS["zai-coding-plan"]
+
+    def test_default_endpoint_builds_anthropic_request_shape(self, coding_profile):
+        """Pin the docstring claim at the adapter level: the default
+        ``/api/anthropic`` endpoint produces the Anthropic request shape —
+        thinking as budget_tokens (not the OpenAI-compat
+        reasoning_effort/top-level param the paas/v4 wire would use)
+        (review point on PR #86560)."""
+        from agent.anthropic_adapter import build_anthropic_kwargs
+
+        kwargs = build_anthropic_kwargs(
+            model="glm-5.3",
+            messages=[{"role": "user", "content": "hello"}],
+            tools=None,
+            max_tokens=8192,
+            reasoning_config={"enabled": True, "effort": "high"},
+            base_url=coding_profile.base_url,
+        )
+        assert "reasoning_effort" not in kwargs
+        assert kwargs["thinking"]["type"] == "enabled"
+        assert isinstance(kwargs["thinking"]["budget_tokens"], int)
+        assert kwargs["thinking"]["budget_tokens"] > 0
+
     def test_model_list_registered(self):
         from hermes_cli.models import _PROVIDER_MODELS
 
