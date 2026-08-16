@@ -154,6 +154,12 @@ from environment variables (which include everything in `~/.hermes/.env`).
 This is useful when a catalog entry wants to reference a value the user
 configured elsewhere — e.g. `${HOME}/foo` or `${MY_PROVIDER_TOKEN}`.
 
+Cursor-style context variables are also substituted (case-sensitive):
+`${userHome}` (home directory), `${workspaceFolder}` (session workspace
+root), `${workspaceFolderBasename}`, and `${pathSeparator}` / `${/}`
+(the OS path separator). See the
+[MCP config reference](/docs/reference/mcp-config-reference) for details.
+
 Note this is distinct from `${INSTALL_DIR}` in catalog manifests, which is
 substituted at install-time with the path the catalog cloned the entry's
 repo into.
@@ -175,6 +181,23 @@ after a Hermes update if a manifest version changed.
 
 To add an MCP to the catalog, open a PR against
 [`optional-mcps/`](https://github.com/NousResearch/hermes-agent/tree/main/optional-mcps).
+
+### Suggestion metadata (`suggest:`)
+
+A manifest may declare an optional `suggest:` block with `keywords:` and/or
+`hosts:` lists. UI surfaces (currently the Desktop app's composer) use it to
+offer a one-click "Add &lt;server&gt;" pill when your draft mentions one of the
+keywords as a completed word, or contains a pasted link whose hostname ends
+with one of the host suffixes. It is purely advisory — installs still flow
+through the same validated catalog/config paths — and most hosted remote
+entries (Atlassian, Sentry, Notion, Stripe, Vercel, Supabase, and friends)
+declare it.
+
+GitHub is deliberately **not** in the catalog: its hosted MCP requires each
+client to bring its own OAuth app (generic dynamic client registration is
+rejected), and Hermes's bundled `github/*` skills driving the `gh` CLI are a
+more capable integration. On Desktop, GitHub mentions instead offer the
+`github-auth` skill when `gh` isn't signed in yet.
 
 ## Two kinds of MCP servers
 
