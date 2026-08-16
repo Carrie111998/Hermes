@@ -429,7 +429,15 @@ def _load_provider_from_dir(
     *,
     register_skills: bool = True,
 ) -> Optional["MemoryProvider"]:
-    """Thread-safe wrapper around the dynamic provider import transaction."""
+    """Serialize module readiness and its one-time registration transaction.
+
+    ``register()`` remains inside the boundary deliberately: it returns the
+    provider and may register provider-owned skills/hooks/tools. Returning to a
+    sibling caller before those registrations finish would expose another
+    partially initialized provider state. Skill registration only validates a
+    path and updates in-memory plugin-manager mappings; it does not read the
+    skill body or perform network I/O.
+    """
     with _PROVIDER_LOAD_LOCK:
         return _load_provider_from_dir_unlocked(
             provider_dir,

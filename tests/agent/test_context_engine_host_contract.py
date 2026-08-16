@@ -69,6 +69,8 @@ def test_concurrent_context_engine_load_waits_for_module_execution(
             )
     finally:
         sys.modules.pop("plugins.context_engine.slowcontext", None)
+        if hasattr(context_plugins, "slowcontext"):
+            delattr(context_plugins, "slowcontext")
 
     assert all(engine is not None for engine in engines)
     assert {engine.name for engine in engines} == {"slowcontext"}

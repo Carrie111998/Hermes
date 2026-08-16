@@ -373,9 +373,56 @@ class TestPluginMemoryDiscovery:
                 )
         finally:
             sys.modules.pop("plugins.memory.slowmemory", None)
+            if hasattr(memory_plugins, "slowmemory"):
+                delattr(memory_plugins, "slowmemory")
 
         assert all(provider is not None for provider in providers)
         assert {provider.name for provider in providers} == {"slowmemory"}
+
+    def test_register_skills_finishes_before_locked_load_returns(
+        self, tmp_path, monkeypatch
+    ):
+        """Skill registration stays inside the one-time readiness boundary."""
+        import sys
+        import plugins.memory as memory_plugins
+
+        provider_dir = tmp_path / "skillmemory"
+        provider_dir.mkdir()
+        (provider_dir / "__init__.py").write_text(
+            "from agent.memory_provider import MemoryProvider\n"
+            "class SkillMemory(MemoryProvider):\n"
+            "    @property\n"
+            "    def name(self): return 'skillmemory'\n"
+            "    def is_available(self): return True\n"
+            "    def initialize(self, **kw): pass\n"
+            "    def sync_turn(self, *a, **kw): pass\n"
+            "    def get_tool_schemas(self): return []\n"
+            "    def handle_tool_call(self, *a, **kw): return '{}'\n"
+            "def register(ctx):\n"
+            "    ctx.register_memory_provider(SkillMemory())\n"
+            "    ctx.register_skill('ready-skill', 'SKILL.md')\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(memory_plugins, "_MEMORY_PLUGINS_DIR", tmp_path)
+        sys.modules.pop("plugins.memory.skillmemory", None)
+        registered = []
+        monkeypatch.setattr(
+            memory_plugins._ProviderCollector,
+            "register_skill",
+            lambda self, *args, **kwargs: registered.append(args[0]),
+        )
+
+        try:
+            provider = memory_plugins.load_memory_provider(
+                "skillmemory", register_skills=True
+            )
+        finally:
+            sys.modules.pop("plugins.memory.skillmemory", None)
+            if hasattr(memory_plugins, "skillmemory"):
+                delattr(memory_plugins, "skillmemory")
+
+        assert provider is not None
+        assert registered == ["ready-skill"]
 
 
 class TestUserInstalledProviderDiscovery:
