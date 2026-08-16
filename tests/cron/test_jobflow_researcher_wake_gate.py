@@ -25,10 +25,51 @@ import sys
 
 import pytest
 
-GATE = (
-    pathlib.Path(__file__).resolve().parents[3]
-    / "profiles" / "main" / "scripts" / "jobflow_researcher_wake_gate.py"
+# The deployed gate script, relative to the Hermes root. Note that `profiles/`
+# is tracked in the *outer* Hermes repo (`~/.hermes`), not in `agent-src` — so
+# the anchor is `agent-src`'s parent, not the `agent-src` repo root.
+_GATE_REL = (
+    pathlib.Path("profiles") / "main" / "scripts"
+    / "jobflow_researcher_wake_gate.py"
 )
+
+
+def _find_hermes_root() -> pathlib.Path | None:
+    """Return the Hermes root (the checkout holding `profiles/`), or None.
+
+    Searches upward from this file for the directory that actually contains
+    the gate script. Deliberately *not* a fixed count of `.parent` hops: this
+    file sits three levels deeper inside a git worktree
+    (`agent-src/.claude/worktrees/<name>/tests/cron/`) than in the main
+    checkout (`agent-src/tests/cron/`), so any fixed count that escapes the
+    checkout is right in exactly one of the two layouts. The previous
+    `parents[3]` was correct only from the main checkout and silently resolved
+    to `agent-src/.claude/worktrees` otherwise, failing all ten tests with a
+    FileNotFoundError.
+
+    Git cannot anchor this either: `rev-parse --show-toplevel` returns the
+    *worktree* path rather than `agent-src`, and `hermes_constants`'
+    `get_default_hermes_root()` reads `HERMES_HOME`, which the suite redirects
+    to a per-test tempdir (see `tests/conftest.py`) — the very reason this path
+    is hand-derived. Searching for the artifact itself is correct at any
+    nesting depth and needs neither a subprocess nor the environment.
+    """
+    for candidate in pathlib.Path(__file__).resolve().parents:
+        if (candidate / _GATE_REL).is_file():
+            return candidate
+    return None
+
+
+_HERMES_ROOT = _find_hermes_root()
+if _HERMES_ROOT is None:
+    pytest.skip(
+        f"Hermes root not found: no ancestor of {pathlib.Path(__file__).resolve()} "
+        f"contains {_GATE_REL.as_posix()}. The gate script is deployed in the "
+        "outer ~/.hermes checkout, which is absent from this tree.",
+        allow_module_level=True,
+    )
+
+GATE = _HERMES_ROOT / _GATE_REL
 
 
 def _load():
