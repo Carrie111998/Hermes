@@ -237,6 +237,48 @@ class TestHeadlessApprovalFailClosed:
         parsed = json.loads(out)
         assert "error" not in parsed, out
 
+    def test_cron_mode_approve_allows_destructive_action(self, monkeypatch):
+        """approvals.cron_mode: approve must auto-approve computer_use exactly
+        like it already does for a flagged dangerous shell command — the
+        no-callback fallback isn't limited to the global bypass.
+
+        Fetches the backend AFTER setting the cron/bypass state (rather than
+        via the ``noop_backend`` fixture, captured earlier): permission mode
+        is part of the backend cache key, so changing it here can rebuild a
+        fresh backend instance and a pre-captured reference would go stale.
+        """
+        import tools.approval as approval_module
+        from tools.computer_use import tool as cu_tool
+
+        monkeypatch.setenv("HERMES_CRON_SESSION", "1")
+        monkeypatch.setattr(approval_module, "_get_cron_approval_mode", lambda: "approve")
+        with patch("tools.approval.is_approval_bypass_active_for_session",
+                    return_value=False):
+            backend = cu_tool._get_backend()
+            out = cu_tool.handle_computer_use({"action": "click", "element": 3})
+
+        parsed = json.loads(out)
+        assert "error" not in parsed, out
+        assert any(c[0] == "click" for c in backend.calls)
+
+    def test_cron_mode_deny_blocks_with_config_hint(self, monkeypatch):
+        """approvals.cron_mode: deny (the default) still blocks, with a
+        message pointing at the config key instead of a generic error."""
+        import tools.approval as approval_module
+        from tools.computer_use import tool as cu_tool
+
+        monkeypatch.setenv("HERMES_CRON_SESSION", "1")
+        monkeypatch.setattr(approval_module, "_get_cron_approval_mode", lambda: "deny")
+        with patch("tools.approval.is_approval_bypass_active_for_session",
+                    return_value=False):
+            backend = cu_tool._get_backend()
+            out = cu_tool.handle_computer_use({"action": "click", "element": 3})
+
+        parsed = json.loads(out)
+        assert parsed.get("code") == "approval_unavailable", out
+        assert "cron_mode" in parsed.get("error", ""), out
+        assert not backend.calls
+
     def test_callback_still_takes_precedence_over_bypass_check(self, noop_backend):
         """When a callback IS wired (CLI), it decides — the bypass check is
         only the no-callback fallback path, not a replacement for it."""
