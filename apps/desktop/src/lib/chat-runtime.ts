@@ -435,6 +435,7 @@ export function toRuntimeMessage(message: ChatMessage): ThreadMessage {
     ...(message.reactions?.length ? { reactions: message.reactions } : {})
   }
 
+  const displayKindMeta = message.displayKind ? { displayKind: message.displayKind } : {}
   const timelineMeta =
     typeof message.timestamp === 'number' && Number.isFinite(message.timestamp) && message.timestamp > 0
       ? { timelineTimestamp: message.timestamp }
@@ -447,7 +448,9 @@ export function toRuntimeMessage(message: ChatMessage): ThreadMessage {
       content: message.parts.filter((part): part is Extract<ChatMessagePart, { type: 'text' }> => part.type === 'text'),
       attachments: [],
       createdAt,
-      metadata: { custom: { attachmentRefs: message.attachmentRefs ?? [], ...reactionMeta, ...timelineMeta } }
+      metadata: {
+        custom: { attachmentRefs: message.attachmentRefs ?? [], ...reactionMeta, ...timelineMeta, ...displayKindMeta }
+      }
     } as ThreadMessage
   }
 
@@ -459,7 +462,7 @@ export function toRuntimeMessage(message: ChatMessage): ThreadMessage {
       role,
       content: [textPart(text)],
       createdAt,
-      metadata: { custom: timelineMeta }
+      metadata: { custom: { ...timelineMeta, ...displayKindMeta } }
     } as ThreadMessage
   }
 
@@ -484,7 +487,8 @@ export function toRuntimeMessage(message: ChatMessage): ThreadMessage {
         ...timelineMeta,
         ...(message.completedAt !== undefined ? { timelineCompletedAt: message.completedAt } : {}),
         ...(message.durationS !== undefined ? { durationS: message.durationS } : {}),
-        ...reactionMeta
+        ...reactionMeta,
+        ...displayKindMeta
       }
     }
   } as ThreadMessage

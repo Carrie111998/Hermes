@@ -23,6 +23,7 @@ import {
 
 import {
   appendText,
+  isRealUserMessage,
   isFailedUserTurn,
   isSessionBusyError,
   visibleUserIndexAtOrdinal,
@@ -405,7 +406,7 @@ export function planReload(messages: ChatMessage[], parentId: null | string): nu
   const parentIndex = parentId ? messages.findIndex(m => m.id === parentId) : messages.length - 1
 
   const userBack =
-    parentIndex >= 0 ? [...messages.slice(0, parentIndex + 1)].reverse().findIndex(m => m.role === 'user') : -1
+    parentIndex >= 0 ? [...messages.slice(0, parentIndex + 1)].reverse().findIndex(isRealUserMessage) : -1
 
   if (userBack < 0) {
     return null
@@ -441,7 +442,7 @@ export function planReload(messages: ChatMessage[], parentId: null | string): nu
 
 /** Optimistic reload state: keep the user turn, hide the branch's assistants. */
 export function applyReloadOptimistic(state: ClientSessionState, plan: ReloadPlan): ClientSessionState {
-  const nextUserIndex = state.messages.findIndex((m, i) => i > plan.userIndex && m.role === 'user')
+  const nextUserIndex = state.messages.findIndex((m, i) => i > plan.userIndex && isRealUserMessage(m))
   const end = nextUserIndex < 0 ? state.messages.length : nextUserIndex
 
   return {
@@ -481,7 +482,7 @@ export interface RestorePlan {
 
 /** Resolve the user turn to rewind to; throws with a user-facing reason. */
 export function planRestore(messages: ChatMessage[], messageId: string, target?: RestoreTarget): RestorePlan {
-  const idIndex = messages.findIndex(m => m.id === messageId && m.role === 'user')
+  const idIndex = messages.findIndex(m => m.id === messageId && isRealUserMessage(m))
 
   const fallbackIndex =
     target?.userOrdinal === null || target?.userOrdinal === undefined
@@ -491,7 +492,7 @@ export function planRestore(messages: ChatMessage[], messageId: string, target?:
   const sourceIndex = idIndex >= 0 ? idIndex : fallbackIndex
   const source = messages[sourceIndex]
 
-  if (!source || source.role !== 'user') {
+  if (!source || !isRealUserMessage(source)) {
     throw new Error('Could not find the message to restore.')
   }
 
@@ -506,10 +507,9 @@ export function planRestore(messages: ChatMessage[], messageId: string, target?:
   // truncation address would mis-aim (#86573/#86623) — resubmit plainly.
   const isFailedTurn = isFailedUserTurn(messages, sourceIndex)
 
-  const truncateOrdinal =
-    target?.userOrdinal === null || target?.userOrdinal === undefined
-      ? visibleUserOrdinal(messages, sourceIndex)
-      : target.userOrdinal
+  // Recompute from the resolved message id. The renderer ordinal can include
+  // display-only rows and may be stale after hydration.
+  const truncateOrdinal = visibleUserOrdinal(messages, sourceIndex)
 
   return {
     sourceIndex,
@@ -546,10 +546,10 @@ export function planEdit(messages: ChatMessage[], edited: AppendMessage): EditPl
     return null
   }
 
-  const sourceIndex = messages.findIndex(m => m.id === sourceId)
+  const sourceIndex = messages.findIndex(m => m.id === sourceId && isRealUserMessage(m))
   const source = messages[sourceIndex]
 
-  if (!source || source.role !== 'user' || chatMessageText(source).trim() === text) {
+  if (!source || !isRealUserMessage(source) || chatMessageText(source).trim() === text) {
     return null
   }
 

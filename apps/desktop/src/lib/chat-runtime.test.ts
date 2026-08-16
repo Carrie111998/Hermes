@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
+import type { ChatMessage } from '@/lib/chat-messages'
 import type { ComposerAttachment } from '@/store/composer'
 
 import {
@@ -240,7 +241,21 @@ describe('messageCreatedAt', () => {
   })
 })
 
-describe('toRuntimeMessage timeline metadata', () => {
+describe('toRuntimeMessage', () => {
+  it('carries displayKind through assistant-ui metadata', () => {
+    const message = {
+      id: 'skill-turn',
+      role: 'user',
+      parts: [{ type: 'text', text: 'expanded skill invocation' }],
+      displayKind: 'skill_invocation'
+    } as ChatMessage
+
+    const runtime = toRuntimeMessage(message)
+    const custom = runtime.metadata?.custom as { displayKind?: string }
+
+    expect(custom.displayKind).toBe('skill_invocation')
+  })
+
   it('does not expose a fabricated visible timestamp for timestamp-less history', () => {
     const runtime = toRuntimeMessage({
       id: 'old-message',

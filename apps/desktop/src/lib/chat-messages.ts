@@ -21,6 +21,8 @@ export type ChatMessagePart = Exclude<ThreadMessageLike['content'], string>[numb
 export type ChatMessage = {
   id: string
   role: SessionMessage['role']
+  /** Original durable `display_kind`; absent on optimistic-only messages. */
+  displayKind?: SessionMessage['display_kind'] | null
   parts: ChatMessagePart[]
   timestamp?: number
   completedAt?: number
@@ -1230,6 +1232,7 @@ export function toChatMessages(messages: SessionMessage[]): ChatMessage[] {
     result.push({
       id: `${message.timestamp || Date.now()}-${index}-${displayRole}`,
       role: displayRole,
+      displayKind: message.display_kind ?? null,
       parts,
       timestamp: earliestTimestamp(message.timestamp, ...parts.map(part => part.timestamp)),
       ...(rowId !== undefined ? { rowId } : {}),

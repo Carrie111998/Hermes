@@ -600,11 +600,15 @@ export function appendText(message: AppendMessage): string {
     .trim()
 }
 
+export function isRealUserMessage(message: Pick<ChatMessage, 'displayKind' | 'hidden' | 'role'>): boolean {
+  return message.role === 'user' && !message.hidden && !message.displayKind
+}
+
 /** The one visible-user filter every user-ordinal computation must share —
  *  truncate ordinals, ordinal→index resolution, and survivor-rowId rebinding
  *  all rely on counting exactly the same turns. */
 export function isVisibleUserMessage(message: ChatMessage): boolean {
-  return message.role === 'user' && !message.hidden
+  return isRealUserMessage(message)
 }
 
 /**
