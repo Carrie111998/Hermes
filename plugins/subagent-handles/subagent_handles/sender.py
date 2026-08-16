@@ -1,7 +1,7 @@
 import logging
 from typing import Any, Dict
 
-from src.registry import registry
+from subagent_handles.registry import registry
 
 logger = logging.getLogger(__name__)
 
@@ -57,7 +57,7 @@ def handle_cancel_subagent(params: Dict[str, Any]) -> Dict[str, Any]:
     # Persist the cancelled state so a later session sees it (same store as
     # the hooks use — survive-restart parity with start/stop).
     try:
-        from src.persister import SessionPersister, default_persist_root
+        from subagent_handles.persister import SessionPersister, default_persist_root
 
         SessionPersister(default_persist_root()).checkpoint(handle)
     except Exception:

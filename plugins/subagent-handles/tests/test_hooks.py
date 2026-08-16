@@ -11,7 +11,7 @@ plugin = importlib.util.module_from_spec(_spec)
 sys.modules["subagent_handles_plugin"] = plugin
 _spec.loader.exec_module(plugin)
 
-from src.registry import SubagentRegistry
+from subagent_handles.registry import SubagentRegistry
 
 
 @pytest.fixture(autouse=True)

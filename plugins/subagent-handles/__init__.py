@@ -1,12 +1,12 @@
 import logging
-from src.registry import SubagentHandle, registry
-from src.persister import default_persist_root
+from subagent_handles.registry import SubagentHandle, registry
+from subagent_handles.persister import default_persist_root
 
 logger = logging.getLogger(__name__)
 
 
 def _get_persister():
-    from src.persister import SessionPersister
+    from subagent_handles.persister import SessionPersister
 
     return SessionPersister(default_persist_root())
 
@@ -72,7 +72,7 @@ def register(ctx) -> None:
     # Wire the subagent_send / cancel_subagent tools so the agent can
     # actually call them at runtime. They share the module-level registry.
     try:
-        from src.sender import register_tools as _register_tools
+        from subagent_handles.sender import register_tools as _register_tools
 
         _register_tools(ctx)
     except Exception:

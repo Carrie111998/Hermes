@@ -4,7 +4,7 @@ import threading
 from dataclasses import dataclass, field
 from typing import Dict, Optional
 
-from src.registry import SubagentHandle, SubagentRegistry
+from subagent_handles.registry import SubagentHandle, SubagentRegistry
 
 
 def default_persist_root() -> str:
@@ -13,9 +13,17 @@ def default_persist_root() -> str:
     Scoped to the active profile and shared by the start/stop hooks and the
     cancel tool so all writers land in the same store (survive-restart parity).
     """
-    _home = os.environ.get(
-        "HERMES_HOME", os.path.join(os.path.expanduser("~"), "AppData", "Local", "hermes")
-    )
+    try:
+        from hermes_constants import get_hermes_home
+
+        _home = str(get_hermes_home())
+    except Exception:
+        # Outside the Hermes runtime (standalone tests): prefer HERMES_HOME,
+        # falling back to a per-OS user state dir only as a last resort.
+        _home = os.environ.get(
+            "HERMES_HOME",
+            os.path.join(os.path.expanduser("~"), "AppData", "Local", "hermes"),
+        )
     return os.path.join(_home, "state", "subagent-handles")
 
 
@@ -87,6 +95,12 @@ class SessionPersister:
             handle = self.load(subagent_id)
             if handle is None:
                 continue
+            # A handle persisted as "running" belongs to a process that has
+            # since exited — children are subprocesses of the owner. Reconcile
+            # it to "failed" so subagent_send does not report queued to a dead
+            # child after a restart.
+            if handle.state == "running":
+                handle.state = "failed"
             try:
                 registry.register(handle)
                 restored[subagent_id] = handle

@@ -2,7 +2,7 @@ import threading
 
 import pytest
 
-from src.registry import SubagentHandle, SubagentRegistry, _ALLOWED_STATES
+from subagent_handles.registry import SubagentHandle, SubagentRegistry, _ALLOWED_STATES
 
 
 def test_register_and_resolve():

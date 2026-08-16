@@ -8,9 +8,9 @@ plugin = importlib.util.module_from_spec(_spec)
 sys.modules["subagent_handles_plugin"] = plugin
 _spec.loader.exec_module(plugin)
 
-from src import sender
-from src.sender import SCHEMA, handle_cancel_subagent, handle_subagent_send
-from src.registry import registry as shared_registry
+from subagent_handles import sender
+from subagent_handles.sender import SCHEMA, handle_cancel_subagent, handle_subagent_send
+from subagent_handles.registry import registry as shared_registry
 
 
 def _install_registry():
@@ -96,10 +96,10 @@ def test_schema_keys():
 # Regression test for the separate-registry bug: sender.py used to create
 # its own SubagentRegistry(), so a handle registered by the subagent_start
 # hook could never be resolved by subagent_send/cancel_subagent. Both now
-# import the module-level singleton from src.registry.
+# import the module-level singleton from subagent_handles.registry.
 
 def test_hook_registered_handle_is_resolvable_by_sender():
-    from src.registry import registry as shared
+    from subagent_handles.registry import registry as shared
     from subagent_handles_plugin import _on_subagent_start, _on_subagent_stop
 
     # Clean slate
@@ -136,9 +136,9 @@ def test_hook_registered_handle_is_resolvable_by_sender():
 
 def test_singleton_identity():
     """The hook module and the sender module must reference the same object."""
-    from src.registry import registry as shared_registry
+    from subagent_handles.registry import registry as shared_registry
     import subagent_handles_plugin
-    from src import sender
+    from subagent_handles import sender
 
     assert subagent_handles_plugin.registry is shared_registry
     assert sender.registry is shared_registry

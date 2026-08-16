@@ -4,8 +4,8 @@ import tempfile
 
 import pytest
 
-from src.persister import SessionPersister
-from src.registry import SubagentHandle, SubagentRegistry
+from subagent_handles.persister import SessionPersister
+from subagent_handles.registry import SubagentHandle, SubagentRegistry
 
 
 def test_checkpoint_roundtrip():
@@ -37,7 +37,9 @@ def test_restore_into_registry():
         registry = SubagentRegistry()
         restored = p.restore(registry)
         assert set(restored.keys()) == {"a1", "a2"}
-        assert registry.resolve("a1").state == "running"
+        # A handle persisted as "running" belongs to a since-dead process; it
+        # is reconciled to "failed" so the sender won't steer a corpse.
+        assert registry.resolve("a1").state == "failed"
         assert registry.resolve("a2").state == "done"
 
 
@@ -121,7 +123,7 @@ def test_register_restores_persisted_handles(monkeypatch, tmp_path):
 
     handle = plugin.registry.resolve("sa-old")
     assert handle is not None
-    assert handle.state == "running"
+    assert handle.state == "failed"  # persisted 'running' is a dead child post-restart
 
 
 def test_stop_hook_persists_done_state(monkeypatch, tmp_path):
