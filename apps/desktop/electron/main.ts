@@ -10026,8 +10026,14 @@ ipcMain.handle('hermes:claw3d:setup', async (event, profile) => {
       win.webContents.send('hermes:claw3d:setup-progress', progress)
     }
   }
-  await claw3d.setupClaw3d(broadcast, profile)
-  return { ok: true }
+  try {
+    await claw3d.setupClaw3d(broadcast, profile)
+    return { ok: true }
+  } catch (error) {
+    // Keep the declared { ok: boolean } IPC contract on git-clone/npm-install
+    // failures instead of rejecting the invoke with an unhandled error.
+    return { ok: false, error: error instanceof Error ? error.message : String(error) }
+  }
 })
 ipcMain.handle('hermes:claw3d:start', async (_event, profile) => claw3d.startAll(profile))
 ipcMain.handle('hermes:claw3d:stop', async () => {

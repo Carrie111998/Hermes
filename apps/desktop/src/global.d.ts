@@ -45,7 +45,7 @@ declare global {
           error: string
           oauthUnsupported: boolean
         }>
-        setup: (profile?: null | string) => Promise<{ ok: boolean }>
+        setup: (profile?: null | string) => Promise<{ ok: boolean; error?: string }>
         start: (profile?: null | string) => Promise<{ success: boolean; error?: string }>
         stop: () => Promise<{ ok: boolean }>
         getLogs: () => Promise<{ logs: string }>

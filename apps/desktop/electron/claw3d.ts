@@ -15,8 +15,7 @@
  */
 import type { ChildProcess} from 'child_process';
 import { execFileSync, spawn, spawnSync } from 'child_process'
-import { existsSync, mkdirSync, readdirSync, readFileSync, unlinkSync, writeFileSync } from 'fs'
-import http from 'http'
+import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from 'fs'
 import { createConnection } from 'net'
 import { homedir } from 'os'
 import { join } from 'path'
@@ -182,6 +181,19 @@ export function adapterPortFromWsUrl(url: string): number {
   return DEFAULT_ADAPTER_PORT
 }
 
+/** Strip the session token from a gateway URL. NEXT_PUBLIC_* values are
+ *  inlined into the client bundle by Next.js, so the tokenized URL must only
+ *  ever reach server-side vars (CLAW3D_GATEWAY_URL / CLAW3D_GATEWAY_TOKEN). */
+export function stripGatewayToken(url: string): string {
+  try {
+    const parsed = new URL(url)
+    parsed.searchParams.delete('token')
+    return parsed.toString()
+  } catch {
+    return url
+  }
+}
+
 export function buildOfficeEnv(opts: {
   port: number
   url: string
@@ -196,7 +208,7 @@ export function buildOfficeEnv(opts: {
     '# Auto-configured by Hermes Desktop',
     `PORT=${opts.port}`,
     `HOST=127.0.0.1`,
-    `NEXT_PUBLIC_GATEWAY_URL=${opts.url}`,
+    `NEXT_PUBLIC_GATEWAY_URL=${stripGatewayToken(opts.url)}`,
     `CLAW3D_GATEWAY_URL=${opts.url}`,
     `CLAW3D_GATEWAY_TOKEN=${opts.apiKey}`,
     `CLAW3D_GATEWAY_ADAPTER_TYPE=hermes`,
@@ -329,22 +341,6 @@ function probeTcp(port: number, host = '127.0.0.1', timeoutMs = 300): Promise<bo
   })
 }
 
-function probeHttp(url: string, timeoutMs = 1500): Promise<boolean> {
-  return new Promise(resolve => {
-    const req = http.request(url, { method: 'GET', timeout: timeoutMs }, res => {
-      res.resume()
-      resolve(true)
-    })
-
-    req.on('error', () => resolve(false))
-    req.on('timeout', () => {
-      req.destroy()
-      resolve(false)
-    })
-    req.end()
-  })
-}
-
 export interface Claw3dStatus {
   cloned: boolean
   installed: boolean
@@ -413,6 +409,45 @@ function isAdapterRunning(): boolean {
   const pid = readPid(ADAPTER_PID_FILE)
 
   if (pid && isProcessRunning(pid)) {return true}
+  cleanupPid(ADAPTER_PID_FILE)
+
+  return false
+}
+
+/** Trust a pid file's liveness claim blindly only while the child may still be
+ *  booting; after that, cross-check the TCP port so an OS-reused PID can't
+ *  keep reporting a dead server as "running". */
+const PID_STARTUP_GRACE_MS = 60_000
+
+function pidFileAgeMs(file: string): number {
+  try {
+    return Date.now() - statSync(file).mtimeMs
+  } catch {
+    return Number.POSITIVE_INFINITY
+  }
+}
+
+async function isDevServerLive(): Promise<boolean> {
+  if (devServerProcess && !devServerProcess.killed) {return true}
+  const pid = readPid(DEV_PID_FILE)
+
+  if (pid && isProcessRunning(pid)) {
+    if (pidFileAgeMs(DEV_PID_FILE) < PID_STARTUP_GRACE_MS) {return true}
+    if (await probeTcp(getClaw3dPort())) {return true}
+  }
+  cleanupPid(DEV_PID_FILE)
+
+  return false
+}
+
+async function isAdapterLive(): Promise<boolean> {
+  if (adapterProcess && !adapterProcess.killed) {return true}
+  const pid = readPid(ADAPTER_PID_FILE)
+
+  if (pid && isProcessRunning(pid)) {
+    if (pidFileAgeMs(ADAPTER_PID_FILE) < PID_STARTUP_GRACE_MS) {return true}
+    if (await probeTcp(DEFAULT_ADAPTER_PORT)) {return true}
+  }
   cleanupPid(ADAPTER_PID_FILE)
 
   return false
@@ -503,9 +538,9 @@ export async function getClaw3dStatus(profile?: string): Promise<Claw3dStatus> {
 
   if (installed) {void writeClaw3dSettings(profile)}
   const port = getClaw3dPort()
-  const devRunning = isDevServerRunning()
+  const devRunning = await isDevServerLive()
   const portInUse = devRunning ? false : await probeTcp(port)
-  const adapterUp = isAdapterRunning()
+  const adapterUp = await isAdapterLive()
 
   return {
     cloned,

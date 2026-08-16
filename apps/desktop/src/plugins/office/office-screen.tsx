@@ -71,7 +71,9 @@ export function OfficeScreen() {
     setActionError(null)
 
     try {
-      await runSetup()
+      const result = await runSetup()
+
+      if (!result.ok) {setActionError(result.error ?? k.setupFailed)}
       await refetch()
     } catch (err) {
       setActionError(err instanceof Error ? err.message : k.setupFailed)

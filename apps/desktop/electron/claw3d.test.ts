@@ -11,6 +11,7 @@ import {
   gatewayWsUrl,
   isWindowsCommandScript,
   pickWindowsCommandCandidate,
+  stripGatewayToken,
   writeOfficeFileIfChanged
 } from './claw3d'
 
@@ -65,6 +66,24 @@ describe('adapterPortFromWsUrl', () => {
   })
 })
 
+describe('stripGatewayToken', () => {
+  it('removes the token query parameter', () => {
+    expect(stripGatewayToken('ws://127.0.0.1:18968/api/ws?token=x')).toBe('ws://127.0.0.1:18968/api/ws')
+  })
+
+  it('keeps other query parameters', () => {
+    expect(stripGatewayToken('ws://127.0.0.1:18968/api/ws?token=x&other=1')).toBe('ws://127.0.0.1:18968/api/ws?other=1')
+  })
+
+  it('leaves a tokenless URL unchanged', () => {
+    expect(stripGatewayToken('ws://127.0.0.1:18968/api/ws')).toBe('ws://127.0.0.1:18968/api/ws')
+  })
+
+  it('falls back to the raw input on parse failure', () => {
+    expect(stripGatewayToken('not a url')).toBe('not a url')
+  })
+})
+
 describe('buildOfficeEnv', () => {
   it('writes the expected dotenv lines', () => {
     const env = buildOfficeEnv({
@@ -81,6 +100,23 @@ describe('buildOfficeEnv', () => {
     expect(env).toContain('HERMES_API_KEY=x')
     expect(env).toContain('HERMES_ADAPTER_PORT=18989')
     expect(env).toContain('CLAW3D_GATEWAY_ADAPTER_TYPE=hermes')
+  })
+
+  it('keeps the session token out of the client-bundle var', () => {
+    const env = buildOfficeEnv({
+      port: 3000,
+      url: 'ws://127.0.0.1:18968/api/ws?token=sekret',
+      apiUrl: 'http://127.0.0.1:8642',
+      apiKey: 'sekret',
+      model: 'hermes',
+      adapterPort: 18989
+    })
+
+    // NEXT_PUBLIC_* vars are inlined into the client bundle — the tokenized
+    // URL must only reach the server-side CLAW3D_GATEWAY_URL.
+    expect(env).toContain('NEXT_PUBLIC_GATEWAY_URL=ws://127.0.0.1:18968/api/ws\n')
+    expect(env).not.toContain('NEXT_PUBLIC_GATEWAY_URL=ws://127.0.0.1:18968/api/ws?token=')
+    expect(env).toContain('CLAW3D_GATEWAY_URL=ws://127.0.0.1:18968/api/ws?token=sekret')
   })
 })
 
