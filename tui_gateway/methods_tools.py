@@ -48,8 +48,14 @@ def _(rid, params: dict) -> dict:
 
 @method("process.list")
 def _(rid, params: dict) -> dict:
-    """Session-scoped view of the background process registry (desktop status stack)."""
-    session, err = _sess(params, rid)
+    """Session-scoped view of the background process registry (desktop status stack).
+
+    Resolves via ``_sess_building``: ``_session_processes`` matches on
+    ``session_key`` against the global process registry and never touches the
+    agent, so waiting on the deferred build only left the status stack empty for
+    up to 30 seconds on a cold resume.
+    """
+    session, err = _sess_building(params, rid)
     if err:
         return err
     try:
