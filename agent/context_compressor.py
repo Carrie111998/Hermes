@@ -177,6 +177,7 @@ MAX_ITERATIONS_SUMMARY_REQUEST = (
     "Please provide a final response summarizing what you've found and accomplished so far, "
     "without calling any more tools."
 )
+_BACKGROUND_PROCESS_NOTIFICATION_PREFIX = "[IMPORTANT: Background process "
 
 
 def _fresh_compaction_message_copy(msg: Dict[str, Any]) -> Dict[str, Any]:
@@ -4582,7 +4583,8 @@ This compaction should PRIORITISE preserving all information related to the focu
         """Recognize internal user-role rows after SessionDB projection.
 
         SessionDB preserves role/content but not underscore-prefixed metadata,
-        so the stable todo and continuation content markers are authoritative.
+        so stable runtime-notification, todo, and continuation content markers
+        are authoritative.
         """
         if not isinstance(message, dict) or message.get("role") != "user":
             return False
@@ -4592,12 +4594,37 @@ This compaction should PRIORITISE preserving all information related to the focu
         if cls._is_context_summary_content(content):
             return True
         text = _content_text_for_contains(content).strip()
+        # Sibling recovery nudges from agent.conversation_loop's retry loop:
+        # same "ephemeral scaffolding, not a real human turn" class as the
+        # markers above (see _CODEX_INCOMPLETE_NUDGE's own docstring there),
+        # imported lazily to avoid a module-load-order cycle (conversation_loop
+        # already imports FROM this module at call time for the same reason).
+        from agent.conversation_loop import (
+            _CODEX_ACK_CONTINUATION_NUDGE,
+            _CODEX_INCOMPLETE_NUDGE,
+            _DROPPED_TOOLCALL_NUDGE_CONTENT,
+            _EMPTY_TOOL_RESPONSE_NUDGE,
+            _LENGTH_CONTINUATION_DROPPED_TOOLS_PREFIX,
+            _LENGTH_CONTINUATION_NETWORK_STUB,
+            _LENGTH_CONTINUATION_OUTPUT_LIMIT,
+        )
+
         return text in {
             COMPRESSION_CONTINUATION_USER_CONTENT,
             _LEGACY_COMPRESSION_CONTINUATION_USER_CONTENT,
             MAX_ITERATIONS_SUMMARY_REQUEST,
+            _CODEX_INCOMPLETE_NUDGE,
+            _CODEX_ACK_CONTINUATION_NUDGE,
+            _DROPPED_TOOLCALL_NUDGE_CONTENT,
+            _EMPTY_TOOL_RESPONSE_NUDGE,
+            _LENGTH_CONTINUATION_NETWORK_STUB,
+            _LENGTH_CONTINUATION_OUTPUT_LIMIT,
         } or text.startswith(
+            _BACKGROUND_PROCESS_NOTIFICATION_PREFIX
+        ) or text.startswith(
             TODO_INJECTION_HEADER + "\n"
+        ) or text.startswith(
+            _LENGTH_CONTINUATION_DROPPED_TOOLS_PREFIX
         )
 
     @staticmethod
@@ -6576,17 +6603,15 @@ This compaction should PRIORITISE preserving all information related to the focu
         _previous_summary_before_scan = self._previous_summary
         _summary_has_user_turn_before_scan = getattr(self, "_summary_has_user_turn", None)
         # A persisted handoff summary can sit in the protected head after a
-        # resume (commonly immediately after the system prompt). Search from
-        # the first non-system message through the compression window. On the
-        # first compaction after a restart, extend through the full transcript
-        # so summaries that landed in the protected tail or drifted past the
-        # decay probe still rehydrate iterative-summary state instead of being
-        # copied forward as stacked fossils.
+        # resume (commonly immediately after the system prompt), or later in
+        # the live window past a degenerate compress_end (#83248). Always
+        # search the full transcript for handoff rows: the content-prefix
+        # check is cheap, Phase 4 already advances tail_start when
+        # summary_idx >= compress_end, and the #57835 cross-session discard
+        # must only fire after a full-window miss — never after a narrow
+        # scan that could hide a same-session handoff beyond the cut.
         summary_search_start = 1 if messages and messages[0].get("role") == "system" else 0
-        summary_search_end = compress_end
-        if self.compression_count < 1 and not self._previous_summary:
-            summary_search_end = len(messages)
-        summary_search_end = min(len(messages), summary_search_end)
+        summary_search_end = len(messages)
         summary_indices: set[int] = set()
         summary_idx = None
         summary_body = None
@@ -6656,11 +6681,12 @@ This compaction should PRIORITISE preserving all information related to the focu
             if summary_idx >= compress_end:
                 tail_start = summary_idx + 1
         elif self._previous_summary:
-            # No handoff summary found in the current messages, but
+            # Full-window scan found no handoff in the current messages, but
             # _previous_summary is non-empty — it was set by a different
             # (now-ended) session (e.g., a cron job, a prior /new).  Discard
             # it so _generate_summary() does not inject cross-session content
             # into the summarizer prompt via the iterative-update path.
+            # Do not clear based on a compress_end-bounded miss (#83248).
             self._previous_summary = None
             self._summary_has_user_turn = real_user_present
         else:
