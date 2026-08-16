@@ -329,6 +329,92 @@ def test_scope_mutation_invalidates_grant_before_consumption(
     ) is None
 
 
+def test_scope_digest_tracks_prior_attempt_context(kanban_home: Path) -> None:
+    from hermes_cli import kanban_approval as ka
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="retry review", assignee="worker-o")
+        assert kb.claim_task(conn, task_id, claimer="dispatcher:first") is not None
+        assert kb.block_task(conn, task_id, reason="original attempt summary") is True
+        before_context = kb.build_worker_context(conn, task_id)
+        before_digest = ka.task_scope_digest(conn, task_id)
+        conn.execute(
+            "UPDATE task_runs SET summary = ? WHERE task_id = ?",
+            ("mutated attempt summary", task_id),
+        )
+        conn.commit()
+
+        assert kb.build_worker_context(conn, task_id) != before_context
+        assert ka.task_scope_digest(conn, task_id) != before_digest
+
+
+def test_parent_run_handoff_mutation_invalidates_grant(
+    kanban_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from hermes_cli import kanban_approval as ka
+
+    with kb.connect() as conn:
+        parent_id = kb.create_task(conn, title="parent", assignee="worker-s")
+        assert kb.claim_task(conn, parent_id, claimer="dispatcher:parent") is not None
+        assert kb.complete_task(conn, parent_id, summary="original parent handoff") is True
+        task_id = kb.create_task(
+            conn,
+            title="review child",
+            assignee="worker-o",
+            parents=[parent_id],
+        )
+        before_context = kb.build_worker_context(conn, task_id)
+        stored = ka.grant_task_approval(conn, task_id, _grant(), now=1_000)
+        before_digest = stored["scope_digest"]
+        conn.execute(
+            "UPDATE task_runs SET summary = ? WHERE task_id = ?",
+            ("mutated parent handoff", parent_id),
+        )
+        conn.commit()
+
+        assert kb.build_worker_context(conn, task_id) != before_context
+        assert ka.task_scope_digest(conn, task_id) != before_digest
+        claimed = kb.claim_task(conn, task_id, claimer="dispatcher:child")
+        assert claimed is not None
+
+    _bind_worker_env(monkeypatch, claimed, "apr-relay-test-001")
+    assert ka.consume_task_approval(
+        ["test.run"], action_class="command", now=1_001
+    ) is None
+
+
+def test_cross_task_role_history_mutation_invalidates_grant(
+    kanban_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from hermes_cli import kanban_approval as ka
+
+    with kb.connect() as conn:
+        prior_id = kb.create_task(conn, title="prior review", assignee="worker-o")
+        assert kb.claim_task(conn, prior_id, claimer="dispatcher:prior") is not None
+        assert kb.complete_task(conn, prior_id, summary="original role history") is True
+        task_id = kb.create_task(conn, title="next review", assignee="worker-o")
+        before_context = kb.build_worker_context(conn, task_id)
+        stored = ka.grant_task_approval(conn, task_id, _grant(), now=1_000)
+        before_digest = stored["scope_digest"]
+        conn.execute(
+            "UPDATE task_runs SET summary = ? WHERE task_id = ?",
+            ("mutated role history", prior_id),
+        )
+        conn.commit()
+
+        assert kb.build_worker_context(conn, task_id) != before_context
+        assert ka.task_scope_digest(conn, task_id) != before_digest
+        claimed = kb.claim_task(conn, task_id, claimer="dispatcher:next")
+        assert claimed is not None
+
+    _bind_worker_env(monkeypatch, claimed, "apr-relay-test-001")
+    assert ka.consume_task_approval(
+        ["test.run"], action_class="command", now=1_001
+    ) is None
+
+
 def test_grant_rejects_actor_mismatch_invalid_ttl_and_empty_operations(
     kanban_home: Path,
 ) -> None:

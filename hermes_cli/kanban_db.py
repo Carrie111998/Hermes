@@ -10665,6 +10665,95 @@ def run_daemon(
 # Worker context builder (what a spawned worker sees)
 # ---------------------------------------------------------------------------
 
+def worker_context_history_snapshot(
+    conn: sqlite3.Connection,
+    task_id: str,
+) -> dict[str, Any]:
+    """Return the canonical run/handoff/history inputs rendered for a worker.
+
+    Approval scope hashing consumes this same snapshot. Keep instruction-bearing
+    DB input in this helper rather than adding an independent query to
+    ``build_worker_context``; otherwise a prompt mutation could escape a bound
+    approval digest.
+    """
+    task = get_task(conn, task_id)
+    if not task:
+        raise ValueError(f"unknown task {task_id}")
+
+    all_prior = [run for run in list_runs(conn, task_id) if run.ended_at is not None]
+    prior_omitted = max(0, len(all_prior) - _CTX_MAX_PRIOR_ATTEMPTS)
+    shown_prior = all_prior[-_CTX_MAX_PRIOR_ATTEMPTS:]
+    prior_attempts = [
+        {
+            "id": run.id,
+            "profile": run.profile,
+            "status": run.status,
+            "started_at": run.started_at,
+            "ended_at": run.ended_at,
+            "outcome": run.outcome,
+            "summary": run.summary,
+            "metadata": run.metadata,
+            "error": run.error,
+        }
+        for run in shown_prior
+    ]
+
+    parent_handoffs: list[dict[str, Any]] = []
+    parent_rows = conn.execute(
+        "SELECT parent_id FROM task_links WHERE child_id = ? ORDER BY parent_id",
+        (task_id,),
+    ).fetchall()
+    for parent_row in parent_rows:
+        parent = get_task(conn, parent_row["parent_id"])
+        if not parent or parent.status != "done":
+            continue
+        completed_runs = [
+            run for run in list_runs(conn, parent.id) if run.outcome == "completed"
+        ]
+        completed_runs.sort(key=lambda run: run.started_at, reverse=True)
+        run = completed_runs[0] if completed_runs else None
+        parent_handoffs.append(
+            {
+                "task_id": parent.id,
+                "task_result": parent.result,
+                "task_completed_at": parent.completed_at,
+                "run": (
+                    {
+                        "id": run.id,
+                        "started_at": run.started_at,
+                        "ended_at": run.ended_at,
+                        "summary": run.summary,
+                        "metadata": run.metadata,
+                    }
+                    if run is not None
+                    else None
+                ),
+            }
+        )
+
+    role_history: list[dict[str, Any]] = []
+    if task.assignee:
+        role_history = [
+            {key: row[key] for key in row.keys()}
+            for row in conn.execute(
+                "SELECT t.id, t.title, r.summary, r.ended_at "
+                "FROM task_runs r JOIN tasks t ON r.task_id = t.id "
+                "WHERE r.profile = ? AND r.task_id != ? "
+                "  AND r.outcome = 'completed' "
+                "ORDER BY r.ended_at DESC LIMIT 5",
+                (task.assignee, task_id),
+            ).fetchall()
+        ]
+
+    return {
+        "schema_version": 1,
+        "prior_attempts_omitted": prior_omitted,
+        "prior_attempts": prior_attempts,
+        "parent_handoffs": parent_handoffs,
+        "role_history": role_history,
+    }
+
+
 def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     """Return the full text a worker should read to understand its task.
 
@@ -10691,6 +10780,7 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     task = get_task(conn, task_id)
     if not task:
         raise ValueError(f"unknown task {task_id}")
+    history_snapshot = worker_context_history_snapshot(conn, task_id)
 
     # Single clock reading shared by every relative-age stamp below, so all
     # ages in one rendering are consistent ("3h ago" / "3h ago", not drifting
@@ -10756,16 +10846,9 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     # Cap at _CTX_MAX_PRIOR_ATTEMPTS most-recent closed runs; older
     # attempts get collapsed into a one-line marker so the worker knows
     # more exist without bloating the prompt.
-    all_prior = [r for r in list_runs(conn, task_id) if r.ended_at is not None]
-    # list_runs returns ascending by started_at; "most recent" = last N
-    if len(all_prior) > _CTX_MAX_PRIOR_ATTEMPTS:
-        omitted = len(all_prior) - _CTX_MAX_PRIOR_ATTEMPTS
-        shown = all_prior[-_CTX_MAX_PRIOR_ATTEMPTS:]
-        first_shown_idx = omitted + 1
-    else:
-        omitted = 0
-        shown = all_prior
-        first_shown_idx = 1
+    omitted = history_snapshot["prior_attempts_omitted"]
+    shown = history_snapshot["prior_attempts"]
+    first_shown_idx = omitted + 1
     if shown:
         lines.append("## Prior attempts on this task")
         if omitted:
@@ -10775,19 +10858,21 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
             )
         for offset, run in enumerate(shown):
             idx = first_shown_idx + offset
-            ts = time.strftime("%Y-%m-%d %H:%M", time.localtime(run.started_at))
-            age = _relative_age(run.started_at, _now)
+            ts = time.strftime("%Y-%m-%d %H:%M", time.localtime(run["started_at"]))
+            age = _relative_age(run["started_at"], _now)
             ts_disp = f"{ts}, {age}" if age else ts
-            profile = run.profile or "(unknown)"
-            outcome = run.outcome or run.status
+            profile = run["profile"] or "(unknown)"
+            outcome = run["outcome"] or run["status"]
             lines.append(f"### Attempt {idx} — {outcome} ({profile}, {ts_disp})")
-            if run.summary and run.summary.strip():
-                lines.append(_cap(run.summary))
-            if run.error and run.error.strip():
-                lines.append(f"_error_: {_cap(run.error)}")
-            if run.metadata:
+            if run["summary"] and run["summary"].strip():
+                lines.append(_cap(run["summary"]))
+            if run["error"] and run["error"].strip():
+                lines.append(f"_error_: {_cap(run['error'])}")
+            if run["metadata"]:
                 try:
-                    meta_str = json.dumps(run.metadata, ensure_ascii=False, sort_keys=True)
+                    meta_str = json.dumps(
+                        run["metadata"], ensure_ascii=False, sort_keys=True
+                    )
                     lines.append(f"_metadata_: `{_cap(meta_str)}`")
                 except Exception:
                     pass
@@ -10796,54 +10881,43 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     # Parents: prefer the most-recent 'completed' run's summary + metadata,
     # fall back to ``task.result`` when no run rows exist (legacy DBs,
     # or tasks completed before the runs table landed).
-    parent_rows = conn.execute(
-        "SELECT parent_id FROM task_links WHERE child_id = ? ORDER BY parent_id",
-        (task_id,),
-    ).fetchall()
-    parent_ids = [r["parent_id"] for r in parent_rows]
-
-    if parent_ids:
-        wrote_header = False
-        for pid in parent_ids:
-            pt = get_task(conn, pid)
-            if not pt or pt.status != "done":
-                continue
-            runs = [r for r in list_runs(conn, pid) if r.outcome == "completed"]
-            runs.sort(key=lambda r: r.started_at, reverse=True)
-            run = runs[0] if runs else None
-
-            if not wrote_header:
-                lines.append("## Parent task results")
-                lines.append(
-                    "_Handoffs from upstream tasks, captured when each parent "
-                    "completed (see age below). These are point-in-time "
-                    "snapshots, not live state — if a result drives your "
-                    "current work and it's not recent, re-verify against the "
-                    "source before acting on it as current._"
-                )
-                wrote_header = True
+    parent_handoffs = history_snapshot["parent_handoffs"]
+    if parent_handoffs:
+        lines.append("## Parent task results")
+        lines.append(
+            "_Handoffs from upstream tasks, captured when each parent "
+            "completed (see age below). These are point-in-time "
+            "snapshots, not live state — if a result drives your "
+            "current work and it's not recent, re-verify against the "
+            "source before acting on it as current._"
+        )
+        for parent in parent_handoffs:
+            pid = parent["task_id"]
+            run = parent["run"]
 
             # When did this parent's result get produced? Prefer the
             # completed run's end time; fall back to the task's completed_at.
             done_ts = None
-            if run is not None and getattr(run, "ended_at", None):
-                done_ts = run.ended_at
-            elif pt.completed_at:
-                done_ts = pt.completed_at
+            if run is not None and run["ended_at"]:
+                done_ts = run["ended_at"]
+            elif parent["task_completed_at"]:
+                done_ts = parent["task_completed_at"]
             age = _relative_age(done_ts, _now)
             lines.append(f"### {pid}" + (f" (completed {age})" if age else ""))
 
             body_lines: list[str] = []
-            if run is not None and run.summary and run.summary.strip():
-                body_lines.append(_cap(run.summary))
-            elif pt.result:
-                body_lines.append(_cap(pt.result))
+            if run is not None and run["summary"] and run["summary"].strip():
+                body_lines.append(_cap(run["summary"]))
+            elif parent["task_result"]:
+                body_lines.append(_cap(parent["task_result"]))
             else:
                 body_lines.append("(no result recorded)")
 
-            if run is not None and run.metadata:
+            if run is not None and run["metadata"]:
                 try:
-                    meta_str = json.dumps(run.metadata, ensure_ascii=False, sort_keys=True)
+                    meta_str = json.dumps(
+                        run["metadata"], ensure_ascii=False, sort_keys=True
+                    )
                     body_lines.append(f"_metadata_: `{_cap(meta_str)}`")
                 except Exception:
                     pass
@@ -10856,27 +10930,19 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     # the user to wire anything into SOUL.md / MEMORY.md. Bounded to the
     # most recent 5 completed runs, excluding this task so the retry
     # section above isn't duplicated. Safe on assignee=None (skipped).
-    if task.assignee:
-        role_rows = conn.execute(
-            "SELECT t.id, t.title, r.summary, r.ended_at "
-            "FROM task_runs r JOIN tasks t ON r.task_id = t.id "
-            "WHERE r.profile = ? AND r.task_id != ? "
-            "  AND r.outcome = 'completed' "
-            "ORDER BY r.ended_at DESC LIMIT 5",
-            (task.assignee, task_id),
-        ).fetchall()
-        if role_rows:
-            lines.append(f"## Recent work by @{task.assignee}")
-            for row in role_rows:
-                ts = time.strftime(
-                    "%Y-%m-%d %H:%M", time.localtime(int(row["ended_at"]))
-                )
-                age = _relative_age(row["ended_at"], _now)
-                ts_disp = f"{ts}, {age}" if age else ts
-                s = (row["summary"] or "").strip().splitlines()
-                first = s[0][:200] if s else "(no summary)"
-                lines.append(f"- {row['id']} — {row['title']} ({ts_disp}): {first}")
-            lines.append("")
+    role_rows = history_snapshot["role_history"]
+    if role_rows:
+        lines.append(f"## Recent work by @{task.assignee}")
+        for row in role_rows:
+            ts = time.strftime(
+                "%Y-%m-%d %H:%M", time.localtime(int(row["ended_at"]))
+            )
+            age = _relative_age(row["ended_at"], _now)
+            ts_disp = f"{ts}, {age}" if age else ts
+            s = (row["summary"] or "").strip().splitlines()
+            first = s[0][:200] if s else "(no summary)"
+            lines.append(f"- {row['id']} — {row['title']} ({ts_disp}): {first}")
+        lines.append("")
 
     # Comments: cap at the most-recent _CTX_MAX_COMMENTS so
     # comment-storm tasks don't blow out the worker's prompt. Older

@@ -273,11 +273,14 @@ def _sha256_file(path_value: str) -> str:
 def task_scope_digest(conn, task_id: str) -> str:
     """Hash every durable input that becomes worker instruction/context.
 
-    Runtime status, claim/run rows, task events, and the approval row itself are
-    excluded because dispatcher bookkeeping changes them after issuance. Task
-    fields, comments, parent outcomes, and attachment bytes are included so a
-    post-grant context edit invalidates the capability.
+    Runtime status, the active claim/run, task events, and the approval row itself
+    are excluded because dispatcher bookkeeping changes them after issuance.
+    Task fields, comments, attachment bytes, prior attempts, parent handoffs, and
+    role history are included so a post-grant context edit invalidates the
+    capability.
     """
+    from hermes_cli import kanban_db as kb
+
     task = conn.execute(
         _TASK_SCOPE_QUERY,
         (task_id,),
@@ -316,6 +319,7 @@ def task_scope_digest(conn, task_id: str) -> str:
         "comments": comments,
         "parents": parents,
         "attachments": attachments,
+        "worker_context_history": kb.worker_context_history_snapshot(conn, task_id),
     }
     canonical = json.dumps(
         payload,
