@@ -194,6 +194,23 @@ def test_build_system_prompt_records_stable_prefix():
     assert prompt[len(agent._cached_system_prompt_static):].startswith("\n\ncontext")
 
 
+def test_execution_mode_selects_stable_prompt_guidance():
+    common = dict(
+        valid_tool_names=["read_file"],
+        model="gpt-5",
+        _tool_use_enforcement=True,
+        _parallel_tool_call_guidance=False,
+    )
+    fast = _stable_prompt(_make_agent(_execution_mode="fast", **common))
+    balanced = _stable_prompt(_make_agent(_execution_mode="balanced", **common))
+    rigorous = _stable_prompt(_make_agent(_execution_mode="rigorous", **common))
+
+    assert "zero to three tool calls" in fast
+    assert "reasonable chance" in balanced
+    assert "Keep calling tools until" in rigorous
+    assert len({fast, balanced, rigorous}) == 3
+
+
 def test_coding_prompt_preserves_legacy_workspace_order(monkeypatch):
     """The cache split must not reorder the stored coding prompt."""
     import agent.system_prompt as system_prompt

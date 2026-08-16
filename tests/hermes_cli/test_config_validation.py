@@ -111,6 +111,20 @@ class TestVoiceSubmitModeValidation:
         )
 
 
+class TestExecutionModeValidation:
+    def test_accepts_supported_modes(self):
+        for mode in ("fast", "balanced", "rigorous"):
+            issues = validate_config_structure({"agent": {"execution_mode": mode}})
+            assert not any("execution_mode" in issue.message for issue in issues)
+
+    def test_rejects_unknown_mode(self):
+        issues = validate_config_structure({"agent": {"execution_mode": "turbo"}})
+        assert any(
+            issue.severity == "error" and "fast, balanced, rigorous" in issue.message
+            for issue in issues
+        )
+
+
 class TestUnknownTopLevelKeys:
     """Arbitrary top-level keys must NOT warn — they are bridged to os.environ.
 
@@ -140,4 +154,3 @@ class TestUnknownTopLevelKeys:
         ]
         assert any("base_url" in i.message for i in misplaced)
         assert any("api_key" in i.message for i in misplaced)
-

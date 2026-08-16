@@ -1015,6 +1015,31 @@ When the iteration budget is fully exhausted, the CLI shows a notification to th
 
 `agent.api_max_retries` controls how many times Hermes retries a provider API call on transient errors (rate limits, connection drops, 5xx) **before** fallback-provider switching engages. The default is `3` — four attempts total. If you have [fallback providers](/user-guide/features/fallback-providers) configured and want to fail over faster, drop this to `0` so the first transient error on your primary immediately hands off to the fallback instead of churning retries against the flaky endpoint.
 
+### Execution mode
+
+`agent.execution_mode` controls how aggressively the system prompt asks the agent to use tools, retry, verify, and load skills. The default is `rigorous`, preserving the behavior of existing installations.
+
+| Mode | Behavior |
+|------|----------|
+| `fast` | Direct answers for simple questions, selective skill loading, bounded retries, and proportional verification. Grounding and side-effect checks remain mandatory. |
+| `balanced` | Uses tools and skills when materially useful, retries when likely to help, and verifies side effects and consequential claims. |
+| `rigorous` | Preserves exhaustive execution, persistence, verification, and mandatory skill loading for builds, migrations, incident response, and high-risk work. |
+
+For faster everyday interactions:
+
+```bash
+hermes config set agent.execution_mode fast
+```
+
+Or edit `config.yaml`:
+
+```yaml
+agent:
+  execution_mode: fast
+```
+
+The selected mode is fixed when a conversation starts. Changing it affects new conversations, not the cached prompt of an existing conversation.
+
 ## Verify-on-Stop (coding verification)
 
 When enabled, Hermes refuses to accept a final answer on a turn where the agent edited code in a workspace but produced no fresh verification evidence (a passing test run, build, lint, etc.) — it injects a synthetic follow-up asking the agent to verify or explain why it can't. Doc/markdown/skill-only edits never trigger it, and the loop is bounded so it can never trap the agent.

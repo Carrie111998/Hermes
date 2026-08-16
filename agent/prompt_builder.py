@@ -354,6 +354,38 @@ TOOL_USE_ENFORCEMENT_GUIDANCE = (
     "without acting are not acceptable."
 )
 
+EXECUTION_MODES = ("fast", "balanced", "rigorous")
+
+
+def normalize_execution_mode(value: object) -> str:
+    """Return a supported execution mode, preserving legacy rigor by default."""
+    mode = str(value or "rigorous").strip().lower()
+    return mode if mode in EXECUTION_MODES else "rigorous"
+
+
+def build_tool_use_enforcement_guidance(execution_mode: str) -> str:
+    """Build deterministic tool-action guidance for one conversation mode."""
+    mode = normalize_execution_mode(execution_mode)
+    if mode == "fast":
+        return (
+            "# Tool-use discipline\n"
+            "Answer direct conversational questions directly. Use tools only when the answer "
+            "depends on live/current facts, calculations, hashes or encodings, system or file "
+            "state, Git state, current versions, a requested side effect, or materially necessary "
+            "verification. If you state that you will take an action, make the corresponding tool "
+            "call in the same response; never promise work you do not perform. Stop when the "
+            "user's actual request is satisfied."
+        )
+    if mode == "balanced":
+        return (
+            "# Tool-use discipline\n"
+            "Use tools when they are materially useful for correctness or to perform a requested "
+            "action. If you state that you will take an action, make the corresponding tool call "
+            "in the same response; never promise work you do not perform. Verify side effects and "
+            "consequential claims, and stop once the request is satisfied."
+        )
+    return TOOL_USE_ENFORCEMENT_GUIDANCE
+
 # Model name substrings that trigger tool-use enforcement guidance.
 # Add new patterns here when a model family needs explicit steering.
 TOOL_USE_ENFORCEMENT_MODELS = ("gpt", "codex", "gemini", "gemma", "grok", "glm", "qwen", "deepseek")
@@ -388,6 +420,28 @@ TASK_COMPLETION_GUIDANCE = (
     "for results you couldn't actually produce. Reporting a blocker honestly "
     "is always better than inventing a result."
 )
+
+
+def build_task_completion_guidance(execution_mode: str) -> str:
+    """Build completion/retry guidance without weakening real-action grounding."""
+    mode = normalize_execution_mode(execution_mode)
+    if mode == "fast":
+        return (
+            "# Finishing the job\n"
+            "When the user requests an action, perform it and report the real result; do not stop "
+            "at a promise, stub, or plan. For routine low-risk work, try at most one materially "
+            "different strategy after a failure, then report the blocker. Never fabricate output "
+            "or claim a side effect occurred without verification. Stop when the request is satisfied."
+        )
+    if mode == "balanced":
+        return (
+            "# Finishing the job\n"
+            "When the user requests an action, complete it and report the real result rather than "
+            "a promise, stub, or plan. Retry a failure when another attempt has a reasonable chance "
+            "of succeeding. Never fabricate output, and verify side effects and consequential claims. "
+            "Stop when the request is satisfied."
+        )
+    return TASK_COMPLETION_GUIDANCE
 
 # Universal parallel-tool-call guidance — applied to ALL models.
 #
@@ -438,7 +492,7 @@ PARALLEL_TOOL_CALL_GUIDANCE = (
 # without tool calls, suggests workarounds instead of using existing tools,
 # replies with plans/suggestions instead of executing). The body is
 # family-agnostic; the OPENAI_ prefix reflects origin, not exclusivity.
-OPENAI_MODEL_EXECUTION_GUIDANCE = (
+RIGOROUS_MODEL_EXECUTION_GUIDANCE = (
     "# Execution discipline\n"
     "<tool_persistence>\n"
     "- Use tools whenever they improve correctness, completeness, or grounding.\n"
@@ -497,6 +551,46 @@ OPENAI_MODEL_EXECUTION_GUIDANCE = (
     "- If you must proceed with incomplete information, label assumptions explicitly.\n"
     "</missing_context>"
 )
+
+FAST_MODEL_EXECUTION_GUIDANCE = (
+    "# Execution discipline\n"
+    "Give direct answers to direct conversational questions. A simple request should normally "
+    "need zero to three tool calls. Do not use tools unless the answer depends on current/live "
+    "facts; arithmetic or calculations; hashes, checksums, or encodings; current date, time, or "
+    "timezone; system state; file contents or filesystem facts; Git history, branches, or diffs; "
+    "current versions; a requested side effect; or materially necessary verification.\n"
+    "For routine low-risk work, retry a failed or incomplete result at most once using a "
+    "materially different strategy, then report the blocker. Use proportional verification: "
+    "verify real side effects and high-risk claims without repeatedly rechecking settled facts. "
+    "Stop when the user's actual request is satisfied. Never fabricate tool output or claim an "
+    "action occurred without confirming it. Preserve approval, secret-handling, injection-defense, "
+    "and destructive/external/financial/credential/deployment/production safeguards."
+)
+
+BALANCED_MODEL_EXECUTION_GUIDANCE = (
+    "# Execution discipline\n"
+    "Use tools when materially useful. Retry incomplete results when another attempt has a "
+    "reasonable chance of succeeding. Require tools for arithmetic and calculations; hashes, "
+    "checksums, and encodings; current date, time, and timezone; live system or filesystem state; "
+    "file contents; Git history, branches, and diffs; current news, weather, versions, and other "
+    "time-sensitive facts; and requested side effects. Verify side effects and consequential "
+    "claims, but avoid exhaustive investigation after the request is satisfied. Never fabricate "
+    "tool output or claim an action occurred without confirming it. Preserve approval, secret-"
+    "handling, injection-defense, and high-risk-action safeguards."
+)
+
+
+def build_model_execution_guidance(execution_mode: str) -> str:
+    """Return the byte-stable model execution block for *execution_mode*."""
+    return {
+        "fast": FAST_MODEL_EXECUTION_GUIDANCE,
+        "balanced": BALANCED_MODEL_EXECUTION_GUIDANCE,
+        "rigorous": RIGOROUS_MODEL_EXECUTION_GUIDANCE,
+    }[normalize_execution_mode(execution_mode)]
+
+
+# Backward-compatible export for callers/tests that import the historical name.
+OPENAI_MODEL_EXECUTION_GUIDANCE = RIGOROUS_MODEL_EXECUTION_GUIDANCE
 
 # Gemini/Gemma-specific operational guidance, adapted from OpenCode's gemini.txt.
 # Injected alongside TOOL_USE_ENFORCEMENT_GUIDANCE when the model is Gemini or Gemma.
@@ -1744,6 +1838,7 @@ def build_skills_system_prompt(
     available_toolsets: "set[str] | None" = None,
     compact_categories: "frozenset[str] | None" = None,
     skills_dir_override: "Path | None" = None,
+    execution_mode: str = "rigorous",
 ) -> str:
     """Build a compact skill index for the system prompt.
 
@@ -1765,6 +1860,7 @@ def build_skills_system_prompt(
     visible and loadable via ``skill_view`` / ``skills_list``; only the
     descriptions are dropped, and a footer note explains the demotion.
     """
+    execution_mode = normalize_execution_mode(execution_mode)
     # Home resolution is EXPLICIT when a caller passes skills_dir_override
     # (the agent knows its own profile home from its session_db path). This
     # avoids the ContextVar-on-a-thread trap: build threads that didn't bind
@@ -1790,6 +1886,7 @@ def build_skills_system_prompt(
             available_tools,
             available_toolsets,
             compact_categories,
+            execution_mode,
         )
     finally:
         if _home_token is not None:
@@ -1802,6 +1899,7 @@ def _build_skills_system_prompt_inner(
     available_tools: "set[str] | None",
     available_toolsets: "set[str] | None",
     compact_categories: "frozenset[str] | None",
+    execution_mode: str,
 ) -> str:
     # Include the resolved platform so per-platform disabled-skill lists
     # produce distinct cache entries (gateway serves multiple platforms).
@@ -1815,6 +1913,7 @@ def _build_skills_system_prompt_inner(
         _platform_hint,
         tuple(sorted(disabled)),
         tuple(sorted(compact_categories or ())),
+        execution_mode,
     )
     with _SKILLS_PROMPT_CACHE_LOCK:
         cached = _SKILLS_PROMPT_CACHE.get(cache_key)
@@ -2023,19 +2122,44 @@ def _build_skills_system_prompt_inner(
                 else:
                     index_lines.append(f"    - {name}")
 
-        result = (
-            "## Skills (mandatory)\n"
-            "Before replying, scan the skills below. If a skill matches or is even partially relevant "
-            "to your task, you MUST load it with skill_view(name) and follow its instructions. "
-            "Err on the side of loading — it is always better to have context you don't need "
-            "than to miss critical steps, pitfalls, or established workflows. "
+        if execution_mode == "fast":
+            skills_heading = "## Skills"
+            skill_policy = (
+                "Before replying, scan the skills below. Load a skill with skill_view(name) only "
+                "when it is clearly relevant and likely to materially improve correctness. Do not "
+                "load a skill merely because it is tangentially or partially relevant. "
+            )
+        elif execution_mode == "balanced":
+            skills_heading = "## Skills"
+            skill_policy = (
+                "Before replying, scan the skills below. If a skill is relevant and materially "
+                "useful to the task, load it with skill_view(name) and follow its instructions. "
+            )
+        else:
+            skills_heading = "## Skills (mandatory)"
+            skill_policy = (
+                "Before replying, scan the skills below. If a skill matches or is even partially relevant "
+                "to your task, you MUST load it with skill_view(name) and follow its instructions. "
+                "Err on the side of loading — it is always better to have context you don't need "
+                "than to miss critical steps, pitfalls, or established workflows. "
+            )
+        skill_value = (
             "Skills contain specialized knowledge — API endpoints, tool-specific commands, "
-            "and proven workflows that outperform general-purpose approaches. Load the skill "
-            "even if you think you could handle the task with basic tools like web_search or terminal. "
-            "Skills also encode the user's preferred approach, conventions, and quality standards "
-            "for tasks like code review, planning, and testing — load them even for tasks you "
-            "already know how to do, because the skill defines how it should be done here.\n"
-            "Whenever the user asks you to configure, set up, install, enable, disable, modify, "
+            "and proven workflows that can outperform general-purpose approaches. "
+        )
+        if execution_mode == "rigorous":
+            skill_value += (
+                "Load the skill even if you think you could handle the task with basic tools like "
+                "web_search or terminal. Skills also encode the user's preferred approach, "
+                "conventions, and quality standards for tasks like code review, planning, and "
+                "testing — load them even for tasks you already know how to do, because the skill "
+                "defines how it should be done here.\n"
+            )
+        result = (
+            skills_heading + "\n"
+            + skill_policy
+            + skill_value
+            + "Whenever the user asks you to configure, set up, install, enable, disable, modify, "
             "or troubleshoot Hermes Agent itself — its CLI, config, models, providers, tools, "
             "skills, voice, gateway, plugins, or any feature — load the `hermes-agent` skill "
             "first. It has the actual commands (e.g. `hermes config set …`, `hermes tools`, "
@@ -2049,7 +2173,11 @@ def _build_skills_system_prompt_inner(
             + "\n".join(index_lines) + "\n"
             "</available_skills>\n"
             "\n"
-            "Only proceed without loading a skill if genuinely none are relevant to the task."
+            + (
+                "Only proceed without loading a skill if genuinely none are relevant to the task."
+                if execution_mode == "rigorous"
+                else "Proceed without loading a skill when none meet the relevance standard above."
+            )
             + hidden_note
         )
 

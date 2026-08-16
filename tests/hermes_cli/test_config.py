@@ -39,6 +39,21 @@ class TestGetHermesHome:
             assert home == Path.home() / ".hermes"
 
 
+class TestExecutionModeConfig:
+    def test_existing_config_defaults_to_rigorous_without_materializing_key(self, tmp_path):
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text("agent:\n  max_turns: 50\n", encoding="utf-8")
+
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+            loaded = load_config()
+            migrate_config(interactive=False, quiet=True)
+            raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+
+        assert DEFAULT_CONFIG["agent"]["execution_mode"] == "rigorous"
+        assert loaded["agent"]["execution_mode"] == "rigorous"
+        assert "execution_mode" not in raw.get("agent", {})
+
+
 class TestEnsureHermesHome:
 
     def test_creates_default_soul_md_if_missing(self, tmp_path):

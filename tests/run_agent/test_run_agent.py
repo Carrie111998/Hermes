@@ -1014,7 +1014,12 @@ class TestBuildSystemPrompt:
 class TestToolUseEnforcementConfig:
     """Tests for the agent.tool_use_enforcement config option."""
 
-    def _make_agent(self, model="openai/gpt-4.1", tool_use_enforcement="auto"):
+    def _make_agent(
+        self,
+        model="openai/gpt-4.1",
+        tool_use_enforcement="auto",
+        execution_mode="rigorous",
+    ):
         """Create an agent with tools and a specific enforcement config."""
         with (
             patch(
@@ -1025,10 +1030,21 @@ class TestToolUseEnforcementConfig:
             patch("run_agent.OpenAI"),
             patch(
                 "hermes_cli.config.load_config",
-                return_value={"agent": {"tool_use_enforcement": tool_use_enforcement}},
-            ), patch(
+                return_value={
+                    "agent": {
+                        "tool_use_enforcement": tool_use_enforcement,
+                        "execution_mode": execution_mode,
+                    }
+                },
+            ),
+            patch(
                 "hermes_cli.config.load_config_readonly",
-                return_value={"agent": {"tool_use_enforcement": tool_use_enforcement}},
+                return_value={
+                    "agent": {
+                        "tool_use_enforcement": tool_use_enforcement,
+                        "execution_mode": execution_mode,
+                    }
+                },
             ),
         ):
             a = AIAgent(
@@ -1047,6 +1063,11 @@ class TestToolUseEnforcementConfig:
         agent = self._make_agent(model="openai/gpt-4.1", tool_use_enforcement="auto")
         prompt = agent._build_system_prompt()
         assert TOOL_USE_ENFORCEMENT_GUIDANCE in prompt
+
+    def test_execution_mode_is_frozen_on_agent_and_selects_fast_guidance(self):
+        agent = self._make_agent(execution_mode="fast")
+        assert agent._execution_mode == "fast"
+        assert "zero to three tool calls" in agent._build_system_prompt()
 
 
 

@@ -37,16 +37,16 @@ from agent.prompt_builder import (
     HERMES_AGENT_HELP_GUIDANCE,
     KANBAN_GUIDANCE,
     MEMORY_GUIDANCE,
-    OPENAI_MODEL_EXECUTION_GUIDANCE,
     PARALLEL_TOOL_CALL_GUIDANCE,
     PLATFORM_HINTS,
     SESSION_SEARCH_GUIDANCE,
     SKILLS_GUIDANCE,
     STEER_CHANNEL_NOTE,
-    TASK_COMPLETION_GUIDANCE,
     TELEGRAM_RICH_MESSAGES_HINT,
-    TOOL_USE_ENFORCEMENT_GUIDANCE,
     TOOL_USE_ENFORCEMENT_MODELS,
+    build_model_execution_guidance,
+    build_task_completion_guidance,
+    build_tool_use_enforcement_guidance,
     drain_truncation_warnings,
 )
 from agent.runtime_cwd import resolve_context_cwd
@@ -369,6 +369,10 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         if isinstance(_cc_len, int) and _cc_len > 0:
             _ctx_len = _cc_len
 
+    # Frozen during AIAgent initialization. Never re-read config here: the
+    # selected prompt mode must remain byte-stable for this conversation.
+    execution_mode = getattr(agent, "_execution_mode", "rigorous")
+
     # ── Stable tier ────────────────────────────────────────────────
     stable_parts: List[str] = []
 
@@ -399,7 +403,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # config.yaml ``agent.task_completion_guidance`` (default True) so
     # users who want a leaner prompt can turn it off.
     if getattr(agent, "_task_completion_guidance", True) and agent.valid_tool_names:
-        stable_parts.append(TASK_COMPLETION_GUIDANCE)
+        stable_parts.append(build_task_completion_guidance(execution_mode))
 
     # Universal parallel-tool-call guidance.  Tells the model to batch
     # independent tool calls into one assistant turn rather than emitting one
@@ -471,7 +475,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
             model_lower = (agent.model or "").lower()
             _inject = any(p in model_lower for p in TOOL_USE_ENFORCEMENT_MODELS)
         if _inject:
-            stable_parts.append(TOOL_USE_ENFORCEMENT_GUIDANCE)
+            stable_parts.append(build_tool_use_enforcement_guidance(execution_mode))
             _model_lower = (agent.model or "").lower()
             # Google model operational guidance (conciseness, absolute
             # paths, parallel tool calls, verify-before-edit, etc.)
@@ -483,7 +487,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
             # without tool calls, suggests workarounds instead of using
             # existing tools, replies with plans instead of executing).
             if "gpt" in _model_lower or "codex" in _model_lower or "grok" in _model_lower:
-                stable_parts.append(OPENAI_MODEL_EXECUTION_GUIDANCE)
+                stable_parts.append(build_model_execution_guidance(execution_mode))
 
     has_skills_tools = any(name in agent.valid_tool_names for name in ['skills_list', 'skill_view', 'skill_manage'])
     if has_skills_tools:
@@ -512,6 +516,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
             available_toolsets=avail_toolsets,
             compact_categories=_compact_cats or None,
             skills_dir_override=_agent_skills_dir(agent),
+            execution_mode=execution_mode,
         )
     else:
         skills_prompt = ""

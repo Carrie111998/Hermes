@@ -1994,6 +1994,9 @@ class ConfigIssue:
     hint: str
 
 
+_EXECUTION_MODES = frozenset({"fast", "balanced", "rigorous"})
+
+
 def validate_config_structure(config: Optional[Dict[str, Any]] = None) -> List["ConfigIssue"]:
     """Validate config.yaml structure and return a list of detected issues.
 
@@ -2022,6 +2025,16 @@ def validate_config_structure(config: Optional[Dict[str, Any]] = None) -> List["
                 "error",
                 f"voice.submit_mode must be 'direct' or 'draft', got {submit_mode!r}",
                 "Set voice.submit_mode to direct (submit immediately) or draft (edit before sending)",
+            ))
+
+    agent_cfg = config.get("agent")
+    if isinstance(agent_cfg, dict) and "execution_mode" in agent_cfg:
+        execution_mode = agent_cfg.get("execution_mode")
+        if not isinstance(execution_mode, str) or execution_mode.strip().lower() not in _EXECUTION_MODES:
+            issues.append(ConfigIssue(
+                "error",
+                "agent.execution_mode must be one of: fast, balanced, rigorous",
+                "Set it with: hermes config set agent.execution_mode fast",
             ))
 
     # ── custom_providers must be a list, not a dict ──────────────────────
@@ -5219,6 +5232,15 @@ def set_config_value(key: str, value: str, force: bool = False):
     if is_managed():
         managed_error("set configuration values")
         return
+    if key.strip().lower() == "agent.execution_mode":
+        normalized_mode = str(value).strip().lower()
+        if normalized_mode not in _EXECUTION_MODES:
+            print(
+                "✗ agent.execution_mode must be one of: fast, balanced, rigorous",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        value = normalized_mode
     # Managed scope guard (D2): a key pinned by the managed layer cannot be set by
     # the user — the next load would override it anyway. Hard-reject and name the
     # source. Distinct from is_managed() above (the package-manager write-lock).
