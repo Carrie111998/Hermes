@@ -167,12 +167,36 @@ def _write_usage_file(path: Optional[str], result: dict, failure: Optional[str] 
         pass
 
 
+def _normalize_skills(skills: object = None) -> Optional[list[str]]:
+    """Normalize --skills into a deduplicated list (None when unset)."""
+    if skills is None:
+        return None
+    if isinstance(skills, str):
+        raw_values = [skills]
+    elif isinstance(skills, (list, tuple)):
+        raw_values = [str(item) for item in skills if item is not None]
+    else:
+        raw_values = [str(skills)]
+
+    parsed: list[str] = []
+    seen: set[str] = set()
+    for raw in raw_values:
+        for part in raw.split(","):
+            normalized = part.strip()
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            parsed.append(normalized)
+    return parsed or None
+
+
 def run_oneshot(
     prompt: str,
     model: Optional[str] = None,
     provider: Optional[str] = None,
     toolsets: object = None,
     usage_file: Optional[str] = None,
+    skills: object = None,
 ) -> int:
     """Execute a single prompt and print only the final content block.
 
@@ -187,6 +211,7 @@ def run_oneshot(
             cost, token counts, model, api_calls) is written there after the
             run — even when the run fails — so pipelines can account for
             spend per invocation.
+        skills: Optional comma-separated string or iterable of skills to preload.
 
     Returns the exit code.  The caller owns process termination.
     """
@@ -259,6 +284,7 @@ def run_oneshot(
                     provider=provider,
                     toolsets=explicit_toolsets,
                     use_config_toolsets=use_config_toolsets,
+                    skills=explicit_skills,
                 )
             except BaseException as exc:  # noqa: BLE001
                 # Capture anything that escapes the agent (including OSError
@@ -327,6 +353,7 @@ def _run_agent(
     provider: Optional[str] = None,
     toolsets: object = None,
     use_config_toolsets: bool = True,
+    skills: Optional[list[str]] = None,
 ) -> tuple[str, dict]:
     """Build an AIAgent exactly like a normal CLI chat turn would, then
     run a single conversation.  Returns ``(final_response, run_result)``."""
@@ -432,6 +459,14 @@ def _run_agent(
         # gateway sessions.
         _fb = get_fallback_chain(cfg)
 
+        ephemeral_system_prompt = None
+        if skills:
+            from agent.skill_commands import build_preloaded_skills_prompt
+
+            skills_prompt, _, _missing = build_preloaded_skills_prompt(skills)
+            if skills_prompt:
+                ephemeral_system_prompt = skills_prompt
+
         agent = AIAgent(
             api_key=runtime.get("api_key"),
             base_url=runtime.get("base_url"),
@@ -445,6 +480,7 @@ def _run_agent(
             session_db=session_db,
             credential_pool=runtime.get("credential_pool"),
             fallback_model=_fb or None,
+            ephemeral_system_prompt=ephemeral_system_prompt,
             # Interactive callbacks are intentionally NOT wired beyond this
             # one.  In oneshot mode there's no user sitting at a terminal:
             #   - clarify  → returns a synthetic "pick a default" instruction
