@@ -9,6 +9,7 @@ the consumer.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import sys
 import uuid
@@ -30,6 +31,31 @@ _GATEWAY_CHURN_READ_BYTES = 1024 * 1024
 _EVENT_TYPES = frozenset({"start", "replace"})
 _IS_WINDOWS = sys.platform == "win32"
 _WINDOWS_LOCK_OFFSET = 1024 * 1024
+
+
+def configure_gateway_churn_from_config(config: object) -> Path | None:
+    """Bridge an explicit gateway.churn_path setting to the writer."""
+
+    if not isinstance(config, dict):
+        return None
+    gateway_config = config.get("gateway")
+    if not isinstance(gateway_config, dict) or "churn_path" not in gateway_config:
+        return None
+
+    raw = gateway_config["churn_path"]
+    if isinstance(raw, str) and raw.strip():
+        try:
+            path = Path(raw.strip()).expanduser()
+        except (OSError, RuntimeError):
+            path = None
+        if path is not None and path.is_absolute():
+            os.environ[GATEWAY_CHURN_PATH_ENV] = str(path)
+            return path
+
+    logging.getLogger(__name__).warning(
+        "Ignoring gateway.churn_path: expected a nonempty absolute path"
+    )
+    return None
 
 
 def gateway_churn_record_path() -> Path | None:
@@ -124,13 +150,17 @@ def _read_tail(path: Path) -> list[bytes]:
         size = path.stat().st_size
         with path.open("rb") as handle:
             start = max(0, size - _GATEWAY_CHURN_READ_BYTES)
+            starts_mid_line = False
+            if start > 0:
+                handle.seek(start - 1)
+                starts_mid_line = handle.read(1) not in (b"\n", b"\r")
             handle.seek(start)
             data = handle.read(_GATEWAY_CHURN_READ_BYTES + 1)
     except FileNotFoundError:
         return []
 
     lines = data.splitlines(keepends=True)
-    if start > 0 and lines:
+    if starts_mid_line and lines:
         lines = lines[1:]
     complete = [line for line in lines if line.endswith((b"\n", b"\r"))]
     return complete[-(GATEWAY_CHURN_MAX_RECORDS - 1) :]

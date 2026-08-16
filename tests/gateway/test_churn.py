@@ -35,6 +35,41 @@ def test_hook_info_is_side_effect_free(tmp_path, monkeypatch):
     assert not path.exists()
 
 
+def test_config_bridge_sets_churn_path(tmp_path, monkeypatch):
+    path = tmp_path / "gateway-churn.jsonl"
+    monkeypatch.setenv(
+        churn.GATEWAY_CHURN_PATH_ENV, str(tmp_path / "from-environment.jsonl")
+    )
+
+    configured = churn.configure_gateway_churn_from_config(
+        {"gateway": {"churn_path": str(path)}}
+    )
+
+    assert configured == path
+    assert churn.gateway_churn_record_path() == path
+
+
+def test_config_bridge_absent_leaves_environment_untouched(tmp_path, monkeypatch):
+    path = tmp_path / "from-environment.jsonl"
+    monkeypatch.setenv(churn.GATEWAY_CHURN_PATH_ENV, str(path))
+
+    assert churn.configure_gateway_churn_from_config({"gateway": {}}) is None
+    assert churn.gateway_churn_record_path() == path
+
+
+def test_config_bridge_rejects_malformed_values(tmp_path, monkeypatch, caplog):
+    original = tmp_path / "from-environment.jsonl"
+    monkeypatch.setenv(churn.GATEWAY_CHURN_PATH_ENV, str(original))
+
+    for value in ("relative/churn.jsonl", 123):
+        caplog.clear()
+        assert churn.configure_gateway_churn_from_config(
+            {"gateway": {"churn_path": value}}
+        ) is None
+        assert churn.gateway_churn_record_path() == original
+        assert len(caplog.records) == 1
+
+
 def test_racing_writers_preserve_every_event(tmp_path, monkeypatch):
     path = tmp_path / "gateway-churn.jsonl"
     monkeypatch.setenv(churn.GATEWAY_CHURN_PATH_ENV, str(path))
@@ -62,6 +97,28 @@ def test_record_drops_oldest_at_cap(tmp_path, monkeypatch):
     assert [record["pid_new"] for record in records] == list(
         range(total - churn.GATEWAY_CHURN_MAX_RECORDS + 1, total + 1)
     )
+
+
+def test_tail_keeps_first_record_when_window_starts_at_line_boundary(
+    tmp_path, monkeypatch
+):
+    path = tmp_path / "gateway-churn.jsonl"
+    monkeypatch.setenv(churn.GATEWAY_CHURN_PATH_ENV, str(path))
+    monkeypatch.setattr(churn, "_GATEWAY_CHURN_READ_BYTES", 8)
+    monkeypatch.setattr(churn, "GATEWAY_CHURN_MAX_RECORDS", 10)
+    path.write_bytes(b"old\nfirst\nx")
+
+    assert churn.append_gateway_churn_event("start", pid_old=None, pid_new=1)
+
+    assert path.read_bytes().startswith(b"first\n")
+
+
+def test_tail_drops_partial_record_when_window_starts_mid_line(tmp_path, monkeypatch):
+    path = tmp_path / "gateway-churn.jsonl"
+    monkeypatch.setattr(churn, "_GATEWAY_CHURN_READ_BYTES", 8)
+    path.write_bytes(b"oldxx\nfirst\n")
+
+    assert churn._read_tail(path) == [b"first\n"]
 
 
 def test_reader_never_sees_partial_window(tmp_path, monkeypatch):

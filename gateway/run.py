@@ -2132,6 +2132,9 @@ if _config_path.exists():
             _cfg = managed_scope.apply_managed_overlay(_cfg)
         except Exception:
             pass
+        from gateway.churn import configure_gateway_churn_from_config
+
+        configure_gateway_churn_from_config(_cfg)
         # Top-level simple values (fallback only — don't override .env)
         for _key, _val in _cfg.items():
             if isinstance(_val, (str, int, float, bool)) and _key not in os.environ:
