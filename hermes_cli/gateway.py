@@ -1732,6 +1732,12 @@ def _reap_unsupervised_gateway_orphans(extra_exclude: set | None = None) -> bool
     running gateway — gating on ``supports_systemd_services()`` keeps the
     orphan-aware scan from killing live management processes there.
 
+    On Windows ``os.kill(pid, SIGTERM)`` is TerminateProcess, so the
+    planned-stop marker written for each orphan is the only graceful stop
+    request that exists there. The marker is written and the immediate kill
+    is skipped; the survivor window below is the escalation, which makes
+    Windows match POSIX exactly — graceful request, 5 seconds, force-kill.
+
     Args:
         extra_exclude: Additional PIDs to skip (e.g. a PID already killed by
             the caller so the sweep doesn't send a redundant SIGTERM/SIGKILL).
@@ -1823,11 +1829,25 @@ def _reap_unsupervised_gateway_orphans(extra_exclude: set | None = None) -> bool
         return False
 
     reaped = False
+    windows = is_windows()
     for pid in orphans:
         try:
             write_planned_stop_marker(pid)
         except Exception:
             pass
+        if windows:
+            # On Windows the marker IS the stop request, and it is the only
+            # one there is: os.kill(pid, SIGTERM) below is TerminateProcess,
+            # which would destroy the orphan microseconds after the marker
+            # lands — before the planned-stop watcher's 0.5s poll can
+            # consume it — so the drain never runs and ``resume_pending`` is
+            # never set. Let the survivor window below supply the wait that
+            # the POSIX SIGTERM handler gets for free, then escalate. This
+            # spends the function's own existing 5s budget rather than
+            # adding one, so Windows now matches POSIX exactly: graceful
+            # request, 5 seconds, force-kill.
+            reaped = True
+            continue
         try:
             os.kill(pid, signal.SIGTERM)
         except ProcessLookupError:
@@ -1848,7 +1868,16 @@ def _reap_unsupervised_gateway_orphans(extra_exclude: set | None = None) -> bool
             time.sleep(0.2)
     for pid in survivors:
         try:
-            os.kill(pid, getattr(signal, "SIGKILL", signal.SIGTERM))
+            if windows:
+                # SIGKILL does not exist on Windows and the getattr fallback
+                # to SIGTERM is another bare TerminateProcess that strands
+                # the detached gateway's children. Use the same bounded
+                # tree-kill the Windows backend escalates with.
+                from gateway.status import terminate_pid
+
+                terminate_pid(pid, force=True)
+            else:
+                os.kill(pid, getattr(signal, "SIGKILL", signal.SIGTERM))
         except (ProcessLookupError, PermissionError, OSError):
             pass
 
