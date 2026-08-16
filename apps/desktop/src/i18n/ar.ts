@@ -1349,7 +1349,64 @@ export const ar = defineLocale({
         help: 'موصى به. أرقام هواتف أو معرّفات WhatsApp مفصولة بفواصل.'
       }
     },
-    platformIntro: {}
+    platformIntro: {
+      telegram:
+        'في Telegram، تحدث إلى @BotFather، وقم بتشغيل /newbot، انسخ الرمز الذي يعطيك إياه. ثم احصل على معرّف مستخدمك الرقمي من @userinfobot.',
+      discord:
+        'افتح بوابة مطوري Discord، أنشئ تطبيقًا، أضف Bot، وانسخ رمزه. قم بدعوة البوت إلى خادمك بالنطاقات الصحيحة.',
+      slack:
+        'أنشئ تطبيق Slack، فعّل Socket Mode، ثبّته في مساحة العمل الخاصة بك، وانسخ رمز البوت ورمز مستوى التطبيق.',
+      mattermost: 'أنشئ حساب بوت أو رمز وصول شخصي على خادم Mattermost الخاص بك، ثم الصق رابط الخادم والرمز هنا.',
+      matrix: 'سجّل الدخول إلى الخادم الرئيسي باستخدام حساب البوت، وانسخ رمز الوصول ومعرّف المستخدم ورابط الخادم الرئيسي.',
+      signal: 'قم بتشغيل جسر signal-cli REST في موقع يمكن الوصول إليه، ثم وجّه Hermes إلى هذا الرابط ورقم الهاتف المسجل.',
+      whatsapp: 'قم بتشغيل جسر WhatsApp المدمج في Hermes، امسح رمز QR عند التشغيل الأول، ثم فعّل المنصة.',
+      bluebubbles:
+        'قم بتشغيل خادم BlueBubbles على Mac يحتوي على iMessage، اكشف API الخاص به، ثم وجّه Hermes إلى هذا الرابط مع كلمة مرور الخادم.',
+      homeassistant: 'افتح ملفك الشخصي في Home Assistant وأنشئ رمز وصول طويل الأجل. الصقه هنا مع رابط HA الخاص بك.',
+      email:
+        'استخدم صندوق بريد مخصص. بالنسبة لـ Gmail/Workspace، أنشئ كلمة مرور للتطبيق واستخدم imap.gmail.com / smtp.gmail.com.',
+      sms: 'احصل على Account SID و Auth Token من وحدة تحكم Twilio، بالإضافة إلى رقم هاتف قادر على إرسال الرسائل القصيرة.',
+      dingtalk: 'أنشئ تطبيق DingTalk في وحدة تحكم المطورين، وانسخ Client ID (App key) و Client Secret هنا.',
+      feishu: 'أنشئ تطبيق Feishu / Lark، قم بإعداد قدرات البوت، وانسخ App ID و App secret ومفتاح تشفير الأحداث.',
+      wecom:
+        'أضف بوت مجموعة في WeCom، وانسخ مفتاح webhook الخاص به كـ WECOM_BOT_ID. إرسال فقط — للاتجاهين استخدم خيار WeCom (التطبيق).',
+      wecom_callback: 'قم بإعداد تطبيق WeCom الذاتي، اكشف رابط callback الخاص به، وقدم corp ID و secret و agent ID و AES key.',
+      weixin:
+        'قم بتشغيل `hermes gateway setup`، اختر Weixin، ثم امسح وأكّد رمز QR باستخدام حساب WeChat الشخصي الخاص بك. سيتصل Hermes عبر Tencent iLink Bot API ويحفظ بيانات الاعتماد.',
+      qqbot: 'سجّل تطبيقًا على منصة QQ المفتوحة (q.qq.com)، وانسخ App ID و Client Secret.',
+      api_server:
+        'اكشف Hermes كـ API متوافق مع OpenAI. قم بتعيين مفتاح مصادقة، ثم وجّه Open WebUI / LobeChat وغيرها إلى host:port.',
+      webhook: 'قم بتشغيل خادم HTTP حتى تتمكن الأدوات الأخرى (GitHub، GitLab، التطبيقات المخصصة) من POST. تحقق من التوقيعات باستخدام السر.',
+      a2a: 'لا توجد تبعيات خارجية (المكتبة القياسية فقط). قم بتعيين رمز مشترك أو رمز نظير للسماح لمثيلات Hermes الأخرى بالاتصال عبر بروتوكول A2A.',
+      buzz: 'يتطلب أداة buzz CLI (https://github.com/block/buzz) في PATH أو BUZZ_CLI_PATH. اتصل بمجتمع Buzz عبر Nostr relay.',
+      raft: 'انضم إلى مساحة عمل Raft كوكيل خارجي.'
+    },
+    platformDescription: {
+      telegram: 'استخدم Hermes في رسائل Telegram الخاصة والمجموعات والمواضيع.',
+      discord: 'دمج Hermes مع رسائل Discord المباشرة والقنوات والخيوط.',
+      slack: 'استخدم Hermes في Slack عبر Socket Mode. أضف معرّفات أعضاء Slack المسموح بهم وسيستجيب البوت المتصل.',
+      mattermost: 'دمج Hermes مع قنوات Mattermost والرسائل المباشرة.',
+      matrix: 'استخدم Hermes في غرف Matrix والرسائل المباشرة.',
+      signal: 'اتصل عبر جسر signal-cli REST.',
+      whatsapp: 'استخدم Hermes عبر جسر WhatsApp المدمج مع مصادقة رمز QR.',
+      bluebubbles: 'استخدم Hermes في iMessage عبر خادم BlueBubbles.',
+      homeassistant: 'تحكم في منزلك الذكي من Hermes عبر Home Assistant.',
+      email: 'تحدث مع Hermes عبر صندوق بريد IMAP/SMTP.',
+      sms: 'أرسل واستقبل الرسائل النصية عبر Twilio.',
+      dingtalk: 'دمج Hermes مع مجموعات DingTalk.',
+      feishu: 'استخدم Hermes داخل Feishu / Lark.',
+      google_chat: 'دمج Hermes مع Google Chat عبر Cloud Pub/Sub.',
+      wecom: 'بوت مجموعة WeCom للإرسال فقط عبر webhook.',
+      wecom_callback: 'تكامل WeCom ثنائي الاتجاه عبر تطبيق callback.',
+      weixin: 'اربط حساب WeChat الشخصي عبر Tencent iLink Bot API.',
+      qqbot: 'دمج Hermes مع بوت QQ على منصة QQ المفتوحة.',
+      yuanbao: 'دمج Hermes مع Tencent Yuanbao.',
+      api_server: 'اكشف Hermes كـ HTTP API متوافق مع OpenAI لأدوات مثل Open WebUI.',
+      webhook: 'استقبل الأحداث من مصادر webhook مثل GitHub و GitLab.',
+      a2a: 'تحدث مع مثيلات Hermes أو الوكلاء الآخرين محليًا أو عن بعد عبر بروتوكول A2A.',
+      buzz: 'اتصل بمجتمع Buzz اللامركزي عبر Nostr relay (يتطلب buzz CLI).',
+      raft: 'انضم إلى مساحة عمل Raft كوكيل خارجي للتعاون في المهام.'
+    }
   },
   profiles: {
     close: 'إغلاق',
@@ -1545,7 +1602,83 @@ export const ar = defineLocale({
     optional: 'اختياري',
     promptScheduleRequired: 'الرسالة والجدول مطلوبان',
     saveChanges: 'حفظ التغييرات',
-    createAction: 'إنشاء'
+    createAction: 'إنشاء مهمة مجدولة',
+    tabs: {
+      jobs: 'المهام',
+      blueprints: 'المخططات'
+    },
+    blueprints: {
+      tab: 'المخططات',
+      startFrom: 'ابدأ من هنا',
+      custom: 'مخصص',
+      subtitle: 'أتمتة جاهزة',
+      dialogDesc: 'املأ التفاصيل وحدد الموعد.',
+      scheduleIt: 'جدولة المهمة',
+      scheduling: 'جار الجدولة...',
+      scheduled: 'تم جدولة المخطط',
+      loading: 'جار تحميل المخططات...',
+      failedLoad: 'فشل تحميل المخططات',
+      emptyTitle: 'لا توجد مخططات متاحة',
+      emptyDesc: 'لا توجد مخططات أتمتة متاحة على هذا الخادم.',
+      titles: {
+        'Morning briefing': 'إحاطة الصباح',
+        'Important-mail monitor': 'مراقب البريد المهم',
+        'Weekly review': 'مراجعة أسبوعية',
+        'Workday start reminder': 'تذكير ببداية يوم العمل',
+        'Custom reminder': 'تذكير مخصص',
+        'Evening wind-down': 'استرخاء المساء',
+        'Topic news digest': 'ملخص أخبار الموضوع',
+        'Bills & renewals reminder': 'تذكير بالفواتير والتجديدات',
+        'Price & availability watch': 'مراقبة السعر والتوفر',
+        'Competitor news watch': 'مراقبة أخبار المنافسين',
+        'Habit check-in': 'تسجيل وصول العادة',
+        'Hydration & movement nudge': 'تذكير بالشرب والحركة',
+        'Weekly meal plan': 'خطة وجبات أسبوعية',
+        'Daily learning drip': 'تعلم يومي',
+        'Gratitude & reflection prompt': 'مطالبة بالامتنان والتأمل',
+        'On-this-day discovery': 'اكتشاف في مثل هذا اليوم'
+      },
+      descriptions: {
+        'Morning briefing': 'إحاطة يومية موجزة: التقويم اليومي والطقس والمهام العاجلة.',
+        'Important-mail monitor': 'تحقق من صندوق الوارد بانتظام، تنبيه فقط عندما يحتاج حقًا إلى اهتمام.',
+        'Weekly review': 'مراجعة أسبوعية: ما تم إنجازه، والمهام المعلقة، وما هو قادم.',
+        'Workday start reminder': 'تذكير بيوم العمل مع جدول الأعمال والمهام الأولى.',
+        'Custom reminder': 'تذكير متكرر مخصص حسب جدولك الزمني.',
+        'Evening wind-down': 'فحص نهاية اليوم: ما هو قادم غدًا وما تحتاج إعداده الليلة.',
+        'Topic news digest': 'ملخص منتظم حول المواضيع التي تهتم بها — فقط العناصر الجديدة حقًا بعد إلغاء التكرار.',
+        'Bills & renewals reminder': 'تحذير مسبق قبل المدفوعات المتكررة أو تجديدات الاشتراك أو تواريخ الاستحقاق — تجنب الرسوم المفاجئة.',
+        'Price & availability watch': 'راقب منتجات أو رحلات أو فنادق أو قوائم محددة، تنبيه عندما يتطابق السعر أو التوفر مع معاييرك.',
+        'Competitor news watch': 'تتبع الأخبار الكبيرة من شركات محددة — إطلاق منتجات، تسعير، تمويل، ملفات — مع ملخص مقتبس.',
+        'Habit check-in': 'تذكيرات منتظمة للحفاظ على العادة والتفكير في الإكمال.',
+        'Hydration & movement nudge': 'تذكيرات منتظمة طوال اليوم للشرب والوقوف والتمدد.',
+        'Weekly meal plan': 'خطة وجبات أسبوعية مصممة حسب نظامك الغذائي ووقت الطهي، مع قائمة تسوق مجمعة.',
+        'Daily learning drip': 'درس صغير واحد يوميًا حول موضوع تريد تعلمه — يتراكم مع مرور الوقت.',
+        'Gratitude & reflection prompt': 'مطالبة يومية أو أسبوعية للتأمل، لتسجيل الامتنان والرؤى.',
+        'On-this-day discovery': 'أحداث مثيرة للاهتمام حدثت في التاريخ في هذا اليوم — مخصصة حسب اهتماماتك.'
+      },
+      labels: {
+        'What time?': 'أي وقت؟',
+        'Where to deliver?': 'أين التسليم؟',
+        'How often?': 'كم مرة؟',
+        'Remind me to…': 'ذكرني بـ…',
+        'Which day?': 'أي يوم؟',
+        'Repeat on': 'كرر في',
+        'What topic?': 'أي موضوع؟',
+        'How many bullets?': 'كم نقطة؟',
+        "What's due?": 'ما المستحق؟',
+        'What exactly to watch?': 'ماذا تراقب بالضبط؟',
+        'Alert me when…': 'نبهني عندما…',
+        'Which companies?': 'أي شركات؟',
+        'Which events matter?': 'أي أحداث مهمة؟',
+        'Which habit?': 'أي عادة؟',
+        'Start hour': 'ساعة البدء',
+        'End hour': 'ساعة الانتهاء',
+        'Diet?': 'قيود غذائية؟',
+        'Meals per day?': 'وجبات يوميًا؟',
+        'Cooking effort?': 'جهد الطهي؟',
+        'Only notify me if the mail…': 'فقط أخبرني إذا كان البريد…'
+      }
+    }
   },
   artifacts: {
     search: 'بحث',
