@@ -1,6 +1,6 @@
 ---
 title: "ARCH-003 implementation plan: runtime-state audit and replay verification"
-status: IMPLEMENTATION_PLAN_REVISE_V33_PENDING
+status: IMPLEMENTATION_PLAN_REVISE_V34_PENDING
 date: 2026-08-16
 type: implementation-plan
 ticket: ARCH-003
@@ -192,16 +192,18 @@ Add a versioned runtime-state-owned journal table with:
 - sealed materialized-write counter when event kind is `baseline`.
 
 Within the same migration transaction, add the non-null
-`materialized_write_counter` column to every runtime-state materialized row
-with deterministic default `0`, backfill all pre-existing rows to `0`, and
-install the database-level replay-tuple trigger/write-guard for INSERT and
+`materialized_writer_generation` and `materialized_write_counter` columns
+to every runtime-state materialized row. Both have deterministic default `0`;
+backfill all pre-existing rows to `0` for both columns. Install the
+database-level replay-tuple trigger/write-guard for INSERT and
 replay-tuple-changing UPDATE before the migration commits. The INSERT guard
 treats row creation as a replay-tuple change: it starts from the deterministic
 default counter `0` and persists an after-counter of `1`; the UPDATE guard
 advances the counter only when a replay-tuple member changes. No row may be
-observable with a missing counter or without the guard. Migration compatibility
-tests must verify the column, default, backfill, INSERT/UPDATE guard, and guard
-survival through prior-version startup and rollback.
+observable with a missing generation marker or counter or without the guard.
+Migration compatibility tests must verify both columns' nullability, defaults,
+backfills, INSERT/UPDATE guard, generation-marker values, and guard survival
+through prior-version startup and rollback.
 
 Add a durable database-level current-generation record:
 `runtime_state_journal_meta.current_generation`, owned by the runtime-state
@@ -245,8 +247,9 @@ current-generation record, writer epoch, transition marker, and counter
 metadata inside the same `BEGIN DEFERRED` snapshot as the event stream and
 materialized row.
 
-Add a materialized-row journal-writer generation marker and a monotonic
-`materialized_write_counter`. The counter increments only for a committed mutation that changes a member of
+Add the non-null materialized-row
+`materialized_writer_generation` journal-writer generation marker and a
+monotonic `materialized_write_counter`. The counter increments only for a committed mutation that changes a member of
 the replay tuple. In the new writer transaction, the trigger increment/read-back
 and journal emission share atomicity: if that transaction rolls back, neither is
 committed. The database-level trigger still records a replay-tuple change made
@@ -494,10 +497,14 @@ Implement a bounded verifier that:
   `OK`. The first applicable
   code wins; `EMPTY_HISTORY` therefore wins over row-marker mismatch when
   the entity has zero journal rows, while `MATERIALIZED_STATE_ASYMMETRY`
-  applies when one side exists and the other does not. Compute the start candidates as the highest valid baseline
-  under the current digest identifier and the latest valid marked genesis under
-  the current digest identifier, when present; select the later candidate by
-  `entity_seq`. If neither candidate exists, return `UNKNOWN` with
+  applies when one side exists and the other does not. A structurally present
+  baseline that fails sequence, origin, or conflict validation returns
+  `BASELINE_INVALID` and is not skipped in favor of a lower baseline; a
+  non-current digest-parameter identifier returns
+  `DIGEST_PARAMETER_MISMATCH` before baseline selection. Compute the start
+  candidates as the highest valid baseline under the current digest identifier
+  and the latest valid marked genesis under the current digest identifier, when
+  present; select the later candidate by `entity_seq`. If neither candidate exists, return `UNKNOWN` with
   `LEGACY_ORIGIN_MISSING`. Baseline and genesis rows carry the origin epoch
   marker and origin-genesis sequence, so
   current-origin validity is checked from bounded row metadata without scanning
@@ -515,7 +522,11 @@ Implement a bounded verifier that:
   `GENERATION_MISMATCH`, a materialized-write counter not equal to the latest
   journaled counter returning `WRITE_COUNTER_GAP` only when the generation
   marker is current, or a materialized state advanced during a generation with
-  no current-generation event;
+  no current-generation event. A structurally present baseline that fails any
+  of the sequence, origin, or conflict checks is `BASELINE_INVALID`; it is
+  never skipped in favor of a lower baseline. A baseline carrying a
+  non-current digest-parameter identifier returns
+  `DIGEST_PARAMETER_MISMATCH` before baseline selection.
 - returns `UNKNOWN` with the corresponding closed reason code on empty history
   (`EMPTY_HISTORY`), snapshot failure, unsupported/newer versions, malformed
   history, unknown digest regime, key-check mismatch, verify-time key
@@ -618,12 +629,15 @@ Add deterministic tests for:
 - truncated-head history without an origin marker returning `UNKNOWN`;
 - sealed-baseline tuple mismatch against the materialized row returning
   `UNKNOWN`;
-- baseline behind the current maximum sequence returning `UNKNOWN`;
-- baseline with no valid current origin returning `UNKNOWN`;
-- baseline with a non-current digest-parameter identifier returning `UNKNOWN`;
+- baseline behind the current maximum sequence returning `UNKNOWN` with
+  `BASELINE_INVALID`;
+- baseline with no valid current origin returning `UNKNOWN` with
+  `BASELINE_INVALID`;
+- baseline with a non-current digest-parameter identifier returning `UNKNOWN`
+  with `DIGEST_PARAMETER_MISMATCH`;
 - same-sequence conflicting baselines and contradictory overlapping baselines
-  returning `UNKNOWN`, while strictly increasing successive baselines select
-  the highest valid one;
+  returning `UNKNOWN` with `BASELINE_INVALID`, while strictly increasing
+  successive valid baselines select the highest valid one;
 - a baseline followed by a newer-writer-epoch marked genesis selecting the
   later genesis start and reaching `CONSISTENT`;
 - sealed baseline contents, baseline sequence consumption, and post-baseline
@@ -1152,6 +1166,23 @@ DGX changes, deployment, repair, or event-sourcing. The corrected plan must
 return to the same authenticated Claude reviewer family and then to AGY on the
 identical packet.
 
+## Implementation-plan review reconciliation v33
+
+The v33 authenticated Claude Opus review returned `REVISE` with two bounded
+plan-text corrections. The corrections are incorporated above:
+
+1. The materialized writer-generation marker is explicitly named,
+   non-null, defaulted and backfilled to `0` in the same migration transaction
+   as the counter, with compatibility coverage.
+2. Structurally invalid baselines return `BASELINE_INVALID` and are never
+   skipped for a lower baseline; non-current digest identifiers return
+   `DIGEST_PARAMETER_MISMATCH`, with Gate 4 bindings.
+
+These remain plan-only corrections and do not authorize source edits, tests,
+DGX changes, deployment, repair, or event-sourcing. The corrected plan must
+return to the same authenticated Claude reviewer family and then to AGY on the
+identical packet.
+
 ## Acceptance criteria
 
 ARCH-003 implementation is ready for its delivery gates only when:
@@ -1181,7 +1212,7 @@ ARCH-003 implementation is ready for its delivery gates only when:
   retention job; entities beyond the replay limit remain UNKNOWN in this ticket,
   and the 100,000-event/100 MiB per-profile threshold is a documented follow-up
   operational review, not an in-ticket operator gate;
-- reconciliation v1 and v5-v32 items are incorporated into the normative
+- reconciliation v1 and v5-v33 items are incorporated into the normative
   Gates 0-4 text (with v2-v4 explicitly folded into the v1/v4 text), and this
   merged plan revision receives the same-family re-review;
 - all focused and relevant tests pass;
@@ -1255,6 +1286,8 @@ ARCH-003 implementation is ready for its delivery gates only when:
   and bounded caller contracts for all mutation-surface refusal codes.
 - v32: maintenance RW-lock applicability in both writer branches and explicit
   INSERT/NEW_ENTITY_GENESIS counter semantics.
+- v33: materialized generation-marker migration contract and non-skippable
+  baseline-invalid diagnostics.
 
 
 ## Non-goals
