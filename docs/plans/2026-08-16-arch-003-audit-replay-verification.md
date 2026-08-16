@@ -1,6 +1,6 @@
 ---
 title: "ARCH-003: runtime-state audit and replay verification"
-status: DESIGN_REVIEW_PENDING
+status: DESIGN_REVIEW_REVISE_PENDING
 date: 2026-08-16
 type: architecture
 ticket: ARCH-003
@@ -11,7 +11,7 @@ target_repo: hermes-agent
 
 ## Status
 
-DESIGN_REVIEW_PENDING
+DESIGN_REVIEW_REVISE_PENDING
 
 This ticket is a design gate only. No source implementation, runtime-state
 migration, DGX database inspection, deployment, or automatic repair is
@@ -163,6 +163,42 @@ It must not contain source text, full event samples containing identifiers,
 PDF/DOCX content, secrets, tokens, absolute paths, prompts, message bodies,
 generated evidence, or reviewer instructions that authorize implementation.
 
+## Design review reconciliation v1
+
+Status: DESIGN_REVIEW_REVISE_PENDING
+
+The identical metadata-only packet (SHA-256
+`cdda4fee9b65e35edcd045adf689a86226029263df0da6513491769a90249946`) received:
+
+- authenticated Claude Opus: `REVISE`;
+- authenticated AGY: `PASS`.
+
+The Claude correction set is bounded to this design and does not authorize
+implementation:
+
+1. Specify a keyed entity-key digest over profile scope plus entity key, with
+   runtime-state-owned key material never journaled; digests from different
+   profiles are non-comparable.
+2. Specify a per-profile/entity monotonic sequence allocated in the same
+   transaction, with uniqueness; timestamps are diagnostic only.
+3. Require one runtime-state CAS chokepoint for all mutation paths, sharing the
+   caller's connection and transaction, with a bypass-path hermetic test.
+4. Define an append-only sealed baseline/watermark event for verified compaction;
+   missing predecessors without a baseline return `UNKNOWN`.
+5. Define result algebra: complete verified history is required for `DRIFT`;
+   `UNKNOWN` is absorbing; unknown/newer journal versions and open-ended
+   reason codes return `UNKNOWN`.
+6. Define a concrete replay bound; exceeding it returns `UNKNOWN`.
+7. State that retention, replay bounds, and compaction policy are internal
+   runtime-state constants, not user-facing `HERMES_*` variables.
+8. State that verification is out-of-band and never called from the gateway
+   conversation or prompt-construction path.
+
+These corrections must be re-reviewed by the same Claude family before any
+implementation gate. AGY's PASS applies only to the pre-correction packet and
+does not waive the Claude re-review. No source, migration, test, DGX runtime,
+deployment, or repair action is authorized by this reconciliation.
+
 ## Planned implementation evidence
 
 Not run. No source files, migrations, tests, DGX runtime, or deployment have
@@ -170,6 +206,6 @@ been changed by this ticket.
 
 ## Current next action
 
-Obtain Claude + AGY design-review consensus on the bounded packet. If both
-return PASS, create a separate implementation plan. If either returns REVISE,
-reconcile and re-review before any source edit.
+Re-review the reconciled correction set with the same authenticated Claude
+family using the same bounded packet revision. Only a Claude PASS on the
+corrected design can close this design gate; implementation remains separate.
