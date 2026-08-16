@@ -264,6 +264,64 @@ def test_modify_other_keys_shift_letter_produces_uppercase(letter):
     )
 
 
+# ---------------------------------------------------------------------------
+# Shift+letter for non-Latin cased scripts (#87631)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize(
+    "lower,upper",
+    [
+        ("п", "П"),  # Cyrillic
+        ("р", "Р"),
+        ("и", "И"),
+        ("α", "Α"),  # Greek
+        ("ü", "Ü"),  # Latin-1
+        ("ā", "Ā"),  # Latin Extended-A
+        ("ա", "Ա"),  # Armenian
+    ],
+)
+def test_modify_other_keys_shift_non_latin_letter_produces_uppercase(lower, upper):
+    """#87631: WezTerm re-encodes Shift+П exactly like Shift+p; the Latin-only
+    table left every non-Latin layout leaking literal CSI into the buffer."""
+    for cp in (ord(lower), ord(upper)):
+        mok_seq = f"\x1b[27;2;{cp}~"
+        assert _parse(mok_seq) == [upper], (
+            f"modifyOtherKeys Shift codepoint {cp} ({mok_seq!r}) should "
+            f"produce '{upper}'"
+        )
+        csiu_seq = f"\x1b[{cp};2u"
+        assert _parse(csiu_seq) == [upper], (
+            f"CSI-u Shift codepoint {cp} ({csiu_seq!r}) should produce '{upper}'"
+        )
+
+
+def test_modify_other_keys_shift_cyrillic_word_types_cleanly():
+    """The issue's exact repro: typing ПРИВЕТ inserts ПРИВЕТ — the ESC byte
+    is not swallowed as Escape and no literal '[27;2;...' text leaks."""
+    typed = "".join(
+        ch
+        for part in (_parse(f"\x1b[27;2;{ord(ch)}~") for ch in "ПРИВЕТ")
+        for ch in part
+    )
+    assert typed == "ПРИВЕТ"
+
+
+def test_modify_other_keys_shift_alt_non_latin_letter():
+    """Shift+Alt+non-Latin normalizes onto (Escape, UPPER) like Latin."""
+    assert _parse(f"\x1b[27;4;{ord('п')}~") == [Keys.Escape, "П"]
+    assert _parse(f"\x1b[{ord('α')};4u") == [Keys.Escape, "Α"]
+
+
+@pytest.mark.parametrize("codepoint", [0x4E2D, 0x6587])  # 中, 文
+def test_modify_other_keys_uncased_codepoint_stays_unmapped(codepoint):
+    """Case-less scripts (CJK) are layout-specific and deliberately NOT
+    mapped — a leak is better than potentially wrong input. The sequences
+    parse as Escape + literal text (prompt_toolkit's default for unmapped
+    CSI), never as a bare character."""
+    result = _parse(f"\x1b[27;2;{codepoint}~")
+    assert result != [chr(codepoint)]
+
+
 def test_does_not_clobber_shift_enter_alias():
     """install_modify_other_keys_aliases must not overwrite mappings
     installed by install_shift_enter_alias (modifier=2, not 5)."""
