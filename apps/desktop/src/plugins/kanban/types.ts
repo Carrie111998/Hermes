@@ -89,6 +89,10 @@ export interface KanbanAttachment {
   id: number | string
   filename: string
   size?: null | number
+  /** Absolute on-disk path the worker wrote (server-side). The drawer opens
+   *  the file through the OS door when present; older backends omit it and
+   *  the row falls back to plain text. */
+  stored_path?: null | string
 }
 
 /** Fields present only on the detail endpoint (beyond the card's KanbanTask).

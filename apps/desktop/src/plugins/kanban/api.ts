@@ -9,7 +9,7 @@
  * desktop's selection never flips the server-wide current-board pointer.
  */
 
-import { atom, type PluginRestOptions, type PluginStorage, queryClient } from '@hermes/plugin-sdk'
+import { atom, type PluginOs, type PluginRestOptions, type PluginStorage, queryClient } from '@hermes/plugin-sdk'
 
 import type {
   BoardMeta,
@@ -28,6 +28,7 @@ type Rest = <T>(path: string, opts?: PluginRestOptions) => Promise<T>
 type Socket = (path: string, onMessage: (data: unknown) => void) => () => void
 
 let rest: null | Rest = null
+let os: null | PluginOs = null
 
 /** Selected board slug ('' = the server's current board). Persisted. */
 export const $boardSlug = atom<string>('')
@@ -79,8 +80,9 @@ interface Persisted<T> {
  *  runs on unload/disable — so nothing (store sync, socket) survives a toggle
  *  or duplicates on re-enable. The events socket is pinned to a board at
  *  handshake, so a board switch closes + reopens it. */
-export function bindApi(r: Rest, storage: PluginStorage, socket: Socket): () => void {
+export function bindApi(r: Rest, storage: PluginStorage, socket: Socket, osDoor: PluginOs): () => void {
   rest = r
+  os = osDoor
   const unsubs: Array<() => void> = []
 
   // Hydrate an atom from storage and keep storage in sync with it.
@@ -108,7 +110,40 @@ export function bindApi(r: Rest, storage: PluginStorage, socket: Socket): () => 
     unsubs.forEach(unsub => unsub())
     close?.()
     rest = null
+    os = null
   }
+}
+
+/** Absolute path → `file://` URL, the same local-mode form the app's media
+ *  layer uses (`src/lib/media.ts`); the shell opens it with the OS default
+ *  handler and falls back to reveal-in-folder. Handles Windows drive
+ *  letters (`C:\...` → `file:///C:/...`) and percent-encodes characters a
+ *  URL must not carry raw (`#`, spaces, non-ASCII). */
+export const attachmentFileUrl = (storedPath: string): string => {
+  if (/^file:/i.test(storedPath)) {
+    return storedPath
+  }
+  const normalized = storedPath.replace(/\\/g, '/')
+  const withDrive = /^[A-Za-z]:\//.test(normalized) ? `/${normalized}` : normalized
+  return `file://${encodeURI(withDrive).replace(/#/g, '%23')}`
+}
+
+/** True while the OS door is bound — i.e. an Electron shell that can open
+ *  external files. Plain-browser / older-shell contexts render the drawer
+ *  rows read-only instead of offering a dead button. */
+export function canOpenAttachments(): boolean {
+  return os !== null
+}
+
+/** Open an attachment's file with the OS default handler. Resolves false
+ *  when there's no stored path (older backend) or the OS door is unavailable
+ *  (plain browser / older shell) — callers no-op on that. */
+export function openAttachmentFile(storedPath?: null | string): Promise<boolean> {
+  if (!storedPath || !os) {
+    return Promise.resolve(false)
+  }
+
+  return os.openExternal(attachmentFileUrl(storedPath))
 }
 
 function call<T>(path: string, opts?: PluginRestOptions): Promise<T> {
