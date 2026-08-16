@@ -1,6 +1,6 @@
 ---
 title: "ARCH-003 implementation plan: runtime-state audit and replay verification"
-status: IMPLEMENTATION_PLAN_REVISE_V35_PENDING
+status: IMPLEMENTATION_PLAN_REVISE_V36_PENDING
 date: 2026-08-16
 type: implementation-plan
 ticket: ARCH-003
@@ -247,10 +247,9 @@ current-generation record, writer epoch, transition marker, and counter
 metadata inside the same `BEGIN DEFERRED` snapshot as the event stream and
 materialized row.
 
-Add the non-null materialized-row
-`materialized_writer_generation` journal-writer generation marker and a
-monotonic `materialized_write_counter`. The counter increments only for a committed mutation that changes a member of
-the replay tuple. In the new writer transaction, the trigger increment/read-back
+The materialized writer-generation marker is a provenance continuity field,
+not a replayed business-state value. The counter increments only for a
+committed mutation that changes a member of the replay tuple. In the new writer transaction, the trigger increment/read-back
 and journal emission share atomicity: if that transaction rolls back, neither is
 committed. The database-level trigger still records a replay-tuple change made
 by a prior or unaware writer that emits no journal event, so that rollback or
@@ -428,14 +427,18 @@ Migration compatibility tests must assert this posture.
   equals the materialized counter at commit.
 - Any mutation/genesis journal constraint or write failure aborts the complete
   enclosing materialized-state mutation; errors must not be swallowed.
-- The CAS caller receives a typed bounded mutation refusal for
-  `LOCK_TIMEOUT`, `KEY_UNAVAILABLE`, or `WRITE_ABORT` (covering
-  continuity, downgrade-unsafe, journal-transaction, lock-acquisition, and
-  key-custody failure); it performs no automatic retry, does not drop or
-  corrupt the session loop, and leaves unaffected conversations/platform loops
-  running. The gateway-facing error boundary returns the existing safe
-  operation-failure response without entering prompt construction; Gate 4
-  exercises this caller contract with a real CAS caller adapter.
+- Any ordinary mutation SQLite busy-timeout exhaustion returns mutation-side
+  `LOCK_TIMEOUT`, the same closed code used for named maintenance-lock
+  acquisition timeout; other continuity, downgrade-unsafe, journal-transaction,
+  or constraint/write failures return `WRITE_ABORT`. The CAS caller receives
+  a typed bounded mutation refusal for `LOCK_TIMEOUT`, `KEY_UNAVAILABLE`,
+  or `WRITE_ABORT` (covering lock-acquisition, busy-timeout, continuity,
+  downgrade-unsafe, journal-transaction, and key-custody failure); it performs
+  no automatic retry, does not drop or corrupt the session loop, and leaves
+  unaffected conversations/platform loops running. The gateway-facing error
+  boundary returns the existing safe operation-failure response without
+  entering prompt construction; Gate 4 exercises this caller contract with a
+  real CAS caller adapter.
 - Prepare and validate the digest key before acquiring the shared maintenance
   lock. If it is unavailable, fail closed before opening SQLite or acquiring
   any lock, leave materialized state unchanged, emit no event, and surface the
@@ -498,7 +501,9 @@ Implement a bounded verifier that:
   `OK`. The first applicable
   code wins; `EMPTY_HISTORY` therefore wins over row-marker mismatch when
   the entity has zero journal rows, while `MATERIALIZED_STATE_ASYMMETRY`
-  applies when one side exists and the other does not. First determine the
+  applies only when journal history exists without a materialized row; the
+  reverse direction, a materialized row with zero journal rows, is owned by
+  `EMPTY_HISTORY`. First determine the
   latest valid marked genesis and highest valid baseline candidates under the
   current digest identifier and current origin metadata, then select the later
   candidate by `entity_seq`. If a structurally present baseline fails
@@ -527,10 +532,7 @@ Implement a bounded verifier that:
   `GENERATION_MISMATCH`, a materialized-write counter not equal to the latest
   journaled counter returning `WRITE_COUNTER_GAP` only when the generation
   marker is current, or a materialized state advanced during a generation with
-  no current-generation event. Structurally invalid or stale-identifier
-  baselines strictly before the selected replay start are ignored; at or after
-  that start, the invalid baseline returns `BASELINE_INVALID` or
-  `DIGEST_PARAMETER_MISMATCH` respectively.
+  no current-generation event.
 - returns `UNKNOWN` with the corresponding closed reason code on empty history
   (`EMPTY_HISTORY`), snapshot failure, unsupported/newer versions, malformed
   history, unknown digest regime, key-check mismatch, verify-time key
@@ -653,7 +655,9 @@ Add deterministic tests for:
   origin-epoch metadata validation, current-epoch genesis selection, baseline
   selection, and every member of each surface's closed reason-code subset;
 - verifier-performs-no-writes using a direct database-change assertion;
-- materialized-row/history asymmetry returning `UNKNOWN`;
+- history existing without a materialized row returning `UNKNOWN` with
+  `MATERIALIZED_STATE_ASYMMETRY`; a materialized row with zero journal rows
+  is covered by the `EMPTY_HISTORY` test above;
 - post-terminal events returning `UNKNOWN` with
   `POST_TERMINAL_EVENT`;
 - prompt-cache/gateway no-change check: runtime-state modules must not import
@@ -1206,6 +1210,24 @@ DGX changes, deployment, repair, or event-sourcing. The corrected plan must
 return to the same authenticated Claude reviewer family and then to AGY on the
 identical packet.
 
+## Implementation-plan review reconciliation v35
+
+The v35 authenticated Claude Opus review returned `REVISE` with two blocking
+and two cleanup corrections. The corrections are incorporated above:
+
+1. Named maintenance-lock acquisition timeout and ordinary SQLite busy-timeout
+   exhaustion both return `LOCK_TIMEOUT`; `WRITE_ABORT` is reserved for
+   continuity, downgrade, journal, and other mutation failures.
+2. `MATERIALIZED_STATE_ASYMMETRY` is reachable only for history without a
+   materialized row; a materialized row without history is `EMPTY_HISTORY`.
+3. The duplicate materialized-column declaration and duplicate pre-start
+   baseline rule were folded into single normative locations.
+
+These remain plan-only corrections and do not authorize source edits, tests,
+DGX changes, deployment, repair, or event-sourcing. The corrected plan must
+return to the same authenticated Claude reviewer family and then to AGY on the
+identical packet.
+
 ## Acceptance criteria
 
 ARCH-003 implementation is ready for its delivery gates only when:
@@ -1235,7 +1257,7 @@ ARCH-003 implementation is ready for its delivery gates only when:
   retention job; entities beyond the replay limit remain UNKNOWN in this ticket,
   and the 100,000-event/100 MiB per-profile threshold is a documented follow-up
   operational review, not an in-ticket operator gate;
-- reconciliation v1 and v5-v34 items are incorporated into the normative
+- reconciliation v1 and v5-v35 items are incorporated into the normative
   Gates 0-4 text (with v2-v4 explicitly folded into the v1/v4 text), and this
   merged plan revision receives the same-family re-review;
 - all focused and relevant tests pass;
@@ -1313,6 +1335,8 @@ ARCH-003 implementation is ready for its delivery gates only when:
   baseline-invalid diagnostics.
 - v34: deterministic baseline-origin ownership, pre-start invalid-baseline
   handling, and structural digest-mismatch precedence.
+- v35: deterministic timeout-code mapping, reachable asymmetry direction, and
+  removal of duplicate normative rules.
 
 
 ## Non-goals
