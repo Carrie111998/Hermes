@@ -25,6 +25,7 @@ import hermes_cli.gateway as gateway_mod
 _GATEWAY_CMD = "C:/h/venv/Scripts/pythonw.exe -m hermes_cli.main gateway run --replace"
 _UPDATER_CMD = "C:/h/venv/Scripts/python.exe -m hermes_cli.main update --yes --gateway"
 _STATUS_CMD = "C:/h/venv/Scripts/python.exe -m hermes_cli.main gateway status"
+_RESTART_CMD = "C:/h/venv/Scripts/pythonw.exe -m hermes_cli.main gateway restart"
 
 GATEWAY_PID = 14112
 UPDATER_PID = 22001
@@ -38,7 +39,10 @@ def _wmic_listing(entries: dict[int, str]) -> str:
 
 
 def _scan(
-    entries: dict[int, str], ancestors: set[int], exclude: set[int] | None = None
+    entries: dict[int, str],
+    ancestors: set[int],
+    exclude: set[int] | None = None,
+    include_restart_managers: bool = False,
 ):
     """Run the Windows scan arm against a stubbed process table."""
     result = MagicMock(returncode=0, stdout=_wmic_listing(entries))
@@ -54,7 +58,75 @@ def _scan(
             "hermes_cli.gateway._filter_venv_launcher_stubs", side_effect=lambda p: p
         ),
     ):
-        return gateway_mod._scan_gateway_pids(exclude or set(), all_profiles=True)
+        return gateway_mod._scan_gateway_pids(
+            exclude or set(),
+            all_profiles=True,
+            include_restart_managers=include_restart_managers,
+        )
+
+
+class TestSuppressionPredicateCannotDiverge:
+    """The suppression predicate must never be narrower than the include one.
+
+    Raised in review: ``_suppressed_as_ancestor`` gates on
+    ``looks_like_gateway_runtime_command_line`` while the include decision uses
+    ``_matches_gateway_runtime``, so a command matching the include predicate
+    but not the suppression one would still be hidden and #87594 would return
+    in that shape. That set is empty today, and these pin it that way rather
+    than leaving the argument in a comment.
+    """
+
+    def test_strict_matcher_is_a_subset_of_the_runtime_matcher(self):
+        """``run`` is in ``{run, restart}``, so strict implies runtime."""
+        from gateway.status import (
+            looks_like_gateway_command_line,
+            looks_like_gateway_runtime_command_line,
+        )
+
+        commands = [
+            _GATEWAY_CMD,
+            _UPDATER_CMD,
+            _STATUS_CMD,
+            _RESTART_CMD,
+            "python -m hermes_cli.main gateway run",
+            "python -m hermes_cli.main gateway dashboard",
+            "hermes gateway run --replace",
+            "hermes gateway restart",
+            "python -m tui_gateway",
+            "",
+        ]
+
+        for command in commands:
+            if looks_like_gateway_command_line(command):
+                assert looks_like_gateway_runtime_command_line(command), (
+                    f"{command!r} is included by the strict matcher but would "
+                    "be suppressed as an ancestor: the two predicates have "
+                    "diverged and #87594 is reachable again"
+                )
+
+    def test_restart_hosted_runtime_ancestor_stays_visible(self):
+        """The other accepted subcommand form, which the first tests omitted.
+
+        A no-supervisor ``gateway restart`` runs ``run_gateway()`` in its own
+        process, so it hosts the runtime and holds the ``.pyd`` files while its
+        argv still says ``restart``. Windows takes exactly this path, because
+        ``include_restart_managers`` is ``not supports_systemd_services()``.
+
+        This does not discriminate between the two candidate gatings: where
+        ``include_restart_managers`` is False a restart process is not included
+        at all, and where it is True both predicates accept it. The difference
+        is robustness under future edits, which
+        ``test_strict_matcher_is_a_subset_of_the_runtime_matcher`` is what
+        actually guards.
+        """
+        pids = _scan(
+            {GATEWAY_PID: _RESTART_CMD, UPDATER_PID: _UPDATER_CMD},
+            ancestors={UPDATER_PID, GATEWAY_PID, 4},
+            include_restart_managers=True,
+        )
+
+        assert GATEWAY_PID in pids
+        assert UPDATER_PID not in pids
 
 
 class TestAncestorGatewayStaysVisible:
