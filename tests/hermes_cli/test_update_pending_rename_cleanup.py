@@ -156,10 +156,33 @@ def test_removes_pair_when_target_old_backup_gone(tmp_path, monkeypatch):
     assert stored["value"] == [""]
 
 
-def test_keeps_pair_when_both_source_and_target_exist(tmp_path, monkeypatch):
-    """A pending rename for a hermes shim where both source and target
-    still exist is NOT a stale entry — it may be a legitimate pending
-    operation.  Keep it."""
+def test_removes_armed_pair_healthy_shim_with_old_target(tmp_path, monkeypatch):
+    """The #85839 booby trap: healthy hermes.exe exists AND .old. target exists.
+    This is the ARMED rename-away that will clobber the healthy shim on next boot.
+    Once we're running, the install is good — disarm it regardless of target existence."""
+    healthy_shim = tmp_path / "Scripts" / "hermes.exe"
+    old_backup = tmp_path / "Scripts" / "hermes.exe.old.1786674911157"
+    healthy_shim.parent.mkdir(parents=True)
+    healthy_shim.write_bytes(b"new")
+    old_backup.write_bytes(b"old")
+
+    # Both exist — source is the HEALTHY shim (no .old. in name), target is .old.
+    entries = [_nt(str(healthy_shim)), _nt(str(old_backup)), ""]
+
+    winreg_mod, _, stored = _make_winreg_mock(initial_entries=entries)
+    _patch_windows_and_winreg(monkeypatch, winreg_mod)
+
+    cli_main._cleanup_pending_file_rename_operations()
+
+    # The armed pair should be DISARMED (removed) — healthy shim must not be renamed away.
+    assert stored is not None
+    assert stored["value"] == [""]
+
+
+def test_removes_armed_pair_both_exist_legacy_case(tmp_path, monkeypatch):
+    """Legacy test case: source=hermes.exe + target=hermes.exe.old.* both exist.
+    This IS the armed trap — the source is the healthy shim (no .old.) and target
+    is .old. backup. Should be removed to prevent next-boot clobber."""
     src = tmp_path / "Scripts" / "hermes.exe"
     tgt = tmp_path / "Scripts" / "hermes.exe.old.1234567890"
     src.parent.mkdir(parents=True)
@@ -173,8 +196,9 @@ def test_keeps_pair_when_both_source_and_target_exist(tmp_path, monkeypatch):
 
     cli_main._cleanup_pending_file_rename_operations()
 
+    # Armed pair removed — healthy shim must not be renamed away on next boot.
     assert stored is not None
-    assert stored["value"] == entries
+    assert stored["value"] == [""]
 
 
 def test_preserves_non_hermes_entries(tmp_path, monkeypatch):
@@ -262,6 +286,11 @@ def test_integration_called_from_cleanup_quarantined_exes(tmp_path, monkeypatch)
 
     scripts_dir = tmp_path / "Scripts"
     scripts_dir.mkdir(parents=True)
+
+    # Need to mock winreg so the real function doesn't touch the actual registry.
+    winreg_mod, _, _ = _make_winreg_mock(initial_entries=[""])
+    import sys
+    monkeypatch.setitem(sys.modules, "winreg", winreg_mod)
 
     called = False
     original = cli_main._cleanup_pending_file_rename_operations
