@@ -52,6 +52,16 @@ def _parse(byte_seq: str):
     return [kp.key for kp in out]
 
 
+def _parse_events(byte_seq: str):
+    """Like _parse, but returns the full KeyPress objects (key AND data)."""
+    out = []
+    parser = Vt100Parser(out.append)
+    for ch in byte_seq:
+        parser.feed(ch)
+    parser.flush()
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Ctrl+letter: a-z
 # ---------------------------------------------------------------------------
@@ -320,6 +330,43 @@ def test_modify_other_keys_uncased_codepoint_stays_unmapped(codepoint):
     CSI), never as a bare character."""
     result = _parse(f"\x1b[27;2;{codepoint}~")
     assert result != [chr(codepoint)]
+
+
+# ---------------------------------------------------------------------------
+# Insertion-level contract (data path) — #87637 review, coordinated with #87785
+# ---------------------------------------------------------------------------
+
+@pytest.mark.xfail(
+    reason=(
+        "prompt_toolkit's default Keys.Any binding inserts event.data (the "
+        "matched bytes), not the key — so a character-valued mapping types "
+        "the raw escape sequence until the data-path fix in #87785 lands. "
+        "Turns green automatically once #87785 is applied on top."
+    ),
+    strict=False,
+)
+@pytest.mark.parametrize(
+    "seq,expected",
+    [
+        ("\x1b[27;2;104~", "H"),      # Latin — the #87511 case
+        ("\x1b[27;2;1087~", "П"),     # Cyrillic
+        ("\x1b[27;2;945~", "Α"),      # Greek
+    ],
+)
+def test_shift_letter_data_path_types_the_character(seq, expected):
+    """Insertion-level guard: the parse-level `key` assertion above cannot
+    see what actually reaches the prompt buffer — prompt_toolkit inserts
+    ``KeyPress.data`` for character-valued entries, and before #87785 data
+    is still the raw sequence. This pins the full observable (key AND data)
+    so the insertion path cannot regress silently once #87785 makes data the
+    character."""
+    events = _parse_events(seq)
+    assert len(events) == 1, f"expected a single KeyPress for {seq!r}"
+    assert events[0].key == expected
+    assert events[0].data == expected, (
+        f"insertion inserts event.data; for {seq!r} data is still the raw "
+        f"bytes {events[0].data!r} rather than {expected!r} (needs #87785)"
+    )
 
 
 def test_does_not_clobber_shift_enter_alias():
