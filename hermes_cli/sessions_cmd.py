@@ -878,6 +878,13 @@ def cmd_sessions(args, sessions_parser=None):
         else:
             print(f"Session '{args.session_id}' not found.")
 
+    elif (
+        action == "prune"
+        and getattr(args, "never_active", False)
+        and getattr(args, "include_live", False)
+    ):
+        print("Error: --include-live cannot be combined with --never-active.")
+
     elif action == "prune" and getattr(args, "never_active", False):
         # Separate branch on purpose: the shared prune/archive selector is
         # pinned to `ended_at IS NOT NULL`, so never-closed rows sit outside

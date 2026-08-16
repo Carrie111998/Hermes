@@ -160,3 +160,41 @@ def test_sessions_prune_include_live_runs_when_only_open_sessions_match(monkeypa
     assert archived_filters == filters
     assert "Pruned 0 ended session(s); archived 2 open session(s)." in out
     assert "No sessions match" not in out
+
+
+def test_sessions_prune_rejects_include_live_with_never_active(monkeypatch, capsys):
+    import hermes_cli.main as main_mod
+    import hermes_state
+
+    called = False
+
+    class FakeDB:
+        def prune_never_active_keyed_sessions(self, **kwargs):
+            nonlocal called
+            called = True
+            return 1, 0
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(hermes_state, "SessionDB", lambda: FakeDB())
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "hermes",
+            "sessions",
+            "prune",
+            "--never-active",
+            "--include-live",
+            "--yes",
+        ],
+    )
+
+    main_mod.main()
+
+    assert not called
+    assert (
+        "Error: --include-live cannot be combined with --never-active."
+        in capsys.readouterr().out
+    )
