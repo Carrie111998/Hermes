@@ -37,7 +37,11 @@ import type { SessionProfileRoute } from '@/store/session-request-router'
 // Re-exported for the many session-actions/tile call sites that already import
 // it from here; the canonical definition lives in @/store/session.
 export { sessionMatchesStoredId }
-import { sessionOwnerRouteFromRow, type SessionOwnerScope } from '@/store/session-request-router'
+import {
+  isSessionOwnerRoute,
+  sessionOwnerRouteFromRow,
+  type SessionOwnerScope
+} from '@/store/session-request-router'
 import { reportBackendContract, reportInstallMethodWarning } from '@/store/updates'
 import type { SessionCreateResponse, SessionInfo, SessionResumeResponse, SessionRuntimeInfo } from '@/types/hermes'
 
@@ -1389,10 +1393,14 @@ function upsertResolvedSession(session: SessionInfo, storedSessionId: string) {
 
 export async function resolveStoredSession(
   storedSessionId: string,
-  ownerRoute?: SessionProfileRoute
+  owner?: SessionOwnerScope
 ): Promise<SessionInfo | undefined> {
-  const cached = [...$sessions.get(), ...$cronSessions.get(), ...$messagingSessions.get()].find(session =>
-    sessionMatchesStoredId(session, storedSessionId)
+  const ownerRoute = isSessionOwnerRoute(owner) ? owner : undefined
+  const requestedOwner = typeof owner === 'string' && owner.trim() ? normalizeProfileKey(owner) : undefined
+  const cached = [...$sessions.get(), ...$cronSessions.get(), ...$messagingSessions.get()].find(
+    session =>
+      sessionMatchesStoredId(session, storedSessionId) &&
+      (!requestedOwner || normalizeProfileKey(session.profile) === requestedOwner)
   )
 
   if (ownerRoute) {
@@ -1420,6 +1428,25 @@ export async function resolveStoredSession(
     } catch {
       // An explicit owner is fail-closed. Probing the ambient or another
       // profile would turn a stale route into a cross-connection open.
+      return undefined
+    }
+  }
+
+  // A run-history row already carries immutable profile provenance. Honor it
+  // directly instead of probing the active/default backend first: cron session
+  // ids can collide when two profiles use the same job id and timestamp.
+  if (requestedOwner) {
+    if (cached) {
+      return cached
+    }
+
+    try {
+      const session = await getSession(storedSessionId, requestedOwner)
+      session.profile = requestedOwner
+      upsertResolvedSession(session, storedSessionId)
+
+      return session
+    } catch {
       return undefined
     }
   }

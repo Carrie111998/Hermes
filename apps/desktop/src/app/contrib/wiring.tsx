@@ -975,8 +975,8 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     onEdit: editMessage,
     onLoadMoreMessaging: loadMoreMessagingForPlatform,
     onLoadMoreSessions: loadMoreSessions,
-    onManageCronJob: jobId => {
-      setCronFocusJobId(jobId)
+    onManageCronJob: (jobId, profile) => {
+      setCronFocusJobId(jobId, profile)
       navigate(CRON_ROUTE)
     },
     onNavigate: selectSidebarItem,
@@ -1001,13 +1001,13 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     // previewing profile A and the resume dials profile B. Pin the row's own
     // (connection, profile) as the resume owner before navigating; untagged
     // rows (single-profile installs, legacy pages) keep the id-only path.
-    onResumeSession: (sessionId, session) => {
-      const rowProfile = session?.profile?.trim()
+    onResumeSession: (sessionId, owner) => {
+      const rowProfile = (typeof owner === 'string' ? owner : owner?.profile)?.trim()
 
       if (rowProfile) {
         requestSessionResume(sessionId, {
-          connectionId: session?.connection_id?.trim() || 'local',
-          ...(session?.connection_id?.trim() ? {} : { mode: 'local' as const }),
+          connectionId: (typeof owner === 'object' ? owner.connection_id?.trim() : '') || 'local',
+          ...(typeof owner === 'object' && owner.connection_id?.trim() ? {} : { mode: 'local' as const }),
           profile: rowProfile,
           targetProfile: rowProfile
         })

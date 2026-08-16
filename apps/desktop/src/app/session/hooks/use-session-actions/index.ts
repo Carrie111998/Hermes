@@ -800,7 +800,7 @@ export function useSessionActions({
   }, [navigate, selectedStoredSessionId])
 
   const resumeSession = useCallback(
-    async (storedSessionId: string, replaceRoute = false, capturedOwner?: SessionProfileRoute) => {
+    async (storedSessionId: string, replaceRoute = false, capturedOwner?: SessionOwnerScope) => {
       const requestId = resumeRequestRef.current + 1
       resumeRequestRef.current = requestId
       const resumedSameSelectedSession = selectedStoredSessionIdRef.current === storedSessionId
@@ -891,7 +891,8 @@ export function useSessionActions({
       // gateway call (no-op when it's already on that profile / single-profile).
       // resolveStoredSession finds the row by id (cheap), so an uncached pasted
       // id loads as fast as a sidebar click instead of hanging on a list scan.
-      const ownerRoute = capturedOwner || getSessionOwnerHint(storedSessionId)
+      const hintedOwner = capturedOwner || getSessionOwnerHint(storedSessionId)
+      const ownerRoute = typeof hintedOwner === 'object' ? hintedOwner : undefined
       // A connection switch clears/reloads the session rows before this path
       // runs, so an untagged row belongs to the connection that supplied the
       // current list. Capture that source before the async metadata lookup. If
@@ -903,8 +904,9 @@ export function useSessionActions({
       const ambientConnectionId =
         ambientConnection?.mode === 'remote' ? ambientConnection.connectionId?.trim() || '' : ''
 
-      const storedForProfile = await resolveStoredSession(storedSessionId, ownerRoute)
-      const sessionProfile = storedForProfile?.profile
+      const storedForProfile = await resolveStoredSession(storedSessionId, hintedOwner)
+      const sessionProfile =
+        typeof hintedOwner === 'string' ? hintedOwner.trim() || storedForProfile?.profile : storedForProfile?.profile
 
       if (resumeRequestRef.current !== requestId) {
         return
