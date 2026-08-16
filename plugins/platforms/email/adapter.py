@@ -876,9 +876,14 @@ class EmailAdapter(BasePlatformAdapter):
                 dispatch_future.result(timeout=IMAP_FETCH_WATCHDOG_TIMEOUT)
             except FutureTimeoutError as exc:
                 if dispatch_future.done():
-                    raise _EmailDispatchError(
-                        f"Message dispatch for IMAP UID {uid!r} failed: {exc}"
-                    ) from exc
+                    try:
+                        dispatch_future.result()
+                    except Exception as completed_exc:
+                        raise _EmailDispatchError(
+                            f"Message dispatch for IMAP UID {uid!r} failed: "
+                            f"{completed_exc}"
+                        ) from completed_exc
+                    return
                 dispatch_future.cancel()
                 raise _EmailDispatchTimeout(
                     f"Message dispatch for IMAP UID {uid!r} made no progress for "

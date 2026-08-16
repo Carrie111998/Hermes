@@ -642,7 +642,7 @@ class TestPollLoop(unittest.TestCase):
         adapter._abort_active_imap = abort_fetch
         adapter.set_fatal_error_handler(mock_fatal_handler)
 
-        with patch.object(email_adapter, "IMAP_FETCH_WATCHDOG_TIMEOUT", 0.05):
+        with patch.object(email_adapter, "IMAP_FETCH_WATCHDOG_TIMEOUT", 0.5):
             elapsed = asyncio.run(exercise())
 
         self.assertTrue(fetch_started.is_set())
@@ -651,7 +651,7 @@ class TestPollLoop(unittest.TestCase):
         self.assertEqual(aborted, [True])
         self.assertEqual(adapter.fatal_error_code, "email_imap_fetch_timeout")
         self.assertTrue(adapter.fatal_error_retryable)
-        self.assertIn("no progress for 0.05s", adapter.fatal_error_message)
+        self.assertIn("no progress for 0.5s", adapter.fatal_error_message)
 
     def test_progressing_fetch_can_exceed_watchdog_total_duration(self):
         """The watchdog measures inactivity, not total healthy batch time."""
@@ -665,7 +665,7 @@ class TestPollLoop(unittest.TestCase):
 
         def progressing_fetch(dispatch_callback=None):
             for _ in range(5):
-                time.sleep(0.03)
+                time.sleep(0.15)
                 adapter._record_fetch_progress()
             return []
 
@@ -675,7 +675,7 @@ class TestPollLoop(unittest.TestCase):
         adapter._fetch_new_messages = progressing_fetch
         adapter.set_fatal_error_handler(mock_fatal_handler)
 
-        with patch.object(email_adapter, "IMAP_FETCH_WATCHDOG_TIMEOUT", 0.05):
+        with patch.object(email_adapter, "IMAP_FETCH_WATCHDOG_TIMEOUT", 0.5):
             asyncio.run(adapter._check_inbox())
 
         self.assertEqual(notified, [])
@@ -725,7 +725,7 @@ class TestPollLoop(unittest.TestCase):
         adapter.set_fatal_error_handler(mock_fatal_handler)
 
         with patch("imaplib.IMAP4_SSL", return_value=mock_imap), patch.object(
-            email_adapter, "IMAP_FETCH_WATCHDOG_TIMEOUT", 0.05
+            email_adapter, "IMAP_FETCH_WATCHDOG_TIMEOUT", 0.5
         ):
             asyncio.run(exercise())
 
@@ -734,6 +734,62 @@ class TestPollLoop(unittest.TestCase):
         self.assertEqual(adapter.fatal_error_code, "email_message_dispatch_timeout")
         self.assertTrue(adapter.fatal_error_retryable)
         self.assertNotIn(b"1", adapter._seen_uids)
+
+    def test_dispatch_timeout_boundary_success_is_committed_once(self):
+        """A dispatch completing during timeout handling must still commit its UID."""
+        import asyncio
+
+        adapter = self._make_adapter()
+        notified = []
+        raw_email = MIMEText("Body", "plain", "utf-8")
+        raw_email["From"] = "sender@test.com"
+        raw_email["Subject"] = "Boundary success"
+        mock_imap = MagicMock()
+
+        def uid_handler(command, *args):
+            if command == "search":
+                return ("OK", [b"1"])
+            if command == "fetch":
+                return ("OK", [(b"1", raw_email.as_bytes())])
+            return ("NO", [])
+
+        class BoundaryFuture:
+            def __init__(self):
+                self.result_calls = 0
+
+            def result(self, timeout=None):
+                self.result_calls += 1
+                if self.result_calls == 1:
+                    raise TimeoutError()
+                return None
+
+            def done(self):
+                return True
+
+        boundary_future = BoundaryFuture()
+
+        def complete_at_boundary(coro, loop):
+            coro.close()
+            return boundary_future
+
+        async def mock_fatal_handler(failed_adapter):
+            notified.append(failed_adapter)
+
+        mock_imap.uid.side_effect = uid_handler
+        adapter.set_fatal_error_handler(mock_fatal_handler)
+
+        with patch("imaplib.IMAP4_SSL", return_value=mock_imap), patch(
+            "asyncio.run_coroutine_threadsafe", side_effect=complete_at_boundary
+        ):
+            asyncio.run(adapter._check_inbox())
+
+        self.assertEqual(boundary_future.result_calls, 2)
+        self.assertEqual(notified, [])
+        self.assertIn(b"1", adapter._seen_uids)
+        self.assertIn(
+            call("store", b"1", "+FLAGS", "(\\Seen)"),
+            mock_imap.uid.call_args_list,
+        )
 
     def test_dispatch_failure_is_not_reported_as_imap_failure(self):
         """A downstream dispatch exception must retain its own failure classification."""
@@ -809,7 +865,7 @@ class TestPollLoop(unittest.TestCase):
         adapter._dispatch_message = dispatch
 
         with patch("imaplib.IMAP4_SSL", return_value=mock_imap), patch.object(
-            email_adapter, "IMAP_FETCH_WATCHDOG_TIMEOUT", 0.05
+            email_adapter, "IMAP_FETCH_WATCHDOG_TIMEOUT", 0.5
         ):
             asyncio.run(adapter._check_inbox())
 
