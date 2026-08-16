@@ -245,6 +245,41 @@ def _get_approval_callback():
     return getattr(_callback_tls, "approval", None)
 
 
+def _can_prompt_for_sudo() -> bool:
+    """True only when a sudo prompt can reach the person who asked for it.
+
+    Two conditions, and the second one matters more than it looks.
+
+    A registered sudo callback always qualifies: only the CLI and the TUI
+    register one, and it prompts the same person who typed the command.
+
+    A raw tty qualifies ONLY when the interactive signal came from the
+    environment, meaning a human started this process. It must NOT qualify when
+    the signal came from the run-scoped ContextVar, because that is an adapter
+    run with a REMOTE caller. `hermes-agui` is normally started by uvicorn in a
+    foreground terminal, so stdin is a tty and the process does own one -- it
+    just belongs to the operator, not to the client issuing the command.
+    Prompting there asks the operator for a root password on behalf of a remote
+    request, and plain `sudo cmd` is deliberately excluded from the
+    dangerous-command patterns (tools/approval.py) precisely because it is
+    TTY-bound, so no approval interrupt fires first.
+    """
+    # An explicit non-interactive signal suppresses prompting outright, from
+    # either source. Checking this first also keeps a lingering callback from
+    # re-enabling a prompt in a run that declared itself non-interactive.
+    if not is_interactive_cli():
+        return False
+    if _get_sudo_password_callback() is not None:
+        return True
+    if interactive_signal_source() != "env":
+        return False
+    import sys as _sys
+    try:
+        return _sys.stdin.isatty()
+    except Exception:
+        return False
+
+
 def set_sudo_password_callback(cb):
     """Register a callback for sudo password prompts (used by CLI).
 
@@ -318,6 +353,8 @@ def _reset_cached_sudo_passwords() -> None:
 # Dangerous command detection + approval now consolidated in tools/approval.py
 from tools.approval import (
     check_all_command_guards as _check_all_guards_impl,
+    interactive_signal_source,
+    is_interactive_cli,
 )
 
 
@@ -870,7 +907,7 @@ def _transform_sudo_command(command: str | None) -> tuple[str | None, str | None
     if not has_configured_password and not sudo_password and _sudo_nopasswd_works():
         return command, None
 
-    if not has_configured_password and not sudo_password and env_var_enabled("HERMES_INTERACTIVE"):
+    if not has_configured_password and not sudo_password and _can_prompt_for_sudo():
         sudo_password = _prompt_for_sudo_password(timeout_seconds=45)
         if sudo_password:
             _set_cached_sudo_password(sudo_password)
