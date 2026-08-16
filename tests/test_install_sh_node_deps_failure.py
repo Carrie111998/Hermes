@@ -111,6 +111,10 @@ def test_root_node_dependency_failure_is_fatal(tmp_path: Path) -> None:
     assert "Node.js dependencies installed" not in proc.stdout
     assert "TUI dependencies installed" not in proc.stdout
     assert not (install_dir / "node_modules").exists()
+    # The failure is install-blocking, so npm's own diagnostics must be
+    # replayed — one opaque line is not enough to tell EBADENGINE from a
+    # network timeout (#87340).
+    assert "simulated npm lifecycle failure" in proc.stderr
 
 
 def test_tui_node_dependency_failure_is_fatal(tmp_path: Path) -> None:
@@ -126,6 +130,7 @@ def test_tui_node_dependency_failure_is_fatal(tmp_path: Path) -> None:
     assert calls == [str(install_dir), str(tui_dir)]
     assert "Node.js dependencies installed" in proc.stdout
     assert "TUI dependencies installed" not in proc.stdout
+    assert "simulated npm lifecycle failure" in proc.stderr
 
 
 def test_node_dependency_success_remains_successful(tmp_path: Path) -> None:
