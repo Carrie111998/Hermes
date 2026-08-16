@@ -439,6 +439,15 @@ def _read_referenced_script(path: Path) -> tuple[Optional[str], bool]:
         return None, False
     try:
         metadata = os.fstat(descriptor)
+        if stat.S_ISDIR(metadata.st_mode):
+            # A path-shaped token in *argument text* (e.g. a multi-line
+            # `gh pr create --body` mentioning `github/repositories/`) can
+            # resolve to an existing directory in cwd. A directory is not a
+            # script — it can be neither executed nor read as one — so this
+            # is "nothing to scan" (mirroring the binary-sniff branch below),
+            # not a fail-closed block (#87401). Other non-regular types
+            # (FIFOs, devices, sockets) stay fail-closed.
+            return None, False
         if not stat.S_ISREG(metadata.st_mode):
             return None, True
         # Sniff a small prefix first: files that are clearly compiled

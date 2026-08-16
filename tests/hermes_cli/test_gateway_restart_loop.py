@@ -724,6 +724,55 @@ class TestLifecycleGuardModule:
         assert text is None
         assert unsafe is False
 
+    def test_read_referenced_script_directory_is_nothing_to_scan(self, tmp_path):
+        """#87401: a path-shaped token in argument text (a multi-line
+        ``gh pr create --body`` mentioning ``github/repositories/``) can
+        resolve to an existing *directory* in cwd. A directory is not a
+        script — it must read as "nothing to scan", not trip the
+        non-regular fail-closed branch that used to block the command."""
+        from cron.lifecycle_guard import _read_referenced_script
+
+        text, unsafe = _read_referenced_script(tmp_path)
+        assert text is None
+        assert unsafe is False
+
+    def test_directory_token_in_multiline_argument_not_blocked(self, tmp_path):
+        """#87401 end-to-end: the referenced-script walk must not block an
+        innocuous ``gh pr create`` whose --body text mentions a repo-relative
+        path across a newline when the first segment matches an existing
+        directory in cwd."""
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+
+        (tmp_path / "github").mkdir()
+        # Real newline in the command: the continuation line tokenizes
+        # cleanly (per-line quoting mangled or stripped upstream, as in the
+        # gateway session from the report), so `github/` becomes the
+        # segment's executable candidate and resolves to the existing
+        # directory. Unpatched this is a hard block.
+        command = "gh pr create --title t --body x\ngithub/ 2 files (not a CI target)"
+        result = contains_gateway_lifecycle_command_or_referenced_script(
+            command, cwd=str(tmp_path)
+        )
+        assert result is False
+
+    def test_non_regular_referenced_script_still_fails_closed(self, tmp_path):
+        """#87401 guard: only directories became nothing-to-scan. Other
+        non-regular files (FIFOs, devices, sockets) keep the fail-closed
+        read so an unreadable candidate can never smuggle a lifecycle
+        command past the walk."""
+        import stat as stat_mod
+
+        from cron.lifecycle_guard import _read_referenced_script
+
+        fifo = tmp_path / "script.fifo"
+        os.mkfifo(fifo)
+        text, unsafe = _read_referenced_script(fifo)
+        assert text is None
+        assert unsafe is True
+        assert stat_mod.S_ISFIFO(fifo.stat().st_mode)
+
     def test_remote_read_fallback_binary_does_not_crash_guard(self):
         """#77703: in the gateway the referenced-script walk carries a
         ``read_remote_script`` fallback (SSH/Modal/Daytona backends read the
@@ -1205,9 +1254,13 @@ class TestLifecycleGuardNeverRaises:
         assert self._scan(f"bash {weird}") is False
 
     def test_directory_and_dev_null_fail_closed_not_crash(self, tmp_path):
-        # Non-regular files are suspicious (fail closed = blocked), but the
-        # important contract is: verdict, not exception.
-        assert self._scan(f"bash {tmp_path}") is True
+        # A directory reference is "nothing to scan" (#87401): a directory
+        # can be neither executed nor read as a script, so blocking on it
+        # only produced false positives (argument text mentioning a
+        # repo-relative path after a newline). Other non-regular files
+        # (devices, FIFOs) stay fail-closed, and the important contract
+        # is: verdict, not exception.
+        assert self._scan(f"bash {tmp_path}") is False
         assert self._scan("bash /dev/null") is True
 
     def test_magic_prefix_binaries_skipped_without_full_read(self, tmp_path):
@@ -1238,6 +1291,10 @@ class TestLifecycleGuardNeverRaises:
         binary.write_bytes(b"\x7fELF" + bytes(128))
         for value in ("nul\x00byte.sh", str(binary), "/nonexistent/x.sh"):
             check_gateway_lifecycle("clean prompt", value)  # must not raise
-        for value in ("/dev/null", str(tmp_path)):
+        # A directory script value is nothing to scan, not a lifecycle
+        # block (#87401) — the job fails at exec time with the shell's own
+        # "is a directory" error. /dev/null (a device) still fails closed.
+        check_gateway_lifecycle("clean prompt", str(tmp_path))  # must not raise
+        for value in ("/dev/null",):
             with pytest.raises(GatewayLifecycleBlocked):
                 check_gateway_lifecycle("clean prompt", value)
