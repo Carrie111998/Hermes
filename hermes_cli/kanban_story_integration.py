@@ -952,14 +952,11 @@ def _finalize_prepared_intent(
                 "target_tip_sha": target_tip_sha,
             },
         )
-        kb._append_event(
+        kb._record_epic_base_pin(
             conn,
             current.key.epic_id,
-            kb.EPIC_BASE_PINNED_EVENT,
-            {
-                "branch": kb.epic_branch_for(current.key.epic_id),
-                "base_sha": target_tip_sha,
-            },
+            kb.epic_branch_for(current.key.epic_id),
+            target_tip_sha,
         )
         conn.execute(
             "UPDATE epic_release_snapshots SET status='invalidated', updated_at=? "
