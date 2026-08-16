@@ -58,6 +58,14 @@ const colorizeHint = (s: string, hex?: string) => {
   return `${ESC}[38;2;${r};${g};${b}m${s}${ESC}[39m`
 }
 
+// Typed-text fast-echo must carry the SAME explicit fg the Ink render uses:
+// the bypass writes raw cells, and a default-fg glyph goes invisible the
+// moment a skin repaints the background to the opposite polarity (a dark
+// skin on a light terminal ⇒ black-on-black). No color ⇒ passthrough, so
+// unthemed inputs keep the terminal default.
+export const colorizeEcho = (s: string, hex?: string) =>
+  /^#[0-9a-f]{6}$/i.test(hex ?? '') ? `${ESC}[38;2;${hintRgb(hex).join(';')}m${s}${ESC}[39m` : s
+
 /** Synthetic placeholder cursor: a hint-colored chip with luminance-picked
  *  ink, standing in for the hidden hardware cursor (bubbles pattern). */
 const hintCursorCell = (ch: string, hex?: string) => {
@@ -149,6 +157,54 @@ export function applyPrintableInsert(
 
 export const shouldRouteMultiCharInputAsPaste = (text: string): boolean => text.includes('\n')
 
+export function valueForReturnSubmit(
+  value: string,
+  cursor: number,
+  input: string,
+  range?: { end: number; start: number } | null
+): TextInsertResult {
+  const pending = input.replace(BRACKET_PASTE, '').replace(/\r\n/g, '\n').replace(/\r/g, '\n')
+
+  if (!pending) {
+    return { cursor, value }
+  }
+
+  // Browser/xterm IME commits can arrive as one burst immediately followed by
+  // Return (for example "会丢失内容\r").  The Return keypath is already about to
+  // submit, but the committed text has not passed through the ordinary
+  // printable-input branch yet.  Preserve the printable prefix before the first
+  // newline so the visible, just-committed IME text is part of the submitted
+  // prompt instead of being silently dropped.
+  const [beforeReturn] = pending.split('\n', 1)
+
+  if (!beforeReturn) {
+    return { cursor, value }
+  }
+
+  return applyPrintableInsert(value, cursor, beforeReturn, range) ?? { cursor, value }
+}
+
+/**
+ * Transactional cut. Writes `text` to the clipboard and only invokes
+ * `removeSelection` once the write actually succeeds. On failure (e.g. a
+ * headless/SSH box with no clipboard backend) the selection is left untouched
+ * so the text is never destroyed without a copy to paste back. Returns whether
+ * the clipboard write succeeded.
+ */
+export async function cutSelection(
+  text: string,
+  write: (text: string) => Promise<boolean>,
+  removeSelection: () => void
+): Promise<boolean> {
+  const ok = await write(text)
+
+  if (ok) {
+    removeSelection()
+  }
+
+  return ok
+}
+
 export function shouldPreserveCtrlJNewline(env: MinimalEnv = process.env): boolean {
   if (env.WT_SESSION) {
     return true
@@ -226,6 +282,16 @@ function wordRight(s: string, p: number) {
   }
 
   return i
+}
+
+/**
+ * Delete the word to the RIGHT of the cursor (readline meta+d / kill-word).
+ * The cursor stays put; the text from the cursor to the next word boundary is
+ * removed. Callers guard against `cursor >= value.length` themselves; when the
+ * cursor is already at the end this is a no-op.
+ */
+export function deleteWordForward(value: string, cursor: number): TextInsertResult {
+  return { cursor, value: value.slice(0, cursor) + value.slice(wordRight(value, cursor)) }
 }
 
 /**
@@ -311,6 +377,53 @@ export function resolveCursorLayout(display: string, cur: number, curRefCurrent:
   void cur // intentionally unused for layout — see doc comment above
 
   return cursorLayout(display, curRefCurrent, columns)
+}
+
+/**
+ * Readline `unix-line-discard` (Ctrl+U / Cmd+Backspace): kill backward to
+ * the start of the *current logical line*, not to the start of the whole
+ * buffer. In single-line input the two are identical; in multiline input
+ * they are not, and repeating the keystroke walks up one line at a time.
+ *
+ * When the cursor already sits at a line start, consume the preceding
+ * newline so a repeat press makes progress instead of wedging — this is
+ * what makes "repeat to clear across lines" work.
+ */
+export function killToLineStart(value: string, cursor: number): { value: string; cursor: number } {
+  const start = value.lastIndexOf('\n', Math.max(0, cursor - 1)) + 1
+  const from = start === cursor && cursor > 0 ? start - 1 : start
+
+  return { value: value.slice(0, from) + value.slice(cursor), cursor: from }
+}
+
+/**
+ * Readline `kill-line` (Ctrl+K / Cmd+ForwardDelete): kill forward to the
+ * end of the current logical line. At a line end, consume the newline so a
+ * repeat press joins the next line rather than doing nothing.
+ */
+export function killToLineEnd(value: string, cursor: number): { value: string; cursor: number } {
+  const nl = value.indexOf('\n', cursor)
+  const to = nl < 0 ? value.length : nl === cursor ? nl + 1 : nl
+
+  return { value: value.slice(0, cursor) + value.slice(to), cursor }
+}
+
+/**
+ * True when a Backspace / ForwardDelete keystroke should kill to the line
+ * boundary rather than delete a single word.
+ *
+ * Only the *super* bit qualifies. It is tempting to reuse `isActionMod`,
+ * but that accepts `key.meta` on macOS — and hermes-ink reports Option as
+ * `meta`, so Option+Backspace (delete-word, the macOS standard) would be
+ * swallowed. On Linux/Windows `isActionMod` is `key.ctrl`, and
+ * Ctrl+Backspace is delete-word there too. `super` is set only by kitty
+ * CSI-u / xterm modifyOtherKeys, where it unambiguously means Cmd.
+ *
+ * Terminals that instead rewrite Cmd+Backspace to Ctrl+U are handled by
+ * the `isMacActionFallback` kill-to-start path, not by this predicate.
+ */
+export function isLineKillModifier(key: { ctrl: boolean; meta: boolean; super?: boolean }): boolean {
+  return key.super === true
 }
 
 /**
@@ -565,6 +678,7 @@ export function TextInput({
   voiceRecordKey = DEFAULT_VOICE_RECORD_KEY,
   placeholder = '',
   placeholderColor,
+  color,
   focus = true
 }: TextInputProps) {
   const [cur, setCur] = useState(value.length)
@@ -583,6 +697,15 @@ export function TextInput({
   const parentChangeTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const pendingParentValue = useRef<string | null>(null)
   const localRenderTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  // True for one keystroke after a commit took the full Ink render path
+  // (syncParent). Ink repaints the whole input line, so the terminal cursor
+  // baseline that the fast-echo "\b \b" shortcut assumes is no longer valid;
+  // a fast-echo backspace fired right after an Ink repaint desyncs the screen
+  // and strands glyphs (the OpenKey Vietnamese "hạ␣␣" bug: an injected U+202F
+  // marker forces an Ink repaint, then the recompose backspaces fast-echo
+  // against a stale baseline). Suppress fast-echo for that one next edit.
+  const inkRepaintedRef = useRef(false)
+  const inkRepaintResetTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const lineWidthRef = useRef(stringWidth(value.includes('\n') ? value.slice(value.lastIndexOf('\n') + 1) : value))
   const mouseAnchorRef = useRef<null | number>(null)
   const lastClickRef = useRef<{ at: number; offset: number }>({ at: 0, offset: -1 })
@@ -680,18 +803,21 @@ export function TextInput({
   }, [cur, display, focus, nativeCursor, placeholder, placeholderColor, selected])
 
   useEffect(() => {
-    if (self.current) {
-      self.current = false
-    } else {
-      setCur(value.length)
-      setSel(null)
-      curRef.current = value.length
-      selRef.current = null
-      vRef.current = value
-      lineWidthRef.current = stringWidth(value.includes('\n') ? value.slice(value.lastIndexOf('\n') + 1) : value)
-      undo.current = []
-      redo.current = []
+    const ownEcho = self.current && value === vRef.current
+    self.current = false
+
+    if (ownEcho) {
+      return
     }
+
+    setCur(value.length)
+    setSel(null)
+    curRef.current = value.length
+    selRef.current = null
+    vRef.current = value
+    lineWidthRef.current = stringWidth(value.includes('\n') ? value.slice(value.lastIndexOf('\n') + 1) : value)
+    undo.current = []
+    redo.current = []
   }, [value])
 
   useEffect(() => {
@@ -715,6 +841,39 @@ export function TextInput({
         setCur(vRef.current.length)
         curRef.current = vRef.current.length
       },
+      copy: () => {
+        const range = selRange()
+
+        if (range) {
+          void writeClipboardText(vRef.current.slice(range.start, range.end))
+        }
+      },
+      cut: () => {
+        const range = selRange()
+
+        if (!range) {
+          return
+        }
+
+        // Transactional cut: only remove the selection once the clipboard
+        // write actually succeeds. A fire-and-forget write on a headless/SSH
+        // box (no clipboard backend) would otherwise destroy the text with no
+        // copy to paste back. On failure the selection is left intact.
+        const text = vRef.current.slice(range.start, range.end)
+
+        void cutSelection(text, writeClipboardText, () => {
+          // Re-read the selection: the awaited clipboard write opens a window
+          // in which the user could have moved/changed the selection. Only
+          // remove when it still matches what we copied.
+          const current = selRange()
+
+          if (!current || current.start !== range.start || current.end !== range.end) {
+            return
+          }
+
+          commit(vRef.current.slice(0, current.start) + vRef.current.slice(current.end), current.start)
+        })
+      },
       end: selected?.end ?? curRef.current,
       start: selected?.start ?? curRef.current,
       value: vRef.current
@@ -735,6 +894,10 @@ export function TextInput({
 
       if (localRenderTimer.current) {
         clearTimeout(localRenderTimer.current)
+      }
+
+      if (inkRepaintResetTimer.current) {
+        clearTimeout(inkRepaintResetTimer.current)
       }
     },
     []
@@ -790,7 +953,7 @@ export function TextInput({
     canFastEchoBase() && canFastAppendShape(current, cursor, text, columns, lineWidthRef.current)
 
   const canFastBackspace = (current: string, cursor: number) =>
-    canFastEchoBase() && canFastBackspaceShape(current, cursor, columns)
+    !inkRepaintedRef.current && canFastEchoBase() && canFastBackspaceShape(current, cursor, columns)
 
   const commit = (
     next: string,
@@ -836,6 +999,24 @@ export function TextInput({
         flushParentChange()
         self.current = true
         cbChange.current(next)
+        // A full Ink repaint just happened. Mark it so any fast-echo backspace
+        // later in this IME recompose burst is suppressed (it would write
+        // "\b \b" against a baseline Ink just invalidated, stranding the U+202F
+        // marker glyph — the "hạ␣␣" bug). IME reads arrive as SEPARATE stdin
+        // events with small macrotask gaps, so a setTimeout(0) reset would
+        // clear the flag between reads and miss the very backspaces it must
+        // guard. Use a short real-time window that spans a recompose burst;
+        // normal typing re-enables fast-echo via the append path below.
+        inkRepaintedRef.current = true
+
+        if (inkRepaintResetTimer.current) {
+          clearTimeout(inkRepaintResetTimer.current)
+        }
+
+        inkRepaintResetTimer.current = setTimeout(() => {
+          inkRepaintResetTimer.current = null
+          inkRepaintedRef.current = false
+        }, 60)
       } else {
         self.current = true
         scheduleParentChange(next)
@@ -1104,13 +1285,15 @@ export function TextInput({
       if (k.return) {
         flushKeyBurst()
 
+        const range = selRange()
+        const pending = valueForReturnSubmit(vRef.current, curRef.current, inp, range)
         const sequence = (event.keypress as { sequence?: string }).sequence
         const preserveBareLineFeed = shouldPreserveCtrlJNewline() && sequence === '\n'
 
         if (k.shift || k.ctrl || preserveBareLineFeed || (isMac ? isActionMod(k) : k.meta)) {
-          commit(ins(vRef.current, curRef.current, '\n'), curRef.current + 1)
+          commit(ins(pending.value, pending.cursor, '\n'), pending.cursor + 1)
         } else {
-          cbSubmit.current?.(vRef.current)
+          cbSubmit.current?.(pending.value)
         }
 
         return
@@ -1185,11 +1368,30 @@ export function TextInput({
       } else if (wordMod && inp === 'f') {
         clearSel()
         c = wordRight(v, c)
+      } else if (wordMod && inp === 'd') {
+        // meta+d (readline kill-word). The web dashboard maps Ctrl+Delete to
+        // ESC d, which hermes-ink decodes as meta+'d'; without this branch it
+        // fell through to the printable path and typed a literal "d".
+        if (range) {
+          v = v.slice(0, range.start) + v.slice(range.end)
+          c = range.start
+        } else if (c < v.length) {
+          clearSel()
+          const next = deleteWordForward(v, c)
+          v = next.value
+          c = next.cursor
+        } else {
+          return
+        }
       } else if (range && (k.backspace || delFwd)) {
         v = v.slice(0, range.start) + v.slice(range.end)
         c = range.start
       } else if (k.backspace && c > 0) {
-        if (wordMod) {
+        if (isLineKillModifier(k)) {
+          // Cmd+Backspace — kill backward to start of line, matching the
+          // Ctrl+U (unix-line-discard) path below.
+          ;({ cursor: c, value: v } = killToLineStart(v, c))
+        } else if (wordMod) {
           const t = wordLeft(v, c)
           v = v.slice(0, t) + v.slice(c)
           c = t
@@ -1213,9 +1415,11 @@ export function TextInput({
           c = t
         }
       } else if (delFwd && c < v.length) {
-        if (wordMod) {
-          const t = wordRight(v, c)
-          v = v.slice(0, c) + v.slice(t)
+        if (isLineKillModifier(k)) {
+          // Cmd+ForwardDelete — kill to end of line, matching Ctrl+K.
+          ;({ cursor: c, value: v } = killToLineEnd(v, c))
+        } else if (wordMod) {
+          v = deleteWordForward(v, c).value
         } else {
           v = v.slice(0, c) + v.slice(nextPos(v, c))
         }
@@ -1236,15 +1440,14 @@ export function TextInput({
           v = v.slice(0, range.start) + v.slice(range.end)
           c = range.start
         } else {
-          v = v.slice(c)
-          c = 0
+          ;({ cursor: c, value: v } = killToLineStart(v, c))
         }
       } else if (actionKillToEnd) {
         if (range) {
           v = v.slice(0, range.start) + v.slice(range.end)
           c = range.start
         } else {
-          v = v.slice(0, c)
+          ;({ cursor: c, value: v } = killToLineEnd(v, c))
         }
       } else if (event.keypress.isPasted || inp.length > 0) {
         const bracketed = event.keypress.isPasted || inp.includes('[200~')
@@ -1281,7 +1484,17 @@ export function TextInput({
 
           v = inserted.value
           c = inserted.cursor
-          scheduleKeyBurstCommit(v, c)
+          // Multi-character inserts are IME recompositions or pastes, NOT rapid
+          // single-key typing. Committing them through the 16ms deferred
+          // key-burst path opens a race: when an IME recompose arrives as a
+          // burst of backspaces followed by this text in one stdin read (e.g.
+          // OpenKey Vietnamese Telex, which injects a U+202F marker then erases
+          // and re-emits the syllable), the single `self.current` guard can be
+          // consumed by an interleaved re-render before the deferred commit
+          // flushes, snapping the buffer back to a stale parent value and
+          // dropping the recomposed tail (the "hanhj -> hạ␣␣" bug). Commit
+          // synchronously so the recomposed value reaches the parent atomically.
+          commit(v, c)
 
           return
         }
@@ -1306,7 +1519,19 @@ export function TextInput({
 
             if (simpleAppend) {
               const effect = fastAppendEffect(preInsertValue, preInsertCursor, text)
-              stdout!.write(effect.write)
+              // Same explicit fg as the Ink render (see the <Text color>) —
+              // the bypass cell must not flash the terminal-default color.
+              stdout!.write(colorizeEcho(effect.write, color))
+              // A real character was just fast-echoed to the screen, so the
+              // terminal baseline is synced again — clear any pending Ink-repaint
+              // fast-echo suppression so normal backspace fast-echo resumes.
+              inkRepaintedRef.current = false
+
+              if (inkRepaintResetTimer.current) {
+                clearTimeout(inkRepaintResetTimer.current)
+                inkRepaintResetTimer.current = null
+              }
+
               // ASCII-printable text advances the physical cursor by exactly
               // text.length cells (canFastAppendShape rejects non-ASCII,
               // wide chars, newlines). Notify Ink so the cached displayCursor
@@ -1395,7 +1620,14 @@ export function TextInput({
       ref={boxRef}
       width={columns}
     >
-      <Text wrap="wrap">{rendered}</Text>
+      {/* Explicit theme color on the typed text — default fg tracks the HOST
+          terminal's polarity, not the skin's, so a live dark-skin repaint on a
+          light terminal would otherwise leave the input black-on-black. chalk
+          re-opens the outer color after embedded [39m closes (placeholder
+          chips), and INV cursor/selection cells don't touch fg. */}
+      <Text color={color} wrap="wrap">
+        {rendered}
+      </Text>
     </Box>
   )
 }
@@ -1416,6 +1648,8 @@ export interface PasteEvent {
 }
 
 interface TextInputProps {
+  /** Hex color for typed text (theme text); terminal default when omitted. */
+  color?: string
   columns?: number
   focus?: boolean
   mask?: string
@@ -1467,6 +1701,7 @@ export const shouldPassThroughToGlobalHandler = (
 ): boolean =>
   (key.ctrl && input === 'c') ||
   (key.ctrl && input === 'x') ||
+  (key.ctrl && input === 'o') ||
   key.tab ||
   (key.shift && key.tab) ||
   key.pageUp ||
