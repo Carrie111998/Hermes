@@ -1094,8 +1094,10 @@ def _is_remote_terminal_backend(backend: str) -> bool:
 
 def _backend_fallback_description(backend: str) -> str:
     definition = _backend_definition(backend)
-    if definition is not None and definition.description.strip():
-        return definition.description.strip()
+    if definition is not None:
+        description = definition.validated_picker_metadata()["description"].strip()
+        if description:
+            return description
     return f"a {backend} environment (likely Linux)"
 
 
@@ -1229,6 +1231,7 @@ def _probe_remote_backend(env_type: str) -> str | None:
             container_config=container_config,
             task_id="prompt-backend-probe",
             host_cwd=config.get("host_cwd"),
+            backend_config=config.get("backend_config", {}),
         )
         # Single-line POSIX probe — works on any Unixy backend. Wrapped in
         # `2>/dev/null` so a missing binary doesn't pollute the output.
