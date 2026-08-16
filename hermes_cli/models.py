@@ -437,27 +437,6 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "MiniMax-M2.1",
         "MiniMax-M2",
     ],
-    # Vertex has no /models discovery endpoint (see plugins/model-providers/
-    # vertex: fetch_models returns None by design), so without a curated entry
-    # here provider_model_ids("vertex") returns [] and the /model picker's
-    # vertex row enumerates zero models — the configured model only appears
-    # when some other cache path (docs catalog, anthropic) happens to render
-    # it, which is why it seemed intermittent. Exact publisher-qualified IDs
-    # only: bare aliases 404 on the Vertex surface. Claude entries use bare
-    # IDs (AnthropicVertex SDK path); Gemini/partner entries use the
-    # "google/" or vendor publisher prefix Vertex's openapi endpoint expects
-    # (see hermes_cli/model_setup_flows.py).
-    "vertex": [
-        "claude-fable-5",
-        "claude-opus-4-8",
-        "claude-sonnet-5",
-        "google/gemini-3.1-pro-preview",
-        "google/gemini-3-pro-preview",
-        "google/gemini-3.5-flash",
-        "google/gemini-3-flash-preview",
-        "google/gemini-3.1-flash-lite-preview",
-        "deepseek-ai/deepseek-v3.2-maas",
-    ],
     "anthropic": [
         "claude-fable-5",
         "claude-sonnet-5",
@@ -661,14 +640,16 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "claude-fable-5",
         "claude-sonnet-5",
         "google/gemini-3.1-pro-preview",
-        "google/gemini-3-pro-preview",
         "google/gemini-3.6-flash",
         "google/gemini-3.5-flash",
         "google/gemini-3.5-flash-lite",
         "google/gemini-3-flash-preview",
-        "google/gemini-3.1-flash-lite-preview",
         "google/gemini-3.1-flash-lite",
         "deepseek-ai/deepseek-v3.2-maas",
+        "zai-org/glm-5-maas",
+        "moonshotai/kimi-k2-thinking-maas",
+        "xai/grok-4.20-reasoning",
+        "xai/grok-4.1-fast-reasoning",
     ],
     "novita": [
         "moonshotai/kimi-k2.5",

@@ -195,6 +195,34 @@ _OFFICIAL_DOCS_PRICING: Dict[tuple[str, str], PricingEntry] = {
         pricing_version="openai-gpt-5.6-2026-07",
     ),
     # ── Anthropic Claude 4.8 ─────────────────────────────────────────────
+    # Claude Opus 5 — current flagship. $5/$25 per 1M, same base rates as the
+    # 4.5–4.8 Opus generation (cache read 0.1x input, cache write 1.25x input).
+    # Served identically on Anthropic direct and Vertex Model Garden.
+    (
+        "anthropic",
+        "claude-opus-5",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("5.00"),
+        output_cost_per_million=Decimal("25.00"),
+        cache_read_cost_per_million=Decimal("0.50"),
+        cache_write_cost_per_million=Decimal("6.25"),
+        source="official_docs_snapshot",
+        source_url="https://platform.claude.com/docs/en/about-claude/pricing",
+        pricing_version="anthropic-pricing-2026-05",
+    ),
+    # Claude Fable 5 — premium tier, $10/$50 per 1M.
+    (
+        "anthropic",
+        "claude-fable-5",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("10.00"),
+        output_cost_per_million=Decimal("50.00"),
+        cache_read_cost_per_million=Decimal("1.00"),
+        cache_write_cost_per_million=Decimal("12.50"),
+        source="official_docs_snapshot",
+        source_url="https://platform.claude.com/docs/en/about-claude/pricing",
+        pricing_version="anthropic-pricing-2026-05",
+    ),
     # Same $5/$25 base pricing as 4.6/4.7.  Fast-mode variant is a separate
     # model ID with 2x premium (vs the 6x premium on older Opus generations).
     # Source: https://openrouter.ai/anthropic/claude-opus-4.8
@@ -1093,7 +1121,17 @@ def resolve_billing_route(
         or base_url_host_matches(base_url or "", "aiplatform.googleapis.com")
         or base_url_host_matches(base_url or "", "generativelanguage.googleapis.com")
     ):
-        return BillingRoute(provider="google", model=model.split("/")[-1], base_url=base_url or "", billing_mode="official_docs_snapshot")
+        # Vertex Model Garden also serves Anthropic Claude (via the
+        # AnthropicVertex rawPredict path) at the SAME per-token rates as
+        # Anthropic direct — Claude on Vertex is a Marketplace product, so
+        # list price matches. Route those to provider='anthropic' so they hit
+        # the existing Claude pricing keys; otherwise every Claude-on-Vertex
+        # call looks up a ("google", "claude-*") key that does not exist and
+        # is silently recorded as $0.00 with cost_status='unknown'.
+        _bare = model.split("/")[-1]
+        if _bare.startswith("claude"):
+            return BillingRoute(provider="anthropic", model=_bare, base_url=base_url or "", billing_mode="official_docs_snapshot")
+        return BillingRoute(provider="google", model=_bare, base_url=base_url or "", billing_mode="official_docs_snapshot")
     if provider_name == "fireworks" or base_url_host_matches(base_url or "", "api.fireworks.ai"):
         # Fireworks model ids look like accounts/fireworks/models/<name>;
         # rsplit("/", 1)[-1] yields just <name> which is what the dict keys on.
