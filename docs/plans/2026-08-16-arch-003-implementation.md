@@ -1,6 +1,6 @@
 ---
 title: "ARCH-003 implementation plan: runtime-state audit and replay verification"
-status: IMPLEMENTATION_PLAN_REVISE_V28_PENDING
+status: IMPLEMENTATION_PLAN_REVISE_V29_PENDING
 date: 2026-08-16
 type: implementation-plan
 ticket: ARCH-003
@@ -179,8 +179,9 @@ Add a versioned runtime-state-owned journal table with:
 - owner-version before/after;
 - state schema version and journal event version;
 - journal-writer generation/epoch continuity marker;
-- materialized-write counter before/after, incremented for every committed
-  materialized-state mutation and stored in each mutation/genesis event;
+- materialized-write counter before/after, incremented only for every committed
+  mutation that changes a replay-tuple member and stored in each mutation/genesis
+  event;
 - diagnostic timestamp;
 - baseline sealed lifecycle state, owner-version, state schema version, and
   sealed-through sequence when event kind is `baseline`;
@@ -211,9 +212,11 @@ A same-epoch restart never advances `current_generation`. A startup observing a 
 durable global `DOWNGRADE_UNSAFE` mode for the database: all ordinary
 runtime-state writes across all profiles and entities, including both
 event-only baseline and re-originating genesis writers, return mutation-side
-`WRITE_ABORT`; only read-only verification may continue. The mode exits only
-when a writer at least as new as the durable epoch completes the startup
-transition and atomically clears the mode. A startup lock/busy timeout is
+`WRITE_ABORT`; only read-only verification may continue. The mode exits only when a writer at least as new as the durable epoch
+completes the startup transition and atomically clears the mode. An equal-epoch
+startup performs this durable mode-clear write under the exclusive lock and
+`BEGIN IMMEDIATE` but does not advance `current_generation`; only a
+strictly newer epoch advances the generation. A startup lock/busy timeout is
 different: it enters process-local `STARTUP_LOCKED` read-only state with
 `LOCK_TIMEOUT`, writes no durable mode or transition record, and clears only
 after a later successful startup transition in that process. The transition
@@ -368,7 +371,7 @@ Migration compatibility tests must assert this posture.
   before issuing any replay-tuple UPDATE. A true no-op issues no replay-tuple
   UPDATE, therefore does not fire the counter trigger and emits no event.
   Do not implement a write-then-revert shape.
-- Emit no event for a true no-op that changes no replayed column.
+
 - Ordinary mutation/genesis paths acquire the shared side of the named
   cross-process maintenance RW lock before opening the SQLite WAL transaction;
   use `BEGIN IMMEDIATE` or equivalent before sequence allocation; release the
@@ -443,8 +446,9 @@ Implement a bounded verifier that:
 - requires complete verified history for `DRIFT`;
 - validates event kind, origin/genesis markers, journal generation/epoch
   continuity, baseline contents and baseline-to-next-event sequence continuity,
-  duplicate or missing predecessors, digest-parameter identity, schemas, the
-  shared and verifier-side closed reason-code subsets, and terminal state;
+  duplicate or missing predecessors (`SEQUENCE_INVALID`), malformed history
+  (`HISTORY_MALFORMED`), digest-parameter identity, schemas, the shared and
+  verifier-side closed reason-code subsets, and terminal state;
 - uses a code-level `REPLAY_EVENT_LIMIT = 10000` counted from the effective
   replay start point. Before status/reason selection, apply this total verifier
   diagnostic precedence from highest to lowest: `SNAPSHOT_FAILURE`,
@@ -562,7 +566,9 @@ Add deterministic tests for:
   rotation without bridging, verify-time key unavailability, and mutation-time
   key unavailability returning shared `KEY_UNAVAILABLE` without changing
   materialized state;
-- duplicate, missing, malformed, non-contiguous, and unsupported events;
+- duplicate or missing predecessors returning `UNKNOWN` with
+  `SEQUENCE_INVALID`; malformed/non-contiguous/unsupported events returning
+  `UNKNOWN` with `HISTORY_MALFORMED` or their more specific closed code;
 - the same fixture with a materialized-write counter gap in either direction
   (`>` or `<`) returning `UNKNOWN` with `WRITE_COUNTER_GAP`, and a baseline
   attempt refused with `WRITE_ABORT`;
@@ -1019,6 +1025,23 @@ DGX changes, deployment, repair, or event-sourcing. The corrected plan must
 return to the same authenticated Claude reviewer family and then to AGY on the
 identical packet.
 
+## Implementation-plan review reconciliation v28
+
+The v28 authenticated Claude Opus review returned `REVISE` with five bounded
+plan-text corrections. The corrections are incorporated above:
+
+1. The schema counter field is limited to replay-tuple-changing mutations.
+2. Growth accounting includes authorized re-originating genesis rows.
+3. Sequence and malformed-history conditions bind to explicit reason codes.
+4. Equal-epoch startup durably clears downgrade mode without advancing the
+   generation.
+5. The redundant Gate 2 no-op bullet is removed.
+
+These remain plan-only corrections and do not authorize source edits, tests,
+DGX changes, deployment, repair, or event-sourcing. The corrected plan must
+return to the same authenticated Claude reviewer family and then to AGY on the
+identical packet.
+
 ## Acceptance criteria
 
 ARCH-003 implementation is ready for its delivery gates only when:
@@ -1043,11 +1066,12 @@ ARCH-003 implementation is ready for its delivery gates only when:
   benchmark arm, where exceeding 5 ms p95 blocks delivery and requires plan
   revision; CI records the result but does not gate on host-noise variance;
 - journal growth is one bounded metadata row per committed replay-tuple
-  mutation, plus one row per out-of-band baseline event, with no automatic
+  mutation, plus one row per out-of-band baseline event and one row per
+  explicitly authorized out-of-band re-originating genesis, with no automatic
   retention job; entities beyond the replay limit remain UNKNOWN in this ticket,
   and the 100,000-event/100 MiB per-profile threshold is a documented follow-up
   operational review, not an in-ticket operator gate;
-- reconciliation v1 and v5-v27 items are incorporated into the normative
+- reconciliation v1 and v5-v28 items are incorporated into the normative
   Gates 0-4 text (with v2-v4 explicitly folded into the v1/v4 text), and this
   merged plan revision receives the same-family re-review;
 - all focused and relevant tests pass;
