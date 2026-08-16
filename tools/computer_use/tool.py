@@ -569,9 +569,35 @@ def _request_approval(action: str, args: Dict[str, Any],
             return None
     cb = _approval_callback
     if cb is None:
-        # No CLI approval wired — default allow. Gateway approval is handled
-        # one layer out via the normal tool-approval infra.
-        return None
+        # No CLI approval callback wired — e.g. cron, bot-platform gateways,
+        # or ACP, none of which call set_approval_callback(). There is no
+        # other approval gate for computer_use (tools/approval.py's dangerous-
+        # command system is terminal/shell-specific and never inspects this
+        # tool): only proceed if the user explicitly opted into unattended
+        # operation for this session (the same YOLO/bypass check
+        # _cua_permission_mode above uses), otherwise fail closed instead of
+        # silently allowing destructive actions (#87724).
+        try:
+            from tools.approval import (
+                get_current_session_key,
+                is_approval_bypass_active_for_session,
+            )
+
+            if is_approval_bypass_active_for_session(session_id):
+                return None
+            current_key = get_current_session_key(default="")
+            if current_key and is_approval_bypass_active_for_session(current_key):
+                return None
+        except Exception:
+            # Approval state must fail closed if it cannot be resolved.
+            pass
+        return json.dumps({
+            "error": "approval required but no approval mechanism is available",
+            "hint": "computer_use needs interactive CLI approval or an explicit "
+                    "unattended-mode opt-in (/yolo, or the configured bypass) "
+                    "before destructive actions can run in this context.",
+            "action": action,
+        })
     summary = _summarize_action(action, args)
     try:
         verdict = cb(action, args, summary)

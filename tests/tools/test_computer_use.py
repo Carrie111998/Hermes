@@ -18,11 +18,19 @@ import pytest
 
 @pytest.fixture(autouse=True)
 def _reset_backend():
-    """Tear down the cached backend between tests."""
+    """Tear down the cached backend between tests.
+
+    Also bypasses computer_use approval by default: this file's tests exercise
+    schema/dispatch/routing/capture behavior, not approval semantics (that's
+    covered by test_computer_use_approval_isolation.py and the Phase C tests
+    in test_computer_use_delivery_ladder.py) — without an explicit bypass,
+    every destructive-action dispatch here would now fail closed (#87724).
+    """
     from tools.computer_use.tool import reset_backend_for_tests
     reset_backend_for_tests()
     # Force the noop backend.
-    with patch.dict(os.environ, {"HERMES_COMPUTER_USE_BACKEND": "noop"}, clear=False):
+    with patch.dict(os.environ, {"HERMES_COMPUTER_USE_BACKEND": "noop"}, clear=False), \
+         patch("tools.approval.is_approval_bypass_active_for_session", return_value=True):
         yield
     reset_backend_for_tests()
 
@@ -166,6 +174,69 @@ class TestDispatch:
         # No follow-up capture should have been issued.
         capture_calls = [c for c in noop_backend.calls if c[0] == "capture"]
         assert len(capture_calls) == 0, "capture must not be called after a failed action"
+
+
+# ---------------------------------------------------------------------------
+# Approval fail-closed (#87724): headless dispatch (cron, bot-platform
+# gateways, ACP) never calls set_approval_callback(), so a destructive action
+# must not silently execute just because no callback is wired.
+# ---------------------------------------------------------------------------
+
+class TestHeadlessApprovalFailClosed:
+    def test_destructive_action_denied_with_no_callback_and_no_bypass(self, noop_backend):
+        from tools.computer_use.tool import handle_computer_use
+
+        with patch("tools.approval.is_approval_bypass_active_for_session",
+                    return_value=False):
+            out = handle_computer_use({"action": "click", "element": 3})
+
+        parsed = json.loads(out)
+        assert parsed.get("error"), out
+        assert not noop_backend.calls, (
+            "backend must not be invoked when approval cannot be resolved"
+        )
+
+    def test_destructive_action_allowed_when_bypass_active(self, noop_backend):
+        """Explicit unattended opt-in (/yolo, approvals.mode: off) must still
+        work in headless dispatch — this is not a blanket lockout."""
+        from tools.computer_use.tool import handle_computer_use
+
+        with patch("tools.approval.is_approval_bypass_active_for_session",
+                    return_value=True):
+            out = handle_computer_use({"action": "click", "element": 3})
+
+        parsed = json.loads(out)
+        assert "error" not in parsed, out
+        assert any(c[0] == "click" for c in noop_backend.calls)
+
+    def test_safe_action_unaffected_by_missing_callback(self, noop_backend):
+        """Read-only actions were never gated and must stay ungated."""
+        from tools.computer_use.tool import handle_computer_use
+
+        with patch("tools.approval.is_approval_bypass_active_for_session",
+                    return_value=False):
+            out = handle_computer_use({"action": "capture", "mode": "ax"})
+
+        parsed = json.loads(out)
+        assert "error" not in parsed, out
+
+    def test_callback_still_takes_precedence_over_bypass_check(self, noop_backend):
+        """When a callback IS wired (CLI), it decides — the bypass check is
+        only the no-callback fallback path, not a replacement for it."""
+        from tools.computer_use.tool import handle_computer_use, set_approval_callback
+
+        try:
+            set_approval_callback(lambda action, args, summary: "deny")
+            with patch("tools.approval.is_approval_bypass_active_for_session",
+                        return_value=True):
+                out = handle_computer_use({"action": "click", "element": 3})
+        finally:
+            set_approval_callback(None)
+
+        parsed = json.loads(out)
+        assert parsed.get("error") == "denied by user"
+        assert not noop_backend.calls
+
 
 # ---------------------------------------------------------------------------
 # Safety guards (type / key block lists)
