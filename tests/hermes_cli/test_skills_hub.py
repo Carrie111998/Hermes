@@ -313,3 +313,202 @@ def test_do_search_json_flag_emits_full_identifiers(capsys):
     # Table render must be suppressed — sink should be empty (no "Searching for:" header).
     assert "Searching for:" not in sink.getvalue()
 
+
+# ---------------------------------------------------------------------------
+# Install/scan provenance: unsigned index must not unlock builtin trust
+# ---------------------------------------------------------------------------
+
+
+def _bundle(identifier, source="hermes-index", trust_level="community"):
+    return type("Bundle", (), {
+        "name": identifier.rsplit("/", 1)[-1],
+        "identifier": identifier,
+        "source": source,
+        "trust_level": trust_level,
+        "metadata": {},
+    })()
+
+
+def _meta(identifier):
+    return type("Meta", (), {"extra": {}, "identifier": identifier})()
+
+
+def test_scan_source_requires_optional_skill_source_instance():
+    """source_id()=='official' alone must not grant builtin scan provenance."""
+    from hermes_cli.skills_hub import _scan_source_for_install
+    from tools.skills_hub import OptionalSkillSource
+
+    class _SpoofOfficial:
+        def source_id(self):
+            return "official"
+
+    stamped = _bundle("attacker/evil", source="official", trust_level="builtin")
+    assert _scan_source_for_install(
+        stamped, _meta("attacker/evil"), "attacker/evil", _SpoofOfficial()
+    ) == "attacker/evil"
+
+    assert _scan_source_for_install(
+        stamped, _meta("official/agent/x"), "official/agent/x", OptionalSkillSource()
+    ) == "official"
+
+
+def test_scan_source_scrubs_reserved_identifier_from_non_optional_adapter():
+    from hermes_cli.skills_hub import _scan_source_for_install
+
+    class _HermesIndexLike:
+        def source_id(self):
+            return "hermes-index"
+
+    reserved = _bundle("official", source="hermes-index")
+    assert _scan_source_for_install(
+        reserved, _meta("official"), "official", _HermesIndexLike()
+    ) == "hermes-index"
+
+
+@pytest.mark.parametrize("prefix", ("skills-sh/", "skills.sh/", "skils-sh/", "skils.sh/"))
+@pytest.mark.parametrize("reserved", ("official", "agent-created"))
+def test_scan_source_scrubs_prefixed_reserved_aliases(prefix, reserved):
+    from hermes_cli.skills_hub import (
+        _scan_source_for_install,
+        _scan_source_for_lock_entry,
+    )
+    from tools.skills_guard import _resolve_trust_level
+
+    class _HermesIndexLike:
+        def source_id(self):
+            return "hermes-index"
+
+    alias = f"{prefix}{reserved}"
+    scan_source = _scan_source_for_install(
+        _bundle(alias), _meta(alias), alias, _HermesIndexLike()
+    )
+    lock_source = _scan_source_for_lock_entry(
+        {"identifier": alias, "source": "hermes-index"}
+    )
+
+    assert scan_source == "hermes-index"
+    assert lock_source == "hermes-index"
+    assert _resolve_trust_level(scan_source) == "community"
+    assert _resolve_trust_level(lock_source) == "community"
+
+
+def test_stamped_official_blocks_dangerous_install_policy():
+    """Index-stamped official must not unlock builtin dangerous allowance."""
+    from hermes_cli.skills_hub import _scan_source_for_install
+    from tools.skills_guard import (
+        Finding,
+        ScanResult,
+        _resolve_trust_level,
+        should_allow_install,
+    )
+    from tools.skills_hub import OptionalSkillSource
+
+    class _HermesIndexLike:
+        def source_id(self):
+            return "hermes-index"
+
+    stamped = _bundle("attacker/evil", source="official", trust_level="builtin")
+    scan_source = _scan_source_for_install(
+        stamped, _meta("attacker/evil"), "attacker/evil", _HermesIndexLike()
+    )
+    trust = _resolve_trust_level(scan_source)
+    assert scan_source != "official"
+    assert trust != "builtin"
+
+    finding = Finding(
+        "pipe-curl", "critical", "exfiltration", "run.sh", 1, "curl|bash", "pipe"
+    )
+    result = ScanResult(
+        skill_name="evil",
+        source=scan_source,
+        trust_level=trust,
+        verdict="dangerous",
+        findings=[finding],
+    )
+    allowed, reason = should_allow_install(result, force=False)
+    assert allowed is False
+    assert "Blocked" in reason
+
+    # Contrast: real OptionalSkillSource still maps to builtin and may allow.
+    official_source = _scan_source_for_install(
+        stamped, _meta("official/agent/x"), "official/agent/x", OptionalSkillSource()
+    )
+    assert _resolve_trust_level(official_source) == "builtin"
+    allowed_official, _ = should_allow_install(
+        ScanResult(
+            skill_name="x",
+            source=official_source,
+            trust_level="builtin",
+            verdict="dangerous",
+            findings=[finding],
+        ),
+        force=False,
+    )
+    assert allowed_official is True
+
+
+def test_lock_entry_scrubs_reserved_audit_identifiers():
+    from hermes_cli.skills_hub import _scan_source_for_lock_entry
+
+    assert _scan_source_for_lock_entry(
+        {"identifier": "official", "source": "hermes-index"}
+    ) == "hermes-index"
+    assert _scan_source_for_lock_entry(
+        {"identifier": "agent-created", "source": "agent-created"}
+    ) == "community"
+
+
+def test_lock_entry_uses_fetched_repository_over_spoofed_index_identifier():
+    from hermes_cli.skills_hub import _scan_source_for_lock_entry
+    from tools.skills_guard import _resolve_trust_level
+
+    scan_source = _scan_source_for_lock_entry(
+        {
+            "identifier": "openai/skills/evil",
+            "source": "github",
+            "metadata": {
+                "source_url": "https://github.com/attacker/repo/tree/abc/evil"
+            },
+        }
+    )
+
+    assert scan_source == "attacker/repo"
+    assert _resolve_trust_level(scan_source) == "community"
+    assert _scan_source_for_lock_entry(
+        {"identifier": "attacker/evil", "source": "hermes-index"}
+    ) == "attacker/evil"
+
+
+def test_lock_entry_ignores_github_url_metadata_from_non_github_adapter():
+    from hermes_cli.skills_hub import _scan_source_for_lock_entry
+    from tools.skills_guard import _resolve_trust_level
+
+    scan_source = _scan_source_for_lock_entry(
+        {
+            "identifier": "browse-sh/evil",
+            "source": "browse-sh",
+            "metadata": {"source_url": "https://github.com/openai/skills/evil"},
+        }
+    )
+
+    assert scan_source == "browse-sh/evil"
+    assert _resolve_trust_level(scan_source) == "community"
+
+
+def test_lock_entry_recovers_fetched_repository_for_legacy_skills_sh_install():
+    from hermes_cli.skills_hub import _scan_source_for_lock_entry
+    from tools.skills_guard import _resolve_trust_level
+
+    scan_source = _scan_source_for_lock_entry(
+        {
+            "identifier": "skills-sh/openai/skills/evil",
+            "source": "skills.sh",
+            "metadata": {
+                "source_url": "https://github.com/attacker/repo/tree/abc/evil"
+            },
+        }
+    )
+
+    assert scan_source == "attacker/repo"
+    assert _resolve_trust_level(scan_source) == "community"
+

@@ -245,9 +245,30 @@ class TestSkillsShSource:
 
         assert bundle is not None
         assert bundle.source == "skills.sh"
+        assert bundle.identifier == "owner/repo/cli-tool/components/skills/development/my-skill"
+        assert bundle.metadata["skills_sh_identifier"] == "skills-sh/owner/repo/my-skill"
         assert bundle.files["SKILL.md"] == "# My Skill"
         # Verify the tree-resolved identifier was used for the final GitHub fetch
         mock_fetch.assert_any_call("owner/repo/cli-tool/components/skills/development/my-skill")
+
+    def test_fetch_preserves_resolved_repository_over_trusted_display_identifier(self):
+        src = self._source()
+        src._fetch_detail_page = lambda canonical: None
+        src._candidate_identifiers = lambda canonical: []
+        src._discover_identifier = lambda canonical, detail=None: "attacker/repo/evil"
+        src.github.fetch = MagicMock(return_value=SkillBundle(
+            name="evil",
+            files={"SKILL.md": "# evil"},
+            source="github",
+            identifier="attacker/repo/evil",
+            trust_level="community",
+        ))
+
+        bundle = src.fetch("skills-sh/openai/skills/evil")
+
+        assert bundle is not None
+        assert bundle.identifier == "attacker/repo/evil"
+        assert bundle.metadata["skills_sh_identifier"] == "skills-sh/openai/skills/evil"
 
 class TestFindSkillInRepoTree:
     """Tests for GitHubSource._find_skill_in_repo_tree."""
@@ -688,6 +709,93 @@ class TestProviderFilter:
         src.search.return_value = [nv, other]
         results = unified_search("cuda", [src], source_filter="nvidia", limit=25)
         assert [r.identifier for r in results] == ["NVIDIA/skills/cuda"]
+
+
+class TestHermesIndexProvenanceSanitization:
+    def test_sanitize_index_source_strips_privileged_markers(self):
+        from tools.skills_hub import _sanitize_index_source
+
+        assert _sanitize_index_source("official") == "hermes-index"
+        assert _sanitize_index_source("agent-created") == "hermes-index"
+        assert _sanitize_index_source("github") == "github"
+        assert _sanitize_index_source(None) == "hermes-index"
+
+    def test_sanitize_index_trust_strips_builtin(self):
+        from tools.skills_hub import _sanitize_index_trust_level
+
+        assert _sanitize_index_trust_level("builtin") == "community"
+        assert _sanitize_index_trust_level("agent-created") == "community"
+        assert _sanitize_index_trust_level("trusted") == "trusted"
+
+    def test_fetch_does_not_stamp_official_source_from_index(self):
+        from tools.skills_hub import SkillBundle
+
+        src = _make_index_source([
+            {
+                "name": "evil",
+                "description": "bad",
+                "source": "official",
+                "identifier": "attacker/evil",
+                "trust_level": "builtin",
+                "resolved_github_id": "attacker/repo/evil",
+            },
+        ])
+        fake = SkillBundle(
+            name="evil",
+            files={"SKILL.md": b"# evil"},
+            source="github",
+            identifier="attacker/repo/evil",
+            trust_level="community",
+        )
+        src._get_github = lambda: type("G", (), {"fetch": lambda self, ident: fake})()
+
+        bundle = src.fetch("attacker/evil")
+        assert bundle is not None
+        assert bundle.source == "hermes-index"
+        assert bundle.identifier == "attacker/repo/evil"
+
+    def test_fetch_preserves_resolved_repository_over_trusted_index_identifier(self):
+        from tools.skills_hub import SkillBundle
+
+        src = _make_index_source([
+            {
+                "name": "evil",
+                "description": "bad",
+                "source": "github",
+                "identifier": "openai/skills/evil",
+                "trust_level": "trusted",
+                "resolved_github_id": "attacker/repo/evil",
+            },
+        ])
+        fake = SkillBundle(
+            name="evil",
+            files={"SKILL.md": b"# evil"},
+            source="github",
+            identifier="attacker/repo/evil",
+            trust_level="community",
+            metadata={"source_url": "https://github.com/attacker/repo/tree/abc/evil"},
+        )
+        src._get_github = lambda: type("G", (), {"fetch": lambda self, ident: fake})()
+
+        bundle = src.fetch("openai/skills/evil")
+
+        assert bundle is not None
+        assert bundle.source == "hermes-index"
+        assert bundle.identifier == "attacker/repo/evil"
+        assert bundle.metadata["index_identifier"] == "openai/skills/evil"
+        assert src.inspect("attacker/repo/evil") is not None
+
+    def test_to_meta_sanitizes_privileged_fields(self):
+        src = _make_index_source([])
+        meta = src._to_meta({
+            "name": "evil",
+            "description": "bad",
+            "source": "official",
+            "identifier": "attacker/evil",
+            "trust_level": "builtin",
+        })
+        assert meta.source == "hermes-index"
+        assert meta.trust_level == "community"
 
 
 # ---------------------------------------------------------------------------

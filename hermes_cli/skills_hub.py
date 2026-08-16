@@ -15,6 +15,7 @@ import re
 import shutil
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlsplit
 
 from rich.console import Console
 from rich.panel import Panel
@@ -150,6 +151,113 @@ def _resolve_source_meta_and_bundle(identifier: str, sources):
             break
 
     return meta, bundle, matched_source
+
+
+def _is_official_optional_adapter(matched_source) -> bool:
+    """True only when the resolving adapter is the local optional-skills source.
+
+    Bundle ``source`` / index metadata strings are not provenance: adapters such
+    as HermesIndexSource can stamp ``source="official"`` onto third-party
+    GitHub content. Builtin install trust must follow the concrete adapter
+    class — another SkillSource that merely returns ``source_id() == "official"``
+    must not unlock builtin policy.
+    """
+    if matched_source is None:
+        return False
+    from tools.skills_hub import OptionalSkillSource
+
+    return isinstance(matched_source, OptionalSkillSource)
+
+
+_RESERVED_SCAN_PROVENANCE = frozenset({"official", "agent-created"})
+_SCAN_PROVENANCE_PREFIX_ALIASES = (
+    "skills-sh/",
+    "skills.sh/",
+    "skils-sh/",
+    "skils.sh/",
+)
+
+
+def _is_reserved_scan_provenance(candidate: str) -> bool:
+    normalized = candidate
+    for prefix in _SCAN_PROVENANCE_PREFIX_ALIASES:
+        if normalized.startswith(prefix):
+            normalized = normalized[len(prefix):]
+            break
+    return normalized in _RESERVED_SCAN_PROVENANCE
+
+
+def _scrub_reserved_scan_provenance(candidate: str, matched_source=None) -> str:
+    """Refuse reserved trust markers unless the adapter is OptionalSkillSource.
+
+    Reserved tokens unlock privileged trust in skills_guard._resolve_trust_level.
+    Never honor them from unsigned index metadata, lock identifiers, or any
+    non-optional adapter (e.g. hermes-index echoing identifier="official").
+    """
+    if not _is_reserved_scan_provenance(candidate):
+        return candidate
+    if _is_official_optional_adapter(matched_source):
+        return candidate
+    source_id = getattr(matched_source, "source_id", None)
+    if callable(source_id):
+        sid = source_id()
+        if sid and not _is_reserved_scan_provenance(sid):
+            return sid
+    return "community"
+
+
+def _scan_source_for_install(bundle, meta, identifier: str, matched_source) -> str:
+    """Choose the scanner trust identity for an install/hub-scan."""
+    if _is_official_optional_adapter(matched_source):
+        return "official"
+    candidate = (
+        getattr(bundle, "identifier", "")
+        or getattr(meta, "identifier", "")
+        or identifier
+        or ""
+    )
+    return _scrub_reserved_scan_provenance(candidate, matched_source)
+
+
+def _github_repo_from_lock_metadata(entry: dict) -> str:
+    """Recover the fetched GitHub repository from immutable scan metadata."""
+    if entry.get("source") not in {"github", "hermes-index", "skills.sh", "skills-sh"}:
+        return ""
+    metadata = entry.get("metadata") or {}
+    resolved = metadata.get("resolved_github_id")
+    if resolved:
+        return str(resolved)
+
+    source_url = metadata.get("source_url")
+    if not source_url:
+        return ""
+    try:
+        parsed = urlsplit(str(source_url))
+    except ValueError:
+        return ""
+    if parsed.hostname not in {"github.com", "www.github.com"}:
+        return ""
+    parts = [part for part in parsed.path.split("/") if part]
+    return "/".join(parts[:2]) if len(parts) >= 2 else ""
+
+
+def _scan_source_for_lock_entry(entry: dict) -> str:
+    """Choose scanner trust identity for an already-installed hub lock entry."""
+    # Older HermesIndexSource installs persisted the unsigned index identifier,
+    # but their GitHubSource metadata still records where the bytes came from.
+    # Prefer that concrete repository so audits cannot resurrect spoofed trust.
+    candidate = (
+        _github_repo_from_lock_metadata(entry)
+        or entry.get("identifier")
+        or entry.get("source")
+        or "community"
+    )
+    if _is_reserved_scan_provenance(candidate):
+        alt = entry.get("source") or ""
+        if alt and not _is_reserved_scan_provenance(alt):
+            return alt
+        return "community"
+    return candidate
 
 
 def _derive_category_from_install_path(install_path: str) -> str:
@@ -542,7 +650,7 @@ def do_install(identifier: str, category: str = "", force: bool = False,
 
     c.print(f"\n[bold]Fetching:[/] {identifier}")
 
-    meta, bundle, _matched_source = _resolve_source_meta_and_bundle(identifier, sources)
+    meta, bundle, matched_source = _resolve_source_meta_and_bundle(identifier, sources)
 
     if not bundle:
         # Check if any source hit GitHub API rate limit
@@ -563,6 +671,8 @@ def do_install(identifier: str, category: str = "", force: bool = False,
         else:
             c.print()
         return
+
+    is_official_optional = _is_official_optional_adapter(matched_source)
 
     # URL-sourced skills may arrive with an empty name when SKILL.md has no
     # ``name:`` in frontmatter AND the URL path doesn't yield a valid
@@ -619,7 +729,8 @@ def do_install(identifier: str, category: str = "", force: bool = False,
     # Auto-detect the full parent path for official skills. Optional skills
     # can be nested (e.g. "official/mlops/training/trl-fine-tuning"), so keep
     # every identifier segment between "official" and the final skill slug.
-    if bundle.source == "official" and not category:
+    # Only the local OptionalSkillSource adapter is authoritative for this.
+    if is_official_optional and not category:
         id_parts = bundle.identifier.split("/")
         if len(id_parts) >= 3:
             category = "/".join(id_parts[1:-1])
@@ -647,16 +758,9 @@ def do_install(identifier: str, category: str = "", force: bool = False,
         return
     c.print(f"[dim]Quarantined to {q_path.relative_to(q_path.parent.parent.parent)}[/]")
 
-    # Scan
+    # Scan - builtin trust only when the matched adapter is OptionalSkillSource.
     c.print("[bold]Running security scan...[/]")
-    if bundle.source == "official":
-        scan_source = "official"
-    else:
-        scan_source = (
-            getattr(bundle, "identifier", "")
-            or getattr(meta, "identifier", "")
-            or identifier
-        )
+    scan_source = _scan_source_for_install(bundle, meta, identifier, matched_source)
     from tools.skills_hub import HUB_DIR, source_url_for_bundle
     result, scan_provenance = scan_skill_cached(
         q_path,
@@ -693,11 +797,11 @@ def do_install(identifier: str, category: str = "", force: bool = False,
         if metadata_lines:
             c.print(Panel("\n".join(metadata_lines), title="Upstream Metadata", border_style="blue"))
 
-    # Confirm with user — show appropriate warning based on source
+    # Confirm with user — show appropriate warning based on adapter provenance
     # skip_confirm bypasses the prompt (needed in TUI mode where input() hangs)
     if not force and not skip_confirm:
         c.print()
-        if bundle.source == "official":
+        if is_official_optional:
             c.print(Panel(
                 "[bold bright_cyan]This is an official optional skill maintained by Nous Research.[/]\n\n"
                 "It ships with hermes-agent but is not activated by default.\n"
@@ -1122,7 +1226,7 @@ def do_audit(name: Optional[str] = None, console: Optional[Console] = None,
             c.print(f"[yellow]Warning:[/] {entry['name']} — path missing: {entry['install_path']}")
             continue
 
-        result = scan_skill(skill_path, source=entry.get("identifier", entry["source"]))
+        result = scan_skill(skill_path, source=_scan_source_for_lock_entry(entry))
         c.print(format_scan_report(result))
 
         if deep:

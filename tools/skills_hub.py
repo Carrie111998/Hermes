@@ -1695,12 +1695,14 @@ class SkillsShSource(SkillSource):
 
     def fetch(self, identifier: str) -> Optional[SkillBundle]:
         canonical = self._normalize_identifier(identifier)
+        registry_identifier = self._wrap_identifier(canonical)
         detail = self._fetch_detail_page(canonical)
         for candidate in self._candidate_identifiers(canonical):
             bundle = self.github.fetch(candidate)
             if bundle:
                 bundle.source = "skills.sh"
-                bundle.identifier = self._wrap_identifier(canonical)
+                bundle.metadata["skills_sh_identifier"] = registry_identifier
+                bundle.metadata["resolved_github_id"] = bundle.identifier
                 bundle.metadata.update(self._detail_to_metadata(canonical, detail))
                 return bundle
 
@@ -1709,7 +1711,8 @@ class SkillsShSource(SkillSource):
             bundle = self.github.fetch(resolved)
             if bundle:
                 bundle.source = "skills.sh"
-                bundle.identifier = self._wrap_identifier(canonical)
+                bundle.metadata["skills_sh_identifier"] = registry_identifier
+                bundle.metadata["resolved_github_id"] = bundle.identifier
                 bundle.metadata.update(self._detail_to_metadata(canonical, detail))
                 return bundle
         return None
@@ -4168,6 +4171,27 @@ def check_for_skill_updates(
 # ---------------------------------------------------------------------------
 
 HERMES_INDEX_URL = "https://hermes-agent.nousresearch.com/docs/api/skills-index.json"
+
+# Index JSON is unsigned. Never promote reserved origin markers from it onto
+# fetched bundles or inspect metadata - those markers unlock builtin trust.
+_INDEX_PRIVILEGED_SOURCES = frozenset({"official", "agent-created"})
+_INDEX_PRIVILEGED_TRUST = frozenset({"builtin", "agent-created"})
+
+
+def _sanitize_index_source(raw: Optional[str]) -> str:
+    source = (raw or "hermes-index").strip() or "hermes-index"
+    if source in _INDEX_PRIVILEGED_SOURCES:
+        return "hermes-index"
+    return source
+
+
+def _sanitize_index_trust_level(raw: Optional[str]) -> str:
+    trust = (raw or "community").strip() or "community"
+    if trust in _INDEX_PRIVILEGED_TRUST:
+        return "community"
+    return trust
+
+
 HERMES_INDEX_TTL = 6 * 3600  # 6 hours
 
 
@@ -4304,7 +4328,7 @@ class HermesIndexSource(SkillSource):
         index = self._ensure_loaded()
         for skill in index.get("skills", []):
             if skill.get("identifier") == identifier:
-                return skill.get("trust_level", "community")
+                return _sanitize_index_trust_level(skill.get("trust_level", "community"))
         return "community"
 
     def search(self, query: str, limit: int = 10) -> List[SkillMeta]:
@@ -4379,8 +4403,13 @@ class HermesIndexSource(SkillSource):
         if resolved:
             bundle = self._get_github().fetch(resolved)
             if bundle:
-                bundle.source = entry.get("source", "hermes-index")
-                bundle.identifier = identifier
+                # The index is an unsigned resolver, not the content origin.
+                # Keep the identifier produced by GitHubSource so scanner trust
+                # follows the repository that supplied the bytes, never the
+                # index-controlled display identifier.
+                bundle.source = "hermes-index"
+                bundle.metadata["index_identifier"] = identifier
+                bundle.metadata["resolved_github_id"] = resolved
                 return bundle
 
         # Fall back to identifier-based fetch via repo/path
@@ -4390,8 +4419,9 @@ class HermesIndexSource(SkillSource):
             github_id = f"{repo}/{path}"
             bundle = self._get_github().fetch(github_id)
             if bundle:
-                bundle.source = entry.get("source", "hermes-index")
-                bundle.identifier = identifier
+                bundle.source = "hermes-index"
+                bundle.metadata["index_identifier"] = identifier
+                bundle.metadata["resolved_github_id"] = github_id
                 return bundle
 
         return None
@@ -4411,6 +4441,18 @@ class HermesIndexSource(SkillSource):
         # Exact identifier match
         for s in skills:
             if s.get("identifier") == identifier:
+                return s
+
+        # Lock entries created from index installs persist the concrete GitHub
+        # identifier. Accept it on update without restoring trust in the
+        # unsigned display identifier.
+        for s in skills:
+            resolved = s.get("resolved_github_id")
+            if not resolved:
+                repo = s.get("repo", "")
+                path = s.get("path", "")
+                resolved = f"{repo}/{path}" if repo and path else ""
+            if resolved == identifier:
                 return s
 
         # Try without source prefix (e.g. "skills-sh/" stripped)
@@ -4439,9 +4481,9 @@ class HermesIndexSource(SkillSource):
         return SkillMeta(
             name=entry.get("name", ""),
             description=entry.get("description", ""),
-            source=entry.get("source", "hermes-index"),
+            source=_sanitize_index_source(entry.get("source", "hermes-index")),
             identifier=entry.get("identifier", ""),
-            trust_level=entry.get("trust_level", "community"),
+            trust_level=_sanitize_index_trust_level(entry.get("trust_level", "community")),
             repo=entry.get("repo"),
             path=entry.get("path"),
             tags=entry.get("tags", []),
