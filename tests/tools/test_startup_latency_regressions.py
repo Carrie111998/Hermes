@@ -11,9 +11,17 @@ These pin the CLI cold-start contract established in the sub-400ms pass:
 import sys
 import threading
 import time
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
+
+
+def _drop_cached_provider(aux, provider: str) -> None:
+    """Remove every cache entry a test created, keyed by its unique provider."""
+    with aux._client_cache_lock:
+        for key in [k for k in aux._client_cache if k[0] == provider]:
+            del aux._client_cache[key]
 
 
 class TestAuxProbeMode:
@@ -33,6 +41,72 @@ class TestAuxProbeMode:
         aux._store_cached_client(key, stub, "m")
         with aux._client_cache_lock:
             assert key not in aux._client_cache
+
+    def test_probe_stub_never_cached_by_get_cached_client(self):
+        """The inline cache in _get_cached_client is the second writer into
+        ``_client_cache`` and must uphold the same rule (#87654)."""
+        import agent.auxiliary_client as aux
+
+        provider = "probe-test-87654-a"
+        try:
+            with patch.object(
+                aux,
+                "resolve_provider_client",
+                lambda *a, **k: (aux._AuxProbeClientStub(), "vendor/m"),
+            ):
+                with aux.aux_probe_mode():
+                    client, _model = aux._get_cached_client(provider, model="vendor/m")
+            assert isinstance(client, aux._AuxProbeClientStub)
+            with aux._client_cache_lock:
+                assert not any(k[0] == provider for k in aux._client_cache)
+        finally:
+            _drop_cached_provider(aux, provider)
+
+    def test_repeat_probe_is_stable_for_slash_bearing_models(self):
+        """A cached stub poisoned the next probe, so the answer flipped after
+        the first call and the vision tools disappeared (#87654).
+
+        Unpatched this raises RuntimeError on the second call: the cache hit
+        runs _compat_model -> _is_openrouter_client, whose
+        ``getattr(client, "_client", None)`` only absorbs AttributeError.
+        A slash-free model would mask it, so the model id matters here.
+        """
+        import agent.auxiliary_client as aux
+
+        provider = "probe-test-87654-b"
+        try:
+            with patch.object(
+                aux,
+                "resolve_provider_client",
+                lambda *a, **k: (aux._AuxProbeClientStub(), "vendor/m"),
+            ):
+                with aux.aux_probe_mode():
+                    seen = [
+                        aux._get_cached_client(provider, model="vendor/m")[0]
+                        for _ in range(3)
+                    ]
+            assert all(isinstance(c, aux._AuxProbeClientStub) for c in seen)
+        finally:
+            _drop_cached_provider(aux, provider)
+
+    def test_real_clients_are_still_cached(self):
+        """Guardrail: the stub bypass must not disable caching generally."""
+        import agent.auxiliary_client as aux
+
+        provider = "probe-test-87654-c"
+        real = SimpleNamespace(base_url="https://x.invalid/v1")
+        try:
+            with patch.object(
+                aux, "resolve_provider_client", lambda *a, **k: (real, "vendor/m")
+            ):
+                first, _ = aux._get_cached_client(provider, model="vendor/m")
+                second, _ = aux._get_cached_client(provider, model="vendor/m")
+            assert first is real
+            assert second is real
+            with aux._client_cache_lock:
+                assert any(k[0] == provider for k in aux._client_cache)
+        finally:
+            _drop_cached_provider(aux, provider)
 
     def test_probe_stub_raises_on_runtime_use(self):
         import agent.auxiliary_client as aux

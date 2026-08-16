@@ -7801,6 +7801,23 @@ def _get_cached_client(
         is_vision=is_vision,
         task=task,
     )
+    if isinstance(client, _AuxProbeClientStub):
+        # Probe stubs must never enter the cache, same rule _store_cached_client
+        # states at the other write path into ``_client_cache``. This inline
+        # block is the second writer and lost the guard, so an availability
+        # probe left its stub behind and every later hit on that key returned a
+        # non-functional client. The damage is not deferred to a runtime call
+        # either: the hit path runs _compat_model -> _is_openrouter_client,
+        # whose ``getattr(client, "_client", None)`` cannot absorb the stub's
+        # deliberate RuntimeError because a getattr default only swallows
+        # AttributeError. check_vision_requirements catches that and reports
+        # False, so vision_analyze and browser_vision vanished for the rest of
+        # the process after the first probe (#87654).
+        #
+        # Returning rather than calling _store_cached_client because the block
+        # below also owns FIFO eviction and closing a concurrently built loser,
+        # neither of which _store_cached_client does.
+        return client, model or default_model
     if client is not None:
         # For async clients, remember which loop they were created on so we
         # can detect stale entries later.
