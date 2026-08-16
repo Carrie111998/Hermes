@@ -229,11 +229,11 @@ def test_stale_summary_must_not_archive_live_tail_landing_during_provider_call_r
         holder_at_insert["value"] = db.get_compression_lock_holder(sid)
         assert holder_at_insert["value"], "compression lease holder not visible"
         b_content = "live-tail-B-arrived-during-provider-call"
-        
+
         # In our new implementation, normal appends (compression_lock_holder=None)
         # are permitted, but let's test that both work.
         db.append_message(sid, "user", b_content)
-        
+
         assert any(m["content"] == b_content for m in db.get_messages(sid)), \
             "live tail B was not durably inserted before the commit"
 
@@ -250,7 +250,7 @@ def test_stale_summary_must_not_archive_live_tail_landing_during_provider_call_r
         assert len(b_live) == 1, f"live tail B appears {len(b_live)}x in active, expected 1"
         assert len(b_any) == 1, f"live tail B appears {len(b_any)}x in disk, expected 1"
         assert agent.session_id == sid, "session ID rotated"
-        
+
         children = db.find_live_compression_child(sid)
         assert children is None, f"orphan sibling fork detected: {children}"
     finally:
@@ -279,10 +279,10 @@ def test_append_allowed_mutation_blocked_during_admission(tmp_path: Path):
     _seed(db, sid)
 
     db.try_acquire_compression_lock(sid, "admission:holder", ttl_seconds=60)
-    
+
     # Append should succeed
     db.append_message(sid, "user", "ok-append")
-    
+
     # Replace should fail
     with pytest.raises(SessionCompressionInProgressError):
         db.replace_messages(sid, [{"role": "user", "content": "rewritten"}])
@@ -302,7 +302,7 @@ def test_holder_safety(tmp_path: Path):
 
     # Holder A try to release B's lock
     db.release_compression_lock(sid, "admission:holder-A")
-    
+
     # Verify B's lock is still intact in the database
     holder = db.get_compression_lock_holder(sid)
     assert holder == "admission:holder-B"
@@ -313,7 +313,7 @@ def test_tail_ordering_and_multiplicity(tmp_path: Path):
     db = SessionDB(db_path=tmp_path / "state.db")
     sid = "tail-ordering"
     db.create_session(sid, source="test")
-    
+
     # Snapshot messages (A)
     db.append_message(sid, "user", "A1")
     db.append_message(sid, "assistant", "A2")
@@ -357,13 +357,13 @@ def test_metadata_preservation(tmp_path: Path):
     db = SessionDB(db_path=tmp_path / "state.db")
     sid = "metadata-preservation"
     db.create_session(sid, source="test")
-    
+
     db.append_message(sid, "user", "A")
     active_m = db.get_messages(sid)
     max_snapshot_id = max(m["id"] for m in active_m)
 
     db.try_acquire_compression_lock(sid, "exclusive:holder")
-    
+
     # Append message directly to messages table with full mock metadata
     # We will use an internal insert helper to customize fields
     db._execute_write(lambda conn: db._insert_message_rows(conn, sid, [{
@@ -461,7 +461,7 @@ def test_expired_lease_recovery(tmp_path: Path):
     # B tries to acquire lock
     acquired = db.try_acquire_compression_lock(sid, "admission:holder-B", ttl_seconds=60)
     assert acquired is True
-    
+
     # Lock belongs to B now
     assert db.get_compression_lock_holder(sid) == "admission:holder-B"
 
