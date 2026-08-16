@@ -21,6 +21,10 @@ from unittest.mock import patch
 import pytest
 
 
+import functools
+
+
+@functools.lru_cache(maxsize=1)
 def _has_working_bash() -> bool:
     """True when bash can actually execute a script given a Windows path.
 
@@ -30,7 +34,8 @@ def _has_working_bash() -> bool:
     - Git Bash handles Windows paths fine.
 
     Probe by running a real script file through bash and requiring its
-    stdout to come back (see #86830).
+    stdout to come back (see #86830). Cached so the subprocess probe runs
+    once per process even if the module is imported multiple times.
     """
     import os
     import tempfile
