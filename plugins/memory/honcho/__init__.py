@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import threading
 import time
@@ -220,6 +221,11 @@ class HonchoMemoryProvider(MemoryProvider):
         self._base_context_cache: Optional[str] = None
         self._base_context_lock = threading.Lock()
 
+        # Injection audit (see _log_injection). Off unless explicitly enabled:
+        # the record contains the user's representation verbatim.
+        self._injection_log_path: Optional[str] = None
+        self._injection_log_lock = threading.Lock()
+
         # B5: Cost-awareness turn counting and cadence
         self._turn_count = 0
         self._injection_frequency = "every-turn"  # or "first-turn"
@@ -336,6 +342,7 @@ class HonchoMemoryProvider(MemoryProvider):
                 self._reasoning_heuristic = cfg.reasoning_heuristic
                 if cfg.reasoning_level_cap in self._LEVEL_ORDER:
                     self._reasoning_level_cap = cfg.reasoning_level_cap
+                self._injection_log_path = self._resolve_injection_log_path(raw)
             except Exception as e:
                 logger.debug("Honcho cost-awareness config parse error: %s", e)
 
@@ -632,6 +639,78 @@ class HonchoMemoryProvider(MemoryProvider):
 
         return header
 
+    @staticmethod
+    def _resolve_injection_log_path(raw: dict) -> Optional[str]:
+        """Where to write the injection audit, or None to keep it off.
+
+        Enabled by the ``logging`` config key or ``HONCHO_LOGGING`` — both of
+        which callers already set today and neither of which had any effect
+        before this. Rather than add a seventh knob, this gives the existing
+        ones a job.
+
+        ``HONCHO_INJECTION_LOG`` overrides the destination outright, for
+        harnesses that collect from a fixed path.
+        """
+        explicit = os.environ.get("HONCHO_INJECTION_LOG")
+        if explicit:
+            return explicit
+        enabled = raw.get("logging")
+        if enabled is None:
+            enabled = os.environ.get("HONCHO_LOGGING", "").lower() in ("1", "true", "yes")
+        if not enabled:
+            return None
+        # Beside the plugin's own config, which every caller already creates.
+        return os.path.join(
+            os.path.expanduser("~"), ".honcho", "injection.log"
+        )
+
+    def _log_injection(self, reason: str, payload: str = "") -> str:
+        """Record what this turn's injection contained and why, then return it.
+
+        Why the *reason* and not just the payload: ``prefetch`` has six distinct
+        ways to return an empty string — cron guard, tools-only mode, session
+        not ready, first-turn-only cadence, trivial prompt, and "fetched but
+        everything came back empty". They have opposite fixes, and an empty
+        payload on its own cannot tell them apart. Logging only the bytes would
+        reproduce, one layer down, exactly the failure that makes injection
+        audits untrustworthy: a zero that means "could not look" being read as a
+        zero that means "nothing was delivered".
+
+        The turn number is recorded for the same reason. Base context is served
+        asynchronously — the first fetch caches an empty string and consumes the
+        real result on a later turn — so *when* a payload arrives decides
+        whether the agent had it while choosing its approach or only in time to
+        write the closing summary. That difference is invisible in any
+        aggregate.
+
+        Returns ``payload`` unchanged so call sites stay ``return
+        self._log_injection(...)``, and is deliberately swallow-everything: an
+        audit that can break the agent is worse than no audit.
+        """
+        path = self._injection_log_path
+        if not path:
+            return payload
+        try:
+            record = json.dumps(
+                {
+                    "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                    "turn": self._turn_count,
+                    "session_key": self._session_key or "",
+                    "recall_mode": self._recall_mode,
+                    "reason": reason,
+                    "bytes": len(payload.encode("utf-8")),
+                    "payload": payload,
+                },
+                ensure_ascii=False,
+            )
+            with self._injection_log_lock:
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path, "a", encoding="utf-8") as fh:
+                    fh.write(record + "\n")
+        except Exception as e:  # pragma: no cover - diagnostics must never bite
+            logger.debug("Honcho injection log write failed: %s", e)
+        return payload
+
     def prefetch(self, query: str, *, session_id: str = "") -> str:
         """Return base context (representation + card) plus dialectic supplement.
 
@@ -644,24 +723,24 @@ class HonchoMemoryProvider(MemoryProvider):
         Port #3265: Truncates to context_tokens budget.
         """
         if self._cron_skipped:
-            return ""
+            return self._log_injection("cron-guard")
 
         # B1: tools-only mode — no auto-injection
         if self._recall_mode == "tools":
-            return ""
+            return self._log_injection("tools-only-mode")
 
         if not self._session_ready():
             self._start_session_init_background()
-            return ""
+            return self._log_injection("session-not-ready")
 
         # B5: injection_frequency — if "first-turn" and past first turn, return empty.
         # _turn_count is 1-indexed (first user message = 1), so > 1 means "past first".
         if self._injection_frequency == "first-turn" and self._turn_count > 1:
-            return ""
+            return self._log_injection("first-turn-only-cadence")
 
         # Trivial prompts ("ok", "yes", slash commands) carry no semantic signal.
         if self._is_trivial_prompt(query):
-            return ""
+            return self._log_injection("trivial-prompt")
 
         parts = []
 
@@ -768,14 +847,14 @@ class HonchoMemoryProvider(MemoryProvider):
             parts.append(dialectic_result)
 
         if not parts:
-            return ""
+            return self._log_injection("fetched-but-empty")
 
         result = "\n\n".join(parts)
 
         # ----- Port #3265: token budget enforcement -----
         result = self._truncate_to_budget(result)
 
-        return result
+        return self._log_injection("injected", result)
 
     def _truncate_to_budget(self, text: str) -> str:
         """Truncate text to fit within context_tokens budget if set."""
