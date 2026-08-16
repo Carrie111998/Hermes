@@ -2019,6 +2019,38 @@ def _xai_bool_config(value: Any, default: bool = False) -> bool:
     return _config_bool(value, default=default)
 
 
+def _is_valid_xai_speech_tag_rewrite(tagged: str, transcript: str) -> bool:
+    """Return whether tags are balanced and the spoken text is unchanged."""
+    wrapping_tags: list[str] = []
+
+    for match in _XAI_SPEECH_TAG_RE.finditer(tagged):
+        token = match.group(0)
+        if token.startswith("["):
+            continue
+
+        closing = token.startswith("</")
+        name = token[2:-1] if closing else token[1:-1]
+        name = name.casefold()
+
+        if not closing:
+            wrapping_tags.append(name)
+            continue
+
+        if not wrapping_tags or wrapping_tags[-1] != name:
+            return False
+
+        wrapping_tags.pop()
+
+    if wrapping_tags:
+        return False
+
+    def spoken_text(value: str) -> str:
+        without_tags = _XAI_SPEECH_TAG_RE.sub(" ", value)
+        return re.sub(r"\s+", " ", without_tags).strip()
+
+    return spoken_text(tagged) == spoken_text(transcript)
+
+
 def _apply_xai_auto_speech_tags(text: str) -> str:
     """Add xAI speech tags for more natural voice-mode replies.
 
@@ -2081,7 +2113,12 @@ def _apply_xai_auto_speech_tags(text: str) -> str:
         fence = re.fullmatch(r"```(?:[A-Za-z0-9_-]+)?\s*(.*?)\s*```", tagged, flags=re.DOTALL)
         if fence:
             tagged = fence.group(1).strip()
-        return tagged or local
+        if not tagged:
+            return local
+        if not _is_valid_xai_speech_tag_rewrite(tagged, local):
+            logger.debug("xAI TTS audio tag rewrite was invalid; using locally-tagged text")
+            return local
+        return tagged
     except Exception as exc:
         logger.debug("xAI TTS audio tag rewrite failed; using locally-tagged text: %s", exc)
         return local
