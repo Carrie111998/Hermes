@@ -21,11 +21,28 @@ Usage:
 import argparse
 import base64
 import json
+import os
 import sys
 import time
 from urllib.parse import parse_qsl, urlsplit
 
 from playwright.sync_api import sync_playwright
+
+
+def _write_private_har(path: str, har: dict) -> None:
+    """Write a HAR with owner-only permissions, including when replacing a file."""
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(path, flags, 0o600)
+    try:
+        os.chmod(path, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            fd = -1
+            json.dump(har, f)
+    finally:
+        if fd >= 0:
+            os.close(fd)
 
 
 def run_action(page, spec: str) -> None:
@@ -131,8 +148,7 @@ def main() -> int:
     har = {"log": {"version": "1.2",
                    "creator": {"name": "har_capture_cdp", "version": "0.1"},
                    "entries": entries}}
-    with open(args.har_path, "w", encoding="utf-8") as f:
-        json.dump(har, f)
+    _write_private_har(args.har_path, har)
     print(f"HAR written: {args.har_path} ({len(entries)} entries)")
     return 0
 

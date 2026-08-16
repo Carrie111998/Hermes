@@ -46,8 +46,10 @@ HAR recording works differently in each case (see How to Run).
   - (If a system Playwright already has browsers under `~/.cache/ms-playwright`, reuse it.)
 - `requests` or `httpx` for the replay step (stdlib `urllib` also works).
 - No API keys are needed by the skill itself. Treat captured keys, tokens, and
-  cookies as secrets; `har_to_client.py` reports their presence but redacts
-  credential header values from its output.
+  cookies as secrets; `har_to_client.py` reports their presence and redacts
+  credential headers plus common query/JSON/form credential fields. Capture
+  scripts restrict newly written HAR files to the current OS user where POSIX
+  permissions are available.
 - For the CDP path (`har_capture_cdp.py`): a reachable CDP endpoint. On Hermes,
   run `/browser connect` to print the active endpoint, or read `BROWSER_CDP_URL`
   / `browser.cdp_url` in config. Cloud backends expose it as `cdpUrl`/`connectUrl`.
@@ -108,7 +110,7 @@ har_capture_cdp.py <cdp_url> <out.har> [--goto URL] [--wait S] [--action SPEC ..
 
 har_to_client.py <in.har> [--host SUBSTR] [--include-static] [--max-body N]
   default: keeps only XHR/fetch/JSON; --host narrows to one domain
-  prints per endpoint: query params, non-boring req headers, req body sample,
+  prints per endpoint: redacted query params, non-boring req headers, req body sample,
                        response status/content-type + body sample
   prints "### Replay hints": the browser User-Agent, cookie/auth presence
 ```
@@ -144,7 +146,7 @@ for p in r.json()["pages"]:
 - **A failed `--action` aborts before the HAR flushes** — you get no file. If capture errors on a selector, the run produced nothing; fix the selector (use `--headed` to watch) and rerun. Don't debug a missing HAR.
 - **Server-rendered pages have no XHR** to derive — `har_to_client.py` prints "No API-looking entries". The data came in the HTML; scrape it or find the interaction that does fetch JSON.
 - **Debounced/typeahead XHRs need a real pause.** Add `--action "sleep:3"` after `fill`; typing alone won't have fired the request when the HAR closes.
-- **Auth/session endpoints** need equivalent current `Cookie`/`Authorization` values, and those expire. The derivation output redacts credential headers; load approved values at runtime from a secret manager, protected environment, or other project-approved source. HARs contain live secrets — restrict access and delete `out.har` after deriving.
+- **Auth/session endpoints** need equivalent current `Cookie`/`Authorization` values, and those expire. The derivation output redacts credential headers and common structured credential fields, but arbitrary unstructured bodies can still contain sensitive data. Load approved values at runtime from a secret manager, protected environment, or other project-approved source. HARs contain live secrets — restrict access and delete `out.har` after deriving.
 - **`record_har_content="embed"` makes big HARs.** Use `--max-body` to cap what's printed; the file itself can be large for media-heavy pages.
 - **Endpoints shift.** Sites change private APIs without notice. Re-run the capture→derive loop when a client breaks rather than patching URLs by hand.
 - **Wrong capturer = empty/no HAR.** `har_capture.py` on a cloud/CDP backend records nothing (it launches its own local browser instead of the one you meant). `har_capture_cdp.py` needs the endpoint; on Hermes get it from `/browser connect` or `BROWSER_CDP_URL`. Match the capturer to the pathway (How to Run table).

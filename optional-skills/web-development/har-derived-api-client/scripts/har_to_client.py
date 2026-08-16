@@ -17,7 +17,7 @@ import json
 import re
 import sys
 from collections import OrderedDict
-from urllib.parse import parse_qsl, urlsplit
+from urllib.parse import parse_qsl, urlencode, urlsplit
 
 BORING_HEADERS = {
     "accept-encoding", "accept-language", "connection", "content-length",
@@ -29,6 +29,14 @@ BORING_HEADERS = {
 ID_SEG = re.compile(r"^(\d+|[0-9a-f]{8}-[0-9a-f-]{27,}|[0-9a-f]{16,})$", re.I)
 STATIC_EXT = re.compile(r"\.(js|css|png|jpe?g|gif|svg|webp|ico|woff2?|ttf|mp4|map)$", re.I)
 SENSITIVE_HEADER_MARKERS = ("authorization", "apikey", "token", "secret", "credential")
+SENSITIVE_FIELD_NAMES = {
+    "accesstoken", "apikey", "authorization", "authtoken", "bearertoken",
+    "clientsecret", "cookie", "credential", "csrftoken", "idtoken", "oauthaccesstoken",
+    "oauthtoken", "pass", "password", "passwd", "privatekey", "pwd", "refreshtoken",
+    "secret", "secretkey", "session", "sessionid", "sessionkey", "sessiontoken",
+    "signature", "signedtoken", "token", "xsrftoken",
+}
+REDACTED = "[REDACTED]"
 
 
 def path_template(path: str) -> str:
@@ -58,6 +66,43 @@ def trunc(text, n: int) -> str:
 def is_sensitive_header(name: str) -> bool:
     compact = re.sub(r"[^a-z0-9]", "", name.lower().lstrip(":"))
     return any(marker in compact for marker in SENSITIVE_HEADER_MARKERS)
+
+
+def is_sensitive_field(name: str) -> bool:
+    """Identify credential-bearing query/body field names without broad substring matches."""
+    compact = re.sub(r"[^a-z0-9]", "", str(name).lower())
+    return compact in SENSITIVE_FIELD_NAMES
+
+
+def redact_structure(value):
+    """Recursively redact credential values from decoded JSON-like structures."""
+    if isinstance(value, dict):
+        return {
+            key: REDACTED if is_sensitive_field(key) else redact_structure(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [redact_structure(item) for item in value]
+    return value
+
+
+def body_sample(mime: str, text: str, max_body: int) -> str:
+    """Redact structured JSON/form credentials before truncating the displayed sample."""
+    mime = (mime or "").lower()
+    if "json" in mime:
+        try:
+            decoded = json.loads(text)
+        except (TypeError, ValueError):
+            pass
+        else:
+            return trunc(json.dumps(redact_structure(decoded), ensure_ascii=False), max_body)
+    if "application/x-www-form-urlencoded" in mime:
+        fields = [
+            (name, REDACTED if is_sensitive_field(name) else value)
+            for name, value in parse_qsl(text, keep_blank_values=True)
+        ]
+        return trunc(urlencode(fields), max_body)
+    return trunc(text, max_body)
 
 
 def query_items(req: dict, url) -> list[tuple[str, str]]:
@@ -95,22 +140,25 @@ def main() -> int:
                                     "req_body": None, "resp": None})
         g["count"] += 1
         for name, value in query_items(req, url):
-            g["queries"].add((name, trunc(value, 80)))
+            displayed = REDACTED if is_sensitive_field(name) else trunc(value, 80)
+            g["queries"].add((name, displayed))
         for h in req.get("headers", []):
             name = h["name"].lower().lstrip(":")
             if name in BORING_HEADERS or name in ("method", "path", "scheme", "authority"):
                 continue
             g["headers"][name] = (
-                "[REDACTED]" if is_sensitive_header(name) else trunc(h["value"], 120)
+                REDACTED if is_sensitive_header(name) else trunc(h["value"], 120)
             )
         post = req.get("postData", {})
         if post.get("text") and g["req_body"] is None:
-            g["req_body"] = (post.get("mimeType", ""), trunc(post["text"], args.max_body))
+            mime = post.get("mimeType", "")
+            g["req_body"] = (mime, body_sample(mime, post["text"], args.max_body))
         resp = entry.get("response", {})
         if g["resp"] is None and resp:
             content = resp.get("content", {})
-            g["resp"] = (resp.get("status"), content.get("mimeType", ""),
-                         trunc(content.get("text") or "", args.max_body))
+            mime = content.get("mimeType", "")
+            g["resp"] = (resp.get("status"), mime,
+                         body_sample(mime, content.get("text") or "", args.max_body))
 
     if not groups:
         print("No API-looking entries found. Re-run with --include-static to see everything.")
