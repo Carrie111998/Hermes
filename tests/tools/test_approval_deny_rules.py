@@ -115,6 +115,60 @@ class TestMatchUserDenyRule:
     @pytest.mark.parametrize(
         "command",
         [
+            "nice -n 5 git status",
+            "timeout --signal KILL 30 git status",
+            "stdbuf --output L git status",
+            "ionice --class 2 git status",
+            "chrt --fifo 20 git status",
+            "taskset --cpu-list 0 git status",
+            "chroot --userspec root:root /srv git status",
+        ],
+    )
+    def test_exact_rule_matches_common_process_launchers(
+        self, deny_config, command
+    ):
+        deny_config(["git status"])
+        assert mod._match_user_deny_rule(command) == "git status"
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "ionice --pid 1234",
+            "chrt --pid 1234",
+            "taskset --pid 1 1234",
+        ],
+    )
+    def test_process_query_modes_do_not_treat_ids_as_commands(
+        self, deny_config, command
+    ):
+        deny_config(["1234"])
+        assert mod._match_user_deny_rule(command) is None
+
+    def test_exact_rule_ignores_trailing_shell_comment(self, deny_config):
+        deny_config(["git status"])
+        assert mod._match_user_deny_rule(
+            "git status # diagnostic only"
+        ) == "git status"
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "echo ok # ignored; git status",
+            "echo ok;# ignored; git status",
+        ],
+    )
+    def test_shell_comment_does_not_create_command_starts(
+            self, deny_config, command):
+        deny_config(["git status"])
+        assert mod._match_user_deny_rule(command) is None
+
+    def test_hash_inside_word_is_not_a_shell_comment(self, deny_config):
+        deny_config(["echo value"])
+        assert mod._match_user_deny_rule("echo value#suffix") is None
+
+    @pytest.mark.parametrize(
+        "command",
+        [
             "for item in a b; do git push --force origin main; done",
             "while true; do git push --force origin main; done",
             "until false; do git push --force origin main; done",
@@ -230,6 +284,10 @@ class TestDenyBeatsYolo:
             "VAR=1 2>/dev/null git push --force origin main",
             "command -p git push --force origin main",
             "coproc git push --force origin main",
+            "nice -n 5 git push --force origin main",
+            "timeout --signal KILL 30 git push --force origin main",
+            "stdbuf --output L git push --force origin main",
+            "git push --force origin main # diagnostic only",
             (
                 "case x in @(deploy|force)) "
                 "git push --force origin main ;; esac"

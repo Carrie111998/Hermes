@@ -1320,13 +1320,20 @@ _SHELL_REDIRECTION_RE = re.compile(
     r"(?:<<<|<<-|<<|>>|<>|>&|<&|>\||>|<)"
 )
 _COMMAND_WRAPPER_WORDS = {
+    "chroot",
+    "chrt",
     "coproc",
     "sudo",
     "env",
     "exec",
+    "ionice",
+    "nice",
     "nohup",
     "setsid",
+    "stdbuf",
+    "taskset",
     "time",
+    "timeout",
     "command",
     "builtin",
 }
@@ -1348,14 +1355,31 @@ _SUDO_OPTIONS_WITH_ARG = {
     "-u", "--user",
 }
 _COMMAND_WRAPPER_OPTIONS_WITH_ARG = {
+    "chroot": {"--groups", "--userspec"},
     "sudo": _SUDO_OPTIONS_WITH_ARG,
     "env": {"-c", "--chdir", "-s", "--split-string", "-u", "--unset"},
     "exec": {"-a"},
+    "ionice": {"-c", "--class", "-n", "--classdata"},
+    "nice": {"-n", "--adjustment"},
+    "stdbuf": {"-e", "--error", "-i", "--input", "-o", "--output"},
     "time": {"-f", "--format", "-o", "--output"},
+    "timeout": {"-k", "--kill-after", "-s", "--signal"},
 }
 _COMMAND_WRAPPER_NON_EXECUTING_OPTIONS = {
     # ``command -v`` and ``command -V`` inspect a name; they do not execute it.
     "command": {"-v"},
+    # These modes alter or inspect an existing process instead of launching
+    # the following token as a command.
+    "chrt": {"-p", "--pid"},
+    "ionice": {"-p", "--pid", "--pgid", "--uid"},
+    "taskset": {"-p", "--pid"},
+}
+_COMMAND_WRAPPER_POSITIONAL_ARGS = {
+    # Positional operands consumed before the command being launched.
+    "chroot": 1,   # NEWROOT
+    "chrt": 1,     # PRIORITY
+    "taskset": 1,  # CPU mask/list
+    "timeout": 1,  # DURATION
 }
 
 _INTERPRETER_EXEC_FLAGS = {
@@ -2193,6 +2217,23 @@ def _deobfuscate_shell_word_for_detection(word: str) -> str:
     return deobfuscated
 
 
+def _is_shell_comment_start(command: str, index: int) -> bool:
+    """Return whether ``#`` starts a shell comment at this position.
+
+    A hash embedded in a word (``value#suffix``) remains data. The command
+    scanners call this only outside quotes and after handling escapes.
+    """
+    return (
+        0 <= index < len(command)
+        and command[index] == "#"
+        and (
+            index == 0
+            or command[index - 1].isspace()
+            or command[index - 1] in ";&|(){}<>"
+        )
+    )
+
+
 def _iter_shell_command_starts(command: str):
     starts = [0]
 
@@ -2234,6 +2275,12 @@ def _iter_shell_command_starts(command: str):
                 continue
             if ch == "\\" and i + 1 < end:
                 i += 2
+                continue
+            if _is_shell_comment_start(command, i):
+                newline = command.find("\n", i + 1, end)
+                if newline < 0:
+                    return
+                i = newline
                 continue
             if command.startswith("$(", i):
                 nested_end = _scan_dollar_paren_end(command, i)
@@ -2330,6 +2377,12 @@ def _iter_shell_case_body_starts(command: str, command_start: int):
         if char == "\\":
             escaped = True
             index += 1
+            continue
+        if _is_shell_comment_start(command, index):
+            newline = command.find("\n", index + 1)
+            if newline < 0:
+                break
+            index = newline
             continue
         if command.startswith("$(", index):
             nested_end = _scan_dollar_paren_end(command, index)
@@ -2522,6 +2575,7 @@ def _iter_shell_command_word_spans(command: str):
         prefix_words = 0
         skip_next_wrapper_arg = False
         active_wrapper: str | None = None
+        remaining_wrapper_positionals = 0
         while prefix_words < 12:
             redirection_end = _skip_shell_redirection(command, pos)
             if redirection_end is not None:
@@ -2556,12 +2610,20 @@ def _iter_shell_command_word_spans(command: str):
                 pos = word_end
                 prefix_words += 1
                 continue
+            if active_wrapper and remaining_wrapper_positionals:
+                remaining_wrapper_positionals -= 1
+                pos = word_end
+                prefix_words += 1
+                continue
 
             yield (word_start, word_end, word)
             prefix_words += 1
 
             if lower_word in _COMMAND_WRAPPER_WORDS:
                 active_wrapper = lower_word
+                remaining_wrapper_positionals = (
+                    _COMMAND_WRAPPER_POSITIONAL_ARGS.get(lower_word, 0)
+                )
                 pos = word_end
                 continue
             if _ENV_ASSIGNMENT_RE.fullmatch(deobfuscated):
@@ -2612,6 +2674,8 @@ def _shell_command_segment(command: str, start: int) -> str:
                 quote = None
         elif char in {"'", '"'}:
             quote = char
+        elif _is_shell_comment_start(command, index):
+            break
         elif char in ";&|\n)}":
             break
         index += 1
