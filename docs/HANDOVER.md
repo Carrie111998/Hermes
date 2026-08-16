@@ -48,11 +48,11 @@ The local audit checkout observed during this refresh is `D:/PROJECT/Hermes`, br
 ### Current lane: ARCH-002
 
 - **Plan:** `docs/plans/2026-08-16-arch-002-runtime-state-contract.md`.
-- **Status:** `IMPLEMENTED_USER_OVERRIDE_REVIEW_BLOCKED`; lifecycle transitions are enforced at the CAS boundary, terminal states cannot regress, and same-state retries are idempotent no-ops. Focused tests are `24 passed`; GitHub CI run `31932199413` required checks and timing report passed. Local Ruff was `NOT RUN` because it is unavailable in the isolated checkout.
+- **Status:** `IMPLEMENTED_IMPLEMENTATION_REVIEW_PASS_DESIGN_OVERRIDE`; lifecycle transitions are enforced at the CAS boundary, terminal states cannot regress, and same-state retries are idempotent no-ops. Focused tests are `24 passed`; GitHub CI run `31932199413` required checks and timing report passed. Local Ruff was `NOT RUN` because it is unavailable in the isolated checkout.
 - **Branch:** `ticket/arch-002-runtime-state-contract`; implementation is not merged or deployed.
-- **Review boundary:** the identical metadata-only implementation packet (SHA-256 `ef1109ed4fd13b7e135be997f11b2aa0d0f2d06181d03063be8c118e651bba7c`) produced AGY advisory `PASS`; Claude did not issue a formal verdict, so consensus remains `BLOCKED`. This was explicitly overridden by the user for isolated implementation only; it is not recorded as review PASS.
-- **Next action:** inspect the isolated diff, commit and push if authorized, then keep CI, review, merge, deployment, and runtime health as separate gates.
-- **Do not:** modify the primary dirty checkout, merge, deploy, migrate DGX runtime state, or claim independent review consensus.
+- **Review boundary:** the corrected identical metadata-only v3 packet (SHA-256 `6d55a0944efd858ab63d5af809f81e6c5fab09d1c02c2f293fd11fae4ed213c1`) produced AGY `PASS` and Claude Opus 4.8 `PASS`, with no correction set. Implementation-review consensus is `PASS` for the bounded advisory scope. The earlier design-review gate was explicitly overridden by the user for isolated implementation; merge/deploy remain separate.
+- **Next action:** keep PR #29 draft until merge authorization is explicit; then keep merge, deployment, and runtime health as separate gates.
+- **Do not:** modify the primary dirty checkout, deploy, migrate DGX runtime state, or claim that implementation review authorizes deployment.
 
 ### Other ticket state
 
@@ -62,11 +62,11 @@ The local audit checkout observed during this refresh is `D:/PROJECT/Hermes`, br
 - `HERMES-CALENDAR-GUARD-001`: `MERGED_DEPLOYED`; PR #17/#18 plus correction PR #24; the actual `hermes-mcp-health-guard.timer` is active/waiting. The old `hermes-calendar-guard.timer` name is not present and requires a separate documentation reconciliation if needed.
 - `Managed CA trust correction`: `MERGED_DEPLOYED`; PR #25, merge `29d4663b...`, CI `31918804987`, release `v2026.8.16-hermes-ca-29d4663bb9`; focused release tests `6 passed`, source/release hashes matched, and service health is active/running.
 - `HERMES-MONITORING-001`: `BLOCKED`; do not infer readiness from this deployment.
-- `ARCH-002`: `IMPLEMENTED_UNMERGED_REVIEW_BLOCKED`; isolated branch implementation is complete with `24 passed`, CI run `31932199413` PASS, AGY advisory PASS, and missing Claude verdict. Commit/push is complete; merge/deploy remain separate.
+- `ARCH-002`: `IMPLEMENTED_UNMERGED_IMPLEMENTATION_REVIEW_PASS_DESIGN_OVERRIDE`; isolated branch implementation is complete with `24 passed`, CI run `31932199413` PASS, and v3 AGY + Claude Opus consensus PASS. Commit/push is complete; merge/deploy remain separate.
 
 ### Gate rule
 
-Implementation, tests, independent review, reconciliation, CI, merge, deployment, service health, inbound polling, outbound delivery, and rollback are separate gates. ARCH-002 has implementation/test evidence only; its review gate remains blocked and no merge/deploy evidence exists.
+Implementation, tests, independent review, reconciliation, CI, merge, deployment, service health, inbound polling, outbound delivery, and rollback are separate gates. ARCH-002 implementation, tests, CI, and bounded implementation review passed; no merge/deploy evidence exists.
 
 ## 5. Safe continuation instructions
 

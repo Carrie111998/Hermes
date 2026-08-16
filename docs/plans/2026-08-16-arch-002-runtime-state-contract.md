@@ -1,6 +1,6 @@
 ---
 title: "ARCH-002: harden the profile-scoped runtime-state contract"
-status: IMPLEMENTED_USER_OVERRIDE_REVIEW_BLOCKED
+status: IMPLEMENTED_IMPLEMENTATION_REVIEW_PASS_DESIGN_OVERRIDE
 date: 2026-08-16
 type: architecture
 ticket: ARCH-002
@@ -11,7 +11,7 @@ target_repo: hermes-agent
 
 ## Status
 
-IMPLEMENTED_USER_OVERRIDE_REVIEW_BLOCKED
+IMPLEMENTED_IMPLEMENTATION_REVIEW_PASS_DESIGN_OVERRIDE
 
 The independent design-review gate remains blocked because the authenticated
 Claude family did not issue a verdict. The user explicitly directed direct
@@ -149,20 +149,22 @@ source edit or implementation branch is authorized.
 
 ## Implementation review evidence
 
-- Packet: identical metadata-only implementation packet for both reviewer
-  families; SHA-256 `ef1109ed4fd13b7e135be997f11b2aa0d0f2d06181d03063be8c118e651bba7c`.
+- Final packet: identical corrected metadata-only implementation packet for
+  both reviewer families; v3 SHA-256
+  `6d55a0944efd858ab63d5af809f81e6c5fab09d1c02c2f293fd11fae4ed213c1`.
 - GitHub CI run `31932199413`: required checks and timing report completed
   successfully, including blocking Ruff/ty, Windows footgun, Python test, and
   e2e jobs.
-- DGX AGY 1.1.13: `PASS`, findings none, correction set none.
-- DGX Claude Code 2.1.197: declined a formal verdict because the packet had
-  no source and Claude would not certify claims it could not independently
-  observe.
-- Implementation-review consensus: `BLOCKED`; AGY PASS does not substitute
-  for the missing Claude verdict. No merge or deployment authorization follows
-  from CI or the AGY advisory result.
+- DGX AGY 1.1.13: v3 `PASS`, findings none, correction set none.
+- DGX Claude Opus 4.8 (`claude-opus-4-8`): v3 `PASS`, informational findings
+  only, correction set none.
+- Implementation-review consensus: `PASS` for the metadata-only advisory
+  scope. The earlier design-review gate remained blocked and was explicitly
+  overridden by the user for isolated implementation; this does not authorize
+  merge or deployment.
 
 ## Current next action
 
-Review the isolated diff and test evidence. Do not merge, deploy, mutate DGX,
-or clean the primary dirty worktree without a separate explicit gate.
+Review merge authorization and the isolated diff. Do not merge, deploy,
+mutate DGX, or clean the primary dirty worktree without a separate explicit
+gate.
