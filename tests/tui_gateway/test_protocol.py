@@ -763,26 +763,106 @@ def test_cli_exec_blocked(server, argv):
 # ── slash.exec skill command interception ────────────────────────────
 
 
-def test_slash_exec_rejects_skill_commands(server):
-    """slash.exec must reject skill commands so the TUI falls through to command.dispatch."""
-    # Register a mock session
+def test_slash_exec_dispatches_skill_commands(server):
+    """slash.exec must return the skill payload, never spawn the worker."""
     sid = "test-session"
     server._sessions[sid] = {"session_key": sid, "agent": None}
+    spawned = {"n": 0}
 
-    # Mock scan_skill_commands to return a known skill
-    fake_skills = {"/hermes-agent-dev": {"name": "hermes-agent-dev", "description": "Dev workflow"}}
+    class _BoomWorker:
+        def __init__(self, *args, **kwargs):
+            spawned["n"] += 1
 
+        def run(self, cmd):
+            raise AssertionError(f"worker must not run skill slash {cmd!r}")
+
+    server._SlashWorker = _BoomWorker
+    fake_skills = {"/ratchet-panel": {"name": "ratchet-panel", "description": "vet"}}
+
+    def fake_dispatch(rid, params):
+        assert params["name"] == "ratchet-panel"
+        assert params["arg"] == "PLAN.md"
+        return server._ok(
+            rid,
+            {
+                "type": "skill",
+                "name": "ratchet-panel",
+                "message": "SKILL_BODY",
+                "display": "/ratchet-panel PLAN.md",
+            },
+        )
+
+    server._methods["command.dispatch"] = fake_dispatch
     with patch("agent.skill_commands.get_skill_commands", return_value=fake_skills):
-        resp = server.handle_request({
-            "id": "r1",
-            "method": "slash.exec",
-            "params": {"command": "hermes-agent-dev", "session_id": sid},
-        })
+        resp = server.handle_request(
+            {
+                "id": "r1",
+                "method": "slash.exec",
+                "params": {
+                    "command": "ratchet-panel PLAN.md",
+                    "session_id": sid,
+                },
+            }
+        )
 
-    # Should return an error so the TUI's .catch() fires command.dispatch
-    assert "error" in resp
+    assert "error" not in resp
+    assert resp["result"]["type"] == "skill"
+    assert resp["result"]["message"] == "SKILL_BODY"
+    assert spawned["n"] == 0
+
+
+def test_slash_exec_resolves_underscored_skill_name(server):
+    sid = "test-session"
+    server._sessions[sid] = {"session_key": sid, "agent": None}
+    seen = {}
+
+    def fake_dispatch(rid, params):
+        seen.update(params)
+        return server._ok(rid, {"type": "skill", "name": "ratchet-panel", "message": "BODY"})
+
+    server._methods["command.dispatch"] = fake_dispatch
+    with patch(
+        "agent.skill_commands.get_skill_commands",
+        return_value={"/ratchet-panel": {"name": "ratchet-panel"}},
+    ):
+        resp = server.handle_request(
+            {
+                "id": "r2",
+                "method": "slash.exec",
+                "params": {"command": "ratchet_panel", "session_id": sid},
+            }
+        )
+
+    assert "error" not in resp
+    assert seen["name"] == "ratchet-panel"
+
+
+def test_slash_exec_skill_resolver_failure_is_4018_not_worker(server):
+    """Import/scan failure must 4018 so clients fall through — never the worker."""
+    sid = "test-session"
+    server._sessions[sid] = {"session_key": sid, "agent": None}
+    spawned = {"n": 0}
+
+    class _BoomWorker:
+        def __init__(self, *args, **kwargs):
+            spawned["n"] += 1
+
+    server._SlashWorker = _BoomWorker
+    with patch(
+        "agent.skill_commands.resolve_skill_slash",
+        side_effect=RuntimeError("scan exploded"),
+    ):
+        resp = server.handle_request(
+            {
+                "id": "r3",
+                "method": "slash.exec",
+                "params": {"command": "ratchet-panel", "session_id": sid},
+            }
+        )
+
     assert resp["error"]["code"] == 4018
     assert "skill command" in resp["error"]["message"]
+    assert spawned["n"] == 0
 
 
 def test_command_dispatch_queue_sends_message(server):

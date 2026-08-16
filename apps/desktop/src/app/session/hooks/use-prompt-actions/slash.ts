@@ -383,9 +383,16 @@ export function useSlashCommand(deps: SlashCommandDeps) {
             applyGoalStatusText(sessionId, output.output)
           }
 
-          renderSlashOutput(output?.warning ? `warning: ${output.warning}\n${body}` : body)
+          // Worker-swallowed skill: process_command printed "⚡ Loading skill"
+          // and parked the body on unread _pending_input. Treat that as a miss
+          // and fall through to command.dispatch so the turn still starts.
+          if (/loading skill/i.test(body)) {
+            slashExecError = new Error(body)
+          } else {
+            renderSlashOutput(output?.warning ? `warning: ${output.warning}\n${body}` : body)
 
-          return
+            return
+          }
         } catch (error) {
           // Fall back to command.dispatch for skill/send/alias directives, but
           // keep the worker error: a slash.exec worker timeout/crash is the real

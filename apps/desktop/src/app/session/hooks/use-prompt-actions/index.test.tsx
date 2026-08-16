@@ -1203,6 +1203,51 @@ describe('usePromptActions slash.exec dispatch payloads', () => {
     expect(renderedText).not.toContain('/goal: no output')
   })
 
+  it('falls through to command.dispatch when slash.exec only printed Loading skill', async () => {
+    const calls: { method: string; params?: Record<string, unknown> }[] = []
+
+    const requestGateway = vi.fn(async (method: string, params?: Record<string, unknown>) => {
+      calls.push({ method, params })
+
+      if (method === 'slash.exec') {
+        return { output: '⚡ Loading skill: ratchet-panel' } as never
+      }
+
+      if (method === 'command.dispatch') {
+        return {
+          type: 'skill',
+          name: 'ratchet-panel',
+          message: '[IMPORTANT: invoked ratchet-panel]\n\nDo the panel.',
+          display: '/ratchet-panel'
+        } as never
+      }
+
+      return {} as never
+    })
+
+    let handle: HarnessHandle | null = null
+    await actRender(
+      <Harness
+        onReady={h => (handle = h)}
+        refreshSessions={async () => undefined}
+        requestGateway={requestGateway}
+      />
+    )
+
+    await handle!.submitText('/ratchet-panel')
+
+    expect(calls.map(c => c.method)).toEqual(['slash.exec', 'command.dispatch', 'prompt.submit'])
+    expect(calls[1]?.params).toEqual({
+      session_id: RUNTIME_SESSION_ID,
+      name: 'ratchet-panel',
+      arg: ''
+    })
+    expect(calls[2]?.params).toMatchObject({
+      session_id: RUNTIME_SESSION_ID,
+      text: '[IMPORTANT: invoked ratchet-panel]\n\nDo the panel.'
+    })
+  })
+
   it('queues the /goal kickoff instead of dropping it when the session is busy (#63352)', async () => {
     // The backend sets the goal the moment slash.exec runs — dropping the
     // returned kickoff message because busyRef was true left a goal the agent

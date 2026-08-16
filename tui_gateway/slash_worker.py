@@ -97,6 +97,17 @@ def _run(cli: HermesCLI, command: str) -> str:
     if not cmd.startswith("/"):
         cmd = f"/{cmd}"
 
+    # Belt: slash.exec should have bounced skills already. If one still lands
+    # here, refuse instead of parking the body on unread _pending_input.
+    try:
+        from agent.skill_commands import resolve_skill_slash
+
+        skill_key = resolve_skill_slash(cmd[1:].split(None, 1)[0])
+    except Exception:
+        skill_key = None
+    if skill_key:
+        raise RuntimeError(f"skill command: use command.dispatch for {skill_key}")
+
     buf = io.StringIO()
 
     # Rich Console captures its file handle at construction time, so

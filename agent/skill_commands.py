@@ -594,6 +594,23 @@ def resolve_skill_command_key(command: str) -> Optional[str]:
     return cmd_key if cmd_key in get_skill_commands() else None
 
 
+def resolve_skill_slash(command: str, *, rescan_if_missing: bool = True) -> Optional[str]:
+    """Resolve a typed slash token to a skill key, optionally rescanning once.
+
+    ``get_skill_commands()`` is a process-wide cache. A long-lived ``hermes
+    serve`` can miss a skill that a freshly spawned slash_worker would see, or
+    an import/scan blip can leave the map empty. One rescan is cheap compared
+    to parking the expanded skill body on the worker's unread ``_pending_input``
+    queue (Desktop then renders ``⚡ Loading skill`` and never starts a turn).
+    """
+    token = (command or "").strip().lstrip("/").split(None, 1)[0] if command else ""
+    key = resolve_skill_command_key(token)
+    if key is not None or not rescan_if_missing:
+        return key
+    scan_skill_commands()
+    return resolve_skill_command_key(token)
+
+
 def build_skill_invocation_message(
     cmd_key: str,
     user_instruction: str = "",

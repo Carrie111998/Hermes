@@ -1176,16 +1176,30 @@ def _(rid, params: dict) -> dict:
     except Exception:
         pass
 
+    # Skills must never reach the slash worker. The worker's process_command
+    # loads the skill into HermesCLI._pending_input — a queue nobody reads in
+    # that child — and returns "⚡ Loading skill: …". Desktop treats that as
+    # successful exec output, so the agent turn never starts. Prefer returning
+    # the same structured {type: skill, …} payload command.dispatch already
+    # builds (current Desktop/TUI submit it). On resolver failure, 4018 so
+    # older clients still fall through to command.dispatch.
     try:
-        from agent.skill_commands import get_skill_commands
+        from agent.skill_commands import resolve_skill_slash
 
-        _cmd_key = f"/{_cmd_base}"
-        if _cmd_key in get_skill_commands():
-            return _err(
-                rid, 4018, f"skill command: use command.dispatch for {_cmd_key}"
+        _cmd_key = resolve_skill_slash(_cmd_base)
+        if _cmd_key is not None:
+            return _methods["command.dispatch"](
+                rid,
+                {
+                    "name": _cmd_key.lstrip("/"),
+                    "arg": _cmd_arg,
+                    "session_id": params.get("session_id", ""),
+                },
             )
     except Exception:
-        pass
+        return _err(
+            rid, 4018, f"skill command: use command.dispatch for /{_cmd_base}"
+        )
 
     plugin_handler = None
     resolve_plugin_command_result = None
