@@ -268,6 +268,8 @@ export function AppearanceSettings() {
   const [query, setQuery] = useState('')
 
   // Close-button behavior, persisted by the main process (userData/close-behavior.json).
+  // Only relevant on Windows — other platforms keep the stock close behavior.
+  const isWin32 = typeof navigator !== 'undefined' && navigator.platform.includes('Win')
   const [closeBehavior, setCloseBehavior] = useState<'tray' | 'quit'>('tray')
 
   useEffect(() => {
@@ -485,6 +487,7 @@ export function AppearanceSettings() {
             title={a.sessionDensityTitle}
           />
 
+          {isWin32 && (
           <ListRow
             action={
               <SegmentedControl
@@ -500,6 +503,7 @@ export function AppearanceSettings() {
             description={a.closeBehaviorDesc}
             title={a.closeBehaviorTitle}
           />
+          )}
 
           <ListRow
             action={

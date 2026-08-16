@@ -31,6 +31,13 @@ import {
 } from 'electron'
 import nodePty from 'node-pty'
 
+import {
+  readCloseBehaviorState,
+  shouldHideToTray,
+  writeCloseBehaviorState,
+  type CloseBehavior
+} from './close-behavior'
+
 import { classifyActiveRuntime } from './active-runtime-state'
 import { stopBackendChild as stopBackendChildImpl, stopBackendTreesForUpdate } from './backend-child'
 import { dashboardFallbackArgs, sourceDeclaresServe } from './backend-command'
@@ -1141,9 +1148,10 @@ function registerMediaProtocol() {
 let mainWindow = null
 // Close-to-tray state: trayIcon is created lazily on the first close-to-tray;
 // isQuitting is set by before-quit so a real quit still closes the window
-// instead of hiding it; trayNotified gates the one-time balloon hint.
+// instead of hiding it. The one-time balloon flag lives in the persisted
+// close-behavior state (electron/close-behavior.ts), not in memory, so a
+// restart doesn't re-notify.
 let trayIcon: Electron.Tray | null = null
-let trayNotified = false
 let isQuitting = false
 const backendConnectionState = createBackendConnectionState<ReturnType<typeof spawn>, any>()
 const remoteLiveness = new RemoteLivenessTracker()
@@ -5730,36 +5738,19 @@ function getAppIconPath() {
 
 // ─── Close-to-tray (Windows) ──────────────────────────────────────────────
 // When the close button hides the window instead of quitting, the app keeps
-// running in the system tray. The behavior is user-configurable via
-// Settings → Appearance → "Close window": 'tray' (default, hide to tray) or
-// 'quit' (close button quits, the classic behavior). Persisted in
-// userData/close-behavior.json; the tray is created lazily on first use.
+// running in the system tray. Behavior is user-configurable (Settings →
+// Appearance → "When closing the window") and persisted in
+// userData/close-behavior.json alongside the one-time balloon flag; the tray
+// is created lazily on first use. Windows only — Linux/macOS are untested and
+// keep the stock close behavior. See electron/close-behavior.ts.
 
-export type CloseBehavior = 'tray' | 'quit'
-
-function readCloseBehavior(): CloseBehavior {
-  try {
-    const mode = JSON.parse(fs.readFileSync(DESKTOP_CLOSE_BEHAVIOR_PATH, 'utf8'))?.mode
-
-    return mode === 'quit' ? 'quit' : 'tray'
-  } catch {
-    return 'tray'
-  }
-}
-
-function writeCloseBehavior(mode: CloseBehavior) {
-  try {
-    fs.mkdirSync(path.dirname(DESKTOP_CLOSE_BEHAVIOR_PATH), { recursive: true })
-    writeFileAtomic(DESKTOP_CLOSE_BEHAVIOR_PATH, JSON.stringify({ mode }, null, 2))
-  } catch (err) {
-    rememberLog(`[close-behavior] persist failed: ${err?.message || err}`)
-  }
-}
-
-ipcMain.handle('hermes:close-behavior:get', () => readCloseBehavior())
+ipcMain.handle('hermes:close-behavior:get', () => readCloseBehaviorState(DESKTOP_CLOSE_BEHAVIOR_PATH).mode)
 ipcMain.handle('hermes:close-behavior:set', (_event, mode: unknown) => {
   const next: CloseBehavior = mode === 'quit' ? 'quit' : 'tray'
-  writeCloseBehavior(next)
+  writeCloseBehaviorState(DESKTOP_CLOSE_BEHAVIOR_PATH, {
+    ...readCloseBehaviorState(DESKTOP_CLOSE_BEHAVIOR_PATH),
+    mode: next
+  })
 
   return next
 })
@@ -11274,16 +11265,26 @@ function createWindow() {
 
     // On Windows the close button can hide the window to the system tray
     // instead of quitting — user-configurable via Settings → Appearance →
-    // "Close window". A real quit (tray menu "Exit Hermes", app.quit) still
-    // closes the window; the one-time balloon tells the user where the app
-    // went.
-    if (IS_WINDOWS && !isQuitting && readCloseBehavior() === 'tray') {
+    // "When closing the window". A real quit (tray menu "Exit Hermes",
+    // app.quit) always closes the window. The balloon hint shows once per
+    // install (persisted flag), not on every launch.
+    const closeState = readCloseBehaviorState(DESKTOP_CLOSE_BEHAVIOR_PATH)
+
+    if (shouldHideToTray({ isWindows: IS_WINDOWS, isQuitting, mode: closeState.mode })) {
+      // Create the tray first — if ensureHermesTray returns null (no icon
+      // found on disk), skip the hide so the window remains visible and
+      // recoverable instead of vanishing with no tray icon to restore it.
+      const tray = ensureHermesTray()
+
+      if (!tray) {
+        return
+      }
+
       event.preventDefault()
       mainWindow.hide()
-      ensureHermesTray()
 
-      if (!trayNotified) {
-        trayNotified = true
+      if (!closeState.trayNotified) {
+        writeCloseBehaviorState(DESKTOP_CLOSE_BEHAVIOR_PATH, { ...closeState, trayNotified: true })
 
         try {
           trayIcon?.displayBalloon?.({
