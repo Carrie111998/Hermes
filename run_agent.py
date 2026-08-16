@@ -8170,6 +8170,16 @@ class AIAgent:
                     )
                     _durable_session_exists = True
             _external_holder = str(session_turn_lease_holder or "").strip() or None
+            if _external_holder is not None and not session_id:
+                # Every fence below is keyed on the session id, so a holder
+                # supplied without one is inert: nothing arms, and the turn
+                # runs unfenced while the caller believes its lease covers it.
+                # Say so rather than dropping it silently.
+                logger.warning(
+                    "session turn lease holder supplied without a session id; "
+                    "ignoring it and running this turn unfenced: %s",
+                    _external_holder,
+                )
             if _external_holder is not None and _turn_db is not None and session_id:
                 # The caller already holds this conversation's lease and made
                 # its own admission decision. Arm the write fence with its
