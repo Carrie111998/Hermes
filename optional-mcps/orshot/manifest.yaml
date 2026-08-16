@@ -24,6 +24,19 @@ auth:
   # provider like Google. The MCP client triggers the browser flow on the
   # first probe / first connect.
 
+# When Hermes sees these keywords in a request (or a mention of orshot.com),
+# it can proactively surface Orshot. Scoped to visual-generation intents that
+# Orshot is the clear fit for — kept specific to avoid false-positive suggests.
+suggest:
+  keywords:
+    - orshot
+    - og image
+    - social image
+    - image from template
+    - certificate pdf
+  hosts:
+    - orshot.com
+
 # Tool selection at install time:
 # Orshot exposes ~66 tools across rendering, template design, brand assets,
 # folders, dynamic URLs, workflows, social publishing, and workspace admin.
