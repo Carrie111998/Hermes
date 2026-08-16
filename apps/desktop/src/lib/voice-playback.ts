@@ -448,8 +448,6 @@ export async function playSpeechText(text: string, options: VoicePlaybackOptions
     return false
   }
 
-  markTextSpoken(text, options.sessionId)
-
   const ownSequence = sequence
   const isCurrent = () => ownSequence === sequence
 
@@ -469,6 +467,10 @@ export async function playSpeechText(text: string, options: VoicePlaybackOptions
         }
 
         setVoicePlaybackState(currentState('idle'))
+        // Marked only once playback has actually finished, not before it
+        // starts — so a failed/barged-in attempt never suppresses a later
+        // retry of the same text.
+        markTextSpoken(text, options.sessionId)
 
         return true
       }
@@ -482,6 +484,7 @@ export async function playSpeechText(text: string, options: VoicePlaybackOptions
 
     if (played) {
       setVoicePlaybackState(currentState('idle'))
+      markTextSpoken(text, options.sessionId)
     }
 
     return played

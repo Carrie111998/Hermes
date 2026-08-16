@@ -1,6 +1,13 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 
-import { markTextSpoken, wasTextAlreadySpoken } from './voice-playback'
+vi.mock('@/hermes', () => ({
+  getApiRequestProfile: () => null,
+  speakText: vi.fn()
+}))
+
+import { speakText } from '@/hermes'
+
+import { markTextSpoken, playSpeechText, wasTextAlreadySpoken } from './voice-playback'
 
 describe('wasTextAlreadySpoken', () => {
   it('is false before anything has been marked spoken', () => {
@@ -34,5 +41,17 @@ describe('wasTextAlreadySpoken', () => {
     expect(wasTextAlreadySpoken('Fixed.', 'session-a')).toBe(true)
     expect(wasTextAlreadySpoken('Fixed.', 'session-b')).toBe(false)
     expect(wasTextAlreadySpoken('Yes.', 'session-b')).toBe(true)
+  })
+})
+
+describe('playSpeechText', () => {
+  it('does not mark text spoken when playback fails before any audio is heard', async () => {
+    vi.mocked(speakText).mockRejectedValueOnce(new Error('tts unavailable'))
+
+    await expect(playSpeechText('never actually heard', { source: 'read-aloud' })).rejects.toThrow(
+      'tts unavailable'
+    )
+
+    expect(wasTextAlreadySpoken('never actually heard')).toBe(false)
   })
 })
