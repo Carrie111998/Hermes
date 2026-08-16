@@ -613,7 +613,7 @@ def _redact_gateway_user_facing_secrets(text: str) -> str:
     return redacted
 
 
-def _redact_tool_progress_args(args: Any) -> Any:
+def _redact_tool_progress_args(args: dict | None) -> dict | None:
     """Redact credential-shaped values from tool-call args before chat display.
 
     The tool-progress bubble is an egress boundary that renders verbatim
@@ -3873,8 +3873,9 @@ class TurnRunner:
         # sees sanitized values: args is the tool-call argument dict
         # (redacted recursively), and preview is an independent channel
         # that can carry a secret fragment the args walk does not see.
-        args = _redact_tool_progress_args(args)
-        if isinstance(preview, str):
+        if args:
+            args = _redact_tool_progress_args(args)
+        if preview:
             from agent.redact import redact_sensitive_text
 
             preview = redact_sensitive_text(preview, force=True)
