@@ -71,12 +71,6 @@ class PluginOperationError(Exception):
     """Recoverable plugin install/update failure (CLI exits; HTTP maps to 4xx)."""
 
 
-# Minimum manifest version this installer understands.
-# Plugins may declare ``manifest_version: 1`` in plugin.yaml;
-# future breaking changes to the manifest schema bump this.
-_SUPPORTED_MANIFEST_VERSION = 1
-
-
 def _plugins_dir() -> Path:
     """Return the user plugins directory, creating it if needed."""
     plugins = get_hermes_home() / "plugins"
@@ -743,12 +737,16 @@ def _install_plugin_core(
                     f"Plugin '{plugin_name}' has invalid manifest_version "
                     f"'{mv}' (expected an integer).",
                 ) from None
-            if mv_int > _SUPPORTED_MANIFEST_VERSION:
+            # Shared with the runtime loader so the installer can never
+            # drift behind what the loader accepts (#85879).
+            from hermes_cli.plugins import SUPPORTED_MANIFEST_VERSION
+
+            if mv_int > SUPPORTED_MANIFEST_VERSION:
                 from hermes_cli.config import recommended_update_command
 
                 raise PluginOperationError(
                     f"Plugin '{plugin_name}' requires manifest_version {mv}, "
-                    f"but this installer only supports up to {_SUPPORTED_MANIFEST_VERSION}. "
+                    f"but this Hermes supports up to {SUPPORTED_MANIFEST_VERSION}. "
                     f"Run {recommended_update_command()} to update Hermes.",
                 ) from None
 
