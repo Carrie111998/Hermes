@@ -232,14 +232,15 @@ class TestFlushAfterCompression:
                 agent._tool_catalog_snapshot_id = snapshot.snapshot_id
                 agent._tool_catalog_snapshot_notice = snapshot.notice
                 agent.context_compressor = SuccessCompressor()
+                old_request = "old request " * 200
 
                 compressed, _ = compress_context(
                     agent,
                     [
                         {
                             "role": "user",
-                            "content": "old request",
-                            "api_content": snapshot.notice + "\n\nold request",
+                            "content": old_request,
+                            "api_content": snapshot.notice + "\n\n" + old_request,
                         },
                         {"role": "assistant", "content": "old answer"},
                         {"role": "user", "content": "current request"},
@@ -364,13 +365,17 @@ class TestFlushAfterCompression:
             # for a reason INDEPENDENT of _db_persisted (ephemeral scaffolding,
             # synthetic recovery turns). Keep this fixture free of such messages
             # or the row count would legitimately differ from len(compressed).
+            # The transcript must also be large enough that the provider-less
+            # static fallback net-shrinks it (middle drops must outweigh the
+            # fixed compaction marker overhead), or the no-growth commit guard
+            # correctly refuses the rotation this test exercises.
             messages = [
                 {
                     "role": "user" if i % 2 == 0 else "assistant",
-                    "content": f"message {i}",
+                    "content": f"message {i} " + "x" * 200,
                     "_db_persisted": True,
                 }
-                for i in range(12)
+                for i in range(40)
             ]
 
             with patch("agent.context_compressor.call_llm", side_effect=RuntimeError("no provider")):

@@ -213,9 +213,19 @@ def test_returns_turn_context_with_user_message_appended():
     assert isinstance(ctx, TurnContext)
     assert ctx.user_message == "hello"
     # The user turn was appended and indexed.
-    assert ctx.messages[-1] == {"role": "user", "content": "hello"}
+    assert ctx.messages[-1]["role"] == "user"
+    assert ctx.messages[-1]["content"] == "hello"
+    assert isinstance(ctx.messages[-1]["timestamp"], float)
     assert ctx.current_turn_user_idx == len(ctx.messages) - 1
     assert ctx.active_system_prompt == "SYSTEM"
+
+
+def test_user_message_preserves_platform_event_timestamp():
+    agent = _FakeAgent()
+
+    ctx = _build(agent, persist_user_timestamp=123.5)
+
+    assert ctx.messages[-1]["timestamp"] == 123.5
 
 
 # ── Trivial-prompt prefetch gate (PR #25350 salvage) ─────────────────────────
@@ -277,7 +287,10 @@ def test_turn_start_replaces_stale_parent_history_with_compression_child():
     assert agent._current_turn_id.startswith("compression-child:")
     log_context.assert_called_once_with("compression-child")
     assert ctx.conversation_history == compacted_history
-    assert ctx.messages == compacted_history + [{"role": "user", "content": "hello"}]
+    assert ctx.messages[:-1] == compacted_history
+    assert ctx.messages[-1]["role"] == "user"
+    assert ctx.messages[-1]["content"] == "hello"
+    assert isinstance(ctx.messages[-1]["timestamp"], float)
     assert all(message.get("content") != "stale parent" for message in ctx.messages)
 
 
@@ -311,6 +324,7 @@ def test_pending_cli_message_uses_clean_override_for_api_local_note():
     assert ctx.messages[-1] is staged
     assert ctx.messages[-1]["content"] == "[MODEL NOTE]\n\nclean prompt"
     assert ctx.messages[-1]["_db_persisted"] is True
+    assert isinstance(ctx.messages[-1]["timestamp"], float)
     assert agent._pending_cli_user_message is None
 
 
@@ -576,6 +590,18 @@ def test_initial_tool_catalog_snapshot_folds_into_real_user_turn():
                     {"role": "assistant", "content": "done"},
                 ],
             )
+            calls_after_second = get_defs.call_count
+            third = _build(
+                agent,
+                conversation_history=[
+                    {
+                        "role": "user",
+                        "content": "hello",
+                        "api_content": ctx.messages[-1]["content"],
+                    },
+                    {"role": "assistant", "content": "done"},
+                ],
+            )
 
         content = ctx.messages[-1]["content"]
         assert content.endswith("\n\nhello")
@@ -584,7 +610,8 @@ def test_initial_tool_catalog_snapshot_folds_into_real_user_turn():
         assert ctx.original_user_message == "hello"
         assert [message["role"] for message in ctx.messages] == ["user"]
         assert second.messages[-1]["content"] == "hello"
-        get_defs.assert_called_once()
+        assert third.messages[-1]["content"] == "hello"
+        assert get_defs.call_count == calls_after_second
     finally:
         registry.deregister(name)
 
