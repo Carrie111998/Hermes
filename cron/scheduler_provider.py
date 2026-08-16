@@ -385,6 +385,7 @@ class InProcessCronScheduler(CronScheduler):
         # Heartbeat once before the first sleep so `hermes cron status` sees a
         # live ticker immediately after startup, not only after the first tick.
         record_ticker_heartbeat()
+        consecutive_failures = 0
         while not stop_event.is_set():
             ok = False
             try:
@@ -420,9 +421,29 @@ class InProcessCronScheduler(CronScheduler):
             # "actually firing jobs" (#32612, #32895).
             record_ticker_heartbeat(success=ok)
             if ok:
+                consecutive_failures = 0
                 clear_ticker_error()
-            stop_event.wait(interval)
+                try:
+                    from gateway.status import write_runtime_status
 
+                    write_runtime_status(platform="cron", platform_state="connected", error_message="")
+                except Exception:
+                    pass
+            else:
+                consecutive_failures += 1
+                if consecutive_failures >= 3:
+                    try:
+                        from gateway.status import write_runtime_status
+
+                        write_runtime_status(
+                            platform="cron",
+                            platform_state="degraded",
+                            error_message=f"Cron ticker failing ({consecutive_failures} consecutive errors)",
+                            needs_attention=True,
+                        )
+                    except Exception:
+                        pass
+            stop_event.wait(interval)
     def _start_multiplex(
         self,
         stop_event,
@@ -475,6 +496,7 @@ class InProcessCronScheduler(CronScheduler):
             finally:
                 reset_hermes_home_override(home_token)
 
+        consecutive_failures = 0
         while not stop_event.is_set():
             ok = False
             try:
@@ -501,6 +523,28 @@ class InProcessCronScheduler(CronScheduler):
                 _tick_error = f"{type(e).__name__}: {e}"
             else:
                 _tick_error = None
+            if ok:
+                consecutive_failures = 0
+                try:
+                    from gateway.status import write_runtime_status
+
+                    write_runtime_status(platform="cron", platform_state="connected", error_message="")
+                except Exception:
+                    pass
+            else:
+                consecutive_failures += 1
+                if consecutive_failures >= 3:
+                    try:
+                        from gateway.status import write_runtime_status
+
+                        write_runtime_status(
+                            platform="cron",
+                            platform_state="degraded",
+                            error_message=_tick_error or f"Cron ticker failing ({consecutive_failures} consecutive errors)",
+                            needs_attention=True,
+                        )
+                    except Exception:
+                        pass
             # Record per-profile heartbeat after each tick cycle.
             for entry in profile_homes:
                 home = entry[1] if isinstance(entry, tuple) else entry

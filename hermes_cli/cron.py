@@ -275,7 +275,7 @@ def cron_status():
         STALE_AFTER = TICKER_INTERVAL_SECONDS * 3 + 20  # = 200s at the 60s default
         hb_age = get_ticker_heartbeat_age()
         ok_age = get_ticker_success_age()
-
+        last_error = get_ticker_last_error()
         if hb_age is not None and hb_age > STALE_AFTER:
             # No heartbeat at all → the ticker thread is gone.
             print(color(
@@ -285,20 +285,20 @@ def cron_status():
             ))
             print(f"  PID: {', '.join(map(str, pids))}")
             print("  Cron jobs may NOT be firing. Restart: hermes gateway restart")
-        elif hb_age is not None and ok_age is not None and ok_age > STALE_AFTER:
+        elif (hb_age is not None and ok_age is not None and ok_age > STALE_AFTER) or (
+            last_error is not None and (ok_age is None or ok_age > TICKER_INTERVAL_SECONDS)
+        ):
             # Loop is alive (fresh heartbeat) but no tick has SUCCEEDED in a
-            # long time → ticks are failing every iteration.
+            # long time or the last tick failed with an active error.
+            time_str = f"in {int(ok_age)}s" if ok_age is not None else "since startup"
             print(color(
-                "⚠ Gateway and cron ticker are running, but no tick has "
-                f"succeeded in {int(ok_age)}s — ticks may be failing.",
+                f"⚠ Gateway and cron ticker are running, but no tick has succeeded {time_str} — ticks may be failing.",
                 Colors.YELLOW,
             ))
             print(f"  PID: {', '.join(map(str, pids))}")
-            last_error = get_ticker_last_error()
             if last_error:
                 # Show WHY ticks fail — e.g. a root-rewritten jobs.json
-                # (PermissionError) that silently locked out the ticker's
-                # uid for ~14h in the field (#68483).
+                # (PermissionError) or EMFILE (Too many open files).
                 print(color(f"  Last tick error: {last_error}", Colors.RED))
                 if "Permission denied" in last_error:
                     print(color(
@@ -306,6 +306,13 @@ def cron_status():
                         "(e.g. rewritten by a root `docker exec hermes "
                         "hermes cron ...`). Fix ownership to match the "
                         "gateway user, and prefer `docker exec -u <uid>:<gid>`.",
+                        Colors.YELLOW,
+                    ))
+                elif "Too many open files" in last_error or "Errno 24" in last_error:
+                    print(color(
+                        "  Hint: Process hit file descriptor limit (EMFILE). "
+                        "Check for unclosed subprocesses or file handle leaks, "
+                        "and consider increasing ulimit -n.",
                         Colors.YELLOW,
                     ))
             print("  Check the gateway log for 'Cron tick error'.")
