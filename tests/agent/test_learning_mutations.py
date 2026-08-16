@@ -6,6 +6,9 @@ against a temp HERMES_HOME, never mocks — the id→file mapping is the whole p
 
 from __future__ import annotations
 
+import multiprocessing
+import os
+
 import pytest
 
 from agent import learning_mutations as lm
@@ -20,6 +23,16 @@ description: A test skill.
 
 Body.
 """
+
+
+def _exclude_wiki_process(home: str, wiki: str, node_id: str, ready, start, results) -> None:
+    os.environ["HERMES_HOME"] = home
+    os.environ["WIKI_PATH"] = wiki
+    ready.set()
+    start.wait()
+    from agent import learning_mutations
+
+    results.put(learning_mutations.delete_node(node_id))
 
 
 @pytest.fixture
@@ -99,6 +112,34 @@ def test_wiki_exclusions_are_scoped_to_the_active_root(home, monkeypatch, tmp_pa
     assert lm.delete_node("wiki:project.md")["ok"]
 
     monkeypatch.setenv("WIKI_PATH", str(home / "wiki"))
+    assert _wiki_cards() == []
+
+
+def test_concurrent_wiki_exclusions_preserve_both_pages(home):
+    wiki = home / "wiki"
+    (wiki / "second.md").write_text("# Second\n", encoding="utf-8")
+    ctx = multiprocessing.get_context("spawn")
+    start = ctx.Event()
+    results = ctx.Queue()
+    processes = []
+    for node_id in ("wiki:project.md", "wiki:second.md"):
+        ready = ctx.Event()
+        process = ctx.Process(
+            target=_exclude_wiki_process,
+            args=(str(home), str(wiki), node_id, ready, start, results),
+        )
+        process.start()
+        assert ready.wait(5)
+        processes.append(process)
+
+    start.set()
+    for process in processes:
+        process.join(10)
+        assert process.exitcode == 0
+    assert [results.get(timeout=1)["ok"] for _ in processes] == [True, True]
+
+    from agent.learning_graph import _wiki_cards
+
     assert _wiki_cards() == []
 
 

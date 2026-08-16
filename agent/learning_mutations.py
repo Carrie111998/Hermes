@@ -17,10 +17,17 @@ file. Pure stdlib + existing skill/memory helpers.
 
 from __future__ import annotations
 
+import contextlib
+import os
+import tempfile
+import threading
+import time
 from pathlib import Path
 from typing import Any
 
 _MEMORY_FILES = {"memory": "MEMORY.md", "profile": "USER.md"}
+_WIKI_EXCLUSION_LOCK_TIMEOUT_SECONDS = 5.0
+_WIKI_EXCLUSION_THREAD_LOCK = threading.Lock()
 
 
 def parse_node_kind(node_id: str) -> str:
@@ -188,6 +195,63 @@ def _delete_memory(node_id: str) -> dict[str, Any]:
     return {"ok": True, "message": f"deleted memory from {path.name}"}
 
 
+@contextlib.contextmanager
+def _wiki_exclusion_lock(index: Path):
+    """Serialize the wiki exclusion index across threads and processes."""
+    lock_path = index.with_name(index.name + ".lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with _WIKI_EXCLUSION_THREAD_LOCK:
+        handle = lock_path.open("a+b")
+        acquired = False
+        try:
+            if lock_path.stat().st_size == 0:
+                handle.write(b" ")
+                handle.flush()
+            deadline = time.monotonic() + _WIKI_EXCLUSION_LOCK_TIMEOUT_SECONDS
+            if os.name == "nt":
+                import msvcrt
+
+                while True:
+                    try:
+                        handle.seek(0)
+                        msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                        acquired = True
+                        break
+                    except OSError:
+                        if time.monotonic() >= deadline:
+                            break
+                        time.sleep(0.05)
+            else:
+                import fcntl
+
+                while True:
+                    try:
+                        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        acquired = True
+                        break
+                    except (BlockingIOError, OSError):
+                        if time.monotonic() >= deadline:
+                            break
+                        time.sleep(0.05)
+            if not acquired:
+                raise TimeoutError("wiki exclusion index is busy — try again")
+            yield
+        finally:
+            try:
+                if acquired:
+                    if os.name == "nt":
+                        import msvcrt
+
+                        handle.seek(0)
+                        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                    else:
+                        import fcntl
+
+                        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            finally:
+                handle.close()
+
+
 def _exclude_wiki(node_id: str) -> dict[str, Any]:
     import json
 
@@ -197,16 +261,23 @@ def _exclude_wiki(node_id: str) -> dict[str, Any]:
     path, relative = _wiki_path(node_id)
     if not path.is_file():
         return {"ok": False, "message": f"wiki page '{relative}' not found"}
-    roots = _wiki_exclusion_roots()
-    root = str(_wiki_root().resolve())
-    excluded = roots.setdefault(root, set())
-    excluded.add(relative)
     index = get_hermes_home() / "journey" / "wiki-excluded.json"
-    index.parent.mkdir(parents=True, exist_ok=True)
-    temp = index.with_suffix(".tmp")
-    payload = {"roots": {key: sorted(paths) for key, paths in sorted(roots.items())}}
-    temp.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
-    temp.replace(index)
+    try:
+        with _wiki_exclusion_lock(index):
+            roots = _wiki_exclusion_roots()
+            root = str(_wiki_root().resolve())
+            roots.setdefault(root, set()).add(relative)
+            payload = {"roots": {key: sorted(paths) for key, paths in sorted(roots.items())}}
+            fd, temp_name = tempfile.mkstemp(prefix=f".{index.name}.", suffix=".tmp", dir=index.parent)
+            temp = Path(temp_name)
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                    handle.write(json.dumps(payload, indent=2) + "\n")
+                os.replace(temp, index)
+            finally:
+                temp.unlink(missing_ok=True)
+    except (OSError, TimeoutError) as exc:
+        return {"ok": False, "message": str(exc)}
     return {"ok": True, "message": f"removed wiki page '{relative}' from journey (file kept)"}
 
 
