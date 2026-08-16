@@ -134,6 +134,7 @@ def finalize_turn(
     _turn_exit_reason,
     _pending_verification_response=None,
     _pending_verification_response_previewed=False,
+    response_id=None,
 ):
     """Run the post-loop finalization and return the turn ``result`` dict.
 
@@ -726,6 +727,8 @@ def finalize_turn(
         ).get("service_tier"),
         "session_id": agent.session_id,
     }
+    if response_id:
+        result["response_id"] = response_id
     if agent._tool_guardrail_halt_decision is not None:
         result["guardrail"] = agent._tool_guardrail_halt_decision.to_metadata()
     # Persistence failures already set failed=True + an explanation in

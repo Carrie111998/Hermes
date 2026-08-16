@@ -1763,6 +1763,7 @@ def run_conversation(
     # Main conversation loop counters (pure locals consumed by the loop below).
     api_call_count = 0
     final_response = None
+    response_id = None
     interrupted = False
     failed = False
     codex_ack_continuations = 0
@@ -2994,6 +2995,12 @@ def run_conversation(
                     else:
                         interrupted = True
                     break
+
+                candidate_response_id = getattr(response, "id", None)
+                if candidate_response_id is None and isinstance(response, dict):
+                    candidate_response_id = response.get("id")
+                if candidate_response_id:
+                    response_id = str(candidate_response_id)
                 
                 api_duration = time.time() - api_start_time
                 
@@ -8118,6 +8125,7 @@ def run_conversation(
         _turn_exit_reason=_turn_exit_reason,
         _pending_verification_response=_pending_verification_response,
         _pending_verification_response_previewed=_pending_verification_response_previewed,
+        response_id=response_id,
     )
 
 

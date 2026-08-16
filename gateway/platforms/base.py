@@ -3906,7 +3906,11 @@ class BasePlatformAdapter(ABC):
             chat_id: The chat/channel ID to send to
             content: Message content (may be markdown)
             reply_to: Optional message ID to reply to
-            metadata: Additional platform-specific options
+            metadata: Additional platform-specific options. Live cron deliveries
+                include ``metadata["cron"]`` with ``job_id``, ``job_name``,
+                ``schedule``, ``deliver``, and (when available) ``origin``,
+                run ``status``/``ran_at``, ``response_id``, ``session_id``,
+                ``model``, and ``provider``.
         
         Returns:
             SendResult with success status and message ID
