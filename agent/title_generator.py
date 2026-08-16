@@ -105,6 +105,71 @@ _TITLE_RESPONSE_FORMAT = {
     },
 }
 
+# json_object is the loosest structured-output hint: DeepSeek, Moonshot/Kimi
+# and other OpenAI-compatible endpoints document only json_object (DeepSeek
+# rejects json_schema with HTTP 400 "This response_format type is unavailable
+# now"). The title prompt already embeds the expected shape and
+# _extract_title_text() has a loose-JSON scan, so a looser hint stays safe.
+_TITLE_RESPONSE_FORMAT_JSON_OBJECT = {"type": "json_object"}
+
+
+def _response_format_rejected(exc: BaseException) -> bool:
+    """True when the provider rejected the ``response_format`` parameter.
+
+    Matches the parameter name in the error text (DeepSeek: "This
+    response_format type is unavailable now"; most providers echo the
+    parameter they reject). Also catches HTTP 400s that never mention
+    ``response_format`` — e.g. vLLM gateways translating json_schema into
+    ``guided_grammar`` and failing with ``compile_grammar_error: No module
+    named 'xgrammar'`` — so the retry ladder still rescues those. Auth,
+    quota, and network failures (403/429/timeout) are deliberately excluded:
+    a different response format cannot fix those, so they break out of the
+    ladder immediately.
+    """
+    text = str(exc)
+    if "response_format" in text or "json_schema" in text:
+        return True
+    status = getattr(exc, "status_code", None)
+    if status == 400 and ("grammar" in text or "guided" in text):
+        return True
+    return False
+
+
+def _title_call_kwargs(
+    *,
+    response_format,
+    disable_thinking: bool,
+    messages: list,
+    timeout,
+    main_runtime,
+) -> dict:
+    """Build call_llm kwargs for one rung of the response-format ladder.
+
+    ``disable_thinking`` pins reasoning off through both available channels:
+    ``reasoning_config`` (translated to the native thinking field by
+    reasoning-aware provider profiles) and ``extra_body.thinking`` (the
+    OpenAI-compatible wire shape DeepSeek and similar endpoints read
+    directly). Profiles override extra_body, so sending both guarantees the
+    disable lands whether or not the provider has a profile.
+    """
+    extra_body: dict = {}
+    if response_format is not None:
+        extra_body["response_format"] = response_format
+    if disable_thinking:
+        extra_body["thinking"] = {"type": "disabled"}
+    return {
+        "task": "title_generation",
+        "messages": messages,
+        # A title is a handful of tokens. The old 500-token ceiling let a
+        # chatty model burn seconds generating prose we then threw away.
+        "max_tokens": 64,
+        "temperature": 0.3,
+        "timeout": timeout,
+        "main_runtime": main_runtime,
+        "reasoning_config": {"enabled": False} if disable_thinking else None,
+        "extra_body": extra_body,
+    }
+
 # Control-tag wrappers that surround machine-authored content inside what is
 # nominally a "user" message. Titling from these is what produces a session
 # named after a slash command or an injected reminder rather than the user's
@@ -391,31 +456,47 @@ def generate_title(
         {"role": "user", "content": user_snippet},
     ]
 
-    try:
-        response = call_llm(
-            task="title_generation",
-            messages=messages,
-            # A title is a handful of tokens. The old 500-token ceiling let a
-            # chatty model burn seconds generating prose we then threw away.
-            max_tokens=64,
-            temperature=0.3,
-            timeout=timeout,
-            main_runtime=main_runtime,
-            extra_body={"response_format": _TITLE_RESPONSE_FORMAT},
-        )
-        content = response.choices[0].message.content or ""
-        return _clean_title(_extract_title_text(content))
-    except Exception as e:
-        # Log at WARNING so this shows up in agent.log without debug mode.
-        # Full detail at debug level for operators who need the stack.
-        logger.warning("Title generation failed: %s", e)
-        logger.debug("Title generation traceback", exc_info=True)
-        if failure_callback is not None:
-            try:
-                failure_callback("title generation", e)
-            except Exception:
-                logger.debug("Title generation failure_callback raised", exc_info=True)
-        return None
+    # Walk a response-format ladder: strict json_schema → json_object →
+    # unconstrained. Providers without structured-output support (DeepSeek,
+    # Moonshot/Kimi, some vLLM gateways) 400 on json_schema; retrying looser
+    # keeps titling alive instead of dropping to the derived title forever.
+    # Failures unrelated to response_format (auth, quota, network) break out
+    # immediately — a different format cannot fix those. The retried rungs
+    # also pin thinking off: DeepSeek V4 and similar default-on reasoning
+    # models burn the 64-token budget on reasoning_content and return an
+    # empty content even after the 400 is gone (verified live 2026-08-11).
+    last_exc: Optional[BaseException] = None
+    for response_format, disable_thinking in (
+        (_TITLE_RESPONSE_FORMAT, False),
+        (_TITLE_RESPONSE_FORMAT_JSON_OBJECT, True),
+        (None, True),
+    ):
+        try:
+            response = call_llm(
+                **_title_call_kwargs(
+                    response_format=response_format,
+                    disable_thinking=disable_thinking,
+                    messages=messages,
+                    timeout=timeout,
+                    main_runtime=main_runtime,
+                )
+            )
+            content = response.choices[0].message.content or ""
+            return _clean_title(_extract_title_text(content))
+        except Exception as e:
+            last_exc = e
+            if not _response_format_rejected(e):
+                break
+    # Log at WARNING so this shows up in agent.log without debug mode.
+    # Full detail at debug level for operators who need the stack.
+    logger.warning("Title generation failed: %s", last_exc)
+    logger.debug("Title generation traceback", exc_info=True)
+    if failure_callback is not None:
+        try:
+            failure_callback("title generation", last_exc)
+        except Exception:
+            logger.debug("Title generation failure_callback raised", exc_info=True)
+    return None
 
 
 def _persist_session_title(session_db, session_id, title, *, source, dedupe=True):
