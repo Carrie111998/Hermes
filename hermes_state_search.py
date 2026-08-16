@@ -1268,6 +1268,52 @@ class SessionSearchMixin:
 
         return sanitized.strip()
 
+    # Explicit FTS5 syntax the user typed deliberately: quoted phrases, prefix
+    # wildcards, or (uppercase — FTS5 is case-sensitive about them) boolean
+    # operators. A query using any of these is never rewritten by the recall
+    # fallback below — the caller has opted into exact semantics.
+    _EXPLICIT_FTS_SYNTAX = re.compile(r'["*]|\b(?:AND|OR|NOT|NEAR)\b')
+
+    # Term shape for the recall fallback: words, keeping dotted / hyphenated /
+    # slashed identifiers (paths, versions, file names) as single terms — the
+    # sanitizer phrase-quotes those so FTS5 doesn't split them.
+    _BROADEN_TERM = re.compile(r"[\w./-]+")
+
+    _BROADEN_MAX_TERMS = 12
+
+    @classmethod
+    def _broaden_fts5_query(cls, query: str) -> Optional[str]:
+        """OR-join a plain multi-word query for the zero-result recall fallback.
+
+        MATCH defaults to AND-ing every term, so a naturally-phrased query
+        ("what error did go vet report for lexer.go?") returns nothing unless
+        every word happens to co-occur in one message. Models and users
+        overwhelmingly write queries in that shape; requiring them to know the
+        OR syntax turns a healthy index into a zero-recall one.
+
+        Returns the broadened query, or None when broadening does not apply:
+        single-term queries (nothing to broaden), queries already using
+        explicit FTS5 syntax (quotes, ``*``, uppercase booleans), or queries
+        with no extractable terms. Terms shorter than 2 chars are dropped and
+        the term list is capped at ``_BROADEN_MAX_TERMS`` — BM25 ranking keeps
+        rare, specific terms on top regardless of how common the rest are.
+        """
+        if not query or cls._EXPLICIT_FTS_SYNTAX.search(query):
+            return None
+        terms = [t for t in cls._BROADEN_TERM.findall(query) if len(t) >= 2]
+        # Dedupe preserving order; a repeated term adds nothing under OR.
+        terms = list(dict.fromkeys(terms))[: cls._BROADEN_MAX_TERMS]
+        if len(terms) < 2:
+            return None
+        # Phrase-quote identifier-shaped terms. The sanitizer quotes dotted and
+        # hyphenated barewords itself but not slashed ones (paths), and an
+        # unquoted ``/`` is an FTS5 syntax error — swallowed into zero rows at
+        # the execute site, which would defeat the fallback exactly on the
+        # path-heavy queries it exists for.
+        return " OR ".join(
+            f'"{t}"' if any(c in t for c in "./-") else t for t in terms
+        )
+
     @staticmethod
     def _is_cjk_codepoint(cp: int) -> bool:
         return (0x4E00 <= cp <= 0x9FFF or    # CJK Unified Ideographs
@@ -1445,6 +1491,26 @@ class SessionSearchMixin:
                 include_inactive=include_inactive,
                 fields=fields,
             )
+            if not rows and not self._contains_cjk(query or ""):
+                # Zero-result recall fallback: MATCH ANDs every term, so plain
+                # multi-word queries ("what error did go vet report for
+                # lexer.go") miss unless all terms share one message. Retry
+                # OR-joined — precision-first semantics are preserved because
+                # this only ever runs when the AND pass found nothing, and
+                # never for queries using explicit FTS5 syntax.
+                broadened = self._broaden_fts5_query(query or "")
+                if broadened:
+                    rows = self._search_messages_impl(
+                        broadened,
+                        source_filter=source_filter,
+                        exclude_sources=exclude_sources,
+                        role_filter=role_filter,
+                        limit=limit,
+                        offset=offset,
+                        sort=sort,
+                        include_inactive=include_inactive,
+                        fields=fields,
+                    )
             return rows
         finally:
             try:
