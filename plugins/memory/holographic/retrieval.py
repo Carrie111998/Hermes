@@ -549,7 +549,10 @@ class FactRetriever:
                 rows = []
 
         # Arm 2: per-run LIKE for short CJK runs (adds to, not replaces,
-        # the MATCH arm so mixed queries get full recall).
+        # the MATCH arm so mixed queries get full recall). A leading-
+        # wildcard LIKE cannot use an index, so bound it to the top
+        # _LIKE_SCAN_CAP rows by trust/updated_at (idx_facts_trust covers
+        # the subquery ORDER BY) instead of scanning the whole facts table.
         if short_runs:
             like_clauses = []
             like_params: list = []
@@ -557,16 +560,26 @@ class FactRetriever:
                 like_clauses.append("(f.content LIKE ? OR f.tags LIKE ?)")
                 pat = f"%{run}%"
                 like_params.extend([pat, pat])
+            inner_clauses = ["trust_score >= ?"]
+            inner_params = [min_trust]
+            if category:
+                inner_clauses.insert(0, "category = ?")
+                inner_params.insert(0, category)
             sql_like = f"""
                 SELECT f.*, 0.0 as fts_rank_raw
-                FROM facts f
-                WHERE ({" OR ".join(like_clauses)}) AND {tail_sql}
+                FROM (
+                    SELECT * FROM facts
+                    WHERE {" AND ".join(inner_clauses)}
+                    ORDER BY trust_score DESC, updated_at DESC
+                    LIMIT {int(self._LIKE_SCAN_CAP)}
+                ) f
+                WHERE ({" OR ".join(like_clauses)})
                 ORDER BY f.trust_score DESC, f.updated_at DESC
                 LIMIT ?
             """
             try:
                 like_rows = conn.execute(
-                    sql_like, like_params + tail_params + [limit]
+                    sql_like, inner_params + like_params + [limit]
                 ).fetchall()
             except Exception:
                 like_rows = []
@@ -648,24 +661,11 @@ class FactRetriever:
     # CJK-aware retrieval: an FTS5 trigram index cannot match a sub-3-char
     # CJK query (Chinese given names are typically 2 chars), and OR-joined
     # phrase literals of bigrams are no better than LIKE at that point.
-    # Detect a short CJK run and flag the caller to use LIKE instead.
     _CJK_RE = re.compile(r'[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]+')
 
-    @classmethod
-    def _is_short_cjk_query(cls, query: str) -> bool:
-        """True when the query's only meaningful tokens are short (<3 char)
-        CJK runs — e.g. a bare Chinese name like "张伟". Such queries can
-        never match a trigram index, so the caller must fall back to LIKE.
-        """
-        import re as _re
-        cjk_runs = cls._CJK_RE.findall(query)
-        if not cjk_runs:
-            return False
-        non_cjk = _re.sub(cls._CJK_RE.pattern, ' ', query)
-        # If there are meaningful non-CJK tokens, trigram can still work.
-        if any(len(t) >= 2 for t in non_cjk.split()):
-            return False
-        return all(len(run) < 3 for run in cjk_runs)
+    # Upper bound of rows the unindexable LIKE arm may scan (trust-ordered
+    # subquery). Keeps per-query cost O(cap) instead of O(table) at scale.
+    _LIKE_SCAN_CAP = 500
 
     @classmethod
     def _cjk_fts_query(cls, query: str) -> str:
@@ -673,7 +673,7 @@ class FactRetriever:
 
         For queries containing CJK runs >= 3 chars, emit phrase literals for
         each run (the trigram index can match those). For shorter CJK runs,
-        emit a LIKE clause via the caller's fallback path (_is_short_cjk_query).
+        emit nothing; the caller's LIKE arm covers short-run recall.
         Non-CJK tokens are handled by the base _sanitize_fts_query logic.
         """
         tokens: list[str] = []
@@ -685,7 +685,7 @@ class FactRetriever:
                 if len(seg) >= 3:
                     tokens.append(f'"{seg}"')
                 # runs < 3 chars: skipped here; caller falls back to LIKE
-                # via _is_short_cjk_query() when this is the only token class
+                # when short runs are the only CJK content in the query
             else:
                 for word in seg.lower().split():
                     cleaned = word.strip('.,;:!?()[]{}#@<>\"\'').translate(
@@ -695,7 +695,11 @@ class FactRetriever:
                         continue
                     tokens.append(f'"{cleaned}"')
         if not tokens:
-            return query  # fallback: raw query
+            # No trigram-matchable token survived (short CJK only, or all
+            # stopwords). Returning the raw query into MATCH risks a
+            # malformed-query error; the empty-string match is a no-op and
+            # the caller's LIKE arm still covers short-CJK recall.
+            return '""'
         return " OR ".join(tokens)
 
     @classmethod
@@ -737,8 +741,11 @@ class FactRetriever:
             # sneak through as operators.
             tokens.append(f'"{cleaned}"')
         if not tokens:
-            # Fallback: raw query (likely returns 0, but never crashes)
-            return query
+            # No trigram-matchable token survived (short CJK only, or all
+            # stopwords). Returning the raw query risks a malformed-query
+            # exception in MATCH; an empty phrase literal is a valid no-op
+            # and the caller's LIKE arm still covers short-CJK recall.
+            return '""'
         return " OR ".join(tokens)
 
     @staticmethod
