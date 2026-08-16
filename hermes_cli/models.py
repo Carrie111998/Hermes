@@ -652,6 +652,7 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "moonshotai/kimi-k2-thinking-maas",
         "xai/grok-4.20-reasoning",
         "xai/grok-4.1-fast-reasoning",
+        "xai/grok-4.1-fast-non-reasoning",
     ],
     "novita": [
         "moonshotai/kimi-k2.5",

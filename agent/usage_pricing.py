@@ -581,6 +581,63 @@ _OFFICIAL_DOCS_PRICING: Dict[tuple[str, str], PricingEntry] = {
         source_url="https://api-docs.deepseek.com/quick_start/pricing",
         pricing_version="deepseek-pricing-2026-07",
     ),
+    # ── xAI Grok on Vertex Model Garden ──────────────────────────────────
+    # The 4.1-fast tier is the cheap high-throughput SKU; the 4.20/4.3 tier is
+    # the frontier SKU. Public sources disagree on the Vertex rate for the
+    # 4.20/4.3 tier ($1.25/$2.50 xAI-direct vs ~$2/$6 quoted for Vertex), so the
+    # HIGHER figure is recorded here — under-reporting spend is the worse error.
+    # NOTE: Vertex bills Grok reasoning tokens as output, but (unlike Gemini
+    # 3.x) they do NOT count against max_tokens — verified 2026-08-15.
+    (
+        "xai",
+        "grok-4.1-fast-non-reasoning",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("0.20"),
+        output_cost_per_million=Decimal("0.50"),
+        source="official_docs_snapshot",
+        source_url="https://cloud.google.com/gemini-enterprise-agent-platform/generative-ai/pricing",
+        pricing_version="xai-vertex-2026-08",
+    ),
+    (
+        "xai",
+        "grok-4.1-fast-reasoning",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("0.20"),
+        output_cost_per_million=Decimal("0.50"),
+        source="official_docs_snapshot",
+        source_url="https://cloud.google.com/gemini-enterprise-agent-platform/generative-ai/pricing",
+        pricing_version="xai-vertex-2026-08",
+    ),
+    (
+        "xai",
+        "grok-4.20-reasoning",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("2.00"),
+        output_cost_per_million=Decimal("6.00"),
+        source="official_docs_snapshot",
+        source_url="https://cloud.google.com/gemini-enterprise-agent-platform/generative-ai/pricing",
+        pricing_version="xai-vertex-2026-08",
+    ),
+    (
+        "xai",
+        "grok-4.20-non-reasoning",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("2.00"),
+        output_cost_per_million=Decimal("6.00"),
+        source="official_docs_snapshot",
+        source_url="https://cloud.google.com/gemini-enterprise-agent-platform/generative-ai/pricing",
+        pricing_version="xai-vertex-2026-08",
+    ),
+    (
+        "xai",
+        "grok-4.3",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("2.00"),
+        output_cost_per_million=Decimal("6.00"),
+        source="official_docs_snapshot",
+        source_url="https://cloud.google.com/gemini-enterprise-agent-platform/generative-ai/pricing",
+        pricing_version="xai-vertex-2026-08",
+    ),
     # Google Gemini
     # Gemini 3.7 Flash — introductory pricing $0.75/$3.75 per 1M through
     # 2026-12-31 (half of 3.6 Flash); standard rates take effect 2027-01-01.
@@ -1145,6 +1202,14 @@ def resolve_billing_route(
         _bare = model.split("/")[-1]
         if _bare.startswith("claude"):
             return BillingRoute(provider="anthropic", model=_bare, base_url=base_url or "", billing_mode="official_docs_snapshot")
+        # Vertex Model Garden likewise serves xAI Grok under the "xai/"
+        # publisher prefix. Routing those to provider='google' looks up a
+        # ("google", "grok-*") key that does not exist, so every Grok call on
+        # Vertex is silently recorded as $0.00 / cost_status='unknown' — the
+        # same bug class the Claude branch above fixes. Keep the vendor
+        # identity so the ("xai", "grok-*") pricing keys match.
+        if model.lower().startswith("xai/") or _bare.startswith("grok"):
+            return BillingRoute(provider="xai", model=_bare, base_url=base_url or "", billing_mode="official_docs_snapshot")
         return BillingRoute(provider="google", model=_bare, base_url=base_url or "", billing_mode="official_docs_snapshot")
     if provider_name == "fireworks" or base_url_host_matches(base_url or "", "api.fireworks.ai"):
         # Fireworks model ids look like accounts/fireworks/models/<name>;
