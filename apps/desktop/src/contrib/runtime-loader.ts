@@ -31,6 +31,8 @@
 import { installPluginSdk, sdkImportMap } from '@/sdk/runtime'
 import { notifyError } from '@/store/notifications'
 
+import spatialSource from '../../../../runtime-plugin/spatial/plugin.js?raw'
+
 import { createPluginContext, type HermesPlugin } from './plugin'
 import { dropPlugin, pluginActive, type PluginKind, publishPlugin } from './plugins-store'
 
@@ -50,6 +52,11 @@ interface LoadOptions {
 
 /** Live runtime plugins: id -> disposers (unload/reload support). */
 const loaded = new Map<string, (() => void)[]>()
+
+/** Runtime plugins shipped with Desktop. They still traverse the exact same
+ * source -> rewrite -> evaluate -> register pipeline as disk plugins; this
+ * table is the distribution seam that makes their source part of the build. */
+const shipped = [{ origin: 'spatial', source: spatialSource }] as const
 
 // Matches the specifier of a static `from '…'`, a side-effect `import '…'`, or
 // a dynamic `import('…')` — anchored to import/export syntax so a bare string
@@ -409,6 +416,13 @@ export function watchRuntimePlugins(): void {
   }
 
   watching = true
+
+  // Shipped sources are evaluated through the runtime loader rather than the
+  // bundled TS plugin glob. This both delivers them in a clean installation
+  // and preserves one canonical implementation for copied/on-disk installs.
+  for (const plugin of shipped) {
+    void loadRuntimePlugin(plugin.source, plugin.origin, { kind: 'bundled' })
+  }
 
   const dirWatchIds = new Set<string>()
   const watchedDirs = new Set<string>()

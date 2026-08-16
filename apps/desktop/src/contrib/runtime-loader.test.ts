@@ -4,7 +4,7 @@ import type { HermesReadDirResult } from '@/global'
 import type * as HermesModule from '@/hermes'
 
 import { $pluginRecords, setPluginEnabled } from './plugins-store'
-import { discoverRuntimePlugins, watchRuntimePlugins } from './runtime-loader'
+import { discoverRuntimePlugins, loadRuntimePlugin, watchRuntimePlugins } from './runtime-loader'
 
 // getStatus would supply the connected backend's hermes_home — a REMOTE path in
 // remote mode. The disk scanner must NOT derive the plugin root from it (#66899).
@@ -176,5 +176,33 @@ describe('watchRuntimePlugins dir watch (#66899)', () => {
     expect(watchDirectory).toHaveBeenCalledWith('/local/.hermes/plugins')
     expect(watchDirectory).not.toHaveBeenCalledWith('/remote/box/.hermes/desktop-plugins')
     expect(getStatus).not.toHaveBeenCalled()
+  })
+})
+
+describe('shipped runtime plugins', () => {
+  it('registers a source through the runtime evaluation pipeline', async () => {
+    const register = vi.fn()
+    ;(globalThis as unknown as { __shippedRegister: unknown }).__shippedRegister = register
+
+    const createObjectURL = vi
+      .spyOn(URL, 'createObjectURL')
+      .mockReturnValue(
+        `data:text/javascript;base64,${Buffer.from(
+          'export default { id: "shipped-fixture", register: globalThis.__shippedRegister }'
+        ).toString('base64')}`
+      )
+    const revokeObjectURL = vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => undefined)
+
+    try {
+      expect(await loadRuntimePlugin('fixture source', 'shipped-fixture', { kind: 'bundled' })).toBe(
+        'shipped-fixture'
+      )
+      expect(register).toHaveBeenCalledTimes(1)
+      expect($pluginRecords.get()['shipped-fixture']).toMatchObject({ kind: 'bundled', status: 'loaded' })
+    } finally {
+      createObjectURL.mockRestore()
+      revokeObjectURL.mockRestore()
+      delete (globalThis as unknown as { __shippedRegister?: unknown }).__shippedRegister
+    }
   })
 })
