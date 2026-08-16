@@ -1,6 +1,6 @@
 ---
 title: "ARCH-003 implementation plan: runtime-state audit and replay verification"
-status: IMPLEMENTATION_PLAN_REVISE_V27_PENDING
+status: IMPLEMENTATION_PLAN_REVISE_V28_PENDING
 date: 2026-08-16
 type: implementation-plan
 ticket: ARCH-003
@@ -448,12 +448,12 @@ Implement a bounded verifier that:
 - uses a code-level `REPLAY_EVENT_LIMIT = 10000` counted from the effective
   replay start point. Before status/reason selection, apply this total verifier
   diagnostic precedence from highest to lowest: `SNAPSHOT_FAILURE`,
-  `UNSUPPORTED_VERSION`, `HISTORY_MALFORMED`, `EMPTY_HISTORY`,
-  `MATERIALIZED_STATE_ASYMMETRY`, `GENERATION_MISMATCH`,
+  `UNSUPPORTED_VERSION`, `POST_TERMINAL_EVENT`, `HISTORY_MALFORMED`,
+  `EMPTY_HISTORY`, `MATERIALIZED_STATE_ASYMMETRY`, `GENERATION_MISMATCH`,
   `KEY_UNAVAILABLE`, `KEY_CHECK_MISMATCH`, `DIGEST_PARAMETER_MISMATCH`,
   `LEGACY_ORIGIN_MISSING`, `SEQUENCE_INVALID`, `BASELINE_INVALID`,
-  `WRITE_COUNTER_GAP`, `REPLAY_LIMIT_EXCEEDED`,
-  `POST_TERMINAL_EVENT`, `DRIFT_DETECTED`, `OK`. The first applicable
+  `WRITE_COUNTER_GAP`, `REPLAY_LIMIT_EXCEEDED`, `DRIFT_DETECTED`,
+  `OK`. The first applicable
   code wins; `EMPTY_HISTORY` therefore wins over row-marker mismatch when
   the entity has zero journal rows, while `MATERIALIZED_STATE_ASYMMETRY`
   applies when one side exists and the other does not. Compute the start candidates as the highest valid baseline
@@ -485,8 +485,8 @@ Implement a bounded verifier that:
   (`WRITE_COUNTER_GAP`), or a materialized-row/history asymmetry;
 - treats a materialized row missing while history exists, or history existing
   without a materialized row, as `UNKNOWN`, never `DRIFT`;
-- treats any event observed after a terminal lifecycle state as malformed
-  history and returns `UNKNOWN`, never `DRIFT`;
+- treats any event observed after a terminal lifecycle state as
+  `POST_TERMINAL_EVENT` and returns `UNKNOWN`, never `DRIFT`;
 - may read digest key material through the approved local key store, but never
   logs, persists, echoes, or includes key material in diagnostics or results;
 - performs no writes, ownership claims, external calls, gateway replay, or
@@ -592,7 +592,8 @@ Add deterministic tests for:
   selection, and every member of each surface's closed reason-code subset;
 - verifier-performs-no-writes using a direct database-change assertion;
 - materialized-row/history asymmetry returning `UNKNOWN`;
-- post-terminal events returning `UNKNOWN`;
+- post-terminal events returning `UNKNOWN` with
+  `POST_TERMINAL_EVENT`;
 - prompt-cache/gateway no-change check: runtime-state modules must not import
   or invoke gateway conversation or prompt-construction modules;
 - mutation benchmark: 20 repetitions, each with 200 warmup mutations followed
@@ -1003,6 +1004,21 @@ DGX changes, deployment, repair, or event-sourcing. The corrected plan must
 return to the same authenticated Claude reviewer family and then to AGY on the
 identical packet.
 
+## Implementation-plan review reconciliation v27
+
+The v27 authenticated Claude Opus review returned `REVISE` with three bounded
+plan-text corrections. The corrections are incorporated above:
+
+1. `POST_TERMINAL_EVENT` is above `HISTORY_MALFORMED` in total precedence,
+   and post-terminal Gate 4 coverage names the code.
+2. The changelog index includes v26.
+3. Acceptance coverage now includes v26.
+
+These remain plan-only corrections and do not authorize source edits, tests,
+DGX changes, deployment, repair, or event-sourcing. The corrected plan must
+return to the same authenticated Claude reviewer family and then to AGY on the
+identical packet.
+
 ## Acceptance criteria
 
 ARCH-003 implementation is ready for its delivery gates only when:
@@ -1031,7 +1047,7 @@ ARCH-003 implementation is ready for its delivery gates only when:
   retention job; entities beyond the replay limit remain UNKNOWN in this ticket,
   and the 100,000-event/100 MiB per-profile threshold is a documented follow-up
   operational review, not an in-ticket operator gate;
-- reconciliation v1 and v5-v26 items are incorporated into the normative
+- reconciliation v1 and v5-v27 items are incorporated into the normative
   Gates 0-4 text (with v2-v4 explicitly folded into the v1/v4 text), and this
   merged plan revision receives the same-family re-review;
 - all focused and relevant tests pass;
@@ -1091,6 +1107,9 @@ ARCH-003 implementation is ready for its delivery gates only when:
   no-op determination.
 - v25: reason-code spelling alignment, complete bypass allowance, and
   consolidated counter-gap test coverage.
+- v26: post-terminal classification separation, asymmetry-direction wording,
+  and STARTUP_LOCKED versus DOWNGRADE_UNSAFE state separation.
+- v27: precedence/index alignment and explicit post-terminal reason coverage.
 
 
 ## Non-goals
