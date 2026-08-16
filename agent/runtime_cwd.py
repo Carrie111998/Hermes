@@ -69,18 +69,28 @@ def _session_cwd_override() -> str:
 def resolve_agent_cwd() -> Path:
     # A non-local backend's configured cwd lives on the backend's filesystem,
     # not this host's — Path.is_dir() would always be False there and discard
-    # a valid remote path in favor of the host's launch dir (#83515).
+    # a valid remote path in favor of the host's launch dir (#83515). Nor can
+    # `~` be expanded here: expanduser() would resolve it against this host's
+    # HOME, not the remote's, silently pointing the agent at the wrong path.
+    # Kept verbatim instead, matching tui_gateway/methods_session.py's
+    # session.create handling of a remote raw_cwd.
     remote = (os.environ.get("TERMINAL_ENV") or "").strip().lower() in _REMOTE_TERMINAL_BACKENDS
     override = _session_cwd_override()
     if override:
+        if remote:
+            logger.debug("cwd validation skipped for remote backend: %s", override)
+            return Path(override)
         p = Path(override).expanduser()
-        if remote or p.is_dir():
+        if p.is_dir():
             return p
         logger.warning("configured working directory does not exist: %s", override)
     raw = os.environ.get("TERMINAL_CWD", "").strip()
     if raw:
+        if remote:
+            logger.debug("cwd validation skipped for remote backend: %s", raw)
+            return Path(raw)
         p = Path(raw).expanduser()
-        if remote or p.is_dir():
+        if p.is_dir():
             return p
         logger.warning("TERMINAL_CWD does not exist: %s", raw)
     return Path(os.getcwd())
