@@ -69,7 +69,7 @@ If your skill is specialized, community-contributed, or niche, it's better suite
 
 ### Should it be a Script? — the third option
 
-Hermes cron jobs support a `no_agent: true` mode that runs a script directly without spinning up the LLM — **zero token cost, perfect determinism**. Add this question to your decision process:
+Hermes cron jobs support a `no_agent: true` mode that runs a script directly without spinning up the LLM — **no LLM call, zero inference-token spend** (note: the script itself can still time out or exit non-zero). Add this question to your decision process:
 
 | Option | Token cost | Reliability | Best for |
 |--------|:----------:|:-----------:|:---------|
@@ -89,7 +89,7 @@ Hermes cron jobs support a `no_agent: true` mode that runs a script directly wit
 - You need the LLM to decide *whether* to run or how to interpret the result
 - Example: "summarize new GitHub issues" needs judgment → skill; "alert if disk > 90%" is purely deterministic → script
 
-The most common mistake is defaulting to a Skill when a Script would do. Every LLM call burns tokens; scripts cost nothing to run and never hallucinate.
+The most common mistake is defaulting to a Skill when a Script would do. Every LLM call burns tokens; scripts cost nothing to run and, with no LLM in the loop, cannot hallucinate.
 
 ---
 
