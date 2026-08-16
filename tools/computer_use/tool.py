@@ -569,9 +569,12 @@ def _request_approval(action: str, args: Dict[str, Any],
             return None
     cb = _approval_callback
     if cb is None:
-        # No CLI approval wired — default allow. Gateway approval is handled
-        # one layer out via the normal tool-approval infra.
-        return None
+        # No CLI callback registered. Nothing upstream gates computer_use by
+        # name — ToolRegistry.dispatch calls the handler directly, and
+        # model_tools' pre-dispatch hook only covers ACP *edit* approval — so
+        # returning None here is the whole decision, not a deferral to another
+        # layer. Route it to the generic human gate instead.
+        return _request_generic_approval(action, args, scope_key)
     summary = _summarize_action(action, args)
     try:
         verdict = cb(action, args, summary)
@@ -595,6 +598,53 @@ def _request_approval(action: str, args: Dict[str, Any],
             "action": action,
         })
     return json.dumps({"error": "denied by user", "action": action})
+
+
+def _request_generic_approval(action: str, args: Dict[str, Any],
+                              scope_key: Tuple[str, str]) -> Optional[str]:
+    """Gate a destructive action through the shared human-approval gate.
+
+    Reached only when no CLI approval callback is registered, which is every
+    non-CLI entry point: the gateway, cron jobs, ``-q`` single-query runs and
+    bare scripts. ``request_tool_approval`` is the same gate a plugin
+    ``pre_tool_call`` escalation uses, so computer_use inherits the policy it
+    already implements rather than inventing a second one: yolo bypasses,
+    the gateway submits a pending approval and waits, cron honors
+    ``approvals.cron_mode``, ``-q`` honors ``approvals.single_query_mode``,
+    and any other context with no human present fails CLOSED.
+
+    ``rule_key`` carries this call's approval scope, so the ``[a]lways``
+    allowlist has the same grain as the in-process ``_always_allow`` set: an
+    unlock for a background click does not silently cover the foreground form
+    of the same action (#67052), and the separate ``bring_to_front`` rung
+    stays separate.
+    """
+    # Call-time import: tools.approval reaches back into tools.computer_use
+    # (release_computer_use_session), so keep the edge one-directional at
+    # import time.
+    from tools.approval import request_tool_approval
+
+    summary = _summarize_action(action, args)
+    try:
+        verdict = request_tool_approval(
+            "computer_use",
+            f"desktop control: {summary}",
+            rule_key=f"computer_use:{scope_key[0]}:{scope_key[1]}",
+        )
+    except Exception as e:
+        # Fail closed. An approval gate that cannot run is not consent, and
+        # this branch only executes where no human is watching the screen.
+        logger.warning("computer_use approval gate unavailable: %s", e)
+        return json.dumps({
+            "error": f"approval gate unavailable, refusing to act: {e}",
+            "action": action,
+        })
+    if verdict.get("approved"):
+        return None
+    return json.dumps({
+        "error": verdict.get("message") or "denied by user",
+        "action": action,
+    })
 
 
 def _summarize_action(action: str, args: Dict[str, Any]) -> str:

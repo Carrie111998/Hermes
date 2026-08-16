@@ -220,7 +220,7 @@ def test_bad_delivery_mode_rejected():
     assert res.code == "bad_delivery_mode"
 
 
-def test_dispatcher_threads_delivery_mode_to_backend():
+def test_dispatcher_threads_delivery_mode_to_backend(approve_computer_use):
     """End-to-end through the tool dispatcher with the noop backend."""
     from tools.computer_use import tool as cu
     with patch.dict(os.environ, {"HERMES_COMPUTER_USE_BACKEND": "noop"}, clear=False):

@@ -102,7 +102,7 @@ class TestDispatch:
         assert "error" in parsed
 
 
-    def test_type_action_routes_to_type_text_backend(self, noop_backend):
+    def test_type_action_routes_to_type_text_backend(self, noop_backend, approve_computer_use):
         """type action must call backend.type_text, not type_text_chars (issue #24170, bug 3)."""
         from tools.computer_use.tool import handle_computer_use
         out = handle_computer_use({"action": "type", "text": "hello"})
@@ -113,7 +113,7 @@ class TestDispatch:
         type_kw = next(c[1] for c in noop_backend.calls if c[0] == "type")
         assert type_kw["text"] == "hello"
 
-    def test_drag_action_routes_to_backend_by_element(self, noop_backend):
+    def test_drag_action_routes_to_backend_by_element(self, noop_backend, approve_computer_use):
         """drag action must dispatch to backend.drag with element indices (issue #24170, bug 4)."""
         from tools.computer_use.tool import handle_computer_use
         out = handle_computer_use({
@@ -142,7 +142,7 @@ class TestDispatch:
             "mode": "ax", "app": None, "pid": 23502, "window_id": 58720504,
         }
 
-    def test_capture_after_skipped_when_action_failed(self, noop_backend):
+    def test_capture_after_skipped_when_action_failed(self, noop_backend, approve_computer_use):
         """capture_after must not fire when res.ok=False (regression guard).
 
         A follow-up screenshot after a failed action shows the screen in a
@@ -205,7 +205,7 @@ class TestSafetyGuards:
             assert "error" in parsed, keys
             assert "blocked key combo" in parsed["error"], keys
 
-    def test_safe_key_combos_pass(self, noop_backend):
+    def test_safe_key_combos_pass(self, noop_backend, approve_computer_use):
         # Non-destructive combos, including hyphen notation and the literal '-'
         # zoom key, must not be caught by the widened separator.
         from tools.computer_use.tool import handle_computer_use
@@ -213,7 +213,7 @@ class TestSafetyGuards:
             parsed = json.loads(handle_computer_use({"action": "key", "keys": keys}))
             assert "error" not in parsed, keys
 
-    def test_type_with_empty_string_is_allowed(self, noop_backend):
+    def test_type_with_empty_string_is_allowed(self, noop_backend, approve_computer_use):
         from tools.computer_use.tool import handle_computer_use
         out = handle_computer_use({"action": "type", "text": ""})
         parsed = json.loads(out)
@@ -799,7 +799,7 @@ class TestCaptureAfterAppContext:
     the preceding capture/focus_app call, rather than the frontmost window.
     """
 
-    def test_capture_after_uses_last_app(self):
+    def test_capture_after_uses_last_app(self, approve_computer_use):
         """capture_after=True should pass _last_app to the follow-up capture."""
         from tools.computer_use.backend import ActionResult, CaptureResult
         from tools.computer_use import tool as cu_tool
@@ -865,7 +865,7 @@ class TestCaptureAfterAppContext:
             f"Expected follow-up capture with app='Calculator', got {captured_app_args[0]!r}"
         )
 
-    def test_capture_after_without_prior_app_uses_none(self):
+    def test_capture_after_without_prior_app_uses_none(self, approve_computer_use):
         """When no app context is set, follow-up capture uses app=None (frontmost)."""
         from tools.computer_use.backend import ActionResult, CaptureResult
         from tools.computer_use import tool as cu_tool

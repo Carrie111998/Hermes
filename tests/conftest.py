@@ -1692,6 +1692,25 @@ def _isolate_computer_use_approval_state():
         pass
 
 
+@pytest.fixture
+def approve_computer_use():
+    """Approve computer_use destructive actions for this test.
+
+    A destructive action with no approval callback registered no longer
+    defaults to allow: ``_request_approval`` routes it to
+    ``tools.approval.request_tool_approval``, which fails closed when no
+    human is present — which is every pytest run. Request this fixture in
+    tests that exercise dispatch/plumbing rather than the gate itself, so
+    the approval is stated at the call site instead of being an accident of
+    the default. Cleared by ``_isolate_computer_use_approval_state`` above.
+    """
+    from tools.computer_use import tool as _cu_tool
+
+    _cu_tool.set_approval_callback(lambda action, args, summary: "approve_once")
+
+    return _cu_tool
+
+
 @pytest.fixture(autouse=True)
 def _moa_caches_isolated():
     """Clear module-level MoA cold-start caches before each test.

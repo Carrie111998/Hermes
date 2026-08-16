@@ -6,8 +6,8 @@ stores are module-globals. Without the autouse reset fixture in
 changes the behavior of every later computer-use test in the process:
 a raising callback becomes ``verdict = "deny"`` (dispatch tests see an
 empty backend call list), a blocking callback hangs the run. The pair
-below simulates the forgetful test and asserts the next test still sees
-default-allow behavior.
+below simulates the forgetful test and asserts the next test starts with
+no callback installed.
 """
 
 import json
@@ -59,12 +59,25 @@ def test_a_forgets_a_poisoned_approval_callback():
     # no reset — the autouse fixture must clean this up
 
 
-def test_b_still_dispatches_with_default_allow():
-    """Without the isolation fixture this fails: the stale callback raises
-    (arity), ``_request_approval`` converts that into a deny, and the
-    backend never sees the click."""
+def test_b_starts_from_a_cleared_approval_callback():
+    """Without the isolation fixture this fails on the first assert: the
+    stale callback from test A is still installed.
+
+    The leak is asserted directly rather than inferred from the dispatch
+    outcome. It used to be inferrable, because a missing callback meant
+    default-allow and a leaked one meant deny — but a missing callback now
+    routes to ``tools.approval.request_tool_approval``, which fails closed
+    under pytest, so both states block the click and the outcome no longer
+    tells them apart. The dispatch half is kept below (under a callback this
+    test installs itself, AFTER the assert) so the file still exercises the
+    path the fixture protects."""
     from tools.computer_use import tool as cu_tool
 
+    assert cu_tool._approval_callback is None, (
+        "test A's approval callback leaked past the isolation fixture"
+    )
+
+    cu_tool.set_approval_callback(lambda action, args, summary: "approve_once")
     backend = _install_backend(cu_tool)
     result = cu_tool.handle_computer_use({"action": "click", "element": 3})
     call_names = [c[0] for c in backend.calls]
