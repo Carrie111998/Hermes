@@ -32,7 +32,7 @@ class TestBuildAnthropicClientForProvider:
         built = {}
         monkeypatch.setattr(
             aa, "build_anthropic_vertex_client",
-            lambda project, region, credentials=None: built.update(
+            lambda project, region, credentials=None, **kwargs: built.update(
                 project=project, region=region, credentials=credentials
             ) or "VERTEX_CLIENT",
         )
@@ -50,7 +50,7 @@ class TestBuildAnthropicClientForProvider:
         built = {}
         monkeypatch.setattr(
             aa, "build_anthropic_vertex_client",
-            lambda project, region, credentials=None: built.update(
+            lambda project, region, credentials=None, **kwargs: built.update(
                 project=project, region=region, credentials=credentials
             ) or "VERTEX_CLIENT",
         )

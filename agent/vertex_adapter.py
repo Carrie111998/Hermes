@@ -347,3 +347,25 @@ def get_vertex_anthropic_config(
 
     effective_region = _resolve_region(region)
     return creds, project_id, effective_region
+
+
+def get_vertex_anthropic_base_url() -> str | None:
+    """Resolve the base URL for AnthropicVertex (corporate proxies/gateways).
+
+    Resolves from ANTHROPIC_VERTEX_BASE_URL env var, then vertex.anthropic_base_url
+    config. Returns None if unset (falls back to Google's public endpoint).
+    """
+    import os
+    env_url = os.environ.get("ANTHROPIC_VERTEX_BASE_URL")
+    if env_url:
+        return env_url
+    try:
+        from hermes_cli.config import load_config
+        config = load_config()
+        if config and isinstance(config, dict):
+            vertex_conf = config.get("vertex")
+            if isinstance(vertex_conf, dict):
+                return vertex_conf.get("anthropic_base_url")
+    except Exception:
+        pass
+    return None

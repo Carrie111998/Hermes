@@ -985,6 +985,7 @@ def build_anthropic_vertex_client(
     project_id: Optional[str],
     region: str,
     credentials=None,
+    base_url: Optional[str] = None,
 ):
     """Create an AnthropicVertex client for Claude-on-Vertex (Google Cloud).
 
@@ -1042,6 +1043,8 @@ def build_anthropic_vertex_client(
     # resolve it from the credentials / ADC (passing None would override that).
     if project_id:
         _kwargs["project_id"] = project_id
+    if base_url:
+        _kwargs["base_url"] = base_url
     return _anthropic_sdk.AnthropicVertex(**_kwargs)
 
 
@@ -1087,7 +1090,9 @@ def build_anthropic_client_for_provider(
     if provider_norm == "vertex":
         from agent.vertex_adapter import get_vertex_anthropic_config
 
+        from agent.vertex_adapter import get_vertex_anthropic_base_url
         _creds, _project, _region = get_vertex_anthropic_config()
+        _base_url = get_vertex_anthropic_base_url()
         if agent is not None:
             _project = _project or getattr(agent, "_vertex_project_id", None)
             _region = _region or getattr(agent, "_vertex_region", None)
@@ -1097,7 +1102,7 @@ def build_anthropic_client_for_provider(
             agent._vertex_project_id = _project
             agent._vertex_region = _region
             agent._vertex_credentials = _creds
-        return build_anthropic_vertex_client(_project, _region, credentials=_creds)
+        return build_anthropic_vertex_client(_project, _region, credentials=_creds, base_url=_base_url)
 
     return build_anthropic_client(
         api_key,
