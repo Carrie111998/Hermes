@@ -1445,3 +1445,68 @@ def test_set_child_subreaper_adopts_double_forked_grandchild():
         f"grandchild reparented to ppid {reported!r}; expected the subreaper "
         f"{subreaper_pid}, not init (pid 1)"
     )
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="POSIX group/owner semantics")
+def test_writable_by_others_tolerates_private_group_but_rejects_shared(monkeypatch):
+    # Regression for a umask-002 checkout: a bundled helper left mode 0664 with
+    # a private per-user group (no secondary members) is NOT writable by others
+    # and must be accepted — the pre-fix `& 0o022` check rejected it and HELD
+    # every Linux op fetch. World- and shared-group-writable stay unsafe.
+    import grp
+    import pwd
+
+    def st(mode, uid=4242, gid=4242):
+        return mock.Mock(st_mode=mode, st_uid=uid, st_gid=gid)
+
+    def set_group(name, members):
+        monkeypatch.setattr(
+            grp, "getgrgid", lambda gid: mock.Mock(gr_name=name, gr_mem=members)
+        )
+
+    monkeypatch.setattr(
+        pwd, "getpwuid", lambda uid: mock.Mock(pw_name="alice", pw_gid=4242)
+    )
+    monkeypatch.setattr(os, "listxattr", lambda fd: [])  # no extended ACL by default
+
+    def w(mode, **kw):
+        return op._writable_by_others(st(mode, **kw), fd=7)
+
+    # Owner's own private per-user group: gid == owner's login gid (4242),
+    # named after the owner, no secondary members, no ACL -> safe.
+    set_group("alice", [])
+    assert w(0o100644) is False
+    assert w(0o100664) is False
+
+    # World-writable is always unsafe.
+    assert w(0o100666) is True
+    assert w(0o100646) is True
+
+    # An extended POSIX ACL (the group-write bit may be a mask hiding a
+    # u:other:w grant) is unsafe even for the owner's own private group.
+    monkeypatch.setattr(os, "listxattr", lambda fd: ["system.posix_acl_access"])
+    assert w(0o100664) is True
+    monkeypatch.setattr(os, "listxattr", lambda fd: [])
+
+    # Group-writable but the file's group is NOT the owner's primary gid — some
+    # other account could hold gid 9999 as its primary group -> unsafe.
+    assert w(0o100664, gid=9999) is True
+
+    # Group-writable via a shared group not named after the owner -> unsafe.
+    set_group("developers", [])
+    assert w(0o100664) is True
+
+    # Owner-named primary group with a secondary member -> unsafe.
+    set_group("alice", ["bob"])
+    assert w(0o100664) is True
+
+    # Owner's own private group listing only the owner -> safe.
+    set_group("alice", ["alice"])
+    assert w(0o100664) is False
+
+    # Unresolvable identity fails closed (unsafe).
+    def _boom(_gid):
+        raise KeyError(_gid)
+
+    monkeypatch.setattr(grp, "getgrgid", _boom)
+    assert w(0o100664) is True

@@ -587,6 +587,45 @@ def _op_daemon_identity_matches_ignoring_exe(
     )
 
 
+def _writable_by_others(st: os.stat_result, fd: int) -> bool:
+    """Whether anyone other than the file's owner can write it.
+
+    World-writable is always unsafe. A group-writable file is safe only when
+    BOTH: (a) it carries no extended POSIX ACL — a group-write bit can be an
+    ACL *mask* concealing a ``u:other:w`` grant (possibly inherited from a
+    directory default ACL), which the mode bits alone cannot distinguish from
+    a real group permission; and (b) the owning group is the owner's own
+    private per-user group — gid == the owner's primary/login gid, named after
+    the owner, no secondary members. This is the USERGROUPS / ``umask 002``
+    scheme in which each user's primary gid is unique. Any extended ACL, shared
+    group, or unresolvable identity fails closed. POSIX-only; Linux path.
+    """
+    import grp
+    import pwd
+
+    mode = stat.S_IMODE(st.st_mode)
+    if mode & stat.S_IWOTH:
+        return True
+    if mode & stat.S_IWGRP:
+        try:
+            if "system.posix_acl_access" in os.listxattr(fd):
+                return True  # extended ACL: the group bit may be a mask
+        except OSError:
+            pass  # filesystem without xattr/ACL support -> the bit is a real perm
+        try:
+            owner = pwd.getpwuid(st.st_uid)
+            group = grp.getgrgid(st.st_gid)
+        except (KeyError, OSError):
+            return True
+        if (
+            st.st_gid != owner.pw_gid
+            or group.gr_name != owner.pw_name
+            or set(group.gr_mem) - {owner.pw_name}
+        ):
+            return True
+    return False
+
+
 def _inspect_op_daemon(
     pid: int,
     namespace: _OpRuntimeNamespace,
@@ -995,7 +1034,7 @@ def _run_op_process(
         if (
             not stat.S_ISREG(fd_stat.st_mode)
             or fd_stat.st_uid != os.getuid()  # windows-footgun: ok
-            or stat.S_IMODE(fd_stat.st_mode) & 0o022
+            or _writable_by_others(fd_stat, helper_fd)
             or (fd_stat.st_dev, fd_stat.st_ino) != (path_stat.st_dev, path_stat.st_ino)
         ):
             os.close(helper_fd)
