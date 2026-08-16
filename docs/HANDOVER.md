@@ -24,7 +24,7 @@ The local audit checkout observed during this refresh is `D:/PROJECT/Hermes`, br
 - **Completed and deployed:** HERMES-UPDATE-001, PR #22, merged SHA `0fe3773ccfbec860984d0dc93adc4875ca2d5d4b`; immutable DGX release is active.
 - **Completed and corrected:** Calendar Guard wrapper correction, PR #24, merged SHA `91ae4a7f7a73a4c331e2f5dd018b7ce2ca5c03a9`; the valid immutable release path is no longer mistaken for the fallback sentinel.
 - **Completed and deployed:** managed-CA trust correction, PR #25, squash merge `29d4663bb94cf2d9603d2de9d437a431b5101f14`; authenticated Claude and AGY implementation reviews both PASS, CI run `31918804987` passed, and the new immutable DGX release is active.
-- **E2E state:** gateway process/service is healthy and outbound Telegram delivery passed, but inbound polling has no qualifying `getUpdates` progress evidence.
+- **E2E state:** gateway process/service is healthy and outbound Telegram delivery passed, but inbound polling has no qualifying `getUpdates` progress evidence. The 2026-08-16 bounded DGX window recorded `Connected to Telegram (polling mode)` and gateway startup completion, but no explicit `getUpdates` success or accepted-update event.
 - **Deferred:** ARCH-002 remains the next core candidate after the active Telegram transport gate; HERMES-MONITORING-001 remains blocked and does not absorb this transport diagnosis.
 
 ## 3. Verified runtime and deployment state
@@ -47,9 +47,9 @@ The local audit checkout observed during this refresh is `D:/PROJECT/Hermes`, br
 ### Current lane: HERMES-TELEGRAM-INBOUND-001
 
 - **Plan:** `docs/plans/2026-08-16-hermes-telegram-inbound-001.md`.
-- **Status:** `DESIGN_REVIEW_PASS`; ticket design consensus recorded in the plan.
+- **Status:** `DIAGNOSIS_EVIDENCE_RECORDED / IMPLEMENTATION_SCOPE_PENDING`; design consensus and bounded DGX diagnosis are recorded in the plan.
 - **Parent lane:** HERMES-TELEGRAM-TRANSPORT-001 is `MERGED_DEPLOYED_RUNTIME_DEGRADED`; its service and outbound gates passed, but inbound readiness remains unproven.
-- **Next action:** perform bounded read-only DGX diagnosis and line-map the missing `getUpdates` progress signal before preparing any implementation correction. Claude and AGY ticket-design review consensus is already recorded; implementation remains a separate authorized gate.
+- **Next action:** prepare a narrowly scoped implementation correction set for the missing qualifying inbound evidence, then obtain the required Claude+AGY implementation review. Claude and AGY ticket-design review consensus is already recorded; implementation remains a separate authorized gate.
 - **Do not:** implement, restart, deploy, change credentials/allowlists/webhook state, or claim inbound readiness before the ticket review and direct polling evidence gates pass.
 
 ### Other ticket state

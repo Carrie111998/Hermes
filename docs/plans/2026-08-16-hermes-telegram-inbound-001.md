@@ -11,7 +11,7 @@ target_repo: hermes-agent
 
 ## Status
 
-PLAN_ONLY / READY_FOR_REVIEW
+DIAGNOSIS_EVIDENCE_RECORDED / IMPLEMENTATION_SCOPE_PENDING
 
 ## Context
 
@@ -112,9 +112,81 @@ evidence. A green process or CI result does not close inbound readiness.
 - Consensus: `DESIGN_REVIEW_PASS`; the ticket design gate is complete.
   Implementation remains a separate, explicitly authorized gate.
 
+## Diagnosis evidence
+
+Read-only diagnosis completed on 2026-08-16 against the authenticated DGX
+Spark runtime. No source, credential, Telegram state, systemd unit, or live
+runtime was modified.
+
+### Runtime identity and service boundary
+
+- Host/user: `55-0940189-03` / `cwliao`.
+- Service: `hermes-gateway.service`, `ActiveState=active`,
+  `SubState=running`, `MainPID=27416`, `NRestarts=0`, `ExecMainStatus=0`.
+- Active release: `v2026.8.16-hermes-ca-29d4663bb9`.
+- Release marker: `29d4663bb94cf2d9603d2de9d437a431b5101f14`.
+- The process command uses the shared Hermes venv with `PYTHONPATH` bound to
+  the active immutable release; import verification resolved the active
+  `adapter.py` and `telegram_network.py` from that release.
+
+### Active code path
+
+- `plugins/platforms/telegram/adapter.py:3277` `connect()` selects polling
+  mode when `TELEGRAM_WEBHOOK_URL` is absent.
+- `adapter.py:3426-3469` builds separate general and `getUpdates` request
+  pools, using the fallback transport when fallback IPs are available, then
+  instruments the dedicated polling request.
+- `adapter.py:3505` bounds application initialization with the wall-clock
+  `_await_with_thread_deadline()` helper; the default initialization timeout
+  is 30 seconds.
+- `adapter.py:3615` performs best-effort `deleteWebhook`, and
+  `adapter.py:3647` enters `_start_polling_resilient()`.
+- `adapter.py:1994-2005` promotes inbound polling health only when an
+  error-free `getUpdates` response has an `ok=true` envelope and result;
+  `start_polling()` return and `getMe()` do not promote that state.
+- `adapter.py:2031-2059` observes the dedicated request without changing the
+  PTB payload or parser; `adapter.py:2072-2124` schedules a bounded progress
+  verifier after polling starts.
+- `plugins/platforms/telegram/telegram_network.py` preserves the logical
+  Telegram host while trying the primary path and DoH-discovered fallback IPs.
+
+### Bounded live observations
+
+- The gateway log recorded `Connected to Telegram (polling mode)` at
+  `09:14:27`, followed by `gateway.run: Gateway running with 1 platform(s)`;
+  command-menu registration completed afterward.
+- The same bounded post-start log window contained no explicit
+  `getUpdates` success/progress record, no accepted-update record, and no
+  post-start Telegram timeout/reconnect error.
+- The journal stderr slice ended at `Connecting to Telegram (attempt 1/8)`;
+  the gateway log showed the later successful bootstrap, so the two streams
+  are not interchangeable evidence of inbound readiness.
+- An unauthenticated reachability probe to `https://api.telegram.org/`
+  returned HTTP `302` with connection time `0.002875s` and first-byte time
+  `0.879259s`; system DNS resolved `api.telegram.org` to
+  `149.154.166.110`. This proves only general endpoint reachability, not Bot
+  API authorization or `getUpdates` success.
+- No token-protected `getUpdates` request was issued, and no inbound message
+  or accepted-update callback was injected. Therefore inbound readiness
+  remains `DEGRADED/UNPROVEN`.
+
+### Diagnosis result and stop condition
+
+The service/process and general Telegram bootstrap are currently healthy, and
+the bounded window did not reproduce a live transport timeout. The confirmed
+remaining boundary is that the current operational evidence does not expose a
+qualifying `getUpdates` success or accepted-update event, even though the
+active code has an internal promotion hook. This is not enough to claim a
+transport root cause or authorize implementation yet.
+
+Next gate: turn this evidence boundary into a narrowly scoped implementation
+correction set (including safe, metadata-only observability and hermetic
+coverage), then obtain the required Claude+AGY implementation review before
+editing source. Keep inbound, service, and outbound gates separate.
+
 ## Current next action
 
-Perform bounded, read-only DGX diagnosis and prepare the implementation
-correction set. Do not modify code, credentials, Telegram state, systemd units,
-or the live DGX runtime until diagnosis, implementation review, tests, CI, and
-deployment gates are separately authorized and complete.
+Prepare the implementation correction set from the confirmed evidence
+boundary. Do not modify code, credentials, Telegram state, systemd units, or
+the live DGX runtime until implementation review, tests, CI, and deployment
+gates are separately authorized and complete.
