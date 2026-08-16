@@ -49,12 +49,16 @@ def test_detects_known_winerror_codes(code):
 def test_detects_winerror_via_os_error_suffix_when_attribute_absent():
     """Rust/subprocess-relayed errors carry the code only in text, e.g. the
     ``(os error 4551)`` suffix ``std::io::Error``'s ``Display`` produces —
-    ``winerror`` is a Windows-only ``OSError`` attribute Python does not
-    always populate for text relayed from a child process."""
+    ``winerror`` is a Windows-only ``OSError`` attribute. On Windows CPython
+    sets it to 0 by default when unset; on other platforms the attribute is
+    never populated at all, so deletion must tolerate both."""
     exc = OSError(
         "An Application Control policy has blocked this file. (os error 4551)"
     )
-    del exc.winerror  # CPython sets this to 0 by default on non-Windows too
+    try:
+        del exc.winerror
+    except AttributeError:
+        pass  # not populated on non-Windows platforms
     assert detect_policy_block(exc) is True
 
 
