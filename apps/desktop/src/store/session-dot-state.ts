@@ -100,6 +100,8 @@ export const sessionStatusRank = (state?: SessionDotState): number => STATUS_RAN
 
 let dotStates: Readonly<Record<string, SessionDotState>> = {}
 
+// Module-level on purpose: stableArray needs the previous result to preserve
+// identity when unrelated stream updates re-evaluate this projection.
 let standingGoalIds: readonly string[] = []
 const $standingGoalSessionIds = computed(
   [$goalsBySession, $sessionStates, $sessions],
