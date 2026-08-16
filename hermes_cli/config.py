@@ -991,6 +991,75 @@ def get_missing_env_vars(required_only: bool = False) -> List[Dict[str, Any]]:
     return missing
 
 
+def _split_config_key(dotted_key: str) -> list[str]:
+    """Split a config path on unquoted dots.
+
+    Double-quoted segments preserve literal dots, so
+    ``providers."qwen3.5".extra_headers`` targets the provider named
+    ``qwen3.5`` instead of creating ``providers.qwen3.5`` as nested keys.
+    """
+    parts: list[str] = []
+    buf: list[str] = []
+    in_quotes = False
+    escape = False
+
+    for char in dotted_key:
+        if escape:
+            buf.append(char)
+            escape = False
+            continue
+        if in_quotes and char == "\\":
+            escape = True
+            continue
+        if char == '"':
+            in_quotes = not in_quotes
+            continue
+        if char == "." and not in_quotes:
+            parts.append("".join(buf))
+            buf = []
+            continue
+        buf.append(char)
+
+    if escape:
+        buf.append("\\")
+    if in_quotes:
+        raise ValueError("unclosed quoted segment")
+
+    parts.append("".join(buf))
+    return parts
+
+
+def _validate_config_key_syntax_or_exit(key: str) -> None:
+    """Validate CLI config-key quoting and print a friendly error on failure."""
+    try:
+        _split_config_key(key)
+    except ValueError as exc:
+        print(f"✗ Invalid config key {key!r}: {exc}", file=sys.stderr)
+        print(
+            '  Close quoted literal-dot segments, e.g. providers."qwen3.5".api',
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+
+def _resolve_existing_dict_segment(
+    current: dict,
+    parts: list[str],
+    index: int,
+) -> tuple[str, int]:
+    """Resolve a path segment, joining dotted pieces when an existing key matches."""
+    part = parts[index]
+    if part in current:
+        return part, 1
+
+    for end in range(len(parts), index + 1, -1):
+        candidate = ".".join(parts[index:end])
+        if candidate in current:
+            return candidate, end - index
+
+    return part, 1
+
+
 def _set_nested(config, dotted_key: str, value):
     """Set a value at an arbitrarily nested dotted key path.
 
@@ -1013,9 +1082,11 @@ def _set_nested(config, dotted_key: str, value):
     destroying list-typed config like ``custom_providers`` whenever a
     caller used an indexed path.
     """
-    parts = dotted_key.split(".")
+    parts = _split_config_key(dotted_key)
     current = config
-    for part in parts[:-1]:
+    index = 0
+    while index < len(parts) - 1:
+        part = parts[index]
         if isinstance(current, list):
             try:
                 idx = int(part)
@@ -1026,15 +1097,22 @@ def _set_nested(config, dotted_key: str, value):
                 )
             current = current[idx]
         elif isinstance(current, dict):
+            remaining_key = ".".join(parts[index:])
+            if remaining_key in current:
+                current[remaining_key] = value
+                return
+            part, consumed = _resolve_existing_dict_segment(current, parts, index)
             existing = current.get(part)
             # Preserve dicts and lists; replace missing/scalar with a fresh dict.
             if part not in current or not isinstance(existing, (dict, list)):
                 current[part] = {}
             current = current[part]
+            index += consumed - 1
         else:
             raise TypeError(
                 f"Cannot navigate into {type(current).__name__} at key {dotted_key!r}"
             )
+        index += 1
     last = parts[-1]
     if isinstance(current, list):
         current[int(last)] = value
@@ -1075,30 +1153,38 @@ _MISSING = object()
 def _get_nested(config, dotted_key: str):
     """Return a dotted-path value from nested dict/list config data."""
     current = config
-    for part in dotted_key.split("."):
+    parts = _split_config_key(dotted_key)
+    index = 0
+    while index < len(parts):
+        part = parts[index]
         if isinstance(current, list):
             try:
                 current = current[int(part)]
             except (TypeError, ValueError, IndexError):
                 return _MISSING
         elif isinstance(current, dict):
+            part, consumed = _resolve_existing_dict_segment(current, parts, index)
             if part not in current:
                 return _MISSING
             current = current[part]
+            index += consumed - 1
         else:
             return _MISSING
+        index += 1
     return current
 
 
 def _unset_nested(config, dotted_key: str) -> bool:
     """Remove a dotted-path value from nested dict/list config data."""
-    parts = dotted_key.split(".")
+    parts = _split_config_key(dotted_key)
     if not parts:
         return False
 
     parents = []
     current = config
-    for part in parts[:-1]:
+    index = 0
+    while index < len(parts) - 1:
+        part = parts[index]
         parents.append((current, part))
         if isinstance(current, list):
             try:
@@ -1106,11 +1192,19 @@ def _unset_nested(config, dotted_key: str) -> bool:
             except (TypeError, ValueError, IndexError):
                 return False
         elif isinstance(current, dict):
+            remaining_key = ".".join(parts[index:])
+            if remaining_key in current:
+                del current[remaining_key]
+                return True
+            part, consumed = _resolve_existing_dict_segment(current, parts, index)
+            parents[-1] = (current, part)
             if part not in current:
                 return False
             current = current[part]
+            index += consumed - 1
         else:
             return False
+        index += 1
 
     last = parts[-1]
     removed = False
@@ -1149,6 +1243,33 @@ def _unset_nested(config, dotted_key: str) -> bool:
         break
 
     return removed
+
+
+_JSON_OBJECT_CONFIG_LEAF_KEYS = frozenset({
+    "extra_body",
+    "extra_headers",
+})
+
+
+def _coerce_config_set_value(user_config: dict, key: str, value: str) -> Any:
+    """Coerce a CLI string value while preserving legacy scalar behavior."""
+    existing = _get_nested(user_config, key)
+    leaf = _split_config_key(key)[-1] if key else ""
+    stripped = value.strip()
+    if (
+        (isinstance(existing, dict) or leaf in _JSON_OBJECT_CONFIG_LEAF_KEYS)
+        and stripped.startswith("{")
+        and stripped.endswith("}")
+    ):
+        try:
+            parsed = json.loads(stripped)
+        except json.JSONDecodeError:
+            pass
+        else:
+            if isinstance(parsed, dict):
+                return parsed
+
+    return value
 
 
 def _is_env_config_key(key: str) -> bool:
@@ -5015,7 +5136,7 @@ def _default_value_for_key(dotted_key: str):
     best-effort coercion used by ``config set``.
     """
     node = DEFAULT_CONFIG
-    for part in dotted_key.split("."):
+    for part in _split_config_key(dotted_key):
         if not isinstance(node, dict) or part not in node:
             return None
         node = node[part]
@@ -5127,7 +5248,7 @@ def _validate_config_key(key: str) -> tuple[bool, Optional[str]]:
     if not key:
         return False, None
 
-    segments = key.split(".")
+    segments = _split_config_key(key)
     top = segments[0]
 
     # ── Underscore-prefixed keys are internal/test markers ───────────
@@ -5219,6 +5340,7 @@ def set_config_value(key: str, value: str, force: bool = False):
     if is_managed():
         managed_error("set configuration values")
         return
+    _validate_config_key_syntax_or_exit(key)
     # Managed scope guard (D2): a key pinned by the managed layer cannot be set by
     # the user — the next load would override it anyway. Hard-reject and name the
     # source. Distinct from is_managed() above (the package-manager write-lock).
@@ -5282,16 +5404,16 @@ def set_config_value(key: str, value: str, force: bool = False):
     # Preserve values for string-typed settings.  In particular, enum members
     # such as approvals.mode="off" must not become YAML booleans.  Unknown keys
     # retain the historical best-effort coercion behavior.
-    coerced_value: Any = value
-    if not isinstance(_default_value_for_key(key), str):
-        if value.lower() in {'true', 'yes', 'on'}:
+    coerced_value: Any = _coerce_config_set_value(user_config, key, value)
+    if isinstance(coerced_value, str) and not isinstance(_default_value_for_key(key), str):
+        if coerced_value.lower() in {'true', 'yes', 'on'}:
             coerced_value = True
-        elif value.lower() in {'false', 'no', 'off'}:
+        elif coerced_value.lower() in {'false', 'no', 'off'}:
             coerced_value = False
-        elif value.isdigit():
-            coerced_value = int(value)
-        elif value.replace('.', '', 1).isdigit():
-            coerced_value = float(value)
+        elif coerced_value.isdigit():
+            coerced_value = int(coerced_value)
+        elif coerced_value.replace('.', '', 1).isdigit():
+            coerced_value = float(coerced_value)
 
     value = coerced_value
     # Normalize a scalar ``model`` key before writing sub-keys so that
@@ -5428,6 +5550,7 @@ def set_config_value(key: str, value: str, force: bool = False):
 
 def get_config_value(key: str, *, as_json: bool = False):
     """Print a resolved configuration value."""
+    _validate_config_key_syntax_or_exit(key)
     if _is_env_config_key(key):
         env_value = get_env_value(key.upper())
         value = _MISSING if env_value is None else env_value
@@ -5446,6 +5569,7 @@ def unset_config_value(key: str):
     if is_managed():
         managed_error("unset configuration values")
         return
+    _validate_config_key_syntax_or_exit(key)
     # Managed scope guard: a key pinned by the managed layer cannot be unset by
     # the user — the next load would reinstate it anyway (mirrors set_config_value).
     from hermes_cli import managed_scope
