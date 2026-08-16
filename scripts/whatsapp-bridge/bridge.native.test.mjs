@@ -20,9 +20,21 @@ import {
   extractBridgeEvent,
   inboundReadReceiptKeys,
   mediaPayloadForFile,
+  missingMessageStoreLookup,
   pollCreationMessageFromPayload,
   pollUpdateForAggregation,
 } from './bridge_helpers.js';
+
+// -- missing outbound message store ---------------------------------------
+{
+  const unavailable = await missingMessageStoreLookup({
+    id: 'retry-after-cache-miss',
+    remoteJid: '15551234567@s.whatsapp.net',
+    fromMe: true,
+  });
+  assert.equal(unavailable, undefined);
+  console.log('  ✓ missing outbound store skips resend instead of sending an empty message');
+}
 
 // -- inbound read receipts ------------------------------------------------
 {

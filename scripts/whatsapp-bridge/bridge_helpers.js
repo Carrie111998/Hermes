@@ -65,6 +65,17 @@ export function createBoundedMessageStore(limit = 512) {
   return { remember, get };
 }
 
+/**
+ * Baileys asks getMessage to reproduce an outbound message after a peer's
+ * decryption retry cache misses. The bridge has no durable outbound store, so
+ * it cannot reproduce that message. Returning undefined is Baileys' native
+ * "message not available" signal; returning a placeholder object would make
+ * Baileys encrypt and send the placeholder as a real (empty) message.
+ */
+export async function missingMessageStoreLookup() {
+  return undefined;
+}
+
 export function pollCreationMessageSecret(pollCreation) {
   return pollCreation?.message?.messageContextInfo?.messageSecret
     || pollCreation?.messageContextInfo?.messageSecret

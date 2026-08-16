@@ -44,6 +44,7 @@ import {
   inboundReadReceiptKeys,
   inferMediaType,
   mediaPayloadForFile,
+  missingMessageStoreLookup,
   pollCreationMessageFromPayload,
   pollUpdateForAggregation,
 } from './bridge_helpers.js';
@@ -410,13 +411,11 @@ async function startSocket() {
     browser: ['Hermes Agent', 'Chrome', '120.0'],
     syncFullHistory: false,
     markOnlineOnConnect: false,
-    // Required for Baileys 7.x: without this, incoming messages that need
-    // E2EE session re-establishment are silently dropped (msg.message === null)
-    getMessage: async (key) => {
-      // We don't maintain a message store, so return a placeholder.
-      // This is enough for Baileys to complete the retry handshake.
-      return { conversation: '' };
-    },
+    // We keep no durable outbound store, so a retried message cannot be
+    // reproduced. Baileys treats undefined as "message not available" and
+    // skips the resend; any placeholder object would be delivered as a real
+    // empty message. Session repair runs before this lookup either way.
+    getMessage: missingMessageStoreLookup,
   });
 
   sock.ev.on('creds.update', () => { saveCreds(); lidToPhone = buildLidMap(); });
