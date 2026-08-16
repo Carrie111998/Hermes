@@ -615,6 +615,46 @@ class TestRenderLoginHtmlNext:
         assert "%22injected" in html_out
 
 
+
+# ---------------------------------------------------------------------------
+# Regression: issue #87788 - the zero-providers empty state must not tell
+# operators to restart with the deprecated --insecure bypass, which has
+# been a no-op since the June 2026 hardening (see web_server.py's
+# "--insecure no longer bypasses dashboard authentication" warning).
+# ---------------------------------------------------------------------------
+
+
+class TestEmptyLoginHtmlDoesNotRecommendInsecureBypass:
+    """render_login_html() with zero registered providers renders the
+    "Sign-in unavailable" empty state. It must point operators at a real
+    fix (OAuth registration or the bundled password provider), not the
+    deprecated --insecure flag that no longer bypasses the auth gate."""
+
+    def setup_method(self):
+        clear_providers()
+
+    def teardown_method(self):
+        clear_providers()
+
+    def test_no_providers_omits_insecure_flag(self):
+        from hermes_cli.dashboard_auth.login_page import render_login_html
+
+        html_out = render_login_html()
+        assert "Sign-in unavailable" in html_out
+        assert "restart with" not in html_out
+        assert "to bypass the" not in html_out
+        # --insecure may still be *mentioned* to explain it no longer
+        # works, but must never be framed as the fix.
+        assert "no longer bypasses this gate" in html_out
+
+    def test_no_providers_points_at_working_fix(self):
+        from hermes_cli.dashboard_auth.login_page import render_login_html
+
+        html_out = render_login_html()
+        assert "hermes dashboard register" in html_out
+        assert "dashboard.basic_auth" in html_out
+
+
 # ---------------------------------------------------------------------------
 # Unit-level coverage: /auth/login persists next= into the PKCE cookie
 # ---------------------------------------------------------------------------

@@ -393,8 +393,13 @@ _EMPTY_HTML = """\
 <p>This dashboard is bound to a non-loopback host but no authentication
 providers are installed.</p>
 <p>Install <code>plugins/dashboard-auth-nous</code> (default) or another
-auth provider, or restart with <code>--insecure</code> to bypass the
-auth gate (not recommended on untrusted networks).</p>
+auth provider &mdash; run <code>hermes dashboard register</code> for
+OAuth, or set <code>dashboard.basic_auth</code> in config.yaml for a
+username/password provider.</p>
+<p><code>--insecure</code> no longer bypasses this gate (June 2026
+hardening). To keep the dashboard local without configuring a provider,
+bind to <code>127.0.0.1</code> and reach it over an SSH tunnel or
+Tailscale instead.</p>
 </main>
 </body>
 </html>
