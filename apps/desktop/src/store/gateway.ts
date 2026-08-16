@@ -115,6 +115,22 @@ const g = gatewayState()
 // to. (A fresh `atom()` per reload would orphan existing subscriptions.)
 export const $gateway = g.$gateway
 
+export interface ActiveGatewayIdentity {
+  connectionId: null | string
+  profile: string
+}
+
+/** The backend identity currently owning renderer requests. Registry
+ * secondaries carry their source id; primary/local and legacy profile routes
+ * deliberately retain a null connection id. */
+export function activeGatewayIdentity(): ActiveGatewayIdentity {
+  const secondary = g.secondaries.get(g.activeKey)
+
+  return secondary
+    ? { connectionId: secondary.connectionId, profile: secondary.profile }
+    : { connectionId: null, profile: g.primaryProfile }
+}
+
 export function configureGatewayRegistry(cfg: RegistryConfig): void {
   g.config = cfg
 }

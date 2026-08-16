@@ -1,6 +1,8 @@
+import { backendScopeKey } from '@hermes/shared'
 import { atom, computed } from 'nanostores'
 
 import { readKey, writeKey } from '@/lib/storage'
+import { activeGatewayIdentity, type ActiveGatewayIdentity } from '@/store/gateway'
 import { $activeGatewayProfile, normalizeProfileKey } from '@/store/profile'
 import { $currentCwd } from '@/store/session'
 
@@ -21,9 +23,12 @@ export interface TerminalEntry {
    *  a terminal; at most it re-SELECTS a same-profile tab already pointed at the
    *  session's cwd (see the $currentCwd listener). */
   cwd: string
-  /** Gateway profile whose backend owns this shell. Snapshotted with the cwd so
-   *  switching the profile rail never silently moves a terminal between hosts.
-   *  Absent only on tabs persisted by older Desktop versions. */
+  /** Registry connection whose backend owns this shell. Absent/null means the
+   *  local/legacy v1 route. */
+  connectionId?: string
+  /** Gateway profile whose backend owns this shell. Snapshotted with the cwd
+   *  and connection id so context switches never move a terminal between
+   *  hosts. Absent only on tabs persisted by older Desktop versions. */
   profile?: string
   /** Last observed working directory of the live shell (tracked via the PTY
    *  cwd probe / OSC 7). Used to reopen the tab where the user last `cd`'d
@@ -42,6 +47,7 @@ export interface TerminalEntry {
 
 interface PersistedTerminalEntry {
   auto: boolean
+  connectionId?: string
   cwd: string
   id: string
   profile?: string
@@ -73,6 +79,7 @@ function sanitizePersistedTerminal(value: unknown): PersistedTerminalEntry | nul
   const cwd = typeof record.cwd === 'string' ? record.cwd : ''
   const restoreCwd = typeof record.restoreCwd === 'string' && record.restoreCwd ? record.restoreCwd : undefined
   const reviveBuffer = typeof record.reviveBuffer === 'string' ? record.reviveBuffer : undefined
+  const connectionId = typeof record.connectionId === 'string' && record.connectionId.trim() ? record.connectionId.trim() : undefined
 
   const profile =
     typeof record.profile === 'string' && /^[a-z0-9][a-z0-9_-]{0,63}$/.test(record.profile.trim())
@@ -85,6 +92,7 @@ function sanitizePersistedTerminal(value: unknown): PersistedTerminalEntry | nul
 
   return {
     auto: typeof record.auto === 'boolean' ? record.auto : true,
+    ...(connectionId ? { connectionId } : {}),
     cwd,
     id,
     ...(profile ? { profile } : {}),
@@ -134,6 +142,7 @@ function persistTerminals(list: readonly TerminalEntry[], activeTerminalId: null
     .filter(term => term.kind === 'user')
     .map(term => ({
       auto: term.auto,
+      ...(term.connectionId ? { connectionId: term.connectionId } : {}),
       cwd: term.cwd,
       id: term.id,
       ...(term.profile ? { profile: term.profile } : {}),
@@ -170,18 +179,37 @@ export const $activeTerminal = computed(
 const newId = () =>
   globalThis.crypto?.randomUUID?.() ?? `term-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`
 
-const terminalMatchesProfile = (term: TerminalEntry, profile: string) =>
-  term.kind === 'user' && (!term.profile || normalizeProfileKey(term.profile) === normalizeProfileKey(profile))
+const terminalMatchesIdentity = (term: TerminalEntry, identity: ActiveGatewayIdentity) =>
+  term.kind === 'user' &&
+  (!term.profile ||
+    backendScopeKey(term.connectionId, normalizeProfileKey(term.profile)) ===
+      backendScopeKey(identity.connectionId, normalizeProfileKey(identity.profile)))
+
+const currentTerminalIdentity = (): ActiveGatewayIdentity => ({
+  ...activeGatewayIdentity(),
+  profile: normalizeProfileKey($activeGatewayProfile.get())
+})
 
 /** Append a fresh terminal and focus it. Captures the current cwd and gateway
  *  profile once; pass explicit values to override. Returns the id. */
 export function createTerminal(
   cwd: string = $currentCwd.get(),
-  profile: string = $activeGatewayProfile.get()
+  identity: ActiveGatewayIdentity = currentTerminalIdentity()
 ): string {
   const id = newId()
-  const profileKey = normalizeProfileKey(profile)
-  $terminals.set([...$terminals.get(), { id, title: 'Terminal', auto: true, cwd, kind: 'user', profile: profileKey }])
+  const profile = normalizeProfileKey(identity.profile)
+  $terminals.set([
+    ...$terminals.get(),
+    {
+      id,
+      title: 'Terminal',
+      auto: true,
+      cwd,
+      kind: 'user',
+      ...(identity.connectionId ? { connectionId: identity.connectionId } : {}),
+      profile
+    }
+  ])
   $activeTerminalId.set(id)
 
   return id
@@ -190,11 +218,28 @@ export function createTerminal(
 /** Migrate a pre-profile terminal tab to the backend that first revives it.
  *  Explicit bindings are immutable: a later rail switch must never move a live
  *  shell to another machine. */
-export function bindTerminalProfile(id: string, profile: string): void {
-  const key = normalizeProfileKey(profile)
+export function bindTerminalIdentity(id: string, identity: ActiveGatewayIdentity): void {
+  const profile = normalizeProfileKey(identity.profile)
   $terminals.set(
     $terminals.get().map(term =>
-      term.id === id && term.kind === 'user' && !term.profile ? { ...term, profile: key } : term
+      term.id === id && term.kind === 'user' && !term.profile
+        ? { ...term, connectionId: identity.connectionId ?? undefined, profile }
+        : term
+    )
+  )
+}
+
+/** Bind every tab restored from the pre-identity storage schema before the
+ * workspace mounts their PTY effects. This snapshots one backend identity for
+ * all legacy tabs and prevents a later rail switch from restarting an inactive
+ * tab on another machine. */
+export function bindLegacyTerminalIdentities(identity: ActiveGatewayIdentity): void {
+  const profile = normalizeProfileKey(identity.profile)
+  $terminals.set(
+    $terminals.get().map(term =>
+      term.kind === 'user' && !term.profile
+        ? { ...term, connectionId: identity.connectionId ?? undefined, profile }
+        : term
     )
   )
 }
@@ -244,7 +289,7 @@ export function openAgentTerminal(procId: string, title: string): void {
 /** Guarantee at least one tab exists when the pane opens.
  *  If a status-stack click already opened an agent tab, don't create a
  *  second, unrelated user shell just because the pane became visible. */
-export function ensureTerminal(profile: string = $activeGatewayProfile.get()): void {
+export function ensureTerminal(identity: ActiveGatewayIdentity = currentTerminalIdentity()): void {
   const list = $terminals.get()
   const active = list.find(term => term.id === $activeTerminalId.get())
 
@@ -255,17 +300,17 @@ export function ensureTerminal(profile: string = $activeGatewayProfile.get()): v
   }
 
   const match =
-    (active && terminalMatchesProfile(active, profile) ? active : null) ??
-    list.find(term => terminalMatchesProfile(term, profile))
+    (active && terminalMatchesIdentity(active, identity) ? active : null) ??
+    list.find(term => terminalMatchesIdentity(term, identity))
 
   if (match) {
-    bindTerminalProfile(match.id, profile)
+    bindTerminalIdentity(match.id, identity)
     $activeTerminalId.set(match.id)
 
     return
   }
 
-  createTerminal($currentCwd.get(), profile)
+  createTerminal($currentCwd.get(), identity)
 }
 
 export function selectTerminal(id: string): void {
@@ -295,6 +340,7 @@ const terminalCwd = (term: TerminalEntry) => normalizePath(term.restoreCwd || te
 $currentCwd.listen(cwd => {
   const target = normalizePath(cwd)
   const profile = normalizeProfileKey($activeGatewayProfile.get())
+  const identity = { ...activeGatewayIdentity(), profile }
 
   if (!target) {
     return
@@ -303,11 +349,11 @@ $currentCwd.listen(cwd => {
   const list = $terminals.get()
   const active = list.find(term => term.id === $activeTerminalId.get())
 
-  if (active && terminalMatchesProfile(active, profile) && terminalCwd(active) === target) {
+  if (active && terminalMatchesIdentity(active, identity) && terminalCwd(active) === target) {
     return
   }
 
-  const match = list.find(term => terminalMatchesProfile(term, profile) && terminalCwd(term) === target)
+  const match = list.find(term => terminalMatchesIdentity(term, identity) && terminalCwd(term) === target)
 
   if (match) {
     $activeTerminalId.set(match.id)

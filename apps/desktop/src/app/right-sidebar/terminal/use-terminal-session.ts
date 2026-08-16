@@ -27,7 +27,7 @@ import {
   terminalTheme
 } from './selection'
 import { prepareTerminalFontFamily } from './terminal-font'
-import { bindTerminalProfile, closeTerminal, updateTerminalRestoreCwd, updateTerminalReviveBuffer } from './terminals'
+import { bindTerminalIdentity, closeTerminal, updateTerminalRestoreCwd, updateTerminalReviveBuffer } from './terminals'
 import { useTerminalFontController } from './use-terminal-font'
 
 // How many scrollback lines to serialize for relaunch restore. Mirrors VS Code's
@@ -236,6 +236,8 @@ interface UseTerminalSessionOptions {
   /** Only the active tab is visible, owns the agent reader, and runs injections. */
   active: boolean
   onAddSelectionToChat: (text: string, label?: string) => void
+  /** Registry connection captured when this terminal tab was created. */
+  connectionId?: null | string
   /** Backend profile captured when this terminal tab was created. */
   profile?: string
   /** Last observed shell cwd from the previous session; the fresh PTY starts
@@ -385,6 +387,7 @@ export function useTerminalSession({
   cwd,
   active,
   onAddSelectionToChat,
+  connectionId,
   profile,
   restoreCwd,
   reviveBuffer,
@@ -837,14 +840,20 @@ export function useTerminalSession({
 
     const startSession = () => {
       if (profile) {
-        bindTerminalProfile(id, profile)
+        bindTerminalIdentity(id, { connectionId: connectionId ?? null, profile })
       }
 
       void terminalApi
         // Prefer the prior session's last cwd so a reopened tab lands where the
         // user last `cd`'d; the main side falls back to the launch cwd (then
         // home) if that dir no longer exists.
-        .start({ cols: term.cols, cwd: initialRestoreCwdRef.current || cwd, profile, rows: term.rows })
+        .start({
+          cols: term.cols,
+          connectionId,
+          cwd: initialRestoreCwdRef.current || cwd,
+          profile,
+          rows: term.rows
+        })
         .then(session => {
           if (disposed) {
             void terminalApi.dispose(session.id)
@@ -960,7 +969,7 @@ export function useTerminalSession({
     // `id` is stable for the instance's life (keyed by tab id), so listing it
     // doesn't re-create the shell — it just satisfies the deps check for the
     // closeTerminal(id) call in onExit.
-  }, [addSelectionToChat, cwd, id, latestFontFamilyRef, mountedRef, profile])
+  }, [addSelectionToChat, connectionId, cwd, id, latestFontFamilyRef, mountedRef, profile])
 
   useEffect(() => {
     const term = termRef.current

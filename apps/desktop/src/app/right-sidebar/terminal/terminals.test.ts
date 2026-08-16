@@ -6,6 +6,7 @@ const STORAGE_KEY = 'hermes.desktop.terminals.v1'
 async function loadTerminalStore() {
   const $currentCwd = atom('/workspace')
   const $activeGatewayProfile = atom('default')
+  let activeConnectionId: null | string = null
 
   vi.doMock('@/store/session', () => ({
     $currentCwd
@@ -14,8 +15,19 @@ async function loadTerminalStore() {
     $activeGatewayProfile,
     normalizeProfileKey: (name: string | null | undefined) => name?.trim() || 'default'
   }))
+  vi.doMock('@/store/gateway', () => ({
+    activeGatewayIdentity: () => ({ connectionId: activeConnectionId, profile: $activeGatewayProfile.get() })
+  }))
 
-  return { ...(await import('./terminals')), $activeGatewayProfile, $currentCwd }
+  return {
+    ...(await import('./terminals')),
+    $activeGatewayProfile,
+    $currentCwd,
+    setActiveGatewayIdentity: (connectionId: null | string, profile: string) => {
+      activeConnectionId = connectionId
+      $activeGatewayProfile.set(profile)
+    }
+  }
 }
 
 describe('terminal store persistence', () => {
@@ -30,7 +42,15 @@ describe('terminal store persistence', () => {
       JSON.stringify({
         activeTerminalId: 'term-two',
         terminals: [
-          { auto: false, cwd: '/repo/one', id: 'term-one', reviveBuffer: 'last output', title: 'zsh' },
+          {
+            auto: false,
+            connectionId: 'homelab',
+            cwd: '/repo/one',
+            id: 'term-one',
+            profile: 'venture',
+            reviveBuffer: 'last output',
+            title: 'zsh'
+          },
           { auto: true, cwd: '/repo/two', id: 'term-two', title: 'Terminal' }
         ]
       })
@@ -40,7 +60,16 @@ describe('terminal store persistence', () => {
 
     expect($activeTerminalId.get()).toBe('term-two')
     expect($terminals.get()).toEqual([
-      { auto: false, cwd: '/repo/one', id: 'term-one', kind: 'user', reviveBuffer: 'last output', title: 'zsh' },
+      {
+        auto: false,
+        connectionId: 'homelab',
+        cwd: '/repo/one',
+        id: 'term-one',
+        kind: 'user',
+        profile: 'venture',
+        reviveBuffer: 'last output',
+        title: 'zsh'
+      },
       { auto: true, cwd: '/repo/two', id: 'term-two', kind: 'user', title: 'Terminal' }
     ])
   })
@@ -75,7 +104,23 @@ describe('terminal store persistence', () => {
     expect(JSON.parse(window.localStorage.getItem(STORAGE_KEY) ?? '{}').terminals[0].profile).toBe('venture')
   })
 
-  it('migrates a legacy tab once without rebinding it after a profile switch', async () => {
+  it('persists the full registry backend identity for a new tab', async () => {
+    const { $terminals, createTerminal, setActiveGatewayIdentity } = await loadTerminalStore()
+    setActiveGatewayIdentity('homelab', 'venture')
+
+    const id = createTerminal('/remote/repo')
+
+    expect($terminals.get().find(term => term.id === id)).toMatchObject({
+      connectionId: 'homelab',
+      profile: 'venture'
+    })
+    expect(JSON.parse(window.localStorage.getItem(STORAGE_KEY) ?? '{}').terminals[0]).toMatchObject({
+      connectionId: 'homelab',
+      profile: 'venture'
+    })
+  })
+
+  it('migrates a pre-profile tab to the full identity once without rebinding it', async () => {
     window.localStorage.setItem(
       STORAGE_KEY,
       JSON.stringify({
@@ -83,13 +128,60 @@ describe('terminal store persistence', () => {
         terminals: [{ auto: true, cwd: '/repo', id: 'legacy', title: 'Terminal' }]
       })
     )
-    const { $terminals, bindTerminalProfile } = await loadTerminalStore()
+    const { $terminals, bindTerminalIdentity } = await loadTerminalStore()
 
-    bindTerminalProfile('legacy', 'venture')
-    bindTerminalProfile('legacy', 'jemma')
+    bindTerminalIdentity('legacy', { connectionId: 'homelab', profile: 'venture' })
+    bindTerminalIdentity('legacy', { connectionId: 'other', profile: 'jemma' })
 
-    expect($terminals.get()[0]?.profile).toBe('venture')
-    expect(JSON.parse(window.localStorage.getItem(STORAGE_KEY) ?? '{}').terminals[0].profile).toBe('venture')
+    expect($terminals.get()[0]).toMatchObject({ connectionId: 'homelab', profile: 'venture' })
+    expect(JSON.parse(window.localStorage.getItem(STORAGE_KEY) ?? '{}').terminals[0]).toMatchObject({
+      connectionId: 'homelab',
+      profile: 'venture'
+    })
+  })
+
+  it('binds every legacy tab before the workspace can start their sessions', async () => {
+    window.localStorage.setItem(
+      STORAGE_KEY,
+      JSON.stringify({
+        activeTerminalId: 'legacy-a',
+        terminals: [
+          { auto: true, cwd: '/a', id: 'legacy-a', title: 'Terminal' },
+          { auto: true, cwd: '/b', id: 'legacy-b', title: 'Terminal' }
+        ]
+      })
+    )
+    const { $terminals, bindLegacyTerminalIdentities } = await loadTerminalStore()
+
+    bindLegacyTerminalIdentities({ connectionId: 'homelab', profile: 'venture' })
+    bindLegacyTerminalIdentities({ connectionId: 'other', profile: 'jemma' })
+
+    expect($terminals.get()).toEqual([
+      expect.objectContaining({ id: 'legacy-a', connectionId: 'homelab', profile: 'venture' }),
+      expect.objectContaining({ id: 'legacy-b', connectionId: 'homelab', profile: 'venture' })
+    ])
+  })
+
+  it('keeps profile-only persisted tabs on the legacy/local route', async () => {
+    window.localStorage.setItem(
+      STORAGE_KEY,
+      JSON.stringify({
+        activeTerminalId: 'legacy-local',
+        terminals: [{ auto: true, cwd: '/repo', id: 'legacy-local', profile: 'venture', title: 'Terminal' }]
+      })
+    )
+    const { $activeTerminalId, $terminals, ensureTerminal, setActiveGatewayIdentity } = await loadTerminalStore()
+    setActiveGatewayIdentity('homelab', 'venture')
+
+    ensureTerminal()
+
+    expect($activeTerminalId.get()).not.toBe('legacy-local')
+    expect($terminals.get()).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ id: 'legacy-local', profile: 'venture' }),
+        expect.objectContaining({ connectionId: 'homelab', profile: 'venture' })
+      ])
+    )
   })
 
   it('selects the active profile terminal and creates one when that profile has none', async () => {
@@ -99,14 +191,14 @@ describe('terminal store persistence', () => {
     const localId = createTerminal('/windows')
     $activeGatewayProfile.set('venture')
 
-    ensureTerminal('venture')
+    ensureTerminal({ connectionId: null, profile: 'venture' })
     const remoteId = $activeTerminalId.get()
 
     expect(remoteId).not.toBe(localId)
     expect($terminals.get().find(term => term.id === remoteId)?.profile).toBe('venture')
 
     $activeGatewayProfile.set('default')
-    ensureTerminal('default')
+    ensureTerminal({ connectionId: null, profile: 'default' })
     expect($activeTerminalId.get()).toBe(localId)
   })
 
@@ -115,7 +207,7 @@ describe('terminal store persistence', () => {
     const agentId = ensureAgentTerminal('proc-1', 'background task')!
     selectTerminal(agentId)
 
-    ensureTerminal('venture')
+    ensureTerminal({ connectionId: null, profile: 'venture' })
 
     expect($activeTerminalId.get()).toBe(agentId)
   })

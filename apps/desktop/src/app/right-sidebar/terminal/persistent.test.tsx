@@ -18,7 +18,13 @@ vi.mock('@/store/profile', async () => ({
   $activeGatewayProfile: (await import('nanostores')).atom('default')
 }))
 
+vi.mock('@/store/gateway', async () => ({
+  $gateway: (await import('nanostores')).atom(null),
+  activeGatewayIdentity: () => ({ connectionId: null, profile: 'default' })
+}))
+
 vi.mock('./terminals', () => ({
+  bindLegacyTerminalIdentities: vi.fn(),
   ensureTerminal: vi.fn()
 }))
 

@@ -39,14 +39,20 @@ vi.mock('@/store/notify-baseline', () => ({ markNativeNotifyBaseline: vi.fn() })
 
 const {
   $gateway,
+  activeGatewayIdentity,
   closeSecondaryGateways,
   configureGatewayRegistry,
   ensureActiveGatewayOpen,
+  ensureGatewayForAgent,
   ensureGatewayForProfile,
   setPrimaryGateway
 } = await import('./gateway')
 
-type DesktopStub = { getConnection: ReturnType<typeof vi.fn> }
+type DesktopStub = {
+  getConnection: ReturnType<typeof vi.fn>
+  getConnectionFor?: ReturnType<typeof vi.fn>
+  getGatewayWsUrlFor?: ReturnType<typeof vi.fn>
+}
 
 function installDesktop(stub: DesktopStub): void {
   ;(window as unknown as { hermesDesktop: unknown }).hermesDesktop = stub
@@ -71,6 +77,38 @@ afterEach(() => {
 })
 
 describe('ensureGatewayForProfile under a shared global remote', () => {
+  it('reports primary/local and registry-secondary identities from the active gateway', async () => {
+    const primary = makePrimary()
+    setPrimaryGateway(primary as never, 'default')
+
+    expect(activeGatewayIdentity()).toEqual({ connectionId: null, profile: 'default' })
+
+    const registryConnection = {
+      authMode: 'token',
+      baseUrl: 'https://homelab.invalid',
+      connectionId: 'homelab',
+      mode: 'remote',
+      profile: 'default',
+      token: 'fake-test-token',
+      wsUrl: 'wss://homelab.invalid/api/ws?token=fake-test-token'
+    }
+
+    installDesktop({
+      getConnection: vi.fn(),
+      getConnectionFor: vi.fn(async () => registryConnection),
+      getGatewayWsUrlFor: vi.fn(async () => ({ ok: true, wsUrl: registryConnection.wsUrl }))
+    })
+    gatewayMocks.connect.mockResolvedValueOnce(undefined)
+
+    await ensureGatewayForAgent('homelab', 'default')
+
+    expect(activeGatewayIdentity()).toEqual({ connectionId: 'homelab', profile: 'default' })
+
+    await ensureGatewayForAgent('local', 'default')
+
+    expect(activeGatewayIdentity()).toEqual({ connectionId: null, profile: 'default' })
+  })
+
   it('activates the primary socket for an explicitly shared-primary descriptor', async () => {
     const primary = makePrimary()
     setPrimaryGateway(primary as never, 'default')

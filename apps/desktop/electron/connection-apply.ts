@@ -37,15 +37,15 @@ function commitConnectionFailure(current, starting, commit) {
   return true
 }
 
-async function resolveTerminalConnection(profile, getTarget, ensureBackend) {
-  let target = getTarget(profile)
+async function resolveTerminalConnection(identity, getTarget, ensureBackend) {
+  let target = getTarget(identity)
 
   if (target !== 'pending') {
     return target
   }
 
-  await ensureBackend(profile)
-  target = getTarget(profile)
+  await ensureBackend(identity)
+  target = getTarget(identity)
 
   if (target === 'pending') {
     throw new Error('Remote connection is not ready yet. Try again in a moment.')
@@ -54,4 +54,16 @@ async function resolveTerminalConnection(profile, getTarget, ensureBackend) {
   return target
 }
 
-export { applyConnectionChange, commitConnectionFailure, resolveTerminalConnection }
+/** Classify registry terminal transport without silently downgrading a stale
+ * persisted connection to a local shell. */
+function terminalRegistrySourceKind(connectionId, sources) {
+  const source = sources.find(source => source.id === connectionId)
+
+  if (!source) {
+    return 'missing'
+  }
+
+  return source.kind === 'ssh' ? 'ssh' : 'local'
+}
+
+export { applyConnectionChange, commitConnectionFailure, resolveTerminalConnection, terminalRegistrySourceKind }
