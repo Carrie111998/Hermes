@@ -612,6 +612,54 @@ def _map_gemini_finish_reason(reason: str) -> str:
     return mapping.get(str(reason or "").upper(), "stop")
 
 
+# Human-readable guidance per Gemini ``promptFeedback.blockReason`` value.
+# Mirrors Google's documented block-reason enum (BlockedReason in the
+# generateContent API). A prompt-level block returns NO candidates at all —
+# without this handler the adapter used to synthesize an empty "stop"
+# response and the turn silently produced nothing.
+_GEMINI_BLOCK_REASON_GUIDANCE: Dict[str, str] = {
+    "BLOCKLIST": "The prompt includes blocked terms. Rephrase and try again.",
+    "PROHIBITED_CONTENT": "The prompt may contain prohibited content. Adjust it and try again.",
+    "RECITATION": "The prompt was blocked due to recitation risk. Use more original wording.",
+    "SAFETY": "The prompt was blocked by Gemini's safety filters. Adjust it and try again.",
+    "SPII": "The prompt may include sensitive personal information (SPII). Remove sensitive details and try again.",
+    "LANGUAGE": "The requested language isn't supported by this model.",
+    "IMAGE_SAFETY": "The generated image was blocked for safety reasons.",
+    "OTHER": "The prompt was blocked for an unspecified reason. Rephrase and try again.",
+}
+
+
+def _prompt_block_error(block_reason: str, prompt_feedback: Dict[str, Any]) -> "GeminiAPIError":
+    """Build the terminal error for a prompt-level Gemini safety block.
+
+    The message deliberately carries ``blockReason=<VALUE>`` so
+    ``agent.error_classifier`` can classify it as ``content_policy_blocked``
+    (non-retryable, fallback-eligible): the block is deterministic for the
+    unchanged prompt, so retrying the same request just burns paid attempts.
+    """
+    reason = str(block_reason or "").upper()
+    guidance = _GEMINI_BLOCK_REASON_GUIDANCE.get(
+        reason, "The prompt was blocked. Adjust it and try again."
+    )
+    return GeminiAPIError(
+        f"Gemini blocked this prompt (blockReason={reason or 'UNKNOWN'}): {guidance}",
+        code="gemini_prompt_blocked",
+        status_code=400,
+        details={"promptFeedback": prompt_feedback},
+    )
+
+
+def _extract_prompt_block(resp: Dict[str, Any]) -> Optional["GeminiAPIError"]:
+    """Return a terminal block error when ``promptFeedback.blockReason`` is set."""
+    feedback = resp.get("promptFeedback")
+    if not isinstance(feedback, dict):
+        return None
+    block_reason = feedback.get("blockReason")
+    if not block_reason or not isinstance(block_reason, str):
+        return None
+    return _prompt_block_error(block_reason, feedback)
+
+
 def _tool_call_extra_from_part(part: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     sig = part.get("thoughtSignature")
     if isinstance(sig, str) and sig:
@@ -646,6 +694,13 @@ def _empty_response(model: str) -> SimpleNamespace:
 
 
 def translate_gemini_response(resp: Dict[str, Any], model: str) -> SimpleNamespace:
+    # A prompt-level safety block (promptFeedback.blockReason) arrives as an
+    # HTTP 200 with no candidates. Surface it as a terminal error instead of
+    # synthesizing an empty "stop" response the loop would render as silence.
+    block_error = _extract_prompt_block(resp)
+    if block_error is not None:
+        raise block_error
+
     candidates = resp.get("candidates") or []
     if not isinstance(candidates, list) or not candidates:
         return _empty_response(model)
@@ -790,6 +845,14 @@ def _iter_sse_events(response: httpx.Response) -> Iterator[Dict[str, Any]]:
 
 
 def translate_stream_event(event: Dict[str, Any], model: str, tool_call_indices: Dict[str, Dict[str, Any]]) -> List[_GeminiStreamChunk]:
+    # Prompt-level safety blocks can also arrive as a streaming event with
+    # promptFeedback.blockReason and no candidates. Raise the same terminal
+    # error as the non-streaming path so the block is never rendered as an
+    # empty turn (the generator consumer classifies it as non-retryable).
+    block_error = _extract_prompt_block(event)
+    if block_error is not None:
+        raise block_error
+
     candidates = event.get("candidates") or []
     if not candidates:
         return []

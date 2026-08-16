@@ -519,6 +519,12 @@ _CONTENT_POLICY_BLOCKED_PATTERNS = [
     # echo back; the underscore form is provider-specific enough.
     "content_filter",
     "responsibleaipolicyviolation",
+    # Google Gemini prompt-level safety block. The native adapter
+    # (agent/gemini_native_adapter.py) raises a GeminiAPIError whose message
+    # carries the verbatim ``blockReason=<ENUM>`` token when generateContent
+    # returns promptFeedback.blockReason (PROHIBITED_CONTENT, SAFETY, SPII,
+    # BLOCKLIST, ...). The block is deterministic for the unchanged prompt.
+    "blockreason=",
     # MiniMax output-layer safety filter. The error string is surfaced
     # verbatim by MiniMax SDK / OpenAI-compatible endpoints, usually in the
     # form "output new_sensitive (1027)" when the model's *output* (often a

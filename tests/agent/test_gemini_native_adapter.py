@@ -350,3 +350,60 @@ def test_build_gemini_request_does_not_raise_when_thinking_is_disabled():
 
 
 
+
+
+class TestPromptBlockReason:
+    """promptFeedback.blockReason must surface as a terminal error, not silence.
+
+    Gemini returns HTTP 200 with promptFeedback.blockReason and zero
+    candidates when a prompt is blocked (PROHIBITED_CONTENT, SAFETY, SPII,
+    BLOCKLIST, ...). Ported behavior from lobehub/lobehub#17937.
+    """
+
+    def test_non_streaming_block_raises_terminal_error(self):
+        from agent.gemini_native_adapter import GeminiAPIError, translate_gemini_response
+
+        resp = {
+            "promptFeedback": {"blockReason": "PROHIBITED_CONTENT"},
+        }
+        with pytest.raises(GeminiAPIError) as excinfo:
+            translate_gemini_response(resp, model="gemini-3.6-flash")
+        err = excinfo.value
+        assert err.code == "gemini_prompt_blocked"
+        assert "blockReason=PROHIBITED_CONTENT" in str(err)
+        assert err.details["promptFeedback"]["blockReason"] == "PROHIBITED_CONTENT"
+
+    def test_stream_event_block_raises_terminal_error(self):
+        from agent.gemini_native_adapter import GeminiAPIError, translate_stream_event
+
+        event = {"promptFeedback": {"blockReason": "SAFETY"}}
+        with pytest.raises(GeminiAPIError) as excinfo:
+            translate_stream_event(event, model="gemini-3.6-flash", tool_call_indices={})
+        assert "blockReason=SAFETY" in str(excinfo.value)
+
+    def test_unknown_block_reason_still_raises_with_generic_guidance(self):
+        from agent.gemini_native_adapter import GeminiAPIError, translate_gemini_response
+
+        resp = {"promptFeedback": {"blockReason": "SOME_FUTURE_REASON"}}
+        with pytest.raises(GeminiAPIError) as excinfo:
+            translate_gemini_response(resp, model="gemini-3.6-flash")
+        assert "blockReason=SOME_FUTURE_REASON" in str(excinfo.value)
+
+    def test_no_block_reason_keeps_empty_response_shape(self):
+        from agent.gemini_native_adapter import translate_gemini_response
+
+        # promptFeedback without blockReason (e.g. only safetyRatings) must
+        # NOT raise — preserve the existing empty-response fallback.
+        resp = {"promptFeedback": {"safetyRatings": []}}
+        out = translate_gemini_response(resp, model="gemini-3.6-flash")
+        assert out.choices[0].finish_reason == "stop"
+
+    def test_block_error_classifies_as_content_policy_blocked(self):
+        from agent.error_classifier import FailoverReason, classify_api_error
+        from agent.gemini_native_adapter import _prompt_block_error
+
+        err = _prompt_block_error("PROHIBITED_CONTENT", {"blockReason": "PROHIBITED_CONTENT"})
+        result = classify_api_error(err, provider="gemini", model="gemini-3.6-flash")
+        assert result.reason == FailoverReason.content_policy_blocked
+        assert result.retryable is False
+        assert result.should_fallback is True
