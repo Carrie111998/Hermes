@@ -1,6 +1,6 @@
 ---
 title: "ARCH-003 implementation plan: runtime-state audit and replay verification"
-status: IMPLEMENTATION_PLAN_REVISE_V29_PENDING
+status: IMPLEMENTATION_PLAN_REVISE_V30_PENDING
 date: 2026-08-16
 type: implementation-plan
 ticket: ARCH-003
@@ -208,22 +208,27 @@ process-local `STARTUP_LOCKED` read-only state, writes no durable transition,
 and serves no ordinary or event-only writes until a later successful startup
 transition in that process; it must not serve mutations under an uncleared
 transition.
-A same-epoch restart never advances `current_generation`. A startup observing a durable epoch newer than the running writer enters the
-durable global `DOWNGRADE_UNSAFE` mode for the database: all ordinary
-runtime-state writes across all profiles and entities, including both
-event-only baseline and re-originating genesis writers, return mutation-side
-`WRITE_ABORT`; only read-only verification may continue. The mode exits only when a writer at least as new as the durable epoch
-completes the startup transition and atomically clears the mode. An equal-epoch
-startup performs this durable mode-clear write under the exclusive lock and
-`BEGIN IMMEDIATE` but does not advance `current_generation`; only a
-strictly newer epoch advances the generation. A startup lock/busy timeout is
-different: it enters process-local `STARTUP_LOCKED` read-only state with
-`LOCK_TIMEOUT`, writes no durable mode or transition record, and clears only
-after a later successful startup transition in that process. The transition
-record and durable mode are written before the upgraded writer serves
-mutations, so a strictly newer contract transition is represented by a
-distinct epoch transition rather than by process restart count. Delivery must
-record intervals spent in either write-blocked state. A rollback followed by roll-forward to the same
+A same-epoch restart never advances `current_generation`. A startup observing a durable epoch newer than the running writer acquires the
+exclusive side of the named maintenance RW lock and uses one `BEGIN IMMEDIATE`
+transaction to set the durable global `DOWNGRADE_UNSAFE` mode for the
+database: all ordinary runtime-state writes across all profiles and entities,
+including both event-only baseline and re-originating genesis writers, return
+mutation-side `WRITE_ABORT`; only read-only verification may continue. If
+that mode-set lock or transaction reaches either fixed timeout, no durable mode
+is written and the process falls back to process-local `STARTUP_LOCKED` with
+`LOCK_TIMEOUT`. The durable mode exits only when a writer at least as new as
+the durable epoch completes the startup transition and atomically clears it.
+An equal-epoch startup performs this durable mode-clear write under the
+exclusive lock and `BEGIN IMMEDIATE` but does not advance
+`current_generation`; only a strictly newer epoch advances the generation.
+A startup lock/busy timeout remains process-local `STARTUP_LOCKED` read-only,
+writes no durable mode or transition record, and remains read-only until a
+later explicit startup transition attempt (supervisor restart/re-exec or
+explicitly authorized maintenance retry) succeeds. Mutation entry does not
+retry or clear it. The transition record and durable mode are written before
+the upgraded writer serves mutations, so a strictly newer contract transition
+is represented by a distinct epoch transition rather than by process restart
+count. Delivery must record intervals spent in either write-blocked state. A rollback followed by roll-forward to the same
 writer epoch does not advance `current_generation`; it is detected by the
 materialized-write counter gap defined below. Gate 3 reads the
 current-generation record, writer epoch, transition marker, and counter
@@ -523,8 +528,10 @@ Add deterministic tests for:
   detected by the materialized-write counter gap, global downgrade-unsafe
   startup blocking all profiles/entities and both event-only writers with
   mutation-side `WRITE_ABORT`, newer-epoch/equal-epoch roll-forward clearing
-  that mode, startup lock/busy timeout returning `LOCK_TIMEOUT` while
-  remaining write-blocked, baseline refusal across a counter gap returning
+  that mode, startup lock/busy timeout returning `LOCK_TIMEOUT`, asserting no durable
+  mode/transition was written, remaining read-only without mutation retry, and
+  clearing process-local `STARTUP_LOCKED` only after a later explicit startup
+  transition attempt succeeds, baseline refusal across a counter gap returning
   `WRITE_ABORT`, separately authorized same-epoch re-originating genesis
   restoring mutation ability, atomic concurrent startup advancing exactly once,
   delivery recording of the blocked interval, and concurrent generation
@@ -1042,6 +1049,23 @@ DGX changes, deployment, repair, or event-sourcing. The corrected plan must
 return to the same authenticated Claude reviewer family and then to AGY on the
 identical packet.
 
+## Implementation-plan review reconciliation v29
+
+The v29 authenticated Claude Opus review returned `REVISE` with three bounded
+plan-text corrections. The corrections are incorporated above:
+
+1. Durable `DOWNGRADE_UNSAFE` mode-setting uses the exclusive maintenance lock
+   and one `BEGIN IMMEDIATE` transaction; timeout falls back to process-local
+   `STARTUP_LOCKED` without writing durable mode.
+2. `STARTUP_LOCKED` exits only on a later explicit startup transition attempt;
+   mutation entry does not retry or clear it.
+3. The changelog index includes v28 and acceptance coverage includes v28.
+
+These remain plan-only corrections and do not authorize source edits, tests,
+DGX changes, deployment, repair, or event-sourcing. The corrected plan must
+return to the same authenticated Claude reviewer family and then to AGY on the
+identical packet.
+
 ## Acceptance criteria
 
 ARCH-003 implementation is ready for its delivery gates only when:
@@ -1071,7 +1095,7 @@ ARCH-003 implementation is ready for its delivery gates only when:
   retention job; entities beyond the replay limit remain UNKNOWN in this ticket,
   and the 100,000-event/100 MiB per-profile threshold is a documented follow-up
   operational review, not an in-ticket operator gate;
-- reconciliation v1 and v5-v28 items are incorporated into the normative
+- reconciliation v1 and v5-v29 items are incorporated into the normative
   Gates 0-4 text (with v2-v4 explicitly folded into the v1/v4 text), and this
   merged plan revision receives the same-family re-review;
 - all focused and relevant tests pass;
@@ -1134,6 +1158,11 @@ ARCH-003 implementation is ready for its delivery gates only when:
 - v26: post-terminal classification separation, asymmetry-direction wording,
   and STARTUP_LOCKED versus DOWNGRADE_UNSAFE state separation.
 - v27: precedence/index alignment and explicit post-terminal reason coverage.
+- v28: counter-field scope, re-origin growth accounting,
+  reason-code domain binding, equal-epoch durable mode clearing, and no-op
+  test deduplication.
+- v29: durable DOWNGRADE_UNSAFE mode-set lock/timeout,
+  STARTUP_LOCKED exit trigger, and complete coverage.
 
 
 ## Non-goals
