@@ -6,13 +6,22 @@ GLM-5.2 on Volcengine ARK. Before #57601's salvage, ``CustomProfile`` emitted
 nothing when reasoning was *enabled*, so a configured ``reasoning_effort``
 was silently dropped for every custom endpoint.
 
-These tests pin the wire-shape contract:
+These tests pin the wire-shape contract (the enable cases pass
+``supports_reasoning=True``, i.e. the target model declares a thinking
+capability; the disable cases do not need it):
   - disabled            → extra_body.think = False
   - enabled + effort    → top-level reasoning_effort (native OpenAI-compat
                           format GLM/ARK expect), passed through verbatim
                           including ``max``/``xhigh``
   - enabled + no effort → nothing emitted (endpoint's server default applies)
   - ollama_num_ctx      → extra_body.options.num_ctx, orthogonal to reasoning
+
+``TestCustomReasoningCapabilityGate`` covers the ``supports_reasoning=False``
+side: local Ollama models without the "thinking" capability (e.g.
+qwen2.5:7b) must never receive an effort value, since Ollama's
+``/v1/chat/completions`` 400s with ``"<model>" does not support thinking``.
+Disabling reasoning stays ungated — those same models accept
+``reasoning_effort="none"`` and ``think=false`` with HTTP 200.
 """
 
 from __future__ import annotations
@@ -81,7 +90,8 @@ class TestCustomReasoningWireShape:
         native deep-reasoning level and must survive.
         """
         eb, tl = custom_profile.build_api_kwargs_extras(
-            reasoning_config={"enabled": True, "effort": effort}, model="glm-5.2"
+            reasoning_config={"enabled": True, "effort": effort}, model="glm-5.2",
+            supports_reasoning=True,
         )
         assert tl == {"reasoning_effort": effort}
         assert "reasoning_effort" not in eb
@@ -92,7 +102,8 @@ class TestCustomReasoningWireShape:
         """We must never send think=True on enable — it's Ollama-only and
         would 400 on GLM/vLLM endpoints that don't recognize it."""
         eb, _ = custom_profile.build_api_kwargs_extras(
-            reasoning_config={"enabled": True, "effort": "high"}, model="glm-5.2"
+            reasoning_config={"enabled": True, "effort": "high"}, model="glm-5.2",
+            supports_reasoning=True,
         )
         assert eb.get("think") is not True
 
@@ -105,5 +116,83 @@ class TestCustomReasoningWithNumCtx:
             reasoning_config=None, ollama_num_ctx=8192, model="qwen3"
         )
         assert eb == {"options": {"num_ctx": 8192}}
+        assert tl == {}
+
+    def test_num_ctx_survives_capability_gate_suppressing_reasoning(self, custom_profile):
+        """num_ctx must still be emitted even when supports_reasoning=False
+        suppresses every reasoning field — the two are wired independently."""
+        eb, tl = custom_profile.build_api_kwargs_extras(
+            reasoning_config={"enabled": True, "effort": "high"},
+            ollama_num_ctx=8192,
+            supports_reasoning=False,
+            model="qwen2.5:7b",
+        )
+        assert eb == {"options": {"num_ctx": 8192}}
+        assert tl == {}
+
+
+class TestCustomReasoningCapabilityGate:
+    """``supports_reasoning`` gates the ENABLE branch only.
+
+    Reproduces the reported bug: a local Ollama model without the "thinking"
+    capability (qwen2.5:7b) must never receive an effort value — Ollama's
+    /v1/chat/completions 400s with ``"qwen2.5:7b" does not support thinking``.
+
+    Measured against that endpoint with qwen2.5:7b:
+
+        reasoning_effort="medium" → HTTP 400 (does not support thinking)
+        reasoning_effort="none"   → HTTP 200
+        think=false               → HTTP 200
+
+    So the rejection is about *enabling* thinking, not about the field being
+    present. The disable branch stays ungated accordingly.
+    """
+
+    def test_supports_reasoning_false_suppresses_effort(self, custom_profile):
+        eb, tl = custom_profile.build_api_kwargs_extras(
+            reasoning_config={"enabled": True, "effort": "medium"},
+            supports_reasoning=False,
+            model="qwen2.5:7b",
+        )
+        assert eb == {}
+        assert tl == {}
+
+    def test_supports_reasoning_false_still_emits_disable_fields(self, custom_profile):
+        """The explicit-disable branch stays ungated.
+
+        Non-thinking models accept the disable fields with HTTP 200 (see the
+        class docstring), so gating this branch would buy nothing and would
+        silently drop a user's explicit "don't reason" on any route whose
+        capability probe is unavailable — leaving a thinking-capable model
+        reasoning against instructions.
+        """
+        eb, tl = custom_profile.build_api_kwargs_extras(
+            reasoning_config={"enabled": False},
+            supports_reasoning=False,
+            model="qwen2.5:7b",
+        )
+        assert eb == {"think": False}
+        assert tl == {"reasoning_effort": "none"}
+
+    def test_supports_reasoning_true_emits_effort(self, custom_profile):
+        """Non-regression: a local Ollama model that DOES declare thinking
+        (e.g. deepseek-r1) still gets reasoning_effort wired through."""
+        eb, tl = custom_profile.build_api_kwargs_extras(
+            reasoning_config={"enabled": True, "effort": "high"},
+            supports_reasoning=True,
+            model="deepseek-r1",
+        )
+        assert tl == {"reasoning_effort": "high"}
+        assert "think" not in eb
+
+    def test_default_is_false_when_omitted(self, custom_profile):
+        """The parameter defaults to False (fail closed) when a caller omits
+        it entirely — see the transport-level non-regression test for proof
+        every real call site always passes it explicitly."""
+        eb, tl = custom_profile.build_api_kwargs_extras(
+            reasoning_config={"enabled": True, "effort": "high"},
+            model="qwen2.5:7b",
+        )
+        assert eb == {}
         assert tl == {}
 

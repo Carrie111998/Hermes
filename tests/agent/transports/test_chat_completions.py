@@ -235,6 +235,36 @@ class TestChatCompletionsBuildKwargs:
         )
         assert kw["extra_body"]["think"] is False
 
+    def test_custom_disable_survives_missing_capability(self, transport):
+        """Omitting supports_reasoning (defaults False) must NOT drop the
+        disable fields: Ollama accepts reasoning_effort="none"/think=false
+        with HTTP 200 even on non-thinking models, and dropping them would
+        silently leave a thinking-capable model reasoning against an explicit
+        request not to."""
+        from providers import get_provider_profile
+        profile = get_provider_profile("custom")
+        msgs = [{"role": "user", "content": "Hi"}]
+        kw = transport.build_kwargs(
+            model="qwen2.5:7b", messages=msgs,
+            provider_profile=profile,
+            reasoning_config={"effort": "none"},
+        )
+        assert kw["extra_body"]["think"] is False
+        assert kw["reasoning_effort"] == "none"
+
+    def test_custom_supports_reasoning_false_omits_effort(self, transport):
+        from providers import get_provider_profile
+        profile = get_provider_profile("custom")
+        msgs = [{"role": "user", "content": "Hi"}]
+        kw = transport.build_kwargs(
+            model="qwen2.5:7b", messages=msgs,
+            provider_profile=profile,
+            reasoning_config={"enabled": True, "effort": "medium"},
+            supports_reasoning=False,
+        )
+        assert "reasoning_effort" not in kw
+        assert "think" not in kw.get("extra_body", {})
+
 
 
     def test_gemini_openai_compat_flash_reasoning_maps_to_nested_google_thinking_config(self, transport):

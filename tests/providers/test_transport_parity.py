@@ -170,3 +170,18 @@ class TestCustomOllamaParity:
             reasoning_config={"enabled": False, "effort": "none"},
         )
         assert kw["extra_body"]["think"] is False
+
+    def test_no_effort_when_capability_unsupported(self, transport):
+        """Gate regression check: a model without the thinking capability
+        (supports_reasoning=False, the local-Ollama default) must never get an
+        effort value — that is what Ollama 400s on. The disable fields still
+        go through, since non-thinking models accept them with HTTP 200."""
+        kw = transport.build_kwargs(
+            model="qwen2.5:7b",
+            messages=_simple_messages(),
+            tools=None,
+            provider_profile=get_provider_profile("custom"),
+            reasoning_config={"enabled": True, "effort": "medium"},
+        )
+        assert "reasoning_effort" not in kw
+        assert "think" not in kw.get("extra_body", {})
