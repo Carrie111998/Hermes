@@ -136,12 +136,19 @@ class WriteToolRateLimiter:
             self._save_entries(kept)
             return reservation_id
 
-    def reconcile(self, reservation_id: str, *, succeeded: bool) -> None:
+    def reconcile(
+        self,
+        reservation_id: str,
+        *,
+        succeeded: bool,
+        now: Optional[float] = None,
+    ) -> None:
         """Commit successful dispatches and release capacity for failed calls."""
         path = self.state_path
         assert path is not None
         with _state_lock(path):
-            entries = self._pruned(self._load_entries(), time.time())
+            current = now if now is not None else time.time()
+            entries = self._pruned(self._load_entries(), current)
             updated: list[dict[str, Any]] = []
             for entry in entries:
                 if entry.get("id") != reservation_id:
@@ -152,9 +159,10 @@ class WriteToolRateLimiter:
             self._save_entries(updated)
 
     def record(self, now: Optional[float] = None) -> None:
-        reservation_id = self.reserve(now=now)
+        current = now if now is not None else time.time()
+        reservation_id = self.reserve(now=current)
         if reservation_id is not None:
-            self.reconcile(reservation_id, succeeded=True)
+            self.reconcile(reservation_id, succeeded=True, now=current)
 
     def remaining(self, now: Optional[float] = None) -> int:
         return max(0, self.max_per_hour - len(self.prune(now=now)))

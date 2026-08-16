@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -96,7 +97,8 @@ def test_mcp_handler_integration_blocks_write_tool(trader_home, monkeypatch):
     from tools.mcp_tool import _make_tool_handler
 
     handler = _make_tool_handler("defi-trading", "execute_swap", 30.0)
-    with patch("tools.mcp_tool._servers", {}):
+    connected = SimpleNamespace(session=object())
+    with patch("tools.mcp_tool._get_connected_server_for_call", return_value=connected):
         result = handler(_args())
     payload = json.loads(result)
     assert "error" in payload

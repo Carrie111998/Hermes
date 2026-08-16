@@ -21,8 +21,8 @@ def _intent_from_mcp_args(args: dict[str, Any]) -> TradeIntent:
     return TradeIntent.from_mapping(
         {
             "action": args.get("action", "buy"),
-            "chain": args.get("chain"),
-            "token_address": args.get("token_address"),
+            "chain": args.get("chain") or "",
+            "token_address": args.get("token_address") or "",
             "size_usd": args.get("amount_usd", args.get("size_usd")),
             "confidence": args.get("confidence", 1.0),
             "pool_liquidity_usd": args.get("pool_liquidity_usd"),
