@@ -904,12 +904,15 @@ def _spawn_gateway_restart_watcher(old_pid: int, run_argv: list[str]) -> bool:
     # See gateway_windows.windowless_gateway_restart_spec.
     respawn_cwd = ""
     respawn_env_overlay: dict[str, str] = {}
+    watcher_env: dict[str, str] | None = None
     if sys.platform == "win32":
         try:
             from hermes_cli.gateway_windows import (
+                root_gateway_subprocess_env,
                 windowless_gateway_restart_spec,
             )
 
+            watcher_env = root_gateway_subprocess_env(os.environ)
             run_argv, respawn_cwd, respawn_env_overlay = (
                 windowless_gateway_restart_spec(list(run_argv))
             )
@@ -999,12 +1002,15 @@ def _spawn_gateway_restart_watcher(old_pid: int, run_argv: list[str]) -> bool:
 
     # Same platform-aware detach for the watcher process itself — so
     # closing the user's terminal doesn't kill the watcher.
+    watcher_popen_kwargs: dict = windows_detach_popen_kwargs()
+    if watcher_env is not None:
+        watcher_popen_kwargs["env"] = watcher_env
     try:
         subprocess.Popen(
             watcher_argv,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
-            **windows_detach_popen_kwargs(),
+            **watcher_popen_kwargs,
         )
     except OSError:
         # CREATE_BREAKAWAY_FROM_JOB rejected by the parent job object
@@ -1018,6 +1024,8 @@ def _spawn_gateway_restart_watcher(old_pid: int, run_argv: list[str]) -> bool:
                 if sys.platform == "win32"
                 else {"start_new_session": True}
             )
+            if watcher_env is not None:
+                fallback_kwargs["env"] = watcher_env
             subprocess.Popen(
                 watcher_argv,
                 stdout=subprocess.DEVNULL,
