@@ -146,6 +146,31 @@ class TestGenerateTitle:
         assert captured[0][1] is exc
 
 
+    def test_retries_without_response_format_when_gateway_rejects_json_schema(self):
+        """Gateways that 400 on json_schema must get one retry without it.
+
+        OpenCode Zen ("Console Go") rejects the strict json_schema
+        response_format outright; the prompt still demands a {"title": ...}
+        object and the loose parser recovers it.
+        """
+
+        def _first_rejects_then_plain(*_args, **_kwargs):
+            if "response_format" in (_kwargs.get("extra_body") or {}):
+                raise RuntimeError(
+                    "HTTP 400: Error from provider (Console Go): Upstream request "
+                    "failed: [invalid_request_error] This response_format type is "
+                    "unavailable now"
+                )
+            return MagicMock(
+                choices=[MagicMock(message=MagicMock(content='{"title": "Fix auth"}'))]
+            )
+
+        with patch("agent.title_generator.call_llm", side_effect=_first_rejects_then_plain):
+            result = generate_title("the auth is broken")
+
+        assert result == "Fix auth"
+
+
 
 
 
