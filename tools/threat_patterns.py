@@ -309,6 +309,21 @@ def _compile() -> None:
 _compile()
 
 
+def patterns_for_ids(pattern_ids) -> List[Tuple[str, str]]:
+    """Return ``(regex, pattern_id)`` pairs for every ``_PATTERNS`` entry whose
+    ``pattern_id`` is in *pattern_ids*, in file order (English original first,
+    translations after — see module docstring).
+
+    Lets independent gates that keep their own severity/label scheme (the cron
+    guard in ``tools/cronjob_tools.py``, the skill-install gate in
+    ``tools/skills_guard.py``) pull the canonical — including translated —
+    regex text for a pattern_id instead of hand-duplicating it, so the copies
+    can't drift apart the way #81134 review found them to.
+    """
+    wanted = set(pattern_ids)
+    return [(pattern, pid) for pattern, pid, _scope in _PATTERNS if pid in wanted]
+
+
 def scan_for_threats(content: str, scope: str = "context") -> List[str]:
     """Return a list of matched pattern IDs in ``content`` at the given scope.
 
@@ -386,4 +401,5 @@ __all__ = [
     "MAX_SCAN_CHARS",
     "scan_for_threats",
     "first_threat_message",
+    "patterns_for_ids",
 ]
