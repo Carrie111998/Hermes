@@ -25,11 +25,14 @@ carry ONE thing on top of it: the ATM injection patch stack (see
    tests (`tests/gateway/test_inject_internal_message.py`, 26 expected) + hooks tests
 4. green → push candidate branch, `git format-patch upstream/main..` attached as PR
    artifact, open PR to `main`
-5. review chain: **contessa** (local-llm) reviews the diff-vs-upstream and test
-   output — the diff must be exactly the known patch stack, nothing more; then the
-   **qwen reviewer** profile reviews contessa's review + the PR and approves/merges
-   (branch protection requires 1 approval). Disagreement or anything unexpected →
-   level 2.
+5. review chain: **contessa** (local qwen, free — does the context-intensive
+   work) reviews the diff-vs-upstream and test output — the diff must be exactly
+   the known patch stack, nothing more; then **alpha-prime** (qwen 3.7) approves
+   and merges routine PRs and signs off smoke tests (branch protection requires
+   1 approval), then advances the stack pointer
+   (`git push origin +<candidate>:atm/stack`). **Loki** (frontier, expensive) is
+   NOT in the routine path — non-trivial PRs, reviewer disagreement, or anything
+   unexpected → level 2.
 
 **Level 2 — escalation (agent judgment):** triggered by rebase conflict, test
 failure, or reviewer rejection. The escalation agent is **loki** (hermes-agent-atm
