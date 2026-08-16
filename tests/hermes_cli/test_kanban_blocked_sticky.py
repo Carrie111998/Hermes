@@ -76,6 +76,58 @@ def test_worker_block_is_not_auto_promoted_by_recompute_ready(kanban_home: Path)
             assert kb.get_task(conn, tid).status == "blocked"
 
 
+def test_initially_blocked_child_requires_explicit_unblock_after_parent_completion(
+    kanban_home: Path,
+) -> None:
+    """A child created as blocked is a human gate, not a dependency wait."""
+    with kb.connect() as conn:
+        parent_id = kb.create_task(conn, title="implementation")
+        blocked_child_id = kb.create_task(
+            conn,
+            title="human approval",
+            parents=[parent_id],
+            initial_status="blocked",
+        )
+        ready_child_id = kb.create_task(
+            conn,
+            title="ordinary dependent",
+            parents=[parent_id],
+        )
+
+        blocked_child = kb.get_task(conn, blocked_child_id)
+        ready_child = kb.get_task(conn, ready_child_id)
+        assert blocked_child is not None and blocked_child.status == "blocked"
+        assert ready_child is not None and ready_child.status == "todo"
+
+        parent = kb.claim_task(conn, parent_id, claimer="test-parent")
+        assert parent is not None
+        assert kb.complete_task(
+            conn,
+            parent_id,
+            summary="implementation complete",
+            expected_run_id=parent.current_run_id,
+        )
+
+        blocked_child = kb.get_task(conn, blocked_child_id)
+        ready_child = kb.get_task(conn, ready_child_id)
+        assert ready_child is not None and ready_child.status == "ready"
+        assert blocked_child is not None and blocked_child.status == "blocked"
+        assert kb.claim_task(conn, blocked_child_id, claimer="must-not-claim") is None
+        before_unblock_events = {
+            row["kind"]
+            for row in conn.execute(
+                "SELECT kind FROM task_events WHERE task_id = ?",
+                (blocked_child_id,),
+            ).fetchall()
+        }
+        assert before_unblock_events.isdisjoint({"promoted", "claimed", "spawned"})
+
+        assert kb.unblock_task(conn, blocked_child_id)
+        blocked_child = kb.get_task(conn, blocked_child_id)
+        assert blocked_child is not None and blocked_child.status == "ready"
+        assert kb.claim_task(conn, blocked_child_id, claimer="after-unblock") is not None
+
+
 
 
 # ---------------------------------------------------------------------------
