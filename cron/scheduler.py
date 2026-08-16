@@ -4709,12 +4709,16 @@ def run_job(
         # clear_session_vars also clears _SESSION_CWD internally, so no
         # separate clear_session_cwd() call is needed.
         clear_session_vars(_ctx_tokens)
+        # Restore the caller's delegated-child identity first. A ContextVar
+        # reset can raise for a stale token, and this boundary must not leak
+        # cron's root identity back to the scheduler caller if another reset
+        # fails during cleanup.
+        if _delegated_child_token is not None:
+            _DELEGATED_CHILD_CONTEXT.reset(_delegated_child_token)
         if _cron_session_token is not None:
             _cron_session_var.reset(_cron_session_token)
         if _non_dispatcher_token is not None:
             exit_non_dispatcher_owned_context(_non_dispatcher_token)
-        if _delegated_child_token is not None:
-            _DELEGATED_CHILD_CONTEXT.reset(_delegated_child_token)
         for _var_name in _cron_delivery_vars:
             _VAR_MAP[_var_name].set("")
         if _session_db:
