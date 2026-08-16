@@ -244,7 +244,7 @@ Anything on this list is delivered as a native attachment on platforms that supp
 
 ### Media routing and batching
 
-Inbound media routing on Telegram is table-driven. The adapter maps image extensions and MIME types via `_TELEGRAM_IMAGE_EXTENSIONS`, `_TELEGRAM_IMAGE_MIME_TO_EXT`, and `_TELEGRAM_IMAGE_EXT_TO_MIME` (currently `.png`, `.jpg`, `.jpeg`, `.webp`, `.gif`); voice/audio use `_TELEGRAM_VOICE_EXTS` / `_TELEGRAM_AUDIO_ATTACHMENT_EXTS` from the base platform class. These tables are module constants and not user-configurable today.
+Inbound media routing on Telegram is table-driven. The adapter maps image extensions and MIME types (currently `.png`, `.jpg`, `.jpeg`, `.webp`, `.gif`); voice/audio are handled via the base platform class. These tables are module constants and not user-configurable today.
 
 Rapid bursts (albums, client-side message splits) are debounced into a single agent turn. Operators can tune the timing via environment variables:
 
