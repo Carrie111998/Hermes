@@ -117,6 +117,7 @@ def _run_with_fakes(monkeypatch, client, events: list[str], *, decision: Any = N
 
     monkeypatch.setattr("agent.session_write_policy.pre_spawn_consult", fake_pre_spawn_consult)
     monkeypatch.setattr("agent.copilot_acp_client._build_subprocess_env", fake_build_env)
+    monkeypatch.setattr("agent.copilot_acp_client._acp_supported", lambda *_args, **_kwargs: True)
     monkeypatch.setattr("agent.copilot_acp_client.subprocess.Popen", fake_popen)
 
     result = client._run_prompt("hello", timeout_seconds=1)
@@ -222,6 +223,7 @@ def _run_real_policy_context(monkeypatch, tmp_path, policy: SessionWritePolicy) 
         return _FakePopenProcess()
 
     monkeypatch.setattr("agent.copilot_acp_client._build_subprocess_env", fake_build_env)
+    monkeypatch.setattr("agent.copilot_acp_client._acp_supported", lambda *_args, **_kwargs: True)
     monkeypatch.setattr("agent.copilot_acp_client.subprocess.Popen", fake_popen)
 
     with session_write_policy_scope(policy):

@@ -3050,11 +3050,12 @@ def test_module_loads_when_fcntl_missing(monkeypatch):
         print('WINDOWS_IMPORT_OK')
         """
     )
+    repo_root = Path(__file__).resolve().parents[2]
     result = subprocess.run(
         [sys.executable, "-c", probe],
         capture_output=True,
         text=True,
-        cwd="/home/jr-ubuntu/.hermes/hermes-agent",
+        cwd=str(repo_root),
         timeout=60,
     )
     assert result.returncode == 0, (

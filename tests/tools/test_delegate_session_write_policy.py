@@ -382,6 +382,8 @@ def test_child_execution_binds_normal_policy_and_restores_external_context(monke
         lambda argv, **kwargs: popen_calls.append({"argv": argv, "kwargs": kwargs})
         or _FakeACPProcess(),
     )
+    monkeypatch.setattr("agent.copilot_acp_client._acp_supported", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr("shutil.which", lambda cmd: f"/usr/bin/{cmd}")
     parent = _parent(
         SessionWritePolicy.normal("parent-normal"),
         acp_command="fake-copilot",
