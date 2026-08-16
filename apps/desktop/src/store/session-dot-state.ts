@@ -28,6 +28,7 @@ import { computed } from 'nanostores'
 import { stableArray, stableRecord } from '@/lib/stable-array'
 
 import { $backgroundRunningSessionIds } from './composer-status'
+import { $goalsBySession } from './goals'
 import { $sessions, $unreadFinishedSessionIds, lineageAliases } from './session'
 import {
   $attentionSessionIds,
@@ -102,6 +103,7 @@ let dotStates: Readonly<Record<string, SessionDotState>> = {}
 export const $sessionDotStateById = computed(
   [
     $attentionSessionIds,
+    $goalsBySession,
     $workingSessionIds,
     $stalledSessionIds,
     $backgroundRunningSessionIds,
@@ -111,7 +113,7 @@ export const $sessionDotStateById = computed(
     $sessions,
     $unreadWriteGuard
   ],
-  (attention, working, stalled, background, delegating, unread, draft, sessions, unreadWriteGuard) => {
+  (attention, goals, working, stalled, background, delegating, unread, draft, sessions, unreadWriteGuard) => {
     const next: Record<string, SessionDotState> = {}
 
     const claim = (ids: readonly string[], state: SessionDotState) => {
@@ -157,6 +159,15 @@ export const $sessionDotStateById = computed(
 
     claim(persistedUnread, 'unread')
 
+    // A standing Goal can keep working between model turns. Treat it as
+    // background work so the sidebar does not fall back to an idle dot while
+    // the Goal remains active; a live turn below still upgrades it to working.
+    claim(
+      Object.entries(goals)
+        .filter(([, goal]) => goal.status === 'active' || goal.status === 'waiting')
+        .map(([id]) => id),
+      'background'
+    )
     claim(background, 'background')
     // Async delegation: the parent turn has ended but its subagents are still
     // running, so the session's work continues in child sessions. Same visual
