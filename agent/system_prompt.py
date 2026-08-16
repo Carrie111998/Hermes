@@ -50,7 +50,7 @@ from agent.prompt_builder import (
     drain_truncation_warnings,
 )
 from agent.runtime_cwd import resolve_context_cwd
-from hermes_constants import get_hermes_home
+from hermes_constants import get_default_hermes_root, get_hermes_home
 from pathlib import Path
 from utils import is_truthy_value
 
@@ -163,9 +163,16 @@ def _plugin_session_info(agent: Any) -> Dict[str, str]:
     except Exception:
         cwd = ""
     try:
-        from hermes_cli.profiles import get_active_profile_name
+        # Prefer the agent's own home (override-aware, session_db fallback) —
+        # ambient get_active_profile_name() misreports on threads that lost
+        # the HERMES_HOME ContextVar (#86313 class; plugin half per @helix4u).
+        _home = _agent_home(agent)
+        if _home is not None:
+            profile_name = _profile_name_for_home(_home)
+        else:
+            from hermes_cli.profiles import get_active_profile_name
 
-        profile_name = str(get_active_profile_name() or "default")
+            profile_name = str(get_active_profile_name() or "default")
     except Exception:
         profile_name = "default"
     return {
@@ -264,15 +271,33 @@ def _plugin_section_blocks(sections: tuple, position: str) -> List[str]:
 
 
 def _agent_home(agent: Any) -> Optional[Path]:
-    """The agent's OWN profile home, resolved from its dedicated session_db.
+    """The agent's OWN profile home.
 
-    The agent's ``_session_db.db_path`` is ``<home>/state.db`` — ground truth
-    for which profile this agent belongs to, independent of any HERMES_HOME
-    ContextVar (which a build thread can lose: ContextVars don't propagate
-    into ``threading.Thread``, so an unbound build falls back to the launch
-    home and leaks the default profile's skills/identity into a bot prompt).
-    Returns None when it can't be resolved so callers fall back to ambient.
+    Resolution order:
+
+    1. A bound HERMES_HOME ContextVar override wins. Surfaces that multiplex
+       several profiles over ONE shared session DB (the messaging gateway:
+       ``gateway/run.py`` hands every agent the launch-home ``state.db`` and
+       binds the profile home per turn via ``_profile_runtime_scope`` +
+       ``copy_context``) would otherwise have the db-derived launch home
+       STOMP the correctly-bound profile — inverting the leak this helper
+       exists to fix (found by @kshitijk4poor's post-merge probe on #86313).
+    2. Fallback: the home containing the agent's ``_session_db.db_path``
+       (``<home>/state.db``) — ground truth on threads that lost the
+       ContextVar (ContextVars don't propagate into ``threading.Thread``),
+       where the unbound build previously fell back to the launch home and
+       leaked the default profile's skills/identity into a bot prompt.
+
+    Returns None when neither resolves so callers fall back to ambient.
     """
+    try:
+        from hermes_constants import get_hermes_home_override
+
+        override = get_hermes_home_override()
+        if override:
+            return Path(override)
+    except Exception:
+        pass
     try:
         db = getattr(agent, "_session_db", None)
         db_path = getattr(db, "db_path", None)
@@ -352,7 +377,10 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # cwd project instructions disabled.
     _soul_loaded = False
     if agent.load_soul_identity or not agent.skip_context_files:
-        _soul_content = _r.load_soul_md(_ctx_len)
+        # Scope the SOUL.md read to the agent's OWN home (see _agent_home) —
+        # ambient resolution on a thread that lost the HERMES_HOME ContextVar
+        # reads the launch profile's SOUL.md instead (#50233).
+        _soul_content = _r.load_soul_md(_ctx_len, home_override=_agent_home(agent))
         if _soul_content:
             stable_parts.append(_soul_content)
             _soul_loaded = True
@@ -586,10 +614,8 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # paths. Without an agent home, keep the ambient resolution byte-identical
     # to the legacy behavior (and patchable via this module's get_hermes_home).
     if _agent_home_path is not None:
-        from hermes_constants import get_default_hermes_root as _root_fn
-
         _home_str = str(_agent_home_path)
-        _root_str = str(_root_fn())
+        _root_str = str(get_default_hermes_root())
     else:
         _home_str = _root_str = str(get_hermes_home())
     if active_profile == "default":
@@ -602,11 +628,20 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
             "you to."
         )
     else:
+        # A non-default name is only ever returned when the resolved home is
+        # ALREADY <root>/profiles/<name> — that is exactly how both
+        # _profile_name_for_home() and _resolve_active_profile_name() derive
+        # it. So the profile home is the session home itself; appending
+        # /profiles/<name> again doubled it (#72894). The default profile's
+        # data sits at the ROOT (get_default_hermes_root()), which in ambient
+        # profile mode is NOT get_hermes_home().
+        profile_home = _home_str
+        default_root = get_default_hermes_root()
         post_workspace_parts.append(
             f"Active Hermes profile: {active_profile}. This session reads "
-            f"and writes {_home_str}/. The default "
-            f"profile's data lives at {_root_str}/skills/, {_root_str}/plugins/, "
-            f"{_root_str}/cron/, {_root_str}/memories/ — those belong to a "
+            f"and writes {profile_home}/. The default "
+            f"profile's data lives at {default_root}/skills/, {default_root}/plugins/, "
+            f"{default_root}/cron/, {default_root}/memories/ — those belong to a "
             f"different session run from a different shell. Do NOT modify "
             f"another profile's skills/plugins/cron/memories unless the user "
             f"explicitly directs you to. The cross-profile write guard will "
@@ -685,7 +720,8 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         context_files_prompt = _r.build_context_files_prompt(
             cwd=resolve_context_cwd(), skip_soul=_soul_loaded,
             context_length=_ctx_len,
-            allow_install_tree_fallback=agent.platform in ("cli", "tui"))
+            allow_install_tree_fallback=agent.platform in ("cli", "tui"),
+            home_override=_agent_home(agent))
         if context_files_prompt:
             context_parts.append(context_files_prompt)
 
@@ -733,7 +769,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         _plugin_section_blocks(_frozen_plugin_prompt_sections(agent), "after_memory")
     )
 
-    from hermes_time import now as _hermes_now
+    from hermes_time import get_timezone as _hermes_tz, now as _hermes_now
     now = _hermes_now()
     # Date-only (not minute-precision) so the system prompt is byte-stable
     # for the full day.  Minute-precision changes invalidate prefix-cache KV
@@ -741,7 +777,31 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # session resume without a stored prompt).  The model can still query the
     # exact wall-clock time via tools when it actually needs it.
     # Credit: @iamfoz (PR #20451).
-    timestamp_line = f"Conversation started: {now.strftime('%A, %B %d, %Y')}"
+    #
+    # Zone and UTC offset ARE included: tools that accept instants reject naive
+    # datetimes and require an explicit offset, and with the bare date the model
+    # has to infer EST vs EDT on its own (a coin-flip near a DST boundary, and a
+    # wrong guess silently writes the record onto the wrong day).  Both values
+    # are constant for the whole day -- they shift only at a DST transition --
+    # so the byte-stability the comment above depends on is preserved.
+    # ``get_timezone()`` returns None when no timezone is configured, in which
+    # case we fall back to the abbreviation of the server-local (still tz-aware)
+    # time.
+    _tz = _hermes_tz()
+    _zone_bits = []
+    _iana = getattr(_tz, "key", None)
+    if _iana:
+        _zone_bits.append(_iana)
+    _abbrev = now.strftime("%Z")
+    if _abbrev and _abbrev != _iana:
+        _zone_bits.append(_abbrev)
+    _offset = now.strftime("%z")
+    if _offset:  # '-0400' -> 'UTC-04:00'
+        _zone_bits.append(f"UTC{_offset[:3]}:{_offset[3:]}")
+    _zone_suffix = f" ({', '.join(_zone_bits)})" if _zone_bits else ""
+    timestamp_line = (
+        f"Conversation started: {now.strftime('%A, %B %d, %Y')}{_zone_suffix}"
+    )
     if agent.pass_session_id and agent.session_id:
         timestamp_line += f"\nSession ID: {agent.session_id}"
     if agent.model:
