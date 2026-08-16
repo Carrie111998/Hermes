@@ -111,6 +111,14 @@ SIGNAL_GROUP_ALLOWED_USERS=groupId1,groupId2     # Enable groups (omit to disabl
 SIGNAL_HOME_CHANNEL=+1234567890                  # Default delivery target for cron jobs
 ```
 
+Behavior settings belong in `~/.hermes/config.yaml`:
+
+```yaml
+signal:
+  require_mention: true
+  observe_unmentioned_group_messages: true
+```
+
 Then start the gateway:
 
 ```bash
@@ -140,6 +148,24 @@ Group access is controlled by the `SIGNAL_GROUP_ALLOWED_USERS` env var:
 | Not set (default) | All group messages are ignored. The bot only responds to DMs. |
 | Set with group IDs | Only listed groups are monitored (e.g., `groupId1,groupId2`). |
 | Set to `*` | The bot responds in any group it's a member of. |
+
+### Passive group context
+
+When `signal.require_mention: true`, Hermes normally drops unmentioned group
+messages. Set `signal.observe_unmentioned_group_messages: true` in
+`config.yaml` to keep up to 50 recent text messages per allowed group as
+background context for the next message that explicitly mentions the bot.
+
+Observed messages never start an agent turn, typing indicator, tool call, or
+reaction. The pending buffer is memory-only, isolated per group, consumed by
+the next authorized addressed message, and cleared on gateway restart. Its text
+then becomes context on that normal addressed turn. Attachments from unmentioned
+messages are not downloaded, and messages from senders outside the configured
+user allowlist are not buffered.
+
+When one primary Signal transport is shared across multiplexed profile routes,
+passive buffering is skipped for chats routed to another profile. Addressed
+messages continue through the normal profile-routing path.
 
 ---
 
