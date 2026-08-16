@@ -11783,17 +11783,54 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         why an otherwise matching session was skipped without making live
         sessions eligible for destructive pruning.
         """
-        self._apply_prune_age_filter(older_than_days, filters)
-        where, params = self._prune_filter_where(source=source, **filters)
-        ended_guard = "s.ended_at IS NOT NULL"
-        if not where.startswith(ended_guard):
-            raise RuntimeError("prune filter lost its ended-session safety guard")
-        open_where = f"s.ended_at IS NULL{where[len(ended_guard):]}"
+        open_where, params = self._open_prune_filter_where(
+            older_than_days, source, filters
+        )
         with self._lock:
             cursor = self._conn.execute(
                 f"SELECT COUNT(*) FROM sessions s WHERE {open_where}", params
             )
             return int(cursor.fetchone()[0])
+
+    def _open_prune_filter_where(
+        self,
+        older_than_days: Optional[float],
+        source: Optional[str],
+        filters: Dict[str, Any],
+    ) -> Tuple[str, List[Any]]:
+        """Build the prune filter with only its ended-session guard inverted."""
+        self._apply_prune_age_filter(older_than_days, filters)
+        where, params = self._prune_filter_where(source=source, **filters)
+        ended_guard = "s.ended_at IS NOT NULL"
+        if not where.startswith(ended_guard):
+            raise RuntimeError("prune filter lost its ended-session safety guard")
+        return f"s.ended_at IS NULL{where[len(ended_guard):]}", params
+
+    def archive_open_prune_matches(
+        self,
+        older_than_days: Optional[float] = None,
+        source: str = None,
+        **filters,
+    ) -> int:
+        """Archive unended sessions matching the otherwise-destructive prune filters.
+
+        This is deliberately separate from :meth:`prune_sessions`: destructive
+        pruning must retain its ended-session guard. Only unarchived rows are
+        selected, and each match is archived through ``set_session_archived`` so
+        compression lineages remain hidden and recoverable as a unit.
+        """
+        filters["archived"] = False
+        open_where, params = self._open_prune_filter_where(
+            older_than_days, source, filters
+        )
+        with self._lock:
+            cursor = self._conn.execute(
+                f"SELECT s.id FROM sessions s WHERE {open_where}", params
+            )
+            session_ids = [row["id"] for row in cursor.fetchall()]
+        for session_id in session_ids:
+            self.set_session_archived(session_id, True)
+        return len(session_ids)
 
     def archive_sessions(
         self,

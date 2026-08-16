@@ -575,6 +575,41 @@ class TestSessionManagementEndpoints:
         assert db.get_session("sess-old-open") is not None
         db.close()
 
+    def test_prune_include_live_archives_open_and_deletes_ended_sessions(self):
+        from hermes_state import SessionDB
+
+        db = SessionDB()
+        db.create_session(session_id="include-live-open", source="include-live-test")
+        db.create_session(session_id="include-live-ended", source="include-live-test")
+        db.end_session("include-live-ended", "completed")
+        db._conn.execute(
+            "UPDATE sessions SET started_at = ? WHERE id IN (?, ?)",
+            (1.0, "include-live-open", "include-live-ended"),
+        )
+        db._conn.commit()
+        db.close()
+
+        r = self.client.post(
+            "/api/sessions/prune",
+            json={
+                "older_than_days": 1,
+                "source": "include-live-test",
+                "include_live": True,
+            },
+        )
+
+        assert r.status_code == 200
+        assert r.json() == {
+            "ok": True,
+            "removed": 1,
+            "archived": 1,
+            "skipped_open": 0,
+        }
+        db = SessionDB()
+        assert db.get_session("include-live-ended") is None
+        assert db.get_session("include-live-open")["archived"] == 1
+        db.close()
+
 
 
 class TestSkillsHubSearchEndpoint:

@@ -1154,6 +1154,27 @@ class TestPruneSessions:
             older_than_days=90, source="cron", archived=False
         )} == {"ended"}
 
+    def test_archive_open_prune_matches_preserves_ended_sessions(self, db):
+        db.create_session(session_id="matching-open", source="cron")
+        db.create_session(session_id="other-source", source="cli")
+        db.create_session(session_id="ended", source="cron")
+        db.end_session("ended", "completed")
+        old = time.time() - 200 * 86400
+        db._conn.execute(
+            "UPDATE sessions SET started_at = ? WHERE id IN (?, ?, ?)",
+            (old, "matching-open", "other-source", "ended"),
+        )
+        db._conn.commit()
+
+        archived = db.archive_open_prune_matches(
+            older_than_days=90, source="cron"
+        )
+
+        assert archived == 1
+        assert db.get_session("matching-open")["archived"] == 1
+        assert db.get_session("other-source")["archived"] == 0
+        assert db.get_session("ended")["archived"] == 0
+
 
 
 

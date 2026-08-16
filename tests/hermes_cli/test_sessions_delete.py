@@ -81,6 +81,10 @@ def _run_prune(monkeypatch, capsys, argv_tail, candidates=None, skipped_open=0):
         def prune_sessions(self, **kwargs):
             return len(rows)
 
+        def archive_open_prune_matches(self, **kwargs):
+            seen["archived_open_with"] = kwargs
+            return skipped_open
+
         def close(self):
             pass
 
@@ -127,3 +131,32 @@ def test_sessions_prune_surfaces_matching_open_sessions(monkeypatch, capsys):
     assert "prune only deletes ended sessions" in out
     assert "hermes sessions delete <id>" in out
     assert "No sessions match" in out
+
+
+def test_sessions_prune_include_live_archives_matching_open_sessions(monkeypatch, capsys):
+    filters, out = _run_prune(
+        monkeypatch,
+        capsys,
+        ["--source", "cron", "--include-live", "--yes"],
+        skipped_open=2,
+    )
+
+    archived_filters = filters.pop("archived_open_with")
+    assert archived_filters == filters
+    assert "Pruned 2 ended session(s); archived 2 open session(s)." in out
+    assert "will be skipped" not in out
+
+
+def test_sessions_prune_include_live_runs_when_only_open_sessions_match(monkeypatch, capsys):
+    filters, out = _run_prune(
+        monkeypatch,
+        capsys,
+        ["--source", "cron", "--include-live", "--yes"],
+        candidates=[],
+        skipped_open=2,
+    )
+
+    archived_filters = filters.pop("archived_open_with")
+    assert archived_filters == filters
+    assert "Pruned 0 ended session(s); archived 2 open session(s)." in out
+    assert "No sessions match" not in out
