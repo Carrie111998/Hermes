@@ -33,6 +33,15 @@ DEFAULT_CONFIG = {
     # sessions (no live client) so accumulated agents don't pile up under memory
     # pressure. Reopening one re-resumes it from disk. 0/null disables.
     "max_live_sessions": 16,
+    "session": {
+        # Per-terminal `hermes -c`: each CLI session drops a breadcrumb file
+        # under $HERMES_HOME/terminal-sessions/<terminal-id>, and a bare
+        # -c/--continue resumes THIS terminal's session (tmux pane, kitty
+        # window, wezterm pane, plain tty, ...) instead of the globally
+        # most-recent one. Set false to restore the old latest-session
+        # behavior everywhere.
+        "terminal_continue": True,
+    },
     "agent": {
         "max_turns": 500,
         # Inactivity timeout for gateway agent execution (seconds).
@@ -650,6 +659,17 @@ DEFAULT_CONFIG = {
                                       # threshold and this token count. Clamped to
                                       # the model's context length at apply-time.
         "target_ratio": 0.20,         # fraction of threshold to preserve as recent tail
+        "tail_mode": "legacy",        # tail retention policy (#87326):
+                                      #   "legacy" — 0.20×window verbatim tail (default)
+                                      #   "lean"   — clamped 2.5%-of-window tail
+                                      #              (10K floor / 25K cap) plus chunked
+                                      #              digests, a mechanical anchor index,
+                                      #              verbatim user messages, and
+                                      #              session_search recovery pointers in
+                                      #              the summary. ~3x fewer retained
+                                      #              tokens after compaction; costs a few
+                                      #              extra summarizer calls at the
+                                      #              compaction boundary.
         "protect_last_n": 20,         # minimum recent messages to keep uncompressed
         "min_tail_user_messages": 1,  # REAL (actionable) user messages guaranteed to
                                       # survive in the uncompressed tail. 1 = existing
