@@ -3252,10 +3252,38 @@ def read_raw_config_readonly() -> Dict[str, Any]:
         return cached_copy
 
 
+def _is_read_only_config_check(argv: Optional[List[str]] = None) -> bool:
+    """Return whether the current CLI invocation is ``config check``.
+
+    Profile selectors are accepted here even though ``hermes_cli.main``
+    normally removes them before dispatch. Keeping this guard independent of
+    dispatcher ordering also protects startup hooks that run after argument
+    parsing but before the subcommand handler.
+    """
+    args = list(sys.argv[1:] if argv is None else argv)
+    command_args: List[str] = []
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if arg == "--profile":
+            index += 2
+            continue
+        if arg.startswith("--profile=") or arg == "--default":
+            index += 1
+            continue
+        command_args.append(arg)
+        index += 1
+    return command_args[:2] == ["config", "check"]
+
+
 def require_readable_config_before_write(config_path: Optional[Path] = None) -> None:
-    """Refuse to replace an existing config.yaml that cannot be read."""
+    """Refuse config writes from read-only or unreadable contexts."""
     if config_path is None:
         config_path = get_config_path()
+    if _is_read_only_config_check():
+        raise RuntimeError(
+            f"Refusing to write {config_path}: `hermes config check` is read-only."
+        )
     try:
         config_path.stat()
     except FileNotFoundError:
