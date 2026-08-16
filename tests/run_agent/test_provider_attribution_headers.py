@@ -6,6 +6,8 @@ referrerUrl / appName / User-Agent flow into gateway analytics.
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from run_agent import AIAgent
 
 
@@ -53,6 +55,84 @@ def test_named_remote_ollama_keeps_configured_provider_headers():
     assert agent._client_kwargs["default_headers"] == {
         "Authorization": "remote-header-sentinel"
     }
+
+
+def _write_ollama_header_config(tmp_path, *, base_url):
+    (tmp_path / "config.yaml").write_text(
+        f"""\
+model:
+  default_headers:
+    Authorization: model-default-header-sentinel
+  extra_headers:
+    X-Model-Token: model-extra-header-sentinel
+providers:
+  ollama:
+    base_url: {base_url}
+    extra_headers:
+      X-Provider-Token: provider-header-sentinel
+""",
+        encoding="utf-8",
+    )
+
+
+@pytest.mark.parametrize(
+    ("provider", "requested_provider"),
+    [("custom", "ollama"), ("ollama", None)],
+)
+def test_full_constructor_and_rebuild_drop_all_local_ollama_headers(
+    tmp_path, monkeypatch, provider, requested_provider
+):
+    """Both client creation paths isolate model and provider headers locally."""
+    base_url = "http://127.0.0.1:11434/v1"
+    _write_ollama_header_config(tmp_path, base_url=base_url)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr("run_agent.OpenAI", MagicMock(return_value=MagicMock()))
+
+    agent = AIAgent(
+        api_key="no-key-required",
+        base_url=base_url,
+        provider=provider,
+        requested_provider=requested_provider,
+        api_mode="chat_completions",
+        model="local-model",
+        quiet_mode=True,
+        skip_context_files=True,
+        skip_memory=True,
+    )
+
+    assert agent._client_kwargs.get("default_headers") is None
+    agent._apply_client_headers_for_base_url(base_url)
+    assert agent._client_kwargs.get("default_headers") is None
+
+
+def test_full_constructor_and_rebuild_keep_remote_ollama_headers(tmp_path, monkeypatch):
+    """Remote Ollama retains configured credentials and header behavior."""
+    base_url = "https://ollama.remote.example/v1"
+    _write_ollama_header_config(tmp_path, base_url=base_url)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr("run_agent.OpenAI", MagicMock(return_value=MagicMock()))
+
+    agent = AIAgent(
+        api_key="remote-credential-sentinel",
+        base_url=base_url,
+        provider="custom",
+        requested_provider="ollama",
+        api_mode="chat_completions",
+        model="remote-model",
+        quiet_mode=True,
+        skip_context_files=True,
+        skip_memory=True,
+    )
+
+    expected_headers = {
+        "Authorization": "model-default-header-sentinel",
+        "X-Model-Token": "model-extra-header-sentinel",
+        "X-Provider-Token": "provider-header-sentinel",
+    }
+    assert agent.api_key == "remote-credential-sentinel"
+    assert agent._client_kwargs["default_headers"] == expected_headers
+    agent._apply_client_headers_for_base_url(base_url)
+    assert agent._client_kwargs["default_headers"] == expected_headers
 
 
 @patch("run_agent.OpenAI")

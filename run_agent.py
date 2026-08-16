@@ -6351,6 +6351,11 @@ class AIAgent:
         """
         if self.api_mode in ("anthropic_messages", "bedrock_converse"):
             return
+        from hermes_cli.runtime_provider import _is_named_loopback_ollama_route
+
+        route_provider = getattr(self, "requested_provider", "") or self.provider
+        if _is_named_loopback_ollama_route(route_provider, self.base_url):
+            return
         from agent.auxiliary_client import (
             _apply_user_default_headers as _merge_user_headers,
         )

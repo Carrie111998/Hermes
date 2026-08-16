@@ -1429,11 +1429,15 @@ def init_agent(
             # custom_providers[].extra_headers) — proxies, gateways, custom
             # auth. Applied last so the most specific config level wins.
             # SECURITY: values may carry credentials — never log them.
-            apply_custom_provider_extra_headers_to_client_kwargs(
-                client_kwargs,
-                _cp_base_url,
-                _cp_entries,
-            )
+            from hermes_cli.runtime_provider import _is_named_loopback_ollama_route
+
+            route_provider = agent.requested_provider or agent.provider
+            if not _is_named_loopback_ollama_route(route_provider, _cp_base_url):
+                apply_custom_provider_extra_headers_to_client_kwargs(
+                    client_kwargs,
+                    _cp_base_url,
+                    _cp_entries,
+                )
         except Exception:
             logger.debug("custom-provider TLS resolution skipped", exc_info=True)
 

@@ -136,6 +136,28 @@ def test_named_loopback_ollama_explicit_endpoint_bypasses_pool_credentials(monke
     assert pool_calls == []
 
 
+@pytest.mark.parametrize(
+    ("requested_provider", "base_url", "expected"),
+    [
+        ("ollama", "http://127.0.0.1:11434/v1", True),
+        ("ollama", "http://127.0.0.2:11434/v1", True),
+        ("ollama", "http://127.255.255.254:11434/v1", True),
+        ("ollama", "http://[::1]:11434/v1", True),
+        ("ollama", "http://localhost:11434/v1", True),
+        ("ollama", "http://0.0.0.0:11434/v1", True),
+        ("ollama", "http://[::2]:11434/v1", False),
+        ("ollama", "http://128.0.0.1:11434/v1", False),
+        ("ollama", "https://ollama.remote.example/v1", False),
+        ("custom:ollama", "http://127.0.0.2:11434/v1", False),
+    ],
+)
+def test_named_loopback_ollama_route_uses_parsed_loopback_addresses(
+    requested_provider, base_url, expected
+):
+    """Loopback classification accepts the whole IPv4 range and parsed IPv6."""
+    assert rp._is_named_loopback_ollama_route(requested_provider, base_url) is expected
+
+
 def test_named_remote_ollama_preserves_configured_credentials_and_headers(tmp_path, monkeypatch):
     """The local credential boundary does not change remote Ollama routes."""
     (tmp_path / "config.yaml").write_text(

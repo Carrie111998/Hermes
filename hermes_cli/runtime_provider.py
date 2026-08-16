@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+from ipaddress import ip_address
 from urllib.parse import urlparse
 from typing import Any, Dict, Optional
 
@@ -70,8 +71,15 @@ def _normalize_custom_provider_name(value: str) -> str:
 
 
 def _loopback_hostname(host: str) -> bool:
-    h = (host or "").lower().rstrip(".")
-    return h in {"localhost", "127.0.0.1", "::1", "0.0.0.0"}
+    h = (host or "").lower().rstrip(".").strip("[]")
+    if h in {"localhost", "0.0.0.0"}:
+        # Preserve Hermes' existing wildcard-bind compatibility. A listener
+        # configured this way is still a local Ollama route.
+        return True
+    try:
+        return ip_address(h).is_loopback
+    except ValueError:
+        return False
 
 
 def _is_named_loopback_ollama_route(requested_provider: str, base_url: str) -> bool:
