@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import signal
 import subprocess
@@ -83,6 +84,18 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parse_args(argv)
     log_path: Path = args.error_log
+
+    # macOS launchd sets XPC_SERVICE_NAME to the job label only for its DIRECT
+    # child. This wrapper re-execs the real gateway as a grandchild via
+    # Popen, and on macOS 26 the grandchild sees the interactive-shell
+    # sentinel "0" instead — so the gateway's supervised-conflict guard
+    # (``_guard_supervised_gateway_conflict``) fails to recognize itself as
+    # launchd-owned, detects its own service as "already running", and
+    # exit(1)s into a KeepAlive respawn loop. Re-export the supervisor
+    # marker through the escape hatch designed for wrappers that replace
+    # the child environment (gateway/restart.py EXTERNAL_GATEWAY_SUPERVISOR_ENV).
+    if os.environ.get("XPC_SERVICE_NAME", "") not in ("", "0"):
+        os.environ.setdefault("HERMES_GATEWAY_EXTERNAL_SUPERVISOR", "1")
 
     try:
         proc = subprocess.Popen(args.command, stderr=subprocess.PIPE)
