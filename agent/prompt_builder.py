@@ -1235,6 +1235,12 @@ def _probe_remote_backend(env_type: str) -> str | None:
                 "modal_mode": config.get("modal_mode", "auto"),
                 "docker_volumes": config.get("docker_volumes", []),
                 "docker_mount_cwd_to_workspace": config.get("docker_mount_cwd_to_workspace", False),
+                # Sibling container_config sites (terminal/file/code_execution)
+                # carry this too — without it the probe container silently
+                # falls back to bridge networking while the session container
+                # honors the no-network lockdown (#87995, same asymmetry class
+                # as #46358).
+                "docker_network": config.get("docker_network", True),
                 "docker_forward_env": config.get("docker_forward_env", []),
                 "docker_env": config.get("docker_env", {}),
                 "docker_run_as_host_user": config.get("docker_run_as_host_user", False),
