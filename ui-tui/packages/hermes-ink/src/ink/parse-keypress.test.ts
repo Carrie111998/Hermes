@@ -4,12 +4,11 @@ import { INITIAL_STATE, parseMultipleKeypresses } from './parse-keypress.js'
 import { PASTE_END, PASTE_START } from './termio/csi.js'
 
 describe('legacy modified return parsing', () => {
-  it('parses ESC+CR as one Alt+Enter keypress', () => {
-    const [keys] = parseMultipleKeypresses(INITIAL_STATE, '\x1b\r')
+  it.each(['\r', '\n'])('parses ESC+%j as one Alt+Enter keypress', lineEnding => {
+    const sequence = `\x1b${lineEnding}`
+    const [keys] = parseMultipleKeypresses(INITIAL_STATE, sequence)
 
-    expect(keys).toEqual([
-      expect.objectContaining({ name: 'return', ctrl: false, meta: true, shift: false, sequence: '\x1b\r' })
-    ])
+    expect(keys).toEqual([expect.objectContaining({ name: 'return', ctrl: false, meta: true, shift: false, sequence })])
   })
 })
 

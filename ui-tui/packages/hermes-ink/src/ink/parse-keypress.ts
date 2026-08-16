@@ -292,7 +292,7 @@ export function parseMultipleKeypresses(
   const inputString = isFlush ? '' : inputToString(input)
 
   // Get or create tokenizer
-  const tokenizer = prevState._tokenizer ?? createTokenizer({ x10Mouse: true })
+  const tokenizer = prevState._tokenizer ?? createTokenizer({ x10Mouse: true, legacyAltEnter: true })
 
   // Tokenize the input
   const tokens = isFlush ? tokenizer.flush() : tokenizer.feed(inputString)
@@ -796,7 +796,7 @@ function parseKeypress(s: string = ''): ParsedKey {
     return createNavKey(s, 'mouse', false)
   }
 
-  if (s === '\r' || s === '\n' || s === '\x1b\r') {
+  if (s === '\r' || s === '\n' || s === '\x1b\r' || s === '\x1b\n') {
     key.raw = undefined
     key.name = 'return'
     key.meta = s.startsWith('\x1b')
