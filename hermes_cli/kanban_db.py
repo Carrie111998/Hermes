@@ -3029,6 +3029,10 @@ def _is_busy_error(exc: BaseException) -> bool:
     )
 
 
+class NotificationClaimBusyError(RuntimeError):
+    """A bounded notification cursor claim could not acquire the board writer."""
+
+
 def _execute_boundary_with_retry(conn: sqlite3.Connection, sql: str) -> None:
     for attempt in range(_BUSY_MAX_RETRIES + 1):
         try:
@@ -11400,6 +11404,61 @@ def unseen_events_for_sub(
     return max_id, out
 
 
+@contextlib.contextmanager
+def _notification_claim_txn(
+    conn: sqlite3.Connection, lock_wait_timeout_ms: Optional[int]
+):
+    """Run one cursor claim with an optional single board-lock wait."""
+    if lock_wait_timeout_ms is None:
+        with write_txn(conn):
+            yield
+        return
+    _assert_not_delegated_child_mutation()
+    if lock_wait_timeout_ms <= 0:
+        raise ValueError("lock_wait_timeout_ms must be positive")
+    if getattr(conn, "in_transaction", False):
+        raise RuntimeError("notification claim cannot start inside a transaction")
+
+    timeout_row = conn.execute("PRAGMA busy_timeout").fetchone()
+    previous_timeout_ms = (
+        int(timeout_row[0]) if timeout_row and timeout_row[0] is not None else 0
+    )
+    conn.execute(f"PRAGMA busy_timeout={int(lock_wait_timeout_ms)}")
+    try:
+        # Do not use write_txn's general retries here: each retry can consume
+        # another full busy timeout while the caller holds state.db reserved.
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+        except sqlite3.OperationalError as exc:
+            if _is_busy_error(exc):
+                # Do not let SessionDB._execute_write mistake this board expiry
+                # for state.db contention and retry the whole ownership claim.
+                raise NotificationClaimBusyError(
+                    "notification board claim lock wait expired"
+                ) from exc
+            raise
+        try:
+            yield
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.OperationalError:
+                pass
+            raise
+        else:
+            try:
+                conn.execute("COMMIT")
+            except Exception:
+                try:
+                    conn.execute("ROLLBACK")
+                except sqlite3.OperationalError:
+                    pass
+                raise
+            _check_file_length_invariant(conn)
+    finally:
+        conn.execute(f"PRAGMA busy_timeout={previous_timeout_ms}")
+
+
 def claim_unseen_events_for_sub(
     conn: sqlite3.Connection,
     *,
@@ -11408,6 +11467,7 @@ def claim_unseen_events_for_sub(
     chat_id: str,
     thread_id: Optional[str] = None,
     kinds: Optional[Iterable[str]] = None,
+    lock_wait_timeout_ms: Optional[int] = None,
 ) -> tuple[int, int, list[Event]]:
     """Atomically claim unseen notification events for one subscription.
 
@@ -11422,8 +11482,12 @@ def claim_unseen_events_for_sub(
     Callers should send the claimed events, then either leave the cursor at
     ``new_cursor`` on success or call :func:`rewind_notify_cursor` if delivery
     failed before any terminal unsubscribe removed the row.
+
+    ``lock_wait_timeout_ms`` bounds only this claim's board writer acquisition.
+    The general Kanban transaction timeout and retry policy remains unchanged.
     """
-    with write_txn(conn):
+
+    with _notification_claim_txn(conn, lock_wait_timeout_ms):
         row = conn.execute(
             "SELECT last_event_id FROM kanban_notify_subs "
             "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?",

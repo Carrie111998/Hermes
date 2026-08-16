@@ -12,7 +12,9 @@ unsubscribe) and ``_format_kanban_event_text``.
 """
 
 from contextlib import contextmanager
+import sqlite3
 from threading import Event, Thread
+import time
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -67,6 +69,131 @@ def _live_session_db(monkeypatch, tmp_path):
 
 
 class TestCollectKanbanNotifications:
+    def test_bounded_claim_rejects_delegated_child_before_cursor_mutation(
+        self, monkeypatch
+    ):
+        tid = _create_subscribed_task()
+        _complete(tid, summary="delegated child must not claim")
+        pre_cursor = _sub_rows(tid)[0]["last_event_id"]
+
+        conn = kb.connect()
+        try:
+            monkeypatch.setenv("HERMES_DELEGATED_CHILD_CONTEXT", "1")
+            with pytest.raises(PermissionError, match="delegate_task child contexts"):
+                kb.claim_unseen_events_for_sub(
+                    conn,
+                    task_id=tid,
+                    platform="tui",
+                    chat_id=SESSION_KEY,
+                    lock_wait_timeout_ms=75,
+                )
+            assert _sub_rows(tid)[0]["last_event_id"] == pre_cursor
+
+            monkeypatch.delenv("HERMES_DELEGATED_CHILD_CONTEXT")
+            old_cursor, new_cursor, events = kb.claim_unseen_events_for_sub(
+                conn,
+                task_id=tid,
+                platform="tui",
+                chat_id=SESSION_KEY,
+                lock_wait_timeout_ms=75,
+            )
+        finally:
+            conn.close()
+
+        assert old_cursor == pre_cursor
+        assert new_cursor > old_cursor
+        assert len(events) == 1
+        assert events[0].kind == "completed"
+        assert _sub_rows(tid)[0]["last_event_id"] == new_cursor
+
+    def test_board_lock_expiry_releases_state_and_retries_claim_once(
+        self, monkeypatch, tmp_path
+    ):
+        """A contended board must not pin the state ownership transaction."""
+        state_path = tmp_path / "state.db"
+        state_db = SessionDB(state_path)
+        state_db.create_session("parent", source="desktop")
+        monkeypatch.setattr(tui_server, "_get_db", lambda: state_db)
+
+        tid = _create_subscribed_task(chat_id="parent")
+        _complete(tid, summary="retry after board contention")
+        pre_cursor = _sub_rows(tid)[0]["last_event_id"]
+
+        # Keep the general connection wait small enough for a fast RED while
+        # requiring the claim-specific path to fit within one bounded wait,
+        # rather than multiplying it by write_txn's boundary retries.
+        claim_budget_ms = 75
+        monkeypatch.setenv("HERMES_KANBAN_BUSY_TIMEOUT_MS", str(claim_budget_ms))
+        monkeypatch.setattr(
+            tui_server,
+            "_KANBAN_NOTIFY_CLAIM_BUSY_TIMEOUT_MS",
+            claim_budget_ms,
+            raising=False,
+        )
+
+        board_lock = kb.connect()
+        board_lock.execute("BEGIN IMMEDIATE")
+        claim_entered = Event()
+        original_claim = kb.claim_unseen_events_for_sub
+
+        def record_claim(*args, **kwargs):
+            claim_entered.set()
+            return original_claim(*args, **kwargs)
+
+        monkeypatch.setattr(kb, "claim_unseen_events_for_sub", record_claim)
+        outcome = {}
+
+        def collect():
+            started = time.monotonic()
+            try:
+                outcome["value"] = _collect_kanban_notifications(_session("parent"))
+            except BaseException as exc:  # surfaced on the asserting thread
+                outcome["error"] = exc
+            finally:
+                outcome["elapsed"] = time.monotonic() - started
+
+        claim_thread = Thread(target=collect, name="bounded-notify-claim")
+        claim_thread.start()
+        assert claim_entered.wait(5), "collector never reached the locked board claim"
+
+        state_write_done = Event()
+        state_outcome = {}
+
+        def write_state():
+            started = time.monotonic()
+            state_writer = sqlite3.connect(state_path, timeout=2, isolation_level=None)
+            try:
+                state_writer.execute("BEGIN IMMEDIATE")
+                state_writer.execute("ROLLBACK")
+            except BaseException as exc:  # surfaced on the asserting thread
+                state_outcome["error"] = exc
+            finally:
+                state_writer.close()
+                state_outcome["elapsed"] = time.monotonic() - started
+                state_write_done.set()
+
+        state_thread = Thread(target=write_state, name="state-writer-after-claim-expiry")
+        state_thread.start()
+        claim_thread.join(2)
+        assert not claim_thread.is_alive(), "board claim exceeded its bounded wait"
+        assert "error" not in outcome, outcome
+        assert outcome["value"] == []
+        assert outcome["elapsed"] < 0.5
+        assert state_write_done.wait(1), "state.db stayed reserved after claim expiry"
+        state_thread.join(1)
+        assert "error" not in state_outcome, state_outcome
+        assert state_outcome["elapsed"] < 0.5
+
+        assert _sub_rows(tid)[0]["last_event_id"] == pre_cursor
+        board_lock.execute("ROLLBACK")
+        board_lock.close()
+
+        retry = _collect_kanban_notifications(_session("parent"))
+        assert len(retry) == 1
+        assert "retry after board contention" in retry[0]
+        assert _collect_kanban_notifications(_session("parent")) == []
+        assert _sub_rows(tid)[0]["last_event_id"] > pre_cursor
+
     def test_parent_subscription_claims_only_at_live_multi_hop_compression_tip(
         self, monkeypatch, tmp_path
     ):
@@ -189,7 +316,7 @@ class TestCollectKanbanNotifications:
         _complete(tid, summary="deliver before compression")
         pre_cursor = _sub_rows(tid)[0]["last_event_id"]
 
-        original_write_txn = kb.write_txn
+        original_claim_txn = kb._notification_claim_txn
         pause = {
             "armed": False,
             "entered": Event(),
@@ -198,14 +325,14 @@ class TestCollectKanbanNotifications:
 
         @contextmanager
         def pause_inside_board_claim(conn, *args, **kwargs):
-            with original_write_txn(conn, *args, **kwargs):
+            with original_claim_txn(conn, *args, **kwargs):
                 if pause["armed"]:
                     pause["armed"] = False
                     pause["entered"].set()
                     assert pause["release"].wait(5), "board claim was never released"
                 yield
 
-        monkeypatch.setattr(kb, "write_txn", pause_inside_board_claim)
+        monkeypatch.setattr(kb, "_notification_claim_txn", pause_inside_board_claim)
 
         def start_thread(name, target):
             outcome = {}

@@ -9466,6 +9466,10 @@ _KANBAN_NOTIFY_KINDS = (
     "status", "archived", "unblocked",
 )
 _KANBAN_SILENT_KINDS = frozenset({"archived", "unblocked"})
+# The ownership transaction reserves state.db until the board cursor CAS
+# commits. Bound only that board writer acquisition so general Kanban lock
+# retries cannot pin state writers for minutes under board contention.
+_KANBAN_NOTIFY_CLAIM_BUSY_TIMEOUT_MS = 1000
 _KANBAN_POLL_SECONDS = 5.0
 _LOOP_POLL_SECONDS = 5.0
 
@@ -9705,18 +9709,26 @@ def _collect_kanban_notifications(session: dict) -> list:
             for sub in subs:
                 if (sub.get("platform") or "").lower() != "tui":
                     continue
-                claimed = session_db.claim_if_notification_owner(
-                    str(sub.get("chat_id") or ""),
-                    session_key,
-                    lambda: _kb.claim_unseen_events_for_sub(
-                        conn,
-                        task_id=sub["task_id"],
-                        platform=sub["platform"],
-                        chat_id=sub["chat_id"],
-                        thread_id=sub.get("thread_id") or "",
-                        kinds=_KANBAN_NOTIFY_KINDS,
-                    ),
-                )
+                try:
+                    claimed = session_db.claim_if_notification_owner(
+                        str(sub.get("chat_id") or ""),
+                        session_key,
+                        lambda: _kb.claim_unseen_events_for_sub(
+                            conn,
+                            task_id=sub["task_id"],
+                            platform=sub["platform"],
+                            chat_id=sub["chat_id"],
+                            thread_id=sub.get("thread_id") or "",
+                            kinds=_KANBAN_NOTIFY_KINDS,
+                            lock_wait_timeout_ms=(
+                                _KANBAN_NOTIFY_CLAIM_BUSY_TIMEOUT_MS
+                            ),
+                        ),
+                    )
+                except _kb.NotificationClaimBusyError:
+                    # SessionDB rolled back state.db; leave the board cursor
+                    # unchanged so the next poll can retry the same event.
+                    continue
                 if claimed is None:
                     continue
                 _old, _new, events = claimed
