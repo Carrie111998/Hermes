@@ -1851,7 +1851,7 @@ def _run_llm_review(prompt: str) -> Dict[str, Any]:
 
     def _bounded_summary(value: str, fallback: str = "") -> str:
         text = value or fallback
-        return text[:240] + "…" if len(text) > 240 else text
+        return text[:239] + "…" if len(text) > 240 else text
 
     try:
         from run_agent import AIAgent
