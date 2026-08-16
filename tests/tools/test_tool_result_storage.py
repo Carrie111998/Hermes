@@ -12,12 +12,16 @@ from tools.tool_result_storage import (
     HEREDOC_MARKER,
     PERSISTED_OUTPUT_TAG,
     PERSISTED_OUTPUT_CLOSING_TAG,
+    RETENTION_DAYS,
     STORAGE_DIR,
     _build_persisted_message,
     _heredoc_marker,
+    _last_cleanup_at,
     _resolve_storage_dir,
     _safe_result_filename,
+    _should_run_cleanup,
     _write_to_sandbox,
+    cleanup_stale_results,
     enforce_turn_budget,
     generate_preview,
     maybe_persist_tool_result,
@@ -169,6 +173,11 @@ class TestBuildPersistedMessage:
 # ── maybe_persist_tool_result ─────────────────────────────────────────
 
 class TestMaybePersistToolResult:
+    def setup_method(self):
+        # Deterministic cleanup-throttle state: the first persist in each
+        # test triggers the retention sweep.
+        _last_cleanup_at.clear()
+
     def test_below_threshold_returns_unchanged(self):
         content = "small result"
         result = maybe_persist_tool_result(
@@ -194,7 +203,9 @@ class TestMaybePersistToolResult:
         assert PERSISTED_OUTPUT_TAG in result
         assert "tc_456.txt" in result
         assert len(result) < len(content)
-        env.execute.assert_called_once()
+        # Call 1 writes the result; call 2 is the retention sweep.
+        assert env.execute.call_count == 2
+        assert "cat >" in env.execute.call_args_list[0][0][0]
 
     def test_persists_full_content_as_is(self):
         """Content is persisted verbatim — no JSON extraction."""
@@ -213,7 +224,8 @@ class TestMaybePersistToolResult:
         assert PERSISTED_OUTPUT_TAG in result
         # Content is delivered through stdin (no longer embedded in the
         # command string — see test_large_content_via_stdin for why).
-        assert env.execute.call_args[1]["stdin_data"] == content
+        write_call = env.execute.call_args_list[0]
+        assert write_call[1]["stdin_data"] == content
 
 
     def test_tool_use_id_cannot_escape_storage_dir(self):
@@ -228,7 +240,7 @@ class TestMaybePersistToolResult:
             env=env,
             threshold=30_000,
         )
-        cmd = env.execute.call_args[0][0]
+        cmd = env.execute.call_args_list[0][0][0]
         target = cmd.split("cat > ", 1)[1].split(" <<", 1)[0]
 
         assert "Full output saved to: /tmp/hermes-results/outside_whoami_x_" in result
@@ -287,6 +299,72 @@ class TestEnforceTurnBudget:
     def test_empty_messages(self):
         result = enforce_turn_budget([], env=None, config=BudgetConfig(turn_budget=200_000))
         assert result == []
+
+
+# ── cleanup_stale_results ─────────────────────────────────────────────
+
+class TestCleanupStaleResults:
+    def setup_method(self):
+        _last_cleanup_at.clear()
+
+    def test_none_env_is_noop(self):
+        cleanup_stale_results(None)  # must not raise
+
+    def test_runs_find_with_mtime_and_retention(self):
+        env = MagicMock()
+        env.get_temp_dir = None  # fall back to STORAGE_DIR
+        env.execute.return_value = {"output": "", "returncode": 0}
+        cleanup_stale_results(env, STORAGE_DIR)
+        env.execute.assert_called_once()
+        cmd = env.execute.call_args[0][0]
+        assert "find" in cmd
+        assert STORAGE_DIR in cmd
+        assert f"-mtime +{RETENTION_DAYS - 1}" in cmd
+        assert "-delete" in cmd
+        assert "-maxdepth 1" in cmd
+        assert "'*.txt'" in cmd
+
+    def test_throttled_within_interval(self):
+        env = MagicMock()
+        env.execute.return_value = {"output": "", "returncode": 0}
+        cleanup_stale_results(env, STORAGE_DIR)
+        cleanup_stale_results(env, STORAGE_DIR)
+        assert env.execute.call_count == 1
+
+    def test_separate_dirs_each_swept(self):
+        env = MagicMock()
+        env.execute.return_value = {"output": "", "returncode": 0}
+        cleanup_stale_results(env, "/tmp/hermes-results")
+        cleanup_stale_results(env, "/other/hermes-results")
+        assert env.execute.call_count == 2
+
+    def test_execute_failure_swallowed(self):
+        env = MagicMock()
+        env.execute.side_effect = RuntimeError("backend gone")
+        cleanup_stale_results(env, STORAGE_DIR)  # must not raise
+
+    def test_should_run_cleanup_gate(self):
+        assert _should_run_cleanup("/tmp/x", now=1000.0) is True
+        assert _should_run_cleanup("/tmp/x", now=1000.0 + 60) is False
+        assert _should_run_cleanup("/tmp/x", now=1000.0 + 7 * 60 * 60) is True
+
+    def test_persist_triggers_cleanup(self):
+        env = MagicMock()
+        env.get_temp_dir = MagicMock(return_value="/tmp")
+        env.execute.return_value = {"output": "", "returncode": 0}
+        content = "x" * 60_000
+        result = maybe_persist_tool_result(
+            content=content,
+            tool_name="terminal",
+            tool_use_id="tc_cleanup",
+            env=env,
+            threshold=30_000,
+        )
+        assert PERSISTED_OUTPUT_TAG in result
+        # First call writes the result; second call is the cleanup sweep.
+        cmds = [c[0][0] for c in env.execute.call_args_list]
+        assert any("cat >" in c for c in cmds)
+        assert any("find" in c and "-delete" in c for c in cmds)
 
 
 # ── Per-tool threshold integration ────────────────────────────────────

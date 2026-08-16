@@ -27,6 +27,7 @@ import logging
 import os
 import re
 import shlex
+import threading
 import uuid
 
 from tools.budget_config import (
@@ -43,6 +44,17 @@ HEREDOC_MARKER = "HERMES_PERSIST_EOF"
 _BUDGET_TOOL_NAME = "__budget_enforcement__"
 _UNSAFE_RESULT_FILENAME_CHARS = re.compile(r"[^A-Za-z0-9_.-]+")
 _MAX_RESULT_FILENAME_STEM = 120
+
+# Retention for persisted results (port of anomalyco/opencode#40987's
+# truncation-cleanup design, adapted to Hermes' env.execute() model).
+# Persisted results are session artifacts the model reads back within the
+# same conversation; anything older than the retention window is dead weight
+# that otherwise accumulates until a reboot clears /tmp (and on Termux or
+# Docker volumes, never clears at all).
+RETENTION_DAYS = 7
+_CLEANUP_MIN_INTERVAL_SECONDS = 6 * 60 * 60  # at most one sweep per 6h per process
+_cleanup_lock = threading.Lock()
+_last_cleanup_at: dict[str, float] = {}
 
 
 def _resolve_storage_dir(env) -> str:
@@ -116,6 +128,53 @@ def _write_to_sandbox(content: str, remote_path: str, env) -> bool:
     return result.get("returncode", 1) == 0
 
 
+def _should_run_cleanup(storage_dir: str, *, now: float | None = None) -> bool:
+    """Throttle gate: at most one cleanup sweep per storage dir per interval.
+
+    Keeps the sweep off the hot path — persistence fires on large tool
+    results, so without a throttle every oversized result would pay for a
+    ``find`` in the sandbox.
+    """
+    import time
+
+    now = time.monotonic() if now is None else now
+    with _cleanup_lock:
+        last = _last_cleanup_at.get(storage_dir)
+        if last is not None and (now - last) < _CLEANUP_MIN_INTERVAL_SECONDS:
+            return False
+        _last_cleanup_at[storage_dir] = now
+        return True
+
+
+def cleanup_stale_results(env, storage_dir: str | None = None) -> None:
+    """Delete persisted results older than ``RETENTION_DAYS`` (best-effort).
+
+    Uses file mtime — not any timestamp encoded in the filename — as the age
+    signal, matching opencode#40987's fix (ID-embedded timestamps wrap/drift;
+    the filesystem's own clock is authoritative). Runs through env.execute()
+    so it works on every backend (local, Docker, SSH, Modal); failures are
+    swallowed — retention is hygiene, never a reason to fail a tool result.
+
+    ``find -mtime +N`` matches files whose age strictly exceeds N*24h, so
+    ``+{RETENTION_DAYS - 1}`` deletes anything older than RETENTION_DAYS days
+    in whole-day granularity while never touching same-week files.
+    """
+    if env is None:
+        return
+    target = storage_dir or _resolve_storage_dir(env)
+    if not _should_run_cleanup(target):
+        return
+    cmd = (
+        f"[ -d {shlex.quote(target)} ] && "
+        f"find {shlex.quote(target)} -maxdepth 1 -type f -name '*.txt' "
+        f"-mtime +{RETENTION_DAYS - 1} -delete || true"
+    )
+    try:
+        env.execute(cmd, timeout=15)
+    except Exception as exc:
+        logger.debug("Stale persisted-result cleanup failed for %s: %s", target, exc)
+
+
 def _build_persisted_message(
     preview: str,
     has_more: bool,
@@ -185,6 +244,7 @@ def maybe_persist_tool_result(
                     "Persisted large tool result: %s (%s, %d chars -> %s)",
                     tool_name, tool_use_id, len(content), remote_path,
                 )
+                cleanup_stale_results(env, storage_dir)
                 return _build_persisted_message(preview, has_more, len(content), remote_path)
         except Exception as exc:
             logger.warning("Sandbox write failed for %s: %s", tool_use_id, exc)
