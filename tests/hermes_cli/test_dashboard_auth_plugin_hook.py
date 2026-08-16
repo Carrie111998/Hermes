@@ -5,12 +5,17 @@ art).
 """
 from __future__ import annotations
 
-import pytest
+import asyncio
 
-from hermes_cli.dashboard_auth import clear_providers, get_provider
+import pytest
+from starlette.requests import Request
+from starlette.responses import JSONResponse
+
+from hermes_constants import hermes_home_key
+from hermes_cli.dashboard_auth import clear_providers, get_provider, register_provider
 from hermes_cli.dashboard_auth import token_auth
 from hermes_cli.dashboard_auth.base import (
-    DashboardAuthProvider, LoginStart, Session,
+    DashboardAuthProvider, LoginStart, Session, TokenPrincipal,
 )
 from hermes_cli.plugins import PluginContext, PluginManifest, PluginRegistration
 
@@ -18,6 +23,16 @@ from hermes_cli.plugins import PluginContext, PluginManifest, PluginRegistration
 class _Stub(DashboardAuthProvider):
     name = "stub"
     display_name = "Stub IdP"
+    supports_token = True
+
+    def verify_token(self, *, token):
+        if token != "profile-secret":
+            return None
+        return TokenPrincipal(
+            principal="profile-client",
+            provider=self.name,
+            scopes=("write",),
+        )
 
     def start_login(self, *, redirect_uri):
         return LoginStart(redirect_url="x", cookie_payload={})
@@ -33,6 +48,10 @@ class _Stub(DashboardAuthProvider):
 
     def revoke_session(self, *, refresh_token):
         return None
+
+
+async def _call_next_ok(_request):
+    return JSONResponse({"ok": True})
 
 
 class _MinimalManager:
@@ -98,6 +117,38 @@ def test_plugin_ctx_token_route_handle_cleans_up_profile_scoped_policy():
     assert not token_auth.is_token_route(
         "/api/plugin/machine", scope=_MinimalManager.scope_key
     )
+
+
+def test_active_profile_plugin_route_is_visible_to_token_middleware(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    manager = _MinimalManager()
+    manager.scope_key = hermes_home_key()
+    manifest = PluginManifest(name="dashboard-auth-active", version="0.0.1")
+    ctx = PluginContext(manifest=manifest, manager=manager)  # type: ignore[arg-type]
+    register_provider(_Stub())
+    handle = ctx.register_dashboard_token_route(
+        "/api/plugin/machine",
+        provider="stub",
+        required_scopes=("write",),
+    )
+    request = Request(
+        {
+            "type": "http",
+            "scheme": "https",
+            "server": ("example.test", 443),
+            "client": ("127.0.0.1", 1234),
+            "path": "/api/plugin/machine",
+            "query_string": b"",
+            "headers": [(b"authorization", b"Bearer profile-secret")],
+        }
+    )
+
+    response = asyncio.run(token_auth.token_auth_middleware(request, _call_next_ok))
+
+    assert response.status_code == 200
+    assert request.state.token_authenticated is True
+    assert request.state.token_principal.provider == "stub"
+    handle.dispose()
 
 
 def test_plugin_ctx_token_route_tracking_failure_rolls_back_raw_registration():
