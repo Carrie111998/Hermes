@@ -153,6 +153,61 @@ class TestFallbackChainAdvancement:
         assert overlong_value not in serialized
         assert len(serialized.encode("utf-8")) <= 768
 
+    def test_recursive_skip_applies_rate_limit_backoff_once(self):
+        """One API failure must arm one cooldown despite skipped candidates."""
+        agent = _make_agent(
+            fallback_model=[
+                {"provider": "unconfigured", "model": "unavailable"},
+                {"provider": "openai", "model": "gpt-4o"},
+            ]
+        )
+        agent.provider = "ollama"
+        agent.model = "nemotron-3.5-lightning:30b-mlx"
+        agent.base_url = "http://localhost:11434/v1"
+        agent._rate_limited_until = 0
+        frozen = 1_000.0
+
+        with (
+            patch("agent.chat_completion_helpers.time.monotonic", return_value=frozen),
+            patch(
+                "agent.auxiliary_client.resolve_provider_client",
+                side_effect=[(None, None), (_mock_client(), "gpt-4o")],
+            ),
+        ):
+            assert agent._try_activate_fallback(
+                reason=FailoverReason.rate_limit,
+                http_status=429,
+            ) is True
+
+        assert agent._rate_limit_backoff_count == 1
+        assert agent._rate_limited_until == frozen + 60
+        assert agent._last_fallback_event["reason_code"] == "rate_limit"
+        assert agent._last_fallback_event["http_status"] == 429
+
+    def test_exhausted_attempt_preserves_latest_successful_event(self):
+        """A failed later attempt cannot erase the task's latest transition."""
+        agent = _make_agent(
+            fallback_model=[{"provider": "openai", "model": "gpt-4o"}]
+        )
+        agent.provider = "ollama"
+        agent.model = "nemotron-3.5-lightning:30b-mlx"
+        agent.base_url = "http://localhost:11434/v1"
+        with patch(
+            "agent.auxiliary_client.resolve_provider_client",
+            return_value=(_mock_client(), "gpt-4o"),
+        ):
+            assert agent._try_activate_fallback(
+                reason=FailoverReason.timeout,
+                http_status=504,
+            ) is True
+
+        latest_event = dict(agent._last_fallback_event)
+        assert agent._try_activate_fallback(
+            reason=FailoverReason.timeout,
+            http_status=504,
+        ) is False
+        assert agent._last_fallback_event == latest_event
+
 
 
     def test_skips_unconfigured_provider_to_next(self):

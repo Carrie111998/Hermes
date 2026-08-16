@@ -2563,6 +2563,7 @@ def try_activate_fallback(
     http_status: Optional[int] = None,
     _initial_provider: Optional[str] = None,
     _initial_model: Optional[str] = None,
+    _diagnostic_reason: "FailoverReason | None" = None,
 ) -> bool:
     """Switch to the next fallback model/provider in the chain.
 
@@ -2576,16 +2577,18 @@ def try_activate_fallback(
     mappings.
     """
     if _initial_provider is None and _initial_model is None:
-        agent._last_fallback_event = None
         _initial_provider = getattr(agent, "provider", "")
         _initial_model = getattr(agent, "model", "")
+    if _diagnostic_reason is None:
+        _diagnostic_reason = reason
 
     def _try_next_fallback() -> bool:
         return agent._try_activate_fallback(
-            reason,
+            None,
             http_status=http_status,
             _initial_provider=_initial_provider,
             _initial_model=_initial_model,
+            _diagnostic_reason=_diagnostic_reason,
         )
 
     if reason in {FailoverReason.rate_limit, FailoverReason.billing, FailoverReason.upstream_rate_limit}:
@@ -2991,10 +2994,10 @@ def try_activate_fallback(
                 "initial_model": _initial_model,
                 "selected_fallback_provider": fb_provider,
                 "selected_fallback_model": fb_model,
-                "failure_class": _fallback_failure_class(reason),
+                "failure_class": _fallback_failure_class(_diagnostic_reason),
                 "reason_code": (
-                    reason.value
-                    if isinstance(reason, FailoverReason)
+                    _diagnostic_reason.value
+                    if isinstance(_diagnostic_reason, FailoverReason)
                     else FailoverReason.unknown.value
                 ),
                 "http_status": http_status,

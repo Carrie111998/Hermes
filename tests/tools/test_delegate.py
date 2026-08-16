@@ -573,7 +573,7 @@ class TestDelegateObservability(unittest.TestCase):
             mock_child.model = "glm-5.2"
             mock_child.session_prompt_tokens = 10
             mock_child.session_completion_tokens = 5
-            mock_child._last_fallback_event = {
+            polluted_event = {
                 "initial_provider": "ollama",
                 "initial_model": "nemotron-3.5-lightning:30b-mlx",
                 "selected_fallback_provider": "ollama-cloud",
@@ -585,13 +585,18 @@ class TestDelegateObservability(unittest.TestCase):
                 "prompt": prompt_sentinel,
                 "headers": {"authorization": secret_sentinel},
             }
-            mock_child.run_conversation.return_value = {
-                "final_response": "done",
-                "completed": True,
-                "interrupted": False,
-                "api_calls": 2,
-                "messages": [],
-            }
+
+            def run_with_fallback_event(*args, **kwargs):
+                mock_child._last_fallback_event = polluted_event
+                return {
+                    "final_response": "done",
+                    "completed": True,
+                    "interrupted": False,
+                    "api_calls": 2,
+                    "messages": [],
+                }
+
+            mock_child.run_conversation.side_effect = run_with_fallback_event
             MockAgent.return_value = mock_child
 
             result = json.loads(

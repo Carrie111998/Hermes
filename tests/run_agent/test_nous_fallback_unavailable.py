@@ -7,7 +7,7 @@ to the next provider.
 
 from __future__ import annotations
 
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from run_agent import AIAgent
 
@@ -95,6 +95,9 @@ class TestNousFallbackLocalAvailability:
         ), patch(
             "agent.auxiliary_client.resolve_provider_client",
             return_value=(_mock_client(api_key="fb"), "anthropic/claude-sonnet-4.6"),
+        ), patch(
+            "agent.anthropic_adapter.build_anthropic_client",
+            return_value=MagicMock(),
         ):
             activated = agent._try_activate_fallback(None)
         assert activated is True

@@ -6989,6 +6989,7 @@ class AIAgent:
         http_status: Optional[int] = None,
         _initial_provider: Optional[str] = None,
         _initial_model: Optional[str] = None,
+        _diagnostic_reason: "FailoverReason | None" = None,
     ) -> bool:
         """Forwarder — see ``agent.chat_completion_helpers.try_activate_fallback``."""
         from agent.chat_completion_helpers import try_activate_fallback
@@ -6998,6 +6999,7 @@ class AIAgent:
             http_status=http_status,
             _initial_provider=_initial_provider,
             _initial_model=_initial_model,
+            _diagnostic_reason=_diagnostic_reason,
         )
 
     def _has_pending_fallback(self) -> bool:

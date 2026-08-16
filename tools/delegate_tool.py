@@ -2751,6 +2751,12 @@ def _run_single_child(
             list(file_state.known_reads(parent_task_id)) if parent_task_id else []
         )
 
+        # A child object may be reused by an embedding/test harness, but one
+        # delegated task must never inherit a prior task's diagnostic. Reset
+        # exactly once at the task boundary; a same-task schema retry below
+        # intentionally keeps any event produced by the first turn.
+        child._last_fallback_event = None
+
         # Run child with an optional hard timeout (off by default —
         # result(timeout=None) blocks until the child finishes). Stuck-child
         # protection comes from the heartbeat staleness monitor instead.

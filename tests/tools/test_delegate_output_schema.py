@@ -215,6 +215,45 @@ class TestRunSingleChildSchemaValidation:
         # final summary is the retried (valid) answer
         assert json.loads(entry["summary"])["city"] == "Oslo"
 
+    def test_task_boundary_resets_stale_event_but_schema_retry_keeps_fresh_event(self):
+        stale_event = {
+            "initial_provider": "stale-primary",
+            "initial_model": "stale-model",
+            "selected_fallback_provider": "stale-fallback",
+            "selected_fallback_model": "stale-fallback-model",
+            "failure_class": "unknown",
+            "reason_code": "unknown",
+            "http_status": None,
+        }
+        fresh_event = {
+            "initial_provider": "ollama",
+            "initial_model": "nemotron-3.5-lightning:30b-mlx",
+            "selected_fallback_provider": "ollama-cloud",
+            "selected_fallback_model": "glm-5.2",
+            "failure_class": "availability",
+            "reason_code": "overloaded",
+            "http_status": 503,
+        }
+        child = _StubChild(["not json", '{"city": "Oslo"}'])
+        child._delegate_output_schema = ADDRESS_SCHEMA
+        child._last_fallback_event = stale_event
+        observed_before_turn = []
+        original_run = child.run_conversation
+
+        def run_and_activate(user_message, task_id=None, **kwargs):
+            observed_before_turn.append(child._last_fallback_event)
+            result = original_run(user_message, task_id=task_id, **kwargs)
+            if len(observed_before_turn) == 1:
+                child._last_fallback_event = fresh_event
+            return result
+
+        child.run_conversation = run_and_activate
+        entry = _run(child)
+
+        assert observed_before_turn == [None, fresh_event]
+        assert entry["schema_retries"] == 1
+        assert entry["fallback_event"] == fresh_event
+
     def test_invalid_twice_surfaces_errors_and_stops(self):
         child = _StubChild(["nope", "still nope"])
         child._delegate_output_schema = ADDRESS_SCHEMA
