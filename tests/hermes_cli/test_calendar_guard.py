@@ -1,4 +1,5 @@
 import json
+import os
 import subprocess
 from pathlib import Path
 
@@ -234,6 +235,50 @@ def test_installer_renders_user_units_without_gateway_env(tmp_path):
     assert "hermes_cli.calendar_guard --recover" in service
     assert calls[0][0] == ["systemctl", "--user", "daemon-reload"]
     assert len(calls) == 1
+
+
+def test_rendered_wrapper_preserves_valid_release_path(tmp_path):
+    home = tmp_path / ".hermes"
+    release = home / "releases" / "v1"
+    release.mkdir(parents=True)
+    (release / ".hermes-release-sha").write_text("a" * 40 + "\n")
+    fake_python = tmp_path / "fake-python"
+    output = tmp_path / "wrapper-output"
+    fake_python.write_text(
+        "#!/bin/sh\n"
+        "printf '%s\\n' \"$PYTHONPATH\" > \"$HERMES_TEST_OUTPUT\"\n"
+        "printf '%s\\n' \"$@\" >> \"$HERMES_TEST_OUTPUT\"\n"
+    )
+    fake_python.chmod(0o755)
+
+    install_user_units(
+        home,
+        release,
+        fake_python,
+        unit_dir=tmp_path / "systemd-user",
+        runner=lambda *args, **kwargs: subprocess.CompletedProcess(
+            args, 0, stdout="", stderr=""
+        ),
+    )
+    env = os.environ.copy()
+    env.update(
+        {
+            "HERMES_HOME": str(home),
+            "HERMES_PYTHON": str(fake_python),
+            "HERMES_TEST_OUTPUT": str(output),
+        }
+    )
+    subprocess.run(
+        ["bash", str(home / "scripts" / "hermes_calendar_guard.sh")],
+        check=True,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+
+    lines = output.read_text().splitlines()
+    assert lines[0] == str(release)
+    assert lines[1:] == ["-m", "hermes_cli.calendar_guard", "--check"]
 
 
 def test_installer_only_enables_timer_when_explicitly_requested(tmp_path):

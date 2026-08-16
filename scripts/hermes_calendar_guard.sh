@@ -7,7 +7,7 @@ VENV_PY="${HERMES_PYTHON:-$HERMES_HOME/hermes-agent/venv/bin/python}"
 RELEASE_PATH="@RELEASE_PATH@"
 RELEASE_PYTHON="@PYTHON@"
 
-if [[ "$RELEASE_PATH" == "@RELEASE_PATH@" || ! -d "$RELEASE_PATH" ]]; then
+if [[ ! -d "$RELEASE_PATH" ]]; then
   RELEASE_PATH="$HERMES_HOME/hermes-agent"
 fi
 export PYTHONPATH="$RELEASE_PATH${PYTHONPATH:+:$PYTHONPATH}"
