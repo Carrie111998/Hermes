@@ -363,8 +363,12 @@ def _read_openai_version_fast() -> str | None:
 def _print_fast_version_info() -> None:
     from hermes_cli import __release_date__, __version__
 
+    # PROJECT_ROOT is defined later in this module (after the argparse imports),
+    # so the Termux pre-import fast path must compute it locally instead of
+    # referencing the module-level name (NameError on `hermes --version`).
+    _fast_project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     print(f"Hermes Agent v{__version__} ({__release_date__})")
-    print(f"Install directory: {PROJECT_ROOT}")
+    print(f"Install directory: {_fast_project_root}")
 
     print(f"Python: {sys.version.split()[0]}")
 
