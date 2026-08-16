@@ -3608,3 +3608,33 @@ class TestStaleCrossSigningSignatureWarning:
         assert "cross-signing verified via recovery key" not in caplog.text
 
         await adapter.disconnect()
+
+    @pytest.mark.asyncio
+    async def test_connect_does_not_overclaim_verified_when_check_unavailable(
+        self, monkeypatch, caplog
+    ):
+        """When the server-side check cannot run (None), do not claim 'verified'.
+
+        The local recovery-key signing succeeded, but the server state was
+        never confirmed, so logging 'verified' would overstate what we know.
+        The log must say the check could not run instead.
+        """
+        import logging
+
+        monkeypatch.setenv("MATRIX_RECOVERY_KEY", "EsTfakerecoverykey")
+        adapter = self._encrypted_adapter()
+        mock_client, mock_olm = self._connect_mocks()
+        mock_olm.verify_with_recovery_key = AsyncMock()
+        stale_check = AsyncMock(return_value=None)
+
+        with caplog.at_level(logging.INFO):
+            assert await self._run_connect(
+                adapter, mock_client, mock_olm, stale_check
+            ) is True
+
+        mock_olm.verify_with_recovery_key.assert_awaited_once()
+        stale_check.assert_awaited_once_with(mock_client)
+        assert "cross-signing verified via recovery key" not in caplog.text
+        assert "signature check could not run" in caplog.text
+
+        await adapter.disconnect()

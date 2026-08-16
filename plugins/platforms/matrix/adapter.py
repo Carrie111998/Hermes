@@ -1605,7 +1605,6 @@ class MatrixAdapter(BasePlatformAdapter):
             resp = await client.query_keys({client.mxid: [client.device_id]})
             device_keys = resp.device_keys[client.mxid][client.device_id]
             ssk_obj = resp.self_signing_keys[client.mxid]
-            ssk_pubkey = next(iter(ssk_obj.keys.values()))
         except Exception as exc:
             logger.warning(
                 "Matrix: could not check cross-signing signature state: %s", exc
@@ -1617,22 +1616,30 @@ class MatrixAdapter(BasePlatformAdapter):
             else device_keys
         )
         sigs = (signed.get("signatures") or {}).get(str(client.mxid)) or {}
-        if f"ed25519:{ssk_pubkey}" not in sigs:
-            logger.warning(
-                "Matrix: device %s has no cross-signing signature on the server",
+        # The device should be signed by one of the server's current
+        # self-signing keys. Iterate over all of them rather than assume a
+        # single key: after key rotation the server may serve several, and
+        # the device's signature entry names the specific key id it was
+        # signed with.
+        for key_id, ssk_key in ssk_obj.keys.items():
+            if str(key_id) not in sigs:
+                continue
+            if verify_signature_json(signed, client.mxid, ssk_key, ssk_key):
+                return True
+            # The signature is present under this key id but does not verify.
+            logger.error(
+                "Matrix: the homeserver has a stale cross-signing signature for "
+                "device %s (left over from earlier device-key changes) and "
+                "silently refuses to replace it. Other clients will show this "
+                "bot as unverified and may withhold encryption keys. Fix: sign "
+                "the bot out of this session, create a new access token (fresh "
+                "device ID), update MATRIX_ACCESS_TOKEN, and restart — the "
+                "local crypto store resets automatically on device change.",
                 client.device_id,
             )
             return False
-        if verify_signature_json(signed, client.mxid, ssk_pubkey, ssk_pubkey):
-            return True
-        logger.error(
-            "Matrix: the homeserver has a stale cross-signing signature for "
-            "device %s (left over from earlier device-key changes) and "
-            "silently refuses to replace it. Other clients will show this "
-            "bot as unverified and may withhold encryption keys. Fix: sign "
-            "the bot out of this session, create a new access token (fresh "
-            "device ID), update MATRIX_ACCESS_TOKEN, and restart — the "
-            "local crypto store resets automatically on device change.",
+        logger.warning(
+            "Matrix: device %s has no cross-signing signature on the server",
             client.device_id,
         )
         return False
@@ -2013,18 +2020,31 @@ class MatrixAdapter(BasePlatformAdapter):
                             server_state = (
                                 await self._warn_if_cross_signing_signature_stale(client)
                             )
-                            # Only claim "verified" when the server check did not
-                            # prove the signature stale. On a stale signature the
-                            # helper already logged the actionable error; logging
-                            # "verified" here would contradict it and mislead
-                            # operators into thinking the device is trusted.
-                            if server_state is not False:
+                            # Only claim "verified" when the server check
+                            # confirmed the served signature is valid. When the
+                            # check could not run (None), the local recovery-key
+                            # signing did succeed but we have not confirmed the
+                            # server state, so say exactly that instead of
+                            # overclaiming "verified". When the check returned
+                            # False the helper already logged the actionable
+                            # stale-signature error.
+                            if server_state is True:
                                 logger.info(
                                     "Matrix: cross-signing verified via recovery key"
+                                )
+                            elif server_state is None:
+                                logger.info(
+                                    "Matrix: cross-signing signed via recovery key "
+                                    "(server-side signature check could not run)"
                                 )
                         except Exception as exc:
                             logger.warning("Matrix: recovery key verification failed: %s", exc)
                     else:
+                        # No recovery key configured: the bot only reads the
+                        # server's cross-signing keys here (it cannot sign the
+                        # device without the recovery key), so the stale-
+                        # signature check on the recovery-key path does not
+                        # apply to this branch.
                         try:
                             own_xsign = await olm.get_own_cross_signing_public_keys()
                         except Exception as exc:
