@@ -1,6 +1,6 @@
 ---
 title: "ARCH-003 implementation plan: runtime-state audit and replay verification"
-status: IMPLEMENTATION_PLAN_REVISE_V36_PENDING
+status: IMPLEMENTATION_PLAN_REVISE_V37_PENDING
 date: 2026-08-16
 type: implementation-plan
 ticket: ARCH-003
@@ -134,7 +134,9 @@ prompt construction, legacy `state.db`, or unrelated dirty worktree files.
   remain `CONSISTENT`, `DRIFT`, and `UNKNOWN`. The only permitted codes,
   partitioned by surface, are:
   - shared: `OK`, `KEY_UNAVAILABLE`;
-  - mutation-side only: `LOCK_TIMEOUT`, `WRITE_ABORT`;
+  - mutation-side only: `LOCK_TIMEOUT`, `WRITE_ABORT`. This mutation-side
+    subset covers every write-contract surface: ordinary mutation/genesis,
+    startup transition and durable mode-set, and privileged maintenance writes;
   - verifier-side only: `DRIFT_DETECTED`, `EMPTY_HISTORY`,
     `LEGACY_ORIGIN_MISSING`, `KEY_CHECK_MISMATCH`,
     `DIGEST_PARAMETER_MISMATCH`, `GENERATION_MISMATCH`,
@@ -143,7 +145,8 @@ prompt construction, legacy `state.db`, or unrelated dirty worktree files.
     `REPLAY_LIMIT_EXCEEDED`, `SNAPSHOT_FAILURE`,
     `POST_TERMINAL_EVENT`, and `WRITE_COUNTER_GAP`.
   Gate 3 validates only the shared and verifier-side subsets; Gate 4 tests
-  every member on the surface where it is legal. No implementation may add a
+  every member on the surface where it is legal, including startup and mode
+  transition coverage for mutation-side codes. No implementation may add a
   code outside this partition without a plan revision.
 - Freeze the origin-marker enum before Gate 1 edits:
   `POST_MIGRATION_GENESIS`, `NEW_ENTITY_GENESIS`,
@@ -196,10 +199,12 @@ Within the same migration transaction, add the non-null
 to every runtime-state materialized row. Both have deterministic default `0`;
 backfill all pre-existing rows to `0` for both columns. Install the
 database-level replay-tuple trigger/write-guard for INSERT and
-replay-tuple-changing UPDATE before the migration commits. The INSERT guard
-treats row creation as a replay-tuple change: it starts from the deterministic
-default counter `0` and persists an after-counter of `1`; the UPDATE guard
-advances the counter only when a replay-tuple member changes. No row may be
+replay-tuple-changing UPDATE before the migration commits. The INSERT guard treats row creation as a replay-tuple change: a
+single-statement create starts from the deterministic default counter `0` and
+persists `1`; any further replay-tuple-changing UPDATE in the same transaction
+advances the counter again. The UPDATE guard advances the counter only when a
+replay-tuple member changes, and the transaction's read-back value at commit is
+normative. No row may be
 observable with a missing generation marker or counter or without the guard.
 Migration compatibility tests must verify both columns' nullability, defaults,
 backfills, INSERT/UPDATE guard, generation-marker values, and guard survival
@@ -399,10 +404,12 @@ Migration compatibility tests must assert this posture.
 - Inside that write transaction, compare an existing materialized row's counter
   with the latest journaled after-counter (or baseline sealed counter). For a
   row-creating mutation, no prior materialized counter or journaled
-  after-counter exists: the INSERT trigger/write-guard starts at counter `0`
-  and persists `1`, the mutation emits `NEW_ENTITY_GENESIS` with
-  before-counter `0` and after-counter `1`, and the in-transaction gap
-  comparison is explicitly exempt. A prior or unaware writer's row INSERT
+  after-counter exists: the INSERT trigger/write-guard starts at counter `0`; for a single-statement
+  create it persists `1`, while any further replay-tuple-changing update in
+  the same transaction may advance it beyond `1`. The mutation emits
+  `NEW_ENTITY_GENESIS` with before-counter `0` and the trigger-produced
+  after-counter read back at commit as its after-counter; the in-transaction
+  gap comparison is explicitly exempt. A prior or unaware writer's row INSERT
   receives the same guard treatment and is therefore counter-observable even
   when it emits no event. For a same-epoch ordinary mutation on an existing
   row, a mismatch is a persisted counter gap: abort with mutation-side
@@ -589,7 +596,8 @@ Add deterministic tests for:
 - first post-generation-advance mutation emitting a marked genesis, with a
   plain mutation alone unable to re-establish the epoch;
 - one event per committed replay-tuple mutation;
-- multi-statement replay-tuple mutation reads back the trigger-produced
+- multi-statement replay-tuple mutation, including a row-creating INSERT
+  followed by a replay-tuple-changing UPDATE, reads back the trigger-produced
   after-counter and matches the event at commit;
 - true no-op without an event;
 - owner-version-only mutation;
@@ -1228,6 +1236,22 @@ DGX changes, deployment, repair, or event-sourcing. The corrected plan must
 return to the same authenticated Claude reviewer family and then to AGY on the
 identical packet.
 
+## Implementation-plan review reconciliation v36
+
+The v36 authenticated Claude Opus review returned `REVISE` with one blocking
+and one cleanup correction. The corrections are incorporated above:
+
+1. Row creation uses before-counter `0`, but the trigger-produced after-counter
+   read-back at commit is normative and may exceed `1` for a multi-statement
+   create; Gate 4 covers that path.
+2. The mutation-side reason-code subset explicitly covers ordinary mutations,
+   startup transition/mode-set, and privileged maintenance write contracts.
+
+These remain plan-only corrections and do not authorize source edits, tests,
+DGX changes, deployment, repair, or event-sourcing. The corrected plan must
+return to the same authenticated Claude reviewer family and then to AGY on the
+identical packet.
+
 ## Acceptance criteria
 
 ARCH-003 implementation is ready for its delivery gates only when:
@@ -1257,7 +1281,7 @@ ARCH-003 implementation is ready for its delivery gates only when:
   retention job; entities beyond the replay limit remain UNKNOWN in this ticket,
   and the 100,000-event/100 MiB per-profile threshold is a documented follow-up
   operational review, not an in-ticket operator gate;
-- reconciliation v1 and v5-v35 items are incorporated into the normative
+- reconciliation v1 and v5-v36 items are incorporated into the normative
   Gates 0-4 text (with v2-v4 explicitly folded into the v1/v4 text), and this
   merged plan revision receives the same-family re-review;
 - all focused and relevant tests pass;
@@ -1337,6 +1361,8 @@ ARCH-003 implementation is ready for its delivery gates only when:
   handling, and structural digest-mismatch precedence.
 - v35: deterministic timeout-code mapping, reachable asymmetry direction, and
   removal of duplicate normative rules.
+- v36: normative row-create counter read-back and explicit startup/mode write
+  surface coverage.
 
 
 ## Non-goals
