@@ -313,6 +313,7 @@ export const fr = defineLocale({
       providerApiKeys: 'Clés API',
       providerCustomEndpoints: 'Endpoints personnalisés',
       gateway: 'Passerelle',
+      connections: 'Connexions',
       apiKeys: 'Outils & Clés',
       keybinds: 'Raccourcis clavier',
       keysTools: 'Outils',
@@ -418,6 +419,14 @@ export const fr = defineLocale({
       translucencyDesc: 'Voir votre bureau à travers toute la fenêtre. macOS et Windows uniquement.',
       backdropTitle: 'Fond de conversation',
       backdropDesc: 'L\'image de statue en filigrane derrière la conversation.',
+      terminalFontTitle: 'Police du terminal',
+      terminalFontDesc:
+        'Choisissez une police installée pour les terminaux du bureau. Les Nerd Fonts affichent Powerlevel10k et les icônes de shell ; laissez vide pour utiliser le JetBrains Mono intégré.',
+      terminalFontPlaceholder: 'MesloLGS NF ou une pile de polices CSS',
+      terminalFontPreview: 'Aperçu des glyphes',
+      terminalFontReset: 'Utiliser la valeur par défaut',
+      reactionsTitle: 'Réactions aux messages',
+      reactionsDesc: 'Tapbacks emoji façon iMessage — réagissez aux messages, et Hermes peut réagir aux vôtres.',
       embedsTitle: 'Intégrations inline',
       embedsDesc:
         'Les aperçus riches proviennent de sites tiers (YouTube, X, …). Demander affiche un placeholder jusqu\'à autorisation ; Toujours les charge automatiquement ; Jamais garde les liens bruts.',
@@ -792,7 +801,7 @@ export const fr = defineLocale({
       imported: 'Configuration importée',
       invalidJson: 'JSON de configuration invalide',
       keepAwakeTitle: 'Empêcher la mise en veille',
-      keepAwakeDesc: 'Empêche cette machine de se mettre en veille pour que les exécutions longues ou nocturnes continuent. L\'écran peut toujours s\'assombrir.'
+      keepAwakeDesc: 'Empêcher cette machine de se mettre en veille pendant les exécutions longues ou nocturnes. L\'écran peut encore s\'assombrir.'
     },
     quickEntry: {
       enabledTitle: 'Saisie rapide',
@@ -822,6 +831,50 @@ export const fr = defineLocale({
       replace: 'Remplacer',
       set: 'Définir',
       clear: 'Effacer'
+    },
+    connections: {
+      title: 'Connexions',
+      intro:
+        'Enregistrez chaque endroit où résident vos agents — cet appareil, les passerelles distantes sur votre réseau et les instances Hermes Cloud. Toutes sont stockées ici.',
+      stagedNote:
+        'Les chats et la liste des agents suivent la source que vous choisissez ; le backend de la fenêtre géré par l\'app est toujours choisi dans Paramètres → Passerelle.',
+      loadFailed: 'Impossible de charger les connexions',
+      primaryPill: 'Principale',
+      managedPill: 'Cet appareil',
+      addConnection: 'Ajouter une connexion',
+      editConnection: 'Modifier',
+      removeConnection: 'Supprimer',
+      removeConfirmTitle: 'Supprimer cette connexion ?',
+      removeConfirmDesc: label =>
+        `« ${label} » sera retirée de cette application. L'instance elle-même n'est pas touchée — vous pouvez la rajouter à tout moment.`,
+      makePrimary: 'Définir comme principale',
+      testConnection: 'Tester',
+      testOk: 'Joignable',
+      testFailed: 'Échec du test de connexion',
+      saveFailed: 'Impossible de sauvegarder la connexion',
+      removeFailed: 'Impossible de supprimer la connexion',
+      updateAll: 'Mettre à jour toutes les instances',
+      updateAllRunning: 'Mise à jour de toutes les instances…',
+      updateAllDone: 'Mises à jour lancées',
+      updateAllFailed: 'Échec de la distribution des mises à jour',
+      updateSkippedCloud: 'Géré par Hermes Cloud',
+      kindLocal: 'Local',
+      kindRemote: 'Passerelle distante',
+      kindCloud: 'Hermes Cloud',
+      kindSsh: 'SSH',
+      kindLocalDesc: 'Le runtime Hermes géré par cette application.',
+      kindRemoteDesc: 'Une passerelle Hermes joignable via HTTP(S) — LAN, Tailscale ou internet.',
+      kindCloudDesc: 'Une instance hébergée découverte via votre compte Hermes Cloud.',
+      kindSshDesc: 'Une installation Hermes joignable via SSH.',
+      labelTitle: 'Nom',
+      labelDesc: 'Obligatoire. Affiché partout où cette instance apparaît ; doit être unique (ex. « Homelab », « Laptop boulot »).',
+      labelPlaceholder: 'Homelab',
+      urlTitle: 'URL de la passerelle',
+      sshHostTitle: 'Hôte SSH',
+      save: 'Enregistrer la connexion',
+      saving: 'Enregistrement…',
+      cancel: 'Annuler',
+      empty: 'Aucune connexion enregistrée pour l\'instant.'
     },
     gateway: {
       loading: 'Chargement des paramètres de la passerelle...',
@@ -3053,8 +3106,8 @@ export const fr = defineLocale({
   },
 
   billingBlock: {
-    titleNous: 'Plus de crédits Nous',
-    titleProvider: provider => `Plus de crédits — ${provider}`,
+    titleNous: 'Crédits Nous épuisés',
+    titleProvider: provider => `Crédits épuisés — ${provider}`,
     fallbackMessage: 'Votre compte n\'a plus de crédits. Ajoutez des crédits pour continuer.',
     openBilling: 'Ouvrir la facturation',
     addCredits: 'Ajouter des crédits',
