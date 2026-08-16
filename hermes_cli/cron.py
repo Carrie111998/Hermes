@@ -459,6 +459,12 @@ def _confirm_pinned_model(args, existing_job: Optional[dict] = None) -> bool:
 
 
 def cron_create(args):
+    # Selection-time guards run BEFORE the job is stored: once written, the job
+    # fires unattended inside the gateway, where no confirm prompt is possible.
+    # No-ops unless --model/--provider was passed and a guard actually fires.
+    if not _confirm_pinned_model(args):
+        return 1
+
     # The gateway-lifecycle guard lives in cron.jobs.create_job so it fires on
     # every job-creation path (this CLI subcommand AND the agent's `cronjob`
     # model tool, which calls create_job directly). When it blocks, create_job
