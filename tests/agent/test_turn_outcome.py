@@ -757,6 +757,41 @@ class TestParseJudgeJson:
         assert verdict is not None
         assert verdict["task_succeeded"] is True
 
+    def test_trailing_prose_with_braces(self):
+        from agent.turn_outcome import _parse_judge_json
+
+        # Trailing prose that re-opens a brace must not swallow the verdict —
+        # the object ends at its own balanced closing brace, not the last one.
+        verdict = _parse_judge_json(
+            '{"task_succeeded": false, "confidence": 0.9, "failure_points": ["x"], '
+            '"reason": "wrong"} Then I checked the output. {Re-checked, same result.}'
+        )
+        assert verdict is not None
+        assert verdict["task_succeeded"] is False
+        assert verdict["failure_points"] == ["x"]
+
+    def test_second_json_fragment_ignored(self):
+        from agent.turn_outcome import _parse_judge_json
+
+        # A second object later in the response must not shadow the first.
+        verdict = _parse_judge_json(
+            '{"task_succeeded": true, "confidence": 0.8, "failure_points": [], "reason": "ok"} '
+            '{"task_succeeded": false, "confidence": 0.2}'
+        )
+        assert verdict is not None
+        assert verdict["task_succeeded"] is True
+
+    def test_braces_inside_string_value(self):
+        from agent.turn_outcome import _parse_judge_json
+
+        # Braces inside a quoted string are not object delimiters.
+        verdict = _parse_judge_json(
+            '{"task_succeeded": true, "confidence": 0.6, "failure_points": [], '
+            '"reason": "formatted {like this}"}'
+        )
+        assert verdict is not None
+        assert verdict["task_succeeded"] is True
+
     def test_truncated_object_returns_none(self):
         from agent.turn_outcome import _parse_judge_json
 
@@ -880,6 +915,43 @@ class TestDefaultAuxEvalRealResolution:
         monkeypatch.setattr(
             "agent.turn_outcome._default_outcome_config",
             lambda: {"enabled": True, "max_tokens": 200},
+        )
+
+        assert _default_aux_eval("judge this turn") is None
+
+    def test_empty_choices_returns_none(self, monkeypatch):
+        """A provider response with an empty/missing ``choices`` list must not
+        IndexError into the response shape — it records no verdict."""
+        from agent.turn_outcome import _default_aux_eval
+
+        class _FakeResp:
+            choices = []
+
+        def _fake_call_llm(task=None, **kw):
+            return _FakeResp()
+
+        monkeypatch.setattr("agent.auxiliary_client.call_llm", _fake_call_llm)
+        monkeypatch.setattr(
+            "agent.turn_outcome._default_outcome_config",
+            lambda: {"enabled": True, "max_tokens": 1000},
+        )
+
+        assert _default_aux_eval("judge this turn") is None
+
+    def test_missing_choices_attribute_returns_none(self, monkeypatch):
+        """A response that carries no ``choices`` at all must also be handled."""
+        from agent.turn_outcome import _default_aux_eval
+
+        class _FakeResp:
+            pass
+
+        def _fake_call_llm(task=None, **kw):
+            return _FakeResp()
+
+        monkeypatch.setattr("agent.auxiliary_client.call_llm", _fake_call_llm)
+        monkeypatch.setattr(
+            "agent.turn_outcome._default_outcome_config",
+            lambda: {"enabled": True, "max_tokens": 1000},
         )
 
         assert _default_aux_eval("judge this turn") is None

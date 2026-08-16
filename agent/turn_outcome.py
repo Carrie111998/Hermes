@@ -45,7 +45,6 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Union
@@ -58,11 +57,47 @@ _AUX_TASK = "outcome"
 # "reason"}`` as JSON. Models routinely wrap answers in ```json fences, lead
 # with a sentence of prose, or truncate mid-JSON at max_tokens — a bare
 # ``json.loads(content)`` would return None for all of these and silently
-# record nothing (the eval's verdict is the whole feature). This regex grabs
-# the first JSON object (``{...}``) in the response so prose/fences around it
-# don't kill the parse. A truncated object (unbalanced braces) is rejected,
-# but a valid object embedded anywhere in the text survives.
-_JSON_OBJECT_RE = re.compile(r"\{.*\}", re.DOTALL)
+# record nothing (the eval's verdict is the whole feature). We therefore scan
+# for the first BALANCED ``{...}`` object in the response so prose/fences
+# around it don't kill the parse. The scan is balance-aware and skips braces
+# inside string literals, so trailing prose that re-opens a brace after the
+# object — or a second JSON fragment — cannot swallow the verdict the way a
+# greedy ``{.*}`` match would. A truncated object (unbalanced braces) is
+# rejected, but a valid object embedded anywhere in the text survives.
+
+
+def _first_balanced_json_object(text: str) -> Optional[str]:
+    """Return the first balanced ``{...}`` span in *text*, or None.
+
+    Walks *text* tracking ``{``/``}`` depth and string literals so the scan
+    stops at the object's true closing brace — not the first or last ``}`` in
+    the whole response. A span that balances but isn't valid JSON is still
+    returned; ``json.loads`` in the caller rejects it and the parse ends.
+    """
+    depth = 0
+    start = -1
+    in_string = False
+    escaped = False
+    for i, ch in enumerate(text):
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0 and start != -1:
+                return text[start : i + 1]
+    return None
 
 # The eval-success gate for NEUTRAL outcomes. A neutral (a sample that claims
 # neither success nor failure) is only recorded when the eval declares success
@@ -184,12 +219,12 @@ def _parse_judge_json(content: str) -> Optional[Dict[str, Any]]:
         return parsed if isinstance(parsed, dict) else None
     except (json.JSONDecodeError, TypeError, ValueError):
         pass
-    # Tolerant path: strip fences/prose and parse the first {…} object.
-    match = _JSON_OBJECT_RE.search(text)
-    if not match:
+    # Tolerant path: strip fences/prose and parse the first balanced {…} object.
+    span = _first_balanced_json_object(text)
+    if span is None:
         return None
     try:
-        parsed = json.loads(match.group(0))
+        parsed = json.loads(span)
         return parsed if isinstance(parsed, dict) else None
     except (json.JSONDecodeError, TypeError, ValueError):
         return None
@@ -217,7 +252,12 @@ def _default_aux_eval(prompt: str) -> Optional[Dict[str, Any]]:
             messages=[{"role": "user", "content": prompt}],
             max_tokens=max_tokens,
         )
-        content = getattr(getattr(resp, "choices", [{}])[0].message, "content", "") or ""
+        content = ""
+        for choice in getattr(resp, "choices", None) or ():
+            msg = getattr(choice, "message", None)
+            content = getattr(msg, "content", "") or ""
+            if content:
+                break
         return _parse_judge_json(content)
     except Exception as e:
         logger.debug("outcome aux eval failed: %s", e, exc_info=True)
