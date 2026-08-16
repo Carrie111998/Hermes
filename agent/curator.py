@@ -1930,7 +1930,15 @@ def _run_llm_review(prompt: str, dry_run: bool = False) -> Dict[str, Any]:
             credential_pool=_credential_pool,
             request_overrides=_request_overrides,
             **_agent_kwargs,
-            enabled_toolsets=["skills", "terminal"],
+            enabled_toolsets=(
+                # Dry-run (#87793 follow-up): the terminal toolset expands to
+                # terminal + process, an ungated shell surface that could write
+                # the skill library directly and bypass the skill_manage dry-run
+                # gate.  A dry-run fork gets the skills toolset only — its
+                # readers (skills_list / skill_view) plus the gated
+                # skill_manage — so every write-capable surface is covered.
+                ["skills"] if dry_run else ["skills", "terminal"]
+            ),
             # Umbrella-building over a large skill collection is worth a
             # high iteration ceiling — the pass typically takes 50-100
             # API calls against hundreds of candidate skills. The

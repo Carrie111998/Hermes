@@ -859,6 +859,46 @@ def test_review_fork_restricts_toolsets_to_skills_and_terminal(curator_env, monk
     )
 
 
+def test_dry_run_fork_drops_terminal_toolset(curator_env, monkeypatch):
+    """A dry-run fork must not carry the terminal toolset (#87793 follow-up).
+
+    ``terminal`` expands to terminal + process — an ungated shell surface
+    that can write the skill library directly and bypass the skill_manage
+    dry-run gate.  The dry-run fork gets the skills toolset only: its
+    readers plus the already-gated skill_manage.
+    """
+    curator = curator_env["curator"]
+
+    import importlib
+    importlib.reload(curator)
+
+    captured = {}
+
+    class _StubAgent:
+        def __init__(self, *args, **kwargs):
+            captured["enabled_toolsets"] = kwargs.get("enabled_toolsets", "UNSET")
+            self._memory_write_origin = "assistant_tool"
+            self._memory_nudge_interval = 0
+            self._skill_nudge_interval = 0
+            self._session_messages = []
+
+        def run_conversation(self, user_message=None, **kwargs):
+            return {"final_response": "no change"}
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr("run_agent.AIAgent", _StubAgent)
+
+    meta = curator._run_llm_review("review prompt", dry_run=True)
+
+    assert meta.get("error") is None, meta.get("error")
+    assert captured.get("enabled_toolsets") == ["skills"], (
+        "dry-run curator fork kept write-capable toolsets; expected "
+        f"['skills'], got {captured.get('enabled_toolsets')!r}"
+    )
+
+
 def test_review_fork_toolset_surface_is_skills_plus_terminal():
     """Documentary check on the static surface the fork's kwarg resolves to.
 
