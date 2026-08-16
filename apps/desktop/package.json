@@ -287,5 +287,9 @@
       "uninstallDisplayName": "Hermes",
       "warningsAsErrors": false
     }
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/NousResearch/Hermes-Agent.git"
   }
 }
