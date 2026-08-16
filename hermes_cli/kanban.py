@@ -2683,6 +2683,10 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
                 for (tid, who, current) in res.skipped_per_profile_capped
             ],
             "auto_assigned_default": res.auto_assigned_default,
+            "preclaim_guarded": [
+                {"task_id": tid, "reason": reason}
+                for (tid, reason) in res.preclaim_guarded
+            ],
         }, indent=2))
         return 0
     print(f"Reclaimed:    {res.reclaimed}")
@@ -2720,6 +2724,8 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             f"Skipped (non-spawnable assignee — terminal lane, OK): "
             f"{', '.join(res.skipped_nonspawnable)}"
         )
+    for tid, reason in res.preclaim_guarded:
+        print(f"Deferred (pre-claim gate: {reason}): {tid}")
     return 0
 
 
