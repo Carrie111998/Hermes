@@ -11,10 +11,13 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 from tools.watch_tool import (
+    WATCH_SCHEMA,
     _eval_condition,
     _parse_duration,
     _plan_ticks,
+    _should_notify,
     run_once,
+    stop_all_watches,
 )
 
 
@@ -85,8 +88,15 @@ def test_run_once_echo():
 
 
 def test_run_once_timeout_safe():
-    out = run_once("sleep 5", timeout=1)
+    out = run_once('python -c "import time; time.sleep(5)"', timeout=1)
     assert "timeout after 1s" in out
+
+
+def test_should_notify_rising_edge_and_unconditional_once():
+    assert _should_notify(condition='contains "x"', triggered=True, prev_triggered=False, tick=2) is True
+    assert _should_notify(condition='contains "x"', triggered=True, prev_triggered=True, tick=3) is False
+    assert _should_notify(condition="", triggered=True, prev_triggered=False, tick=1) is True
+    assert _should_notify(condition="", triggered=True, prev_triggered=True, tick=2) is False
 
 
 def test_dispatch_end_to_end_registers_and_runs():
@@ -96,8 +106,7 @@ def test_dispatch_end_to_end_registers_and_runs():
     import tools.watch_tool  # noqa: F401  (self-register side effect)
     from tools.registry import registry
 
-    # ensure registered
-    assert "watch" in [e for e in dir(registry)] or True
+    assert "watch" in registry.get_all_tool_names()
     res = registry.dispatch("watch", {"command": "echo integrated", "interval": 5})
     data = _json.loads(res)
     assert data["status"] == "completed"
@@ -121,43 +130,105 @@ def test_dispatch_condition_match_and_no_match():
     assert miss["observations"][0]["triggered"] is False
 
 
-def test_background_loop_runs_on_event_loop():
-    """End-to-end: the watch handler must run its poll loop as a background task
-    on a live event loop and surface a notification when the condition matches.
-    This catches the regression where dispatch never forwarded the agent object,
-    silently disabling all background polling."""
-    import asyncio
+def test_background_poll_survives_dispatch_without_agent_loop():
+    """Production agents have no ``_loop``. Polling must live on a worker
+    thread that keeps ticking after ``registry.dispatch`` returns — the
+    gateway ``_run_async`` worker loop would cancel an asyncio task here.
+    """
     import json as _json
+    import time as _time
     import tools.watch_tool  # noqa: F401
     from tools.registry import registry
 
     class FakeAgent:
         def __init__(self):
-            self._watch_sessions = {}
-            self._loop = None
-            self.notify_calls = []
-        def notify(self, msg):
-            self.notify_calls.append(msg)
+            self.status_calls = []
+        def _emit_status(self, msg):
+            self.status_calls.append(msg)
 
     agent = FakeAgent()
-    ticks = {"n": 0}
+    hold = registry.dispatch(
+        "watch",
+        {
+            "command": 'python -c "import time; time.sleep(2); print(\'hold\')"',
+            "interval": 5,
+            "duration": "30s",
+            "condition": "NEVER",
+        },
+        agent=agent,
+    )
+    hold_data = _json.loads(hold)
+    assert hold_data["status"] == "running"
+    assert "_task" not in hold_data
+    hold_session = agent._watch_sessions[hold_data["watch_id"]]
+    assert hold_session["_task"].is_alive(), "watch worker must outlive dispatch"
+    stop_all_watches(agent)
 
-    async def main():
-        # The handler reads agent._loop; bind it to the running loop.
-        agent._loop = asyncio.get_running_loop()
-        res = registry.dispatch(
-            "watch",
-            {"command": "echo STATUS_UP", "interval": 1, "condition": "UP", "duration": "3s"},
-            agent=agent,
-        )
-        data = _json.loads(res)
-        assert data["status"] == "running"  # background task scheduled
-        await asyncio.sleep(3.5)  # let the background poll tick
-
-    asyncio.run(main())
-
-    # Locate the session the handler created on the agent.
+    res = registry.dispatch(
+        "watch",
+        {"command": "echo STATUS_UP", "interval": 5, "condition": "UP", "duration": "30s"},
+        agent=agent,
+    )
+    data = _json.loads(res)
+    assert data["status"] == "running"
+    assert "_task" not in data
     session = next(iter(agent._watch_sessions.values()))
+    worker = session.get("_task")
+    assert worker is not None
+    assert worker.is_alive(), "watch worker must outlive dispatch"
+    deadline = _time.time() + 3
+    while _time.time() < deadline and session.get("status") == "running":
+        _time.sleep(0.05)
     assert session["status"] == "matched"
-    assert len(session["observations"]) >= 1
-    assert agent.notify_calls, "condition match must trigger a notification"
+    assert session["observations"]
+    assert agent.status_calls, "match must go through agent._emit_status"
+    stop_all_watches(agent)
+
+
+def test_watch_list_and_stop_lifecycle():
+    import json as _json
+    import tools.watch_tool  # noqa: F401
+    from tools.registry import registry
+
+    class FakeAgent:
+        pass
+
+    agent = FakeAgent()
+    registry.dispatch("watch", {"command": "echo a", "interval": 5, "duration": "60s"}, agent=agent)
+    registry.dispatch("watch", {"command": "echo b", "interval": 5, "duration": "60s"}, agent=agent)
+    listed = _json.loads(registry.dispatch("watch", {"action": "list"}, agent=agent))
+    assert listed["count"] == 2
+    wid = listed["watches"][0]["watch_id"]
+    stopped = _json.loads(
+        registry.dispatch("watch", {"action": "stop", "watch_id": wid}, agent=agent)
+    )
+    assert wid in stopped["stopped"]
+    listed2 = _json.loads(registry.dispatch("watch", {"action": "list"}, agent=agent))
+    assert listed2["count"] == 1
+    registry.dispatch("watch", {"action": "stop", "watch_id": "all"}, agent=agent)
+    listed3 = _json.loads(registry.dispatch("watch", {"action": "list"}, agent=agent))
+    assert listed3["count"] == 0
+
+
+def test_watch_interval_parses_duration_strings():
+    import json as _json
+    import tools.watch_tool  # noqa: F401
+    from tools.registry import registry
+
+    res = _json.loads(
+        registry.dispatch("watch", {"command": "echo ok", "interval": "30s", "timeout": "oops"})
+    )
+    assert res["interval"] == 30
+    assert res["observations"][0]["output"].strip() == "ok"
+
+
+def test_watch_schema_does_not_require_command():
+    required = WATCH_SCHEMA["function"]["parameters"].get("required") or []
+    assert "command" not in required
+    import json as _json
+    import tools.watch_tool  # noqa: F401
+    from tools.registry import registry
+
+    listed = _json.loads(registry.dispatch("watch", {"action": "list"}))
+    assert listed["action"] == "list"
+    assert listed["count"] == 0

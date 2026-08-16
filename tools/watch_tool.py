@@ -13,28 +13,30 @@ Design notes
 * Registration uses the standard ``registry.register(...)`` self-registration
   pattern (same as ``cronjob_tools.py``), so ``discover_builtin_tools`` picks
   this module up automatically.
-* The async poll loop and lifecycle bookkeeping live in
-  ``agent/conversation_loop.py`` (see ``_start_watch_session``), which is
-  invoked from the handler via the agent object passed through
-  ``handle_function_call(..., agent=agent)`` -> ``registry.dispatch``. This
-  module owns the pure, unit-testable helpers (condition evaluation, duration
-  math, the synchronous single tick) and the handler contract.
+* The poll loop runs on a dedicated daemon thread so it outlives
+  ``registry.dispatch`` / ``_run_async``'s disposable worker loop. A
+  ``threading.Event`` on the session handle is the cancel signal; the
+  worker is pinned as ``handle["_task"]``.
+* Lifecycle: ``action="list"`` / ``action="stop"`` enumerate or cancel
+  watches. ``stop_all_watches(agent)`` plus a ``weakref.finalize`` on the
+  agent tears the workers down when the agent is collected.
 * ``condition`` is a tiny, safe expression language — ``contains "x"``,
   ``not contains "x"``, ``equals "x"``, ``matches "regex"``, or a bare
   substring — deliberately avoiding ``eval``/``exec`` on agent input.
-* This module has NO dependency on AgentRadio/Coral; it surfaces results
-  through the agent's existing notify hook, so the same code serves both the
-  upstream feature and downstream passive-awareness ports.
+* Notifications go through ``agent.notify`` when present, otherwise
+  ``agent._emit_status`` (the AIAgent lifecycle hook).
 """
 
 from __future__ import annotations
 
-import asyncio
 import json
 import re
 import subprocess
+import threading
 import time
-from typing import Any, Callable, Dict, List, Optional
+import uuid
+import weakref
+from typing import Any, Dict, List, Optional
 
 from tools.registry import registry
 
@@ -117,6 +119,107 @@ def _plan_ticks(interval: int, duration: Optional[int]) -> int:
     return max(1, int(duration // interval) + (1 if duration % interval else 0))
 
 
+def _parse_bounded(value: Any, default: int, lo: int, hi: int) -> int:
+    """Parse a duration-like tool arg and clamp it.
+
+    Uses ``_parse_duration`` so ``"30s"`` / ``"5m"`` work. Unparseable input
+    (e.g. ``"oops"``) falls back to ``default`` instead of raising.
+    """
+    n = _parse_duration(value) if value is not None else 0
+    if n <= 0:
+        n = default
+    return max(lo, min(hi, n))
+
+
+def _parse_bool(value: Any, default: bool = True) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    s = str(value).strip().lower()
+    if s in {"1", "true", "yes", "on"}:
+        return True
+    if s in {"0", "false", "no", "off"}:
+        return False
+    return default
+
+
+def _should_notify(
+    *,
+    condition: Optional[str],
+    triggered: bool,
+    prev_triggered: bool,
+    tick: int,
+) -> bool:
+    """When to fire a user-visible notification.
+
+    * Condition set: rising edge only (false → true).
+    * Unconditional: first tick only (avoids up to 1000 notifies).
+    """
+    if condition and str(condition).strip():
+        return bool(triggered) and not prev_triggered
+    return tick == 1
+
+
+def _notify_agent(agent: Any, message: str) -> None:
+    fn = getattr(agent, "notify", None)
+    if not callable(fn):
+        fn = getattr(agent, "_emit_status", None)
+    if not callable(fn):
+        return
+    try:
+        fn(message)
+    except Exception:
+        pass
+
+
+def _public_view(handle: Dict[str, Any], *, include_observations: bool = False) -> Dict[str, Any]:
+    skip = {"_task", "_stop"}
+    if not include_observations:
+        skip = skip | {"observations"}
+    view = {k: v for k, v in handle.items() if k not in skip}
+    view["observation_count"] = len(handle.get("observations") or [])
+    return view
+
+
+def _cancel_session(sess: Dict[str, Any]) -> None:
+    stop = sess.get("_stop")
+    if stop is not None and hasattr(stop, "set"):
+        stop.set()
+    sess["status"] = "stopped"
+
+
+def stop_all_watches(agent: Any) -> List[str]:
+    """Cancel every watch on *agent*. Safe to call from teardown/finalize."""
+    sessions = getattr(agent, "_watch_sessions", None) if agent is not None else None
+    if not sessions:
+        return []
+    stopped = []
+    for wid in list(sessions.keys()):
+        sess = sessions.get(wid) or {}
+        _cancel_session(sess)
+        stopped.append(wid)
+        sessions.pop(wid, None)
+    return stopped
+
+
+def _stop_sessions_dict(sessions: Dict[str, Any]) -> None:
+    for sess in list((sessions or {}).values()):
+        _cancel_session(sess)
+    if sessions is not None:
+        sessions.clear()
+
+
+def _ensure_sessions(agent: Any) -> Dict[str, Any]:
+    sessions = getattr(agent, "_watch_sessions", None)
+    if sessions is None:
+        sessions = {}
+        agent._watch_sessions = sessions
+        # Finalize must not capture *agent* (that would pin it forever).
+        weakref.finalize(agent, _stop_sessions_dict, sessions)
+    return sessions
+
+
 # ---------------------------------------------------------------------------
 # Synchronous command runner (unit-testable without an event loop)
 # ---------------------------------------------------------------------------
@@ -168,73 +271,23 @@ def _make_observation(
 # ---------------------------------------------------------------------------
 
 
-async def watch(args: Dict[str, Any], **kw: Any) -> Dict[str, Any]:
-    """Watch a command's output over time and surface observations.
+def _start_poll_thread(handle: Dict[str, Any], agent: Any) -> None:
+    stop = handle["_stop"]
+    command = handle["command"]
+    interval = handle["interval"]
+    timeout = handle["timeout"]
+    condition = handle.get("condition")
+    notify = handle.get("notify", True)
+    max_ticks = handle["planned_ticks"]
+    seconds = handle["duration_seconds"]
+    watch_id = handle["watch_id"]
 
-    The registry calls handlers as ``handler(args, **kwargs)``, so the tool
-    arguments arrive as a single ``args`` dict (mirrors cronjob_tools.py).
-    The agent object is injected via the ``agent=`` kwarg by
-    ``handle_function_call``; when present, the poll loop runs as a background
-    task on the agent's event loop so it survives across the calling turn.
-
-    Args (in ``args``):
-        command: Shell command to run on each tick.
-        interval: Seconds between ticks (clamped to 5-3600).
-        condition: Optional trigger expression (see ``_eval_condition``).
-            When set, notify/observation marking only fires on match.
-        notify: If True, surface a notification when an observation is recorded
-            (gated by ``condition`` when present).
-        duration: Total window: ``"24h"``, ``"30m"``, or raw seconds.
-            Defaults to one interval when omitted.
-        timeout: Per-tick command timeout in seconds.
-
-    Returns a handle describing the watch session. Falls back to a single
-    synchronous tick when no agent/event loop is reachable (e.g. unit tests).
-    """
-    command = str(args.get("command", ""))
-    interval = int(args.get("interval", 60))
-    condition = args.get("condition")
-    notify = bool(args.get("notify", True))
-    duration = args.get("duration")
-    timeout = int(args.get("timeout", 30))
-
-    interval = max(5, min(3600, interval))
-    seconds = _parse_duration(duration) if duration else interval
-    max_ticks = min(_plan_ticks(interval, seconds), 1000)  # hard safety cap
-
-    watch_id = f"watch_{int(time.time() * 1000)}"
-    handle = {
-        "watch_id": watch_id,
-        "command": command,
-        "interval": interval,
-        "condition": condition,
-        "notify": notify,
-        "duration_seconds": seconds,
-        "planned_ticks": max_ticks,
-    }
-
-    agent = kw.get("agent") or kw.get("ctx")
-    loop = getattr(agent, "_loop", None) or getattr(agent, "loop", None)
-    if loop is None:
+    def _poll() -> None:
+        tick = 0
+        deadline = time.time() + seconds
+        prev_triggered = False
         try:
-            loop = asyncio.get_event_loop()
-        except RuntimeError:
-            loop = None
-
-    if agent is not None and loop is not None and loop.is_running():
-        # Background poll on the agent's live event loop.
-        sessions = getattr(agent, "_watch_sessions", None)
-        if sessions is None:
-            sessions = {}
-            agent._watch_sessions = sessions
-        handle["status"] = "running"
-        handle["observations"] = []
-        sessions[watch_id] = handle
-
-        async def _poll() -> None:
-            tick = 0
-            deadline = time.time() + seconds
-            while time.time() < deadline and tick < max_ticks:
+            while not stop.is_set() and time.time() < deadline and tick < max_ticks:
                 tick += 1
                 out = run_once(command, timeout)
                 triggered = _eval_condition(condition or "", out)
@@ -248,23 +301,113 @@ async def watch(args: Dict[str, Any], **kw: Any) -> Dict[str, Any]:
                         triggered=triggered,
                     )
                 )
-                if triggered:
-                    if notify and callable(getattr(agent, "notify", None)):
-                        try:
-                            agent.notify(
-                                f"[watch:{watch_id}] tick {tick} matched "
-                                f"condition={condition!r}: {out[:200]}"
-                            )
-                        except Exception:
-                            pass
-                    if condition:  # stop after first match when a condition is set
-                        handle["status"] = "matched"
-                        return
-                await asyncio.sleep(interval)
-            handle["status"] = "completed"
+                if notify and _should_notify(
+                    condition=condition,
+                    triggered=triggered,
+                    prev_triggered=prev_triggered,
+                    tick=tick,
+                ):
+                    label = condition if condition else "unconditional"
+                    _notify_agent(
+                        agent,
+                        f"[watch:{watch_id}] tick {tick} matched "
+                        f"condition={label!r}: {out[:200]}",
+                    )
+                if condition and str(condition).strip() and triggered and not prev_triggered:
+                    handle["status"] = "matched"
+                    return
+                prev_triggered = triggered
+                if stop.wait(interval):
+                    break
+            if handle.get("status") == "running":
+                handle["status"] = "stopped" if stop.is_set() else "completed"
+        except Exception as exc:  # pragma: no cover - defensive
+            handle["status"] = "error"
+            handle["error"] = str(exc)
 
-        loop.create_task(_poll())
-    else:  # pragma: no cover - fallback when no agent/loop (e.g. unit tests)
+    worker = threading.Thread(
+        target=_poll,
+        name=f"hermes-watch-{watch_id}",
+        daemon=True,
+    )
+    handle["_task"] = worker
+    worker.start()
+
+
+def watch(args: Dict[str, Any], **kw: Any) -> str:
+    """Watch a command's output over time and surface observations.
+
+    Sync handler on purpose: async dispatch is bridged through
+    ``model_tools._run_async``, whose gateway path cancels leftover tasks
+    when the handler returns. Background polling therefore lives on a
+    daemon thread, not on that disposable loop.
+
+    The agent object is injected via the ``agent=`` kwarg by
+    ``handle_function_call``.
+    """
+    agent = kw.get("agent") or kw.get("ctx")
+    action = str(args.get("action", "start")).lower()
+
+    if action in ("list", "stop"):
+        sessions = getattr(agent, "_watch_sessions", None) if agent is not None else None
+        if sessions is None:
+            sessions = {}
+        if action == "list":
+            running = [
+                _public_view(s)
+                for s in sessions.values()
+                if s.get("status") == "running"
+            ]
+            return json.dumps(
+                {"action": "list", "count": len(running), "watches": running},
+                ensure_ascii=False,
+            )
+        target = str(args.get("watch_id", "all"))
+        stopped = []
+        for wid in list(sessions.keys()):
+            if target == "all" or wid == target:
+                sess = sessions.get(wid, {})
+                _cancel_session(sess)
+                stopped.append(wid)
+                sessions.pop(wid, None)
+        return json.dumps({"action": "stop", "stopped": stopped}, ensure_ascii=False)
+
+    command = str(args.get("command", "") or "")
+    if not command.strip():
+        return json.dumps({"error": "command is required to start a watch"}, ensure_ascii=False)
+
+    interval = _parse_bounded(args.get("interval", 60), default=60, lo=5, hi=3600)
+    condition = args.get("condition")
+    notify = _parse_bool(args.get("notify", True), default=True)
+    duration = args.get("duration")
+    timeout = _parse_bounded(args.get("timeout", 30), default=30, lo=1, hi=3600)
+
+    seconds = _parse_duration(duration) if duration else interval
+    if seconds <= 0:
+        seconds = interval
+    max_ticks = min(_plan_ticks(interval, seconds), 1000)
+
+    watch_id = f"watch_{uuid.uuid4().hex[:12]}"
+    handle = {
+        "watch_id": watch_id,
+        "command": command,
+        "interval": interval,
+        "timeout": timeout,
+        "condition": condition,
+        "notify": notify,
+        "duration_seconds": seconds,
+        "planned_ticks": max_ticks,
+    }
+
+    if agent is not None:
+        sessions = _ensure_sessions(agent)
+        handle["status"] = "running"
+        handle["observations"] = []
+        handle["_stop"] = threading.Event()
+        handle["_task"] = None
+        sessions[watch_id] = handle
+        _start_poll_thread(handle, agent)
+    else:
         out = run_once(command, timeout)
         triggered = _eval_condition(condition or "", out)
         handle["observations"] = [
@@ -278,7 +421,7 @@ async def watch(args: Dict[str, Any], **kw: Any) -> Dict[str, Any]:
             )
         ]
         handle["status"] = "completed"
-    return json.dumps(handle, ensure_ascii=False)
+    return json.dumps(_public_view(handle, include_observations=True), ensure_ascii=False)
 
 
 WATCH_SCHEMA = {
@@ -289,19 +432,37 @@ WATCH_SCHEMA = {
             "Poll a shell command on an interval and surface observations "
             "when an optional condition is met. Useful for monitoring a "
             "service, watching for a file to appear, or polling an API — "
-            "without blocking the conversation."
+            "without blocking the conversation. Use action='list' / 'stop' "
+            "to manage running watches (command not required for those)."
         ),
         "parameters": {
             "type": "object",
             "properties": {
+                "action": {
+                    "type": "string",
+                    "description": (
+                        "What to do: 'start' (default, create a watch), "
+                        "'list' (show active watches), or 'stop' "
+                        "(cancel a watch by watch_id, or 'all')."
+                    ),
+                    "enum": ["start", "list", "stop"],
+                    "default": "start",
+                },
+                "watch_id": {
+                    "type": "string",
+                    "description": "Watch ID to stop (for action='stop').",
+                },
                 "command": {
                     "type": "string",
-                    "description": "Shell command to run each tick.",
+                    "description": "Shell command to run each tick (required for start).",
                 },
                 "interval": {
-                    "type": "integer",
-                    "description": "Seconds between ticks (5-3600).",
-                    "default": 60,
+                    "type": "string",
+                    "description": (
+                        "Seconds between ticks (5-3600), or a duration "
+                        "string like '30s' / '5m'."
+                    ),
+                    "default": "60",
                 },
                 "condition": {
                     "type": "string",
@@ -313,7 +474,7 @@ WATCH_SCHEMA = {
                 },
                 "notify": {
                     "type": "boolean",
-                    "description": "Surface a notification on match.",
+                    "description": "Surface a notification on match (rising edge / first tick).",
                     "default": True,
                 },
                 "duration": {
@@ -324,12 +485,12 @@ WATCH_SCHEMA = {
                     ),
                 },
                 "timeout": {
-                    "type": "integer",
-                    "description": "Per-tick command timeout (seconds).",
-                    "default": 30,
+                    "type": "string",
+                    "description": "Per-tick command timeout (seconds or '30s').",
+                    "default": "30",
                 },
             },
-            "required": ["command"],
+            "required": [],
         },
     },
 }
@@ -340,5 +501,5 @@ registry.register(
     toolset="watch",
     schema=WATCH_SCHEMA,
     handler=watch,
-    is_async=True,
+    is_async=False,
 )
