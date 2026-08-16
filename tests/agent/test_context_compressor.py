@@ -415,9 +415,10 @@ class TestCompress:
         auto-compression could never fire. It now triggers at 85% of the
         window — high enough not to waste the small budget, below 100% so it
         actually fires."""
-        from agent.context_compressor import MINIMUM_CONTEXT_LENGTH
-        t = ContextCompressor._compute_threshold_tokens(MINIMUM_CONTEXT_LENGTH, 0.50)
-        assert t < MINIMUM_CONTEXT_LENGTH
+        from agent.model_metadata import get_minimum_context_length
+        minimum_context_length = get_minimum_context_length()
+        t = ContextCompressor._compute_threshold_tokens(minimum_context_length, 0.50)
+        assert t < minimum_context_length
         assert t == 54400  # 85% of 64000
 
 

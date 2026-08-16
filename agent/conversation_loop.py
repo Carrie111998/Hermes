@@ -65,11 +65,11 @@ from agent.message_sanitization import (
 # monkeypatch get_hermes_home to return a str).
 _STALE_MARKER_RE = re.compile(r"^\[[A-Za-z_][A-Za-z0-9_.-]*\]$")
 from agent.model_metadata import (
-    MINIMUM_CONTEXT_LENGTH,
     _estimate_tools_tokens_rough,
     estimate_messages_tokens_rough,
     estimate_request_tokens_rough,
     get_context_length_from_provider_error,
+    get_minimum_context_length,
     is_output_cap_error,
     parse_available_output_tokens_from_error,
     save_context_length,
@@ -424,7 +424,8 @@ def _ollama_context_limit_error(agent: Any, request_tokens: int) -> Optional[str
     runtime_ctx = getattr(agent, "_ollama_num_ctx", None)
     if not isinstance(runtime_ctx, int) or runtime_ctx <= 0:
         return None
-    if runtime_ctx >= MINIMUM_CONTEXT_LENGTH:
+    minimum_context_length = get_minimum_context_length()
+    if runtime_ctx >= minimum_context_length:
         return None
 
     model = getattr(agent, "model", "") or "the selected model"
@@ -441,7 +442,7 @@ def _ollama_context_limit_error(agent: Any, request_tokens: int) -> Optional[str
         provider,
         base_url,
         runtime_ctx,
-        MINIMUM_CONTEXT_LENGTH,
+        minimum_context_length,
         request_tokens,
         tool_count,
         getattr(agent, "session_id", None) or "none",
@@ -449,7 +450,7 @@ def _ollama_context_limit_error(agent: Any, request_tokens: int) -> Optional[str
 
     return (
         f"Ollama loaded `{model}` with only {runtime_ctx:,} tokens of runtime "
-        f"context, but Hermes needs at least {MINIMUM_CONTEXT_LENGTH:,} tokens "
+        f"context, but Hermes needs at least {minimum_context_length:,} tokens "
         "for reliable tool use.\n\n"
         "Increase the Ollama context for this model and restart/reload the "
         "model before trying again. A known-good starting point is 65,536 "

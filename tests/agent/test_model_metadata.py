@@ -1635,3 +1635,26 @@ class TestFallbackWarning:
             if r.levelno == logging.WARNING and "falling back" in r.getMessage()
         ]
         assert len(fallback_warnings) == 0
+
+
+class TestGetMinimumContextLength:
+    """Tests for get_minimum_context_length() — config override and fallback."""
+
+    def test_default_when_config_absent(self):
+        from agent.model_metadata import get_minimum_context_length
+        assert get_minimum_context_length(None) == 64000
+
+    def test_default_when_key_absent(self):
+        from agent.model_metadata import get_minimum_context_length
+        assert get_minimum_context_length({"agent": {"max_turns": 100}}) == 64000
+
+    def test_override(self):
+        from agent.model_metadata import get_minimum_context_length
+        cfg = {"agent": {"minimum_context_length": 32768}}
+        assert get_minimum_context_length(cfg) == 32768
+
+    @pytest.mark.parametrize("bad", [0, -1, "garbage", 12.5, True, False, None, "", []])
+    def test_garbage_falls_back_to_default(self, bad):
+        from agent.model_metadata import get_minimum_context_length
+        cfg = {"agent": {"minimum_context_length": bad}}
+        assert get_minimum_context_length(cfg) == 64000
