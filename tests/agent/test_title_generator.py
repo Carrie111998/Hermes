@@ -64,6 +64,36 @@ class TestGenerateTitle:
             assert "<think>" not in title
             assert "summarize" not in title
 
+    def test_falls_back_to_reasoning_content(self):
+        """A reasoning model that returns the structured JSON only in
+        ``reasoning_content`` with an empty ``content`` (e.g. opencode-go's
+        glm-5 aux tier) must still produce a title instead of silently
+        dropping back to the derived placeholder."""
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = ""
+        mock_response.choices[0].message.reasoning_content = (
+            '{"title": "Debugging Python Import Errors"}'
+        )
+
+        with patch("agent.title_generator.call_llm", return_value=mock_response):
+            title = generate_title("help me fix this import")
+            assert title == "Debugging Python Import Errors"
+
+    def test_falls_back_to_reasoning_field(self):
+        """Same fallback via the ``reasoning`` field used by other reasoning
+        providers (DeepSeek, Moonshot, ...)."""
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = ""
+        mock_response.choices[0].message.reasoning = (
+            '{"title": "Debugging Python Import Errors"}'
+        )
+
+        with patch("agent.title_generator.call_llm", return_value=mock_response):
+            title = generate_title("help me fix this import")
+            assert title == "Debugging Python Import Errors"
+
     def test_strips_unterminated_think_block(self):
         """An unterminated <think> block (no close tag) must still be
         stripped so the leaked reasoning doesn't become the title."""

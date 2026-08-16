@@ -23,7 +23,7 @@ import re
 import threading
 from typing import Any, Callable, Optional
 
-from agent.auxiliary_client import call_llm
+from agent.auxiliary_client import call_llm, extract_content_or_reasoning
 from agent.context_compressor import LEGACY_SUMMARY_PREFIX
 from agent.message_content import flatten_message_text
 
@@ -403,7 +403,7 @@ def generate_title(
             main_runtime=main_runtime,
             extra_body={"response_format": _TITLE_RESPONSE_FORMAT},
         )
-        content = response.choices[0].message.content or ""
+        content = extract_content_or_reasoning(response) or ""
         return _clean_title(_extract_title_text(content))
     except Exception as e:
         # Log at WARNING so this shows up in agent.log without debug mode.
