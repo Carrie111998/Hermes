@@ -2,7 +2,7 @@ import { memo, useCallback, useEffect, useMemo, useRef } from 'react'
 
 import { Codicon } from '@/components/ui/codicon'
 
-import type { TimeAxis } from './time-axis'
+import { allocateStarKinds, type TimeAxis } from './time-axis'
 
 interface TimelineProps {
   axis: TimeAxis
@@ -69,8 +69,7 @@ function buildStars(axis: TimeAxis): Star[] {
     // sqrt curve so a single co-timed burst (a packed core ring) doesn't crush
     // every quieter bucket down to the 1-star floor and read as blank.
     const count = Math.max(1, Math.round(Math.sqrt(intensity) * MAX_STARS_PER_BUCKET))
-    const skillCount = Math.round((b.skill / b.total) * count)
-    const wikiCount = Math.round((b.wiki / b.total) * count)
+    const kinds = allocateStarKinds(b, count)
     const r = rng(i * 9973 + 7)
     const slot = 1 / n
     const center = (i + 0.5) / n
@@ -84,7 +83,7 @@ function buildStars(axis: TimeAxis): Star[] {
       stars.push({
         delay: r() * 3,
         duration: 2.4 + r() * 2.6,
-        kind: s < skillCount ? 'skill' : s < skillCount + wikiCount ? 'wiki' : 'memory',
+        kind: kinds[s],
         leftPct: Math.max(0, Math.min(1, center + jitter)) * 100,
         // Brighter, slightly larger stars are rarer.
         opacity: 0.5 + r() * 0.5,

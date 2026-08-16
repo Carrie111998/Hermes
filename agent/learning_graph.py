@@ -16,6 +16,7 @@ Run as a module to print edge-density stats against real data:
 from __future__ import annotations
 
 import json
+import os
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -233,17 +234,14 @@ def _journey_config() -> dict[str, Any]:
 
 
 def _wiki_root() -> Path:
-    """Resolve the wiki skill's logical ``wiki.path`` configuration."""
-    try:
-        from agent.skill_utils import resolve_skill_config_values
+    """Resolve the same ``WIKI_PATH`` contract used by the llm-wiki skill."""
+    return Path(os.getenv("WIKI_PATH") or "~/wiki").expanduser()
 
-        values = resolve_skill_config_values(
-            [{"key": "wiki.path", "default": "~/wiki", "description": "Wiki directory"}]
-        )
-        value = values.get("wiki.path")
-    except Exception:
-        value = None
-    return Path(str(value or "~/wiki")).expanduser()
+
+def _read_wiki_prefix(path: Path, limit: int = 4000) -> str:
+    """Decode only the prefix used for graph metadata and lexical links."""
+    with path.open("rb") as handle:
+        return handle.read(limit).decode("utf-8", errors="replace")
 
 
 def _wiki_exclusions() -> set[str]:
@@ -271,7 +269,7 @@ def _wiki_cards() -> list[dict[str, Any]]:
             relative = path.relative_to(root).as_posix()
             if relative in excluded:
                 continue
-            text = path.read_text(encoding="utf-8")
+            text = _read_wiki_prefix(path)
             stat = path.stat()
         except (OSError, ValueError):
             continue
@@ -332,7 +330,8 @@ def _wiki_skill_edges(cards: list[dict[str, Any]], skills: list[SkillNode]) -> l
         for skill, skill_tokens, skill_name in skill_meta:
             if skill.name in declared:
                 continue
-            score = (6 if skill_name in text else 0) + len(skill_tokens & tokens)
+            exact_name = re.search(rf"(?<![a-z0-9]){re.escape(skill_name)}(?![a-z0-9])", text)
+            score = (6 if exact_name else 0) + len(skill_tokens & tokens)
             if score > 0:
                 scored.append((score, skill.name))
         scored.sort(key=lambda item: (-item[0], item[1]))

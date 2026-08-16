@@ -23,7 +23,7 @@ Body.
 
 
 @pytest.fixture
-def home():
+def home(monkeypatch):
     base = get_hermes_home()
     (base / "memories").mkdir(parents=True, exist_ok=True)
     (base / "memories" / "MEMORY.md").write_text("alpha note\nline two\n§\nbeta note", encoding="utf-8")
@@ -34,10 +34,7 @@ def home():
     wiki = base / "wiki"
     wiki.mkdir()
     (wiki / "project.md").write_text("---\ntitle: Project\n---\n\nOriginal.", encoding="utf-8")
-    (base / "config.yaml").write_text(
-        f"skills:\n  config:\n    wiki:\n      path: {wiki.as_posix()}\n",
-        encoding="utf-8",
-    )
+    monkeypatch.setenv("WIKI_PATH", str(wiki))
     return base
 
 
@@ -71,7 +68,7 @@ def test_skill_detail_returns_skill_md(home):
     assert "name: my-skill" in d["content"]
 
 
-def test_wiki_detail_and_edit_resolve_configured_page(home):
+def test_wiki_detail_and_edit_resolve_runtime_page(home):
     detail = lm.node_detail("wiki:project.md")
     assert detail["ok"] and detail["kind"] == "wiki" and detail["label"] == "Project"
 

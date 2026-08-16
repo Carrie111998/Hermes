@@ -59,7 +59,7 @@ def test_memory_is_cards_split_on_separator(tmp_path):
     assert any(n["kind"] == "memory" for n in graph["nodes"])
 
 
-def test_wiki_pages_are_first_class_nodes_with_real_dates_and_edges(tmp_path):
+def test_wiki_pages_are_first_class_nodes_with_real_dates_and_edges(tmp_path, monkeypatch):
     home = tmp_path / ".hermes"
     wiki = tmp_path / "wiki"
     page = wiki / "projects" / "launch.md"
@@ -69,10 +69,7 @@ def test_wiki_pages_are_first_class_nodes_with_real_dates_and_edges(tmp_path):
         encoding="utf-8",
     )
     home.mkdir()
-    (home / "config.yaml").write_text(
-        f"skills:\n  config:\n    wiki:\n      path: {wiki.as_posix()}\n",
-        encoding="utf-8",
-    )
+    monkeypatch.setenv("WIKI_PATH", str(wiki))
     token = set_hermes_home_override(home)
     try:
         graph = learning_graph.build_learning_graph()
@@ -91,16 +88,14 @@ def test_wiki_pages_are_first_class_nodes_with_real_dates_and_edges(tmp_path):
     assert ("wiki:projects/launch.md", "release-workflow") in edges
 
 
-def test_journey_can_opt_out_of_wiki_nodes(tmp_path):
+def test_journey_can_opt_out_of_wiki_nodes(tmp_path, monkeypatch):
     home = tmp_path / ".hermes"
     wiki = tmp_path / "wiki"
     wiki.mkdir()
     (wiki / "page.md").write_text("# Hidden", encoding="utf-8")
     home.mkdir()
-    (home / "config.yaml").write_text(
-        f"journey:\n  include_wiki: false\nskills:\n  config:\n    wiki:\n      path: {wiki.as_posix()}\n",
-        encoding="utf-8",
-    )
+    (home / "config.yaml").write_text("journey:\n  include_wiki: false\n", encoding="utf-8")
+    monkeypatch.setenv("WIKI_PATH", str(wiki))
     token = set_hermes_home_override(home)
     try:
         graph = learning_graph.build_learning_graph()
@@ -108,6 +103,32 @@ def test_journey_can_opt_out_of_wiki_nodes(tmp_path):
         reset_hermes_home_override(token)
 
     assert not any(n["kind"] == "wiki" for n in graph["nodes"])
+
+
+def test_wiki_scan_reads_only_the_graph_prefix(tmp_path, monkeypatch):
+    wiki = tmp_path / "wiki"
+    wiki.mkdir()
+    page = wiki / "large.md"
+    page.write_bytes(b"---\ntitle: Bounded\n---\n" + b"x" * 5000 + b"\xff")
+    monkeypatch.setenv("WIKI_PATH", str(wiki))
+
+    cards = learning_graph._wiki_cards()
+
+    assert cards[0]["title"] == "Bounded"
+    assert len(cards[0]["body"]) == 1200
+
+
+def test_wiki_skill_name_bonus_requires_name_boundaries():
+    card = {"path": "page.md", "title": "Cargo", "body": "Algorithm notes", "relatedSkills": []}
+    skills = [
+        learning_graph.SkillNode(name="go", category="dev"),
+        learning_graph.SkillNode(name="algo", category="dev"),
+    ]
+
+    assert learning_graph._wiki_skill_edges([card], skills) == []
+
+    card["body"] = "Use Go for this service."
+    assert learning_graph._wiki_skill_edges([card], skills) == [("wiki:page.md", "go")]
 
 
 

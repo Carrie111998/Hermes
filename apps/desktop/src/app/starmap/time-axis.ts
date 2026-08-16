@@ -60,6 +60,29 @@ export interface TimeBucket {
   wiki: number
 }
 
+export type TimelineStarKind = 'memory' | 'skill' | 'wiki'
+
+export function allocateStarKinds(bucket: TimeBucket, count: number): TimelineStarKind[] {
+  const weighted: Array<{ kind: TimelineStarKind; value: number }> = [
+    { kind: 'skill', value: bucket.skill },
+    { kind: 'wiki', value: bucket.wiki },
+    { kind: 'memory', value: bucket.memory }
+  ]
+  const allocations = weighted.map(({ kind, value }, index) => {
+    const exact = bucket.total > 0 ? (value / bucket.total) * count : 0
+    return { count: Math.floor(exact), fraction: exact % 1, index, kind }
+  })
+  let remaining = count - allocations.reduce((sum, allocation) => sum + allocation.count, 0)
+  for (const allocation of [...allocations].sort((a, b) => b.fraction - a.fraction || a.index - b.index)) {
+    if (remaining === 0) break
+    if (weighted[allocation.index].value > 0) {
+      allocation.count += 1
+      remaining -= 1
+    }
+  }
+  return allocations.flatMap(({ count: allocation, kind }) => Array<TimelineStarKind>(allocation).fill(kind))
+}
+
 export interface TimeAxis {
   buckets: TimeBucket[]
   maxTotal: number
