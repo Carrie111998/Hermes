@@ -1,7 +1,7 @@
 # Project Handover - hermes-agent
 
 **Plan key:** hermes-agent  
-**Last verified:** 2026-08-16 09:44 CST  
+**Last verified:** 2026-08-16 12:43 CST
 **Handover owner/session:** Codex  
 **Authoritative project log:** `docs/ROADMAP-HERMES-DGX.md`
 
@@ -9,7 +9,7 @@
 
 - **Purpose:** Hermes is a private-first agent gateway and CLI with memory, skills, scheduled jobs, delegated agents, and messaging-platform adapters.
 - **Repository:** <https://github.com/cwliao/hermes-agent>
-- **Canonical mainline:** merged code commit `29d4663bb94cf2d9603d2de9d437a431b5101f14` (PR #25); handover refreshes are documentation-only commits on `main` after deployment.
+- **Canonical mainline:** merged code commit `178c9be1c5e2cc8052d69a0c140131b417a44ee8` (PR #26); handover refreshes are documentation-only commits after deployment.
 - **DGX runtime:** configured target, live source checkout `/home/cwliao/.hermes/hermes-agent`, user service `hermes-gateway.service`.
 - **In scope:** Hermes CLI, gateway, runtime state, platform adapters, CI, skills, documentation, and explicitly ticketed deployment work.
 - **Out of scope by default:** laptop files as handover sources, unrelated DGX services, credentials/tokens, and external marketplace or SkillClaw changes without a separate reviewed ticket.
@@ -20,20 +20,21 @@ The local audit checkout observed during this refresh is `D:/PROJECT/Hermes`, br
 
 ## 2. Goal and roadmap
 
-- **Current goal:** diagnose the remaining Telegram inbound polling degradation after the merged transport implementation; do not claim inbound readiness from process health or a returned `start_polling()`.
+- **Current goal:** diagnose and prove the remaining Telegram inbound polling boundary after the merged health-transition correction; do not claim inbound readiness from process health or a returned `start_polling()`.
 - **Completed and deployed:** HERMES-UPDATE-001, PR #22, merged SHA `0fe3773ccfbec860984d0dc93adc4875ca2d5d4b`; immutable DGX release is active.
 - **Completed and corrected:** Calendar Guard wrapper correction, PR #24, merged SHA `91ae4a7f7a73a4c331e2f5dd018b7ce2ca5c03a9`; the valid immutable release path is no longer mistaken for the fallback sentinel.
 - **Completed and deployed:** managed-CA trust correction, PR #25, squash merge `29d4663bb94cf2d9603d2de9d437a431b5101f14`; authenticated Claude and AGY implementation reviews both PASS, CI run `31918804987` passed, and the new immutable DGX release is active.
+- **Completed through implementation and deployment gates:** HERMES-TELEGRAM-INBOUND-001, PR #26, merge `178c9be1c5e2cc8052d69a0c140131b417a44ee8`; implementation review consensus PASS, CI had 22 success, 8 skipped, 1 neutral, and no failures, and the immutable DGX release is active. Inbound readiness remains a separate open gate.
 - **E2E state:** gateway process/service is healthy and outbound Telegram delivery passed, but inbound polling has no qualifying `getUpdates` progress evidence. The 2026-08-16 bounded DGX window recorded `Connected to Telegram (polling mode)` and gateway startup completion, but no explicit `getUpdates` success or accepted-update event.
 - **Deferred:** ARCH-002 remains the next core candidate after the active Telegram transport gate; HERMES-MONITORING-001 remains blocked and does not absorb this transport diagnosis.
 
 ## 3. Verified runtime and deployment state
 
-- **DGX release:** `/home/cwliao/.hermes/releases/v2026.8.16-hermes-ca-29d4663bb9`.
-- **Release identity:** `.hermes-release-sha` is `29d4663bb94cf2d9603d2de9d437a431b5101f14`.
-- **Effective gateway drop-in:** `32-hermes-ca-29d4663bb9.conf`; prior release/drop-ins, including `31-hermes-update-001-0fe3773ccf.conf` and `ssl-ca.conf`, remain available for rollback.
-- **Gateway evidence:** `active/running`, MainPID `27416`, `ExecMainStatus=0`, `NRestarts=0`; effective WorkingDirectory and PYTHONPATH point to the new release after a bounded stability check.
-- **Calendar guard evidence:** recovery timer `active/waiting`; the deployed wrapper now preserves the valid release path. Direct wrapper execution exited 0, and cron job `85dcd4b817d6` completed successfully when manually triggered. The old release and drop-in were not deleted.
+- **DGX release:** `/home/cwliao/.hermes/releases/v2026.8.16-hermes-telegram-inbound-178c9be1`.
+- **Release identity:** `.hermes-release-sha` is `178c9be1c5e2cc8052d69a0c140131b417a44ee8`.
+- **Effective gateway drop-in:** `33-hermes-telegram-inbound-178c9be1.conf`; prior release/drop-ins, including `32-hermes-ca-29d4663bb9`, remain available for rollback.
+- **Gateway evidence:** `active/running`, MainPID `202065`, `ExecMainStatus=0`, `NRestarts=0`; effective WorkingDirectory, PYTHONPATH, and `HERMES_RELEASE_SHA` point to the merged release after a bounded stability check.
+- **Health guard evidence:** the actual DGX unit is `hermes-mcp-health-guard.timer`, `active/waiting`, result `success`; the older expected name `hermes-calendar-guard.timer` is not installed. This handover naming discrepancy is recorded and was not mutated during the gateway deployment.
 - **Source checkout evidence:** the DGX live checkout remains separate from the active immutable release and was not reset or overwritten.
 
 ### Telegram E2E boundary
@@ -47,17 +48,17 @@ The local audit checkout observed during this refresh is `D:/PROJECT/Hermes`, br
 ### Current lane: HERMES-TELEGRAM-INBOUND-001
 
 - **Plan:** `docs/plans/2026-08-16-hermes-telegram-inbound-001.md`.
-- **Status:** `IMPLEMENTATION_REVIEW_BLOCKED_CLAUDE_UNAVAILABLE`; design consensus, bounded DGX diagnosis, and the failed Claude/AGY correction-set review are recorded in the plan.
+- **Status:** `MERGED_DEPLOYED_RUNTIME_DEGRADED`; implementation review, CI, merge, immutable deployment, and service health gates passed. Inbound polling remains `DEGRADED/UNPROVEN`.
 - **Parent lane:** HERMES-TELEGRAM-TRANSPORT-001 is `MERGED_DEPLOYED_RUNTIME_DEGRADED`; its service and outbound gates passed, but inbound readiness remains unproven.
-- **Next action:** obtain one authenticated Claude PASS on the exact correction packet and reconcile it with the recorded AGY PASS. Implementation remains blocked until both reviewer-family gates pass.
-- **Do not:** implement, restart, deploy, change credentials/allowlists/webhook state, or claim inbound readiness before the ticket review and direct polling evidence gates pass.
+- **Next action:** run a bounded post-deploy inbound test and inspect metadata-only polling progress; if still unproven, open a narrow follow-up correction with the normal review/CI/deploy gates.
+- **Do not:** change credentials/allowlists/webhook state, weaken TLS, or claim inbound readiness from service health, outbound delivery, or absent/ambiguous polling evidence.
 
 ### Other ticket state
 
 - `HERMES-UPDATE-001`: `MERGED_DEPLOYED`; PR #22, SHA `0fe3773c...`, Lane 2/3 review PASS and targeted tests passed.
 - `HERMES-AUTH-001`: merged/deployed separately.
 - `HERMES-AUTH-002`: `MERGED_DEPLOYED`; PR #16 merged as `826349ccbfe165ef9f2f7f47f72ed53226c13603`; implementation commit `5e8df81b6`, targeted tests/CI/Windows wrapper evidence recorded. The active release SHA `0fe3773ccfbec860984d0dc93adc4875ca2d5d4b` is four commits ahead of the AUTH-002 merge, so no separate AUTH-002 runtime restart is required.
-- `HERMES-CALENDAR-GUARD-001`: `MERGED_DEPLOYED`; PR #17/#18 plus correction PR #24; timer, recovery unit, wrapper, and cron execution are verified.
+- `HERMES-CALENDAR-GUARD-001`: `MERGED_DEPLOYED`; PR #17/#18 plus correction PR #24; the actual `hermes-mcp-health-guard.timer` is active/waiting. The old `hermes-calendar-guard.timer` name is not present and requires a separate documentation reconciliation if needed.
 - `Managed CA trust correction`: `MERGED_DEPLOYED`; PR #25, merge `29d4663b...`, CI `31918804987`, release `v2026.8.16-hermes-ca-29d4663bb9`; focused release tests `6 passed`, source/release hashes matched, and service health is active/running. Telegram inbound remains a separate `DEGRADED/UNPROVEN` gate.
 - `HERMES-MONITORING-001`: `BLOCKED`; do not infer readiness from this deployment.
 - `ARCH-002`: proposed next core ticket, deferred until the current Telegram transport gate is resolved or explicitly re-sequenced.
