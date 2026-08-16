@@ -244,16 +244,26 @@ def _read_wiki_prefix(path: Path, limit: int = 4000) -> str:
         return handle.read(limit).decode("utf-8", errors="replace")
 
 
-def _wiki_exclusions() -> set[str]:
+def _wiki_exclusion_roots() -> dict[str, set[str]]:
     path = get_hermes_home() / "journey" / "wiki-excluded.json"
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError, TypeError):
-        return set()
-    if not isinstance(raw, dict) or raw.get("root") != str(_wiki_root().resolve()):
-        return set()
-    paths = raw.get("paths")
-    return {str(item) for item in paths if isinstance(item, str)} if isinstance(paths, list) else set()
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    roots = raw.get("roots")
+    if not isinstance(roots, dict):
+        return {}
+    return {
+        str(root): {str(item) for item in paths if isinstance(item, str)}
+        for root, paths in roots.items()
+        if isinstance(paths, list)
+    }
+
+
+def _wiki_exclusions() -> set[str]:
+    return _wiki_exclusion_roots().get(str(_wiki_root().resolve()), set())
 
 
 def _wiki_cards() -> list[dict[str, Any]]:

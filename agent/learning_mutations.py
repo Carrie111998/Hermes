@@ -191,18 +191,20 @@ def _delete_memory(node_id: str) -> dict[str, Any]:
 def _exclude_wiki(node_id: str) -> dict[str, Any]:
     import json
 
-    from agent.learning_graph import _wiki_exclusions, _wiki_root
+    from agent.learning_graph import _wiki_exclusion_roots, _wiki_root
     from hermes_constants import get_hermes_home
 
     path, relative = _wiki_path(node_id)
     if not path.is_file():
         return {"ok": False, "message": f"wiki page '{relative}' not found"}
-    excluded = _wiki_exclusions()
+    roots = _wiki_exclusion_roots()
+    root = str(_wiki_root().resolve())
+    excluded = roots.setdefault(root, set())
     excluded.add(relative)
     index = get_hermes_home() / "journey" / "wiki-excluded.json"
     index.parent.mkdir(parents=True, exist_ok=True)
     temp = index.with_suffix(".tmp")
-    payload = {"root": str(_wiki_root().resolve()), "paths": sorted(excluded)}
+    payload = {"roots": {key: sorted(paths) for key, paths in sorted(roots.items())}}
     temp.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
     temp.replace(index)
     return {"ok": True, "message": f"removed wiki page '{relative}' from journey (file kept)"}

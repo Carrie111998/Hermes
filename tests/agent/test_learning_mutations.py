@@ -96,6 +96,10 @@ def test_wiki_exclusions_are_scoped_to_the_active_root(home, monkeypatch, tmp_pa
     from agent.learning_graph import _wiki_cards
 
     assert [card["path"] for card in _wiki_cards()] == ["project.md"]
+    assert lm.delete_node("wiki:project.md")["ok"]
+
+    monkeypatch.setenv("WIKI_PATH", str(home / "wiki"))
+    assert _wiki_cards() == []
 
 
 def test_wiki_node_rejects_path_traversal(home):
