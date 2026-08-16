@@ -1289,11 +1289,17 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
 
             entry = platform_registry.get(platform_name)
             handler = entry.send_message_handler if entry is not None else None
-            if handler is not None:
+            # A whole-request handler expects the complete send_message request
+            # dict. Cron delivery and other standalone callers invoke
+            # _send_to_platform WITHOUT a request dict; handing the handler an
+            # empty dict silently drops the message, thread and media (#87634).
+            # Only take the whole-request path for a REAL request; otherwise
+            # fall through to the live adapter / standalone_sender_fn path.
+            if handler is not None and args:
                 try:
                     import inspect
 
-                    result = handler(args or {}, chat_id, platform_name, pconfig)
+                    result = handler(args, chat_id, platform_name, pconfig)
                     if inspect.isawaitable(result):
                         result = await result
                     return result

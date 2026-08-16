@@ -269,3 +269,64 @@ print(json.dumps({"host_send": host_send, "cron": cron,
     assert payload["host_send"]["chat_id"] == "@alice@example.com"
     assert payload["cron"]["chat_id"] == "@alice@example.com"
     assert payload["model_registered"] is False
+
+
+def test_cron_delivery_without_args_reaches_standalone_sender(monkeypatch):
+    """#87634: cron delivery calls _send_to_platform without a request dict.
+
+    A registered whole-request send_message_handler must NOT swallow the
+    delivery: the message, thread_id and media are only present in the
+    standalone sender contract, so the no-args path must fall through to
+    standalone_sender_fn instead of invoking the handler with {}.
+    """
+    from tools.send_message_tool import _send_to_platform
+
+    name = "cron-delivery-ext"
+    seen_handler: list = []
+    seen_standalone: list = []
+
+    def handler(args, chat_id, platform_name, pconfig):
+        seen_handler.append((dict(args), chat_id))
+        return {"success": True, "note": "handler"}
+
+    async def standalone(pconfig, chat_id, message, thread_id=None, **kw):
+        seen_standalone.append((chat_id, message, thread_id))
+        return {"success": True, "note": "standalone", "message_id": "m1"}
+
+    entry = PlatformEntry(
+        name=name,
+        label="Cron Delivery Ext",
+        adapter_factory=lambda cfg: None,
+        check_fn=lambda: True,
+        send_message_handler=handler,
+        standalone_sender_fn=standalone,
+    )
+    platform_registry.register(entry)
+    try:
+        pconfig = SimpleNamespace(enabled=True, token=None, extra={})
+        # cron shape: no request dict
+        res = asyncio.run(
+            _send_to_platform(
+                Platform(name), pconfig, "allowed@example.com",
+                "cron body", thread_id="topic-17",
+            )
+        )
+        assert not seen_handler, "whole-request handler must not run for cron delivery"
+        assert len(seen_standalone) == 1, "standalone sender must receive cron delivery"
+        chat_id, message, thread_id = seen_standalone[0]
+        assert chat_id == "allowed@example.com"
+        assert message == "cron body"
+        assert thread_id == "topic-17"
+        assert res.get("success") and res.get("note") == "standalone"
+        # real request shape: whole-request handler still wins
+        res2 = asyncio.run(
+            _send_to_platform(
+                Platform(name), pconfig, "allowed@example.com",
+                "req body", args={"message": "req body"},
+            )
+        )
+        assert len(seen_handler) == 1
+        assert seen_handler[0][0] == {"message": "req body"}
+        assert res2.get("note") == "handler"
+    finally:
+        platform_registry.unregister(name)
