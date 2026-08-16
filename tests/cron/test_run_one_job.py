@@ -92,6 +92,10 @@ def test_run_one_job_success_sequence(monkeypatch):
             {"required_patterns": [123], "on_failure": "fail"},
             "stored response contract is invalid",
         ),
+        (
+            {"forbidden_patterns": ["Calendar update"], "on_failure": "fail"},
+            "forbidden response content is present",
+        ),
     ],
 )
 def test_run_one_job_response_contract_failure_suppresses_delivery(
