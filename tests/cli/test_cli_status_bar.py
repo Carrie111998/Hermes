@@ -89,6 +89,24 @@ class TestCLIStatusBar:
 
         assert snapshot["model_short"] == "gpt-5.6-sol"
 
+    def test_status_bar_unmatched_provider_does_not_use_model_only_fallback(self):
+        cli_mod._REVERSE_ALIAS_CACHE = None
+        cli_obj = _make_cli(model="gpt-5.6-sol")
+        cli_obj.agent = SimpleNamespace(model="gpt-5.6-sol", provider="openai-codex-beta")
+
+        config = {
+            "model": {
+                "aliases": {
+                    "local-gpt56": "local-sub2api/gpt-5.6-sol",
+                    "codex-gpt56": "openai-codex/gpt-5.6-sol",
+                }
+            }
+        }
+        with patch("hermes_cli.config.load_config", return_value=config):
+            snapshot = cli_obj._get_status_bar_snapshot()
+
+        assert snapshot["model_short"] == "gpt-5.6-sol"
+
     def test_reverse_alias_keeps_model_only_fallback_without_provider(self):
         cli_mod._REVERSE_ALIAS_CACHE = None
         config = {
