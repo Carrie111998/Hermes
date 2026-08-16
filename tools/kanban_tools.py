@@ -1116,7 +1116,14 @@ def _handle_comment(args: dict, **kw) -> str:
 
 
 def _handle_attach(args: dict, **kw) -> str:
-    """Attach an inline (base64) file to a task.
+    """Attach a file to a task.
+
+    Two mutually-exclusive content sources are accepted:
+
+    - ``content_file`` — a local file path; the tool reads the file
+      server-side and feeds the existing inline-bytes flow, so a worker
+      never has to hand-assemble a multi-KB base64 string;
+    - ``content_base64`` — inline base64-encoded bytes (legacy path, kept).
 
     Mirrors the dashboard's upload endpoint for the agent surface: decode
     the payload, enforce the shared size cap, write it under the per-task
@@ -1139,15 +1146,42 @@ def _handle_attach(args: dict, **kw) -> str:
     filename = args.get("filename")
     if not filename or not str(filename).strip():
         return tool_error("filename is required")
+    content_file = args.get("content_file")
     content_b64 = args.get("content_base64")
-    if not content_b64 or not str(content_b64).strip():
-        return tool_error("content_base64 is required")
-    import base64
-    import binascii
-    try:
-        data = base64.b64decode(str(content_b64), validate=True)
-    except (binascii.Error, ValueError) as e:
-        return tool_error(f"content_base64 is not valid base64: {e}")
+    if content_file and content_b64:
+        return tool_error(
+            "content_file and content_base64 are mutually exclusive; pass exactly one"
+        )
+    if content_file:
+        import os
+
+        path = str(content_file)
+        if not os.path.isfile(path):
+            return tool_error(f"content_file is not an existing file: {path}")
+        if not os.access(path, os.R_OK):
+            return tool_error(f"content_file is not readable: {path}")
+        if os.path.getsize(path) > kb.KANBAN_ATTACHMENT_MAX_BYTES:
+            limit_mb = kb.KANBAN_ATTACHMENT_MAX_BYTES // (1024 * 1024)
+            return tool_error(
+                f"kanban_attach: attachment exceeds {limit_mb} MB limit"
+            )
+        try:
+            with open(path, "rb") as fh:
+                data = fh.read()
+        except OSError as e:
+            return tool_error(f"content_file could not be read: {path}: {e}")
+    elif content_b64:
+        if not str(content_b64).strip():
+            return tool_error("content_base64 is required")
+        import base64
+        import binascii
+
+        try:
+            data = base64.b64decode(str(content_b64), validate=True)
+        except (binascii.Error, ValueError) as e:
+            return tool_error(f"content_base64 is not valid base64: {e}")
+    else:
+        return tool_error("content_file or content_base64 is required")
     content_type = args.get("content_type")
     board = args.get("board")
     try:
@@ -2036,11 +2070,12 @@ KANBAN_COMMENT_SCHEMA = {
 KANBAN_ATTACH_SCHEMA = {
     "name": "kanban_attach",
     "description": (
-        "Attach a file to a task by passing its bytes inline (base64). "
-        "Use for genuine file artifacts the next worker or a human should "
-        "be able to download — generated reports, images, exports. The "
-        "file is stored as a real attachment (not a comment link) under "
-        "the task's attachments dir, capped at 25 MB. Prefer "
+        "Attach a file to a task by passing its bytes inline (base64) or "
+        "by pointing at a local file path (content_file). Use for genuine "
+        "file artifacts the next worker or a human should be able to "
+        "download — generated reports, images, exports. The file is "
+        "stored as a real attachment (not a comment link) under the "
+        "task's attachments dir, capped at 25 MB. Prefer "
         "kanban_attach_url when you only have a URL."
     ),
     "parameters": {
@@ -2057,9 +2092,21 @@ KANBAN_ATTACH_SCHEMA = {
                     "Directory components are stripped; only the leaf is kept."
                 ),
             },
+            "content_file": {
+                "type": "string",
+                "description": (
+                    "Local file path to attach. The tool reads the file "
+                    "server-side and stores it, so you don't have to "
+                    "hand-assemble base64. Mutually exclusive with "
+                    "content_base64."
+                ),
+            },
             "content_base64": {
                 "type": "string",
-                "description": "The file contents, base64-encoded. Max 25 MB decoded.",
+                "description": (
+                    "The file contents, base64-encoded. Max 25 MB decoded. "
+                    "Mutually exclusive with content_file."
+                ),
             },
             "content_type": {
                 "type": "string",
@@ -2067,7 +2114,7 @@ KANBAN_ATTACH_SCHEMA = {
             },
             "board": _board_schema_prop(),
         },
-        "required": ["filename", "content_base64"],
+        "required": ["filename"],
     },
 }
 
