@@ -10,7 +10,7 @@ import { SCAFFOLD_LABEL_CLASS } from '@/components/chat/scaffold-row'
 import { Codicon } from '@/components/ui/codicon'
 import { Loader } from '@/components/ui/loader'
 import { StatusPulse } from '@/components/ui/status-pulse'
-import { useI18n } from '@/i18n'
+import { type Translations, useI18n } from '@/i18n'
 import { cn } from '@/lib/utils'
 import { $backgroundResume } from '@/store/background-delegation'
 import { sessionCompacting } from '@/store/compaction'
@@ -42,9 +42,6 @@ const StatusRow: FC<{ children: ReactNode; label: string } & React.ComponentProp
     {children}
   </div>
 )
-
-// Fixed label while auto-compaction runs — decoupled from backend status text.
-const COMPACTION_LABEL = 'Summarizing thread'
 
 const HintText: FC<{ children: ReactNode }> = ({ children }) => (
   <span className={cn(SCAFFOLD_LABEL_CLASS, 'shimmer min-w-0 flex-1 truncate')}>{children}</span>
@@ -79,7 +76,7 @@ const DRAFTING_REVEAL_MS = 200
  * What to call the wait, if it deserves a name. Compaction outranks a draft —
  * it's rarer, slower, and explains a transcript that looks like it reset.
  */
-function useStatusHint(compacting: boolean, drafting: DraftingTool | null): string {
+function useStatusHint(compacting: boolean, drafting: DraftingTool | null, t: Translations): string {
   const [revealed, setRevealed] = useState(false)
   const name = drafting?.name ?? ''
 
@@ -96,10 +93,10 @@ function useStatusHint(compacting: boolean, drafting: DraftingTool | null): stri
   }, [name])
 
   if (compacting) {
-    return COMPACTION_LABEL
+    return t.assistant.thread.summarizingThread
   }
 
-  return revealed && name ? toolPresentVerb(name) : ''
+  return revealed && name ? toolPresentVerb(name, t) : ''
 }
 
 export const CenteredThreadSpinner: FC = () => {
@@ -127,7 +124,7 @@ export const ResponseLoadingIndicator: FC = () => {
   const { t } = useI18n()
   const { compacting, drafting, turnTimerKey } = useThreadSessionStatus()
   const elapsed = useElapsedSeconds(true, turnTimerKey)
-  const hint = useStatusHint(compacting, drafting)
+  const hint = useStatusHint(compacting, drafting, t)
 
   return (
     <StatusRow data-slot="aui_response-loading" label={hint || t.assistant.thread.loadingResponse}>
@@ -186,6 +183,7 @@ const STREAM_STALL_S = 2
 // so that per-token updates re-render only this leaf, not the whole
 // AssistantMessage subtree.
 export const StreamStallIndicator: FC = () => {
+  const { t } = useI18n()
   const activity = useAuiState(s => {
     let textLength = 0
 
@@ -206,7 +204,7 @@ export const StreamStallIndicator: FC = () => {
   // component, which is the whole turn so far.
   const [quietSince, setQuietSince] = useState<number | undefined>(undefined)
   const { awaitingInput, compacting, drafting, turnTimerKey } = useThreadSessionStatus()
-  const hint = useStatusHint(compacting, drafting)
+  const hint = useStatusHint(compacting, drafting, t)
 
   // A tool run at the tail already narrates the wait — its summary counts the
   // calls, its ticker names the current one, and it carries its own timer. A
@@ -240,7 +238,7 @@ export const StreamStallIndicator: FC = () => {
   }
 
   return (
-    <StatusRow data-slot="aui_stream-stall" label={hint || 'Hermes is thinking'}>
+    <StatusRow data-slot="aui_stream-stall" label={hint || t.assistant.thread.hermesThinking}>
       <StatusPulse
         aria-hidden="true"
         className="dither inline-block size-3 rounded-[2px] text-midground/80"

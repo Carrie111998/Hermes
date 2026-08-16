@@ -163,6 +163,44 @@ export interface Translations {
     memoryProviderSettingsFailed: string
   }
 
+  toolRun: {
+    edit: {
+      present: string
+      presentTarget: (target: string) => string
+      pastTarget: (target: string) => string
+      presentCount: (count: number) => string
+      pastCount: (count: number) => string
+    }
+    explore: {
+      present: string
+      presentTarget: (target: string) => string
+      pastTarget: (target: string) => string
+      presentCount: (count: number) => string
+      pastCount: (count: number) => string
+    }
+    run: {
+      present: string
+      presentTarget: (target: string) => string
+      pastTarget: (target: string) => string
+      presentCount: (count: number) => string
+      pastCount: (count: number) => string
+    }
+    delegate: {
+      present: string
+      presentTarget: (target: string) => string
+      pastTarget: (target: string) => string
+      presentCount: (count: number) => string
+      pastCount: (count: number) => string
+    }
+    other: {
+      present: string
+      presentTarget: (target: string) => string
+      pastTarget: (target: string) => string
+      presentCount: (count: number) => string
+      pastCount: (count: number) => string
+    }
+  }
+
   fileMenu: {
     revealFinder: string
     revealExplorer: string
@@ -2558,6 +2596,8 @@ export interface Translations {
       loadingResponse: string
       resumeWhenBackgroundDone: (count: number) => string
       thinking: string
+      hermesThinking: string
+      summarizingThread: string
       thought: string
       thoughtBriefly: string
       thoughtFor: (duration: string) => string

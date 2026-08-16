@@ -116,6 +116,43 @@ export const en: Translations = {
     removeReaction: emoji => `Remove ${emoji} reaction`,
     memoryProviderSettingsFailed: 'Memory provider settings failed to load',
   },
+  toolRun: {
+    edit: {
+      present: 'Editing',
+      presentTarget: target => `Editing ${target}`,
+      pastTarget: target => `Edited ${target}`,
+      presentCount: count => `Editing ${count} ${count === 1 ? 'file' : 'files'}`,
+      pastCount: count => `Edited ${count} ${count === 1 ? 'file' : 'files'}`
+    },
+    explore: {
+      present: 'Exploring',
+      presentTarget: target => `Exploring ${target}`,
+      pastTarget: target => `Explored ${target}`,
+      presentCount: count => `Exploring ${count} ${count === 1 ? 'file' : 'files'}`,
+      pastCount: count => `Explored ${count} ${count === 1 ? 'file' : 'files'}`
+    },
+    run: {
+      present: 'Running',
+      presentTarget: target => `Running ${target}`,
+      pastTarget: target => `Ran ${target}`,
+      presentCount: count => `Running ${count} ${count === 1 ? 'command' : 'commands'}`,
+      pastCount: count => `Ran ${count} ${count === 1 ? 'command' : 'commands'}`
+    },
+    delegate: {
+      present: 'Delegating',
+      presentTarget: target => `Delegating ${target}`,
+      pastTarget: target => `Delegated ${target}`,
+      presentCount: count => `Delegating ${count} ${count === 1 ? 'task' : 'tasks'}`,
+      pastCount: count => `Delegated ${count} ${count === 1 ? 'task' : 'tasks'}`
+    },
+    other: {
+      present: 'Using',
+      presentTarget: target => `Using ${target}`,
+      pastTarget: target => `Used ${target}`,
+      presentCount: count => `Using ${count} ${count === 1 ? 'tool' : 'tools'}`,
+      pastCount: count => `Used ${count} ${count === 1 ? 'tool' : 'tools'}`
+    }
+  },
 
   fileMenu: {
     revealFinder: 'Reveal in Finder',
@@ -2978,6 +3015,8 @@ export const en: Translations = {
           ? 'Will resume when the background task finishes'
           : `Will resume when ${count} background tasks finish`,
       thinking: 'Thinking',
+      hermesThinking: 'Hermes is thinking',
+      summarizingThread: 'Summarizing thread',
       thought: 'Thought',
       thoughtBriefly: 'Thought briefly',
       thoughtFor: duration => `Thought for ${duration}`,

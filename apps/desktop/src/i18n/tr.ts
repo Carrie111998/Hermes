@@ -116,6 +116,43 @@ export const tr = defineLocale({
     removeReaction: emoji => `${emoji} tepkisini kaldır`,
     memoryProviderSettingsFailed: 'Bellek sağlayıcı ayarları yüklenemedi',
   },
+  toolRun: {
+    edit: {
+      present: 'Düzenliyor',
+      presentTarget: target => `${target} düzenleniyor`,
+      pastTarget: target => `${target} düzenlendi`,
+      presentCount: count => `${count} dosya düzenleniyor`,
+      pastCount: count => `${count} dosya düzenlendi`
+    },
+    explore: {
+      present: 'İnceliyor',
+      presentTarget: target => `${target} inceleniyor`,
+      pastTarget: target => `${target} incelendi`,
+      presentCount: count => `${count} dosya inceleniyor`,
+      pastCount: count => `${count} dosya incelendi`
+    },
+    run: {
+      present: 'Çalışıyor',
+      presentTarget: target => `${target} çalıştırılıyor`,
+      pastTarget: target => `${target} çalıştırıldı`,
+      presentCount: count => `${count} komut çalıştırılıyor`,
+      pastCount: count => `${count} komut çalıştırıldı`
+    },
+    delegate: {
+      present: 'Görev devrediyor',
+      presentTarget: target => `${target} devrediliyor`,
+      pastTarget: target => `${target} devredildi`,
+      presentCount: count => `${count} görev devrediliyor`,
+      pastCount: count => `${count} görev devredildi`
+    },
+    other: {
+      present: 'Kullanıyor',
+      presentTarget: target => `${target} kullanılıyor`,
+      pastTarget: target => `${target} kullanıldı`,
+      presentCount: count => `${count} araç kullanılıyor`,
+      pastCount: count => `${count} araç kullanıldı`
+    }
+  },
 
   fileMenu: {
     revealFinder: "Finder'da göster",
@@ -3226,6 +3263,8 @@ export const tr = defineLocale({
           ? 'Arka plan görevi bitince devam edecek'
           : `${count} arka plan görevi bitince devam edecek`,
       thinking: 'Düşünüyor',
+      hermesThinking: 'Hermes düşünüyor',
+      summarizingThread: 'Konu özetleniyor',
       thought: 'Düşünce',
       thoughtBriefly: 'Kısaca düşündü',
       thoughtFor: duration => `${duration} boyunca düşündü`,

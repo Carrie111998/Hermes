@@ -116,6 +116,43 @@ export const zh: Translations = {
     removeReaction: emoji => `移除 ${emoji} 反应`,
     memoryProviderSettingsFailed: '记忆提供程序设置加载失败',
   },
+  toolRun: {
+    edit: {
+      present: '编辑中',
+      presentTarget: target => `正在编辑 ${target}`,
+      pastTarget: target => `已编辑 ${target}`,
+      presentCount: count => `正在编辑 ${count} 个文件`,
+      pastCount: count => `已编辑 ${count} 个文件`
+    },
+    explore: {
+      present: '探索中',
+      presentTarget: target => `正在探索 ${target}`,
+      pastTarget: target => `已探索 ${target}`,
+      presentCount: count => `正在探索 ${count} 个文件`,
+      pastCount: count => `已探索 ${count} 个文件`
+    },
+    run: {
+      present: '运行中',
+      presentTarget: target => `正在运行 ${target}`,
+      pastTarget: target => `运行了 ${target}`,
+      presentCount: count => `正在运行 ${count} 条命令`,
+      pastCount: count => `运行了 ${count} 条命令`
+    },
+    delegate: {
+      present: '委派中',
+      presentTarget: target => `正在委派 ${target}`,
+      pastTarget: target => `已委派 ${target}`,
+      presentCount: count => `正在委派 ${count} 项任务`,
+      pastCount: count => `已委派 ${count} 项任务`
+    },
+    other: {
+      present: '使用中',
+      presentTarget: target => `正在使用 ${target}`,
+      pastTarget: target => `已使用 ${target}`,
+      presentCount: count => `正在使用 ${count} 个工具`,
+      pastCount: count => `已使用 ${count} 个工具`
+    }
+  },
 
   fileMenu: {
     revealFinder: '在访达中显示',
@@ -3148,6 +3185,8 @@ export const zh: Translations = {
       resumeWhenBackgroundDone: count =>
         count === 1 ? '后台任务完成后将自动继续' : `${count} 个后台任务完成后将自动继续`,
       thinking: '思考中',
+      hermesThinking: 'Hermes 正在思考',
+      summarizingThread: '正在总结线程',
       thought: '已思考',
       thoughtBriefly: '思考了片刻',
       thoughtFor: duration => `思考了 ${duration}`,
