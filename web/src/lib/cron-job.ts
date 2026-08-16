@@ -13,6 +13,7 @@ export interface CronJobFormState {
   no_agent: boolean;
   context_from: string;
   enabled_toolsets: string[];
+  max_iterations: string;
   workdir: string;
 }
 
@@ -49,6 +50,7 @@ function asString(value: unknown): string {
 export function buildCronJobPayload(form: CronJobFormState): CronJobMutation {
   const contextFrom = splitCronList(form.context_from);
   const enabledToolsets = form.enabled_toolsets.filter(Boolean);
+  const maxIterations = form.max_iterations.trim();
   return {
     name: form.name.trim(),
     prompt: form.prompt.trim(),
@@ -62,6 +64,8 @@ export function buildCronJobPayload(form: CronJobFormState): CronJobMutation {
     no_agent: Boolean(form.no_agent),
     context_from: contextFrom.length > 0 ? contextFrom : null,
     enabled_toolsets: enabledToolsets.length > 0 ? enabledToolsets : null,
+    max_iterations:
+      !form.no_agent && maxIterations ? Number(maxIterations) : null,
     workdir: optionalText(form.workdir),
   };
 }
@@ -90,6 +94,8 @@ export function cronJobFormFromJob(job: CronJob): CronJobFormState {
     no_agent: Boolean(job.no_agent),
     context_from: listToText(job.context_from),
     enabled_toolsets: splitCronList(job.enabled_toolsets),
+    max_iterations:
+      typeof job.max_iterations === "number" ? String(job.max_iterations) : "",
     workdir: asString(job.workdir),
   };
 }

@@ -98,6 +98,29 @@ fallback_providers:
     key_env: MY_LOCAL_KEY            # env var name containing the API key
 ```
 
+### Per-fallback resource limits
+
+A backup provider may have a lower output ceiling or tokens-per-minute quota
+than the primary. Add `max_output_tokens` to an individual fallback entry:
+
+```yaml
+fallback_providers:
+  - provider: custom
+    model: my-lower-limit-model
+    base_url: https://backup.example.com/v1
+    key_env: BACKUP_API_KEY
+    max_output_tokens: 2048
+```
+
+- `max_output_tokens` caps one fallback response. `max_tokens` is accepted as
+  an alias.
+
+The cap is scoped to that entry. If Hermes advances to another fallback, the
+next entry starts from the primary response cap rather than inheriting the
+previous fallback's cap. The primary cap is restored when the fallback turn
+ends. Invalid or non-positive token limits are ignored and logged instead of
+disabling the chain.
+
 ### When Fallback Triggers
 
 The fallback activates automatically when the primary model fails with:

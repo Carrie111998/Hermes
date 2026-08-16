@@ -146,6 +146,7 @@ function emptyCronJobForm(): CronJobEditorState {
     no_agent: false,
     context_from: "",
     enabled_toolsets: [],
+    max_iterations: "",
     workdir: "",
     scheduleState: { ...DEFAULT_SCHEDULE_STATE },
   };
@@ -281,14 +282,29 @@ function CronAdvancedFields({
           </div>
         </div>
 
-        <div className="grid gap-1">
-          <Label htmlFor={`${idPrefix}-workdir`}>Workdir</Label>
-          <Input
-            id={`${idPrefix}-workdir`}
-            value={form.workdir}
-            onChange={(e) => update("workdir", e.target.value)}
-            placeholder="/absolute/project/path"
-          />
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+          <div className="grid gap-1">
+            <Label htmlFor={`${idPrefix}-workdir`}>Workdir</Label>
+            <Input
+              id={`${idPrefix}-workdir`}
+              value={form.workdir}
+              onChange={(e) => update("workdir", e.target.value)}
+              placeholder="/absolute/project/path"
+            />
+          </div>
+          <div className="grid gap-1">
+            <Label htmlFor={`${idPrefix}-max-iterations`}>Max iterations</Label>
+            <Input
+              id={`${idPrefix}-max-iterations`}
+              type="number"
+              min={1}
+              step={1}
+              value={form.max_iterations}
+              onChange={(e) => update("max_iterations", e.target.value)}
+              placeholder="Use cron default"
+              disabled={form.no_agent}
+            />
+          </div>
         </div>
 
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
@@ -697,6 +713,13 @@ export default function CronPage() {
       showToast("no_agent jobs require a script", "error");
       return;
     }
+    if (
+      payload.max_iterations != null &&
+      (!Number.isInteger(payload.max_iterations) || payload.max_iterations <= 0)
+    ) {
+      showToast("Max iterations must be a positive integer", "error");
+      return;
+    }
     setCreating(true);
     try {
       await api.createCronJob(payload, createProfile);
@@ -723,6 +746,13 @@ export default function CronPage() {
     }
     if (payload.no_agent && !payload.script) {
       showToast("no_agent jobs require a script", "error");
+      return;
+    }
+    if (
+      payload.max_iterations != null &&
+      (!Number.isInteger(payload.max_iterations) || payload.max_iterations <= 0)
+    ) {
+      showToast("Max iterations must be a positive integer", "error");
       return;
     }
     setSaving(true);

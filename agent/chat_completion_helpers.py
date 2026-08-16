@@ -2652,6 +2652,46 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         agent.requested_provider = fb_provider
         agent.base_url = fb_base_url
         agent.api_mode = fb_api_mode
+        from agent.agent_runtime_helpers import apply_provider_iteration_policy
+
+        apply_provider_iteration_policy(agent, fb_provider)
+        # Every fallback entry starts from the primary response cap. A previous
+        # fallback may have installed a tighter cap; entries that omit the
+        # option must not inherit that prior entry's policy as the chain
+        # advances.
+        _primary_request_state = getattr(agent, "_primary_runtime", {}) or {}
+        if not isinstance(_primary_request_state, dict):
+            _primary_request_state = {}
+        _primary_request_state.setdefault(
+            "max_tokens", getattr(agent, "max_tokens", None)
+        )
+        agent.max_tokens = _primary_request_state.get(
+            "max_tokens", getattr(agent, "max_tokens", None)
+        )
+        # A fallback endpoint can have a much smaller output/rate limit than
+        # the primary provider.  Without a per-entry cap the transport falls
+        # back to the provider profile default (custom providers default to
+        # 65,536), which can make the recovery request fail before generation
+        # begins.  Accept both names used elsewhere in config and keep invalid
+        # values non-fatal so one typo does not disable the entire chain.
+        _fb_max_tokens_raw = fb.get("max_output_tokens", fb.get("max_tokens"))
+        if _fb_max_tokens_raw is not None:
+            try:
+                if isinstance(_fb_max_tokens_raw, bool) or not isinstance(
+                    _fb_max_tokens_raw, (int, str)
+                ):
+                    raise ValueError("token limit must be an integer")
+                _fb_max_tokens = int(_fb_max_tokens_raw)
+                if _fb_max_tokens <= 0:
+                    raise ValueError("token limit must be positive")
+                agent.max_tokens = _fb_max_tokens
+            except (TypeError, ValueError, OverflowError):
+                logger.warning(
+                    "Ignoring invalid fallback max_output_tokens for %s/%s: %r",
+                    fb_provider,
+                    fb_model,
+                    _fb_max_tokens_raw,
+                )
         if hasattr(agent, "_transport_cache"):
             agent._transport_cache.clear()
         agent._fallback_activated = True

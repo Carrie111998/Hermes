@@ -133,6 +133,41 @@ model:
   #       CF-Access-Client-Secret: "${CF_ACCESS_SECRET}"
   #       X-Client-Name: "hermes-agent"
 
+# =============================================================================
+# Fallback Resource Limits (optional)
+# =============================================================================
+# Each fallback entry can lower its response cap for providers with tighter
+# output or tokens-per-minute limits. The primary cap is restored after
+# fallback, and each fallback entry starts from that cap rather than inheriting
+# a previous entry's limit.
+#
+# fallback_providers:
+#   - provider: custom
+#     model: my-backup-model
+#     base_url: "https://backup.example.com/v1"
+#     key_env: BACKUP_API_KEY
+#     max_output_tokens: 2048       # `max_tokens` is accepted as an alias
+
+# =============================================================================
+# Cron Agent Budgets (optional)
+# =============================================================================
+# `cron.max_iterations` limits only scheduled agent runs. A positive
+# per-job `max_iterations` wins; otherwise cron falls back to agent.max_turns.
+# The optional final-window policy can raise (never lower) the limit shortly
+# before a provider's weekly reset. A profile-scoped `HERMES_TIMEZONE` value
+# overrides the top-level `timezone`; when neither is set, server-local time is
+# used. Weekdays follow Python: Monday=0 through Sunday=6.
+#
+# cron:
+#   max_iterations: 20
+#   weekly_final_day:
+#     enabled: false
+#     provider: "zai"               # empty = any provider
+#     reset_weekday: 5               # Saturday
+#     reset_time: "10:00"            # HH:MM or HH:MM:SS
+#     window_hours: 24
+#     max_iterations: 40
+
 # Command-minted credentials (optional): key_cmd
 # ------------------------------------------------------------------
 # Enterprise gateways often issue SHORT-LIVED bearers (SSO/OIDC brokers, cloud

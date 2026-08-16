@@ -485,6 +485,30 @@ async def test_dashboard_cron_mutations_notify_selected_profile_provider(
 
 
 @pytest.mark.asyncio
+async def test_dashboard_cron_persists_and_clears_per_job_iteration_limit(
+    isolated_profiles,
+):
+    from hermes_cli import web_server
+
+    created = await web_server.create_cron_job(
+        web_server.CronJobCreate(
+            prompt="bounded profile job",
+            schedule="every 1h",
+            max_iterations=12,
+        ),
+        profile="worker_alpha",
+    )
+    assert created["max_iterations"] == 12
+
+    updated = await web_server.update_cron_job(
+        created["id"],
+        web_server.CronJobUpdate(updates={"max_iterations": None}),
+        profile="worker_alpha",
+    )
+    assert updated["max_iterations"] is None
+
+
+@pytest.mark.asyncio
 async def test_blueprint_instantiation_notifies_selected_profile_provider(
     isolated_profiles,
     monkeypatch,

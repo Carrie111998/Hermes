@@ -41,6 +41,22 @@ def test_cron_edit_no_agent_tristate():
     assert parser.parse_args(["cron", "edit", "j"]).no_agent is None
 
 
+def test_cron_max_iterations_create_edit_and_clear_flags():
+    parser = _build()
+
+    created = parser.parse_args(
+        ["cron", "create", "every 1h", "task", "--max-iterations", "12"]
+    )
+    edited = parser.parse_args(
+        ["cron", "edit", "j", "--max-iterations", "18"]
+    )
+    cleared = parser.parse_args(["cron", "edit", "j", "--clear-max-iterations"])
+
+    assert created.max_iterations == 12
+    assert edited.max_iterations == 18
+    assert cleared.max_iterations == 0
+
+
 def test_cron_accept_hooks_flag_on_run_and_tick():
     parser = _build()
     # --accept-hooks is suppressed-default; present only when passed.

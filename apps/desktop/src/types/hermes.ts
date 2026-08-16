@@ -834,6 +834,7 @@ export interface CronJob {
   id: string
   last_error?: null | string
   last_run_at?: null | string
+  max_iterations?: null | number
   model?: null | string
   name?: null | string
   next_run_at?: null | string
@@ -849,6 +850,7 @@ export interface CronJob {
 export interface CronJobCreatePayload {
   deliver?: string
   model?: string
+  max_iterations?: number
   name?: string
   prompt: string
   provider?: string
@@ -865,6 +867,7 @@ export interface CronJobUpdates {
   deliver?: string
   enabled?: boolean
   model?: null | string
+  max_iterations?: null | number
   name?: string
   prompt?: string
   provider?: null | string

@@ -811,6 +811,43 @@ class TestEnabledToolsets:
         assert job["enabled_toolsets"] == ["web", "terminal"]
 
 
+class TestMaxIterations:
+    def test_positive_per_job_limit_is_stored_and_updated(self, tmp_cron_dir):
+        job = create_job(
+            prompt="bounded job",
+            schedule="every 1h",
+            max_iterations=12,
+        )
+        assert job["max_iterations"] == 12
+
+        updated = update_job(job["id"], {"max_iterations": "18"})
+        assert updated["max_iterations"] == 18
+
+        cleared = update_job(job["id"], {"max_iterations": None})
+        assert cleared["max_iterations"] is None
+
+    @pytest.mark.parametrize("value", [True, False, 0, -1, 1.5, "nope"])
+    def test_invalid_per_job_limit_is_rejected(self, tmp_cron_dir, value):
+        with pytest.raises(ValueError, match="positive integer"):
+            create_job(
+                prompt="bounded job",
+                schedule="every 1h",
+                max_iterations=value,
+            )
+
+    def test_invalid_update_does_not_replace_existing_limit(self, tmp_cron_dir):
+        job = create_job(
+            prompt="bounded job",
+            schedule="every 1h",
+            max_iterations=12,
+        )
+
+        with pytest.raises(ValueError, match="positive integer"):
+            update_job(job["id"], {"max_iterations": True})
+
+        assert get_job(job["id"])["max_iterations"] == 12
+
+
 class TestMarkJobRunConcurrency:
     """Regression tests for concurrent parallel job state writes.
 
@@ -986,7 +1023,7 @@ class TestSaveJobOutput:
     def test_creates_output_file(self, tmp_cron_dir):
         output_file = save_job_output("test123", "# Results\nEverything ok.")
         assert output_file.exists()
-        assert output_file.read_text() == "# Results\nEverything ok."
+        assert output_file.read_text(encoding="utf-8") == "# Results\nEverything ok."
         assert "test123" in str(output_file)
 
 
@@ -998,7 +1035,7 @@ class TestCronOutputRetention:
         d.mkdir(parents=True, exist_ok=True)
         names = [f"2026-06-25_10-00-{i:02d}.md" for i in range(count)]
         for n in names:
-            (d / n).write_text("x")
+            (d / n).write_text("x", encoding="utf-8")
         return names
 
     def test_prune_keeps_newest_n(self, tmp_path):

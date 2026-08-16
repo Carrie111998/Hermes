@@ -1563,6 +1563,26 @@ def _normalize_job_optional_text(value: Any, *, strip_trailing_slash: bool = Fal
     return text or None
 
 
+def _normalize_job_max_iterations(value: Any) -> Optional[int]:
+    """Normalize a user-owned per-job agent budget.
+
+    ``None`` clears the override. Booleans and non-positive/non-integral
+    values are rejected so malformed dashboard or programmatic requests do
+    not silently fall through to a broader fleet-wide budget.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, str)):
+        raise ValueError("max_iterations must be a positive integer")
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("max_iterations must be a positive integer") from exc
+    if parsed <= 0:
+        raise ValueError("max_iterations must be a positive integer")
+    return parsed
+
+
 def _compute_provider_model_snapshots(
     *,
     provider: Any,
@@ -1668,6 +1688,7 @@ def create_job(
     attach_to_session: Optional[bool] = None,
     monitor_script: Optional[str] = None,
     monitor_url: Optional[str] = None,
+    max_iterations: Optional[int] = None,
 ) -> Dict[str, Any]:
     """
     Create a new cron job.
@@ -1699,6 +1720,9 @@ def create_job(
                           When set, only tools from these toolsets are loaded, reducing
                           token overhead. When omitted, all default tools are loaded.
                           Ignored when ``no_agent=True``.
+        max_iterations: Optional positive per-job agent iteration limit. This
+                        overrides ``cron.max_iterations`` for this job and is
+                        ignored when ``no_agent=True``.
         workdir: Optional absolute path.  When set, the job runs as if launched
                 from that directory: AGENTS.md / CLAUDE.md / .cursorrules from
                 that directory are injected into the system prompt, and the
@@ -1754,6 +1778,7 @@ def create_job(
     normalized_script = normalized_script or None
     normalized_toolsets = [str(t).strip() for t in enabled_toolsets if str(t).strip()] if enabled_toolsets else None
     normalized_toolsets = normalized_toolsets or None
+    normalized_max_iterations = _normalize_job_max_iterations(max_iterations)
     normalized_workdir = _normalize_workdir(workdir)
     normalized_no_agent = bool(no_agent)
     normalized_attach = attach_to_session if isinstance(attach_to_session, bool) else None
@@ -1860,6 +1885,8 @@ def create_job(
         "enabled_toolsets": normalized_toolsets,
         "workdir": normalized_workdir,
     }
+    if normalized_max_iterations is not None:
+        job["max_iterations"] = normalized_max_iterations
     # Only persist attach_to_session when explicitly set, so existing jobs and
     # the common case stay byte-identical (absent key => fall back to the
     # global cron.mirror_delivery config, default off).
@@ -1962,6 +1989,11 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                     updates["workdir"] = None
                 else:
                     updates["workdir"] = _normalize_workdir(_wd)
+
+            if "max_iterations" in updates:
+                updates["max_iterations"] = _normalize_job_max_iterations(
+                    updates["max_iterations"]
+                )
 
             # Normalize monitor fields the same way create_job does (empty
             # string clears the field).

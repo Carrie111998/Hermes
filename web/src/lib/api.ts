@@ -2244,6 +2244,7 @@ export interface CronJobMutation {
   no_agent?: boolean;
   context_from?: string[] | null;
   enabled_toolsets?: string[] | null;
+  max_iterations?: number | null;
   workdir?: string | null;
 }
 
@@ -2269,6 +2270,7 @@ export interface CronJob {
   no_agent?: boolean | null;
   context_from?: string[] | string | null;
   enabled_toolsets?: string[] | null;
+  max_iterations?: number | null;
   workdir?: string | null;
   last_run_at?: string | null;
   next_run_at?: string | null;

@@ -386,8 +386,18 @@ class CronJobCreate(BaseModel):
     script: Optional[str] = None
     context_from: Optional[Any] = None
     enabled_toolsets: Optional[List[str]] = None
+    max_iterations: Optional[int] = None
     workdir: Optional[str] = None
     no_agent: bool = False
+
+    @field_validator("max_iterations", mode="before")
+    @classmethod
+    def _validate_max_iterations(cls, value):
+        if value is None:
+            return None
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ValueError("max_iterations must be a positive integer")
+        return value
 
 
 class CronJobUpdate(BaseModel):
@@ -738,4 +748,3 @@ class _PluginProvidersPutBody(BaseModel):
 
 class _PluginVisibilityBody(BaseModel):
     hidden: bool
-
