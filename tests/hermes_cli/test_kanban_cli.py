@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -49,6 +50,18 @@ def test_fmt_ts_tolerates_string_timestamps():
     assert kc._fmt_ts(1785902715) == "2026-08-04 21:05"
     assert kc._fmt_ts(None) == ""
     assert kc._fmt_ts(0) == ""
+
+
+def test_fmt_ts_does_not_misparse_compact_or_short_strings():
+    """Only purely-numeric strings are treated as epochs; compact-ISO and
+    short/odd strings fall through to the ISO branch instead of rendering a
+    wrong year."""
+    # Compact ISO without separators must NOT be parsed as an epoch.
+    assert kc._fmt_ts("20260804T210515") == "20260804 210515"
+    # A short numeric epoch (pre-2001) is still a valid epoch -> a date.
+    assert kc._fmt_ts("987654321") == time.strftime(
+        "%Y-%m-%d %H:%M", time.localtime(987654321)
+    )
 
 
 def test_kanban_list_json_includes_session_id(kanban_home):
