@@ -399,19 +399,24 @@ async function pidIsOurDashboard(ssh, pid, spawnNonce, hermesPath = '', ownershi
       'ok=False\n' +
       'try:\n' +
       ' serve=args.index("serve")\n' +
-      ' owner=args.index("--ssh-owner-nonce",serve+1)\n' +
+      ' def option(name):\n' +
+      '  matches=[i for i,arg in enumerate(args[serve+1:],serve+1) if arg==name or (argv_exact and arg.startswith(name+"="))]\n' +
+      '  if len(matches)>1:raise ValueError\n' +
+      '  if not matches:return None\n' +
+      '  i=matches[0]\n' +
+      '  return args[i+1] if args[i]==name else args[i].split("=",1)[1]\n' +
+      ' owner=option("--ssh-owner-nonce")\n' +
+      ' token=option("--ssh-session-token-file")\n' +
+      ' host=option("--host")\n' +
+      ' port=option("--port")\n' +
+      ' if owner is None:raise ValueError\n' +
       ' direct=args[0]==expected\n' +
       ' python_entry=len(args)>1 and args[1]==expected and os.path.basename(args[0]).startswith("python")\n' +
       ' executable_match=direct or python_entry\n' +
       ' wrapper_owned=False\n' +
       ' if tokenfile and argv_exact:\n' +
-      '  try:\n' +
-      '   token=args.index("--ssh-session-token-file",serve+1)\n' +
-      '   host=args.index("--host",serve+1)\n' +
-      '   port=args.index("--port",serve+1)\n' +
-      '   wrapper_owned=(os.path.normpath(args[token+1])==os.path.normpath(tokenfile) and args[host+1]=="127.0.0.1" and args[port+1]=="0")\n' +
-      '  except (ValueError,IndexError):pass\n' +
-      ' ok=(executable_match or wrapper_owned) and "--isolated" in args[serve+1:] and args[owner+1]==nonce\n' +
+      '  wrapper_owned=(token is not None and os.path.normpath(token)==os.path.normpath(tokenfile) and host=="127.0.0.1" and port=="0")\n' +
+      ' ok=(executable_match or wrapper_owned) and "--isolated" in args[serve+1:] and owner==nonce\n' +
       'except (ValueError,IndexError):pass\n' +
       'print("OWNED" if ok else "FOREIGN")'
 

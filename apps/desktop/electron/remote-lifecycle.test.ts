@@ -342,7 +342,10 @@ subprocess.check_output = fallback_check_output
 // `exec`s the venv entrypoint, so the shell is replaced IN PLACE (same pid) and
 // the kernel rewrites argv for the entrypoint's shebang. The launcher path we
 // record in the lockfile then appears in neither argv[0] nor argv[1].
-function spawnThroughExecWrapper(extraServeArgs: string[]) {
+function spawnThroughExecWrapper(
+  extraServeArgs: string[],
+  bindArgs: string[] = ['--host', '127.0.0.1', '--port', '0']
+) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'hermes-wrapper-'))
   const entrypoint = path.join(dir, 'venv', 'bin', 'hermes')
   const launcher = path.join(dir, '.local', 'bin', 'hermes')
@@ -351,7 +354,7 @@ function spawnThroughExecWrapper(extraServeArgs: string[]) {
   fs.writeFileSync(entrypoint, '#!/usr/bin/env python3\nimport time\ntime.sleep(120)\n', { mode: 0o755 })
   fs.writeFileSync(launcher, `#!/bin/sh\nexec ${JSON.stringify(entrypoint)} "$@"\n`, { mode: 0o755 })
 
-  const child = spawn(launcher, ['serve', '--isolated', '--host', '127.0.0.1', '--port', '0', ...extraServeArgs], {
+  const child = spawn(launcher, ['serve', '--isolated', ...bindArgs, ...extraServeArgs], {
     stdio: 'ignore'
   })
 
@@ -441,6 +444,50 @@ test('pidIsOurDashboard reclaims a dashboard whose exec wrapper rewrote argv', a
       true,
       'a live process carrying our exact serve --isolated shape, owner nonce and ownership token-file path is ours'
     )
+  } finally {
+    wrapper.cleanup()
+  }
+})
+
+test('pidIsOurDashboard accepts equals-form wrapper ownership arguments', async () => {
+  if (process.platform !== 'linux') {
+    return
+  }
+
+  const tokenFilePath = `${ownershipDirectory(OWNERSHIP_ID).replace(/^~/, os.homedir())}/${SPAWN_NONCE}.token`
+
+  const wrapper = spawnThroughExecWrapper(
+    [`--ssh-session-token-file=${tokenFilePath}`, `--ssh-owner-nonce=${SPAWN_NONCE}`],
+    ['--host=127.0.0.1', '--port=0']
+  )
+
+  try {
+    await waitForServeArgv(wrapper.pid, wrapper.entrypoint)
+    assert.equal(await pidIsOurDashboard(shellSsh(), wrapper.pid, SPAWN_NONCE, wrapper.launcher, OWNERSHIP_ID), true)
+  } finally {
+    wrapper.cleanup()
+  }
+})
+
+test('pidIsOurDashboard rejects duplicate wrapper ownership arguments', async () => {
+  if (process.platform !== 'linux') {
+    return
+  }
+
+  const tokenFilePath = `${ownershipDirectory(OWNERSHIP_ID).replace(/^~/, os.homedir())}/${SPAWN_NONCE}.token`
+
+  const wrapper = spawnThroughExecWrapper([
+    '--ssh-session-token-file',
+    tokenFilePath,
+    '--ssh-owner-nonce',
+    SPAWN_NONCE,
+    '--ssh-owner-nonce',
+    'fedcba9876543210'
+  ])
+
+  try {
+    await waitForServeArgv(wrapper.pid, wrapper.entrypoint)
+    assert.equal(await pidIsOurDashboard(shellSsh(), wrapper.pid, SPAWN_NONCE, wrapper.launcher, OWNERSHIP_ID), false)
   } finally {
     wrapper.cleanup()
   }
