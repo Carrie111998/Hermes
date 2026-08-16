@@ -2453,6 +2453,7 @@ export const zhHant = defineLocale({
       loadFailedConsole: (code, message) => `載入失敗${code ? ` (${code})` : ''}：${message}`,
       unreachableDescription: '無法連線至預覽頁面。',
       openTarget: url => `開啟 ${url}`,
+      openExternal: '在預設瀏覽器開啟',
       fallbackTitle: '預覽',
       goBack: '上一頁',
       goForward: '下一頁',

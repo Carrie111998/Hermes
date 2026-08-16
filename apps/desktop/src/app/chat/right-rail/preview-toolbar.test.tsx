@@ -16,6 +16,7 @@ const baseProps = {
   onBack: vi.fn(),
   onForward: vi.fn(),
   onReload: vi.fn(),
+  onOpenExternal: vi.fn(),
   onSubmit: vi.fn(),
   onTogglePick: vi.fn(),
   onViewportChange: vi.fn(),
@@ -208,6 +209,21 @@ describe('PreviewToolbar', () => {
     const rendered = render(<PreviewToolbar {...baseProps} picking={true} />)
 
     expect(rendered.getByRole('button', { name: 'Cancel element selection' })).toBeTruthy()
+  })
+
+  it('fires onOpenExternal from the external-link button', () => {
+    const onOpenExternal = vi.fn()
+    const rendered = render(<PreviewToolbar {...baseProps} onOpenExternal={onOpenExternal} />)
+
+    fireEvent.click(rendered.getByRole('button', { name: 'Open in default browser' }))
+
+    expect(onOpenExternal).toHaveBeenCalledOnce()
+  })
+
+  it('disables the external-link button when the address is invalid', () => {
+    const rendered = render(<PreviewToolbar {...baseProps} address="not a url" addressValid={false} />)
+
+    expect((rendered.getByRole('button', { name: 'Open in default browser' }) as HTMLButtonElement).disabled).toBe(true)
   })
 
   it('does not rotate the reload icon when idle', () => {

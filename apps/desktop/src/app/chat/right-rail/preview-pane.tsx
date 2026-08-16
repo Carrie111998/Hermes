@@ -6,6 +6,7 @@ import { requestComposerFocus, requestComposerInsert } from '@/app/chat/composer
 import { Tip } from '@/components/ui/tooltip'
 import { type Translations, useI18n } from '@/i18n'
 import { isDesktopFsRemoteMode } from '@/lib/desktop-fs'
+import { openExternalLink } from '@/lib/external-link'
 import { guardGuestPointers } from '@/lib/guest-pointer-guard'
 import { openPreviewTargetInBrowser, remoteHtmlPreviewDocument } from '@/lib/local-preview'
 import { rafCoalesce } from '@/lib/raf-coalesce'
@@ -381,6 +382,16 @@ export function PreviewPane({ embedded = false, onRestartServer, reloadRequest =
     setViewport(next)
     saveViewportMode(next)
   }, [])
+
+  const openExternal = useCallback(() => {
+    const url = (webviewRef.current?.getURL?.() || currentUrl).trim()
+
+    if (!isHttpUrl(url)) {
+      return
+    }
+
+    void openExternalLink(url)
+  }, [currentUrl])
 
   const appendConsoleEntry = useCallback(
     (entry: Omit<ConsoleEntry, 'id'>) => {
@@ -850,6 +861,7 @@ export function PreviewPane({ embedded = false, onRestartServer, reloadRequest =
             }}
             onBack={goBack}
             onForward={goForward}
+            onOpenExternal={openExternal}
             onReload={reloadPreview}
             onSubmit={submitAddress}
             onTogglePick={togglePicking}

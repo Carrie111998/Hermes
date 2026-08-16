@@ -2995,6 +2995,7 @@ export const zh: Translations = {
       loadFailedConsole: (code, message) => `加载失败${code ? ` (${code})` : ''}: ${message}`,
       unreachableDescription: '无法访问预览页面。',
       openTarget: url => `打开 ${url}`,
+      openExternal: '在默认浏览器中打开',
       fallbackTitle: '预览',
       goBack: '后退',
       goForward: '前进',
