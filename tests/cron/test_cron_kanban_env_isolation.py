@@ -428,10 +428,13 @@ class TestSubprocessEnvScrub:
         import cron.scheduler as sched
 
         captured_env: dict = {}
+        observed: dict = {}
 
         def fake_run_job_script(script_path, workdir=None, cancel_event=None):
+            from agent.delegation_context import is_dispatcher_owned_worker_context
             from tools.environments.local import build_subprocess_env
             captured_env.update(build_subprocess_env())
+            observed["dispatcher_owned_during_script"] = is_dispatcher_owned_worker_context()
             return True, "ok"
 
         monkeypatch.setattr(sched, "_run_job_script", fake_run_job_script)
@@ -446,6 +449,9 @@ class TestSubprocessEnvScrub:
         assert captured_env, "fake script runner was never invoked"
         assert "HERMES_KANBAN_TASK" not in captured_env
         assert "HERMES_KANBAN_CLAIM_LOCK" not in captured_env
+        # The wrap in run_job() must cover the whole _run_job_script_with_claim_heartbeat
+        # call, not just leave the marker to be inferred from the scrubbed env.
+        assert observed["dispatcher_owned_during_script"] is False
 
     def test_prerun_script_subprocess_env_is_scrubbed(self, monkeypatch, worker_env):
         """Integration: the wake-gate pre-check script also builds its
@@ -453,10 +459,13 @@ class TestSubprocessEnvScrub:
         import cron.scheduler as sched
 
         captured_env: dict = {}
+        observed: dict = {}
 
         def fake_run_job_script(script_path, workdir=None, cancel_event=None):
+            from agent.delegation_context import is_dispatcher_owned_worker_context
             from tools.environments.local import build_subprocess_env
             captured_env.update(build_subprocess_env())
+            observed["dispatcher_owned_during_script"] = is_dispatcher_owned_worker_context()
             return True, '{"wakeAgent": false}'
 
         monkeypatch.setattr(sched, "_run_job_script", fake_run_job_script)
@@ -471,6 +480,7 @@ class TestSubprocessEnvScrub:
         assert captured_env, "fake script runner was never invoked"
         assert "HERMES_KANBAN_TASK" not in captured_env
         assert "HERMES_KANBAN_CLAIM_LOCK" not in captured_env
+        assert observed["dispatcher_owned_during_script"] is False
 
 
 # ---------------------------------------------------------------------------
