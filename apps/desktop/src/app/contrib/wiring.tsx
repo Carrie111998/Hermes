@@ -132,6 +132,7 @@ import { useDesktopIntegrations } from './hooks/use-desktop-integrations'
 import { usePetBridge } from './hooks/use-pet-bridge'
 import { useQuickEntryBridge } from './hooks/use-quick-entry-bridge'
 import { useSessionTileDelegate } from './hooks/use-session-tile-delegate'
+import { McpInstallDeepLinkDialog } from './mcp-install-deeplink-dialog'
 import { $restartPreviewServer, useTitlebarToolContributions } from './panes'
 import { ChatRoutesSurface, SidebarSurface, StatusbarSurface, TerminalSurface } from './surfaces'
 import type { WiringActions, WiringApi } from './types'
@@ -1068,6 +1069,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
       <PetGenerateOverlay />
       <SessionSwitcher />
       <FileActionDialogs />
+      <McpInstallDeepLinkDialog />
       <RemoteFolderPicker />
       <FindBar />
 
