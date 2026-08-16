@@ -1,6 +1,6 @@
 ---
 title: "ARCH-003 implementation plan: runtime-state audit and replay verification"
-status: IMPLEMENTATION_PLAN_REVISE_V31_PENDING
+status: IMPLEMENTATION_PLAN_REVISE_V32_PENDING
 date: 2026-08-16
 type: implementation-plan
 ticket: ARCH-003
@@ -410,13 +410,14 @@ Migration compatibility tests must assert this posture.
   equals the materialized counter at commit.
 - Any mutation/genesis journal constraint or write failure aborts the complete
   enclosing materialized-state mutation; errors must not be swallowed.
-- The CAS caller receives a typed bounded `WRITE_ABORT` refusal for
-  continuity, downgrade-unsafe, or journal-transaction failure; it performs no
-  automatic retry, does not drop or corrupt the session loop, and leaves
-  unaffected conversations/platform loops running. The gateway-facing error
-  boundary returns the existing safe operation-failure response without
-  entering prompt construction; Gate 4 exercises this caller contract with a
-  real CAS caller adapter.
+- The CAS caller receives a typed bounded mutation refusal for
+  `LOCK_TIMEOUT`, `KEY_UNAVAILABLE`, or `WRITE_ABORT` (covering
+  continuity, downgrade-unsafe, journal-transaction, lock-acquisition, and
+  key-custody failure); it performs no automatic retry, does not drop or
+  corrupt the session loop, and leaves unaffected conversations/platform loops
+  running. The gateway-facing error boundary returns the existing safe
+  operation-failure response without entering prompt construction; Gate 4
+  exercises this caller contract with a real CAS caller adapter.
 - Prepare and validate the digest key before acquiring the shared maintenance
   lock. If it is unavailable, fail closed before opening SQLite or acquiring
   any lock, leave materialized state unchanged, emit no event, and surface the
@@ -449,8 +450,14 @@ Implement a bounded verifier that:
   and the current-generation record, bounded event stream, and materialized row
   are all read after that snapshot establishment and before the transaction
   ends. Immutable-open is prohibited for this verifier;
-- validates the HMAC-SHA-256 key-check, algorithm/truncation parameters, and
-  digest identifier before replay;
+- if snapshot establishment or the first snapshot read fails, returns
+  `UNKNOWN` with `SNAPSHOT_FAILURE` before evaluating any
+  snapshot-dependent key-check or digest-parameter comparison;
+- after the snapshot is established, validates local key availability first,
+  then validates the HMAC-SHA-256 algorithm/truncation parameters and digest
+  identifier, and finally validates the key-check bound to that identifier.
+  The pre-replay reason order is `KEY_UNAVAILABLE` ->
+  `DIGEST_PARAMETER_MISMATCH` -> `KEY_CHECK_MISMATCH`;
 - returns per-entity `CONSISTENT`, `DRIFT`, or `UNKNOWN`;
 - treats `UNKNOWN` as absorbing;
 - requires complete verified history for `DRIFT`;
@@ -460,13 +467,11 @@ Implement a bounded verifier that:
   (`HISTORY_MALFORMED`), digest-parameter identity, schemas, the shared and
   verifier-side closed reason-code subsets, and terminal state;
 - uses a code-level `REPLAY_EVENT_LIMIT = 10000` counted from the effective
-  replay start point. Before replay, key availability, key-check,
-  algorithm/truncation parameters, and digest-parameter identity are
-  validated; any applicable `KEY_UNAVAILABLE`, `KEY_CHECK_MISMATCH`, or
-  `DIGEST_PARAMETER_MISMATCH` is returned before replay and before the
-  structural precedence below. After those replay preconditions pass, apply
-  this structural verifier diagnostic precedence from highest to lowest:
-  `SNAPSHOT_FAILURE`, `UNSUPPORTED_VERSION`, `POST_TERMINAL_EVENT`,
+  replay start point. Snapshot failure is the highest-precedence result and
+  returns `SNAPSHOT_FAILURE` before any snapshot-dependent precondition can
+  be evaluated. After the pre-replay reason order above passes, apply this
+  structural verifier diagnostic precedence from highest to lowest:
+  `UNSUPPORTED_VERSION`, `POST_TERMINAL_EVENT`,
   `HISTORY_MALFORMED`, `EMPTY_HISTORY`,
   `MATERIALIZED_STATE_ASYMMETRY`, `GENERATION_MISMATCH`,
   `LEGACY_ORIGIN_MISSING`, `SEQUENCE_INVALID`, `BASELINE_INVALID`,
@@ -577,8 +582,9 @@ Add deterministic tests for:
   `GENERATION_MISMATCH`;
 - bypass-path rejection for mutation/genesis while permitting only the named
   baseline writer and the explicitly authorized re-originating genesis writer;
-- caller contract for `WRITE_ABORT`: no automatic retry, affected operation
-  receives a bounded failure, and unaffected loops continue;
+- caller contract for mutation-surface `LOCK_TIMEOUT`, `KEY_UNAVAILABLE`,
+  and `WRITE_ABORT`: no automatic retry, each affected operation receives a
+  bounded failure, and unaffected loops continue;
 - keyed digest/profile isolation, identifier/key-check mismatch, digest
   rotation without bridging, verify-time key unavailability, and mutation-time
   key unavailability returning shared `KEY_UNAVAILABLE` without changing
@@ -1094,6 +1100,25 @@ DGX changes, deployment, repair, or event-sourcing. The corrected plan must
 return to the same authenticated Claude reviewer family and then to AGY on the
 identical packet.
 
+## Implementation-plan review reconciliation v31
+
+The v31 authenticated Claude Opus review returned `REVISE` with three bounded
+plan-text corrections. The corrections are incorporated above:
+
+1. Snapshot establishment failure is the highest-precedence verifier result;
+   snapshot-dependent digest/key checks are not attempted when it fails.
+2. The pre-replay mutation-independent reason order is explicit:
+   `KEY_UNAVAILABLE` -> `DIGEST_PARAMETER_MISMATCH` ->
+   `KEY_CHECK_MISMATCH`, followed only after success by structural precedence.
+3. Mutation-surface `LOCK_TIMEOUT`, `KEY_UNAVAILABLE`, and `WRITE_ABORT`
+   share the bounded no-retry and unaffected-loop caller contract, with Gate 4
+   coverage.
+
+These remain plan-only corrections and do not authorize source edits, tests,
+DGX changes, deployment, repair, or event-sourcing. The corrected plan must
+return to the same authenticated Claude reviewer family and then to AGY on the
+identical packet.
+
 ## Acceptance criteria
 
 ARCH-003 implementation is ready for its delivery gates only when:
@@ -1123,7 +1148,7 @@ ARCH-003 implementation is ready for its delivery gates only when:
   retention job; entities beyond the replay limit remain UNKNOWN in this ticket,
   and the 100,000-event/100 MiB per-profile threshold is a documented follow-up
   operational review, not an in-ticket operator gate;
-- reconciliation v1 and v5-v30 items are incorporated into the normative
+- reconciliation v1 and v5-v31 items are incorporated into the normative
   Gates 0-4 text (with v2-v4 explicitly folded into the v1/v4 text), and this
   merged plan revision receives the same-family re-review;
 - all focused and relevant tests pass;
@@ -1193,6 +1218,8 @@ ARCH-003 implementation is ready for its delivery gates only when:
   STARTUP_LOCKED exit trigger, and complete coverage.
 - v30: STARTUP_LOCKED write abort contract, counter/journal transaction
   atomicity, and key/digest precondition ordering.
+- v31: snapshot-failure precedence, deterministic pre-replay reason order,
+  and bounded caller contracts for all mutation-surface refusal codes.
 
 
 ## Non-goals
