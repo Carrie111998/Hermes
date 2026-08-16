@@ -1012,7 +1012,19 @@ def _set_nested(config, dotted_key: str, value):
     replaced any non-dict value (including lists) with ``{}``, silently
     destroying list-typed config like ``custom_providers`` whenever a
     caller used an indexed path.
+
+    Rejects bracket index syntax (``name[N]``, e.g. ``pre_llm_call[1]``):
+    bracket segments can never resolve here (we split on ``.`` only), so
+    they would silently fall through to plain dict assignment and create a
+    literal junk key next to the real list (#87689).  The failure must be
+    explicit, not a confident no-op.
     """
+    if "[" in dotted_key or "]" in dotted_key:
+        raise ValueError(
+            f"Cannot set key {dotted_key!r}: bracket index syntax ('name[N]') "
+            f"is not supported. Use numeric dotted segments "
+            f"(e.g. 'custom_providers.0.api_key') or edit config.yaml directly."
+        )
     parts = dotted_key.split(".")
     current = config
     for part in parts[:-1]:
@@ -1092,6 +1104,15 @@ def _get_nested(config, dotted_key: str):
 
 def _unset_nested(config, dotted_key: str) -> bool:
     """Remove a dotted-path value from nested dict/list config data."""
+    # Symmetric with _set_nested (#87689): bracket index syntax can never
+    # resolve here, so reject it instead of treating ``name[N]`` as a
+    # literal dict key.
+    if "[" in dotted_key or "]" in dotted_key:
+        raise ValueError(
+            f"Cannot unset key {dotted_key!r}: bracket index syntax ('name[N]') "
+            f"is not supported. Use numeric dotted segments "
+            f"(e.g. 'custom_providers.0.api_key') or edit config.yaml directly."
+        )
     parts = dotted_key.split(".")
     if not parts:
         return False
@@ -5202,6 +5223,29 @@ def _validate_config_key(key: str) -> tuple[bool, Optional[str]]:
     return True, None
 
 
+def _reject_bracket_index_syntax(key: str, verb: str) -> None:
+    """Reject bracket index syntax (``name[N]``) in config set/unset keys.
+
+    Before #87689, ``hermes config set hooks.pre_llm_call[1].command ...``
+    reported ``✓ Set`` and wrote a literal ``pre_llm_call[1]`` dict key next
+    to the real list — completely inert at runtime, so the operator's guard
+    hook never fired.  Bracket segments can never resolve: the nested
+    navigators split on ``.`` only, so the bracketed segment falls through
+    to plain dict assignment.  Reject up front with an explicit error
+    instead of writing a junk key.
+    """
+    if "[" in key or "]" in key:
+        print(
+            f"✗ Cannot {verb} '{key}': bracket index syntax ('name[N]') is not "
+            f"supported by 'hermes config {verb}'.\n"
+            f"  Use the numeric dotted-path form to address a list element,\n"
+            f"  e.g. 'hermes config {verb} hooks.pre_llm_call.1.command <value>',\n"
+            f"  or edit config.yaml directly.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+
 def set_config_value(key: str, value: str, force: bool = False):
     """Set a configuration value.
 
@@ -5216,6 +5260,9 @@ def set_config_value(key: str, value: str, force: bool = False):
             refused (bare ``model`` is redirected to ``model.default``). The
             CLI exposes this via ``hermes config set --force``.
     """
+    # Reject bracket index syntax before anything is routed or written —
+    # the failure must be explicit, never a silent literal junk key (#87689).
+    _reject_bracket_index_syntax(key, "set")
     if is_managed():
         managed_error("set configuration values")
         return
@@ -5443,6 +5490,8 @@ def get_config_value(key: str, *, as_json: bool = False):
 
 def unset_config_value(key: str):
     """Remove a user-set configuration or .env value."""
+    # Symmetric with set_config_value (#87689).
+    _reject_bracket_index_syntax(key, "unset")
     if is_managed():
         managed_error("unset configuration values")
         return
