@@ -1810,15 +1810,6 @@ def switch_model(
         except Exception:
             pass
 
-    # --- Direct alias override: use exact base_url from the alias if set ---
-    if resolved_alias:
-        _da = direct_alias
-        if _da is not None and _da.base_url:
-            base_url = _da.base_url
-            api_mode = ""  # clear so determine_api_mode re-detects from URL
-            if not api_key:
-                api_key = "no-key-required"
-
     # --- Resolve api_mode from the final (provider, base_url) before validation ---
     # Two cases this closes, both surfaced when the switched model's reasoning
     # is actually applied (post the reasoning-unification refactor):

@@ -377,20 +377,20 @@ def _run_agent(
             if direct is not None:
                 effective_model = direct.model
                 effective_provider = direct.provider
+                explicit_api_key_from_alias = direct.api_key.strip()
+                if (
+                    explicit_api_key_from_alias.startswith("${")
+                    and explicit_api_key_from_alias.endswith("}")
+                ):
+                    explicit_api_key_from_alias = _ms._scoped_key_env(
+                        explicit_api_key_from_alias[2:-1]
+                    )
+                if not explicit_api_key_from_alias and direct.key_env.strip():
+                    explicit_api_key_from_alias = _ms._scoped_key_env(
+                        direct.key_env.strip()
+                    )
                 if direct.base_url:
                     explicit_base_url_from_alias = direct.base_url.rstrip("/")
-                    explicit_api_key_from_alias = direct.api_key.strip()
-                    if (
-                        explicit_api_key_from_alias.startswith("${")
-                        and explicit_api_key_from_alias.endswith("}")
-                    ):
-                        explicit_api_key_from_alias = _ms._scoped_key_env(
-                            explicit_api_key_from_alias[2:-1]
-                        )
-                    if not explicit_api_key_from_alias and direct.key_env.strip():
-                        explicit_api_key_from_alias = _ms._scoped_key_env(
-                            direct.key_env.strip()
-                        )
             else:
                 cfg_provider = ""
                 if isinstance(model_cfg, dict):
