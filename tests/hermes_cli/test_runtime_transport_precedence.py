@@ -76,6 +76,79 @@ class TestFallbackApiMode:
         )
 
 
+class TestMiniMaxOpenAiCompatRoute:
+    """Regression: MiniMax overlays default to anthropic_messages but the
+    /v1 endpoint is OpenAI-compatible. A user setting
+    ``MINIMAX_CN_BASE_URL=https://api.minimaxi.com/v1`` (or pointing
+    ``model.base_url`` at the same path) used to land on
+    ``anthropic_messages`` because the overlay won outright and the URL
+    was not recognised as a wire-format mandate. That forced the user to
+    hand-roll a custom provider. Hosts recognised here:
+
+      - api.minimaxi.com   (China, /v1 OpenAI-compat)
+      - api.minimax.io    (global, /v1 OpenAI-compat)
+
+    The /anthropic path on the same hosts is NOT affected — it's caught
+    by the ``endswith("/anthropic")`` branch and stays on
+    ``anthropic_messages`` as before.
+    """
+
+    @pytest.mark.parametrize(
+        "provider,base_url",
+        [
+            ("minimax-cn", "https://api.minimaxi.com/v1"),
+            ("minimax-cn", "https://api.minimaxi.com/v1/"),
+            ("minimax", "https://api.minimax.io/v1"),
+            ("minimax", "https://api.minimax.io/v1/"),
+            ("minimax-oauth", "https://api.minimax.io/v1"),
+        ],
+    )
+    def test_minimax_v1_openai_compat_routes_to_chat_completions(
+        self, provider, base_url
+    ):
+        # Both URL detection and the full determine_api_mode path must
+        # agree, because runtime_provider._fallback_api_mode consults
+        # URL detection first, but model_switch / persisted config paths
+        # consult determine_api_mode directly.
+        from hermes_cli.runtime_provider import _detect_api_mode_for_url
+
+        assert _detect_api_mode_for_url(base_url) == "chat_completions"
+        assert _fallback_api_mode(provider, base_url) == "chat_completions"
+        assert (
+            __import__("hermes_cli.providers", fromlist=["determine_api_mode"])
+            .determine_api_mode(provider, base_url)
+            == "chat_completions"
+        )
+
+    @pytest.mark.parametrize(
+        "provider,base_url",
+        [
+            ("minimax-cn", "https://api.minimaxi.com/anthropic"),
+            ("minimax", "https://api.minimax.io/anthropic"),
+            ("minimax-oauth", "https://api.minimax.io/anthropic"),
+        ],
+    )
+    def test_minimax_anthropic_path_still_anthropic_messages(
+        self, provider, base_url
+    ):
+        # The OpenAI-compat carve-out must NOT regress the working
+        # /anthropic routes — those are the default and stay
+        # anthropic_messages.
+        from hermes_cli.providers import determine_api_mode
+
+        assert determine_api_mode(provider, base_url) == "anthropic_messages"
+
+    def test_minimax_v1_spoofed_subdomain_is_not_anthropic(self):
+        # The hostname match is exact — a lookalike subdomain
+        # (api.minimaxi.com.attacker.test/v1) must NOT inherit the
+        # MiniMax carve-out. Same spoof-rejection contract as
+        # is_official_openai_host (#32243).
+        from hermes_cli.runtime_provider import _detect_api_mode_for_url
+
+        spoofed = "https://api.minimaxi.com.attacker.test/v1"
+        assert _detect_api_mode_for_url(spoofed) is None
+
+
 class TestExplicitRuntimeIntegration:
     """The explicit-runtime path resolves regional OpenAI to codex_responses."""
 

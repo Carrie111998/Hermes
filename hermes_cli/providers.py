@@ -620,6 +620,14 @@ def host_mandated_api_mode(base_url: str = "") -> Optional[str]:
       - api.anthropic.com / ``…/anthropic`` suffixes speak native Messages.
       - Kimi's ``/coding`` endpoint speaks native Messages.
       - AWS Bedrock runtime hosts speak Converse.
+      - MiniMax (international + China) exposes an OpenAI-compatible
+        ``/v1`` endpoint alongside its Anthropic-Messages ``/anthropic``
+        endpoint. The MiniMax overlay defaults to ``anthropic_messages``,
+        so a user pointing ``MINIMAX_CN_BASE_URL`` (or
+        ``model.base_url``) at the OpenAI-compatible ``/v1`` route would
+        silently 4xx until they hand-rolled a custom provider. Treat the
+        ``/v1`` suffix on the two known MiniMax hosts as mandating
+        ``chat_completions`` so the URL on the wire wins over the overlay.
 
     These are *mandatory* — a session carrying a stale api_mode (e.g. a
     /model switch that kept the previous provider's ``chat_completions``)
@@ -644,6 +652,21 @@ def host_mandated_api_mode(base_url: str = "") -> Optional[str]:
     # catalog filtering and listing authority.
     if is_official_openai_host(base_url):
         return "codex_responses"
+    # MiniMax OpenAI-compatible endpoint. The ``/v1`` path on the two
+    # known MiniMax hosts is documented as the OpenAI-compat surface —
+    # see the ``MiniMaxProfile`` reasoning-controls hook in
+    # plugins/model-providers/minimax/__init__.py, which is only wired up
+    # for that route. Mandating ``chat_completions`` here lets a user set
+    # ``MINIMAX_CN_BASE_URL=https://api.minimaxi.com/v1`` (or the global
+    # equivalent) without a custom-provider workaround; the
+    # ``/anthropic`` path on these hosts is caught by the
+    # ``endswith("/anthropic")`` branch above and stays on
+    # ``anthropic_messages``.
+    if (
+        hostname in {"api.minimax.io", "api.minimaxi.com"}
+        and (url_lower.endswith("/v1") or "/v1/" in url_lower)
+    ):
+        return "chat_completions"
     if hostname.startswith("bedrock-runtime.") and base_url_host_matches(base_url, "amazonaws.com"):
         return "bedrock_converse"
     return None
