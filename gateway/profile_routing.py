@@ -114,13 +114,36 @@ def _coerce_route_id(key: str, value: Any, name: str) -> Optional[str]:
     ``str`` — an ``int`` route would silently never match and messages
     would fall through to the default profile. Normalize here so the
     comparison is type-consistent, and surface the misconfiguration.
+
+    Only ``int`` is coerced (the legitimate YAML-numeric-ID case). Other
+    non-string types (float, bool, ...) are almost always mis-parsed YAML:
+    stringifying them would produce a value that can never match a string
+    discriminator (``123.0`` vs ``"123"``) — recreating the silent-no-match
+    this helper exists to fix. They are still returned as strings (never
+    None: a None discriminator makes the route unconstrained and would
+    match everything), but the warning says outright that the value can
+    never match.
     """
     if value is None or isinstance(value, str):
         return value
+    if isinstance(value, bool):  # bool is an int subclass — check first
+        logger.warning(
+            "Profile route %r: %s=%r is a boolean and can never match — "
+            "quote the value in config.yaml (e.g. `%s: \"%s\"`).",
+            name, key, value, key, value,
+        )
+        return str(value)
+    if isinstance(value, int):
+        logger.warning(
+            "Profile route %r: %s=%r is not a string — coercing to %r. "
+            "Quote the value in config.yaml (e.g. `%s: \"%s\"`) to be explicit.",
+            name, key, value, str(value), key, value,
+        )
+        return str(value)
     logger.warning(
-        "Profile route %r: %s=%r is not a string — coercing to %r. "
-        "Quote the value in config.yaml (e.g. `%s: \"%s\"`) to be explicit.",
-        name, key, value, str(value), key, value,
+        "Profile route %r: %s=%r (type %s) can never match a string route "
+        "discriminator — quote it in config.yaml (e.g. `%s: \"%s\"`).",
+        name, key, value, type(value).__name__, key, value,
     )
     return str(value)
 
