@@ -136,6 +136,27 @@ class TestGetDefinitions:
         assert len(defs) == 2
         assert calls["count"] == 1
 
+    def test_can_skip_check_fn_probes_for_schema_only_surfaces(self):
+        reg = ToolRegistry()
+        calls = {"count": 0}
+
+        def check_fn():
+            calls["count"] += 1
+            return False
+
+        reg.register(
+            name="cold_tool",
+            toolset="cold",
+            schema=_make_schema("cold_tool"),
+            handler=_dummy_handler,
+            check_fn=check_fn,
+        )
+
+        defs = reg.get_definitions({"cold_tool"}, skip_check_fn=True)
+
+        assert [d["function"]["name"] for d in defs] == ["cold_tool"]
+        assert calls["count"] == 0
+
 
 class TestUnknownToolDispatch:
     def test_returns_error_json(self):

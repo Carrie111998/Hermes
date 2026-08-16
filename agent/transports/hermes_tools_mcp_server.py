@@ -45,6 +45,7 @@ Spawned by: CodexAppServerSession.ensure_started() when the runtime is
 from __future__ import annotations
 
 import inspect
+import importlib
 import json
 import logging
 import os
@@ -150,6 +151,59 @@ EXPOSED_TOOLS: tuple[str, ...] = (
     "kanban_link",
 )
 
+# These modules register every built-in tool that can appear in EXPOSED_TOOLS.
+# Importing them directly populates the registry without importing model_tools,
+# whose module-level discovery loads the entire Hermes tool catalog.
+MCP_TOOL_MODULES: tuple[str, ...] = (
+    "tools.web_tools",
+    "tools.browser_tool",
+    "tools.vision_tools",
+    "tools.image_generation_tool",
+    "tools.skills_tool",
+    "tools.tts_tool",
+    "tools.kanban_tools",
+)
+
+MCP_KANBAN_TOOLS = frozenset(
+    name for name in EXPOSED_TOOLS if name.startswith("kanban_")
+)
+
+
+def _load_mcp_tool_definitions() -> list[dict]:
+    """Load only the registry modules needed to build the MCP schema."""
+    from tools.registry import registry
+
+    for module_name in MCP_TOOL_MODULES:
+        try:
+            importlib.import_module(module_name)
+        except Exception as exc:
+            logger.warning("Could not import MCP tool module %s: %s", module_name, exc)
+
+    # Kanban availability is a cheap environment/profile gate. Keep it
+    # accurate, but do not run the cold dependency probes for browser, vision,
+    # image generation, or TTS while Codex is waiting for MCP initialization.
+    tool_names = set(EXPOSED_TOOLS)
+    check_results = {}
+    for name in MCP_KANBAN_TOOLS:
+        entry = registry.get_entry(name)
+        check_fn = entry.check_fn if entry is not None else None
+        if check_fn is None:
+            continue
+        if check_fn not in check_results:
+            try:
+                check_results[check_fn] = bool(check_fn())
+            except Exception as exc:
+                logger.debug("MCP Kanban availability check failed: %s", exc)
+                check_results[check_fn] = False
+        if not check_results[check_fn]:
+            tool_names.discard(name)
+
+    return registry.get_definitions(
+        tool_names,
+        quiet=True,
+        skip_check_fn=True,
+    )
+
 
 def _build_server() -> Any:
     """Create the FastMCP server with Hermes tools attached. Lazy imports
@@ -161,12 +215,6 @@ def _build_server() -> Any:
         raise ImportError(
             f"hermes-tools MCP server requires the 'mcp' package: {exc}"
         ) from exc
-
-    # Discover Hermes tools so dispatch works.
-    from model_tools import (
-        get_tool_definitions,
-        handle_function_call,
-    )
 
     mcp = FastMCP(
         "hermes-tools",
@@ -183,7 +231,7 @@ def _build_server() -> Any:
     # MCP clients see the same parameter docs Hermes gives the model.
     all_defs = {
         td["function"]["name"]: td["function"]
-        for td in (get_tool_definitions(quiet_mode=True) or [])
+        for td in (_load_mcp_tool_definitions() or [])
         if isinstance(td, dict) and td.get("type") == "function"
     }
 
@@ -210,6 +258,11 @@ def _build_server() -> Any:
 
             def _dispatch(**kwargs: Any) -> str:
                 try:
+                    # Keep the full dispatcher off the MCP startup path. It
+                    # imports every Hermes tool and plugin; the first real
+                    # tool call is the correct point to pay that cost.
+                    from model_tools import handle_function_call
+
                     # Filter out None values before dispatch so unset optionals
                     # aren't forwarded to the handler.
                     args = {k: v for k, v in kwargs.items() if v is not None}
