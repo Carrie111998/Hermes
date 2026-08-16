@@ -1569,6 +1569,7 @@ export const ar = defineLocale({
     last: 'آخر تشغيل',
     next: 'التالي',
     noRuns: 'لا توجد تشغيلات',
+    outputUnavailable: outputId => `لم تعد نتيجة التشغيل «${outputId}.md» متاحة.`,
     manage: 'إدارة',
     showRuns: 'إظهار التشغيلات',
     hideRuns: 'إخفاء التشغيلات',

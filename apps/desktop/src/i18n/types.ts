@@ -1701,6 +1701,7 @@ export interface Translations {
     last: string
     next: string
     noRuns: string
+    outputUnavailable: (outputId: string) => string
     manage: string
     showRuns: string
     hideRuns: string
