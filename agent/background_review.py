@@ -111,6 +111,34 @@ def _resolve_review_runtime(agent: Any) -> Dict[str, Any]:
         return parent
 
 
+# Historical hardcoded value — kept as the default so existing behavior is
+# unchanged when the config key is unset.
+_DEFAULT_REVIEW_MAX_ITERATIONS = 16
+
+
+def _resolve_review_max_iterations(agent: Any) -> int:
+    """Resolve the review fork's tool-calling iteration budget.
+
+    Default 16 (unchanged historical behavior). Configurable via
+    ``auxiliary.background_review.max_iterations`` so operators can bound the
+    worst-case cost of a review that never concludes "nothing to save" and
+    instead runs to the cap every time. Clamped to [1, 64]; any config-read
+    or parse failure falls back to the default (same best-effort pattern as
+    ``auxiliary_client._transient_retry_count``).
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+        cfg = load_config_readonly()
+        aux = cfg.get("auxiliary", {}) if isinstance(cfg.get("auxiliary"), dict) else {}
+        task = aux.get("background_review", {}) if isinstance(aux.get("background_review"), dict) else {}
+        val = task.get("max_iterations")
+        if val is None:
+            return _DEFAULT_REVIEW_MAX_ITERATIONS
+        return max(1, min(int(val), 64))
+    except Exception:
+        return _DEFAULT_REVIEW_MAX_ITERATIONS
+
+
 def _msg_text(m: Dict) -> str:
     c = m.get("content")
     if isinstance(c, str):
@@ -811,7 +839,7 @@ def _run_review_in_thread(
                         _fork_kwargs[_pref_attr] = _pref_val
             review_agent = AIAgent(
                 model=_rt.get("model") or agent.model,
-                max_iterations=16,
+                max_iterations=_resolve_review_max_iterations(agent),
                 quiet_mode=True,
                 platform=agent.platform,
                 provider=_rt.get("provider") or agent.provider,
