@@ -10,6 +10,7 @@ import hashlib
 import json
 import math
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import Enum
 from types import MappingProxyType
@@ -215,7 +216,13 @@ class SourceIdentity:
 
 @dataclass(frozen=True, slots=True)
 class ProtectedFact:
-    """An immutable, provenance-bound fact eligible for protected storage."""
+    """An immutable, provenance-bound fact eligible for protected storage.
+
+    ``fact_id`` is a deterministic identity over the full canonical fact,
+    including its provenance and source identity.  Therefore the same value
+    captured from different session/message provenance intentionally receives
+    different IDs; this is provenance-scoped identity, not hash instability.
+    """
 
     fact_kind: str
     capture_status: CaptureStatus
@@ -295,6 +302,9 @@ class Supersession:
     }
 
     def __post_init__(self) -> None:
+        self._validate()
+
+    def _validate(self) -> None:
         if self.schema_version != SUPERSESSION_SCHEMA_VERSION:
             raise ContractValidationError("unsupported Supersession schema_version")
         for field in ("old_fact_id", "new_fact_id"):
@@ -317,23 +327,13 @@ class Supersession:
     def from_dict(cls, data: Any) -> "Supersession":
         data = _strict_object(data, cls._FIELDS, "Supersession")
         _require(data, cls._FIELDS, "Supersession")
-        if data["schema_version"] != SUPERSESSION_SCHEMA_VERSION:
-            raise ContractValidationError("unsupported Supersession schema_version")
-        for field in ("old_fact_id", "new_fact_id"):
-            value = _text(data[field], field)
-            if not _FACT_ID_RE.fullmatch(value):
-                raise ContractValidationError(f"invalid {field}")
-        if data["old_fact_id"] == data["new_fact_id"]:
-            raise ContractValidationError("supersession cannot target itself")
-        ordering = data["ordering"]
-        if isinstance(ordering, bool) or not isinstance(ordering, int) or ordering < 1:
-            raise ContractValidationError("ordering must be a positive integer")
         return cls(
             data["old_fact_id"],
             data["new_fact_id"],
             ProvenancePointer.from_dict(data["new_provenance"]),
-            _text(data["authority_ref"], "authority_ref"),
-            ordering,
+            data["authority_ref"],
+            data["ordering"],
+            schema_version=data["schema_version"],
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -351,8 +351,8 @@ class Supersession:
 class ProtectedBlock:
     """A deterministic collection of protected facts and transitions."""
 
-    facts: tuple[ProtectedFact, ...]
-    supersessions: tuple[Supersession, ...] = ()
+    facts: Sequence[ProtectedFact]
+    supersessions: Sequence[Supersession] = ()
     schema_version: str = BLOCK_SCHEMA_VERSION
 
     _FIELDS: ClassVar[set[str]] = {"schema_version", "facts", "supersessions"}
@@ -360,10 +360,16 @@ class ProtectedBlock:
     def __post_init__(self) -> None:
         if self.schema_version != BLOCK_SCHEMA_VERSION:
             raise ContractValidationError("unsupported ProtectedBlock schema_version")
-        if not isinstance(self.facts, tuple):
-            raise ContractValidationError("ProtectedBlock.facts must be a tuple")
-        if not isinstance(self.supersessions, tuple):
-            raise ContractValidationError("ProtectedBlock.supersessions must be a tuple")
+        if isinstance(self.facts, (str, bytes, bytearray)) or not isinstance(
+            self.facts, Sequence
+        ):
+            raise ContractValidationError("ProtectedBlock.facts must be a sequence")
+        if isinstance(self.supersessions, (str, bytes, bytearray)) or not isinstance(
+            self.supersessions, Sequence
+        ):
+            raise ContractValidationError("ProtectedBlock.supersessions must be a sequence")
+        object.__setattr__(self, "facts", tuple(self.facts))
+        object.__setattr__(self, "supersessions", tuple(self.supersessions))
         if not all(isinstance(fact, ProtectedFact) for fact in self.facts):
             raise ContractValidationError("ProtectedBlock.facts contains an invalid fact")
         fact_ids = [fact.fact_id for fact in self.facts]

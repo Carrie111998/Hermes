@@ -173,6 +173,18 @@ def test_direct_block_construction_rejects_duplicate_or_dangling_transitions() -
         ProtectedBlock((old,), (transition,))
 
 
+def test_protected_block_normalizes_sequence_inputs_and_rejects_invalid_elements() -> None:
+    fact = ProtectedFact.from_dict(fact_data())
+    from_list = ProtectedBlock([fact], [])
+    from_tuple = ProtectedBlock((fact,), ())
+
+    assert isinstance(from_list.facts, tuple)
+    assert isinstance(from_list.supersessions, tuple)
+    assert from_list.to_dict() == from_tuple.to_dict()
+    with pytest.raises(ContractValidationError, match="invalid fact"):
+        ProtectedBlock([object()])  # type: ignore[list-item]
+
+
 def test_protected_block_is_deterministic_and_rejects_duplicate_facts() -> None:
     first = ProtectedFact.from_dict(fact_data())
     second = ProtectedFact.from_dict(
