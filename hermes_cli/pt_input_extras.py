@@ -150,6 +150,53 @@ def install_cmd_backspace_alias() -> int:
     return changed
 
 
+def _install_literal_key_data_patch() -> bool:
+    """Make character-valued ``ANSI_SEQUENCES`` entries insert themselves.
+
+    prompt_toolkit's VT100 parser builds every key press as
+    ``KeyPress(key=<table value>, data=<matched bytes>)``, and the default
+    ``Keys.Any`` binding inserts ``event.data`` — the *bytes*, not the key.
+    That is invisible for entries resolving to a ``Keys`` member (bindings
+    match on ``key``, and ``data`` is unused), which is every entry stock
+    prompt_toolkit ships.
+
+    It is not invisible for the character-valued entries registered above.
+    Mapping ``ESC[27;2;72~`` → ``"H"`` makes the parser emit
+    ``KeyPress(key="H", data="\\x1b[27;2;72~")``, so the prompt still
+    receives the raw escape sequence as literal text — the mapping alone
+    fixes what the key *is* but not what it *types*.
+
+    This narrows ``data`` to the character for exactly that case. The
+    parser's fallback path already calls the handler with ``key is data``
+    for ordinary typing, and stock prompt_toolkit ships no character-valued
+    table entries, so nothing else changes shape.
+
+    Idempotent; returns True when this call installed the patch.
+    """
+    try:
+        from prompt_toolkit.input.vt100_parser import Vt100Parser
+        from prompt_toolkit.keys import Keys
+    except Exception:
+        return False
+
+    if getattr(Vt100Parser, "_hermes_literal_key_data", False):
+        return False
+
+    original_call_handler = Vt100Parser._call_handler
+
+    def _call_handler(self, key, insert_text):  # type: ignore[no-untyped-def]
+        if isinstance(key, str) and not isinstance(key, Keys) and len(key) == 1:
+            insert_text = key
+        return original_call_handler(self, key, insert_text)
+
+    try:
+        Vt100Parser._call_handler = _call_handler  # type: ignore[assignment]
+        Vt100Parser._hermes_literal_key_data = True  # type: ignore[attr-defined]
+    except Exception:
+        return False
+    return True
+
+
 def install_modify_other_keys_aliases() -> int:
     """Map Ctrl+key and Alt+key sequences emitted under ``modifyOtherKeys`` level 2
     and Kitty CSI-u to the same ``Keys``.* values that the raw control bytes
@@ -385,6 +432,11 @@ def install_modify_other_keys_aliases() -> int:
     # created before this install (or in earlier tests) can't misparse.
     if changed:
         _clear_vt100_prefix_cache()
+
+    # Character-valued entries above (Shift+letter, Shift+Space, keypad
+    # digits) need the parser to type the character rather than the escape
+    # sequence that produced it.
+    _install_literal_key_data_patch()
 
     return changed
 
