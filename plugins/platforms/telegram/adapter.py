@@ -236,6 +236,11 @@ async def _shutdown_abandoned_app(app) -> None:
 try:
     from telegram import Update, Bot, Message, InlineKeyboardButton, InlineKeyboardMarkup
     try:
+        from telegram import InlineQueryResultArticle, InputTextMessageContent
+    except ImportError:
+        InlineQueryResultArticle = None
+        InputTextMessageContent = None
+    try:
         from telegram import LinkPreviewOptions
     except ImportError:
         LinkPreviewOptions = None
@@ -258,6 +263,8 @@ except ImportError:
     Message = Any
     InlineKeyboardButton = Any
     InlineKeyboardMarkup = Any
+    InlineQueryResultArticle = Any
+    InputTextMessageContent = Any
     LinkPreviewOptions = None
     Application = Any
     CommandHandler = Any
@@ -1612,11 +1619,20 @@ class TelegramAdapter(BasePlatformAdapter):
             }
         return {"message_thread_id": cls._message_thread_id_for_send(thread_id)}
 
+    @staticmethod
+    def _numeric_message_thread_id(thread_id: Optional[str]) -> Optional[int]:
+        """Return a Bot API topic id, omitting only Guest synthetic lanes."""
+        if not thread_id:
+            return None
+        if str(thread_id).startswith("guest:"):
+            return None
+        return int(thread_id)
+
     @classmethod
     def _message_thread_id_for_send(cls, thread_id: Optional[str]) -> Optional[int]:
         if not thread_id or str(thread_id) == cls._GENERAL_TOPIC_THREAD_ID:
             return None
-        return int(thread_id)
+        return cls._numeric_message_thread_id(thread_id)
 
     @classmethod
     def _message_thread_id_for_typing(cls, thread_id: Optional[str]) -> Optional[int]:
@@ -1629,7 +1645,7 @@ class TelegramAdapter(BasePlatformAdapter):
         # sends still map "1" → None via _message_thread_id_for_send.
         if not thread_id:
             return None
-        return int(thread_id)
+        return cls._numeric_message_thread_id(thread_id)
 
     @staticmethod
     def _is_thread_not_found_error(error: Exception) -> bool:
@@ -4228,6 +4244,15 @@ class TelegramAdapter(BasePlatformAdapter):
         ))
         # Handle inline keyboard button callbacks (update prompts)
         app.add_handler(CallbackQueryHandler(self._handle_callback_query))
+        if (
+            self._telegram_allow_guest_queries()
+            and TypeHandler is not None
+            and hasattr(Update, "GUEST_MESSAGE")
+            and InlineQueryResultArticle is not None
+            and InputTextMessageContent is not None
+        ):
+            # Guest updates are a fallback after ordinary handlers in group 0.
+            app.add_handler(TypeHandler(Update, self._handle_guest_message), group=1)
         # gateway_platform_event observer (see _on_platform_update); group 99 so
         # it observes alongside, never displaces, the core handlers.
         app.add_handler(TypeHandler(Update, self._on_platform_update), group=99)
@@ -9679,54 +9704,6 @@ class TelegramAdapter(BasePlatformAdapter):
                 logger.info("[%s] Lazy-registered %d commands for forum chat %s", self.name, len(bot_commands), chat_id)
             except Exception as e:
                 logger.warning("[%s] Forum command lazy-registration failed: %s", self.name, _redact_telegram_error_text(e))
-
-    def _register_handlers(self, app) -> None:
-        """Register all Telegram update handlers on ``app``.
-
-        Extracted so the registration wiring — in particular the group
-        assignment that controls dispatch order — is unit-testable without
-        standing up a live Application. See the group-ordering note on the
-        Guest Mode handler below.
-        """
-        app.add_handler(TelegramMessageHandler(
-            filters.TEXT & ~filters.COMMAND,
-            self._handle_text_message
-        ))
-        app.add_handler(TelegramMessageHandler(
-            filters.COMMAND,
-            self._handle_command
-        ))
-        app.add_handler(TelegramMessageHandler(
-            filters.LOCATION | getattr(filters, "VENUE", filters.LOCATION),
-            self._handle_location_message
-        ))
-        app.add_handler(TelegramMessageHandler(
-            filters.PHOTO | filters.VIDEO | filters.AUDIO | filters.VOICE | filters.Document.ALL | filters.Sticker.ALL,
-            self._handle_media_message
-        ))
-        # Handle inline keyboard button callbacks (update prompts)
-        app.add_handler(CallbackQueryHandler(self._handle_callback_query))
-        if (
-            self._telegram_allow_guest_queries()
-            and TypeHandler is not None
-            and hasattr(Update, "GUEST_MESSAGE")
-            and InlineQueryResultArticle is not None
-            and InputTextMessageContent is not None
-        ):
-            # Register the Guest Mode catch-all in a LATER group (1), after
-            # the normal text/command/media handlers in the default group
-            # (0). PTB evaluates each group independently and runs at most
-            # one matching handler per group, so a TypeHandler(Update) —
-            # which matches every update — must not sit in a group that is
-            # evaluated before normal intake. Group 1 makes it a strict
-            # fallback: ordinary updates are handled by group 0 first, and
-            # this handler only does real work for guest updates (guarded
-            # below). The generic text/command handlers keep their own
-            # guest_message guards so a guest update that also matches a
-            # group-0 filter is not double-processed.
-            app.add_handler(TypeHandler(Update, self._handle_guest_message), group=1)
-        # Preserve upstream's platform-event observer registration.
-        app.add_handler(TypeHandler(Update, self._on_platform_update), group=99)
 
     def _effective_update_message(self, update: Update) -> Optional[Message]:
         """Return the message-like payload for normal messages and channel posts.

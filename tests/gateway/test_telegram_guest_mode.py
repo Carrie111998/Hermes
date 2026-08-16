@@ -701,15 +701,15 @@ def _install_recording_handlers(monkeypatch, *, guest_symbols: bool):
 
     monkeypatch.setattr(adapter_mod, "TelegramMessageHandler", _message_handler)
     monkeypatch.setattr(adapter_mod, "CallbackQueryHandler", _callback_query_handler)
-    monkeypatch.setattr(
-        adapter_mod, "TypeHandler", _type_handler if guest_symbols else None
-    )
-    # The guest branch also requires these symbols to be non-None. Under the
-    # gateway conftest telegram mock they already are; pin them explicitly so
-    # the branch is deterministic regardless of the import path taken.
+    monkeypatch.setattr(adapter_mod, "TypeHandler", _type_handler)
+    # TypeHandler is also required by upstream's platform-event observer;
+    # simulate missing Guest Mode support with guest-only symbols instead.
     if guest_symbols:
         monkeypatch.setattr(adapter_mod, "InlineQueryResultArticle", object())
         monkeypatch.setattr(adapter_mod, "InputTextMessageContent", object())
+    else:
+        monkeypatch.setattr(adapter_mod, "InlineQueryResultArticle", None)
+        monkeypatch.setattr(adapter_mod, "InputTextMessageContent", None)
 
 
 def _group_for_callback(handlers, callback):
@@ -735,10 +735,15 @@ def test_guest_catch_all_registers_in_later_group_than_normal_handlers(monkeypat
     # group than every normal handler — so it can never occupy the single
     # per-group handler slot ahead of ordinary text/command intake.
     guest_cb = adapter._handle_guest_message
-    normal_groups = [g for h, g in app.handlers if h.callback != guest_cb]
+    observer_cb = adapter._on_platform_update
+    normal_groups = [
+        g for h, g in app.handlers
+        if h.callback not in {guest_cb, observer_cb}
+    ]
     assert guest_groups == [1]
-    assert normal_groups, "expected normal handlers to be registered"
+    assert normal_groups, "expected normal intake handlers to be registered"
     assert guest_groups[0] > max(normal_groups)
+    assert _group_for_callback(app.handlers, observer_cb) == [99]
 
 
 def test_no_guest_handler_registered_without_guest_symbols(monkeypatch):
