@@ -3801,14 +3801,17 @@ def run_conversation(
                         )
                         agent._cleanup_task_resources(effective_task_id)
                         agent._persist_session(messages, conversation_history)
-                        return {
-                            "final_response": _rep_response,
-                            "messages": messages,
-                            "api_calls": api_call_count,
-                            "completed": False,
-                            "partial": True,
-                            "error": _rep_error,
-                        }
+                        return _terminal_result_with_pending_steer(
+                            agent,
+                            {
+                                "final_response": _rep_response,
+                                "messages": messages,
+                                "api_calls": api_call_count,
+                                "completed": False,
+                                "partial": True,
+                                "error": _rep_error,
+                            },
+                        )
 
                     if agent.api_mode in {"chat_completions", "bedrock_converse", "anthropic_messages"}:
                         assistant_message = _trunc_msg
