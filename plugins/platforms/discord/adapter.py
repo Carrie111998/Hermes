@@ -1353,6 +1353,9 @@ class DiscordAdapter(BasePlatformAdapter):
             )
             proxy_url = resolve_proxy_url(platform_env_var="DISCORD_PROXY")
             if proxy_url:
+                # SECURITY: never log the raw proxy URL — userinfo embeds a
+                # credential that would otherwise reach the log on every
+                # restart (#58994).
                 logger.info("[%s] Using proxy for Discord: %s", self.name, safe_url_for_log(proxy_url))
 
             # Create bot — proxy= for HTTP, connector= for SOCKS.

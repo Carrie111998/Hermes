@@ -1323,7 +1323,9 @@ class MatrixAdapter(BasePlatformAdapter):
         # Proxy support — resolve once at init, reuse for all HTTP traffic.
         self._proxy_url: str | None = resolve_proxy_url(platform_env_var="MATRIX_PROXY")
         if self._proxy_url:
-            logger.info("Matrix: proxy configured — %s", self._proxy_url)
+            # SECURITY: never log the raw proxy URL — userinfo embeds a
+            # credential that would otherwise reach the log on every init (#58994).
+            logger.info("Matrix: proxy configured — %s", safe_url_for_log(self._proxy_url))
         try:
             self._max_media_bytes = int(os.getenv("MATRIX_MAX_MEDIA_BYTES", str(100 * 1024 * 1024)))
         except ValueError:

@@ -4453,7 +4453,14 @@ class TelegramAdapter(BasePlatformAdapter):
                     },
                 )
             elif proxy_url:
-                logger.info("[%s] Proxy detected; passing explicitly to HTTPXRequest: %s", self.name, safe_url_for_log(proxy_url))
+                # SECURITY: never log the raw proxy URL — userinfo embeds a
+                # credential that would otherwise reach the log on every
+                # restart (#58994). The URL passed to HTTPXRequest is unchanged.
+                logger.info(
+                    "[%s] Proxy detected; passing explicitly to HTTPXRequest: %s",
+                    self.name,
+                    safe_url_for_log(proxy_url),
+                )
                 request = HTTPXRequest(
                     **request_kwargs, proxy=proxy_url, httpx_kwargs=_with_limits()
                 )
