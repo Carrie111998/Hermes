@@ -2416,6 +2416,37 @@ class TestAgentRuntimePostHookOwnershipSync:
             tool_name for tool_name, _ in self._CASES
         }
 
+    def test_session_search_forwards_gateway_scope_and_requested_profile(
+        self, agent, monkeypatch
+    ):
+        captured = {}
+        session_db = object()
+        monkeypatch.setattr(
+            "hermes_cli.plugins._dispatch_pre_tool_call_hooks",
+            lambda *args, **kwargs: (None, None),
+        )
+        monkeypatch.setattr("hermes_cli.lifecycle.has_hook", lambda name: False)
+        monkeypatch.setattr(agent, "_get_session_db_for_recall", lambda: session_db)
+        monkeypatch.setattr(
+            "tools.session_search_tool.session_search",
+            lambda **kwargs: captured.update(kwargs) or '{"success":true}',
+        )
+        agent._gateway_session_key = "telegram:dm:owner"
+        agent.session_id = "current-session"
+
+        result = agent._invoke_tool(
+            "session_search",
+            {"query": "needle", "profile": "work"},
+            "task-1",
+            tool_call_id="call-1",
+        )
+
+        assert json.loads(result)["success"] is True
+        assert captured["db"] is session_db
+        assert captured["current_session_id"] == "current-session"
+        assert captured["caller_session_key"] == "telegram:dm:owner"
+        assert captured["profile"] == "work"
+
 
 class TestPathsOverlap:
     """Unit tests for the _paths_overlap helper."""

@@ -99,7 +99,7 @@ class TestSchema:
             "sort",
             "profile",
         ]
-        assert parameters == [*historical_prefix, "detail"]
+        assert parameters == [*historical_prefix, "detail", "caller_session_key"]
 
 
 class TestFormatTimestamp:
@@ -171,6 +171,149 @@ class TestBrowseShape:
         sids = [r["session_id"] for r in result["results"]]
         assert "s_newest" not in sids
 
+
+class TestGatewayOwnershipScope:
+    @staticmethod
+    def _seed(db):
+        db.create_session(
+            "owned-current", source="telegram", session_key="telegram:dm:owner"
+        )
+        db.create_session(
+            "owned-history", source="telegram", session_key="telegram:dm:owner"
+        )
+        owned_mid = db.append_message(
+            "owned-history", role="user", content="private scope needle owned"
+        )
+        db.create_session(
+            "other-history", source="telegram", session_key="telegram:dm:other"
+        )
+        other_mid = db.append_message(
+            "other-history", role="user", content="private scope needle other"
+        )
+        return owned_mid, other_mid
+
+    def test_browse_only_lists_sessions_in_the_callers_gateway_scope(self, db):
+        self._seed(db)
+
+        result = json.loads(
+            session_search(
+                db=db,
+                current_session_id="owned-current",
+                caller_session_key="telegram:dm:owner",
+            )
+        )
+
+        assert {row["session_id"] for row in result["results"]} == {
+            "owned-history"
+        }
+
+    def test_discovery_only_returns_hits_in_the_callers_gateway_scope(self, db):
+        self._seed(db)
+
+        result = json.loads(
+            session_search(
+                query="private scope needle",
+                detail="full",
+                limit=10,
+                db=db,
+                current_session_id="owned-current",
+                caller_session_key="telegram:dm:owner",
+            )
+        )
+
+        assert {row["session_id"] for row in result["results"]} == {
+            "owned-history"
+        }
+        assert "other" not in json.dumps(result)
+
+    @pytest.mark.parametrize("shape", ["read", "scroll"])
+    def test_direct_lookup_rejects_another_gateway_scope(self, db, shape):
+        _, other_mid = self._seed(db)
+        kwargs = {"session_id": "other-history"}
+        if shape == "scroll":
+            kwargs["around_message_id"] = other_mid
+
+        result = json.loads(
+            session_search(
+                db=db,
+                current_session_id="owned-current",
+                caller_session_key="telegram:dm:owner",
+                **kwargs,
+            )
+        )
+
+        assert result["success"] is False
+        assert "not found" in result["error"].lower()
+
+    @pytest.mark.parametrize("shape", ["read", "scroll"])
+    def test_direct_lookup_allows_the_same_gateway_scope(self, db, shape):
+        owned_mid, _ = self._seed(db)
+        kwargs = {"session_id": "owned-history"}
+        if shape == "scroll":
+            kwargs["around_message_id"] = owned_mid
+
+        result = json.loads(
+            session_search(
+                db=db,
+                current_session_id="owned-current",
+                caller_session_key="telegram:dm:owner",
+                **kwargs,
+            )
+        )
+
+        assert result["success"] is True
+        assert result["session_id"] == "owned-history"
+
+    def test_scoped_lookup_fails_closed_for_legacy_row_without_session_key(self, db):
+        db.create_session("legacy", source="telegram")
+        db.append_message("legacy", role="user", content="legacy private text")
+
+        result = json.loads(
+            session_search(
+                db=db,
+                session_id="legacy",
+                caller_session_key="telegram:dm:owner",
+            )
+        )
+
+        assert result["success"] is False
+        assert "not found" in result["error"].lower()
+
+    def test_scoped_call_rejects_explicit_and_automatic_cross_profile_lookup(
+        self, db, monkeypatch
+    ):
+        self._seed(db)
+        resolved = []
+        located = []
+        monkeypatch.setattr(
+            "tools.session_search_tool._resolve_profile_db",
+            lambda profile: resolved.append(profile),
+        )
+        monkeypatch.setattr(
+            "tools.session_search_tool._locate_session_db",
+            lambda sid: located.append(sid),
+        )
+
+        explicit = json.loads(
+            session_search(
+                db=db,
+                session_id="foreign",
+                profile="work",
+                caller_session_key="telegram:dm:owner",
+            )
+        )
+        automatic = json.loads(
+            session_search(
+                db=db,
+                session_id="missing",
+                caller_session_key="telegram:dm:owner",
+            )
+        )
+
+        assert explicit["success"] is False
+        assert automatic["success"] is False
+        assert resolved == []
+        assert located == []
 
 # =========================================================================
 # Discovery shape (with query)

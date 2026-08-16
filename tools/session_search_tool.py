@@ -388,6 +388,23 @@ def _session_link(session_id: str, profile: str = None) -> str:
     return f"@session:{name}/{session_id}" if name else f"@session:{session_id}"
 
 
+def _session_in_scope(db, session_id: str, caller_session_key: str = None) -> bool:
+    """Whether *session_id* belongs to the caller's gateway conversation.
+
+    Local CLI/desktop callers have no gateway session key and retain the
+    profile-wide history behavior. Gateway callers are scoped by the exact
+    stable key that already separates DM/group/thread and per-user sessions.
+    Missing or legacy ownership metadata fails closed.
+    """
+    if not caller_session_key:
+        return True
+    try:
+        row = db.get_session(session_id) or {}
+    except Exception:
+        return False
+    return bool(row.get("session_key")) and row.get("session_key") == caller_session_key
+
+
 def _locate_session_db(session_id: str):
     """Scan every profile's ``state.db`` (read-only) for a session id.
 
@@ -482,7 +499,13 @@ def _read_session(db, session_id: str, head: int = 20, tail: int = 10, link_prof
     return json.dumps(response, ensure_ascii=False)
 
 
-def _list_recent_sessions(db, limit: int, current_session_id: str = None, link_profile: str = None) -> str:
+def _list_recent_sessions(
+    db,
+    limit: int,
+    current_session_id: str = None,
+    link_profile: str = None,
+    caller_session_key: str = None,
+) -> str:
     """Return metadata for the most recent sessions (no LLM calls, no FTS5)."""
     try:
         # list_sessions_rich (include_children=False) already applies the
@@ -496,6 +519,7 @@ def _list_recent_sessions(db, limit: int, current_session_id: str = None, link_p
             limit=limit + 15,
             exclude_sources=list(_HIDDEN_SESSION_SOURCES),
             order_by_last_active=True,
+            session_key=caller_session_key,
         )  # fetch extra so we can skip current / compression roots
 
         current_root, has_compression_hop = (
@@ -685,6 +709,7 @@ def _title_match_result(
     db,
     query: str,
     current_lineage_root: Optional[str],
+    caller_session_key: str = None,
 ) -> Optional[Dict[str, Any]]:
     """Return a discovery-shaped result when the query matches a session title."""
     title_query = _normalize_title_query(query)
@@ -697,6 +722,8 @@ def _title_match_result(
         logging.debug("resolve_session_by_title failed for %r", title_query, exc_info=True)
         return None
     if not session_id:
+        return None
+    if not _session_in_scope(db, session_id, caller_session_key):
         return None
 
     lineage_root = _resolve_lineage(db, session_id)
@@ -761,11 +788,14 @@ def _discover(
     detail: str,
     current_session_id: str = None,
     link_profile: str = None,
+    caller_session_key: str = None,
 ) -> str:
     """Discovery shape: FTS5 plus adaptive or full result hydration."""
     role_list = role_filter if role_filter else ["user", "assistant"]
     current_lineage_root = _resolve_lineage(db, current_session_id) if current_session_id else None
-    title_result = _title_match_result(db, query, current_lineage_root)
+    title_result = _title_match_result(
+        db, query, current_lineage_root, caller_session_key
+    )
 
     try:
         raw_results = db.search_messages(
@@ -787,7 +817,13 @@ def _discover(
     # high-volume cron corpus can't starve the user's own sessions out of the
     # top `limit` results (#19434). Stable — preserves BM25/recency order
     # within each class.
-    raw_results = _order_for_recall(raw_results)
+    raw_results = _order_for_recall(
+        [
+            row
+            for row in raw_results
+            if _session_in_scope(db, row.get("session_id"), caller_session_key)
+        ]
+    )
 
     if not raw_results and not title_result:
         _empty_payload = {
@@ -949,6 +985,7 @@ def _session_search_impl(
     profile: str = None,
     # Discovery result shaping (appended to preserve positional compatibility)
     detail: str = "adaptive",
+    caller_session_key: str = None,
     *,
     _owned_dbs: Optional[List[Any]] = None,
 ) -> str:
@@ -975,6 +1012,14 @@ def _session_search_impl(
             if emb_profile and (profile is None or not str(profile).strip()):
                 profile = emb_profile
 
+    # A gateway conversation is never authority to traverse another profile.
+    # Local operator surfaces have no caller_session_key and preserve explicit
+    # cross-profile links for desktop/CLI workflows.
+    if caller_session_key and profile is not None and str(profile).strip():
+        return tool_error(
+            "session_id not found in the current conversation", success=False
+        )
+
     # Cross-profile read: swap in the named profile's DB (read-only) for every
     # shape below. The current-session-lineage guards no longer apply across
     # profiles, but they key off ids that won't collide, so they stay inert.
@@ -991,6 +1036,8 @@ def _session_search_impl(
 
     # Scroll shape takes precedence — explicit anchor beats any query.
     if (isinstance(session_id, str) and session_id.strip()) and around_message_id is not None:
+        if not _session_in_scope(db, session_id.strip(), caller_session_key):
+            return tool_error(f"session_id not found: {session_id.strip()}", success=False)
         return _scroll(
             db=db,
             session_id=session_id,
@@ -1002,6 +1049,8 @@ def _session_search_impl(
     # Read shape: a session_id with no anchor → dump the whole session.
     if isinstance(session_id, str) and session_id.strip():
         sid = session_id.strip()
+        if not _session_in_scope(db, sid, caller_session_key):
+            return tool_error(f"session_id not found: {sid}", success=False)
         result = _read_session(db, sid, link_profile=profile)
         if json.loads(result).get("success"):
             return result
@@ -1009,7 +1058,9 @@ def _session_search_impl(
         # Miss in the target profile — the model may have dropped the owning
         # profile from the link. Scan every profile and read it from wherever
         # it lives, tagging the profile it was found in.
-        located, owner = _locate_session_db(sid)
+        located, owner = (None, None)
+        if not caller_session_key:
+            located, owner = _locate_session_db(sid)
         if located is not None:
             try:
                 found = json.loads(_read_session(located, sid, link_profile=owner))
@@ -1030,7 +1081,13 @@ def _session_search_impl(
 
     # Browse shape: no query → recent sessions.
     if not query or not isinstance(query, str) or not query.strip():
-        return _list_recent_sessions(db, limit, current_session_id, link_profile=profile)
+        return _list_recent_sessions(
+            db,
+            limit,
+            current_session_id,
+            link_profile=profile,
+            caller_session_key=caller_session_key,
+        )
 
     # Parse role_filter
     role_list: Optional[List[str]] = None
@@ -1059,6 +1116,7 @@ def _session_search_impl(
         detail=detail_norm,
         current_session_id=current_session_id,
         link_profile=profile,
+        caller_session_key=caller_session_key,
     )
 
 
@@ -1078,6 +1136,8 @@ def session_search(
     profile: str = None,
     # Discovery result shaping (appended to preserve positional compatibility)
     detail: str = "adaptive",
+    # Internal ownership scope (not model-facing).
+    caller_session_key: str = None,
 ) -> str:
     """Run session search and close databases opened by this invocation."""
     owned_dbs: List[Any] = []
@@ -1106,6 +1166,7 @@ def session_search(
             sort=sort,
             profile=profile,
             detail=detail,
+            caller_session_key=caller_session_key,
             _owned_dbs=owned_dbs,
         )
     finally:
@@ -1315,6 +1376,7 @@ registry.register(
         profile=args.get("profile"),
         db=kw.get("db"),
         current_session_id=kw.get("current_session_id"),
+        caller_session_key=kw.get("caller_session_key"),
     ),
     check_fn=check_session_search_requirements,
     emoji="🔍",
