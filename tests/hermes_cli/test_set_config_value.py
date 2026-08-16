@@ -399,6 +399,17 @@ class TestListAppend:
         assert exc.value.code == 1
         assert "Cannot parse" in capsys.readouterr().err
 
+    def test_append_reports_non_utf8_config(self, _isolated_hermes_home, capsys):
+        from hermes_cli.config import append_config_value
+
+        (_isolated_hermes_home / "config.yaml").write_bytes(b"hooks: \xff\n")
+
+        with pytest.raises(SystemExit) as exc:
+            append_config_value("hooks.pre_llm_call", '"check.py"')
+
+        assert exc.value.code == 1
+        assert "Cannot parse" in capsys.readouterr().err
+
     def test_append_rejects_managed_list(self, monkeypatch, capsys):
         from hermes_cli import managed_scope
         from hermes_cli.config import append_config_value
