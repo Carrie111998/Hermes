@@ -188,6 +188,8 @@ When `send_read_receipts` is `true`, the adapter marks policy-accepted inbound m
 
 In **self-chat mode**, Hermes' replies and scheduled-job deliveries are sent from your own linked account, so WhatsApp leaves the conversation read — easy to miss an async cron reminder or briefing. Set `mark_sent_unread: true` to have the bridge mark the self-chat unread again immediately after a successful send. This only applies in self-chat mode (bot-mode replies are genuinely incoming on the recipient's phone) and only creates the unread indicator — it does not guarantee a push notification. Disabled by default, preserving current behavior.
 
+`mark_sent_unread` marks the whole conversation unread, which also reverses the effect of `send_read_receipts: true` on the inbound message that triggered the reply — the message you just marked read becomes unread again. If you run both settings together in self-chat mode, expect the chat to end up unread after each reply.
+
 ---
 
 ## Message Formatting & Delivery
