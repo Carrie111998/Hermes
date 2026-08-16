@@ -1631,6 +1631,7 @@ export const zhHant = defineLocale({
     pairedUntil: date => `配對有效期至 ${date}`,
     disconnect: '中斷連線',
     refreshing: '正在重新整理工作階段',
+    reconnecting: '正在重新連線…',
     sessions: '工作階段',
     noSessions: '沒有可用的遠端工作階段。',
     untitled: '（無標題）',

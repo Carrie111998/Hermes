@@ -1862,6 +1862,7 @@ export const en: Translations = {
     pairedUntil: date => `Paired until ${date}`,
     disconnect: 'Disconnect',
     refreshing: 'Refreshing sessions',
+    reconnecting: 'Reconnecting…',
     sessions: 'Sessions',
     noSessions: 'No remote sessions are available.',
     untitled: '(untitled)',

@@ -2053,6 +2053,7 @@ export const zh: Translations = {
     pairedUntil: date => `配对有效期至 ${date}`,
     disconnect: '断开连接',
     refreshing: '正在刷新会话',
+    reconnecting: '正在重新连接…',
     sessions: '会话',
     noSessions: '没有可用的远程会话。',
     untitled: '（无标题）',

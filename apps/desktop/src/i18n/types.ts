@@ -1558,6 +1558,7 @@ export interface Translations {
     pairedUntil: (date: string) => string
     disconnect: string
     refreshing: string
+    reconnecting: string
     sessions: string
     noSessions: string
     untitled: string

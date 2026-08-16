@@ -1686,6 +1686,7 @@ export const ja = defineLocale({
     pairedUntil: date => `${date} までペアリング済み`,
     disconnect: '切断',
     refreshing: 'セッションを更新中',
+    reconnecting: '再接続中…',
     sessions: 'セッション',
     noSessions: '利用可能なリモートセッションはありません。',
     untitled: '（無題）',

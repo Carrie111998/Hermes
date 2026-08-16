@@ -192,7 +192,7 @@ function SessionRow({ attached, busy, session }: { attached: boolean; busy: bool
       </div>
       <Button
         aria-label={attached ? c.detachFrom(title) : c.attachTo(title)}
-        disabled={busy}
+        disabled={busy && !attached}
         onClick={() => (attached ? detachSession() : void attachToSession(session.id))}
         size="xs"
         variant={attached ? 'secondary' : 'outline'}
@@ -282,6 +282,7 @@ function ConnectedView() {
   const { t } = useI18n()
   const c = t.remoteAttach
   const busy = state.status === 'connecting'
+  const reconnecting = busy && state.reconnecting === true
   const attached = state.sessions.find(session => session.id === state.attachedSessionId)
 
   useEffect(() => {
@@ -295,14 +296,21 @@ function ConnectedView() {
           <div className="truncate font-mono text-foreground">
             {state.host}:{state.port}
           </div>
-          <div className="text-(--ui-text-tertiary)">{c.pairedUntil(formattedDate(state.expiresAt))}</div>
+          {reconnecting ? (
+            <div className="flex items-center gap-1 text-(--ui-text-tertiary)" role="status">
+              <GlyphSpinner ariaLabel={c.reconnecting} />
+              <span>{c.reconnecting}</span>
+            </div>
+          ) : (
+            <div className="text-(--ui-text-tertiary)">{c.pairedUntil(formattedDate(state.expiresAt))}</div>
+          )}
         </div>
         <div className="flex items-center gap-2">
           <Button disabled={busy} onClick={() => void refreshSessions()} size="sm" variant="outline">
-            {busy ? <GlyphSpinner ariaLabel={c.refreshing} /> : null}
+            {busy && !reconnecting ? <GlyphSpinner ariaLabel={c.refreshing} /> : null}
             {t.common.refresh}
           </Button>
-          <Button disabled={busy} onClick={disconnect} size="sm" variant="secondary">
+          <Button disabled={busy && !reconnecting} onClick={disconnect} size="sm" variant="secondary">
             {c.disconnect}
           </Button>
         </div>

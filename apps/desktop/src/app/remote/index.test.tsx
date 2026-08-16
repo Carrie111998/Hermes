@@ -163,6 +163,22 @@ describe('RemoteView', () => {
     expect((screen.getByLabelText('Message remote session') as HTMLInputElement).value).toBe('')
   })
 
+  it('shows reconnecting state while keeping detach and disconnect available', () => {
+    remote.state.set({
+      ...connectedState,
+      attachedSessionId: connectedState.sessions[0].id,
+      status: 'connecting',
+      reconnecting: true
+    })
+
+    renderRemote()
+
+    expect(screen.getByText('Reconnecting…')).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'Detach from Alpha' }).hasAttribute('disabled')).toBe(false)
+    expect(screen.getByRole('button', { name: 'Disconnect' }).hasAttribute('disabled')).toBe(false)
+    expect(screen.getByRole('button', { name: 'Refresh' }).hasAttribute('disabled')).toBe(true)
+  })
+
   it('shows an error banner and restores the pairing form when the token expired', () => {
     remote.state.set({
       ...connectedState,
