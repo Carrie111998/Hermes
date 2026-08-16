@@ -107,6 +107,28 @@ class TestSteerChannelNote:
 
         assert "STEER" in stable
 
+    def test_preserved_for_delegated_subagents_with_steer_control(self, monkeypatch):
+        import agent.system_prompt as system_prompt
+
+        monkeypatch.setattr(system_prompt, "STEER_CHANNEL_NOTE", "STEER")
+
+        stable = _stable_prompt(
+            _make_agent(valid_tool_names=["read_file"], platform="subagent")
+        )
+
+        assert "STEER" in stable
+
+    def test_preserved_when_platform_uses_aia_agent_default(self, monkeypatch):
+        import agent.system_prompt as system_prompt
+
+        monkeypatch.setattr(system_prompt, "STEER_CHANNEL_NOTE", "STEER")
+
+        stable = _stable_prompt(
+            _make_agent(valid_tool_names=["read_file"], platform=None)
+        )
+
+        assert "STEER" in stable
+
 
 def _init_code_repo(path):
     """A git repo that actually holds code — the coding posture requires a source
@@ -114,7 +136,7 @@ def _init_code_repo(path):
     import subprocess
 
     subprocess.run(["git", "-C", str(path), "init", "-q"], check=True)
-    (path / "main.py").write_text("print('hi')\n")
+    (path / "main.py").write_text("print('hi')\n", encoding="utf-8")
 
 
 class TestCodingContextBlock:
@@ -364,7 +386,7 @@ class TestTelegramRichMessagesHint:
         )
         home = tmp_path / "hermes_home"
         home.mkdir()
-        (home / "config.yaml").write_text(config_yaml)
+        (home / "config.yaml").write_text(config_yaml, encoding="utf-8")
 
         monkeypatch.setenv("HERMES_HOME", str(home))
         # Point config resolution at the temp file without mocking the loader:
