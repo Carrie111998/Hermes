@@ -1,6 +1,6 @@
 ---
 title: "ARCH-003 implementation plan: runtime-state audit and replay verification"
-status: IMPLEMENTATION_PLAN_REVISE_V19_PENDING
+status: IMPLEMENTATION_PLAN_REVISE_V20_PENDING
 date: 2026-08-16
 type: implementation-plan
 ticket: ARCH-003
@@ -185,14 +185,20 @@ Add a durable database-level current-generation record:
 `runtime_state_journal_meta.current_generation`, owned by the runtime-state
 migration/startup module. Define a durable writer-epoch transition record
 alongside it. The upgraded startup path computes its immutable writer epoch from
-the journal schema/code-contract version and advances `current_generation`
-exactly once only when that epoch is strictly newer than the durable epoch;
+the journal schema/code-contract version and, under the exclusive side of the
+named maintenance RW lock and one `BEGIN IMMEDIATE` transaction, performs an
+atomic compare-and-set: it advances `current_generation` exactly once only
+when that epoch is strictly newer than the durable epoch;
 restarting the same writer epoch never advances it. A startup observing a
-durable epoch newer than the running writer enters downgrade-unsafe mode and
-must not perform ordinary runtime-state writes. The transition record is
-durable before the upgraded writer serves mutations, so a strictly newer
-contract transition is represented by a distinct epoch transition rather than
-by process restart count. A rollback followed by roll-forward to the same
+durable epoch newer than the running writer enters global downgrade-unsafe
+mode for the database: all ordinary runtime-state writes across all profiles
+and entities return mutation-side `WRITE_ABORT`, while read-only verification
+may continue. The mode exits only when a writer at least as new as the durable
+epoch completes the startup transition and atomically clears the mode. The
+transition record and mode are durable before the upgraded writer serves
+mutations, so a strictly newer contract transition is represented by a
+distinct epoch transition rather than by process restart count. Delivery must
+record any interval spent in this global write-blocked mode. A rollback followed by roll-forward to the same
 writer epoch does not advance `current_generation`; it is detected by the
 materialized-write counter gap defined below. Gate 3 reads the
 current-generation record, writer epoch, transition marker, and counter
@@ -362,9 +368,12 @@ Migration compatibility tests must assert this posture.
   boundary returns the existing safe operation-failure response without
   entering prompt construction; Gate 4 exercises this caller contract with a
   real CAS caller adapter.
-- If the digest key is unavailable while preparing a mutation/genesis, fail
-  closed before opening the SQLite transaction, leave materialized state
-  unchanged, emit no event, and surface the shared `KEY_UNAVAILABLE` reason.
+- Prepare and validate the digest key before acquiring the shared maintenance
+  lock. If it is unavailable, fail closed before opening SQLite or acquiring
+  any lock, leave materialized state unchanged, emit no event, and surface the
+  shared `KEY_UNAVAILABLE` reason. If a future implementation checks the key
+  after acquiring the lock, it must release that lock on the pre-transaction
+  abort; the primary contract is the pre-lock check.
   This is distinct from `WRITE_ABORT`, which covers a transaction or
   continuity refusal after the mutation path has entered its write contract.
 - The privileged baseline writer and the explicitly authorized re-originating
@@ -453,12 +462,13 @@ Add deterministic tests for:
 - prior-version startup with the journal table present and rollback posture;
 - current-generation record advancement only on a strictly newer writer epoch,
   same-epoch restart without advancement, same-epoch rollback/roll-forward
-  detected by the materialized-write counter gap, downgrade-unsafe startup
-  returning mutation-side `WRITE_ABORT`, baseline refusal across a counter
-  gap returning `WRITE_ABORT`, separately authorized same-epoch
-  re-originating genesis restoring mutation ability, and concurrent generation
-  advance during verify returning `CONSISTENT` or `UNKNOWN`, never false
-  `DRIFT`;
+  detected by the materialized-write counter gap, global downgrade-unsafe
+  startup blocking all profiles/entities with mutation-side `WRITE_ABORT`,
+  newer-epoch roll-forward clearing that mode, baseline refusal across a
+  counter gap returning `WRITE_ABORT`, separately authorized same-epoch
+  re-originating genesis restoring mutation ability, atomic concurrent startup
+  advancing exactly once, and concurrent generation advance during verify
+  returning `CONSISTENT` or `UNKNOWN`, never false `DRIFT`;
 - a newly created post-migration entity whose first journaled mutation is a
   marked genesis and reaches `CONSISTENT` after a valid follow-up mutation;
 - first post-generation-advance mutation emitting a marked genesis, with a
@@ -475,9 +485,13 @@ Add deterministic tests for:
   start;
 - SQLite WAL, fixed `SQLITE_BUSY_TIMEOUT = 5s`, `BEGIN IMMEDIATE`, and
   read-only WAL preconditions;
+- concurrent upgraded startup compare-and-set advancing the generation exactly
+  once, global downgrade-unsafe write blocking, newer-epoch roll-forward exit,
+  and delivery recording of the blocked interval;
 - `LOCK_ACQUIRE_TIMEOUT = 5s`, `SQLITE_BUSY_TIMEOUT = 5s`,
-  `LOCK_TIMEOUT` reason, stale-holder recovery, and shared/exclusive
-  cross-process RW-lock exclusion/release ordering;
+  `LOCK_TIMEOUT` reason, stale-holder recovery, shared/exclusive
+  cross-process RW-lock exclusion/release ordering, and pre-lock key
+  unavailability without lock leakage;
 - single-writer invariant and defensive abort; no sequence-collision retry is
   expected under write-lock-first discipline;
 - baseline generation-marker mismatch returning `UNKNOWN`;
@@ -792,6 +806,24 @@ DGX changes, deployment, repair, or event-sourcing. The corrected plan must
 return to the same authenticated Claude reviewer family and then to AGY on the
 identical packet.
 
+## Implementation-plan review reconciliation v19
+
+The v19 authenticated Claude Opus review returned `REVISE` with four bounded
+plan-text corrections. The corrections are incorporated above:
+
+1. Downgrade-unsafe mode is a global database write block with a newer-epoch
+   roll-forward exit and delivery-recorded consequence.
+2. Current-generation advancement uses the exclusive lock and atomic
+   `BEGIN IMMEDIATE` compare-and-set, with a concurrent-startup test.
+3. Digest-key availability is checked before shared-lock acquisition, with
+   explicit no-leak fallback behavior.
+4. Acceptance coverage now includes v18.
+
+These remain plan-only corrections and do not authorize source edits, tests,
+DGX changes, deployment, repair, or event-sourcing. The corrected plan must
+return to the same authenticated Claude reviewer family and then to AGY on the
+identical packet.
+
 ## Acceptance criteria
 
 ARCH-003 implementation is ready for its delivery gates only when:
@@ -820,7 +852,7 @@ ARCH-003 implementation is ready for its delivery gates only when:
   retention job; entities beyond the replay limit remain UNKNOWN in this ticket,
   and the 100,000-event/100 MiB per-profile threshold is a documented follow-up
   operational review, not an in-ticket operator gate;
-- reconciliation v1 and v5-v17 items are incorporated into the normative
+- reconciliation v1 and v5-v18 items are incorporated into the normative
   Gates 0-4 text (with v2-v4 explicitly folded into the v1/v4 text), and this
   merged plan revision receives the same-family re-review;
 - all focused and relevant tests pass;
@@ -865,6 +897,8 @@ ARCH-003 implementation is ready for its delivery gates only when:
   bypass allowance, and mandatory database-level counter guard.
 - v18: bounded WRITE_ABORT caller behavior, explicit no-CLI operational
   consequence, and atomic counter migration initialization.
+- v19: global downgrade-unsafe scope and exit, startup compare-and-set,
+  pre-lock key check, and complete coverage.
 
 
 ## Non-goals
