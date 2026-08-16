@@ -1920,6 +1920,42 @@ def _repair_backup_headroom_bytes(total_bytes: int) -> int:
     )
 
 
+def _repair_scratch_space_error(db_path: Path) -> Optional[str]:
+    """Return an error unless snapshot, VACUUM and promotion can fit safely."""
+    import shutil
+
+    try:
+        main_bytes = db_path.stat().st_size
+        snapshot_bytes = main_bytes
+        for suffix in _DB_SIDECAR_SUFFIXES:
+            sidecar = db_path.with_name(db_path.name + suffix)
+            if sidecar.exists():
+                snapshot_bytes += sidecar.stat().st_size
+        usage = shutil.disk_usage(db_path.parent)
+        headroom = _repair_backup_headroom_bytes(usage.total)
+        # Strategy 2 runs VACUUM on the staged database. SQLite documents that
+        # VACUUM may need up to twice the database size in additional free
+        # space while it builds the replacement and journals the overwrite.
+        # Reserve that beyond the snapshot itself; after VACUUM releases its
+        # temporary files, the same reserve also covers transactional
+        # promotion into the live database.
+        required = snapshot_bytes + (2 * main_bytes) + headroom
+        if usage.free >= required:
+            return None
+        return (
+            f"only {usage.free / 1e9:.2f}GB free on {db_path.parent}; the "
+            f"repair snapshot needs up to {snapshot_bytes / 1e9:.2f}GB, "
+            f"VACUUM may need another {(2 * main_bytes) / 1e9:.2f}GB, and "
+            f"{headroom / 1e9:.2f}GB must remain as headroom. Free disk space, "
+            "then retry."
+        )
+    except OSError as exc:
+        return (
+            f"could not determine free space on {db_path.parent} ({exc}); "
+            "refusing the repair snapshot rather than risk filling the volume"
+        )
+
+
 def _repair_ledger_path(db_path: Path) -> Path:
     return db_path.with_name(db_path.name + ".repair-attempts.json")
 
@@ -2183,12 +2219,12 @@ def _prune_malformed_backups(db_path: Path, keep: int = _MAX_MALFORMED_BACKUPS) 
 def _backup_db_file(db_path: Path) -> "Tuple[Optional[Path], Optional[str]]":
     """Copy a (possibly malformed) DB file to a timestamped backup beside it.
     Raw file copy on purpose: the DB won't open cleanly, so we preserve the
-    bytes exactly for forensics / manual restore. WAL and SHM sidecars are
-    copied too when present. Returns ``(backup_path, None)`` on success or
+    bytes exactly for forensics / manual restore. WAL, SHM and rollback-journal
+    sidecars are copied too when present. Returns ``(backup_path, None)`` on success or
     ``(None, reason)`` on failure — callers on the repair path treat a
-    refused backup as a HARD STOP (see #69603: proceeding without the
-    pre-repair backup leaves the writable_schema surgery, FTS deletion and
-    VACUUM strategies mutating the only remaining copy of the damaged DB).
+    refused backup as a HARD STOP (see #69603). Repair strategies run on a
+    scratch snapshot, but the forensic bundle remains the recovery path when
+    corruption defeats them.
 
     Refuses when a connection to this database is still live in the process:
     reading the file would ``close()`` a descriptor for it and cancel that
@@ -2528,6 +2564,40 @@ def _reapply_durability_barriers(conn: sqlite3.Connection) -> bool:
         return False
 
 
+def _copy_database_snapshot(source_path: Path, destination_path: Path) -> None:
+    """Copy one complete SQLite snapshot without replacing either file inode.
+
+    SQLite's online backup API incorporates committed WAL frames into the
+    source snapshot and writes the destination inside one transaction. This
+    avoids both the main-file-only staging gap and replacing ``state.db`` from
+    under handles that already refer to it. If backup is interrupted, SQLite
+    rolls the destination transaction back.
+    """
+    source = _connect_repair_durable(source_path)
+    destination: Optional[sqlite3.Connection] = None
+    deadline = time.monotonic() + _REPAIR_LOCK_TIMEOUT_SECONDS
+
+    def _check_deadline(_status: int, _remaining: int, _total: int) -> None:
+        if time.monotonic() >= deadline:
+            raise TimeoutError(
+                "timed out copying SQLite repair snapshot after "
+                f"{_REPAIR_LOCK_TIMEOUT_SECONDS:.0f}s"
+            )
+
+    try:
+        destination = _connect_repair_durable(destination_path)
+        source.backup(
+            destination,
+            pages=256,
+            progress=_check_deadline,
+            sleep=_REPAIR_LOCK_POLL_SECONDS,
+        )
+    finally:
+        if destination is not None:
+            destination.close()
+        source.close()
+
+
 def _db_opens_cleanly(db_path: Path) -> Optional[str]:
     """Probe a DB on a fresh connection. Returns None if healthy, else a reason.
 
@@ -2729,8 +2799,10 @@ def repair_state_db_schema(db_path: Path, *, backup: bool = True) -> Dict[str, A
          The next ``SessionDB()`` open rebuilds the FTS indexes from the
          canonical ``messages`` table.
 
-    Canonical ``sessions`` / ``messages`` rows are never modified. A
-    timestamped raw backup is taken first unless ``backup=False``.
+    Canonical ``sessions`` / ``messages`` rows are never modified by a failed
+    attempt. Mutating strategies run against a complete SQLite snapshot and a
+    successful result is copied back transactionally. A timestamped raw backup
+    is taken first unless ``backup=False``.
 
     The surgery below is serialised across processes (see
     :func:`_cross_process_repair_lock`): the gateway service, the Desktop
@@ -2807,10 +2879,12 @@ def repair_state_db_schema(db_path: Path, *, backup: bool = True) -> Dict[str, A
         # Persist the outcome AFTER surgery, keyed on the post-attempt
         # fingerprint — that is the file state the NEXT attempt's exhaustion
         # probe will observe. Failures count toward the cross-restart cap;
-        # success clears the ledger. (A failing strategy that mutates the
-        # file re-keys the ledger and restarts the count: that keeps a
-        # genuinely NEW corruption event from inheriting a stale budget,
-        # while the backup dedupe/cap above bounds the disk cost either way.)
+        # success clears the ledger. A FAILED attempt now leaves the file
+        # byte-for-byte unchanged (the strategies run on a scratch copy), so
+        # the fingerprint is stable across attempts and the budget actually
+        # accumulates instead of being re-keyed by the damage each pass did.
+        # A genuinely new corruption event still changes the fingerprint and
+        # gets its own budget.
         _record_repair_outcome(db_path, repaired=bool(result.get("repaired")))
         return result
 
@@ -2821,7 +2895,42 @@ def _repair_state_db_schema_locked(
     """Repair strategies for :func:`repair_state_db_schema`.
 
     Caller must hold the cross-process repair lock for *db_path*.
+
+    The strategies run on a SCRATCH COPY and the result is copied back through
+    SQLite's transactional backup API only once it is proven to open cleanly.
+    A repair that does not succeed therefore leaves the database byte-for-byte
+    unchanged — which is what :func:`repair_state_db_schema`'s docstring
+    already promises ("canonical ``sessions`` / ``messages`` rows are never
+    modified").
+
+    They used to run in place, and Strategy 2 ends in ``VACUUM``. VACUUM does
+    not preserve what it cannot parse: it rebuilds the file from the schema
+    SQLite can still read, so when the damage IS in the schema b-tree — page
+    1's child pointers resolving to data pages, which is exactly the
+    ``malformed database schema ()`` class this function exists to handle —
+    every table hanging off the unreadable part is silently dropped. The probe
+    afterwards then correctly reports the file is STILL malformed, so the
+    function returns ``repaired=False`` and advises a manual restore, having
+    already destroyed the thing it was asked to save. Destroying the data and
+    reporting the repair failed are not mutually exclusive outcomes, and
+    nothing here treated them as a contradiction.
+
+    The pre-repair backup (#69603) does not close this: it is a forensic
+    artefact that nothing reads back, so recovery still depends on a human
+    noticing a ``.malformed-backup-*`` file and knowing what to do with it.
+    Not mutating the original in the first place is the property that holds
+    without a human in the loop.
     """
+    scratch = db_path.with_name(f"{db_path.name}.repair-scratch")
+    cleanup_error = _unlink_db_triple(scratch)
+    if cleanup_error is not None:
+        report["error"] = (
+            "could not remove a stale repair snapshot before probing state.db: "
+            f"{cleanup_error}"
+        )
+        logger.error("state.db repair aborted: %s", report["error"])
+        return report
+
     # Re-probe under the lock: a process we queued behind may have just
     # repaired the file, in which case redoing the surgery would undo its
     # work on a now-healthy DB (the repair/re-corrupt cascade this lock
@@ -2835,12 +2944,9 @@ def _repair_state_db_schema_locked(
         bpath, backup_error = _backup_db_file(db_path)
         report["backup_path"] = str(bpath) if bpath else None
         if bpath is None:
-            # HARD STOP (#69603): every strategy below mutates the damaged
-            # file in place (FTS rebuild, REINDEX, writable_schema surgery,
-            # VACUUM). Without the pre-repair backup, the damaged DB is the
-            # only copy of the user's data — a failed or interrupted repair
-            # would then be unrecoverable. Abort and surface the reason
-            # instead of proceeding fail-open.
+            # HARD STOP (#69603). The forensic recovery image remains required
+            # when corruption defeats every strategy, even though the
+            # strategies themselves now run against an isolated snapshot.
             report["error"] = (
                 "pre-repair backup refused; aborting schema repair to avoid "
                 f"mutating the only copy of the damaged DB: {backup_error}"
@@ -2848,6 +2954,105 @@ def _repair_state_db_schema_locked(
             logger.error("state.db repair aborted: %s", report["error"])
             return report
 
+    space_error = _repair_scratch_space_error(db_path)
+    if space_error is not None:
+        report["error"] = space_error
+        logger.error("state.db repair aborted: %s", report["error"])
+        return report
+
+    try:
+        _copy_database_snapshot(db_path, scratch)
+    except (OSError, sqlite3.Error, TimeoutError) as exc:
+        report["error"] = (
+            f"could not stage a complete SQLite repair snapshot of {db_path}: {exc}"
+        )
+        logger.error("state.db repair aborted: %s", report["error"])
+        _unlink_db_triple(scratch)
+        return report
+
+    try:
+        _run_repair_strategies(scratch, report)
+        if report.get("repaired"):
+            try:
+                # Do not os.replace the live DB: Windows rejects replacement
+                # under open handles, while POSIX would leave those handles on
+                # the old inode. SQLite serialises this write and rolls it back
+                # if promotion is interrupted.
+                _copy_database_snapshot(scratch, db_path)
+            except (OSError, sqlite3.Error, TimeoutError) as exc:
+                report["repaired"] = False
+                report["strategy"] = None
+                report["error"] = (
+                    "repaired snapshot could not be promoted transactionally: "
+                    f"{exc}"
+                )
+                logger.error("state.db repair promotion failed: %s", exc)
+            else:
+                logger.warning(
+                    "state.db repaired via '%s' and promoted transactionally: %s",
+                    report.get("strategy"),
+                    db_path,
+                )
+        if not report.get("repaired"):
+            # Logged HERE, not inside the strategies: they run against the
+            # scratch copy, and naming that throwaway path in the one message
+            # a human is meant to act on would send them to a file that no
+            # longer exists by the time they read it.
+            logger.error(
+                "state.db schema repair could not recover %s automatically "
+                "(the original is left byte-for-byte unchanged; backup: %s); "
+                "manual restore from backup may be required.",
+                db_path,
+                report["backup_path"],
+            )
+        return report
+    finally:
+        # Never leave a half-repaired file beside the DB for a later probe —
+        # or a later human — to mistake for the real thing.
+        cleanup_error = _unlink_db_triple(scratch)
+        if cleanup_error is not None:
+            logger.warning(
+                "Could not remove state.db repair snapshot after repair: %s",
+                cleanup_error,
+            )
+
+
+def _unlink_db_triple(path: Path) -> Optional[str]:
+    """Remove *path* and every SQLite sidecar; return any cleanup failure."""
+    failures: List[str] = []
+    for suffix in ("", *_DB_SIDECAR_SUFFIXES):
+        victim = path if not suffix else path.with_name(path.name + suffix)
+        for attempt in range(10):
+            try:
+                victim.unlink()
+                break
+            except FileNotFoundError:
+                break
+            except PermissionError as exc:
+                # Windows may retain a just-closed SQLite handle for a few
+                # scheduler ticks. Bound the retry; a later backup open still
+                # fails safely if the handle truly remains live.
+                if _IS_WINDOWS and attempt < 9:
+                    time.sleep(0.05)
+                    continue
+                failures.append(f"{victim}: {exc}")
+                break
+            except OSError as exc:
+                failures.append(f"{victim}: {exc}")
+                break
+    return "; ".join(failures) or None
+
+
+def _run_repair_strategies(
+    db_path: Path, report: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Escalating repair attempts, applied to *db_path* IN PLACE.
+
+    Every strategy here mutates its argument — FTS rebuild, REINDEX,
+    ``writable_schema`` surgery, ``VACUUM``. It is therefore only ever called
+    by :func:`_repair_state_db_schema_locked` on a scratch copy that nothing
+    else holds open, never on the user's database.
+    """
     # ── Strategy 0: rebuild FTS indexes in place (FTS write-corruption) ──
     # The FTS5 'rebuild' command rewrites the internal index from the canonical
     # content table. This is the recommended, least-destructive recovery for a
@@ -2941,6 +3146,13 @@ def _repair_state_db_schema_locked(
         logger.warning("state.db dedup repair pass failed: %s", exc)
 
     # ── Strategy 2: drop all FTS schema, VACUUM, rebuild on next open ──
+    #
+    # The destructive one, and the reason this whole path now runs on a
+    # scratch copy. VACUUM rebuilds the file from the schema SQLite can still
+    # parse, so on a damaged schema b-tree it silently drops every table
+    # hanging off the unreadable part — and the probe below then correctly
+    # reports the result is still malformed. On a scratch copy that is merely
+    # a discarded attempt; on the live file it was data loss.
     try:
         conn = _connect_repair_durable(db_path)
         try:
@@ -2969,12 +3181,8 @@ def _repair_state_db_schema_locked(
     except sqlite3.DatabaseError as exc:
         report["error"] = str(exc)
 
-    if not report["repaired"]:
-        logger.error(
-            "state.db schema repair could not recover %s automatically "
-            "(backup: %s); manual restore from backup may be required.",
-            db_path, report["backup_path"],
-        )
+    # The "could not recover" log lives in the caller: it must name the user's
+    # database, not the scratch copy these strategies were handed.
     return report
 
 
