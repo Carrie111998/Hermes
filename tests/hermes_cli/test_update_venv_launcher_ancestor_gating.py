@@ -28,7 +28,10 @@ def _fake_psutil_with_ancestry(proc_tree, cmdlines):
     """
 
     class FakeProc:
-        def __init__(self, pid):
+        def __init__(self, pid=None):
+            # psutil.Process() with no args returns the CURRENT process.
+            if pid is None:
+                pid = cli_main.os.getpid()
             self.pid = pid
 
         def cmdline(self):
