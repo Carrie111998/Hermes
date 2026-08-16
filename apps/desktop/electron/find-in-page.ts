@@ -72,6 +72,46 @@ export function performFind(
 }
 
 /**
+ * Start a find request and resolve after Chromium emits its first matching
+ * result. This acknowledgment lets the renderer remove a temporary `inert`
+ * boundary only after the query field has been excluded from the index.
+ */
+export function performFindAfterIndexingStarted(
+  webContents: Electron.WebContents | null | undefined,
+  query: string,
+  options: FindInPageOptions | null | undefined
+): Promise<void> {
+  if (!webContents || webContents.isDestroyed()) {
+    return Promise.resolve()
+  }
+
+  return new Promise(resolve => {
+    let requestId: number | undefined
+
+    const finish = () => {
+      webContents.off('found-in-page', onFound)
+      webContents.off('destroyed', finish)
+      resolve()
+    }
+
+    const onFound = (_event: Electron.Event, result: { requestId?: number }) => {
+      if (requestId !== undefined && result?.requestId === requestId) {
+        finish()
+      }
+    }
+
+    webContents.on('found-in-page', onFound)
+    webContents.once('destroyed', finish)
+
+    const opts = options && typeof options === 'object' ? options : {}
+    requestId = webContents.findInPage(String(query ?? ''), {
+      forward: opts.forward !== false,
+      findNext: Boolean(opts.findNext)
+    })
+  })
+}
+
+/**
  * Stop the current find and clear highlights. The default `action` matches
  * what the renderer sends on Escape / close.
  */
@@ -150,6 +190,7 @@ const IS_MAC = () => process.platform === 'darwin'
 
 export function installFindShortcut(window: Electron.BrowserWindow, isMac: () => boolean = IS_MAC): () => void {
   const { webContents } = window
+
   if (!webContents || webContents.isDestroyed()) {
     return () => {}
   }
@@ -158,6 +199,7 @@ export function installFindShortcut(window: Electron.BrowserWindow, isMac: () =>
     if (!webContents || webContents.isDestroyed()) {
       return
     }
+
     const key = String(input.key || '').toLowerCase()
     // Accept the platform's primary accelerator (Cmd on macOS, Ctrl elsewhere)
     // AND literal Ctrl on macOS so the chord still reaches us when the user
@@ -165,17 +207,17 @@ export function installFindShortcut(window: Electron.BrowserWindow, isMac: () =>
     // Ctrl+F before the renderer's keydown fires — this main-process handler
     // runs strictly before that (#81727).
     const hasMod = isMac() ? input.meta || input.control : input.control
-    const isFindChord =
-      key === 'f' &&
-      hasMod &&
-      !input.alt &&
-      !input.shift
+
+    const isFindChord = key === 'f' && hasMod && !input.alt && !input.shift
+
     if (!isFindChord) {
       return
     }
+
     if (typeof event.preventDefault === 'function') {
       event.preventDefault()
     }
+
     webContents.send('hermes:open-find-bar')
   }
 

@@ -2,6 +2,7 @@ import { useStore } from '@nanostores/react'
 import { useEffect, useRef, useState } from 'react'
 import { useLocation } from 'react-router'
 
+import { appViewForPath, isOverlayView } from '@/app/routes'
 import { Tip } from '@/components/ui/tooltip'
 import { useI18n } from '@/i18n'
 import { findBarKeyAction, formatMatchLabel } from '@/lib/find-in-page'
@@ -37,6 +38,7 @@ export function FindBar() {
   const { t } = useI18n()
   const { active, query, matchOrdinal, matchCount } = useStore($findInPage)
   const inputRef = useRef<HTMLInputElement>(null)
+  const nativeSearchRequestRef = useRef(0)
   const [localQuery, setLocalQuery] = useState('')
   const [filesPaneRight, setFilesPaneRight] = useState<number | null>(null)
   const { pathname } = useLocation()
@@ -90,8 +92,7 @@ export function FindBar() {
     let rafId: null | number = null
     let observedAside: Element | null = null
 
-    const resizeObserver =
-      typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(() => scheduleMeasure())
+    const resizeObserver = typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(() => scheduleMeasure())
 
     const measure = () => {
       rafId = null
@@ -157,11 +158,49 @@ export function FindBar() {
 
   // Debounce search — fire findInPage 200ms after the user stops typing.
   useEffect(() => {
+    const requestId = ++nativeSearchRequestRef.current
+    const input = inputRef.current
+
     if (!active || !localQuery) {
+      if (input?.inert) {
+        input.inert = false
+      }
+
       return undefined
     }
 
-    const id = setTimeout(() => setFindQuery(localQuery), 200)
+    const id = setTimeout(() => {
+      if (!input) {
+        void setFindQuery(localQuery)
+
+        return
+      }
+
+      const hadFocus = document.activeElement === input
+      const selectionStart = input.selectionStart
+      const selectionEnd = input.selectionEnd
+
+      // The HTML inert contract excludes this truthful search control from
+      // find-in-page. Keep it inert until the IPC reply confirms Electron has
+      // started the request, then restore focus and selection.
+      input.inert = true
+
+      void setFindQuery(localQuery).finally(() => {
+        if (nativeSearchRequestRef.current !== requestId) {
+          return
+        }
+
+        input.inert = false
+
+        if (hadFocus && input.isConnected) {
+          input.focus({ preventScroll: true })
+
+          if (selectionStart !== null && selectionEnd !== null) {
+            input.setSelectionRange(selectionStart, selectionEnd)
+          }
+        }
+      })
+    }, 200)
 
     // Cleanup covers every exit: another keystroke, the bar closing, and
     // unmount. Nothing can fire a find after the bar is gone.
@@ -204,7 +243,7 @@ export function FindBar() {
     return () => window.removeEventListener('keydown', onKeyDown, { capture: true })
   }, [active])
 
-  if (!active) {
+  if (!active || isOverlayView(appViewForPath(pathname))) {
     return null
   }
 
@@ -214,7 +253,7 @@ export function FindBar() {
 
     // Empty query: clear highlights immediately rather than after the debounce.
     if (!value) {
-      setFindQuery('')
+      void setFindQuery('')
     }
   }
 
@@ -239,10 +278,7 @@ export function FindBar() {
 
   const matchLabel = formatMatchLabel(query, matchOrdinal, matchCount)
 
-  const barStyle =
-    filesPaneRight != null
-      ? { right: `calc(${filesPaneRight}px + 0.75rem)` }
-      : undefined
+  const barStyle = filesPaneRight != null ? { right: `calc(${filesPaneRight}px + 0.75rem)` } : undefined
 
   return (
     <div
@@ -261,12 +297,13 @@ export function FindBar() {
     >
       <input
         aria-label={t.keybinds.actions['view.findInPage'] ?? 'Find in page'}
+        autoComplete="off"
         className="h-6 w-40 bg-transparent text-xs text-(--ui-text-primary) outline-none placeholder:text-(--ui-text-tertiary)"
         onChange={onInput}
         onKeyDown={onKeyDown}
         placeholder={t.keybinds.actions['view.findInPage'] ?? 'Find in page'}
         ref={inputRef}
-        type="text"
+        type="search"
         value={localQuery}
       />
 
