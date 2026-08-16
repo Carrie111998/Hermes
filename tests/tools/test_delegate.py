@@ -562,6 +562,60 @@ class TestDelegateObservability(unittest.TestCase):
             )
             self.assertEqual(entry["tool_trace"][0]["status"], "ok")
 
+    def test_surfaces_only_allowlisted_child_fallback_event(self):
+        """Delegation preserves one safe fallback event, not raw child data."""
+        parent = _make_mock_parent(depth=0)
+        secret_sentinel = "SENTINEL_SECRET_MUST_NOT_SURVIVE"
+        prompt_sentinel = "SENTINEL_PROMPT_MUST_NOT_SURVIVE"
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            mock_child = MagicMock()
+            mock_child.model = "glm-5.2"
+            mock_child.session_prompt_tokens = 10
+            mock_child.session_completion_tokens = 5
+            mock_child._last_fallback_event = {
+                "initial_provider": "ollama",
+                "initial_model": "nemotron-3.5-lightning:30b-mlx",
+                "selected_fallback_provider": "ollama-cloud",
+                "selected_fallback_model": "glm-5.2",
+                "failure_class": "availability",
+                "reason_code": "overloaded",
+                "http_status": 503,
+                "raw_exception": secret_sentinel + ("X" * 10_000),
+                "prompt": prompt_sentinel,
+                "headers": {"authorization": secret_sentinel},
+            }
+            mock_child.run_conversation.return_value = {
+                "final_response": "done",
+                "completed": True,
+                "interrupted": False,
+                "api_calls": 2,
+                "messages": [],
+            }
+            MockAgent.return_value = mock_child
+
+            result = json.loads(
+                delegate_task(goal="Test fallback metadata", parent_agent=parent)
+            )
+
+        event = result["results"][0]["fallback_event"]
+        self.assertEqual(
+            set(event),
+            {
+                "initial_provider",
+                "initial_model",
+                "selected_fallback_provider",
+                "selected_fallback_model",
+                "failure_class",
+                "reason_code",
+                "http_status",
+            },
+        )
+        serialized = json.dumps(event, sort_keys=True)
+        self.assertNotIn(secret_sentinel, serialized)
+        self.assertNotIn(prompt_sentinel, serialized)
+        self.assertLessEqual(len(serialized.encode("utf-8")), 768)
+
     def test_tool_trace_handles_list_content_blocks(self):
         """Tool-result content blocks should not crash observability metadata."""
         parent = _make_mock_parent(depth=0)

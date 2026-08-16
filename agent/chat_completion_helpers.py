@@ -65,6 +65,138 @@ _PROVIDER_STREAM_ERROR_TEXT_LIMIT = 4096
 # narrower non-rate-limit case.  See issue #24996.
 _FALLBACK_EXHAUSTED_COOLDOWN_S = 5.0
 
+_FALLBACK_EVENT_ROUTE_MAX_CHARS = 120
+_FALLBACK_EVENT_ALLOWED_KEYS = frozenset(
+    {
+        "initial_provider",
+        "initial_model",
+        "selected_fallback_provider",
+        "selected_fallback_model",
+        "failure_class",
+        "reason_code",
+        "http_status",
+    }
+)
+_FALLBACK_FAILURE_CLASSES = frozenset(
+    {
+        "authentication",
+        "quota",
+        "availability",
+        "transport",
+        "capacity",
+        "policy",
+        "request",
+        "provider_protocol",
+        "unknown",
+    }
+)
+
+
+def _normalize_fallback_route_label(value: Any) -> Optional[str]:
+    """Return a bounded provider/model label, never an arbitrary payload."""
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip()
+    if not normalized or len(normalized) > _FALLBACK_EVENT_ROUTE_MAX_CHARS:
+        return None
+    if "://" in normalized:
+        return None
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:+/@-]*", normalized):
+        return None
+    return normalized
+
+
+def _fallback_failure_class(reason: "FailoverReason | None") -> str:
+    if reason in {FailoverReason.auth, FailoverReason.auth_permanent}:
+        return "authentication"
+    if reason in {
+        FailoverReason.billing,
+        FailoverReason.rate_limit,
+        FailoverReason.upstream_rate_limit,
+    }:
+        return "quota"
+    if reason in {FailoverReason.overloaded, FailoverReason.server_error}:
+        return "availability"
+    if reason in {FailoverReason.timeout, FailoverReason.ssl_cert_verification}:
+        return "transport"
+    if reason in {
+        FailoverReason.context_overflow,
+        FailoverReason.payload_too_large,
+        FailoverReason.image_too_large,
+    }:
+        return "capacity"
+    if reason in {
+        FailoverReason.model_not_found,
+        FailoverReason.provider_policy_blocked,
+        FailoverReason.content_policy_blocked,
+    }:
+        return "policy"
+    if reason in {
+        FailoverReason.format_error,
+        FailoverReason.invalid_encrypted_content,
+        FailoverReason.multimodal_tool_content_unsupported,
+    }:
+        return "request"
+    if reason in {
+        FailoverReason.thinking_signature,
+        FailoverReason.long_context_tier,
+        FailoverReason.oauth_long_context_beta_forbidden,
+        FailoverReason.llama_cpp_grammar_pattern,
+    }:
+        return "provider_protocol"
+    return "unknown"
+
+
+def sanitize_fallback_event(event: Any) -> Optional[Dict[str, Any]]:
+    """Copy one fallback event through an exact, bounded allowlist.
+
+    This intentionally accepts no exception object or message. Callers may
+    retain only route labels, enum-derived classification, and a valid HTTP
+    status; response bodies, prompts, headers, URLs, and arbitrary payloads
+    are structurally unreachable from the returned value.
+    """
+    if not isinstance(event, dict):
+        return None
+
+    sanitized: Dict[str, Any] = {}
+    for key in (
+        "initial_provider",
+        "initial_model",
+        "selected_fallback_provider",
+        "selected_fallback_model",
+    ):
+        value = _normalize_fallback_route_label(event.get(key))
+        if value is None:
+            return None
+        sanitized[key] = value
+
+    failure_class = event.get("failure_class")
+    sanitized["failure_class"] = (
+        failure_class
+        if isinstance(failure_class, str)
+        and failure_class in _FALLBACK_FAILURE_CLASSES
+        else "unknown"
+    )
+
+    reason_code = event.get("reason_code")
+    allowed_reasons = {reason.value for reason in FailoverReason}
+    sanitized["reason_code"] = (
+        reason_code
+        if isinstance(reason_code, str) and reason_code in allowed_reasons
+        else FailoverReason.unknown.value
+    )
+
+    http_status = event.get("http_status")
+    sanitized["http_status"] = (
+        http_status
+        if isinstance(http_status, int)
+        and not isinstance(http_status, bool)
+        and 100 <= http_status <= 599
+        else None
+    )
+    assert set(sanitized) == _FALLBACK_EVENT_ALLOWED_KEYS
+    return sanitized
+
 
 def _context_thread_target(callback):
     """Bind a no-argument thread target to the caller's ContextVars."""
@@ -2424,7 +2556,14 @@ def _fallback_entry_unavailable_without_network(agent, fb: dict) -> Optional[str
 
 
 
-def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool:
+def try_activate_fallback(
+    agent,
+    reason: "FailoverReason | None" = None,
+    *,
+    http_status: Optional[int] = None,
+    _initial_provider: Optional[str] = None,
+    _initial_model: Optional[str] = None,
+) -> bool:
     """Switch to the next fallback model/provider in the chain.
 
     Called when the current model is failing after retries.  Swaps the
@@ -2436,6 +2575,19 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
     auth resolution and client construction — no duplicated provider→key
     mappings.
     """
+    if _initial_provider is None and _initial_model is None:
+        agent._last_fallback_event = None
+        _initial_provider = getattr(agent, "provider", "")
+        _initial_model = getattr(agent, "model", "")
+
+    def _try_next_fallback() -> bool:
+        return agent._try_activate_fallback(
+            reason,
+            http_status=http_status,
+            _initial_provider=_initial_provider,
+            _initial_model=_initial_model,
+        )
+
     if reason in {FailoverReason.rate_limit, FailoverReason.billing, FailoverReason.upstream_rate_limit}:
         # Only start cooldown when leaving the primary provider.  If we're
         # already on a fallback and chain-switching, the primary wasn't the
@@ -2484,11 +2636,11 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         agent._unavailable_fallback_keys = unavailable
     if fb_key in unavailable:
         logger.debug("Fallback skip: %s previously marked unavailable", fb_key)
-        return agent._try_activate_fallback(reason)
+        return _try_next_fallback()
     fb_provider = (fb.get("provider") or "").strip().lower()
     fb_model = (fb.get("model") or "").strip()
     if not fb_provider or not fb_model:
-        return agent._try_activate_fallback(reason)  # skip invalid, try next
+        return _try_next_fallback()  # skip invalid, try next
 
     local_skip_reason = _fallback_entry_unavailable_without_network(agent, fb)
     if local_skip_reason:
@@ -2499,7 +2651,7 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
             fb_model,
             local_skip_reason,
         )
-        return agent._try_activate_fallback(reason)
+        return _try_next_fallback()
 
     # Skip entries that resolve to the same backend that just failed —
     # falling back to it loops the failure. Identity semantics (which axes
@@ -2524,7 +2676,7 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
             "as the current one (%s)",
             fb_provider, fb_model, current_ident.base_url or current_ident.provider,
         )
-        return agent._try_activate_fallback(reason)
+        return _try_next_fallback()
 
     # Use centralized router for client construction.
     # raw_codex=True because the main agent needs direct responses.stream()
@@ -2581,7 +2733,7 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
                 "Fallback to %s failed: provider not configured",
                 fb_provider)
             unavailable.add(fb_key)
-            return agent._try_activate_fallback(reason)  # try next in chain
+            return _try_next_fallback()  # try next in chain
         try:
             from hermes_cli.model_normalize import normalize_model_for_provider
 
@@ -2833,12 +2985,27 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         # short-circuit the freshly activated fallback before it gets a
         # single stream attempt.
         _reset_stale_streak(agent)
+        agent._last_fallback_event = sanitize_fallback_event(
+            {
+                "initial_provider": _initial_provider,
+                "initial_model": _initial_model,
+                "selected_fallback_provider": fb_provider,
+                "selected_fallback_model": fb_model,
+                "failure_class": _fallback_failure_class(reason),
+                "reason_code": (
+                    reason.value
+                    if isinstance(reason, FailoverReason)
+                    else FailoverReason.unknown.value
+                ),
+                "http_status": http_status,
+            }
+        )
         return True
     except Exception as e:
         if fb_provider == "nous":
             unavailable.add(fb_key)
         logger.error("Failed to activate fallback %s: %s", fb_model, e)
-        return agent._try_activate_fallback(reason)  # try next in chain
+        return _try_next_fallback()  # try next in chain
 
 
 

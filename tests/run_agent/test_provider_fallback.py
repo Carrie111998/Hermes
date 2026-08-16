@@ -5,8 +5,10 @@ the new list-based ``fallback_providers`` config format and chain
 advancement through multiple providers.
 """
 
+import json
 from unittest.mock import MagicMock, patch
 
+from agent.error_classifier import FailoverReason, classify_api_error
 from run_agent import AIAgent, _pool_may_recover_from_rate_limit
 
 
@@ -85,6 +87,71 @@ class TestFallbackChainAdvancement:
             assert agent._fallback_index == 1
             assert agent.model == "gpt-4o"
             assert agent._fallback_activated is True
+
+    def test_records_bounded_sanitized_failure_event(self):
+        """Fallback diagnostics retain routing facts, never raw failure data."""
+        agent = _make_agent(
+            fallback_model=[
+                {"provider": "unconfigured", "model": "unavailable"},
+                {"provider": "ollama-cloud", "model": "glm-5.2"},
+            ]
+        )
+        agent.provider = "ollama"
+        agent.model = "nemotron-3.5-lightning:30b-mlx"
+        agent.base_url = "http://localhost:11434/v1"
+
+        secret_sentinel = "SENTINEL_SECRET_MUST_NOT_SURVIVE"
+        prompt_sentinel = "SENTINEL_PROMPT_MUST_NOT_SURVIVE"
+        overlong_value = "Z" * 10_000
+        error = RuntimeError(
+            f"provider failure {secret_sentinel} {prompt_sentinel} {overlong_value}"
+        )
+        error.status_code = 503
+        classified = classify_api_error(
+            error,
+            provider=agent.provider,
+            model=agent.model,
+        )
+        assert classified.reason == FailoverReason.overloaded
+        assert secret_sentinel in classified.message
+        assert prompt_sentinel in classified.message
+
+        with (
+            patch(
+                "agent.auxiliary_client.resolve_provider_client",
+                side_effect=[
+                    (None, None),
+                    (
+                        _mock_client(base_url="https://ollama.com/v1"),
+                        "glm-5.2",
+                    ),
+                ],
+            ),
+            patch(
+                "hermes_cli.model_normalize.normalize_model_for_provider",
+                side_effect=lambda model, provider: model,
+            ),
+        ):
+            assert agent._try_activate_fallback(
+                reason=classified.reason,
+                http_status=classified.status_code,
+            ) is True
+
+        event = agent._last_fallback_event
+        assert event == {
+            "initial_provider": "ollama",
+            "initial_model": "nemotron-3.5-lightning:30b-mlx",
+            "selected_fallback_provider": "ollama-cloud",
+            "selected_fallback_model": "glm-5.2",
+            "failure_class": "availability",
+            "reason_code": "overloaded",
+            "http_status": 503,
+        }
+        serialized = json.dumps(event, sort_keys=True)
+        assert secret_sentinel not in serialized
+        assert prompt_sentinel not in serialized
+        assert overlong_value not in serialized
+        assert len(serialized.encode("utf-8")) <= 768
 
 
 

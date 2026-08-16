@@ -3122,6 +3122,13 @@ def _run_single_child(
                 else 0.0
             ),
         }
+        from agent.chat_completion_helpers import sanitize_fallback_event
+
+        fallback_event = sanitize_fallback_event(
+            getattr(child, "_last_fallback_event", None)
+        )
+        if fallback_event is not None:
+            entry["fallback_event"] = fallback_event
         # Per-delegation spend, serialized back to the model alongside
         # tokens/api_calls so the parent can see what each delegation cost.
         # Mirrors _child_cost_usd (which is stripped pre-serialization and
