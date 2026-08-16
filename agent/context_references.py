@@ -38,29 +38,6 @@ _SENSITIVE_HOME_FILES = (
     Path(".npmrc"),
     Path(".pypirc"),
 )
-def _read_text_attachment(path: Path) -> tuple[str, str]:
-    data = path.read_bytes()
-
-    for bom, encoding in _TEXT_ATTACHMENT_BOMS:
-        if data.startswith(bom):
-            return data.decode(encoding), encoding
-
-    try:
-        return data.decode("utf-8"), "utf-8"
-    except UnicodeDecodeError:
-        pass
-
-    from charset_normalizer import from_bytes
-
-    result = from_bytes(data)
-    best = result.best()
-    if best is not None:
-        return str(best), best.encoding
-
-    # Re-raise the original UTF-8 error — nothing could decode the bytes.
-    raise UnicodeDecodeError(
-        "utf-8", data, 0, len(data), "no encoding detected by charset-normalizer"
-    )
 _TEXT_ATTACHMENT_BOMS = (
     (b"\xff\xfe\x00\x00", "utf-32"),
     (b"\x00\x00\xfe\xff", "utf-32"),

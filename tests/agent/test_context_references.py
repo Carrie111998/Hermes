@@ -160,16 +160,46 @@ def test_file_reference_expands_gb18030_csv(tmp_path: Path):
     assert "测试商户" in result.message
 
 
-def test_file_reference_expands_big5_csv(tmp_path: Path):
+@pytest.mark.parametrize(
+    ("filename", "text", "expected"),
+    [
+        (
+            "short-big5.txt",
+            "這是繁體中文測試檔案\n第二行內容\n",
+            "這是繁體中文測試檔案",
+        ),
+        (
+            "big5-prose.txt",
+            "台灣繁體中文的處理需要正確的編碼設定,否則會出現亂碼問題。\n" * 8,
+            "編碼設定",
+        ),
+        (
+            "big5-names.csv",
+            "陳大文,林小美,黃志明,吳雅婷,張家豪\n" * 10,
+            "黃志明",
+        ),
+        (
+            "big5-statement.csv",
+            (
+                "日期,摘要,金額\n"
+                "2026-08-11,轉帳手續費,12.50\n"
+                "備註:這是一份繁體中文的銀行對帳單匯出檔案,\n"
+            )
+            * 6,
+            "轉帳手續費",
+        ),
+    ],
+)
+def test_file_reference_expands_big5_text_without_cjk_fallback_mojibake(
+    tmp_path: Path, filename: str, text: str, expected: str
+):
     from agent.context_references import preprocess_context_references
 
-    payload = tmp_path / "big5-sample.csv"
-    payload.write_bytes(
-        "日期,摘要,金額\n2026-08-11,轉帳手續費,12.50\n".encode("big5")
-    )
+    payload = tmp_path / filename
+    payload.write_bytes(text.encode("big5"))
 
     result = preprocess_context_references(
-        "Summarize @file:big5-sample.csv",
+        f"Summarize @file:{filename}",
         cwd=tmp_path,
         context_length=100_000,
     )
@@ -177,8 +207,8 @@ def test_file_reference_expands_big5_csv(tmp_path: Path):
     assert result.expanded
     assert not result.warnings
     assert "decoded as big5" in result.message
-    assert "日期" in result.message
-    assert "轉帳手續費" in result.message
+    assert expected in result.message
+    assert "ｳoｬO" not in result.message
 
 
 def test_file_reference_expands_cp932_text_with_line_range(tmp_path: Path):
