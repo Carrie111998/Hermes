@@ -19,7 +19,15 @@ const PLATFORM = process.platform
 // launch via install.ps1 / install.sh, per the Phase 1 thin-installer flow).
 const APP = (() => {
   if (PLATFORM === 'darwin') {
-    const appPath = path.join(RELEASE_ROOT, `mac-${ARCH}`, 'Hermes.app')
+    // electron-builder omits the arch suffix for its default arch, and that
+    // default is x64 -- so an Intel pack lands in `release/mac` while arm64
+    // gets `release/mac-arm64`. `release/mac-x64` is never produced, which
+    // left every Intel host failing here with "app not found". Probe the
+    // suffixed path first, then the bare one, mirroring the mac-arm64 -> mac
+    // fallback scripts/install.sh and scripts/desktop-update/posix.sh use.
+    const appPath =
+      [`mac-${ARCH}`, 'mac'].map(dir => path.join(RELEASE_ROOT, dir, 'Hermes.app')).find(exists) ??
+      path.join(RELEASE_ROOT, `mac-${ARCH}`, 'Hermes.app')
     return {
       appPath,
       binary: path.join(appPath, 'Contents', 'MacOS', 'Hermes'),
