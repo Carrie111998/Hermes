@@ -1752,8 +1752,61 @@ export const en: Translations = {
         help: 'Recommended. Comma-separated phone numbers or WhatsApp IDs.'
       }
     },
-    platformIntro: {},
-    platformDescription: {}
+    platformIntro: {
+      telegram:
+        'In Telegram, talk to @BotFather, run /newbot, and copy the token it gives you. Then get your numeric user ID from @userinfobot.',
+      discord:
+        'Open the Discord Developer Portal, create an application, add a Bot, then copy its token. Invite the bot to your server with proper permission scopes.',
+      slack: 'Create a Slack app, enable Socket Mode, install it to your workspace, then copy the bot token and app-level token.',
+      mattermost: 'On your Mattermost server, create a bot account or personal access token, then paste the server URL and token here.',
+      matrix: 'Log in to your homeserver with the bot account, then copy the access token, user ID, and homeserver URL.',
+      signal: 'Run a signal-cli REST bridge at an accessible location, then point Hermes at that URL and a registered phone number.',
+      whatsapp: 'Start the bundled WhatsApp bridge with Hermes, scan the QR code on first run, then enable the platform.',
+      bluebubbles:
+        'Run BlueBubbles Server on a Mac with iMessage, expose its API, then point Hermes at that URL with the server password.',
+      homeassistant: 'Open your profile in Home Assistant and create a long-lived access token. Paste it here along with your HA URL.',
+      email: 'Use a dedicated mailbox. For Gmail/Workspace, create an app-specific password and use imap.gmail.com / smtp.gmail.com.',
+      sms: 'Get your Account SID and Auth Token from the Twilio console, along with an SMS-enabled phone number.',
+      dingtalk: 'Create a DingTalk application in the developer console, then copy the Client ID (App key) and Client Secret here.',
+      feishu: 'Create a Feishu / Lark app, configure bot capabilities, and copy the App ID, App secret, and event encryption key.',
+      wecom: 'Add a group bot in WeCom, copy its webhook key as WECOM_BOT_ID. Send-only — for two-way use the WeCom (App) option.',
+      wecom_callback: 'Set up a WeCom self-built app, expose its callback URL, and provide the corp ID, secret, agent ID, and AES key.',
+      weixin:
+        'Run `hermes gateway setup`, choose Weixin, then scan and confirm the QR code with your personal WeChat account. Hermes will connect via Tencent iLink Bot API and save credentials.',
+      qqbot: 'Register an application on QQ Open Platform (q.qq.com), copy the App ID and Client Secret.',
+      api_server:
+        'Expose Hermes as an OpenAI-compatible API. Set an auth key, then point Open WebUI / LobeChat etc. at host:port.',
+      webhook: 'Run an HTTP server for other tools (GitHub, GitLab, custom apps) to POST to. Verify signatures with a secret.',
+      a2a: 'No external dependencies (stdlib only). Set a shared token or peer tokens to allow other Hermes instances to connect via A2A protocol.',
+      buzz: 'Requires buzz CLI tool (https://github.com/block/buzz) in PATH or BUZZ_CLI_PATH. Connects to Buzz community via Nostr relays.',
+      raft: 'Join a Raft workspace as an external agent.'
+    },
+    platformDescription: {
+      telegram: 'Use Hermes in Telegram private chats, groups, and topics.',
+      discord: 'Connect Hermes to Discord DMs, channels, and threads.',
+      slack: 'Use Hermes in Slack via Socket Mode. The bot only responds to connected users after adding allowed Slack member IDs.',
+      mattermost: 'Connect Hermes to Mattermost channels and DMs.',
+      matrix: 'Use Hermes in Matrix rooms and DMs.',
+      signal: 'Connect via signal-cli REST bridge.',
+      whatsapp: 'Use Hermes with WhatsApp via bundled bridge — scan to auth.',
+      bluebubbles: 'Use Hermes in iMessage via BlueBubbles server.',
+      homeassistant: 'Control your smart home from Hermes via Home Assistant.',
+      email: 'Talk to Hermes via IMAP/SMTP mailbox.',
+      sms: 'Send and receive SMS via Twilio.',
+      dingtalk: 'Connect Hermes to DingTalk groups.',
+      feishu: 'Use Hermes in Feishu / Lark.',
+      google_chat: 'Connect Hermes to Google Chat via Cloud Pub/Sub.',
+      wecom: 'Send-only WeCom group bot (webhook style).',
+      wecom_callback: 'Two-way WeCom integration via callback app.',
+      weixin: 'Connect personal WeChat account via Tencent iLink Bot API.',
+      qqbot: 'Connect Hermes to QQ Open Platform bots.',
+      yuanbao: 'Connect Hermes to Tencent Yuanbao.',
+      api_server: 'Expose Hermes as an OpenAI-compatible HTTP API for tools like Open WebUI.',
+      webhook: 'Receive events from webhook sources like GitHub, GitLab.',
+      a2a: 'Talk to other Hermes instances or agents locally or remotely via A2A protocol.',
+      buzz: 'Connect to decentralized Buzz community via Nostr relays (requires buzz CLI).',
+      raft: 'Join a Raft workspace as an external agent to collaborate on tasks.'
+    }
   },
 
   webhooks: {
@@ -2047,7 +2100,65 @@ export const en: Translations = {
       loading: 'Loading blueprints...',
       failedLoad: 'Failed to load blueprints',
       emptyTitle: 'No blueprints available',
-      emptyDesc: 'No automation blueprints are available on this backend.'
+      emptyDesc: 'No automation blueprints are available on this backend.',
+      titles: {
+        'Morning briefing': 'Morning briefing',
+        'Important-mail monitor': 'Important-mail monitor',
+        'Weekly review': 'Weekly review',
+        'Workday start reminder': 'Workday start reminder',
+        'Custom reminder': 'Custom reminder',
+        'Evening wind-down': 'Evening wind-down',
+        'Topic news digest': 'Topic news digest',
+        'Bills & renewals reminder': 'Bills & renewals reminder',
+        'Price & availability watch': 'Price & availability watch',
+        'Competitor news watch': 'Competitor news watch',
+        'Habit check-in': 'Habit check-in',
+        'Hydration & movement nudge': 'Hydration & movement nudge',
+        'Weekly meal plan': 'Weekly meal plan',
+        'Daily learning drip': 'Daily learning drip',
+        'Gratitude & reflection prompt': 'Gratitude & reflection prompt',
+        'On-this-day discovery': 'On-this-day discovery'
+      },
+      descriptions: {
+        'Morning briefing': 'A short daily briefing: today's calendar, weather, and any pending urgent items.',
+        'Important-mail monitor': 'Checks your inbox periodically and alerts only when something truly needs attention.',
+        'Weekly review': 'Weekly recap: what got done, what's pending, and what's coming up.',
+        'Workday start reminder': 'Workday reminder with your agenda and top priorities.',
+        'Custom reminder': 'Custom recurring reminder on your schedule.',
+        'Evening wind-down': 'End-of-day check: a glance at tomorrow's schedule and what to prepare tonight.',
+        'Topic news digest': 'Periodic digest on topics you care about — deduplicated so only truly new items surface.',
+        'Bills & renewals reminder': 'Advance warning before recurring payments, subscription renewals, or due dates — so nothing auto-charges unexpectedly.',
+        'Price & availability watch': 'Monitor exact products, flights, hotels, or listings and alert when price or availability conditions are met.',
+        'Competitor news watch': 'Track notable news about specified companies — launches, pricing, funding, filings — with cited summaries.',
+        'Habit check-in': 'Periodic reminder to maintain a habit and reflect on completion.',
+        'Hydration & movement nudge': 'Periodic reminders throughout the day to drink water, stand up, and stretch.',
+        'Weekly meal plan': 'Weekly meal plan with a merged shopping list, tailored to your diet and cooking time.',
+        'Daily learning drip': 'One small lesson per day on a topic you want to learn — builds up over time.',
+        'Gratitude & reflection prompt': 'Daily or weekly reflection prompt to note gratitudes and insights.',
+        'On-this-day discovery': 'Interesting events from history that happened on this day — personalized to your interests.'
+      },
+      labels: {
+        'What time?': 'What time?',
+        'Where to deliver?': 'Where to deliver?',
+        'How often?': 'How often?',
+        'Remind me to…': 'Remind me to…',
+        'Which day?': 'Which day?',
+        'Repeat on': 'Repeat on',
+        'What topic?': 'What topic?',
+        'How many bullets?': 'How many bullets?',
+        "What's due?": "What's due?",
+        'What exactly to watch?': 'What exactly to watch?',
+        'Alert me when…': 'Alert me when…',
+        'Which companies?': 'Which companies?',
+        'Which events matter?': 'Which events matter?',
+        'Which habit?': 'Which habit?',
+        'Start hour': 'Start hour',
+        'End hour': 'End hour',
+        'Diet?': 'Diet?',
+        'Meals per day?': 'Meals per day?',
+        'Cooking effort?': 'Cooking effort?',
+        'Only notify me if the mail…': 'Only notify me if the mail…'
+      }
     }
   },
 

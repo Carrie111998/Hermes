@@ -2186,7 +2186,10 @@ export const ja = defineLocale({
       api_server:
         'Hermes を OpenAI 互換 API として公開します。認証キーを設定し、Open WebUI / LobeChat などを host:port に向けてください。',
       webhook:
-        '他のツール (GitHub、GitLab、カスタムアプリ) が POST できる HTTP サーバーを実行します。シークレットで署名を検証します。'
+        '他のツール (GitHub、GitLab、カスタムアプリ) が POST できる HTTP サーバーを実行します。シークレットで署名を検証します。',
+      a2a: '外部依存関係なし（標準ライブラリのみ）。共有トークンまたはピアトークンを設定して、他の Hermes インスタンスが A2A プロトコル経由で接続できるようにします。',
+      buzz: 'buzz CLI ツール (https://github.com/block/buzz) が PATH または BUZZ_CLI_PATH に必要です。Nostr リレー経由で Buzz コミュニティに接続します。',
+      raft: 'Raft ワークスペースに外部エージェントとして参加します。'
     },
     platformDescription: {
       telegram: 'Telegram の DM、グループ、トピックで Hermes を使います。',
@@ -2205,6 +2208,15 @@ export const ja = defineLocale({
       google_chat: 'Cloud Pub/Sub 経由で Google Chat に Hermes を接続します。',
       wecom: 'Webhook 経由の送信専用 WeCom グループボット。',
       wecom_callback: 'コールバックアプリによる双方向の WeCom 連携。',
+      weixin: 'Tencent iLink Bot API 経由で個人 WeChat アカウントを接続します。',
+      qqbot: 'QQ オープンプラットフォームのボットに Hermes を接続します。',
+      yuanbao: 'Tencent Yuanbao に Hermes を接続します。',
+      api_server: 'Open WebUI などのツール向けに Hermes を OpenAI 互換 HTTP API として公開します。',
+      webhook: 'GitHub、GitLab などの webhook ソースからイベントを受信します。',
+      a2a: 'A2A プロトコル経由でローカルまたはリモートで他の Hermes インスタンスやエージェントと会話します。',
+      buzz: 'Nostr リレー経由で分散型 Buzz コミュニティに接続します（buzz CLI が必要）。',
+      raft: 'Raft ワークスペースに外部エージェントとして参加してタスクで協力します。'
+    },
       weixin: 'Tencent の iLink Bot API を通じて個人の WeChat アカウントを接続します。',
       qqbot: 'QQ オープンプラットフォームの QQ ボットに Hermes を接続します。',
       yuanbao: 'Tencent Yuanbao に Hermes を接続します。',
@@ -2439,8 +2451,66 @@ export const ja = defineLocale({
       scheduled: 'ブレーンプリントをスケジュールしました',
       loading: 'ブレーンプリントを読み込み中...',
       failedLoad: 'ブレーンプリントの読み込みに失敗しました',
-      emptyTitle: '利用できるブレーンプリントはありません',
-      emptyDesc: 'このバックエンドで利用できる自動化ブレーンプリントはありません。'
+      emptyTitle: '利用できるブループリントはありません',
+      emptyDesc: 'このバックエンドで利用できる自動化ブループリントはありません。',
+      titles: {
+        'Morning briefing': '朝のブリーフィング',
+        'Important-mail monitor': '重要メール監視',
+        'Weekly review': '週次レビュー',
+        'Workday start reminder': '勤務開始リマインダー',
+        'Custom reminder': 'カスタムリマインダー',
+        'Evening wind-down': '夜のまとめ',
+        'Topic news digest': 'トピックニュースダイジェスト',
+        'Bills & renewals reminder': '請求書と更新のリマインダー',
+        'Price & availability watch': '価格と在庫監視',
+        'Competitor news watch': '競合ニュース監視',
+        'Habit check-in': '習慣チェックイン',
+        'Hydration & movement nudge': '水分補給と運動の促し',
+        'Weekly meal plan': '週間食事計画',
+        'Daily learning drip': '毎日の学習',
+        'Gratitude & reflection prompt': '感謝と振り返りのプロンプト',
+        'On-this-day discovery': '今日は何の日'
+      },
+      descriptions: {
+        'Morning briefing': '毎日の簡単なブリーフィング：今日のカレンダー、天気、保留中の緊急事項。',
+        'Important-mail monitor': '定期的に受信トレイをチェックし、本当に注意が必要なときだけ通知します。',
+        'Weekly review': '週次まとめ：完了したこと、保留中のこと、これから来ること。',
+        'Workday start reminder': '議題と最優先事項を含む勤務日リマインダー。',
+        'Custom reminder': 'スケジュールに基づくカスタム繰り返しリマインダー。',
+        'Evening wind-down': '終日チェック：明日のスケジュールと今夜準備すべきことの一覧。',
+        'Topic news digest': '関心のあるトピックに関する定期的なダイジェスト — 重複排除されて本当に新しいアイテムだけが表示されます。',
+        'Bills & renewals reminder': '定期支払い、サブスクリプション更新、または期限日の前に事前警告 — 予期しない自動請求を防ぎます。',
+        'Price & availability watch': '正確な商品、フライト、ホテル、またはリストを監視し、価格または在庫状況の条件が満たされたときに通知します。',
+        'Competitor news watch': '指定企業に関する注目すべきニュースを追跡 — 製品発売、価格設定、資金調達、申告 — 引用付き要約。',
+        'Habit check-in': '習慣を維持し、完了を振り返るための定期的なリマインダー。',
+        'Hydration & movement nudge': '日中に定期的に水を飲み、立ち上がり、ストレッチするためのリマインダー。',
+        'Weekly meal plan': 'あなたの食事と調理時間に合わせた、統合された買い物リスト付きの週間食事計画。',
+        'Daily learning drip': '学びたいトピックについて毎日少しずつ学習 — 時間をかけて蓄積されます。',
+        'Gratitude & reflection prompt': '感謝と洞察を記録するための毎日または毎週の振り返りプロンプト。',
+        'On-this-day discovery': '歴史上の今日に起こった興味深い出来事 — あなたの興味に合わせてパーソナライズされます。'
+      },
+      labels: {
+        'What time?': '何時？',
+        'Where to deliver?': 'どこに配信しますか？',
+        'How often?': '頻度は？',
+        'Remind me to…': 'リマインダー内容…',
+        'Which day?': '何曜日？',
+        'Repeat on': '繰り返し',
+        'What topic?': 'トピックは？',
+        'How many bullets?': 'いくつの箇条書き？',
+        "What's due?": '何が期限ですか？',
+        'What exactly to watch?': '正確に何を監視しますか？',
+        'Alert me when…': '通知条件…',
+        'Which companies?': 'どの企業？',
+        'Which events matter?': 'どのイベントが重要？',
+        'Which habit?': 'どの習慣？',
+        'Start hour': '開始時刻',
+        'End hour': '終了時刻',
+        'Diet?': '食事制限は？',
+        'Meals per day?': '1日の食事回数？',
+        'Cooking effort?': '調理の労力？',
+        'Only notify me if the mail…': 'メールが…の場合のみ通知'
+      }
     }
   },
 

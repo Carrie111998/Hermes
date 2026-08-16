@@ -2474,7 +2474,10 @@ export const zh: Translations = {
       qqbot: '在 QQ 开放平台 (q.qq.com) 注册一个应用，复制 App ID 和 Client Secret。',
       api_server:
         '把 Hermes 暴露为兼容 OpenAI 的 API。设置一个鉴权密钥，然后把 Open WebUI / LobeChat 等指向 host:port。',
-      webhook: '运行一个 HTTP 服务器，供其他工具 (GitHub、GitLab、自定义应用)POST。用 secret 验证签名。'
+      webhook: '运行一个 HTTP 服务器，供其他工具 (GitHub、GitLab、自定义应用)POST。用 secret 验证签名。',
+      a2a: '无需额外依赖（仅 stdlib）。设置共享令牌或对等令牌以允许其他 Hermes 实例通过 A2A 协议连接。',
+      buzz: '需要 buzz CLI 工具（https://github.com/block/buzz）在 PATH 或 BUZZ_CLI_PATH。通过 Nostr 中继连接 Buzz 社区。',
+      raft: '作为外部代理加入 Raft 工作区。'
     },
     platformDescription: {
       telegram: '在 Telegram 私聊、群组和话题中使用 Hermes。',
@@ -2497,7 +2500,10 @@ export const zh: Translations = {
       qqbot: '把 Hermes 接入 QQ 开放平台的 QQ 机器人。',
       yuanbao: '把 Hermes 接入腾讯元宝。',
       api_server: '把 Hermes 暴露为兼容 OpenAI 的 HTTP API，供 Open WebUI 等工具使用。',
-      webhook: '接收来自 GitHub、GitLab 等 Webhook 源的事件。'
+      webhook: '接收来自 GitHub、GitLab 等 Webhook 源的事件。',
+      a2a: '通过 A2A 协议与其他 Hermes 实例或代理进行本地或远程通信。',
+      buzz: '通过 Nostr 中继连接去中心化的 Buzz 社区（需要 buzz CLI）。',
+      raft: '作为外部代理加入 Raft 工作区以协作处理任务。'
     }
   },
 
@@ -2791,7 +2797,65 @@ export const zh: Translations = {
       loading: '正在加载模板...',
       failedLoad: '加载模板失败',
       emptyTitle: '没有可用的模板',
-      emptyDesc: '此后端上没有可用的自动化模板。'
+      emptyDesc: '此后端上没有可用的自动化模板。',
+      titles: {
+        'Morning briefing': '早间简报',
+        'Important-mail monitor': '重要邮件监控',
+        'Weekly review': '每周回顾',
+        'Workday start reminder': '工作日开始提醒',
+        'Custom reminder': '自定义提醒',
+        'Evening wind-down': '晚间放松',
+        'Topic news digest': '主题新闻摘要',
+        'Bills & renewals reminder': '账单与续费提醒',
+        'Price & availability watch': '价格与可用性监控',
+        'Competitor news watch': '竞品新闻监控',
+        'Habit check-in': '习惯打卡',
+        'Hydration & movement nudge': '饮水与活动提醒',
+        'Weekly meal plan': '每周膳食计划',
+        'Daily learning drip': '每日学习滴灌',
+        'Gratitude & reflection prompt': '感恩与反思提示',
+        'On-this-day discovery': '历史上的今天'
+      },
+      descriptions: {
+        'Morning briefing': '每日简短简报：今日日程、天气和任何等待处理的紧急事项。',
+        'Important-mail monitor': '定期检查收件箱，仅提醒真正需要关注的邮件。',
+        'Weekly review': '每周回顾：已完成的事项、待办事项和即将到来的安排。',
+        'Workday start reminder': '工作日提醒，包含你的议程和首要任务。',
+        'Custom reminder': '按你的日程安排的自定义重复提醒。',
+        'Evening wind-down': '每日结束时的检查：一览明天的日程和今晚需要准备的事项。',
+        'Topic news digest': '关于你关心的主题的定期摘要——去重后只推送真正新的内容。',
+        'Bills & renewals reminder': '在定期付款、订阅续费或到期日之前提前提醒——以免意外扣费。',
+        'Price & availability watch': '监控确切的产品、航班、酒店或列表，在满足价格或可用性条件时发出提醒。',
+        'Competitor news watch': '追踪指定公司的重要新闻——产品发布、定价、融资、申报——附引用摘要。',
+        'Habit check-in': '定期提醒以保持习惯并反思是否完成。',
+        'Hydration & movement nudge': '白天定期提醒喝水、站起来和伸展。',
+        'Weekly meal plan': '每周膳食计划加合并的购物清单，根据你的饮食和烹饪时间调整。',
+        'Daily learning drip': '每天一个关于你想学习的主题的小课程，随时间逐步积累。',
+        'Gratitude & reflection prompt': '每日或每周的反思提示，记录感恩和见解。',
+        'On-this-day discovery': '历史上的今天发生的有趣事件——个性化推荐。'
+      },
+      labels: {
+        'What time?': '什么时间？',
+        'Where to deliver?': '投递至何处？',
+        'How often?': '多久一次？',
+        'Remind me to…': '提醒我…',
+        'Which day?': '哪一天？',
+        'Repeat on': '重复于',
+        'What topic?': '什么主题？',
+        'How many bullets?': '多少条？',
+        "What's due?": '什么到期？',
+        'What exactly to watch?': '确切要监控什么？',
+        'Alert me when…': '何时提醒我…',
+        'Which companies?': '哪些公司？',
+        'Which events matter?': '哪些事件重要？',
+        'Which habit?': '哪个习惯？',
+        'Start hour': '开始时间',
+        'End hour': '结束时间',
+        'Diet?': '饮食？',
+        'Meals per day?': '每天几餐？',
+        'Cooking effort?': '烹饪难度？',
+        'Only notify me if the mail…': '仅在邮件…时通知我'
+      }
     }
   },
 

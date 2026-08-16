@@ -2020,7 +2020,10 @@ export const zhHant = defineLocale({
       weixin: '執行 `hermes gateway setup`，選擇 Weixin，然後使用個人微信帳號掃描並確認 QR code。Hermes 會透過騰訊 iLink Bot API 連線並儲存憑證。',
       qqbot: '在 QQ 開放平台 (q.qq.com) 註冊一個應用，複製 App ID 和 Client Secret。',
       api_server: '把 Hermes 公開為相容 OpenAI 的 API。設定一個驗證金鑰，然後把 Open WebUI / LobeChat 等指向 host:port。',
-      webhook: '執行一個 HTTP 伺服器，供其他工具 (GitHub、GitLab、自訂應用) POST。用 secret 驗證簽章。'
+      webhook: '執行一個 HTTP 伺服器，供其他工具 (GitHub、GitLab、自訂應用) POST。用 secret 驗證簽章。',
+      a2a: '無外部依賴（僅標準函式庫）。設定共用 token 或對等 token 以允許其他 Hermes 實例透過 A2A 協定連線。',
+      buzz: '需要 buzz CLI 工具 (https://github.com/block/buzz) 在 PATH 或 BUZZ_CLI_PATH 中。透過 Nostr relay 連接到 Buzz 社群。',
+      raft: '以外部代理的身分加入 Raft 工作區。'
     },
     platformDescription: {
       telegram: '在 Telegram 私訊、群組和話題中使用 Hermes。',
@@ -2043,7 +2046,10 @@ export const zhHant = defineLocale({
       qqbot: '把 Hermes 接入 QQ 開放平台的 QQ 機器人。',
       yuanbao: '把 Hermes 接入騰訊元寶。',
       api_server: '把 Hermes 公開為相容 OpenAI 的 HTTP API，供 Open WebUI 等工具使用。',
-      webhook: '接收來自 GitHub、GitLab 等 Webhook 來源的事件。'
+      webhook: '接收來自 GitHub、GitLab 等 Webhook 來源的事件。',
+      a2a: '透過 A2A 協定在本地或遠端與其他 Hermes 實例或代理對話。',
+      buzz: '透過 Nostr relay 連接到去中心化的 Buzz 社群（需要 buzz CLI）。',
+      raft: '以外部代理的身分加入 Raft 工作區，協作完成任務。'
     }
   },
 
@@ -2270,7 +2276,65 @@ export const zhHant = defineLocale({
       loading: '正在載入藍圖...',
       failedLoad: '載入藍圖失敗',
       emptyTitle: '沒有可用的藍圖',
-      emptyDesc: '此後端上沒有可用的自動化藍圖。'
+      emptyDesc: '此後端上沒有可用的自動化藍圖。',
+      titles: {
+        'Morning briefing': '早間簡報',
+        'Important-mail monitor': '重要郵件監控',
+        'Weekly review': '每週回顧',
+        'Workday start reminder': '工作日開始提醒',
+        'Custom reminder': '自訂提醒',
+        'Evening wind-down': '晚間整理',
+        'Topic news digest': '主題新聞摘要',
+        'Bills & renewals reminder': '帳單與續約提醒',
+        'Price & availability watch': '價格與庫存監控',
+        'Competitor news watch': '競爭對手新聞監控',
+        'Habit check-in': '習慣簽到',
+        'Hydration & movement nudge': '補水與運動提醒',
+        'Weekly meal plan': '每週膳食計畫',
+        'Daily learning drip': '每日學習',
+        'Gratitude & reflection prompt': '感恩與反思提示',
+        'On-this-day discovery': '歷史上的今天'
+      },
+      descriptions: {
+        'Morning briefing': '簡短的每日簡報：今日行事曆、天氣和待辦緊急事項。',
+        'Important-mail monitor': '定期檢查收件匣，僅在真正需要注意時提醒。',
+        'Weekly review': '每週回顧：已完成的事項、待辦事項和即將到來的事項。',
+        'Workday start reminder': '工作日提醒，附帶議程和首要任務。',
+        'Custom reminder': '依您的排程自訂的重複提醒。',
+        'Evening wind-down': '一日結束檢查：瞭解明日行程和今晚需準備的事項。',
+        'Topic news digest': '關於您關心主題的定期摘要——去重後僅顯示真正的新項目。',
+        'Bills & renewals reminder': '定期付款、訂閱續約或到期日前的提前警告——避免意外自動扣款。',
+        'Price & availability watch': '監控特定商品、航班、飯店或清單，並在價格或庫存狀況符合條件時提醒。',
+        'Competitor news watch': '追蹤指定公司的重要新聞——產品發布、定價、融資、申報——附引用摘要。',
+        'Habit check-in': '定期提醒以維持習慣並反思完成情況。',
+        'Hydration & movement nudge': '全天定期提醒喝水、站立和伸展。',
+        'Weekly meal plan': '依您的飲食和烹飪時間量身打造的每週膳食計畫，附合併購物清單。',
+        'Daily learning drip': '每天一個小課程，關於您想學習的主題——日積月累。',
+        'Gratitude & reflection prompt': '每日或每週的反思提示，記錄感恩和洞察。',
+        'On-this-day discovery': '歷史上在今天發生的有趣事件——依您的興趣個人化。'
+      },
+      labels: {
+        'What time?': '什麼時間？',
+        'Where to deliver?': '送達何處？',
+        'How often?': '多久一次？',
+        'Remind me to…': '提醒我…',
+        'Which day?': '哪一天？',
+        'Repeat on': '重複於',
+        'What topic?': '什麼主題？',
+        'How many bullets?': '幾個項目符號？',
+        "What's due?": '什麼到期？',
+        'What exactly to watch?': '確切監控什麼？',
+        'Alert me when…': '提醒我當…',
+        'Which companies?': '哪些公司？',
+        'Which events matter?': '哪些事件重要？',
+        'Which habit?': '哪個習慣？',
+        'Start hour': '開始時間',
+        'End hour': '結束時間',
+        'Diet?': '飲食限制？',
+        'Meals per day?': '每日幾餐？',
+        'Cooking effort?': '烹飪難度？',
+        'Only notify me if the mail…': '僅在郵件…時通知我'
+      }
     }
   },
 
