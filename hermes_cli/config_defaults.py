@@ -1147,6 +1147,12 @@ DEFAULT_CONFIG = {
             "timeout": 120,
             "extra_body": {},
             "reasoning_effort": "",  # per-task thinking level: none|minimal|low|medium|high|xhigh|max|ultra (empty = provider default)
+            # Tool-calling iteration budget for the review fork. Default 16
+            # matches historical behavior. The review has no "nothing to do"
+            # early-out — a session with nothing worth saving still burns the
+            # full budget before concluding "Nothing to save." Lower this to
+            # bound worst-case cost; clamped to [1, 64].
+            "max_iterations": 16,
         },
         "moa_reference": {
             "provider": "auto",

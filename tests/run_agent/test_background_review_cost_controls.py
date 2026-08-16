@@ -158,3 +158,40 @@ def test_digest_records_tool_names_in_arc():
     digest = out[0]["content"]
     assert "USER: do the thing" in digest
     assert "tools: skill_view, patch" in digest
+
+
+# ---------------------------------------------------------------------------
+# _resolve_review_max_iterations — configurable iteration budget (#87250)
+# ---------------------------------------------------------------------------
+
+def test_max_iterations_unset_falls_back_to_default():
+    agent = _FakeAgent()
+    with patch("hermes_cli.config.load_config_readonly", return_value={}):
+        assert br._resolve_review_max_iterations(agent) == 16
+
+
+def test_max_iterations_honors_config_override():
+    agent = _FakeAgent()
+    cfg = {"auxiliary": {"background_review": {"max_iterations": 4}}}
+    with patch("hermes_cli.config.load_config_readonly", return_value=cfg):
+        assert br._resolve_review_max_iterations(agent) == 4
+
+
+def test_max_iterations_clamped_to_upper_bound():
+    agent = _FakeAgent()
+    cfg = {"auxiliary": {"background_review": {"max_iterations": 999}}}
+    with patch("hermes_cli.config.load_config_readonly", return_value=cfg):
+        assert br._resolve_review_max_iterations(agent) == 64
+
+
+def test_max_iterations_clamped_to_lower_bound():
+    agent = _FakeAgent()
+    cfg = {"auxiliary": {"background_review": {"max_iterations": 0}}}
+    with patch("hermes_cli.config.load_config_readonly", return_value=cfg):
+        assert br._resolve_review_max_iterations(agent) == 1
+
+
+def test_max_iterations_falls_back_to_default_on_config_error():
+    agent = _FakeAgent()
+    with patch("hermes_cli.config.load_config_readonly", side_effect=RuntimeError("boom")):
+        assert br._resolve_review_max_iterations(agent) == 16
