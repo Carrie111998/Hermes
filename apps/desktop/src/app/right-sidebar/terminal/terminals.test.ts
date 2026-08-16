@@ -6,7 +6,11 @@ const STORAGE_KEY = 'hermes.desktop.terminals.v1'
 async function loadTerminalStore() {
   const $currentCwd = atom('/workspace')
   const $activeGatewayProfile = atom('default')
-  let activeConnectionId: null | string = null
+
+  const $activeGatewayIdentity = atom<{ connectionId: null | string; profile: string }>({
+    connectionId: null,
+    profile: 'default'
+  })
 
   vi.doMock('@/store/session', () => ({
     $currentCwd
@@ -16,7 +20,7 @@ async function loadTerminalStore() {
     normalizeProfileKey: (name: string | null | undefined) => name?.trim() || 'default'
   }))
   vi.doMock('@/store/gateway', () => ({
-    activeGatewayIdentity: () => ({ connectionId: activeConnectionId, profile: $activeGatewayProfile.get() })
+    $activeGatewayIdentity
   }))
 
   return {
@@ -24,7 +28,7 @@ async function loadTerminalStore() {
     $activeGatewayProfile,
     $currentCwd,
     setActiveGatewayIdentity: (connectionId: null | string, profile: string) => {
-      activeConnectionId = connectionId
+      $activeGatewayIdentity.set({ connectionId, profile })
       $activeGatewayProfile.set(profile)
     }
   }
@@ -95,8 +99,8 @@ describe('terminal store persistence', () => {
   })
 
   it('binds new tabs to the active gateway profile and persists the route', async () => {
-    const { $activeGatewayProfile, $terminals, createTerminal } = await loadTerminalStore()
-    $activeGatewayProfile.set('venture')
+    const { $terminals, createTerminal, setActiveGatewayIdentity } = await loadTerminalStore()
+    setActiveGatewayIdentity(null, 'venture')
 
     const id = createTerminal('/remote/repo')
 
@@ -185,11 +189,11 @@ describe('terminal store persistence', () => {
   })
 
   it('selects the active profile terminal and creates one when that profile has none', async () => {
-    const { $activeGatewayProfile, $activeTerminalId, $terminals, createTerminal, ensureTerminal } =
+    const { $activeTerminalId, $terminals, createTerminal, ensureTerminal, setActiveGatewayIdentity } =
       await loadTerminalStore()
 
     const localId = createTerminal('/windows')
-    $activeGatewayProfile.set('venture')
+    setActiveGatewayIdentity(null, 'venture')
 
     ensureTerminal({ connectionId: null, profile: 'venture' })
     const remoteId = $activeTerminalId.get()
@@ -197,7 +201,7 @@ describe('terminal store persistence', () => {
     expect(remoteId).not.toBe(localId)
     expect($terminals.get().find(term => term.id === remoteId)?.profile).toBe('venture')
 
-    $activeGatewayProfile.set('default')
+    setActiveGatewayIdentity(null, 'default')
     ensureTerminal({ connectionId: null, profile: 'default' })
     expect($activeTerminalId.get()).toBe(localId)
   })
@@ -325,9 +329,9 @@ describe('session cwd → terminal tab linking', () => {
   })
 
   it('never selects a same-cwd terminal owned by a different profile', async () => {
-    const { $activeGatewayProfile, $activeTerminalId, $currentCwd, createTerminal } = await loadTerminalStore()
+    const { $activeTerminalId, $currentCwd, createTerminal, setActiveGatewayIdentity } = await loadTerminalStore()
     const localId = createTerminal('/shared')
-    $activeGatewayProfile.set('venture')
+    setActiveGatewayIdentity(null, 'venture')
     const remoteId = createTerminal('/remote')
 
     $currentCwd.set('/shared')

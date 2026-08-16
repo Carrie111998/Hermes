@@ -19,8 +19,7 @@ vi.mock('@/store/profile', async () => ({
 }))
 
 vi.mock('@/store/gateway', async () => ({
-  $gateway: (await import('nanostores')).atom(null),
-  activeGatewayIdentity: () => ({ connectionId: null, profile: 'default' })
+  $activeGatewayIdentity: (await import('nanostores')).atom({ connectionId: null, profile: 'default' })
 }))
 
 vi.mock('./terminals', () => ({

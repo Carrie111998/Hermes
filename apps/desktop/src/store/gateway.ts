@@ -69,8 +69,10 @@ interface GatewayRegistryState {
   primaryProfile: string
   activeKey: string
   activationEpoch: number
+  activeRouteProfile: string
   secondaries: Map<string, Secondary>
   $gateway: ReturnType<typeof atom<HermesGateway | null>>
+  $activeIdentity?: ReturnType<typeof atom<ActiveGatewayIdentity>>
 }
 
 const STATE_KEY = Symbol.for('hermes.desktop.gatewayRegistryState')
@@ -82,6 +84,7 @@ function createRegistryState(): GatewayRegistryState {
     primaryProfile: 'default',
     activeKey: 'default',
     activationEpoch: 0,
+    activeRouteProfile: 'default',
     secondaries: new Map<string, Secondary>(),
     // The active gateway instance, exposed for inline message-stream
     // components (inline ClarifyTool, model overlays) that call gateway
@@ -120,15 +123,19 @@ export interface ActiveGatewayIdentity {
   profile: string
 }
 
+/** Atomically published route identity. Unlike `$activeGatewayProfile`, this is
+ * updated in the same operation as the active gateway key, so consumers cannot
+ * observe a connection id paired with the previous visible profile. */
+export const $activeGatewayIdentity = (g.$activeIdentity ??= atom<ActiveGatewayIdentity>({
+  connectionId: null,
+  profile: g.activeRouteProfile ?? g.primaryProfile
+}))
+
 /** The backend identity currently owning renderer requests. Registry
  * secondaries carry their source id; primary/local and legacy profile routes
  * deliberately retain a null connection id. */
 export function activeGatewayIdentity(): ActiveGatewayIdentity {
-  const secondary = g.secondaries.get(g.activeKey)
-
-  return secondary
-    ? { connectionId: secondary.connectionId, profile: secondary.profile }
-    : { connectionId: null, profile: g.primaryProfile }
+  return $activeGatewayIdentity.get()
 }
 
 export function configureGatewayRegistry(cfg: RegistryConfig): void {
@@ -209,9 +216,9 @@ export function reportPrimaryGatewayState(state: ConnectionState): void {
   reportGatewayState(g.primaryProfile, state)
 }
 
-function setActive(profile: string): void {
+function setActive(profile: string, routeProfile = profile): void {
   const activationEpoch = beginGatewayActivation()
-  applyActive(profile, activationEpoch)
+  applyActive(profile, activationEpoch, routeProfile)
 }
 
 function beginGatewayActivation(): number {
@@ -220,15 +227,22 @@ function beginGatewayActivation(): number {
   return g.activationEpoch
 }
 
-function applyActive(profile: string, activationEpoch: number): boolean {
+function applyActive(profile: string, activationEpoch: number, routeProfile = profile): boolean {
   if (gatewayActivationEpoch() !== activationEpoch) {
     return false
   }
 
   g.activeKey = normKey(profile)
+  g.activeRouteProfile = normKey(routeProfile)
   const gateway = activeGateway()
   g.$gateway.set(gateway)
   setGatewayState(gateway?.connectionState ?? 'closed')
+  const secondary = g.secondaries.get(g.activeKey)
+  $activeGatewayIdentity.set(
+    secondary
+      ? { connectionId: secondary.connectionId, profile: secondary.profile }
+      : { connectionId: null, profile: g.activeRouteProfile }
+  )
   // Push the active scope's registry connection into the hermes module (null
   // for the local pool) so connection-building WS calls (pluginSocket) resolve
   // through the same source of truth every activation path maintains here —
@@ -347,6 +361,7 @@ async function reconnectSecondary(entry: Secondary): Promise<void> {
       entry.reconnecting = false
       disposeSecondary(entry)
       g.secondaries.delete(entry.scope)
+      restoreActiveToPrimaryIfEvicted()
 
       return
     }
@@ -663,7 +678,7 @@ export async function ensureGatewayForAgent(connectionId: null | string, profile
     entry.wantOpen &&
     g.secondaries.get(scope) === entry &&
     Boolean(entry.connection) &&
-    applyActive(scope, activationEpoch)
+    applyActive(scope, activationEpoch, profile)
 
   if (activated && entry.connection) {
     publishActiveConnection(entry.connection)
@@ -690,7 +705,7 @@ export async function ensureGatewayForProfile(profile: string): Promise<void> {
   // descriptor — $activeGatewayProfile still moves to `key`, so request
   // scoping and profile-aware surfaces behave identically.
   if (await sharedPrimaryRoute(key)) {
-    applyActive(g.primaryProfile, activationEpoch)
+    applyActive(g.primaryProfile, activationEpoch, key)
 
     return
   }

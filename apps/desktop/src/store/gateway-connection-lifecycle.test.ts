@@ -46,11 +46,14 @@ vi.mock('@/store/session', () => ({
 vi.mock('@/store/notify-baseline', () => ({ markNativeNotifyBaseline: vi.fn() }))
 
 const {
+  $activeGatewayIdentity,
+  $gateway,
   closeSecondaryGateways,
   configureGatewayRegistry,
   disposeSecondariesForConnection,
   ensureActiveGatewayOpen,
   ensureGatewayForAgent,
+  isActivePrimary,
   setPrimaryGateway
 } = await import('./gateway')
 
@@ -90,21 +93,24 @@ describe('disposeSecondariesForConnection', () => {
 
     installDesktop({ getConnectionFor })
 
+    await ensureGatewayForAgent('office', 'default')
     await ensureGatewayForAgent('homelab', 'default')
     await ensureGatewayForAgent('homelab', 'work')
-    await ensureGatewayForAgent('office', 'default')
 
     expect(gatewayMocks.instances).toHaveLength(3)
 
     disposeSecondariesForConnection('homelab')
 
     // Both homelab sockets closed; the office socket untouched.
-    expect(gatewayMocks.instances[0].close).toHaveBeenCalledOnce()
+    expect(gatewayMocks.instances[0].close).not.toHaveBeenCalled()
     expect(gatewayMocks.instances[1].close).toHaveBeenCalledOnce()
-    expect(gatewayMocks.instances[2].close).not.toHaveBeenCalled()
+    expect(gatewayMocks.instances[2].close).toHaveBeenCalledOnce()
 
     // No redial for a removal.
     expect(getConnectionFor).toHaveBeenCalledTimes(3)
+    expect(isActivePrimary()).toBe(true)
+    expect($gateway.get()).not.toBeNull()
+    expect($activeGatewayIdentity.get()).toEqual({ connectionId: null, profile: 'default' })
   })
 
   it('re-dials disposed secondaries when redial is requested (material edit)', async () => {
@@ -170,6 +176,9 @@ describe('reconnect fail-stop on a removed connection', () => {
     const callsAfterFailStop = getConnectionFor.mock.calls.length
     await ensureActiveGatewayOpen()
     expect(getConnectionFor.mock.calls.length).toBe(callsAfterFailStop)
+    expect(isActivePrimary()).toBe(true)
+    expect($gateway.get()).not.toBeNull()
+    expect($activeGatewayIdentity.get()).toEqual({ connectionId: null, profile: 'default' })
   })
 
   it('keeps retrying on ordinary transport failures', async () => {

@@ -77,7 +77,7 @@ afterEach(() => {
 })
 
 describe('ensureGatewayForProfile under a shared global remote', () => {
-  it('reports primary/local and registry-secondary identities from the active gateway', async () => {
+  it('reports primary and explicit registry-source identities from the active gateway', async () => {
     const primary = makePrimary()
     setPrimaryGateway(primary as never, 'default')
 
@@ -106,7 +106,7 @@ describe('ensureGatewayForProfile under a shared global remote', () => {
 
     await ensureGatewayForAgent('local', 'default')
 
-    expect(activeGatewayIdentity()).toEqual({ connectionId: null, profile: 'default' })
+    expect(activeGatewayIdentity()).toEqual({ connectionId: 'local', profile: 'default' })
   })
 
   it('activates the primary socket for an explicitly shared-primary descriptor', async () => {
@@ -122,6 +122,7 @@ describe('ensureGatewayForProfile under a shared global remote', () => {
 
     expect(gatewayMocks.connect).not.toHaveBeenCalled()
     expect($gateway.get()).toBe(primary)
+    expect(activeGatewayIdentity()).toEqual({ connectionId: null, profile: 'venture' })
   })
 
   it('dials the exact WebSocket URL for a pooled profile descriptor that carries profile', async () => {

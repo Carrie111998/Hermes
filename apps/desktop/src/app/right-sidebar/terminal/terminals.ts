@@ -2,8 +2,8 @@ import { backendScopeKey } from '@hermes/shared'
 import { atom, computed } from 'nanostores'
 
 import { readKey, writeKey } from '@/lib/storage'
-import { activeGatewayIdentity, type ActiveGatewayIdentity } from '@/store/gateway'
-import { $activeGatewayProfile, normalizeProfileKey } from '@/store/profile'
+import { $activeGatewayIdentity, type ActiveGatewayIdentity } from '@/store/gateway'
+import { normalizeProfileKey } from '@/store/profile'
 import { $currentCwd } from '@/store/session'
 
 import { setTerminalTakeover } from '../store'
@@ -185,10 +185,7 @@ const terminalMatchesIdentity = (term: TerminalEntry, identity: ActiveGatewayIde
     backendScopeKey(term.connectionId, normalizeProfileKey(term.profile)) ===
       backendScopeKey(identity.connectionId, normalizeProfileKey(identity.profile)))
 
-const currentTerminalIdentity = (): ActiveGatewayIdentity => ({
-  ...activeGatewayIdentity(),
-  profile: normalizeProfileKey($activeGatewayProfile.get())
-})
+const currentTerminalIdentity = (): ActiveGatewayIdentity => $activeGatewayIdentity.get()
 
 /** Append a fresh terminal and focus it. Captures the current cwd and gateway
  *  profile once; pass explicit values to override. Returns the id. */
@@ -339,8 +336,7 @@ const terminalCwd = (term: TerminalEntry) => normalizePath(term.restoreCwd || te
 // `subscribe`) so boot keeps the persisted active tab.
 $currentCwd.listen(cwd => {
   const target = normalizePath(cwd)
-  const profile = normalizeProfileKey($activeGatewayProfile.get())
-  const identity = { ...activeGatewayIdentity(), profile }
+  const identity = $activeGatewayIdentity.get()
 
   if (!target) {
     return
