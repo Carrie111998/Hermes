@@ -178,6 +178,13 @@ stateful script. Payload fields cannot override either variable. GitHub HMAC
 and generic V2 signatures authenticate the body (and V2's timestamp), not these
 transport headers; deployments must enforce trusted proxy and header handling.
 
+:::caution Existing script routes
+This is stricter than the previous timestamp fallback. Existing script routes
+whose senders do not provide `X-GitHub-Delivery`, `svix-id`, or `X-Request-ID`
+now receive HTTP 400. Configure the provider or trusted proxy to supply a stable
+delivery identity before enabling a script on that route.
+:::
+
 ```python
 # ~/.hermes/scripts/todoist-hermes-label.py
 import json
@@ -197,6 +204,7 @@ Script outcomes:
 
 - JSON object stdout replaces the payload used by `prompt` and `deliver_extra`.
 - Non-JSON text stdout is added to the payload as `script_output`.
+- JSON stdout that is not an object is a failed script execution and is retryable.
 - Empty stdout, exact `[SILENT]`, or `{"__hermes_ignore__": true}` is an intentional completed ignore: it returns HTTP 200 with `{"status":"ignored","reason":"script"}` and retains the delivery reservation.
 - A timeout, missing script, or nonzero exit is a failed script execution: it returns HTTP 500 after releasing the delivery reservation so the sender can retry the same delivery.
 

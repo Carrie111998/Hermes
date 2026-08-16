@@ -707,6 +707,44 @@ class TestPayloadFilters:
         assert counter.read_text(encoding="utf-8") == "2"
 
     @pytest.mark.asyncio
+    async def test_non_object_json_script_output_releases_delivery_for_retry(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        scripts = tmp_path / "scripts"
+        scripts.mkdir()
+        counter = tmp_path / "attempts.txt"
+        (scripts / "invalid_output.py").write_text(
+            "import pathlib\n"
+            f"counter = pathlib.Path({str(counter)!r})\n"
+            "attempt = int(counter.read_text()) + 1 if counter.exists() else 1\n"
+            "counter.write_text(str(attempt))\n"
+            "print('[1, 2, 3]')\n",
+            encoding="utf-8",
+        )
+        adapter = _make_adapter(
+            routes={
+                "scripted": {
+                    "secret": _INSECURE_NO_AUTH,
+                    "script": "invalid_output.py",
+                    "prompt": "unused",
+                }
+            }
+        )
+        headers = {
+            "X-Webhook-Event": "test",
+            "X-GitHub-Delivery": "invalid-output-1",
+        }
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            first = await cli.post("/webhooks/scripted", json={}, headers=headers)
+            retried = await cli.post("/webhooks/scripted", json={}, headers=headers)
+
+        assert first.status == 500
+        assert retried.status == 500
+        assert counter.read_text(encoding="utf-8") == "2"
+
+    @pytest.mark.asyncio
     async def test_successful_script_ignore_retains_delivery_reservation(
         self, tmp_path, monkeypatch
     ):

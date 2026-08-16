@@ -303,7 +303,7 @@ class WebhookRouteProcessor:
             transformed = {**payload, "script_output": stdout}
         if not isinstance(transformed, dict):
             logger.warning("[webhook] script stdout must be a JSON object or text")
-            return "ignored", None
+            return "failed", None
         if (
             transformed.get("[SILENT]") is True
             or transformed.get("__hermes_ignore__") is True

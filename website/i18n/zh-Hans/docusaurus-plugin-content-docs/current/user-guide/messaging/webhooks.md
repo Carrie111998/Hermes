@@ -166,6 +166,15 @@ platforms:
 
 路由 payload 以 JSON 形式发送到 stdin：
 
+Hermes 验证请求体后，脚本路由会通过 `HERMES_WEBHOOK_EVENT_TYPE` 和
+`HERMES_WEBHOOK_DELIVERY_ID` 两个环境变量接收有长度限制的提供方/代理
+传输请求头元数据。投递 ID 从 `X-GitHub-Delivery`、`svix-id` 或
+`X-Request-ID` 解析，并与 Hermes 用于幂等处理的值相同。脚本路由若缺少
+这些外部提供的身份之一，会返回 HTTP 400；Hermes 不会再为有状态脚本合成
+基于时间戳的身份。现有脚本路由必须先配置提供方或可信代理，使其提供稳定的
+投递身份。请求体签名不会以加密方式绑定这些传输请求头，因此部署还必须确保
+代理和请求头处理可信。
+
 ```python
 # ~/.hermes/scripts/todoist-hermes-label.py
 import json
@@ -185,6 +194,7 @@ print(json.dumps(payload))
 
 - stdout 为 JSON 对象时，替换 `prompt` 和 `deliver_extra` 使用的 payload。
 - 非 JSON 文本 stdout 会以 `script_output` 字段加入 payload。
+- 可解析但不是对象的 JSON stdout 表示执行失败，并允许发送方重试。
 - 空 stdout、精确的 `[SILENT]` 或 `{"__hermes_ignore__": true}` 表示脚本已成功执行但有意忽略事件：返回 HTTP 200，并保留投递 ID 的去重记录。
 - 超时、脚本缺失或非零退出码表示执行失败：释放投递 ID 的预留并返回 HTTP 500，以便提供方重试同一事件。
 
