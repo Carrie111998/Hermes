@@ -11,6 +11,7 @@ with Bitcoin Lightning (L402) or Base USDC (X402) micro-payments.
 
 import json
 import os
+import shlex
 import subprocess
 from typing import Any, Dict, Optional
 
@@ -160,7 +161,7 @@ class HermesAippTool:
                 "AIPP_PAY_CMD",
                 "docker exec aipp-phoenixd /phoenix/phoenix-cli payinvoice --invoice={invoice}",
             ).format(invoice=payment_request)
-            res = subprocess.run(pay_cmd.split(), capture_output=True, text=True, timeout=60)
+            res = subprocess.run(shlex.split(pay_cmd), capture_output=True, text=True, timeout=60)
             if res.returncode != 0:
                 return {"status": "PAYMENT_FAILED", "error": res.stderr}
             data = json.loads(res.stdout)

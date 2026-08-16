@@ -1,6 +1,6 @@
 ---
 name: aipp-micropayments
-description: "AIPP Protocol L402 (Bitcoin Lightning) & X402 (Base USDC) micro-payment tool for Hermes — issue charges, verify settlement, and get EU AI Act Article 26 receipts."
+description: "Accept L402 Lightning payments with AIPP."
 version: 1.0.0
 author: Hermes Agent (aipp.dev)
 license: MIT
@@ -25,7 +25,7 @@ Enables Hermes agents to **monetize premium tools and reasoning** and **pay for 
 
 - An AIPP merchant API key (`aipp_merch_...`), obtained by registering a Lightning address at `https://aipp.dev` (Wallet = Identity, no password).
 - Python 3.8+ with `requests`.
-- (Optional) A local Phoenixd node (`aipp-phoenixd`) or any `phoenix-cli`-compatible wallet to settle Lightning invoices.
+- **To pay invoices (`pay_aipp_invoice`):** the default path requires **Docker** and a running `aipp-phoenixd` container (`docker exec aipp-phoenixd /phoenix/phoenix-cli payinvoice ...`). To use another wallet, set `AIPP_PAY_CMD` to any compatible payment command (e.g. a direct `phoenix-cli` binary or another Lightning CLI). Issuing charges and verifying settlement do not require Docker.
 
 ## Setup
 
@@ -49,6 +49,11 @@ print(charge["payment_hash"])
 
 # 2. After the user pays, verify settlement
 receipt = tool.verify_aipp_settlement(charge["payment_hash"])
+# Always check `status` first: failure responses may contain only `error`.
+if receipt.get("status") == "FAILED":
+    print(receipt.get("error"))
+else:
+    print(receipt.get("preimage"))
 # -> {"status": "SETTLED", "preimage": "...", "receipt_id": "rec_...", "compliance": "EU AI Act Art. 26"}
 ```
 
@@ -77,4 +82,3 @@ Issues a real $0.01 L402 charge, settles it, and verifies the receipt — end-to
 ## Related
 
 - AIPP docs: `https://aipp.dev/docs`
-- n8n monetization workflow: `examples/n8n_aipp_monetization_workflow.json` (in the aipp-key repo)
