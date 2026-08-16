@@ -34,7 +34,17 @@ def _normalize_skill_names(values) -> Set[str]:
     if values is None:
         return set()
     if isinstance(values, str):
-        values = [values]
+        # A JSON-array string like '["a","b"]' should be parsed,
+        # not wrapped as a single opaque name (#86661).
+        import json
+        try:
+            parsed = json.loads(values)
+            if isinstance(parsed, list):
+                values = parsed
+            else:
+                values = [values]
+        except (json.JSONDecodeError, ValueError):
+            values = [values]
     try:
         return {str(v).strip() for v in values if str(v).strip()}
     except TypeError:
