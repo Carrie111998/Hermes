@@ -3528,6 +3528,30 @@ class AIAgent:
             self._pending_steer = None
         return text
 
+    @staticmethod
+    def _canonical_file_mutation_path(path: str) -> str:
+        """Return a stable identity for a file-mutation target.
+
+        Tool arguments can name the same Windows file with relative/absolute
+        paths, mixed separators, or different drive-letter casing.  The
+        human-readable state key remains untouched; this identity is only
+        used to reconcile outcomes for the same concrete file.
+        """
+        try:
+            expanded = os.path.expandvars(os.path.expanduser(str(path)))
+            return os.path.normcase(os.path.normpath(os.path.realpath(os.path.abspath(expanded))))
+        except (OSError, TypeError, ValueError):
+            return os.path.normcase(os.path.normpath(str(path)))
+
+    @staticmethod
+    def _file_mutation_signature(path: str) -> tuple[bool, int, int]:
+        """Return a cheap disk signature suitable for end-of-turn rechecks."""
+        try:
+            stat = os.stat(path)
+            return True, stat.st_size, stat.st_mtime_ns
+        except OSError:
+            return False, 0, 0
+
     def _record_file_mutation_result(
         self,
         tool_name: str,
@@ -3537,11 +3561,9 @@ class AIAgent:
     ) -> None:
         """Record a ``write_file`` / ``patch`` outcome for the turn-end verifier.
 
-        On failure, store ``{path: {error_preview, tool}}`` entries.  On
-        success, remove any prior failure entries for the same paths (the
-        model recovered within the turn).  Silently no-ops if the per-turn
-        state dict hasn't been initialised yet (e.g. a tool dispatched
-        outside ``run_conversation``).
+        Failures retain their original display path plus a canonical identity
+        and pre-failure disk signature.  A later tracked success clears every
+        failure for the same canonical file, even when a path alias was used.
         """
         if tool_name not in _FILE_MUTATING_TOOLS:
             return
@@ -3552,24 +3574,53 @@ class AIAgent:
         if not targets:
             return
         landed = file_mutation_result_landed(tool_name, result)
+        landed_paths = _extract_landed_file_mutation_paths(tool_name, args, result) if landed else []
         if landed:
             changed = getattr(self, "_turn_file_mutation_paths", None)
             if changed is not None:
-                changed.update(_extract_landed_file_mutation_paths(tool_name, args, result))
+                changed.update(landed_paths)
         if is_error and not landed:
             preview = _extract_error_preview(result)
             for path in targets:
-                # Keep the FIRST error we saw for a given path unless we
-                # later see success.  A repeated failure with a different
-                # message shouldn't silently overwrite the original.
                 if path not in state:
+                    canonical = self._canonical_file_mutation_path(path)
                     state[path] = {
                         "tool": tool_name,
                         "error_preview": preview,
+                        "canonical_path": canonical,
+                        "before_signature": self._file_mutation_signature(canonical),
                     }
         else:
-            for path in targets:
-                state.pop(path, None)
+            successful_identities = {
+                self._canonical_file_mutation_path(path)
+                for path in [*targets, *landed_paths]
+            }
+            for display_path, info in list(state.items()):
+                canonical = info.get("canonical_path") or self._canonical_file_mutation_path(display_path)
+                if canonical in successful_identities:
+                    state.pop(display_path, None)
+
+    def _reconcile_file_mutation_failures(
+        self,
+    ) -> tuple[Dict[str, Dict[str, Any]], Dict[str, Dict[str, Any]]]:
+        """Split residual failures into unchanged and out-of-band changes.
+
+        Terminal commands and external processes are intentionally not treated
+        as file-mutating tools.  If one changed a failed target later in the
+        same turn, surface that uncertainty accurately instead of claiming the
+        file was not modified.
+        """
+        unchanged: Dict[str, Dict[str, Any]] = {}
+        changed_elsewhere: Dict[str, Dict[str, Any]] = {}
+        state = getattr(self, "_turn_failed_file_mutations", None) or {}
+        for display_path, info in state.items():
+            canonical = info.get("canonical_path") or self._canonical_file_mutation_path(display_path)
+            before = info.get("before_signature")
+            if before is not None and self._file_mutation_signature(canonical) != tuple(before):
+                changed_elsewhere[display_path] = info
+            else:
+                unchanged[display_path] = info
+        return unchanged, changed_elsewhere
 
     def _file_mutation_verifier_enabled(self) -> bool:
         """Check whether the per-turn file-mutation verifier footer is on.
@@ -3679,6 +3730,41 @@ class AIAgent:
         # Neutralize any path the preview text echoed (the bullet path is
         # already backticked above; the lookbehind keeps it from being
         # double-wrapped).
+        return cls._neutralize_footer_paths("\n".join(lines))
+
+    @classmethod
+    def _format_file_mutation_out_of_band_footer(
+        cls,
+        changed: Dict[str, Dict[str, Any]],
+    ) -> str:
+        """Render failures whose targets later changed outside file tools.
+
+        A tracked ``write_file`` / ``patch`` still failed, but the target's
+        disk signature changed before turn end.  Report that uncertainty
+        instead of falsely claiming the file was not modified.
+        """
+        if not changed:
+            return ""
+        lines = [
+            "⚠️ File-mutation verifier: "
+            f"{len(changed)} file(s) were modified outside tracked file tools "
+            "after a failed write attempt. Run `read_file`, `git status`, or "
+            "`git diff` to verify the final contents."
+        ]
+        shown = 0
+        for path, info in changed.items():
+            if shown >= 10:
+                break
+            preview = (info.get("error_preview") or "").strip()
+            tool = info.get("tool") or "patch"
+            if preview:
+                lines.append(f"  • `{path}` — [{tool}] {preview}")
+            else:
+                lines.append(f"  • `{path}` — [{tool}] failed before an external change")
+            shown += 1
+        remaining = len(changed) - shown
+        if remaining > 0:
+            lines.append(f"  • … and {remaining} more")
         return cls._neutralize_footer_paths("\n".join(lines))
 
     def _turn_completion_explainer_enabled(self) -> bool:

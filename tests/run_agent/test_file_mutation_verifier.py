@@ -227,8 +227,59 @@ class TestRecordFileMutationResult:
         # the initial root cause.
         assert "first error" in agent._turn_failed_file_mutations["/tmp/a.md"]["error_preview"]
 
+    def test_success_clears_failure_for_canonical_path_alias(self, tmp_path, monkeypatch):
+        target = tmp_path / "registry.json"
+        target.write_text('{"entries": []}\n', encoding="utf-8")
+        monkeypatch.chdir(tmp_path)
+        agent = _bare_agent()
 
+        agent._record_file_mutation_result(
+            "patch",
+            {"mode": "replace", "path": "registry.json", "old_string": "x", "new_string": "y"},
+            json.dumps({"error": "Found 100 matches"}),
+            is_error=True,
+        )
+        agent._record_file_mutation_result(
+            "patch",
+            {"mode": "replace", "path": str(target).replace("\\", "/")},
+            json.dumps({"success": True, "files_modified": [str(target)]}),
+            is_error=False,
+        )
 
+        assert agent._turn_failed_file_mutations == {}
+
+    def test_reconcile_classifies_out_of_band_disk_change(self, tmp_path):
+        target = tmp_path / "runtime-registry.json"
+        target.write_text('{"entries": []}\n', encoding="utf-8")
+        agent = _bare_agent()
+        agent._record_file_mutation_result(
+            "patch",
+            {"mode": "replace", "path": str(target), "old_string": "x", "new_string": "y"},
+            json.dumps({"error": "Found 100 matches"}),
+            is_error=True,
+        )
+
+        target.write_text('{"entries": [{"id": "R104"}]}\n', encoding="utf-8")
+        unchanged, changed_elsewhere = agent._reconcile_file_mutation_failures()
+
+        assert unchanged == {}
+        assert str(target) in changed_elsewhere
+
+    def test_reconcile_keeps_true_failure_when_disk_is_unchanged(self, tmp_path):
+        target = tmp_path / "runtime-registry.json"
+        target.write_text('{"entries": []}\n', encoding="utf-8")
+        agent = _bare_agent()
+        agent._record_file_mutation_result(
+            "patch",
+            {"mode": "replace", "path": str(target), "old_string": "x", "new_string": "y"},
+            json.dumps({"error": "Found 100 matches"}),
+            is_error=True,
+        )
+
+        unchanged, changed_elsewhere = agent._reconcile_file_mutation_failures()
+
+        assert str(target) in unchanged
+        assert changed_elsewhere == {}
 
 
 # ---------------------------------------------------------------------------
@@ -248,6 +299,15 @@ class TestFormatFooter:
         assert "/tmp/a.md" in out
         assert "Could not find old_string" in out
         assert "git status" in out  # user-actionable hint
+
+    def test_out_of_band_change_footer_does_not_claim_not_modified(self):
+        out = AIAgent._format_file_mutation_out_of_band_footer(
+            {"/tmp/a.md": {"tool": "patch", "error_preview": "Found 100 matches"}},
+        )
+        assert "modified outside tracked file tools" in out
+        assert "NOT modified" not in out
+        assert "/tmp/a.md" in out
+        assert "read_file" in out
 
     def test_truncation_at_10_entries(self):
         failed = {

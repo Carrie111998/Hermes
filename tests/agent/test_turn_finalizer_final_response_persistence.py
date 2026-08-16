@@ -226,6 +226,58 @@ def test_final_response_fills_pure_tool_call_tail(monkeypatch):
     assert sum(1 for m in persisted if m.get("role") == "assistant") == 1
 
 
+def test_finalizer_uses_out_of_band_footer_after_reconcile(monkeypatch):
+    """A later external disk change must not be reported as NOT modified."""
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+
+    class MutationVerifierAgent(FakeAgent):
+        def __init__(self):
+            super().__init__()
+            self._turn_failed_file_mutations = {
+                "runtime-registry.json": {
+                    "tool": "patch",
+                    "error_preview": "Found 100 matches",
+                }
+            }
+
+        def _file_mutation_verifier_enabled(self):
+            return True
+
+        def _reconcile_file_mutation_failures(self):
+            return {}, self._turn_failed_file_mutations
+
+        def _format_file_mutation_failure_footer(self, _failed):
+            return "NOT modified"
+
+        def _format_file_mutation_out_of_band_footer(self, _changed):
+            return "modified outside tracked file tools"
+
+    agent = MutationVerifierAgent()
+    messages = [
+        {"role": "user", "content": "update registry"},
+        {"role": "assistant", "content": "Done."},
+    ]
+
+    result = finalize_turn(
+        agent,
+        final_response="Done.",
+        api_call_count=1,
+        interrupted=False,
+        failed=False,
+        messages=messages,
+        conversation_history=[],
+        effective_task_id="task",
+        turn_id="turn",
+        user_message="update registry",
+        original_user_message="update registry",
+        _should_review_memory=False,
+        _turn_exit_reason="text_response(final)",
+    )
+
+    assert "modified outside tracked file tools" in result["final_response"]
+    assert "NOT modified" not in result["final_response"]
+
+
 
 
 
