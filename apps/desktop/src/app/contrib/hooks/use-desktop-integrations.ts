@@ -17,8 +17,8 @@ import { openUpdatesWindow, startUpdatePoller, stopUpdatePoller } from '@/store/
 import { isHudWindow, isSecondaryWindow } from '@/store/windows'
 import type { SessionInfo } from '@/types/hermes'
 
-import { requestComposerFocus, requestComposerInsert } from '../../chat/composer/focus'
 import { appViewForPath, isOverlayView, NEW_CHAT_ROUTE, routeSessionId, sessionRoute } from '../../routes'
+import { handleDesktopDeepLink } from '../deep-link'
 
 type RememberedSession = Pick<SessionInfo, '_lineage_root_id' | 'id' | 'profile'>
 
@@ -187,24 +187,11 @@ export function useDesktopIntegrations({
     return () => unsubscribe?.()
   }, [])
 
-  // hermes:// deep links -> a reviewable /blueprint command in the composer.
+  // hermes:// deep links -> a reviewable blueprint command or a blank chat in
+  // an already-installed profile. Neither route auto-sends a prompt.
   useEffect(() => {
     const unsubscribe = window.hermesDesktop?.onDeepLink?.(payload => {
-      if (!payload || payload.kind !== 'blueprint' || !payload.name) {
-        return
-      }
-
-      const slots = Object.entries(payload.params || {})
-        .map(([k, v]) => {
-          const sval = /\s/.test(v) ? `"${v.replace(/"/g, '\\"')}"` : v
-
-          return `${k}=${sval}`
-        })
-        .join(' ')
-
-      const command = `/blueprint ${payload.name}${slots ? ' ' + slots : ''}`
-      requestComposerInsert(command, { mode: 'block', target: 'main' })
-      requestComposerFocus('main')
+      void handleDesktopDeepLink(payload)
     })
 
     void window.hermesDesktop?.signalDeepLinkReady?.()

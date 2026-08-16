@@ -176,6 +176,31 @@ The app also surfaces the broader Hermes management surface so you don't have to
 - **Concurrent multi-profile sessions** — run sessions across multiple [profiles](./profiles.md) at the same time, and reference a session in another profile with cross-profile `@session` links.
 - **Export / import a profile** — share a whole setup as a single file. **⌘K → Export profile…** (or right-click a profile square in the rail) writes a `.tar.gz` with skills, memory, persona, crons, plugins, and settings; API keys are stripped. Exporting from the desktop also bundles your appearance and interface — skin, light/dark mode, custom themes, the profile's rail color, and your window layout — so an imported profile arrives looking the way the sender had it. Import via **⌘K → Import profile…** or the button beside the rail's **+**; it applies the overlay and drops you into the new profile. The same archive works with `/export` / `/import` in chat and `hermes profile export` / `import` from a shell. See [Export and import a profile file](./profile-distributions.md#export-and-import-a-profile-file).
 
+#### Launch a blank chat in an installed profile
+
+Local integrations can ask Hermes Desktop to focus and open a new, blank chat
+in an already-installed profile:
+
+```text
+hermes://profile/<profile-name>?new=1
+```
+
+Percent-encode the profile path segment when constructing the URL. The name
+must be a valid Hermes profile identifier and must already appear in the local
+profile list. A missing profile produces a visible error and leaves the current
+chat untouched.
+
+This link selects the profile only for the new Desktop chat. It does not change
+Desktop's persistent primary profile, does not run `hermes profile use`, and
+does not change the CLI's sticky default. It also cannot carry or send a prompt:
+the only accepted query is exactly `new=1`. Treat `hermes://` URLs as untrusted
+external input; Desktop allow-lists the route, validates the identifier at the
+native boundary, verifies that the profile is installed, and then uses the
+existing live multi-profile session/gateway path.
+
+Existing `hermes://blueprint/...` links continue to preload a reviewable
+`/blueprint` command in the composer without sending it.
+
 ## Updating
 
 The app checks for updates in the background and offers a one-click update when one is ready.
