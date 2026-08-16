@@ -1,6 +1,6 @@
 ---
 title: "ARCH-003 implementation plan: runtime-state audit and replay verification"
-status: IMPLEMENTATION_PLAN_REVISE_V26_PENDING
+status: IMPLEMENTATION_PLAN_REVISE_V27_PENDING
 date: 2026-08-16
 type: implementation-plan
 ticket: ARCH-003
@@ -201,23 +201,26 @@ alongside it. The upgraded startup path computes its immutable writer epoch from
 the journal schema/code-contract version and, under the exclusive side of the
 named maintenance RW lock and one `BEGIN IMMEDIATE` transaction, performs an
 atomic compare-and-set: it advances `current_generation` exactly once only
-when that epoch is strictly newer than the durable epoch. If lock acquisition
-or the startup write transaction reaches its fixed timeout, startup returns
-`LOCK_TIMEOUT` before opening or committing SQLite, remains global
-downgrade-unsafe/read-only, and serves no ordinary or event-only writes until a
-later successful startup transition; it must not serve mutations under an
-uncleared transition.
-A same-epoch restart never advances `current_generation`. A startup observing
-a durable epoch newer than the running writer enters global downgrade-unsafe
-mode for the database: all ordinary runtime-state writes across all profiles
-and entities, including both event-only baseline and re-originating genesis
-writers, return mutation-side `WRITE_ABORT`; only read-only verification may
-continue. The mode exits only when a writer at least as new as the durable
-epoch completes the startup transition and atomically clears the mode. The
-transition record and mode are durable before the upgraded writer serves
+when that epoch is strictly newer than the durable epoch. If lock acquisition or the startup write transaction reaches its fixed timeout,
+startup returns `LOCK_TIMEOUT` before opening or committing SQLite, enters
+process-local `STARTUP_LOCKED` read-only state, writes no durable transition,
+and serves no ordinary or event-only writes until a later successful startup
+transition in that process; it must not serve mutations under an uncleared
+transition.
+A same-epoch restart never advances `current_generation`. A startup observing a durable epoch newer than the running writer enters the
+durable global `DOWNGRADE_UNSAFE` mode for the database: all ordinary
+runtime-state writes across all profiles and entities, including both
+event-only baseline and re-originating genesis writers, return mutation-side
+`WRITE_ABORT`; only read-only verification may continue. The mode exits only
+when a writer at least as new as the durable epoch completes the startup
+transition and atomically clears the mode. A startup lock/busy timeout is
+different: it enters process-local `STARTUP_LOCKED` read-only state with
+`LOCK_TIMEOUT`, writes no durable mode or transition record, and clears only
+after a later successful startup transition in that process. The transition
+record and durable mode are written before the upgraded writer serves
 mutations, so a strictly newer contract transition is represented by a
 distinct epoch transition rather than by process restart count. Delivery must
-record any interval spent in this global write-blocked mode. A rollback followed by roll-forward to the same
+record intervals spent in either write-blocked state. A rollback followed by roll-forward to the same
 writer epoch does not advance `current_generation`; it is detected by the
 materialized-write counter gap defined below. Gate 3 reads the
 current-generation record, writer epoch, transition marker, and counter
@@ -982,6 +985,24 @@ DGX changes, deployment, repair, or event-sourcing. The corrected plan must
 return to the same authenticated Claude reviewer family and then to AGY on the
 identical packet.
 
+## Implementation-plan review reconciliation v26
+
+The v26 authenticated Claude Opus review returned `REVISE` with four bounded
+plan-text corrections. The corrections are incorporated above:
+
+1. Acceptance coverage now includes v25.
+2. `POST_TERMINAL_EVENT` is a distinct higher-precedence classification than
+   `HISTORY_MALFORMED`.
+3. Materialized-state asymmetry directions and `EMPTY_HISTORY` mapping are
+   explicit.
+4. Process-local `STARTUP_LOCKED` is separated from durable
+   `DOWNGRADE_UNSAFE`, with distinct exit and delivery-recording behavior.
+
+These remain plan-only corrections and do not authorize source edits, tests,
+DGX changes, deployment, repair, or event-sourcing. The corrected plan must
+return to the same authenticated Claude reviewer family and then to AGY on the
+identical packet.
+
 ## Acceptance criteria
 
 ARCH-003 implementation is ready for its delivery gates only when:
@@ -1010,7 +1031,7 @@ ARCH-003 implementation is ready for its delivery gates only when:
   retention job; entities beyond the replay limit remain UNKNOWN in this ticket,
   and the 100,000-event/100 MiB per-profile threshold is a documented follow-up
   operational review, not an in-ticket operator gate;
-- reconciliation v1 and v5-v24 items are incorporated into the normative
+- reconciliation v1 and v5-v26 items are incorporated into the normative
   Gates 0-4 text (with v2-v4 explicitly folded into the v1/v4 text), and this
   merged plan revision receives the same-family re-review;
 - all focused and relevant tests pass;
