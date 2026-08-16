@@ -107,6 +107,7 @@ import os
 import random
 import re
 import shutil
+import subprocess
 import sys
 import threading
 import time
@@ -4741,17 +4742,36 @@ _stdio_pgids: Dict[int, int] = {}  # pid -> pgid
 def _snapshot_child_pids() -> set:
     """Return a set of current child process PIDs.
 
-    Uses /proc on Linux, falls back to psutil, then empty set.
-    Used by _run_stdio to identify the subprocess spawned by stdio_client.
+    Uses /proc on Linux, falls back to `ps --ppid`, then psutil, then
+    empty set.  Used by _run_stdio to identify the subprocess spawned by
+    stdio_client.
     """
     my_pid = os.getpid()
 
-    # Linux: read from /proc
+    # Linux: read from /proc.  Some kernels (notably WSL2) can return a
+    # readable but EMPTY children file — treat that as "no data" rather
+    # than "no children" and fall through to the ps/psutil fallbacks.
     try:
         children_path = f"/proc/{my_pid}/task/{my_pid}/children"
         with open(children_path, encoding="utf-8") as f:
-            return {int(p) for p in f.read().split() if p.strip()}
+            pids = {int(p) for p in f.read().split() if p.strip()}
+        if pids:
+            return pids
     except (FileNotFoundError, OSError, ValueError):
+        pass
+
+    # Fallback: ps --ppid (works where /proc children data is missing or
+    # empty, including WSL2 kernels that do not maintain that file)
+    try:
+        out = subprocess.run(
+            ["ps", "--ppid", str(my_pid), "-o", "pid="],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if out.returncode == 0 and out.stdout.strip():
+            return {int(p) for p in out.stdout.split() if p.strip()}
+    except Exception:
         pass
 
     # Fallback: psutil

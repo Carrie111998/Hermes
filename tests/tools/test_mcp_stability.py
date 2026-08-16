@@ -3,6 +3,7 @@
 import asyncio
 import os
 import signal
+import sys
 from unittest.mock import patch, MagicMock
 
 import pytest
@@ -55,6 +56,98 @@ class TestMCPLoopExceptionHandler:
 # Fix 2: stdio PID tracking
 # ---------------------------------------------------------------------------
 
+
+class TestSnapshotChildPidsFallbacks:
+    """_snapshot_child_pids falls through /proc → ps → psutil on WSL2 empty reads."""
+
+    def test_proc_children_empty_falls_through_to_ps(self, monkeypatch, tmp_path):
+        """/proc children file readable but EMPTY → ps --ppid fallback used."""
+        import tools.mcp_tool as mcp_mod
+
+        # 1. Force the /proc read to return an empty file
+        empty_children = tmp_path / "children"
+        empty_children.write_text("")
+
+        _real_open = open
+
+        def fake_open(path, *args, **kwargs):
+            if str(path).startswith("/proc/") and str(path).endswith("/children"):
+                return _real_open(empty_children, *args, **kwargs)
+            return _real_open(path, *args, **kwargs)
+
+        monkeypatch.setattr(
+            "builtins.open", fake_open, raising=True
+        )
+
+        # 2. Mock the ps fallback to return a known PID set
+        fake_proc = MagicMock()
+        fake_proc.returncode = 0
+        fake_proc.stdout = "4242\n"
+        monkeypatch.setattr(
+            mcp_mod.subprocess, "run", lambda *a, **kw: fake_proc
+        )
+
+        result = mcp_mod._snapshot_child_pids()
+        assert result == {4242}
+
+    def test_proc_children_empty_ps_empty_falls_through_to_psutil(self, monkeypatch, tmp_path):
+        """/proc empty AND ps returns nothing → psutil fallback used."""
+        import tools.mcp_tool as mcp_mod
+
+        empty_children = tmp_path / "children"
+        empty_children.write_text("")
+
+        _real_open = open
+
+        def fake_open(path, *args, **kwargs):
+            if str(path).startswith("/proc/") and str(path).endswith("/children"):
+                return _real_open(empty_children, *args, **kwargs)
+            return _real_open(path, *args, **kwargs)
+
+        monkeypatch.setattr("builtins.open", fake_open, raising=True)
+
+        fake_proc = MagicMock()
+        fake_proc.returncode = 0
+        fake_proc.stdout = ""
+        monkeypatch.setattr(
+            mcp_mod.subprocess, "run", lambda *a, **kw: fake_proc
+        )
+
+        fake_psutil = MagicMock()
+        fake_child = MagicMock()
+        fake_child.pid = 7777
+        fake_psutil.Process.return_value.children.return_value = [fake_child]
+        monkeypatch.setitem(sys.modules, "psutil", fake_psutil)
+
+        result = mcp_mod._snapshot_child_pids()
+        assert result == {7777}
+
+    def test_proc_children_populated_skips_fallbacks(self, monkeypatch, tmp_path):
+        """/proc children with data → returned directly, no subprocess spawn."""
+        import tools.mcp_tool as mcp_mod
+
+        children_file = tmp_path / "children"
+        children_file.write_text("1111 2222\n")
+
+        _real_open = open
+
+        def fake_open(path, *args, **kwargs):
+            if str(path).startswith("/proc/") and str(path).endswith("/children"):
+                return _real_open(children_file, *args, **kwargs)
+            return _real_open(path, *args, **kwargs)
+
+        monkeypatch.setattr("builtins.open", fake_open, raising=True)
+
+        # If the code tried to spawn ps, this would raise (mock returns garbage)
+        def boom(*a, **kw):
+            raise AssertionError("subprocess.run must not be called when /proc has data")
+
+        monkeypatch.setattr(mcp_mod.subprocess, "run", boom)
+
+        result = mcp_mod._snapshot_child_pids()
+        assert result == {1111, 2222}
+
+
 class TestStdioPidTracking:
     """_snapshot_child_pids and _stdio_pids track subprocess PIDs."""
 
@@ -65,6 +158,7 @@ class TestStdioPidTracking:
         # All elements should be ints
         for pid in result:
             assert isinstance(pid, int)
+
 
 
     def test_kill_orphaned_handles_dead_pids(self):
