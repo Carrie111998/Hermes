@@ -4,6 +4,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import type { SessionInfo } from '@/hermes'
 
+import type { SidebarSessionGroup } from './projects/workspace-groups'
 import { SidebarSessionsSection, VIRTUALIZE_THRESHOLD } from './sessions-section'
 import type { VirtualSessionListProps } from './virtual-session-list'
 
@@ -39,6 +40,18 @@ vi.mock('./virtual-session-list', () => ({
 vi.mock('./session-row', () => ({
   SidebarSessionRow: ({ session }: { session: SessionInfo }) => (
     <div data-testid={`session-row-${session.id}`}>{session.id}</div>
+  )
+}))
+
+// The group branch exercises the real sortable wiring, so stub the heavy group
+// renderer and record whether each group was handed the sortable bindings.
+vi.mock('./projects', () => ({
+  EnteredProjectContent: () => null,
+  ProjectOverviewRow: () => null,
+  SidebarWorkspaceGroup: ({ group, reorderable }: { group: SidebarSessionGroup; reorderable?: boolean }) => (
+    <div data-group-id={group.id} data-reorderable={String(Boolean(reorderable))}>
+      {group.id}
+    </div>
   )
 }))
 
@@ -180,5 +193,84 @@ describe('SidebarSessionsSection memoization & virtualizer stability', () => {
 
     const thirdRowsRef = mockVirtualListPropsHistory[2].rows
     expect(thirdRowsRef).not.toBe(secondRowsRef)
+  })
+})
+
+describe('SidebarSessionsSection profile-group reorder', () => {
+  const group = (id: string): SidebarSessionGroup => ({
+    id,
+    label: id,
+    mode: 'profile',
+    path: null,
+    sessions: [makeSession(`session-${id}`)]
+  })
+
+  const renderGroups = (groups: SidebarSessionGroup[], onReorderGroups?: (ids: string[]) => void) =>
+    render(
+      <SidebarSessionsSection
+        activeSessionId={null}
+        emptyState={<div>Empty</div>}
+        groups={groups}
+        label="Sessions"
+        onArchiveSession={noop}
+        onDeleteSession={noop}
+        onReorderGroups={onReorderGroups}
+        onResumeSession={noop}
+        onToggle={noop}
+        onTogglePin={noop}
+        open={true}
+        pinned={false}
+        sessions={[]}
+      />
+    )
+
+  it('makes named profile groups sortable and keeps default a static fixture on top', () => {
+    const { container } = renderGroups(
+      [group('beta'), group('default'), group('alpha')],
+      vi.fn()
+    )
+
+    const rendered = Array.from(container.querySelectorAll('[data-group-id]')).map(
+      node => [node.getAttribute('data-group-id'), node.getAttribute('data-reorderable')]
+    )
+
+    expect(rendered).toEqual([
+      ['default', 'false'],
+      ['beta', 'true'],
+      ['alpha', 'true']
+    ])
+  })
+
+  it('renders every group static when no reorder handler is wired', () => {
+    const { container } = renderGroups([group('default'), group('alpha'), group('beta')])
+
+    const rendered = Array.from(container.querySelectorAll('[data-group-id]')).map(node =>
+      node.getAttribute('data-reorderable')
+    )
+
+    expect(rendered).toEqual(['false', 'false', 'false'])
+  })
+
+  it('renders a single named group static — one item has nothing to reorder', () => {
+    const { container } = renderGroups([group('default'), group('alpha')], vi.fn())
+
+    const rendered = Array.from(container.querySelectorAll('[data-group-id]')).map(node =>
+      node.getAttribute('data-reorderable')
+    )
+
+    expect(rendered).toEqual(['false', 'false'])
+  })
+
+  it('leaves non-profile groups static even with a reorder handler wired', () => {
+    const { container } = renderGroups(
+      [{ ...group('alpha'), mode: 'workspace' }, { ...group('beta'), mode: 'source' }],
+      vi.fn()
+    )
+
+    const rendered = Array.from(container.querySelectorAll('[data-group-id]')).map(node =>
+      node.getAttribute('data-reorderable')
+    )
+
+    expect(rendered).toEqual(['false', 'false'])
   })
 })

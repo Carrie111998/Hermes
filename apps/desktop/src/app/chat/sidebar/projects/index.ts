@@ -18,6 +18,7 @@ export {
   sessionRecency,
   type SidebarProjectTree,
   type SidebarSessionGroup,
-  type SidebarWorkspaceTree
+  type SidebarWorkspaceTree,
+  sortProfileGroups
 } from './workspace-groups'
 export { StartWorkButton } from './workspace-header'

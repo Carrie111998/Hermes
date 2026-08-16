@@ -15,6 +15,7 @@ import {
   sessionProjectColor,
   type SidebarProjectTree,
   type SidebarSessionGroup,
+  sortProfileGroups,
   sortWorktreeGroups
 } from './workspace-groups'
 
@@ -1131,5 +1132,49 @@ describe('excludeProjectSessions', () => {
     const overlaid = overlayLiveLanes(filtered, [], new Set(['someone-else']))
 
     expect(overlaid.repos[0].groups.map(g => g.id)).toEqual(['wt'])
+  })
+})
+
+describe('sortProfileGroups', () => {
+  const group = (id: string): SidebarSessionGroup => lane({ id, label: id, mode: 'profile' })
+
+  it('pins default first as a fixture, even when the stored order ranks it last', () => {
+    const sorted = sortProfileGroups([group('zeta'), group('default'), group('alpha')], ['default', 'alpha', 'zeta'])
+
+    expect(sorted.map(g => g.id)).toEqual(['default', 'alpha', 'zeta'])
+  })
+
+  it('orders named profiles by the stored order', () => {
+    const sorted = sortProfileGroups([group('default'), group('zeta'), group('alpha')], ['zeta', 'alpha'])
+
+    expect(sorted.map(g => g.id)).toEqual(['default', 'zeta', 'alpha'])
+  })
+
+  it('appends profiles the stored order does not know alphabetically at the tail', () => {
+    const sorted = sortProfileGroups(
+      [group('default'), group('zeta'), group('alpha'), group('beta')],
+      ['zeta']
+    )
+
+    expect(sorted.map(g => g.id)).toEqual(['default', 'zeta', 'alpha', 'beta'])
+  })
+
+  it('falls back to alphabetical after default when there is no stored order', () => {
+    const sorted = sortProfileGroups([group('zeta'), group('alpha'), group('default')], [])
+
+    expect(sorted.map(g => g.id)).toEqual(['default', 'alpha', 'zeta'])
+  })
+
+  it('ignores stale stored names that have no group', () => {
+    const sorted = sortProfileGroups([group('default'), group('alpha')], ['ghost', 'alpha'])
+
+    expect(sorted.map(g => g.id)).toEqual(['default', 'alpha'])
+  })
+
+  it('returns a new array and leaves the input untouched', () => {
+    const input = [group('default'), group('zeta'), group('alpha')]
+
+    expect(sortProfileGroups(input, ['alpha'])).not.toBe(input)
+    expect(input.map(g => g.id)).toEqual(['default', 'zeta', 'alpha'])
   })
 })

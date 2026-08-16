@@ -75,10 +75,12 @@ import { notifyError } from '@/store/notifications'
 import {
   $newChatProfile,
   $profileColors,
+  $profileOrder,
   $profiles,
   $profileScope,
   ALL_PROFILES,
-  normalizeProfileKey
+  normalizeProfileKey,
+  setProfileOrder
 } from '@/store/profile'
 import {
   $activeProjectId,
@@ -160,6 +162,7 @@ import {
   type SidebarProjectTree,
   type SidebarSessionGroup,
   type SidebarWorkspaceTree,
+  sortProfileGroups,
   sortProjectsForOverview,
   StartWorkButton,
   useRepoWorktreeMap
@@ -1210,10 +1213,13 @@ export function ChatSidebar({
   }, [messagingSessions, messagingPlatformTotals, messagingTruncated, isPinnedSession])
 
   // Grouping by profile: one collapsible group per profile, color on the header
-  // (not on every row). Default profile floats to the top, the rest alpha.
+  // (not on every row). Default profile floats to the top as a fixture; the
+  // named profiles follow the user's dragged order — shared with the profile
+  // rail via $profileOrder, so reordering a group here reorders the rail too.
   // Only reachable while the sidebar is showing every profile — scoped to one,
   // it would draw a single group around the whole list.
   const profileGrouped = showAllProfiles && grouping === 'profile'
+  const profileOrder = useStore($profileOrder)
 
   const profileGroups = useMemo<SidebarSessionGroup[] | undefined>(() => {
     if (!profileGrouped) {
@@ -1239,11 +1245,8 @@ export function ChatSidebar({
       groups.set(key, group)
     }
 
-    // default (root) first, then the rest alphabetically.
-    return [...groups.values()].sort((a, b) =>
-      a.id === 'default' ? -1 : b.id === 'default' ? 1 : a.label.localeCompare(b.label)
-    )
-  }, [profileGrouped, agentSessions, profileColors])
+    return sortProfileGroups([...groups.values()], profileOrder)
+  }, [profileGrouped, agentSessions, profileColors, profileOrder])
 
   // The flat Sessions list always shows ALL recent sessions; Projects is a
   // parallel grouped view, not a filter on this one — nothing is hidden here.
@@ -1409,6 +1412,13 @@ export function ChatSidebar({
   // Persist the new project overview order (drag-to-reorder); orderByIds applies
   // it over the default sort, so stale/new ids reconcile on the next render.
   const reorderProjects = (ids: string[]) => setSidebarProjectOrderIds(ids)
+
+  // Persist the new profile-group order (drag-to-reorder in the All-profiles
+  // view). It shares $profileOrder with the rail, so both surfaces (and the
+  // ⌘N hotkeys) follow the same sequence. The full visible list of named
+  // profiles is persisted — unranked ones included — so a drag also pins the
+  // profiles that had only been alphabetised so far.
+  const reorderProfileGroups = (ids: string[]) => setProfileOrder(ids)
 
   // Sortable rows carry live session ids; the pinned store is keyed by durable
   // (lineage-root) ids, so translate before persisting the new order.
@@ -1762,6 +1772,7 @@ export function ChatSidebar({
                 // is a folder, and the new session lands in the active profile
                 // — the same one the composer would have started it in.
                 onNewSessionInWorkspace={onNewSessionInWorkspace}
+                onReorderGroups={reorderProfileGroups}
                 onReorderProjects={showAllProfiles ? undefined : reorderProjects}
                 onReorderSessions={showAllProfiles ? undefined : reorderSessions}
                 onResumeSession={onResumeSession}

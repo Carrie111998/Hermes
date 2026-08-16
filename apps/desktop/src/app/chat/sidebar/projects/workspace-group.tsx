@@ -8,6 +8,7 @@ import type { SessionInfo } from '@/hermes'
 import { useI18n } from '@/i18n'
 import { displayPath } from '@/lib/display-path'
 import { useStoreSelector } from '@/lib/use-session-slice'
+import { cn } from '@/lib/utils'
 import { setWorkspaceNodeOpen } from '@/store/layout'
 import { notifyError } from '@/store/notifications'
 import { newSessionInProfile, selectProfile } from '@/store/profile'
@@ -15,7 +16,7 @@ import { switchBranchInRepo } from '@/store/projects'
 import { $sessionProfilesUsage } from '@/store/session'
 import { $sidebarSessionRankIds } from '@/store/sidebar-sort'
 
-import { SidebarGroupRow, SidebarRowLead, SidebarRowLink, SidebarRowStack } from '../chrome'
+import { SidebarGroupRow, SidebarRowGrab, SidebarRowLead, SidebarRowLink, SidebarRowStack } from '../chrome'
 import { rankSessions } from '../order'
 
 import { PROJECT_PREVIEW_COUNT, SIDEBAR_GROUP_PAGE, useWorkspaceNodeOpen } from './model'
@@ -35,9 +36,27 @@ interface SidebarWorkspaceGroupProps {
   // When set (linked worktree rows), shows a remove affordance that runs a real
   // `git worktree remove`.
   onRemove?: () => void
+  // Drag-to-reorder contract (same shape ProjectOverviewRow accepts): the
+  // sortable wrapper in sessions-section spreads useSortableBindings here, and
+  // the profile header renders a grab handle in its lead cell.
+  reorderable?: boolean
+  dragging?: boolean
+  dragHandleProps?: React.HTMLAttributes<HTMLElement>
+  ref?: React.Ref<HTMLDivElement>
+  style?: React.CSSProperties
 }
 
-export function SidebarWorkspaceGroup({ group, renderRows, onNewSession, onRemove }: SidebarWorkspaceGroupProps) {
+export function SidebarWorkspaceGroup({
+  group,
+  renderRows,
+  onNewSession,
+  onRemove,
+  reorderable = false,
+  dragging = false,
+  dragHandleProps,
+  ref,
+  style
+}: SidebarWorkspaceGroupProps) {
   const { t } = useI18n()
   const s = t.sidebar
   const isProfileGroup = group.mode === 'profile'
@@ -110,76 +129,107 @@ export function SidebarWorkspaceGroup({ group, renderRows, onNewSession, onRemov
     <WorkspaceAddButton label={s.newSessionIn(group.label)} onClick={() => void handleNewSession()} />
   )
 
+  // The lead cell: when the group is in a sortable list, the glyph becomes the
+  // grab handle (grabber glyph revealed on hover), like project overview rows.
+  const profileLead = reorderable ? (
+    <SidebarRowGrab
+      ariaLabel={s.projects.reorder(group.label)}
+      dragging={dragging}
+      dragHandleProps={dragHandleProps}
+      leadClassName="overflow-visible"
+    >
+      <ProfileGlyph
+        className="size-full"
+        color={group.color ?? null}
+        isDefault={group.id === 'default'}
+        name={group.label}
+      />
+    </SidebarRowGrab>
+  ) : (
+    <SidebarRowLead>
+      {/* Fills the lead cell like a project's icon does: the glyph's own
+          16px would sit 2px proud of the 14px column. */}
+      <ProfileGlyph
+        className="size-full"
+        color={group.color ?? null}
+        isDefault={group.id === 'default'}
+        name={group.label}
+      />
+    </SidebarRowLead>
+  )
+
   return (
-    <SidebarRowStack>
-      {isProfileGroup ? (
-        // A profile heads its sessions the way a project does, so it takes the
-        // project row's shape rather than the tree caption the lanes below use.
-        <SidebarGroupRow
-          actions={addButton}
-          // Clicking a profile scopes the sidebar to it, the way clicking a
-          // project enters that project. Capitalized to sit level with the
-          // project labels it alternates with (`Home`, and whatever the user
-          // named theirs) — profile keys are stored lowercase.
-          label={
-            <SidebarRowLink
-              aria-label={t.profiles.switchToProfile(group.label)}
-              labelClassName="capitalize hover:text-foreground hover:underline"
-              onClick={() => selectProfile(group.id)}
-            >
-              {group.label}
-            </SidebarRowLink>
-          }
-          lead={
-            <SidebarRowLead>
-              {/* Fills the lead cell like a project's icon does: the glyph's own
-                  16px would sit 2px proud of the 14px column. */}
-              <ProfileGlyph
-                className="size-full"
-                color={group.color ?? null}
-                isDefault={group.id === 'default'}
-                name={group.label}
-              />
-            </SidebarRowLead>
-          }
-          toggle={{ ariaLabel: s.projects.toggle(group.label, !open), onToggle: toggleOpen, open }}
-          totals={{ costUsd: usage?.cost_usd ?? 0, tokens: usage?.tokens ?? 0 }}
-        />
-      ) : (
-        <WorkspaceContextMenu onRemove={onRemove} path={group.path}>
-          <WorkspaceHeader
-            action={
-              (onNewSession || onRemove) && (
-                <div className="flex items-center">
-                  {addButton}
-                  {onRemove && <WorkspaceMenu onRemove={onRemove} path={group.path} />}
-                </div>
-              )
+    <div className={cn(dragging && 'relative z-10')} ref={ref} style={style}>
+      <SidebarRowStack>
+        {isProfileGroup ? (
+          // A profile heads its sessions the way a project does, so it takes the
+          // project row's shape rather than the tree caption the lanes below use.
+          <SidebarGroupRow
+            actions={addButton}
+            className={cn(dragging && 'cursor-grabbing bg-(--ui-sidebar-surface-background)')}
+            // Clicking a profile scopes the sidebar to it, the way clicking a
+            // project enters that project. Capitalized to sit level with the
+            // project labels it alternates with (`Home`, and whatever the user
+            // named theirs) — profile keys are stored lowercase.
+            label={
+              <SidebarRowLink
+                aria-label={t.profiles.switchToProfile(group.label)}
+                labelClassName="capitalize hover:text-foreground hover:underline"
+                onClick={() => selectProfile(group.id)}
+              >
+                {group.label}
+              </SidebarRowLink>
             }
-            icon={leadingIcon}
-            label={group.label}
-            onToggle={toggleOpen}
-            open={open}
-            title={group.path ? displayPath(group.path) : undefined}
+            lead={profileLead}
+            // The label is grab surface too, not just the lead's grabber — same
+            // listeners, minus the controls that keep their own gestures.
+            {...dragHandleProps}
+            onPointerDown={event => {
+              if ((event.target as HTMLElement).closest('[data-reorder-handle], [data-row-actions]')) {
+                return
+              }
+
+              dragHandleProps?.onPointerDown?.(event)
+            }}
+            toggle={{ ariaLabel: s.projects.toggle(group.label, !open), onToggle: toggleOpen, open }}
+            totals={{ costUsd: usage?.cost_usd ?? 0, tokens: usage?.tokens ?? 0 }}
           />
-        </WorkspaceContextMenu>
-      )}
-      {open && (
-        <>
-          {visibleSessions.length === 0 ? (
-            <div className="min-h-7 pl-2 text-[0.75rem] leading-7 text-(--ui-text-quaternary)">{s.noSessions}</div>
-          ) : (
-            renderRows(visibleSessions)
-          )}
-          {hiddenCount > 0 && (
-            <WorkspaceShowMoreButton
-              count={nextCount}
+        ) : (
+          <WorkspaceContextMenu onRemove={onRemove} path={group.path}>
+            <WorkspaceHeader
+              action={
+                (onNewSession || onRemove) && (
+                  <div className="flex items-center">
+                    {addButton}
+                    {onRemove && <WorkspaceMenu onRemove={onRemove} path={group.path} />}
+                  </div>
+                )
+              }
+              icon={leadingIcon}
               label={group.label}
-              onClick={() => setVisibleCount(count => count + SIDEBAR_GROUP_PAGE)}
+              onToggle={toggleOpen}
+              open={open}
+              title={group.path ? displayPath(group.path) : undefined}
             />
-          )}
-        </>
-      )}
-    </SidebarRowStack>
+          </WorkspaceContextMenu>
+        )}
+        {open && (
+          <>
+            {visibleSessions.length === 0 ? (
+              <div className="min-h-7 pl-2 text-[0.75rem] leading-7 text-(--ui-text-quaternary)">{s.noSessions}</div>
+            ) : (
+              renderRows(visibleSessions)
+            )}
+            {hiddenCount > 0 && (
+              <WorkspaceShowMoreButton
+                count={nextCount}
+                label={group.label}
+                onClick={() => setVisibleCount(count => count + SIDEBAR_GROUP_PAGE)}
+              />
+            )}
+          </>
+        )}
+      </SidebarRowStack>
+    </div>
   )
 }
