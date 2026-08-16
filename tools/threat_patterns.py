@@ -101,8 +101,8 @@ _PATTERNS: List[Tuple[str, str, str]] = [
      rf'|ignore[zs]?\s+{_FILLER}instructions?\s+{_FILLER}(?:pr[ée]c[ée]dent\w*|ant[ée]rieur\w*)',
      "prompt_injection", "all"),  # fr: "ignore(z) (toutes) les instructions précédentes"
     (rf'ignor(?:a|e|en|ad)\s+{_FILLER}(?:anterior\w*|previ\w*|tod\w*)\s+{_FILLER}instruccion\w*'
-     rf'|ignor(?:a|e|en|ad)\s+{_FILLER}instruccion\w*\s+{_FILLER}anterior\w*',
-     "prompt_injection", "all"),  # es: "ignora todas las instrucciones anteriores"
+     rf'|ignor(?:a|e|en|ad)\s+{_FILLER}instruccion\w*\s+{_FILLER}(?:anterior\w*|previ\w*|pasad\w*)',
+     "prompt_injection", "all"),  # es: "ignora (todas) las instrucciones anteriores/previas/pasadas"
     (rf'ignoriere\s+{_FILLER}(?:alle\s+{_FILLER})?vorherig\w*\s+{_FILLER}anweisung\w*',
      "prompt_injection", "all"),  # de: "ignoriere alle vorherigen Anweisungen"
     (rf'игнориру(?:й|йте)\s+{_FILLER}(?:все\s+{_FILLER})?предыдущ\w*\s+{_FILLER}инструкци\w*',
@@ -129,7 +129,7 @@ _PATTERNS: List[Tuple[str, str, str]] = [
      "deception_hide", "all"),  # de: "sag/verrate es dem Benutzer/Nutzer nicht"
     (rf'не\s+{_FILLER}говори\w*\s+{_FILLER}(?:это\s+{_FILLER})?пользовател\w*',
      "deception_hide", "all"),  # ru: "не говори (это) пользователю"
-    (r'不要告诉用户', "deception_hide", "all"),  # zh: "不要告诉用户"
+    (rf'不要{_FILLER_CJK}告诉{_FILLER_CJK}用户', "deception_hide", "all"),  # zh: "不要...告诉...用户" (bounded separators)
 
     # ── Role-play / identity hijack (context + strict; common attack
     #    surface in scraped web content and poisoned context files) ──
