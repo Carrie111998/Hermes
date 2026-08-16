@@ -1,6 +1,6 @@
 ---
 title: "ARCH-003 implementation plan: runtime-state audit and replay verification"
-status: IMPLEMENTATION_PLAN_REVISE_V2_PENDING
+status: IMPLEMENTATION_PLAN_REVISE_V3_PENDING
 date: 2026-08-16
 type: implementation-plan
 ticket: ARCH-003
@@ -121,49 +121,70 @@ Add a versioned runtime-state-owned journal table with:
 - bounded closed reason code;
 - diagnostic timestamp;
 - baseline sealed lifecycle state, owner-version, state schema version, and
-  sealed sequence position when event kind is `baseline`.
+  sealed-through sequence when event kind is `baseline`.
 
 The replay tuple is explicitly `lifecycle_state`, `owner_version`, and
 `state_schema_version`; terminality is derived from lifecycle state. Columns
 outside this tuple are outside the verifier's `CONSISTENT` claim.
 
+Baseline events consume the same per-profile/entity sequence space. A baseline
+row has `entity_seq = sealed_through_seq + 1`; the first subsequent mutation
+or genesis must use `entity_seq + 1`. The verifier starts from the baseline
+tuple and checks this continuity. A baseline is the sole event kind allowed to
+commit without an accompanying materialized-state mutation.
+
+The privileged baseline writer is an internal runtime-state maintenance
+operation with explicit operator authorization, outside the gateway, scheduler,
+and verifier surfaces. It opens its own SQLite write transaction, validates the
+sealed tuple against the current materialized row, then appends the baseline
+event on the same connection. This ticket implements the representation and
+verification rules but never invokes this writer.
+
 The migration must not record raw business keys, owner tokens, prompts,
 messages, tool arguments, credentials, filesystem paths, provider payloads, or
 arbitrary user data.
 
-Legacy entities use the explicit no-backfill policy: pre-journal rows remain
-`UNKNOWN` until a successful post-migration mutation emits a marked
-post-migration genesis event. A truncated head without the required origin
-marker also returns `UNKNOWN`.
+Legacy entities use the no-backfill policy: pre-journal rows remain `UNKNOWN`
+until a successful post-migration mutation emits a marked post-migration
+genesis event. That genesis adopts the then-observed replay tuple as its
+trusted origin; `CONSISTENT` for that entity covers only post-genesis history.
+A truncated head without the required origin marker also returns `UNKNOWN`.
 
 Digest parameter identifiers are persisted metadata; key material is never
 journaled. A digest-parameter rotation makes pre-rotation history
 non-comparable and `UNKNOWN` unless a valid sealed baseline explicitly
 bridges the regimes. Verify-time key unavailability is `UNKNOWN`.
 
-Migration rollback is forward-compatible: prior code must tolerate the
-journal table's presence and continue serving materialized rows; rollback must
-not delete the table or rewrite history. Migration compatibility tests must
-assert this posture.
+Migration rollback is forward-compatible: prior code must tolerate the journal
+table's presence and continue serving materialized rows; rollback must not
+delete the table or rewrite history. Migration compatibility tests must assert
+this posture.
 
 ### Gate 2 - atomic emission at the CAS chokepoint
 
-- Emit exactly one event for every committed mutation that changes any member
-  of the replay tuple, including owner-version-only changes with unchanged
-  lifecycle state.
+- Emit exactly one `mutation` or `genesis` event for every committed
+  mutation that changes any member of the replay tuple, including
+  owner-version-only changes with unchanged lifecycle state.
 - Emit no event for a true no-op that changes no replayed column.
-- Use the caller's existing SQLite connection and transaction.
-- Any journal constraint/write failure aborts the complete enclosing mutation;
-  errors must not be swallowed.
+- Use the caller's existing SQLite connection and transaction for mutation and
+  genesis events.
+- Any mutation/genesis journal constraint or write failure aborts the complete
+  enclosing materialized-state mutation; errors must not be swallowed.
+- The privileged baseline writer is the sole exception: a baseline event may
+  commit without a materialized-state mutation, but only through the named
+  out-of-band writer after its sealed tuple validation and within its own
+  explicit transaction.
 - Align sequence allocation with the Gate 0 writer model. In the multi-writer
   branch, use a code-level `SEQUENCE_RETRY_LIMIT = 3`; retry with a fresh
   in-transaction sequence and abort the enclosing mutation when the cap is
   exhausted. In the single-writer branch, prove contention cannot occur and
   retain an explicit defensive abort path.
-- Neither retry nor abort may create a committed event without its state
-  mutation or a replay-visible sequence gap.
-- Add a negative test proving lifecycle writes cannot bypass the emission
-  chokepoint.
+- Neither retry nor abort may create a committed mutation/genesis event without
+  its state mutation or a replay-visible sequence gap. Baseline sequence
+  continuity is governed by Gate 1.
+- Add a negative test proving lifecycle writes cannot bypass the mutation/genesis
+  emission chokepoint; the test must not reject the explicitly named baseline
+  writer.
 
 ### Gate 3 - read-only verifier
 
@@ -175,14 +196,17 @@ Implement a bounded verifier that:
 - returns per-entity `CONSISTENT`, `DRIFT`, or `UNKNOWN`;
 - treats `UNKNOWN` as absorbing;
 - requires complete verified history for `DRIFT`;
-- validates event kind, origin/genesis markers, sequence continuity, duplicate
-  or missing predecessors, baseline contents, digest-parameter identity,
-  schema versions, reason codes, and terminal state;
+- validates event kind, origin/genesis markers, baseline contents and
+  baseline-to-next-event sequence continuity, duplicate or missing
+  predecessors, digest-parameter identity, schema versions, reason codes, and
+  terminal state;
 - uses a code-level `REPLAY_EVENT_LIMIT = 10000` per entity; exceeding it or
   failing to establish the read snapshot returns `UNKNOWN`;
 - returns `UNKNOWN` on snapshot failure, unsupported/newer versions, malformed
   history, unknown digest regime, verify-time key unavailability, exceeded
-  bound, or missing legacy origin;
+  bound, missing legacy origin, or a materialized-row/history asymmetry;
+- treats a materialized row missing while history exists, or history existing
+  without a materialized row, as `UNKNOWN`, never `DRIFT`;
 - may read digest key material through the approved local key store, but never
   logs, persists, echoes, or includes key material in diagnostics or results;
 - performs no writes, ownership claims, external calls, gateway replay, or
@@ -198,31 +222,41 @@ Add deterministic tests for:
 
 - empty database and journal migration;
 - legacy populated rows returning `UNKNOWN`;
-- marked post-migration genesis and truncated-head history;
+- marked post-migration genesis adopting a trusted origin tuple and limiting
+  `CONSISTENT` to post-genesis history;
 - prior-version startup with the journal table present and rollback posture;
 - one event per committed replay-tuple mutation;
 - true no-op without an event;
 - owner-version-only mutation;
-- journal failure rolling back materialized state;
-- writer-model, SQLite WAL/busy-timeout policy, sequence retry cap, and
-  concurrent contention;
-- bypass-path rejection;
+- mutation/genesis journal failure rolling back materialized state;
+- writer-model branch:
+  - multi-writer: SQLite WAL/busy-timeout policy, sequence retry cap, and
+    concurrent contention;
+  - single-writer: single-writer invariant and defensive abort path;
+- bypass-path rejection for mutation/genesis while permitting the named baseline
+  writer;
 - keyed digest/profile isolation, digest-parameter rotation, and verify-time
   key unavailability;
 - duplicate, missing, malformed, non-contiguous, and unsupported events;
-- sealed baseline contents and post-baseline continuity;
+- sealed baseline contents, baseline sequence consumption, and post-baseline
+  continuity;
 - snapshot race using the selected read-transaction mechanism, returning
   `CONSISTENT` or `UNKNOWN`, never false `DRIFT`;
 - replay bound and closed reason-code enforcement;
 - verifier-performs-no-writes using a direct database-change assertion;
+- materialized-row/history asymmetry returning `UNKNOWN`;
 - prompt-cache/gateway no-change check: runtime-state modules must not import
   or invoke gateway conversation or prompt-construction modules;
+- mutation benchmark: 200 warmup mutations followed by 1000 measured
+  mutations against a temp SQLite WAL database, comparing the journal-enabled
+  CAS path with the journal-disabled control at the same measurement boundary;
+  report p95 incremental overhead and block delivery if it exceeds 5 ms;
 - `DRIFT` only for complete verified history;
 - non-replayed columns remain outside the verifier claim.
 
 Run focused tests first, then the repository's relevant full test suite.
 
-### Gate 5 — implementation cross-review
+### Gate 5 - implementation cross-review
 
 Create a metadata-only implementation packet containing only:
 
@@ -236,7 +270,7 @@ Use exactly one authenticated Claude reviewer and one authenticated AGY
 reviewer on the same packet. Reconcile any correction set and re-review the
 same reviewer family before CI or merge.
 
-### Gate 6 — CI and delivery
+### Gate 6 - CI and delivery
 
 Keep these gates separate and record evidence independently:
 
@@ -282,22 +316,11 @@ tests, DGX changes, deployment, repair, or event-sourcing.
 
 ## Implementation-plan review reconciliation v2
 
-The authenticated Claude re-review of reconciliation v1 found that the earlier
-corrections were appended rather than incorporated into the normative gates.
-The v2 update folds them into Gates 0–4 and adds:
-
-- an explicit replay tuple;
-- concrete SQLite read-snapshot behavior;
-- baseline and genesis schema fields;
-- a bounded sequence retry cap;
-- verify-time key handling;
-- direct no-write and gateway/prompt isolation tests;
-- migration rollback compatibility;
-- mutation overhead and journal growth acceptance bounds;
-- a requirement that the merged Gate 0–4 text itself be re-reviewed.
-
-The optional encoding cleanup was handled by using ASCII gate headings. This
-section is a changelog only; the normative behavior is in Gates 0–4 above.
+The v2 review found that the first correction list was appended rather than
+incorporated. The normative Gate 0-4 bodies now contain the writer model,
+snapshot mechanism, baseline/genesis schema, key handling, rollback posture,
+bounded retry, benchmark, growth follow-up, and test requirements. This section
+is retained as changelog only; the Gate 0-4 bodies are authoritative.
 
 ## Acceptance criteria
 
@@ -307,7 +330,7 @@ ARCH-003 implementation is ready for its delivery gates only when:
 - journal failure cannot commit a materialized mutation;
 - the writer model, snapshot mechanism, sequence retry cap, baseline/genesis
   schema, digest rotation behavior, rollback posture, and key handling are
-  explicit in the Gate 0–4 bodies;
+  explicit in the Gates 0-4 bodies;
 - profile/entity sequences are contiguous and race-safe;
 - legacy rows have explicit `UNKNOWN` behavior;
 - baselines and digest regimes are verifiable;
@@ -317,9 +340,10 @@ ARCH-003 implementation is ready for its delivery gates only when:
 - incremental mutation-path overhead target is at most 5 ms p95 in the focused
   benchmark; exceeding it blocks delivery and requires plan revision;
 - journal growth is one bounded metadata row per committed replay-tuple
-  mutation, with no automatic retention job; operational review is required at
-  100,000 events or 100 MiB per profile, whichever occurs first;
-- reconciliation v1 items are incorporated into the normative Gate 0–4 text and
+  mutation, with no automatic retention job; the 100,000-event/100 MiB
+  per-profile threshold is documented as a follow-up operational review,
+  because no operator surfacing path is in scope for this ticket;
+- reconciliation v1 items are incorporated into the normative Gates 0-4 text and
   this merged plan revision receives the same-family re-review;
 - all focused and relevant tests pass;
 - authenticated Claude + AGY implementation review reaches consensus;
