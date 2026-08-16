@@ -1,6 +1,6 @@
 ---
 title: "ARCH-003 implementation plan: runtime-state audit and replay verification"
-status: IMPLEMENTATION_PLAN_REVISE_V21_PENDING
+status: IMPLEMENTATION_PLAN_REVISE_V22_PENDING
 date: 2026-08-16
 type: implementation-plan
 ticket: ARCH-003
@@ -192,8 +192,9 @@ when that epoch is strictly newer than the durable epoch;
 restarting the same writer epoch never advances it. A startup observing a
 durable epoch newer than the running writer enters global downgrade-unsafe
 mode for the database: all ordinary runtime-state writes across all profiles
-and entities return mutation-side `WRITE_ABORT`, while read-only verification
-may continue. The mode exits only when a writer at least as new as the durable
+and entities, including both event-only baseline and re-originating genesis
+writers, return mutation-side `WRITE_ABORT`; only read-only verification may
+continue. The mode exits only when a writer at least as new as the durable
 epoch completes the startup transition and atomically clears the mode. The
 transition record and mode are durable before the upgraded writer serves
 mutations, so a strictly newer contract transition is represented by a
@@ -219,9 +220,11 @@ observable during rollback. The new writer must not increment the counter both
 in application code and in the trigger/write-guard. The mutation/genesis
 transaction records the counter before/after values in its event and updates
 the row marker. A row whose marker is older
-than the current generation, or whose materialized counter is greater than the
-latest journaled counter for that entity, is `UNKNOWN`, never `DRIFT`. Every event's before-counter must equal the immediately preceding event's
-after-counter, or the baseline's sealed counter. A marked genesis for an
+than the current generation, or whose materialized counter is not equal to the
+latest journaled counter for that entity, is `UNKNOWN` with
+`WRITE_COUNTER_GAP`, never `DRIFT`. Every event's before-counter must equal
+the immediately preceding event's after-counter, or the baseline's sealed
+counter. A marked genesis for an
 entity with no current-epoch history is the other valid starting point: its
 before-counter adopts the observed materialized counter and its after-counter
 becomes the new epoch's starting counter. Any discontinuity after the selected
@@ -470,15 +473,13 @@ Add deterministic tests for:
 - current-generation record advancement only on a strictly newer writer epoch,
   same-epoch restart without advancement, same-epoch rollback/roll-forward
   detected by the materialized-write counter gap, global downgrade-unsafe
-  startup blocking all profiles/entities with mutation-side `WRITE_ABORT`,
-  newer-epoch roll-forward clearing that mode, baseline refusal across a
-  counter gap returning `WRITE_ABORT`, separately authorized same-epoch
-  re-originating genesis restoring mutation ability, atomic concurrent startup
-  advancing exactly once, delivery recording of the blocked interval, and
-  concurrent generation advance during verify returning `CONSISTENT` or
-  `UNKNOWN`, never false `DRIFT`;
-- concurrent startup, global downgrade-unsafe blocking, newer-epoch exit, and
-  blocked-interval delivery recording are covered by the preceding test;
+  startup blocking all profiles/entities and both event-only writers with
+  mutation-side `WRITE_ABORT`, newer-epoch/equal-epoch roll-forward clearing
+  that mode, baseline refusal across a counter gap returning `WRITE_ABORT`,
+  separately authorized same-epoch re-originating genesis restoring mutation
+  ability, atomic concurrent startup advancing exactly once, delivery recording
+  of the blocked interval, and concurrent generation advance during verify
+  returning `CONSISTENT` or `UNKNOWN`, never false `DRIFT`;
 - a newly created post-migration entity whose first journaled mutation is a
   marked genesis and reaches `CONSISTENT` after a valid follow-up mutation;
 - first post-generation-advance mutation emitting a marked genesis, with a
@@ -492,6 +493,8 @@ Add deterministic tests for:
   mutation-side `WRITE_ABORT`;
 - any same-epoch ordinary mutation attempted in downgrade-unsafe mode or
   against a persisted counter-gap entity returns mutation-side `WRITE_ABORT`;
+  both event-only writers are also rejected while global downgrade-unsafe mode
+  is set;
   a strictly newer writer-epoch or separately authorized same-epoch
   re-originating genesis is exempt and supersedes the gap at the later replay
   start;
@@ -514,9 +517,10 @@ Add deterministic tests for:
   materialized state;
 - duplicate, missing, malformed, non-contiguous, and unsupported events;
 - empty history returning `UNKNOWN` with `EMPTY_HISTORY`;
-- the same fixture with a materialized-write counter gap returning `UNKNOWN`
-  with `WRITE_COUNTER_GAP`, a baseline attempt refused with `WRITE_ABORT`,
-  and a subsequent ordinary mutation rejected with `WRITE_ABORT`;
+- the same fixture with a materialized-write counter gap in either direction
+  (`>` or `<`) returning `UNKNOWN` with `WRITE_COUNTER_GAP`, a baseline
+  attempt refused with `WRITE_ABORT`, and a subsequent ordinary mutation
+  rejected with `WRITE_ABORT`;
 - the same fixture with an explicitly authorized out-of-band same-epoch
   re-originating genesis adopting the observed counter, followed by a valid
   mutation reaching `CONSISTENT`;
@@ -848,6 +852,25 @@ DGX changes, deployment, repair, or event-sourcing. The corrected plan must
 return to the same authenticated Claude reviewer family and then to AGY on the
 identical packet.
 
+## Implementation-plan review reconciliation v21
+
+The v21 authenticated Claude Opus review returned `REVISE` with five bounded
+plan-text corrections. The corrections are incorporated above:
+
+1. Counter mismatch is bidirectional: either materialized counter greater than
+   or less than the latest journaled counter returns `UNKNOWN` with
+   `WRITE_COUNTER_GAP`.
+2. Both event-only writers are blocked during global downgrade-unsafe mode.
+3. The residual cross-reference bullet was removed from Gate 4.
+4. Equal-epoch restart clearing downgrade-unsafe mode is included in the test
+   matrix.
+5. Acceptance coverage now includes v20.
+
+These remain plan-only corrections and do not authorize source edits, tests,
+DGX changes, deployment, repair, or event-sourcing. The corrected plan must
+return to the same authenticated Claude reviewer family and then to AGY on the
+identical packet.
+
 ## Acceptance criteria
 
 ARCH-003 implementation is ready for its delivery gates only when:
@@ -876,7 +899,7 @@ ARCH-003 implementation is ready for its delivery gates only when:
   retention job; entities beyond the replay limit remain UNKNOWN in this ticket,
   and the 100,000-event/100 MiB per-profile threshold is a documented follow-up
   operational review, not an in-ticket operator gate;
-- reconciliation v1 and v5-v19 items are incorporated into the normative
+- reconciliation v1 and v5-v20 items are incorporated into the normative
   Gates 0-4 text (with v2-v4 explicitly folded into the v1/v4 text), and this
   merged plan revision receives the same-family re-review;
 - all focused and relevant tests pass;
@@ -925,6 +948,8 @@ ARCH-003 implementation is ready for its delivery gates only when:
   pre-lock key check, and complete coverage.
 - v20: trigger counter read-back, multi-statement mutation coverage, and
   deduplicated startup/downgrade tests.
+- v21: bidirectional counter-gap detection, event-only writer blocking during
+  downgrade-unsafe mode, and equal-epoch exit coverage.
 
 
 ## Non-goals
