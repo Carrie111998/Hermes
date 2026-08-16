@@ -565,7 +565,9 @@ async function openSecondary(entry: Secondary): Promise<void> {
       // turn that successful transport recovery into a reported dial failure.
     }
 
-    if (!entry.wantOpen) {
+    // Teardown or replacement can win while connect() itself is pending. Close
+    // the exact orphaned socket rather than publishing a removed registry entry.
+    if (!entry.wantOpen || g.secondaries.get(entry.scope) !== entry) {
       entry.gateway.close()
 
       return

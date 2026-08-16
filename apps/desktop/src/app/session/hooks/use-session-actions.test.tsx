@@ -196,6 +196,7 @@ function Harness({
     busyRef: ref(false),
     creatingSessionRef: ref(false),
     ensureSessionState: () => ({}) as ClientSessionState,
+    gatewayRef: ref(gatewayWithRequest(requestGateway)),
     getRouteToken: () => 'token',
     getRoutedStoredSessionId: () => null,
     navigate: navigate as never,
@@ -284,6 +285,7 @@ function StoredIdRotationHarness({
     busyRef: ref(false),
     creatingSessionRef: ref(false),
     ensureSessionState: () => ({}) as ClientSessionState,
+    gatewayRef: ref(gatewayWithRequest(async () => ({}) as never)),
     getRouteToken: () => 'token',
     getRoutedStoredSessionId,
     navigate: navigate as never,
@@ -788,6 +790,7 @@ function ResumeHarness({
     busyRef: ref(false),
     creatingSessionRef: ref(false),
     ensureSessionState: () => ({}) as ClientSessionState,
+    gatewayRef: ref(gatewayWithRequest(requestGateway)),
     getRouteToken: () => 'token',
     getRoutedStoredSessionId: () => null,
     navigate: vi.fn() as never,
@@ -840,9 +843,11 @@ function ResumeTimerHarness({
   const actions = useSessionActions({
     activeSessionId,
     activeSessionIdRef: cache.activeSessionIdRef,
+    bindGatewayRequest: directGatewayLease,
     busyRef,
     creatingSessionRef: useRef(false),
     ensureSessionState: cache.ensureSessionState,
+    gatewayRef: useRef(gatewayWithRequest(requestGateway)),
     getRouteToken: () => 'timer-contract',
     navigate: vi.fn() as never,
     requestGateway,
@@ -1574,11 +1579,13 @@ function BranchHarness({
     creatingSessionRef: ref(false),
     ensureSessionState: (sessionId, storedSessionId) => {
       const existing = sessionStates.current.get(sessionId)
+
       const state = existing
         ? { ...existing, ...(storedSessionId !== undefined ? { storedSessionId } : {}) }
         : createClientSessionState(storedSessionId ?? null)
 
       sessionStates.current.set(sessionId, state)
+
       return state
     },
     gatewayRef: gatewayRef ?? ref(gatewayWithRequest(requestGateway)),
@@ -1594,6 +1601,7 @@ function BranchHarness({
     syncSessionStateToView: vi.fn(),
     updateSessionState: (sessionId, updater, storedSessionId) => {
       const current = sessionStates.current.get(sessionId) ?? createClientSessionState(storedSessionId ?? null)
+
       const next = updater(
         storedSessionId !== undefined && current.storedSessionId !== storedSessionId
           ? { ...current, storedSessionId }
@@ -1601,6 +1609,7 @@ function BranchHarness({
       )
 
       sessionStates.current.set(sessionId, next)
+
       return next
     }
   })

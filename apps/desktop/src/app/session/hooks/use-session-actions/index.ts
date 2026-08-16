@@ -2136,6 +2136,7 @@ export function useSessionActions({
           startSelectedStoredId: parentStoredId,
           nowSelectedStoredId: selectedStoredSessionIdRef.current
         })
+
         const runtimeChanged = activeSessionIdRef.current !== startingActiveSessionId
         const selectionChanged = selectedStoredSessionIdRef.current !== parentStoredId
 
@@ -2183,6 +2184,7 @@ export function useSessionActions({
       copy,
       forkBranch,
       gatewayRef,
+      getRouteToken,
       selectedStoredSessionIdRef,
       sessionStateByRuntimeIdRef
     ]
