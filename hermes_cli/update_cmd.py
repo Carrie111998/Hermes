@@ -3408,12 +3408,35 @@ def _venv_launcher_ancestors(pids: list[int]) -> list[int]:
 
     # Never return ourselves or our own ancestry: a CLI ``hermes update``
     # runs from the venv python and would otherwise nominate itself.
+    # Exception (mirrors PR #87608 / #87594): an ancestor that is ITSELF a
+    # running gateway (command line matches ``gateway run``) is a real
+    # venv-holder, not a false positive — when the update was spawned by the
+    # gateway (e.g. /update from a messaging platform), the gateway launcher
+    # sits in this process's ancestry, and skipping it leaves the launcher
+    # locking venv .pyd files so the update still aborts on the venv-holder
+    # guard. Only skip ancestors that are NOT gateways.
     skip: set[int] = {os.getpid()}
     try:
+        from gateway.status import looks_like_gateway_runtime_command_line
+
         for anc in psutil.Process().parents():
-            skip.add(int(anc.pid))
+            anc_pid = int(anc.pid)
+            try:
+                anc_cmdline = " ".join(anc.cmdline() or [])
+            except Exception:
+                anc_cmdline = ""
+            if anc_cmdline and looks_like_gateway_runtime_command_line(anc_cmdline):
+                # A gateway ancestor is the very process we want to pause —
+                # keep it out of the skip set so the launcher is found below.
+                continue
+            skip.add(anc_pid)
     except Exception:
-        pass
+        # Fallback to the previous behaviour: skip the whole ancestry.
+        try:
+            for anc in psutil.Process().parents():
+                skip.add(int(anc.pid))
+        except Exception:
+            pass
 
     found: list[int] = []
     for pid in pids:
