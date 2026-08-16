@@ -1,6 +1,6 @@
 ---
 title: "ARCH-003 implementation plan: runtime-state audit and replay verification"
-status: IMPLEMENTATION_PLAN_REVISE_V37_PENDING
+status: IMPLEMENTATION_PLAN_PASS
 date: 2026-08-16
 type: implementation-plan
 ticket: ARCH-003
@@ -1252,6 +1252,30 @@ DGX changes, deployment, repair, or event-sourcing. The corrected plan must
 return to the same authenticated Claude reviewer family and then to AGY on the
 identical packet.
 
+## Implementation-plan review reconciliation v37
+
+The v37 authenticated Claude Opus review returned `PASS`, and the
+authenticated DGX Spark AGY review returned `PASS`, using the identical
+metadata-only packet:
+
+- plan commit: `d74d9499fb878864569e08051b911ef4af284a63`;
+- packet SHA-256:
+  `1745c07d94bdf0f7419e304a6bee7d7e705d0e210a36a167a90e627e6d4e5ead`.
+
+The consensus is plan-level only. It authorizes neither implementation,
+migration, tests, source edits, DGX mutation, deployment, repair, nor
+event-sourcing. Claude recorded two non-blocking implementation/editorial
+notes: treat a row marker newer than `current_generation` as `UNKNOWN`,
+and collapse the remaining compatible trigger-wording duplication during
+implementation review.
+
+## Final implementation-plan review consensus
+
+Status: `IMPLEMENTATION_PLAN_PASS`.
+Claude Opus and AGY independently passed the same correction set. The next
+gate is separate user authorization for implementation and Gate 0 preflight.
+No source, primary dirty worktree, or DGX runtime state was changed.
+
 ## Acceptance criteria
 
 ARCH-003 implementation is ready for its delivery gates only when:
@@ -1281,7 +1305,7 @@ ARCH-003 implementation is ready for its delivery gates only when:
   retention job; entities beyond the replay limit remain UNKNOWN in this ticket,
   and the 100,000-event/100 MiB per-profile threshold is a documented follow-up
   operational review, not an in-ticket operator gate;
-- reconciliation v1 and v5-v36 items are incorporated into the normative
+- reconciliation v1 and v5-v37 items are incorporated into the normative
   Gates 0-4 text (with v2-v4 explicitly folded into the v1/v4 text), and this
   merged plan revision receives the same-family re-review;
 - all focused and relevant tests pass;
@@ -1363,6 +1387,7 @@ ARCH-003 implementation is ready for its delivery gates only when:
   removal of duplicate normative rules.
 - v36: normative row-create counter read-back and explicit startup/mode write
   surface coverage.
+- v37: Claude and AGY consensus on the identical plan-only packet.
 
 
 ## Non-goals
