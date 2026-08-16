@@ -365,7 +365,15 @@ async function remotePidAlive(ssh, pid) {
 // A pid is "provably ours" only if its remote cmdline carries our dashboard
 // args — never kill a pid we can't positively identify as our dashboard.
 async function pidIsOurDashboard(ssh, pid, spawnNonce, hermesPath = '', ownershipId = '') {
-  if (!pid || !/^[0-9a-f]{16}$/.test(String(spawnNonce || '')) || !hermesPath) {
+  const numericPid = Number(pid)
+
+  if (
+    !Number.isInteger(numericPid) ||
+    numericPid <= 0 ||
+    numericPid > 4194304 ||
+    !/^[0-9a-f]{16}$/.test(String(spawnNonce || '')) ||
+    !hermesPath
+  ) {
     return false
   }
 
@@ -382,7 +390,7 @@ async function pidIsOurDashboard(ssh, pid, spawnNonce, hermesPath = '', ownershi
   try {
     const script =
       'import os,shlex,subprocess,sys\n' +
-      `pid=${Number(pid)}\n` +
+      `pid=${numericPid}\n` +
       `expected=os.path.expanduser(${shq(hermesPath)})\n` +
       `nonce=${shq(spawnNonce)}\n` +
       `tokenfile=os.path.expanduser(${shq(tokenFilePath)})\n` +

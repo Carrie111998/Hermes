@@ -272,6 +272,13 @@ test('pidIsOurDashboard requires the exact serve ownership nonce', async () => {
   assert.equal(await pidIsOurDashboard(fakeSsh([[/print\("OWNED"/, 'FOREIGN\n']]), 5, SPAWN_NONCE, '/x/hermes'), false)
 })
 
+test('pidIsOurDashboard rejects a non-numeric pid without probing the process', async () => {
+  const ssh = fakeSsh([])
+
+  assert.equal(await pidIsOurDashboard(ssh, 'not-a-pid', SPAWN_NONCE, '/x/hermes'), false)
+  assert.deepEqual(ssh.calls, [])
+})
+
 // An ssh stub that REALLY RUNS the command. pidIsOurDashboard's decision
 // procedure is a python program embedded in a string, so a fakeSsh that returns
 // a canned OWNED/FOREIGN proves nothing about which argv shapes it accepts.
