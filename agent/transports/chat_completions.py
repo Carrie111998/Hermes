@@ -48,8 +48,15 @@ def _add_prompt_cache_key(
     tools: list[dict[str, Any]] | None,
     supports_prompt_cache_key: bool,
     session_id: str | None = None,
+    cache_scope_id: str | None = None,
 ) -> None:
-    """Add a content-addressed key only for an explicitly capable endpoint."""
+    """Add a content-addressed key only for an explicitly capable endpoint.
+
+    ``cache_scope_id``, when provided, is the rotation-stable logical scope
+    (compression-lineage root — agent/prompt_cache_scope.py) and takes
+    precedence over the physical ``session_id`` so the key survives
+    context-compression session rotation (#79017).
+    """
     if not supports_prompt_cache_key:
         return
 
@@ -70,7 +77,7 @@ def _add_prompt_cache_key(
     cache_key = _content_cache_key(
         _static_prompt_instructions(messages),
         tools,
-        _cache_scope_from_session_id(session_id),
+        _cache_scope_from_session_id(cache_scope_id or session_id),
     )
     if cache_key:
         api_kwargs["prompt_cache_key"] = cache_key
@@ -159,6 +166,26 @@ def _snake_case_gemini_thinking_config(config: dict | None) -> dict | None:
     if isinstance(config.get("thinkingBudget"), (int, float)):
         translated["thinking_budget"] = int(config["thinkingBudget"])
     return translated or None
+
+
+def _raise_gemini_thinking_max_tokens(
+    model: str,
+    reasoning_config: dict | None,
+    requested: Any,
+) -> Any:
+    """Raise Gemini output caps that thinking tokens would otherwise consume.
+
+    Gemini bills thought tokens against maxOutputTokens / max_tokens. A
+    global Hermes cap of 4096 is enough for visible text, but Ultra/high
+    thinking can exhaust it on the first request and abort after four
+    length-continuations.
+    """
+    thinking_config = _build_gemini_thinking_config(model, reasoning_config)
+    if not thinking_config:
+        return requested
+    from agent.gemini_native_adapter import _effective_gemini_max_output_tokens
+
+    return _effective_gemini_max_output_tokens(requested, thinking_config)
 
 
 def _is_gemini_openai_compat_base_url(base_url: Any) -> bool:
@@ -510,9 +537,17 @@ class ChatCompletionsTransport(ProviderTransport):
         reasoning_config = _reasoning_config_for_model(model, params.get("reasoning_config"))
 
         if ephemeral is not None and max_tokens_fn:
-            api_kwargs.update(max_tokens_fn(ephemeral))
+            api_kwargs.update(
+                max_tokens_fn(
+                    _raise_gemini_thinking_max_tokens(model, reasoning_config, ephemeral)
+                )
+            )
         elif max_tokens is not None and max_tokens_fn:
-            api_kwargs.update(max_tokens_fn(max_tokens))
+            api_kwargs.update(
+                max_tokens_fn(
+                    _raise_gemini_thinking_max_tokens(model, reasoning_config, max_tokens)
+                )
+            )
         elif anthropic_max_out is not None:
             api_kwargs["max_tokens"] = anthropic_max_out
 
@@ -641,6 +676,7 @@ class ChatCompletionsTransport(ProviderTransport):
             supports_prompt_cache_key=bool(params.get("supports_prompt_cache_key"))
             or _is_openai_api_base_url(params.get("base_url")),
             session_id=params.get("session_id"),
+            cache_scope_id=params.get("cache_scope_id"),
         )
 
         return api_kwargs
@@ -703,18 +739,30 @@ class ChatCompletionsTransport(ProviderTransport):
         # they front several backends with different completion-token limits
         # (e.g. opencode-go: mimo-v2.5-pro = 131072).
         profile_max = profile.get_max_tokens(model)
+        reasoning_config = _reasoning_config_for_model(model, params.get("reasoning_config"))
 
         if ephemeral is not None and max_tokens_fn:
-            api_kwargs.update(max_tokens_fn(ephemeral))
+            api_kwargs.update(
+                max_tokens_fn(
+                    _raise_gemini_thinking_max_tokens(model, reasoning_config, ephemeral)
+                )
+            )
         elif user_max is not None and max_tokens_fn:
-            api_kwargs.update(max_tokens_fn(user_max))
+            api_kwargs.update(
+                max_tokens_fn(
+                    _raise_gemini_thinking_max_tokens(model, reasoning_config, user_max)
+                )
+            )
         elif profile_max and max_tokens_fn:
-            api_kwargs.update(max_tokens_fn(profile_max))
+            api_kwargs.update(
+                max_tokens_fn(
+                    _raise_gemini_thinking_max_tokens(model, reasoning_config, profile_max)
+                )
+            )
         elif anthropic_max is not None:
             api_kwargs["max_tokens"] = anthropic_max
 
         # Provider-specific api_kwargs extras (reasoning_effort, metadata, etc.)
-        reasoning_config = _reasoning_config_for_model(model, params.get("reasoning_config"))
         extra_body_from_profile, top_level_from_profile = (
             profile.build_api_kwargs_extras(
                 reasoning_config=reasoning_config,
@@ -791,6 +839,7 @@ class ChatCompletionsTransport(ProviderTransport):
             tools=api_kwargs.get("tools"),
             supports_prompt_cache_key=bool(getattr(profile, "supports_prompt_cache_key", False)),
             session_id=params.get("session_id"),
+            cache_scope_id=params.get("cache_scope_id"),
         )
 
         return api_kwargs
