@@ -106,12 +106,17 @@ def _is_alive_like_dispatcher(pid: int) -> bool:
     return True
 
 
-def _spawn_synthetic(env_overrides: dict) -> subprocess.Popen:
+def _spawn_synthetic(env_overrides: dict, cwd) -> subprocess.Popen:
     env = dict(os.environ)
     env.update(env_overrides)
+    # cwd pinned to the caller's tmp_path: run_tests_parallel.py gives every
+    # pytest worker cwd=repo_root, so anything a child writes relative to its
+    # CWD lands in the shared checkout root. Safe to repoint because the
+    # synthetic script is stdlib-only and never imports from the repo.
     proc = subprocess.Popen(
         [sys.executable, "-u", "-c", _synthetic_worker_script()],
         env=env,
+        cwd=str(cwd),
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         start_new_session=True,
@@ -142,10 +147,10 @@ def _cleanup(proc: subprocess.Popen) -> None:
     sys.platform == "win32",
     reason="SIGTERM semantics differ on Windows; kanban dispatcher is POSIX-only",
 )
-def test_sigterm_with_kanban_task_env_terminates_quickly():
+def test_sigterm_with_kanban_task_env_terminates_quickly(tmp_path):
     """With HERMES_KANBAN_TASK set, SIGTERM should kill the process in <2s
     even when a non-daemon thread is still alive."""
-    proc = _spawn_synthetic({"HERMES_KANBAN_TASK": "t_test_28181"})
+    proc = _spawn_synthetic({"HERMES_KANBAN_TASK": "t_test_28181"}, cwd=tmp_path)
     try:
         t0 = time.time()
         os.kill(proc.pid, signal.SIGTERM)
@@ -171,7 +176,7 @@ def test_sigterm_with_kanban_task_env_terminates_quickly():
     sys.platform == "win32",
     reason="SIGTERM semantics differ on Windows; kanban dispatcher is POSIX-only",
 )
-def test_sigterm_without_kanban_task_env_uses_keyboard_interrupt_path():
+def test_sigterm_without_kanban_task_env_uses_keyboard_interrupt_path(tmp_path):
     """Without HERMES_KANBAN_TASK, the original KeyboardInterrupt path runs.
 
     This is the contrast case proving the fix is gated on the env var: in
@@ -180,7 +185,7 @@ def test_sigterm_without_kanban_task_env_uses_keyboard_interrupt_path():
     concern. We just verify the handler logs the KeyboardInterrupt branch
     rather than os._exit'ing.
     """
-    proc = _spawn_synthetic({})
+    proc = _spawn_synthetic({}, cwd=tmp_path)
     try:
         os.kill(proc.pid, signal.SIGTERM)
         # Wait a moment for the handler to react.

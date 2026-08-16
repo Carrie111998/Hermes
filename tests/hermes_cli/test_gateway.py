@@ -7,6 +7,7 @@ import signal
 import subprocess
 import sys
 import textwrap
+from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
 import pytest
@@ -136,12 +137,18 @@ def test_gateway_run_subprocess_preserves_daemon_exit_codes(
         gateway_cli.run_gateway()
         """
     )
+    repo_root = Path(__file__).resolve().parents[2]
     env = {
         **os.environ,
         "HERMES_HOME": str(tmp_path),
         "HERMES_GATEWAY_EXIT_DIAG": "0",
         "HERMES_TEST_GATEWAY_OUTCOME": outcome,
         "INVOCATION_ID": "systemd-test",
+        # Pinned explicitly because the spawn below pins cwd. Without it the
+        # child would resolve ``import hermes_cli.gateway`` through the
+        # editable install, i.e. the shared checkout at ~/.hermes/agent-src,
+        # silently testing a different tree than the one under test.
+        "PYTHONPATH": str(repo_root) + os.pathsep + os.environ.get("PYTHONPATH", ""),
     }
 
     master_fd = slave_fd = None
@@ -158,6 +165,11 @@ def test_gateway_run_subprocess_preserves_daemon_exit_codes(
             stderr=subprocess.PIPE,
             text=True,
             env=env,
+            # cwd pinned to tmp_path: run_tests_parallel.py gives every pytest
+            # worker cwd=repo_root, so anything a child writes relative to its
+            # CWD lands in the shared checkout root. The import root moves to
+            # the explicit PYTHONPATH above rather than to cwd.
+            cwd=str(tmp_path),
             timeout=30,
             check=False,
         )

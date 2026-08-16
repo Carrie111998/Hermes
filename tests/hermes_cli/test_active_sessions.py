@@ -180,6 +180,12 @@ def test_active_session_hard_exit_is_reclaimed(tmp_path, monkeypatch):
             ),
         ],
         env=env,
+        # cwd pinned to tmp_path: run_tests_parallel.py gives every pytest
+        # worker cwd=repo_root, so anything a child writes relative to its CWD
+        # lands in the shared checkout root. Safe to repoint because PYTHONPATH
+        # above already pins the import root -- the child does not need cwd for
+        # `import hermes_cli`.
+        cwd=str(tmp_path),
         text=True,
         capture_output=True,
         timeout=10,
@@ -291,6 +297,9 @@ def test_cross_process_acquire_claims_only_one_last_slot(tmp_path, monkeypatch):
                 subprocess.Popen(
                     [sys.executable, "-c", script],
                     env=worker_env,
+                    # cwd pinned for the same reason as in
+                    # test_active_session_hard_exit_is_reclaimed above.
+                    cwd=str(tmp_path),
                     text=True,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,

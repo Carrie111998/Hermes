@@ -74,9 +74,16 @@ def _run_gateway_import(hermes_home: Path, initial_env: dict[str, str]) -> dict[
             if k in os.environ and k not in env:
                 env[k] = os.environ[k]
 
+    # cwd pinned to hermes_home: run_tests_parallel.py gives every pytest
+    # worker cwd=repo_root, so anything this child writes relative to its CWD
+    # lands in the shared checkout root -- including the literal
+    # "%SystemDrive%/" tree the comment above describes, which the curated env
+    # is only half a defence against. Safe to repoint because the script
+    # sys.path.insert()s PROJECT_ROOT itself and never relies on cwd.
     result = subprocess.run(
         [sys.executable, "-c", script],
         env=env,
+        cwd=str(hermes_home),
         capture_output=True,
         text=True,
         timeout=60,

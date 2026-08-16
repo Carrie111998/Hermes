@@ -36,12 +36,17 @@ def _run_shim(
     env = os.environ.copy()
     env["HERMES_TINI_SHIM_TARGET"] = str(init)
     env["HERMES_TINI_SHIM_WRAPPER"] = str(wrapper)
+    # cwd pinned to the recorder's tmp_path: run_tests_parallel.py gives every
+    # pytest worker cwd=repo_root, so anything the shim writes relative to its
+    # CWD lands in the shared checkout root. Safe to repoint -- SHIM and both
+    # recorder hooks are absolute paths.
     return subprocess.run(
         ["sh", str(SHIM), *args],
         capture_output=True,
         text=True,
         timeout=10,
         env=env,
+        cwd=str(init.parent),
         check=False,
     )
 

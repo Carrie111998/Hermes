@@ -222,8 +222,13 @@ echo "FINAL_RC=$?"
         runlog = lf.name
     try:
         env = dict(os.environ, RUNLOG=runlog)
-        proc = subprocess.run(["bash", "-c", harness], capture_output=True,
-                              text=True, env=env)
+        # cwd pinned to a scratch dir: run_tests_parallel.py gives every pytest
+        # worker cwd=repo_root, so anything this bash harness writes relative
+        # to its CWD lands in the shared checkout root. Safe to repoint -- the
+        # harness is passed inline via -c and RUNLOG is an absolute path.
+        with tempfile.TemporaryDirectory(prefix="install_sh_cwd_") as cwd:
+            proc = subprocess.run(["bash", "-c", harness], capture_output=True,
+                                  text=True, env=env, cwd=cwd)
         runs = Path(runlog).read_text().strip().splitlines()
         final_rc = None
         for line in proc.stdout.splitlines():

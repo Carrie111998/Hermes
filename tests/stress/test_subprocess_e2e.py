@@ -38,12 +38,18 @@ def make_spawn_fn(home: str):
             "PATH": f"{os.path.dirname(PY)}:{os.environ.get('PATH','')}",
         }
         log_f = open(log_path, "ab")
+        # cwd pinned to the temp home: run_tests_parallel.py gives every pytest
+        # worker cwd=repo_root, so anything this worker writes relative to its
+        # CWD lands in the shared checkout root. Safe to repoint because
+        # PYTHONPATH=WT above already pins the import root and FAKE_WORKER is
+        # an absolute path.
         proc = subprocess.Popen(
             [PY, FAKE_WORKER],
             stdin=subprocess.DEVNULL,
             stdout=log_f,
             stderr=subprocess.STDOUT,
             env=env,
+            cwd=home,
             start_new_session=True,
         )
         return proc.pid

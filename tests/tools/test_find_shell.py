@@ -225,12 +225,18 @@ class TestMacosLoginShellSwallowRegression:
         env["HOME"] = str(home)
         # Mirror process_registry.spawn_local: [shell, "-lic", "set +m; <cmd>"]
         # with stdin redirected to /dev/null.
+        #
+        # cwd pinned to tmp_path: run_tests_parallel.py gives every pytest
+        # worker cwd=repo_root, so anything this login shell writes relative to
+        # its CWD lands in the shared checkout root. Safe to repoint -- the
+        # commands this helper is given use absolute marker paths.
         return subprocess.run(
             [shell, "-lic", f"set +m; {command}"],
             stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
             env=env,
+            cwd=str(tmp_path),
         )
 
     def test_system_bash_swallows_but_zsh_does_not(self, tmp_path):

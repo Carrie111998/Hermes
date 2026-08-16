@@ -325,12 +325,20 @@ def test_sidebar_preview_budget_default_is_readable_minimum_or_larger(
 
 
 def test_default_config_import_is_safe_without_a_resolvable_home(
+    tmp_path: Path,
 ) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
     environ = {
         key: value
         for key, value in os.environ.items()
         if key not in {"HERMES_HOME", "LOCALAPPDATA", "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "HOME"}
     }
+    # Pinned explicitly because the spawn below pins cwd. Without it the child
+    # would resolve ``hermes_cli.config`` through the editable install, i.e.
+    # the shared checkout at ~/.hermes/agent-src, silently testing a different
+    # tree than the one under test. Not a home var, so it cannot re-resolve the
+    # home this test is proving unavailable.
+    environ["PYTHONPATH"] = str(repo_root) + os.pathsep + environ.get("PYTHONPATH", "")
     result = subprocess.run(
         [
             sys.executable,
@@ -340,6 +348,11 @@ def test_default_config_import_is_safe_without_a_resolvable_home(
         capture_output=True,
         check=True,
         env=environ,
+        # cwd pinned to tmp_path: run_tests_parallel.py gives every pytest
+        # worker cwd=repo_root, and a child stripped of every home var is
+        # precisely the shape that falls back to CWD-relative paths -- which
+        # would land in the shared checkout root.
+        cwd=str(tmp_path),
         text=True,
     )
 

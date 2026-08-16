@@ -89,7 +89,7 @@ while True:  # the wedge: never observes any unwind
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX signals")
-def test_sigterm_on_wedged_process_forces_exit_within_leash():
+def test_sigterm_on_wedged_process_forces_exit_within_leash(tmp_path):
     """E2E: a wedged process armed via the signal path self-exits at ~2×
     HERMES_EXIT_WATCHDOG_S; without the signal it would live forever."""
     env = dict(os.environ, HERMES_EXIT_WATCHDOG_S="1", PYTHONPATH=_REPO_ROOT)
@@ -97,9 +97,14 @@ def test_sigterm_on_wedged_process_forces_exit_within_leash():
     # worker); the subprocess must look like a real CLI.
     env.pop("PYTEST_CURRENT_TEST", None)
     src = _WEDGE_SRC.format(repo=_REPO_ROOT)
+    # cwd pinned to tmp_path: run_tests_parallel.py gives every pytest worker
+    # cwd=repo_root, so anything a child writes relative to its CWD lands in
+    # the shared checkout root. Safe to repoint because PYTHONPATH above
+    # already pins the import root — the child does not rely on cwd for it.
     p = subprocess.Popen(
         [sys.executable, "-c", src],
         env=env,
+        cwd=str(tmp_path),
         stdout=subprocess.PIPE,
         text=True,
     )

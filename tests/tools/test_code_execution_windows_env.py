@@ -216,7 +216,7 @@ class TestWindowsSocketSmokeTest:
     regression that motivated the fix — without SYSTEMROOT the child
     hits WinError 10106 before any RPC is attempted."""
 
-    def test_child_can_create_socket_with_scrubbed_env(self):
+    def test_child_can_create_socket_with_scrubbed_env(self, tmp_path):
         scrubbed = _scrub_child_env(os.environ, is_passthrough=_no_passthrough)
 
         # Build a tiny child script that simply opens an AF_INET socket.
@@ -232,9 +232,17 @@ class TestWindowsSocketSmokeTest:
                 sys.exit(1)
         """).strip()
 
+        # cwd pinned to tmp_path: run_tests_parallel.py gives every pytest
+        # worker cwd=repo_root, so anything a child writes relative to its CWD
+        # lands in the shared checkout root -- and a deliberately scrubbed env
+        # is exactly the shape that falls back to CWD-relative paths. Only cwd
+        # is added: `scrubbed` is the subject under test and must not be
+        # supplemented. (The script is stdlib-only, so cwd is not an import
+        # root here.)
         result = subprocess.run(
             [sys.executable, "-c", script],
             env=scrubbed,
+            cwd=str(tmp_path),
             capture_output=True,
             text=True,
             timeout=15,
@@ -623,7 +631,7 @@ class TestChildStdioIsUtf8:
             "locale-encoded files on Windows."
         )
 
-    def test_live_child_can_print_non_ascii(self):
+    def test_live_child_can_print_non_ascii(self, tmp_path):
         """Live regression: spawn a Python child with the same env
         treatment the sandbox uses (PYTHONIOENCODING=utf-8 + PYTHONUTF8=1)
         and verify it can print em-dashes, arrows, and emoji to stdout
@@ -649,6 +657,9 @@ class TestChildStdioIsUtf8:
         result = subprocess.run(
             [sys.executable, "-c", script],
             env=scrubbed,
+            # cwd pinned for the same reason as in
+            # test_child_can_create_socket_with_scrubbed_env above.
+            cwd=str(tmp_path),
             capture_output=True,
             timeout=15,
             # Don't decode at the subprocess boundary — we want to check
@@ -668,7 +679,7 @@ class TestChildStdioIsUtf8:
         sys.platform != "win32",
         reason="cp1252 stdout default is Windows-specific",
     )
-    def test_windows_child_without_utf8_env_would_fail(self):
+    def test_windows_child_without_utf8_env_would_fail(self, tmp_path):
         """Negative control: spawn a Python child *without* our env
         overrides and prove that on Windows, printing non-ASCII fails.
         If this ever starts passing, Python has changed its default
@@ -691,6 +702,9 @@ class TestChildStdioIsUtf8:
         result = subprocess.run(
             [sys.executable, "-c", script],
             env=scrubbed,
+            # cwd pinned for the same reason as in
+            # test_child_can_create_socket_with_scrubbed_env above.
+            cwd=str(tmp_path),
             capture_output=True,
             text=False,
             timeout=15,

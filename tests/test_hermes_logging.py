@@ -1774,7 +1774,7 @@ class TestNoEagerHeavyImports:
     fails (returncode 1) if the sentinel is removed or stops working.
     """
 
-    def test_importing_hermes_logging_stays_off_the_redis_stack(self):
+    def test_importing_hermes_logging_stays_off_the_redis_stack(self, tmp_path):
         # Run in a clean subprocess: within the pytest process these modules
         # may already be imported by unrelated tests, which would mask the
         # regression.  A fresh interpreter isolates hermes_logging's own graph.
@@ -1794,6 +1794,13 @@ class TestNoEagerHeavyImports:
             text=True,
             timeout=120,
             env=env,
+            # cwd pinned to tmp_path: run_tests_parallel.py gives every pytest
+            # worker cwd=repo_root, so anything a child writes relative to its
+            # CWD lands in the shared checkout root. Safe to repoint because
+            # PYTHONPATH above already pins the import root -- and pinning it
+            # is what keeps this test measuring THIS tree's hermes_logging
+            # rather than the editable install's.
+            cwd=str(tmp_path),
         )
         assert result.returncode == 0, (
             "importing hermes_logging eagerly pulled a heavy import stack "

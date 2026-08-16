@@ -234,10 +234,14 @@ def _(home, kb):
         '{"unclosed',  # truncated
     ]
     for bad in bad_metas:
+        # cwd pinned to the scenario's temp home: run_tests_parallel.py gives
+        # every pytest worker cwd=repo_root, so anything this child writes
+        # relative to its CWD lands in the shared checkout root. Safe to
+        # repoint because PYTHONPATH=WT above already pins the import root.
         r = subprocess.run(
             [sys.executable, "-m", "hermes_cli.main", "kanban",
              "complete", tid, "--metadata", bad],
-            capture_output=True, text=True, env=env,
+            capture_output=True, text=True, env=env, cwd=home,
         )
         # Should print an error to stderr, exit non-zero, not touch the task
         assert "metadata" in r.stderr.lower() or "json" in r.stderr.lower(), (

@@ -72,7 +72,12 @@ def test_real_binaries_execute_leading_dash_program_payload(
     if needs_tty:
         argv = ["script", "-qec", shlex.join(argv), "/dev/null"]
 
-    subprocess.run(argv, input=input_text, text=True, capture_output=True, env=env, timeout=20)
+    # cwd pinned to tmp_path: run_tests_parallel.py gives every pytest worker
+    # cwd=repo_root, so anything these binaries write relative to their CWD
+    # lands in the shared checkout root. Safe to repoint -- every path handed
+    # to the tool (payload, input file, MARKER) is already absolute.
+    subprocess.run(argv, input=input_text, text=True, capture_output=True, env=env,
+                   cwd=str(tmp_path), timeout=20)
 
     assert marker.read_text() == "executed"
 
