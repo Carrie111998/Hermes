@@ -541,31 +541,41 @@ def resolve_whatsapp_bridge_dir() -> Path:
     # hash stamp owns dependency refreshes independently.
     try:
         hermes_home_bridge.parent.mkdir(parents=True, exist_ok=True)
+        if hermes_home_bridge.exists():
+            # copytree overlays changed files but cannot remove deleted source
+            # paths or replace a file with a directory (and vice versa).
+            # Reconcile deepest paths first, leaving npm's dependency tree
+            # untouched, before copying the current packaged sources.
+            mirrored_paths = sorted(
+                hermes_home_bridge.rglob("*"),
+                key=lambda path: len(path.parts),
+                reverse=True,
+            )
+            for mirrored_path in mirrored_paths:
+                relative_path = mirrored_path.relative_to(hermes_home_bridge)
+                if relative_path.parts[0] == "node_modules":
+                    continue
+                install_path = install_bridge / relative_path
+                install_exists = install_path.exists() or install_path.is_symlink()
+                same_type = (
+                    install_exists
+                    and not mirrored_path.is_symlink()
+                    and mirrored_path.is_dir() == install_path.is_dir()
+                )
+                if same_type:
+                    continue
+                if mirrored_path.is_dir() and not mirrored_path.is_symlink():
+                    mirrored_path.rmdir()
+                else:
+                    mirrored_path.unlink()
         shutil.copytree(
             install_bridge,
             hermes_home_bridge,
             dirs_exist_ok=True,
             ignore=shutil.ignore_patterns("node_modules"),
         )
-        # copytree overlays changed files but does not remove packaged source
-        # files deleted by an update. Reconcile those stale paths after the
-        # copy while leaving the dependency tree under npm's ownership.
-        mirrored_paths = sorted(
-            hermes_home_bridge.rglob("*"),
-            key=lambda path: len(path.parts),
-            reverse=True,
-        )
-        for mirrored_path in mirrored_paths:
-            relative_path = mirrored_path.relative_to(hermes_home_bridge)
-            if relative_path.parts[0] == "node_modules":
-                continue
-            install_path = install_bridge / relative_path
-            if install_path.exists() or install_path.is_symlink():
-                continue
-            if mirrored_path.is_dir() and not mirrored_path.is_symlink():
-                mirrored_path.rmdir()
-            else:
-                mirrored_path.unlink()
         return hermes_home_bridge
     except Exception:
-        return hermes_home_bridge if hermes_home_bridge.exists() else install_bridge
+        # Never execute a mirror that may have been only partly reconciled or
+        # refreshed. The packaged tree is read-only but remains authoritative.
+        return install_bridge

@@ -75,6 +75,14 @@ def test_readonly_install_refreshes_existing_mirror_without_deleting_dependencie
     removed_dir = existing / "removed-source-dir"
     removed_dir.mkdir()
     (removed_dir / "old.js").write_text("// removed upstream\n")
+    (existing / "file-to-dir").write_text("// old file\n")
+    source_dir = install_bridge / "file-to-dir"
+    source_dir.mkdir()
+    (source_dir / "current.js").write_text("// current directory\n")
+    mirror_dir = existing / "dir-to-file"
+    mirror_dir.mkdir()
+    (mirror_dir / "old.js").write_text("// old directory\n")
+    (install_bridge / "dir-to-file").write_text("// current file\n")
     node_modules = existing / "node_modules"
     node_modules.mkdir()
     dependency_marker = node_modules / "keep-me"
@@ -102,6 +110,10 @@ def test_readonly_install_refreshes_existing_mirror_without_deleting_dependencie
     assert (existing / "bridge_auth.js").read_text() == "// auth helper\n"
     assert not (existing / "removed-helper.js").exists()
     assert not removed_dir.exists()
+    assert (existing / "file-to-dir" / "current.js").read_text() == (
+        "// current directory\n"
+    )
+    assert (existing / "dir-to-file").read_text() == "// current file\n"
     assert dependency_marker.read_text() == "installed"
 
 
