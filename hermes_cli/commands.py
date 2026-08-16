@@ -120,6 +120,10 @@ COMMAND_REGISTRY: list[CommandDef] = [
                gateway_only=True, aliases=("set-home",)),
     CommandDef("resume", "Resume a previously-named session", "Session",
                args_hint="[name]"),
+    CommandDef("fast-wrap", "Run the fast session-wrap skill mode for ticket-focused delta closeout", "Session",
+               aliases=("fw", "quick-wrap"), cli_only=True),
+    CommandDef("full-wrap", "Run the full session-wrap skill mode for once-daily hygiene closeout", "Session",
+               aliases=("daily-wrap", "wrap-full"), cli_only=True),
 
     # Configuration
     CommandDef("sessions", "Browse and resume previous sessions", "Session"),

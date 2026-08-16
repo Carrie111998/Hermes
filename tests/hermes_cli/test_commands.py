@@ -111,6 +111,21 @@ class TestResolveCommand:
         assert resolve_command("reload_mcp").name == "reload-mcp"
         assert resolve_command("codex_runtime").name == "codex-runtime"
         assert resolve_command("tasks").name == "agents"
+        for alias, canonical in (
+            ("fw", "fast-wrap"),
+            ("quick-wrap", "fast-wrap"),
+            ("daily-wrap", "full-wrap"),
+            ("wrap-full", "full-wrap"),
+        ):
+            cmd = resolve_command(alias)
+            assert cmd is not None
+            assert cmd.name == canonical
+
+    def test_session_wrap_commands_are_cli_only(self):
+        for name in ("fast-wrap", "full-wrap"):
+            cmd = resolve_command(name)
+            assert cmd is not None
+            assert cmd.cli_only is True
 
     def test_topic_is_gateway_command(self):
         topic = resolve_command("topic")
@@ -901,8 +916,14 @@ class TestGhostText:
         assert _suggestion("/fast f") == "ast"
 
     def test_fast_subcommand_suggestion_hidden_when_filtered(self):
-        completer = SlashCommandCompleter(command_filter=lambda cmd: cmd != "/fast")
+        completer = SlashCommandCompleter(
+            command_filter=lambda cmd: cmd not in {"/fast", "/fast-wrap"}
+        )
         assert _suggestion("/fa", completer=completer) is None
+
+    def test_fast_wrap_command_name_suggestion_when_fast_filtered(self):
+        completer = SlashCommandCompleter(command_filter=lambda cmd: cmd != "/fast")
+        assert _suggestion("/fa", completer=completer) == "st-wrap"
 
     def test_no_suggestion_for_non_slash(self):
         assert _suggestion("hello") is None

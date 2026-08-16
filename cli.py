@@ -8180,6 +8180,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             self._handle_resume_command(cmd_original)
         elif canonical == "sessions":
             self._handle_sessions_command(cmd_original)
+        elif canonical in {"fast-wrap", "full-wrap"}:
+            wrap_seed = "fast wrap" if canonical == "fast-wrap" else "full wrap"
+            self._pending_agent_seed = wrap_seed
+            _cprint(f"  Queued session-wrap mode: {wrap_seed}")
         elif canonical == "model":
             self._handle_model_switch(cmd_original)
         elif canonical == "codex-runtime":
