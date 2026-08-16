@@ -129,8 +129,9 @@ class TestCreateProfile:
             line.startswith("#") or not line.strip()
             for line in content.splitlines()
         )
-        mode = stat.S_IMODE(env_path.stat().st_mode)
-        assert mode == 0o600
+        if sys.platform != "win32":
+            mode = stat.S_IMODE(env_path.stat().st_mode)
+            assert mode == 0o600
 
 
 
@@ -139,17 +140,17 @@ class TestCreateProfile:
         tmp_path = profile_env
         default_home = tmp_path / ".hermes"
         # Create source config files in default profile
-        (default_home / "config.yaml").write_text("model: test")
-        (default_home / ".env").write_text("KEY=val")
-        (default_home / "SOUL.md").write_text("Be helpful.")
+        (default_home / "config.yaml").write_text("model: test", encoding="utf-8")
+        (default_home / ".env").write_text("KEY=val", encoding="utf-8")
+        (default_home / "SOUL.md").write_text("Be helpful.", encoding="utf-8")
 
         profile_dir = create_profile("coder", clone_config=True, no_alias=True)
 
-        cloned_config = yaml.safe_load((profile_dir / "config.yaml").read_text())
+        cloned_config = yaml.safe_load((profile_dir / "config.yaml").read_text(encoding="utf-8"))
         assert cloned_config["_config_version"] == DEFAULT_CONFIG["_config_version"]
         assert cloned_config["model"] == "test"
-        assert (profile_dir / ".env").read_text().strip() == "KEY=val"
-        assert (profile_dir / "SOUL.md").read_text() == "Be helpful."
+        assert (profile_dir / ".env").read_text(encoding="utf-8").strip() == "KEY=val"
+        assert (profile_dir / "SOUL.md").read_text(encoding="utf-8") == "Be helpful."
 
 
 
@@ -168,7 +169,7 @@ class TestNoSkillsOptOut:
         # Marker file is present
         marker = profile_dir / NO_BUNDLED_SKILLS_MARKER
         assert marker.is_file(), "expected .no-bundled-skills marker in profile root"
-        assert "--no-skills" in marker.read_text()
+        assert "--no-skills" in marker.read_text(encoding="utf-8")
 
         # has_bundled_skills_opt_out() agrees
         assert has_bundled_skills_opt_out(profile_dir) is True
@@ -220,7 +221,10 @@ class TestBackfillProfileEnvs:
     def test_copies_default_env_into_envless_profiles(self, profile_env):
         import stat
         tmp_path = profile_env
-        (tmp_path / ".hermes" / ".env").write_text("OPENROUTER_API_KEY=root-key\n")
+        (tmp_path / ".hermes" / ".env").write_text(
+            "OPENROUTER_API_KEY=root-key\n",
+            encoding="utf-8",
+        )
         p1 = create_profile("old1", no_alias=True)
         p2 = create_profile("old2", no_alias=True)
         # Simulate pre-#44792 profiles: no .env
@@ -231,8 +235,9 @@ class TestBackfillProfileEnvs:
 
         assert sorted(backfilled) == ["old1", "old2"]
         for p in (p1, p2):
-            assert (p / ".env").read_text() == "OPENROUTER_API_KEY=root-key\n"
-            assert stat.S_IMODE((p / ".env").stat().st_mode) == 0o600
+            assert (p / ".env").read_text(encoding="utf-8") == "OPENROUTER_API_KEY=root-key\n"
+            if sys.platform != "win32":
+                assert stat.S_IMODE((p / ".env").stat().st_mode) == 0o600
 
 
     def test_placeholder_when_default_has_no_env(self, profile_env):
@@ -408,7 +413,7 @@ class TestAliasCollision:
         wrapper_dir = profile_env / ".local" / "bin"
         wrapper_dir.mkdir(parents=True, exist_ok=True)
         bat_path = wrapper_dir / "mybot.bat"
-        bat_path.write_text("@echo off\r\nhermes -p mybot %*\r\n")
+        bat_path.write_text("@echo off\r\nhermes -p mybot %*\r\n", encoding="utf-8")
         with patch("subprocess.run") as mock_run:
             mock_run.return_value = MagicMock(
                 returncode=0, stdout=str(bat_path),
@@ -432,13 +437,14 @@ class TestAliasCollision:
 class TestWrapperScript:
     """Tests for create_wrapper_script() and remove_wrapper_script()."""
 
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX wrapper script")
     def test_creates_sh_on_posix(self, profile_env, monkeypatch):
         monkeypatch.setattr("hermes_cli.profiles.shutil.which", lambda name: "/opt/hermes/bin/hermes")
         from hermes_cli.profiles import create_wrapper_script
         wrapper = create_wrapper_script("mybot")
         assert wrapper is not None
         assert wrapper.name == "mybot"
-        content = wrapper.read_text()
+        content = wrapper.read_text(encoding="utf-8")
         assert content.startswith("#!/bin/sh")
         assert "exec /opt/hermes/bin/hermes -p mybot" in content
 
@@ -502,7 +508,10 @@ class TestFindAliasForProfile:
         from hermes_cli.profiles import _get_wrapper_dir, find_alias_for_profile
         wrapper_dir = _get_wrapper_dir()
         wrapper_dir.mkdir(parents=True, exist_ok=True)
-        (wrapper_dir / "pip").write_text("#!/bin/sh\nexec python -m pip \"$@\"\n")
+        (wrapper_dir / "pip").write_text(
+            "#!/bin/sh\nexec python -m pip \"$@\"\n",
+            encoding="utf-8",
+        )
         assert find_alias_for_profile("steve") is None
 
 
@@ -517,7 +526,8 @@ class TestFindAliasForProfile:
         info = next(p for p in list_profiles() if p.name == "steve")
         assert info.alias_name == "qiaobusi"
         assert info.alias_path is not None
-        assert info.alias_path.name == "qiaobusi"
+        expected_alias_file = "qiaobusi.bat" if sys.platform == "win32" else "qiaobusi"
+        assert info.alias_path.name == expected_alias_file
 
 
 # ===================================================================
@@ -545,25 +555,28 @@ class TestRenameProfile:
         tmp_path = profile_env
         create_profile("ssi_health", no_alias=True)
         honcho_path = tmp_path / ".hermes" / "honcho.json"
-        honcho_path.write_text(json.dumps({
-            "hosts": {
-                "hermes.ssi_health": {
-                    "recallMode": "hybrid",
-                    "writeFrequency": "async",
-                    "sessionStrategy": "per-session",
-                    "saveMessages": True,
-                    "peerName": "user-peer",
-                    "aiPeer": "ssi_health",
-                    "workspace": "hermes",
-                    "enabled": True,
+        honcho_path.write_text(
+            json.dumps({
+                "hosts": {
+                    "hermes.ssi_health": {
+                        "recallMode": "hybrid",
+                        "writeFrequency": "async",
+                        "sessionStrategy": "per-session",
+                        "saveMessages": True,
+                        "peerName": "user-peer",
+                        "aiPeer": "ssi_health",
+                        "workspace": "hermes",
+                        "enabled": True,
+                    }
                 }
-            }
-        }))
+            }),
+            encoding="utf-8",
+        )
 
         with patch("hermes_cli.profiles.check_alias_collision", return_value="skip"):
             rename_profile("ssi_health", "heimdall")
 
-        cfg = json.loads(honcho_path.read_text())
+        cfg = json.loads(honcho_path.read_text(encoding="utf-8"))
         assert "hermes.ssi_health" not in cfg["hosts"]
         assert cfg["hosts"]["hermes_heimdall"]["aiPeer"] == "ssi_health"
         assert cfg["hosts"]["hermes_heimdall"]["peerName"] == "user-peer"
@@ -590,12 +603,12 @@ class TestExportImport:
     def test_export_default_includes_profile_data(self, profile_env, tmp_path):
         """Profile data files end up in the archive (credentials excluded)."""
         default_dir = get_profile_dir("default")
-        (default_dir / "config.yaml").write_text("model: test")
-        (default_dir / ".env").write_text("KEY=val")
-        (default_dir / "SOUL.md").write_text("Be nice.")
+        (default_dir / "config.yaml").write_text("model: test", encoding="utf-8")
+        (default_dir / ".env").write_text("KEY=val", encoding="utf-8")
+        (default_dir / "SOUL.md").write_text("Be nice.", encoding="utf-8")
         mem_dir = default_dir / "memories"
         mem_dir.mkdir(exist_ok=True)
-        (mem_dir / "MEMORY.md").write_text("remember this")
+        (mem_dir / "MEMORY.md").write_text("remember this", encoding="utf-8")
 
         output = tmp_path / "export" / "default.tar.gz"
         output.parent.mkdir(parents=True, exist_ok=True)
@@ -610,6 +623,7 @@ class TestExportImport:
         assert "default/memories/MEMORY.md" in names
 
 
+    @pytest.mark.require_symlinks
     def test_export_default_handles_broken_symlinks(self, profile_env, tmp_path):
         """Broken symlinks inside allowed artifacts are preserved, not crashed (#58394).
 
@@ -619,7 +633,7 @@ class TestExportImport:
         symlinks; the link and its target are both retained.
         """
         default_dir = get_profile_dir("default")
-        (default_dir / "config.yaml").write_text("ok")
+        (default_dir / "config.yaml").write_text("ok", encoding="utf-8")
         # Place broken symlink *inside* the allowed ``skills/`` tree so the
         # root-level allow-list passes the directory through; the
         # symlinks=True flag must then preserve the link instead of
@@ -628,7 +642,7 @@ class TestExportImport:
         broken_dir.mkdir(parents=True)
         (broken_dir / "broken_link").symlink_to("/nonexistent/path")
         # Valid symlink for comparison
-        (broken_dir / "valid_target.txt").write_text("real data")
+        (broken_dir / "valid_target.txt").write_text("real data", encoding="utf-8")
         (broken_dir / "valid_link").symlink_to(
             broken_dir / "valid_target.txt"
         )
@@ -787,6 +801,7 @@ class TestWriteProfileMetaDurability:
         assert "🧙" in raw
         assert profiles.read_profile_meta(profile_dir)["description"] == "Code wizard 🧙 ✨"
 
+    @pytest.mark.require_symlinks
     def test_symlinked_profile_yaml_survives_the_write(self, tmp_path):
         """Guard on the conversion, not a behavior change.
 
@@ -880,16 +895,16 @@ class TestEdgeCases:
         tmp_path = profile_env
         # Create source profile with config
         source_dir = create_profile("source", no_alias=True)
-        (source_dir / "config.yaml").write_text("model: cloned")
-        (source_dir / ".env").write_text("SECRET=yes")
+        (source_dir / "config.yaml").write_text("model: cloned", encoding="utf-8")
+        (source_dir / ".env").write_text("SECRET=yes", encoding="utf-8")
 
         target_dir = create_profile(
             "target", clone_from="source", clone_config=True, no_alias=True,
         )
-        cloned_config = yaml.safe_load((target_dir / "config.yaml").read_text())
+        cloned_config = yaml.safe_load((target_dir / "config.yaml").read_text(encoding="utf-8"))
         assert cloned_config["_config_version"] == DEFAULT_CONFIG["_config_version"]
         assert cloned_config["model"] == "cloned"
-        assert (target_dir / ".env").read_text().strip() == "SECRET=yes"
+        assert (target_dir / ".env").read_text(encoding="utf-8").strip() == "SECRET=yes"
 
 
 
@@ -935,6 +950,4 @@ class TestProfilesToServe:
 
         assert set(serve) == {"default", "worker"}
         assert serve["worker"] == get_profile_dir("worker")
-
-
 
