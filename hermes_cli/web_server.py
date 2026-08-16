@@ -304,6 +304,27 @@ def _resolve_restart_drain_timeout() -> float:
         return DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT
 
 
+def _eager_reconcile_own_session_db() -> None:
+    """One writable open of this process's own state.db at startup.
+
+    ``SessionDB.__init__`` runs ``_init_schema`` → ``_reconcile_columns``,
+    bringing a store left behind by `hermes update` current before the
+    dashboard's first session-list poll, with the open-time lock patience
+    (jittered retries) absorbing transient contention. Never raises: a
+    store this cannot fix is still served through the read-probe heal in
+    :func:`_open_session_db_at_path`, which retries on every poll.
+    """
+    try:
+        from hermes_state import SessionDB, _default_db_path
+
+        SessionDB(db_path=Path(_default_db_path()), read_only=False).close()
+    except Exception as exc:
+        _log.warning(
+            "startup schema reconcile of state.db failed (%s); session "
+            "reads will retry the heal per poll", exc,
+        )
+
+
 @asynccontextmanager
 async def _lifespan(app: "FastAPI"):
     app.state.event_channels = {}  # dict[str, set]
@@ -314,6 +335,23 @@ async def _lifespan(app: "FastAPI"):
     # On app.state (not a module global) so the Lock binds to the running
     # event loop during lifespan startup — see _get_event_state's docstring.
     app.state.chat_argv_lock = asyncio.Lock()
+
+    # Bring this profile's state.db schema current BEFORE the first
+    # session-list poll (#79531/#80037). Migrations used to run lazily on
+    # the first writable open — typically the user's first new session —
+    # so a store left behind by `hermes update` kept 500ing every
+    # /api/sessions poll (and the read-probe heal, while it retries per
+    # poll, can lose repeatedly to lock contention from orphaned sibling
+    # backends). One writable open here runs _init_schema →
+    # _reconcile_columns with the full open-time lock patience. Runs in a
+    # daemon thread so a locked store never delays the server socket (the
+    # Desktop ready-probe times out at 10s, GH-73083); reads that land
+    # before it finishes are still covered by the read-probe heal.
+    threading.Thread(
+        target=_eager_reconcile_own_session_db,
+        daemon=True,
+        name="statedb-eager-reconcile",
+    ).start()
 
     # Import hermes_cli.gateway eagerly *before* the lifespan yield so the
     # GIL-heavy .pyc compilation and Defender scan cost is absorbed during
@@ -365,12 +403,12 @@ async def _lifespan(app: "FastAPI"):
     try:
         yield
     finally:
+        if cron_stop is not None:
+            cron_stop.set()
         pty_reaper_task.cancel()
         selftest_task.cancel()
         auto_archive_task.cancel()
         await PTY_REGISTRY.close_all()
-        if cron_stop is not None:
-            cron_stop.set()
         if os.getenv("HERMES_DESKTOP") == "1":
             _terminate_desktop_managed_gateway()
 
@@ -416,6 +454,7 @@ def _get_pty_active_session_files(app: "FastAPI") -> dict[str, Path]:
 
 
 app = FastAPI(title="Hermes Agent", version=__version__, lifespan=_lifespan)
+
 
 # Memory-provider OAuth connect routes live in the memory layer, not here.
 from hermes_cli.memory_oauth import router as _memory_oauth_router  # noqa: E402
@@ -1165,6 +1204,9 @@ _CATEGORY_MERGE: Dict[str, str] = {
     # field — fold it into the agent tab rather than spawning a one-field
     # orphan category.
     "runtime": "agent",
+    # `session.terminal_continue` is the only schema-surfaced session field —
+    # fold it into general rather than spawning a one-field orphan category.
+    "session": "general",
 }
 
 # Display order for tabs — unlisted categories sort alphabetically after these.
@@ -1847,6 +1889,21 @@ _MEDIA_CONTENT_TYPES = {
 _MEDIA_MAX_BYTES = 25 * 1024 * 1024
 _MANAGED_FILES_ROOT_ENV = "HERMES_DASHBOARD_FILES_ROOT"
 _MANAGED_FILE_MAX_BYTES = 100 * 1024 * 1024
+_STREAMABLE_MEDIA_EXTENSIONS = frozenset(
+    {
+        ".avi",
+        ".flac",
+        ".m4a",
+        ".mkv",
+        ".mov",
+        ".mp3",
+        ".mp4",
+        ".ogg",
+        ".opus",
+        ".wav",
+        ".webm",
+    }
+)
 _HOSTED_MANAGED_FILES_ROOT = Path("/opt/data")
 
 
@@ -2537,17 +2594,14 @@ async def read_managed_file(request: Request, path: str):
     }
 
 
-@app.get("/api/files/download")
-async def download_managed_file(request: Request, path: str):
-    """Stream a managed file as an attachment download.
-
-    Remote clients (desktop app, browser dashboard) open agent-written files
-    that live on *this* gateway's disk, not theirs. Auth-gated like every other
-    managed-files route — ``auth_middleware`` additionally accepts the session
-    token as a ``?token=`` query param here so a shell/browser-opened download
-    (which can't set the session header) still authenticates. See ``/api/pty``
-    for the same query-token precedent.
-    """
+def _managed_file_response(
+    request: Request,
+    path: str,
+    *,
+    content_disposition_type: str,
+    media_only: bool = False,
+) -> FileResponse:
+    """Build a range-aware response after applying managed-file policy."""
     policy, target, _display_path = _resolve_managed_path(path, request)
     if not target.exists():
         raise HTTPException(status_code=404, detail="File not found")
@@ -2555,6 +2609,8 @@ async def download_managed_file(request: Request, path: str):
         raise HTTPException(status_code=400, detail="Path is not a file")
     if _is_sensitive_path(target):
         raise HTTPException(status_code=403, detail="Access to sensitive files is not allowed")
+    if media_only and target.suffix.lower() not in _STREAMABLE_MEDIA_EXTENSIONS:
+        raise HTTPException(status_code=415, detail="Unsupported media type")
 
     try:
         size = target.stat().st_size
@@ -2569,7 +2625,52 @@ async def download_managed_file(request: Request, path: str):
         path=str(target),
         media_type=mime_type,
         filename=target.name,
-        content_disposition_type="attachment",
+        content_disposition_type=content_disposition_type,
+        headers={"X-Content-Type-Options": "nosniff"} if media_only else None,
+    )
+
+
+@app.get("/api/files/download")
+async def download_managed_file(request: Request, path: str):
+    """Stream a managed file as an attachment download.
+
+    Remote clients (desktop app, browser dashboard) open agent-written files
+    that live on *this* gateway's disk, not theirs. Auth-gated like every other
+    managed-files route — ``auth_middleware`` additionally accepts the session
+    token as a ``?token=`` query param here so a shell/browser-opened download
+    (which can't set the session header) still authenticates. See ``/api/pty``
+    for the same query-token precedent. Chromium identifies ``<audio>`` and
+    ``<video>`` subresource requests through ``Sec-Fetch-Dest``; serve those
+    inline for compatibility with Desktop builds that still use this route as
+    their player source, while preserving attachment semantics for ordinary
+    link/document requests.
+    """
+    fetch_destination = request.headers.get("sec-fetch-dest", "").lower()
+    is_media_subresource = fetch_destination in {"audio", "video"}
+    return _managed_file_response(
+        request,
+        path,
+        content_disposition_type="inline" if is_media_subresource else "attachment",
+        media_only=is_media_subresource,
+    )
+
+
+@app.get("/api/files/stream")
+@app.head("/api/files/stream")
+async def stream_managed_file(request: Request, path: str):
+    """Stream managed audio/video inline with HTTP Range support.
+
+    Electron's Chromium media pipeline may reject an attachment response used
+    as an ``<audio>`` or ``<video>`` source. This route shares the download
+    endpoint's authentication, size cap, sensitive-file guard, MIME detection,
+    and Starlette ``FileResponse`` range handling, but explicitly marks the
+    response inline so metadata loading, playback, and seeking work remotely.
+    """
+    return _managed_file_response(
+        request,
+        path,
+        content_disposition_type="inline",
+        media_only=True,
     )
 
 
@@ -2827,6 +2928,19 @@ async def fs_read_data_url(path: str):
     except OSError as exc:
         raise HTTPException(status_code=400, detail=str(exc) or "File read failed")
     return {"dataUrl": f"data:{_fs_mime_type(target)};base64,{encoded}"}
+
+
+@app.get("/api/fs/download")
+async def fs_download(path: str):
+    target, _st = _fs_regular_file(_fs_path(path))
+    if _is_sensitive_path(target):
+        raise HTTPException(status_code=403, detail="Access to sensitive files is not allowed")
+    return FileResponse(
+        path=str(target),
+        media_type=_fs_mime_type(target),
+        filename=target.name,
+        content_disposition_type="attachment",
+    )
 
 
 @app.get("/api/fs/git-root")
@@ -11958,10 +12072,23 @@ def _validate_dashboard_cron_context_from(
 
 
 def _cron_profile_dicts() -> List[Dict[str, Any]]:
-    """Return dashboard profile records, falling back to a directory scan."""
+    """Return the minimal profile records needed by cron aggregation.
+
+    The two callers only consume ``name``.  ``list_profiles()`` also parses
+    config/distribution metadata, probes gateway processes, and counts skills
+    for every profile; polling cron jobs through that path creates avoidable
+    GIL pressure on large profile pools.
+    """
     from hermes_cli import profiles as profiles_mod
     try:
-        return [_profile_to_dict(p) for p in profiles_mod.list_profiles()]
+        return [
+            {
+                "name": name,
+                "path": str(home),
+                "is_default": name == "default",
+            }
+            for name, home in profiles_mod.profiles_to_serve(multiplex=True)
+        ]
     except Exception:
         _log.exception("Failed to list profiles for cron dashboard; falling back to directory scan")
         return _fallback_profile_dicts(profiles_mod)
@@ -12041,6 +12168,73 @@ def _call_cron_for_profile(target_profile: Optional[str], func_name: str, *args,
         return [_annotate_cron_job(j, profile_name, home) for j in result]
     if isinstance(result, dict):
         return _annotate_cron_job(result, profile_name, home)
+    return result
+
+
+def _notify_cron_provider_for_profile(target_profile: Optional[str]) -> None:
+    """Best-effort provider reconcile against one profile's job store.
+
+    Fail-closed for external providers on a multi-profile dashboard: an
+    external provider's ``reconcile`` converges its REMOTE registry toward
+    one profile's jobs.json, and its orphan cleanup cancels every remote
+    entry absent from that store. The NAS registry is not profile-scoped,
+    so reconciling profile B would silently disarm profile A's one-shots.
+    Until the provider contract carries a profile identity through
+    arm/cancel/list, a multi-profile dashboard must not drive unscoped
+    external reconciles at all — the affected profile simply re-arms on
+    its next fire/start (idempotent via dedup_key). The built-in provider
+    re-reads jobs.json each tick and stays a no-op here.
+    """
+    try:
+        _profile_name, home = _cron_profile_home(target_profile)
+        from cron import jobs as cron_jobs
+        from cron.scheduler_provider import (
+            InProcessCronScheduler,
+            resolve_cron_scheduler,
+        )
+        from hermes_constants import (
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+
+        token = set_hermes_home_override(str(home))
+        try:
+            with cron_jobs.use_cron_store(home):
+                provider = resolve_cron_scheduler()
+                if not isinstance(provider, InProcessCronScheduler):
+                    profile_names = [
+                        str(p.get("name") or "")
+                        for p in _cron_profile_dicts()
+                    ]
+                    if len([n for n in profile_names if n]) > 1:
+                        _log.warning(
+                            "Skipping cron provider reconcile for profile %s: "
+                            "external provider '%s' reconcile is not "
+                            "profile-scoped and would disarm other profiles' "
+                            "armed one-shots. The mutated profile re-arms "
+                            "idempotently on its next fire/start.",
+                            target_profile,
+                            provider.name,
+                        )
+                        return
+                provider.on_jobs_changed()
+        finally:
+            reset_hermes_home_override(token)
+    except Exception:
+        _log.debug(
+            "Cron provider reconciliation failed for profile %s",
+            target_profile,
+            exc_info=True,
+        )
+
+
+def _mutate_cron_for_profile(
+    target_profile: Optional[str], func_name: str, *args, **kwargs
+):
+    """Apply a cron store mutation and reconcile its scheduler provider."""
+    result = _call_cron_for_profile(target_profile, func_name, *args, **kwargs)
+    if result:
+        _notify_cron_provider_for_profile(target_profile)
     return result
 
 
@@ -12188,7 +12382,7 @@ def _create_cron_job_sync(body: CronJobCreate, profile: Optional[str] = None):
             "script": script,
             "no_agent": no_agent,
         })
-        return _call_cron_for_profile(
+        return _mutate_cron_for_profile(
             profile_name,
             "create_job",
             prompt=body.prompt or "",
@@ -12241,7 +12435,7 @@ def _update_cron_job_sync(job_id: str, body: CronJobUpdate, profile: Optional[st
             if "skills" in updates and "skill" not in updates:
                 effective["skill"] = None
             _validate_dashboard_cron_effective_job(effective)
-        job = _call_cron_for_profile(profile_name, "update_job", job_id, updates)
+        job = _mutate_cron_for_profile(profile_name, "update_job", job_id, updates)
     except HTTPException:
         raise
     except ValueError as exc:
@@ -12257,7 +12451,7 @@ def _pause_cron_job_sync(job_id: str, profile: Optional[str] = None):
     selected = profile or _find_cron_job_profile(job_id)
     if not selected:
         raise HTTPException(status_code=404, detail="Job not found")
-    job = _call_cron_for_profile(selected, "pause_job", job_id)
+    job = _mutate_cron_for_profile(selected, "pause_job", job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     return job
@@ -12269,7 +12463,7 @@ def _resume_cron_job_sync(job_id: str, profile: Optional[str] = None):
     selected = profile or _find_cron_job_profile(job_id)
     if not selected:
         raise HTTPException(status_code=404, detail="Job not found")
-    job = _call_cron_for_profile(selected, "resume_job", job_id)
+    job = _mutate_cron_for_profile(selected, "resume_job", job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     return job
@@ -12281,10 +12475,34 @@ def _trigger_cron_job_sync(job_id: str, profile: Optional[str] = None):
     selected = profile or _find_cron_job_profile(job_id)
     if not selected:
         raise HTTPException(status_code=404, detail="Job not found")
-    job = _call_cron_for_profile(selected, "trigger_job", job_id)
+    job = _call_cron_for_profile(selected, "resolve_job_ref", job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
-    return job
+    # Do not expose the job as due before claiming it: the built-in ticker and
+    # external/manual fire paths share the same durable claim, so only one can
+    # execute this selected run even if they race across processes. Active jobs
+    # keep the legacy provider call shape; paused jobs need the explicit force
+    # flag to resume and claim atomically.
+    force = not job.get("enabled", True) or job.get("state") == "paused"
+    ran = _fire_cron_job_for_profile(selected, job["id"], force=force)
+    refreshed = _call_cron_for_profile(selected, "get_job", job["id"])
+    if refreshed and refreshed.get("last_run_at") != job.get("last_run_at"):
+        return refreshed
+    if not ran:
+        raise HTTPException(
+            status_code=409,
+            detail="Job is already running or was claimed by another scheduler",
+        )
+    if refreshed:
+        return refreshed
+    # A one-shot may remove itself after exhausting repeat=1. Keep the response
+    # shape compatible without inventing an outcome that is no longer present
+    # in the job store; authoritative list refresh removes the completed row.
+    return {
+        **job,
+        "enabled": False,
+        "state": "completed",
+    }
 
 
 
@@ -12294,7 +12512,7 @@ def _delete_cron_job_sync(job_id: str, profile: Optional[str] = None):
     if not selected:
         raise HTTPException(status_code=404, detail="Job not found")
     try:
-        removed = _call_cron_for_profile(selected, "remove_job", job_id)
+        removed = _mutate_cron_for_profile(selected, "remove_job", job_id)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     if not removed:
@@ -12304,8 +12522,17 @@ def _delete_cron_job_sync(job_id: str, profile: Optional[str] = None):
 
 
 
-def _fire_cron_job_for_profile(profile: str, job_id: str) -> bool:
-    """DEPRECATED — retained only until callers migrate; do not add new uses.
+def _fire_cron_job_for_profile(
+    profile: str,
+    job_id: str,
+    *,
+    force: bool = False,
+) -> bool:
+    """DEPRECATED for NAS webhook fires (superseded by gateway forwarding);
+    retained for the dashboard trigger path — do not add new uses.
+
+    Run ONE due cron job end-to-end for ``profile`` via the resolved
+    scheduler provider's ``fire_due`` (store CAS claim + ``run_one_job``).
 
     Superseded by :func:`_forward_cron_fire_to_gateway`: cron fires must
     execute in the GATEWAY process (which owns the live platform adapters),
@@ -12317,7 +12544,10 @@ def _fire_cron_job_for_profile(profile: str, job_id: str) -> bool:
     """
     _profile_name, home = _cron_profile_home(profile)
     from cron import jobs as cron_jobs
-    from cron.scheduler_provider import resolve_cron_scheduler
+    from cron.scheduler_provider import (
+        provider_supports_force_fire,
+        resolve_cron_scheduler,
+    )
     from hermes_constants import (
         reset_hermes_home_override,
         set_hermes_home_override,
@@ -12327,6 +12557,18 @@ def _fire_cron_job_for_profile(profile: str, job_id: str) -> bool:
     try:
         with cron_jobs.use_cron_store(home):
             provider = resolve_cron_scheduler()
+            if force:
+                if not provider_supports_force_fire(provider):
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            f"Cron provider '{getattr(provider, 'name', 'custom')}' "
+                            "does not support atomic forced firing of paused jobs"
+                        ),
+                    )
+                return bool(
+                    provider.fire_due(job_id, adapters=None, loop=None, force=True)
+                )
             return bool(provider.fire_due(job_id, adapters=None, loop=None))
     finally:
         reset_hermes_home_override(token)
@@ -14969,6 +15211,10 @@ else:
 
 _RESIZE_RE = re.compile(rb"\x1b\[RESIZE:(\d+);(\d+)\]")
 _PTY_READ_CHUNK_TIMEOUT = 0.2
+# Back-off delay between idle PTY reads so a quiet terminal does not spin
+# the event loop.  A positive sleep lets other coroutines run and keeps
+# dashboard idle CPU low (#42627).
+_PTY_IDLE_BACKOFF = 0.05
 
 # Keep-alive PTY sessions: a terminal connecting with ``?attach=<token>`` is
 # bound to a process that survives disconnect/refresh and is reattachable.
@@ -15003,7 +15249,7 @@ async def _legacy_pump(ws: "WebSocket", bridge) -> None:
                 if chunk is None:  # EOF
                     return
                 if not chunk:  # no data this tick; yield control and retry
-                    await asyncio.sleep(0)
+                    await asyncio.sleep(_PTY_IDLE_BACKOFF)
                     continue
                 try:
                     await ws.send_bytes(chunk)
