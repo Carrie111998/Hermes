@@ -693,8 +693,25 @@ _apply_profile_override()
 
 # Load .env from ~/.hermes/.env first, then project root as dev fallback.
 # User-managed env files should override stale shell exports on restart.
-from hermes_cli.config import get_hermes_home
+from hermes_cli.config import (
+    get_hermes_home,
+    _block_config_writes_for_process,
+    _deactivate_config_write_block,
+)
 from hermes_cli.env_loader import load_hermes_dotenv
+
+_CONFIG_CHECK_WRITE_BLOCK_TOKEN = None
+if sys.argv[1:3] == ["config", "check"]:
+    _CONFIG_CHECK_WRITE_BLOCK_TOKEN = _block_config_writes_for_process(
+        "`hermes config check` is read-only"
+    )
+
+
+def _release_config_check_write_block() -> None:
+    global _CONFIG_CHECK_WRITE_BLOCK_TOKEN
+    if _CONFIG_CHECK_WRITE_BLOCK_TOKEN is not None:
+        _deactivate_config_write_block(_CONFIG_CHECK_WRITE_BLOCK_TOKEN)
+        _CONFIG_CHECK_WRITE_BLOCK_TOKEN = None
 
 # Updating dependencies must not import optional secret-manager libraries into
 # the updater process before ``uv`` replaces the environment.  On Windows,
@@ -11689,6 +11706,14 @@ def _advertise_agent_env() -> None:
 
 
 def main():
+    """Run one CLI invocation and release process-scoped config policy."""
+    try:
+        return _main()
+    finally:
+        _release_config_check_write_block()
+
+
+def _main():
     """Main entry point for hermes CLI."""
     # Cosmetic: make the process show up as 'hermes' instead of 'python3.11'
     # in ps/top/htop.  Non-fatal — just a nicer UX.
