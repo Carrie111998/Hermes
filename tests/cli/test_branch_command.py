@@ -158,6 +158,74 @@ class TestBranchCommandDef:
         assert "branch" in names
 
 
+def _children_of(session_db, parent_id):
+    """Return session ids whose parent_session_id == parent_id (direct SQL —
+    SessionDB has no generic list_sessions helper)."""
+    import sqlite3
+    with sqlite3.connect(session_db.db_path) as conn:
+        rows = conn.execute(
+            "SELECT id FROM sessions WHERE parent_session_id = ?", (parent_id,)
+        ).fetchall()
+    return [r[0] for r in rows]
+
+
+class TestBranchStayInPlace:
+    """/branch --stay creates the copy but keeps the original session active
+    (Factory Droid v0.196 fork-stays-in-place semantics)."""
+    def test_stay_keeps_current_session(self, cli_instance, session_db):
+        from cli import HermesCLI
+
+        original_id = cli_instance.session_id
+        HermesCLI._handle_branch_command(cli_instance, "/branch --stay")
+
+        # Still in the original session
+        assert cli_instance.session_id == original_id
+        # Original session was NOT ended
+        row = session_db.get_session(original_id)
+        assert row is not None
+        assert (row.get("end_reason") or "") != "branched"
+
+    def test_stay_creates_resumable_copy_with_history(self, cli_instance, session_db):
+        from cli import HermesCLI
+
+        original_id = cli_instance.session_id
+        HermesCLI._handle_branch_command(cli_instance, "/branch my copy --stay")
+
+        # A child session exists with the parent link and full history
+        children = _children_of(session_db, original_id)
+        assert len(children) == 1
+        child_id = children[0]
+        assert child_id != original_id
+        messages = session_db.get_messages_as_conversation(child_id)
+        assert len(messages) == 4
+        assert session_db.get_session_title(child_id) == "my copy"
+
+    def test_stay_does_not_fire_session_switch_hook(self, cli_instance, session_db):
+        """--stay never rotates the live session, so memory providers must
+        NOT be told the session switched."""
+        from cli import HermesCLI
+
+        agent = MagicMock()
+        mm = MagicMock()
+        agent._memory_manager = mm
+        cli_instance.agent = agent
+
+        HermesCLI._handle_branch_command(cli_instance, "/branch --stay")
+
+        mm.on_session_switch.assert_not_called()
+
+    def test_stay_flag_stripped_from_title(self, cli_instance, session_db):
+        """The --stay token itself must not leak into the branch title."""
+        from cli import HermesCLI
+
+        original_id = cli_instance.session_id
+        HermesCLI._handle_branch_command(cli_instance, "/branch --stay refactor path")
+
+        children = _children_of(session_db, original_id)
+        assert session_db.get_session_title(children[0]) == "refactor path"
+
+
+class TestBranchCommandDefCategory:
     def test_branch_in_session_category(self):
         """The branch command should be in the Session category."""
         from hermes_cli.commands import COMMAND_REGISTRY

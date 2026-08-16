@@ -78,6 +78,7 @@ gateway:
     switch_failed:         "Branche créée mais impossible de basculer dessus."
     branched_one:          "⑂ Branche **{title}** créée ({count} message copié)\nOriginal : `{parent}`\nBranche : `{new}`\nUtilisez `/resume` pour revenir à l'original."
     branched_many:         "⑂ Branche **{title}** créée ({count} messages copiés)\nOriginal : `{parent}`\nBranche : `{new}`\nUtilisez `/resume` pour revenir à l'original."
+    branched_stay:         "⑂ Branche **{title}** créée ({count} messages copiés)\nVous restez dans la session actuelle.\nOuvrez la branche à tout moment avec `/resume {new}`."
 
   commands:
     usage:                 "Utilisation : `/commands [page]`"

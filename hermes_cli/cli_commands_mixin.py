@@ -1178,11 +1178,16 @@ class CLICommandsMixin:
         self._handle_resume_command(f"/resume {arg}")
 
     def _handle_branch_command(self, cmd_original: str) -> None:
-        """Handle /branch [name] — fork the current session into a new independent copy.
+        """Handle /branch [name] [--stay] — fork the current session into a new copy.
 
         Copies the full conversation history to a new session so the user can
         explore a different approach without losing the original session state.
         Inspired by Claude Code's /branch command.
+
+        With ``--stay`` the current session remains active: the branch is
+        created in the background and a resume hint is printed instead of
+        switching into the copy (inspired by Factory Droid v0.196's
+        fork-stays-in-place behavior).
         """
         from cli import _cprint, _sync_process_session_id
         if not self.conversation_history:
@@ -1196,6 +1201,16 @@ class CLICommandsMixin:
 
         parts = cmd_original.split(None, 1)
         branch_name = parts[1].strip() if len(parts) > 1 else ""
+        stay_in_place = False
+        if branch_name:
+            arg_tokens = [tok for tok in branch_name.split() if tok]
+            kept: list[str] = []
+            for tok in arg_tokens:
+                if tok.lower() in ("--stay", "--no-switch"):
+                    stay_in_place = True
+                else:
+                    kept.append(tok)
+            branch_name = " ".join(kept)
 
         # Generate the new session ID
         now = datetime.now()
@@ -1227,11 +1242,14 @@ class CLICommandsMixin:
             except Exception:
                 pass
 
-        # End the old session
-        try:
-            self._session_db.end_session(self.session_id, "branched")
-        except Exception:
-            pass
+        # End the old session — unless we're staying in it (--stay), in which
+        # case the original keeps running untouched and only the copy is
+        # created.
+        if not stay_in_place:
+            try:
+                self._session_db.end_session(self.session_id, "branched")
+            except Exception:
+                pass
 
         # Create the new session with parent link.
         # Persist a stable ``_branched_from`` marker in model_config so
@@ -1289,6 +1307,24 @@ class CLICommandsMixin:
             self._session_db.set_session_title(new_session_id, branch_title)
         except Exception:
             pass
+
+        # --stay: keep working in the original session. The copy is left
+        # ended-but-resumable (same lifecycle as a branched-away parent), and
+        # we print the resume command instead of switching (Droid v0.196
+        # fork-stays-in-place semantics).
+        if stay_in_place:
+            try:
+                self._session_db.end_session(new_session_id, "branched")
+            except Exception:
+                pass
+            msg_count = len([m for m in self.conversation_history if m.get("role") == "user"])
+            _cprint(
+                f"  ⑂ Created branch \"{branch_title}\""
+                f" ({msg_count} user message{'s' if msg_count != 1 else ''} copied)"
+            )
+            _cprint(f"  Staying in session: {self.session_id}")
+            _cprint(f"  Open the branch anytime with: /resume {new_session_id}")
+            return
 
         # Switch to the new session
         self._transfer_session_yolo(self.session_id, new_session_id)

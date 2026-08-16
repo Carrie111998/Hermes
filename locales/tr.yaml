@@ -78,6 +78,7 @@ gateway:
     switch_failed:         "Dal oluşturuldu ancak ona geçilemedi."
     branched_one:          "⑂ **{title}** dalına geçildi ({count} mesaj kopyalandı)\nOrijinal: `{parent}`\nDal: `{new}`\nOrijinale geri dönmek için `/resume` kullanın."
     branched_many:         "⑂ **{title}** dalına geçildi ({count} mesaj kopyalandı)\nOrijinal: `{parent}`\nDal: `{new}`\nOrijinale geri dönmek için `/resume` kullanın."
+    branched_stay:         "⑂ **{title}** dalı oluşturuldu ({count} mesaj kopyalandı)\nMevcut oturumda kalıyorsunuz.\nDalı istediğiniz zaman `/resume {new}` ile açabilirsiniz."
 
   commands:
     usage:                 "Kullanım: `/commands [page]`"

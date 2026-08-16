@@ -82,6 +82,7 @@ gateway:
     switch_failed:         "Cruthaíodh an brainse ach theip ar athrú chuige."
     branched_one:          "⑂ Brainseáilte go **{title}** ({count} teachtaireacht cóipeáilte)\nBunaidh: `{parent}`\nBrainse: `{new}`\nÚsáid `/resume` chun filleadh ar an mbunaidh."
     branched_many:         "⑂ Brainseáilte go **{title}** ({count} teachtaireacht cóipeáilte)\nBunaidh: `{parent}`\nBrainse: `{new}`\nÚsáid `/resume` chun filleadh ar an mbunaidh."
+    branched_stay:         "⑂ Cruthaíodh brainse **{title}** ({count} teachtaireacht cóipeáilte)\nFanann tú sa seisiún reatha.\nOscail an brainse am ar bith le `/resume {new}`."
 
   commands:
     usage:                 "Úsáid: `/commands [page]`"

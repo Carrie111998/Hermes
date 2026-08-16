@@ -101,6 +101,7 @@ gateway:
     switch_failed:         "أُنشئ الفرع لكن تعذّر التبديل إليه."
     branched_one:          "⑂ تم التفريع إلى **{title}** (نُسخت {count} رسالة)\nالأصل: `{parent}`\nالفرع: `{new}`\nاستخدم `/resume` للعودة إلى الأصل."
     branched_many:         "⑂ تم التفريع إلى **{title}** (نُسخت {count} رسالة)\nالأصل: `{parent}`\nالفرع: `{new}`\nاستخدم `/resume` للعودة إلى الأصل."
+    branched_stay:         "⑂ تم إنشاء الفرع **{title}** (نُسخت {count} رسالة)\nستبقى في الجلسة الحالية.\nافتح الفرع في أي وقت باستخدام `/resume {new}`."
 
   commands:
     usage:                 "الاستخدام: `/commands [page]`"

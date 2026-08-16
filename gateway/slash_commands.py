@@ -4945,11 +4945,16 @@ class GatewaySlashCommandsMixin:
         )
 
     async def _handle_branch_command(self, event: MessageEvent) -> str:
-        """Handle /branch [name] — fork the current session into a new independent copy.
+        """Handle /branch [name] [--stay] — fork the current session into a new copy.
 
         Copies conversation history to a new session so the user can explore
         a different approach without losing the original.
         Inspired by Claude Code's /branch command.
+
+        With ``--stay`` the chat keeps its current session: the branch is
+        created in the background and a resume hint is returned instead of
+        switching into the copy (Factory Droid v0.196 fork-stays-in-place
+        semantics).
         """
         import uuid as _uuid
 
@@ -4967,6 +4972,15 @@ class GatewaySlashCommandsMixin:
             return t("gateway.branch.no_conversation")
 
         branch_name = event.get_command_args().strip()
+        stay_in_place = False
+        if branch_name:
+            kept = []
+            for tok in branch_name.split():
+                if tok.lower() in ("--stay", "--no-switch"):
+                    stay_in_place = True
+                else:
+                    kept.append(tok)
+            branch_name = " ".join(kept)
 
         # Generate the new session ID
         from datetime import datetime as _dt
@@ -5080,6 +5094,22 @@ class GatewaySlashCommandsMixin:
             await self._session_db.set_session_title(new_session_id, branch_title)
         except Exception:
             pass
+
+        # --stay: keep this chat on its current session. The copy is left
+        # ended-but-resumable and we return a resume hint instead of
+        # switching (Droid v0.196 fork-stays-in-place semantics).
+        if stay_in_place:
+            try:
+                await self._session_db.end_session(new_session_id, "branched")
+            except Exception:
+                pass
+            msg_count = len([m for m in history if m.get("role") == "user"])
+            return t(
+                "gateway.branch.branched_stay",
+                title=branch_title,
+                count=msg_count,
+                new=new_session_id,
+            )
 
         # Switch the session store entry to the new session
         new_entry = await self.async_session_store.switch_session(session_key, new_session_id)
