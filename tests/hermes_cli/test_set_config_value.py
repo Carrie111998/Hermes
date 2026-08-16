@@ -340,14 +340,19 @@ class TestListAppend:
 
         append_config_value(
             "hooks.pre_llm_call",
-            '{"name":"on","values":["off","null","ordinary"]}',
+            '{"name":"on","values":["off","null","ordinary"],'
+            '"metadata":{"on":"yes"}}',
         )
 
         import yaml
 
         saved = yaml.safe_load(_read_config(_isolated_hermes_home))
         assert saved["hooks"]["pre_llm_call"] == [
-            {"name": "on", "values": ["off", "null", "ordinary"]}
+            {
+                "name": "on",
+                "values": ["off", "null", "ordinary"],
+                "metadata": {"on": "yes"},
+            }
         ]
 
     def test_append_seeds_nonempty_default_list(self, _isolated_hermes_home):

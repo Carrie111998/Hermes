@@ -711,7 +711,8 @@ def atomic_roundtrip_yaml_append(
             return DoubleQuotedScalarString(item)
         if isinstance(item, dict):
             return CommentedMap(
-                (key, _yaml11_safe_value(child)) for key, child in item.items()
+                (_yaml11_safe_value(key), _yaml11_safe_value(child))
+                for key, child in item.items()
             )
         if isinstance(item, list):
             return CommentedSeq(_yaml11_safe_value(child) for child in item)
