@@ -751,7 +751,10 @@ Separately from the `tool_output` caps above, Hermes **persists** oversized
 tool results (file reads, searches, script output) to the sandbox and replaces
 them in-context with a short preview plus the file path. The default threshold
 is 100K characters for large-context models, scaled down proportionally for
-small models.
+small models. The value is read when an agent is initialized and remains
+fixed for that conversation; after changing it, start a new session (or restart
+the gateway) for the new threshold to take effect. This startup-time behavior
+preserves the conversation's stable prompt and cache prefix.
 
 Set `tools.tool_result_persist_threshold_chars` to override that default with
 an explicit cap:

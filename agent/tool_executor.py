@@ -107,9 +107,22 @@ def _budget_for_agent(agent) -> BudgetConfig:
         ctx = int(_ctx) if _ctx else None
     except Exception:
         ctx = None
-    explicit = normalize_persist_threshold(
-        getattr(agent, "_tool_result_persist_threshold_chars", None)
-    )
+    raw_explicit = getattr(agent, "_tool_result_persist_threshold_chars", None)
+    explicit = normalize_persist_threshold(raw_explicit)
+    if raw_explicit is not None and explicit is None:
+        if not getattr(agent, "_tool_result_persist_threshold_warning_emitted", False):
+            logger.warning(
+                "invalid programmatic tools.tool_result_persist_threshold_chars=%r; "
+                "ignoring (keeping context-scaled default)",
+                raw_explicit,
+            )
+            try:
+                agent._tool_result_persist_threshold_warning_emitted = True
+            except Exception:
+                # Some test doubles/plugins may use slot-only objects. The
+                # fallback remains safe; only the once-per-agent suppression
+                # is unavailable for those objects.
+                pass
     if explicit is not None:
         return budget_with_persist_threshold(explicit, ctx)
     return budget_for_context_window(ctx) if ctx else DEFAULT_BUDGET

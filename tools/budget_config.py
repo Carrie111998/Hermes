@@ -161,7 +161,7 @@ def normalize_persist_threshold(value) -> int | None:
 
 
 def budget_with_persist_threshold(
-    threshold_chars: int, context_length: int | None = None
+    threshold_chars: int | str | None, context_length: int | None = None
 ) -> BudgetConfig:
     """Return a BudgetConfig with an explicit per-result persistence cap.
 
@@ -172,8 +172,9 @@ def budget_with_persist_threshold(
     ``context_length`` is unknown), so a small model keeps its small-window
     turn-budget protection instead of being reset to the 200K default.
 
+    ``int`` values and whole-number strings are the supported inputs.
     Non-positive, ``None``, boolean, float/Decimal/Fraction, ``bytes`` or
-    unconvertible values are treated as "unset" (via
+    other unconvertible values are treated as "unset" (via
     ``normalize_persist_threshold``) and return the context-scaled budget
     unchanged (a 0/negative value must NOT clamp to 1, which would
     persist almost every tool result). ``resolve_threshold`` still applies

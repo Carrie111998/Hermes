@@ -8,6 +8,7 @@ context-scaled default; otherwise context scaling and the DEFAULT_BUDGET
 fallback behave exactly as before.
 """
 
+import logging
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -16,7 +17,7 @@ from tools.budget_config import (
     DEFAULT_BUDGET,
     DEFAULT_RESULT_SIZE_CHARS,
     DEFAULT_TURN_BUDGET_CHARS,
-    budget_with_persist_threshold,
+    budget_for_context_window,
 )
 
 
@@ -45,8 +46,9 @@ class TestExplicitThresholdPrecedence:
         agent = _agent(persist_threshold=20_000, context_length=65_536)
         cfg = _budget_for_agent(agent)
         assert cfg.default_result_size == 20_000
-        assert cfg.turn_budget == int(65_536 * 4 * 0.30)  # ~78,643 < 200K
-        assert cfg.preview_size == 1_500
+        scaled = budget_for_context_window(65_536)
+        assert cfg.turn_budget == scaled.turn_budget
+        assert cfg.preview_size == scaled.preview_size
         assert cfg.turn_budget < DEFAULT_TURN_BUDGET_CHARS
 
     def test_explicit_threshold_ignores_context_failure(self):
@@ -59,7 +61,10 @@ class TestExplicitThresholdPrecedence:
         agent = _agent(persist_threshold="not-an-int", context_length=65_536)
         cfg = _budget_for_agent(agent)
         assert cfg is not DEFAULT_BUDGET
-        assert cfg.default_result_size == int(65_536 * 4 * 0.15)  # 39,321
+        baseline = _budget_for_agent(
+            _agent(persist_threshold=None, context_length=65_536)
+        )
+        assert cfg.default_result_size == baseline.default_result_size
         agent2 = _agent(persist_threshold="not-an-int", context_length=None)
         assert _budget_for_agent(agent2) is DEFAULT_BUDGET
 
@@ -97,8 +102,11 @@ class TestExplicitThresholdPrecedence:
         # as agent_init and fall back to context scaling.
         agent = _agent(persist_threshold=True, context_length=65_536)
         cfg = _budget_for_agent(agent)
-        assert cfg.turn_budget == int(65_536 * 4 * 0.30)
-        assert cfg.default_result_size == int(65_536 * 4 * 0.15)
+        baseline = _budget_for_agent(
+            _agent(persist_threshold=None, context_length=65_536)
+        )
+        assert cfg.turn_budget == baseline.turn_budget
+        assert cfg.default_result_size == baseline.default_result_size
         assert cfg.default_result_size != 1
         assert cfg.turn_budget < DEFAULT_TURN_BUDGET_CHARS
         agent2 = _agent(persist_threshold=False, context_length=None)
@@ -109,5 +117,22 @@ class TestExplicitThresholdPrecedence:
         # are rejected wholesale so the rule stays simple and single-sourced.
         agent = _agent(persist_threshold=20_000.0, context_length=65_536)
         cfg = _budget_for_agent(agent)
-        assert cfg.default_result_size == int(65_536 * 4 * 0.15)
+        baseline = _budget_for_agent(
+            _agent(persist_threshold=None, context_length=65_536)
+        )
+        assert cfg.default_result_size == baseline.default_result_size
         assert cfg.default_result_size != 20_000
+
+    def test_invalid_programmatic_value_warns_once(self, caplog):
+        agent = _agent(persist_threshold="not-an-int", context_length=65_536)
+        with caplog.at_level(logging.WARNING, logger="agent.tool_executor"):
+            _budget_for_agent(agent)
+            _budget_for_agent(agent)
+
+        matches = [
+            record
+            for record in caplog.records
+            if "invalid programmatic tools.tool_result_persist_threshold_chars"
+            in record.getMessage()
+        ]
+        assert len(matches) == 1
