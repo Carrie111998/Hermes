@@ -351,6 +351,11 @@ export const host = {
 // commands, routes, themes, panes, composer extensions, and bar items with
 // the same area ids + payload types core uses.
 export { COMPOSER_AREAS, type ComposerAttachmentProvider, type ComposerMiddleware } from '@/app/chat/composer/contrib'
+/** THE embedded session surface — a native transcript + composer for an
+ *  explicitly-owned session (profile + stored id, never implicit). Plugin
+ *  panes mount this to render a full chat without foregrounding the session;
+ *  the profile always routes the resume/adopt to its owning backend. */
+export { SessionSurface, type SessionSurfaceIdentity, type SessionSurfaceProps } from '@/app/chat/session-surface'
 
 // -- ui: the design language --------------------------------------------------
 
