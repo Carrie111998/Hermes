@@ -1073,7 +1073,9 @@ def _resolve_windows_powershell_host() -> str:
     directory (and PATHEXT) before PATH, so an attacker-writable cwd can plant
     ``powershell.exe`` / ``.cmd`` / ``.bat`` and run arbitrary code under
     ``-ExecutionPolicy Bypass``. Prefer the well-known System32 host only —
-    never fall back to an unresolved bare name.
+    never fall back to an unresolved bare name. This closes cwd/PATHEXT host
+    planting; like other Windows process launches, it trusts the inherited
+    OS environment to provide the genuine ``SystemRoot`` / ``WINDIR``.
     """
     system_root = os.environ.get("SystemRoot") or os.environ.get("WINDIR")
     if not system_root:
