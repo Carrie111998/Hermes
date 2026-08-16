@@ -4,6 +4,7 @@ import { $rightRailActiveTabId, selectRightRailTab } from '@/store/layout'
 import { closeRightRail, openPreview, type PreviewTarget } from '@/store/preview'
 
 import { PREVIEW_READ_MAX_CHARS, readActivePreview, registerPreviewPageReader } from './preview-reader'
+import { $previewChat } from './preview-chat'
 
 function urlTarget(url: string): PreviewTarget {
   return { kind: 'url', label: 'Browser', source: url, url }
@@ -33,6 +34,7 @@ describe('readActivePreview (read_preview tool)', () => {
 
     cleanups = []
     closeRightRail()
+    $previewChat.set(null)
     window.localStorage.clear()
   })
 
@@ -136,5 +138,19 @@ describe('readActivePreview (read_preview tool)', () => {
     first()
 
     expect(await readActivePreview()).toMatchObject({ text: 'second' })
+  })
+
+  it('prefers the Browser tab when the asking session is pinned', async () => {
+    openPreview(urlTarget('https://example.com'), 'tool-result')
+    register('url:browser', async () => ({ text: 'page', title: 'Example', url: 'https://example.com' }))
+    openPreview(fileTarget('/work/notes.md'), 'file-browser')
+    $previewChat.set('run-main')
+
+    expect(await readActivePreview({ sessionId: 'run-main' })).toMatchObject({
+      kind: 'url',
+      text: 'page',
+      url: 'https://example.com'
+    })
+    expect(await readActivePreview({ sessionId: 'other' })).toMatchObject({ path: '/work/notes.md' })
   })
 })

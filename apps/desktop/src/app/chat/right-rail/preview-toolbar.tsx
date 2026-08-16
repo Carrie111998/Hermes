@@ -23,6 +23,7 @@ import { useI18n } from '@/i18n'
 import { ArrowUpRight, ChevronLeft, ChevronRight, RefreshCw } from '@/lib/icons'
 import { cn } from '@/lib/utils'
 
+import { PreviewChatControl } from './preview-chat-control'
 import { type ViewportMode } from './preview-viewport'
 import { PreviewViewportControl } from './preview-viewport-control'
 
@@ -141,6 +142,7 @@ export function PreviewToolbar({
         <RefreshCw className={cn(loading && 'animate-spin')} />
       </TooltipIconButton>
       <PreviewViewportControl mode={viewport} onModeChange={onViewportChange} />
+      <PreviewChatControl />
     </form>
   )
 }

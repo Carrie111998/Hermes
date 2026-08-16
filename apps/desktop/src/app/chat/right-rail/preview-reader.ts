@@ -15,6 +15,8 @@
 import { $rightRailActiveTabId } from '@/store/layout'
 import { $previewTabs } from '@/store/preview'
 
+import { $previewChat } from './preview-chat'
+
 export interface PreviewReadOptions {
   /** Characters to return from `start` (capped at PREVIEW_READ_MAX_CHARS). */
   count?: number
@@ -74,9 +76,13 @@ function windowText(
 }
 
 /** Read the ACTIVE preview tab. Null only when no tab is open at all. */
-export async function readActivePreview(opts: PreviewReadOptions = {}): Promise<PreviewReadResult | null> {
+export async function readActivePreview(
+  opts: PreviewReadOptions & { sessionId?: string } = {}
+): Promise<PreviewReadResult | null> {
   const tabs = $previewTabs.get()
-  const tab = tabs.find(t => t.id === $rightRailActiveTabId.get()) ?? tabs[0]
+  const pinned = opts.sessionId && $previewChat.get() === opts.sessionId
+  const browser = tabs.find(t => t.id === 'url:browser')
+  const tab = (pinned && browser) || tabs.find(t => t.id === $rightRailActiveTabId.get()) || tabs[0]
 
   if (!tab) {
     return null

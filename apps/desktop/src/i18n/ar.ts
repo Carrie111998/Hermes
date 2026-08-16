@@ -2268,7 +2268,11 @@ export const ar = defineLocale({
       viewportMobile: 'جوال',
       viewportWidth: 'العرض',
       viewportHeight: 'الارتفاع',
-      viewportApply: 'تطبيق'
+      viewportApply: 'تطبيق',
+      chat: 'اختيار الصفحة للدردشة',
+      chatNone: 'التبويب النشط',
+      chatTile: 'بلاطة',
+      chatEmpty: 'لا توجد دردشات مفتوحة'
     }
   },
   zones: {

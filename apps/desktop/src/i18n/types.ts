@@ -2420,6 +2420,10 @@ export interface Translations {
       viewportWidth: string
       viewportHeight: string
       viewportApply: string
+      chat: string
+      chatNone: string
+      chatTile: string
+      chatEmpty: string
     }
   }
 

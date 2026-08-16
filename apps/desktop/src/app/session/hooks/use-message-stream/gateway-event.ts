@@ -1300,7 +1300,7 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
           const start = typeof payload?.start === 'number' ? payload.start : undefined
           const count = typeof payload?.count === 'number' ? payload.count : undefined
 
-          void readActivePreview({ count, start }).then(result => {
+          void readActivePreview({ count, sessionId: sessionId ?? undefined, start }).then(result => {
             void $gateway.get()?.request('preview.read.respond', {
               request_id: requestId,
               text: result ? JSON.stringify(result) : ''

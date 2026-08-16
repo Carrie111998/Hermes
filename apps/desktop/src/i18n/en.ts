@@ -2835,7 +2835,11 @@ export const en: Translations = {
       viewportMobile: 'Mobile',
       viewportWidth: 'Viewport width',
       viewportHeight: 'Viewport height',
-      viewportApply: 'Apply'
+      viewportApply: 'Apply',
+      chat: 'Select page for chat',
+      chatNone: 'Active tab',
+      chatTile: 'Tile',
+      chatEmpty: 'No open chats'
     }
   },
 

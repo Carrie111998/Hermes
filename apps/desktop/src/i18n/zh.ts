@@ -3008,7 +3008,11 @@ export const zh: Translations = {
       viewportMobile: '手机',
       viewportWidth: '宽度',
       viewportHeight: '高度',
-      viewportApply: '应用'
+      viewportApply: '应用',
+      chat: '为对话选择页面',
+      chatNone: '当前标签',
+      chatTile: '分栏',
+      chatEmpty: '没有打开的对话'
     }
   },
 

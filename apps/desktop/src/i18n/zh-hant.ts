@@ -2466,7 +2466,11 @@ export const zhHant = defineLocale({
       viewportMobile: '手機',
       viewportWidth: '寬度',
       viewportHeight: '高度',
-      viewportApply: '套用'
+      viewportApply: '套用',
+      chat: '為對話選擇頁面',
+      chatNone: '目前分頁',
+      chatTile: '分欄',
+      chatEmpty: '沒有開啟的對話'
     }
   },
 
