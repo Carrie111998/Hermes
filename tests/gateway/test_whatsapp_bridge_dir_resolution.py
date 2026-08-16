@@ -71,6 +71,10 @@ def test_readonly_install_refreshes_existing_mirror_without_deleting_dependencie
     existing = hermes_home / "scripts" / "whatsapp-bridge"
     existing.mkdir(parents=True)
     (existing / "bridge.js").write_text("// stale bridge\n")
+    (existing / "removed-helper.js").write_text("// removed upstream\n")
+    removed_dir = existing / "removed-source-dir"
+    removed_dir.mkdir()
+    (removed_dir / "old.js").write_text("// removed upstream\n")
     node_modules = existing / "node_modules"
     node_modules.mkdir()
     dependency_marker = node_modules / "keep-me"
@@ -96,6 +100,8 @@ def test_readonly_install_refreshes_existing_mirror_without_deleting_dependencie
     assert resolved == existing
     assert (existing / "bridge.js").read_text() == "// bridge\n"
     assert (existing / "bridge_auth.js").read_text() == "// auth helper\n"
+    assert not (existing / "removed-helper.js").exists()
+    assert not removed_dir.exists()
     assert dependency_marker.read_text() == "installed"
 
 

@@ -547,6 +547,25 @@ def resolve_whatsapp_bridge_dir() -> Path:
             dirs_exist_ok=True,
             ignore=shutil.ignore_patterns("node_modules"),
         )
+        # copytree overlays changed files but does not remove packaged source
+        # files deleted by an update. Reconcile those stale paths after the
+        # copy while leaving the dependency tree under npm's ownership.
+        mirrored_paths = sorted(
+            hermes_home_bridge.rglob("*"),
+            key=lambda path: len(path.parts),
+            reverse=True,
+        )
+        for mirrored_path in mirrored_paths:
+            relative_path = mirrored_path.relative_to(hermes_home_bridge)
+            if relative_path.parts[0] == "node_modules":
+                continue
+            install_path = install_bridge / relative_path
+            if install_path.exists() or install_path.is_symlink():
+                continue
+            if mirrored_path.is_dir() and not mirrored_path.is_symlink():
+                mirrored_path.rmdir()
+            else:
+                mirrored_path.unlink()
         return hermes_home_bridge
     except Exception:
         return hermes_home_bridge if hermes_home_bridge.exists() else install_bridge
