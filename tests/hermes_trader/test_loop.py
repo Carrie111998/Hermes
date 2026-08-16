@@ -253,6 +253,7 @@ def test_live_approved_cycle_submits_via_mcp(tmp_path, monkeypatch):
         min_confidence=0.5,
         max_position_pct=10.0,
         min_pool_liquidity_usd=100_000.0,
+        pool_data_fallback="none",
     )
     recorder = McpRecorder()
 

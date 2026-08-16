@@ -184,7 +184,7 @@ def test_retrieve_context_includes_strategic_and_working(episode_db):
 def test_cycle_records_episode_and_next_retrieves(tmp_path):
     recorder = McpRecorder()
     store = EpisodeStore(tmp_path / "episodes.db")
-    cfg = TraderConfig(mode="paper")
+    cfg = TraderConfig(mode="paper", pool_data_fallback="none")
 
     run_trading_cycle(config=cfg, mcp_call=recorder, episode_store=store)
     assert store.count() == 1
