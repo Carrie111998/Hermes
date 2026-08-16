@@ -1,6 +1,6 @@
 ---
 title: "ARCH-003 implementation plan: runtime-state audit and replay verification"
-status: IMPLEMENTATION_PLAN_REVISE_V20_PENDING
+status: IMPLEMENTATION_PLAN_REVISE_V21_PENDING
 date: 2026-08-16
 type: implementation-plan
 ticket: ARCH-003
@@ -359,6 +359,13 @@ Migration compatibility tests must assert this posture.
 - Use the caller's existing SQLite WAL connection and transaction for mutation
   and genesis events, update the materialized generation marker, and record the
   current generation in the event.
+- After all replay-tuple-changing updates in the transaction, read the
+  trigger-produced materialized counter back from the row before inserting the
+  event; record the counter observed before the first update and the actual
+  persisted after-counter, never a predicted `+1`. Intermediate updates are
+  not externally visible under the transaction. Gate 4 must exercise a
+  multi-statement replay-tuple mutation and assert that the event after-counter
+  equals the materialized counter at commit.
 - Any mutation/genesis journal constraint or write failure aborts the complete
   enclosing materialized-state mutation; errors must not be swallowed.
 - The CAS caller receives a typed bounded `WRITE_ABORT` refusal for
@@ -467,13 +474,18 @@ Add deterministic tests for:
   newer-epoch roll-forward clearing that mode, baseline refusal across a
   counter gap returning `WRITE_ABORT`, separately authorized same-epoch
   re-originating genesis restoring mutation ability, atomic concurrent startup
-  advancing exactly once, and concurrent generation advance during verify
-  returning `CONSISTENT` or `UNKNOWN`, never false `DRIFT`;
+  advancing exactly once, delivery recording of the blocked interval, and
+  concurrent generation advance during verify returning `CONSISTENT` or
+  `UNKNOWN`, never false `DRIFT`;
+- concurrent startup, global downgrade-unsafe blocking, newer-epoch exit, and
+  blocked-interval delivery recording are covered by the preceding test;
 - a newly created post-migration entity whose first journaled mutation is a
   marked genesis and reaches `CONSISTENT` after a valid follow-up mutation;
 - first post-generation-advance mutation emitting a marked genesis, with a
   plain mutation alone unable to re-establish the epoch;
 - one event per committed replay-tuple mutation;
+- multi-statement replay-tuple mutation reads back the trigger-produced
+  after-counter and matches the event at commit;
 - true no-op without an event;
 - owner-version-only mutation;
 - mutation/genesis journal failure rolling back materialized state with
@@ -485,9 +497,6 @@ Add deterministic tests for:
   start;
 - SQLite WAL, fixed `SQLITE_BUSY_TIMEOUT = 5s`, `BEGIN IMMEDIATE`, and
   read-only WAL preconditions;
-- concurrent upgraded startup compare-and-set advancing the generation exactly
-  once, global downgrade-unsafe write blocking, newer-epoch roll-forward exit,
-  and delivery recording of the blocked interval;
 - `LOCK_ACQUIRE_TIMEOUT = 5s`, `SQLITE_BUSY_TIMEOUT = 5s`,
   `LOCK_TIMEOUT` reason, stale-holder recovery, shared/exclusive
   cross-process RW-lock exclusion/release ordering, and pre-lock key
@@ -824,6 +833,21 @@ DGX changes, deployment, repair, or event-sourcing. The corrected plan must
 return to the same authenticated Claude reviewer family and then to AGY on the
 identical packet.
 
+## Implementation-plan review reconciliation v20
+
+The v20 authenticated Claude Opus review returned `REVISE` with three bounded
+plan-text corrections. The corrections are incorporated above:
+
+1. Mutation/genesis records the database trigger's actual after-counter by
+   in-transaction read-back, including multi-statement mutation coverage.
+2. Acceptance coverage now includes v19.
+3. Duplicate Gate 4 startup/downgrade tests are merged into one matrix entry.
+
+These remain plan-only corrections and do not authorize source edits, tests,
+DGX changes, deployment, repair, or event-sourcing. The corrected plan must
+return to the same authenticated Claude reviewer family and then to AGY on the
+identical packet.
+
 ## Acceptance criteria
 
 ARCH-003 implementation is ready for its delivery gates only when:
@@ -852,7 +876,7 @@ ARCH-003 implementation is ready for its delivery gates only when:
   retention job; entities beyond the replay limit remain UNKNOWN in this ticket,
   and the 100,000-event/100 MiB per-profile threshold is a documented follow-up
   operational review, not an in-ticket operator gate;
-- reconciliation v1 and v5-v18 items are incorporated into the normative
+- reconciliation v1 and v5-v19 items are incorporated into the normative
   Gates 0-4 text (with v2-v4 explicitly folded into the v1/v4 text), and this
   merged plan revision receives the same-family re-review;
 - all focused and relevant tests pass;
@@ -899,6 +923,8 @@ ARCH-003 implementation is ready for its delivery gates only when:
   consequence, and atomic counter migration initialization.
 - v19: global downgrade-unsafe scope and exit, startup compare-and-set,
   pre-lock key check, and complete coverage.
+- v20: trigger counter read-back, multi-statement mutation coverage, and
+  deduplicated startup/downgrade tests.
 
 
 ## Non-goals
