@@ -253,6 +253,13 @@ export function EnvVarRow({
         )}
       </div>
 
+      {info.onepassword_stale && (
+        <p className="text-xs text-amber-500">
+          {t.env.onePasswordStaleHint ??
+            "Mapped to 1Password, but a stale value is still stored here. Remove it to let 1Password manage this key."}
+        </p>
+      )}
+
       <p className="text-xs text-muted-foreground">{info.description}</p>
 
       {info.tools.length > 0 && (

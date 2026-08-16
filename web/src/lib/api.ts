@@ -1976,6 +1976,11 @@ export interface EnvVarInfo {
   /** 'onepassword' when this key is resolved via the 1Password secret source
    * (secrets.onepassword.env in config.yaml) rather than stored in .env. */
   managed_by?: string | null;
+  /** True when this key is mapped via secrets.onepassword.env AND a stale
+   * plaintext value still exists in .env. save_env_value() refuses any Save
+   * for it until the stale value is removed, even though the row renders
+   * as a normal editable key (managed_by is null). */
+  onepassword_stale?: boolean;
 }
 
 export interface TelegramOnboardingStartResponse {

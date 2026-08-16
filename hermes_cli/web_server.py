@@ -7436,22 +7436,51 @@ def _get_env_vars_sync(profile: Optional[str] = None):
     with _profile_scope(profile):
         env_on_disk = load_env()
         onepassword_keys = onepassword_managed_env_keys()
+        # A key can be *mapped* via secrets.onepassword.env yet still show up
+        # in os.environ for reasons that have nothing to do with 1Password
+        # (a same-named shell export, or a prior `op` resolution that failed
+        # or never ran) — a bare `var_name in onepassword_keys` + os.environ
+        # check would mislabel that row "Managed via 1Password" while the
+        # value actually came from the shell (review finding #1). Resolve
+        # this profile's provenance explicitly: hydrate_profile_secret_sources()
+        # never mutates os.environ and is a cached no-op after the first call
+        # per home (it's what the process's own startup already ran for the
+        # default profile), so this costs nothing on the hot path.
+        from hermes_cli.env_loader import get_secret_source, hydrate_profile_secret_sources
+
+        onepassword_resolved = hydrate_profile_secret_sources(get_hermes_home())
 
         def _row(var_name: str, info: dict, *, custom: bool = False) -> dict:
             value = env_on_disk.get(var_name)
+            # A key mapped via secrets.onepassword.env that still has a real
+            # plaintext value on disk (`hermes secrets onepassword set` maps
+            # a key without deleting any stale .env copy). Surfaced as
+            # ``onepassword_stale`` so the UI can hint that this row's Save
+            # button will be refused by save_env_value()'s 1Password guard
+            # until the stale value is removed — otherwise the row looks like
+            # a normal editable key (see below) and every Save attempt
+            # produces an unexplained error toast (final-review finding #2).
+            onepassword_stale = var_name in onepassword_keys and bool(value)
             # Only treat this row as 1Password-managed when there is NOT
-            # already a real plaintext value in .env for it. `hermes secrets
-            # onepassword set` maps a key without deleting any stale .env
-            # copy, so if one is still on disk the row must behave like a
-            # normal editable key (final-review finding #2) — otherwise the
-            # locked "Managed via 1Password" badge hides the only UI control
-            # that could remove the stale plaintext secret.
-            managed_by_onepassword = var_name in onepassword_keys and not value
+            # already a real plaintext value in .env for it AND the
+            # onepassword source actually resolved this var for this
+            # profile — never infer "managed" from os.environ alone.
+            # If a stale .env copy is present the row must behave like a
+            # normal editable key — otherwise the locked "Managed via
+            # 1Password" badge hides the only UI control that could remove
+            # the stale plaintext secret.
+            managed_by_onepassword = (
+                var_name in onepassword_keys
+                and not value
+                and get_secret_source(var_name) == "onepassword"
+            )
             if managed_by_onepassword:
-                # Resolved into this process's os.environ at startup by the
-                # onepassword secret source — intentionally never written to
-                # .env (docs/rfcs/2026-08-onepassword-provider-keys.md).
-                value = os.environ.get(var_name)
+                # Resolved by the onepassword secret source for this profile
+                # — intentionally never written to .env
+                # (docs/rfcs/2026-08-onepassword-provider-keys.md). Prefer
+                # the source's own resolved value over os.environ, which is
+                # only correct for the process's own default profile.
+                value = onepassword_resolved.get(var_name) or os.environ.get(var_name)
             cat_meta = catalog_meta.get(var_name) or {}
             # Hand OPTIONAL_ENV_VARS prose wins where present; the catalog fills any
             # gaps (description/url) and always supplies provider grouping hints.
@@ -7480,6 +7509,7 @@ def _get_env_vars_sync(profile: Optional[str] = None):
                 # hiding everything it doesn't recognise.
                 "custom": custom,
                 "managed_by": "onepassword" if managed_by_onepassword else None,
+                "onepassword_stale": onepassword_stale,
             }
 
         result = {}
