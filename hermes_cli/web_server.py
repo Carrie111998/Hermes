@@ -83,6 +83,7 @@ from hermes_cli.config import (
     write_platform_config_field,
     _deep_merge,
 )
+from hermes_cli.skin_engine import builtin_skin_names
 from plugins.memory.config_schema import (
     ProviderConfigSchema,
     ProviderField,
@@ -960,10 +961,7 @@ _SCHEMA_OVERRIDES: Dict[str, Dict[str, Any]] = {
     "display.skin": {
         "type": "select",
         "description": "CLI visual theme",
-        "options": [
-            "default", "ares", "mono", "slate", "nous-blue-contrast",
-            "daylight", "warm-lightmode", "poseidon", "sisyphus", "charizard",
-        ],
+        "options": builtin_skin_names(),
     },
     "dashboard.theme": {
         "type": "select",

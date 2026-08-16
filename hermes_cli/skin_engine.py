@@ -830,6 +830,11 @@ _active_skin: Optional[SkinConfig] = None
 _active_skin_name: str = "default"
 
 
+def builtin_skin_names() -> List[str]:
+    """Return built-in skin names in display order."""
+    return list(_BUILTIN_SKINS)
+
+
 def _skins_dir() -> Path:
     """User skins directory."""
     return get_hermes_home() / "skins"

@@ -51,11 +51,11 @@ describe("Nous Blue Contrast terminal palette", () => {
     expect(nousBlueContrastTheme.palette).toBe(nousBlueTheme.palette);
     expect(nousBlueContrastTheme.typography).toBe(nousBlueTheme.typography);
     expect(nousBlueContrastTheme.layout).toBe(nousBlueTheme.layout);
-    expect(nousBlueContrastTheme.terminalBackground).toBe(
-      nousBlueTheme.seriesColors?.inputTokenAccent,
-    );
-    expect(nousBlueContrastTheme.terminalForeground).toBe(
+    expect(nousBlueContrastTheme.terminalBackground).not.toBe(
       nousBlueTheme.terminalBackground,
+    );
+    expect(nousBlueContrastTheme.terminalForeground).not.toBe(
+      nousBlueTheme.terminalForeground,
     );
   });
 });

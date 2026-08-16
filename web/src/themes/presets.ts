@@ -213,6 +213,8 @@ export const nousBlueContrastTheme: DashboardTheme = {
   name: "nous-blue-contrast",
   label: "Nous Blue Contrast",
   description: "Nous Blue with a navy, high-contrast terminal",
+  // Keep these independent of Nous Blue's chart accents: changing the light
+  // theme must not silently recolor this theme's terminal canvas.
   terminalBackground: "#001934",
   terminalForeground: "#f5f8fc",
 };
