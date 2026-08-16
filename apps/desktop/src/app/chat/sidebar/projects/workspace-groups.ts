@@ -760,58 +760,6 @@ export function overlayLiveLanes(
   return { ...project, repos, sessionCount: repos.reduce((n, repo) => n + repo.sessionCount, 0) }
 }
 
-/**
- * When drill-in hydration has not landed yet (or failed), the overview node
- * still carries `previewSessions` — the same recent rows the project row
- * showed before enter. Seed empty main lanes from those previews so the
- * entered view never renders as a stale subset of `$sessions` overlay alone.
- */
-export function seedEmptyLanesFromPreviews(project: SidebarProjectTree): SidebarProjectTree {
-  const previews = project.previewSessions ?? []
-
-  if (!previews.length) {
-    return project
-  }
-
-  let changed = false
-
-  const repos = project.repos.map(repo => {
-    if (repo.groups.some(group => group.sessions.length > 0)) {
-      return repo
-    }
-
-    if (!repo.groups.length) {
-      return repo
-    }
-
-    const sorted = [...previews].sort((a, b) => sessionRecency(b) - sessionRecency(a))
-    const mainIdx = repo.groups.findIndex(group => group.isMain || group.isHome)
-    const targetIdx = mainIdx >= 0 ? mainIdx : 0
-
-    changed = true
-
-    const groups = repo.groups.map((group, index) =>
-      index === targetIdx ? { ...group, sessions: sorted } : group
-    )
-
-    return {
-      ...repo,
-      groups,
-      sessionCount: sorted.length
-    }
-  })
-
-  if (!changed) {
-    return project
-  }
-
-  return {
-    ...project,
-    repos,
-    sessionCount: repos.reduce((n, repo) => n + repo.sessionCount, 0)
-  }
-}
-
 interface PreviewOverlayOptions {
   removed?: ReadonlySet<string>
   /** The active sort key as an id order; recency when empty. */

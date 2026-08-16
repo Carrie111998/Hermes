@@ -159,7 +159,6 @@ import {
   ProjectBackRow,
   ProjectMenu,
   projectTreeCwd,
-  seedEmptyLanesFromPreviews,
   sessionRecency as sessionTime,
   type SidebarProjectTree,
   type SidebarSessionGroup,
@@ -972,8 +971,6 @@ export function ChatSidebar({
 
   // Prefer the hydrated tree; fall back to the overview node (empty lanes) while
   // the drill-in fetch is in flight, so the header/structure render immediately.
-  // Seed empty lanes from overview previews so the entered view never paints as
-  // only whatever `$sessions` happens to still carry for this cwd.
   const enteredProject = useMemo<SidebarProjectTree | undefined>(() => {
     if (!overviewEnteredProject) {
       return undefined
@@ -982,12 +979,7 @@ export function ChatSidebar({
     const hydrated =
       enteredProjectTree && enteredProjectTree.id === overviewEnteredProject.id
         ? enteredProjectTree
-        : seedEmptyLanesFromPreviews({
-            ...overviewEnteredProject,
-            // Carry previews onto the fallback node explicitly — the overview
-            // already has them, but keep the seed helper's contract obvious.
-            previewSessions: overviewEnteredProject.previewSessions
-          })
+        : overviewEnteredProject
 
     // The live-session overlay (creates/evictions) is applied per-repo in
     // RepoFlatSection, AFTER the visual git-worktree lanes are merged in (so

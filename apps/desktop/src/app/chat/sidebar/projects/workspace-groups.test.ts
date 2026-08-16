@@ -12,7 +12,6 @@ import {
   NO_PROJECT_ID,
   overlayLiveLanes,
   overlayLivePreviews,
-  seedEmptyLanesFromPreviews,
   sessionProjectColor,
   type SidebarProjectTree,
   type SidebarSessionGroup,
@@ -1064,71 +1063,6 @@ describe('overlayLiveLanes', () => {
     // Session must appear only in the worktree lane
     expect(featureLane?.sessions.map(s => s.id)).toEqual(['moved'])
     expect(overlaid.sessionCount).toBe(1)
-  })
-})
-
-describe('seedEmptyLanesFromPreviews', () => {
-  it('seeds empty main lanes from overview previewSessions', () => {
-    const recent = makeSession('/www/app', { id: 'recent', last_active: 200, started_at: 200 })
-    const older = makeSession('/www/app', { id: 'older', last_active: 100, started_at: 100 })
-
-    const project = projectNode({
-      id: 'p_app',
-      path: '/www/app',
-      previewSessions: [older, recent],
-      sessionCount: 40,
-      repos: [
-        {
-          id: '/www/app',
-          label: 'app',
-          path: '/www/app',
-          sessionCount: 40,
-          groups: [
-            lane({
-              id: '/www/app::branch::main',
-              label: 'main',
-              isMain: true,
-              path: '/www/app',
-              sessions: []
-            })
-          ]
-        }
-      ]
-    })
-
-    const seeded = seedEmptyLanesFromPreviews(project)
-
-    expect(seeded.repos[0].groups[0].sessions.map(s => s.id)).toEqual(['recent', 'older'])
-    expect(seeded.sessionCount).toBe(2)
-  })
-
-  it('leaves already-hydrated lanes untouched', () => {
-    const existing = makeSession('/www/app', { id: 'backend-row', last_active: 50 })
-    const preview = makeSession('/www/app', { id: 'preview-only', last_active: 200 })
-
-    const project = projectNode({
-      id: 'p_app',
-      previewSessions: [preview],
-      repos: [
-        {
-          id: '/www/app',
-          label: 'app',
-          path: '/www/app',
-          sessionCount: 1,
-          groups: [
-            lane({
-              id: '/www/app::branch::main',
-              label: 'main',
-              isMain: true,
-              path: '/www/app',
-              sessions: [existing]
-            })
-          ]
-        }
-      ]
-    })
-
-    expect(seedEmptyLanesFromPreviews(project)).toBe(project)
   })
 })
 
