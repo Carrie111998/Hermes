@@ -2126,6 +2126,14 @@ run_with_timeout() {
             # `--foreground`, `timeout` puts COMMAND in its own process group
             # and the deadline kill reaches that whole group, so the download
             # actually dies with it.
+            #
+            # Accepted tradeoff: this reintroduces the #35166 behavior the flag was
+            # added to avoid — a terminal Ctrl+C now reaches `timeout`'s own process
+            # group, not COMMAND directly, so interactive interrupt only force-kills
+            # at the deadline instead of immediately. Every real caller here (npx,
+            # npm, uv, bash -c) spawns the actual work as a descendant, so
+            # `--foreground`'s benefit never applied to them while its cost
+            # (surviving descendants) did.
             if "$timeout_bin" -k 10 1 true >/dev/null 2>&1; then
                 "$timeout_bin" -k 10 "$timeout_seconds" "$@"
             else
