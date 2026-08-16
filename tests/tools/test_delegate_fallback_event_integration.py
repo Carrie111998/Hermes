@@ -8,7 +8,7 @@ from types import MappingProxyType, SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import httpx
-from openai import NotFoundError
+from openai import APIStatusError, NotFoundError, RateLimitError
 
 from agent.chat_completion_helpers import sanitize_fallback_event
 from run_agent import AIAgent
@@ -238,6 +238,27 @@ def _assert_sanitized_event(event, expected, sentinels):
     assert len(serialized.encode("utf-8")) <= 768
 
 
+def _pool_with_no_successful_rotation():
+    """Keep late fallback reachable without simulating a recovered key."""
+    current = SimpleNamespace(
+        id="credential-1",
+        runtime_api_key="test-key",
+        last_status=None,
+    )
+    alternate = SimpleNamespace(
+        id="credential-2",
+        runtime_api_key="alternate-key",
+        last_status=None,
+    )
+    pool = MagicMock()
+    pool.provider = "ollama"
+    pool.current.return_value = current
+    pool.entries.return_value = [current, alternate]
+    pool.has_available.return_value = True
+    pool.mark_exhausted_and_rotate.return_value = None
+    return pool
+
+
 def test_sdk_not_found_max_retry_fallback_retains_only_safe_http_status(
     tmp_path, monkeypatch
 ):
@@ -328,6 +349,110 @@ def test_nonretryable_sdk_error_fallback_retains_classification_without_raw_data
             "http_status": 404,
         },
         (secret_sentinel, body_sentinel),
+    )
+
+
+def test_max_retry_rate_limit_diagnostic_does_not_start_new_cooldown(
+    tmp_path, monkeypatch
+):
+    """Late diagnostic forwarding cannot add behavioral rate-limit state."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
+    message_sentinel = "SENTINEL_MESSAGE_MUST_NOT_SURVIVE"
+    body_sentinel = "SENTINEL_BODY_MUST_NOT_SURVIVE"
+    primary_error = RateLimitError(
+        message=f"rate limit {message_sentinel}",
+        response=httpx.Response(
+            429,
+            request=httpx.Request(
+                "POST", "http://localhost:11434/v1/chat/completions"
+            ),
+        ),
+        body={"error": {"message": body_sentinel}},
+    )
+    child = _loop_child(
+        base_url="http://localhost:11434/v1",
+        model="nemotron-3.5-lightning:30b-mlx",
+        max_iterations=4,
+    )
+    child._credential_pool = _pool_with_no_successful_rotation()
+    child._credential_pool_entry_id = "credential-1"
+    child._rate_limit_backoff_count = 0
+    child._rate_limited_until = 0
+
+    result, calls = _run_loop_with_fallback(child, primary_error)
+
+    assert result["completed"] is True
+    assert calls == [
+        ("ollama", "nemotron-3.5-lightning:30b-mlx"),
+        ("ollama", "nemotron-3.5-lightning:30b-mlx"),
+        ("ollama", "nemotron-3.5-lightning:30b-mlx"),
+        ("ollama-cloud", "glm-5.2"),
+    ]
+    assert child._rate_limit_backoff_count == 0
+    assert child._rate_limited_until == 0
+    _assert_sanitized_event(
+        child._last_fallback_event,
+        {
+            "initial_provider": "ollama",
+            "initial_model": "nemotron-3.5-lightning:30b-mlx",
+            "selected_fallback_provider": "ollama-cloud",
+            "selected_fallback_model": "glm-5.2",
+            "failure_class": "quota",
+            "reason_code": "rate_limit",
+            "http_status": 429,
+        },
+        (message_sentinel, body_sentinel),
+    )
+
+
+def test_nonretryable_billing_diagnostic_does_not_start_new_cooldown(
+    tmp_path, monkeypatch
+):
+    """Late billing diagnostics preserve the former no-cooldown behavior."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
+    message_sentinel = "SENTINEL_MESSAGE_MUST_NOT_SURVIVE"
+    body_sentinel = "SENTINEL_BODY_MUST_NOT_SURVIVE"
+    primary_error = APIStatusError(
+        message=f"credits exhausted {message_sentinel}",
+        response=httpx.Response(
+            402,
+            request=httpx.Request(
+                "POST", "http://localhost:11434/v1/chat/completions"
+            ),
+        ),
+        body={"error": {"message": body_sentinel}},
+    )
+    child = _loop_child(
+        base_url="http://localhost:11434/v1",
+        model="nemotron-3.5-lightning:30b-mlx",
+        max_iterations=2,
+    )
+    child._credential_pool = _pool_with_no_successful_rotation()
+    child._credential_pool_entry_id = "credential-1"
+    child._rate_limit_backoff_count = 0
+    child._rate_limited_until = 0
+
+    result, calls = _run_loop_with_fallback(child, primary_error)
+
+    assert result["completed"] is True
+    assert calls == [
+        ("ollama", "nemotron-3.5-lightning:30b-mlx"),
+        ("ollama-cloud", "glm-5.2"),
+    ]
+    assert child._rate_limit_backoff_count == 0
+    assert child._rate_limited_until == 0
+    _assert_sanitized_event(
+        child._last_fallback_event,
+        {
+            "initial_provider": "ollama",
+            "initial_model": "nemotron-3.5-lightning:30b-mlx",
+            "selected_fallback_provider": "ollama-cloud",
+            "selected_fallback_model": "glm-5.2",
+            "failure_class": "quota",
+            "reason_code": "billing",
+            "http_status": 402,
+        },
+        (message_sentinel, body_sentinel),
     )
 
 
