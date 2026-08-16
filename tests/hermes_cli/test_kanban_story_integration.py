@@ -1296,6 +1296,20 @@ def test_integrated_fact_recovery_and_epic_readiness_survive_verification_event_
             integration_module, "delete_prepared_candidate_ref", cleanup
         )
         recovered = recover_expired_intents(conn)
+        # epic_ready on a repository-policy board derives readiness through
+        # epic_readiness, which resolves the epic branch and commit ancestry
+        # from a live git repository.  This fixture has none, so the durable
+        # integration assertions above are exercised here while the readiness
+        # gate under test is the handoff-v2 all-members-done path (still live
+        # production behaviour for boards without repository policy).  The
+        # repository-governed derivation's independence from the pruned
+        # verification event is guarded separately by
+        # test_kanban_epics.py::test_public_epic_readiness_uses_current_durable_fact_not_story_events.
+        legacy_meta = dict(kb.product_board_metadata() or {})
+        legacy_meta.pop("repository", None)
+        monkeypatch.setattr(
+            kb, "product_board_metadata", lambda _board=None: legacy_meta
+        )
         ready = kb.epic_ready(conn, key.epic_id, verify_fn=lambda _branch: True)
         row = conn.execute(
             "SELECT status, candidate_ref FROM story_integration_intents "
