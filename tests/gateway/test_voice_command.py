@@ -114,6 +114,34 @@ class TestHandleVoiceCommand:
         assert runner._voice_mode["telegram:123"] == "off"
 
     @pytest.mark.asyncio
+    async def test_status_reports_inherited_auto_tts(self, runner):
+        event = _make_event("/voice status")
+        adapter = SimpleNamespace(
+            _should_auto_tts_for_chat=lambda chat_id: chat_id == "123",
+        )
+        runner.adapters[event.source.platform] = adapter
+
+        result = await runner._handle_voice_command(event)
+
+        assert result == "Voice mode: TTS (voice reply to all messages)"
+
+    @pytest.mark.asyncio
+    async def test_toggle_disables_inherited_auto_tts(self, runner):
+        event = _make_event("/voice")
+        adapter = SimpleNamespace(
+            _auto_tts_disabled_chats=set(),
+            _auto_tts_enabled_chats=set(),
+            _should_auto_tts_for_chat=lambda chat_id: chat_id == "123",
+        )
+        runner.adapters[event.source.platform] = adapter
+
+        result = await runner._handle_voice_command(event)
+
+        assert result.startswith("Voice mode disabled.")
+        assert runner._voice_mode == {"telegram:123": "off"}
+        assert adapter._auto_tts_disabled_chats == {"123"}
+
+    @pytest.mark.asyncio
     async def test_persistence_saved(self, runner):
         event = _make_event("/voice on")
         await runner._handle_voice_command(event)

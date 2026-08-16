@@ -3196,6 +3196,23 @@ class GatewaySlashCommandsMixin:
 
         return t("gateway.set_home.success", name=chat_name, chat_id=chat_id)
 
+    def _effective_voice_mode(self, platform: Platform, chat_id: str) -> str:
+        """Return the mode that controls voice delivery for a chat."""
+        voice_key = self._voice_key(platform, chat_id)
+        explicit_mode = self._voice_mode.get(voice_key)
+        if explicit_mode is not None:
+            return explicit_mode
+
+        adapter = self.adapters.get(platform)
+        should_auto_tts = getattr(adapter, "_should_auto_tts_for_chat", None)
+        if not callable(should_auto_tts):
+            return "off"
+
+        try:
+            return "all" if should_auto_tts(chat_id) else "off"
+        except Exception:
+            return "off"
+
     async def _handle_voice_command(self, event: MessageEvent) -> str:
         """Handle /voice [on|off|tts|channel|leave|status] command."""
         args = event.get_command_args().strip().lower()
@@ -3228,7 +3245,7 @@ class GatewaySlashCommandsMixin:
         elif args == "leave":
             return await self._handle_voice_channel_leave(event)
         elif args == "status":
-            mode = self._voice_mode.get(voice_key, "off")
+            mode = self._effective_voice_mode(platform, chat_id)
             labels = {
                 "off": t("gateway.voice.label_off"),
                 "voice_only": t("gateway.voice.label_voice_only"),
@@ -3252,7 +3269,7 @@ class GatewaySlashCommandsMixin:
             return t("gateway.voice.status_mode", label=labels.get(mode, mode))
         else:
             # Toggle: off → on, on/all → off
-            current = self._voice_mode.get(voice_key, "off")
+            current = self._effective_voice_mode(platform, chat_id)
             if current == "off":
                 self._voice_mode[voice_key] = "voice_only"
                 self._save_voice_modes()
