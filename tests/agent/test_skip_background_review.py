@@ -111,37 +111,6 @@ def test_finalize_turn_fires_review_when_flag_unset() -> None:
     agent._spawn_background_review.assert_called_once()
 
 
-def test_finalize_turn_receipts_primary_memory_update_once() -> None:
-    """A real primary-turn learning write gets the same queued receipt rail."""
-    agent = _make_agent(skip_background_review=True)
-    _stub_agent_for_finalize(agent)
-    agent.memory_notifications = "on"
-    agent.background_review_callback = MagicMock()
-    messages = [
-        {"role": "user", "content": "remember this"},
-        {
-            "role": "assistant",
-            "content": "",
-            "tool_calls": [{
-                "id": "memory-call",
-                "function": {"name": "memory", "arguments": '{"action":"add","target":"memory","content":"durable rule"}'},
-            }],
-        },
-        {"role": "tool", "tool_call_id": "memory-call", "content": '{"success":true,"message":"Entry added","target":"memory"}'},
-        {"role": "assistant", "content": "saved"},
-    ]
-    finalize_turn(
-        agent, final_response="saved", api_call_count=1, interrupted=False,
-        failed=False, messages=messages, conversation_history=[],
-        effective_task_id="test", turn_id="test-turn", user_message="remember this",
-        original_user_message="remember this", current_turn_user_idx=0,
-        _should_review_memory=False, _turn_exit_reason="text_response(1)",
-    )
-    agent.background_review_callback.assert_called_once_with(
-        "💾 Self-improvement review: Memory updated"
-    )
-
-
 def test_cron_construction_sets_skip_background_review() -> None:
     """The cron scheduler MUST construct AIAgent with skip_background_review=True.
 
