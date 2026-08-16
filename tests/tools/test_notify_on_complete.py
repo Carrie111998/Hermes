@@ -357,6 +357,33 @@ def test_background_process_captures_runtime_ui_session_before_spawn(
     assert spawned_kwargs["origin_ui_session_id"] == "runtime-session-a"
 
 
+def test_background_process_logs_runtime_ui_owner_lookup_failure(
+    monkeypatch, tmp_path, caplog
+):
+    from gateway import session_context
+
+    spawned_kwargs = {}
+    tt = _silent_bg_harness(monkeypatch, tmp_path, spawned_kwargs)
+
+    original_get_session_env = session_context.get_session_env
+
+    def fail_ui_session_lookup(name, default=""):
+        if name == "HERMES_UI_SESSION_ID":
+            raise RuntimeError("session context unavailable")
+        return original_get_session_env(name, default)
+
+    monkeypatch.setattr(session_context, "get_session_env", fail_ui_session_lookup)
+    try:
+        with caplog.at_level("DEBUG", logger=tt.__name__):
+            tt.terminal_tool(command="python worker.py", background=True)
+    finally:
+        tt._active_environments.pop("default", None)
+        tt._last_activity.pop("default", None)
+
+    assert spawned_kwargs["origin_ui_session_id"] == ""
+    assert "Unable to capture the background process UI session" in caplog.text
+
+
 def test_background_without_notify_emits_silent_process_hint(monkeypatch, tmp_path):
     """The footgun case (May 2026 PR #31231): bg=True alone runs silently
     and the agent has no signal it finished. Tool must nudge."""

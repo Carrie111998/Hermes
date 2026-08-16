@@ -2998,7 +2998,11 @@ def terminal_tool(
                 origin_ui_session_id = get_session_env(
                     "HERMES_UI_SESSION_ID", ""
                 ) or ""
-            except Exception:
+            except Exception as exc:
+                logger.debug(
+                    "Unable to capture the background process UI session: %s",
+                    exc,
+                )
                 origin_ui_session_id = ""
 
             effective_cwd = _resolve_command_cwd(
