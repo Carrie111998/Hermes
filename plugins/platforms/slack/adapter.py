@@ -3602,7 +3602,17 @@ class SlackAdapter(BasePlatformAdapter):
         """Return normalized Slack bot-message policy."""
         raw = self.config.extra.get("allow_bots", "")
         if not raw:
-            raw = os.getenv("SLACK_ALLOW_BOTS", "none")
+            raw = getattr(self, "_gateway_allow_bots_policy", "")
+        if not raw:
+            # Process environment is not profile-local. In multiplex mode a
+            # value bridged while loading one profile must not authorize
+            # another; the runner binds each profile's effective env policy to
+            # ``_gateway_allow_bots_policy`` during adapter configuration.
+            from agent.secret_scope import is_multiplex_active
+
+            raw = "none" if is_multiplex_active() else os.getenv(
+                "SLACK_ALLOW_BOTS", "none"
+            )
         value = str(raw).lower().strip()
         if value not in {"none", "mentions", "all"}:
             logger.warning("[Slack] Unknown allow_bots=%r; treating as 'none'", raw)
@@ -4307,30 +4317,45 @@ class SlackAdapter(BasePlatformAdapter):
                 else self._app.client
             )
             result = await client.users_info(user=user_id)
-            payload = _slack_response_payload(result)
-            if not payload:
-                self._user_is_bot_cache[cache_key] = False
-                self._user_name_cache[cache_key] = user_id
-                return user_id
-            user = payload.get("user", {})
-            profile = user.get("profile", {}) if isinstance(user, dict) else {}
+        except Exception as e:
+            logger.debug("[Slack] users.info failed for %s: %s", user_id, e)
+            return user_id
+
+        payload = _slack_response_payload(result)
+        if not payload or payload.get("ok") is False:
+            return user_id
+        user = payload.get("user")
+        if not isinstance(user, dict):
+            return user_id
+        profile = user.get("profile", {})
+        if not isinstance(profile, dict):
+            profile = {}
+
+        # Bot status is shared with the strict-mention clarification gate. Only
+        # cache it when Slack returned explicit identity evidence; malformed or
+        # incomplete users.info responses must remain unknown, never human.
+        if (
+            "is_bot" in user
+            or "is_workflow_bot" in user
+            or bool(profile.get("bot_id"))
+        ):
             self._user_is_bot_cache[cache_key] = bool(
                 user.get("is_bot")
                 or user.get("is_workflow_bot")
-                or (isinstance(profile, dict) and profile.get("bot_id"))
+                or profile.get("bot_id")
             )
-            # Prefer display_name → real_name → user_id
-            name = (
-                profile.get("display_name")
-                or profile.get("real_name")
-                or user.get("real_name")
-                or user.get("name")
-                or user_id
+            self._trim_oldest_dict_entries(
+                self._user_is_bot_cache, self._USER_NAME_CACHE_MAX
             )
-        except Exception as e:
-            logger.debug("[Slack] users.info failed for %s: %s", user_id, e)
-            name = user_id
 
+        # Prefer display_name → real_name → user_id.
+        name = str(
+            profile.get("display_name")
+            or profile.get("real_name")
+            or user.get("real_name")
+            or user.get("name")
+            or user_id
+        )
         self._user_name_cache[cache_key] = name
         if len(self._user_name_cache) > self._USER_NAME_CACHE_MAX:
             excess = len(self._user_name_cache) - self._USER_NAME_CACHE_MAX // 2
@@ -4466,21 +4491,20 @@ class SlackAdapter(BasePlatformAdapter):
 
     async def _resolve_user_is_bot(
         self, user_id: str, chat_id: str = "", team_id: str = ""
-    ) -> bool:
-        """Resolve whether a Slack user ID is a bot account, with caching.
+    ) -> Optional[bool]:
+        """Resolve bot status, returning ``None`` when identity is unknown.
 
         Workspace-scoped like :meth:`_resolve_user_name` — Slack user IDs are
         team-local, so the cache key includes the team.
         """
         if not user_id:
-            return False
+            return None
         team_id = str(team_id or self._channel_team.get(chat_id, ""))
         cache_key = (team_id, str(user_id))
         if cache_key in self._user_is_bot_cache:
             return self._user_is_bot_cache[cache_key]
         if not self._app:
-            self._user_is_bot_cache[cache_key] = False
-            return False
+            return None
 
         try:
             client = (
@@ -4490,16 +4514,24 @@ class SlackAdapter(BasePlatformAdapter):
             )
             result = await client.users_info(user=user_id)
             payload = _slack_response_payload(result)
-            if not payload:
-                self._user_is_bot_cache[cache_key] = False
-                self._user_name_cache.setdefault(cache_key, user_id)
-                return False
-            user = payload.get("user", {})
-            profile = user.get("profile", {}) if isinstance(user, dict) else {}
+            if not payload or payload.get("ok") is False:
+                return None
+            user = payload.get("user")
+            if not isinstance(user, dict):
+                return None
+            profile = user.get("profile", {})
+            if not isinstance(profile, dict):
+                profile = {}
+            if (
+                "is_bot" not in user
+                and "is_workflow_bot" not in user
+                and not profile.get("bot_id")
+            ):
+                return None
             is_bot = bool(
                 user.get("is_bot")
                 or user.get("is_workflow_bot")
-                or (isinstance(profile, dict) and profile.get("bot_id"))
+                or profile.get("bot_id")
             )
             self._user_is_bot_cache[cache_key] = is_bot
             self._trim_oldest_dict_entries(
@@ -4518,8 +4550,7 @@ class SlackAdapter(BasePlatformAdapter):
             return is_bot
         except Exception as e:
             logger.debug("[Slack] users.info bot check failed for %s: %s", user_id, e)
-            self._user_is_bot_cache[cache_key] = False
-            return False
+            return None
 
     async def send_image_file(
         self,
@@ -6009,10 +6040,6 @@ class SlackAdapter(BasePlatformAdapter):
             event, str(team_id or ""), str(user_id or "")
         )
 
-        # Track which workspace owns this channel
-        if team_id and channel_id:
-            self._remember_channel_team(channel_id, team_id)
-
         # Determine if this is a DM or channel message
         channel_type = event.get("channel_type", "")
         if not channel_type and channel_id.startswith("D"):
@@ -6035,27 +6062,48 @@ class SlackAdapter(BasePlatformAdapter):
         # both as DM-style persistent conversations.
         is_one_to_one_dm = channel_type == "im"
 
-        # Reject unauthorized users before thread lookups, name resolution,
-        # or file downloads.  The final gateway runner auth check happens
-        # after MessageEvent construction, so adapter-side media fetches need
-        # the same auth chain up front.
-        _runner = getattr(getattr(self, "_message_handler", None), "__self__", None)
-        _auth_fn = getattr(_runner, "_is_user_authorized", None)
-        if user_id and callable(_auth_fn):
-            _source = self.build_source(
-                chat_id=channel_id,
-                chat_name="",
-                chat_type="dm" if is_dm else "group",
-                user_id=user_id,
-                user_name="",
+        # Reject unauthorized human users before thread lookups, name
+        # resolution, or file downloads. Bot/workflow events have already
+        # passed the Slack ``allow_bots`` policy above and must retain their
+        # explicit mention/all compatibility path.
+        if not sender_is_bot:
+            _registered_auth_check = getattr(self, "_authorization_check", None)
+            _registered_auth = self._is_sender_authorized(
+                user_id,
+                "dm" if is_dm else "group",
+                channel_id,
             )
-            if not _auth_fn(_source):
+            _runner = getattr(
+                getattr(self, "_message_handler", None), "__self__", None
+            )
+            _auth_fn = getattr(_runner, "_is_user_authorized", None)
+            if _registered_auth_check is not None and _registered_auth is not True:
                 logger.warning(
                     "[Slack] Early reject of unauthorized user %s in channel %s",
                     user_id,
                     channel_id,
                 )
                 return
+            if user_id and _registered_auth_check is None and callable(_auth_fn):
+                _source = self.build_source(
+                    chat_id=channel_id,
+                    chat_name="",
+                    chat_type="dm" if is_dm else "group",
+                    user_id=user_id,
+                    user_name="",
+                )
+                if not _auth_fn(_source):
+                    logger.warning(
+                        "[Slack] Early reject of unauthorized user %s in channel %s",
+                        user_id,
+                        channel_id,
+                    )
+                    return
+
+        # Track workspace ownership only after the sender passes the early
+        # authorization gate so rejected events cannot mutate routing state.
+        if team_id and channel_id:
+            self._remember_channel_team(channel_id, team_id)
 
         # Build thread_ts for session keying.
         # In channels: fall back to ts so each top-level @mention starts a
@@ -6144,8 +6192,12 @@ class SlackAdapter(BasePlatformAdapter):
         # ``allow_bots: mentions`` require the current message text to mention
         # this bot — thread history, reply parents, and active sessions do not
         # count as a bot-to-bot summons.
+        sender_is_bot_user = self._event_declares_bot_sender(event)
+        if user_id and user_id in {uid for uid in (bot_uid, self._bot_user_id) if uid}:
+            return
+        pending_clarify_reply = False
+        pending_clarify_id = None
         if user_id and user_id != bot_uid:
-            sender_is_bot_user = self._event_declares_bot_sender(event)
             if not sender_is_bot_user:
                 sender_is_bot_user = await self._resolve_user_is_bot(
                     user_id,
@@ -6185,8 +6237,29 @@ class SlackAdapter(BasePlatformAdapter):
                 )
                 return
 
-            if force_process:
-                pass  # Explicit internal routing path (reaction trigger).
+            # A typed response to an active clarify prompt is already a
+            # narrowly-scoped reply to this bot. Let it reach the gateway's
+            # clarify interceptor even when strict_mention/thread gating would
+            # otherwise discard an unmentioned thread reply. Authorization,
+            # bot-sender policy, and allowed_channels checks have all run above.
+            if (
+                is_thread_reply
+                and bool(user_id)
+                and sender_is_bot_user is False
+                and not is_command_text
+                and bool((original_text or "").strip())
+            ):
+                pending_clarify_id = self._pending_text_clarify_id_for_thread(
+                    channel_id=channel_id,
+                    thread_ts=str(event_thread_ts),
+                    user_id=user_id,
+                    team_id=team_id,
+                    chat_type="dm" if is_dm else "group",
+                )
+                pending_clarify_reply = bool(pending_clarify_id)
+
+            if force_process or pending_clarify_reply:
+                pass  # Explicitly addressed internal/pending interaction path.
             elif (
                 channel_id not in self._slack_require_mention_channels()
                 and (
@@ -6728,12 +6801,17 @@ class SlackAdapter(BasePlatformAdapter):
             user_name=user_name,
             thread_id=thread_ts,
             scope_id=str(team_id) if team_id else None,
-            # Slack Workflow Builder / app posts arrive as
-            # subtype=bot_message with user=None; flag them so the
-            # gateway SLACK_ALLOW_BOTS bypass can authorize them
-            # (they carry no user_id to match against the allowlist).
-            is_bot=bool(event.get("bot_id")) or event.get("subtype") == "bot_message",
+            # Preserve both declared bot/workflow markers and bot identity
+            # positively resolved through users.info so the gateway's final
+            # allow_bots authorization sees the same classification as intake.
+            is_bot=bool(sender_is_bot),
         )
+        # Secondary adapters in a multiplexed gateway are profile-owned before
+        # their message handler gets a chance to stamp ``source.profile``.
+        # Preserve that route on the normalized event as well as during the
+        # pre-handler clarify lookup.
+        if not source.profile:
+            source.profile = getattr(self, "_gateway_profile_name", None)
 
         # Per-channel ephemeral prompt
         from gateway.platforms.base import (
@@ -6814,6 +6892,11 @@ class SlackAdapter(BasePlatformAdapter):
                 "slack_team_id": team_id,
                 "slack_channel_id": channel_id,
                 "slack_thread_ts": thread_ts,
+                **(
+                    {"_hermes_clarify_response_only": pending_clarify_id}
+                    if pending_clarify_reply and not is_mentioned
+                    else {}
+                ),
             },
         )
 
@@ -8307,6 +8390,43 @@ class SlackAdapter(BasePlatformAdapter):
         finally:
             _slash_user_id.reset(_slash_user_id_token)
 
+    def _pending_text_clarify_id_for_thread(
+        self,
+        channel_id: str,
+        thread_ts: str,
+        user_id: str,
+        team_id: str = "",
+        *,
+        chat_type: str = "group",
+    ) -> Optional[str]:
+        """Return the exact free-form clarify ID pending for this Slack thread."""
+        session_store = getattr(self, "_session_store", None)
+        if session_store is None:
+            return None
+        try:
+            from tools import clarify_gateway
+
+            source = self.build_source(
+                chat_id=channel_id,
+                chat_type=chat_type,
+                user_id=user_id,
+                thread_id=thread_ts,
+                scope_id=team_id or None,
+            )
+            if not source.profile:
+                source.profile = getattr(self, "_gateway_profile_name", None)
+            session_key = session_store._generate_session_key(source)
+
+            pending = clarify_gateway.get_pending_for_session(session_key)
+            return pending.clarify_id if pending is not None else None
+        except Exception:
+            logger.debug(
+                "[Slack] Failed to inspect pending clarify state for thread %s",
+                thread_ts,
+                exc_info=True,
+            )
+            return None
+
     def _build_thread_session_key(
         self,
         channel_id: str,
@@ -9491,14 +9611,13 @@ def _apply_yaml_config(yaml_cfg: dict, slack_cfg: dict) -> dict | None:
     legacy ``slack_cfg`` block that used to live in
     ``gateway/config.py::load_gateway_config()`` before this migration.
 
-    The SlackAdapter reads its runtime configuration via ``os.getenv()``
-    throughout the connect / handle code paths, so rather than rewrite those
-    call sites to read from ``PlatformConfig.extra``, this hook keeps the
-    existing env-driven model and owns the YAML→env translation here, next to
-    the adapter that consumes it. Env vars take precedence over YAML — every
-    assignment is guarded by ``not os.getenv(...)`` so explicit env vars
-    survive a config.yaml update. Returns ``None`` because no extras are
-    seeded into ``PlatformConfig.extra`` directly (everything flows through env).
+    The SlackAdapter still consumes most settings through ``os.getenv()``. The
+    ``allow_bots`` policy is also returned in ``PlatformConfig.extra`` because
+    multiplex profiles can configure different policies in YAML and process
+    environment cannot represent those simultaneously. The adapter-local value
+    is authoritative for the transport that admitted the event; other settings
+    retain the legacy YAML→env bridge. Env assignments remain guarded so
+    explicit process values are not overwritten.
     """
     if "require_mention" in slack_cfg and not os.getenv("SLACK_REQUIRE_MENTION"):
         os.environ["SLACK_REQUIRE_MENTION"] = str(slack_cfg["require_mention"]).lower()
@@ -9550,7 +9669,9 @@ def _apply_yaml_config(yaml_cfg: dict, slack_cfg: dict) -> dict | None:
         if isinstance(ic, list):
             ic = ",".join(str(v) for v in ic)
         os.environ["SLACK_IGNORED_CHANNELS"] = str(ic)
-    return None  # all settings flow through env; nothing to merge into extras
+    if "allow_bots" in slack_cfg:
+        return {"allow_bots": str(slack_cfg["allow_bots"]).lower()}
+    return None
 
 
 def _is_connected(config) -> bool:

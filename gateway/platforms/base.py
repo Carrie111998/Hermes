@@ -3701,10 +3701,11 @@ class BasePlatformAdapter(ABC):
         when no check is registered (caller should treat as "trust unknown"
         and preserve legacy behaviour).
         """
-        if not user_id or self._authorization_check is None:
+        authorization_check = getattr(self, "_authorization_check", None)
+        if not user_id or authorization_check is None:
             return None
         try:
-            return bool(self._authorization_check(user_id, chat_type, chat_id))
+            return bool(authorization_check(user_id, chat_type, chat_id))
         except Exception:
             logger.warning(
                 "[%s] Authorization check raised for user %s; treating as unknown",
@@ -6092,10 +6093,14 @@ class BasePlatformAdapter(ABC):
                 except Exception:
                     _has_text_clarify = False
 
-                if _has_text_clarify:
+                _clarify_response_only = bool(
+                    (event.metadata or {}).get("_hermes_clarify_response_only")
+                )
+                if _has_text_clarify or _clarify_response_only:
                     logger.debug(
-                        "[%s] Routing message to clarify text-intercept for %s",
-                        self.name, session_key,
+                        "[%s] Routing message to clarify text-intercept/drop for %s",
+                        self.name,
+                        session_key,
                     )
                     try:
                         _thread_meta = _thread_metadata_for_source(
