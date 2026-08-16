@@ -184,7 +184,11 @@ correction set (including safe, metadata-only observability and hermetic
 coverage), then obtain the required Claude+AGY implementation review before
 editing source. Keep inbound, service, and outbound gates separate.
 
-## Implementation correction-set review evidence
+## Historical initial correction-set review evidence (superseded)
+
+The following blocked result records the first review attempt. It was
+superseded by the final implementation review evidence recorded below; it is
+retained only to preserve the review history.
 
 - Packet boundary: identical metadata-only packet for both reviewer families;
   no source, credentials, secrets, absolute paths, or evidence text.
