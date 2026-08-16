@@ -1,6 +1,6 @@
 ---
 name: session-librarian
-description: "Organize sessions by prompt: group, find, rename, archive, prune."
+description: "Organize sessions by prompt: group, find, rename, archive."
 version: 1.0.0
 author: Hermes Agent + Teknium
 license: MIT
