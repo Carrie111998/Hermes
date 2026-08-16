@@ -8542,13 +8542,18 @@ def _run_install_with_heartbeat(
     can stay quiet for minutes. Emit a simple elapsed-time heartbeat so users
     know ``hermes update`` is still progressing even if pip/uv itself is silent.
 
-    Captures stderr so that on failure the ``CalledProcessError`` carries the
-    installer's actual error output (``e.stderr``).  Without capture, the
-    error handler in ``_cmd_update_impl`` can only print a bare exit code and
-    the real cause — a locked ``.pyd``, a resolver conflict, a build failure
-    — is invisible in ``update.log`` (#85840).  Stdout is not captured: the
-    heartbeat thread already provides progress feedback, and unbuffered stdout
-    passthrough avoids breaking installers that use ANSI cursor tricks.
+    Captures stderr (``stderr=PIPE``) so that on failure the
+    ``CalledProcessError`` carries the installer's actual error output
+    (``e.stderr``).  Without capture, the error handler in
+    ``_cmd_update_impl`` can only print a bare exit code and the real cause
+    — a locked ``.pyd``, a resolver conflict, a build failure — is invisible
+    in ``update.log`` (#85840).
+
+    Stdout is passed through to the terminal (inherited, not captured): the
+    heartbeat thread already provides elapsed-time feedback, and unbuffered
+    stdout passthrough preserves live installer progress (ANSI cursor tricks,
+    progress bars) that ``capture_output`` would buffer away and silently
+    discard.  Only stderr is captured so it can be surfaced on failure.
     """
     done = threading.Event()
     start = _time.time()
@@ -8571,7 +8576,8 @@ def _run_install_with_heartbeat(
             cwd=PROJECT_ROOT,
             check=True,
             env=env,
-            capture_output=True,
+            stdout=None,  # inherit → live passthrough; preserves ANSI progress bars
+            stderr=subprocess.PIPE,  # capture stderr only → e.stderr on failure
             text=True,
             encoding="utf-8",
             errors="replace",

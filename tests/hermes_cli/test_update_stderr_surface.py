@@ -41,8 +41,14 @@ def test_heartbeat_captures_stderr_on_failure(monkeypatch):
     fake_stderr = "error: failed to build cryptography\nos error 5"
 
     def fake_run(cmd, **kwargs):
-        assert kwargs.get("capture_output") is True, (
-            "_run_install_with_heartbeat must pass capture_output=True"
+        assert kwargs.get("stderr") == subprocess.PIPE, (
+            "_run_install_with_heartbeat must pass stderr=PIPE to capture installer stderr"
+        )
+        assert kwargs.get("stdout") is None, (
+            "_run_install_with_heartbeat must leave stdout inherited (None) to preserve live progress"
+        )
+        assert kwargs.get("capture_output") is not True, (
+            "capture_output=True would buffer stdout and break ANSI progress bars"
         )
         raise subprocess.CalledProcessError(
             returncode=2,
@@ -62,11 +68,13 @@ def test_heartbeat_captures_stderr_on_failure(monkeypatch):
 
 
 def test_heartbeat_passes_capture_output_on_success(monkeypatch):
-    """On success, verify capture_output is passed so that *if* it failed,
-    stderr would be available."""
+    """On success, verify stderr capture is in place so that *if* it failed,
+    stderr would be available, without buffering stdout."""
 
     def fake_run(cmd, **kwargs):
-        assert kwargs.get("capture_output") is True
+        assert kwargs.get("stderr") == subprocess.PIPE
+        assert kwargs.get("stdout") is None
+        assert kwargs.get("capture_output") is not True
         return subprocess.CompletedProcess(cmd, 0)
 
     monkeypatch.setattr(cli_main.subprocess, "run", fake_run)
