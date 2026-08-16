@@ -21,3 +21,26 @@ def test_run_strips_ansi_from_output():
 
     assert "\x1b[" not in out
     assert out == "colored plain"
+
+
+def test_run_refuses_skill_slash_instead_of_pending_input(monkeypatch):
+    from tui_gateway import slash_worker
+
+    monkeypatch.setattr(
+        "agent.skill_commands.resolve_skill_slash",
+        lambda token, **kwargs: "/ratchet-panel",
+    )
+
+    class _CLI:
+        console = None
+
+        def process_command(self, cmd: str) -> None:
+            raise AssertionError(f"must not process_command skill {cmd!r}")
+
+    try:
+        slash_worker._run(_CLI(), "ratchet-panel")
+    except RuntimeError as exc:
+        assert "skill command" in str(exc)
+        assert "ratchet-panel" in str(exc)
+    else:
+        raise AssertionError("expected RuntimeError for skill slash")
