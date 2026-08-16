@@ -221,7 +221,7 @@ class TestDefaultContextLengths:
         """GLM-5.3 must not fall through to the legacy 202K GLM family."""
         with patch("agent.model_metadata.fetch_model_metadata", return_value={}):
             for model in ("glm-5.3", "z-ai/glm-5.3"):
-                assert get_model_context_length(model) == 1_048_576
+                assert get_model_context_length(model) == 1_000_000
 
     def test_glm_5_3_discards_legacy_cached_family_fallback(self):
         """A pre-catalog 202K cache entry must not mask GLM-5.3's 1M window."""
@@ -238,7 +238,7 @@ class TestDefaultContextLengths:
                 "glm-5.3",
                 provider="zai",
                 base_url="https://api.z.ai/api/paas/v4",
-            ) == 1_048_576
+            ) == 1_000_000
 
         invalidate.assert_called_once()
 
