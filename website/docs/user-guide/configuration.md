@@ -745,6 +745,47 @@ tool_output:
   max_lines: 500
 ```
 
+## Tool Result Persistence Threshold
+
+Separately from the `tool_output` caps above, Hermes **persists** oversized
+tool results (file reads, searches, script output) to the sandbox and replaces
+them in-context with a short preview plus the file path. The default threshold
+is 100K characters for large-context models, scaled down proportionally for
+small models.
+
+Set `tools.tool_result_persist_threshold_chars` to override that default with
+an explicit cap:
+
+```yaml
+tools:
+  # Persist any single tool result larger than 20K chars (preview + path
+  # stays in context; full result stays on disk for audit/replay).
+  tool_result_persist_threshold_chars: 20000
+```
+
+- `None` (default) — keep today's context-scaled behavior unchanged.
+- `int > 0` — explicit per-result cap. A value *smaller* than the default
+  reclaims medium-sized results (30–50K char search/execute output) from
+  re-sent history early, which reduces input tokens on long tool loops;
+  the full original result is always persisted and can be re-read on demand.
+- The explicit cap overrides **only** the per-result size. The per-turn
+  aggregate budget and the preview size still come from the model's context
+  window scaling, so a small-window model keeps its small turn budget (an
+  explicit value must not silently reset it back to the 200K default).
+- The explicit value still sits under each tool's own registry cap (web,
+  terminal and x_search register a 100K max), so a larger value is bounded
+  by the tool rather than unbounded.
+- `read_file` is always exempt (`PINNED_THRESHOLDS`) to avoid infinite
+  persist→read→persist loops.
+- Non-positive values (`0`, negative), booleans (`true`/`false`), floats and
+  any other non-integer numeric type (`Decimal`, `Fraction`), `bytes`, or
+  non-whole-number strings (`"20.5"`, `"1e4"`) are rejected with a warning and
+  treated as unset — only non-boolean `int` and whole-number strings are
+  accepted. Rejection is enforced at every layer (config parsing, budget
+  factory, executor) through a single normalizer
+  (`tools/budget_config.normalize_persist_threshold`), so values set
+  programmatically by plugins are handled identically to YAML.
+
 ## Global Toolset Disable
 
 To suppress specific toolsets across the CLI and every gateway platform in one

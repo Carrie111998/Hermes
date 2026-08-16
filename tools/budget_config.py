@@ -3,8 +3,14 @@
 Per-tool resolution: pinned > config overrides > registry > default.
 """
 
-from dataclasses import dataclass, field
+import re
+from dataclasses import dataclass, field, replace
 from typing import Dict
+
+# Strict whitelist for explicit persist-threshold strings: optional sign
+# followed by digits only. "20.5", "1e4", "" etc. are rejected up front so the
+# only strings that reach int() are guaranteed whole numbers.
+_INT_STR_PATTERN = re.compile(r"^[+-]?\d+$")
 
 # Tools whose thresholds must never be overridden.
 # read_file=inf prevents infinite persist->read->persist loops.
@@ -112,3 +118,71 @@ def budget_for_context_window(context_length: int | None) -> BudgetConfig:
         turn_budget=per_turn,
         preview_size=DEFAULT_PREVIEW_SIZE_CHARS,
     )
+
+
+def normalize_persist_threshold(value) -> int | None:
+    """Validate and normalize the explicit persist-threshold config value.
+
+    Single source of truth for ``tools.tool_result_persist_threshold_chars``:
+    ``agent_init`` (config parsing), ``budget_with_persist_threshold`` (factory)
+    and ``_budget_for_agent`` (programmatic access) all funnel through here so
+    the accept/reject rules cannot drift between layers.
+
+    Strict type whitelist -- only non-``bool`` ``int`` and whole-number
+    strings are accepted:
+
+    - ``None`` (unset) -> ``None``
+    - ``bool`` -> ``None`` -- bool is an int subclass, so ``int(True) == 1``
+      would silently persist almost every tool result; booleans are rejected
+      even when set programmatically (plugins/tests), not just via YAML
+    - other numeric types (``float``, ``Decimal``, ``Fraction``) -> ``None``
+      -- ``int(1.5) == 1``, ``int(Decimal("1.5")) == 1`` and
+      ``int(Fraction(3, 2)) == 1`` all silently truncate a fractional value
+      into a near-universal persist threshold; only ints and whole-number
+      strings are accepted
+    - ``bytes`` and arbitrary objects -> ``None`` -- no coercion
+    - positive ``int`` -> itself; whole-number ``str`` -> parsed ``int``
+    - non-positive values (0/negative) -> ``None`` ("unset")
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        n = value
+    elif isinstance(value, str):
+        if not _INT_STR_PATTERN.match(value.strip()):
+            return None
+        try:
+            n = int(value)
+        except ValueError:
+            return None
+    else:
+        return None
+    return n if n > 0 else None
+
+
+def budget_with_persist_threshold(
+    threshold_chars: int, context_length: int | None = None
+) -> BudgetConfig:
+    """Return a BudgetConfig with an explicit per-result persistence cap.
+
+    User-configured ``tools.tool_result_persist_threshold_chars`` path: the
+    explicit value overrides ONLY the per-result cap (``default_result_size``);
+    the turn budget and preview size keep the context-scaled values from
+    ``budget_for_context_window`` (falling back to the historical defaults when
+    ``context_length`` is unknown), so a small model keeps its small-window
+    turn-budget protection instead of being reset to the 200K default.
+
+    Non-positive, ``None``, boolean, float/Decimal/Fraction, ``bytes`` or
+    unconvertible values are treated as "unset" (via
+    ``normalize_persist_threshold``) and return the context-scaled budget
+    unchanged (a 0/negative value must NOT clamp to 1, which would
+    persist almost every tool result). ``resolve_threshold`` still applies
+    ``PINNED_THRESHOLDS`` (read_file stays exempt) and the per-tool registry
+    cap, so a smaller explicit value always wins while a larger one is bounded
+    by what the tool itself registers.
+    """
+    base = budget_for_context_window(context_length)
+    normalized = normalize_persist_threshold(threshold_chars)
+    if normalized is None:
+        return base
+    return replace(base, default_result_size=normalized)
