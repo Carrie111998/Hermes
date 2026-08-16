@@ -19,6 +19,29 @@ from agent.transports.base import ProviderTransport
 from agent.transports.types import NormalizedResponse, ToolCall, Usage
 
 
+def _strip_enclosing_markdown_fence(text: str) -> str:
+    """Strip a markdown code fence that wraps the entire ``text``, if present.
+
+    Handles both a well-formed fence (opening ```` ``` ```` or ```` ```json
+    ```` on its own line, matching closing ```` ``` ````) and the malformed
+    case where the model never emits a closing fence at all. Leaves ``text``
+    unchanged if it isn't a whole-string fence (e.g. a fence embedded in a
+    longer prose reply).
+    """
+    if not text.startswith("```"):
+        return text
+    first_newline = text.find("\n")
+    if first_newline == -1:
+        return text
+    opening = text[3:first_newline].strip()
+    if opening and not opening.isalnum():
+        return text
+    body = text[first_newline + 1:]
+    if body.endswith("```"):
+        body = body[: -3]
+    return body.strip()
+
+
 def _parse_leaked_tool_calls(content: Any) -> list["ToolCall"] | None:
     """Recover tool call(s) a model emitted as raw JSON in ``content``
     instead of the structured ``tool_calls`` field.
@@ -34,12 +57,19 @@ def _parse_leaked_tool_calls(content: Any) -> list["ToolCall"] | None:
     Deliberately strict: the *entire* stripped content must decode as a
     sequence of such objects with nothing else around them, so this never
     misfires on ordinary prose that happens to contain a JSON fragment.
+
+    Also recovers a narrower variant where the model wraps the leaked call
+    in a markdown code fence (```` ```json ... ``` ````) — including the
+    malformed case where the closing fence is missing entirely. Only a
+    fence wrapping the *whole* content is stripped, so a code block that's
+    part of a longer prose reply is left alone.
     """
     if not isinstance(content, str):
         return None
     text = content.strip()
     if not text:
         return None
+    text = _strip_enclosing_markdown_fence(text)
 
     decoder = json.JSONDecoder()
     calls: list[ToolCall] = []

@@ -519,6 +519,69 @@ class TestChatCompletionsNormalize:
         assert nr.tool_calls[1].name == "todo_list"
         assert json.loads(nr.tool_calls[1].arguments) == {}
 
+    def test_tool_call_leaked_into_markdown_fence_is_recovered(self, transport):
+        """A narrower leak shape than the bare-JSON case: Ollama wraps the
+        leaked call in a markdown code fence with a ``json`` info string.
+        Reproduced live via chief-of-staff -> monitor delegation on
+        qwen2.5-coder:7b: content == '```json\\n{"name": ..., "arguments":
+        {...}}\\n```', tool_calls == None, finish_reason == "stop"."""
+        r = SimpleNamespace(
+            choices=[SimpleNamespace(
+                message=SimpleNamespace(
+                    content='```json\n{"name": "delegate_task", "arguments": {"goal": "Use the bookmarks-digest-reader MCP tool to read the output from the skills that triage X bookmarks (x-bookmarks-triage / x-bookmarks-digest), and process those results."}}\n```',
+                    tool_calls=None,
+                    reasoning_content=None,
+                ),
+                finish_reason="stop",
+            )],
+            usage=None,
+        )
+        nr = transport.normalize_response(r)
+        assert nr.tool_calls is not None
+        assert len(nr.tool_calls) == 1
+        assert nr.tool_calls[0].name == "delegate_task"
+        assert json.loads(nr.tool_calls[0].arguments) == {
+            "goal": "Use the bookmarks-digest-reader MCP tool to read the output from the skills that triage X bookmarks (x-bookmarks-triage / x-bookmarks-digest), and process those results."
+        }
+        assert nr.content is None
+        assert nr.finish_reason == "tool_calls"
+
+    def test_tool_call_leaked_into_unclosed_markdown_fence_is_recovered(self, transport):
+        """Malformed variant: the model never emits a closing fence."""
+        r = SimpleNamespace(
+            choices=[SimpleNamespace(
+                message=SimpleNamespace(
+                    content='```json\n{"name": "todo_list", "arguments": {}}',
+                    tool_calls=None,
+                    reasoning_content=None,
+                ),
+                finish_reason="stop",
+            )],
+            usage=None,
+        )
+        nr = transport.normalize_response(r)
+        assert nr.tool_calls is not None
+        assert len(nr.tool_calls) == 1
+        assert nr.tool_calls[0].name == "todo_list"
+
+    def test_fenced_prose_is_not_mistaken_for_a_leaked_tool_call(self, transport):
+        """Guard against false positives: a fenced code block containing
+        ordinary example JSON (not a tool call) must not be recovered."""
+        r = SimpleNamespace(
+            choices=[SimpleNamespace(
+                message=SimpleNamespace(
+                    content='Here is an example config:\n```json\n{"name": "example"}\n```',
+                    tool_calls=None,
+                    reasoning_content=None,
+                ),
+                finish_reason="stop",
+            )],
+            usage=None,
+        )
+        nr = transport.normalize_response(r)
+        assert nr.tool_calls is None
+        assert nr.content == 'Here is an example config:\n```json\n{"name": "example"}\n```'
+
     def test_plain_text_content_is_not_mistaken_for_a_leaked_tool_call(self, transport):
         """Guard against false positives: ordinary prose must never be
         reinterpreted as a tool call, even if it happens to contain JSON."""
