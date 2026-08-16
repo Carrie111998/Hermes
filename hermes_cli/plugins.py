@@ -609,6 +609,9 @@ def _get_enabled_plugins() -> Optional[List[str]]:
             return None
         enabled = plugins_cfg.get("enabled")
         if not isinstance(enabled, list) or not all(isinstance(item, str) for item in enabled):
+            logger.warning(
+                "Ignoring malformed plugins.enabled; expected a list of plugin names"
+            )
             return None
         return enabled
     except Exception:
