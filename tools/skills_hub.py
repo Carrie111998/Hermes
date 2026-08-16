@@ -4052,12 +4052,17 @@ def uninstall_skill(skill_name: str) -> Tuple[bool, str]:
     append_audit_log("UNINSTALL", skill_name, entry["source"], entry["trust_level"], "n/a", "user_request")
 
     try:
-        from tools.skill_usage import forget
+        from tools.skill_usage import forget_with_lifecycle
 
-        forget(
+        # Derive provenance from the hub lock entry instead of hardcoding
+        # "installed": the lock records how the skill actually got here
+        # (hub source URL / trust level), so the lifecycle event stays
+        # truthful for mixed-provenance skill directories.
+        forget_with_lifecycle(
             skill_name,
             lifecycle_action="uninstalled",
-            provenance="installed",
+            provenance=entry.get("source") or "installed",
+            caller_note="hub uninstall",
         )
     except Exception:
         logger.debug(

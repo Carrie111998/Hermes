@@ -1064,6 +1064,10 @@ def forget(
     Callers pass ``lifecycle_action`` only after the authoritative filesystem
     operation succeeds. The observer is emitted even if sidecar cleanup fails:
     a telemetry-file error cannot undo a deletion that already happened.
+
+    When the skill has no usage record, the lifecycle event is still emitted
+    with ``record=None`` (observer completeness) — hooks can distinguish this
+    via the absent ``prior_record`` payload.
     """
     if not skill_name:
         return
@@ -1087,6 +1091,41 @@ def forget(
             provenance=provenance,
             task_id=task_id,
             session_id=session_id,
+        )
+
+
+def forget_with_lifecycle(
+    skill_name: str,
+    *,
+    lifecycle_action: Optional[str] = None,
+    provenance: Optional[str] = None,
+    task_id: Optional[str] = None,
+    session_id: Optional[str] = None,
+    caller_note: str = "",
+) -> None:
+    """Best-effort forget + lifecycle emit shared by removal paths.
+
+    Both ``skill_manage`` (hard delete) and ``skills_hub`` (uninstall) drop a
+    skill's usage record and report the lifecycle event; keeping the
+    try/except + debug-log wrapper in one place keeps the two removal paths
+    consistent (Copilot review #83316). Never raises.
+    """
+    try:
+        forget(
+            skill_name,
+            lifecycle_action=lifecycle_action,
+            provenance=provenance,
+            task_id=task_id,
+            session_id=session_id,
+        )
+    except Exception as e:
+        logger.debug(
+            "Unable to record %s lifecycle for %s%s: %s",
+            lifecycle_action or "skill",
+            skill_name,
+            f" ({caller_note})" if caller_note else "",
+            e,
+            exc_info=True,
         )
 
 

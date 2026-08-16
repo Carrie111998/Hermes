@@ -1313,7 +1313,7 @@ class TestInstallPathSafety:
             files=["SKILL.md"],
         )
 
-        with patch("tools.skill_usage.forget") as forget:
+        with patch("tools.skill_usage.forget_with_lifecycle") as forget:
             ok, _ = uninstall_skill("hub-skill")
 
         assert ok is True
@@ -1321,7 +1321,8 @@ class TestInstallPathSafety:
         forget.assert_called_once_with(
             "hub-skill",
             lifecycle_action="uninstalled",
-            provenance="installed",
+            provenance="github",
+            caller_note="hub uninstall",
         )
 
 
