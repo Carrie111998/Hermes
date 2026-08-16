@@ -2,7 +2,9 @@ import { act, cleanup, render } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { $desktopBoot } from '@/store/boot'
-import { $gatewayState } from '@/store/session'
+import { closeSecondaryGateways, isActivePrimary } from '@/store/gateway'
+import { $activeGatewayProfile, ensureGatewayProfile } from '@/store/profile'
+import { $connection, $currentCwd, $gatewayState } from '@/store/session'
 
 import { takeGatewaySurvivor } from './gateway-hmr-survivor'
 import { useGatewayBoot } from './use-gateway-boot'
@@ -76,18 +78,30 @@ class FakeWebSocket {
   }
 }
 
-function fakeDesktop() {
-  const conn = {
-    authMode: 'token' as const,
-    baseUrl: 'https://vps.example.com',
-    profile: 'default',
-    token: 't',
-    wsUrl: 'wss://vps.example.com/api/ws?token=t'
-  }
+const primaryConn = {
+  authMode: 'token' as const,
+  baseUrl: 'https://vps.example.com',
+  profile: 'default',
+  token: 't',
+  wsUrl: 'wss://vps.example.com/api/ws?token=t'
+}
 
+const coderConn = {
+  authMode: 'token' as const,
+  baseUrl: 'https://coder.example.com',
+  profile: 'coder',
+  token: 'c',
+  wsUrl: 'wss://coder.example.com/api/ws?token=c'
+}
+
+function fakeDesktop() {
   return {
-    getConnection: vi.fn(async () => conn),
-    getGatewayWsUrl: vi.fn(async () => conn.wsUrl),
+    getConnection: vi.fn(async (profile?: null | string) => {
+      const key = (profile ?? '').trim()
+
+      return !key || key === 'default' ? primaryConn : coderConn
+    }),
+    getGatewayWsUrl: vi.fn(async (conn?: { wsUrl?: string }) => conn?.wsUrl ?? primaryConn.wsUrl),
     getBootProgress: vi.fn(async () => ({
       error: null,
       fakeMode: false,
@@ -143,6 +157,9 @@ beforeEach(() => {
     }
   }
 
+  closeSecondaryGateways()
+  $activeGatewayProfile.set('default')
+  $connection.set(null)
   vi.useFakeTimers()
   FakeWebSocket.mode = 'open'
   FakeWebSocket.instances = []
@@ -177,9 +194,14 @@ afterEach(() => {
     }
   }
 
+  closeSecondaryGateways()
+  $activeGatewayProfile.set('default')
+  $connection.set(null)
   vi.useRealTimers()
   ;(globalThis as { WebSocket: unknown }).WebSocket = originalWebSocket
   delete (window as { hermesDesktop?: unknown }).hermesDesktop
+  window.localStorage.removeItem('hermes.desktop.workspace-cwd')
+  $currentCwd.set('')
 })
 
 // Let pending microtasks (awaits) AND the queued 0ms socket open/error fire.
@@ -336,5 +358,92 @@ describe('useGatewayBoot remote reconnect loop (real hook, fake socket)', () => 
     expect($desktopBoot.get().error).toBeNull()
     expect($desktopBoot.get().visible).toBe(false)
     expect($desktopBoot.get().phase).toBe('renderer.ready')
+  })
+
+  it('seeds the configured default project dir pre-connect — no route-resume race (#71873)', async () => {
+    // The reporter's scenario: a configured default project dir must be applied
+    // at boot regardless of route-resume timing. The seed now runs BEFORE the
+    // gateway opens, so no session restore can race it (route-resume is gated
+    // on gatewayState === 'open').
+    const desktop = fakeDesktop() as {
+      sanitizeWorkspaceCwd?: unknown
+      settings?: unknown
+    }
+
+    desktop.settings = {
+      getDefaultProjectDir: vi.fn(async () => ({
+        defaultLabel: 'C:\\Users\\sonny',
+        dir: 'C:\\Hermes',
+        resolvedCwd: 'C:\\Hermes'
+      })),
+      pickDefaultProjectDir: vi.fn(async () => undefined),
+      setDefaultProjectDir: vi.fn(async () => undefined)
+    }
+    desktop.sanitizeWorkspaceCwd = vi.fn(async (cwd: string) => ({ cwd }))
+    ;(window as { hermesDesktop?: unknown }).hermesDesktop = desktop
+
+    // Record the cwd at the exact moment the gateway opens its WebSocket: if
+    // the seed moved back post-connect, this would still be '' here and the
+    // end-state assertion would pass anyway (the seed would run later in the
+    // same flush). The construction-time snapshot is what proves ordering.
+    let cwdAtConnect = ''
+
+    class RecordingSocket extends FakeWebSocket {
+      constructor(url: string) {
+        super(url)
+        cwdAtConnect = $currentCwd.get()
+      }
+    }
+
+    ;(globalThis as { WebSocket: unknown }).WebSocket = RecordingSocket
+
+    render(<Harness />)
+    await flushAsync()
+
+    expect(cwdAtConnect).toBe('C:\\Hermes')
+    expect($currentCwd.get()).toBe('C:\\Hermes')
+  })
+
+  it('FIX: primary sleep/wake reconnect dials the window backend, not the active secondary profile', async () => {
+    const desktop = fakeDesktop()
+
+    ;(window as { hermesDesktop?: unknown }).hermesDesktop = desktop
+
+    render(<Harness />)
+    await flushAsync()
+    expect($gatewayState.get()).toBe('open')
+    expect(FakeWebSocket.instances).toHaveLength(1)
+    expect(FakeWebSocket.instances[0].url).toBe(primaryConn.wsUrl)
+
+    // Profile swap opens a secondary WS; briefly use real timers so that
+    // handshake isn't wedged behind the suite's fake clock.
+    vi.useRealTimers()
+    await ensureGatewayProfile('coder')
+    vi.useFakeTimers()
+
+    expect(isActivePrimary()).toBe(false)
+    expect($activeGatewayProfile.get()).toBe('coder')
+    expect($connection.get()?.profile).toBe('coder')
+    expect($connection.get()?.baseUrl).toBe(coderConn.baseUrl)
+
+    const callsBeforeDrop = desktop.getConnection.mock.calls.length
+    const socketsBeforeDrop = FakeWebSocket.instances.length
+    const primarySocket = FakeWebSocket.instances[0]
+
+    act(() => primarySocket.drop())
+    await flushAsync()
+    await advanceBackoff()
+
+    const reconnectCalls = desktop.getConnection.mock.calls.slice(callsBeforeDrop)
+    expect(reconnectCalls.some(args => (args[0] ?? '').trim() === 'coder')).toBe(false)
+    expect(reconnectCalls.some(args => args.length === 0 || args[0] == null || args[0] === '')).toBe(true)
+
+    const primaryReconnectSockets = FakeWebSocket.instances
+      .slice(socketsBeforeDrop)
+      .filter(socket => socket.url === primaryConn.wsUrl)
+
+    expect(primaryReconnectSockets.length).toBeGreaterThan(0)
+    expect($connection.get()?.profile).toBe('coder')
+    expect($connection.get()?.baseUrl).toBe(coderConn.baseUrl)
   })
 })
