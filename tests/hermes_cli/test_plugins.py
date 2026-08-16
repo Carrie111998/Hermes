@@ -1325,6 +1325,30 @@ class TestResolvePreToolBlock:
         with pytest.raises(RuntimeError, match="secret"):
             plugins_mod.resolve_pre_tool_block("read_file", {})
 
+    def test_required_policy_dispatch_crash_fails_closed_only_for_protected_tool(
+        self, tmp_path, monkeypatch
+    ):
+        import hermes_cli.plugins as plugins_mod
+
+        home = tmp_path / "hermes"
+        home.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        self._configure_required_policy(home, "guard", ["terminal"])
+        monkeypatch.setattr(
+            plugins_mod,
+            "_get_pre_tool_call_directive_details",
+            lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("secret")),
+        )
+
+        message, modified = plugins_mod._dispatch_pre_tool_call_hooks(
+            "terminal", {}
+        )
+        assert message is not None
+        assert "secret" not in message
+        assert modified is None
+        with pytest.raises(RuntimeError, match="secret"):
+            plugins_mod._dispatch_pre_tool_call_hooks("read_file", {})
+
     def test_malformed_required_policy_configuration_fails_closed(
         self, tmp_path, monkeypatch
     ):
@@ -1381,6 +1405,44 @@ class TestPreToolCallModify:
         )
         assert block_msg is None
         assert modified == {"path": "/safe", "content": "fixed"}
+
+    def test_required_allow_policy_preserves_other_plugin_modification(
+        self, tmp_path, monkeypatch
+    ):
+        import hermes_cli.plugins as plugins_mod
+
+        home = tmp_path / "hermes"
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        _make_plugin_dir(
+            home / "plugins",
+            "required_guard",
+            register_body=(
+                'ctx.register_hook("pre_tool_call", '
+                'lambda **kw: {"action": "allow"})'
+            ),
+        )
+        _make_plugin_dir(
+            home / "plugins",
+            "modifier",
+            register_body=(
+                'ctx.register_hook("pre_tool_call", '
+                'lambda **kw: {"action": "modify", '
+                '"args": {"path": "/safe"}})'
+            ),
+        )
+        TestResolvePreToolBlock._configure_required_policy(
+            home, "required_guard", ["write_file"]
+        )
+        manager = PluginManager()
+        monkeypatch.setattr(plugins_mod, "_plugin_manager", manager)
+        manager.discover_and_load()
+
+        block_msg, modified = plugins_mod._dispatch_pre_tool_call_hooks(
+            "write_file", {"path": "/unsafe", "content": "x"}
+        )
+
+        assert block_msg is None
+        assert modified == {"path": "/safe", "content": "x"}
 
     def test_modify_last_wins_on_same_key(self, monkeypatch):
         """When two hooks modify the same key, the later hook wins."""
