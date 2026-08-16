@@ -1,6 +1,6 @@
 ---
 title: "ARCH-003 implementation plan: runtime-state audit and replay verification"
-status: IMPLEMENTATION_PLAN_REVISE_V17_PENDING
+status: IMPLEMENTATION_PLAN_REVISE_V18_PENDING
 date: 2026-08-16
 type: implementation-plan
 ticket: ARCH-003
@@ -192,10 +192,13 @@ journal emission succeeds. Non-replay-tuple-only updates do not increment it
 and remain outside the verifier's `CONSISTENT` claim. A database-level
 trigger restricted to the replay-tuple columns, with a value-change predicate,
 or an equivalent write guard must preserve this increment for any prior writer
-that can mutate those columns. Choose exactly one increment mechanism; the
-new writer must not increment the counter both in application code and in the
-trigger/write-guard. The mutation/genesis transaction records the counter
-before/after values in its event and updates the row marker. A row whose marker is older
+that can mutate those columns. The increment mechanism must be the database-level trigger/write-guard
+restricted to replay-tuple columns with a value-change predicate; an
+application-code-only counter is prohibited because prior writers must remain
+observable during rollback. The new writer must not increment the counter both
+in application code and in the trigger/write-guard. The mutation/genesis
+transaction records the counter before/after values in its event and updates
+the row marker. A row whose marker is older
 than the current generation, or whose materialized counter is greater than the
 latest journaled counter for that entity, is `UNKNOWN`, never `DRIFT`. Every event's before-counter must equal the immediately preceding event's
 after-counter, or the baseline's sealed counter. A marked genesis for an
@@ -229,8 +232,9 @@ writer must observe `sealed_through_seq` equal to the current maximum event
 sequence for that entity. A baseline that seals behind the current maximum is
 invalid and verifies as `UNKNOWN`. The first subsequent mutation or genesis
 must use `entity_seq + 1`. The verifier starts from the baseline tuple and
-checks this continuity. A baseline is the sole event kind allowed to commit
-without an accompanying materialized-state mutation.
+checks this continuity. A baseline or an explicitly authorized re-originating `genesis` is an
+event-only exception allowed to commit without an accompanying
+materialized-state mutation.
 
 The privileged baseline writer is an internal runtime-state maintenance
 operation with explicit operator authorization, outside the gateway, scheduler,
@@ -244,7 +248,20 @@ counter-gap entity cannot be sealed across by this baseline writer: it refuses
 with mutation-side `WRITE_ABORT`, appends no baseline, and leaves the entity
 for the separately authorized re-originating genesis operation. Otherwise it
 appends the baseline event on the same connection and releases the lock after
-commit or rollback. Production gateway, scheduler,
+commit or rollback.
+
+The separately authorized re-originating genesis writer is the second
+event-only exception. It is an internal maintenance operation outside the
+gateway, scheduler, verifier, and automatic-repair paths; it requires explicit
+operator authorization, acquires the exclusive side of the same maintenance
+RW lock before its WAL transaction, and verifies the current materialized row
+and observed counter. It appends exactly one `genesis` event with a new
+manual-reorigin origin marker, before- and after-replay tuples equal to the
+observed materialized replay tuple, and before- and after-counter equal to the
+observed materialized counter. It changes no replay-tuple column, updates only
+the journal-writer provenance marker, and releases the lock after commit or
+rollback. The next ordinary mutation is then allowed from that genesis
+starting point. Production gateway, scheduler,
 and automatic-repair paths never invoke it in this ticket; hermetic tests may
 invoke it directly.
 
@@ -329,14 +346,16 @@ Migration compatibility tests must assert this posture.
   unchanged, emit no event, and surface the shared `KEY_UNAVAILABLE` reason.
   This is distinct from `WRITE_ABORT`, which covers a transaction or
   continuity refusal after the mutation path has entered its write contract.
-- The privileged baseline writer is the sole event-only exception and uses the
-  exclusive lock ordering defined in Gate 1.
+- The privileged baseline writer and the explicitly authorized re-originating
+  genesis writer are the only event-only exceptions and use the exclusive lock
+  ordering defined in Gate 1.
 - There is no sequence retry path under the write-lock-first discipline. An
   unexpected uniqueness collision or busy-timeout exhaustion aborts the whole
   transaction and surfaces a bounded failure; it is not retried inside the
   invalid transaction.
 - Neither abort may create a committed mutation/genesis event without its state
-  mutation or a replay-visible sequence gap. Baseline sequence continuity is
+  mutation or a replay-visible sequence gap. The two named event-only writers
+  are explicit exceptions; baseline and re-origin sequence continuity is
   governed by Gate 1.
 - Add a negative test proving lifecycle writes cannot bypass the mutation/genesis
   emission chokepoint; the test must not reject the explicitly named baseline
@@ -441,8 +460,8 @@ Add deterministic tests for:
 - single-writer invariant and defensive abort; no sequence-collision retry is
   expected under write-lock-first discipline;
 - baseline generation-marker mismatch returning `UNKNOWN`;
-- bypass-path rejection for mutation/genesis while permitting the named baseline
-  writer;
+- bypass-path rejection for mutation/genesis while permitting only the named
+  baseline writer and the explicitly authorized re-originating genesis writer;
 - keyed digest/profile isolation, identifier/key-check mismatch, digest
   rotation without bridging, verify-time key unavailability, and mutation-time
   key unavailability returning shared `KEY_UNAVAILABLE` without changing
@@ -713,6 +732,23 @@ DGX changes, deployment, repair, or event-sourcing. The corrected plan must
 return to the same authenticated Claude reviewer family and then to AGY on the
 identical packet.
 
+## Implementation-plan review reconciliation v17
+
+The v17 authenticated Claude Opus review returned `REVISE` with three bounded
+plan-text corrections. The corrections are incorporated above:
+
+1. The authorized same-epoch re-originating genesis is a fully defined,
+   exclusive-lock, event-only writer with equal observed before/after tuple and
+   counter, and it is included in the allowed-writer/bypass contract.
+2. Counter increment is forced to the database-level trigger/write-guard;
+   application-only increment is prohibited for rollback observability.
+3. Acceptance coverage now includes v16.
+
+These remain plan-only corrections and do not authorize source edits, tests,
+DGX changes, deployment, repair, or event-sourcing. The corrected plan must
+return to the same authenticated Claude reviewer family and then to AGY on the
+identical packet.
+
 ## Acceptance criteria
 
 ARCH-003 implementation is ready for its delivery gates only when:
@@ -741,7 +777,7 @@ ARCH-003 implementation is ready for its delivery gates only when:
   retention job; entities beyond the replay limit remain UNKNOWN in this ticket,
   and the 100,000-event/100 MiB per-profile threshold is a documented follow-up
   operational review, not an in-ticket operator gate;
-- reconciliation v1 and v5-v15 items are incorporated into the normative
+- reconciliation v1 and v5-v16 items are incorporated into the normative
   Gates 0-4 text (with v2-v4 explicitly folded into the v1/v4 text), and this
   merged plan revision receives the same-family re-review;
 - all focused and relevant tests pass;
@@ -782,6 +818,8 @@ ARCH-003 implementation is ready for its delivery gates only when:
   mechanism, LEGACY_ORIGIN_MISSING binding, and corrected coverage.
 - v16: authorized same-epoch re-origin remediation, baseline gap refusal,
   and singular counter increment mechanism.
+- v17: complete re-originating genesis event-only contract, exclusive-lock
+  bypass allowance, and mandatory database-level counter guard.
 
 
 ## Non-goals
