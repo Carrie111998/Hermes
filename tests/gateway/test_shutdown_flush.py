@@ -182,6 +182,28 @@ def test_recover_skips_failing_payload_and_continues(tmp_path, monkeypatch):
     assert bad.exists()
 
 
+def test_recover_survives_unparseable_payload(tmp_path, monkeypatch):
+    """A corrupt flush file must be preserved, not abort the pass."""
+    flush_dir = _make_flush_dir(tmp_path)
+    monkeypatch.setattr(
+        "gateway.shutdown_flush._get_flush_dir", lambda: flush_dir
+    )
+    corrupt = flush_dir / "pending-a-bad.json"
+    corrupt.write_text("not json", encoding="utf-8")
+    good = _write_flush_file(flush_dir, "pending-b-good.json", "sid-good", "kept")
+
+    mock_db = MagicMock()
+    assert recover_pending_to_db(mock_db) == 1
+    mock_db.append_message.assert_called_once_with(
+        session_id="sid-good",
+        role="user",
+        content="kept",
+        timestamp=1700000000,
+    )
+    assert not good.exists()
+    assert corrupt.exists()
+
+
 def test_serialise_object_with_text():
     obj = MagicMock()
     obj.text = "msg"
