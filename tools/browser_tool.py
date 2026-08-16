@@ -2602,6 +2602,11 @@ def _find_agent_browser(*, validate: bool = True) -> str:
     )
 
 
+def _runtime_os_name() -> str:
+    """Return the host OS family through a narrow, testable boundary."""
+    return os.name
+
+
 def _kill_process_tree(proc: "subprocess.Popen") -> None:
     """Best-effort kill of *proc* and any descendants it spawned.
 
@@ -2628,7 +2633,7 @@ def _kill_process_tree(proc: "subprocess.Popen") -> None:
     full timeout budget waiting for a graceful exit — there's nothing to gain
     from waiting again here, only more delay on an already-timed-out call.
     """
-    if os.name == "nt":
+    if _runtime_os_name() == "nt":
         try:
             subprocess.run(
                 ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
@@ -2705,7 +2710,7 @@ def warm_agent_browser_npx_cache(timeout: float = 60.0) -> bool:
         "env": env,
         "creationflags": windows_hide_flags(),
     }
-    if os.name == "posix":
+    if _runtime_os_name() == "posix":
         popen_kwargs["start_new_session"] = True
     else:
         popen_kwargs["creationflags"] |= getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)

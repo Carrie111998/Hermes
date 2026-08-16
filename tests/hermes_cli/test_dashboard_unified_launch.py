@@ -31,17 +31,25 @@ class TestUnifiedDashboardRouting:
 
     def test_profile_launch_reexecs_machine_dashboard(self, main_mod, monkeypatch):
         monkeypatch.delenv("HERMES_HOME", raising=False)
+        monkeypatch.delenv("HERMES_DESKTOP", raising=False)
         monkeypatch.setattr(
             "hermes_cli.profiles.get_active_profile_name", lambda: "worker_x"
         )
         monkeypatch.setattr(main_mod, "_dashboard_listening", lambda host, port: False)
         execs = []
 
-        def fake_exec(exe, argv, env):
-            execs.append((exe, argv, env))
-            raise SystemExit(0)  # execvpe never returns
+        if sys.platform == "win32":
+            def fake_popen(argv, env):
+                execs.append((sys.executable, argv, env))
+                return types.SimpleNamespace(wait=lambda: 0)
 
-        monkeypatch.setattr(main_mod.os, "execvpe", fake_exec)
+            monkeypatch.setattr(main_mod.subprocess, "Popen", fake_popen)
+        else:
+            def fake_exec(exe, argv, env):
+                execs.append((exe, argv, env))
+                raise SystemExit(0)  # execvpe never returns
+
+            monkeypatch.setattr(main_mod.os, "execvpe", fake_exec)
 
         with pytest.raises(SystemExit):
             main_mod.cmd_dashboard(_args())
