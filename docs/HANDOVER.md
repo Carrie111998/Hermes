@@ -54,7 +54,7 @@ The local audit checkout observed during this refresh is `D:/PROJECT/Hermes`, br
 
 - `HERMES-UPDATE-001`: `MERGED_DEPLOYED`; PR #22, SHA `0fe3773c...`, Lane 2/3 review PASS and targeted tests passed.
 - `HERMES-AUTH-001`: merged/deployed separately.
-- `HERMES-AUTH-002`: `READY_FOR_MERGE`; implementation review PASS, commit `5e8df81b6`, targeted tests/CI/Windows wrapper evidence recorded. Merge and deployment remain separate gates.
+- `HERMES-AUTH-002`: `MERGED_DEPLOYED`; PR #16 merged as `826349ccbfe165ef9f2f7f47f72ed53226c13603`; implementation commit `5e8df81b6`, targeted tests/CI/Windows wrapper evidence recorded. The active release SHA `0fe3773ccfbec860984d0dc93adc4875ca2d5d4b` is four commits ahead of the AUTH-002 merge, so no separate AUTH-002 runtime restart is required.
 - `HERMES-CALENDAR-GUARD-001`: `MERGED_DEPLOYED`; PR #17/#18 plus correction PR #24; timer, recovery unit, wrapper, and cron execution are verified.
 - `HERMES-MONITORING-001`: `BLOCKED`; do not infer readiness from this deployment.
 - `ARCH-002`: proposed next core ticket, deferred until the current Telegram transport gate is resolved or explicitly re-sequenced.
