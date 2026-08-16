@@ -1146,14 +1146,19 @@ def _run_cua_driver_installer(label: str = "Installing", verbose: bool = True) -
         popen_kwargs["start_new_session"] = True
 
     def _kill_installer_tree(proc):
-        import signal as _signal
-        try:
-            if not is_windows:
-                os.killpg(os.getpgid(proc.pid), _signal.SIGKILL)  # windows-footgun: ok — POSIX branch only
-            else:
-                proc.kill()
-        except (OSError, ProcessLookupError):
-            proc.kill()
+        """Kill the installer and every descendant.  Never raises.
+
+        Windows needs a REAL tree-kill.  ``proc.kill()`` reaps only the direct
+        child — here the ``powershell`` running upstream's ``install.ps1`` —
+        so the installer's own children survive, keep holding the concurrent-
+        install lock, and wedge every later run.  ``_tree_kill`` is the repo's
+        single implementation of this: ``taskkill /PID <pid> /T /F`` on
+        Windows, ``killpg(SIGKILL)`` on POSIX (valid because ``popen_kwargs``
+        sets ``start_new_session`` there).
+        """
+        from hermes_cli._subprocess_compat import _tree_kill
+
+        _tree_kill(proc)
 
     try:
         # When not verbose (e.g. `hermes update`'s refresh), capture the
@@ -1177,21 +1182,32 @@ def _run_cua_driver_installer(label: str = "Installing", verbose: bool = True) -
                 install_cmd, proc.returncode, stdout=None, stderr=None
             )
         else:
-            proc = subprocess.Popen(
-                install_cmd, shell=use_shell, env=_cua_driver_env(),
-                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                text=True, encoding="utf-8", errors="replace",
-                creationflags=_post_setup_no_window_flags(),
-                **popen_kwargs
+            # Capture into TEMP FILES, not pipes.  This installer spawns
+            # grandchildren by construction — on Windows ``install_cmd`` is
+            # powershell running upstream's ``irm …/install.ps1 | iex``, on
+            # POSIX a bash script that execs ``_install-rust.sh`` — and a
+            # grandchild inherits the capture pipe's write handle.  The pipe
+            # then never reaches EOF, so the post-timeout drain blocked
+            # forever and ``_CUA_INSTALLER_TIMEOUT`` was not a bound at all on
+            # the ``hermes update`` refresh path.  A tree-kill alone does not
+            # fix it (taskkill blows its own 10s cap on a real installer tree
+            # and the grandchild survives) — the pipes have to go.
+            # ``run_text_capture`` also supplies the isolation the Popen
+            # branch builds by hand: CREATE_NO_WINDOW on Windows,
+            # ``start_new_session`` on POSIX so its kill reaches the group.
+            from hermes_cli._subprocess_compat import run_text_capture
+
+            captured = run_text_capture(
+                install_cmd, timeout=_CUA_INSTALLER_TIMEOUT,
+                env=_cua_driver_env(), shell=use_shell,
             )
-            try:
-                out, _ = proc.communicate(timeout=_CUA_INSTALLER_TIMEOUT)
-            except subprocess.TimeoutExpired:
-                _kill_installer_tree(proc)
-                proc.communicate()
-                raise
+            # The old capture merged stderr into stdout (stderr=STDOUT) and
+            # everything below reads ``result.stdout``; concatenate so the
+            # logged "Next steps" wall keeps carrying the warnings too.
             result = subprocess.CompletedProcess(
-                install_cmd, proc.returncode, stdout=out, stderr=None
+                install_cmd, captured.returncode,
+                stdout=(captured.stdout or "") + (captured.stderr or ""),
+                stderr=None,
             )
             # Preserve the full installer output. During `hermes update`,
             # sys.stdout is the mirroring _UpdateOutputStream whose `_log`

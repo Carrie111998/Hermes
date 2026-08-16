@@ -261,13 +261,35 @@ class TestInstallerTimeoutKillsProcessGroup:
     `curl | bash` grandchildren can't survive holding the install lock."""
 
     def test_timeout_kills_process_group_and_returns_false(self, tmp_path):
-        import os
-        import signal
+        """Verbose path: timeout must killpg the whole group, and return False.
+
+        Drives ``verbose=True`` because that is the branch that still owns a
+        ``Popen`` -- it streams the installer live to the console, so it cannot
+        capture.  The capturing branch moved to ``run_text_capture`` (see
+        TestInstallerCapturePipeHazard) and its kill lives inside that helper.
+
+        The kill itself is now ``_subprocess_compat._tree_kill``, so the
+        ``killpg`` to intercept belongs to THAT module, not ``tools_config``.
+
+        ⚠ ``patch("platform.system")`` is not enough to reach the POSIX arm any
+        more: ``_tree_kill`` branches on ``_subprocess_compat.IS_WINDOWS``, a
+        constant bound at import, which stays True on a Windows host no matter
+        what ``platform.system()`` reports.  Patch the constant too or this
+        silently exercises the Windows taskkill arm instead.
+        """
         import subprocess
-        import sys as _sys
         from unittest.mock import MagicMock
         from hermes_cli import tools_config
+        from hermes_cli import _subprocess_compat
 
+        # Windows has neither os.getpgid/os.killpg nor signal.SIGKILL, so all
+        # three need create=True to stand in.  Without the SIGKILL stub this
+        # test fails on Windows for a reason that looks like the code under
+        # test: _tree_kill raises AttributeError before reaching killpg, the
+        # installer's broad `except Exception: return False` swallows it, and
+        # the assertion reports "process group was not killed".  That is the
+        # pre-existing red this test carried on this host.
+        SIGKILL = getattr(__import__("signal"), "SIGKILL", 9)
         killed = {}
 
         fake_proc = MagicMock()
@@ -283,18 +305,26 @@ class TestInstallerTimeoutKillsProcessGroup:
             killed["sig"] = sig
 
         with patch("platform.system", return_value="Linux"), \
+             patch.object(_subprocess_compat, "IS_WINDOWS", False), \
              patch("subprocess.run", return_value=MagicMock(returncode=0, stderr="")), \
              patch("subprocess.Popen", return_value=fake_proc), \
-             patch.object(tools_config.os, "getpgid", return_value=99999), \
-             patch.object(tools_config.os, "killpg", side_effect=fake_killpg), \
+             patch.object(_subprocess_compat.os, "getpgid", return_value=99999,
+                          create=True), \
+             patch.object(_subprocess_compat.os, "killpg", side_effect=fake_killpg,
+                          create=True), \
+             patch.object(_subprocess_compat.signal, "SIGKILL", SIGKILL,
+                          create=True), \
              patch.object(tools_config, "_clear_stale_cua_install_lock"), \
              patch.object(tools_config, "_print_warning"), \
              patch.object(tools_config, "_print_info"):
-            ok = tools_config._run_cua_driver_installer(label="Refreshing", verbose=False)
+            ok = tools_config._run_cua_driver_installer(label="Installing", verbose=True)
 
         assert ok is False
-        assert killed.get("pgid") == 99999
-        assert killed.get("sig") == signal.SIGKILL
+        assert killed.get("pgid") == 99999, (
+            "the installer's process group was not killed -- surviving "
+            "curl|bash grandchildren keep holding the install lock"
+        )
+        assert killed.get("sig") == SIGKILL
         # Post-kill reap happened.
         assert fake_proc.communicate.call_count == 2
 
@@ -305,9 +335,19 @@ class TestInstallerTimeoutKillsProcessGroup:
         assert tools_config._CUA_INSTALLER_TIMEOUT > tools_config._CUA_LOCK_STALE_AFTER
 
     def test_installer_runs_in_new_session_on_posix(self, tmp_path):
+        """POSIX new-session must survive the move to run_text_capture.
+
+        The capturing branch no longer builds its own ``popen_kwargs`` -- the
+        helper does.  This still asserts on the real ``Popen`` call because the
+        patch is on ``subprocess.Popen``, which ``run_text_capture`` calls
+        internally, so the guarantee is checked end to end rather than by
+        trusting the helper.  As above, ``IS_WINDOWS`` must be patched or the
+        helper takes its Windows creationflags arm on this host.
+        """
         import subprocess
         from unittest.mock import MagicMock
         from hermes_cli import tools_config
+        from hermes_cli import _subprocess_compat
 
         captured = {}
         fake_proc = MagicMock()
@@ -320,6 +360,7 @@ class TestInstallerTimeoutKillsProcessGroup:
             return fake_proc
 
         with patch("platform.system", return_value="Linux"), \
+             patch.object(_subprocess_compat, "IS_WINDOWS", False), \
              patch("subprocess.run", return_value=MagicMock(returncode=0, stderr="")), \
              patch("subprocess.Popen", side_effect=fake_popen), \
              patch.object(tools_config, "_clear_stale_cua_install_lock"), \
@@ -327,6 +368,7 @@ class TestInstallerTimeoutKillsProcessGroup:
              patch.object(tools_config, "_print_info"):
             tools_config._run_cua_driver_installer(label="Refreshing", verbose=False)
 
+        assert captured, "no process was spawned at all -- the seam is dead"
         assert captured.get("start_new_session") is True
 
 
@@ -421,3 +463,129 @@ class TestInstallerNoShell:
 
         assert "script" in captured
         assert not os.path.exists(captured["script"])
+
+
+class TestInstallerCapturePipeHazard:
+    """The capturing install path must not capture through PIPES.
+
+    On Windows ``install_cmd`` is ``powershell -Command "irm …/install.ps1 |
+    iex"`` -- an installer that certainly spawns grandchildren.  A grandchild
+    inherits the capture pipe's write handle, so the pipe never reaches EOF,
+    and the post-timeout ``proc.communicate()`` (which carried no timeout)
+    blocked until that grandchild exited.  ``_CUA_INSTALLER_TIMEOUT`` was
+    therefore not a bound at all on the ``hermes update`` refresh path.
+
+    A tree-kill alone does not fix it -- measured, ``taskkill`` blows its own
+    10s cap on a real installer tree and the grandchild survives.  The pipes
+    have to go: ``run_text_capture`` captures into temp files (nothing to
+    drain) and tree-kills.  See ``hermes_cli._subprocess_compat``.
+
+    ⚠ EVERY test here MUST patch ``subprocess.Popen``, even ones that appear
+    not to spawn.  While this class was being written, a test that patched
+    only ``run_text_capture`` -- the seam the code did not use yet -- let the
+    real ``irm … | iex`` run against the network and hang the session on the
+    very reader-thread join it was written to prevent.  ``_no_spawn`` below
+    fails closed so a dead seam can never reach a live installer again.
+    """
+
+    @staticmethod
+    def _no_spawn(*args, **kwargs):
+        raise AssertionError(
+            f"real process spawn attempted in a unit test: {args!r} {kwargs!r}"
+        )
+
+    def test_capturing_path_uses_file_backed_capture_not_pipes(self):
+        import subprocess
+        from hermes_cli import tools_config
+
+        seen = {}
+
+        def fake_capture(argv, **kwargs):
+            seen["argv"] = list(argv)
+            seen["kwargs"] = kwargs
+            return subprocess.CompletedProcess(list(argv), 0, "next steps", "")
+
+        with patch("platform.system", return_value="Windows"), \
+             patch("hermes_cli._subprocess_compat.run_text_capture", fake_capture), \
+             patch("subprocess.Popen", side_effect=self._no_spawn), \
+             patch.object(tools_config, "_cua_driver_cmd", return_value="cua-driver"), \
+             patch.object(tools_config.shutil, "which", return_value=None), \
+             patch.object(tools_config, "_clear_stale_cua_install_lock"), \
+             patch.object(tools_config, "_print_warning"), \
+             patch.object(tools_config, "_print_success"), \
+             patch.object(tools_config, "_print_info"):
+            tools_config._run_cua_driver_installer(label="Refreshing", verbose=False)
+
+        assert "argv" in seen, (
+            "the capturing install path did not go through run_text_capture -- "
+            "back on Popen+PIPE means a surviving installer grandchild makes "
+            "the post-timeout drain unbounded"
+        )
+        assert seen["argv"][0] == "powershell"
+        assert seen["kwargs"]["timeout"] == tools_config._CUA_INSTALLER_TIMEOUT
+
+    def test_capturing_path_timeout_returns_false(self):
+        import subprocess
+        from hermes_cli import tools_config
+
+        called = []
+
+        def fake_capture(argv, **kwargs):
+            called.append(list(argv))
+            raise subprocess.TimeoutExpired(list(argv), kwargs["timeout"])
+
+        with patch("platform.system", return_value="Windows"), \
+             patch("hermes_cli._subprocess_compat.run_text_capture", fake_capture), \
+             patch("subprocess.Popen", side_effect=self._no_spawn), \
+             patch.object(tools_config, "_cua_driver_cmd", return_value="cua-driver"), \
+             patch.object(tools_config, "_clear_stale_cua_install_lock"), \
+             patch.object(tools_config, "_print_warning"), \
+             patch.object(tools_config, "_print_info"):
+            ok = tools_config._run_cua_driver_installer(label="Refreshing", verbose=False)
+
+        # Vacuity guard: the function swallows unexpected exceptions into
+        # `return False`, so `ok is False` alone also passes when the seam is
+        # dead and _no_spawn fired.  Prove the timeout came from the helper.
+        assert called, (
+            "run_text_capture was never reached -- `ok is False` came from the "
+            "broad except swallowing the spawn guard, not from a timeout"
+        )
+        assert ok is False
+
+    def test_verbose_windows_timeout_kills_the_whole_tree(self):
+        """The verbose path keeps Popen (it streams live to the console), so
+        its own kill must reach the tree.  ``proc.kill()`` reaps only
+        powershell.exe and leaves install.ps1's children holding the upstream
+        install lock -- which then wedges every later run.
+        """
+        import subprocess
+        from unittest.mock import MagicMock
+        from hermes_cli import tools_config
+
+        fake_proc = MagicMock()
+        fake_proc.pid = 4321
+        fake_proc.communicate.side_effect = [
+            subprocess.TimeoutExpired(cmd="x", timeout=1),
+            ("", None),
+        ]
+        tree_killed = []
+
+        with patch("platform.system", return_value="Windows"), \
+             patch("subprocess.Popen", return_value=fake_proc), \
+             patch("hermes_cli._subprocess_compat._tree_kill",
+                   side_effect=lambda p: tree_killed.append(p.pid)), \
+             patch.object(tools_config, "_cua_driver_cmd", return_value="cua-driver"), \
+             patch.object(tools_config, "_clear_stale_cua_install_lock"), \
+             patch.object(tools_config, "_print_warning"), \
+             patch.object(tools_config, "_print_info"):
+            ok = tools_config._run_cua_driver_installer(label="Installing", verbose=True)
+
+        assert ok is False
+        assert tree_killed == [4321], (
+            "verbose timeout did not tree-kill; a bare proc.kill() leaves the "
+            "installer's grandchildren alive holding the install lock"
+        )
+        assert fake_proc.kill.call_count == 0, (
+            "a bare proc.kill() reaps only the direct child -- on Windows that "
+            "is powershell.exe, not the installer it launched"
+        )
