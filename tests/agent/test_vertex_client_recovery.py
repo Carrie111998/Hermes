@@ -11,6 +11,7 @@ monkeypatched at the chokepoint; no SDKs or network involved.
 
 from __future__ import annotations
 
+import threading
 from unittest.mock import MagicMock
 
 import pytest
@@ -213,6 +214,42 @@ class _StubAgent:
 
     def _effective_lmstudio_context_length(self, context_intent=None, runtime_context_length=None):
         return context_intent
+
+    # -- upstream's per-request Anthropic client single-slot cache ------------
+    # ``_create_request_anthropic_client`` gained a warm-client cache upstream
+    # (key = credentials/base-url/timeout/1M-beta) guarded by the OpenAI-wire
+    # lock. The stub only exercises the CONSTRUCTION path (does it go through
+    # the provider chokepoint?), so these mirror the real contract minimally:
+    # a real re-entrant lock, an empty slot that always misses, and no-op
+    # close. Without them the stub raises AttributeError before ever reaching
+    # the chokepoint call the test asserts on.
+    def _request_anthropic_client_key(self):
+        return (
+            "direct",
+            self._anthropic_api_key,
+            getattr(self, "_anthropic_base_url", None),
+            None,
+            bool(getattr(self, "_oauth_1m_beta_disabled", False)),
+        )
+
+    def _openai_client_lock(self):
+        if getattr(self, "_stub_client_lock", None) is None:
+            self._stub_client_lock = threading.RLock()
+        return self._stub_client_lock
+
+    def _request_anthropic_client_cache_ref(self):
+        if getattr(self, "_stub_request_anthropic_cache", None) is None:
+            self._stub_request_anthropic_cache = {
+                "client": None, "key": None, "poisoned": False, "in_use": False,
+            }
+        return self._stub_request_anthropic_cache
+
+    @staticmethod
+    def _is_openai_client_closed(client):
+        return False
+
+    def _close_request_anthropic_client(self, client, *, reason: str) -> None:
+        pass
 
 
 def test_transient_recovery_rebuilds_vertex_via_chokepoint(monkeypatch):
