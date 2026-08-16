@@ -420,8 +420,25 @@ class HonchoSessionManager:
         return session
 
     def _flush_session(self, session: HonchoSession) -> bool:
-        """Internal: write unsynced messages to Honcho synchronously."""
+        """Internal: write unsynced messages to Honcho synchronously.
+
+        Honours ``saveMessages``. Messages are marked synced rather than left pending, so
+        a caller that opted out does not accumulate an unbounded local backlog and retry
+        it every turn.
+        """
         if not session.messages:
+            return True
+
+        if self._config is not None and not getattr(self._config, "save_messages", True):
+            skipped = [m for m in session.messages if not m.get("_synced")]
+            for msg in skipped:
+                msg["_synced"] = True
+            if skipped:
+                logger.debug(
+                    "saveMessages disabled — not writing %d message(s) to Honcho "
+                    "for %s; memory stays read-only for this session",
+                    len(skipped), session.key,
+                )
             return True
 
         user_peer = self._get_or_create_peer(session.user_peer_id)
