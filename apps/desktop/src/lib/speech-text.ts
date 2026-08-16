@@ -160,13 +160,16 @@ function normalizeLineBreaks(text: string): string {
     .replace(SOFT_BREAK_RE, ' ')
 }
 
+/** Locale-dependent: placeholders come from `translateNow`, which reads the
+ *  runtime i18n locale — callers outside the i18n runtime (or before locale
+ *  init) get the default locale's copy. */
 export function sanitizeTextForSpeech(text: string): string {
   return normalizeLineBreaks(stripMarkdownTables(text))
-    .replace(FENCED_CODE_RE, translateNow('assistant.thread.speechCodeBlockOmitted'))
+    .replace(FENCED_CODE_RE, () => translateNow('assistant.thread.speechCodeBlockOmitted'))
     .replace(THINKING_PREFIX_RE, ' ')
     .replace(MARKDOWN_LINK_RE, '$1')
     .replace(INLINE_CODE_RE, '$1')
-    .replace(URL_RE, translateNow('assistant.thread.speechLink'))
+    .replace(URL_RE, () => translateNow('assistant.thread.speechLink'))
     .replace(EMOJI_RE, ' ')
     .replace(/^#{1,6}\s+/gm, '')
     .replace(/[*_~>#]/g, '')

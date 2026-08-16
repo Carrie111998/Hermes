@@ -1,12 +1,22 @@
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 
-import { setRuntimeI18nLocale } from '@/i18n'
+import type * as I18nModule from '@/i18n'
 
 import { sanitizeTextForSpeech } from './speech-text'
+
+vi.mock('@/i18n', async importOriginal => {
+  const actual = await importOriginal<typeof I18nModule>()
+
+  return { ...actual, translateNow: vi.fn(actual.translateNow) }
+})
+
+const { setRuntimeI18nLocale, translateNow } = await import('@/i18n')
+const actualI18n = await vi.importActual<typeof I18nModule>('@/i18n')
 
 describe('sanitizeTextForSpeech', () => {
   afterEach(() => {
     setRuntimeI18nLocale('en')
+    vi.mocked(translateNow).mockImplementation(actualI18n.translateNow)
   })
 
   it('summarizes fenced code blocks instead of reading them literally', () => {
@@ -30,6 +40,12 @@ describe('sanitizeTextForSpeech', () => {
 After the table.`
 
     expect(sanitizeTextForSpeech(text)).toBe('Before the table. 表格已省略. After the table.')
+  })
+
+  it('treats a translated placeholder as literal text, not a $-pattern', () => {
+    vi.mocked(translateNow).mockImplementation(key => (key === 'assistant.thread.speechCodeBlockOmitted' ? '$&' : ''))
+
+    expect(sanitizeTextForSpeech('Here is code:\n```ts\nconst x = 1\n```\nDone.')).toBe('Here is code: $& Done.')
   })
 
   it('still keeps normal prose and inline code readable', () => {
@@ -86,7 +102,7 @@ Done.`
     expect(sanitizeTextForSpeech(text)).toBe('Main takeaway: total is unchanged. table omitted. Done.')
   })
 
-  it('skips markdown tables nested inside blockquotes', () => {
+  it('announces omitted markdown tables nested inside blockquotes', () => {
     const text = `Before the table.
 
 > | Item | Value |
@@ -111,7 +127,7 @@ After the table.`
     expect(sanitizeTextForSpeech(text)).toBe('Before the table. table omitted. After the table.')
   })
 
-  it('skips explicit single-column markdown tables', () => {
+  it('announces omission of explicit single-column markdown tables', () => {
     const text = `Before the table.
 
 | Item |
