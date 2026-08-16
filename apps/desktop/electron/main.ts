@@ -28,7 +28,8 @@ import {
   session,
   shell,
   systemPreferences,
-  Tray
+  Tray,
+  type MenuItemConstructorOptions
 } from 'electron'
 import nodePty from 'node-pty'
 
@@ -5505,67 +5506,77 @@ function rebuildHermesTrayMenu() {
     return
   }
 
-  hermesTray.setContextMenu(
-    Menu.buildFromTemplate([
-      { label: 'Show Hermes', click: showMainWindow },
-      { label: 'Hide Hermes', click: () => mainWindow?.hide() },
-      {
-        label: trayPetState.poppedOut ? 'Return pet to Hermes' : 'Show desktop pet',
-        enabled: trayPetState.available,
-        click: () => requestPetCommand(trayPetState.poppedOut ? 'pop-in' : 'pop-out')
-      },
-      { type: 'separator' },
-      {
-        label: 'Enable tray',
-        type: 'checkbox',
-        checked: trayPreferences.enabled,
-        click: item => updateTrayPreferences({ enabled: item.checked })
-      },
-      {
-        label: 'Close window to tray',
-        type: 'checkbox',
-        checked: trayPreferences.closeToTray,
-        enabled: trayPreferences.enabled,
-        click: item => updateTrayPreferences({ closeToTray: item.checked })
-      },
-      {
-        label: 'Start in tray',
-        type: 'checkbox',
-        checked: trayPreferences.startInTray,
-        enabled: trayPreferences.enabled,
-        click: item => updateTrayPreferences({ startInTray: item.checked })
-      },
-      {
-        label: 'Pop out pet on startup',
-        type: 'checkbox',
-        checked: trayPreferences.popOutPetOnStartup,
-        enabled: trayPreferences.enabled,
-        click: item => updateTrayPreferences({ popOutPetOnStartup: item.checked })
-      },
-      {
-        label: 'Launch at login',
-        type: 'checkbox',
-        checked: trayPreferences.launchAtLogin,
-        click: item => updateTrayPreferences({ launchAtLogin: item.checked })
-      },
-      { type: 'separator' },
-      {
-        label: 'Quit Hermes',
-        click: () => {
-          quitFromTray({
-            markQuitting: () => {
-              isQuitting = true
-            },
-            quit: () => app.quit()
-          })
-        }
+  const template: MenuItemConstructorOptions[] = [
+    { label: 'Show Hermes', click: showMainWindow },
+    { label: 'Hide Hermes', click: () => mainWindow?.hide() },
+    {
+      label: trayPetState.poppedOut ? 'Return pet to Hermes' : 'Show desktop pet',
+      enabled: trayPetState.available,
+      click: () => requestPetCommand(trayPetState.poppedOut ? 'pop-in' : 'pop-out')
+    },
+    { type: 'separator' },
+    {
+      label: 'Enable tray',
+      type: 'checkbox',
+      checked: trayPreferences.enabled,
+      click: item => updateTrayPreferences({ enabled: item.checked })
+    },
+    {
+      label: 'Close window to tray',
+      type: 'checkbox',
+      checked: trayPreferences.closeToTray,
+      // Close-to-tray semantics are Windows-only (macOS already keeps the app
+      // alive after the last window closes); don't offer a dead switch there.
+      enabled: IS_WINDOWS && trayPreferences.enabled,
+      click: item => updateTrayPreferences({ closeToTray: item.checked })
+    },
+    {
+      label: 'Start in tray',
+      type: 'checkbox',
+      checked: trayPreferences.startInTray,
+      enabled: IS_WINDOWS && trayPreferences.enabled,
+      click: item => updateTrayPreferences({ startInTray: item.checked })
+    },
+    {
+      label: 'Pop out pet on startup',
+      type: 'checkbox',
+      checked: trayPreferences.popOutPetOnStartup,
+      enabled: trayPreferences.enabled,
+      click: item => updateTrayPreferences({ popOutPetOnStartup: item.checked })
+    },
+    {
+      label: 'Launch at login',
+      type: 'checkbox',
+      checked: trayPreferences.launchAtLogin,
+      // macOS login items are real, but launch-at-login is not part of the
+      // macOS tray/menu-bar story — keep the switch Windows-only too.
+      enabled: IS_WINDOWS,
+      click: item => updateTrayPreferences({ launchAtLogin: item.checked })
+    },
+    { type: 'separator' },
+    { label: 'Open Settings…', click: sendOpenSettingsRequested },
+    { type: 'separator' },
+    {
+      label: 'Quit Hermes',
+      click: () => {
+        quitFromTray({
+          markQuitting: () => {
+            isQuitting = true
+          },
+          quit: () => app.quit()
+        })
       }
-    ])
-  )
+    }
+  ]
+
+  hermesTray.setContextMenu(Menu.buildFromTemplate(template))
 }
 
 function createHermesTray() {
-  if (!IS_WINDOWS || hermesTray || !trayPreferences.enabled) {
+  // Windows: notification-area tray icon. macOS: menu bar icon (Electron Tray
+  // maps to the menu bar there). Both give quick access to the window, pet,
+  // and tray preferences without the app window itself.
+  if ((!IS_WINDOWS && !IS_MAC) || hermesTray || !trayPreferences.enabled) {
     return
   }
 
@@ -5602,6 +5613,26 @@ function sendOpenUpdatesRequested() {
   }
 
   webContents.send('hermes:open-updates')
+
+  if (!mainWindow.isVisible()) {
+    mainWindow.show()
+  }
+
+  mainWindow.focus()
+}
+
+function sendOpenSettingsRequested() {
+  if (!mainWindow || mainWindow.isDestroyed()) {
+    return
+  }
+
+  const { webContents } = mainWindow
+
+  if (!webContents || webContents.isDestroyed()) {
+    return
+  }
+
+  webContents.send('hermes:open-settings')
 
   if (!mainWindow.isVisible()) {
     mainWindow.show()
@@ -10346,24 +10377,6 @@ ipcMain.handle('hermes:pet-overlay:close', async () => {
   closePetOverlay()
 
   return { ok: true }
-})
-ipcMain.handle('hermes:tray:get-preferences', () => {
-  return {
-    preferences: trayPreferences,
-    trayAvailable: Boolean(hermesTray),
-    platform: process.platform,
-    launchAtLoginSupported: IS_WINDOWS
-  }
-})
-ipcMain.handle('hermes:tray:set-preferences', (_event, next) => {
-  const prefs = updateTrayPreferences(next && typeof next === 'object' ? next : {})
-
-  return {
-    preferences: prefs,
-    trayAvailable: Boolean(hermesTray),
-    platform: process.platform,
-    launchAtLoginSupported: IS_WINDOWS
-  }
 })
 ipcMain.on('hermes:tray:pet-state', (_event, payload) => {
   trayPetState = {

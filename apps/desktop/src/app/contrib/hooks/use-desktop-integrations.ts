@@ -2,6 +2,7 @@ import { useEffect, useRef } from 'react'
 
 import { closeActiveTab } from '@/app/chat/close-tab'
 import { openSession } from '@/app/open-session'
+import { SETTINGS_ROUTE } from '@/app/routes'
 import { storedSessionIdForNotification } from '@/lib/session-ids'
 import { respondToApprovalAction } from '@/store/native-notifications'
 import { openFolderAsProject } from '@/store/projects'
@@ -66,6 +67,12 @@ export function useDesktopIntegrations({
       stopUpdatePoller()
     }
   }, [])
+
+  // The tray menu's "Open Settings…" item routes here — surface the settings
+  // overlay in the main window (the window is already shown/focused by main).
+  useEffect(() => {
+    return window.hermesDesktop?.onOpenSettingsRequested?.(() => navigate(SETTINGS_ROUTE))
+  }, [navigate])
 
   // The renderer OWNS ⌘W: on macOS the native menu accelerator would else
   // close the window, so claim it unconditionally — the menu then routes ⌘W
