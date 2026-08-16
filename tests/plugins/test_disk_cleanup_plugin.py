@@ -351,6 +351,15 @@ class TestUserWorkspaceProtection:
         victim = tmp_root / "test_ephemeral.py"
         victim.write_text("x = 1\n")
         try:
+            # Guard the environment assumption: this regression test must
+            # exercise the DELETION path, so the tmp root has to resolve
+            # OUTSIDE every protected top level.  If TMPDIR pointed inside
+            # a protected tree (e.g. HERMES_HOME/state), guess_category()
+            # would return None here and the "still deletes" assertion
+            # below would mis-fire (protection is top-level-only).
+            assert dg.guess_category(victim) == "test", (
+                "tmp root must not be under a protected top level"
+            )
             dg.track(str(victim), "test", silent=True)
             summary = dg.quick()
             assert not victim.exists(), "tmp hermes test file should still be cleaned"
