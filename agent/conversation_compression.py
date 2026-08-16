@@ -3893,7 +3893,13 @@ def _compress_context_via_codex_app_server(
         f"{approx_tokens:,}" if approx_tokens else "unknown",
     )
     try:
-        agent._emit_status(COMPACTION_STATUS)
+        _compaction_status = automatic_compaction_status_message(
+            agent.context_compressor,
+            phase="codex_hermes",
+            default_message=COMPACTION_STATUS,
+        )
+        if _compaction_status:
+            agent._emit_status(_compaction_status)
     except Exception:
         pass
 

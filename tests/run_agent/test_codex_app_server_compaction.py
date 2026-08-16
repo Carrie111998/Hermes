@@ -5,6 +5,7 @@ import pytest
 
 from agent.codex_runtime import _record_codex_app_server_compaction
 from agent.conversation_compression import COMPACTION_DONE_STATUS, COMPACTION_STATUS, compress_context
+from agent.context_engine import AutomaticCompactionStatus
 from agent.transports.codex_app_server_session import TurnResult
 
 
@@ -178,5 +179,7 @@ def test_codex_native_boundary_clears_stale_hermes_fallback_streak():
     )
 
     assert _record_codex_app_server_compaction(agent, turn) is True
+    assert agent._last_compaction_boundary is True
+    assert isinstance(agent.status_events[0][1], AutomaticCompactionStatus)
     assert compressor._fallback_compression_streak == 0
     assert compressor._verify_compaction_cleared_threshold is True

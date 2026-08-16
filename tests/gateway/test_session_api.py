@@ -182,6 +182,7 @@ async def test_run_agent_persists_live_context_usage(adapter, session_db, monkey
 
         def __init__(self):
             self.session_id = session_id
+            self._last_compaction_boundary = True
             self.context_compressor = SimpleNamespace(
                 last_prompt_tokens=62_000,
                 context_length=200_000,
@@ -204,12 +205,14 @@ async def test_run_agent_persists_live_context_usage(adapter, session_db, monkey
     assert result["context"] is not usage["context"]
     result["context"]["used_tokens"] = 1
     assert usage["context"]["used_tokens"] == 62_000
+    assert usage["context"]["compacted"] is True
     assert usage["context"]["compression_progress_percent"] == 62.0
     row = session_db.get_session(session_id)
     assert row["context_used_tokens"] == 62_000
     assert row["context_window_tokens"] == 200_000
     assert row["compression_threshold_tokens"] == 100_000
     assert row["compression_count"] == 3
+    assert row["context_compacted"] == 1
 
 
 @pytest.mark.asyncio

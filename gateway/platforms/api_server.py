@@ -6464,12 +6464,19 @@ class APIServerAdapter(BasePlatformAdapter):
                     )
                     if _compacted_in_place or _session_rotated:
                         result["_compressed"] = True
+                    _compaction_boundary = bool(
+                        getattr(agent, "_last_compaction_boundary", False)
+                    )
                     from agent.context_usage import build_context_usage
 
                     context_usage = build_context_usage(
                         engine=getattr(agent, "context_compressor", None),
                         compression_enabled=getattr(agent, "compression_enabled", True),
-                        compacted=bool(_compacted_in_place or _session_rotated),
+                        compacted=bool(
+                            _compacted_in_place
+                            or _session_rotated
+                            or _compaction_boundary
+                        ),
                     )
                     result["context"] = context_usage
                     usage["context"] = dict(context_usage)
