@@ -58,6 +58,20 @@ const loaded = new Map<string, (() => void)[]>()
  * table is the distribution seam that makes their source part of the build. */
 const shipped = [{ origin: 'spatial', source: spatialSource }] as const
 
+type RuntimePluginLoader = typeof loadRuntimePlugin
+
+/** Run every source that Desktop ships through the runtime-plugin pipeline.
+ * The injectable loader is a narrow behavior seam for proving that the real
+ * shipped table remains connected to startup without evaluating renderer ESM
+ * in Vitest's Node module runner. */
+export async function loadShippedRuntimePlugins(
+  loader: RuntimePluginLoader = loadRuntimePlugin
+): Promise<(null | string)[]> {
+  return Promise.all(
+    shipped.map(plugin => loader(plugin.source, plugin.origin, { kind: 'bundled' }))
+  )
+}
+
 // Matches the specifier of a static `from '…'`, a side-effect `import '…'`, or
 // a dynamic `import('…')` — anchored to import/export syntax so a bare string
 // literal or comment (e.g. `notify('react')`) is never touched.
@@ -420,9 +434,7 @@ export function watchRuntimePlugins(): void {
   // Shipped sources are evaluated through the runtime loader rather than the
   // bundled TS plugin glob. This both delivers them in a clean installation
   // and preserves one canonical implementation for copied/on-disk installs.
-  for (const plugin of shipped) {
-    void loadRuntimePlugin(plugin.source, plugin.origin, { kind: 'bundled' })
-  }
+  void loadShippedRuntimePlugins()
 
   const dirWatchIds = new Set<string>()
   const watchedDirs = new Set<string>()
