@@ -5,7 +5,7 @@ import { readMcpInputValue } from './mcp-input'
 describe('readMcpInputValue', () => {
   it('captures the value before a deferred state updater runs', () => {
     const input = { value: 'https://n8n.example.test' }
-    const event: { currentTarget: { value?: unknown } | null } = { currentTarget: input }
+    const event: { currentTarget: { value: string } | null } = { currentTarget: input }
     const value = readMcpInputValue(event)
 
     event.currentTarget = null
