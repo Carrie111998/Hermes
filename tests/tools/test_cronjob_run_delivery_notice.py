@@ -91,6 +91,19 @@ def _bound_session_key(key):
         _approval_session_key.reset(token)
 
 
+def _dispatch_diag(res) -> str:
+    """TEMP CI diagnostic (08-16): wiring tests fail on CI-only conditions
+    with KeyError 'dispatched' — render the actual result + scheduler running
+    set so the failure message identifies the taken return path."""
+    try:
+        from cron.scheduler import get_running_job_ids
+
+        running = sorted(get_running_job_ids())
+    except Exception as e:  # pragma: no cover - diagnostic only
+        running = f"<unavailable: {e}>"
+    return f"dispatch result: {res!r}; running: {running}"
+
+
 def _drain_completion_event(delegation_id):
     """Wait (bounded) for this delegation's completion event; requeue others.
 
@@ -189,7 +202,7 @@ class TestRunnerSummaryWiring:
                 ),
             ):
                 res = _try_dispatch_background_run(_job("job-dn-01", "telegram"))
-                assert res["dispatched"] is True
+                assert res.get("dispatched") is True, _dispatch_diag(res)
                 evt = _drain_completion_event(res["delegation_id"])
         assert evt is not None, "completion event never reached the queue"
         summary = evt.get("summary") or ""
@@ -214,7 +227,7 @@ class TestRunnerSummaryWiring:
                 ),
             ):
                 res = _try_dispatch_background_run(_job("job-dn-03", ""))
-                assert res["dispatched"] is True
+                assert res.get("dispatched") is True, _dispatch_diag(res)
                 evt = _drain_completion_event(res["delegation_id"])
         assert evt is not None, "completion event never reached the queue"
         summary = evt.get("summary") or ""
@@ -234,7 +247,7 @@ class TestRunnerSummaryWiring:
                 ),
             ):
                 res = _try_dispatch_background_run(_job("job-dn-02", "telegram"))
-                assert res["dispatched"] is True
+                assert res.get("dispatched") is True, _dispatch_diag(res)
                 evt = _drain_completion_event(res["delegation_id"])
         assert evt is not None, "completion event never reached the queue"
         summary = evt.get("summary") or ""
