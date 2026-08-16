@@ -15,8 +15,9 @@ redactor failure never breaks the bubble (fail-soft).
 
 A fixture disables the global redaction flag (``security.redact_secrets:
 false``) to prove ``force=True`` still redacts at this chat-egress boundary,
-the same intent as ``_redact_gateway_user_facing_secrets`` (#23810).
+the same intent as ``_redact_gateway_user_facing_secrets``.
 """
+
 from __future__ import annotations
 
 import json
@@ -63,7 +64,7 @@ class TestRedactToolProgressArgs:
     def test_redacts_all_credential_shapes_top_level(self):
         for secret in _FAKE_ALL:
             out = _redact_tool_progress_args({"value": secret})
-            assert secret not in json.dumps(out), f"leaked {secret[:12]}..."
+            assert secret not in json.dumps(out)
 
     def test_redacts_embedded_in_terminal_command(self):
         args = {"command": f"cat config.yaml && echo {_FAKE_GITHUB_KEY}"}
@@ -110,32 +111,56 @@ class TestRedactToolProgressArgs:
         args = {"query": _FAKE_OPENAI_KEY}
         snapshot = json.loads(json.dumps(args))
         _redact_tool_progress_args(args)
-        assert args == snapshot  # input untouched (helper builds a new dict)
+        assert args == snapshot
 
     def test_verbose_json_dump_is_clean(self):
         args = {"query": _FAKE_OPENAI_KEY, "nested": {"k": _FAKE_GITHUB_KEY}}
         out = _redact_tool_progress_args(args)
         _assert_clean(out)
 
-    def test_fail_soft_on_redactor_error(self, monkeypatch):
-        """If redact_sensitive_text() throws an exception, the bubble must
-        still render, with the original args passed through so chat isn't
-        broken."""
+    def test_bubble_survives_redactor_error(self, monkeypatch):
+        """If the redactor module itself fails (import error), the bubble
+        must still render with the original args. redact_sensitive_text is
+        called bare (repo convention, it is trusted), so this pins the
+        outer crash net, not a per-string guard."""
         import builtins
 
         real_import = builtins.__import__
 
         def fake_import(name, *a, **kw):
             if name == "agent.redact":
-                class _R:
-                    @staticmethod
-                    def redact_sensitive_text(text, force=False):
-                        raise RuntimeError("redactor exploded")
+                raise ImportError("redactor module unavailable")
 
-                return _R()
             return real_import(name, *a, **kw)
 
         monkeypatch.setattr(builtins, "__import__", fake_import)
         args = {"query": _FAKE_OPENAI_KEY, "nested": {"k": _FAKE_GITHUB_KEY}}
         out = _redact_tool_progress_args(args)
-        assert out == args  # original preserved on failure
+        assert out == args
+
+    def test_deeply_nested_payload_partially_redacted(self):
+        """A payload nested past Python's recursion limit must not fail open:
+        a secret at a reachable depth is still redacted, and only the
+        too-deep branch passes through unchanged."""
+        root = {"query": _FAKE_OPENAI_KEY, "nested": {}}
+        cur = root["nested"]
+        for _ in range(1500):
+            nxt = {"payload": "plain"}
+            cur["next"] = nxt
+            cur = nxt
+
+        out = _redact_tool_progress_args(root)
+        assert _FAKE_OPENAI_KEY not in out["query"]
+        assert len(out["query"]) < len(_FAKE_OPENAI_KEY)
+        assert isinstance(out["nested"]["next"], dict)
+
+    def test_secret_in_dict_key_is_not_redacted(self):
+        """Dict keys are never touched: the renderer depends on exact key
+        lookups (args.get('command'), list(args.keys()), preview selection
+        by key name), so key-walking redaction would silently break the
+        display pipeline."""
+        key = _FAKE_OPENAI_KEY
+        args = {key: "value"}
+        out = _redact_tool_progress_args(args)
+        assert list(out.keys()) == list(args.keys())
+        assert out[key] == "value"

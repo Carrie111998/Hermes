@@ -616,33 +616,43 @@ def _redact_gateway_user_facing_secrets(text: str) -> str:
 def _redact_tool_progress_args(args: Any) -> Any:
     """Redact credential-shaped values from tool-call args before chat display.
 
-    The gateway's tool-progress bubble is an egress boundary (it renders
-    verbatim tool-call arguments into the chat on Discord/Telegram/etc.), so
-    a secret that slips into any tool argument (e.g. ``mem0_search(query=
-    \"sk-...\")`` or a ``terminal`` command echoing an API key) must be masked
-    before it can reach any render path (verbose JSON dump, human preview, or
-    terminal code block). Uses the same ``redact_sensitive_text(force=True)``
-    primitive as the outbound response redaction, so the echo is redacted even
-    when the operator has the global ``security.redact_secrets`` toggle off.
+    The tool-progress bubble is an egress boundary that renders verbatim
+    tool-call args into chat, so any secret inside (e.g. ``mem0_search(query=
+    "sk-...")`` or a ``terminal`` command echoing an API key) must be masked
+    on every render path. Uses ``redact_sensitive_text(force=True)`` (same
+    primitive as outbound response redaction), so the echo is redacted even
+    when the global ``security.redact_secrets`` toggle is off.
 
-    Recursively walks nested dicts and lists so a credential at any depth
-    (e.g. ``headers: {\"Authorization\": ...}``) is redacted, not just
-    top-level string values. Dict keys are never touched; non-string,
-    non-container values (ints, floats, bools, None) pass through unchanged.
-    Fail-soft: if ``redact_sensitive_text`` itself throws (raises an
-    exception) for any value, the original args are returned unchanged so a
-    progress bubble is never broken by a redactor error.
+    Walks nested dicts/lists recursively so credentials at any depth are
+    redacted; keys are never touched and non-string, non-container values
+    pass through. ``redact_sensitive_text`` is called bare, like every
+    other call site in the codebase; it does not raise in practice and is
+    trusted. Fail-soft only for structure: a ``RecursionError`` on a
+    too-deep branch passes that branch through unchanged while everything
+    reachable above it stays redacted, so the walk always completes and
+    never breaks the bubble.
     """
     def _walk(value: Any) -> Any:
         if isinstance(value, str):
-            try:
-                return redact_sensitive_text(value, force=True)
-            except Exception:
-                return value
+            return redact_sensitive_text(value, force=True)
         if isinstance(value, dict):
-            return {k: _walk(v) for k, v in value.items()}
+            out = {}
+            for k, v in value.items():
+                try:
+                    out[k] = _walk(v)
+                except RecursionError:
+                    # Too-deep branch: pass through unchanged, keep going.
+                    out[k] = v
+            return out
         if isinstance(value, list):
-            return [_walk(v) for v in value]
+            out = []
+            for v in value:
+                try:
+                    out.append(_walk(v))
+                except RecursionError:
+                    # Too-deep branch: pass through unchanged, keep going.
+                    out.append(v)
+            return out
         return value
 
     if not isinstance(args, dict) or not args:
@@ -3855,6 +3865,19 @@ class TurnRunner:
     def progress_callback(self, event_type: str, tool_name: str = None, preview: str = None, args: dict = None, **kwargs):
         """Callback invoked by agent on tool lifecycle events."""
         ctx = self._ctx
+        # Redact credential-shaped values from tool-call args and the
+        # preview string before they can reach any chat-rendered surface.
+        # The progress bubble is an egress boundary, so secrets must never
+        # render even when the operator has the global logging toggle off.
+        # Both channels are covered up front so every render path below
+        # sees sanitized values: args is the tool-call argument dict
+        # (redacted recursively), and preview is an independent channel
+        # that can carry a secret fragment the args walk does not see.
+        args = _redact_tool_progress_args(args)
+        if isinstance(preview, str):
+            from agent.redact import redact_sensitive_text
+
+            preview = redact_sensitive_text(preview, force=True)
         # Live status line (Slack's assistant status): stash the current
         # tool phrase on the adapter; the _keep_typing refresh renders it
         # within a couple of seconds. Handled before every other gate
@@ -3977,16 +4000,6 @@ class TurnRunner:
         if ctx.progress_mode == "new" and tool_name == ctx.last_tool[0]:
             return
         ctx.last_tool[0] = tool_name
-
-        # Redact credential-shaped values from tool-call args BEFORE they can
-        # reach any chat-rendered surface (verbatim JSON dump in verbose
-        # mode, human preview, or terminal command block).  The progress
-        # bubble is an egress boundary, the same class as the gateway's
-        # outbound response redaction, so secrets must never render even
-        # when the operator has the global logging toggle off.  Redact the
-        # args dict once, up front, so every render path below sees the
-        # sanitized copy.
-        args = _redact_tool_progress_args(args)
 
         # Build progress message with primary argument preview
         from agent.display import get_tool_emoji
