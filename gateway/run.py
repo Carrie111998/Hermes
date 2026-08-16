@@ -10165,10 +10165,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return True
             return bool(self._active_cron_job_count()) and now < cron_deadline
 
-        # Both budgets at 0 leave this loop unentered, which is the legacy
-        # "interrupt immediately" behaviour — expressed as an expired
-        # deadline rather than a special case, so the timed_out value below
-        # is always computed from real state instead of asserted up front.
+        # A zero budget remains an explicit opt-in for tests/operators that
+        # need immediate interruption.  Normal fresh installs use the
+        # non-zero default from config_defaults, giving active model/API and
+        # delegated work a bounded opportunity to publish completion state.
         while _still_draining():
             _maybe_update_status()
             await asyncio.sleep(0.1)

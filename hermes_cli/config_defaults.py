@@ -79,14 +79,15 @@ DEFAULT_CONFIG = {
         },
         # Force-interrupt budget once gateway stop()/drain has begun
         # (seconds). Applies to SIGTERM/external stop and to the final
-        # phase of in-band restart after any after-turn wait. 0 = interrupt
-        # immediately (the default).
+        # phase of in-band restart after any after-turn wait. 180 seconds
+        # gives in-flight model/API calls and delegated children a bounded
+        # window to unwind before they are interrupted.
         #
-        # Keep this short and under systemd TimeoutStopSec — a long value
+        # Keep this bounded and under systemd TimeoutStopSec — a long value
         # here invites SIGKILL-mid-cleanup. For in-band restart
         # (/restart, SIGUSR1), prefer restart_after_turn_timeout below so
         # active turns finish *before* stop() begins (#77184).
-        "restart_drain_timeout": 0,
+        "restart_drain_timeout": 180,
         # Cron-only floor under the stop()/drain wait (seconds). A chat turn
         # interrupted by a restart is announced to the user and resumed on
         # their next message; an interrupted cron run is written to jobs.json

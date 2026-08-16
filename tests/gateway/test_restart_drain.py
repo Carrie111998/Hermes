@@ -14,6 +14,18 @@ from gateway.session import SessionEntry, build_session_key
 from tests.gateway.restart_test_helpers import make_restart_runner, make_restart_source
 
 
+def test_restart_drain_default_allows_in_flight_work_to_unwind():
+    """The shipped default must not interrupt every turn immediately.
+
+    A zero-second force-interrupt budget made a gateway restart send SIGTERM,
+    skip the drain, and mark an in-flight subagent interrupted before it could
+    publish its durable completion.  The operator-level mitigation is
+    ``agent.restart_drain_timeout=180``; keep that behavior durable for fresh
+    configs as well.
+    """
+    assert DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT == 180.0
+
+
 @pytest.mark.asyncio
 async def test_restart_command_while_busy_requests_drain_without_interrupt(monkeypatch):
     # Ensure INVOCATION_ID is NOT set — systemd sets this in service mode,
