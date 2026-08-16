@@ -298,7 +298,9 @@ export function PreviewPane({ embedded = false, onRestartServer, reloadRequest =
       requestComposerInsert(formatPickedElement(raw.element), { mode: 'block' })
       requestComposerFocus('active')
     } catch (error) {
-      notifyError(error, copy.pickFailed)
+      if (pickingRef.current) {
+        notifyError(error, copy.pickFailed)
+      }
     } finally {
       pickingRef.current = false
       setPicking(false)
@@ -792,6 +794,7 @@ export function PreviewPane({ embedded = false, onRestartServer, reloadRequest =
       if (pickingRef.current) {
         pickingRef.current = false
         setPicking(false)
+        void webview.executeJavaScript?.(CANCEL_PICKER_SCRIPT).catch(() => undefined)
       }
     }
 

@@ -43,13 +43,31 @@ export function isPickerResult(value: unknown): value is PickerResult {
     return false
   }
 
-  const result = value as PickerResult
+  const result = value as { element?: unknown; status?: unknown }
 
   if (result.status === 'cancelled') {
     return true
   }
 
-  return result.status === 'selected' && typeof result.element === 'object' && result.element !== null
+  if (result.status !== 'selected' || !result.element || typeof result.element !== 'object') {
+    return false
+  }
+
+  const element = result.element as Partial<PickedElement>
+
+  return typeof element.pageUrl === 'string' && typeof element.tagName === 'string'
+}
+
+function clipText(value: string, max: number): string {
+  return value.length > max ? `${value.slice(0, max)}\n\n[truncated]` : value
+}
+
+/** Fence long enough that a ``` line inside the body cannot close the block. */
+export function fenceFor(body: string, info = ''): { close: string; open: string } {
+  const longest = (body.match(/`+/g) ?? []).reduce((max, run) => Math.max(max, run.length), 0)
+  const ticks = '`'.repeat(Math.max(3, longest + 1))
+
+  return { close: ticks, open: info ? `${ticks}${info}` : ticks }
 }
 
 export function formatPickedElement(picked: PickedElement): string {
@@ -64,9 +82,7 @@ export function formatPickedElement(picked: PickedElement): string {
     const trimmed = value?.trim()
 
     if (trimmed) {
-      lines.push(
-        `${label}: ${trimmed.length > PICKER_MAX_TEXT ? `${trimmed.slice(0, PICKER_MAX_TEXT)}\n\n[truncated]` : trimmed}`
-      )
+      lines.push(`${label}: ${clipText(trimmed, PICKER_MAX_TEXT)}`)
     }
   }
 
@@ -98,20 +114,21 @@ export function formatPickedElement(picked: PickedElement): string {
     )
   }
 
-  const block = (label: string, value: string | undefined, fence: string) => {
+  const block = (label: string, value: string | undefined, info = '') => {
     const trimmed = value?.trim()
 
     if (!trimmed) {
       return
     }
 
-    const body = trimmed.length > PICKER_MAX_TEXT ? `${trimmed.slice(0, PICKER_MAX_TEXT)}\n\n[truncated]` : trimmed
-    lines.push('', `${label}:`, fence, body, '```')
+    const body = clipText(trimmed, PICKER_MAX_TEXT)
+    const fence = fenceFor(body, info)
+    lines.push('', `${label}:`, fence.open, body, fence.close)
   }
 
-  block('Text', picked.text, '```')
-  block('Nearby context', picked.nearbyText, '```')
-  block('HTML excerpt', picked.htmlExcerpt, '```html')
+  block('Text', picked.text)
+  block('Nearby context', picked.nearbyText)
+  block('HTML excerpt', picked.htmlExcerpt, 'html')
 
   return lines.join('\n')
 }
