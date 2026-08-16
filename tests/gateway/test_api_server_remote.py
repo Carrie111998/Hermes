@@ -63,6 +63,7 @@ class _RecordingStreamResponse:
         self.disconnect_after = disconnect_after
         self.frames: list[bytes] = []
         self.prepared = asyncio.Event()
+        self.headers: dict[str, str] = {}
 
     async def prepare(self, request):
         del request
@@ -85,6 +86,15 @@ class _RecordingStreamResponse:
             if data_lines:
                 events.append(json.loads("\n".join(data_lines)))
         return events
+
+
+def _apply_headers(stream: "_RecordingStreamResponse", kwargs: dict) -> "_RecordingStreamResponse":
+    """Mirror headers passed to web.StreamResponse(...) onto the recording stream."""
+    headers = kwargs.get("headers") or {}
+    for key, value in headers.items():
+        stream.headers[str(key)] = str(value)
+    assert kwargs.get("status", 200) == 200
+    return stream
 
 
 def _request(method: str, path: str, session_id: str, *, authenticated=True):
@@ -676,3 +686,59 @@ async def test_remote_session_tool_events_are_redacted_before_broadcast(
     serialized = json.dumps(tool_events)
     assert secret not in serialized
     assert "redacted" in serialized or "..." in serialized
+
+
+def test_remote_attach_preflight_allows_accept_header():
+    """Browser clients (remote-attach desktop UI) must be able to preflight the
+    SSE events stream: the fetch sends `Accept: text/event-stream`, which is not
+    a CORS-safelisted value, so the preflight lists it in
+    Access-Control-Request-Headers. Without Accept in the allowed headers the
+    browser blocks the stream with "Failed to fetch"."""
+    adapter = APIServerAdapter(
+        PlatformConfig(
+            enabled=True,
+            extra={
+                "key": "remote-test-key",
+                "cors_origins": "http://localhost:5174",
+            },
+        )
+    )
+    allowed = adapter._cors_headers_for_origin("http://localhost:5174")
+    assert allowed is not None
+    assert "Accept" in allowed.get("Access-Control-Allow-Headers", "")
+
+
+@pytest.mark.asyncio
+async def test_remote_session_events_stream_includes_cors_headers(session_db, inline_to_thread):
+    """The SSE events stream must carry CORS headers on the response itself:
+    the CORS middleware flushes headers only *after* the handler returns, which
+    is too late for a StreamResponse that already called prepare(). Browser
+    clients (desktop /remote UI) otherwise fail with 'Failed to fetch'."""
+    adapter = APIServerAdapter(
+        PlatformConfig(
+            enabled=True,
+            extra={
+                "key": "remote-test-key",
+                "cors_origins": "http://localhost:5174",
+            },
+        )
+    )
+    adapter._session_db = session_db
+    session_id = session_db.create_session("remote-cors", "cli")
+    stream = _RecordingStreamResponse(disconnect_after=1)
+
+    class _RequestWithOrigin:
+        headers = {"Authorization": "Bearer remote-test-key", "Origin": "http://localhost:5174"}
+        match_info = {"session_id": session_id}
+
+    handler = _route_handler(adapter, "GET", "/api/remote/sessions/{session_id}/events")
+    with patch(
+        "gateway.platforms.api_server.web.StreamResponse",
+        side_effect=lambda **kwargs: _apply_headers(stream, kwargs),
+    ):
+        await handler(_RequestWithOrigin())
+
+    # The handler must have resolved CORS headers into the response headers
+    # BEFORE prepare() flushed them.
+    prepared_headers = stream.headers
+    assert prepared_headers.get("Access-Control-Allow-Origin") == "http://localhost:5174"
