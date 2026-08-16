@@ -229,6 +229,65 @@ async def test_cancellation_still_propagates_to_caller(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_timely_teardown_flushes_pending_exactly_once(tmp_path, monkeypatch):
+    """Moving the tail into a finally must not double-flush the timely path.
+
+    A clean teardown already flushed correctly before this change (#72680);
+    guard that it still writes exactly one payload per pending slot.
+    """
+    flush_dir = _redirect_flush_dir(tmp_path, monkeypatch)
+    adapter = _make_adapter()
+    sk = build_session_key(
+        SessionSource(platform=Platform.TELEGRAM, chat_id="42", chat_type="dm")
+    )
+    adapter._pending_messages[sk] = _event("queued follow-up")
+
+    await adapter.cancel_background_tasks()
+
+    payloads = _flushed_payloads(flush_dir)
+    assert len(payloads) == 1
+    assert payloads[0]["data"]["text"] == "queued follow-up"
+    assert adapter._pending_messages == {}
+    assert adapter._active_sessions == {}
+    assert adapter._background_tasks == set()
+
+
+@pytest.mark.asyncio
+async def test_second_teardown_pass_after_cancellation_is_safe(tmp_path, monkeypatch):
+    """A retried teardown after a cancelled pass must not raise or re-flush.
+
+    ``_bounded_adapter_teardown`` keeps making forward progress after a
+    timeout, so the adapter can see a second cleanup call.  The first pass
+    already drained the pending slots, so the second must be a no-op.
+    """
+    flush_dir = _redirect_flush_dir(tmp_path, monkeypatch)
+    adapter = _make_adapter()
+    sk = build_session_key(
+        SessionSource(platform=Platform.TELEGRAM, chat_id="42", chat_type="dm")
+    )
+    adapter._pending_messages[sk] = _event("queued follow-up")
+
+    resume = asyncio.Event()
+    draining, stubborn_task = await _stall_until_drain(adapter, resume)
+
+    cancel_task = asyncio.create_task(adapter.cancel_background_tasks())
+    await asyncio.wait_for(draining.wait(), timeout=1.0)
+    cancel_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await cancel_task
+
+    assert len(_flushed_payloads(flush_dir)) == 1
+
+    resume.set()
+    await asyncio.gather(stubborn_task, return_exceptions=True)
+
+    # Second pass: nothing left to flush, and it must complete cleanly.
+    await adapter.cancel_background_tasks()
+    assert len(_flushed_payloads(flush_dir)) == 1
+    assert adapter._pending_messages == {}
+
+
+@pytest.mark.asyncio
 async def test_cancel_background_tasks_handles_no_tasks():
     """Regression guard: no tasks, no hang, no error."""
     adapter = _make_adapter()
