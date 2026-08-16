@@ -2,6 +2,7 @@ import { useStore } from '@nanostores/react'
 import type { PointerEvent as ReactPointerEvent } from 'react'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 
+import { requestComposerFocus, requestComposerInsert } from '@/app/chat/composer/focus'
 import { Tip } from '@/components/ui/tooltip'
 import { type Translations, useI18n } from '@/i18n'
 import { isDesktopFsRemoteMode } from '@/lib/desktop-fs'
@@ -21,6 +22,7 @@ import {
   PreviewConsolePanel
 } from './preview-console'
 import { type ConsoleEntry } from './preview-console-state'
+import { CANCEL_PICKER_SCRIPT, formatPickedElement, isPickerResult, PICKER_SCRIPT } from './preview-element-picker'
 import { LocalFilePreview, PreviewEmptyState } from './preview-file'
 import { registerPreviewPageReader } from './preview-reader'
 import { previewConsoleState, registerPreviewDevTools } from './preview-strip-tools'
@@ -158,7 +160,9 @@ export function PreviewPane({ embedded = false, onRestartServer, reloadRequest =
   const [canGoForward, setCanGoForward] = useState(false)
   const [viewport, setViewport] = useState<ViewportMode>(() => loadViewportMode())
   const [hostSize, setHostSize] = useState({ width: 0, height: 0 })
+  const [picking, setPicking] = useState(false)
   const addressFocusedRef = useRef(false)
+  const pickingRef = useRef(false)
   const guestSize = modeSize(viewport)
   const guestScale = guestSize ? scaleFor(hostSize, guestSize) : 1
 
@@ -261,6 +265,55 @@ export function PreviewPane({ embedded = false, onRestartServer, reloadRequest =
       webviewRef.current?.reload?.()
     }
   }, [isWebPreview])
+
+  const stopPicking = useCallback(() => {
+    pickingRef.current = false
+    setPicking(false)
+    void webviewRef.current?.executeJavaScript?.(CANCEL_PICKER_SCRIPT).catch(() => undefined)
+  }, [])
+
+  const startPicking = useCallback(async () => {
+    const webview = webviewRef.current
+
+    if (!webview?.executeJavaScript) {
+      notify({ kind: 'error', title: copy.pickFailed, message: copy.pickUnavailable })
+
+      return
+    }
+
+    pickingRef.current = true
+    setPicking(true)
+
+    try {
+      const raw = await webview.executeJavaScript(PICKER_SCRIPT)
+
+      if (!pickingRef.current) {
+        return
+      }
+
+      if (!isPickerResult(raw) || raw.status === 'cancelled') {
+        return
+      }
+
+      requestComposerInsert(formatPickedElement(raw.element), { mode: 'block' })
+      requestComposerFocus('active')
+    } catch (error) {
+      notifyError(error, copy.pickFailed)
+    } finally {
+      pickingRef.current = false
+      setPicking(false)
+    }
+  }, [copy.pickFailed, copy.pickUnavailable])
+
+  const togglePicking = useCallback(() => {
+    if (pickingRef.current) {
+      stopPicking()
+
+      return
+    }
+
+    void startPicking()
+  }, [startPicking, stopPicking])
 
   const syncNavigationState = useCallback(() => {
     const webview = webviewRef.current
@@ -733,7 +786,14 @@ export function PreviewPane({ embedded = false, onRestartServer, reloadRequest =
       setLoading(false)
     }
 
-    const onStart = () => setLoading(true)
+    const onStart = () => {
+      setLoading(true)
+
+      if (pickingRef.current) {
+        pickingRef.current = false
+        setPicking(false)
+      }
+    }
 
     const onStop = () => {
       setLoading(false)
@@ -789,7 +849,9 @@ export function PreviewPane({ embedded = false, onRestartServer, reloadRequest =
             onForward={goForward}
             onReload={reloadPreview}
             onSubmit={submitAddress}
+            onTogglePick={togglePicking}
             onViewportChange={handleViewportChange}
+            picking={picking}
             placeholder={currentUrl || copy.fallbackTitle}
             viewport={viewport}
           />

@@ -2268,7 +2268,11 @@ export const ar = defineLocale({
       viewportMobile: 'جوال',
       viewportWidth: 'العرض',
       viewportHeight: 'الارتفاع',
-      viewportApply: 'تطبيق'
+      viewportApply: 'تطبيق',
+      pick: 'اختيار عنصر الصفحة للدردشة',
+      pickCancel: 'إلغاء اختيار العنصر',
+      pickFailed: 'فشل اختيار عنصر الصفحة',
+      pickUnavailable: 'صفحة المعاينة ليست جاهزة بعد.'
     }
   },
   zones: {

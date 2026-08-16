@@ -2466,7 +2466,11 @@ export const zhHant = defineLocale({
       viewportMobile: '手機',
       viewportWidth: '寬度',
       viewportHeight: '高度',
-      viewportApply: '套用'
+      viewportApply: '套用',
+      pick: '選擇網頁元素加入聊天',
+      pickCancel: '取消網頁元素選擇',
+      pickFailed: '網頁元素選擇失敗',
+      pickUnavailable: '預覽頁面尚未就緒。'
     }
   },
 

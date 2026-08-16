@@ -17,7 +17,9 @@ const baseProps = {
   onForward: vi.fn(),
   onReload: vi.fn(),
   onSubmit: vi.fn(),
+  onTogglePick: vi.fn(),
   onViewportChange: vi.fn(),
+  picking: false,
   viewport: { kind: 'free' as const }
 }
 
@@ -191,6 +193,21 @@ describe('PreviewToolbar', () => {
 
     expect(reloadIcon).toBeTruthy()
     expect(reloadIcon?.getAttribute('class') ?? '').toContain('animate-spin')
+  })
+
+  it('fires onTogglePick from the picker button', () => {
+    const onTogglePick = vi.fn()
+    const rendered = render(<PreviewToolbar {...baseProps} onTogglePick={onTogglePick} />)
+
+    fireEvent.click(rendered.getByRole('button', { name: 'Select page element for chat' }))
+
+    expect(onTogglePick).toHaveBeenCalledOnce()
+  })
+
+  it('shows the cancel tooltip while picking', () => {
+    const rendered = render(<PreviewToolbar {...baseProps} picking={true} />)
+
+    expect(rendered.getByRole('button', { name: 'Cancel element selection' })).toBeTruthy()
   })
 
   it('does not rotate the reload icon when idle', () => {

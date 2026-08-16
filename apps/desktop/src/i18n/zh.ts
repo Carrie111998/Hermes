@@ -3008,7 +3008,11 @@ export const zh: Translations = {
       viewportMobile: '手机',
       viewportWidth: '宽度',
       viewportHeight: '高度',
-      viewportApply: '应用'
+      viewportApply: '应用',
+      pick: '选择网页元素加入聊天',
+      pickCancel: '取消网页元素选择',
+      pickFailed: '网页元素选择失败',
+      pickUnavailable: '预览页面尚未就绪。'
     }
   },
 

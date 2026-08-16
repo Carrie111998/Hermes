@@ -2546,7 +2546,11 @@ export const ja = defineLocale({
       viewportMobile: 'モバイル',
       viewportWidth: '幅',
       viewportHeight: '高さ',
-      viewportApply: '適用'
+      viewportApply: '適用',
+      pick: 'ページ要素をチャットに入れる',
+      pickCancel: '要素選択をキャンセル',
+      pickFailed: 'ページ要素の選択に失敗しました',
+      pickUnavailable: 'プレビューページの準備ができていません。'
     }
   },
 

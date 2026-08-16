@@ -20,7 +20,7 @@ import { type FormEvent, useCallback } from 'react'
 import { TooltipIconButton } from '@/components/assistant-ui/tooltip-icon-button'
 import { Input } from '@/components/ui/input'
 import { useI18n } from '@/i18n'
-import { ArrowUpRight, ChevronLeft, ChevronRight, RefreshCw } from '@/lib/icons'
+import { ArrowUpRight, ChevronLeft, ChevronRight, MousePointer, RefreshCw } from '@/lib/icons'
 import { cn } from '@/lib/utils'
 
 import { type ViewportMode } from './preview-viewport'
@@ -47,7 +47,9 @@ export interface PreviewToolbarProps {
   onForward: () => void
   onReload: () => void
   onSubmit: (url: string) => void
+  onTogglePick: () => void
   onViewportChange: (next: ViewportMode) => void
+  picking: boolean
   viewport: ViewportMode
 }
 
@@ -87,7 +89,9 @@ export function PreviewToolbar({
   onForward,
   onReload,
   onSubmit,
+  onTogglePick,
   onViewportChange,
+  picking,
   viewport
 }: PreviewToolbarProps) {
   const { t } = useI18n()
@@ -141,6 +145,9 @@ export function PreviewToolbar({
         <RefreshCw className={cn(loading && 'animate-spin')} />
       </TooltipIconButton>
       <PreviewViewportControl mode={viewport} onModeChange={onViewportChange} />
+      <TooltipIconButton onClick={onTogglePick} tooltip={picking ? copy.pickCancel : copy.pick} type="button">
+        <MousePointer className={cn(picking && 'text-primary')} />
+      </TooltipIconButton>
     </form>
   )
 }
