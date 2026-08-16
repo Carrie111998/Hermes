@@ -1828,12 +1828,14 @@ def _run_llm_review(prompt: str) -> Dict[str, Any]:
     """Spawn an AIAgent fork to run the curator review prompt.
 
     Returns a dict with:
-      - final: full (untruncated) final response from the reviewer
+      - final: full (untruncated) final response from the reviewer; a failed
+        pass may still retain partial or diagnostic output here
       - summary: short summary suitable for state file (240-char cap)
       - model, provider: what the fork actually ran on
       - tool_calls: list of {name, arguments} for every tool call made during
         the pass (arguments may be truncated for readability)
-      - error: set if the pass failed mid-run; final/summary may still be empty
+      - error: set if the pass failed mid-run; consumers must use this field
+        rather than infer success from whether ``final`` is populated
 
     Never raises; callers get a structured failure instead.
     """

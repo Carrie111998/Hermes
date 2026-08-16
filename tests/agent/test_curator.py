@@ -809,7 +809,7 @@ def test_review_fork_preserves_structured_conversation_failure(curator_env, monk
     import importlib
     importlib.reload(curator)
     conversation_result = {
-        "final_response": "",
+        "final_response": "partial diagnostic response",
         "failed": True,
         "error": "provider rejected credentials",
     }
@@ -828,6 +828,7 @@ def test_review_fork_preserves_structured_conversation_failure(curator_env, monk
 
     result = curator._run_llm_review("review")
 
+    assert result["final"] == "partial diagnostic response"
     assert result["error"] == "provider rejected credentials"
     assert result["summary"] == "error (provider rejected credentials)"
 
@@ -847,8 +848,6 @@ def test_review_fork_preserves_structured_conversation_failure(curator_env, monk
 
     assert result["error"] == f"error: {long_error}"
     assert result["summary"] == result["error"][:240] + "…"
-
-
 
 
 def test_review_fork_restricts_toolsets_to_skills_and_terminal(curator_env, monkeypatch):
