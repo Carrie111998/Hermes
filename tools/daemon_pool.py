@@ -26,6 +26,7 @@ explicit bounded joins.
 
 from __future__ import annotations
 
+import sys
 import threading
 import weakref
 from concurrent.futures import ThreadPoolExecutor
@@ -52,7 +53,12 @@ class DaemonThreadPoolExecutor(ThreadPoolExecutor):
         num_threads = len(self._threads)
         if num_threads < self._max_workers:
             thread_name = "%s_%d" % (self._thread_name_prefix or self, num_threads)
-            if hasattr(self, "_create_worker_context"):
+            # Gate on BOTH the 3.14 version and the attribute (belt-and-
+            # suspenders): a CPython fork/backport could expose
+            # `_create_worker_context` without the new `_worker(...,
+            # ctx, work_queue)` signature (or vice versa), so the hasattr
+            # alone is not proof of the new contract. Track CPython 3.14.x.
+            if sys.version_info >= (3, 14) and hasattr(self, "_create_worker_context"):
                 # Python 3.14+: WorkerContext object carries initializer/initargs.
                 worker_args = (
                     weakref.ref(self, weakref_cb),

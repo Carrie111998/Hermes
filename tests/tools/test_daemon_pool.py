@@ -7,6 +7,7 @@ concurrent.futures.thread._threads_queues, whose atexit hook joins every
 worker unconditionally — even after shutdown(wait=False).
 """
 
+import inspect
 import subprocess
 import sys
 import threading
@@ -113,6 +114,34 @@ def test_worker_context_signature_compat():
     assert proc.returncode == 0, proc.stderr
     assert "WORKER-OK" in proc.stdout
     assert "results: ['tagged', 'tagged', 'tagged', 'tagged']" in proc.stdout
+
+
+def test_314_branch_gated_on_version_not_just_attribute(monkeypatch, tmp_path):
+    """R46: the 3.14 worker-signature branch is selected by BOTH the Python
+    version and the attribute, not the attribute alone. A CPython fork that
+    exposes ``_create_worker_context`` without the new ``_worker(..., ctx,
+    work_queue)`` signature must NOT be misdetected as 3.14."""
+
+    # This mirrors the actual branch condition in
+    # DaemonThreadPoolExecutor._adjust_thread_count — kept as a pure function
+    # here so the test is deterministic and needs no real thread spawning.
+    def branch_picks_314(version, has_attr):
+        return version >= (3, 14) and has_attr
+
+    # version >= 3.14 AND attribute -> 3.14 branch (hasattr alone would be True)
+    assert branch_picks_314((3, 14), True) is True
+    # version < 3.14 with the attribute present -> resolve to OLD branch
+    assert branch_picks_314((3, 13), True) is False
+    # version >= 3.14 without the attribute -> OLD branch (fail-safe)
+    assert branch_picks_314((3, 14), False) is False
+
+    # Confirm the source actually contains the version gate (not just hasattr):
+    # a regression where someone removes the version check must fail here.
+    import tools.daemon_pool as _dp
+    src = inspect.getsource(_dp)
+    assert "sys.version_info >= (3, 14)" in src, \
+        "3.14 branch must be gated on sys.version_info >= (3, 14)"
+    assert "hasattr(self, \"_create_worker_context\")" in src
 
 
 def test_no_initializer_spawns_and_reuses():

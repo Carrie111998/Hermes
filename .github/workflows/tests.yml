@@ -200,6 +200,48 @@ jobs:
           OPENAI_API_KEY: ""
           NOUS_API_KEY: ""
 
+      # R46 (AI-review point 3): the 3.14 lane previously ran only the four
+      # daemon-pool-adjacent test files, leaving runtime import regressions in
+      # the rest of the tree (gateway, TUI, plugins) uncovered on 3.14. This
+      # smoke imports the major runtime modules so a 3.14 import break surfaces
+      # in CI even if the narrow test files stay green. `uv sync --extra all`
+      # already validated the install surface above; this validates the runtime
+      # import surface.
+      - name: 3.14 runtime import smoke
+        run: |
+          source .venv/bin/activate
+          python - <<'PY'
+          import importlib
+          # Core runtime modules that must import cleanly on 3.14. (Some
+          # interactive surfaces like `cli`/`tui` require prompt_toolkit from
+          # the dev extra and are exercised by the main lanes; this smoke
+          # covers the persistent/agent/gateway/tool runtime that 3.11->3.14
+          # is most likely to break.)
+          mods = [
+              "gateway.run",
+              "gateway.authz_mixin",
+              "gateway.pairing",
+              "run_agent",
+              "hermes_cli.config",
+              "hermes_state",
+              "model_tools",
+              "tools.terminal_tool",
+              "tools.daemon_pool",
+              "tools.skills_tool",
+          ]
+          failed = []
+          for m in mods:
+              try:
+                  importlib.import_module(m)
+              except Exception as exc:  # noqa: BLE001 - surface every failure
+                  failed.append(f"{m}: {type(exc).__name__}: {exc}")
+          if failed:
+              print("3.14 import smoke FAILED:")
+              print("\n".join(failed))
+              raise SystemExit(1)
+          print(f"3.14 import smoke OK ({len(mods)} modules)")
+          PY
+
   # Merge per-slice duration data into a single cache, so future runs
   # (including PRs) get balanced slicing.
   save-durations:
