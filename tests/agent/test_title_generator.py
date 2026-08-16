@@ -65,6 +65,75 @@ class TestGenerateTitle:
         assert "Buzz, Orca" in title_input
         assert "The recording explains reusable agent workflows" in title_input
 
+    def test_contextual_title_prompt_prioritizes_response_topic_over_task_wording(self):
+        response = MagicMock()
+        response.choices = [MagicMock()]
+        response.choices[0].message.content = (
+            '{"title":"Wispr Flow scaling and founder burnout"}'
+        )
+        context = [
+            {"role": "user", "content": "Extract key takeaways from this founder day"},
+            {
+                "role": "assistant",
+                "content": (
+                    "Wispr Flow's founder describes management strain while scaling, "
+                    "burnout, and the weight of responsibility for the team."
+                ),
+            },
+        ]
+
+        with patch("agent.title_generator.call_llm", return_value=response) as llm:
+            title = generate_contextual_title(context[0]["content"], context)
+
+        prompt = llm.call_args.kwargs["messages"][0]["content"]
+        assert "substantive subject" in prompt
+        assert "core finding or decision" in prompt
+        assert "opening request and the first assistant response" in prompt
+        assert "Name what the user wants DONE" not in prompt
+        assert "key takeaways" in prompt
+        assert "founder day" in prompt
+
+        assert title is not None
+        lowered = title.lower()
+        assert "key takeaways" not in lowered
+        assert "founder day" not in lowered
+        assert "wispr flow" in lowered
+        assert any(concept in lowered for concept in ("scaling", "burnout", "responsibility"))
+
+    def test_contextual_title_represents_side_hustle_survival_contrast(self):
+        response = MagicMock()
+        response.choices = [MagicMock()]
+        response.choices[0].message.content = (
+            '{"title":"Philippine side hustles: survival vs ambition"}'
+        )
+        context = [
+            {"role": "user", "content": "Give me the key takeaways from this video"},
+            {
+                "role": "assistant",
+                "content": (
+                    "In the Philippines, side-hustle culture is often survival rather "
+                    "than ambition: low wages and poor job quality push workers into "
+                    "extra work, increasing burnout."
+                ),
+            },
+        ]
+
+        with patch("agent.title_generator.call_llm", return_value=response):
+            title = generate_contextual_title(context[0]["content"], context)
+
+        assert title is not None
+        lowered = title.lower()
+        assert not any(
+            label in lowered
+            for label in ("key takeaways", "video", "article", "request", "analysis")
+        )
+        assert any(place in lowered for place in ("philippine", "filipino", "philippines"))
+        assert "side hustle" in lowered
+        assert any(
+            concept in lowered
+            for concept in ("survival", "ambition", "wages", "job quality", "burnout")
+        )
+
 
 
     def test_strips_think_blocks(self):

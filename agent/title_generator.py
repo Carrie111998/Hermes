@@ -97,6 +97,30 @@ _TITLE_PROMPT_TEMPLATE = (
     'Reply with JSON only: {"title": "..."}'
 )
 
+_CONTEXTUAL_TITLE_PROMPT_TEMPLATE = (
+    "You name completed chat conversations. Synthesize the opening request and the "
+    "first assistant response into a concise, searchable title. Name the substantive "
+    "subject and its core finding or decision, not the task the user asked the "
+    "assistant to perform.\n\n"
+    "Rules:\n"
+    "- 3 to 7 words, sentence case (capitalize only the first word and proper nouns).\n"
+    "- Prioritize specific subjects and conclusions revealed by the assistant response.\n"
+    "- Prefer a subject plus its key finding, decision, tension, or meaningful contrast.\n"
+    "- Preserve proper nouns and precise domain terms that make the title searchable.\n"
+    "- Do not lead with task verbs such as extract, review, explain, summarize, or analyze.\n"
+    "- When a concrete topic exists, avoid generic labels such as key takeaways, video, "
+    "article, request, analysis, or founder day.\n"
+    "- Do not merely paraphrase the opening request; use the completed response to make "
+    "the title more specific.\n"
+    "- No trailing punctuation, no quotes, no tool names, no 'Title:' prefix.\n"
+    "__LANGUAGE_RULE__\n"
+    'Good: {"title": "Wispr Flow scaling and burnout"}\n'
+    'Good: {"title": "Philippine side hustles: survival vs ambition"}\n'
+    'Too generic: {"title": "Extract key takeaways from founder day"}\n'
+    'Too generic: {"title": "Key takeaways from video"}\n\n'
+    'Reply with JSON only: {"title": "..."}'
+)
+
 _LANGUAGE_RULE_MATCH_USER = "- Write the title in the same language as the user's message."
 _LANGUAGE_RULE_PINNED = "- Write the title in {language}."
 
@@ -493,10 +517,8 @@ def generate_contextual_title(
         if language
         else _LANGUAGE_RULE_MATCH_USER
     )
-    prompt = _TITLE_PROMPT_TEMPLATE.replace("__LANGUAGE_RULE__", language_rule)
-    prompt = prompt.replace(
-        "Given the user's opening message",
-        "Given the user's opening message and completed first-turn transcript",
+    prompt = _CONTEXTUAL_TITLE_PROMPT_TEMPLATE.replace(
+        "__LANGUAGE_RULE__", language_rule
     )
 
     try:
