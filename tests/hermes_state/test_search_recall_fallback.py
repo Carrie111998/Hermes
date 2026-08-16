@@ -89,6 +89,21 @@ class TestFallbackDoesNotApply:
         assert db.search_messages("zeppelin quasar nimbus") == []
 
 
+class TestBroadenedRelevance:
+    def test_single_common_word_match_is_not_a_hit(self, db):
+        """A broadened retry must not surface rows sharing only one common
+        word with the query — the regression that broke
+        tools/test_session_search.py's rewind-exclusion test."""
+        _seed(db)
+        # 'sounds good, proceeding with the plan' shares only 'plan'
+        assert db.search_messages("deleted plan gamma") == []
+
+    def test_two_distinct_words_qualify(self, db):
+        _seed(db)
+        rows = db.search_messages("staging docker gamma")
+        assert rows and "docker deployment" in _text(rows[0])
+
+
 class TestFallbackRespectsFilters:
     def test_source_exclusion_applies_to_broadened_pass(self, db):
         """The retry re-issues the same filters: a message in an excluded

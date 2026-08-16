@@ -1330,6 +1330,46 @@ class SessionSearchMixin:
             f'"{t}"' if any(c in t for c in "./-") else t for t in terms
         )
 
+    def _filter_broadened_rows(
+        self, rows: List[Dict[str, Any]], query: str
+    ) -> List[Dict[str, Any]]:
+        """Drop weak matches from a broadened (OR-joined) retry.
+
+        Under OR, a row matching a single common word ("content") ranks as a
+        hit even when it has nothing to do with the query — and can surface
+        rows precisely where the strict pass proved the real target absent or
+        excluded (e.g. searching for rewound-away text must not dredge up
+        unrelated messages sharing one word). Keep a row only when its full
+        content matches an identifier-shaped term (paths, dotted names — one
+        of those alone is a real signal) or at least two distinct plain terms;
+        for queries with fewer than three plain terms a single match stands,
+        since two-of-N would just re-create the AND pass that already failed.
+        """
+        if not rows:
+            return rows
+        terms = [t for t in self._BROADEN_TERM.findall(query) if len(t) >= 2]
+        ident_terms = {t.lower() for t in terms if any(c in t for c in "./-")}
+        word_terms = {t.lower() for t in terms} - ident_terms
+        need = 2 if len(word_terms) >= 3 else 1
+        ids = [r["id"] for r in rows]
+        placeholders = ",".join("?" for _ in ids)
+        with self._read_ctx() as conn:
+            content_by_id = {
+                row[0]: (row[1] or "").lower()
+                for row in conn.execute(
+                    f"SELECT id, content FROM messages WHERE id IN ({placeholders})",
+                    ids,
+                )
+            }
+        kept = []
+        for r in rows:
+            text = content_by_id.get(r["id"], "")
+            if any(t in text for t in ident_terms):
+                kept.append(r)
+            elif sum(t in text for t in word_terms) >= need:
+                kept.append(r)
+        return kept
+
     @staticmethod
     def _is_cjk_codepoint(cp: int) -> bool:
         return (0x4E00 <= cp <= 0x9FFF or    # CJK Unified Ideographs
@@ -1527,6 +1567,7 @@ class SessionSearchMixin:
                         include_inactive=include_inactive,
                         fields=fields,
                     )
+                    rows = self._filter_broadened_rows(rows, query or "")
             return rows
         finally:
             try:
