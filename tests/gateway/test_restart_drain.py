@@ -333,6 +333,29 @@ async def test_shutdown_notification_prefers_restart_channel_over_home():
 
 
 @pytest.mark.asyncio
+async def test_shutdown_rejects_programmatic_cross_platform_restart_channel():
+    """Delivery rechecks target ownership even when config loading is bypassed."""
+    from gateway.config import HomeChannel, Platform
+
+    runner, adapter = make_restart_runner()
+    cfg = runner.config.platforms[Platform.TELEGRAM]
+    cfg.home_channel = HomeChannel(
+        platform=Platform.TELEGRAM, chat_id="daily-digest", name="Digest"
+    )
+    cfg.gateway_restart_channel = HomeChannel(
+        platform=Platform.SLACK,
+        chat_id="C-wrong-platform",
+        name="Wrong platform",
+    )
+    adapter.send = AsyncMock()
+
+    await runner._notify_active_sessions_of_shutdown()
+
+    adapter.send.assert_called_once()
+    assert adapter.send.call_args.args[0] == "daily-digest"
+
+
+@pytest.mark.asyncio
 async def test_relay_fronted_shutdown_uses_lifecycle_channel_with_provenance():
     from gateway.config import HomeChannel, Platform, PlatformConfig
     from gateway.platforms.base import SendResult
@@ -365,6 +388,35 @@ async def test_relay_fronted_shutdown_uses_lifecycle_channel_with_provenance():
     metadata = relay.send_for_platform.await_args.kwargs["metadata"]
     assert metadata["user_id"] == "U123"
     assert metadata["scope_id"] == "T123"
+
+
+@pytest.mark.asyncio
+async def test_failed_enabled_native_platform_does_not_relay_shutdown_notification():
+    from gateway.config import HomeChannel, Platform, PlatformConfig
+    from gateway.platforms.base import SendResult
+
+    runner, _native = make_restart_runner()
+    relay = MagicMock()
+    relay.fronts_platform.side_effect = lambda platform: platform == Platform.SLACK
+    relay.send_for_platform = AsyncMock(
+        return_value=SendResult(success=True, message_id="unexpected")
+    )
+    runner.adapters = {Platform.RELAY: relay}
+    runner.config.platforms = {
+        Platform.RELAY: PlatformConfig(enabled=True),
+        Platform.SLACK: PlatformConfig(
+            enabled=True,
+            gateway_restart_channel=HomeChannel(
+                platform=Platform.SLACK,
+                chat_id="COPS",
+                name="Operations",
+            ),
+        ),
+    }
+
+    await runner._notify_active_sessions_of_shutdown()
+
+    relay.send_for_platform.assert_not_awaited()
 
 
 @pytest.mark.asyncio

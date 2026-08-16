@@ -2547,6 +2547,7 @@ if not _configured_cwd or _configured_cwd in CWD_PLACEHOLDERS:
 
 from gateway.config import (
     ChannelOverride,
+    HomeChannel,
     Platform,
     _BUILTIN_PLATFORM_VALUES,
     GatewayConfig,
@@ -2568,6 +2569,7 @@ from gateway.session import (
     neutralize_untrusted_inline_text,
 )
 from gateway.delivery import (
+    DeliveryTransport,
     DeliveryRouter,
     looks_like_telegram_private_chat_id,
     resolve_delivery_transport,
@@ -10666,6 +10668,62 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
         return len(notified)
 
+    def _resolve_lifecycle_transport(
+        self, platform: Platform, platform_cfg: PlatformConfig
+    ) -> Optional[DeliveryTransport]:
+        """Resolve delivery without masking a failed enabled native adapter.
+
+        Generic delivery may fall back to Relay when it fronts a logical
+        platform. Lifecycle broadcasts are stricter: an enabled native
+        platform must have connected successfully, while an intentionally
+        disabled logical platform may still be delivered through Relay.
+        """
+        if platform_cfg.enabled and (self.adapters or {}).get(platform) is None:
+            logger.debug(
+                "Skipping lifecycle notification for enabled platform without "
+                "a connected native adapter: %s",
+                platform.value,
+            )
+            return None
+        return resolve_delivery_transport(platform, self.config, self.adapters)
+
+    def _resolve_lifecycle_channel(
+        self, platform: Platform, platform_cfg: PlatformConfig
+    ) -> Optional[HomeChannel]:
+        """Resolve a valid same-platform lifecycle target with home fallback."""
+        restart_channel = platform_cfg.gateway_restart_channel
+        if restart_channel is not None:
+            if restart_channel.platform != platform:
+                logger.warning(
+                    "Ignoring gateway_restart_channel platform mismatch at "
+                    "delivery; expected %s, got %s; lifecycle notices will "
+                    "fall back to the home channel",
+                    platform.value,
+                    restart_channel.platform.value,
+                )
+            elif str(restart_channel.chat_id).strip():
+                return restart_channel
+            else:
+                logger.warning(
+                    "Ignoring gateway_restart_channel without a usable chat_id "
+                    "at delivery; lifecycle notices will fall back to the home "
+                    "channel for %s",
+                    platform.value,
+                )
+
+        home_channel = platform_cfg.home_channel
+        if home_channel is None or not str(home_channel.chat_id).strip():
+            return None
+        if home_channel.platform != platform:
+            logger.warning(
+                "Ignoring home-channel platform mismatch for lifecycle "
+                "notification; expected %s, got %s",
+                platform.value,
+                home_channel.platform.value,
+            )
+            return None
+        return home_channel
+
     async def _notify_active_sessions_of_shutdown(self) -> None:
         """Send shutdown/restart notifications to active chats and home channels.
 
@@ -10819,15 +10877,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 continue
 
-            lifecycle_channel = (
-                platform_cfg.gateway_restart_channel or platform_cfg.home_channel
+            lifecycle_channel = self._resolve_lifecycle_channel(
+                platform, platform_cfg
             )
-            if not lifecycle_channel or not lifecycle_channel.chat_id:
+            if lifecycle_channel is None:
                 continue
 
-            transport = resolve_delivery_transport(
-                platform, self.config, self.adapters
-            )
+            transport = self._resolve_lifecycle_transport(platform, platform_cfg)
             if transport is None:
                 continue
 
@@ -13127,7 +13183,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # chat/topic instead of also leaking it to the configured home channel.
         if planned_restart_notification_pending:
             try:
-                await self._send_home_channel_startup_notifications(
+                await self._send_lifecycle_channel_startup_notifications(
                     skip_targets=None,
                 )
             finally:
@@ -24155,7 +24211,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         finally:
             notify_path.unlink(missing_ok=True)
 
-    async def _send_home_channel_startup_notifications(
+    async def _send_lifecycle_channel_startup_notifications(
         self,
         *,
         skip_targets: Optional[set[tuple[str, str, Optional[str]]]] = None,
@@ -24172,7 +24228,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         message = "♻️ Gateway online — Hermes is back and ready."
 
         for platform, platform_cfg in self.config.platforms.items():
-            transport = resolve_delivery_transport(platform, self.config, self.adapters)
+            transport = self._resolve_lifecycle_transport(platform, platform_cfg)
             if transport is None:
                 continue
 
@@ -24183,10 +24239,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 continue
 
-            lifecycle_channel = (
-                platform_cfg.gateway_restart_channel or platform_cfg.home_channel
+            lifecycle_channel = self._resolve_lifecycle_channel(
+                platform, platform_cfg
             )
-            if not lifecycle_channel or not lifecycle_channel.chat_id:
+            if lifecycle_channel is None:
                 continue
 
             target = (
