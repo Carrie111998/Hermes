@@ -8228,6 +8228,7 @@ class AIAgent:
             subagent_id=function_args.get("subagent_id"),
             message=function_args.get("message"),
             parent_agent=self,
+            model=function_args.get("model"),
         )
 
     def _invoke_tool(self, function_name: str, function_args: dict, effective_task_id: str,
