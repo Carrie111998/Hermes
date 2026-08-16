@@ -1,6 +1,6 @@
 ---
 title: "ARCH-003 implementation plan: runtime-state audit and replay verification"
-status: IMPLEMENTATION_PLAN_REVISE_V11_PENDING
+status: IMPLEMENTATION_PLAN_REVISE_V12_PENDING
 date: 2026-08-16
 type: implementation-plan
 ticket: ARCH-003
@@ -160,11 +160,15 @@ Add a versioned runtime-state-owned journal table with:
 - owner-version before/after;
 - state schema version and journal event version;
 - journal-writer generation/epoch continuity marker;
+- materialized-write counter before/after, incremented for every committed
+  materialized-state mutation and stored in each mutation/genesis event;
 - diagnostic timestamp;
 - origin epoch marker and origin-genesis sequence when event kind is
   `genesis` or `baseline`;
 - baseline sealed lifecycle state, owner-version, state schema version, and
-  sealed-through sequence when event kind is `baseline`.
+  sealed-through sequence when event kind is `baseline`;
+- sealed materialized-write counter when event kind is `baseline`;
+- sealed materialized-write counter when event kind is `baseline`.
 
 Add a durable database-level current-generation record:
 `runtime_state_journal_meta.current_generation`, owned by the runtime-state
@@ -175,21 +179,32 @@ exactly once only when that epoch is strictly newer than the durable epoch;
 restarting the same writer epoch never advances it. A startup observing a
 durable epoch newer than the running writer enters downgrade-unsafe mode and
 must not perform ordinary runtime-state writes. The transition record is
-durable before the upgraded writer serves mutations, so a rollback/roll-forward
-window is represented by a distinct epoch transition rather than by process
-restart count. Gate 3 reads the current-generation record, writer epoch, and
-transition marker inside the same `BEGIN DEFERRED` snapshot as the event
-stream and materialized row.
+durable before the upgraded writer serves mutations, so a strictly newer
+contract transition is represented by a distinct epoch transition rather than
+by process restart count. A rollback followed by roll-forward to the same
+writer epoch does not advance `current_generation`; it is detected by the
+materialized-write counter gap defined below. Gate 3 reads the
+current-generation record, writer epoch, transition marker, and counter
+metadata inside the same `BEGIN DEFERRED` snapshot as the event stream and
+materialized row.
 
-Add a materialized-row journal-writer generation marker. Every mutation/genesis
-updates the row marker and records the current generation in its event. A row
-whose marker is older than the current generation, or whose materialized state
-advanced without a corresponding current-generation event, is `UNKNOWN`, never
-`DRIFT`. A rollback-then-roll-forward cycle therefore keeps affected entities
-`UNKNOWN` until the first subsequent journaled genesis re-establishes
-current-generation origin; a plain mutation cannot re-establish that origin.
-A same-epoch process restart does not create this window; only a durable
-writer-epoch transition does.
+Add a materialized-row journal-writer generation marker and a monotonic
+`materialized_write_counter`. Every committed materialized-state mutation
+increments the counter at the CAS/database write guard, independently of
+whether journal emission succeeds; a database-level trigger or equivalent
+write guard must preserve this increment for any prior writer that can mutate
+the table. The mutation/genesis transaction records the counter before/after
+values in its event and updates the row marker. A row whose marker is older
+than the current generation, or whose materialized counter is greater than the
+latest journaled counter for that entity, is `UNKNOWN`, never `DRIFT`. If
+the counters agree, the history is complete, and the replay tuple differs,
+the result may be `DRIFT` with `DRIFT_DETECTED`. This is the concrete
+discriminator between an unjournaled state advance and genuine drift. A
+rollback-then-roll-forward cycle therefore keeps affected entities `UNKNOWN`
+until the first subsequent journaled genesis re-establishes current-generation
+origin; a plain mutation cannot re-establish that origin. A same-epoch process
+restart does not advance `current_generation`; an unjournaled write is
+detected by the counter gap.
 
 The replay tuple is explicitly `lifecycle_state`, `owner_version`, and
 `state_schema_version`; terminality is derived from lifecycle state. The
@@ -320,11 +335,13 @@ Implement a bounded verifier that:
 - selects the valid baseline with the highest `sealed_through_seq`, ignores
   events before it, and returns `UNKNOWN` for same-sequence tuple conflicts,
   overlapping contradictory baselines, a baseline without a valid current
-  origin epoch, a stale generation marker, or a materialized state advanced
-  during a generation with no current-generation event;
-- returns `UNKNOWN` on snapshot failure, unsupported/newer versions, malformed
+  origin epoch, a stale generation marker, a materialized-write counter greater
+  than the latest journaled counter, or a materialized state advanced during a
+  generation with no current-generation event;
+- returns `UNKNOWN` with the corresponding closed reason code on empty history
+  (`EMPTY_HISTORY`), snapshot failure, unsupported/newer versions, malformed
   history, unknown digest regime, key-check mismatch, verify-time key
-  unavailability, exceeded bound, missing legacy origin, or a
+  unavailability, exceeded bound, missing legacy origin, counter gap, or a
   materialized-row/history asymmetry;
 - treats a materialized row missing while history exists, or history existing
   without a materialized row, as `UNKNOWN`, never `DRIFT`;
@@ -355,8 +372,9 @@ Add deterministic tests for:
   `DRIFT`;
 - prior-version startup with the journal table present and rollback posture;
 - current-generation record advancement only on a strictly newer writer epoch,
-  same-epoch restart without advancement, downgrade-unsafe startup, and
-  concurrent generation advance during verify returning `CONSISTENT` or
+  same-epoch restart without advancement, same-epoch rollback/roll-forward
+  detected by the materialized-write counter gap, downgrade-unsafe startup,
+  and concurrent generation advance during verify returning `CONSISTENT` or
   `UNKNOWN`, never false `DRIFT`;
 - a newly created post-migration entity whose first journaled mutation is a
   marked genesis and reaches `CONSISTENT` after a valid follow-up mutation;
@@ -365,7 +383,8 @@ Add deterministic tests for:
 - one event per committed replay-tuple mutation;
 - true no-op without an event;
 - owner-version-only mutation;
-- mutation/genesis journal failure rolling back materialized state;
+- mutation/genesis journal failure rolling back materialized state with
+  mutation-side `WRITE_ABORT`;
 - SQLite WAL, fixed `SQLITE_BUSY_TIMEOUT = 5s`, `BEGIN IMMEDIATE`, and
   read-only WAL preconditions;
 - `LOCK_ACQUIRE_TIMEOUT = 5s`, `SQLITE_BUSY_TIMEOUT = 5s`,
@@ -379,6 +398,10 @@ Add deterministic tests for:
 - keyed digest/profile isolation, identifier/key-check mismatch, digest
   rotation without bridging, and verify-time key unavailability;
 - duplicate, missing, malformed, non-contiguous, and unsupported events;
+- empty history returning `UNKNOWN` with `EMPTY_HISTORY`;
+- the same fixture with a materialized-write counter gap returning `UNKNOWN`,
+  and with equal counters but a tuple mismatch returning `DRIFT` with
+  `DRIFT_DETECTED`;
 - truncated-head history without an origin marker returning `UNKNOWN`;
 - sealed-baseline tuple mismatch against the materialized row returning
   `UNKNOWN`;
@@ -520,6 +543,25 @@ DGX changes, deployment, repair, or event-sourcing. The corrected plan must
 return to the same authenticated Claude reviewer family and then to AGY on the
 identical packet.
 
+## Implementation-plan review reconciliation v11
+
+The v11 authenticated Claude Opus review returned `REVISE` with four bounded
+plan-text corrections. The corrections are incorporated above:
+
+1. Same-epoch rollback/roll-forward is detected by a durable materialized-write
+   counter gap; strictly newer writer epochs alone advance `current_generation`.
+2. Equal counters with a complete history and tuple mismatch are the only
+   `DRIFT` path; counter gaps are `UNKNOWN`.
+3. Acceptance reconciliation now enumerates v1 and v5-v10, with v2-v4 folded
+   explicitly into the earlier normative text.
+4. `WRITE_ABORT`, `EMPTY_HISTORY`, and `DRIFT_DETECTED` are bound to
+   concrete surfaces and tests.
+
+These remain plan-only corrections and do not authorize source edits, tests,
+DGX changes, deployment, repair, or event-sourcing. The corrected plan must
+return to the same authenticated Claude reviewer family and then to AGY on the
+identical packet.
+
 ## Acceptance criteria
 
 ARCH-003 implementation is ready for its delivery gates only when:
@@ -548,9 +590,9 @@ ARCH-003 implementation is ready for its delivery gates only when:
   retention job; entities beyond the replay limit remain UNKNOWN in this ticket,
   and the 100,000-event/100 MiB per-profile threshold is a documented follow-up
   operational review, not an in-ticket operator gate;
-- reconciliation v1, v9, and v10 items are incorporated into the normative
-  Gates 0-4 text and this merged plan revision receives the same-family
-  re-review;
+- reconciliation v1 and v5-v10 items are incorporated into the normative
+  Gates 0-4 text (with v2-v4 explicitly folded into the v1/v4 text), and this
+  merged plan revision receives the same-family re-review;
 - all focused and relevant tests pass;
 - authenticated Claude + AGY implementation review reaches consensus;
 - no unrelated dirty worktree or DGX runtime state was changed.
@@ -577,6 +619,8 @@ ARCH-003 implementation is ready for its delivery gates only when:
 - v10: durable writer-epoch advancement trigger, bounded origin-epoch metadata
   for verifier start selection, reason-code surface partition, and corrected
   reconciliation count.
+- v11: same-epoch continuity counter, UNKNOWN-versus-DRIFT discriminator,
+  complete reconciliation coverage, and explicit reason-code test bindings.
 
 
 ## Non-goals
