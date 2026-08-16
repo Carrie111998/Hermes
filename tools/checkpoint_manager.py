@@ -59,7 +59,7 @@ import subprocess
 import time
 from pathlib import Path
 from hermes_constants import get_hermes_home
-from hermes_cli._subprocess_compat import windows_hide_flags
+from hermes_cli._subprocess_compat import run_text_capture
 from typing import Dict, List, Optional, Set, Tuple
 
 from utils import env_int
@@ -158,6 +158,26 @@ DEFAULT_EXCLUDES = [
 ]
 
 # Git subprocess timeout (seconds).
+#
+# This is a real bound only because ``_run_git`` spawns via
+# ``run_text_capture``.  ``subprocess.run(capture_output=True, timeout=N)``
+# does NOT bound a git command that leaves a grandchild alive: CPython's
+# timeout path kills the direct child, then on Windows re-enters
+# ``communicate()`` with no timeout, which blocks until the capture pipe hits
+# EOF — impossible while a grandchild still holds the inherited write handle.
+# Measured on a Windows host 2026-08-15: a 2s budget against a detached
+# 25-ping child returned in 24.3s.
+#
+# Probed with psutil the same day, ``add -A`` / ``write-tree`` /
+# ``reflog expire`` spawn no descendants, but ``gc --prune=now`` spawns a
+# ``git.exe`` child — so the reclamation paths (``_enforce_size_cap`` on the
+# per-snapshot ``_take``, and ``prune_checkpoints`` from the daily
+# ``maybe_auto_prune_checkpoints`` hook) were the live hang vector: a slow gc
+# on a contended host could wedge the caller with no timeout escape.
+#
+# Callers should size against ``timeout + ~10s`` on Windows — the tree-kill in
+# ``run_text_capture`` runs synchronously and ``taskkill /T /F`` carries its
+# own 10s cap.  Bounded and predictable, unlike the overshoot it replaced.
 _GIT_TIMEOUT: int = max(10, min(60, env_int("HERMES_CHECKPOINT_TIMEOUT", 30)))
 
 # Max files to snapshot — skip huge directories to avoid slowdowns.
@@ -340,18 +360,19 @@ def _run_git(
     allowed_returncodes = allowed_returncodes or set()
 
     try:
-        result = subprocess.run(
+        # NOT subprocess.run: its ``timeout`` does not bound a git command that
+        # leaves a grandchild alive.  See _GIT_TIMEOUT for the mechanism and
+        # which git subcommands are affected.  run_text_capture captures into
+        # temp files rather than pipes and tree-kills on timeout, so the budget
+        # holds; it also suppresses the per-call conhost flash on Windows,
+        # which matters because checkpoints fire several bare git calls per
+        # turn from the console-less desktop/gateway backend.
+        result = run_text_capture(
             cmd,
-            capture_output=True,
-            text=True,
             timeout=timeout,
             env=env,
             cwd=str(normalized_working_dir),
             stdin=subprocess.DEVNULL,
-            # Checkpoints fire several bare git calls per turn from the
-            # console-less desktop/gateway backend; suppress the per-call
-            # conhost flash on Windows (no-op on POSIX).
-            creationflags=windows_hide_flags(),
         )
         ok = result.returncode == 0
         stdout = result.stdout.strip()
@@ -467,12 +488,10 @@ def _init_store(store: Path, working_dir: str) -> Optional[str]:
               "GIT_ALTERNATE_OBJECT_DIRECTORIES"):
         init_env.pop(k, None)
     try:
-        result = subprocess.run(
+        result = run_text_capture(
             ["git", "init", "--bare", str(store)],
-            capture_output=True, text=True,
             env=init_env, timeout=_GIT_TIMEOUT,
             stdin=subprocess.DEVNULL,
-            creationflags=windows_hide_flags(),
         )
         if result.returncode != 0:
             return f"Shadow store init failed: {result.stderr.strip()}"

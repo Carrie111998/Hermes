@@ -17,6 +17,7 @@ from tools.checkpoint_manager import (
     _init_store,
     _run_git,
     _git_env,
+    _normalize_path,
     _dir_file_count,
     _project_hash,
     _store_path,
@@ -344,9 +345,19 @@ class TestRealPruning:
     loaded one.  Because the suite runs --timeout-method=thread, which
     ``os._exit``es the WHOLE pytest process rather than failing one test,
     that overrun aborted an entire tests/tools sweep at 12% (2026-08-11).
-    timeout(600) clears the measured loaded-host cost with ~2.3x margin
-    while staying bounded; individual git calls are independently capped by
-    checkpoint_manager._GIT_TIMEOUT (30s), so a real hang still terminates.
+    timeout(600) clears the measured loaded-host cost with ~2.3x margin while
+    staying bounded.  Individual git calls are independently capped by
+    checkpoint_manager._GIT_TIMEOUT (30s), so a real hang still terminates —
+    but only since 2026-08-15.  Before then that cap was nominal for exactly
+    the calls this class exercises: ``_run_git`` used ``subprocess.run(
+    capture_output=True, timeout=N)``, whose Windows timeout path kills the
+    direct child and then drains the capture pipe with NO timeout, blocking
+    until a surviving grandchild releases the inherited handle.  ``git gc
+    --prune=now`` — which prune_checkpoints and _enforce_size_cap both run —
+    is the one probed git subcommand that spawns such a grandchild, so a slow
+    gc could wedge here indefinitely.  ``_run_git`` now spawns via
+    ``run_text_capture`` (file-backed capture + tree-kill); see
+    TestGitTimeoutIsBounded, which guards the routing.
     """
 
     def test_max_snapshots_trims_history(self, work_dir, checkpoint_base, monkeypatch):
@@ -415,14 +426,21 @@ class TestRealPruning:
             assert m.ensure_checkpoint(str(work_dir), f"seed-{i}") is True
 
         spawned = []
-        real_run = cm.subprocess.run
+        # Wrap the helper _run_git actually spawns through.  This MUST track
+        # whatever checkpoint_manager imports: when _run_git moved off
+        # subprocess.run (2026-08-15, the grandchild-timeout fix), a wrapper
+        # left on the old name counted zero spawns and every assertion below
+        # passed vacuously — a silent false green on the exact regression this
+        # test exists to catch.  The lower bound at the end is what makes that
+        # failure mode loud instead of silent.
+        real_run = cm.run_text_capture
 
         def counting_run(cmd, *args, **kwargs):
             if isinstance(cmd, (list, tuple)) and cmd and "git" in str(cmd[0]):
                 spawned.append(cmd[1] if len(cmd) > 1 else "?")
             return real_run(cmd, *args, **kwargs)
 
-        monkeypatch.setattr("tools.checkpoint_manager.subprocess.run", counting_run)
+        monkeypatch.setattr("tools.checkpoint_manager.run_text_capture", counting_run)
 
         # This snapshot exceeds the cap and prunes seed-0.
         (work_dir / "main.py").write_text("v-final\n")
@@ -436,8 +454,18 @@ class TestRealPruning:
         assert "gc" not in spawned, spawned
         assert "reflog" not in spawned, spawned
 
+        # Vacuity guard: an empty `spawned` satisfies all three assertions
+        # above, so a wrapper pointed at a name _run_git no longer calls would
+        # read as a pass.  A snapshot+prune cannot cost fewer than the 8 git
+        # calls the budget above enumerates for the snapshot alone.
+        assert len(spawned) >= 8, (
+            f"only {len(spawned)} git spawns observed — the counting wrapper is "
+            "not on the call path _run_git actually uses, so the budget "
+            "assertions above are vacuous"
+        )
+
         # The trim itself still happened, newest-first.
-        monkeypatch.setattr("tools.checkpoint_manager.subprocess.run", real_run)
+        monkeypatch.setattr("tools.checkpoint_manager.run_text_capture", real_run)
         cps = m.list_checkpoints(str(work_dir))
         assert [c["reason"] for c in cps] == ["final", "seed-1"]
 
@@ -670,7 +698,7 @@ class TestErrorResilience:
             args=["git", "diff", "--cached", "--quiet"],
             returncode=1, stdout="", stderr="",
         )
-        with patch("tools.checkpoint_manager.subprocess.run", return_value=completed):
+        with patch("tools.checkpoint_manager.run_text_capture", return_value=completed):
             with caplog.at_level(logging.ERROR, logger="tools.checkpoint_manager"):
                 ok, stdout, stderr = _run_git(
                     ["diff", "--cached", "--quiet"],
@@ -702,7 +730,9 @@ class TestErrorResilience:
         def raise_missing_git(*args, **kwargs):
             raise FileNotFoundError(2, "No such file or directory", "git")
 
-        monkeypatch.setattr("tools.checkpoint_manager.subprocess.run", raise_missing_git)
+        monkeypatch.setattr(
+            "tools.checkpoint_manager.run_text_capture", raise_missing_git,
+        )
         with caplog.at_level(logging.ERROR, logger="tools.checkpoint_manager"):
             ok, _, stderr = _run_git(
                 ["status"], tmp_path / "store", str(work),
@@ -1210,3 +1240,96 @@ class TestCheckpointBaseHermeticResolution:
         from hermes_constants import get_hermes_home
 
         assert _store_path().parent == get_hermes_home() / "checkpoints"
+
+
+# =========================================================================
+# Git subprocess timeouts are a real bound (grandchild-hang fix)
+# =========================================================================
+
+class TestGitTimeoutIsBounded:
+    """``_GIT_TIMEOUT`` must be an actual bound, not a nominal kwarg.
+
+    ``subprocess.run(..., capture_output=True, timeout=N)`` does NOT bound a
+    command that leaves a grandchild alive on Windows.  CPython's timeout path
+    kills only the direct child and then calls ``communicate()`` a second time
+    with NO timeout; that call blocks until every handle on the capture pipe is
+    closed, including the ones a surviving grandchild inherited.  Measured on
+    this host 2026-08-15: ``subprocess.run(["cmd","/c","start /b ping -n 25
+    127.0.0.1"], capture_output=True, timeout=2)`` returned after 24.3s.
+
+    ``git gc --prune=now`` is the checkpoint store's grandchild-spawner (probed
+    with psutil the same day: ``add -A``, ``write-tree`` and ``reflog expire``
+    spawn no descendants, ``gc`` spawns a ``git.exe`` child), and it runs on
+    ``_take`` -> ``_enforce_size_cap`` and from the daily auto-prune hook.  So
+    every git call here goes through ``run_text_capture``, which captures into
+    temp files instead of pipes and tree-kills on timeout.
+    """
+
+    def test_run_git_delegates_to_the_bounded_capture_helper(
+        self, work_dir, checkpoint_base, monkeypatch,
+    ):
+        """_run_git must route through run_text_capture, passing its timeout."""
+        seen = {}
+
+        def _fake(argv, **kwargs):
+            seen["argv"] = list(argv)
+            seen["kwargs"] = kwargs
+            return subprocess.CompletedProcess(list(argv), 0, "out", "")
+
+        monkeypatch.setattr("tools.checkpoint_manager.run_text_capture", _fake)
+        ok, stdout, stderr = _run_git(
+            ["rev-parse", "HEAD"], checkpoint_base / "store", str(work_dir),
+            timeout=17,
+        )
+
+        assert (ok, stdout, stderr) == (True, "out", "")
+        assert seen["argv"] == ["git", "rev-parse", "HEAD"]
+        assert seen["kwargs"]["timeout"] == 17, (
+            "the caller's timeout must reach the bounded helper unchanged"
+        )
+        assert seen["kwargs"]["cwd"] == str(_normalize_path(str(work_dir)))
+        assert "GIT_DIR" in seen["kwargs"]["env"]
+
+    def test_run_git_reports_timeout_instead_of_raising(
+        self, work_dir, checkpoint_base, monkeypatch,
+    ):
+        """A bounded timeout still surfaces as the (False, "", msg) contract."""
+        def _fake(argv, **kwargs):
+            raise subprocess.TimeoutExpired(list(argv), kwargs["timeout"])
+
+        monkeypatch.setattr("tools.checkpoint_manager.run_text_capture", _fake)
+        ok, stdout, stderr = _run_git(
+            ["gc", "--prune=now", "--quiet"], checkpoint_base / "store",
+            str(work_dir), timeout=5,
+        )
+
+        assert ok is False
+        assert stdout == ""
+        assert "timed out after 5s" in stderr
+
+    def test_module_makes_no_bare_subprocess_run_calls(self):
+        """AST guard: no call site may reintroduce the unbounded stdlib path.
+
+        ``subprocess.run(timeout=...)`` reads as bounded and is not, so a
+        presence-of-timeout lint (tests/hermes_cli/test_subprocess_timeouts.py)
+        would not catch a regression here.  Ban the call outright instead.
+        """
+        import ast
+
+        from tools import checkpoint_manager
+
+        source = Path(checkpoint_manager.__file__).read_text(encoding="utf-8")
+        offenders = [
+            node.lineno
+            for node in ast.walk(ast.parse(source))
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "run"
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "subprocess"
+        ]
+        assert not offenders, (
+            "checkpoint_manager must spawn git via run_text_capture (file-backed "
+            f"capture + tree-kill); bare subprocess.run at line(s) {offenders} "
+            "does not bound a git command that spawns a grandchild on Windows"
+        )
