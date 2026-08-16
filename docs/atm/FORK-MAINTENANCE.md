@@ -17,7 +17,9 @@ carry ONE thing on top of it: the ATM injection patch stack (see
 
 ## Daily pipeline (2-level cron)
 
-**Level 1 — mechanical (no agent judgment):** `fork-sync-v2.sh` in a scratch clone:
+**Level 1 — mechanical (no agent judgment):** `hermes_ops sync` (Python module in
+hendrix `hermes-ops/`, invoked by the cron via `~/.hermes/scripts/fork-sync.py`;
+unit-tested, idempotent — safe to re-run after any failure) in a scratch clone:
 1. fetch upstream; branch `sync/candidate-YYYYMMDD` from `upstream/main`
 2. rebase `atm/stack` onto it (`git rebase`); a clean rebase proceeds, ANY conflict
    → level 2
