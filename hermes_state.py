@@ -5408,7 +5408,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 (session_id,),
             )
 
-        self._execute_write(_do)
+        try:
+            self._execute_write(_do)
+        except sqlite3.Error as exc:
+            logger.warning(
+                "clear_hygiene_compression_failure_cooldown(%s) failed: %s",
+                session_id, exc,
+            )
 
     def get_compression_failure_cooldown(
         self,

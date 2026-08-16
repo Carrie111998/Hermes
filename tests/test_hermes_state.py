@@ -126,6 +126,19 @@ class TestHygieneCompressionFailureCooldown:
         assert agent is not None
         assert agent["error"] == "agent summary failure"
 
+    def test_hygiene_clear_is_best_effort_on_sqlite_error(self, db, caplog):
+        with mock.patch.object(
+            db,
+            "_execute_write",
+            side_effect=sqlite3.OperationalError("database is locked"),
+        ):
+            db.clear_hygiene_compression_failure_cooldown("cooldown-isolation")
+
+        assert (
+            "clear_hygiene_compression_failure_cooldown(cooldown-isolation) failed"
+            in caplog.text
+        )
+
 
 # =========================================================================
 # Connection lifecycle
