@@ -1680,6 +1680,45 @@ def _reaper_candidate_is_supervisor_owned(pid: int) -> bool:
     return False
 
 
+def _drain_windows_gateway_pid(pid: int) -> bool:
+    """Ask a running Windows gateway to drain, and WAIT for it to exit.
+
+    ``os.kill(pid, signal.SIGTERM)`` is not a signal on Windows: only
+    ``CTRL_C_EVENT``/``CTRL_BREAK_EVENT`` map to a deliverable console
+    event, and every other value goes straight to OpenProcess +
+    TerminateProcess.  So a call site that writes the planned-stop marker
+    and then calls ``os.kill`` on the next statement destroys the gateway
+    microseconds after the marker lands — before the gateway's
+    planned-stop watcher (``gateway/run.py``, 0.5s poll) can consume it.
+    The drain never runs, the in-flight turn dies mid-generation, the
+    transcript tail is never flushed and ``resume_pending`` is never set,
+    so the next start does not auto-resume.
+
+    ``hermes_cli.gateway_windows._drain_gateway_pid()`` is the reference
+    implementation of the correct sequence — it writes the same marker and
+    then waits — so reuse it here instead of racing it.  The window is the
+    Windows backend's own configured stop budget, the same one
+    ``gateway_windows.stop()`` already spends on this exact operation.
+
+    Returns True only when the PID actually exited inside the window.
+    False — including on any import or backend error — means the caller
+    must escalate to a force-kill.
+    """
+    if not pid or pid <= 0:
+        return False
+    try:
+        from hermes_cli.gateway_windows import (
+            _drain_gateway_pid,
+            _windows_stop_drain_timeout,
+        )
+    except Exception:
+        return False
+    try:
+        return bool(_drain_gateway_pid(pid, _windows_stop_drain_timeout()))
+    except Exception:
+        return False
+
+
 def _reap_unsupervised_gateway_orphans(extra_exclude: set | None = None) -> bool:
     """Kill no-supervisor gateway orphans the pidfile/runtime record can't see.
 
@@ -1835,6 +1874,11 @@ def stop_profile_gateway() -> bool:
     the old process exited. After killing the recorded PID, also sweep for
     any remaining orphans so each restart produces at most one live gateway
     (#75936).
+
+    On Windows the planned-stop marker is the ONLY way to ask a running
+    gateway to drain, and ``os.kill(pid, SIGTERM)`` there is
+    TerminateProcess — so the marker is drained-for via
+    ``_drain_windows_gateway_pid()`` before any termination is attempted.
     """
     try:
         from gateway.status import get_running_pid, remove_pid_file
@@ -1845,20 +1889,41 @@ def stop_profile_gateway() -> bool:
     if pid is None:
         return _reap_unsupervised_gateway_orphans()
 
-    try:
-        from gateway.status import write_planned_stop_marker
+    # On Windows the marker written below is inert: os.kill(pid, SIGTERM)
+    # is TerminateProcess, so the gateway dies before its planned-stop
+    # watcher can poll for the marker and the drain is skipped entirely.
+    # Route through the Windows backend's drain helper, which writes the
+    # same marker and then waits, and escalate only once that bounded
+    # window is spent.
+    drained = _drain_windows_gateway_pid(pid) if is_windows() else False
 
-        write_planned_stop_marker(pid)
-    except Exception:
-        pass
+    if not drained:
+        try:
+            from gateway.status import write_planned_stop_marker
 
-    try:
-        os.kill(pid, signal.SIGTERM)
-    except ProcessLookupError:
-        pass  # Already gone
-    except PermissionError:
-        print(f"⚠ Permission denied to kill PID {pid}")
-        return False
+            write_planned_stop_marker(pid)
+        except Exception:
+            pass
+
+        try:
+            if is_windows():
+                from gateway.status import terminate_pid
+
+                # The drain window is spent — escalate with the same
+                # bounded tree-kill the Windows backend uses
+                # (``taskkill /T /F``), not a bare TerminateProcess that
+                # would strand the detached gateway's children.
+                terminate_pid(pid, force=True)
+            else:
+                os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass  # Already gone
+        except PermissionError:
+            print(f"⚠ Permission denied to kill PID {pid}")
+            return False
+        except OSError as exc:
+            print(f"⚠ Failed to stop gateway PID {pid}: {exc}")
+            return False
 
     # Wait briefly for it to exit. On Windows, os.kill(pid, 0) is NOT
     # a no-op — route through the cross-platform existence check.
