@@ -601,6 +601,72 @@ def test_is_agent_created(skills_home):
     assert is_agent_created("hubbed") is False
 
 
+def test_is_verify_optin_eligible(skills_home, monkeypatch):
+    """The verify opt-in is only offered where outcomes feed curator review.
+
+    A skill whose outcomes would never surface in ``curated_report()`` — plain
+    local (no provenance record), hub-installed, external, or a protected
+    built-in — must refuse the opt-in, or the user gets "verify: enabled" with
+    nothing visible downstream.
+    """
+    import tools.skill_usage as mod
+    skills_dir = skills_home / "skills"
+    _write_skill(skills_dir, "managed")
+    _write_skill(skills_dir, "plain-local")
+    _write_skill(skills_dir, "bundled-one")
+    _write_skill(skills_dir, "hub-one")
+
+    mod.mark_agent_created("managed")
+    (skills_dir / ".bundled_manifest").write_text(
+        "bundled-one:abc\n", encoding="utf-8",
+    )
+    hub = skills_dir / ".hub"
+    hub.mkdir()
+    (hub / "lock.json").write_text(
+        json.dumps({"installed": {"hub-one": {}}}), encoding="utf-8",
+    )
+
+    # Curator-managed (agent-created) — always eligible.
+    assert mod.is_verify_optin_eligible("managed") is True
+    # Plain local skill with no provenance record — never surfaces outcomes.
+    assert mod.is_verify_optin_eligible("plain-local") is False
+    # Hub-installed — never.
+    assert mod.is_verify_optin_eligible("hub-one") is False
+    # Bundled built-in: prune OFF (the fixture default) → not eligible...
+    assert mod.is_verify_optin_eligible("bundled-one") is False
+    # ...prune ON → eligible (curation and outcomes can surface).
+    monkeypatch.setattr(mod, "_prune_builtins_enabled", lambda: True)
+    assert mod.is_verify_optin_eligible("bundled-one") is True
+    # Protected built-ins are never eligible, regardless of any flag.
+    assert mod.is_verify_optin_eligible("plan") is False
+    # External-dir skills are read-only to the curator.
+    _write_skill(skills_dir, "ext-skill")
+    monkeypatch.setattr(mod, "is_external_skill_path", lambda p: True)
+    assert mod.is_verify_optin_eligible("ext-skill", skills_dir / "ext-skill") is False
+
+
+def test_is_verify_optin_eligible_from_state_branch_table():
+    """The pure predicate is the single source of truth for the opt-in rule.
+
+    Both ``is_verify_optin_eligible`` (filesystem-resolved) and ``do_list``
+    (bulk-loaded) delegate here; pin the branch table directly so a drift in
+    either caller is caught by the matrix above or by this table.
+    """
+    import tools.skill_usage as mod
+
+    f = mod.is_verify_optin_eligible_from_state
+    # Hub-installed / protected / external are never eligible, regardless of flags.
+    assert f(builtin=True, prune_builtins=True, hub_installed=True) is False
+    assert f(builtin=True, prune_builtins=True, protected=True) is False
+    assert f(builtin=False, prune_builtins=False, external=True, curator_managed=True) is False
+    # Bundled built-ins are eligible iff prune_builtins is on.
+    assert f(builtin=True, prune_builtins=True) is True
+    assert f(builtin=True, prune_builtins=False) is False
+    # Plain local skills are eligible iff curator-managed.
+    assert f(builtin=False, prune_builtins=False, curator_managed=True) is True
+    assert f(builtin=False, prune_builtins=False, curator_managed=False) is False
+
+
 # ---------------------------------------------------------------------------
 # Archive / restore
 # ---------------------------------------------------------------------------

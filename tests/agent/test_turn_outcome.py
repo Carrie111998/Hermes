@@ -162,6 +162,11 @@ def test_down_only_verifier_fail_wins_over_llm_success(turn_env):
     assert outcome.confidence == 1.0
     assert outcome.failure_points == ["bad"]
     assert get_record("bad")["recent_outcomes"] == [False]
+    # The mechanical FAIL's verifier reason must reach the sidecar so the
+    # curator review pass has something actionable, not just a boolean.
+    assert get_record("bad")["recent_outcome_reasons"] == [
+        "commit message 'fix stuff' has no type prefix"
+    ]
 
 
 def test_down_only_blocks_eval_blaming_unverified_sibling(turn_env):

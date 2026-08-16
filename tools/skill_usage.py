@@ -1230,6 +1230,75 @@ def is_sync_enabled(skill_name: str) -> bool:
     return get_record(skill_name).get("sync") is True
 
 
+def prune_builtins_enabled() -> bool:
+    """Public alias for the bundled-builtin curation flag."""
+    return _prune_builtins_enabled()
+
+
+def is_verify_optin_eligible_from_state(
+    *,
+    builtin: bool,
+    prune_builtins: bool,
+    hub_installed: bool = False,
+    protected: bool = False,
+    external: bool = False,
+    curator_managed: bool = False,
+) -> bool:
+    """The verify opt-in rule as a pure predicate over pre-resolved state.
+
+    ``is_verify_optin_eligible`` resolves this state from the filesystem and
+    delegates here; ``do_list`` resolves it from its bulk-loaded usage store
+    and delegates here too. The rule therefore lives in exactly one place —
+    the listing's inline mirror can't drift from ``hermes skills verify``.
+    """
+    if hub_installed or protected or external:
+        return False
+    if builtin:
+        return prune_builtins
+    return curator_managed
+
+
+def is_verify_optin_eligible(skill_name: str, skill_dir: Optional[Path] = None) -> bool:
+    """Whether *skill_name* may be opted into outcome verification.
+
+    The opt-in is only meaningful where the outcomes have a consumer: the
+    curator review pass surfaces ``curated_report()``, which lists
+    agent-created (curator-managed) skills plus bundled built-ins when
+    ``curator.prune_builtins`` is enabled. A skill whose outcomes would never
+    surface — a plain local skill with no ``created_by: agent`` record,
+    hub-installed, external, or a protected built-in — must not be switchable
+    on: the user would get "verify: enabled" with nothing visible downstream.
+    """
+    if skill_dir is not None and is_external_skill_path(skill_dir):
+        return False
+    protected = is_protected_builtin(skill_name)
+    hub = is_hub_installed(skill_name)
+    if is_bundled(skill_name):
+        return is_verify_optin_eligible_from_state(
+            builtin=True,
+            prune_builtins=_prune_builtins_enabled(),
+            hub_installed=hub,
+            protected=protected,
+        )
+    external = False
+    if skill_dir is None:
+        local_dir = _find_skill_dir(skill_name)
+        if local_dir is not None:
+            external = is_external_skill_path(local_dir)
+        elif _find_external_skill_dir(skill_name) is not None:
+            external = True
+    else:
+        external = is_external_skill_path(skill_dir)
+    return is_verify_optin_eligible_from_state(
+        builtin=False,
+        prune_builtins=False,
+        hub_installed=hub,
+        protected=protected,
+        external=external,
+        curator_managed=is_curator_managed(skill_name),
+    )
+
+
 def set_verify_enabled(skill_name: str, enabled: bool) -> None:
     """Set the verify opt-in flag on a skill's usage record.
 
@@ -1237,13 +1306,16 @@ def set_verify_enabled(skill_name: str, enabled: bool) -> None:
     never auto-run unless the user marks the skill with ``verify_enabled``
     here. This is the consent half of the trust boundary — frontmatter (the
     skill author) may DECLARE a capability; only this local sidecar flag (the
-    user) grants permission to execute it. Gated on curation eligibility so a
-    skill the curator can't manage (bundled-by-default, hub-installed,
-    external) can't be switched on by code that doesn't own it.
+    user) grants permission to execute it. ENABLING is gated on curation
+    eligibility so a skill the curator can't manage (bundled-by-default,
+    hub-installed, external) can't be switched on by code that doesn't own it.
+    DISABLING is always allowed: a skill may drift into ineligibility after
+    being enabled (hub-replaced, provenance cleared), and revoking consent
+    for a subprocess runner must never be blocked by that drift.
     """
     def _apply(rec: Dict[str, Any]) -> None:
         rec["verify_enabled"] = bool(enabled)
-    _mutate(skill_name, _apply, require_curation_eligible=True)
+    _mutate(skill_name, _apply, require_curation_eligible=bool(enabled))
 
 
 def is_verify_enabled(skill_name: str) -> bool:

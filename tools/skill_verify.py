@@ -2,9 +2,10 @@
 
 A skill directory may declare a ``metadata.hermes.verify`` block in its
 SKILL.md frontmatter pointing at a deterministic check Hermes runs after the
-skill is used, feeding the result straight into ``skill_usage.bump_outcome()``
-instead of inferring success from tool-call I/O. SKILL.md prose is the policy
-(S); the verify block is how it's judged (V).
+skill is used. Verdicts feed the per-skill outcome pipeline
+(``agent.turn_outcome`` → ``skill_usage.bump_outcome``) instead of being
+inferred from tool-call I/O. SKILL.md prose is the policy (S); the verify
+block is how it's judged (V).
 
 Design notes:
   - Opt-in only — see ``skill_usage.set_verify_enabled`` / ``is_verify_enabled``.
@@ -12,7 +13,8 @@ Design notes:
     a skill may declare a capability but never grant itself permission to run.
   - Applicability before judgment: most turns don't touch what a given skill's
     verifier checks. ``applicability_check`` decides that first — SKIP is a
-    third outcome alongside PASS/FAIL and never reaches ``bump_outcome()``.
+    third outcome alongside PASS/FAIL and never reaches ``bump_outcome()``
+    (it isn't recorded at all).
     Recording a pass for an inapplicable check would be a fake success;
     recording nothing is correct.
   - Structured feedback over bare exit codes: a script that prints
@@ -32,9 +34,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional
 
-from agent.skill_utils import parse_frontmatter
+from agent.skill_utils import parse_frontmatter, verify_block_declared
 from hermes_cli._subprocess_compat import windows_hide_flags
-from tools.skill_usage import bump_outcome, is_curation_eligible, is_verify_enabled
+from tools.skill_usage import is_curation_eligible, is_verify_enabled
 
 logger = logging.getLogger(__name__)
 
@@ -76,12 +78,12 @@ def load_verify_spec(skill_dir: Path) -> Optional[VerifySpec]:
     try:
         content = path.read_text(encoding="utf-8", errors="replace")
         frontmatter, _body = parse_frontmatter(content)
+        if not verify_block_declared(frontmatter):
+            logger.debug("No usable verify block in %s", path)
+            return None
         meta = frontmatter.get("metadata")
         hermes = meta.get("hermes") if isinstance(meta, dict) else None
         verify_cfg = hermes.get("verify") if isinstance(hermes, dict) else None
-        if not isinstance(verify_cfg, dict) or not verify_cfg.get("run"):
-            logger.debug("No usable verify block in %s", path)
-            return None
         timeout = verify_cfg.get("timeout_seconds", _DEFAULT_TIMEOUT)
         try:
             timeout = min(int(timeout), _MAX_TIMEOUT)
@@ -203,13 +205,3 @@ def run_verification(
             "skill_verify.run_verification(%s) failed: %s", skill_name, e, exc_info=True
         )
         return None
-
-
-def verify_and_record_outcome(
-    skill_name: str, skill_dir: Path, task_cwd: Path
-) -> Optional[VerifyOutcome]:
-    """Run verification and, if it produced a judgment, feed it to bump_outcome()."""
-    outcome = run_verification(skill_name, skill_dir, task_cwd)
-    if outcome is not None:
-        bump_outcome(skill_name, outcome.success, reason=outcome.reason or None)
-    return outcome

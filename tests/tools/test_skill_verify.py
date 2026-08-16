@@ -381,27 +381,3 @@ def test_unrecognized_script_suffix_is_refused(verify_env):
     from tools.skill_verify import run_verification
 
     assert run_verification("svc_bad_suffix", d, env["task_cwd"]) is None
-
-
-# ---------------------------------------------------------------------------
-# Wiring — verify_and_record_outcome feeds bump_outcome
-# ---------------------------------------------------------------------------
-
-def test_verify_and_record_outcome_records_verdict(verify_env):
-    env = verify_env
-    d = _write_skill_with_verify(
-        env["skills"], "svc_record", _verify_block("scripts/verify.py")
-    )
-    _write_script(d, "scripts/verify.py", _json_script(False, "failed check"))
-    env["skill_usage"].set_verify_enabled("svc_record", True)
-
-    from tools.skill_verify import verify_and_record_outcome
-
-    outcome = verify_and_record_outcome("svc_record", d, env["task_cwd"])
-    assert outcome is not None
-    assert outcome.success is False
-    rec = env["skill_usage"].get_record("svc_record")
-    assert rec["recent_outcomes"] == [False]
-    # The verifier's reason must be preserved for the curator review pass —
-    # bump_outcome stores it alongside the verdict.
-    assert rec["recent_outcome_reasons"] == ["failed check"]
