@@ -862,13 +862,20 @@ def _print_called_process_error_tail(
         print(f"    {line}")
 
 
-def _zip_overlay_block_reason(root: Path) -> Optional[str]:
+def _zip_overlay_block_reason(
+    root: Path, *, ignore_staging_artifacts: bool = False
+) -> Optional[str]:
     """Why overlaying a ZIP onto ``root`` would destroy work, or None if safe.
 
     The ZIP path swaps every top-level entry (except a tiny preserve set) and
     then deletes the backups, so uncommitted edits and untracked files under
     a replaced directory are gone. Fail closed when git status cannot run:
     unknown dirtiness is not a license to clobber the tree (#87304).
+
+    ``ignore_staging_artifacts`` is for the pre-swap re-check: phase 1 of the
+    two-phase replace creates ``*.hermes-update-staging`` siblings inside the
+    checkout, which git reports as untracked. Those are our own artifacts,
+    not user work — without the filter the re-check would always refuse.
     """
     if not (root / ".git").exists():
         return None
@@ -876,7 +883,9 @@ def _zip_overlay_block_reason(root: Path) -> Optional[str]:
     if sys.platform == "win32":
         git_cmd = ["git", "-c", "windows.appendAtomically=false"]
     result = subprocess.run(
-        git_cmd + ["status", "--porcelain"],
+        # -uall: a user-level ``status.showUntrackedFiles = no`` git config
+        # would otherwise hide untracked files and silently blind this guard.
+        git_cmd + ["status", "--porcelain", "--untracked-files=all"],
         cwd=root,
         capture_output=True,
         text=True,
@@ -887,9 +896,26 @@ def _zip_overlay_block_reason(root: Path) -> Optional[str]:
         detail = (result.stderr or result.stdout or "").strip().splitlines()
         suffix = f" ({detail[0]})" if detail else ""
         return f"could not check the working tree{suffix}"
-    if result.stdout.strip():
+    lines = [line for line in (result.stdout or "").splitlines() if line.strip()]
+    if ignore_staging_artifacts:
+        lines = [
+            line for line in lines if not _is_zip_staging_artifact_status_line(line)
+        ]
+    if lines:
         return "the working tree has uncommitted changes or untracked files"
     return None
+
+
+_ZIP_STAGING_ARTIFACT_SUFFIXES = (".hermes-update-staging", ".hermes-update-old")
+
+
+def _is_zip_staging_artifact_status_line(line: str) -> bool:
+    """True when a porcelain status line is our own two-phase-swap artifact."""
+    payload = line[3:] if len(line) >= 3 else line
+    top_level = (
+        payload.strip().strip('"').replace("\\", "/").rstrip("/").split("/", 1)[0]
+    )
+    return top_level.endswith(_ZIP_STAGING_ARTIFACT_SUFFIXES)
 
 
 def _abort_zip_update_if_dirty_tree() -> None:
@@ -1041,6 +1067,23 @@ def _update_via_zip(args, *, had_desktop_app_before_update: bool = False):
             raise
 
         try:
+            # Re-check the tree right before the swap (#87304 TOCTOU): the
+            # download + extract + staging window above can take minutes, and
+            # work created in it would be destroyed by the commit below. Our
+            # own phase-1 staging siblings are filtered out — they are the
+            # expected artifacts of getting here, not user work.
+            recheck_reason = _zip_overlay_block_reason(
+                _m().PROJECT_ROOT, ignore_staging_artifacts=True
+            )
+            if recheck_reason is not None:
+                _discard_staged(staged)
+                print(f"✗ ZIP fallback aborted before the swap: {recheck_reason}.")
+                print(
+                    "  Files appeared in the checkout while the update was "
+                    "downloading; committing the swap would delete them."
+                )
+                print("  Stash or commit your changes, then rerun `hermes update`.")
+                _m().sys.exit(1)
             _commit_staged_replacements(staged)
         except Exception:
             # The rollback already restored every swapped entry, but staging

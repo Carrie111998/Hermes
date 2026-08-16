@@ -188,3 +188,62 @@ def test_update_via_zip_aborts_before_download_when_dirty(
     out = capsys.readouterr().out
     assert "ZIP fallback refused" in out
     assert "Downloading latest version" not in out
+
+
+# ---------------------------------------------------------------------------
+# Pre-swap TOCTOU re-check
+# ---------------------------------------------------------------------------
+
+
+def test_status_uses_untracked_files_all(tmp_path, monkeypatch):
+    """A user git config hiding untracked files must not blind the guard."""
+    (tmp_path / ".git").mkdir()
+    seen = []
+
+    def fake_run(cmd, **kwargs):
+        seen.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(update_cmd.subprocess, "run", fake_run)
+    update_cmd._zip_overlay_block_reason(tmp_path)
+    assert seen and "--untracked-files=all" in seen[0]
+
+
+def test_staging_artifact_lines_are_recognized():
+    is_artifact = update_cmd._is_zip_staging_artifact_status_line
+    assert is_artifact("?? agent.hermes-update-staging/")
+    assert is_artifact("?? cli.py.hermes-update-staging")
+    assert is_artifact("?? tools.hermes-update-old/")
+    # Nested user files under a staging-lookalike directory don't match the
+    # top-level test only when the TOP level itself is not an artifact.
+    assert not is_artifact("?? agent/scratch/wip.py")
+    assert not is_artifact(" M hermes_cli/update_cmd.py")
+    assert not is_artifact("?? notes.hermes-update-staging.txt")
+
+
+def test_recheck_ignores_own_staging_artifacts(tmp_path, monkeypatch):
+    (tmp_path / ".git").mkdir()
+    monkeypatch.setattr(
+        update_cmd.subprocess,
+        "run",
+        _porcelain_run("?? agent.hermes-update-staging/\n?? cli.py.hermes-update-old\n"),
+    )
+    assert (
+        update_cmd._zip_overlay_block_reason(tmp_path, ignore_staging_artifacts=True)
+        is None
+    )
+    # Without the flag the same output still refuses (pre-download check).
+    assert update_cmd._zip_overlay_block_reason(tmp_path) is not None
+
+
+def test_recheck_still_blocks_user_files_amid_staging_artifacts(tmp_path, monkeypatch):
+    (tmp_path / ".git").mkdir()
+    monkeypatch.setattr(
+        update_cmd.subprocess,
+        "run",
+        _porcelain_run("?? agent.hermes-update-staging/\n?? my-notes.md\n"),
+    )
+    reason = update_cmd._zip_overlay_block_reason(
+        tmp_path, ignore_staging_artifacts=True
+    )
+    assert reason is not None
