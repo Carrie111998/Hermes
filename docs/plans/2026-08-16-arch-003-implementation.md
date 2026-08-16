@@ -1,6 +1,6 @@
 ---
 title: "ARCH-003 implementation plan: runtime-state audit and replay verification"
-status: IMPLEMENTATION_PLAN_PENDING_REVIEW
+status: IMPLEMENTATION_PLAN_REVISE_PENDING
 date: 2026-08-16
 type: implementation-plan
 ticket: ARCH-003
@@ -195,6 +195,33 @@ Keep these gates separate and record evidence independently:
 
 No automatic repair or full event-sourcing work may be inferred from a green
 implementation or deployment result.
+
+## Implementation-plan review reconciliation v1
+
+The identical implementation-plan packet received authenticated AGY `PASS`
+and authenticated Claude Opus `REVISE`. The following bounded plan corrections
+must be incorporated before implementation authorization:
+
+1. Gate 0 must enumerate all runtime-state writer processes/connections and
+   explicitly choose the single-writer model or a multi-writer model. If
+   multi-writer behavior exists, specify SQLite journal mode, busy timeout, and
+   retry policy; align Gate 2's contention rule and Gate 4's test accordingly.
+2. Gate 3 must name the concrete read-snapshot mechanism and isolation guarantee;
+   Gate 4 must test that mechanism rather than only asserting a race outcome.
+3. Gate 1 must add sealed-baseline fields to the journal schema and identify the
+   privileged out-of-band baseline writer, which is not invoked by this ticket.
+4. Gate 1 must add an explicit genesis/origin marker for the first post-migration
+   event of a legacy entity; Gate 4 must cover truncated-head history returning
+   `UNKNOWN`.
+5. Define digest rotation semantics for pre-rotation events and state that
+   verify-time key unavailability returns `UNKNOWN`.
+6. Define migration rollback posture and whether prior code tolerates the new
+   journal table; assert this in migration compatibility tests.
+7. Add an accepted mutation-path overhead budget and journal growth/retention
+   expectation to the acceptance criteria.
+
+These are plan-only corrections. They do not authorize source edits, migration,
+tests, DGX changes, deployment, repair, or event-sourcing.
 
 ## Acceptance criteria
 
