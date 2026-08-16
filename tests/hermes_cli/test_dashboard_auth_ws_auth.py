@@ -461,13 +461,15 @@ class TestAuthMiddlewareQueryTokenPaths:
 
     def test_wrong_token_still_401d_by_middleware_for_ws_path(self, loopback_app):
         """Sanity: the fix must not weaken auth -- a WRONG token is still
-        rejected (either by the middleware directly, or it falls through
-        without a session/valid query token and the WS handler rejects
-        it -- either way, never treated as authenticated)."""
+        rejected by the middleware itself with 401. Verified directly
+        (review of #85525, point 2) that this case deterministically
+        returns 401/{"detail":"Unauthorized"}, not 426 -- a plain HTTP
+        GET with a query param present but WRONG never reaches the
+        426-upgrade-required response, since _has_valid_query_token
+        returns False for it and no session cookie is present either."""
         resp = loopback_app.get("/api/ws?token=wrong-token-value")
-        assert resp.status_code == 401 or resp.status_code == 426, (
-            f"a wrong token must never be accepted: got {resp.status_code}"
-        )
+        assert resp.status_code == 401
+        assert resp.json().get("detail") == "Unauthorized"
 
     def test_has_valid_query_token_recognizes_ws_and_pty_paths(self, loopback_app):
         """Direct unit check on the whitelist itself."""
@@ -500,4 +502,30 @@ class TestAuthMiddlewareQueryTokenPaths:
         }
         request = Request(scope)
         assert not web_server._has_valid_query_token(request, "/api/sessions")
+
+    def test_real_websocket_upgrade_with_valid_token_succeeds(self, loopback_app):
+        """A genuine WebSocket protocol upgrade (not a plain HTTP GET) to
+        /api/ws with a valid ?token= must succeed end-to-end.
+
+        Scope note (review of #85525, point 1): this test passes with or
+        without the _QUERY_TOKEN_API_PATHS middleware fix in this PR,
+        because Starlette's @app.middleware("http") registration never
+        dispatches for websocket-scope requests at all -- confirmed both
+        empirically and against this codebase's own comment on
+        _ws_host_origin_is_allowed ("FastAPI HTTP middleware does not run
+        for WebSocket routes"). The WS handler's own _ws_auth_reason()
+        check is a SEPARATE, already-correct auth gate for genuine
+        upgrades and was never broken by the bug this PR fixes. What this
+        PR's middleware change actually fixes -- verified by
+        test_valid_token_not_401d_by_middleware_for_ws_path above -- is a
+        PLAIN, non-upgrade HTTP GET to these paths (e.g. from a health
+        check, proxy probe, or any HTTP client that doesn't perform the
+        WebSocket handshake) incorrectly getting a middleware 401. Kept
+        here as the requested end-to-end proof that real upgrades were
+        never the affected code path, and remain unaffected either way."""
+        with loopback_app.websocket_connect(
+            f"/api/ws?token={web_server._SESSION_TOKEN}",
+            headers={"host": "127.0.0.1:8080"},
+        ) as conn:
+            pass  # connecting without raising WebSocketDisconnect is the assertion
 
