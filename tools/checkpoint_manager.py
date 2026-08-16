@@ -55,6 +55,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import time
 from pathlib import Path
 from hermes_constants import get_hermes_home
@@ -364,6 +365,54 @@ def _run_git(
     except Exception as exc:
         logger.error("Unexpected git error running %s: %s", " ".join(cmd), exc, exc_info=True)
         return False, "", str(exc)
+
+
+def _run_git_z_paths(
+    args: List[str],
+    store: Path,
+    working_dir: str,
+    timeout: int = _GIT_TIMEOUT,
+    index_file: Optional[Path] = None,
+) -> Tuple[bool, List[str], str]:
+    """Run Git in binary mode and losslessly decode NUL-delimited paths."""
+    normalized_working_dir = _normalize_path(working_dir)
+    if not normalized_working_dir.is_dir():
+        return False, [], f"working directory not found: {normalized_working_dir}"
+    env = _git_env(store, str(normalized_working_dir), index_file=index_file)
+    cmd = ["git"] + list(args)
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=False,
+            timeout=timeout,
+            env=env,
+            cwd=str(normalized_working_dir),
+            stdin=subprocess.DEVNULL,
+            creationflags=windows_hide_flags(),
+        )
+    except subprocess.TimeoutExpired:
+        msg = f"git timed out after {timeout}s: {' '.join(cmd)}"
+        logger.error(msg, exc_info=True)
+        return False, [], msg
+    except OSError as exc:
+        logger.error("Git path command failed: %s", " ".join(cmd), exc_info=True)
+        return False, [], str(exc)
+
+    stderr = result.stderr.decode("utf-8", errors="replace").strip()
+    if result.returncode != 0:
+        logger.error(
+            "Git command failed: %s (rc=%d) stderr=%s",
+            " ".join(cmd), result.returncode, stderr,
+        )
+        return False, [], stderr
+    encoding = sys.getfilesystemencoding()
+    paths = [
+        raw.decode(encoding, errors="surrogateescape")
+        for raw in result.stdout.split(b"\x00")
+        if raw
+    ]
+    return True, paths, stderr
 
 
 # ---------------------------------------------------------------------------
@@ -934,44 +983,126 @@ class CheckpointManager:
         if not (store / "HEAD").exists():
             return {"success": False, "error": "No checkpoints exist for this directory"}
 
-        ok, _, err = _run_git(
-            ["cat-file", "-t", commit_hash], store, abs_dir,
+        ok, target_commit, err = _run_git(
+            ["rev-parse", "--verify", f"{commit_hash}^{{commit}}"],
+            store, abs_dir,
         )
-        if not ok:
+        if not ok or not target_commit:
             return {"success": False, "error": f"Checkpoint '{commit_hash}' not found",
                     "debug": err or None}
 
-        # Take a pre-rollback snapshot so you can undo the undo.
-        self._take(abs_dir, f"pre-rollback snapshot (restoring to {commit_hash[:8]})")
-
         dir_hash = _project_hash(abs_dir)
         index_file = _index_path(store, dir_hash)
-
-        restore_target = file_path if file_path else "."
-        ok, stdout, err = _run_git(
-            ["checkout", commit_hash, "--", restore_target],
-            store, abs_dir, timeout=_GIT_TIMEOUT * 2,
-            index_file=index_file,
+        project_ref = _ref_name(dir_hash)
+        belongs, _, _ = _run_git(
+            ["merge-base", "--is-ancestor", target_commit, project_ref],
+            store, abs_dir,
         )
+        if not belongs:
+            return {
+                "success": False,
+                "error": f"Checkpoint '{commit_hash}' does not belong to this directory",
+            }
 
-        if not ok:
-            return {"success": False, "error": f"Restore failed: {err}",
-                    "debug": err or None}
-
-        ok2, reason_out, _ = _run_git(
-            ["log", "--format=%s", "-1", commit_hash], store, abs_dir,
-        )
-        reason = reason_out if ok2 else "unknown"
-
-        result = {
-            "success": True,
-            "restored_to": commit_hash[:8],
-            "reason": reason,
-            "directory": abs_dir,
-        }
         if file_path:
-            result["file"] = file_path
-        return result
+            normalized_file_path = Path(os.path.normpath(file_path)).as_posix()
+            restore_target = f":(top,literal){normalized_file_path}"
+        else:
+            restore_target = "."
+        paths_ok, target_paths, paths_err = _run_git_z_paths(
+            [
+                "ls-tree", "-r", "-z", "--name-only", target_commit,
+                "--", restore_target,
+            ],
+            store, abs_dir,
+        )
+        if not paths_ok:
+            return {
+                "success": False,
+                "error": "Could not inspect the checkpoint restore scope",
+                "debug": paths_err or None,
+            }
+        required_undo_paths = set(target_paths)
+
+        # Pin the target for the duration of the restore.  Taking the mandatory
+        # pre-rollback snapshot may prune and garbage-collect the project's
+        # history, but the temporary ref keeps this exact commit and tree alive.
+        pin_ref = (
+            f"refs/restore-pins/hermes/{dir_hash}/"
+            f"{os.getpid()}-{time.time_ns()}"
+        )
+        pinned, _, pin_err = _run_git(
+            ["update-ref", pin_ref, target_commit], store, abs_dir,
+        )
+        if not pinned:
+            return {
+                "success": False,
+                "error": "Could not protect the checkpoint for restore",
+                "debug": pin_err or None,
+            }
+
+        try:
+            snapshot_reason = (
+                f"pre-rollback snapshot (restoring to {target_commit[:8]})"
+            )
+            if not self._take(
+                abs_dir,
+                snapshot_reason,
+                force=True,
+                required_paths=required_undo_paths,
+            ):
+                return {
+                    "success": False,
+                    "error": "Pre-rollback checkpoint failed; restore aborted",
+                }
+
+            # Checkout's default overlay mode leaves paths that are absent from
+            # the target checkpoint in place.  Non-overlay mode makes the
+            # selected pathspec exactly match the checkpoint (including
+            # deletions) while preserving excluded/untracked files outside the
+            # shadow index.  File restores use literal pathspec magic so
+            # metacharacters cannot expand the operation to sibling paths.
+            restore_args = [
+                "checkout", "--no-overlay", target_commit, "--", restore_target,
+            ]
+
+            ok, _, err = _run_git(
+                restore_args,
+                store, abs_dir, timeout=_GIT_TIMEOUT * 2,
+                index_file=index_file,
+            )
+
+            if not ok:
+                return {"success": False, "error": f"Restore failed: {err}",
+                        "debug": err or None}
+
+            ok2, reason_out, _ = _run_git(
+                ["log", "--format=%s", "-1", target_commit], store, abs_dir,
+            )
+            reason = reason_out if ok2 else "unknown"
+
+            result = {
+                "success": True,
+                "restored_to": target_commit[:8],
+                "reason": reason,
+                "directory": abs_dir,
+            }
+            if file_path:
+                result["file"] = file_path
+            return result
+        finally:
+            # Pin deletion only mutates the shared checkpoint store.  Use its
+            # stable parent as the subprocess cwd/work-tree so cleanup still
+            # runs if the restored worktree disappears or becomes inaccessible
+            # after the pin was created.
+            cleanup_ok, _, cleanup_err = _run_git(
+                ["update-ref", "-d", pin_ref], store, str(store.parent),
+            )
+            if not cleanup_ok:
+                logger.warning(
+                    "Could not remove temporary checkpoint pin %s: %s",
+                    pin_ref, cleanup_err,
+                )
 
     def get_working_dir_for_path(self, file_path: str) -> str:
         """Resolve a file path to its working directory for checkpointing."""
@@ -995,7 +1126,14 @@ class CheckpointManager:
     # Internal
     # ------------------------------------------------------------------
 
-    def _take(self, working_dir: str, reason: str) -> bool:
+    def _take(
+        self,
+        working_dir: str,
+        reason: str,
+        *,
+        force: bool = False,
+        required_paths: Optional[Set[str]] = None,
+    ) -> bool:
         """Take a snapshot.  Returns True on success."""
         store = _store_path(CHECKPOINT_BASE)
 
@@ -1054,7 +1192,60 @@ class CheckpointManager:
             return False
 
         if self.max_file_size_mb > 0:
-            self._drop_oversize_from_index(store, working_dir, index_file)
+            omitted, filter_ok = self._drop_oversize_from_index(
+                store, working_dir, index_file,
+            )
+            if not filter_ok:
+                logger.debug("Checkpoint oversize-file filtering failed")
+                return False
+            if force and omitted:
+                logger.warning(
+                    "Pre-rollback checkpoint aborted: %d file(s) exceed the "
+                    "%d MB snapshot limit",
+                    len(omitted), self.max_file_size_mb,
+                )
+                return False
+
+        if force and required_paths:
+            ok_index, index_paths, _ = _run_git_z_paths(
+                ["ls-files", "--cached", "-z"],
+                store, working_dir, index_file=index_file,
+            )
+            if not ok_index:
+                logger.debug("Pre-rollback checkpoint index inspection failed")
+                return False
+            indexed_paths = set(index_paths)
+            collision_paths = set(required_paths)
+            for path in required_paths:
+                parts = path.split("/")
+                collision_paths.update(
+                    "/".join(parts[:index])
+                    for index in range(1, len(parts))
+                )
+            abs_workdir = _normalize_path(working_dir)
+            uncaptured = []
+            for path in collision_paths:
+                current_path = abs_workdir / path
+                if not os.path.lexists(current_path):
+                    continue
+                # Exact target paths can replace any existing filesystem
+                # object.  Ancestors only need capture when they are symlinks
+                # or non-directories that checkout may replace to build the
+                # target hierarchy; ordinary directories carry no Git data.
+                needs_capture = (
+                    path in required_paths
+                    or current_path.is_symlink()
+                    or not current_path.is_dir()
+                )
+                if needs_capture and path not in indexed_paths:
+                    uncaptured.append(path)
+            if uncaptured:
+                logger.warning(
+                    "Pre-rollback checkpoint aborted: %d restore collision "
+                    "path(s) were not captured",
+                    len(uncaptured),
+                )
+                return False
 
         # Compare against the current ref tip (not HEAD — HEAD points to a
         # branch that doesn't exist on a bare store, so ``diff --cached``
@@ -1073,7 +1264,7 @@ class CheckpointManager:
                 allowed_returncodes={1},
                 index_file=index_file,
             )
-            if ok_diff:
+            if ok_diff and not force:
                 logger.debug("Checkpoint skipped: no changes in %s", working_dir)
                 return False
         else:
@@ -1131,24 +1322,26 @@ class CheckpointManager:
 
     def _drop_oversize_from_index(
         self, store: Path, working_dir: str, index_file: Path,
-    ) -> None:
+    ) -> Tuple[List[str], bool]:
         """Remove any staged file larger than ``max_file_size_mb`` from the index.
 
         Lets the agent keep snapshotting source code while refusing to
         swallow generated assets (datasets, model weights, logs, videos).
+
+        Returns ``(omitted_paths, ok)`` so mandatory pre-rollback snapshots can
+        fail closed instead of claiming an undo point that omitted live data.
         """
         cap = self.max_file_size_mb * 1024 * 1024
         if cap <= 0:
-            return
-        ok, stdout, _ = _run_git(
+            return [], True
+        ok, paths, _ = _run_git_z_paths(
             ["ls-files", "--cached", "-z"],
             store, working_dir, index_file=index_file,
         )
-        if not ok or not stdout:
-            return
-        # ls-files -z output is NUL-separated. _run_git strips trailing
-        # whitespace but that leaves NULs alone; rebuild list.
-        paths = [p for p in stdout.split("\x00") if p]
+        if not ok:
+            return [], False
+        if not paths:
+            return [], True
         abs_workdir = _normalize_path(working_dir)
         oversize: List[str] = []
         for rel in paths:
@@ -1159,21 +1352,26 @@ class CheckpointManager:
             if size > cap:
                 oversize.append(rel)
         if not oversize:
-            return
+            return [], True
         logger.debug(
             "Checkpoint: dropping %d oversize file(s) (>%d MB) from index",
             len(oversize), self.max_file_size_mb,
         )
-        # Use --pathspec-from-file for safety with many paths.
-        # Chunk into manageable batches.
+        # Chunk into manageable batches.  Force literal pathspec handling so
+        # metacharacters in an oversized filename cannot remove sibling paths
+        # from the checkpoint index.
         BATCH = 200
+        removed_all = True
         for i in range(0, len(oversize), BATCH):
             chunk = oversize[i:i + BATCH]
-            _run_git(
-                ["rm", "--cached", "--quiet", "--"] + chunk,
+            removed, _, _ = _run_git(
+                ["--literal-pathspecs", "rm", "--cached", "--quiet", "--"]
+                + chunk,
                 store, working_dir, index_file=index_file,
                 allowed_returncodes={128},
             )
+            removed_all = removed_all and removed
+        return oversize, removed_all
 
     def _prune(self, store: Path, working_dir: str, ref: str) -> None:
         """Keep only the last ``max_snapshots`` commits on the per-project ref.
