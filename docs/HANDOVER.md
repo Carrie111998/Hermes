@@ -1,7 +1,7 @@
 # Project Handover - hermes-agent
 
 **Plan key:** hermes-agent  
-**Last verified:** 2026-08-16 12:43 CST
+**Last verified:** 2026-08-16 13:27 CST
 **Handover owner/session:** Codex  
 **Authoritative project log:** `docs/ROADMAP-HERMES-DGX.md`
 
@@ -20,12 +20,12 @@ The local audit checkout observed during this refresh is `D:/PROJECT/Hermes`, br
 
 ## 2. Goal and roadmap
 
-- **Current goal:** diagnose and prove the remaining Telegram inbound polling boundary after the merged health-transition correction; do not claim inbound readiness from process health or a returned `start_polling()`.
+- **Current goal:** preserve the proven Telegram inbound polling progress and separately verify user-visible message delivery; do not claim delivery from process health alone.
 - **Completed and deployed:** HERMES-UPDATE-001, PR #22, merged SHA `0fe3773ccfbec860984d0dc93adc4875ca2d5d4b`; immutable DGX release is active.
 - **Completed and corrected:** Calendar Guard wrapper correction, PR #24, merged SHA `91ae4a7f7a73a4c331e2f5dd018b7ce2ca5c03a9`; the valid immutable release path is no longer mistaken for the fallback sentinel.
 - **Completed and deployed:** managed-CA trust correction, PR #25, squash merge `29d4663bb94cf2d9603d2de9d437a431b5101f14`; authenticated Claude and AGY implementation reviews both PASS, CI run `31918804987` passed, and the new immutable DGX release is active.
-- **Completed through implementation and deployment gates:** HERMES-TELEGRAM-INBOUND-001, PR #26, merge `178c9be1c5e2cc8052d69a0c140131b417a44ee8`; implementation review consensus PASS, CI had 22 success, 8 skipped, 1 neutral, and no failures, and the immutable DGX release is active. Inbound readiness remains a separate open gate.
-- **E2E state:** gateway process/service is healthy and outbound Telegram delivery passed, but inbound polling has no qualifying `getUpdates` progress evidence. The 2026-08-16 bounded DGX window recorded `Connected to Telegram (polling mode)` and gateway startup completion, but no explicit `getUpdates` success or accepted-update event.
+- **Completed through inbound polling gate:** HERMES-TELEGRAM-INBOUND-001, PR #26, merge `178c9be1c5e2cc8052d69a0c140131b417a44ee8`; implementation review, CI, immutable deployment, service health, and qualifying polling progress all passed. User-visible message delivery remains a separate evidence gate.
+- **E2E state:** gateway process/service is healthy, outbound Telegram delivery remains separately proven, and the active release recorded qualifying `telegram_polling_progress` metadata. The bounded verification count increased from 301 to 305 with `telegram_polling_degraded=0`; message content was not inspected.
 - **Deferred:** ARCH-002 remains the next core candidate after the active Telegram transport gate; HERMES-MONITORING-001 remains blocked and does not absorb this transport diagnosis.
 
 ## 3. Verified runtime and deployment state
@@ -40,7 +40,7 @@ The local audit checkout observed during this refresh is `D:/PROJECT/Hermes`, br
 ### Telegram E2E boundary
 
 - **Outbound:** the last verified outbound command returned `success=true`, `message_id=1967`, `mirrored=true`.
-- **Inbound:** after the latest bounded restart window, no qualifying successful `getUpdates` progress was observed. The inbound state remains `DEGRADED/UNPROVEN`.
+- **Inbound:** qualifying polling progress is PASS in the active release: the metadata count increased from 301 to 305 and degraded count remained 0. Accepted-update/user-visible response evidence is not recorded here.
 - **Interpretation:** service health PASS and outbound delivery PASS do not upgrade Telegram inbound readiness.
 
 ## 4. Ticket and gate state
@@ -48,9 +48,9 @@ The local audit checkout observed during this refresh is `D:/PROJECT/Hermes`, br
 ### Current lane: HERMES-TELEGRAM-INBOUND-001
 
 - **Plan:** `docs/plans/2026-08-16-hermes-telegram-inbound-001.md`.
-- **Status:** `MERGED_DEPLOYED_RUNTIME_DEGRADED`; implementation review, CI, merge, immutable deployment, and service health gates passed. Inbound polling remains `DEGRADED/UNPROVEN`.
+- **Status:** `MERGED_DEPLOYED_INBOUND_POLLING_PASS`; implementation review, CI, merge, immutable deployment, service health, and qualifying inbound polling progress gates passed. User-visible delivery remains separate.
 - **Parent lane:** HERMES-TELEGRAM-TRANSPORT-001 is `MERGED_DEPLOYED_RUNTIME_DEGRADED`; its service and outbound gates passed, but inbound readiness remains unproven.
-- **Next action:** run a bounded post-deploy inbound test and inspect metadata-only polling progress; if still unproven, open a narrow follow-up correction with the normal review/CI/deploy gates.
+- **Next action:** confirm user-visible response/delivery evidence without exposing message content; keep polling progress and delivery as separate gates.
 - **Do not:** change credentials/allowlists/webhook state, weaken TLS, or claim inbound readiness from service health, outbound delivery, or absent/ambiguous polling evidence.
 
 ### Other ticket state
@@ -59,7 +59,7 @@ The local audit checkout observed during this refresh is `D:/PROJECT/Hermes`, br
 - `HERMES-AUTH-001`: merged/deployed separately.
 - `HERMES-AUTH-002`: `MERGED_DEPLOYED`; PR #16 merged as `826349ccbfe165ef9f2f7f47f72ed53226c13603`; implementation commit `5e8df81b6`, targeted tests/CI/Windows wrapper evidence recorded. The active release SHA `0fe3773ccfbec860984d0dc93adc4875ca2d5d4b` is four commits ahead of the AUTH-002 merge, so no separate AUTH-002 runtime restart is required.
 - `HERMES-CALENDAR-GUARD-001`: `MERGED_DEPLOYED`; PR #17/#18 plus correction PR #24; the actual `hermes-mcp-health-guard.timer` is active/waiting. The old `hermes-calendar-guard.timer` name is not present and requires a separate documentation reconciliation if needed.
-- `Managed CA trust correction`: `MERGED_DEPLOYED`; PR #25, merge `29d4663b...`, CI `31918804987`, release `v2026.8.16-hermes-ca-29d4663bb9`; focused release tests `6 passed`, source/release hashes matched, and service health is active/running. Telegram inbound remains a separate `DEGRADED/UNPROVEN` gate.
+- `Managed CA trust correction`: `MERGED_DEPLOYED`; PR #25, merge `29d4663b...`, CI `31918804987`, release `v2026.8.16-hermes-ca-29d4663bb9`; focused release tests `6 passed`, source/release hashes matched, and service health is active/running.
 - `HERMES-MONITORING-001`: `BLOCKED`; do not infer readiness from this deployment.
 - `ARCH-002`: proposed next core ticket, deferred until the current Telegram transport gate is resolved or explicitly re-sequenced.
 

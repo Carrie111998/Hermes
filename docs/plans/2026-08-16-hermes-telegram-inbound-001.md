@@ -1,6 +1,6 @@
 ---
 title: "HERMES-TELEGRAM-INBOUND-001: restore and prove Telegram inbound polling readiness"
-status: MERGED_DEPLOYED_RUNTIME_DEGRADED
+status: MERGED_DEPLOYED_INBOUND_POLLING_PASS
 date: 2026-08-16
 type: reliability
 ticket: HERMES-TELEGRAM-INBOUND-001
@@ -11,7 +11,7 @@ target_repo: hermes-agent
 
 ## Status
 
-MERGED_DEPLOYED_RUNTIME_DEGRADED
+MERGED_DEPLOYED_INBOUND_POLLING_PASS
 
 ## Context
 
@@ -28,7 +28,7 @@ Current verified boundary:
 - code merge: `178c9be1c5e2cc8052d69a0c140131b417a44ee8`
 - service: `hermes-gateway.service`, active/running, MainPID `202065`, `NRestarts=0`
 - outbound: prior verified `success=true`, `message_id=1967`, `mirrored=true`
-- inbound: `DEGRADED/UNPROVEN`
+- inbound polling: `PASS` for qualifying metadata progress; user-visible delivery remains separate
 
 ## Goal
 
@@ -228,14 +228,14 @@ retained only to preserve the review history.
   effective drop-in is `33-hermes-telegram-inbound-178c9be1.conf`, and the
   prior release/drop-in remains available for rollback.
 - Post-deploy service gate passed: active/running, `ExecMainStatus=0`,
-  `NRestarts=0`. The bounded five-minute metadata window recorded zero
-  `polling_progress`, `getUpdates`, and `polling_degraded` events, so inbound
-  readiness remains `DEGRADED/UNPROVEN`.
+  `NRestarts=0`. The bounded gateway-log verification observed the qualifying
+  `telegram_polling_progress` count increase from 301 to 305 while
+  `telegram_polling_degraded` remained 0. This proves inbound polling progress
+  for the active release; user-visible response/delivery is a separate gate.
 
 ## Current next action
 
-Run a bounded real inbound test and metadata-only progress check. If the
-qualifying `getUpdates` or accepted-update evidence is still absent, open a
-narrow follow-up correction and repeat independent review, focused tests, CI,
-merge, immutable deployment, and inbound evidence gates. Do not change
-credentials, allowlists, webhook state, or TLS verification.
+Confirm user-visible response/delivery evidence without exposing message
+content. Keep this delivery gate separate from the now-passing polling
+progress gate; do not change credentials, allowlists, webhook state, or TLS
+verification.
