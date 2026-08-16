@@ -12,8 +12,10 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from agent.context_engine import ContextEngine
+from hermes_state import SessionDB
 from plugins.context_engine import load_context_engine
 from plugins.context_engine._context_governor import ContextGovernorEngine
+from tools.todo_tool import TODO_INJECTION_HEADER
 
 
 def _bind_fixture(engine):
@@ -246,6 +248,18 @@ def test_governor_config_reaches_rust_policy_owner():
     assert engine.protect_last_n == 5
 
 
+def test_default_provenance_budget_covers_a_tool_heavy_recursive_suffix():
+    """A normal 256-message suffix must fit before checkpoint evaluation."""
+    with patch("hermes_cli.config.load_config", return_value={}):
+        engine = ContextGovernorEngine(binary="/tmp/context-governor")
+
+    conservative_reference_bytes = 1024
+
+    assert engine._policy["max_provenance_bytes"] >= (
+        256 * conservative_reference_bytes
+    )
+
+
 def test_after_n_checkpoint_policy_calls_llm_only_on_intended_boundary():
     engine, llm = _checkpoint_engine(
         target_tokens=90,
@@ -287,3 +301,194 @@ def test_compaction_metrics_expose_deterministic_llm_and_receipt_boundaries():
     assert metrics["deterministic_reduction_tokens"] is not None
     assert metrics["after_tokens"] is not None
     assert metrics["integrity_result"] == "store_admission_verified"
+
+
+def test_fixed_point_without_new_summary_items_still_calls_secondary_llm():
+    """A fixed point enhances the governed projection, not only newly omitted turns."""
+    engine, llm = _checkpoint_engine(
+        target_tokens=90,
+        llm_output=_valid_llm_summary("fixed-point checkpoint"),
+    )
+    response = {
+        "receipt": {
+            "original_approx_tokens": 100,
+            "covered_original_sources": [],
+        },
+        "allocation_plan": {"summarized_item_ids": [], "items": []},
+    }
+    engine._run_json = MagicMock(
+        side_effect=[
+            {"system": "system", "user": "prompt"},
+            {"safe_to_reinject": True},
+        ]
+    )
+    engine.last_compaction_metrics = {"llm_call": False}
+
+    compacted = engine._enhance_with_llm_summary(
+        [
+            {
+                "role": "assistant",
+                "name": "context_governor",
+                "content": "deterministic extractive summary",
+            },
+            {"role": "user", "content": "final"},
+        ],
+        [{"role": "user", "content": "final"}],
+        response,
+        None,
+    )
+
+    assert llm.call_count == 1
+    assert engine.last_compaction_metrics["llm_call"] is True
+    assert compacted[0]["content"] == _valid_llm_summary("fixed-point checkpoint")
+
+
+def test_missing_summary_projection_does_not_claim_an_llm_call():
+    engine, llm = _checkpoint_engine(
+        target_tokens=90,
+        llm_output=_valid_llm_summary(),
+    )
+    engine.last_compaction_metrics = {
+        "llm_call": False,
+        "llm_call_reason": "checkpoint_ready",
+    }
+
+    compacted = engine._enhance_with_llm_summary(
+        [{"role": "user", "content": "final"}],
+        [{"role": "user", "content": "final"}],
+        {"receipt": {}, "allocation_plan": {}},
+        None,
+    )
+
+    assert compacted == [{"role": "user", "content": "final"}]
+    assert llm.call_count == 0
+    assert engine.last_compaction_metrics == {
+        "llm_call": False,
+        "llm_call_reason": "summary_projection_unavailable",
+    }
+
+
+def test_host_todo_snapshot_does_not_block_recursive_llm_checkpoint():
+    """Host-only todo state must not invalidate the receipt-backed parent prefix."""
+    config = {
+        "context": {
+            "governor": {
+                "summary_mode": "llm",
+                "checkpoint_strategy": "after_n:2",
+            }
+        }
+    }
+    with patch("hermes_cli.config.load_config", return_value=config):
+        engine = ContextGovernorEngine(binary="/tmp/context-governor")
+    _bind_fixture(engine)
+    engine._target_tokens = lambda current_tokens: 90
+    engine._store_response = MagicMock(return_value={"verified": True})
+    llm = MagicMock(return_value=_valid_llm_summary("recursive checkpoint"))
+    engine._call_summary_llm = llm
+    parent_projection = None
+    generation = 0
+
+    def run_json(args, payload):
+        nonlocal generation, parent_projection
+        if args[:3] == ["compact-v2", "--dir", str(engine.store_dir)]:
+            incoming = payload["messages"]
+            if parent_projection is not None and incoming[: len(parent_projection)] != parent_projection:
+                raise RuntimeError(
+                    "parent compacted transcript is not the exact child-input prefix"
+                )
+            generation += 1
+            return {
+                "receipt": {
+                    "schema": "ContextCompactionReceiptV2",
+                    "receipt_id": f"ctxr_checkpoint_{generation}",
+                    "original_transcript_blake3": "a" * 64,
+                    "compacted_transcript_blake3": "b" * 64,
+                    "original_approx_tokens": 100,
+                    "compacted_approx_tokens": 95,
+                    "token_savings_estimate": 5,
+                    "generation": generation,
+                    "covered_original_sources": [],
+                },
+                "allocation_plan": {
+                    "summarized_item_ids": ["ctxi_old"],
+                    "items": [{"item_id": "ctxi_old", "start_index": 0}],
+                },
+                "compacted_messages": [
+                    {
+                        "role": "assistant",
+                        "name": "context_governor",
+                        "content": "deterministic extractive summary",
+                    },
+                    {"role": "user", "content": "final"},
+                ],
+            }
+        if args == ["render-prompt-v2"]:
+            return {"system": "system", "user": "prompt"}
+        if args == ["boundary-audit"]:
+            return {"safe_to_reinject": True}
+        if args == ["finalize-v2"]:
+            response = payload
+            parent_projection = response["compacted_messages"]
+            tokens = sum(
+                max(1, len(str(message.get("content", ""))) // 4)
+                for message in parent_projection
+            )
+            response["receipt"]["compacted_approx_tokens"] = tokens
+            response["receipt"]["token_savings_estimate"] = 100 - tokens
+            return response
+        raise AssertionError(f"unexpected command: {args}")
+
+    engine._run_json = run_json
+    first = engine.compress(
+        [{"role": "assistant", "content": "old"}, {"role": "user", "content": "final"}],
+        current_tokens=100,
+    )
+    first[-1]["content"] += f"\n\n{TODO_INJECTION_HEADER}\n- [>] reproduce"
+
+    second = engine.compress(first, current_tokens=100)
+
+    assert llm.call_count == 1
+    assert second[0]["content"] == _valid_llm_summary("recursive checkpoint")
+    assert engine.last_error is None
+
+
+def test_governor_projection_roundtrips_through_session_store(tmp_path):
+    """Receipt projection fields must survive Hermes' durable in-place rewrite."""
+    db = SessionDB(db_path=tmp_path / "state.db")
+    session_id = "governor-roundtrip"
+    db.create_session(session_id, source="cli")
+    engine = ContextGovernorEngine(binary="/tmp/context-governor")
+    governor_messages = [
+        {
+            "role": "tool",
+            "id": "call_123",
+            "name": "skill_view",
+            "content": "tool result",
+            "metadata": {"tool_call_id": "call_123"},
+        },
+        {
+            "role": "assistant",
+            "id": "summary_random_id",
+            "name": "context_governor",
+            "content": "deterministic extractive summary",
+        },
+    ]
+    host_messages = [
+        engine._message_from_governor(message) for message in governor_messages
+    ]
+
+    db.archive_and_compact(session_id, host_messages)
+    reloaded = db.get_messages_as_conversation(session_id)
+    roundtripped = [
+        engine._message_to_governor(message, index)
+        for index, message in enumerate(reloaded)
+    ]
+
+    assert roundtripped == [
+        governor_messages[0],
+        {
+            "role": "assistant",
+            "name": "context_governor",
+            "content": "deterministic extractive summary",
+        },
+    ]

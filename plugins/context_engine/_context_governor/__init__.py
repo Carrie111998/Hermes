@@ -189,7 +189,11 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
             # supposed to save; the Rust owner enforces them before issuing a
             # receipt.
             "max_lineage_generation": 32,
-            "max_provenance_bytes": 131072,
+            # Receipt provenance is durable store metadata; render-prompt-v2
+            # separately bounds the prompt-visible projection to four refs.
+            # One MiB admits tool-heavy recursive suffixes without letting the
+            # manifest grow unbounded across the 32-generation ceiling.
+            "max_provenance_bytes": 1_048_576,
             "min_net_savings_tokens": 128,
         }
         # Override from config if available
@@ -900,7 +904,13 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
         # stores only an adapter-generated one-line placeholder and makes the
         # original unrecoverable from its receipt. The core's allocator decides
         # what to omit/quarantine while retaining the authoritative exact copy.
-        source_messages = messages
+        # Hermes appends its todo snapshot *after* an engine returns and before
+        # the compacted transcript is persisted. That host-owned synthetic block
+        # is refreshed at every boundary, so it is not part of the governor's
+        # receipt projection. Strip the stale copy before recursive compaction;
+        # otherwise the Rust store correctly rejects the child because the
+        # parent's final user message is no longer an exact prefix.
+        source_messages = self._without_host_todo_snapshots(messages)
 
         # Advisory telemetry can conservatively protect a bounded few messages;
         # it never creates causal claims or authorizes check skipping.
@@ -992,7 +1002,6 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
             )
             metrics["llm_call_reason"] = checkpoint_reason
             if checkpoint:
-                metrics["llm_call"] = True
                 metrics["passes"] = 2
                 deterministic_projection = copy.deepcopy(compacted)
                 compacted = self._enhance_with_llm_summary(
@@ -1001,7 +1010,7 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
                 if compacted != deterministic_projection:
                     self._llm_checkpoint_count += 1
                     metrics["llm_call_reason"] = f"{checkpoint_reason}:applied"
-                else:
+                elif metrics.get("llm_call_reason") == checkpoint_reason:
                     metrics["llm_call_reason"] = f"{checkpoint_reason}:fallback_extract"
 
             # Sanitation and the audited LLM checkpoint can both mutate the
@@ -1305,6 +1314,35 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
     # Message format preservation
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _without_host_todo_snapshots(
+        messages: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """Return a copy without host-refreshed todo snapshot suffixes."""
+        from tools.todo_tool import TODO_INJECTION_HEADER
+
+        normalized = copy.deepcopy(messages)
+        for message in normalized:
+            if not isinstance(message, dict):
+                continue
+            content = message.get("content")
+            if isinstance(content, str):
+                marker = content.find(TODO_INJECTION_HEADER)
+                if marker >= 0:
+                    message["content"] = content[:marker].rstrip()
+            elif isinstance(content, list):
+                message["content"] = [
+                    part
+                    for part in content
+                    if not (
+                        isinstance(part, dict)
+                        and str(part.get("text") or "")
+                        .lstrip()
+                        .startswith(TODO_INJECTION_HEADER)
+                    )
+                ]
+        return normalized
+
     def _message_to_governor(self, msg: Dict[str, Any], idx: int) -> Dict[str, Any]:
         role = msg.get("role") or "assistant"
         if role not in {"system", "user", "assistant", "tool"}:
@@ -1313,11 +1351,15 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
             "role": role,
             "content": self._content_to_text(msg.get("content")),
         }
-        message_id = msg.get("id") or msg.get("tool_call_id")
+        # Hermes durably stores tool-call identity but has no generic provider
+        # message-id column. Keep only the identity that survives an in-place
+        # archive/reload so the next receipt can prove an exact parent prefix.
+        message_id = msg.get("tool_call_id") if role == "tool" else None
         if message_id:
             out["id"] = str(message_id)
-        if msg.get("name"):
-            out["name"] = str(msg.get("name"))
+        message_name = msg.get("name") or msg.get("tool_name")
+        if message_name:
+            out["name"] = str(message_name)
         # Preserve OpenAI-specific fields in metadata for roundtrip
         metadata = {}
         if isinstance(msg.get("metadata"), dict):
@@ -1344,8 +1386,12 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
             content = copy.deepcopy(metadata["hermes_content"])
         out = {"role": msg.get("role") or "assistant", "content": content}
         if msg.get("name"):
+            # ``name`` is the provider-facing shape; ``tool_name`` is Hermes'
+            # durable SessionDB column. Carry both so the in-memory transcript
+            # and a resumed transcript normalize to the same receipt message.
             out["name"] = msg.get("name")
-        if msg.get("id"):
+            out["tool_name"] = msg.get("name")
+        if msg.get("id") and msg.get("role") == "tool":
             out["id"] = msg.get("id")
         # Restore OpenAI-specific fields from metadata
         if isinstance(metadata, dict):
@@ -1664,6 +1710,10 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
                 summary_idx = i
                 break
         if summary_idx is None:
+            if self.last_compaction_metrics is not None:
+                self.last_compaction_metrics["llm_call_reason"] = (
+                    "summary_projection_unavailable"
+                )
             return compacted
 
         extractive_summary = compacted[summary_idx].get("content", "")
@@ -1685,7 +1735,14 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
                         turns_to_summarize.append(msg)
 
         if not turns_to_summarize:
-            return compacted  # Nothing to enhance
+            # A deterministic fixed point commonly has no *new* summarized
+            # item IDs: the governed projection already contains the prior
+            # extractive summary. That is precisely when the secondary LLM is
+            # useful. Audit against the full current projection while the Rust
+            # renderer supplies the bounded, receipt-aware summary prompt.
+            turns_to_summarize = [
+                msg for msg in original_messages if isinstance(msg, dict)
+            ]
 
         summary_budget = min(
             int(self.context_length * 0.05) if self.context_length else 4000,
@@ -1720,6 +1777,7 @@ Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command out
                 model, provider, _base_url, _api_key = self._resolve_moa_runtime()
                 metrics["summarizer_model"] = model or None
                 metrics["summarizer_provider"] = provider or None
+                metrics["llm_call"] = True
             llm_summary = self._call_summary_llm(
                 prompt, summary_budget, system_prompt=system_prompt
             )
