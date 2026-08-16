@@ -1,3 +1,4 @@
+import contextlib
 import json
 import os
 import subprocess
@@ -4238,6 +4239,292 @@ def test_session_close_releases_resume_lock_before_slow_teardown(monkeypatch):
 
     assert not thread.is_alive()
     assert response["result"] == {"closed": True}
+
+
+def _session_close_delete_result(session_id: str = "live-sid") -> dict:
+    resp = server.handle_request({
+        "id": "close-delete",
+        "method": "session.close",
+        "params": {"session_id": session_id, "delete": True},
+    })
+    assert resp is not None
+    return resp["result"]
+
+
+def _close_live_session_with_delete(
+    session: dict, session_id: str = "live-sid"
+) -> dict:
+    server._sessions[session_id] = session
+    try:
+        return _session_close_delete_result(session_id)
+    finally:
+        server._sessions.pop(session_id, None)
+
+
+def test_session_close_delete_uses_durable_id_and_profile_store(monkeypatch, tmp_path):
+    calls: dict = {}
+    profile_home = tmp_path / "profile"
+
+    class _DB:
+        def get_session(self, sid):
+            calls["looked_up"] = sid
+            return {"source": "tui"}
+
+        def delete_session(self, sid, sessions_dir=None):
+            calls["deleted"] = (sid, sessions_dir)
+            return True
+
+    db = _DB()
+    profiles = []
+
+    def _profile_db(session):
+        profiles.append(session.get("profile_home"))
+        return contextlib.nullcontext(db)
+
+    monkeypatch.setattr(server, "_session_db", _profile_db)
+    monkeypatch.setattr(
+        server,
+        "_teardown_session",
+        lambda _session, *, end_reason="tui_close": calls.setdefault(
+            "end_reason", end_reason
+        ),
+    )
+    result = _close_live_session_with_delete(
+        _session(
+            agent=types.SimpleNamespace(session_id="compressed-tip"),
+            session_key="stale-parent",
+            profile_home=str(profile_home),
+        )
+    )
+
+    assert result == {
+        "closed": True,
+        "deleted": True,
+        "deleted_session_id": "compressed-tip",
+    }
+    assert calls["looked_up"] == "compressed-tip"
+    assert calls["deleted"] == ("compressed-tip", profile_home / "sessions")
+    assert profiles == [str(profile_home), str(profile_home)]
+    assert calls["end_reason"] == "tui_delete"
+    assert "live-sid" not in server._sessions
+
+
+def test_session_close_delete_refuses_gateway_owned_source(monkeypatch):
+    calls: dict = {}
+    ended = []
+
+    class _DB:
+        def get_session(self, sid):
+            return {"source": "telegram"}
+
+        def end_session(self, sid, end_reason):
+            ended.append((sid, end_reason))
+
+        def delete_session(self, *args, **kwargs):
+            raise AssertionError("gateway-owned history must not be deleted")
+
+    db = _DB()
+    monkeypatch.setattr(
+        server, "_session_db", lambda _session: contextlib.nullcontext(db)
+    )
+    monkeypatch.setattr(server, "_notify_session_boundary", lambda *args: None)
+    real_teardown = server._teardown_session
+
+    def _recording_teardown(session, *, end_reason="tui_close"):
+        calls["end_reason"] = end_reason
+        real_teardown(session, end_reason=end_reason)
+
+    monkeypatch.setattr(server, "_teardown_session", _recording_teardown)
+    session = _session(session_key="telegram-session")
+    session["agent"] = None
+    result = _close_live_session_with_delete(session)
+
+    assert result["closed"] is True
+    assert result["deleted"] is False
+    assert result["deleted_session_id"] == "telegram-session"
+    assert "gateway-owned" in result["delete_error"]
+    assert calls["end_reason"] == "tui_close"
+    assert ended == []
+
+
+def test_session_close_delete_fails_closed_when_ownership_unknown(monkeypatch):
+    calls: dict = {}
+
+    class _DB:
+        def get_session(self, sid):
+            raise RuntimeError("temporary read error")
+
+        def delete_session(self, *args, **kwargs):
+            raise AssertionError("unknown ownership must block deletion")
+
+    monkeypatch.setattr(
+        server, "_session_db", lambda _session: contextlib.nullcontext(_DB())
+    )
+    monkeypatch.setattr(
+        server,
+        "_teardown_session",
+        lambda _session, *, end_reason="tui_close": calls.setdefault(
+            "end_reason", end_reason
+        ),
+    )
+    result = _close_live_session_with_delete(_session(session_key="stored-session"))
+
+    assert result["closed"] is True
+    assert result["deleted"] is False
+    assert "cannot verify session ownership" in result["delete_error"]
+    assert calls["end_reason"] == "tui_close"
+
+
+def test_session_close_delete_fails_closed_when_profile_db_is_unavailable(
+    monkeypatch,
+):
+    calls: dict = {}
+    monkeypatch.setattr(
+        server, "_session_db", lambda _session: contextlib.nullcontext(None)
+    )
+    monkeypatch.setattr(
+        server,
+        "_teardown_session",
+        lambda _session, *, end_reason="tui_close": calls.setdefault(
+            "end_reason", end_reason
+        ),
+    )
+    result = _close_live_session_with_delete(_session(session_key="stored-session"))
+
+    assert result["closed"] is True
+    assert result["deleted"] is False
+    assert "state.db unavailable" in result["delete_error"]
+    assert calls["end_reason"] == "tui_close"
+
+
+def test_session_close_delete_never_uses_runtime_sid_as_delete_key(monkeypatch):
+    calls: dict = {}
+
+    def _unexpected_db(_session):
+        raise AssertionError("DB must not be opened without a durable session id")
+
+    monkeypatch.setattr(server, "_session_db", _unexpected_db)
+    monkeypatch.setattr(
+        server,
+        "_teardown_session",
+        lambda _session, *, end_reason="tui_close": calls.setdefault(
+            "end_reason", end_reason
+        ),
+    )
+    result = _close_live_session_with_delete(
+        _session(agent=types.SimpleNamespace(), session_key="")
+    )
+
+    assert result == {
+        "closed": True,
+        "deleted": False,
+        "delete_error": "no durable session id available for deletion",
+    }
+    assert calls["end_reason"] == "tui_close"
+
+
+@pytest.mark.parametrize(
+    ("delete_outcome", "expected_error"),
+    [
+        (False, "session not found for deletion"),
+        (RuntimeError("read-only filesystem"), "delete failed: read-only filesystem"),
+    ],
+    ids=["not-found", "exception"],
+)
+def test_session_close_delete_reports_failure_after_close(
+    monkeypatch, delete_outcome, expected_error
+):
+    calls: dict = {}
+
+    class _DB:
+        def get_session(self, sid):
+            return {"source": "tui"}
+
+        def delete_session(self, sid, sessions_dir=None):
+            if isinstance(delete_outcome, Exception):
+                raise delete_outcome
+            return delete_outcome
+
+    monkeypatch.setattr(
+        server, "_session_db", lambda _session: contextlib.nullcontext(_DB())
+    )
+    monkeypatch.setattr(
+        server,
+        "_teardown_session",
+        lambda _session, *, end_reason="tui_close": calls.setdefault(
+            "end_reason", end_reason
+        ),
+    )
+    result = _close_live_session_with_delete(_session(session_key="stored-session"))
+
+    assert result == {
+        "closed": True,
+        "deleted": False,
+        "deleted_session_id": "stored-session",
+        "delete_error": expected_error,
+    }
+    assert calls["end_reason"] == "tui_delete"
+
+
+def test_session_close_delete_missing_live_session_does_not_open_db(monkeypatch):
+    def _unexpected_db(_session):
+        raise AssertionError("DB must not be opened without a live session")
+
+    monkeypatch.setattr(server, "_session_db", _unexpected_db)
+    assert _session_close_delete_result("missing") == {
+        "closed": False,
+        "deleted": False,
+    }
+
+
+def test_session_close_delete_releases_resume_lock_before_profile_db_work(
+    monkeypatch,
+):
+    db_started = threading.Event()
+    release_db = threading.Event()
+    response: dict = {}
+
+    class _DB:
+        def get_session(self, sid):
+            return {"source": "tui"}
+
+        def delete_session(self, sid, sessions_dir=None):
+            return True
+
+    @contextlib.contextmanager
+    def _slow_session_db(_session):
+        db_started.set()
+        assert release_db.wait(timeout=2.0)
+        yield _DB()
+
+    monkeypatch.setattr(server, "_session_db", _slow_session_db)
+    monkeypatch.setattr(server, "_teardown_session", lambda *args, **kwargs: None)
+    server._sessions["slow-delete"] = _session(session_key="stored-session")
+
+    def _close():
+        response.update(_session_close_delete_result("slow-delete"))
+
+    thread = threading.Thread(target=_close)
+    thread.start()
+    acquired = False
+    try:
+        assert db_started.wait(timeout=1.0)
+        assert "slow-delete" not in server._sessions
+        acquired = server._session_resume_lock.acquire(timeout=0.2)
+        assert acquired, "delete DB work kept the global resume lock held"
+    finally:
+        if acquired:
+            server._session_resume_lock.release()
+        release_db.set()
+        thread.join(timeout=2.0)
+        server._sessions.pop("slow-delete", None)
+
+    assert not thread.is_alive()
+    assert response == {
+        "closed": True,
+        "deleted": True,
+        "deleted_session_id": "stored-session",
+    }
 
 
 def test_ws_orphan_reap_closes_worker_when_session_stays_detached(monkeypatch):

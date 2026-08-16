@@ -2805,8 +2805,11 @@ def _(rid, params: dict) -> dict:
     # keep every unrelated session.resume waiting behind it.
     with _session_resume_lock:
         session = _pop_session_by_id(sid)
-    closed = _teardown_popped_session(session, end_reason="tui_close")
-    return _ok(rid, {"closed": closed})
+    if is_truthy_value(params.get("delete", False)):
+        result = _teardown_popped_session_and_delete(session)
+    else:
+        result = {"closed": _teardown_popped_session(session, end_reason="tui_close")}
+    return _ok(rid, result)
 
 
 @method("session.branch")

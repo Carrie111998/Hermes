@@ -980,6 +980,88 @@ def _teardown_popped_session(
     return True
 
 
+def _teardown_popped_session_and_delete(session: dict | None) -> dict:
+    """Close a claimed live session and delete its durable local history.
+
+    The caller must pop the session before entering this helper. That atomic
+    claim makes concurrent close/reaper attempts no-ops while all DB reads,
+    plugin finalization, and file deletion remain outside the global resume
+    lock. Deletion uses the session's profile-scoped store and fails closed
+    unless durable lifecycle ownership can be verified.
+    """
+    if session is None:
+        return {"closed": False, "deleted": False}
+
+    runtime_sid = str(session.get("_sid") or "")
+    delete_id = _session_lookup_key(session, fallback="")
+    if not delete_id or delete_id == runtime_sid:
+        _teardown_popped_session(session, end_reason="tui_close")
+        return {
+            "closed": True,
+            "deleted": False,
+            "delete_error": "no durable session id available for deletion",
+        }
+
+    ownership_error = ""
+    gateway_owned = False
+    try:
+        with _session_db(session) as db:
+            if db is None:
+                ownership_error = "state.db unavailable for session profile"
+            else:
+                row = db.get_session(delete_id) or {}
+                source = str(row.get("source") or "")
+                gateway_owned = _is_gateway_owned_source(source)
+    except Exception as exc:
+        ownership_error = f"cannot verify session ownership: {exc}"
+
+    if ownership_error or gateway_owned:
+        _teardown_popped_session(session, end_reason="tui_close")
+        return {
+            "closed": True,
+            "deleted": False,
+            "deleted_session_id": delete_id,
+            "delete_error": ownership_error
+            or "session is gateway-owned; the TUI is a viewer and cannot delete it",
+        }
+
+    # Ownership is known-local. Finalize before deleting so pending messages and
+    # lifecycle hooks run while the durable row still exists.
+    _teardown_popped_session(session, end_reason="tui_delete")
+    profile_home = session.get("profile_home")
+    sessions_dir = (
+        Path(profile_home) / "sessions"
+        if profile_home
+        else get_hermes_home() / "sessions"
+    )
+    try:
+        with _session_db(session) as db:
+            if db is None:
+                return {
+                    "closed": True,
+                    "deleted": False,
+                    "deleted_session_id": delete_id,
+                    "delete_error": "state.db unavailable for session profile",
+                }
+            deleted = bool(db.delete_session(delete_id, sessions_dir=sessions_dir))
+    except Exception as exc:
+        return {
+            "closed": True,
+            "deleted": False,
+            "deleted_session_id": delete_id,
+            "delete_error": f"delete failed: {exc}",
+        }
+
+    result = {
+        "closed": True,
+        "deleted": deleted,
+        "deleted_session_id": delete_id,
+    }
+    if not deleted:
+        result["delete_error"] = "session not found for deletion"
+    return result
+
+
 def _close_session_by_id(
     sid: str,
     *,
