@@ -1676,7 +1676,7 @@ def run_curator_review(
                     )
                 else:
                     prompt = f"{CURATOR_REVIEW_PROMPT}{builtins_note}\n\n{candidate_list}"
-                llm_meta = _run_llm_review(prompt)
+                llm_meta = _run_llm_review(prompt, dry_run=dry_run)
                 final_summary = (
                     f"{prefix}{auto_summary}; llm: {llm_meta.get('summary', 'no change')}"
                 )
@@ -1824,8 +1824,13 @@ def _resolve_review_model(cfg: Dict[str, Any]) -> tuple[str, str]:
     return b.provider, b.model
 
 
-def _run_llm_review(prompt: str) -> Dict[str, Any]:
+def _run_llm_review(prompt: str, dry_run: bool = False) -> Dict[str, Any]:
     """Spawn an AIAgent fork to run the curator review prompt.
+
+    When *dry_run* is True the fork runs under the skill_manage read-only
+    flag (``tools.skill_manager_tool.curator_dry_run_scope``) so a
+    noncompliant model cannot mutate the skill library during a preview
+    (#87793) — the prompt banner alone was not a guarantee.
 
     Returns a dict with:
       - final: full (untruncated) final response from the reviewer
@@ -1838,6 +1843,8 @@ def _run_llm_review(prompt: str) -> Dict[str, Any]:
     Never raises; callers get a structured failure instead.
     """
     import contextlib
+
+    from tools.skill_manager_tool import curator_dry_run_scope
     result_meta: Dict[str, Any] = {
         "final": "",
         "summary": "",
@@ -1955,7 +1962,12 @@ def _run_llm_review(prompt: str) -> Dict[str, Any]:
         with open(os.devnull, "w", encoding="utf-8") as _devnull, \
              contextlib.redirect_stdout(_devnull), \
              contextlib.redirect_stderr(_devnull):
-            conv_result = review_agent.run_conversation(user_message=prompt)
+            # Dry-run backstop (#87793): the banner asks the model to
+            # describe instead of perform; refuse mutations mechanically
+            # while the fork runs. The scope resets the flag on exit so
+            # the read-only state never leaks into the host process.
+            with curator_dry_run_scope(dry_run):
+                conv_result = review_agent.run_conversation(user_message=prompt)
 
         final = ""
         if isinstance(conv_result, dict):
