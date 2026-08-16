@@ -39,6 +39,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
+_MANIFEST_LOCK = threading.Lock()
 
 # Live transcript directories older than this are pruned on new dispatches.
 LIVE_RETENTION_DAYS = 7
@@ -350,6 +351,20 @@ def _manifest_path(delegation_id: str) -> Path:
     return live_transcript_root() / delegation_id / "manifest.json"
 
 
+def _write_manifest_atomic(path: Path, manifest: Dict[str, Any]) -> None:
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        temporary.write_text(
+            json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+        temporary.replace(path)
+    finally:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
 def _write_manifest(delegation_id: str, task_list: List[Dict[str, Any]],
                     paths: List[str]) -> None:
     try:
@@ -372,11 +387,35 @@ def _write_manifest(delegation_id: str, task_list: List[Dict[str, Any]],
                 for i, t in enumerate(task_list)
             ],
         }
-        _manifest_path(delegation_id).write_text(
-            json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8"
-        )
+        _write_manifest_atomic(_manifest_path(delegation_id), manifest)
     except Exception as exc:
         logger.debug("Live transcript manifest write failed: %s", exc)
+
+
+def update_manifest_task_status(
+    delegation_id: Optional[str], result: Dict[str, Any]
+) -> None:
+    """Best-effort atomic update as one delegated task reaches a terminal state."""
+    if not delegation_id or not isinstance(result, dict):
+        return
+    try:
+        with _MANIFEST_LOCK:
+            mp = _manifest_path(delegation_id)
+            manifest = json.loads(mp.read_text(encoding="utf-8"))
+            task_index = result.get("task_index")
+            for task in manifest.get("tasks", []):
+                if task.get("index") != task_index:
+                    continue
+                task["status"] = result.get("status", task.get("status"))
+                if result.get("exit_reason"):
+                    task["exit_reason"] = result["exit_reason"]
+                break
+            tasks = manifest.get("tasks", [])
+            if tasks and all(task.get("status") != "running" for task in tasks):
+                manifest["completed"] = time.strftime("%Y-%m-%d %H:%M:%S")
+            _write_manifest_atomic(mp, manifest)
+    except Exception as exc:
+        logger.debug("Live transcript task status update failed: %s", exc)
 
 
 def update_manifest_statuses(delegation_id: Optional[str],
@@ -385,18 +424,18 @@ def update_manifest_statuses(delegation_id: Optional[str],
     if not delegation_id:
         return
     try:
-        mp = _manifest_path(delegation_id)
-        manifest = json.loads(mp.read_text(encoding="utf-8"))
-        by_index = {r.get("task_index"): r for r in results if isinstance(r, dict)}
-        for task in manifest.get("tasks", []):
-            r = by_index.get(task.get("index"))
-            if r is not None:
-                task["status"] = r.get("status", task.get("status"))
-                if r.get("exit_reason"):
-                    task["exit_reason"] = r["exit_reason"]
-        manifest["completed"] = time.strftime("%Y-%m-%d %H:%M:%S")
-        mp.write_text(json.dumps(manifest, indent=2, ensure_ascii=False),
-                      encoding="utf-8")
+        with _MANIFEST_LOCK:
+            mp = _manifest_path(delegation_id)
+            manifest = json.loads(mp.read_text(encoding="utf-8"))
+            by_index = {r.get("task_index"): r for r in results if isinstance(r, dict)}
+            for task in manifest.get("tasks", []):
+                r = by_index.get(task.get("index"))
+                if r is not None:
+                    task["status"] = r.get("status", task.get("status"))
+                    if r.get("exit_reason"):
+                        task["exit_reason"] = r["exit_reason"]
+            manifest["completed"] = time.strftime("%Y-%m-%d %H:%M:%S")
+            _write_manifest_atomic(mp, manifest)
     except Exception as exc:
         logger.debug("Live transcript manifest update failed: %s", exc)
 

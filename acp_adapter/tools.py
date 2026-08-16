@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import uuid
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import acp
@@ -1303,6 +1305,62 @@ def _is_structured_json_result(result: Optional[str]) -> bool:
     return isinstance(_json_loads_maybe(result), (dict, list))
 
 
+_DELEGATION_ID_PATTERN = re.compile(r"^deleg_[0-9a-f]{8}$")
+_MAX_DELEGATION_TELEMETRY_TASKS = 100
+
+
+def _delegate_task_completion_meta(result: Optional[str]) -> Optional[Dict[str, Any]]:
+    """Extract bounded machine data without depending on polished display text."""
+    parsed = _json_loads_maybe(result)
+    if not isinstance(parsed, dict) or parsed.get("status") != "dispatched":
+        return None
+
+    delegation_id = parsed.get("delegation_id")
+    task_count = parsed.get("count")
+    transcripts = parsed.get("live_transcripts")
+    if (
+        not isinstance(delegation_id, str)
+        or not _DELEGATION_ID_PATTERN.fullmatch(delegation_id)
+        or not isinstance(task_count, int)
+        or isinstance(task_count, bool)
+        or not 1 <= task_count <= _MAX_DELEGATION_TELEMETRY_TASKS
+        or not isinstance(transcripts, list)
+        or len(transcripts) != task_count
+    ):
+        return None
+
+    validated: List[str] = []
+    expected_directory: Optional[Path] = None
+    for index, raw_path in enumerate(transcripts):
+        if not isinstance(raw_path, str) or not raw_path or len(raw_path) > 4096:
+            return None
+        transcript = Path(raw_path)
+        if not transcript.is_absolute():
+            return None
+        directory = transcript.parent
+        if directory.name != delegation_id:
+            return None
+        if expected_directory is None:
+            expected_directory = directory
+        elif directory != expected_directory:
+            return None
+        if transcript != directory / f"task-{index}.log":
+            return None
+        validated.append(raw_path)
+
+    return {
+        "hermes": {
+            "delegateTask": {
+                "schemaVersion": 1,
+                "status": "dispatched",
+                "delegationId": delegation_id,
+                "taskCount": task_count,
+                "liveTranscripts": validated,
+            }
+        }
+    }
+
+
 def build_tool_complete(
     tool_call_id: str,
     tool_name: str,
@@ -1322,13 +1380,16 @@ def build_tool_complete(
             function_args=function_args,
             snapshot=snapshot,
         )
-    return acp.update_tool_call(
+    progress = acp.update_tool_call(
         tool_call_id,
         kind=kind,
         status="failed" if _tool_result_failed(result, tool_name) else "completed",
         content=content,
         raw_output=None if tool_name in _POLISHED_TOOLS or _is_structured_json_result(result) else result,
     )
+    if tool_name == "delegate_task" and progress.status == "completed":
+        progress.field_meta = _delegate_task_completion_meta(result)
+    return progress
 
 
 # ---------------------------------------------------------------------------

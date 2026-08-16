@@ -195,6 +195,76 @@ class TestBuildToolComplete:
         assert "total 42" in content_item.content.text
         assert result.raw_output is None
 
+    def test_delegate_completion_has_compact_machine_metadata_when_display_is_truncated(self):
+        paths = [
+            f"/tmp/.hermes/cache/delegation/live/deleg_abcdef12/task-{index}.log"
+            for index in range(3)
+        ]
+        payload = {
+            "status": "dispatched",
+            "mode": "background",
+            "count": 3,
+            "delegation_id": "deleg_abcdef12",
+            "goals": ["x" * 2_000, "y" * 2_000, "z" * 2_000],
+            "live_transcripts": paths,
+        }
+
+        result = build_tool_complete(
+            "tc-delegate",
+            "delegate_task",
+            __import__("json").dumps(payload),
+        )
+
+        assert result.field_meta == {
+            "hermes": {
+                "delegateTask": {
+                    "schemaVersion": 1,
+                    "status": "dispatched",
+                    "delegationId": "deleg_abcdef12",
+                    "taskCount": 3,
+                    "liveTranscripts": paths,
+                }
+            }
+        }
+        assert "truncated" in result.content[0].content.text
+
+    def test_delegate_completion_omits_machine_metadata_for_inconsistent_paths(self):
+        result = build_tool_complete(
+            "tc-delegate",
+            "delegate_task",
+            '{"status":"dispatched","count":1,"delegation_id":"deleg_abcdef12",'
+            '"live_transcripts":["/tmp/other/task-0.log"]}',
+        )
+
+        assert result.field_meta is None
+
+    def test_delegate_completion_metadata_supports_configured_batch_boundary(self):
+        paths = [
+            f"/tmp/.hermes/cache/delegation/live/deleg_abcdef12/task-{index}.log"
+            for index in range(100)
+        ]
+        payload = {
+            "status": "dispatched",
+            "count": len(paths),
+            "delegation_id": "deleg_abcdef12",
+            "live_transcripts": paths,
+        }
+
+        result = build_tool_complete(
+            "tc-delegate-boundary", "delegate_task", __import__("json").dumps(payload)
+        )
+
+        assert result.field_meta["hermes"]["delegateTask"]["taskCount"] == 100
+
+        payload["count"] = 101
+        payload["live_transcripts"] = paths + [
+            "/tmp/.hermes/cache/delegation/live/deleg_abcdef12/task-100.log"
+        ]
+        rejected = build_tool_complete(
+            "tc-delegate-over-boundary", "delegate_task", __import__("json").dumps(payload)
+        )
+        assert rejected.field_meta is None
+
 
 
 

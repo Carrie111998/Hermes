@@ -735,7 +735,8 @@ def _get_max_concurrent_children() -> int:
     """Read delegation.max_concurrent_children from config, falling back to
     DELEGATION_MAX_CONCURRENT_CHILDREN env var, then the default (10).
 
-    Users can raise this as high as they want; only the floor (1) is enforced.
+    Values are bounded to 100 so execution and delegated-worker telemetry share
+    one explicit resource ceiling rather than silently dropping valid batches.
 
     Uses the same ``_load_config()`` path that the rest of ``delegate_task``
     uses, keeping config priority consistent (config.yaml > env > default).
@@ -744,7 +745,14 @@ def _get_max_concurrent_children() -> int:
     val = cfg.get("max_concurrent_children")
     if val is not None:
         try:
-            result = max(1, int(val))
+            requested = max(1, int(val))
+            result = min(requested, 100)
+            if requested > 100:
+                logger.warning(
+                    "delegation.max_concurrent_children=%d exceeds the supported "
+                    "maximum 100; clamping to 100.",
+                    requested,
+                )
             if result > 10:
                 global _HIGH_CONCURRENCY_WARNED
                 if not _HIGH_CONCURRENCY_WARNED:
@@ -766,7 +774,14 @@ def _get_max_concurrent_children() -> int:
     env_val = os.getenv("DELEGATION_MAX_CONCURRENT_CHILDREN")
     if env_val:
         try:
-            return max(1, int(env_val))
+            requested = max(1, int(env_val))
+            if requested > 100:
+                logger.warning(
+                    "DELEGATION_MAX_CONCURRENT_CHILDREN=%d exceeds the supported "
+                    "maximum 100; clamping to 100.",
+                    requested,
+                )
+            return min(requested, 100)
         except (TypeError, ValueError):
             return _DEFAULT_MAX_CONCURRENT_CHILDREN
     return _DEFAULT_MAX_CONCURRENT_CHILDREN
@@ -3194,6 +3209,54 @@ def _run_single_child(
             logger.debug("Failed to close child Relay session after delegation")
 
 
+def _run_single_child_with_abrupt_finalization(
+    *,
+    task_index: int,
+    goal: str,
+    child,
+    parent_agent,
+    delegation_id: Optional[str],
+    writer,
+    **kwargs,
+):
+    """Run one child and durably terminate telemetry before re-raising BaseException.
+
+    Normal returns stay on the shared aggregation/finalization path. Abrupt
+    process-level exits cannot reach that path, so they are recorded here.
+    """
+    try:
+        return _run_single_child(
+            task_index,
+            goal,
+            child,
+            parent_agent,
+            **kwargs,
+        )
+    except BaseException as exc:
+        status = "interrupted" if isinstance(exc, (KeyboardInterrupt, SystemExit)) else "error"
+        entry = {
+            "task_index": task_index,
+            "status": status,
+            "summary": None,
+            "error": str(exc) or type(exc).__name__,
+            "api_calls": 0,
+            "duration_seconds": 0,
+            "_child_role": getattr(child, "_delegate_role", None),
+        }
+        if writer is not None:
+            try:
+                writer.finalize(entry)
+            except BaseException:
+                logger.debug("Abrupt live transcript finalize failed", exc_info=True)
+        try:
+            from tools.delegation_live_log import update_manifest_task_status
+
+            update_manifest_task_status(delegation_id, entry)
+        except BaseException:
+            logger.debug("Abrupt live manifest finalize failed", exc_info=True)
+        raise
+
+
 _PARENT_FINALIZATION_LOCK_GUARD = threading.Lock()
 _PARENT_FINALIZATION_FALLBACK_LOCK = threading.RLock()
 _CHILD_CONSTRUCTION_LOCK = threading.RLock()
@@ -3622,6 +3685,7 @@ def delegate_task(
     from tools.delegation_live_log import (
         create_live_transcripts,
         update_manifest_statuses,
+        update_manifest_task_status,
         wrap_progress_callback,
     )
 
@@ -3719,19 +3783,23 @@ def delegate_task(
         results block. That is the contract: fan-out runs in the background,
         waits on each other, and returns together.
         """
+        abrupt_batch_exception: Optional[BaseException] = None
         if n_tasks == 1:
             # Single task -- run directly (no thread pool overhead)
             _i, _t, child = children[0]
-            result = _run_single_child(
-                _i,
-                _t["goal"],
-                child,
-                parent_agent,
+            result = _run_single_child_with_abrupt_finalization(
+                task_index=_i,
+                goal=_t["goal"],
+                child=child,
+                parent_agent=parent_agent,
+                delegation_id=live_deleg_id,
+                writer=live_writers[_i] if _i < len(live_writers) else None,
                 owner_session_id=_origin_ui_session_id or None,
                 owner_transport=_origin_owner_transport,
                 owner_session_record=_origin_owner_session_record,
             )
             results.append(result)
+            update_manifest_task_status(live_deleg_id, result)
         else:
             # Batch -- run in parallel with per-task progress lines
             completed_count = 0
@@ -3741,17 +3809,21 @@ def delegate_task(
             # normally, but if the parent is interrupted while a child is
             # wedged, the abandoned worker must not block interpreter exit.
             from tools.daemon_pool import DaemonThreadPoolExecutor
-            with DaemonThreadPoolExecutor(max_workers=max_children) as executor:
+            executor = DaemonThreadPoolExecutor(max_workers=max_children)
+            abandon_pending = False
+            try:
                 futures = {}
                 for i, t, child in children:
                     child_context = contextvars.copy_context()
                     future = executor.submit(
                         child_context.run,
-                        _run_single_child,
+                        _run_single_child_with_abrupt_finalization,
                         task_index=i,
                         goal=t["goal"],
                         child=child,
                         parent_agent=parent_agent,
+                        delegation_id=live_deleg_id,
+                        writer=live_writers[i] if i < len(live_writers) else None,
                         owner_session_id=_origin_ui_session_id or None,
                         owner_transport=_origin_owner_transport,
                         owner_session_record=_origin_owner_session_record,
@@ -3781,10 +3853,12 @@ def delegate_task(
                             if f.done():
                                 try:
                                     entry = f.result()
-                                except Exception as exc:
+                                except BaseException as exc:
                                     entry = {
                                         "task_index": idx,
-                                        "status": "error",
+                                        "status": "interrupted" if isinstance(
+                                            exc, (KeyboardInterrupt, SystemExit)
+                                        ) else "error",
                                         "summary": None,
                                         "error": str(exc),
                                         "api_calls": 0,
@@ -3806,7 +3880,9 @@ def delegate_task(
                                     ),
                                 }
                             results.append(entry)
+                            update_manifest_task_status(live_deleg_id, entry)
                             completed_count += 1
+                        abandon_pending = True
                         break
 
                     from concurrent.futures import wait as _cf_wait, FIRST_COMPLETED
@@ -3817,20 +3893,25 @@ def delegate_task(
                     for future in done:
                         try:
                             entry = future.result()
-                        except Exception as exc:
+                        except BaseException as exc:
                             idx = futures[future]
                             entry = {
                                 "task_index": idx,
-                                "status": "error",
+                                "status": "interrupted" if isinstance(
+                                    exc, (KeyboardInterrupt, SystemExit)
+                                ) else "error",
                                 "summary": None,
-                                "error": str(exc),
+                                "error": str(exc) or type(exc).__name__,
                                 "api_calls": 0,
                                 "duration_seconds": 0,
                                 "_child_role": getattr(
                                     _child_by_index.get(idx), "_delegate_role", None
                                 ),
                             }
+                            if abrupt_batch_exception is None:
+                                abrupt_batch_exception = exc
                         results.append(entry)
+                        update_manifest_task_status(live_deleg_id, entry)
                         completed_count += 1
 
                         # Print per-task completion line above the spinner
@@ -3859,6 +3940,36 @@ def delegate_task(
                                 )
                             except Exception as e:
                                 logger.debug("Spinner update_text failed: %s", e)
+
+                    if abrupt_batch_exception is not None:
+                        # One worker crossed a process-level boundary. Do not
+                        # leave siblings visible as running while that exception
+                        # propagates; cancel queued work and durably mark every
+                        # still-running sibling as interrupted.
+                        for future in pending:
+                            idx = futures[future]
+                            future.cancel()
+                            entry = {
+                                "task_index": idx,
+                                "status": "interrupted",
+                                "summary": None,
+                                "error": "Sibling exited abruptly — delegated task abandoned",
+                                "api_calls": 0,
+                                "duration_seconds": 0,
+                                "_child_role": getattr(
+                                    _child_by_index.get(idx), "_delegate_role", None
+                                ),
+                            }
+                            results.append(entry)
+                            update_manifest_task_status(live_deleg_id, entry)
+                        pending.clear()
+                        abandon_pending = True
+                        break
+            finally:
+                executor.shutdown(
+                    wait=not abandon_pending,
+                    cancel_futures=abandon_pending,
+                )
 
             # Sort by task_index so results match input order
             results.sort(key=lambda r: r["task_index"])
@@ -3897,6 +4008,8 @@ def delegate_task(
         }
         if live_paths:
             combined["live_transcripts"] = list(live_paths)
+        if abrupt_batch_exception is not None:
+            raise abrupt_batch_exception
         return combined
 
     # ----- Background dispatch: run the WHOLE batch as one async unit -----

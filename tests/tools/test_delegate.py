@@ -15,6 +15,7 @@ import threading
 import time
 import types
 import unittest
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from tools.delegate_tool import (
@@ -1440,7 +1441,7 @@ class TestDelegateEventEnum(unittest.TestCase):
 
 
 class TestConcurrencyDefaults(unittest.TestCase):
-    """Tests for the concurrency default and no hard ceiling."""
+    """Tests for the concurrency default and telemetry-aligned safety ceiling."""
 
     def test_load_config_prefers_active_persistent_config_over_cli_defaults(self):
         stale_cli = types.ModuleType("cli")
@@ -1474,6 +1475,108 @@ class TestConcurrencyDefaults(unittest.TestCase):
     def test_zero_clamped_to_one(self, mock_cfg):
         """Floor of 1 is enforced; zero or negative values raise to 1."""
         self.assertEqual(_get_max_concurrent_children(), 1)
+
+    @patch("tools.delegate_tool._load_config",
+           return_value={"max_concurrent_children": 101})
+    def test_value_above_telemetry_boundary_is_clamped(self, mock_cfg):
+        self.assertEqual(_get_max_concurrent_children(), 100)
+
+
+def test_single_child_keyboard_interrupt_finalizes_live_state(monkeypatch):
+    from tools import delegate_tool as delegate
+    from tools.delegation_live_log import create_live_transcripts
+
+    delegation_id, writers, paths = create_live_transcripts(
+        [{"goal": "interrupt safely"}], delegation_id="deleg_abcdef12"
+    )
+    assert delegation_id == "deleg_abcdef12"
+    child = MagicMock()
+
+    def interrupt(*args, **kwargs):
+        raise KeyboardInterrupt("operator stopped child")
+
+    monkeypatch.setattr(delegate, "_run_single_child", interrupt)
+    with unittest.TestCase().assertRaises(KeyboardInterrupt):
+        delegate._run_single_child_with_abrupt_finalization(
+            task_index=0,
+            goal="interrupt safely",
+            child=child,
+            parent_agent=MagicMock(),
+            delegation_id=delegation_id,
+            writer=writers[0],
+        )
+
+    manifest = json.loads(
+        (Path(paths[0]).parent / "manifest.json").read_text(encoding="utf-8")
+    )
+    assert manifest["tasks"][0]["status"] == "interrupted"
+    assert "completed" in manifest
+    assert "interrupted" in Path(paths[0]).read_text(encoding="utf-8").lower()
+
+
+def test_batch_keyboard_interrupt_finalizes_every_live_task(monkeypatch):
+    from tools import delegate_tool as delegate
+    from tools.delegation_live_log import live_transcript_root
+
+    delegation_id = "deleg_deadbeef"
+    parent = _make_mock_parent(depth=0)
+    sibling_started = threading.Event()
+    release_sibling = threading.Event()
+
+    def interrupt(*args, **kwargs):
+        task_index = args[0] if args else kwargs["task_index"]
+        if task_index == 0:
+            sibling_started.set()
+            release_sibling.wait(timeout=5)
+            return {
+                "task_index": task_index,
+                "status": "completed",
+                "summary": "finished too late",
+                "api_calls": 0,
+                "duration_seconds": 0,
+            }
+        assert sibling_started.wait(timeout=1)
+        raise KeyboardInterrupt(f"child {task_index} stopped")
+
+    monkeypatch.setattr(delegate, "_run_single_child", interrupt)
+    monkeypatch.setattr(
+        "tools.delegation_live_log.new_live_delegation_id",
+        lambda: delegation_id,
+    )
+    monkeypatch.setattr(
+        "gateway.session_context.async_delivery_supported",
+        lambda: False,
+    )
+    monkeypatch.setattr(
+        "tools.async_delegation._current_origin_session_id",
+        lambda: "",
+    )
+
+    try:
+        with unittest.TestCase().assertRaises(KeyboardInterrupt):
+            delegate_task(
+                tasks=[
+                    {"goal": "investigate the first delegated task"},
+                    {"goal": "investigate the second delegated task"},
+                ],
+                parent_agent=parent,
+                background=False,
+            )
+    finally:
+        release_sibling.set()
+
+    delegation_dir = live_transcript_root() / delegation_id
+    manifest = json.loads(
+        (delegation_dir / "manifest.json").read_text(encoding="utf-8")
+    )
+    assert [task["status"] for task in manifest["tasks"]] == [
+        "interrupted",
+        "interrupted",
+    ]
+    assert "completed" in manifest
+    for index in range(2):
+        text = (delegation_dir / f"task-{index}.log").read_text(encoding="utf-8")
+        assert "end status=interrupted" in text
 
 class TestAsyncCapUnified(unittest.TestCase):
     """max_async_children is deprecated: the async cap IS max_concurrent_children."""
