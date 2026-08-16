@@ -227,6 +227,43 @@ async def test_current_polling_generation_success_records_progress():
     assert generation > 0
 
 
+def test_polling_operational_records_are_metadata_only_and_rate_limited(caplog, monkeypatch):
+    adapter = _make_adapter()
+    generation, _ = adapter._begin_polling_generation()
+    monkeypatch.setattr(tg_adapter, "_POLLING_OPERATION_LOG_INTERVAL", 60.0)
+
+    with caplog.at_level("INFO", logger=tg_adapter.logger.name):
+        adapter._record_polling_progress(generation, result_class="empty")
+        adapter._record_polling_progress(generation, result_class="non_empty")
+
+    progress_records = [
+        record.getMessage()
+        for record in caplog.records
+        if "event=telegram_polling_progress" in record.getMessage()
+    ]
+    assert len(progress_records) == 1
+    assert "generation=" in progress_records[0]
+    assert "result_class=empty" in progress_records[0]
+    assert "test-token" not in progress_records[0]
+
+    with caplog.at_level("WARNING", logger=tg_adapter.logger.name):
+        adapter._record_polling_degraded_metadata(
+            "polling progress verifier: general path healthy but getUpdates stalled"
+        )
+        adapter._record_polling_degraded_metadata(
+            "polling progress verifier: general path healthy but getUpdates stalled"
+        )
+
+    degraded_records = [
+        record.getMessage()
+        for record in caplog.records
+        if "event=telegram_polling_degraded" in record.getMessage()
+    ]
+    assert len(degraded_records) == 1
+    assert "reason=progress_timeout" in degraded_records[0]
+    assert "test-token" not in degraded_records[0]
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("error_type", [RuntimeError, asyncio.CancelledError])
 async def test_unsuccessful_polling_request_does_not_record_progress(error_type):

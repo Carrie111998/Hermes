@@ -1,7 +1,7 @@
 # Project Handover - hermes-agent
 
 **Plan key:** hermes-agent  
-**Last verified:** 2026-08-16 09:16 CST  
+**Last verified:** 2026-08-16 09:44 CST  
 **Handover owner/session:** Codex  
 **Authoritative project log:** `docs/ROADMAP-HERMES-DGX.md`
 
@@ -24,7 +24,7 @@ The local audit checkout observed during this refresh is `D:/PROJECT/Hermes`, br
 - **Completed and deployed:** HERMES-UPDATE-001, PR #22, merged SHA `0fe3773ccfbec860984d0dc93adc4875ca2d5d4b`; immutable DGX release is active.
 - **Completed and corrected:** Calendar Guard wrapper correction, PR #24, merged SHA `91ae4a7f7a73a4c331e2f5dd018b7ce2ca5c03a9`; the valid immutable release path is no longer mistaken for the fallback sentinel.
 - **Completed and deployed:** managed-CA trust correction, PR #25, squash merge `29d4663bb94cf2d9603d2de9d437a431b5101f14`; authenticated Claude and AGY implementation reviews both PASS, CI run `31918804987` passed, and the new immutable DGX release is active.
-- **E2E state:** gateway process/service is healthy and outbound Telegram delivery passed, but inbound polling has no qualifying `getUpdates` progress evidence.
+- **E2E state:** gateway process/service is healthy and outbound Telegram delivery passed, but inbound polling has no qualifying `getUpdates` progress evidence. The 2026-08-16 bounded DGX window recorded `Connected to Telegram (polling mode)` and gateway startup completion, but no explicit `getUpdates` success or accepted-update event.
 - **Deferred:** ARCH-002 remains the next core candidate after the active Telegram transport gate; HERMES-MONITORING-001 remains blocked and does not absorb this transport diagnosis.
 
 ## 3. Verified runtime and deployment state
@@ -44,12 +44,13 @@ The local audit checkout observed during this refresh is `D:/PROJECT/Hermes`, br
 
 ## 4. Ticket and gate state
 
-### Current lane: HERMES-TELEGRAM-TRANSPORT-001 diagnosis
+### Current lane: HERMES-TELEGRAM-INBOUND-001
 
-- **Plan:** `docs/plans/2026-08-15-hermes-telegram-transport-001.md`.
-- **Status:** `MERGED_DEPLOYED_RUNTIME_DEGRADED`.
-- **Next action:** map the current DGX primary/fallback Telegram network path and polling-progress ownership, then prepare a narrow correction only if the root cause is confirmed.
-- **Do not:** claim inbound readiness, fold ARCH-002 or monitoring work into this lane, or change credentials/allowlists/webhook state.
+- **Plan:** `docs/plans/2026-08-16-hermes-telegram-inbound-001.md`.
+- **Status:** `IMPLEMENTATION_REVIEW_BLOCKED_CLAUDE_UNAVAILABLE`; design consensus, bounded DGX diagnosis, and the failed Claude/AGY correction-set review are recorded in the plan.
+- **Parent lane:** HERMES-TELEGRAM-TRANSPORT-001 is `MERGED_DEPLOYED_RUNTIME_DEGRADED`; its service and outbound gates passed, but inbound readiness remains unproven.
+- **Next action:** obtain one authenticated Claude PASS on the exact correction packet and reconcile it with the recorded AGY PASS. Implementation remains blocked until both reviewer-family gates pass.
+- **Do not:** implement, restart, deploy, change credentials/allowlists/webhook state, or claim inbound readiness before the ticket review and direct polling evidence gates pass.
 
 ### Other ticket state
 
