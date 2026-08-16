@@ -71,12 +71,45 @@ def test_zip_fallback_refuses_uncommitted_and_untracked_files(tmp_path, monkeypa
 
     assert exc_info.value.code == 1
     assert calls == [
-        ["git", "-c", "windows.appendAtomically=false", "status", "--porcelain", "--untracked-files=all"]
+        [
+            "git",
+            "-c",
+            "windows.appendAtomically=false",
+            "status",
+            "--porcelain",
+            "--untracked-files=all",
+            "--ignored=all",
+        ]
     ]
     output = capsys.readouterr().out
     assert "local changes" in output
-    assert "uncommitted or untracked" in output
+    assert "uncommitted, untracked, or ignored" in output
     assert "scratch/new-tool.py" in output
+
+
+def test_zip_fallback_refuses_ignored_source_files_but_allows_preserved_dirs(
+    tmp_path, monkeypatch, capsys
+):
+    (tmp_path / ".git").mkdir()
+    fake_main = _fake_main(tmp_path)
+    monkeypatch.setattr(update_cmd, "_m", lambda: fake_main)
+    monkeypatch.setattr(
+        update_cmd.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(
+            returncode=0,
+            stdout="!! .cache/local-source.py\n!! venv/Lib/site-packages/pkg.py\n",
+            stderr="",
+        ),
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        update_cmd._ensure_zip_update_checkout_is_clean()
+
+    assert exc_info.value.code == 1
+    output = capsys.readouterr().out
+    assert ".cache/local-source.py" in output
+    assert "venv/Lib/site-packages/pkg.py" not in output
 
 
 def test_zip_fallback_allows_clean_git_checkout(tmp_path, monkeypatch):

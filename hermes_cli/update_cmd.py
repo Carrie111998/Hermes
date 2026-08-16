@@ -796,8 +796,10 @@ def _ensure_zip_update_checkout_is_clean() -> None:
 
     ZIP replacement works at top-level entry granularity, so preserving only
     ``venv``/``.git`` cannot preserve edits or untracked files nested below a
-    source directory.  A status failure is also fail-closed: inability to
-    prove the tree is clean must never authorize destructive replacement.
+    source directory.  Ignored files are included as well; an ignored source
+    file is still user data even though ordinary ``git status`` hides it.
+    A status failure is also fail-closed: inability to prove the tree is clean
+    must never authorize destructive replacement.
     Non-git installs retain the existing ZIP fallback behavior.
     """
     project_root = _m().PROJECT_ROOT
@@ -809,7 +811,13 @@ def _ensure_zip_update_checkout_is_clean() -> None:
         git_cmd = ["git", "-c", "windows.appendAtomically=false"]
     try:
         status = subprocess.run(
-            git_cmd + ["status", "--porcelain", "--untracked-files=all"],
+            git_cmd
+            + [
+                "status",
+                "--porcelain",
+                "--untracked-files=all",
+                "--ignored=all",
+            ],
             cwd=project_root,
             capture_output=True,
             text=True,
@@ -829,16 +837,38 @@ def _ensure_zip_update_checkout_is_clean() -> None:
         print("  Resolve the git/filesystem problem and rerun `hermes update`.")
         _m().sys.exit(1)
 
-    dirty = (status.stdout or "").strip()
+    # The ZIP path intentionally preserves these top-level entries. Git
+    # commonly reports their ignored contents (especially ``venv`` and
+    # ``node_modules``), so do not turn those expected entries into a false
+    # dirty-tree refusal. Everything else, including ignored files, blocks.
+    preserved = {"venv", "node_modules", ".git", ".env"}
+
+    def _outside_preserved_entries(line: str) -> bool:
+        payload = line[3:].strip() if len(line) >= 3 else line.strip()
+        paths = payload.split(" -> ")
+        for path in paths:
+            normalized = path.replace("\\", "/").lstrip("./")
+            top_level = normalized.split("/", 1)[0]
+            if top_level not in preserved:
+                return True
+        return False
+
+    dirty = [
+        line
+        for line in (status.stdout or "").splitlines()
+        if line.strip() and _outside_preserved_entries(line)
+    ]
     if dirty:
-        changed = dirty.splitlines()
         print("✗ ZIP update refused: the git checkout has local changes.")
-        print("  The ZIP fallback will not overwrite uncommitted or untracked files.")
+        print(
+            "  The ZIP fallback will not overwrite uncommitted, untracked, "
+            "or ignored files."
+        )
         print("  Commit or save the work, then rerun `hermes update`.")
-        for line in changed[:8]:
+        for line in dirty[:8]:
             print(f"    {line}")
-        if len(changed) > 8:
-            print(f"    … and {len(changed) - 8} more")
+        if len(dirty) > 8:
+            print(f"    … and {len(dirty) - 8} more")
         _m().sys.exit(1)
 
 
