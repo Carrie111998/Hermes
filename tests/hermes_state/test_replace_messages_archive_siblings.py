@@ -138,8 +138,8 @@ class TestAcpPersistPreservesArchives:
 
 class TestTuiPromptTruncationPreservesArchives:
     def test_truncation_write_keeps_archived_rows(self, state_db):
-        """Drive the exact write shape methods_prompt now performs against a
-        compacted session and assert the archive survives."""
+        """Exercise active-only replacement on a compacted session and preserve
+        its archived-row count."""
         sid = "tui-compacted"
         _seed_compacted_session(state_db, sid)
         assert _archived_count(state_db, sid) == 4
