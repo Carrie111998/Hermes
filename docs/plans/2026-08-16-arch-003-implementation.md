@@ -1,6 +1,6 @@
 ---
 title: "ARCH-003 implementation plan: runtime-state audit and replay verification"
-status: IMPLEMENTATION_PLAN_REVISE_V22_PENDING
+status: IMPLEMENTATION_PLAN_REVISE_V23_PENDING
 date: 2026-08-16
 type: implementation-plan
 ticket: ARCH-003
@@ -141,6 +141,11 @@ prompt construction, legacy `state.db`, or unrelated dirty worktree files.
   Gate 3 validates only the shared and verifier-side subsets; Gate 4 tests
   every member on the surface where it is legal. No implementation may add a
   code outside this partition without a plan revision.
+- Freeze the origin-marker enum before Gate 1 edits:
+  `POST_MIGRATION_GENESIS`, `POST_ROTATION_GENESIS`,
+  `GENERATION_REORIGIN_GENESIS`, and `MANUAL_REORIGIN_GENESIS`.
+  A baseline copies the origin marker of the epoch it seals; no other origin
+  marker is valid.
 - Confirm that the prior release can start with the new journal table present
   and that rollback does not require deleting the table or losing materialized
   state.
@@ -157,7 +162,9 @@ Add a versioned runtime-state-owned journal table with:
 - profile-scoped keyed entity digest;
 - non-secret digest-parameter identifier;
 - non-secret key-check value bound to the digest-parameter identifier;
-- origin marker for migration-origin or post-migration genesis;
+- origin marker from the closed set `POST_MIGRATION_GENESIS`,
+  `POST_ROTATION_GENESIS`, `GENERATION_REORIGIN_GENESIS`, or
+  `MANUAL_REORIGIN_GENESIS`;
 - origin epoch marker and origin-genesis sequence, copied into genesis and
   baseline records so origin-epoch validity is checked from bounded row metadata;
 - per-profile/entity monotonic sequence with uniqueness;
@@ -429,13 +436,16 @@ Implement a bounded verifier that:
   current-origin validity is checked from bounded row metadata without scanning
   an unbounded pre-start prefix. Events preceding the selected start are
   ignored after that O(1) metadata check, and counter continuity is enforced
-  only from the selected start forward. This permits a newer-writer-epoch
-  genesis after a baseline to re-originate the entity.
+  only from the selected start forward. If the entity has zero journal rows,
+  the result is `UNKNOWN` with `EMPTY_HISTORY`; if journal rows exist but
+  neither candidate is valid, the result is `UNKNOWN` with
+  `LEGACY_ORIGIN_MISSING`. This permits a newer-writer-epoch genesis after a
+  baseline to re-originate the entity.
 - validates the selected baseline when one is the later replay-start candidate,
   including highest `sealed_through_seq` selection, same-sequence tuple
   conflicts, overlapping contradictory baselines, a baseline without a valid
   current origin epoch, a stale generation marker, a materialized-write counter
-  greater than the latest journaled counter, or a materialized state advanced
+  not equal to the latest journaled counter, or a materialized state advanced
   during a generation with no current-generation event;
 - returns `UNKNOWN` with the corresponding closed reason code on empty history
   (`EMPTY_HISTORY`), snapshot failure, unsupported/newer versions, malformed
@@ -461,7 +471,10 @@ Add deterministic tests for:
 
 - empty database and journal migration;
 - explicit no-delete assertion: no delete/purge path reaches runtime-state rows;
-- legacy populated rows returning `UNKNOWN`;
+- legacy populated rows with zero journal rows returning `UNKNOWN` with
+  `EMPTY_HISTORY`;
+- journal history present without a valid current-epoch origin returning
+  `UNKNOWN` with `LEGACY_ORIGIN_MISSING`;
 - marked post-migration genesis adopting the before-state origin tuple and
   limiting `CONSISTENT` to post-genesis history;
 - post-rotation genesis under a new digest identifier, with pre-rotation
@@ -871,6 +884,23 @@ DGX changes, deployment, repair, or event-sourcing. The corrected plan must
 return to the same authenticated Claude reviewer family and then to AGY on the
 identical packet.
 
+## Implementation-plan review reconciliation v22
+
+The v22 authenticated Claude Opus review returned `REVISE` with four bounded
+plan-text corrections. The corrections are incorporated above:
+
+1. Acceptance coverage now includes v21.
+2. Gate 3 treats either counter inequality as `WRITE_COUNTER_GAP`.
+3. The origin-marker value set is closed and enumerated.
+4. Diagnostic precedence is deterministic: zero events maps to
+   `EMPTY_HISTORY`; existing rows without a valid current origin map to
+   `LEGACY_ORIGIN_MISSING`.
+
+These remain plan-only corrections and do not authorize source edits, tests,
+DGX changes, deployment, repair, or event-sourcing. The corrected plan must
+return to the same authenticated Claude reviewer family and then to AGY on the
+identical packet.
+
 ## Acceptance criteria
 
 ARCH-003 implementation is ready for its delivery gates only when:
@@ -899,7 +929,7 @@ ARCH-003 implementation is ready for its delivery gates only when:
   retention job; entities beyond the replay limit remain UNKNOWN in this ticket,
   and the 100,000-event/100 MiB per-profile threshold is a documented follow-up
   operational review, not an in-ticket operator gate;
-- reconciliation v1 and v5-v20 items are incorporated into the normative
+- reconciliation v1 and v5-v21 items are incorporated into the normative
   Gates 0-4 text (with v2-v4 explicitly folded into the v1/v4 text), and this
   merged plan revision receives the same-family re-review;
 - all focused and relevant tests pass;
@@ -950,6 +980,8 @@ ARCH-003 implementation is ready for its delivery gates only when:
   deduplicated startup/downgrade tests.
 - v21: bidirectional counter-gap detection, event-only writer blocking during
   downgrade-unsafe mode, and equal-epoch exit coverage.
+- v22: origin-marker closed enum, bidirectional Gate 3 wording, deterministic
+  EMPTY_HISTORY versus LEGACY_ORIGIN_MISSING precedence, and complete coverage.
 
 
 ## Non-goals
