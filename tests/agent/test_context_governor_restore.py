@@ -5,6 +5,7 @@ Hermes' built-in LLM ContextCompressor changes the Ares deterministic-first,
 hash-preserving contract and is therefore a conformance failure.
 """
 
+import json
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -492,3 +493,62 @@ def test_governor_projection_roundtrips_through_session_store(tmp_path):
             "content": "deterministic extractive summary",
         },
     ]
+
+
+def test_legacy_receipt_prefix_rehydrates_only_lost_durable_fields(tmp_path):
+    """A pre-fix archive can resume with names absent but no other drift."""
+    session_id = "legacy-prefix"
+    engine = ContextGovernorEngine(binary="/tmp/context-governor", store_dir=tmp_path)
+    engine.session_id = session_id
+    receipt_prefix = [
+        {
+            "role": "tool",
+            "id": "call_123",
+            "name": "skill_view",
+            "content": "tool result",
+            "metadata": {"tool_call_id": "call_123"},
+        },
+        {
+            "role": "assistant",
+            "id": "summary_123",
+            "name": "context_governor",
+            "content": "deterministic extractive summary",
+        },
+    ]
+    (tmp_path / "ctxr_legacy.json").write_text(
+        json.dumps(
+            {
+                "receipt": {
+                    "session_id": session_id,
+                    "generation": 1,
+                    "created_utc": "2026-08-16T00:00:00Z",
+                },
+                "compacted_messages": receipt_prefix,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    # Simulate the historical SessionDB projection: tool-call id survives,
+    # while provider-facing names and the assistant summary id do not.
+    resumed = [
+        {
+            "role": "tool",
+            "content": "tool result",
+            "tool_call_id": "call_123",
+        },
+        {"role": "assistant", "content": "deterministic extractive summary"},
+        {"role": "user", "content": "new work"},
+    ]
+    incoming = [
+        engine._message_to_governor(message, index)
+        for index, message in enumerate(resumed)
+    ]
+
+    assert engine._rehydrate_legacy_parent_prefix(incoming) == receipt_prefix + [
+        {"role": "user", "content": "new work"}
+    ]
+
+    # Same legacy field loss is not sufficient if content has drifted.
+    incoming[0]["content"] = "different result"
+    assert engine._rehydrate_legacy_parent_prefix(incoming) == incoming
