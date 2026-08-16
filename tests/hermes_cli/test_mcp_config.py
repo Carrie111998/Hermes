@@ -852,7 +852,12 @@ def test_defi_trading_preset_is_exact_pinned_and_paper_safe():
     assert preset["args"] == ["-y", "defi-trading-mcp@2.1.3"]
     server_config = {}
     url, command, args, ok = _apply_mcp_preset(
-        "defi-trading", server_config, None, None, []
+        "defi-trading",
+        preset_name="defi-trading",
+        url=None,
+        command=None,
+        cmd_args=[],
+        server_config=server_config,
     )
     assert ok
     assert url is None
