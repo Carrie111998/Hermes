@@ -10,6 +10,8 @@ Exposes an HTTP server with endpoints:
 - GET  /v1/capabilities            — machine-readable API capabilities for external UIs
 - GET  /api/sessions               — list client-visible Hermes sessions
 - GET  /api/remote/sessions        — list open sessions available for remote attach
+- GET  /api/remote/sessions/{session_id}/events — live remote-session SSE events
+- POST /api/remote/sessions/{session_id}/chat — chat with an attached remote session
 - POST /api/sessions               — create an empty Hermes session
 - GET/PATCH/DELETE /api/sessions/{session_id} — read/update/delete a session
 - GET  /api/sessions/{session_id}/messages — read session message history
@@ -1427,6 +1429,12 @@ class APIServerAdapter(BasePlatformAdapter):
         self._run_streams_created: Dict[str, float] = {}
         # Runs with a connected SSE consumer; their queue is actively draining.
         self._run_stream_subscribers: set[str] = set()
+        # Live remote-session subscribers. Unlike /v1/runs, attachment is a
+        # broadcast surface: every queue registered for a session receives
+        # each event, and no event history is retained server-side.
+        self._remote_session_subscribers: Dict[
+            str, set["asyncio.Queue[Dict[str, Any]]"]
+        ] = {}
         # Active run agent/task references for stop support
         self._active_run_agents: Dict[str, Any] = {}
         self._active_run_tasks: Dict[str, "asyncio.Task"] = {}
@@ -2065,6 +2073,16 @@ class APIServerAdapter(BasePlatformAdapter):
             ("GET", "/v1/skills", self._handle_skills),
             ("GET", "/v1/toolsets", self._handle_toolsets),
             ("GET", "/api/remote/sessions", self._handle_remote_sessions),
+            (
+                "GET",
+                "/api/remote/sessions/{session_id}/events",
+                self._handle_remote_session_events,
+            ),
+            (
+                "POST",
+                "/api/remote/sessions/{session_id}/chat",
+                self._handle_remote_session_chat,
+            ),
             ("GET", "/api/sessions", self._handle_list_sessions),
             ("POST", "/api/sessions", self._handle_create_session),
             ("GET", "/api/sessions/{session_id}", self._handle_get_session),
@@ -3273,6 +3291,61 @@ class APIServerAdapter(BasePlatformAdapter):
     # /api/remote — remote-attach discovery
     # ------------------------------------------------------------------
 
+    def _remote_session_is_active(self, session_id: str) -> bool:
+        """Return whether either live-agent registry owns this session."""
+        agents = list(self._shutdown_interruptible_agents.values())
+        agents.extend(self._active_run_agents.values())
+        return any(getattr(agent, "session_id", None) == session_id for agent in agents)
+
+    async def _get_open_remote_session_or_404(
+        self, session_id: str
+    ) -> tuple[Optional[Dict[str, Any]], Optional["web.Response"]]:
+        """Resolve an attachable session; ended sessions are intentionally hidden."""
+        session, err = await self._get_existing_session_or_404(session_id)
+        if err is not None:
+            return None, err
+        if session.get("ended_at") is not None:
+            return None, web.json_response(
+                _openai_error(
+                    f"Session not found: {session_id}", code="session_not_found"
+                ),
+                status=404,
+            )
+        return session, None
+
+    @staticmethod
+    def _redact_remote_session_event(event: Dict[str, Any]) -> Dict[str, Any]:
+        """Apply the mandatory API-boundary redactor to a complete event payload."""
+        serialized = json.dumps(event, ensure_ascii=False, default=str)
+        return json.loads(redact_sensitive_text(serialized, force=True))
+
+    def _publish_remote_session_event(
+        self,
+        session_id: str,
+        event: Dict[str, Any],
+        *,
+        loop: Optional["asyncio.AbstractEventLoop"] = None,
+    ) -> None:
+        """Redact and broadcast one live event to every attached subscriber."""
+        if not self._remote_session_subscribers.get(session_id):
+            return
+        safe_event = self._redact_remote_session_event(event)
+
+        def _broadcast() -> None:
+            for queue in tuple(self._remote_session_subscribers.get(session_id, ())):
+                with suppress(Exception):
+                    queue.put_nowait(safe_event)
+
+        try:
+            running_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            running_loop = None
+        if loop is not None and running_loop is not loop:
+            with suppress(RuntimeError):
+                loop.call_soon_threadsafe(_broadcast)
+            return
+        _broadcast()
+
     async def _handle_remote_sessions(self, request: "web.Request") -> "web.Response":
         """GET /api/remote/sessions — list sessions available for attachment."""
         auth_err = self._check_auth(request)
@@ -3295,17 +3368,6 @@ class APIServerAdapter(BasePlatformAdapter):
             compact_rows=True,
         )
 
-        # Both registries hold live agents, but cover different entry paths:
-        # _shutdown_interruptible_agents tracks direct API turns while
-        # _active_run_agents also covers /v1/runs executors.
-        active_agents = list(self._shutdown_interruptible_agents.values())
-        active_agents.extend(self._active_run_agents.values())
-        active_session_ids = set()
-        for agent in active_agents:
-            session_id = getattr(agent, "session_id", None)
-            if isinstance(session_id, str) and session_id:
-                active_session_ids.add(session_id)
-
         from gateway.status import normalize_updated_at
         from hermes_cli.profiles import get_active_profile_name
 
@@ -3320,7 +3382,9 @@ class APIServerAdapter(BasePlatformAdapter):
                     "id": session_id,
                     "title": session.get("title"),
                     "status": (
-                        "active" if session_id in active_session_ids else "idle"
+                        "active"
+                        if self._remote_session_is_active(session_id)
+                        else "idle"
                     ),
                     "updated_at": normalize_updated_at(
                         session.get("last_active") or session.get("started_at")
@@ -3335,6 +3399,82 @@ class APIServerAdapter(BasePlatformAdapter):
                 "sessions": attachable,
             }
         )
+
+    async def _handle_remote_session_events(
+        self, request: "web.Request"
+    ) -> "web.StreamResponse":
+        """GET /api/remote/sessions/{session_id}/events — live SSE attachment."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        session_id = request.match_info["session_id"]
+        _, err = await self._get_open_remote_session_or_404(session_id)
+        if err is not None:
+            return err
+
+        queue: "asyncio.Queue[Dict[str, Any]]" = asyncio.Queue()
+        subscribers = self._remote_session_subscribers.setdefault(session_id, set())
+        subscribers.add(queue)
+        response = web.StreamResponse(
+            status=200,
+            headers={
+                "Content-Type": "text/event-stream",
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
+        try:
+            await response.prepare(request)
+            await response.write(
+                _sse_frame(
+                    {
+                        "event": "session.status",
+                        "session_id": session_id,
+                        "status": (
+                            "active"
+                            if self._remote_session_is_active(session_id)
+                            else "idle"
+                        ),
+                    }
+                )
+            )
+            while True:
+                try:
+                    event = await asyncio.wait_for(queue.get(), timeout=30.0)
+                except asyncio.TimeoutError:
+                    await response.write(b": keepalive\n\n")
+                    continue
+                await response.write(_sse_frame(event))
+        except Exception as exc:
+            logger.debug(
+                "[api_server] remote session SSE error for %s: %s",
+                session_id,
+                exc,
+            )
+        finally:
+            current = self._remote_session_subscribers.get(session_id)
+            if current is not None:
+                current.discard(queue)
+                if not current:
+                    self._remote_session_subscribers.pop(session_id, None)
+
+        return response
+
+    async def _handle_remote_session_chat(
+        self, request: "web.Request"
+    ) -> "web.Response":
+        """POST /api/remote/sessions/{session_id}/chat — reuse session chat."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        _, err = await self._get_open_remote_session_or_404(
+            request.match_info["session_id"]
+        )
+        if err is not None:
+            return err
+        return await self._handle_session_chat(request)
 
     # ------------------------------------------------------------------
     # /api/sessions — thin client/session resource API
@@ -3798,6 +3938,60 @@ class APIServerAdapter(BasePlatformAdapter):
             )
             if selection_error:
                 return web.json_response(_openai_error(selection_error), status=400)
+        event_loop = asyncio.get_running_loop()
+        self._publish_remote_session_event(
+            session_id,
+            {
+                "event": "session.message",
+                "session_id": session_id,
+                "timestamp": time.time(),
+                "message": {"role": "user", "content": user_message},
+            },
+            loop=event_loop,
+        )
+
+        def _remote_tool_start(
+            tool_call_id: str, function_name: str, function_args: Any
+        ) -> None:
+            self._publish_remote_session_event(
+                session_id,
+                {
+                    "event": "session.tool_call",
+                    "session_id": session_id,
+                    "timestamp": time.time(),
+                    "tool_call": {
+                        "id": tool_call_id,
+                        "name": function_name,
+                        "phase": "started",
+                        "arguments": function_args,
+                    },
+                },
+                loop=event_loop,
+            )
+
+        def _remote_tool_complete(
+            tool_call_id: str,
+            function_name: str,
+            function_args: Any,
+            function_result: Any,
+        ) -> None:
+            self._publish_remote_session_event(
+                session_id,
+                {
+                    "event": "session.tool_call",
+                    "session_id": session_id,
+                    "timestamp": time.time(),
+                    "tool_call": {
+                        "id": tool_call_id,
+                        "name": function_name,
+                        "phase": "completed",
+                        "arguments": function_args,
+                        "result": function_result,
+                    },
+                },
+                loop=event_loop,
+            )
+
         history = await self._conversation_history_for_session(session_id)
         result, usage = await self._run_agent(
             user_message=user_message,
@@ -3810,10 +4004,22 @@ class APIServerAdapter(BasePlatformAdapter):
             requested_runtime=runtime_request.get("requested") or {},
             route_source=runtime_request.get("route_source") or "global",
             confirmed_runtime_lock=lock_active,
+            tool_start_callback=_remote_tool_start,
+            tool_complete_callback=_remote_tool_complete,
             **agent_overrides,
         )
         effective_session_id = result.get("session_id") if isinstance(result, dict) else session_id
         final_response = _resolve_media_to_data_urls(result.get("final_response", "") if isinstance(result, dict) else "")
+        self._publish_remote_session_event(
+            session_id,
+            {
+                "event": "session.message",
+                "session_id": effective_session_id or session_id,
+                "timestamp": time.time(),
+                "message": {"role": "assistant", "content": final_response},
+            },
+            loop=event_loop,
+        )
         headers = {"X-Hermes-Session-Id": effective_session_id or session_id}
         if gateway_session_key:
             headers["X-Hermes-Session-Key"] = gateway_session_key
