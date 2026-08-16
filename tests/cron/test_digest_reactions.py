@@ -6,6 +6,8 @@ import time
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 
 def test_register_digest_reaction_resolves_single_source_response(
     tmp_path, monkeypatch
@@ -104,6 +106,142 @@ def test_latest_output_fallback_ignores_symlink_escape(tmp_path, monkeypatch):
     text = format_digest_detail_response(record, source_index=0)
     assert "SECRET OUTSIDE DETAIL" not in text
     assert "detail output is no longer available" in text
+
+
+def test_source_path_swap_after_validation_fails_closed(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    from cron import digest_reactions
+
+    source_dir = tmp_path / "cron" / "output" / "source-job"
+    source_dir.mkdir(parents=True)
+    source_output = source_dir / "detail.md"
+    source_output.write_text("## Response\nSAFE DETAIL", encoding="utf-8")
+    outside = tmp_path / "outside.md"
+    outside.write_text("## Response\nSECRET OUTSIDE DETAIL", encoding="utf-8")
+    record = {
+        "sources": [
+            {
+                "job_id": "source-job",
+                "name": "Source Job",
+                "output_path": str(source_output),
+            }
+        ]
+    }
+    real_safe_output_path = digest_reactions._safe_output_path
+    validation_calls = 0
+
+    def swap_after_first_validation(path):
+        nonlocal validation_calls
+        safe_path = real_safe_output_path(path)
+        validation_calls += 1
+        if validation_calls == 1:
+            source_output.unlink()
+            source_output.symlink_to(outside)
+        return safe_path
+
+    monkeypatch.setattr(
+        digest_reactions,
+        "_safe_output_path",
+        swap_after_first_validation,
+    )
+
+    text = digest_reactions.format_digest_detail_response(record)
+
+    assert validation_calls >= 1
+    assert "SECRET OUTSIDE DETAIL" not in text
+    assert "detail output is no longer available" in text
+
+
+def test_source_fifo_swap_after_validation_does_not_block(tmp_path):
+    if not hasattr(os, "mkfifo"):
+        return
+
+    worker = r"""
+import os
+import sys
+from pathlib import Path
+
+home = Path(sys.argv[1])
+os.environ["HERMES_HOME"] = str(home)
+
+from cron import digest_reactions
+
+source = home / "cron" / "output" / "source-job" / "detail.md"
+source.parent.mkdir(parents=True)
+source.write_text("## Response\nSAFE DETAIL", encoding="utf-8")
+record = {
+    "sources": [
+        {
+            "job_id": "source-job",
+            "name": "Source Job",
+            "output_path": str(source),
+        }
+    ]
+}
+real_safe_output_path = digest_reactions._safe_output_path
+calls = 0
+
+
+def swap_to_fifo_after_first_validation(path):
+    global calls
+    safe_path = real_safe_output_path(path)
+    calls += 1
+    if calls == 1:
+        source.unlink()
+        os.mkfifo(source)
+    return safe_path
+
+
+digest_reactions._safe_output_path = swap_to_fifo_after_first_validation
+text = digest_reactions.format_digest_detail_response(record)
+assert "detail output is no longer available" in text
+"""
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(Path(__file__).resolve().parents[2])
+
+    result = subprocess.run(
+        [sys.executable, "-c", worker, str(tmp_path)],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=2,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize("missing_flag", ["O_NOFOLLOW", "O_NONBLOCK"])
+def test_safe_output_read_fails_closed_without_required_open_flag(
+    tmp_path, monkeypatch, missing_flag
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    from cron import digest_reactions
+
+    source = tmp_path / "cron" / "output" / "source-job" / "detail.md"
+    source.parent.mkdir(parents=True)
+    source.write_text("## Response\nSAFE DETAIL", encoding="utf-8")
+    record = {
+        "sources": [
+            {
+                "job_id": "source-job",
+                "name": "Source Job",
+                "output_path": str(source),
+            }
+        ]
+    }
+    monkeypatch.delattr(digest_reactions.os, missing_flag, raising=False)
+
+    def output_opened(*_args, **_kwargs):
+        raise AssertionError("unsafe platform fallback must not open artifact files")
+
+    monkeypatch.setattr(digest_reactions.os, "open", output_opened)
+
+    text = digest_reactions.format_digest_detail_response(record)
+
+    assert "detail output is no longer available" in text
+    assert "Source Job" in text
 
 
 def test_detail_without_response_section_never_returns_whole_artifact(

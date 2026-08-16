@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 import tempfile
 import time
 from contextlib import contextmanager
@@ -309,15 +310,59 @@ def _extract_response_section(text: str) -> str:
     return body.strip()
 
 
-def _read_source_detail(source: dict[str, Any]) -> str | None:
-    path = _safe_output_path(source.get("output_path"))
-    if not path:
-        path = _latest_output_path(str(source.get("job_id") or ""))
-    if not path:
+def _read_safe_output_text(path: str | Path | None) -> str | None:
+    """Read one output file from a pinned descriptor, failing closed on swaps."""
+    if not hasattr(os, "O_NOFOLLOW") or not hasattr(os, "O_NONBLOCK"):
+        # Without both flags, a path swap could follow an external link or block
+        # on a special file before post-open validation runs. Fail closed rather
+        # than weaken the output-root contract on unsupported platforms.
+        return None
+
+    safe_path = _safe_output_path(path)
+    if not safe_path:
+        return None
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    flags |= getattr(os, "O_NONBLOCK", 0)
+    try:
+        fd = os.open(safe_path, flags)
+    except OSError:
         return None
     try:
-        text = Path(path).read_text(encoding="utf-8", errors="replace")
+        opened = os.fstat(fd)
+        if not stat.S_ISREG(opened.st_mode):
+            return None
+
+        # Re-resolve after opening and compare the directory entry with the
+        # descriptor. This closes final-component symlink swaps and parent
+        # directory replacement between validation and open.
+        if _safe_output_path(safe_path) != safe_path:
+            return None
+        try:
+            current = os.stat(safe_path, follow_symlinks=False)
+        except OSError:
+            return None
+        if not stat.S_ISREG(current.st_mode):
+            return None
+        if (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino):
+            return None
+
+        with os.fdopen(fd, "r", encoding="utf-8", errors="replace") as handle:
+            fd = -1
+            return handle.read()
     except OSError:
+        return None
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
+
+def _read_source_detail(source: dict[str, Any]) -> str | None:
+    text = _read_safe_output_text(source.get("output_path"))
+    if text is None:
+        fallback = _latest_output_path(str(source.get("job_id") or ""))
+        text = _read_safe_output_text(fallback)
+    if text is None:
         return None
     detail = _extract_response_section(text)
     if len(detail) > _MAX_DETAIL_CHARS:
