@@ -21936,6 +21936,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             agent_cfg = user_config.get("agent") or {}
             disabled_toolsets = agent_cfg.get("disabled_toolsets") or None
+            if disabled_toolsets:
+                # Normalize JSON-array strings (config set / JSON editor saves) so
+                # downstream `in` checks see real names, not chars (#86661).
+                from agent.skill_utils import _normalize_string_set
+
+                disabled_toolsets = _normalize_string_set(disabled_toolsets) or None
 
             pr = self._provider_routing
             max_iterations = _current_max_iterations()
@@ -27462,6 +27468,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
         agent_cfg_local = user_config.get("agent") or {}
         disabled_toolsets = agent_cfg_local.get("disabled_toolsets") or None
+        if disabled_toolsets:
+            # Normalize JSON-array strings (config set / JSON editor saves) so
+            # downstream `in` checks see real names, not chars (#86661).
+            from agent.skill_utils import _normalize_string_set
+
+            disabled_toolsets = _normalize_string_set(disabled_toolsets) or None
 
         display_config = user_config.get("display", {})
         if not isinstance(display_config, dict):

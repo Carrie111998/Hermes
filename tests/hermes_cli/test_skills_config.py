@@ -21,6 +21,41 @@ class TestGetDisabledSkills:
         assert get_disabled_skills({"skills": None}, platform="telegram") == set()
 
 
+    def test_json_array_string_disabled_is_parsed(self):
+        """``skills.disabled: '["a","b"]'`` (JSON-array string from `hermes
+        config set` or a JSON-mode editor) must filter, not be a dead no-op
+        (#86661)."""
+        from hermes_cli.skills_config import get_disabled_skills
+        config = {"skills": {"disabled": '["skill-a","skill-b"]'}}
+        assert get_disabled_skills(config) == {"skill-a", "skill-b"}
+
+    def test_python_list_literal_string_disabled_is_parsed(self):
+        """``skills.disabled: "['a','b']"`` single-quoted literal also parses."""
+        from hermes_cli.skills_config import get_disabled_skills
+        config = {"skills": {"disabled": "['skill-a','skill-b']"}}
+        assert get_disabled_skills(config) == {"skill-a", "skill-b"}
+
+    def test_empty_json_array_string_disables_nothing(self):
+        from hermes_cli.skills_config import get_disabled_skills
+        config = {"skills": {"disabled": "[]"}}
+        assert get_disabled_skills(config) == set()
+
+    def test_json_array_string_platform_disabled_is_parsed(self):
+        from hermes_cli.skills_config import get_disabled_skills
+        config = {
+            "skills": {
+                "platform_disabled": {"telegram": '["tg-skill"]'},
+            }
+        }
+        assert get_disabled_skills(config, platform="telegram") == {"tg-skill"}
+
+    def test_bare_scalar_stays_single_name(self):
+        """#13026: ``disabled: my-skill`` is one name, not a char set."""
+        from hermes_cli.skills_config import get_disabled_skills
+        config = {"skills": {"disabled": "hidden-skill"}}
+        assert get_disabled_skills(config) == {"hidden-skill"}
+
+
 
 
 # ---------------------------------------------------------------------------
