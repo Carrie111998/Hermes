@@ -67,14 +67,9 @@ class TestParseEnvVar:
     def test_unset_timeout_uses_default_180(self):
         """Sanity: the ordinary unset case still resolves to the
         documented 180s default, unaffected by the new guard."""
-        with patch.dict("os.environ", {}, clear=False):
-            os_environ_backup = _tt_mod.os.environ.pop("TERMINAL_TIMEOUT", None)
-            try:
-                config = _tt_mod._get_env_config()
-                assert config["timeout"] == 180
-            finally:
-                if os_environ_backup is not None:
-                    _tt_mod.os.environ["TERMINAL_TIMEOUT"] = os_environ_backup
+        with patch.dict("os.environ", {}, clear=True):
+            config = _tt_mod._get_env_config()
+            assert config["timeout"] == 180
 
 
     # -- invalid int raises ValueError with env var name --
