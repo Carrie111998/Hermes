@@ -11,8 +11,6 @@ from unittest.mock import patch
 
 import pytest
 
-sys.path.insert(0, r"D:\Program file\hermes\hermes-agent")
-
 import hermes_cli.update_cmd as cli_main
 from hermes_cli import main as cli_main_module
 
