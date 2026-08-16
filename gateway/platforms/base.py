@@ -1959,10 +1959,10 @@ MEDIA_TAG_CLEANUP_RE = re.compile(
 # — and the first extension that validates on disk wins. Validation is the
 # oracle, so prose never rides along and non-existent paths stay visible.
 MEDIA_EXTENSIONLESS_TAG_RE = re.compile(
-    r'''[`"'*_]{0,3}MEDIA:\s*'''
+    r'''[`"'*_]{0,3}(?:MEDIA|FILE):\s*'''
     r'''(?P<path>`[^`\n]+`|"[^"\n]+"|'[^'\n]+'|'''
     r'''(?:~/|/|[A-Za-z]:[/\\])[^\s\n`"']+?)'''
-    r'''(?=[`"'\s,;:)\]}]|MEDIA:|$)'''
+    r'''(?=[`"'\s,;:)\]}]|MEDIA:|FILE:|$)'''
     r'''[`"'*_]{0,3}\s*''',
     re.IGNORECASE,
 )
