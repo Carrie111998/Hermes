@@ -508,6 +508,57 @@ class TestImageEnvelopeStripping:
         )
         assert is_titleable_user_message(enriched) is True
 
+    def test_preserves_bare_envelope_quoted_as_entire_message(self):
+        # If the user's *entire* message is an envelope-shaped string
+        # (e.g. quoting one in a bug report), stripping eats everything
+        # and leaves titling with nothing. The guard returns the original
+        # unmodified. Real enrichment messages always have user content
+        # below the envelope, so this never fires in practice.
+        msg = (
+            "[The user attached an image:\n"
+            "A screenshot.\n"
+            "]\n"
+        )
+        assert _strip_image_envelope(msg) == msg
+
+    def test_strips_envelope_even_with_short_user_request(self):
+        # A short user request like "Fix it" after an envelope is a real
+        # enrichment scenario — we strip normally. The guard only fires
+        # when *nothing* remains, not when the remainder is short.
+        msg = (
+            "[The user attached an image:\n"
+            "A screenshot.\n"
+            "]\n"
+            "[You can examine it with vision_analyze using image_url: /tmp/x.png]\n"
+            "Fix it"
+        )
+        assert _strip_image_envelope(msg) == "Fix it"
+
+    def test_matches_looser_wording_variants(self):
+        # The regex keys on "attached an image" as the semantic signal,
+        # not on one exact phrase — so a third call-site wording (or even
+        # a capitalisation change) doesn't silently reintroduce the bug.
+        # Variant: "User attached an image — see below:"
+        msg = (
+            "[User attached an image — see below:\n"
+            "A screenshot of code: array[0] = 1\n"
+            "]\n"
+            "[Examine with vision_analyze: /tmp/x.png]\n"
+            "Fix the indexing bug"
+        )
+        assert _strip_image_envelope(msg) == "Fix the indexing bug"
+
+    def test_matches_case_insensitively(self):
+        # Case variations shouldn't defeat the strip.
+        msg = (
+            "[the user attached an image:\n"
+            "screenshot\n"
+            "]\n"
+            "[you can examine it with vision_analyze]\n"
+            "修复输入法候选词排序"
+        )
+        assert _strip_image_envelope(msg) == "修复输入法候选词排序"
+
 
 class TestAutoTitleDuplicateHandling:
     """Duplicate auto-title handling and not-found hardening (#50537)."""
