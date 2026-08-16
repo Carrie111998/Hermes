@@ -507,10 +507,21 @@ class ProcessRegistry:
 
     @staticmethod
     def _background_resource_policy() -> dict[str, float | int]:
+        # Descendant-tree memory thresholds and the hard-limit confirmation
+        # count are owned by the resource_guard config block (single source of
+        # truth), so per-process caps cannot drift from the gateway guard.
+        # Only terminal-specific knobs live under terminal.background_resource_limits.
+        from hermes_cli.resource_guard import (
+            DESCENDANT_WARN_RSS_MB,
+            DESCENDANT_HARD_RSS_MB,
+            HARD_LIMIT_CONFIRMATIONS,
+        )
+
         defaults = {
             "large_download_max_concurrent": 1,
-            "descendant_warn_rss_mb": 8192,
-            "descendant_hard_rss_mb": 24576,
+            "descendant_warn_rss_mb": DESCENDANT_WARN_RSS_MB,
+            "descendant_hard_rss_mb": DESCENDANT_HARD_RSS_MB,
+            "hard_limit_confirmations": HARD_LIMIT_CONFIRMATIONS,
             "poll_seconds": 15.0,
         }
         try:
@@ -523,20 +534,28 @@ class ProcessRegistry:
                 if isinstance(terminal, dict)
                 else None
             )
-            if not isinstance(raw, dict):
-                return defaults
+            guard = cfg.get("resource_guard") if isinstance(cfg, dict) else None
             policy = dict(defaults)
-            policy["large_download_max_concurrent"] = max(
-                1, int(raw.get("large_download_max_concurrent", 1))
-            )
-            policy["descendant_warn_rss_mb"] = max(
-                1, int(raw.get("descendant_warn_rss_mb", 8192))
-            )
-            policy["descendant_hard_rss_mb"] = max(
-                int(policy["descendant_warn_rss_mb"]),
-                int(raw.get("descendant_hard_rss_mb", 24576)),
-            )
-            policy["poll_seconds"] = max(2.0, float(raw.get("poll_seconds", 15)))
+            if isinstance(raw, dict):
+                policy["large_download_max_concurrent"] = max(
+                    1, int(raw.get("large_download_max_concurrent", 1))
+                )
+                policy["poll_seconds"] = max(
+                    2.0, float(raw.get("poll_seconds", 15))
+                )
+            if isinstance(guard, dict):
+                policy["descendant_warn_rss_mb"] = max(
+                    1,
+                    int(guard.get("descendant_warn_rss_mb", DESCENDANT_WARN_RSS_MB)),
+                )
+                policy["descendant_hard_rss_mb"] = max(
+                    int(policy["descendant_warn_rss_mb"]),
+                    int(guard.get("descendant_hard_rss_mb", DESCENDANT_HARD_RSS_MB)),
+                )
+                policy["hard_limit_confirmations"] = max(
+                    1,
+                    int(guard.get("hard_limit_confirmations", HARD_LIMIT_CONFIRMATIONS)),
+                )
             return policy
         except (TypeError, ValueError, OSError):
             return defaults
@@ -605,7 +624,9 @@ class ProcessRegistry:
             policy = self._background_resource_policy()
             warn_bytes = int(policy["descendant_warn_rss_mb"]) * 1024 * 1024
             hard_bytes = int(policy["descendant_hard_rss_mb"]) * 1024 * 1024
+            confirmations = int(policy["hard_limit_confirmations"])
             poll_seconds = float(policy["poll_seconds"])
+            hard_violations = 0
             while not session._completion_event.wait(poll_seconds):
                 if session.exited or not session.pid:
                     return
@@ -625,15 +646,24 @@ class ProcessRegistry:
                     session._resource_warned = True
                 elif rss < warn_bytes * 0.8:
                     session._resource_warned = False
+                # Debounce the hard limit: a single transient spike above the
+                # cap must not terminate the tree; require consecutive
+                # over-cap samples before acting.
                 if rss >= hard_bytes:
+                    hard_violations += 1
+                else:
+                    hard_violations = 0
+                if hard_violations >= confirmations:
                     logger.error(
                         "Background process memory hard limit: session=%s pid=%s "
-                        "class=%s tree_rss_mb=%.1f hard_mb=%d; terminating tree",
+                        "class=%s tree_rss_mb=%.1f hard_mb=%d confirmations=%d; "
+                        "terminating tree",
                         session.id,
                         session.pid,
                         session.resource_class,
                         rss / (1024 * 1024),
                         int(policy["descendant_hard_rss_mb"]),
+                        hard_violations,
                     )
                     self.kill_process(session.id, source="resource_guard")
                     return

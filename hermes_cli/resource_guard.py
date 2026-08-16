@@ -24,17 +24,26 @@ from hermes_constants import get_hermes_home
 logger = logging.getLogger(__name__)
 _MIB = 1024 * 1024
 
+# Canonical descendant-tree memory thresholds and hard-limit confirmation
+# count, shared with tools.process_registry so per-process caps cannot drift
+# from the gateway guard (single source of truth).
+DESCENDANT_WARN_RSS_MB = 8192
+DESCENDANT_HARD_RSS_MB = 24576
+HARD_LIMIT_CONFIRMATIONS = 2
+
 
 @dataclass(frozen=True)
 class ResourceGuardSettings:
     enabled: bool = True
     poll_seconds: float = 15.0
+    telemetry_enabled: bool = False
     telemetry_seconds: float = 60.0
     warn_rss_mb: int = 2048
     snapshot_rss_mb: int = 4096
     hard_rss_mb: int = 8192
-    descendant_warn_rss_mb: int = 8192
-    descendant_hard_rss_mb: int = 24576
+    descendant_warn_rss_mb: int = DESCENDANT_WARN_RSS_MB
+    descendant_hard_rss_mb: int = DESCENDANT_HARD_RSS_MB
+    hard_limit_confirmations: int = HARD_LIMIT_CONFIRMATIONS
     snapshot_cooldown_seconds: float = 300.0
 
 
@@ -90,6 +99,9 @@ def load_resource_guard_settings() -> ResourceGuardSettings:
     )
     return ResourceGuardSettings(
         enabled=raw.get("enabled", defaults.enabled) is not False,
+        telemetry_enabled=(
+            raw.get("telemetry_enabled", defaults.telemetry_enabled) is True
+        ),
         poll_seconds=_positive_float(
             raw.get("poll_seconds"), defaults.poll_seconds, floor=2.0
         ),
@@ -101,6 +113,10 @@ def load_resource_guard_settings() -> ResourceGuardSettings:
         hard_rss_mb=hard,
         descendant_warn_rss_mb=descendant_warn,
         descendant_hard_rss_mb=descendant_hard,
+        hard_limit_confirmations=_positive_int(
+            raw.get("hard_limit_confirmations"),
+            defaults.hard_limit_confirmations,
+        ),
         snapshot_cooldown_seconds=_positive_float(
             raw.get("snapshot_cooldown_seconds"),
             defaults.snapshot_cooldown_seconds,
@@ -218,6 +234,7 @@ class ProcessMemoryGuard:
         self._warned = False
         self._descendant_warned = False
         self._hard_fired = False
+        self._hard_violations = 0
         self._last_snapshot_at = 0.0
         self._last_telemetry_at = 0.0
 
@@ -252,7 +269,10 @@ class ProcessMemoryGuard:
         rss_mb = snapshot["rss_bytes"] / _MIB
         descendant_mb = snapshot["descendant_rss_bytes"] / _MIB
 
-        if now - self._last_telemetry_at >= self.settings.telemetry_seconds:
+        if (
+            self.settings.telemetry_enabled
+            and now - self._last_telemetry_at >= self.settings.telemetry_seconds
+        ):
             _append_telemetry(snapshot)
             self._last_telemetry_at = now
 
@@ -294,7 +314,14 @@ class ProcessMemoryGuard:
 
         hard_parent = rss_mb >= self.settings.hard_rss_mb
         hard_descendants = descendant_mb >= self.settings.descendant_hard_rss_mb
-        if (hard_parent or hard_descendants) and not self._hard_fired:
+        if hard_parent or hard_descendants:
+            self._hard_violations += 1
+        else:
+            self._hard_violations = 0
+        if (
+            self._hard_violations >= self.settings.hard_limit_confirmations
+            and not self._hard_fired
+        ):
             reason = "hard-parent" if hard_parent else "hard-descendants"
             evidence = _write_evidence_snapshot(snapshot, reason)
             logger.error(
@@ -313,6 +340,9 @@ class ProcessMemoryGuard:
 
 
 __all__ = [
+    "DESCENDANT_WARN_RSS_MB",
+    "DESCENDANT_HARD_RSS_MB",
+    "HARD_LIMIT_CONFIRMATIONS",
     "ProcessMemoryGuard",
     "ResourceGuardSettings",
     "collect_process_memory_snapshot",

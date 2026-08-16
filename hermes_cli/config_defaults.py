@@ -47,12 +47,14 @@ DEFAULT_CONFIG = {
     "resource_guard": {
         "enabled": True,
         "poll_seconds": 15,
+        "telemetry_enabled": False,
         "telemetry_seconds": 60,
         "warn_rss_mb": 2048,
         "snapshot_rss_mb": 4096,
         "hard_rss_mb": 8192,
         "descendant_warn_rss_mb": 8192,
         "descendant_hard_rss_mb": 24576,
+        "hard_limit_confirmations": 2,
         "snapshot_cooldown_seconds": 300,
     },
     "agent": {
@@ -352,11 +354,11 @@ DEFAULT_CONFIG = {
         # Resource policy for local tracked background processes. Large model
         # downloads are serialized; every host process tree is warned/capped
         # by aggregate RSS so child workers cannot silently exhaust unified
-        # memory outside the Hermes process's own guard.
+        # memory outside the Hermes process's own guard. Descendant-tree
+        # thresholds are owned by the resource_guard block (single source of
+        # truth) and shared rather than redefined here.
         "background_resource_limits": {
             "large_download_max_concurrent": 1,
-            "descendant_warn_rss_mb": 8192,
-            "descendant_hard_rss_mb": 24576,
             "poll_seconds": 15,
         },
         # Environment variables to pass through to sandboxed execution
