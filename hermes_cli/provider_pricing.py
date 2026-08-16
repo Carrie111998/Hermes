@@ -162,6 +162,99 @@ def fetch_openrouter_models(timeout: float = 10.0) -> List[dict]:
     return normalize_from_openrouter_payload(payload.get("data", []))
 
 
+def fetch_model_endpoints(model_id: str, timeout: float = 10.0) -> List[dict]:
+    """Fetch the providers serving a model (``/api/v1/models/{id}/endpoints``).
+
+    The model id must appear in the URL path as-is (the slash stays
+    unencoded — percent-encoding the id returns 404). Fails soft -> [].
+    """
+    from urllib.parse import quote
+
+    # Only encode chars that are illegal in a path — never the slash, and
+    # never ':' (OpenRouter uses it in variant ids like ``:free``).
+    safe_id = quote(model_id, safe="/:")
+    url = f"https://openrouter.ai/api/v1/models/{safe_id}/endpoints"
+    try:
+        req = urllib.request.Request(
+            url,
+            headers={"Accept": "application/json", "User-Agent": _USER_AGENT},
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            payload = json.loads(resp.read().decode())
+    except Exception:
+        return []
+    return normalize_endpoint_payload(payload.get("data", {}).get("endpoints", []))
+
+
+def normalize_endpoint(ep: dict) -> Optional[dict]:
+    """Map one endpoint entry to the endpoint table row shape."""
+    provider = ep.get("provider_name")
+    if not provider:
+        return None
+    pricing = ep.get("pricing") or {}
+    discount = pricing.get("discount")
+    try:
+        d = float(discount) if discount not in (None, "") else 0.0
+    except (TypeError, ValueError):
+        d = 0.0
+    discount_pct = round(d * 100) if d > 0 else None
+    latency = ep.get("latency_last_30m")
+    throughput = ep.get("throughput_last_30m")
+    uptime = ep.get("uptime_last_30m")
+    return {
+        "provider": str(provider),
+        "in": _parse_price(pricing.get("prompt")),
+        "out": _parse_price(pricing.get("completion")),
+        "cache": _parse_price(pricing.get("input_cache_read")),
+        "discount_pct": discount_pct,
+        "context": int(ep.get("context_length") or 0),
+        "latency": float(latency) if isinstance(latency, (int, float)) else None,
+        "throughput": float(throughput) if isinstance(throughput, (int, float)) else None,
+        "uptime": float(uptime) if isinstance(uptime, (int, float)) else None,
+    }
+
+
+def normalize_endpoint_payload(raw_endpoints: list) -> List[dict]:
+    """Map a raw ``data.endpoints`` array to endpoint rows."""
+    rows: List[dict] = []
+    for ep in raw_endpoints or []:
+        if isinstance(ep, dict):
+            row = normalize_endpoint(ep)
+            if row:
+                rows.append(row)
+    return rows
+
+
+def format_endpoint_rows(rows: List[dict]) -> List[str]:
+    """Render endpoint rows as an aligned table (2-space indented lines)."""
+    if not rows:
+        return ["  (no endpoints for this model)"]
+    headers = ["PROVIDER", "IN $/M", "OUT $/M", "CACHE $/M", "DISC", "CTX", "LAT", "TPS", "UP%"]
+    widths = [len(h) for h in headers]
+    cells: List[List[str]] = []
+    for row in rows:
+        disc = f"-{row['discount_pct']}%" if row.get("discount_pct") else "-"
+        line = [
+            str(row.get("provider", "")),
+            fmt_cost(float(row.get("in") or 0.0)),
+            fmt_cost(float(row.get("out") or 0.0)),
+            fmt_cost(float(row.get("cache") or 0.0)),
+            disc,
+            f"{int(row.get('context') or 0):,}",
+            f"{row['latency']:.2f}s" if row.get("latency") is not None else "-",
+            str(int(row["throughput"])) if row.get("throughput") is not None else "-",
+            f"{row['uptime']:.2f}" if row.get("uptime") is not None else "-",
+        ]
+        for i, cell in enumerate(line):
+            widths[i] = max(widths[i], len(cell))
+        cells.append(line)
+    out = ["  " + "  ".join(h.ljust(widths[i]) for i, h in enumerate(headers))]
+    out.append("  " + "  ".join("-" * w for w in widths))
+    for line in cells:
+        out.append("  " + "  ".join(c.ljust(widths[i]) for i, c in enumerate(line)))
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Ranking / search
 # ---------------------------------------------------------------------------

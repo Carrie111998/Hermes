@@ -2,10 +2,14 @@
 compare models by value-for-money.
 
 Subcommands:
-  hermes providers [list]     Show every supported provider + auth status
-  hermes providers compare    Rank OpenRouter models by value (live pricing)
-  hermes providers search Q   Find models matching a query
-  hermes providers best       Top-value models for a task + apply commands
+  hermes providers [list]      Show every supported provider + auth status
+  hermes providers compare     Rank OpenRouter models by value (live pricing)
+  hermes providers search Q    Find models matching a query
+  hermes providers best        Top-value models for a task + apply commands
+  hermes providers endpoints M List the providers serving a model (per-provider
+                                pricing/latency/uptime — mirrors the OpenRouter
+                                model-page table)
+  hermes providers route       Show or set provider_routing (sort/order/only/ignore)
 
 Data sources:
   - Provider availability: the canonical provider list
@@ -14,6 +18,12 @@ Data sources:
     provider transport overlays (``hermes_cli.providers.HERMES_OVERLAYS``).
   - Value ranking: live OpenRouter catalog or the bundled models.dev
     registry with ``--offline`` (see ``hermes_cli/provider_pricing.py``).
+  - Per-model endpoints: OpenRouter ``/api/v1/models/{id}/endpoints``.
+  - Routing: writes the documented top-level ``provider_routing`` config
+    section, which Hermes forwards to OpenRouter as the ``provider`` body
+    object (``sort``/``order``/``only``/``ignore``/``require_parameters``/
+    ``data_collection``). See
+    https://hermes-agent.nousresearch.com/docs/user-guide/features/provider-routing
 
 Heavy hermes imports are deliberately lazy (inside handlers) so importing
 this module stays cheap for the CLI fast-path and for tests.
@@ -272,6 +282,117 @@ def _cmd_best(args) -> None:
 
 
 # ---------------------------------------------------------------------------
+# endpoints / route — per-model providers + provider_routing
+# ---------------------------------------------------------------------------
+
+
+def _cmd_endpoints(args) -> None:
+    """Show which providers serve a model, with per-provider pricing."""
+    from hermes_cli.provider_pricing import fetch_model_endpoints, format_endpoint_rows
+
+    model_id = args.model
+    rows = fetch_model_endpoints(model_id)
+    print()
+    if not rows:
+        print(f"  Could not fetch endpoint data for '{model_id}'.")
+        print("  Check the model id (e.g. deepseek/deepseek-v4-flash) and your network.")
+        print()
+        print("  Tip: set `hermes providers route --sort price` to auto-route to the")
+        print("  cheapest available provider, or `--order DeepInfra,Decart` to force one.")
+        print()
+        return
+    print(f"  Providers serving {model_id} — live OpenRouter API")
+    print()
+    for line in format_endpoint_rows(rows):
+        print(line)
+    print()
+    print("  Route a provider with:  hermes providers route --sort price   (auto-cheapest)")
+    print("                    or:  hermes providers route --order <Provider>")
+    print()
+
+
+def _parse_csv(raw: str) -> list:
+    """'A, B ,C' -> ['A', 'B', 'C'] (empty entries dropped)."""
+    return [p.strip() for p in (raw or "").split(",") if p.strip()]
+
+
+def _set_routing_value(pr: dict, key: str, value) -> None:
+    if value is None:
+        return
+    pr[key] = list(value) if isinstance(value, (list, tuple)) else value
+
+
+def _cmd_route(args) -> None:
+    """Show or update the ``provider_routing`` config section."""
+    from hermes_cli.config import load_config, save_config
+
+    cfg = load_config()
+    raw = cfg.get("provider_routing") or {}
+    if not isinstance(raw, dict):
+        raw = {}
+
+    if getattr(args, "clear", False):
+        cfg.pop("provider_routing", None)
+        save_config(cfg)
+        print()
+        print("  provider_routing cleared — Hermes will use OpenRouter's default routing.")
+        print()
+        return
+
+    changes: list[str] = []
+    pr = dict(raw)
+    if args.sort is not None:
+        pr["sort"] = args.sort
+        changes.append(f"sort={args.sort}")
+    if args.order is not None:
+        pr["order"] = _parse_csv(args.order)
+        changes.append(f"order={pr['order']}")
+    if args.only is not None:
+        pr["only"] = _parse_csv(args.only)
+        changes.append(f"only={pr['only']}")
+    if args.ignore is not None:
+        pr["ignore"] = _parse_csv(args.ignore)
+        changes.append(f"ignore={pr['ignore']}")
+    if getattr(args, "require_parameters", False):
+        pr["require_parameters"] = True
+        changes.append("require_parameters=true")
+    if args.data_collection is not None:
+        pr["data_collection"] = args.data_collection
+        changes.append(f"data_collection={args.data_collection}")
+
+    print()
+    if not changes:
+        if pr:
+            print("  Current provider_routing:")
+            for key, value in pr.items():
+                print(f"    {key}: {value}")
+        else:
+            print("  provider_routing is not set — Hermes uses OpenRouter's default routing.")
+            print()
+            print("  Cheapest-first:   hermes providers route --sort price")
+            print("  Force providers:  hermes providers route --order DeepInfra,Decart")
+            print("  Whitelist:        hermes providers route --only DeepInfra")
+            print("  Blacklist:        hermes providers route --ignore SomeProvider")
+            print("  Clear all:        hermes providers route --clear")
+        print()
+        return
+
+    if pr:
+        cfg["provider_routing"] = pr
+    else:
+        cfg.pop("provider_routing", None)
+    save_config(cfg)
+
+    print("  provider_routing updated:")
+    for key, value in pr.items():
+        print(f"    {key}: {value}")
+    print()
+    print("  Takes effect on the next session (restart the CLI or gateway).")
+    print("  Only applies to OpenRouter / Nous Portal routes.")
+    print()
+
+
+# ---------------------------------------------------------------------------
 # Dispatch
 # ---------------------------------------------------------------------------
 
@@ -287,6 +408,10 @@ def cmd_providers(args) -> None:
         _cmd_search(args)
     elif sub == "best":
         _cmd_best(args)
+    elif sub in {"endpoints", "endpoint"}:
+        _cmd_endpoints(args)
+    elif sub == "route":
+        _cmd_route(args)
     else:
         print(f"Unknown providers subcommand: {sub}")
-        print("Use one of: list, compare, search, best")
+        print("Use one of: list, compare, search, best, endpoints, route")

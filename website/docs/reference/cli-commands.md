@@ -1295,6 +1295,8 @@ bundled models.dev catalog instead (no network).
 | `compare` (alias: `cmp`) | Rank OpenRouter models by value: agentic-capable (tool-calling), cheapest first. Flags: `--top N`, `--min-context N`, `--task chat\|code\|reasoning`, `--include-all`, `--offline` |
 | `search <query>` | Case-insensitive substring match on model id/name/lab. Flags: `--top N`, `--offline` |
 | `best` | Top-value models for a task plus the exact `hermes config set` commands to apply the top pick. Flags: `--top N` (default 5), `--min-context N`, `--task` (default `chat`), `--include-all`, `--offline` |
+| `endpoints <model>` (alias: `endpoint`) | List the providers serving a model (e.g. `deepseek/deepseek-v4-flash`) with per-provider pricing, discount, context, latency, throughput, and uptime — the same table as the OpenRouter model page |
+| `route` | Show or set the `provider_routing` config section: `--sort price\|throughput\|latency` (auto-rank; `price` = cheapest first), `--order P1,P2` (force provider priority), `--only P1,P2`, `--ignore P1,P2`, `--require-parameters`, `--data-collection allow\|deny`, `--clear`. See [Provider Routing](../user-guide/features/provider-routing.md) |
 
 `providers best` output, for example:
 

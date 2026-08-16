@@ -12066,6 +12066,58 @@ def main():
         action="store_true",
         help="Include models without tool-calling support",
     )
+    endpoints_parser = providers_subparsers.add_parser(
+        "endpoints",
+        aliases=["endpoint"],
+        help="List providers serving a model (per-provider pricing/latency/uptime)",
+    )
+    endpoints_parser.add_argument(
+        "model", help="OpenRouter model id, e.g. deepseek/deepseek-v4-flash"
+    )
+    route_parser = providers_subparsers.add_parser(
+        "route",
+        help="Show or set provider_routing (sort/order/only/ignore)",
+    )
+    route_parser.add_argument(
+        "--sort",
+        choices=["price", "throughput", "latency"],
+        default=None,
+        help='"price" routes to the cheapest available provider first',
+    )
+    route_parser.add_argument(
+        "--order",
+        metavar="P1,P2",
+        default=None,
+        help="Force provider priority order (comma-separated)",
+    )
+    route_parser.add_argument(
+        "--only",
+        metavar="P1,P2",
+        default=None,
+        help="Only use these providers (comma-separated)",
+    )
+    route_parser.add_argument(
+        "--ignore",
+        metavar="P1,P2",
+        default=None,
+        help="Never use these providers (comma-separated)",
+    )
+    route_parser.add_argument(
+        "--require-parameters",
+        action="store_true",
+        help="Only route to providers supporting every request parameter",
+    )
+    route_parser.add_argument(
+        "--data-collection",
+        choices=["allow", "deny"],
+        default=None,
+        help="Control whether providers may use your prompts for training",
+    )
+    route_parser.add_argument(
+        "--clear",
+        action="store_true",
+        help="Remove all provider_routing settings (back to OpenRouter default)",
+    )
     providers_parser.set_defaults(func=cmd_providers)
 
     # =========================================================================

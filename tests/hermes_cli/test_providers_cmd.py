@@ -256,3 +256,156 @@ class TestParserWiring:
         from hermes_cli.main import _BUILTIN_SUBCOMMANDS
 
         assert "providers" in _BUILTIN_SUBCOMMANDS
+
+
+# ---------------------------------------------------------------------------
+# endpoints / route
+# ---------------------------------------------------------------------------
+
+FAKE_ENDPOINT_ROWS = [
+    {
+        "provider": "DeepInfra",
+        "in": 0.09,
+        "out": 0.18,
+        "cache": 0.018,
+        "discount_pct": None,
+        "context": 1048576,
+        "latency": 0.54,
+        "throughput": 53,
+        "uptime": 99.93,
+    },
+    {
+        "provider": "Decart",
+        "in": 0.0657,
+        "out": 0.1314,
+        "cache": 0.01314,
+        "discount_pct": 27,
+        "context": 1048576,
+        "latency": None,
+        "throughput": None,
+        "uptime": 98.86,
+    },
+]
+
+
+def route_args(**overrides):
+    base = dict(
+        providers_command="route",
+        sort=None,
+        order=None,
+        only=None,
+        ignore=None,
+        require_parameters=False,
+        data_collection=None,
+        clear=False,
+    )
+    base.update(overrides)
+    return SimpleNamespace(**base)
+
+
+class TestEndpointsCommand:
+    def test_prints_table_with_routing_tip(self, monkeypatch, capsys):
+        monkeypatch.setattr(
+            "hermes_cli.provider_pricing.fetch_model_endpoints",
+            lambda model: FAKE_ENDPOINT_ROWS,
+        )
+        pc._cmd_endpoints(args(providers_command="endpoints", model="deepseek/deepseek-v4-flash"))
+        out = capsys.readouterr().out
+        assert "Providers serving deepseek/deepseek-v4-flash" in out
+        assert "DeepInfra" in out and "Decart" in out
+        assert "route --sort price" in out
+
+    def test_fetch_failure_prints_hint(self, monkeypatch, capsys):
+        monkeypatch.setattr(
+            "hermes_cli.provider_pricing.fetch_model_endpoints", lambda model: []
+        )
+        pc._cmd_endpoints(args(providers_command="endpoints", model="nope/nope"))
+        out = capsys.readouterr().out
+        assert "Could not fetch endpoint data for 'nope/nope'" in out
+        assert "--order DeepInfra" in out
+
+    def test_dispatch_endpoints_and_endpoint_alias(self, monkeypatch):
+        called = []
+        monkeypatch.setattr(pc, "_cmd_endpoints", lambda a: called.append("endpoints"))
+        pc.cmd_providers(args(providers_command="endpoints"))
+        pc.cmd_providers(args(providers_command="endpoint"))
+        assert called == ["endpoints", "endpoints"]
+
+    def test_dispatch_route(self, monkeypatch):
+        called = []
+        monkeypatch.setattr(pc, "_cmd_route", lambda a: called.append("route"))
+        pc.cmd_providers(route_args())
+        assert called == ["route"]
+
+
+class TestParseCsv:
+    def test_basic(self):
+        assert pc._parse_csv("DeepInfra, Decart ,  ") == ["DeepInfra", "Decart"]
+
+    def test_empty(self):
+        assert pc._parse_csv("") == []
+
+
+class TestRouteCommand:
+    def _fake_config_store(self, monkeypatch):
+        store = {}
+
+        def fake_load():
+            return store
+
+        def fake_save(cfg):
+            data = dict(cfg)
+            store.clear()
+            store.update(data)
+
+        monkeypatch.setattr("hermes_cli.config.load_config", fake_load)
+        monkeypatch.setattr("hermes_cli.config.save_config", fake_save)
+        return store
+
+    def test_set_sort_writes_config(self, monkeypatch, capsys):
+        store = self._fake_config_store(monkeypatch)
+        pc._cmd_route(route_args(sort="price"))
+        assert store.get("provider_routing") == {"sort": "price"}
+        out = capsys.readouterr().out
+        assert "provider_routing updated" in out
+        assert "sort: price" in out
+        assert "next session" in out
+
+    def test_set_order_parses_csv(self, monkeypatch):
+        store = self._fake_config_store(monkeypatch)
+        pc._cmd_route(route_args(order="DeepInfra,Decart"))
+        assert store["provider_routing"]["order"] == ["DeepInfra", "Decart"]
+
+    def test_merge_preserves_existing_keys(self, monkeypatch):
+        store = self._fake_config_store(monkeypatch)
+        store["provider_routing"] = {"only": ["Anthropic"]}
+        pc._cmd_route(route_args(sort="price"))
+        assert store["provider_routing"] == {"only": ["Anthropic"], "sort": "price"}
+
+    def test_clear_removes_section(self, monkeypatch):
+        store = self._fake_config_store(monkeypatch)
+        store["provider_routing"] = {"sort": "price"}
+        pc._cmd_route(route_args(clear=True))
+        assert "provider_routing" not in store
+
+    def test_no_args_shows_current(self, monkeypatch, capsys):
+        store = self._fake_config_store(monkeypatch)
+        store["provider_routing"] = {"sort": "price"}
+        pc._cmd_route(route_args())
+        out = capsys.readouterr().out
+        assert "Current provider_routing" in out
+        assert "price" in out
+        assert "provider_routing updated" not in out
+
+    def test_no_args_when_unset_shows_hints(self, monkeypatch, capsys):
+        self._fake_config_store(monkeypatch)
+        pc._cmd_route(route_args())
+        out = capsys.readouterr().out
+        assert "provider_routing is not set" in out
+        assert "--sort price" in out
+
+    def test_require_parameters_and_data_collection(self, monkeypatch):
+        store = self._fake_config_store(monkeypatch)
+        pc._cmd_route(route_args(require_parameters=True, data_collection="deny"))
+        assert store["provider_routing"]["require_parameters"] is True
+        assert store["provider_routing"]["data_collection"] == "deny"

@@ -77,6 +77,13 @@ def _n(item: dict) -> dict:
     return row
 
 
+def _m(info) -> dict:
+    """Normalize a models.dev ModelInfo stand-in, asserting it survived."""
+    row = pp.normalize_from_models_dev(info)
+    assert row is not None
+    return row
+
+
 # ---------------------------------------------------------------------------
 # Normalization
 # ---------------------------------------------------------------------------
@@ -130,7 +137,7 @@ class TestNormalizeOpenRouter:
 
 class TestNormalizeModelsDev:
     def test_full_info(self):
-        row = pp.normalize_from_models_dev(make_models_dev_info())
+        row = _m(make_models_dev_info())
         assert row["id"] == "deepseek/deepseek-chat"
         assert row["lab"] == "deepseek"
         assert row["context"] == 64000
@@ -305,3 +312,121 @@ class TestFetch:
         monkeypatch.setattr("urllib.request.urlopen", lambda *a, **k: FakeResp())
         rows = pp.fetch_openrouter_models()
         assert len(rows) == 3
+
+
+# ---------------------------------------------------------------------------
+# Endpoints — /api/v1/models/{id}/endpoints (mirrors the OpenRouter model page)
+# ---------------------------------------------------------------------------
+
+DEEPINFRA_ENDPOINT = {
+    "name": "DeepInfra | deepseek/deepseek-v4-flash-20260423",
+    "model_id": "deepseek/deepseek-v4-flash",
+    "provider_name": "DeepInfra",
+    "context_length": 1048576,
+    "pricing": {
+        "prompt": "0.00000009",
+        "completion": "0.00000018",
+        "input_cache_read": "0.000000018",
+        "discount": 0,
+    },
+    "latency_last_30m": 0.54,
+    "throughput_last_30m": 53,
+    "uptime_last_30m": 99.93,
+}
+
+DECART_ENDPOINT = {
+    "name": "Decart | deepseek/deepseek-v4-flash-20260423",
+    "model_id": "deepseek/deepseek-v4-flash",
+    "provider_name": "Decart",
+    "context_length": 1048576,
+    "pricing": {
+        "prompt": "0.0000000657",
+        "completion": "0.0000001314",
+        "input_cache_read": "0.00000001314",
+        "discount": 0.27,
+    },
+    "latency_last_30m": None,
+    "throughput_last_30m": None,
+    "uptime_last_30m": 98.86,
+}
+
+ENDPOINTS_PAYLOAD = {"data": {"endpoints": [DEEPINFRA_ENDPOINT, DECART_ENDPOINT, "garbage"]}}
+
+
+class TestEndpoints:
+    def test_normalize_endpoint(self):
+        row = pp.normalize_endpoint(DEEPINFRA_ENDPOINT)
+        assert row is not None
+        assert row["provider"] == "DeepInfra"
+        assert row["in"] == pytest.approx(0.09)
+        assert row["out"] == pytest.approx(0.18)
+        assert row["cache"] == pytest.approx(0.018)
+        assert row["discount_pct"] is None  # discount 0 -> no chrome
+        assert row["latency"] == pytest.approx(0.54)
+        assert row["throughput"] == pytest.approx(53)
+        assert row["uptime"] == pytest.approx(99.93)
+
+    def test_normalize_endpoint_discount_and_missing_latency(self):
+        row = pp.normalize_endpoint(DECART_ENDPOINT)
+        assert row is not None
+        assert row["in"] == pytest.approx(0.0657)
+        assert row["discount_pct"] == 27  # 0.27 -> "27% off"
+        assert row["latency"] is None
+        assert row["throughput"] is None
+
+    def test_normalize_endpoint_missing_provider_returns_none(self):
+        assert pp.normalize_endpoint({"name": "x"}) is None
+
+    def test_payload_skips_garbage(self):
+        rows = pp.normalize_endpoint_payload(ENDPOINTS_PAYLOAD["data"]["endpoints"])
+        assert len(rows) == 2
+        assert {r["provider"] for r in rows} == {"DeepInfra", "Decart"}
+
+    def test_format_endpoint_rows(self):
+        rows = pp.normalize_endpoint_payload(ENDPOINTS_PAYLOAD["data"]["endpoints"])
+        joined = "\n".join(pp.format_endpoint_rows(rows))
+        assert "PROVIDER" in joined and "DISC" in joined
+        assert "DeepInfra" in joined
+        assert "0.54s" in joined and "53" in joined
+        assert "-27%" in joined
+        assert "1,048,576" in joined
+
+    def test_fetch_endpoints_fail_soft(self, monkeypatch):
+        monkeypatch.setattr("urllib.request.urlopen", lambda *a, **k: (_ for _ in ()).throw(OSError("down")))
+        assert pp.fetch_model_endpoints("deepseek/deepseek-v4-flash") == []
+
+    def test_fetch_endpoints_parses(self, monkeypatch):
+        class FakeResp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def read(self):
+                return json.dumps(ENDPOINTS_PAYLOAD).encode()
+
+        monkeypatch.setattr("urllib.request.urlopen", lambda *a, **k: FakeResp())
+        rows = pp.fetch_model_endpoints("deepseek/deepseek-v4-flash")
+        assert len(rows) == 2
+
+    def test_fetch_endpoints_keeps_slash_unencoded(self, monkeypatch):
+        seen = {}
+
+        class FakeResp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def read(self):
+                return b'{"data": {"endpoints": []}}'
+
+        def fake_urlopen(req, **kwargs):
+            seen["url"] = req.full_url
+            return FakeResp()
+
+        monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+        pp.fetch_model_endpoints("deepseek/deepseek-v4-flash:free")
+        assert "/models/deepseek/deepseek-v4-flash:free/endpoints" in seen["url"]
