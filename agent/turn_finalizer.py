@@ -83,6 +83,7 @@ def finalize_turn(
     original_user_message,
     _should_review_memory,
     _turn_exit_reason,
+    current_turn_user_idx=0,
     _pending_verification_response=None,
     _pending_verification_response_previewed=False,
 ):
@@ -752,6 +753,33 @@ def finalize_turn(
         interrupted=interrupted,
         messages=messages,
     )
+
+    # A primary turn may itself make a durable memory/skill update.  That is
+    # just as meaningful to the user as a later review-fork update, but the
+    # review summarizer deliberately excludes inherited primary actions.  Send
+    # one receipt for actions belonging to *this* turn; the gateway queues it
+    # until the normal answer is delivered and keeps the captured origin.
+    # The later background-review pass still reports only its new actions, so
+    # it cannot duplicate this receipt.
+    if final_response and not interrupted:
+        try:
+            from agent.background_review import summarize_background_review_actions
+
+            current_turn_messages = list(messages[current_turn_user_idx:])
+            primary_actions = summarize_background_review_actions(
+                current_turn_messages,
+                [],
+                notification_mode=getattr(agent, "memory_notifications", "on"),
+            )
+            if primary_actions:
+                callback = getattr(agent, "background_review_callback", None)
+                if callback:
+                    callback(
+                        "💾 Self-improvement review: "
+                        + " · ".join(dict.fromkeys(primary_actions))
+                    )
+        except Exception:
+            logger.debug("Primary learning receipt summary failed", exc_info=True)
 
     # Background memory/skill review — runs AFTER the response is delivered
     # so it never competes with the user's task for model attention.
