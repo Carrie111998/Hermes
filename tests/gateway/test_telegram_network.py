@@ -519,7 +519,7 @@ class TestExhaustionRediscovery:
     """A frozen fallback list must refresh itself after total exhaustion."""
 
     @pytest.mark.asyncio
-    async def test_exhaustion_schedules_rediscovery_and_merges(self, monkeypatch):
+    async def test_exhaustion_schedules_rediscovery_and_recovers(self, monkeypatch):
         calls = []
         behavior = {
             "api.telegram.org": "timeout",
@@ -549,6 +549,65 @@ class TestExhaustionRediscovery:
         assert resp.status_code == 200
         assert calls[-1]["url_host"] == "149.154.167.221"
         assert calls[-1]["sni_hostname"] == "api.telegram.org"
+        await transport.aclose()
+
+    @pytest.mark.asyncio
+    async def test_rediscovery_replaces_stale_ips(self, monkeypatch):
+        calls = []
+        behavior = {
+            "api.telegram.org": "timeout",
+            "149.154.175.50": "connect_error",  # exhausted captured IP
+        }
+        monkeypatch.setattr(
+            tnet.httpx, "AsyncHTTPTransport", _fake_transport_factory(calls, behavior)
+        )
+
+        async def fake_discover():
+            # discover_fallback_ips() output shape: fresh answers + seed tail
+            return ["149.154.167.221", *tnet._SEED_FALLBACK_IPS]
+
+        monkeypatch.setattr(tnet, "discover_fallback_ips", fake_discover)
+
+        transport = tnet.TelegramFallbackTransport(["149.154.175.50"])
+        with pytest.raises(httpx.ConnectError):
+            await transport.handle_async_request(_telegram_request())
+        await transport._rediscover_task
+
+        # The exhausted captured IP is dropped; seeds survive as the tail
+        assert transport._fallback_ips == ["149.154.167.221", *tnet._SEED_FALLBACK_IPS]
+        await transport.aclose()
+
+    @pytest.mark.asyncio
+    async def test_rediscovery_caps_list_but_keeps_seeds(self, monkeypatch):
+        calls = []
+        behavior = {
+            "api.telegram.org": "timeout",
+            "149.154.167.220": "connect_error",
+        }
+        monkeypatch.setattr(
+            tnet.httpx, "AsyncHTTPTransport", _fake_transport_factory(calls, behavior)
+        )
+
+        flood = [f"149.154.170.{i}" for i in range(1, 21)]
+
+        async def fake_discover():
+            return [*flood, *tnet._SEED_FALLBACK_IPS]
+
+        monkeypatch.setattr(tnet, "discover_fallback_ips", fake_discover)
+
+        transport = tnet.TelegramFallbackTransport(["149.154.167.220"])
+        with pytest.raises(httpx.ConnectError):
+            await transport.handle_async_request(_telegram_request())
+        await transport._rediscover_task
+
+        cap = tnet.TelegramFallbackTransport._MAX_FALLBACK_IPS
+        assert len(transport._fallback_ips) == cap
+        for seed in tnet._SEED_FALLBACK_IPS:
+            assert seed in transport._fallback_ips
+        # Discovered IPs fill the budget in order; seeds are never trimmed
+        assert transport._fallback_ips[: cap - len(tnet._SEED_FALLBACK_IPS)] == flood[
+            : cap - len(tnet._SEED_FALLBACK_IPS)
+        ]
         await transport.aclose()
 
     @pytest.mark.asyncio

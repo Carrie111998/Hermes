@@ -68,6 +68,12 @@ class TelegramFallbackTransport(httpx.AsyncBaseTransport):
     # so one refresh a minute keeps the list fresh without hammering DoH.
     _REDISCOVER_MIN_INTERVAL = 60.0
 
+    # Upper bound on the fallback rotation. Rotating DoH answers across a long
+    # outage must not grow the candidate list without limit -- every dead entry
+    # left in the rotation costs one connect timeout per request cycle. The cap
+    # trims discovered IPs only; seed endpoints are never trimmed.
+    _MAX_FALLBACK_IPS = 8
+
     def __init__(self, fallback_ips: Iterable[str], **transport_kwargs):
         self._fallback_ips = list(dict.fromkeys(_normalize_fallback_ips(fallback_ips)))
         self._rediscover_task: Optional[asyncio.Task] = None
@@ -202,14 +208,35 @@ class TelegramFallbackTransport(httpx.AsyncBaseTransport):
         except Exception as exc:  # DoH itself may be down mid-outage — retry next window
             logger.debug("[Telegram] Fallback IP re-discovery failed: %s", exc)
             return
-        added = [ip for ip in _normalize_fallback_ips(fresh) if ip not in self._fallback_ips]
-        if not added:
+        refreshed = list(dict.fromkeys(_normalize_fallback_ips(fresh)))
+        if not refreshed:
             return
-        self._fallback_ips.extend(added)
+        # Replace, do not append: the previous generation of captured IPs is
+        # exactly what just exhausted, so carrying it forward only adds a
+        # connect timeout per dead IP to every later cycle.
+        # discover_fallback_ips() keeps the seed endpoints as the tail, so a
+        # replacement can never drop the last-resort seeds. Cap the result so
+        # rotating DoH answers across a long outage cannot grow the rotation
+        # unboundedly; the cap trims discovered IPs, never seeds.
+        if len(refreshed) > self._MAX_FALLBACK_IPS:
+            seeds = {ip for ip in _SEED_FALLBACK_IPS if ip in refreshed}
+            budget = self._MAX_FALLBACK_IPS - len(seeds)
+            trimmed: list[str] = []
+            for ip in refreshed:
+                if ip in seeds:
+                    trimmed.append(ip)
+                elif budget > 0:
+                    trimmed.append(ip)
+                    budget -= 1
+            refreshed = trimmed
+        if refreshed == self._fallback_ips:
+            return
+        # Rebind rather than mutate: an in-flight retry loop iterating the old
+        # list keeps its own snapshot.
+        self._fallback_ips = refreshed
         logger.warning(
-            "[Telegram] Fallback IPs refreshed after exhaustion; added %s (now %s)",
-            ", ".join(added),
-            ", ".join(self._fallback_ips),
+            "[Telegram] Fallback IPs refreshed after exhaustion (now %s)",
+            ", ".join(refreshed),
         )
 
     async def aclose(self) -> None:
