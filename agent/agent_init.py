@@ -2666,10 +2666,11 @@ def init_agent(
             f"Model {agent.model} has a context window of {_ctx:,} tokens, "
             f"which is below the minimum {_minimum_context_length:,} required "
             f"by Hermes Agent.  Choose a model with at least "
-            f"{_minimum_context_length // 1000}K context.  If your server "
+            f"{_minimum_context_length:,} tokens of context.  If your server "
             f"reports a window smaller than the model's true window, set "
             f"model.context_length in config.yaml to the real value "
-            f"(this must be at least {_minimum_context_length // 1000}K)."
+            f"(this must be at least {_minimum_context_length:,}).  To run "
+            f"smaller models anyway, lower agent.minimum_context_length."
         )
 
     # Nous Hermes 3/4 are chat models, not tool-call-tuned. The interactive

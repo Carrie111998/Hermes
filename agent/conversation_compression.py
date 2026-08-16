@@ -5,8 +5,9 @@ Three concerns live here:
 * :func:`check_compression_model_feasibility` — startup probe of the
   configured auxiliary compression model.  Warns when the aux context
   window can't fit the main model's compression threshold; auto-lowers
-  the session threshold when possible; hard-rejects auxes below
-  ``MINIMUM_CONTEXT_LENGTH``.
+  the session threshold when possible; hard-rejects auxes below the
+  configured floor (``agent.minimum_context_length``, default
+  ``MINIMUM_CONTEXT_LENGTH``).
 
 * :func:`replay_compression_warning` — re-emit a stored warning through
   the gateway ``status_callback`` once it's wired up (the callback is
@@ -1717,7 +1718,7 @@ def check_compression_model_feasibility(agent: Any) -> None:
                 f"window of {aux_context:,} tokens, which is below the "
                 f"minimum {minimum_context_length:,} required by Hermes "
                 f"Agent.  Choose a compression model with at least "
-                f"{minimum_context_length // 1000}K context (set "
+                f"{minimum_context_length:,} tokens of context (set "
                 f"auxiliary.compression.model in config.yaml), or set "
                 f"auxiliary.compression.context_length to override the "
                 f"detected value if it is wrong."

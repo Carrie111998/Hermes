@@ -404,6 +404,25 @@ def _warn_context_length_fallback(model: str, base_url: str) -> None:
 # Sessions, model switches, and cron jobs should reject models below this.
 MINIMUM_CONTEXT_LENGTH = 64_000
 
+# Invalid ``agent.minimum_context_length`` values already warned about, so the
+# hot paths that consult the floor (threshold math, per-request guards) log
+# once instead of on every call.
+_MINIMUM_CONTEXT_WARNED: set = set()
+
+
+def _warn_invalid_minimum_context_length(value: Any) -> None:
+    """Warn (once per bad value) that a configured floor override was ignored."""
+    key = repr(value)
+    if key in _MINIMUM_CONTEXT_WARNED:
+        return
+    _MINIMUM_CONTEXT_WARNED.add(key)
+    logger.warning(
+        "Ignoring agent.minimum_context_length=%s in config.yaml — expected a "
+        "positive integer number of tokens (e.g. 32768). Falling back to the "
+        "built-in minimum of %s.",
+        key, f"{MINIMUM_CONTEXT_LENGTH:,}",
+    )
+
 
 def get_minimum_context_length(config: Optional[Dict[str, Any]] = None) -> int:
     """Return the configured minimum context length required by Hermes Agent.
@@ -430,15 +449,17 @@ def get_minimum_context_length(config: Optional[Dict[str, Any]] = None) -> int:
         agent_cfg = config.get("agent")
         if isinstance(agent_cfg, dict):
             value = agent_cfg.get("minimum_context_length")
-    if isinstance(value, bool):
-        value = None
-    # Accept only real integers — floats and numeric strings are treated as
-    # config garbage rather than being silently truncated (int("12.5") would
-    # raise; int(12.5) == 12 would otherwise sneak through as "valid").
-    if not isinstance(value, int):
-        value = None
-    if value and value > 0:
+    # Accept only real positive integers — bools, floats and numeric strings
+    # are treated as config garbage rather than being silently coerced
+    # (int("12.5") would raise; int(12.5) == 12 would otherwise sneak through
+    # as "valid").  A value that IS present but unusable is warned about once
+    # so the override isn't silently ignored while the user watches the floor
+    # reject their model anyway.
+    if value is None:
+        return MINIMUM_CONTEXT_LENGTH
+    if isinstance(value, int) and not isinstance(value, bool) and value > 0:
         return value
+    _warn_invalid_minimum_context_length(value)
     return MINIMUM_CONTEXT_LENGTH
 
 # Short-lived in-process cache for local-server context probes. Bounds the
