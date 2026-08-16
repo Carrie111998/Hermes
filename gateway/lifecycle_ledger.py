@@ -262,7 +262,11 @@ def record_startup(home: Optional[Path] = None) -> Optional[Dict[str, Any]]:
 
         start_time = get_process_start_time(os.getpid())
     except Exception:
-        start_time = None  # err on "alive" in _pid_alive_with_start_time
+        # err on "alive" in _pid_alive_with_start_time; debug-log so a real
+        # regression in get_process_start_time is not silently masked
+        # (#86818 review).
+        logger.debug("Failed to read process start time", exc_info=True)
+        start_time = None
     try:
         claim: Dict[str, Any] = {
             "phase": "running",
