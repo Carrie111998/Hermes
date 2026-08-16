@@ -26,6 +26,7 @@ Electron main process both use this without loading the full CLI.
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -57,8 +58,16 @@ def icon_path(project_root: Path) -> Path:
     return project_root / "apps" / "desktop" / "assets" / "icon.png"
 
 
+#: Shebang interpreters that may be overridden with ``sys.executable``.
+#: The CPython family only: a substring test would also claim ``pypy3``,
+#: ``python2``, or a wrapper whose *path* merely contains "python"
+#: (e.g. ``/opt/python-wrapper``), and running those under
+#: ``sys.executable`` would invoke the wrong interpreter.
+_PYTHON_SHEBANG_RE = re.compile(rb"python(?:3(?:\.?\d+)*)?")
+
+
 def _is_python_script(path: Path) -> bool:
-    """True when ``path`` is a script whose shebang names a Python interpreter.
+    """True when ``path`` is a script whose shebang names a CPython interpreter.
 
     A desktop entry runs without shell ``PATH`` customizations, so a bare
     script with an ``env python`` shebang resolves to the *system*
@@ -71,7 +80,20 @@ def _is_python_script(path: Path) -> bool:
             first = fh.readline(128)
     except OSError:
         return False
-    return first.startswith(b"#!") and b"python" in first
+    if not first.startswith(b"#!"):
+        return False
+    tokens = first[2:].strip().split()
+    if tokens and tokens[0].rsplit(b"/", 1)[-1] == b"env":
+        # ``env`` may take flags (-S) or VAR=value assignments first.
+        tokens = tokens[1:]
+        while tokens and (tokens[0].startswith(b"-") or b"=" in tokens[0]):
+            tokens = tokens[1:]
+    if not tokens:
+        return False
+    # Match the interpreter basename only, so a wrapper whose *path*
+    # contains "python" is not claimed.
+    basename = tokens[0].rsplit(b"/", 1)[-1]
+    return _PYTHON_SHEBANG_RE.fullmatch(basename) is not None
 
 
 def resolve_exec_command() -> str:
@@ -98,7 +120,9 @@ def resolve_exec_command() -> str:
         else:
             argv = [str(resolved), "desktop"]
     else:
-        argv = [str(Path(sys.executable).resolve()), "-m", "hermes_cli.main", "desktop"]
+        # sys.executable verbatim, never resolved — same venv-symlink rule
+        # as the script branch above.
+        argv = [sys.executable, "-m", "hermes_cli.main", "desktop"]
     return " ".join(_quote_exec_arg(a) for a in argv)
 
 
