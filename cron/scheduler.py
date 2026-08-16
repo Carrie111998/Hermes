@@ -43,6 +43,7 @@ from typing import Any, List, Optional, Protocol
 # the module) fail with ModuleNotFoundError for hermes_time et al.
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+from agent.i18n import t
 from hermes_constants import get_hermes_home
 from hermes_cli._subprocess_compat import windows_hide_flags
 from hermes_cli.config import (
@@ -2268,6 +2269,22 @@ def _is_channel_dm_topic(
     return is_channel
 
 
+def _cron_delivery_text_for_platform(
+    platform_name: str,
+    wrapped_content: str,
+    unwrapped_content: str,
+) -> str:
+    """Return the platform-facing cron text without parsing localized copy.
+
+    Yuanbao has historically displayed only the cron result body. Select the
+    canonical unwrapped body before transport routing so that behavior does not
+    depend on any translated header or footer text.
+    """
+    if platform_name.lower() == "yuanbao":
+        return unwrapped_content
+    return wrapped_content
+
+
 def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Optional[str]:
     """
     Deliver job output to the configured target(s) (origin chat, specific platform, etc.).
@@ -2318,12 +2335,17 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
     if wrap_response:
         task_name = job.get("name", job["id"])
         job_id = job.get("id", "")
-        delivery_content = (
-            f"Cronjob Response: {task_name}\n"
-            f"(job_id: {job_id})\n"
-            f"-------------\n\n"
-            f"{content}\n\n"
-            f"To stop or manage this job, send me a new message (e.g. \"stop reminder {task_name}\")."
+        language = os.environ.get("HERMES_LANGUAGE")
+        if not language and isinstance(user_cfg, dict):
+            display_cfg = user_cfg.get("display") or {}
+            if isinstance(display_cfg, dict):
+                language = display_cfg.get("language")
+        delivery_content = t(
+            "cron.delivery.wrapper",
+            lang=language,
+            task_name=task_name,
+            job_id=job_id,
+            content=content,
         )
     else:
         delivery_content = content
@@ -2332,6 +2354,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
     from gateway.platforms.base import BasePlatformAdapter
     media_files, cleaned_delivery_content = BasePlatformAdapter.extract_media(delivery_content)
     media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
+    _, cleaned_unwrapped_content = BasePlatformAdapter.extract_media(content)
 
     # Resolve the delivery-mirror gate ONCE (default off). When on, each
     # successful delivery is also appended to the target chat's gateway session
@@ -2394,6 +2417,11 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
             logger.warning("Job '%s': %s", job["id"], msg)
             delivery_errors.append(msg)
             continue
+        target_delivery_content = _cron_delivery_text_for_platform(
+            platform_name,
+            cleaned_delivery_content,
+            cleaned_unwrapped_content,
+        )
 
         from gateway.delivery import resolve_delivery_transport
 
@@ -2612,7 +2640,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 # standalone cron path lacked this, so DM-topic cron deliveries
                 # landed in the General topic or were rejected by Bot API 10.0
                 # (#22773).
-                text_to_send = cleaned_delivery_content.strip()
+                text_to_send = target_delivery_content.strip()
                 adapter_ok = True
                 timed_out = False
                 if text_to_send:
@@ -2852,7 +2880,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 delivery_errors.extend(target_errors)
                 continue
             # Standalone path: run the async send in a fresh event loop (safe from any thread)
-            coro = _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files)
+            coro = _send_to_platform(platform, pconfig, chat_id, target_delivery_content, thread_id=thread_id, media_files=media_files)
             try:
                 result = asyncio.run(coro)
             except RuntimeError as run_err:
@@ -2881,7 +2909,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 try:
                     pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
                     try:
-                        future = pool.submit(asyncio.run, _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files))
+                        future = pool.submit(asyncio.run, _send_to_platform(platform, pconfig, chat_id, target_delivery_content, thread_id=thread_id, media_files=media_files))
                         result = future.result(timeout=30)
                     finally:
                         pool.shutdown(wait=False)
