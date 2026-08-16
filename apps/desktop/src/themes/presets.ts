@@ -290,3 +290,5 @@ export const BUILTIN_THEME_LIST = Object.values(BUILTIN_THEMES)
 
 /** Skin used when nothing is persisted or the persisted name is retired. */
 export const DEFAULT_SKIN_NAME = 'nous'
+>>>>>>> 3f912ee1d (fix(desktop): restore BUILTIN_THEMES export to fix white screen)
+export const DEFAULT_SKIN_NAME = 'nous'
