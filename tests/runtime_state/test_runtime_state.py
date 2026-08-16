@@ -12,6 +12,7 @@ import pytest
 from runtime_state import (
     DEFAULT_RETRY_CONFIG,
     INVALID_PROFILE_REFERENCE,
+    INVALID_TRANSITION,
     MIGRATION_1_CHECKSUM,
     NOT_FOUND,
     OWNER_MISMATCH,
@@ -172,6 +173,69 @@ def test_update_and_release_stamp_version_and_clear_owner(tmp_path):
             "WHERE profile_name = 'p' AND session_id = 'session'"
         ).fetchone()
         assert row == (None, 3, "completed", SCHEMA_VERSION)
+
+
+def test_same_state_retry_is_idempotent_without_advancing_version(tmp_path):
+    with RuntimeStateDB(tmp_path / "state.db") as db:
+        _insert_session(db, "p", "session")
+        claimed = cas_claim_owner(
+            db.connection, "session_state", "p", "session", "owner", 0
+        )
+
+        first = cas_update_columns(
+            db.connection,
+            "session_state",
+            "p",
+            "session",
+            "owner",
+            claimed.owner_version,
+            {"status": "active"},
+        )
+        retry = cas_update_columns(
+            db.connection,
+            "session_state",
+            "p",
+            "session",
+            "owner",
+            first.owner_version,
+            {"status": "active"},
+        )
+
+        assert first.success and retry.success
+        assert first.owner_version == retry.owner_version == claimed.owner_version
+
+
+def test_terminal_state_rejects_later_transition(tmp_path):
+    with RuntimeStateDB(tmp_path / "state.db") as db:
+        _insert_session(db, "p", "session")
+        claimed = cas_claim_owner(
+            db.connection, "session_state", "p", "session", "owner", 0
+        )
+        completed = cas_update_columns(
+            db.connection,
+            "session_state",
+            "p",
+            "session",
+            "owner",
+            claimed.owner_version,
+            {"status": "completed"},
+        )
+        rejected = cas_update_columns(
+            db.connection,
+            "session_state",
+            "p",
+            "session",
+            "owner",
+            completed.owner_version,
+            {"status": "failed"},
+        )
+
+        assert completed.success
+        assert not rejected.success and rejected.error == INVALID_TRANSITION
+        assert db.connection.execute(
+            "SELECT status, owner_version FROM session_state "
+            "WHERE profile_name = 'p' AND session_id = 'session'"
+        ).fetchone() == ("completed", completed.owner_version)
 
 
 def test_missing_row_is_not_found(tmp_path):
