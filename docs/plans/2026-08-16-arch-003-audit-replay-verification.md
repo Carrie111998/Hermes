@@ -1,6 +1,6 @@
 ---
 title: "ARCH-003: runtime-state audit and replay verification"
-status: DESIGN_REVIEW_REVISE_V2_PENDING
+status: DESIGN_REVIEW_REVISE_V3_PENDING
 date: 2026-08-16
 type: architecture
 ticket: ARCH-003
@@ -11,7 +11,7 @@ target_repo: hermes-agent
 
 ## Status
 
-DESIGN_REVIEW_REVISE_V2_PENDING
+DESIGN_REVIEW_REVISE_V3_PENDING
 
 This ticket is a design gate only. No source implementation, runtime-state
 migration, DGX database inspection, deployment, or automatic repair is
@@ -223,6 +223,25 @@ These corrections remain design-only and must be re-reviewed by the same
 authenticated Claude family, then by AGY on the final corrected packet. No
 implementation, migration, testing, DGX mutation, deployment, or repair is
 authorized.
+
+## Design review reconciliation v3
+
+The authenticated Claude re-review of reconciliation v2 closed all seven design
+questions and returned two bounded residual corrections:
+
+1. Define migration-time origin for entities that predate the journal. Choose
+   either atomic sealed baseline events per existing entity, including lifecycle
+   state, owner-version, initial sequence, and current digest-parameter
+   identifier, or explicitly make pre-journal entities permanently
+   non-verifiable until a later mutation establishes history. Add the matching
+   migration/compatibility test.
+2. Require event-stream and materialized-row reads within one read-only
+   transaction/snapshot. If snapshot consistency cannot be established, return
+   `UNKNOWN`, never `DRIFT`; add a concurrent-mutation replay test.
+
+These are the final design-only corrections currently identified by the same
+authenticated Claude family. No implementation, migration, live-state test,
+DGX mutation, deployment, or repair action is authorized.
 
 ## Planned implementation evidence
 
