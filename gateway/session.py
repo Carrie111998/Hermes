@@ -333,6 +333,11 @@ class SessionContext:
     session_id: str = ""
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
+
+    # Gateway-only logical working directory. This is intentionally not part
+    # of the rendered user context; it is carried through the task-local
+    # session binding to keep concurrent gateway sessions isolated.
+    cwd: str = ""
     
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -3985,5 +3990,8 @@ def build_session_context(
         context.session_id = session_entry.session_id
         context.created_at = session_entry.created_at
         context.updated_at = session_entry.updated_at
+        worktree = (session_entry.metadata or {}).get("hermes_worktree")
+        if isinstance(worktree, dict):
+            context.cwd = str(worktree.get("path") or "")
     
     return context

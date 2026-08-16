@@ -1571,47 +1571,18 @@ def _resolve_worktree_base(
         if _ref_exists(ref):
             logger.debug("worktree base: %s — using cached %s", reason, ref)
             return ref, f"{ref} (cached — {reason})"
-        return "HEAD", f"HEAD (local — {reason}, no cached {ref})"
+        return "", f"origin/main unavailable ({reason}, no cached {ref})"
 
-    # 1. Current branch's upstream, if it tracks one.
+    # All autonomous/gateway work starts from the repository's canonical
+    # integration line. Never inherit the caller's feature branch or local
+    # HEAD: that is how unrelated work leaks into agent PRs.
     try:
-        up = _git(["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"])
-        if up.returncode == 0:
-            upstream = up.stdout.strip()  # e.g. "origin/main"
-            if upstream and "/" in upstream:
-                remote, branch = upstream.split("/", 1)
-                return _refresh(remote, branch, upstream)
+        return _refresh("origin", "main", "origin/main")
     except Exception as e:
-        logger.debug("worktree base: upstream resolution failed: %s", e)
+        logger.debug("worktree base: origin/main resolution failed: %s", e)
 
-    # 2. Remote default branch (origin/HEAD).
-    try:
-        # Resolve the remote's default branch symref.
-        head_ref = _git(["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"])
-        default_ref = ""
-        if head_ref.returncode == 0:
-            default_ref = head_ref.stdout.strip().replace("refs/remotes/", "", 1)
-        if not default_ref:
-            # origin/HEAD not set locally; ask the remote (network — capped
-            # like the fetch so a stalled connection can't hang startup).
-            show = _git(["remote", "show", "origin"], timeout=max(fetch_timeout, 5))
-            for line in show.stdout.splitlines():
-                line = line.strip()
-                if line.startswith("HEAD branch:"):
-                    _branch = line.split(":", 1)[1].strip()
-                    # A remote with no default branch reports "(unknown)";
-                    # don't construct a bogus "origin/(unknown)" ref from it.
-                    if _branch and _branch != "(unknown)":
-                        default_ref = "origin/" + _branch
-                    break
-        if default_ref and "/" in default_ref:
-            remote, branch = default_ref.split("/", 1)
-            return _refresh(remote, branch, default_ref)
-    except Exception as e:
-        logger.debug("worktree base: default-branch resolution failed: %s", e)
-
-    # 3. Fall back to local HEAD (offline / no remote / detached).
-    return "HEAD", "HEAD (local — could not reach remote)"
+    # Strict isolation: falling back to local HEAD defeats the contract.
+    return "", "origin/main unavailable"
 
 
 def _setup_worktree(repo_root: str = None, sync_base: bool = True) -> Optional[Dict[str, str]]:
@@ -1663,13 +1634,13 @@ def _setup_worktree(repo_root: str = None, sync_base: bool = True) -> Optional[D
     except Exception as e:
         logger.debug("Could not update .gitignore: %s", e)
 
-    # Resolve the base ref. By default branch from the freshly-fetched remote
-    # tip so the worktree starts current with the project, not from the
-    # (possibly stale) local HEAD of the standalone clone (#10760 follow-up).
-    if sync_base:
-        base_ref, base_label = _resolve_worktree_base(repo_root)
-    else:
-        base_ref, base_label = "HEAD", "HEAD (local — worktree_sync disabled)"
+    # Always resolve the canonical remote base; sync_base is retained only for
+    # API compatibility and can no longer weaken the autonomous isolation rule.
+    base_ref, base_label = _resolve_worktree_base(repo_root)
+
+    if not base_ref:
+        logger.error("refusing worktree allocation: %s", base_label)
+        return None
 
     # Create the worktree. checkout.workers parallelizes the file
     # materialization (~6k files on this repo): 0.6s serial → ~0.2s with 8
@@ -1689,16 +1660,12 @@ def _setup_worktree(repo_root: str = None, sync_base: bool = True) -> Optional[D
             # If branching from the resolved remote ref failed for any reason
             # (e.g. a partial fetch left the ref unusable), retry from local
             # HEAD so worktree creation never hard-fails on a sync hiccup.
-            if base_ref != "HEAD":
+            if base_ref and base_ref != "HEAD":
                 logger.warning(
                     "worktree add from %s failed (%s); retrying from local HEAD",
                     base_ref, result.stderr.strip(),
                 )
-                base_ref, base_label = "HEAD", "HEAD (fallback — remote base failed)"
-                result = subprocess.run(
-                    ["git", "worktree", "add", str(wt_path), "-b", branch_name, base_ref],
-                    capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30, cwd=repo_root,
-                )
+                return None
             if result.returncode != 0:
                 print(f"\033[31m✗ Failed to create worktree: {result.stderr.strip()}\033[0m")
                 return None

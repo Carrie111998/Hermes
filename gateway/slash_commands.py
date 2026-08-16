@@ -159,6 +159,18 @@ class GatewaySlashCommandsMixin:
         # expiring session id before reset_session() rotates it.
         old_entry = self.session_store._entries.get(session_key)
 
+        if old_entry is not None:
+            try:
+                from gateway.worktree import cleanup_session_worktree
+                _old_worktree = (old_entry.metadata or {}).get("hermes_worktree")
+                if isinstance(_old_worktree, dict):
+                    _cleanup_result = await asyncio.to_thread(
+                        cleanup_session_worktree, _old_worktree, reason="session_reset"
+                    )
+                    logger.info("Gateway session worktree cleanup session=%s result=%s", old_entry.session_id, _cleanup_result)
+            except Exception as _worktree_exc:
+                logger.warning("Gateway session worktree cleanup failed for %s: %s", getattr(old_entry, "session_id", "<unknown>"), _worktree_exc)
+
         # Close tool resources on the old agent (terminal sandboxes, browser
         # daemons, background processes) before evicting from cache.
         # Guard with getattr because test fixtures may skip __init__.

@@ -13320,6 +13320,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 for key, entry in _expired_entries:
                     try:
                         try:
+                            from gateway.worktree import cleanup_session_worktree
+                            _expired_worktree = (entry.metadata or {}).get("hermes_worktree")
+                            if isinstance(_expired_worktree, dict):
+                                _cleanup_result = await asyncio.to_thread(
+                                    cleanup_session_worktree, _expired_worktree, reason="session_expired"
+                                )
+                                logger.info("Expired gateway session worktree cleanup session=%s result=%s", entry.session_id, _cleanup_result)
+                        except Exception as _worktree_exc:
+                            logger.warning("Expired gateway session worktree cleanup failed for %s: %s", entry.session_id, _worktree_exc)
+                        try:
+                            from hermes_cli.lifecycle import finalize_session
                             _parts = key.split(":")
                             _platform = _parts[2] if len(_parts) > 2 else ""
                             # Off-loop + bounded: plugin finalize hooks can
@@ -18466,6 +18477,44 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "session_id": session_entry.session_id,
                 "session_key": session_key,
             })
+
+        # CLI worktree isolation is configured globally via ``worktree: true``
+        # but the CLI startup path is not involved for gateway messages.
+        # Allocate once per durable gateway conversation and persist the
+        # binding so every later turn (including after a restart) returns to
+        # the same checkout. Failure is fatal: never fall back to the main
+        # checkout when isolation was requested.
+        _gateway_cfg = _load_gateway_config()
+        _worktree_enabled = bool(_gateway_cfg.get("worktree", False))
+        if _worktree_enabled:
+            from gateway.worktree import ensure_session_worktree
+
+            try:
+                _worktree_info = await asyncio.to_thread(
+                    ensure_session_worktree,
+                    session_entry,
+                    enabled=True,
+                    repo_root=str(
+                        ((_gateway_cfg.get("terminal") or {}).get("cwd") or "").strip()
+                    ) or None,
+                )
+            except Exception as _worktree_exc:
+                logger.error(
+                    "Gateway worktree allocation failed for session %s: %s",
+                    session_key,
+                    _worktree_exc,
+                    exc_info=True,
+                )
+                return (
+                    "⚠️ I could not start an isolated worktree for this session. "
+                    "No repository changes were run."
+                )
+            if _worktree_info:
+                await self.async_session_store.set_session_metadata(
+                    session_key,
+                    "hermes_worktree",
+                    _worktree_info,
+                )
         
         # Build session context
         context = build_session_context(source, self.config, session_entry)
@@ -23831,6 +23880,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             session_key=context.session_key,
             message_id=str(context.source.message_id) if context.source.message_id else "",
             profile=getattr(context.source, "profile", "") or "",
+            cwd=getattr(context, "cwd", "") or "",
             async_delivery=_async_delivery,
             cron_session="",
         )

@@ -733,6 +733,7 @@ class SignalAdapter(BasePlatformAdapter):
 
         # Parse timestamp from envelope data (milliseconds since epoch)
         ts_ms = envelope_data.get("timestamp", 0)
+        message_ts_ms = data_message.get("timestamp", ts_ms)
         if ts_ms:
             try:
                 timestamp = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc)
@@ -766,7 +767,20 @@ class SignalAdapter(BasePlatformAdapter):
         logger.debug("Signal: message from %s in %s: %s",
                       redact_phone(sender), chat_id[:20], (text or "")[:50])
 
+        await self._send_read_receipt(sender, int(message_ts_ms))
         await self.handle_message(event)
+
+    async def _send_read_receipt(self, sender: str, timestamp: int) -> None:
+        """Mark one accepted inbound message as read through signal-cli RPC."""
+        await self._rpc(
+            "sendReceipt",
+            {
+                "account": self.account,
+                "recipient": sender,
+                "targetTimestamp": timestamp,
+                "type": "read",
+            },
+        )
 
     def _remember_recipient_identifiers(self, number: Optional[str], service_id: Optional[str]) -> None:
         """Cache any number↔UUID mapping observed from Signal envelopes."""

@@ -417,7 +417,7 @@ _KNOWN_DELIVERY_PLATFORMS = frozenset({
     "telegram", "discord", "slack", "whatsapp", "signal",
     "matrix", "mattermost", "homeassistant", "dingtalk", "feishu",
     "wecom", "wecom_callback", "weixin", "sms", "email", "webhook", "bluebubbles",
-    "qqbot", "yuanbao",
+    "qqbot", "yuanbao", "pushover",
 })
 
 # Platforms that support a configured cron/notification home target, mapped to
@@ -2279,6 +2279,19 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
 
     Returns None on success, or an error string on failure.
     """
+    deliver_value = _normalize_deliver_value(job.get("deliver", "local"))
+    if deliver_value == "pushover":
+        try:
+            from cron.pushover_bridge import enqueue_notification, weather_envelope
+
+            outcome = enqueue_notification(weather_envelope(job, content))
+            logger.info("Job '%s': Pushover notification queued (%s)", job["id"], outcome)
+            return None
+        except Exception as exc:
+            msg = str(exc)
+            logger.error("Job '%s': Pushover notification failed: %s", job["id"], msg)
+            return msg
+
     targets = _resolve_delivery_targets(job)
     if not targets:
         deliver_value = _normalize_deliver_value(job.get("deliver", "local"))
@@ -3999,6 +4012,11 @@ def _preflight_check_delivery(job: dict) -> Optional[str]:
                 "delivery target. Fix the job's `deliver` value or configure "
                 "the platform's gateway credentials."
             )
+        if platform_name.lower() == "pushover":
+            # Pushover is a Cosmos-backed bridge target, not a gateway chat
+            # adapter; its credentials/config are validated by the bridge
+            # writer at delivery time.
+            continue
         if connected is None:
             try:
                 from gateway.config import load_gateway_config

@@ -356,6 +356,67 @@ class TestSignalAuthorization:
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_handle_envelope_sends_read_receipt_for_accepted_message(monkeypatch):
+    """Accepted inbound messages send a narrow JSON-RPC read receipt."""
+    from gateway.platforms.signal import SignalAdapter
+
+    adapter = SignalAdapter.__new__(SignalAdapter)
+    adapter.account = "+15550000000"
+    adapter._account_normalized = adapter.account
+    adapter.ignore_stories = False
+    adapter.group_allow_from = []
+    adapter.require_mention = False
+    adapter._recipient_uuid_by_number = {}
+    adapter._recipient_number_by_uuid = {}
+    adapter._sent_message_timestamps = {}
+    adapter._max_sent_message_timestamps = 100
+    adapter._remember_recipient_identifiers = lambda *_args: None
+    adapter.build_source = MagicMock(return_value=MagicMock())
+    adapter.handle_message = AsyncMock()
+    adapter._send_read_receipt = AsyncMock()
+
+    envelope = {
+        "sourceNumber": "+15550000001",
+        "sourceUuid": "11111111-1111-1111-1111-111111111111",
+        "sourceName": "Chief",
+        "timestamp": 1700000000999,
+        "dataMessage": {
+            "timestamp": 1700000000123,
+            "message": "hello",
+            "attachments": [],
+        },
+    }
+
+    await adapter._handle_envelope(envelope)
+
+    adapter._send_read_receipt.assert_awaited_once_with(
+        "+15550000001", 1700000000123
+    )
+    adapter.handle_message.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_send_read_receipt_uses_signal_rpc_contract(monkeypatch):
+    """Read receipts use signal-cli's sendReceipt JSON-RPC contract."""
+    from gateway.platforms.signal import SignalAdapter
+
+    adapter = _make_signal_adapter(monkeypatch, account="+155****4567")
+    adapter._rpc = AsyncMock()
+
+    await adapter._send_read_receipt("+155****0001", 1700000000123)
+
+    adapter._rpc.assert_awaited_once_with(
+        "sendReceipt",
+        {
+            "account": "+155****4567",
+            "recipient": "+155****0001",
+            "targetTimestamp": 1700000000123,
+            "type": "read",
+        },
+    )
+
+
 # send_image_file method (#5105)
 # ---------------------------------------------------------------------------
 
