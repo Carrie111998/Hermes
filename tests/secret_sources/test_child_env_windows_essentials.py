@@ -104,3 +104,35 @@ def test_op_child_env_still_withholds_unrelated_credentials(
     env = op._op_child_env("tok")
     assert "OPENAI_API_KEY" not in env
     assert env["OP_SERVICE_ACCOUNT_TOKEN"] == "tok"
+
+
+def test_run_secret_cli_child_writes_no_unexpanded_template_dir(
+    monkeypatch, tmp_path
+):
+    """End-to-end guard on the OUTCOME, not just the allowlist's contents.
+
+    ``run_secret_cli`` does not pin ``cwd``, so its child inherits the
+    caller's working directory.  If the allowlist ever drops an OS path var
+    again, a Windows child cannot expand the matching ``REG_EXPAND_SZ``
+    known-folder template and materialises it *literally* — e.g. a
+    ``%SystemDrive%\\ProgramData\\...`` tree — right there in the caller's cwd.
+
+    Asserting on any ``%NAME%``-shaped directory rather than on
+    ``%SystemDrive%`` specifically means this still fires if a *different*
+    variable goes missing later.
+
+    Reproduced on 2026-08-16: pre-fix, this spawn wrote
+    ``%SystemDrive%/ProgramData/Microsoft/Windows/Caches`` into the repo root.
+    The writer is the MSIX/WindowsApps-packaged Python — a non-packaged
+    interpreter never does this — so the check is meaningful only when
+    ``sys.executable`` is that build, and is a harmless no-op elsewhere.
+    """
+    monkeypatch.chdir(tmp_path)
+    sb.run_secret_cli([sys.executable, "-c", "pass"])
+
+    stray = [p.name for p in tmp_path.iterdir()
+             if p.is_dir() and p.name.startswith("%") and p.name.endswith("%")]
+    assert not stray, (
+        f"child materialised unexpanded env template(s) {stray} in its cwd — "
+        "an OS path var is missing from the run_secret_cli allowlist"
+    )
