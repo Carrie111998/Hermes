@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import errno
 import os
+import shlex
+import subprocess
 import stat
 from pathlib import Path
 
@@ -140,6 +142,57 @@ def test_exec_prefers_path_wrapper_over_checkout_argv0(tmp_path, xdg_home, monke
     assert str(checkout_script) not in exec_line
 
 
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX launcher probe uses /bin/sh")
+def test_generated_exec_survives_a_cold_desktop_path(tmp_path, xdg_home, monkeypatch):
+    root = _make_project(tmp_path)
+    checkout_script = _make_executable(root / "hermes", ENV_PYTHON_SHEBANG)
+    checkout_script.write_text(
+        ENV_PYTHON_SHEBANG + "print('desktop-ok')\n",
+        encoding="utf-8",
+    )
+
+    wrapper = tmp_path / "launcher-bin" / "hermes"
+    wrapper.parent.mkdir()
+    wrapper.write_text(
+        "#!/bin/sh\n"
+        f"exec {shlex.quote(lde.sys.executable)} "
+        f"{shlex.quote(str(checkout_script))} \"$@\"\n",
+        encoding="utf-8",
+    )
+    wrapper.chmod(0o755)
+
+    # A cold desktop PATH resolves env-python to this deliberately unusable
+    # interpreter. The persisted Exec must instead select the absolute wrapper,
+    # which pins the already-working interpreter before launch.
+    desktop_bin = tmp_path / "desktop-bin"
+    desktop_bin.mkdir()
+    poison_python = desktop_bin / "python3"
+    poison_python.write_text("#!/bin/sh\nexit 97\n", encoding="utf-8")
+    poison_python.chmod(0o755)
+
+    monkeypatch.setattr(lde.sys, "argv", [str(checkout_script), "desktop"])
+    monkeypatch.setenv("PATH", str(wrapper.parent))
+    monkeypatch.setattr(lde, "refresh_desktop_databases", lambda _dir: [])
+
+    entry = lde.install_desktop_entry(root)
+    exec_argv = shlex.split(_parse(entry.read_text(encoding="utf-8"))["Exec"])
+    cold_cwd = tmp_path / "cold-cwd"
+    cold_cwd.mkdir()
+    result = subprocess.run(
+        exec_argv,
+        cwd=cold_cwd,
+        env={"PATH": str(desktop_bin)},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert exec_argv[0] == str(wrapper.resolve())
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "desktop-ok\n"
+
+
 def test_exec_rejects_checkout_argv0_when_no_wrapper_on_path(tmp_path, xdg_home, monkeypatch):
     root = _make_project(tmp_path)
     checkout_script = _make_executable(root / "hermes", ENV_PYTHON_SHEBANG)
@@ -150,9 +203,9 @@ def test_exec_rejects_checkout_argv0_when_no_wrapper_on_path(tmp_path, xdg_home,
     entry = lde.install_desktop_entry(root)
     exec_line = _parse(entry.read_text(encoding="utf-8"))["Exec"]
 
-    # The checkout's bare launcher runs under `/usr/bin/env python3` with
-    # no venv shim, so a cold menu launch cannot import hermes_cli through
-    # it. Persisting it strands the entry permanently.
+    # The checkout's bare launcher runs under `/usr/bin/env python3`, so a
+    # cold menu launch can select a system interpreter without Hermes' venv
+    # dependencies. Persisting it strands the entry permanently.
     assert str(checkout_script) not in exec_line
     assert exec_line.endswith("-m hermes_cli.main desktop")
     assert Path(exec_line.split(" ")[0]).is_absolute()
@@ -207,8 +260,8 @@ def test_exec_rejects_env_python_wrapper_outside_the_checkout(tmp_path, xdg_home
     editable install, sits outside the checkout and so survives
     ``_is_inside_checkout`` — yet it still looks up ``python3`` on ``PATH``
     when it runs. A cold menu launch supplies the desktop session's
-    ``PATH``, not the shell's, and the interpreter it lands on need not
-    have Hermes on ``sys.path``. Rejecting by location alone is not enough.
+    ``PATH``, not the shell's, and can select an interpreter without Hermes'
+    venv dependencies. Rejecting by location alone is not enough.
     """
     root = _make_project(tmp_path)
     wrapper = _make_executable(tmp_path / "home" / "bin" / "hermes", ENV_PYTHON_SHEBANG)

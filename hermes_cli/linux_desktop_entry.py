@@ -61,10 +61,10 @@ def icon_path(project_root: Path) -> Path:
 def _is_inside_checkout(path: Optional[str], project_root: Optional[Path]) -> bool:
     """True when ``path`` lives inside the source checkout.
 
-    An entry point inside the checkout is the bare ``hermes`` launcher
-    script, not an installed wrapper. It runs under ``/usr/bin/env
-    python3`` and leans on the caller's interpreter and ``sys.path`` to
-    import ``hermes_cli``; a cold desktop-menu launch supplies neither.
+    An entry point inside the checkout is normally the bare ``hermes``
+    script, not an installed wrapper. Its ``/usr/bin/env python3`` shebang
+    can select a system interpreter without Hermes' venv dependencies in a
+    cold desktop-menu environment.
     """
     if not path or project_root is None:
         return False
@@ -81,7 +81,7 @@ def _is_env_python_wrapper(path: str) -> bool:
     A ``#!/usr/bin/env python3`` shebang defers the interpreter choice to
     whatever ``PATH`` holds when the script runs. The desktop session's
     ``PATH`` is not the shell's, so such a wrapper can land on a system
-    interpreter with no Hermes venv on ``sys.path`` — the same stranded
+    interpreter without Hermes' venv dependencies — the same stranded
     entry ``_is_inside_checkout`` guards against, reached by shebang
     instead of by location. A hand-written ``~/bin/hermes``, or a console
     script from a non-venv editable install, fails that way while sitting
