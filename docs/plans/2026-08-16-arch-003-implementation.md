@@ -1,6 +1,6 @@
 ---
 title: "ARCH-003 implementation plan: runtime-state audit and replay verification"
-status: IMPLEMENTATION_PLAN_REVISE_V14_PENDING
+status: IMPLEMENTATION_PLAN_REVISE_V15_PENDING
 date: 2026-08-16
 type: implementation-plan
 ticket: ARCH-003
@@ -186,12 +186,14 @@ metadata inside the same `BEGIN DEFERRED` snapshot as the event stream and
 materialized row.
 
 Add a materialized-row journal-writer generation marker and a monotonic
-`materialized_write_counter`. Every committed materialized-state mutation
-increments the counter at the CAS/database write guard, independently of
-whether journal emission succeeds; a database-level trigger or equivalent
-write guard must preserve this increment for any prior writer that can mutate
-the table. The mutation/genesis transaction records the counter before/after
-values in its event and updates the row marker. A row whose marker is older
+`materialized_write_counter`. The counter increments only when a committed
+mutation changes a member of the replay tuple, independently of whether
+journal emission succeeds. Non-replay-tuple-only updates do not increment it
+and remain outside the verifier's `CONSISTENT` claim. A database-level
+trigger restricted to the replay-tuple columns, with a value-change predicate,
+or an equivalent write guard must preserve this increment for any prior writer
+that can mutate those columns. The mutation/genesis transaction records the
+counter before/after values in its event and updates the row marker. A row whose marker is older
 than the current generation, or whose materialized counter is greater than the
 latest journaled counter for that entity, is `UNKNOWN`, never `DRIFT`. Every
 event's before-counter must equal the immediately preceding event's
@@ -289,6 +291,13 @@ this posture.
   cross-process maintenance RW lock before opening the SQLite WAL transaction;
   use `BEGIN IMMEDIATE` or equivalent before sequence allocation; release the
   shared lock only after commit or rollback.
+- Inside that write transaction, compare the materialized row's counter with
+  the latest journaled after-counter (or baseline sealed counter). For a
+  same-epoch ordinary mutation, a mismatch is a persisted counter gap:
+  abort with mutation-side `WRITE_ABORT` before changing replay state or
+  emitting an event. A strictly newer writer-epoch re-originating genesis is
+  the explicit exception; it starts a new selected replay epoch and supersedes
+  the prior gap as defined by Gate 3.
 - Use the caller's existing SQLite WAL connection and transaction for mutation
   and genesis events, update the materialized generation marker, and record the
   current generation in the event.
@@ -341,12 +350,12 @@ Implement a bounded verifier that:
   ignored after that O(1) metadata check, and counter continuity is enforced
   only from the selected start forward. This permits a newer-writer-epoch
   genesis after a baseline to re-originate the entity.
-- selects the valid baseline with the highest `sealed_through_seq`, ignores
-  events before it, and returns `UNKNOWN` for same-sequence tuple conflicts,
-  overlapping contradictory baselines, a baseline without a valid current
-  origin epoch, a stale generation marker, a materialized-write counter greater
-  than the latest journaled counter, or a materialized state advanced during a
-  generation with no current-generation event;
+- validates the selected baseline when one is the later replay-start candidate,
+  including highest `sealed_through_seq` selection, same-sequence tuple
+  conflicts, overlapping contradictory baselines, a baseline without a valid
+  current origin epoch, a stale generation marker, a materialized-write counter
+  greater than the latest journaled counter, or a materialized state advanced
+  during a generation with no current-generation event;
 - returns `UNKNOWN` with the corresponding closed reason code on empty history
   (`EMPTY_HISTORY`), snapshot failure, unsupported/newer versions, malformed
   history, unknown digest regime, key-check mismatch, verify-time key
@@ -394,8 +403,10 @@ Add deterministic tests for:
 - owner-version-only mutation;
 - mutation/genesis journal failure rolling back materialized state with
   mutation-side `WRITE_ABORT`;
-- any ordinary mutation attempted in downgrade-unsafe mode or against a
-  persisted counter-gap entity returns mutation-side `WRITE_ABORT`;
+- any same-epoch ordinary mutation attempted in downgrade-unsafe mode or
+  against a persisted counter-gap entity returns mutation-side `WRITE_ABORT`;
+  a strictly newer writer-epoch re-originating genesis is exempt and
+  supersedes the gap at the later replay start;
 - SQLite WAL, fixed `SQLITE_BUSY_TIMEOUT = 5s`, `BEGIN IMMEDIATE`, and
   read-only WAL preconditions;
 - `LOCK_ACQUIRE_TIMEOUT = 5s`, `SQLITE_BUSY_TIMEOUT = 5s`,
@@ -616,6 +627,26 @@ DGX changes, deployment, repair, or event-sourcing. The corrected plan must
 return to the same authenticated Claude reviewer family and then to AGY on the
 identical packet.
 
+## Implementation-plan review reconciliation v14
+
+The v14 authenticated Claude Opus review returned `REVISE` with five bounded
+plan-text corrections. The corrections are incorporated above:
+
+1. The materialized-write counter is limited to replay-tuple changes; non-replay
+   updates remain outside the verifier claim.
+2. Same-epoch mutation counter-gap detection is an in-transaction comparison
+   before replay-state mutation and returns `WRITE_ABORT`.
+3. A strictly newer writer-epoch genesis is explicitly exempt from that abort
+   and supersedes the prior gap at the later replay start.
+4. Acceptance coverage now includes v13.
+5. The replay-start baseline validation is merged with the later-of-baseline-or-
+   genesis selection rule.
+
+These remain plan-only corrections and do not authorize source edits, tests,
+DGX changes, deployment, repair, or event-sourcing. The corrected plan must
+return to the same authenticated Claude reviewer family and then to AGY on the
+identical packet.
+
 ## Acceptance criteria
 
 ARCH-003 implementation is ready for its delivery gates only when:
@@ -644,7 +675,7 @@ ARCH-003 implementation is ready for its delivery gates only when:
   retention job; entities beyond the replay limit remain UNKNOWN in this ticket,
   and the 100,000-event/100 MiB per-profile threshold is a documented follow-up
   operational review, not an in-ticket operator gate;
-- reconciliation v1 and v5-v12 items are incorporated into the normative
+- reconciliation v1 and v5-v13 items are incorporated into the normative
   Gates 0-4 text (with v2-v4 explicitly folded into the v1/v4 text), and this
   merged plan revision receives the same-family re-review;
 - all focused and relevant tests pass;
@@ -679,6 +710,10 @@ ARCH-003 implementation is ready for its delivery gates only when:
   explicit WRITE_ABORT recovery boundary, and deduplicated schema contract.
 - v13: later-start selection for baseline/genesis re-origination, shared
   mutation-time KEY_UNAVAILABLE semantics, and complete acceptance coverage.
+- v14: replay-tuple-only counter scope, in-transaction gap refusal, explicit
+  newer-epoch genesis exception, and merged replay-start validation.
+- v14: replay-tuple-only counter scope, in-transaction gap refusal, explicit
+  newer-epoch genesis exception, and merged replay-start validation.
 
 
 ## Non-goals
