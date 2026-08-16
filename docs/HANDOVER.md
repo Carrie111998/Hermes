@@ -9,7 +9,7 @@
 
 - **Purpose:** Hermes is a private-first agent gateway and CLI with memory, skills, scheduled jobs, delegated agents, and messaging-platform adapters.
 - **Repository:** <https://github.com/cwliao/hermes-agent>
-- **Canonical mainline:** `main` at `91ae4a7f7a73a4c331e2f5dd018b7ce2ca5c03a9` (PR #24).
+- **Canonical mainline:** `main` HEAD `2fd14c5186bc9494182a72975873dc2d2561b1fe` (handover docs refresh); code merge remains `91ae4a7f7a73a4c331e2f5dd018b7ce2ca5c03a9` (PR #24).
 - **DGX runtime:** configured target, live source checkout `/home/cwliao/.hermes/hermes-agent`, user service `hermes-gateway.service`.
 - **In scope:** Hermes CLI, gateway, runtime state, platform adapters, CI, skills, documentation, and explicitly ticketed deployment work.
 - **Out of scope by default:** laptop files as handover sources, unrelated DGX services, credentials/tokens, and external marketplace or SkillClaw changes without a separate reviewed ticket.
