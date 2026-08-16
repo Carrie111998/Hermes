@@ -771,6 +771,108 @@ class TestReapUnsupervisedGatewayOrphansWindows:
         assert killed_pids == []  # nothing was killed
 
 
+class TestReapUnsupervisedGatewayOrphansWindowsDrain:
+    """The orphan reaper must let a Windows orphan consume its marker.
+
+    ``_reap_unsupervised_gateway_orphans()`` writes the planned-stop marker
+    for every orphan and then signals it — and it is not POSIX-only, so on
+    Windows that signal is TerminateProcess and the marker it just wrote is
+    destroyed before the gateway's planned-stop watcher can poll for it.
+
+    The corrected sequence spends no new time budget. POSIX is SIGTERM (the
+    handler drains) -> 5s survivor wait -> SIGKILL; Windows now writes the
+    marker, skips the immediate kill, and reuses that same 5s survivor
+    window as the drain before escalating.
+
+    Host-agnostic: ``is_windows()`` is monkeypatched, so these run on POSIX CI.
+    """
+
+    @staticmethod
+    def _arrange_reap(monkeypatch, orphan_pid, *, windows, alive):
+        """Reduce the reaper to a single orphan; returns the ordered event log."""
+        events = []
+
+        monkeypatch.setattr(gateway, "is_windows", lambda: windows)
+        monkeypatch.setattr(gateway, "is_macos", lambda: False)
+        monkeypatch.setattr(gateway, "supports_systemd_services", lambda: False)
+        monkeypatch.setattr(
+            gateway, "_windows_scheduled_task_running", lambda _name: False
+        )
+        monkeypatch.setattr("gateway.status.get_running_pid", lambda: None)
+        monkeypatch.setattr(gateway, "_get_service_pids", lambda: set())
+        monkeypatch.setattr(
+            gateway, "_reaper_candidate_is_supervisor_owned", lambda _pid: False
+        )
+        monkeypatch.setattr(
+            gateway,
+            "find_gateway_pids",
+            lambda exclude_pids=None: [
+                p for p in [orphan_pid] if p not in (exclude_pids or set())
+            ],
+        )
+        monkeypatch.setattr(
+            "gateway.status.write_planned_stop_marker",
+            lambda marker_pid: events.append(("marker", marker_pid)),
+        )
+        monkeypatch.setattr(
+            gateway.os,
+            "kill",
+            lambda kill_pid, sig: events.append(("os.kill", kill_pid, sig)),
+        )
+        monkeypatch.setattr(
+            "gateway.status.terminate_pid",
+            lambda term_pid, force=False: events.append(("terminate", term_pid, force)),
+        )
+        monkeypatch.setattr("time.sleep", lambda _s: None)
+        monkeypatch.setattr("gateway.status._pid_exists", lambda _pid: alive)
+        if alive:
+            # Advance the clock on every read so the survivor window closes.
+            clock = {"now": 0.0}
+
+            def _monotonic():
+                clock["now"] += 1.0
+                return clock["now"]
+
+            monkeypatch.setattr("time.monotonic", _monotonic)
+        else:
+            monkeypatch.setattr("time.monotonic", lambda: 1.0)
+        return events
+
+    def test_windows_orphan_is_asked_to_drain_not_terminated(self, monkeypatch):
+        """An orphan that honours the marker exits without ever being killed."""
+        events = self._arrange_reap(monkeypatch, 99998, windows=True, alive=False)
+
+        assert gateway._reap_unsupervised_gateway_orphans() is True
+        # Pre-fix this reads [("marker", ...), ("os.kill", ..., SIGTERM)] —
+        # the marker and the TerminateProcess that makes it unreadable.
+        assert events == [("marker", 99998)]
+
+    def test_windows_orphan_outliving_the_window_is_force_killed(self, monkeypatch):
+        """The survivor window is the escalation, not a reason to skip it."""
+        events = self._arrange_reap(monkeypatch, 99998, windows=True, alive=True)
+
+        assert gateway._reap_unsupervised_gateway_orphans() is True
+        kinds = [event[0] for event in events]
+        assert "marker" in kinds and "terminate" in kinds
+        assert kinds.index("marker") < kinds.index("terminate")
+        # SIGKILL does not exist on Windows and the SIGTERM fallback is
+        # another bare TerminateProcess; escalate with the backend's
+        # bounded tree-kill instead.
+        assert ("terminate", 99998, True) in events
+        assert not any(event[0] == "os.kill" for event in events)
+
+    def test_posix_orphan_reap_is_unchanged(self, monkeypatch):
+        """POSIX still signals immediately — a guard on the untouched path."""
+        events = self._arrange_reap(monkeypatch, 99998, windows=False, alive=False)
+
+        assert gateway._reap_unsupervised_gateway_orphans() is True
+        assert ("marker", 99998) in events
+        assert ("os.kill", 99998, signal.SIGTERM) in events
+        kinds = [event[0] for event in events]
+        assert kinds.index("marker") < kinds.index("os.kill")
+        assert not any(event[0] == "terminate" for event in events)
+
+
 class TestReaperCandidateIsSupervisorOwned:
     """Regression for the Windows pidfile-less supervisor-owned case (#83683).
 
