@@ -510,6 +510,81 @@ def _patch_httpx(monkeypatch, response):
     monkeypatch.setattr("hermes_cli.auth.httpx.Client", _factory)
 
 
+def test_device_code_poll_retries_transient_http_error(monkeypatch):
+    """One transport failure must not orphan an already-issued device code."""
+    import time
+
+    import hermes_cli.auth as auth
+
+    client_outcomes = [
+        [
+            _StubHTTPResponse(
+                200,
+                {
+                    "user_code": "ABCD-EFGH",
+                    "device_auth_id": "device-auth-id",
+                    "interval": "3",
+                },
+            )
+        ],
+        [
+            auth.httpx.ConnectTimeout("slow TLS handshake"),
+            _StubHTTPResponse(
+                200,
+                {
+                    "authorization_code": "authorization-code",
+                    "code_verifier": "code-verifier",
+                },
+            ),
+        ],
+        [
+            _StubHTTPResponse(
+                200,
+                {
+                    "access_token": "access-token",
+                    "refresh_token": "refresh-token",
+                },
+            )
+        ],
+    ]
+    poll_attempts = []
+
+    class _SequencedClient:
+        def __init__(self, outcomes):
+            self._outcomes = outcomes
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def post(self, url, **kwargs):
+            outcome = self._outcomes.pop(0)
+            if url.endswith("/api/accounts/deviceauth/token"):
+                poll_attempts.append(url)
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+
+    def _client_factory(*args, **kwargs):
+        return _SequencedClient(client_outcomes.pop(0))
+
+    ticks = iter(range(10))
+    monkeypatch.setattr(auth.httpx, "Client", _client_factory)
+    monkeypatch.setattr(time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(time, "monotonic", lambda: next(ticks))
+
+    credentials = auth._codex_device_code_login()
+
+    assert credentials["tokens"] == {
+        "access_token": "access-token",
+        "refresh_token": "refresh-token",
+    }
+    assert len(poll_attempts) == 2
+    assert client_outcomes == []
+
+
 
 
 def test_refresh_429_classified_as_quota_not_auth_failure(monkeypatch):
@@ -607,7 +682,6 @@ def _patch_httpx_post(monkeypatch, responses):
             return next(seq)
 
     monkeypatch.setattr("hermes_cli.auth.httpx.Client", lambda *a, **k: _FakeClient())
-
 
 
 
