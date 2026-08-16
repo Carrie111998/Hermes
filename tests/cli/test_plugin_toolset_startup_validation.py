@@ -154,6 +154,54 @@ def test_untracked_tool_prewarm_discovery_finishes_before_validation(
         registry.deregister(plugin_tool)
 
 
+def test_completed_discovery_skips_redundant_join(monkeypatch):
+    """A completed background discovery must not force a redundant join."""
+    plugin_toolset = "completed_discovery_tools"
+    plugin_tool = "completed_discovery_health"
+
+    import hermes_cli.plugins as plugins_mod
+    from tools.registry import registry
+
+    manager = plugins_mod.PluginManager()
+    manager._discovered = True
+    registry.register(
+        name=plugin_tool,
+        toolset=plugin_toolset,
+        schema={
+            "name": plugin_tool,
+            "description": "Read-only health check",
+            "parameters": {"type": "object", "properties": {}},
+        },
+        handler=lambda _args, **_kwargs: '{"status":"ok"}',
+    )
+    manager._plugin_tool_names.add(plugin_tool)
+    monkeypatch.setattr(plugins_mod, "_plugin_manager", manager)
+    monkeypatch.setattr(plugins_mod, "_background_discovery_thread", None)
+
+    def fail_on_join(*args, **kwargs):
+        raise AssertionError("validation joined discovery although it had completed")
+
+    monkeypatch.setattr(plugins_mod, "_join_background_discovery", fail_on_join)
+
+    try:
+        import cli as cli_mod
+
+        warnings = []
+        monkeypatch.setattr(
+            cli_mod.HermesCLI,
+            "_console_print",
+            lambda _self, message, *_args, **_kwargs: warnings.append(str(message)),
+        )
+        cli_mod.HermesCLI(
+            toolsets=[plugin_toolset],
+            compact=True,
+            max_turns=1,
+        )
+        assert not any("Unknown toolsets" in msg for msg in warnings)
+    finally:
+        registry.deregister(plugin_tool)
+
+
 def test_config_selected_plugin_toolset_waits_for_discovery_before_warning(
     tmp_path, monkeypatch, caplog
 ):
