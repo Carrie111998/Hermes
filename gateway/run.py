@@ -159,6 +159,17 @@ _TELEGRAM_NOISY_STATUS_RE = re.compile(
 # public group, so internal provider/model/config details leaked to third
 # parties. Suppressed only on group scopes; DMs and operator surfaces
 # (CLI/TUI/local) keep the notice.
+#
+# Why this is a text rule while _deliver_platform_notice gates on scope
+# alone: an AgentNotice is operator-directed by construction, so that path
+# can suppress the whole class in a group. The status stream is mixed — the
+# same callback carries progress and errors chat participants legitimately
+# see — so it needs a rule that separates the operator-directed subset out of
+# it. The two gates are not redundant and the scope gate is the stronger of
+# the two; a status that stops embedding the CLI opt-out would fall out of
+# this one, which is why the tests build the notice from the emit-site helper
+# (agent_init._build_codex_gpt5_autoraise_notice) instead of a literal, so a
+# rewording fails a test rather than silently reopening the leak.
 _GATEWAY_OPERATOR_STATUS_NOTICE_RE = re.compile(
     r"\bhermes\s+config\s+set\b",
     re.IGNORECASE,
@@ -408,12 +419,11 @@ def _source_is_group_scope(source: Any) -> bool:
 
     Reuses the DM-vs-group mapping from ``gateway.slash_access`` so both
     gates classify a chat identically. Anything that is not an explicit DM
-    counts as group — for operator-facing deliveries an unknown chat type
-    must fail closed (suppress) rather than post to a possibly-public chat.
+    counts as group — for operator-facing deliveries an unknown or empty
+    chat type must fail closed (suppress) rather than post to a
+    possibly-public chat.
     """
-    from gateway.slash_access import _scope_for_chat_type
-
-    return _scope_for_chat_type(getattr(source, "chat_type", None)) == "group"
+    return scope_for_chat_type(getattr(source, "chat_type", None)) == "group"
 
 
 def _adapter_sends_truly_private_notice(adapter: Any) -> bool:
@@ -424,6 +434,15 @@ def _adapter_sends_truly_private_notice(adapter: Any) -> bool:
     that fallback posts the notice publicly, which is exactly the leak the
     group gate exists to prevent, so the default must not count as private.
     Only a genuine override (e.g. Slack ephemerals) qualifies.
+
+    The contract the identity check assumes: ``send_private_notice`` is a
+    plain method on the class, so "is the base function" means "no override".
+    A subclass that binds a real private implementation as an *instance*
+    attribute is not seen here (the class lookup still finds the base) and a
+    property/descriptor on the base compares equal for non-overriders — both
+    drifts resolve to "not private", which suppresses. A mistake here costs a
+    notice nobody receives, never a group leak, but anything that changes how
+    the base declares this method has to revisit this function.
     """
     impl = getattr(type(adapter), "send_private_notice", None)
     if impl is None:
@@ -2590,6 +2609,7 @@ from gateway.session_state import (
 )
 from gateway.authz_mixin import GatewayAuthorizationMixin
 from gateway.kanban_watchers import GatewayKanbanWatchersMixin
+from gateway.slash_access import scope_for_chat_type
 from gateway.slash_commands import GatewaySlashCommandsMixin
 from gateway.turn_context import TurnContext
 from gateway.platforms.base import (

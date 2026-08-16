@@ -95,6 +95,36 @@ async def test_whatsapp_group_public_notice_is_suppressed():
     adapter.send_private_notice.assert_not_awaited()
 
 
+@pytest.mark.parametrize("chat_type", ["", None, "channel", "thread", "supergroup"])
+def test_unknown_or_empty_chat_type_is_group_scope(chat_type):
+    """Only an explicit DM value may take the DM path — everything else
+    fails closed, including an adapter that never set a chat type."""
+    from gateway.run import _source_is_group_scope
+
+    source = SessionSource(
+        platform=Platform.SLACK,
+        chat_id="C123",
+        chat_type=chat_type,
+        user_id="U123",
+    )
+
+    assert _source_is_group_scope(source) is True
+
+
+@pytest.mark.asyncio
+async def test_unknown_chat_type_notice_is_suppressed():
+    """The fail-closed classification reaches delivery, not just the helper."""
+    runner, adapter = _make_runner()
+    source = SessionSource(
+        platform=Platform.SLACK, chat_id="C123", chat_type="", user_id="U123"
+    )
+
+    await runner._deliver_platform_notice(source, "📬 No home channel is set…")
+
+    adapter.send.assert_not_awaited()
+    adapter.send_private_notice.assert_not_awaited()
+
+
 @pytest.mark.asyncio
 async def test_dm_public_notice_still_delivered():
     """DM delivery is unchanged — the 'public' chat IS the operator."""
