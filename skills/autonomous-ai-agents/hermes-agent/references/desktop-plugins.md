@@ -54,9 +54,10 @@ The ONLY import surface is `@hermes/plugin-sdk` (plus `react` /
 `react/jsx-runtime`, which resolve to the app's own React — write UI with
 `jsx()` calls, not JSX syntax; the file is not compiled).
 
-- `host.state.*` — readonly reactive atoms: `activeSessionId`, `cwd`,
-  `gateway`, `model`, `profile`, `viewport`. Read with `.get()` in handlers,
-  `useValue(atom)` in components.
+- `host.state.*` — readonly reactive atoms: `activeSessionId`,
+  `busyBySession`, `cwd`, `gateway` (socket state, not turn-busy), `model`,
+  `profile`, `viewport`. Read with `.get()` in handlers, `useValue(atom)` in
+  components.
 - `host.request(method, params)` — gateway JSON-RPC (sessions, config,
   skills, cron — everything the app uses).
 - `host.onEvent(type, fn)` — live gateway events (`'*'` for all). Returns a

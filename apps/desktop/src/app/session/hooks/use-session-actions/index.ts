@@ -704,6 +704,10 @@ export function useSessionActions({
       if (!takeWarmCache()) {
         setActiveSessionId(null)
         activeSessionIdRef.current = null
+        // History load is not turn-busy. Drop the previous session's leftover
+        // lock so focusing this session cannot inherit another chat's run.
+        busyRef.current = false
+        setBusy(false)
 
         if (!resumedSameSelectedSession) {
           setMessages([])
@@ -982,9 +986,10 @@ export function useSessionActions({
         setMessages([])
       }
 
-      // A history load is not a live turn. Toggling busy here and again in the
-      // finally block re-renders the thread viewport after it has loaded.
-      busyRef.current = true
+      // A history load is not a live turn. Do not mark the incoming session
+      // busy — running ≠ loading, and a leftover true locked the composer.
+      busyRef.current = false
+      setBusy(false)
       setAwaitingResponse(false)
       clearNotifications()
       setSelectedStoredSessionId(storedSessionId)

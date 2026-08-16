@@ -18,7 +18,7 @@
  *  - `ui.*` — the design language, so plugin UI looks native by default.
  */
 
-import { atom, type ReadableAtom } from 'nanostores'
+import { atom, computed, type ReadableAtom } from 'nanostores'
 
 import { openSession, type OpenSessionIntent } from '@/app/open-session'
 import { $narrowViewport } from '@/components/pane-shell/tree/store'
@@ -28,6 +28,7 @@ import { $gateway, ensureGatewayForAgent, openGatewayForAgent, openGatewayForPro
 import { notify, notifyError } from '@/store/notifications'
 import { $activeGatewayProfile, ensureGatewayProfile, newSessionInProfile, setShowAllProfiles } from '@/store/profile'
 import { $activeSessionId, $currentCwd, $currentModel, $gatewayState } from '@/store/session'
+import { $sessionStates } from '@/store/session-states'
 import { runGatewayRestart } from '@/store/system-actions'
 
 // -- state: readonly views over the app's live atoms -------------------------
@@ -48,6 +49,17 @@ const readViewport = (): ViewportRect => ({
   narrow: $narrowViewport.get()
 })
 
+/** Runtime session id → mid-turn. Not gateway socket state. */
+const $busyBySession = computed($sessionStates, states => {
+  const map: Record<string, boolean> = {}
+
+  for (const [id, state] of Object.entries(states)) {
+    map[id] = Boolean(state.busy)
+  }
+
+  return map
+})
+
 const $viewport = atom<ViewportRect>(readViewport())
 
 if (typeof window !== 'undefined') {
@@ -60,9 +72,11 @@ export const host = {
   state: {
     /** Runtime id of the active chat session (null on a fresh draft). */
     activeSessionId: readonlyAtom<null | string>($activeSessionId),
+    /** Runtime session id → mid-turn. Not socket state; see `gateway`. */
+    busyBySession: readonlyAtom<Record<string, boolean>>($busyBySession),
     /** Active workspace cwd ('' when detached). */
     cwd: readonlyAtom<string>($currentCwd),
-    /** Gateway socket state: 'idle' | 'connecting' | 'open' | …. */
+    /** Gateway socket state: 'idle' | 'connecting' | 'open' | …. Not turn-busy. */
     gateway: readonlyAtom<string>($gatewayState),
     /** Current main model slug. */
     model: readonlyAtom<string>($currentModel),
