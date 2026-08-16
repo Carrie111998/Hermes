@@ -2564,7 +2564,15 @@ class SlackAdapter(BasePlatformAdapter):
         metadata: Optional[Dict[str, Any]] = None,
         fallback_text: Optional[str] = None,
     ) -> SendResult:
-        """Start or update a Slack-native plan/task progress stream."""
+        """Start or update a Slack-native plan/task progress stream.
+
+        ``fallback_text`` is accepted for call-site compatibility but is
+        deliberately NOT used: chat.appendStream rejects markdown_text
+        alongside chunks (#87743), and the gateway caller keeps its own
+        editable-text fallback rail (``_send_or_edit_fallback``) that
+        activates when this native call itself fails — so the text has no
+        legitimate place on the append payload.
+        """
         if not self._app:
             return SendResult(success=False, error="Not connected")
         if not tasks:
