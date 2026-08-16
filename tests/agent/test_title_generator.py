@@ -108,6 +108,178 @@ class TestGenerateTitle:
         assert captured[0][0] == "title generation"
         assert captured[0][1] is exc
 
+    def test_falls_back_to_json_object_when_json_schema_rejected(self):
+        """Providers without structured output (DeepSeek: 400 on json_schema)
+        must get a json_object retry with thinking pinned off instead of a
+        failed title."""
+        calls = []
+
+        def mock_call_llm(**kwargs):
+            calls.append(kwargs)
+            if len(calls) == 1:
+                raise RuntimeError(
+                    "Error code: 400 - 'This response_format type is "
+                    "unavailable now'"
+                )
+            resp = MagicMock()
+            resp.choices = [MagicMock()]
+            resp.choices[0].message.content = '{"title": "Fix login button"}'
+            return resp
+
+        with patch("agent.title_generator.call_llm", side_effect=mock_call_llm):
+            title = generate_title("fix login button")
+
+        assert title == "Fix login button"
+        assert len(calls) == 2
+        # First attempt keeps the ideal json_schema constraint.
+        assert calls[0]["extra_body"] == {
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "session_title",
+                    "strict": True,
+                    "schema": {
+                        "type": "object",
+                        "properties": {"title": {"type": "string"}},
+                        "required": ["title"],
+                        "additionalProperties": False,
+                    },
+                },
+            }
+        }
+        # Retry loosens to json_object and disables thinking so a
+        # default-on reasoning model doesn't burn the token budget.
+        assert calls[1]["extra_body"] == {
+            "response_format": {"type": "json_object"},
+            "thinking": {"type": "disabled"},
+        }
+
+    def test_falls_back_to_unconstrained_when_json_object_also_rejected(self):
+        """A provider that rejects both json_schema and json_object still
+        titles via the prompt's own JSON instruction."""
+        calls = []
+
+        def mock_call_llm(**kwargs):
+            calls.append(kwargs)
+            if len(calls) < 3:
+                raise RuntimeError(
+                    "Error code: 400 - 'This response_format type is "
+                    "unavailable now'"
+                )
+            resp = MagicMock()
+            resp.choices = [MagicMock()]
+            resp.choices[0].message.content = (
+                'Here is the title: {"title": "Triage dashboard alerts"}'
+            )
+            return resp
+
+        with patch("agent.title_generator.call_llm", side_effect=mock_call_llm):
+            title = generate_title("triage alerts")
+
+        assert title == "Triage dashboard alerts"
+        assert len(calls) == 3
+        # Last rung: no response_format at all, thinking still pinned off.
+        assert calls[2]["extra_body"] == {"thinking": {"type": "disabled"}}
+
+    def test_format_ladder_does_not_retry_unrelated_failures(self):
+        """Auth/quota/network errors must not burn format-retry attempts."""
+        calls = []
+
+        def mock_call_llm(**kwargs):
+            calls.append(kwargs)
+            raise RuntimeError(
+                "Error code: 403 - usage limit reached for this billing cycle"
+            )
+
+        captured = []
+        with patch("agent.title_generator.call_llm", side_effect=mock_call_llm):
+            result = generate_title(
+                "question", failure_callback=lambda t, e: captured.append(t)
+            )
+
+        assert result is None
+        assert len(calls) == 1
+        assert captured == ["title generation"]
+
+    def test_format_ladder_reports_failure_after_all_rungs(self):
+        """When every rung is rejected on format grounds, the failure
+        callback fires exactly once with the last exception."""
+        calls = []
+
+        def mock_call_llm(**kwargs):
+            calls.append(kwargs)
+            raise RuntimeError(
+                "Error code: 400 - 'This response_format type is unavailable now'"
+            )
+
+        captured = []
+        with patch("agent.title_generator.call_llm", side_effect=mock_call_llm):
+            result = generate_title(
+                "question", failure_callback=lambda t, e: captured.append(t)
+            )
+
+        assert result is None
+        assert len(calls) == 3
+        assert len(captured) == 1
+        assert captured[0] == "title generation"
+
+    def test_catches_vllm_guided_grammar_rejection(self):
+        """vLLM gateways translate json_schema into an uncompilable
+        guided_grammar; the error never mentions response_format, but the
+        grammar/xgrammar marker identifies it as a format rejection."""
+        calls = []
+
+        def mock_call_llm(**kwargs):
+            calls.append(kwargs)
+            if len(calls) == 1:
+                raise RuntimeError(
+                    "Error code: 400 - {'error': {'message': "
+                    "'guided_grammar has compile_grammar_error: "
+                    "No module named xgrammar'}}"
+                )
+            resp = MagicMock()
+            resp.choices = [MagicMock()]
+            resp.choices[0].message.content = '{"title": "Fix grammar"}'
+            return resp
+
+        with patch("agent.title_generator.call_llm", side_effect=mock_call_llm):
+            title = generate_title("debug grammar issue")
+
+        assert title == "Fix grammar"
+        assert len(calls) == 2
+
+    def test_thinking_off_retries_send_reasoning_config(self):
+        """Retried calls must send reasoning_config={'enabled': False} so
+        that provider profiles (e.g. DeepSeekProfile) which override
+        extra_body.thinking don't silently re-enable thinking and burn the
+        64-token budget on reasoning_content. extra_body.thinking alone is
+        overwritten by the profile — reasoning_config is the channel the
+        profile reads to decide enabled/disabled."""
+        calls = []
+
+        def mock_call_llm(**kwargs):
+            calls.append(kwargs)
+            if len(calls) == 1:
+                raise RuntimeError(
+                    "Error code: 400 - 'This response_format type is "
+                    "unavailable now'"
+                )
+            resp = MagicMock()
+            resp.choices = [MagicMock()]
+            resp.choices[0].message.content = '{"title": "Fix login"}'
+            return resp
+
+        with patch("agent.title_generator.call_llm", side_effect=mock_call_llm):
+            generate_title("fix login")
+
+        assert len(calls) == 2
+        # First attempt: no reasoning_config (thinking not pinned off).
+        assert "reasoning_config" not in calls[0]
+        # Retry: reasoning_config must be {"enabled": False} AND
+        # extra_body.thinking must be {"type": "disabled"} — both channels.
+        assert calls[1]["reasoning_config"] == {"enabled": False}
+        assert calls[1]["extra_body"]["thinking"] == {"type": "disabled"}
+
 
 
 
