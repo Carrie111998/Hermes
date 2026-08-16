@@ -1005,8 +1005,12 @@ def _supports_media_in_tool_results(provider: str, model: str) -> bool:
     if p in {"anthropic", "claude", "anthropic-direct"}:
         return True
 
-    # OpenAI Chat Completions and Responses
-    if p in {"openai", "openai-chat", "openai-codex", "azure-openai"}:
+    # OpenAI Chat Completions and Responses. ``openai-api`` is the api-key
+    # provider for the same api.openai.com endpoints that ``openai-codex``
+    # reaches by subscription — same overlay transport (``codex_responses``),
+    # same catalog. Omitting it here silently demoted every vision call on an
+    # api-key OpenAI setup to the auxiliary-LLM text path.
+    if p in {"openai", "openai-api", "openai-chat", "openai-codex", "azure-openai"}:
         return True
 
     # Gemini — gate on model name; older Gemini variants did not support

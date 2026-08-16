@@ -172,6 +172,11 @@ PROVIDER_TO_MODELS_DEV: Dict[str, str] = {
     "anthropic": "anthropic",
     "openai": "openai",
     "openai-codex": "openai",
+    # api-key access to the same api.openai.com catalog that "openai-codex"
+    # reaches by subscription. Without this alias every capability lookup on
+    # an api-key OpenAI setup missed, so vision routing read supports_vision
+    # as unknown and demoted the turn to the auxiliary text path.
+    "openai-api": "openai",
     "zai": "zai",
     "kimi": "kimi-for-coding",
     "kimi-coding": "kimi-for-coding",
