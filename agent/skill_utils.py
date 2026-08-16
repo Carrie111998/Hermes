@@ -502,6 +502,40 @@ def _normalize_string_set(values) -> Set[str]:
     return {name.strip() for name in parse_config_string_list(values) if name.strip()}
 
 
+# -- Foreign app skill roots -------------------------------------------------
+
+_OPENCLAW_HOME_MARKERS = frozenset(("openclaw.json", "clawdbot.json", "moltbot.json"))
+
+
+def _is_openclaw_owned(path: Path) -> bool:
+    """Return True when *path* appears to belong to an OpenClaw home/tree."""
+    try:
+        resolved = Path(path).expanduser().resolve()
+    except (OSError, RuntimeError):
+        resolved = Path(path).expanduser().absolute()
+
+    if any(part.lower() == ".openclaw" for part in resolved.parts):
+        return True
+
+    home = Path.home()
+    for parent in (resolved, *resolved.parents):
+        if any((parent / marker).exists() for marker in _OPENCLAW_HOME_MARKERS):
+            return True
+        if parent == home:
+            break
+    return False
+
+
+def _openclaw_external_dirs_allowed(skills_cfg: Dict[str, Any]) -> bool:
+    """Whether config explicitly opts into indexing OpenClaw-owned skill roots."""
+    value = skills_cfg.get("allow_openclaw_external_dirs")
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return False
+
+
 # ── External skills directories ──────────────────────────────────────────
 
 # (config_path_str, mtime_ns) -> resolved external dirs list.  Keyed by
@@ -529,7 +563,8 @@ def get_external_skills_dirs() -> List[Path]:
     Cached in-process, keyed on ``config.yaml`` mtime — the function is
     called once per skill during banner / tool-registry scans, and YAML
     parsing a non-trivial config dominates ``hermes`` cold-start time
-    when the cache is absent.
+    when the cache is absent. OpenClaw-owned roots are skipped unless the
+    user explicitly opts in via ``skills.allow_openclaw_external_dirs``.
     """
     config_path = get_config_path()
     if not config_path.exists():
@@ -574,6 +609,7 @@ def get_external_skills_dirs() -> List[Path]:
     local_skills = get_skills_dir().resolve()
     seen: Set[Path] = set()
     result = []
+    allow_openclaw = _openclaw_external_dirs_allowed(skills_cfg)
 
     for entry in raw_dirs:
         entry = str(entry).strip()
@@ -590,6 +626,9 @@ def get_external_skills_dirs() -> List[Path]:
         if p == local_skills:
             continue
         if p in seen:
+            continue
+        if _is_openclaw_owned(p) and not allow_openclaw:
+            logger.warning("Skipping OpenClaw-owned external skills directory: %s", p)
             continue
         if p.is_dir():
             seen.add(p)
