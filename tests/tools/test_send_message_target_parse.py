@@ -13,7 +13,7 @@ from gateway.config import Platform
 from tools.send_message_tool import _parse_target_ref, send_message_tool
 
 
-_SIGNAL_GROUP_ID = "w3W0kYAdHINWdTXDFl18LiH9O1xVwIadYMhVOD9tFaE="
+_SIGNAL_GROUP_ID = "4OHi4+Tl5ufo6err7O3u7/Dx8vP09fb3+Pn6+/z9/v8="
 
 
 def _run_async_immediately(coro):
