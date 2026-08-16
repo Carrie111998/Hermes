@@ -600,7 +600,10 @@ class EmailAdapter(BasePlatformAdapter):
 
         # When True, skip the connect()-time pre-fill so existing UNSEEN mail
         # is picked up on the first poll.  Default False = upstream behaviour.
-        self._process_existing = bool(extra.get("process_existing", False))
+        # Parsed via the shared truthy helper rather than bool(): a plain
+        # bool() turns a string-typed "false" (any non-YAML config source)
+        # into True, silently enabling the backlog burst.
+        self._process_existing = is_truthy_value(extra.get("process_existing"), default=False)
 
         # Track message IDs we've already processed to avoid duplicates
         self._seen_uids: set = set()
@@ -752,7 +755,19 @@ class EmailAdapter(BasePlatformAdapter):
                     self._trim_seen_uids()
                     logger.info("[Email] IMAP connection test passed. %d existing messages skipped.", len(self._seen_uids))
                 else:
-                    logger.info("[Email] process_existing=true — will process pre-existing UNSEEN mail on first poll.")
+                    # Pre-fill skipped on purpose. Count the backlog first: the
+                    # first poll turns every one of these into a full agent turn
+                    # (and a reply), so the operator should see the size of that
+                    # burst in the log before it happens rather than after.
+                    pending = 0
+                    status, data = imap.uid("search", None, "UNSEEN")
+                    if status == "OK" and data and data[0]:
+                        pending = len(data[0].split())
+                    logger.info(
+                        "[Email] IMAP connection test passed. process_existing is enabled — "
+                        "%d pre-existing UNSEEN message(s) will be processed on the first poll.",
+                        pending,
+                    )
             finally:
                 if imap is not None:
                     _close_imap(imap)
