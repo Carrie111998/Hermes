@@ -2188,7 +2188,13 @@ def _send_media_via_adapter(
                     job.get("id", "?"), media_path, getattr(result, "error", "unknown"),
                 )
         except Exception as e:
-            logger.warning("Job '%s': failed to send media %s: %s", job.get("id", "?"), media_path, e)
+            # Argument-less exceptions (notably TimeoutError, the most likely
+            # failure on this path) have an empty str(), which would render this
+            # warning with no reason at all. Fall back to the class name.
+            logger.warning(
+                "Job '%s': failed to send media %s: %s",
+                job.get("id", "?"), media_path, str(e) or type(e).__name__,
+            )
 
 
 def _confirm_adapter_delivery(send_result) -> bool:
