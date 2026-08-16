@@ -1320,6 +1320,8 @@ export const ar = defineLocale({
     nameHint: 'اسم الملف الشخصي',
     title: 'الملفات الشخصية',
     count: count => `${count} ملف شخصي`,
+    search: 'البحث في الملفات الشخصية…',
+    noSearchResults: 'لم يتم العثور على ملفات شخصية مطابقة.',
     loading: 'جار التحميل...',
     newProfile: 'ملف شخصي جديد',
     importProfile: 'استيراد ملف شخصي…',

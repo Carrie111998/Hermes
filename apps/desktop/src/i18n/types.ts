@@ -1411,6 +1411,7 @@ export interface Translations {
     title: string
     count: (count: number) => string
     search: string
+    noSearchResults: string
     loading: string
     newProfile: string
     importProfile: string
