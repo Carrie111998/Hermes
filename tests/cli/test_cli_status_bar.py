@@ -152,6 +152,66 @@ class TestCLIStatusBar:
 
         assert cli_mod._reverse_alias_for_display("gpt-5.6-sol") == "local-gpt56"
 
+    def test_reverse_alias_auto_provider_falls_back_to_model_only(self, monkeypatch):
+        _set_alias_config(
+            monkeypatch,
+            {
+                "model": {
+                    "aliases": {
+                        "local-gpt56": "local-sub2api/gpt-5.6-sol",
+                        "any-gpt56": "gpt-5.6-sol",
+                    }
+                }
+            },
+        )
+
+        assert (
+            cli_mod._reverse_alias_for_display("gpt-5.6-sol", "auto")
+            == "any-gpt56"
+        )
+
+    def test_reverse_alias_dict_form_without_provider_uses_model_default(
+        self, monkeypatch
+    ):
+        _set_alias_config(
+            monkeypatch,
+            {
+                "model_aliases": {
+                    "top-level": {
+                        "model": "gpt-5.6-sol",
+                    }
+                },
+                "model": {
+                    "provider": "local-sub2api",
+                },
+            },
+        )
+
+        assert (
+            cli_mod._reverse_alias_for_display("gpt-5.6-sol", "local-sub2api")
+            == "top-level"
+        )
+
+    def test_reverse_alias_dict_form_without_provider_stays_scoped(
+        self, monkeypatch
+    ):
+        _set_alias_config(
+            monkeypatch,
+            {
+                "model_aliases": {
+                    "top-level": {
+                        "model": "gpt-5.6-sol",
+                    }
+                }
+            },
+        )
+
+        assert (
+            cli_mod._reverse_alias_for_display("gpt-5.6-sol", "openai-codex")
+            == "gpt-5.6-sol"
+        )
+        assert cli_mod._reverse_alias_for_display("gpt-5.6-sol") == "top-level"
+
     def test_status_bar_prefers_live_agent_provider(self, monkeypatch):
         _set_alias_config(
             monkeypatch,

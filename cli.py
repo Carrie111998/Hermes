@@ -136,7 +136,7 @@ def _normalize_provider_for_alias_display(provider: str | None) -> str:
         from hermes_cli.models import normalize_provider
 
         return normalize_provider(provider_key)
-    except Exception:
+    except ImportError:
         return provider_key
 
 
@@ -164,14 +164,21 @@ def _reverse_alias_for_display(model_name: str, provider: str | None = None) -> 
         try:
             from hermes_cli.config import load_config
             cfg = load_config() or {}
+            mdl = cfg.get("model", {}) or {}
             ma = cfg.get("model_aliases")
             if isinstance(ma, dict):
                 for alias, entry in ma.items():
                     if isinstance(alias, str) and isinstance(entry, dict):
                         m = str(entry.get("model", "") or "").strip()
                         if m:
-                            remember(alias, m, entry.get("provider", "custom"))
-            mdl = cfg.get("model", {}) or {}
+                            # Fall back to the same default as the string-form
+                            # aliases below so both config shapes behave
+                            # identically for provider-less entries.
+                            remember(
+                                alias,
+                                m,
+                                entry.get("provider") or mdl.get("provider", ""),
+                            )
             if isinstance(mdl, dict):
                 simple = mdl.get("aliases")
                 if isinstance(simple, dict):
