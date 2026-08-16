@@ -274,6 +274,24 @@ def derive_title(user_message: str) -> Optional[str]:
     return line or None
 
 
+def _is_truncated_structured_output(raw: str) -> bool:
+    """True when *raw* is truncated JSON/array/fence output, not prose.
+
+    Called only after ``json.loads`` and the loose ``\"title\"`` scan fail, so a
+    complete object embedded in chatter still extracts via the loose path.
+    Structural signatures only — do not reject prose that starts with
+    markdown emphasis or quotes (``*Fix login*``, ``'Quoted'``).
+    """
+    if not raw:
+        return False
+    # Odd fence count ⇒ unclosed markdown code block (lone ``` is the classic).
+    if raw.count("```") % 2:
+        return True
+    # Leading object/array after failed parse ⇒ truncated structured output
+    # (including unquoted-key variants the loose scan never sees).
+    return raw.lstrip().startswith(("{", "["))
+
+
 def _extract_title_text(content: str) -> str:
     """Pull the title out of a model response.
 
@@ -301,6 +319,11 @@ def _extract_title_text(content: str) -> str:
             return json.loads(f'"{match.group(1)}"').strip()
         except ValueError:
             return match.group(1).strip()
+    # max_tokens can cut {"title":"..."} mid-response. json.loads and the
+    # closing-quote regex both fail; do not prose-fallback the fragment.
+    # Check on the raw response (before quote-strip / first-line pick).
+    if _is_truncated_structured_output(raw):
+        return ""
     # Prose fallback. Reuse the canonical scrubber so reasoning-model output
     # (<think>…) can't leak into a title, then keep the first real line.
     try:
