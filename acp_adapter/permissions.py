@@ -40,12 +40,19 @@ def _permission_option_supports_kind(kind: str) -> bool:
 
 def _build_permission_options(
     *, allow_permanent: bool, smart_denied: bool = False,
+    allowed_scopes: object = None,
 ) -> list[PermissionOption]:
     """Return ACP options that match Hermes approval semantics."""
+    if allowed_scopes is None:
+        scopes = {"once", "session", "always"}
+    else:
+        from tools.approval import _normalize_allowed_scopes
+
+        scopes = _normalize_allowed_scopes(allowed_scopes)
     options = [PermissionOption(
         option_id="allow_once", kind="allow_once", name="Allow once",
     )]
-    if not smart_denied:
+    if not smart_denied and "session" in scopes:
         options.append(PermissionOption(
             option_id="allow_session",
             # ACP has no session-scoped kind, so use the closest persistent
@@ -53,7 +60,7 @@ def _build_permission_options(
             kind="allow_always",
             name="Allow for session",
         ))
-    if allow_permanent and not smart_denied:
+    if allow_permanent and not smart_denied and "always" in scopes:
         options.append(
             PermissionOption(
                 option_id="allow_always",
@@ -62,7 +69,11 @@ def _build_permission_options(
             ),
         )
     options.append(PermissionOption(option_id="deny", kind="reject_once", name="Deny"))
-    if not smart_denied and _permission_option_supports_kind("reject_always"):
+    if (
+        not smart_denied
+        and scopes != {"once"}
+        and _permission_option_supports_kind("reject_always")
+    ):
         options.append(
             PermissionOption(
                 option_id="deny_always",
@@ -133,6 +144,7 @@ def make_approval_callback(
         *,
         allow_permanent: bool = True,
         smart_denied: bool = False,
+        allowed_scopes: object = None,
         **_: object,
     ) -> str:
         from agent.async_utils import safe_schedule_threadsafe
@@ -140,6 +152,7 @@ def make_approval_callback(
         options = _build_permission_options(
             allow_permanent=allow_permanent,
             smart_denied=smart_denied,
+            allowed_scopes=allowed_scopes,
         )
 
         tool_call = _build_permission_tool_call(command, description)

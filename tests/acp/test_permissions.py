@@ -24,6 +24,7 @@ def _invoke_callback(
     *,
     allow_permanent=True,
     smart_denied=False,
+    allowed_scopes=None,
     timeout=60.0,
     use_prompt_path=False,
 ):
@@ -42,19 +43,29 @@ def _invoke_callback(
     with patch("agent.async_utils.asyncio.run_coroutine_threadsafe", side_effect=_schedule):
         cb = make_approval_callback(request_permission, loop, session_id="s1", timeout=timeout)
         if use_prompt_path:
+            prompt_kwargs = {
+                "allow_permanent": allow_permanent,
+                "smart_denied": smart_denied,
+                "approval_callback": cb,
+            }
+            if allowed_scopes is not None:
+                prompt_kwargs["allowed_scopes"] = allowed_scopes
             result = prompt_dangerous_approval(
                 "rm -rf /",
                 "dangerous command",
-                allow_permanent=allow_permanent,
-                smart_denied=smart_denied,
-                approval_callback=cb,
+                **prompt_kwargs,
             )
         else:
+            callback_kwargs = {
+                "allow_permanent": allow_permanent,
+                "smart_denied": smart_denied,
+            }
+            if allowed_scopes is not None:
+                callback_kwargs["allowed_scopes"] = allowed_scopes
             result = cb(
                 "rm -rf /",
                 "dangerous command",
-                allow_permanent=allow_permanent,
-                smart_denied=smart_denied,
+                **callback_kwargs,
             )
 
     scheduled["coro"].close()
@@ -63,6 +74,18 @@ def _invoke_callback(
 
 
 class TestApprovalBridge:
+    def test_once_only_offers_once_and_deny_and_rejects_forged_always(self):
+        result, kwargs, _, _, _ = _invoke_callback(
+            AllowedOutcome(option_id="allow_always", outcome="selected"),
+            allowed_scopes=("once",),
+        )
+
+        assert [option.option_id for option in kwargs["options"]] == [
+            "allow_once",
+            "deny",
+        ]
+        assert result == "deny"
+
     def test_bridge_schedules_request_on_the_given_loop(self):
         result, kwargs, scheduled, _, loop = _invoke_callback(
             AllowedOutcome(option_id="allow_once", outcome="selected"),

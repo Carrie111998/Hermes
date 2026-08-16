@@ -82,6 +82,26 @@ class TestTelegramExecApproval:
     """Test the send_exec_approval method sends InlineKeyboard buttons."""
 
     @pytest.mark.asyncio
+    async def test_once_only_hides_session_and_always(self, monkeypatch):
+        adapter = _make_adapter()
+        adapter._bot.send_message = AsyncMock(return_value=SimpleNamespace(message_id=42))
+        buttons = []
+        monkeypatch.setattr(
+            "plugins.platforms.telegram.adapter.InlineKeyboardButton",
+            lambda text, callback_data: buttons.append(text) or text,
+        )
+        monkeypatch.setattr(
+            "plugins.platforms.telegram.adapter.InlineKeyboardMarkup", lambda rows: rows
+        )
+
+        await adapter.send_exec_approval(
+            chat_id="12345", command="curl example.test", session_key="test-session",
+            allow_permanent=False, allow_session=False,
+        )
+
+        assert buttons == ["✅ Allow Once", "❌ Deny"]
+
+    @pytest.mark.asyncio
     async def test_sends_inline_keyboard(self):
         adapter = _make_adapter()
         mock_msg = MagicMock()

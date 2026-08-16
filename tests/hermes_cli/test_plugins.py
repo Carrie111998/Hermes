@@ -1108,6 +1108,48 @@ class TestResolvePreToolBlock:
             "rule_key": "write_file:ssh",
         }
 
+    def test_approve_passes_allowed_scopes_to_gate(self, monkeypatch):
+        from hermes_cli.plugins import resolve_pre_tool_block
+
+        seen = {}
+        monkeypatch.setattr(
+            "hermes_cli.plugins.invoke_hook",
+            lambda hook_name, **kwargs: [{
+                "action": "approve",
+                "allowed_scopes": ["once"],
+            }],
+        )
+
+        def _approve(*args, **kwargs):
+            seen.update(kwargs)
+            return {"approved": True, "message": None}
+
+        monkeypatch.setattr("tools.approval.request_tool_approval", _approve)
+
+        assert resolve_pre_tool_block("write_file", {}) is None
+        assert seen["allowed_scopes"] == ["once"]
+
+    def test_approve_omits_allowed_scopes_when_directive_field_is_absent(
+        self, monkeypatch
+    ):
+        from hermes_cli.plugins import resolve_pre_tool_block
+
+        seen = {}
+        monkeypatch.setattr(
+            "hermes_cli.plugins.invoke_hook",
+            lambda hook_name, **kwargs: [{"action": "approve"}],
+        )
+        monkeypatch.setattr(
+            "tools.approval.request_tool_approval",
+            lambda *args, **kwargs: seen.update(kwargs) or {
+                "approved": True,
+                "message": None,
+            },
+        )
+
+        assert resolve_pre_tool_block("write_file", {}) is None
+        assert "allowed_scopes" not in seen
+
 
     def test_approve_gate_exception_fails_closed(self, monkeypatch):
         from hermes_cli.plugins import resolve_pre_tool_block
