@@ -599,6 +599,17 @@ def finalize_turn(
                 conversation_history=list(messages),
                 model=agent.model,
                 platform=getattr(agent, "platform", None) or "",
+                sender_id=getattr(agent, "_user_id", None) or "",
+                usage={
+                    "input_tokens": agent.session_input_tokens,
+                    "output_tokens": agent.session_output_tokens,
+                    "cache_read_tokens": agent.session_cache_read_tokens,
+                    "cache_write_tokens": agent.session_cache_write_tokens,
+                    "reasoning_tokens": agent.session_reasoning_tokens,
+                    "prompt_tokens": agent.session_prompt_tokens,
+                    "completion_tokens": agent.session_completion_tokens,
+                    "total_tokens": agent.session_total_tokens,
+                },
             )
         except Exception as exc:
             logger.warning("post_llm_call hook failed: %s", exc)
