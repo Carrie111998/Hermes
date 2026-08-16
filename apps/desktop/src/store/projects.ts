@@ -503,14 +503,11 @@ async function refreshProjectTreeAcrossProfiles(): Promise<void> {
 export async function fetchProjectSessions(projectId: string): Promise<SidebarProjectTree | null> {
   try {
     const res = await gatewayRequest<{ project: SidebarProjectTree | null }>('projects.project_sessions', {
-      project_id: projectId,
-      session_limit: 5000
+      project_id: projectId
     })
 
     return res.project ?? null
-  } catch (err) {
-    console.warn('[projects] fetchProjectSessions failed', projectId, err)
-
+  } catch {
     return null
   }
 }

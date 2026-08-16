@@ -940,15 +940,6 @@ export function ChatSidebar({
   // from the backend — same grouping/ids as the overview, just with rows.
   const [enteredProjectTree, setEnteredProjectTree] = useState<SidebarProjectTree | null>(null)
 
-  // Re-hydrate when the overview's activity stamp for this project moves (a new
-  // session landed or an old one was deleted), not on every `projectTree` array
-  // identity churn — focus/tree refreshes used to cancel in-flight
-  // `projects.project_sessions` and leave the entered view stuck on empty lanes
-  // + a partial `$sessions` overlay (stale history under the home glyph).
-  const enteredProjectActivityKey = overviewEnteredProject
-    ? `${overviewEnteredProject.id}:${overviewEnteredProject.sessionCount}:${overviewEnteredProject.lastActive ?? 0}`
-    : ''
-
   useEffect(() => {
     if (!enteredProjectId || !gatewayReady) {
       setEnteredProjectTree(null)
@@ -959,7 +950,7 @@ export function ChatSidebar({
     let cancelled = false
 
     void fetchProjectSessions(enteredProjectId).then(project => {
-      if (!cancelled && project) {
+      if (!cancelled) {
         setEnteredProjectTree(project)
       }
     })
@@ -967,7 +958,9 @@ export function ChatSidebar({
     return () => {
       cancelled = true
     }
-  }, [enteredProjectId, gatewayReady, enteredProjectActivityKey])
+    // `projectTree` in deps: re-hydrate after a tree refresh so the entered view
+    // stays current with new/ended sessions.
+  }, [enteredProjectId, gatewayReady, projectTree])
 
   // Prefer the hydrated tree; fall back to the overview node (empty lanes) while
   // the drill-in fetch is in flight, so the header/structure render immediately.

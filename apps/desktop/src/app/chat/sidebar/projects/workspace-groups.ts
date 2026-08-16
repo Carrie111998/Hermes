@@ -243,10 +243,10 @@ export function mergeRepoWorktreeGroups(
     const byId = new Map<string, SessionInfo>()
 
     for (const session of sessions) {
-      byId.set(session.id, mergeSessionRow(byId.get(session.id), session))
+      byId.set(session.id, byId.get(session.id) ?? session)
     }
 
-    return [...byId.values()].sort((a, b) => sessionRecency(b) - sessionRecency(a))
+    return [...byId.values()]
   }
 
   // Fold every main-checkout lane into one home lane labeled by the live branch
@@ -448,37 +448,8 @@ export function sessionProjectColor(session: SessionInfo, projects: ProjectInfo[
   return projects.find(project => project.id === projectId)?.color ?? null
 }
 
-/** Prefer the richer of two copies of the same session (backend snapshot vs live). */
-function mergeSessionRow(existing: SessionInfo | undefined, incoming: SessionInfo): SessionInfo {
-  if (!existing) {
-    return incoming
-  }
-
-  // Keep whichever side carries a field; prefer the higher recency stamp so an
-  // overlay row that only knows `started_at` cannot clobber a backend
-  // `last_active` and sink a still-active chat under stale history.
-  const existingRecency = sessionRecency(existing)
-  const incomingRecency = sessionRecency(incoming)
-
-  return {
-    ...existing,
-    ...incoming,
-    cwd: incoming.cwd || existing.cwd,
-    git_branch: incoming.git_branch || existing.git_branch,
-    git_repo_root: incoming.git_repo_root || existing.git_repo_root,
-    last_active: Math.max(existingRecency, incomingRecency) || incoming.last_active || existing.last_active,
-    title: incoming.title || existing.title,
-    preview: incoming.preview || existing.preview
-  }
-}
-
-const upsertSession = (rows: SessionInfo[], session: SessionInfo): SessionInfo[] => {
-  const existing = rows.find(row => row.id === session.id)
-
-  return [mergeSessionRow(existing, session), ...rows.filter(row => row.id !== session.id)].sort(
-    (a, b) => sessionRecency(b) - sessionRecency(a)
-  )
-}
+const upsertSession = (rows: SessionInfo[], session: SessionInfo): SessionInfo[] =>
+  [session, ...rows.filter(row => row.id !== session.id)].sort((a, b) => sessionRecency(b) - sessionRecency(a))
 
 /**
  * The lane a live session belongs to WITHIN a known repo root, by path — the
@@ -590,22 +561,25 @@ export function overlayRepoLanes(
       // After mergeRepoWorktreeGroups folds every main-checkout lane into one
       // home lane labeled by the LIVE branch (e.g. `master`), live rows still
       // compute `::branch::main` when `git_branch` is empty. Matching only by
-      // id/label then FORKS a phantom `main` lane and — worse — the overlay
-      // evicts those rows out of the home lane into the phantom. The entered
-      // project then shows the home lane depleted of anything also present in
-      // `$sessions` (usually the recent work), leaving only stale history under
-      // the home glyph.
+      // id/label then FORKS a phantom `main` lane and evicts those rows out of
+      // home. Prefer the folded home lane.
       lane =
         lanes.find(g => g.id === placed.id) ??
         (placed.isMain ? lanes.find(g => g.isHome) : undefined) ??
         (placed.isMain
           ? lanes.find(g => g.isMain && g.label.toLowerCase() === placed.label.toLowerCase())
           : undefined) ??
-        // Any main-checkout lane on the same repo path — including `::branch::*`
-        // ids from the backend / home fold. The older path-keyed non-git
-        // heuristic (id === path, no `::branch::`) is still covered here.
+        // Non-git backend heuristic (`project_tree._place_by_heuristic`): one
+        // isMain lane keyed by the folder path itself (id === path, label =
+        // basename) — not `::branch::<name>`. Live placement always emits
+        // `::branch::main` / label "main", so id+label miss and used to FORK a
+        // phantom second main lane with the same sessions. Prefer the existing
+        // path-keyed main lane when present.
         (placed.isMain && placedKey
-          ? lanes.find(g => g.isMain && !g.isKanban && pathKey(g.path) === placedKey)
+          ? lanes.find(
+              g =>
+                g.isMain && pathKey(g.path) === placedKey && !g.id.includes('::branch::') && !g.id.includes('::kanban')
+            )
           : undefined) ??
         (!placed.isMain && placedKey ? lanes.find(g => pathKey(g.path) === placedKey) : undefined)
 
