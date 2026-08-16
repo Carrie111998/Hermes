@@ -4830,6 +4830,41 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 # ff-only failed — local and remote have diverged (e.g. upstream
                 # force-pushed or rebase).  Since local changes are already
                 # stashed, reset to match the remote exactly.
+                #
+                # Divergence comes in two shapes: ordinary (a common ancestor
+                # still exists — the reset below is a normal, safe rebase-onto-
+                # remote) and orphan (no common ancestor at all, e.g. a corrupted
+                # local HEAD or a repo re-init — see #87694). In the orphan case
+                # `reset --hard` would silently discard the entire local commit
+                # graph with no way back, so park pre_pull_sha behind a rescue
+                # ref first.
+                merge_base_result = subprocess.run(
+                    git_cmd + ["merge-base", "HEAD", f"origin/{branch}"],
+                    cwd=_m().PROJECT_ROOT,
+                    capture_output=True,
+                    text=True, encoding="utf-8", errors="replace",
+                )
+                has_common_ancestor = bool(
+                    merge_base_result.returncode == 0 and merge_base_result.stdout.strip()
+                )
+                if not has_common_ancestor and pre_pull_sha:
+                    from datetime import timezone
+
+                    rescue_ref = (
+                        f"refs/hermes-update-backups/orphan-{branch}-"
+                        f"{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}"
+                    )
+                    subprocess.run(
+                        git_cmd + ["update-ref", rescue_ref, pre_pull_sha],
+                        cwd=_m().PROJECT_ROOT,
+                        capture_output=True,
+                        text=True, encoding="utf-8", errors="replace",
+                    )
+                    print(
+                        "  ⚠ Local history shares no common ancestor with "
+                        f"origin/{branch} (orphan divergence) — backed up "
+                        f"current HEAD to {rescue_ref} before resetting."
+                    )
                 print(
                     "  ⚠ Fast-forward not possible (history diverged), resetting to match remote..."
                 )

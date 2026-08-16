@@ -118,8 +118,16 @@ def _make_update_side_effect(
     reset_fails=False,
     fetch_fails=False,
     fetch_stderr="",
+    merge_base_exists=True,
 ):
-    """Build a subprocess.run side_effect for cmd_update tests."""
+    """Build a subprocess.run side_effect for cmd_update tests.
+
+    ``merge_base_exists`` controls the ``git merge-base HEAD origin/<branch>``
+    probe used by the ff-only-fallback orphan-history guard (#87694): True
+    (default) simulates ordinary divergence (a common ancestor exists, e.g.
+    upstream force-push), False simulates orphan/unrelated-history divergence
+    (no common ancestor at all).
+    """
     recorded = []
 
     def side_effect(cmd, **kwargs):
@@ -131,10 +139,18 @@ def _make_update_side_effect(
             return SimpleNamespace(stdout="", stderr="", returncode=0)
         if "rev-parse" in joined and "--abbrev-ref" in joined:
             return SimpleNamespace(stdout=f"{current_branch}\n", stderr="", returncode=0)
+        if "rev-parse" in joined and "HEAD" in joined:
+            return SimpleNamespace(stdout="deadbeefcafe1234567890abcdef1234567890\n", stderr="", returncode=0)
         if "checkout" in joined and "main" in joined:
             return SimpleNamespace(stdout="", stderr="", returncode=0)
         if "rev-list" in joined:
             return SimpleNamespace(stdout=f"{commit_count}\n", stderr="", returncode=0)
+        if "merge-base" in joined:
+            if merge_base_exists:
+                return SimpleNamespace(stdout="abc123deadbeef\n", stderr="", returncode=0)
+            return SimpleNamespace(
+                stdout="", stderr="fatal: Not a valid commit name origin/main\n", returncode=1
+            )
         if "--ff-only" in joined:
             if ff_only_fails:
                 return SimpleNamespace(
@@ -191,6 +207,56 @@ def test_cmd_update_skips_stash_restore_when_reset_fails(monkeypatch, tmp_path, 
 
     out = capsys.readouterr().out
     assert "preserved in stash" in out
+
+
+# ---------------------------------------------------------------------------
+# #87694: orphan/unrelated-history divergence must be backed up to a rescue
+# ref before `reset --hard` discards it (ordinary divergence is unaffected).
+# ---------------------------------------------------------------------------
+
+def test_cmd_update_orphan_history_backs_up_before_reset(monkeypatch, tmp_path, capsys):
+    """No common ancestor with origin/<branch> → HEAD is parked behind a
+    ``refs/hermes-update-backups/orphan-*`` ref before the reset proceeds."""
+    _setup_update_mocks(monkeypatch, tmp_path)
+
+    side_effect, recorded = _make_update_side_effect(
+        ff_only_fails=True, merge_base_exists=False,
+    )
+    monkeypatch.setattr(hermes_main.subprocess, "run", side_effect)
+
+    hermes_main.cmd_update(SimpleNamespace())
+
+    update_ref_calls = [c for c in recorded if "update-ref" in " ".join(str(x) for x in c)]
+    assert len(update_ref_calls) == 1
+    ref_name = update_ref_calls[0][update_ref_calls[0].index("update-ref") + 1]
+    assert ref_name.startswith("refs/hermes-update-backups/orphan-main-")
+    assert update_ref_calls[0][update_ref_calls[0].index("update-ref") + 2] == (
+        "deadbeefcafe1234567890abcdef1234567890"
+    )
+
+    out = capsys.readouterr().out
+    assert "orphan divergence" in out
+    assert ref_name in out
+
+
+def test_cmd_update_ordinary_divergence_skips_rescue_ref(monkeypatch, tmp_path, capsys):
+    """Common ancestor still exists (e.g. upstream force-push) → no rescue
+    ref, no orphan messaging, behavior identical to before #87694."""
+    _setup_update_mocks(monkeypatch, tmp_path)
+
+    side_effect, recorded = _make_update_side_effect(
+        ff_only_fails=True, merge_base_exists=True,
+    )
+    monkeypatch.setattr(hermes_main.subprocess, "run", side_effect)
+
+    hermes_main.cmd_update(SimpleNamespace())
+
+    update_ref_calls = [c for c in recorded if "update-ref" in " ".join(str(x) for x in c)]
+    assert update_ref_calls == []
+
+    out = capsys.readouterr().out
+    assert "orphan divergence" not in out
+    assert "Fast-forward not possible (history diverged), resetting to match remote" in out
 
 
 # ---------------------------------------------------------------------------
@@ -337,3 +403,72 @@ def test_update_autostash_survives_undeletable_untracked_dir(tmp_path):
         assert (pkg / "hermes-agent.rb").read_text() == "formula\n"
     finally:
         os.chmod(pkg, 0o755)
+
+
+# ---------------------------------------------------------------------------
+# #87694: real-git sanity check for the merge-base premise the orphan guard
+# relies on — two independently-initialized repos (no shared history) must
+# report no merge-base, while an ordinary branch divergence must report one.
+# ---------------------------------------------------------------------------
+
+def test_merge_base_detects_orphan_vs_ordinary_divergence_with_real_git(tmp_path):
+    """Anchors the assumption behind the #87694 orphan-history guard: `git
+    merge-base` fails/empties on truly unrelated histories, and succeeds on
+    ordinary (e.g. force-pushed) divergence. If a future git version changes
+    this contract, this test breaks instead of the guard silently going
+    inert."""
+    import shutil
+    import subprocess
+
+    if shutil.which("git") is None:
+        pytest.skip("git not available")
+
+    def git(cwd, *args, check=True):
+        return subprocess.run(
+            ["git", *args], cwd=cwd, capture_output=True, text=True, check=check
+        )
+
+    # Ordinary divergence: two branches of the SAME repo, one reset to an
+    # earlier point then given a new commit (simulates an upstream force-push).
+    ordinary = tmp_path / "ordinary"
+    ordinary.mkdir()
+    git(ordinary, "init", "-q", "-b", "main")
+    git(ordinary, "config", "user.email", "t@example.com")
+    git(ordinary, "config", "user.name", "t")
+    (ordinary / "f.txt").write_text("v1\n")
+    git(ordinary, "add", "-A")
+    git(ordinary, "commit", "-qm", "init")
+    git(ordinary, "checkout", "-qb", "origin-main")
+    (ordinary / "f.txt").write_text("v2\n")
+    git(ordinary, "add", "-A")
+    git(ordinary, "commit", "-qm", "upstream")
+    git(ordinary, "checkout", "-q", "main")
+    result = git(ordinary, "merge-base", "HEAD", "origin-main", check=False)
+    assert result.returncode == 0
+    assert result.stdout.strip()
+
+    # Orphan divergence: two independently-init'd repos merged as remotes,
+    # sharing zero history.
+    orphan = tmp_path / "orphan"
+    orphan.mkdir()
+    git(orphan, "init", "-q", "-b", "main")
+    git(orphan, "config", "user.email", "t@example.com")
+    git(orphan, "config", "user.name", "t")
+    (orphan / "f.txt").write_text("local\n")
+    git(orphan, "add", "-A")
+    git(orphan, "commit", "-qm", "local init")
+
+    remote = tmp_path / "orphan-remote"
+    remote.mkdir()
+    git(remote, "init", "-q", "-b", "main")
+    git(remote, "config", "user.email", "t@example.com")
+    git(remote, "config", "user.name", "t")
+    (remote / "f.txt").write_text("remote\n")
+    git(remote, "add", "-A")
+    git(remote, "commit", "-qm", "remote init")
+
+    git(orphan, "remote", "add", "origin", str(remote))
+    git(orphan, "fetch", "-q", "origin")
+    result = git(orphan, "merge-base", "HEAD", "origin/main", check=False)
+    assert result.returncode != 0
+    assert not result.stdout.strip()
