@@ -146,7 +146,7 @@ prompt construction, legacy `state.db`, or unrelated dirty worktree files.
   `POST_ROTATION_GENESIS`, `GENERATION_REORIGIN_GENESIS`, and
   `MANUAL_REORIGIN_GENESIS`. Assign markers by this deterministic
   precedence: explicit `MANUAL_REORIGIN_GENESIS` first; then
-  `NEW_ENTITY_GENESIS) when the row is created by the mutation; then
+  `NEW_ENTITY_GENESIS` when the row is created by the mutation; then
   `GENERATION_REORIGIN_GENESIS` for a pre-existing row after a newer writer
   epoch; then `POST_ROTATION_GENESIS` for a pre-existing row after digest
   rotation; then `POST_MIGRATION_GENESIS` for a legacy/pre-journal row.
