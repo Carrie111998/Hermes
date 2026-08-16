@@ -49,7 +49,7 @@ interface BucketRow {
   memories: number
   nodes: BucketNode[]
   skills: number
-  wiki: number
+  wiki?: number
 }
 
 interface FramesResponse {
@@ -223,7 +223,7 @@ export function Journey({ gw, onClose, t }: JourneyProps) {
         return setNotice(detail.message || 'cannot edit')
       }
 
-      const edited = await openInEditor(detail.content, detail.kind === 'skill' ? '.md' : '.txt')
+      const edited = await openInEditor(detail.content, detail.kind === 'memory' ? '.txt' : '.md')
 
       if (edited == null || edited.trim() === detail.content.trim()) {
         return setNotice('no changes')
@@ -532,7 +532,7 @@ function TreeLine({ active, palette, row, t }: { active: boolean; palette: Starm
           { color: bucket.color ? fadeHex(palette, bucket.color, 0.85) : t.color.label, text: bucket.label },
           {
             color: t.color.muted,
-            text: ` · ${bucket.skills} skills · ${bucket.memories} memories · ${bucket.wiki} wiki${bucket.category ? ` · ${bucket.category}` : ''}`
+            text: ` · ${bucket.skills} skills · ${bucket.memories} memories · ${bucket.wiki ?? 0} wiki${bucket.category ? ` · ${bucket.category}` : ''}`
           }
         ]}
         t={t}

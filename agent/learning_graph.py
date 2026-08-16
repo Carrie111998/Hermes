@@ -250,7 +250,10 @@ def _wiki_exclusions() -> set[str]:
         raw = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError, TypeError):
         return set()
-    return {str(item) for item in raw if isinstance(item, str)} if isinstance(raw, list) else set()
+    if not isinstance(raw, dict) or raw.get("root") != str(_wiki_root().resolve()):
+        return set()
+    paths = raw.get("paths")
+    return {str(item) for item in paths if isinstance(item, str)} if isinstance(paths, list) else set()
 
 
 def _wiki_cards() -> list[dict[str, Any]]:
