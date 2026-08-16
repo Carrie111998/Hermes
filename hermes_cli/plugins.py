@@ -2936,9 +2936,9 @@ class PluginContext:
     def register_telegram_handler(self, factory: Callable) -> PluginRegistration:
         """Register a python-telegram-bot handler factory from a plugin.
 
-        Hermes' Telegram adapter invokes registered factories at ``connect()``
-        time, right after the PTB ``Application`` is built and **before** the
-        core handlers are added. The factory receives ``(application, adapter)``
+        Hermes' Telegram adapter invokes registered factories whenever it
+        (re)builds its PTB ``Application``, always **before** the core
+        handlers are added. The factory receives ``(application, adapter)``
         and wires its own handlers::
 
             def _wire(application, adapter):
@@ -2952,32 +2952,56 @@ class PluginContext:
 
         Notes:
 
-        * The factory is called lazily at connect time, so plugins may import
-          ``telegram`` / ``telegram.ext`` inside the factory body — the
-          plugin's ``register()`` still works when PTB is not installed.
+        * The factory must be a plain synchronous callable. It runs from
+          synchronous wiring code, so an ``async def`` factory is rejected
+          at registration time (its coroutine could never be awaited
+          there). The *callbacks* a factory registers may of course be
+          async, which is the normal PTB pattern.
+        * The factory is called lazily at (re)build time, so plugins may
+          import ``telegram`` / ``telegram.ext`` inside the factory body;
+          the plugin's ``register()`` still works when PTB is not
+          installed. The adapter rebuilds the Application on transient
+          init failures, so a factory can run more than once per connect:
+          keep it idempotent (limit side effects to wiring the
+          application it is given).
         * PTB dispatches only the *first* matching handler within a group.
           Because plugin factories run before the core handlers, a
           pattern-scoped handler (e.g. ``CallbackQueryHandler`` with
           ``pattern=r"^myplugin:"``) takes precedence for its own updates
-          while everything else falls through to the core handlers unchanged.
-          Always scope callback handlers with ``pattern=`` — an unscoped one
-          would swallow the core button flows (approvals, model picker).
-        * ``adapter`` is the ``TelegramAdapter`` instance (``adapter.config``);
-          treat it as read-only. Reach the bot handle via ``application.bot``
-          (PTB), not ``adapter.bot``.
+          while everything else falls through to the core handlers
+          unchanged. Always scope callback handlers with ``pattern=``; an
+          unscoped one would swallow the core button flows (approvals,
+          model picker), and the adapter logs a warning when a factory
+          adds a group-0 handler that could shadow the core set.
+        * ``adapter`` is the ``TelegramAdapter`` instance
+          (``adapter.config``); treat it as read-only. Reach the bot
+          handle via ``application.bot`` (PTB), not ``adapter.bot``.
         * Exceptions raised by the factory are caught and logged by the
-          adapter — a broken plugin cannot prevent Telegram from connecting.
+          adapter; a broken plugin cannot prevent Telegram from
+          connecting.
+        * The returned :class:`PluginRegistration` dequeues the factory
+          when disposed, so a reloaded plugin's stale factory is not
+          invoked on later connects. It does not unwire handlers the
+          factory already added to a running Application.
 
         Args:
-            factory: Callable receiving ``(application, adapter)``.
+            factory: Synchronous callable receiving ``(application, adapter)``.
 
         Raises:
-            ValueError: if ``factory`` is not callable.
+            ValueError: if ``factory`` is not callable, or is a coroutine
+                function (``async def``).
         """
         if not callable(factory):
             raise ValueError(
                 f"Plugin '{self.manifest.name}' tried to register a Telegram "
                 f"handler factory with a non-callable factory."
+            )
+        if inspect.iscoroutinefunction(factory):
+            raise ValueError(
+                f"Plugin '{self.manifest.name}' tried to register an async "
+                f"Telegram handler factory. Factories run from synchronous "
+                f"wiring code; register a sync factory and pass async "
+                f"callbacks to application.add_handler()."
             )
         entry = (factory, self.manifest.name)
         self._manager._telegram_handler_factories.append(entry)

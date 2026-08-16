@@ -4240,10 +4240,14 @@ class TelegramAdapter(BasePlatformAdapter):
         group, so plugin handlers registered first take precedence for the
         updates they scope to (e.g. a ``CallbackQueryHandler`` with a
         ``pattern=`` prefix) while everything else falls through to the core
-        handlers.
+        handlers. Factories may be re-invoked when the Application is
+        rebuilt after transient init failures, so they must stay
+        idempotent; async factories are rejected at registration time.
 
         Each factory is isolated so a misbehaving plugin can't prevent
-        Telegram from connecting.
+        Telegram from connecting. Factories that add group-0 handlers are
+        flagged: group 0 is shared with the core handlers and an unscoped
+        handler there can silently shadow the core button/text flows.
         """
         try:
             from hermes_cli.plugins import get_plugin_manager
@@ -4256,7 +4260,30 @@ class TelegramAdapter(BasePlatformAdapter):
             return
         for factory, plugin_name in factories:
             try:
-                factory(app, self)
+                group0_before = self._group_zero_handlers(app)
+                wired = factory(app, self)
+                if inspect.iscoroutine(wired):
+                    # A sync-callable factory that returns a coroutine
+                    # (e.g. a lambda delegating to an async def) did no
+                    # wiring; close the coroutine so it can't linger as a
+                    # never-awaited RuntimeWarning.
+                    wired.close()
+                    logger.error(
+                        "[%s] Plugin '%s' Telegram handler factory returned "
+                        "a coroutine; wiring is synchronous and the "
+                        "coroutine was discarded. Register a sync factory.",
+                        self.name, plugin_name,
+                    )
+                    continue
+                added_group0 = self._new_group_zero_handlers(app, group0_before)
+                if added_group0:
+                    logger.warning(
+                        "[%s] Plugin '%s' added %d group-0 handler(s) that "
+                        "may shadow the core handlers: PTB dispatches only "
+                        "the first match per group. Scope callback handlers "
+                        "with pattern= or register in a non-zero group.",
+                        self.name, plugin_name, len(added_group0),
+                    )
                 logger.info(
                     "[%s] Wired Telegram handlers from plugin '%s'",
                     self.name, plugin_name,
@@ -4266,6 +4293,26 @@ class TelegramAdapter(BasePlatformAdapter):
                     "[%s] Plugin '%s' Telegram handler factory raised: %s",
                     self.name, plugin_name, tg_factory_exc, exc_info=True,
                 )
+
+    @staticmethod
+    def _group_zero_handlers(app) -> Optional[list]:
+        """Snapshot the live group-0 handler list, or None when the app's
+        handler map cannot be inspected (mock apps in tests)."""
+        try:
+            return list(app.handlers.get(0, []))
+        except Exception:
+            return None
+
+    @staticmethod
+    def _new_group_zero_handlers(app, before) -> list:
+        """Return handlers added to group 0 since the ``before`` snapshot."""
+        if before is None:
+            return []
+        try:
+            current = app.handlers.get(0, [])
+        except Exception:
+            return []
+        return [h for h in current if not any(h is b for b in before)]
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         """Connect to Telegram via polling or webhook.
