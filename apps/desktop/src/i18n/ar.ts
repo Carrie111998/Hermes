@@ -2260,7 +2260,8 @@ export const ar = defineLocale({
       goForward: 'تقدم',
       reload: 'إعادة تحميل المعاينة',
       address: 'رابط المعاينة',
-      navigate: 'التنقل في المعاينة'
+      navigate: 'التنقل في المعاينة',
+      go: 'الانتقال إلى العنوان'
     }
   },
   zones: {

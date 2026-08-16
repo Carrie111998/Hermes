@@ -60,7 +60,7 @@ describe('PreviewToolbar', () => {
     expect(rendered.getByRole('button', { name: 'Go forward' })).toBeTruthy()
     expect(rendered.getByRole('button', { name: 'Reload preview' })).toBeTruthy()
     expect(rendered.getByRole('textbox', { name: 'Preview URL' })).toBeTruthy()
-    expect(rendered.getAllByRole('button', { name: 'Navigate preview' }).length).toBe(1)
+    expect(rendered.getByRole('button', { name: 'Go to address' })).toBeTruthy()
     expect(rendered.getByRole('form', { name: 'Navigate preview' })).toBeTruthy()
   })
 
@@ -84,7 +84,7 @@ describe('PreviewToolbar', () => {
     const input = rendered.getByRole('textbox', { name: 'Preview URL' }) as HTMLInputElement
 
     expect(input.getAttribute('aria-invalid')).toBe('true')
-    expect((rendered.getByRole('button', { name: 'Navigate preview' }) as HTMLButtonElement).disabled).toBe(true)
+    expect((rendered.getByRole('button', { name: 'Go to address' }) as HTMLButtonElement).disabled).toBe(true)
   })
 
   it('does not mark the address invalid when the input is empty (no aria-invalid)', () => {
@@ -93,7 +93,7 @@ describe('PreviewToolbar', () => {
     const input = rendered.getByRole('textbox', { name: 'Preview URL' }) as HTMLInputElement
 
     expect(input.getAttribute('aria-invalid')).toBeNull()
-    expect((rendered.getByRole('button', { name: 'Navigate preview' }) as HTMLButtonElement).disabled).toBe(true)
+    expect((rendered.getByRole('button', { name: 'Go to address' }) as HTMLButtonElement).disabled).toBe(true)
   })
 
   it('fires onBack when the back button is clicked', () => {

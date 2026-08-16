@@ -2538,7 +2538,8 @@ export const ja = defineLocale({
       goForward: '進む',
       reload: 'プレビューを再読み込み',
       address: 'プレビュー URL',
-      navigate: 'プレビューをナビゲート'
+      navigate: 'プレビューをナビゲート',
+      go: 'このアドレスへ移動'
     }
   },
 

@@ -2458,7 +2458,8 @@ export const zhHant = defineLocale({
       goForward: '下一頁',
       reload: '重新載入預覽',
       address: '預覽網址',
-      navigate: '瀏覽預覽'
+      navigate: '瀏覽預覽',
+      go: '前往網址'
     }
   },
 

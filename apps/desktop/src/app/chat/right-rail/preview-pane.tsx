@@ -156,6 +156,7 @@ export function PreviewPane({ embedded = false, onRestartServer, reloadRequest =
   const [canGoBack, setCanGoBack] = useState(false)
   const [canGoForward, setCanGoForward] = useState(false)
   const addressFocusedRef = useRef(false)
+  const submittedAddressRef = useRef(false)
 
   // Artifacts have no URL to load — they render from the registry, never in a
   // webview.
@@ -286,27 +287,45 @@ export function PreviewPane({ embedded = false, onRestartServer, reloadRequest =
     syncNavigationState()
   }, [syncNavigationState])
 
-  const submitAddress = useCallback((next: string) => {
-    const webview = webviewRef.current
-    const url = next.trim()
+  const submitAddress = useCallback(
+    (next: string) => {
+      const webview = webviewRef.current
+      const url = next.trim()
 
-    if (!isHttpUrl(url)) {
-      return
-    }
+      if (!isHttpUrl(url)) {
+        return
+      }
 
-    setLoadError(null)
-    setCurrentUrl(url)
-    setAddress(url)
+      setLoadError(null)
+      setCurrentUrl(url)
+      setAddress(url)
+      submittedAddressRef.current = true
 
-    if (webview?.loadURL) {
-      void Promise.resolve(webview.loadURL(url)).catch(() => undefined)
-    } else {
-      webview?.setAttribute('src', url)
-    }
-  }, [])
+      if (webview?.loadURL) {
+        void Promise.resolve(webview.loadURL(url)).catch(error => {
+          setLoadError({
+            description: error instanceof Error ? error.message : copy.unreachableDescription,
+            url
+          })
+          setLoading(false)
+        })
+      } else {
+        webview?.setAttribute('src', url)
+      }
+    },
+    [copy.unreachableDescription]
+  )
 
   const handleAddressBlur = useCallback(() => {
     addressFocusedRef.current = false
+
+    // Don't snap back if the user just submitted — mousedown on Go fires
+    // submit, then blur. getURL() is still the previous page until did-navigate.
+    if (submittedAddressRef.current) {
+      submittedAddressRef.current = false
+
+      return
+    }
 
     // Sync the address to the webview's actual current URL after the user is
     // done typing — keeps the input truthful without clobbering mid-typing.

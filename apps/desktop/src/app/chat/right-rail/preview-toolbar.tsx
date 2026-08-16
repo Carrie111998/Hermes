@@ -127,7 +127,7 @@ export function PreviewToolbar({
         spellCheck={false}
         value={address}
       />
-      <TooltipIconButton disabled={!addressValid} tooltip={copy.navigate} type="submit">
+      <TooltipIconButton disabled={!addressValid} tooltip={copy.go} type="submit">
         <ArrowUpRight />
       </TooltipIconButton>
       <TooltipIconButton onClick={onReload} tooltip={copy.reload} type="button">

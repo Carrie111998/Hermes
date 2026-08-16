@@ -2827,7 +2827,8 @@ export const en: Translations = {
       goForward: 'Go forward',
       reload: 'Reload preview',
       address: 'Preview URL',
-      navigate: 'Navigate preview'
+      navigate: 'Navigate preview',
+      go: 'Go to address'
     }
   },
 

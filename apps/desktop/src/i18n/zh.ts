@@ -3000,7 +3000,8 @@ export const zh: Translations = {
       goForward: '前进',
       reload: '重新加载预览',
       address: '预览网址',
-      navigate: '浏览预览'
+      navigate: '浏览预览',
+      go: '转到地址'
     }
   },
 

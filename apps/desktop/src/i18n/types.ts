@@ -2412,6 +2412,7 @@ export interface Translations {
       reload: string
       address: string
       navigate: string
+      go: string
     }
   }
 
