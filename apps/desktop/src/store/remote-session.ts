@@ -157,11 +157,19 @@ function remoteBaseUrl(host: string, port: number): string {
 }
 
 function authHeaders(token: string, json = false): Record<string, string> {
-  return {
-    Accept: json ? 'application/json' : 'text/event-stream',
-    ...(token ? { Authorization: `Bearer ${token}` } : {}),
-    ...(json ? { 'Content-Type': 'application/json' } : {})
+  const headers: Record<string, string> = {
+    Accept: json ? 'application/json' : 'text/event-stream'
   }
+
+  if (token) {
+    headers.Authorization = `Bearer ${token}`
+  }
+
+  if (json) {
+    headers['Content-Type'] = 'application/json'
+  }
+
+  return headers
 }
 
 async function checkedFetch(url: string, init: RequestInit): Promise<Response> {
@@ -223,8 +231,12 @@ function publishError(error: unknown): void {
     status: 'error',
     error: authExpired ? TOKEN_EXPIRED_ERROR : errorMessage(error),
     attachedSessionId: undefined,
-    reconnecting: undefined,
-    ...(authExpired ? { token: '', expiresAt: '' } : {})
+    reconnecting: undefined
+  }
+
+  if (authExpired) {
+    next.token = ''
+    next.expiresAt = ''
   }
 
   $remoteAttach.set(next)
