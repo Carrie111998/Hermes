@@ -122,6 +122,22 @@ def test_bare_fixture_source_reads_as_default_account(runner):
     assert runner._adapter_for_source(mock_source) is default_adapter
 
 
+def test_mock_account_does_not_corrupt_the_session_key():
+    """The same pitfall on the session-key side: a non-string ``account``
+    must not be interpolated into the key namespace. Without the guard this
+    derives ``agent:main@<MagicMock ...>`` — and a different key every run,
+    because the repr embeds the object id."""
+    mock_source = MagicMock()
+    mock_source.platform = Platform.TELEGRAM
+    mock_source.chat_id = "777"
+    mock_source.chat_type = "dm"
+    mock_source.user_id = "777"
+    mock_source.thread_id = None
+    key = build_session_key(mock_source)
+    assert "MagicMock" not in key
+    assert key.split(":")[1] == "main"
+
+
 # ── Derived per-account config ──────────────────────────────────────────────
 
 
