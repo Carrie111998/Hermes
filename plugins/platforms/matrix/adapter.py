@@ -2,7 +2,8 @@
 
 Connects to any Matrix homeserver (self-hosted or matrix.org) via the
 mautrix Python SDK.  Supports optional end-to-end encryption (E2EE)
-when installed with ``pip install "mautrix[encryption]"``.
+when installed with ``hermes-agent[matrix-e2ee]`` (or
+``pip install "mautrix[encryption]"``).
 
 Environment variables:
     MATRIX_HOMESERVER           Homeserver URL (e.g. https://matrix.example.org)
@@ -608,8 +609,8 @@ _OUTBOUND_MENTION_RE = re.compile(
 )
 
 _E2EE_INSTALL_HINT = (
-    "Install with: pip install 'mautrix[encryption]' asyncpg aiosqlite  "
-    "(requires libolm C library)"
+    "Install with: pip install 'hermes-agent[matrix-e2ee]' "
+    "(or: pip install 'mautrix[encryption]' asyncpg aiosqlite; requires libolm)"
 )
 
 _MATRIX_IMAGE_FILENAME_EXTS = frozenset({

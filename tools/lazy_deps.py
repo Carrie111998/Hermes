@@ -224,7 +224,11 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
         "aiohttp==3.14.3",  # prior CVEs + GHSA-cq5v-8q36-5273/GHSA-mfx4-hv73-q22v/GHSA-mq44-7p77-q5h7
     ),
     "platform.matrix": (
-        "mautrix[encryption]==0.21.1",
+        # No [encryption] extra: python-olm has no wheels on modern macOS /
+        # Windows, so the extra pin left Matrix stuck on 0.21.0 and the
+        # adapter refused to start (#85588). E2EE remains opt-in via
+        # MATRIX_E2EE_MODE / pip install 'mautrix[encryption]'.
+        "mautrix==0.21.1",
         "aiosqlite==0.22.1",
         "asyncpg==0.31.0",
         "aiohttp-socks==0.11.0",

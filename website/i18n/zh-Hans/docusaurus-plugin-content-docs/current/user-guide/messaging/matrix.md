@@ -245,8 +245,8 @@ E2EE 需要带有加密扩展的 `mautrix` 库以及 `libolm` C 库：
 # 安装带 E2EE 支持的 mautrix
 pip install 'mautrix[encryption]'
 
-# 或通过 hermes extras 安装
-cd ~/.hermes/hermes-agent && uv pip install -e ".[matrix]"
+# 或通过 Hermes extra 安装。仅安装 [matrix] 不会带上加密。
+cd ~/.hermes/hermes-agent && uv pip install -e ".[matrix-e2ee]"
 ```
 
 你还需要在系统上安装 `libolm`：
@@ -326,7 +326,7 @@ Hermes 在启动时会检测到此情况并拒绝启用 E2EE，日志显示：`d
 :::
 
 :::info
-如果未安装 `mautrix[encryption]` 或缺少 `libolm`，机器人会自动回退到普通（未加密）客户端。你会在日志中看到警告。
+如果未安装 `hermes-agent[matrix-e2ee]`（或 `mautrix[encryption]`）或缺少 `libolm`，机器人会自动回退到普通（未加密）客户端。你会在日志中看到警告。仅安装 `hermes-agent[matrix]` 不足以启用 E2EE。
 :::
 
 ## 主房间
@@ -508,7 +508,7 @@ cd ~/.hermes/hermes-agent && uv pip install -e ".[matrix]"
 
 ## 代理模式（macOS 上的 E2EE）
 
-Matrix E2EE 需要 `libolm`，而该库无法在 macOS ARM64（Apple Silicon）上编译。`hermes-agent[matrix]` extra 仅限 Linux。如果你在 macOS 上，代理模式允许你在 Linux 虚拟机的 Docker 容器中运行 E2EE，而实际的 agent 在 macOS 上原生运行，可完整访问你的本地文件、记忆和技能。
+Matrix E2EE 需要 `libolm`，而该库无法在 macOS ARM64（Apple Silicon）上编译。`hermes-agent[matrix-e2ee]` extra 会拉取 `python-olm`，这是 Linux 上的加密安装路径。如果你在 macOS 上，代理模式允许你在 Linux 虚拟机的 Docker 容器中运行 E2EE，而实际的 agent 在 macOS 上原生运行，可完整访问你的本地文件、记忆和技能。
 
 ### 工作原理
 
@@ -589,7 +589,7 @@ services:
 FROM python:3.11-slim
 
 RUN apt-get update && apt-get install -y libolm-dev && rm -rf /var/lib/apt/lists/*
-RUN cd ~/.hermes/hermes-agent && uv pip install -e ".[matrix]"
+RUN cd ~/.hermes/hermes-agent && uv pip install -e ".[matrix-e2ee]"
 
 CMD ["hermes", "gateway"]
 ```

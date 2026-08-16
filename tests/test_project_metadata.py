@@ -18,19 +18,20 @@ def _load_package_data():
 
 
 def test_matrix_extra_not_in_all():
-    """The [matrix] extra pulls `mautrix[encryption]` -> `python-olm`,
+    """The [matrix] extra used to pull `mautrix[encryption]` -> `python-olm`,
     which has Linux-only wheels and no native build path on Windows or
     modern macOS (archived libolm, C++ errors with Clang 21+).
 
-    With matrix in [all], `uv sync --locked` on Windows tried to build
-    python-olm from sdist and failed on `make`. As of 2026-05-12 the
-    [matrix] extra is excluded from [all] entirely and routed through
-    `tools/lazy_deps.py` (LAZY_DEPS["platform.matrix"]) — installs at
-    first use, where the user is expected to have a toolchain.
+    As of #85588 the default [matrix] extra is plain `mautrix` (wheel-only);
+    E2EE is the opt-in `matrix-e2ee` extra. [matrix] stays out of [all]
+    and is lazy-installed via tools/lazy_deps.py.
     """
     optional_dependencies = _load_optional_dependencies()
 
     assert "matrix" in optional_dependencies, "[matrix] extra must still exist for `uv sync --extra matrix`"
+    matrix_specs = optional_dependencies["matrix"]
+    assert any(spec.startswith("mautrix==") for spec in matrix_specs), matrix_specs
+    assert not any("[encryption]" in spec for spec in matrix_specs), matrix_specs
     # Must NOT appear in [all] in any form — neither unconditional nor
     # platform-gated. Lazy-install handles it.
     matrix_in_all = [

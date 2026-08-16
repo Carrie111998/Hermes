@@ -787,6 +787,11 @@ class TestMatrixModuleImport:
 
 class TestMatrixRequirements:
 
+    def test_e2ee_install_hint_names_the_matrix_e2ee_extra(self):
+        from plugins.platforms.matrix.adapter import _E2EE_INSTALL_HINT
+
+        assert "hermes-agent[matrix-e2ee]" in _E2EE_INSTALL_HINT
+        assert "mautrix[encryption]" in _E2EE_INSTALL_HINT
 
     def test_check_requirements_encryption_true_no_e2ee_deps(self, monkeypatch):
         """MATRIX_ENCRYPTION=true should fail if python-olm is not installed."""

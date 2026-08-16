@@ -23,6 +23,13 @@ import tools.lazy_deps as ld
 # ---------------------------------------------------------------------------
 
 
+def test_platform_matrix_does_not_require_encryption_extra():
+    """#85588: lazy-install of Matrix must not pull python-olm."""
+    specs = ld.LAZY_DEPS["platform.matrix"]
+    assert any(spec.startswith("mautrix==") for spec in specs)
+    assert not any("[encryption]" in spec for spec in specs)
+
+
 class TestSpecSafety:
     @pytest.mark.parametrize("spec", [
         "mistralai>=2.3.0,<3",
