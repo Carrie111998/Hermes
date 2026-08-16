@@ -7529,6 +7529,19 @@ def _worktree_base_ref(repo_root: Path) -> str:
             return False
         return verified.returncode == 0
 
+    def _origin_exists() -> bool:
+        try:
+            result = subprocess.run(
+                ["git", "-C", str(repo_root), "remote", "get-url", "origin"],
+                capture_output=True,
+                text=True, encoding="utf-8", errors="replace",
+                timeout=30,
+                check=False,
+            )
+        except Exception:
+            return False
+        return result.returncode == 0
+
     try:
         fetched = subprocess.run(
             ["git", "-C", str(repo_root), "fetch", "--prune", "origin"],
@@ -7540,13 +7553,19 @@ def _worktree_base_ref(repo_root: Path) -> str:
             env=env,
         )
     except Exception as exc:
-        _log.debug("kanban worktree base fetch failed: %s", exc)
+        if _origin_exists():
+            raise RuntimeError(
+                f"could not fetch origin for new Kanban worktree: {exc}"
+            ) from exc
+        _log.debug("kanban worktree has no fetchable origin: %s", exc)
         return "HEAD"
     if fetched.returncode != 0:
-        _log.debug(
-            "kanban worktree base fetch failed: %s",
-            (fetched.stderr or fetched.stdout or "").strip(),
-        )
+        fetch_error = (fetched.stderr or fetched.stdout or "").strip()
+        if _origin_exists():
+            raise RuntimeError(
+                f"could not fetch origin for new Kanban worktree: {fetch_error}"
+            )
+        _log.debug("kanban worktree has no fetchable origin: %s", fetch_error)
         return "HEAD"
 
     candidates = []
