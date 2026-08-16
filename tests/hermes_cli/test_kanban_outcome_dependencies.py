@@ -197,6 +197,43 @@ def test_event_gc_bounds_status_provenance_to_first_invalidating_event(conn):
     )
 
 
+def test_event_gc_deletes_status_churn_without_post_completion_invalidation(conn):
+    parent = _complete_review(
+        conn, outcome_code="APPROVED", subject_sha=APPROVED_SHA
+    )
+    child = _conditional_child(conn, parent)
+    kb._append_event(conn, parent, "status", {"status": "archived"})
+    conn.execute("UPDATE tasks SET status = 'archived' WHERE id = ?", (parent,))
+    conn.execute("UPDATE task_events SET created_at = 0 WHERE task_id = ?", (parent,))
+
+    kb.gc_events(conn, older_than_seconds=1)
+
+    status_count = conn.execute(
+        "SELECT COUNT(*) FROM task_events WHERE task_id = ? AND kind = 'status'",
+        (parent,),
+    ).fetchone()[0]
+    assert status_count == 0
+    assert kb.dependency_blockers(conn, child) == []
+
+
+def test_event_gc_deletes_status_churn_without_structured_run(conn):
+    task = kb.create_task(conn, title="legacy terminal task")
+    assert kb.complete_task(conn, task, result="done")
+    kb._append_event(conn, task, "status", {"status": "todo"})
+    kb._append_event(conn, task, "status", {"status": "ready"})
+    kb._append_event(conn, task, "status", {"status": "archived"})
+    conn.execute("UPDATE tasks SET status = 'archived' WHERE id = ?", (task,))
+    conn.execute("UPDATE task_events SET created_at = 0 WHERE task_id = ?", (task,))
+
+    kb.gc_events(conn, older_than_seconds=1)
+
+    status_count = conn.execute(
+        "SELECT COUNT(*) FROM task_events WHERE task_id = ? AND kind = 'status'",
+        (task,),
+    ).fetchone()[0]
+    assert status_count == 0
+
+
 def test_review_claim_rechecks_conditional_dependencies(conn):
     parent = _complete_review(conn, outcome_code="APPROVED", subject_sha=APPROVED_SHA)
     child = _conditional_child(conn, parent)

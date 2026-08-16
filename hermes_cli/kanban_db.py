@@ -11712,7 +11712,7 @@ def gc_events(
             "AND NOT (kind = 'completed' AND run_id IN "
             "  (SELECT id FROM task_runs WHERE outcome_code IS NOT NULL "
             "   AND subject_sha IS NOT NULL)) "
-            "AND NOT (kind = 'status' AND id = ("
+            "AND NOT (kind = 'status' AND id = COALESCE(("
             "  SELECT MIN(status_event.id) FROM task_events AS status_event "
             "  WHERE status_event.task_id = task_events.task_id "
             "    AND status_event.kind = 'status' "
@@ -11738,7 +11738,7 @@ def gc_events(
             "      THEN COALESCE(json_extract(status_event.payload, '$.status'), '') "
             "           NOT IN ('done', 'archived') "
             "      ELSE 1 END"
-            "))",
+            "), -1))",
             (cutoff,),
         )
     return int(cur.rowcount or 0)
