@@ -73,7 +73,9 @@ def _make_adapter(allowed_user_ids=None):
     adapter._choice_picker_prompts_by_event = {}
     adapter._digest_detail_prompts_by_event = {}
     adapter._approval_require_sender = True
-    adapter.send = AsyncMock(return_value=SimpleNamespace(success=True, message_id="$selection"))
+    adapter.send = AsyncMock(
+        return_value=SimpleNamespace(success=True, message_id="$selection")
+    )
     adapter._send_reaction = AsyncMock(return_value="$reaction")
     return adapter
 
@@ -153,7 +155,9 @@ def test_digest_reaction_offers_selection_for_multiple_sources(tmp_path, monkeyp
 
     asyncio.run(
         adapter._on_reaction(
-            _make_reaction("@alice:example.org", "$selection", key="2️⃣", event_id="$select-b")
+            _make_reaction(
+                "@alice:example.org", "$selection", key="2️⃣", event_id="$select-b"
+            )
         )
     )
 
@@ -183,4 +187,30 @@ def test_digest_reaction_denies_unlisted_user(tmp_path, monkeypatch):
 
     args, kwargs = adapter.send.await_args
     assert "Only an authorized Matrix user" in args[1]
+    assert kwargs["reply_to"] == "$digest"
+
+
+def test_digest_reaction_failure_does_not_expose_internal_exception(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.delenv("GATEWAY_ALLOW_ALL_USERS", raising=False)
+
+    from cron import digest_reactions
+
+    def fail_resolution(*_args, **_kwargs):
+        raise RuntimeError("PRIVATE /root/.hermes/cron/output/source.md")
+
+    monkeypatch.setattr(digest_reactions, "resolve_digest_delivery", fail_resolution)
+    adapter = _make_adapter(allowed_user_ids=["@alice:example.org"])
+
+    asyncio.run(adapter._on_reaction(_make_reaction("@alice:example.org", "$digest")))
+
+    args, kwargs = adapter.send.await_args
+    assert (
+        args[1]
+        == "Failed to load digest detail. Check the local Hermes logs for details."
+    )
+    assert "PRIVATE" not in args[1]
+    assert "/root/.hermes" not in args[1]
     assert kwargs["reply_to"] == "$digest"

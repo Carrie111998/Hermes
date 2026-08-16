@@ -77,7 +77,9 @@ def _registry_transaction_lock():
                     acquired = True
                 except OSError:
                     if time.monotonic() >= deadline:
-                        raise TimeoutError("timed out acquiring Matrix digest registry lock")
+                        raise TimeoutError(
+                            "timed out acquiring Matrix digest registry lock"
+                        )
                     time.sleep(_REGISTRY_LOCK_POLL_SECONDS)
         else:
             import fcntl
@@ -88,7 +90,9 @@ def _registry_transaction_lock():
                     acquired = True
                 except (BlockingIOError, OSError):
                     if time.monotonic() >= deadline:
-                        raise TimeoutError("timed out acquiring Matrix digest registry lock")
+                        raise TimeoutError(
+                            "timed out acquiring Matrix digest registry lock"
+                        )
                     time.sleep(_REGISTRY_LOCK_POLL_SECONDS)
         try:
             yield
@@ -117,7 +121,9 @@ def _load_registry() -> dict[str, dict[str, Any]]:
 def _save_registry(data: dict[str, dict[str, Any]]) -> None:
     path = _registry_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp", prefix=".matrix_digest_")
+    fd, tmp = tempfile.mkstemp(
+        dir=str(path.parent), suffix=".tmp", prefix=".matrix_digest_"
+    )
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2, sort_keys=True)
@@ -287,7 +293,10 @@ def _extract_response_section(text: str) -> str:
     if idx == -1 and text.startswith("## Response"):
         idx = 0
     if idx == -1:
-        return text.strip()
+        # Saved cron artifacts can also contain prompts, script output, and
+        # error diagnostics. Never fall back to returning the whole artifact
+        # when the user-facing response section is absent.
+        return ""
     response = text[idx:].split("\n", 1)
     if len(response) == 1:
         return ""
@@ -318,7 +327,9 @@ def _read_source_detail(source: dict[str, Any]) -> str | None:
     return detail or None
 
 
-def format_digest_detail_response(record: dict[str, Any], *, source_index: int = 0) -> str:
+def format_digest_detail_response(
+    record: dict[str, Any], *, source_index: int = 0
+) -> str:
     """Return a safe Matrix reply for one source report in a registered digest."""
     sources = record.get("sources") if isinstance(record, dict) else None
     if not isinstance(sources, list) or not (0 <= source_index < len(sources)):
@@ -335,5 +346,7 @@ def format_digest_source_selection(record: dict[str, Any]) -> str:
     sources = record.get("sources") if isinstance(record, dict) else []
     lines = ["**🧾 Mehrere Einzelberichte verfügbar**", "", "Wähle per Reaction:"]
     for emoji, source in zip(selection_reactions(len(sources)), sources):
-        lines.append(f"{emoji} {source.get('name') or source.get('job_id') or 'Quelle'}")
+        lines.append(
+            f"{emoji} {source.get('name') or source.get('job_id') or 'Quelle'}"
+        )
     return "\n".join(lines)

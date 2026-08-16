@@ -7,7 +7,9 @@ from pathlib import Path
 from types import SimpleNamespace
 
 
-def test_register_digest_reaction_resolves_single_source_response(tmp_path, monkeypatch):
+def test_register_digest_reaction_resolves_single_source_response(
+    tmp_path, monkeypatch
+):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
 
     from cron.digest_reactions import (
@@ -76,7 +78,11 @@ def test_register_digest_reaction_ignores_unsafe_source_path(tmp_path, monkeypat
 def test_latest_output_fallback_ignores_symlink_escape(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
 
-    from cron.digest_reactions import format_digest_detail_response, register_digest_delivery, resolve_digest_delivery
+    from cron.digest_reactions import (
+        format_digest_detail_response,
+        register_digest_delivery,
+        resolve_digest_delivery,
+    )
 
     outside = tmp_path / "outside.md"
     outside.write_text("## Response\nSECRET OUTSIDE DETAIL", encoding="utf-8")
@@ -100,7 +106,40 @@ def test_latest_output_fallback_ignores_symlink_escape(tmp_path, monkeypatch):
     assert "detail output is no longer available" in text
 
 
-def test_scheduler_registers_matrix_digest_metadata_only_after_confirmed_send(tmp_path, monkeypatch):
+def test_detail_without_response_section_never_returns_whole_artifact(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    from cron.digest_reactions import format_digest_detail_response
+
+    source_dir = tmp_path / "cron" / "output" / "source-job"
+    source_dir.mkdir(parents=True)
+    source_output = source_dir / "legacy.md"
+    source_output.write_text(
+        "## Prompt\nPRIVATE PROMPT\n\n## Script Output\nPRIVATE RAW OUTPUT\n",
+        encoding="utf-8",
+    )
+    record = {
+        "sources": [
+            {
+                "job_id": "source-job",
+                "name": "Source Job",
+                "output_path": str(source_output),
+            }
+        ]
+    }
+
+    text = format_digest_detail_response(record)
+
+    assert "detail output is no longer available" in text
+    assert "PRIVATE PROMPT" not in text
+    assert "PRIVATE RAW OUTPUT" not in text
+
+
+def test_scheduler_registers_matrix_digest_metadata_only_after_confirmed_send(
+    tmp_path, monkeypatch
+):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
 
     from cron.digest_reactions import resolve_digest_delivery
@@ -108,7 +147,11 @@ def test_scheduler_registers_matrix_digest_metadata_only_after_confirmed_send(tm
     from gateway.config import Platform
 
     send_result = SimpleNamespace(success=True, message_id="$digest")
-    job = {"id": "digest-job", "name": "Morning Digest", "context_from": ["source-a", "source-b"]}
+    job = {
+        "id": "digest-job",
+        "name": "Morning Digest",
+        "context_from": ["source-a", "source-b"],
+    }
 
     _register_matrix_digest_details_if_applicable(
         job=job,
@@ -123,7 +166,9 @@ def test_scheduler_registers_matrix_digest_metadata_only_after_confirmed_send(tm
     assert [src["job_id"] for src in record["sources"]] == ["source-a", "source-b"]
 
 
-def test_scheduler_does_not_register_failed_matrix_send_with_event_id(tmp_path, monkeypatch):
+def test_scheduler_does_not_register_failed_matrix_send_with_event_id(
+    tmp_path, monkeypatch
+):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
 
     from cron.digest_reactions import _registry_path
@@ -167,7 +212,7 @@ def test_scheduler_does_not_register_non_digest_matrix_delivery(tmp_path, monkey
 
 def test_concurrent_digest_registrations_preserve_both_processes(tmp_path):
     """The shared registry must serialize its full read-modify-write transaction."""
-    worker = r'''
+    worker = r"""
 import os
 import sys
 import time
@@ -204,7 +249,7 @@ for index in range(8):
         source_job_ids=[f"source-{name}"],
         now=1000.0 + index,
     )
-'''
+"""
     env = os.environ.copy()
     env["PYTHONPATH"] = str(Path(__file__).resolve().parents[2])
     processes = [
@@ -234,7 +279,9 @@ for index in range(8):
     assert failures == []
 
     registry = json.loads(
-        (tmp_path / "state" / "matrix-digest-reactions.json").read_text(encoding="utf-8")
+        (tmp_path / "state" / "matrix-digest-reactions.json").read_text(
+            encoding="utf-8"
+        )
     )
     expected = {
         f"!room:example.org\0${name}-{index}"

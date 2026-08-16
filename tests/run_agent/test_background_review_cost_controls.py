@@ -44,7 +44,7 @@ class _FakeAgent:
 def test_routing_auto_inherits_parent_and_downgrades_codex_app_server():
     agent = _FakeAgent()
     cfg = {"auxiliary": {"background_review": {"provider": "auto", "model": ""}}}
-    with patch("hermes_cli.config.load_config", return_value=cfg):
+    with patch("hermes_cli.config.load_config", return_value=cfg), patch("hermes_cli.config.load_config_readonly", return_value=cfg):
         rt = br._resolve_review_runtime(agent)
     assert rt["routed"] is False
     assert rt["provider"] == "openai-codex"
@@ -64,7 +64,7 @@ def test_routing_to_different_model_marks_routed_and_resolves_credentials():
         "request_overrides": {"extra_body": {"store": False}},
         "max_output_tokens": 2048,
     }
-    with patch("hermes_cli.config.load_config", return_value=cfg), \
+    with patch("hermes_cli.config.load_config", return_value=cfg), patch("hermes_cli.config.load_config_readonly", return_value=cfg), \
          patch("hermes_cli.runtime_provider.resolve_runtime_provider", return_value=fake_rp):
         rt = br._resolve_review_runtime(agent)
     assert rt["routed"] is True
@@ -81,7 +81,7 @@ def test_unrouted_runtime_keeps_parent_pool_and_overrides():
     agent._credential_pool = "parent-pool"
     agent.request_overrides = {"service_tier": "priority"}
     agent.max_tokens = 4096
-    with patch("hermes_cli.config.load_config", return_value={}):
+    with patch("hermes_cli.config.load_config", return_value={}), patch("hermes_cli.config.load_config_readonly", return_value={}):
         rt = br._resolve_review_runtime(agent)
     assert rt["credential_pool"] == "parent-pool"
     assert rt["request_overrides"] == {"service_tier": "priority"}
@@ -93,7 +93,7 @@ def test_routing_same_model_as_parent_is_not_routed():
     cfg = {"auxiliary": {"background_review": {
         "provider": "openrouter", "model": "anthropic/claude-opus-4.8",
     }}}
-    with patch("hermes_cli.config.load_config", return_value=cfg):
+    with patch("hermes_cli.config.load_config", return_value=cfg), patch("hermes_cli.config.load_config_readonly", return_value=cfg):
         rt = br._resolve_review_runtime(agent)
     assert rt["routed"] is False  # same model/provider → keep full-replay path
 
@@ -103,7 +103,7 @@ def test_routing_resolution_failure_falls_back_to_parent():
     cfg = {"auxiliary": {"background_review": {
         "provider": "openrouter", "model": "google/gemini-3-flash-preview",
     }}}
-    with patch("hermes_cli.config.load_config", return_value=cfg), \
+    with patch("hermes_cli.config.load_config", return_value=cfg), patch("hermes_cli.config.load_config_readonly", return_value=cfg), \
          patch("hermes_cli.runtime_provider.resolve_runtime_provider",
                side_effect=RuntimeError("boom")):
         rt = br._resolve_review_runtime(agent)
@@ -158,3 +158,65 @@ def test_digest_records_tool_names_in_arc():
     digest = out[0]["content"]
     assert "USER: do the thing" in digest
     assert "tools: skill_view, patch" in digest
+
+
+# ---------------------------------------------------------------------------
+# Cost / configurability controls (issue #87250)
+# ---------------------------------------------------------------------------
+
+def test_max_iterations_unset_falls_back_to_default():
+    with patch("hermes_cli.config.load_config_readonly", return_value={}):
+        assert br._resolve_review_max_iterations() == 16
+
+
+def test_max_iterations_honors_config_override():
+    cfg = {"auxiliary": {"background_review": {"max_iterations": 4}}}
+    with patch("hermes_cli.config.load_config_readonly", return_value=cfg):
+        assert br._resolve_review_max_iterations() == 4
+
+
+def test_max_iterations_clamped_to_upper_bound():
+    cfg = {"auxiliary": {"background_review": {"max_iterations": 999}}}
+    with patch("hermes_cli.config.load_config_readonly", return_value=cfg):
+        assert br._resolve_review_max_iterations() == 64
+
+
+def test_max_iterations_clamped_to_lower_bound():
+    cfg = {"auxiliary": {"background_review": {"max_iterations": 0}}}
+    with patch("hermes_cli.config.load_config_readonly", return_value=cfg):
+        assert br._resolve_review_max_iterations() == 1
+
+
+def test_max_iterations_falls_back_to_default_on_config_error():
+    with patch(
+        "hermes_cli.config.load_config_readonly",
+        side_effect=RuntimeError("boom"),
+    ):
+        assert br._resolve_review_max_iterations() == 16
+
+
+def test_enabled_defaults_true():
+    with patch("hermes_cli.config.load_config_readonly", return_value={}):
+        assert br.is_background_review_enabled() is True
+
+
+def test_enabled_false_disables_automatic_review():
+    cfg = {"auxiliary": {"background_review": {"enabled": False}}}
+    with patch("hermes_cli.config.load_config_readonly", return_value=cfg):
+        assert br.is_background_review_enabled() is False
+
+
+def test_prompt_file_overrides_builtin(tmp_path):
+    prompt_path = tmp_path / "review.md"
+    prompt_path.write_text("Be conservative. Prefer Nothing to save.\n", encoding="utf-8")
+    cfg = {"auxiliary": {"background_review": {"prompt_file": str(prompt_path)}}}
+    agent = _FakeAgent()
+    with patch("hermes_cli.config.load_config_readonly", return_value=cfg):
+        _target, prompt = br.spawn_background_review_thread(
+            agent,
+            messages_snapshot=[{"role": "user", "content": "hi"}],
+            review_skills=True,
+        )
+    assert "Be conservative" in prompt
+    assert "ACTIVE" not in prompt  # built-in skill prompt not used
+    assert callable(_target)
