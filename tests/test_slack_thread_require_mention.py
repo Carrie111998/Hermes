@@ -73,9 +73,15 @@ def arm_thread_clarify(
             profile=(source.profile or profile) if config.multiplex_profiles else None,
         )
 
+    def resolve_profile_for_key(source):
+        if not config.multiplex_profiles:
+            return None
+        return source.profile or profile
+
     adapter._session_store = SimpleNamespace(
         config=config,
         _generate_session_key=generate_session_key,
+        _resolve_profile_for_key=resolve_profile_for_key,
     )
     if profile and stamp_adapter_profile:
         adapter._gateway_profile_name = profile
