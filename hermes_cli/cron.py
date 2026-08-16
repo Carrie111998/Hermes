@@ -526,6 +526,12 @@ def cron_edit(args):
         print(color(f"Job not found: {args.job_id}", Colors.RED))
         return 1
 
+    # Same guard as `cron create`, but the job already exists, so hand the
+    # stored row over: `cron edit --provider <p>` with no --model re-routes the
+    # job's CURRENT pin, and that is the pair the guard has to judge.
+    if not _confirm_pinned_model(args, existing_job=job):
+        return 1
+
     existing_skills = list(job.get("skills") or ([] if not job.get("skill") else [job.get("skill")]))
     replacement_skills = _normalize_skills(getattr(args, "skill", None), getattr(args, "skills", None))
     add_skills = _normalize_skills(None, getattr(args, "add_skills", None)) or []
