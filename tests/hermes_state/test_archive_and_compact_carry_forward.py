@@ -161,3 +161,30 @@ class TestCarryForwardIsNotDuplicated:
         archived = [(a, cp) for c, a, cp in rows if "unique-token-x" in c and a == 0]
         # oldest copy: summarized away (compacted=1). newest: superseded (0, 0).
         assert archived == [(0, 1), (0, 0)], archived
+
+    def test_tool_calls_inserted_through_append_match_the_carried_tail(self, db):
+        sid = _seed(db, n=1)
+        tool_calls = [{"id": "call-1", "type": "function"}]
+        db.append_message(
+            sid,
+            "assistant",
+            content=None,
+            tool_calls=tool_calls,
+            tool_call_id="call-1",
+        )
+        tail = {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": tool_calls,
+            "tool_call_id": "call-1",
+        }
+
+        db.archive_and_compact(sid, [{"role": "user", "content": "SUMMARY"}, tail])
+
+        with db._read_ctx() as conn:
+            rows = conn.execute(
+                "SELECT active, compacted FROM messages "
+                "WHERE session_id = ? AND tool_call_id = ? ORDER BY id",
+                (sid, "call-1"),
+            ).fetchall()
+        assert [(row[0], row[1]) for row in rows] == [(0, 0), (1, 0)]
