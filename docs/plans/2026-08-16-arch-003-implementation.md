@@ -1,6 +1,6 @@
 ---
 title: "ARCH-003 implementation plan: runtime-state audit and replay verification"
-status: IMPLEMENTATION_PLAN_REVISE_V10_PENDING
+status: IMPLEMENTATION_PLAN_REVISE_V11_PENDING
 date: 2026-08-16
 type: implementation-plan
 ticket: ARCH-003
@@ -121,16 +121,20 @@ prompt construction, legacy `state.db`, or unrelated dirty worktree files.
   fields, genesis semantics, generation record, key-check value, and rollback
   posture before edits.
 - Freeze the closed diagnostic reason-code enum before Gate 3 edits. Statuses
-  remain `CONSISTENT`, `DRIFT`, and `UNKNOWN`; the only permitted diagnostic
-  reason codes are: `OK`, `DRIFT_DETECTED`, `LOCK_TIMEOUT`,
-  `EMPTY_HISTORY`, `LEGACY_ORIGIN_MISSING`, `KEY_UNAVAILABLE`,
-  `KEY_CHECK_MISMATCH`, `DIGEST_PARAMETER_MISMATCH`,
-  `GENERATION_MISMATCH`, `MATERIALIZED_STATE_ASYMMETRY`,
-  `SEQUENCE_INVALID`, `BASELINE_INVALID`, `HISTORY_MALFORMED`,
-  `UNSUPPORTED_VERSION`, `REPLAY_LIMIT_EXCEEDED`,
-  `SNAPSHOT_FAILURE`, `POST_TERMINAL_EVENT`, and `WRITE_ABORT`.
-  No implementation may add a reason code outside this set without a plan
-  revision.
+  remain `CONSISTENT`, `DRIFT`, and `UNKNOWN`. The only permitted codes,
+  partitioned by surface, are:
+  - shared: `OK`, `KEY_UNAVAILABLE`;
+  - mutation-side only: `LOCK_TIMEOUT`, `WRITE_ABORT`;
+  - verifier-side only: `DRIFT_DETECTED`, `EMPTY_HISTORY`,
+    `LEGACY_ORIGIN_MISSING`, `KEY_CHECK_MISMATCH`,
+    `DIGEST_PARAMETER_MISMATCH`, `GENERATION_MISMATCH`,
+    `MATERIALIZED_STATE_ASYMMETRY`, `SEQUENCE_INVALID`,
+    `BASELINE_INVALID`, `HISTORY_MALFORMED`, `UNSUPPORTED_VERSION`,
+    `REPLAY_LIMIT_EXCEEDED`, `SNAPSHOT_FAILURE`, and
+    `POST_TERMINAL_EVENT`.
+  Gate 3 validates only the shared and verifier-side subsets; Gate 4 tests
+  every member on the surface where it is legal. No implementation may add a
+  code outside this partition without a plan revision.
 - Confirm that the prior release can start with the new journal table present
   and that rollback does not require deleting the table or losing materialized
   state.
@@ -148,6 +152,8 @@ Add a versioned runtime-state-owned journal table with:
 - non-secret digest-parameter identifier;
 - non-secret key-check value bound to the digest-parameter identifier;
 - origin marker for migration-origin or post-migration genesis;
+- origin epoch marker and origin-genesis sequence, copied into genesis and
+  baseline records so origin-epoch validity is checked from bounded row metadata;
 - per-profile/entity monotonic sequence with uniqueness;
 - operation category;
 - lifecycle state before/after;
@@ -155,14 +161,25 @@ Add a versioned runtime-state-owned journal table with:
 - state schema version and journal event version;
 - journal-writer generation/epoch continuity marker;
 - diagnostic timestamp;
+- origin epoch marker and origin-genesis sequence when event kind is
+  `genesis` or `baseline`;
 - baseline sealed lifecycle state, owner-version, state schema version, and
   sealed-through sequence when event kind is `baseline`.
 
 Add a durable database-level current-generation record:
 `runtime_state_journal_meta.current_generation`, owned by the runtime-state
-migration/startup module. Only the upgraded startup path advances it. Gate 3
-reads it inside the same `BEGIN DEFERRED` snapshot as the event stream and
-materialized row.
+migration/startup module. Define a durable writer-epoch transition record
+alongside it. The upgraded startup path computes its immutable writer epoch from
+the journal schema/code-contract version and advances `current_generation`
+exactly once only when that epoch is strictly newer than the durable epoch;
+restarting the same writer epoch never advances it. A startup observing a
+durable epoch newer than the running writer enters downgrade-unsafe mode and
+must not perform ordinary runtime-state writes. The transition record is
+durable before the upgraded writer serves mutations, so a rollback/roll-forward
+window is represented by a distinct epoch transition rather than by process
+restart count. Gate 3 reads the current-generation record, writer epoch, and
+transition marker inside the same `BEGIN DEFERRED` snapshot as the event
+stream and materialized row.
 
 Add a materialized-row journal-writer generation marker. Every mutation/genesis
 updates the row marker and records the current generation in its event. A row
@@ -171,6 +188,8 @@ advanced without a corresponding current-generation event, is `UNKNOWN`, never
 `DRIFT`. A rollback-then-roll-forward cycle therefore keeps affected entities
 `UNKNOWN` until the first subsequent journaled genesis re-establishes
 current-generation origin; a plain mutation cannot re-establish that origin.
+A same-epoch process restart does not create this window; only a durable
+writer-epoch transition does.
 
 The replay tuple is explicitly `lifecycle_state`, `owner_version`, and
 `state_schema_version`; terminality is derived from lifecycle state. The
@@ -289,12 +308,15 @@ Implement a bounded verifier that:
 - validates event kind, origin/genesis markers, journal generation/epoch
   continuity, baseline contents and baseline-to-next-event sequence continuity,
   duplicate or missing predecessors, digest-parameter identity, schemas, the
-  closed Gate 0 reason-code enum, and terminal state;
+  shared and verifier-side closed reason-code subsets, and terminal state;
 - uses a code-level `REPLAY_EVENT_LIMIT = 10000` counted from the effective
   replay start point: the latest valid baseline under the current digest
   identifier if one exists, otherwise the latest valid marked genesis under the
-  current digest identifier; otherwise `UNKNOWN`. Events preceding that start
-  are ignored;
+  current digest identifier; otherwise `UNKNOWN`. Baseline and genesis rows
+  carry the origin epoch marker and origin-genesis sequence, so current-origin
+  validity is checked from bounded row metadata without scanning an unbounded
+  pre-start prefix. Events preceding the selected start are ignored after that
+  O(1) metadata check;
 - selects the valid baseline with the highest `sealed_through_seq`, ignores
   events before it, and returns `UNKNOWN` for same-sequence tuple conflicts,
   overlapping contradictory baselines, a baseline without a valid current
@@ -332,8 +354,10 @@ Add deterministic tests for:
   disabled, roll forward, and assert verifier returns `UNKNOWN`, never
   `DRIFT`;
 - prior-version startup with the journal table present and rollback posture;
-- current-generation record advancement and concurrent generation advance during
-  verify returning `CONSISTENT` or `UNKNOWN`, never false `DRIFT`;
+- current-generation record advancement only on a strictly newer writer epoch,
+  same-epoch restart without advancement, downgrade-unsafe startup, and
+  concurrent generation advance during verify returning `CONSISTENT` or
+  `UNKNOWN`, never false `DRIFT`;
 - a newly created post-migration entity whose first journaled mutation is a
   marked genesis and reaches `CONSISTENT` after a valid follow-up mutation;
 - first post-generation-advance mutation emitting a marked genesis, with a
@@ -369,9 +393,10 @@ Add deterministic tests for:
 - snapshot race using explicit `BEGIN DEFERRED` and the selected WAL
   read-transaction mechanism, returning `CONSISTENT` or `UNKNOWN`, never
   false `DRIFT`;
-- replay bound counted from the effective replay start point, current-epoch
-  genesis selection, baseline selection, generation mismatch, and every member
-  of the closed reason-code enum;
+- replay bound counted from the effective replay start point, bounded
+  origin-epoch metadata validation, current-epoch genesis selection, baseline
+  selection, generation mismatch, and every member of each surface's closed
+  reason-code subset;
 - verifier-performs-no-writes using a direct database-change assertion;
 - materialized-row/history asymmetry returning `UNKNOWN`;
 - post-terminal events returning `UNKNOWN`;
@@ -459,7 +484,8 @@ Gates 0-4 above. This section is changelog only.
 ## Implementation-plan review reconciliation v9
 
 The v9 authenticated Claude Opus review returned `REVISE` with seven bounded
-plan-text corrections. The corrections are incorporated above:
+plan-text findings, grouped into six correction areas. The corrections are
+incorporated above:
 
 1. Any entity without current-epoch history, including post-migration-created
    entities, begins with a marked genesis; generation recovery is genesis-only.
@@ -470,6 +496,24 @@ plan-text corrections. The corrections are incorporated above:
 4. Gate 0 freezes the closed diagnostic reason-code enum.
 5. Growth accounting includes out-of-band baseline rows.
 6. `SQLITE_BUSY_TIMEOUT = 5s` is fixed and included in the benchmark contract.
+
+These remain plan-only corrections and do not authorize source edits, tests,
+DGX changes, deployment, repair, or event-sourcing. The corrected plan must
+return to the same authenticated Claude reviewer family and then to AGY on the
+identical packet.
+
+## Implementation-plan review reconciliation v10
+
+The v10 authenticated Claude Opus review returned `REVISE` with four bounded
+plan-text corrections. The corrections are incorporated above:
+
+1. Current-generation advancement is tied to a strictly newer durable writer
+   epoch, not ordinary process restart; downgrade-unsafe startup is explicit.
+2. Genesis and baseline records carry bounded origin-epoch metadata, so
+   pre-start origin validation does not create an unbounded verifier scan.
+3. The closed reason-code enum is partitioned into shared, mutation-side, and
+   verifier-side surfaces.
+4. The v9 changelog now states seven findings grouped into six correction areas.
 
 These remain plan-only corrections and do not authorize source edits, tests,
 DGX changes, deployment, repair, or event-sourcing. The corrected plan must
@@ -504,8 +548,9 @@ ARCH-003 implementation is ready for its delivery gates only when:
   retention job; entities beyond the replay limit remain UNKNOWN in this ticket,
   and the 100,000-event/100 MiB per-profile threshold is a documented follow-up
   operational review, not an in-ticket operator gate;
-- reconciliation v1 items are incorporated into the normative Gates 0-4 text and
-  this merged plan revision receives the same-family re-review;
+- reconciliation v1, v9, and v10 items are incorporated into the normative
+  Gates 0-4 text and this merged plan revision receives the same-family
+  re-review;
 - all focused and relevant tests pass;
 - authenticated Claude + AGY implementation review reaches consensus;
 - no unrelated dirty worktree or DGX runtime state was changed.
@@ -529,6 +574,9 @@ ARCH-003 implementation is ready for its delivery gates only when:
 - v9: post-migration creation genesis, genesis-only generation recovery,
   closed reason-code enumeration, fixed SQLite busy timeout, no-retry acceptance
   wording, benchmark enforcement point, and baseline-inclusive growth accounting.
+- v10: durable writer-epoch advancement trigger, bounded origin-epoch metadata
+  for verifier start selection, reason-code surface partition, and corrected
+  reconciliation count.
 
 
 ## Non-goals
