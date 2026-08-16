@@ -1,6 +1,7 @@
 import { renderHook } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
+import type * as ProfileStore from '@/store/profile'
 import { _resetLegacyDiscardForTests } from '@/store/session'
 import type * as WindowsStore from '@/store/windows'
 import type { SessionInfo } from '@/types/hermes'
@@ -18,6 +19,22 @@ vi.mock('@/store/windows', async importOriginal => {
   return {
     ...actual,
     isHudWindow: () => hudWindowMock()
+  }
+})
+
+// The gateway swap a session deep link performs. Held as a mock so a test can
+// keep it pending: the ordering it guarantees — backend first, session second —
+// is only observable while the swap has not settled.
+const { ensureGatewayProfileMock } = vi.hoisted(() => ({
+  ensureGatewayProfileMock: vi.fn<(profile: null | string | undefined) => Promise<void>>()
+}))
+
+vi.mock('@/store/profile', async importOriginal => {
+  const actual = await importOriginal<typeof ProfileStore>()
+
+  return {
+    ...actual,
+    ensureGatewayProfile: (profile: null | string | undefined) => ensureGatewayProfileMock(profile)
   }
 })
 
@@ -59,6 +76,8 @@ describe('useDesktopIntegrations', () => {
     navigate = vi.fn()
     // Every test starts as a main window; only the HUD describe flips this.
     hudWindowMock.mockReturnValue(false)
+    ensureGatewayProfileMock.mockReset()
+    ensureGatewayProfileMock.mockResolvedValue(undefined)
 
     // Stub the desktop bridge so the hook's useEffect callbacks don't try to
     // reach real Electron IPC. The established desktop-test pattern assigns a
@@ -89,6 +108,7 @@ describe('useDesktopIntegrations', () => {
     profileReady = false,
     resumeExhaustedSessionId = null as string | null,
     routedSessionId = null as string | null,
+    runtimeMap = new Map<string, string>(),
     sessions = [] as readonly SessionInfo[]
   } = {}) {
     return renderHook(
@@ -117,7 +137,7 @@ describe('useDesktopIntegrations', () => {
           refreshSessions: vi.fn(),
           resumeExhaustedSessionId,
           routedSessionId,
-          runtimeIdByStoredSessionId: { current: new Map() },
+          runtimeIdByStoredSessionId: { current: runtimeMap },
           sessions
         }),
       {
@@ -464,6 +484,107 @@ describe('useDesktopIntegrations', () => {
       })
 
       expect(window.localStorage.getItem('hermes.desktop.lastSessionId.profile.default')).toBe('other-session')
+    })
+  })
+
+  describe('session deep links', () => {
+    // Grab the onDeepLink callback the hook registers with the desktop bridge,
+    // so a test can fire payloads the way the main process would — more than
+    // one against a single render, which is what the staleness guard is about.
+    function deepLinkHandler(opts: Parameters<typeof render>[0] = {}) {
+      render({ profileReady: true, ...opts })
+
+      const onDeepLink = desktopWindow.hermesDesktop?.onDeepLink as ReturnType<typeof vi.fn>
+
+      return onDeepLink.mock.calls[0]?.[0] as (p: unknown) => void
+    }
+
+    function fireDeepLink(payload: unknown, opts: Parameters<typeof render>[0] = {}) {
+      deepLinkHandler(opts)(payload)
+    }
+
+    /// A swap that only settles when the test says so, so the window between
+    /// "asked for the profile" and "opened the session" stays observable.
+    function pendingSwaps() {
+      const settle: Array<() => void> = []
+
+      ensureGatewayProfileMock.mockImplementation(() => new Promise<void>(resolve => settle.push(() => resolve())))
+
+      return settle
+    }
+
+    it('opens the session a hermes://session/<id> link names', () => {
+      fireDeepLink({ kind: 'session', name: 'stored-session', params: {} })
+
+      // Empty runtime map → the id is already a stored id and passes through,
+      // which is the trail-back case (Cairn hands us the stored session key).
+      expect(navigate).toHaveBeenCalledWith('/stored-session')
+    })
+
+    it('translates a runtime id to its stored id before opening', () => {
+      fireDeepLink(
+        { kind: 'session', name: 'runtime-xyz', params: {} },
+        { runtimeMap: new Map([['stored-session', 'runtime-xyz']]) }
+      )
+
+      expect(navigate).toHaveBeenCalledWith('/stored-session')
+    })
+
+    it('ignores a session link with no id', () => {
+      fireDeepLink({ kind: 'session', name: '', params: {} })
+
+      expect(navigate).not.toHaveBeenCalled()
+    })
+
+    it('makes the session own profile live before opening it', async () => {
+      const settle = pendingSwaps()
+
+      fireDeepLink({ kind: 'session', name: 'stored-session', params: { profile: 'research' } })
+
+      expect(ensureGatewayProfileMock).toHaveBeenCalledWith('research')
+      // Opening first would resume against whichever gateway happens to be
+      // live — the launch profile — which is the bug this link exists to fix.
+      expect(navigate).not.toHaveBeenCalled()
+
+      settle[0]?.()
+
+      await vi.waitFor(() => expect(navigate).toHaveBeenCalledWith('/stored-session'))
+    })
+
+    it('leaves the gateway alone when a link names no profile', () => {
+      fireDeepLink({ kind: 'session', name: 'stored-session', params: {} })
+
+      expect(ensureGatewayProfileMock).not.toHaveBeenCalled()
+      expect(navigate).toHaveBeenCalledWith('/stored-session')
+    })
+
+    it('still opens the session when the profile swap fails', async () => {
+      ensureGatewayProfileMock.mockRejectedValue(new Error('gateway down'))
+
+      fireDeepLink({ kind: 'session', name: 'stored-session', params: { profile: 'research' } })
+
+      // Degrading to "opened, possibly on the wrong profile" beats a click
+      // that visibly does nothing.
+      await vi.waitFor(() => expect(navigate).toHaveBeenCalledWith('/stored-session'))
+    })
+
+    it('lets the newest delivery win when two links race', async () => {
+      const settle = pendingSwaps()
+      const onDeepLink = deepLinkHandler()
+
+      onDeepLink({ kind: 'session', name: 'first', params: { profile: 'alpha' } })
+      onDeepLink({ kind: 'session', name: 'second', params: { profile: 'beta' } })
+
+      // The newest link settles first; the stale one lands afterwards and must
+      // not pull the user off the session they actually asked for.
+      settle[1]?.()
+      await vi.waitFor(() => expect(navigate).toHaveBeenCalledWith('/second'))
+
+      settle[0]?.()
+      await Promise.resolve()
+
+      expect(navigate).not.toHaveBeenCalledWith('/first')
+      expect(navigate).toHaveBeenCalledTimes(1)
     })
   })
 })
