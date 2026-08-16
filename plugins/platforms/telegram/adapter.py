@@ -18,6 +18,7 @@ import html as _html
 import random
 import re
 import threading
+import time
 from contextvars import ContextVar
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Set, Any
@@ -489,6 +490,15 @@ _POLLING_GENERATION_CONTEXT: ContextVar[Optional[int]] = ContextVar(
 _POLLING_RETRY_BASE_DELAY = 5.0
 _POLLING_RETRY_MAX_DELAY = 60.0
 _POLLING_RETRY_JITTER_RATIO = 0.20
+_POLLING_OPERATION_LOG_INTERVAL = 10.0
+
+_POLLING_DEGRADED_REASON_CODES = {
+    "polling bootstrap": "bootstrap",
+    "polling progress verifier: updater not running": "updater_not_running",
+    "polling progress verifier connectivity failure": "progress_probe_connectivity",
+    "polling progress verifier: general path healthy but getUpdates stalled": "progress_timeout",
+    "heartbeat probe": "heartbeat_probe",
+}
 
 
 def _polling_retry_delay(attempt: int) -> float:
@@ -1991,7 +2001,36 @@ class TelegramAdapter(BasePlatformAdapter):
         self._send_path_degraded = True
         return self._polling_generation, self._polling_progress_event
 
-    def _record_polling_progress(self, generation: int) -> None:
+    def _record_polling_degraded_metadata(self, reason: str) -> None:
+        """Emit a bounded, metadata-only degraded polling record.
+
+        The normal warning retains its redacted exception for diagnosis. This
+        separate record is intentionally limited to stable state metadata so
+        operational consumers can detect degradation without receiving error
+        text, payloads, tokens, or request details.
+        """
+        if getattr(self, "_polling_teardown_started", False):
+            return
+        now = time.monotonic()
+        last_at = getattr(self, "_polling_degraded_log_at", None)
+        if (
+            last_at is not None
+            and now - last_at < _POLLING_OPERATION_LOG_INTERVAL
+        ):
+            return
+        self._polling_degraded_log_at = now
+        reason_code = _POLLING_DEGRADED_REASON_CODES.get(reason, "other")
+        logger.warning(
+            "[%s] event=telegram_polling_degraded mode=polling "
+            "generation=%d reason=%s",
+            self.name,
+            getattr(self, "_polling_generation", 0),
+            reason_code,
+        )
+
+    def _record_polling_progress(
+        self, generation: int, *, result_class: str = "unknown"
+    ) -> None:
         """Record successful getUpdates I/O for the current generation only."""
         if getattr(self, "_polling_teardown_started", False):
             return
@@ -2003,6 +2042,23 @@ class TelegramAdapter(BasePlatformAdapter):
         self._polling_network_error_count = 0
         self._polling_conflict_count = 0
         self._send_path_degraded = False
+        now = time.monotonic()
+        last_generation = getattr(self, "_polling_progress_log_generation", None)
+        last_at = getattr(self, "_polling_progress_log_at", None)
+        if (
+            last_generation != generation
+            or last_at is None
+            or now - last_at >= _POLLING_OPERATION_LOG_INTERVAL
+        ):
+            self._polling_progress_log_generation = generation
+            self._polling_progress_log_at = now
+            logger.info(
+                "[%s] event=telegram_polling_progress mode=polling "
+                "generation=%d result_class=%s",
+                self.name,
+                generation,
+                result_class if result_class in {"empty", "non_empty"} else "unknown",
+            )
 
     def _observe_polling_request_result(self, request, generation, result):
         """Record getUpdates progress from an observed do_request result.
@@ -2026,7 +2082,8 @@ class TelegramAdapter(BasePlatformAdapter):
             and envelope.get("ok") is True
             and "result" in envelope
         ):
-            self._record_polling_progress(generation)
+            result_class = "empty" if isinstance(envelope["result"], list) and not envelope["result"] else "non_empty"
+            self._record_polling_progress(generation, result_class=result_class)
 
     def _instrument_polling_request(self, request):
         """Instrument one dedicated PTB getUpdates request with progress tracking.
@@ -2194,6 +2251,7 @@ class TelegramAdapter(BasePlatformAdapter):
             )
             return
         self._send_path_degraded = True
+        self._record_polling_degraded_metadata(reason)
         logger.warning(
             "[%s] Telegram polling degraded (%s); gateway stays alive and will retry. Error: %s",
             self.name, reason, error,
