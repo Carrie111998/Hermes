@@ -3,6 +3,10 @@
 import argparse
 import json
 import os
+import subprocess
+import sys
+import time
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -284,6 +288,147 @@ class TestListNavigation:
         assert isinstance(allowlist, list)
         assert allowlist[0] == {"name": "alice", "role": "admin"}
         assert allowlist[1] == {"name": "bob", "role": "admin"}
+
+
+class TestListAppend:
+    def test_append_creates_list_with_json_value(self, _isolated_hermes_home):
+        from hermes_cli.config import append_config_value
+
+        append_config_value(
+            "hooks.pre_llm_call",
+            '{"command":"/opt/hermes/check.py","timeout":9}',
+        )
+
+        import yaml
+
+        saved = yaml.safe_load(_read_config(_isolated_hermes_home))
+        assert saved["hooks"]["pre_llm_call"] == [
+            {"command": "/opt/hermes/check.py", "timeout": 9}
+        ]
+
+    def test_append_preserves_existing_items_and_comments(self, _isolated_hermes_home):
+        from hermes_cli.config import append_config_value
+
+        config_path = _isolated_hermes_home / "config.yaml"
+        config_path.write_text(
+            "# operator note\n"
+            "hooks:\n"
+            "  pre_llm_call:\n"
+            "    - command: /opt/hermes/first.py  # keep inline\n",
+            encoding="utf-8",
+        )
+
+        append_config_value(
+            "hooks.pre_llm_call",
+            '{"command":"/opt/hermes/second.py"}',
+        )
+
+        text = config_path.read_text(encoding="utf-8")
+        assert "# operator note" in text
+        assert "# keep inline" in text
+
+        import yaml
+
+        saved = yaml.safe_load(text)
+        assert [item["command"] for item in saved["hooks"]["pre_llm_call"]] == [
+            "/opt/hermes/first.py",
+            "/opt/hermes/second.py",
+        ]
+
+    def test_append_rejects_invalid_json(self, capsys):
+        from hermes_cli.config import append_config_value
+
+        with pytest.raises(SystemExit) as exc:
+            append_config_value("hooks.pre_llm_call", "{not-json}")
+
+        assert exc.value.code == 1
+        assert "value must be valid JSON" in capsys.readouterr().err
+
+    def test_append_rejects_non_list_target(self, _isolated_hermes_home, capsys):
+        from hermes_cli.config import append_config_value
+
+        (_isolated_hermes_home / "config.yaml").write_text(
+            "hooks:\n  pre_llm_call: disabled\n",
+            encoding="utf-8",
+        )
+
+        with pytest.raises(SystemExit) as exc:
+            append_config_value("hooks.pre_llm_call", '"check.py"')
+
+        assert exc.value.code == 1
+        assert "not a list" in capsys.readouterr().err
+
+    def test_append_reports_malformed_config(self, _isolated_hermes_home, capsys):
+        from hermes_cli.config import append_config_value
+
+        (_isolated_hermes_home / "config.yaml").write_text(
+            "hooks: [unterminated\n",
+            encoding="utf-8",
+        )
+
+        with pytest.raises(SystemExit) as exc:
+            append_config_value("hooks.pre_llm_call", '"check.py"')
+
+        assert exc.value.code == 1
+        assert "Cannot parse" in capsys.readouterr().err
+
+    def test_append_rejects_managed_list(self, monkeypatch, capsys):
+        from hermes_cli import managed_scope
+        from hermes_cli.config import append_config_value
+
+        monkeypatch.setattr(managed_scope, "is_key_managed", lambda key: True)
+        monkeypatch.setattr(managed_scope, "get_managed_dir", lambda: Path("managed"))
+
+        with pytest.raises(SystemExit) as exc:
+            append_config_value("hooks.pre_llm_call", '"check.py"')
+
+        assert exc.value.code == 1
+        assert "managed by your administrator" in capsys.readouterr().err
+
+    def test_concurrent_appenders_do_not_lose_items(self, _isolated_hermes_home):
+        config_path = _isolated_hermes_home / "config.yaml"
+        ready_dir = _isolated_hermes_home / "ready"
+        ready_dir.mkdir()
+        go_file = _isolated_hermes_home / "go"
+        worker = (
+            "import pathlib,sys,time; "
+            "from utils import atomic_roundtrip_yaml_append; "
+            "cfg=pathlib.Path(sys.argv[1]); ready=pathlib.Path(sys.argv[2]); "
+            "go=pathlib.Path(sys.argv[3]); value=int(sys.argv[4]); "
+            "ready.write_text('ready'); "
+            "deadline=time.monotonic()+10; "
+            "\nwhile not go.exists():\n"
+            "    assert time.monotonic() < deadline\n"
+            "    time.sleep(0.01)\n"
+            "atomic_roundtrip_yaml_append(cfg, 'hooks.pre_llm_call', value)"
+        )
+        processes = [
+            subprocess.Popen(
+                [
+                    sys.executable,
+                    "-c",
+                    worker,
+                    str(config_path),
+                    str(ready_dir / str(index)),
+                    str(go_file),
+                    str(index),
+                ],
+                cwd=str(Path(__file__).resolve().parents[2]),
+            )
+            for index in range(6)
+        ]
+        deadline = time.monotonic() + 10
+        while len(list(ready_dir.iterdir())) < len(processes):
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+        go_file.touch()
+        for process in processes:
+            assert process.wait(timeout=15) == 0
+
+        import yaml
+
+        saved = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+        assert sorted(saved["hooks"]["pre_llm_call"]) == list(range(6))
 
 
 # ---------------------------------------------------------------------------
