@@ -1,6 +1,6 @@
 ---
 title: "ARCH-003 implementation plan: runtime-state audit and replay verification"
-status: IMPLEMENTATION_PLAN_REVISE_V23_PENDING
+status: IMPLEMENTATION_PLAN_REVISE_V24_PENDING
 date: 2026-08-16
 type: implementation-plan
 ticket: ARCH-003
@@ -195,7 +195,12 @@ alongside it. The upgraded startup path computes its immutable writer epoch from
 the journal schema/code-contract version and, under the exclusive side of the
 named maintenance RW lock and one `BEGIN IMMEDIATE` transaction, performs an
 atomic compare-and-set: it advances `current_generation` exactly once only
-when that epoch is strictly newer than the durable epoch;
+when that epoch is strictly newer than the durable epoch. If lock acquisition
+or the startup write transaction reaches its fixed timeout, startup returns
+`LOCK_TIMEOUT` before opening or committing SQLite, remains global
+downgrade-unsafe/read-only, and serves no ordinary or event-only writes until a
+later successful startup transition; it must not serve mutations under an
+uncleared transition.
 restarting the same writer epoch never advances it. A startup observing a
 durable epoch newer than the running writer enters global downgrade-unsafe
 mode for the database: all ordinary runtime-state writes across all profiles
@@ -226,10 +231,11 @@ application-code-only counter is prohibited because prior writers must remain
 observable during rollback. The new writer must not increment the counter both
 in application code and in the trigger/write-guard. The mutation/genesis
 transaction records the counter before/after values in its event and updates
-the row marker. A row whose marker is older
-than the current generation, or whose materialized counter is not equal to the
-latest journaled counter for that entity, is `UNKNOWN` with
-`WRITE_COUNTER_GAP`, never `DRIFT`. Every event's before-counter must equal
+the row marker. A row whose marker is older than the current generation is `UNKNOWN` with
+`GENERATION_MISMATCH`. If the marker is current but the materialized counter
+is not equal to the latest journaled counter for that entity, it is `UNKNOWN`
+with `WRITE_COUNTER_GAP`, never `DRIFT`. When both conditions hold,
+`GENERATION_MISMATCH` has precedence over `WRITE_COUNTER_GAP`. Every event's before-counter must equal
 the immediately preceding event's after-counter, or the baseline's sealed
 counter. A marked genesis for an
 entity with no current-epoch history is the other valid starting point: its
@@ -444,9 +450,11 @@ Implement a bounded verifier that:
 - validates the selected baseline when one is the later replay-start candidate,
   including highest `sealed_through_seq` selection, same-sequence tuple
   conflicts, overlapping contradictory baselines, a baseline without a valid
-  current origin epoch, a stale generation marker, a materialized-write counter
-  not equal to the latest journaled counter, or a materialized state advanced
-  during a generation with no current-generation event;
+  current origin epoch, a stale generation marker returning
+  `GENERATION_MISMATCH`, a materialized-write counter not equal to the latest
+  journaled counter returning `WRITE_COUNTER_GAP` only when the generation
+  marker is current, or a materialized state advanced during a generation with
+  no current-generation event;
 - returns `UNKNOWN` with the corresponding closed reason code on empty history
   (`EMPTY_HISTORY`), snapshot failure, unsupported/newer versions, malformed
   history, unknown digest regime, key-check mismatch, verify-time key
@@ -488,11 +496,13 @@ Add deterministic tests for:
   detected by the materialized-write counter gap, global downgrade-unsafe
   startup blocking all profiles/entities and both event-only writers with
   mutation-side `WRITE_ABORT`, newer-epoch/equal-epoch roll-forward clearing
-  that mode, baseline refusal across a counter gap returning `WRITE_ABORT`,
-  separately authorized same-epoch re-originating genesis restoring mutation
-  ability, atomic concurrent startup advancing exactly once, delivery recording
-  of the blocked interval, and concurrent generation advance during verify
-  returning `CONSISTENT` or `UNKNOWN`, never false `DRIFT`;
+  that mode, startup lock/busy timeout returning `LOCK_TIMEOUT` while
+  remaining write-blocked, baseline refusal across a counter gap returning
+  `WRITE_ABORT`, separately authorized same-epoch re-originating genesis
+  restoring mutation ability, atomic concurrent startup advancing exactly once,
+  delivery recording of the blocked interval, and concurrent generation
+  advance during verify returning `CONSISTENT` or `UNKNOWN`, never false
+  `DRIFT`;
 - a newly created post-migration entity whose first journaled mutation is a
   marked genesis and reaches `CONSISTENT` after a valid follow-up mutation;
 - first post-generation-advance mutation emitting a marked genesis, with a
@@ -519,7 +529,10 @@ Add deterministic tests for:
   unavailability without lock leakage;
 - single-writer invariant and defensive abort; no sequence-collision retry is
   expected under write-lock-first discipline;
-- baseline generation-marker mismatch returning `UNKNOWN`;
+- baseline generation-marker mismatch returning `UNKNOWN` with
+  `GENERATION_MISMATCH`;
+- startup lock/busy timeout returning `LOCK_TIMEOUT` and refusing all
+  ordinary and event-only writes until a successful transition;
 - bypass-path rejection for mutation/genesis while permitting only the named
   baseline writer and the explicitly authorized re-originating genesis writer;
 - caller contract for `WRITE_ABORT`: no automatic retry, affected operation
@@ -901,6 +914,23 @@ DGX changes, deployment, repair, or event-sourcing. The corrected plan must
 return to the same authenticated Claude reviewer family and then to AGY on the
 identical packet.
 
+## Implementation-plan review reconciliation v23
+
+The v23 authenticated Claude Opus review returned `REVISE` with three bounded
+plan-text corrections. The corrections are incorporated above:
+
+1. Acceptance coverage now includes v22.
+2. Stale generation marker has deterministic `GENERATION_MISMATCH`
+   precedence; current-marker counter inequality maps to
+   `WRITE_COUNTER_GAP`.
+3. Startup lock or busy timeout fails closed with `LOCK_TIMEOUT`; the writer
+   remains global write-blocked/read-only until a successful transition.
+
+These remain plan-only corrections and do not authorize source edits, tests,
+DGX changes, deployment, repair, or event-sourcing. The corrected plan must
+return to the same authenticated Claude reviewer family and then to AGY on the
+identical packet.
+
 ## Acceptance criteria
 
 ARCH-003 implementation is ready for its delivery gates only when:
@@ -929,7 +959,7 @@ ARCH-003 implementation is ready for its delivery gates only when:
   retention job; entities beyond the replay limit remain UNKNOWN in this ticket,
   and the 100,000-event/100 MiB per-profile threshold is a documented follow-up
   operational review, not an in-ticket operator gate;
-- reconciliation v1 and v5-v21 items are incorporated into the normative
+- reconciliation v1 and v5-v22 items are incorporated into the normative
   Gates 0-4 text (with v2-v4 explicitly folded into the v1/v4 text), and this
   merged plan revision receives the same-family re-review;
 - all focused and relevant tests pass;
@@ -982,6 +1012,8 @@ ARCH-003 implementation is ready for its delivery gates only when:
   downgrade-unsafe mode, and equal-epoch exit coverage.
 - v22: origin-marker closed enum, bidirectional Gate 3 wording, deterministic
   EMPTY_HISTORY versus LEGACY_ORIGIN_MISSING precedence, and complete coverage.
+- v23: generation-mismatch reason precedence, startup timeout fail-closed
+  posture, and complete coverage.
 
 
 ## Non-goals
