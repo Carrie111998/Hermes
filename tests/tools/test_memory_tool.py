@@ -61,6 +61,23 @@ class TestMemoryToolConfigGate:
         monkeypatch.setattr(hc, "load_config", _boom)
         assert check_memory_requirements() is True
 
+    def test_model_tools_builtin_disabled_mirrors_gate(self, monkeypatch):
+        from model_tools import _builtin_memory_tools_disabled
+        self._patch_cfg(monkeypatch, {"memory_enabled": False, "user_profile_enabled": False})
+        assert _builtin_memory_tools_disabled() is True
+        self._patch_cfg(monkeypatch, {"memory_enabled": True, "user_profile_enabled": False})
+        assert _builtin_memory_tools_disabled() is False
+
+    def test_compute_tool_definitions_drops_memory_when_both_disabled(self, monkeypatch):
+        from model_tools import _compute_tool_definitions
+        self._patch_cfg(monkeypatch, {"memory_enabled": False, "user_profile_enabled": False})
+        tools = _compute_tool_definitions(enabled_toolsets=["memory"], quiet_mode=True)
+        assert not any(t["function"]["name"] == "memory" for t in tools)
+
+        self._patch_cfg(monkeypatch, {"memory_enabled": True, "user_profile_enabled": True})
+        tools_enabled = _compute_tool_definitions(enabled_toolsets=["memory"], quiet_mode=True)
+        assert any(t["function"]["name"] == "memory" for t in tools_enabled)
+
 
 # =========================================================================
 # Security scanning

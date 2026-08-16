@@ -417,22 +417,17 @@ def get_tool_definitions(
 def _builtin_memory_tools_disabled() -> bool:
     """True when the user has explicitly disabled BOTH built-in memory stores.
 
-    ``memory.memory_enabled: false`` + ``memory.user_profile_enabled: false``
-    means the operator opted into an external-provider-only memory surface
-    (e.g. Honcho). In that mode the built-in ``memory`` tool has no backing
-    store (agent_init never constructs MemoryStore), so exposing its schema
-    just invites calls that fail with "Memory is not available." Honcho /
-    other provider tools are injected separately and are unaffected.
+    Delegates to :func:`tools.memory_tool.check_memory_requirements` as the
+    single source of truth for the config gate.
 
-    Fails closed (False = keep the tool) if config can't be read.
+    ``model_tools._compute_tool_definitions`` applies this gate synchronously
+    on config fingerprint changes to bypass the 30 s TTL / 60 s flap-grace
+    window in :meth:`tools.registry.ToolRegistry.get_definitions` on a disable
+    flip.
     """
     try:
-        from hermes_cli.config import load_config
-        mem = (load_config() or {}).get("memory") or {}
-        return (
-            mem.get("memory_enabled") is False
-            and mem.get("user_profile_enabled") is False
-        )
+        from tools.memory_tool import check_memory_requirements
+        return not check_memory_requirements()
     except Exception:
         return False
 
