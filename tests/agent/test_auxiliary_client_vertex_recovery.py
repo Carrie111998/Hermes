@@ -118,3 +118,99 @@ class TestVertexCredentialRefresh:
         with patch("agent.vertex_adapter.refresh_vertex_credentials",
                    side_effect=RuntimeError("boom")):
             assert _refresh_provider_credentials("vertex") is False
+
+
+# ── Call-level recovery (sync & async) ───────────────────────────────────────
+
+class TestCallLLMVertexRecovery:
+    def test_sync_call_llm_auto_vertex_401_recovery(self, monkeypatch):
+        import agent.auxiliary_client as ac
+        from openai import AuthenticationError
+        import httpx
+
+        class _MockResponse:
+            pass
+
+        class _MockCompletions:
+            def __init__(self):
+                self.calls = 0
+
+            def create(self, **kwargs):
+                self.calls += 1
+                if self.calls == 1:
+                    raise AuthenticationError(
+                        message="ACCESS_TOKEN_TYPE_UNSUPPORTED",
+                        response=httpx.Response(401, request=httpx.Request("POST", "http://test")),
+                        body=None,
+                    )
+                return _MockResponse()
+
+        class _MockClient:
+            def __init__(self):
+                self.chat = type("Chat", (), {"completions": _MockCompletions()})()
+                self.base_url = "https://aiplatform.googleapis.com/v1beta1/projects/p/locations/global/endpoints/openapi"
+
+        client = _MockClient()
+        monkeypatch.setattr(ac, "resolve_provider_client", lambda *a, **k: (client, "auto", "chat_completions"))
+        monkeypatch.setattr(ac, "_get_cached_client", lambda *a, **k: (client, "m"))
+        monkeypatch.setattr(ac, "_validate_llm_response", lambda resp, *a, **k: resp)
+        
+        refresh_calls = 0
+        def _mock_refresh(provider):
+            nonlocal refresh_calls
+            refresh_calls += 1
+            return True
+            
+        monkeypatch.setattr(ac, "_refresh_provider_credentials", _mock_refresh)
+
+        # Ensure we don't fall into the fallback chain for auth errors if refresh works
+        res = ac.call_llm(messages=[{"role": "user", "content": "hi"}], model="m")
+        assert isinstance(res, _MockResponse)
+        assert client.chat.completions.calls == 2
+        assert refresh_calls == 1
+
+    @pytest.mark.asyncio
+    async def test_async_call_llm_auto_vertex_401_recovery(self, monkeypatch):
+        import agent.auxiliary_client as ac
+        from openai import AuthenticationError
+        import httpx
+
+        class _MockResponse:
+            pass
+
+        class _MockCompletions:
+            def __init__(self):
+                self.calls = 0
+
+            async def create(self, **kwargs):
+                self.calls += 1
+                if self.calls == 1:
+                    raise AuthenticationError(
+                        message="ACCESS_TOKEN_TYPE_UNSUPPORTED",
+                        response=httpx.Response(401, request=httpx.Request("POST", "http://test")),
+                        body=None,
+                    )
+                return _MockResponse()
+
+        class _MockClient:
+            def __init__(self):
+                self.chat = type("Chat", (), {"completions": _MockCompletions()})()
+                self.base_url = "https://us-east4-aiplatform.googleapis.com/v1beta1/projects/p/locations/us-east4/endpoints/openapi"
+
+        client = _MockClient()
+        monkeypatch.setattr(ac, "resolve_provider_client", lambda *a, **k: (client, "auto", "chat_completions"))
+        monkeypatch.setattr(ac, "_get_cached_client", lambda *a, **k: (client, "m"))
+        monkeypatch.setattr(ac, "_validate_llm_response", lambda resp, *a, **k: resp)
+        
+        refresh_calls = 0
+        def _mock_refresh(provider):
+            nonlocal refresh_calls
+            refresh_calls += 1
+            return True
+            
+        monkeypatch.setattr(ac, "_refresh_provider_credentials", _mock_refresh)
+
+        res = await ac.async_call_llm(messages=[{"role": "user", "content": "hi"}], model="m")
+        assert isinstance(res, _MockResponse)
+        assert client.chat.completions.calls == 2
+        assert refresh_calls == 1
