@@ -1,6 +1,6 @@
 ---
 title: "ARCH-003 implementation plan: runtime-state audit and replay verification"
-status: IMPLEMENTATION_PLAN_REVISE_V25_PENDING
+status: IMPLEMENTATION_PLAN_REVISE_V26_PENDING
 date: 2026-08-16
 type: implementation-plan
 ticket: ARCH-003
@@ -422,7 +422,7 @@ Migration compatibility tests must assert this posture.
   governed by Gate 1.
 - Add a negative test proving lifecycle writes cannot bypass the mutation/genesis
   emission chokepoint; the test must not reject the explicitly named baseline
-  writer.
+  writer or the explicitly authorized re-originating genesis writer.
 
 ### Gate 3 - read-only verifier
 
@@ -449,7 +449,7 @@ Implement a bounded verifier that:
   `MATERIALIZED_STATE_ASYMMETRY`, `GENERATION_MISMATCH`,
   `KEY_UNAVAILABLE`, `KEY_CHECK_MISMATCH`, `DIGEST_PARAMETER_MISMATCH`,
   `LEGACY_ORIGIN_MISSING`, `SEQUENCE_INVALID`, `BASELINE_INVALID`,
-  `WRITE_COUNTER_GAP`, `REPLAY_EVENT_LIMIT_EXCEEDED`,
+  `WRITE_COUNTER_GAP`, `REPLAY_LIMIT_EXCEEDED`,
   `POST_TERMINAL_EVENT`, `DRIFT_DETECTED`, `OK`. The first applicable
   code wins; `EMPTY_HISTORY` therefore wins over row-marker mismatch when
   the entity has zero journal rows, while `MATERIALIZED_STATE_ASYMMETRY`
@@ -561,9 +561,8 @@ Add deterministic tests for:
   materialized state;
 - duplicate, missing, malformed, non-contiguous, and unsupported events;
 - the same fixture with a materialized-write counter gap in either direction
-  (`>` or `<`) returning `UNKNOWN` with `WRITE_COUNTER_GAP`, a baseline
-  attempt refused with `WRITE_ABORT`, and a subsequent ordinary mutation
-  rejected with `WRITE_ABORT`;
+  (`>` or `<`) returning `UNKNOWN` with `WRITE_COUNTER_GAP`, and a baseline
+  attempt refused with `WRITE_ABORT`;
 - the same fixture with an explicitly authorized out-of-band same-epoch
   re-originating genesis adopting the observed counter, followed by a valid
   mutation reaching `CONSISTENT`;
@@ -966,6 +965,23 @@ DGX changes, deployment, repair, or event-sourcing. The corrected plan must
 return to the same authenticated Claude reviewer family and then to AGY on the
 identical packet.
 
+## Implementation-plan review reconciliation v25
+
+The v25 authenticated Claude Opus review returned `REVISE` with three bounded
+plan-text corrections. The corrections are incorporated above:
+
+1. The frozen replay-limit reason code is consistently named
+   `REPLAY_LIMIT_EXCEEDED`.
+2. Acceptance coverage now includes v24.
+3. Gate 2 and Gate 4 both permit the explicitly authorized re-originating
+   genesis writer in the bypass contract; redundant counter-gap assertions
+   are consolidated.
+
+These remain plan-only corrections and do not authorize source edits, tests,
+DGX changes, deployment, repair, or event-sourcing. The corrected plan must
+return to the same authenticated Claude reviewer family and then to AGY on the
+identical packet.
+
 ## Acceptance criteria
 
 ARCH-003 implementation is ready for its delivery gates only when:
@@ -994,7 +1010,7 @@ ARCH-003 implementation is ready for its delivery gates only when:
   retention job; entities beyond the replay limit remain UNKNOWN in this ticket,
   and the 100,000-event/100 MiB per-profile threshold is a documented follow-up
   operational review, not an in-ticket operator gate;
-- reconciliation v1 and v5-v23 items are incorporated into the normative
+- reconciliation v1 and v5-v24 items are incorporated into the normative
   Gates 0-4 text (with v2-v4 explicitly folded into the v1/v4 text), and this
   merged plan revision receives the same-family re-review;
 - all focused and relevant tests pass;
@@ -1052,6 +1068,8 @@ ARCH-003 implementation is ready for its delivery gates only when:
 - v24: startup sentence repair, NEW_ENTITY_GENESIS and marker precedence,
   total verifier reason precedence, Gate 4 deduplication, and pre-update
   no-op determination.
+- v25: reason-code spelling alignment, complete bypass allowance, and
+  consolidated counter-gap test coverage.
 
 
 ## Non-goals
