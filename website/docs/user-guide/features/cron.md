@@ -35,6 +35,61 @@ All of this is available to Hermes itself through the `cronjob` tool, so you can
 Cron-run sessions cannot recursively create more cron jobs. Hermes disables cron management tools inside cron executions to prevent runaway scheduling loops.
 :::
 
+## Controlling unattended iteration budgets
+
+Scheduled agents can use a separate tool-calling iteration limit from
+interactive chat. Configure a positive `cron.max_iterations` value to bound all
+cron agents without lowering `agent.max_turns` for normal sessions:
+
+```yaml
+cron:
+  max_iterations: 20
+```
+
+Resolution order is: a positive `max_iterations` stored on the job →
+`cron.max_iterations` → `agent.max_turns` → the legacy top-level `max_turns` →
+500. Invalid, boolean, zero, and negative values fall through to the next
+setting.
+
+Set the per-job value from the dashboard's advanced fields or the CLI. It is
+user-owned, like model/provider pins, so the agent's `cronjob` tool cannot
+raise it:
+
+```bash
+hermes cron create "every 2h" "Check server status" --max-iterations 12
+hermes cron edit <job-id> --max-iterations 20
+hermes cron edit <job-id> --clear-max-iterations
+```
+
+For providers whose allowance resets weekly, an optional final-window policy
+can raise the cron limit shortly before reset so unused quota is available to
+scheduled work:
+
+```yaml
+timezone: "America/Argentina/Buenos_Aires"
+
+cron:
+  max_iterations: 20
+  weekly_final_day:
+    enabled: true
+    provider: "zai"       # empty means any provider
+    reset_weekday: 5       # Monday=0 ... Saturday=5 ... Sunday=6
+    reset_time: "10:00"    # HH:MM or HH:MM:SS
+    window_hours: 24
+    max_iterations: 40
+```
+
+The final-window value only applies to the named runtime provider, only inside
+the bounded window before reset, and only when it is higher than the normal
+resolved limit. A profile-scoped `HERMES_TIMEZONE` value overrides the
+top-level `timezone`; when neither is set, reset times use server-local time.
+The policy never lowers a job's limit.
+
+Cron agents inherit the normal provider fallback chain. When a backup has a
+tighter output budget, use the per-entry
+[`max_output_tokens`](./fallback-providers.md#per-fallback-resource-limits)
+control.
+
 ## Creating scheduled tasks
 
 ### In chat with `/cron`
