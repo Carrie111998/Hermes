@@ -209,9 +209,10 @@ The fallback system also covers auxiliary tasks independently — vision, compre
 3. The last N messages are preserved intact (`compression.protect_last_n`, default: 20)
 4. Tool call/result message pairs are kept together (never split)
 5. By default, compression runs in place: the compacted transcript is soft-archived
-   under the same session id (`compression.in_place`, default `true`). A separate
-   "child" session is only created on the rotation path (e.g. session-id rotation
-   or degraded fallback compression)
+   under the same session id (`compression.in_place`, default `true`), so the session
+   keeps one durable id for life. A separate "child" session is only created on the
+   legacy rotation path — i.e. when `compression.in_place` is explicitly set to
+   `false`
 
 ### Session Persistence
 
