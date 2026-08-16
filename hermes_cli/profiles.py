@@ -1778,6 +1778,16 @@ def _cleanup_gateway_service(name: str, profile_dir: Path) -> None:
                 )
                 plist_path.unlink(missing_ok=True)
                 print("✓ Launchd service removed")
+
+        elif _platform.system() == "Windows":
+            # On Windows, the gateway runs as a Scheduled Task. Stop and delete it
+            # before killing the gateway process, otherwise the task's keepalive
+            # trigger may respawn the gateway between the kill and rmtree.
+            try:
+                from hermes_cli.gateway_windows import uninstall as _gw_uninstall
+                _gw_uninstall()
+            except Exception as e:
+                print(f"⚠ Windows gateway service cleanup: {e}")
     except Exception as e:
         print(f"⚠ Service cleanup: {e}")
     finally:
@@ -1788,17 +1798,41 @@ def _cleanup_gateway_service(name: str, profile_dir: Path) -> None:
 
 
 def _stop_gateway_process(profile_dir: Path) -> None:
-    """Stop a running gateway process via its PID file."""
+    """Stop a running gateway process via its PID file or lock file."""
     import time as _time
 
     pid_file = profile_dir / "gateway.pid"
-    if not pid_file.exists():
+    lock_file = profile_dir / "gateway.lock"
+
+    # Try gateway.pid first, then fall back to gateway.lock (which Task-spawned
+    # gateways on Windows write instead of gateway.pid). The lock file contains
+    # the same JSON record with a "pid" field.
+    pid = None
+    source = None
+
+    if pid_file.exists():
+        try:
+            raw = pid_file.read_text(encoding="utf-8").strip()
+            data = json.loads(raw) if raw.startswith("{") else {"pid": int(raw)}
+            pid = int(data["pid"])
+            source = "gateway.pid"
+        except Exception:
+            pass
+
+    if pid is None and lock_file.exists():
+        try:
+            from gateway.status import _read_gateway_lock_record
+            record = _read_gateway_lock_record(lock_file)
+            if record:
+                pid = int(record["pid"])
+                source = "gateway.lock"
+        except Exception:
+            pass
+
+    if pid is None:
         return
 
     try:
-        raw = pid_file.read_text(encoding="utf-8").strip()
-        data = json.loads(raw) if raw.startswith("{") else {"pid": int(raw)}
-        pid = int(data["pid"])
         # Route through terminate_pid so Windows uses the appropriate
         # primitive (taskkill / TerminateProcess) — raw os.kill with
         # _signal.SIGKILL raises AttributeError at import time on Windows,
@@ -1812,14 +1846,14 @@ def _stop_gateway_process(profile_dir: Path) -> None:
         for _ in range(20):
             _time.sleep(0.5)
             if not _pid_exists(pid):
-                print(f"✓ Gateway stopped (PID {pid})")
+                print(f"✓ Gateway stopped (PID {pid} from {source})")
                 return
         # Force kill
         try:
             _terminate_pid(pid, force=True)
         except (ProcessLookupError, OSError):
             pass
-        print(f"✓ Gateway force-stopped (PID {pid})")
+        print(f"✓ Gateway force-stopped (PID {pid} from {source})")
     except (ProcessLookupError, PermissionError):
         print("✓ Gateway already stopped")
     except Exception as e:
