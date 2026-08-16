@@ -1256,6 +1256,24 @@ class TestProfileArg:
             gateway_cli.EXTERNAL_GATEWAY_SUPERVISOR_ENV
         ] == "1"
 
+    def test_launchd_plist_keeps_homebrew_paths_when_writer_has_minimal_path(
+        self, tmp_path, monkeypatch
+    ):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        monkeypatch.setenv("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+        monkeypatch.setattr(gateway_cli, "get_hermes_home", lambda: hermes_home)
+        monkeypatch.setattr(gateway_cli, "_build_service_path_dirs", lambda: [])
+        monkeypatch.setattr(
+            gateway_cli, "_append_node_dir_for_service", lambda _entries: None
+        )
+
+        parsed = plistlib.loads(gateway_cli.generate_launchd_plist().encode("utf-8"))
+        path_entries = parsed["EnvironmentVariables"]["PATH"].split(os.pathsep)
+
+        assert {"/opt/homebrew/bin", "/opt/homebrew/sbin"} <= set(path_entries)
+        assert len(path_entries) == len(set(path_entries))
+
     def test_launchd_plist_path_uses_real_user_home_not_profile_home(self, tmp_path, monkeypatch):
         profile_dir = tmp_path / ".hermes" / "profiles" / "orcha"
         profile_dir.mkdir(parents=True)
