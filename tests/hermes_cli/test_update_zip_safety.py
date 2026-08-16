@@ -42,6 +42,27 @@ def test_git_failure_is_classified_for_windows_fallback() -> None:
     )
 
 
+def test_fallback_policy_allows_only_windows_git_failures(monkeypatch, tmp_path):
+    fake_main = _fake_main(tmp_path)
+    monkeypatch.setattr(update_cmd, "_m", lambda: fake_main)
+
+    git_failure = subprocess.CalledProcessError(1, ["git.exe", "fetch"])
+    dependency_failure = subprocess.CalledProcessError(
+        2, ["uv.exe", "pip", "install", "-e", "."]
+    )
+    assert update_cmd._should_zip_fallback_on_update_error(git_failure) is True
+    assert update_cmd._should_zip_fallback_on_update_error(dependency_failure) is False
+
+    fake_main._is_windows = lambda: False
+    assert update_cmd._should_zip_fallback_on_update_error(git_failure) is False
+
+
+def test_fallback_policy_rejects_non_process_errors(monkeypatch, tmp_path):
+    fake_main = _fake_main(tmp_path)
+    monkeypatch.setattr(update_cmd, "_m", lambda: fake_main)
+    assert update_cmd._should_zip_fallback_on_update_error(OSError("locked")) is False
+
+
 def test_zip_fallback_refuses_uncommitted_and_untracked_files(tmp_path, monkeypatch, capsys):
     """The guard must fail before a ZIP replacement can delete source-tree work."""
     (tmp_path / ".git").mkdir()
@@ -98,7 +119,7 @@ def test_zip_fallback_refuses_ignored_source_files_but_allows_preserved_dirs(
         "run",
         lambda *args, **kwargs: SimpleNamespace(
             returncode=0,
-            stdout="!! .cache/local-source.py\n!! venv/Lib/site-packages/pkg.py\n",
+            stdout="!! .cache/local-source.py\n!! .env\n!! ./venv/Lib/site-packages/pkg.py\n",
             stderr="",
         ),
     )
@@ -109,6 +130,7 @@ def test_zip_fallback_refuses_ignored_source_files_but_allows_preserved_dirs(
     assert exc_info.value.code == 1
     output = capsys.readouterr().out
     assert ".cache/local-source.py" in output
+    assert ".env" not in output
     assert "venv/Lib/site-packages/pkg.py" not in output
 
 

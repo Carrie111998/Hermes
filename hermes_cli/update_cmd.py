@@ -791,6 +791,21 @@ def _is_git_update_failure(exc: subprocess.CalledProcessError) -> bool:
     return executable.lower() in {"git", "git.exe"}
 
 
+def _should_zip_fallback_on_update_error(exc: BaseException) -> bool:
+    """Return whether an update error may use the Windows ZIP fallback.
+
+    The fallback is specifically a recovery for Git file-I/O failures. Keeping
+    this policy separate from the broad exception handler makes it testable
+    and prevents later update stages from accidentally regaining access to the
+    destructive path.
+    """
+    return (
+        isinstance(exc, subprocess.CalledProcessError)
+        and _m()._is_windows()
+        and _is_git_update_failure(exc)
+    )
+
+
 def _ensure_zip_update_checkout_is_clean() -> None:
     """Refuse the destructive ZIP replacement for a dirty git checkout.
 
@@ -847,7 +862,9 @@ def _ensure_zip_update_checkout_is_clean() -> None:
         payload = line[3:].strip() if len(line) >= 3 else line.strip()
         paths = payload.split(" -> ")
         for path in paths:
-            normalized = path.replace("\\", "/").lstrip("./")
+            normalized = path.replace("\\", "/")
+            while normalized.startswith("./"):
+                normalized = normalized[2:]
             top_level = normalized.split("/", 1)[0]
             if top_level not in preserved:
                 return True
@@ -6491,7 +6508,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
             sys.exit(1)
 
     except subprocess.CalledProcessError as e:
-        if _m()._is_windows() and _is_git_update_failure(e):
+        if _should_zip_fallback_on_update_error(e):
             print(f"⚠ Git update failed: {e}")
             print("→ Falling back to ZIP download...")
             print()
