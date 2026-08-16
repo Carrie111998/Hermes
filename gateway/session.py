@@ -4037,6 +4037,8 @@ class SessionStore:
         """
         if not self._db:
             return True
+        # Serialize against pending-queue drains. A failed rewrite retains the
+        # exact pending retry state; a successful rewrite clears it afterward.
         with self._get_transcript_drain_lock():
             try:
                 self._db.replace_messages(

@@ -11114,15 +11114,17 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         archived. ``message_count``/``tool_call_count`` then track the live set,
         matching :meth:`archive_and_compact`.
 
-        Pass ``archive_dropped=True`` for a prefix-preserving durable rewind.
-        The retained prefix keeps its existing row ids; only the active suffix
-        absent from ``messages`` is marked ``active = 0, compacted = 0``. This
-        avoids copying retained rows into both inactive and active history.
-        ``messages`` must therefore be an exact prefix of the active transcript.
-        ``expected_active_ids`` optionally pins the complete active snapshot so
-        a concurrent append/rewrite fails closed instead of being rewound by a
-        stale request. Both validation and the suffix update happen in the same
-        write transaction.
+        Pass ``archive_dropped=True`` to keep replaced live rows recoverable as
+        ``active = 0, compacted = 0``. Without ``expected_active_ids`` this
+        archives the complete live set and inserts ``messages`` as fresh rows,
+        preserving the TUI row-id recovery contract for verified non-prefix
+        replacements.
+
+        Supplying ``expected_active_ids`` selects the stricter prefix-preserving
+        mode used by gateway ``/retry``. It pins the complete active snapshot,
+        requires ``messages`` to be its exact prefix, keeps retained row ids,
+        and archives only the omitted suffix. Validation and mutation happen in
+        the same write transaction so a stale retry fails closed.
 
         Pass ``reject_active_turn_lease=True`` for user-initiated rewrites that
         do not already own the cross-process turn lease. The lease check and
@@ -11152,14 +11154,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     and session["end_reason"] == "compression"
                 ):
                     raise CompressionSessionClosedError(session_id)
-            if archive_dropped:
+            if archive_dropped and expected_active_ids is not None:
                 rows = conn.execute(
                     f"SELECT {self._CONVERSATION_ROW_COLUMNS} "
                     "FROM messages WHERE session_id = ? AND active = 1 ORDER BY id",
                     (session_id,),
                 ).fetchall()
                 active_ids = [int(row["id"]) for row in rows]
-                if expected_active_ids is not None and active_ids != expected_active_ids:
+                if active_ids != expected_active_ids:
                     raise RuntimeError(
                         "active transcript changed during durable rewrite"
                     )
@@ -11223,6 +11225,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     (len(messages), tool_call_count, session_id),
                 )
                 return
+            elif archive_dropped:
+                # Compatibility mode for verified TUI replacements whose live
+                # ordering is not a byte-for-byte durable prefix.
+                conn.execute(
+                    "UPDATE messages SET active = 0, compacted = 0 "
+                    "WHERE session_id = ? AND active = 1",
+                    (session_id,),
+                )
             else:
                 conn.execute(
                     f"DELETE FROM messages WHERE session_id = ?{active_clause}",
