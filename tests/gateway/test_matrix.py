@@ -1393,6 +1393,129 @@ class TestMatrixPasswordLoginDeviceId:
 
         await adapter.disconnect()
 
+    @pytest.mark.asyncio
+    async def test_password_login_survives_unwritable_env(self, monkeypatch, tmp_path):
+        """A persistence failure on an unwritable .env must not break login.
+
+        Point 1 of the review: _resolve_stable_device_id() originally called
+        save_env_value() before the try block, so an unwritable profile .env
+        raised out of connect() entirely — a regression where password login
+        previously connected. The write is now best-effort: login proceeds
+        with a generated-but-unpersisted ID (equivalent to the pre-fix
+        auto-mint) instead of failing.
+        """
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.delenv("MATRIX_DEVICE_ID", raising=False)
+        import hermes_cli.config as hconfig
+
+        def _raise(*args, **kwargs):
+            raise OSError("read-only filesystem")
+
+        monkeypatch.setattr(hconfig, "save_env_value", _raise)
+
+        from plugins.platforms.matrix.adapter import MatrixAdapter
+
+        config = PlatformConfig(
+            enabled=True,
+            extra={
+                "homeserver": "https://matrix.example.org",
+                "user_id": "@bot:example.org",
+                "password": "secret",
+            },
+        )
+        adapter = MatrixAdapter(config)
+
+        fake_mautrix_mods = _make_fake_mautrix()
+        mock_client = MagicMock()
+        mock_client.mxid = "@bot:example.org"
+        mock_client.device_id = None
+        mock_client.state_store = MagicMock()
+        mock_client.sync_store = MagicMock()
+        mock_client.crypto = None
+        mock_client.login = AsyncMock(
+            return_value=MagicMock(device_id="GENERATED", access_token="tok")
+        )
+        mock_client.sync = AsyncMock(return_value={"rooms": {"join": {}}})
+        mock_client.add_event_handler = MagicMock()
+        mock_client.api = MagicMock()
+        mock_client.api.token = ""
+        mock_client.api.session = MagicMock()
+        mock_client.api.session.close = AsyncMock()
+        fake_mautrix_mods["mautrix.client"].Client = MagicMock(return_value=mock_client)
+
+        with patch.dict("sys.modules", fake_mautrix_mods):
+            with patch.object(adapter, "_refresh_dm_cache", AsyncMock()):
+                with patch.object(adapter, "_sync_loop", AsyncMock(return_value=None)):
+                    # Login must still succeed even though persistence raised.
+                    assert await adapter.connect() is True
+
+        mock_client.login.assert_awaited_once()
+        passed_device_id = mock_client.login.call_args.kwargs.get("device_id")
+        assert passed_device_id and len(passed_device_id) == 10
+
+        await adapter.disconnect()
+
+    @pytest.mark.asyncio
+    async def test_password_login_logs_device_id_divergence(
+        self, monkeypatch, tmp_path, caplog
+    ):
+        """Point 4 of the review: a homeserver-assigned device differing from
+        the requested/persisted one must surface a warning instead of silently
+        diverging."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.delenv("MATRIX_DEVICE_ID", raising=False)
+        from plugins.platforms.matrix.adapter import MatrixAdapter
+
+        # A prior run persisted a device ID; the homeserver then ignores it.
+        (tmp_path / ".env").write_text("MATRIX_DEVICE_ID=PERSISTED_ID\n")
+
+        config = PlatformConfig(
+            enabled=True,
+            extra={
+                "homeserver": "https://matrix.example.org",
+                "user_id": "@bot:example.org",
+                "password": "secret",
+            },
+        )
+        adapter = MatrixAdapter(config)
+
+        fake_mautrix_mods = _make_fake_mautrix()
+        mock_client = MagicMock()
+        mock_client.mxid = "@bot:example.org"
+        mock_client.device_id = None
+        mock_client.state_store = MagicMock()
+        mock_client.sync_store = MagicMock()
+        mock_client.crypto = None
+        mock_client.login = AsyncMock(
+            # Homeserver ignores the requested ID and assigns its own.
+            return_value=MagicMock(device_id="SERVER_ASSIGNED", access_token="tok")
+        )
+        mock_client.sync = AsyncMock(return_value={"rooms": {"join": {}}})
+        mock_client.add_event_handler = MagicMock()
+        mock_client.api = MagicMock()
+        mock_client.api.token = ""
+        mock_client.api.session = MagicMock()
+        mock_client.api.session.close = AsyncMock()
+        fake_mautrix_mods["mautrix.client"].Client = MagicMock(return_value=mock_client)
+
+        with patch.dict("sys.modules", fake_mautrix_mods):
+            with patch.object(adapter, "_refresh_dm_cache", AsyncMock()):
+                with patch.object(adapter, "_sync_loop", AsyncMock(return_value=None)):
+                    assert await adapter.connect() is True
+
+        passed_device_id = mock_client.login.call_args.kwargs.get("device_id")
+        assert passed_device_id == "PERSISTED_ID"
+        # The adapter adopts the homeserver-assigned device even though it
+        # differs from the requested/persisted one.
+        assert mock_client.device_id == "SERVER_ASSIGNED"
+        assert any(
+            "assigned device SERVER_ASSIGNED instead of the requested PERSISTED_ID"
+            in rec.message
+            for rec in caplog.records
+        )
+
+        await adapter.disconnect()
+
 
 class TestMatrixDeviceIdConfig:
     """MATRIX_DEVICE_ID should be plumbed through gateway config."""

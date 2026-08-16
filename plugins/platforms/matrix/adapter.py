@@ -1818,6 +1818,14 @@ class MatrixAdapter(BasePlatformAdapter):
                 )
                 if resp and hasattr(resp, "device_id"):
                     client.device_id = resp.device_id
+                    if self._device_id and resp.device_id and resp.device_id != self._device_id:
+                        logger.warning(
+                            "Matrix: homeserver assigned device %s instead of "
+                            "the requested %s — the persisted MATRIX_DEVICE_ID "
+                            "now diverges from the live device.",
+                            resp.device_id,
+                            self._device_id,
+                        )
                 logger.info("Matrix: logged in as %s", self._user_id)
             except Exception as exc:
                 logger.error("Matrix: login failed — %s", exc)
@@ -5264,7 +5272,20 @@ def _resolve_stable_device_id() -> str:
     if existing:
         return existing
     device_id = _generate_stable_device_id()
-    save_env_value("MATRIX_DEVICE_ID", device_id)
+    try:
+        save_env_value("MATRIX_DEVICE_ID", device_id)
+    except Exception as exc:
+        # An unwritable .env (read-only HOME, container, managed scope that
+        # rejects the write) must not prevent login. Fall back to a
+        # generated-but-unpersisted ID: the session still works, and a later
+        # restart just regenerates (equivalent to the pre-fix auto-mint),
+        # rather than failing connect entirely.
+        logger.warning(
+            "Matrix: could not persist MATRIX_DEVICE_ID (%s); using a "
+            "generated ID for this session only. Restarts may mint a fresh "
+            "device until the profile .env is writable.",
+            exc,
+        )
     return device_id
 
 
