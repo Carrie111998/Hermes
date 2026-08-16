@@ -27,6 +27,7 @@ Usage:
 
 import base64
 import binascii
+import fnmatch
 import os
 import re
 import difflib
@@ -2789,6 +2790,44 @@ class ShellFileOperations(FileOperations):
                 )
         return None
 
+    def _search_files_python(self, pattern: str, path: str, limit: int, offset: int,
+                             search_root: Path, has_hidden_path_ancestor: bool) -> SearchResult:
+        """Search files with pathlib when shell find is not reliable.
+
+        Native Windows sessions can run inside Git Bash/MSYS while still using
+        Windows paths.  ``rg`` is the preferred fast path; when rg is absent,
+        shelling out to ``find`` is brittle because path conversion and CRLF
+        handling vary by installed shell.  A local pathlib walk is slower but
+        deterministic and keeps Windows path spelling intact.
+        """
+        try:
+            root = Path(path)
+            if not root.exists():
+                return SearchResult(error=f"Path not found: {path}", total_count=0)
+
+            candidates = []
+            for file_path in root.rglob("*"):
+                if not file_path.is_file():
+                    continue
+                try:
+                    rel_parts = file_path.resolve().relative_to(search_root.resolve()).parts
+                except ValueError:
+                    rel_parts = file_path.parts
+                if any(part not in {".", ".."} and part.startswith(".") for part in rel_parts):
+                    continue
+                if fnmatch.fnmatch(file_path.name, pattern):
+                    candidates.append(file_path)
+
+            candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+            page = candidates[offset:offset + limit]
+            return SearchResult(
+                files=[str(p) for p in page],
+                total_count=len(candidates),
+                truncated=len(candidates) > offset + limit,
+            )
+        except Exception as e:
+            return SearchResult(error=f"File search failed: {e}", total_count=0)
+
     def _search_files(self, pattern: str, path: str, limit: int, offset: int) -> SearchResult:
         """Search for files by name pattern (glob-like)."""
         # Auto-prepend **/ for recursive search if not already present
@@ -2808,6 +2847,12 @@ class ShellFileOperations(FileOperations):
         # find on wide trees).  Mirrors _search_content which already uses rg.
         if self._has_command('rg'):
             return self._search_files_rg(search_pattern, path, limit, offset)
+
+        from tools.environments import local as local_mod
+        if local_mod._IS_WINDOWS:
+            return self._search_files_python(
+                search_pattern, path, limit, offset, search_root, has_hidden_path_ancestor
+            )
 
         # Fallback: find (slower, no .gitignore awareness)
         if not self._has_command('find'):
