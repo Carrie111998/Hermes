@@ -326,6 +326,55 @@ async def test_inbound_reaction_in_ignored_channel_is_ignored(adapter, monkeypat
 
 
 @pytest.mark.asyncio
+async def test_inbound_reaction_uses_profile_scoped_channel_policy(adapter, monkeypatch):
+    """The adapter snapshot wins over process-global channel gate values."""
+    monkeypatch.setenv("DISCORD_ALLOWED_CHANNELS", "999")
+    adapter._gate_env_snapshot = {
+        "DISCORD_ALLOWED_CHANNELS": "123",
+        "DISCORD_IGNORED_CHANNELS": "",
+    }
+    adapter.handle_message = AsyncMock()
+    channel = _make_mock_channel(
+        adapter._client.user,
+        channel_id=123,
+        guild=SimpleNamespace(id=111, name="Test Server"),
+    )
+    adapter._client.get_channel = MagicMock(return_value=channel)
+
+    await adapter._handle_inbound_reaction(
+        _make_reaction_payload(channel_id=123, guild_id=111),
+        "added",
+    )
+
+    adapter.handle_message.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_inbound_reaction_channel_allowlist_can_authorize_user(adapter):
+    """Guild channel authorization matches normal Discord message ingress."""
+    adapter._allowed_user_ids = set()
+    adapter._allowed_role_ids = set()
+    adapter._gate_env_snapshot = {
+        "DISCORD_ALLOWED_CHANNELS": "123",
+        "DISCORD_IGNORED_CHANNELS": "",
+    }
+    adapter.handle_message = AsyncMock()
+    channel = _make_mock_channel(
+        adapter._client.user,
+        channel_id=123,
+        guild=SimpleNamespace(id=111, name="Test Server"),
+    )
+    adapter._client.get_channel = MagicMock(return_value=channel)
+
+    await adapter._handle_inbound_reaction(
+        _make_reaction_payload(channel_id=123, guild_id=111),
+        "added",
+    )
+
+    adapter.handle_message.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_inbound_reaction_remove_from_role_authorized_bot_is_ignored(adapter):
     """A removal by a role-holding bot cannot enter the synthetic event path."""
     adapter.handle_message = AsyncMock()
