@@ -7,6 +7,9 @@ import threading
 from types import MappingProxyType, SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import httpx
+from openai import NotFoundError
+
 from agent.chat_completion_helpers import sanitize_fallback_event
 from run_agent import AIAgent
 from tools.delegate_tool import delegate_task
@@ -151,6 +154,181 @@ def test_raw_child_exception_reaches_delegate_as_only_sanitized_fallback_event(
     assert prompt_sentinel not in serialized_payload
     assert overlong_value not in serialized_payload
     assert len(serialized.encode("utf-8")) <= 768
+
+
+def _loop_child(*, base_url: str, model: str, max_iterations: int) -> AIAgent:
+    with (
+        patch("run_agent.get_tool_definitions", return_value=[]),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("run_agent.OpenAI"),
+    ):
+        child = AIAgent(
+            api_key="test-key",
+            base_url=base_url,
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+            max_iterations=max_iterations,
+            fallback_model=[
+                {
+                    "provider": "ollama-cloud",
+                    "model": "glm-5.2",
+                    "api_mode": "chat_completions",
+                }
+            ],
+        )
+
+    child.provider = "ollama"
+    child.requested_provider = "ollama"
+    child.model = model
+    child.base_url = base_url
+    child._api_max_retries = 3
+    child._primary_runtime["provider"] = "ollama"
+    child._primary_runtime["model"] = child.model
+    return child
+
+
+def _run_loop_with_fallback(child: AIAgent, primary_error: Exception):
+    calls = []
+
+    def fake_api_call(_api_kwargs):
+        calls.append((child.provider, child.model))
+        if child.provider == "ollama":
+            raise primary_error
+        return _completion("done")
+
+    fallback_client = MagicMock()
+    fallback_client.base_url = "https://ollama.com/v1"
+    fallback_client.api_key = "test-key"
+
+    with (
+        patch.object(child, "_interruptible_api_call", side_effect=fake_api_call),
+        patch.object(child, "_persist_session"),
+        patch.object(child, "_save_trajectory"),
+        patch.object(child, "_cleanup_task_resources"),
+        patch(
+            "agent.auxiliary_client.resolve_provider_client",
+            return_value=(fallback_client, "glm-5.2"),
+        ),
+        patch(
+            "hermes_cli.model_normalize.normalize_model_for_provider",
+            side_effect=lambda model, provider: model,
+        ),
+        patch("agent.model_metadata.get_model_context_length", return_value=128_000),
+        patch("agent.conversation_loop.jittered_backoff", return_value=0.0),
+    ):
+        result = child.run_conversation("hello")
+    return result, calls
+
+
+def _assert_sanitized_event(event, expected, sentinels):
+    assert event == expected
+    serialized = json.dumps(event, sort_keys=True)
+    assert set(event) == {
+        "initial_provider",
+        "initial_model",
+        "selected_fallback_provider",
+        "selected_fallback_model",
+        "failure_class",
+        "reason_code",
+        "http_status",
+    }
+    for sentinel in sentinels:
+        assert sentinel not in serialized
+    assert len(serialized.encode("utf-8")) <= 768
+
+
+def test_sdk_not_found_max_retry_fallback_retains_only_safe_http_status(
+    tmp_path, monkeypatch
+):
+    """A retried SDK 404 keeps its safe status when fallback activates."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
+    secret_sentinel = "SENTINEL_SECRET_MUST_NOT_SURVIVE"
+    prompt_sentinel = "SENTINEL_PROMPT_MUST_NOT_SURVIVE"
+    body_sentinel = "SENTINEL_BODY_MUST_NOT_SURVIVE"
+    primary_error = NotFoundError(
+        message=f"route missing {secret_sentinel} {prompt_sentinel}",
+        response=httpx.Response(
+            404,
+            request=httpx.Request(
+                "POST", "http://localhost:11434/chat/completions"
+            ),
+        ),
+        body={"error": {"message": body_sentinel}},
+    )
+    child = _loop_child(
+        base_url="http://localhost:11434",
+        model="nemotron-3.5-lightning:30b-mlx",
+        max_iterations=4,
+    )
+    result, calls = _run_loop_with_fallback(child, primary_error)
+
+    assert result["completed"] is True
+    assert result["final_response"] == "done"
+    assert calls == [
+        ("ollama", "nemotron-3.5-lightning:30b-mlx"),
+        ("ollama", "nemotron-3.5-lightning:30b-mlx"),
+        ("ollama", "nemotron-3.5-lightning:30b-mlx"),
+        ("ollama-cloud", "glm-5.2"),
+    ]
+    _assert_sanitized_event(
+        child._last_fallback_event,
+        {
+            "initial_provider": "ollama",
+            "initial_model": "nemotron-3.5-lightning:30b-mlx",
+            "selected_fallback_provider": "ollama-cloud",
+            "selected_fallback_model": "glm-5.2",
+            "failure_class": "unknown",
+            "reason_code": "unknown",
+            "http_status": 404,
+        },
+        (secret_sentinel, prompt_sentinel, body_sentinel),
+    )
+
+
+def test_nonretryable_sdk_error_fallback_retains_classification_without_raw_data(
+    tmp_path, monkeypatch
+):
+    """A non-retryable SDK error forwards only classified fallback facts."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
+    secret_sentinel = "SENTINEL_SECRET_MUST_NOT_SURVIVE"
+    body_sentinel = "SENTINEL_BODY_MUST_NOT_SURVIVE"
+    primary_error = NotFoundError(
+        message=f"model not found {secret_sentinel}",
+        response=httpx.Response(
+            404,
+            request=httpx.Request(
+                "POST", "http://localhost:11434/v1/chat/completions"
+            ),
+        ),
+        body={"error": {"message": f"model not found {body_sentinel}"}},
+    )
+    child = _loop_child(
+        base_url="http://localhost:11434/v1",
+        model="missing-model",
+        max_iterations=2,
+    )
+    result, calls = _run_loop_with_fallback(child, primary_error)
+
+    assert result["completed"] is True
+    assert result["final_response"] == "done"
+    assert calls == [
+        ("ollama", "missing-model"),
+        ("ollama-cloud", "glm-5.2"),
+    ]
+    _assert_sanitized_event(
+        child._last_fallback_event,
+        {
+            "initial_provider": "ollama",
+            "initial_model": "missing-model",
+            "selected_fallback_provider": "ollama-cloud",
+            "selected_fallback_model": "glm-5.2",
+            "failure_class": "policy",
+            "reason_code": "model_not_found",
+            "http_status": 404,
+        },
+        (secret_sentinel, body_sentinel),
+    )
 
 
 def test_fallback_event_rejects_unknown_types_bool_status_and_extra_payloads():
