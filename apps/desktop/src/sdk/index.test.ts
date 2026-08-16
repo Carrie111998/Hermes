@@ -176,3 +176,63 @@ describe('host.request connection-mode announcement', () => {
     await expect(host.request('prompt.submit', {})).rejects.toThrow('Hermes gateway unavailable')
   })
 })
+
+/**
+ * `host.getGateway()` is the SDK's OTHER request door. It hands out the live
+ * instance for components that take a `HermesGateway` prop, so a plugin can
+ * reach `getGateway().request(...)` — which would otherwise bypass the
+ * announcement that `host.request` performs and reopen exactly the gap item 3
+ * of the follow-up review closed.
+ */
+describe('host.getGateway connection-mode announcement', () => {
+  afterEach(() => {
+    $gateway.set(null as never)
+    setConnection(null)
+  })
+
+  it('announces on session/prompt RPCs through the returned instance', async () => {
+    setConnection(conn('remote'))
+    const request = vi.fn().mockResolvedValue('ok')
+    $gateway.set({ request } as never)
+
+    await host.getGateway()?.request('prompt.submit', { text: 'hi' })
+
+    expect(request).toHaveBeenCalledWith('prompt.submit', { connection_mode: 'remote', text: 'hi' })
+  })
+
+  it('leaves unrelated RPCs untouched', async () => {
+    setConnection(conn('remote'))
+    const request = vi.fn().mockResolvedValue('ok')
+    $gateway.set({ request } as never)
+    const params = { limit: 3 }
+
+    await host.getGateway()?.request('session.list', params)
+
+    expect(request).toHaveBeenCalledWith('session.list', params)
+  })
+
+  it('delegates non-request members to the real instance', () => {
+    const close = vi.fn()
+    setConnection(conn('remote'))
+    $gateway.set({ close, request: vi.fn(), wsUrl: 'ws://127.0.0.1:8787' } as never)
+
+    const gateway = host.getGateway() as unknown as { close: () => void; wsUrl: string }
+
+    expect(gateway.wsUrl).toBe('ws://127.0.0.1:8787')
+    gateway.close()
+    expect(close).toHaveBeenCalledOnce()
+  })
+
+  it('hands back a stable reference for one live gateway', () => {
+    // SDK components take this as a React prop; a fresh wrapper per call would
+    // churn every memo/effect dependency keyed on it.
+    setConnection(conn('remote'))
+    $gateway.set({ request: vi.fn() } as never)
+
+    expect(host.getGateway()).toBe(host.getGateway())
+  })
+
+  it('stays null before the first socket opens', () => {
+    expect(host.getGateway()).toBeNull()
+  })
+})
