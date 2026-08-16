@@ -1,0 +1,75 @@
+banks:
+  isbank_maximum:
+    gmail:
+      senders: []
+      subject_keywords: ["Hesap Özeti", "Maximum"]
+      attachment_extensions: [".pdf"]
+    display_name: "İş Bankası Maximum"
+    senders:
+      - "[REDACTED]"
+    subject_keywords:
+      - "hesap özeti"
+      - "ekstre"
+    statement_keywords:
+      - "isbank.com.tr"
+      - "maximum"
+      - "Hesap Özetiniz"
+  axess:
+    gmail:
+      senders: []
+      subject_keywords: ["Ekstre"]
+      attachment_extensions: [".pdf"]
+    display_name: "Akbank Axess"
+    senders:
+      - "[REDACTED]"
+    subject_keywords:
+      - "hesap özeti"
+      - "ekstre"
+    statement_keywords:
+      - "Axess"
+      - "Akbank"
+      - "İşlem Tarihi"
+  enpara:
+    gmail:
+      senders:
+        - "enpara@enpara.com"
+        - "enpara@mailer.enpara.com"
+      subject_keywords: ["Kredi Kartı Ekstresi", "Enpara"]
+      attachment_extensions: [".pdf"]
+    display_name: "Enpara.com"
+    senders:
+      - "[REDACTED]"
+    subject_keywords:
+      - "hesap özeti"
+      - "ekstre"
+    statement_keywords:
+      - "en para"
+      - "Kredi Kartı Ekstresi"
+      - "Ekstre borcu"
+  banka_1:
+    display_name: "Banka 1"
+    senders:
+      - "example@bank1.com"
+    subject_keywords:
+      - "hesap özeti"
+      - "ekstre"
+    statement_keywords:
+      - "ekstre"
+  banka_2:
+    display_name: "Banka 2"
+    senders:
+      - "example@bank2.com"
+    subject_keywords:
+      - "hesap özeti"
+      - "ekstre"
+    statement_keywords:
+      - "ekstre"
+  banka_3:
+    display_name: "Banka 3"
+    senders:
+      - "example@bank3.com"
+    subject_keywords:
+      - "hesap özeti"
+      - "ekstre"
+    statement_keywords:
+      - "ekstre"

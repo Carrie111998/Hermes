@@ -1,0 +1,11 @@
+duckdb>=1.1,<2
+PyYAML>=6,<7
+pdfplumber>=0.11,<1
+pypdf>=5,<6
+pypdfium2>=4,<5
+rapidocr-onnxruntime>=1,<2
+python-dotenv>=1,<2
+pandas>=2,<3
+streamlit>=1.40,<2
+plotly>=5,<6
+pytest>=8,<9

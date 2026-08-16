@@ -1,0 +1,24 @@
+categories:
+  Market:
+    - migros
+    - carrefour
+    - a101
+    - bim
+    - file
+    - market
+  "Yeme / İçme":
+    Restoran: [restaurant, restoran, kebap, lokanta]
+    Kahve: [kahve, starbucks, coffee]
+    "Yemek Siparişi": [getir, yemeksepeti, trendyol yemek]
+  Akaryakıt: [shell, opet, opel, petrol, akaryakıt, bp]
+  Ulaşım: [uber, taksi, metro, otobüs, ulaşım, tcdd, otopark]
+  "Online Alışveriş": [amazon, hepsiburada, trendyol, n11, paytr]
+  Elektronik: [teknosa, mediamarkt, elektronik]
+  Ev: [ikea, koçtaş, ev]
+  Sağlık: [eczane, hastane, sağlık]
+  Eğitim: [okul, kurs, eğitim]
+  Eğlence: [sinema, spotify, netflix, oyun]
+  Abonelik: [abonelik, subscription]
+  Faturalar: [elektrik, su, doğalgaz, internet, telefon]
+  Seyahat: [hotel, otel, thy, uçak, booking]
+  Giyim: [zara, lcw, mağaza, giyim]

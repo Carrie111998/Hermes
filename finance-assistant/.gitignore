@@ -1,0 +1,39 @@
+# Secrets and personal financial data
+.env
+.env.*
+!.env.example
+secrets/
+credentials.json
+token.json
+
+# Local data and generated artifacts
+data/statements/*
+data/inbox/*
+data/archive/*
+data/failed/*
+data/raw/*
+data/extracted/*
+data/logs/*
+data/reports/*
+data/database/
+secrets/
+data/tmp/gmail/*
+*.duckdb
+*.duckdb.wal
+*.pdf
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Streamlit
+.streamlit/secrets.toml
+
+# OS/editor
+.DS_Store
+.vscode/
+.idea/

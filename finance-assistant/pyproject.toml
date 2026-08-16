@@ -1,0 +1,26 @@
+[project]
+name = "local-finance-assistant"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+  "duckdb>=1.1,<2",
+  "PyYAML>=6,<7",
+  "pdfplumber>=0.11,<1",
+  "pypdf>=5,<6",
+  "pypdfium2>=4,<5",
+  "rapidocr-onnxruntime>=1,<2",
+  "python-dotenv>=1,<2",
+  "pandas>=2,<3",
+  "streamlit>=1.40,<2",
+  "plotly>=5,<6",
+  "google-api-python-client>=2.150,<3",
+  "google-auth-httplib2>=0.2,<1",
+  "google-auth-oauthlib>=1.2,<2",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8,<9"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
