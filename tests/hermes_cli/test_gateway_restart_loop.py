@@ -89,6 +89,22 @@ class TestGatewayLifecyclePattern:
         assert not _contains_gateway_lifecycle_command(text), f"Should NOT match: {text!r}"
 
     @pytest.mark.parametrize("text", [
+        # Paired positive case for the anchor change above: the true
+        # positives `kill`/`pkill` (as their own token, both orderings)
+        # must still match after adding the leading \b.
+        "kill hermes gateway",
+        "kill the hermes gateway process",
+        "pkill -f hermes.*gateway",
+        "pkill -f gateway.*hermes",
+        # Case-insensitivity: the whole pattern compiles with `(?i)`, so
+        # this must still match — confirms Branch D isn't accidentally
+        # case-sensitive despite having its own `\b` anchors now.
+        "Kill Hermes Gateway",
+    ])
+    def test_kill_and_pkill_still_match_after_anchor(self, text):
+        assert _contains_gateway_lifecycle_command(text), f"Should match: {text!r}"
+
+    @pytest.mark.parametrize("text", [
         "restart the server application",
         "hermes cron list",
         "hermes update",
