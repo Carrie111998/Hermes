@@ -3969,10 +3969,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 "compacted",
             }
             message = str(text if text is not None else kind)
-            normalized = message.lower()
             event_name = (
                 "context.compaction"
-                if is_compaction or "compact" in normalized or "compress" in normalized
+                if is_compaction
                 else "lifecycle.status"
             )
             _enqueue(event_name, {"kind": str(kind), "message": message})
@@ -6472,8 +6471,8 @@ class APIServerAdapter(BasePlatformAdapter):
                         compression_enabled=getattr(agent, "compression_enabled", True),
                         compacted=bool(_compacted_in_place or _session_rotated),
                     )
-                    usage["context"] = context_usage
                     result["context"] = context_usage
+                    usage["context"] = dict(context_usage)
                     try:
                         db = self._ensure_session_db()
                         if db is not None and isinstance(_eff_sid, str) and _eff_sid:

@@ -201,6 +201,9 @@ async def test_run_agent_persists_live_context_usage(adapter, session_db, monkey
     )
 
     assert result["context"] == usage["context"]
+    assert result["context"] is not usage["context"]
+    result["context"]["used_tokens"] = 1
+    assert usage["context"]["used_tokens"] == 62_000
     assert usage["context"]["compression_progress_percent"] == 62.0
     row = session_db.get_session(session_id)
     assert row["context_used_tokens"] == 62_000
@@ -214,7 +217,7 @@ async def test_session_chat_stream_emits_compaction_status_event(adapter, sessio
     session_id = session_db.create_session("context-events", "api_server")
 
     async def fake_run(**kwargs):
-        kwargs["status_callback"]("lifecycle", "Compacting context before continuing")
+        kwargs["status_callback"]("compacting", "Compacting context before continuing")
         return (
             {"final_response": "done", "session_id": session_id, "messages": []},
             {"context": {"compression_count": 1}},
@@ -269,6 +272,35 @@ async def test_session_chat_stream_structures_custom_engine_compaction_status(
 
     assert "event: context.compaction" in body
     assert '"message": "Summarizing earlier turns"' in body
+
+
+@pytest.mark.asyncio
+async def test_session_chat_stream_does_not_infer_compaction_from_status_text(
+    adapter, session_db
+):
+    session_id = session_db.create_session("ordinary-context-status", "api_server")
+
+    async def fake_run(**kwargs):
+        kwargs["status_callback"](
+            "lifecycle", "Skipping compression because the context is already compact"
+        )
+        return (
+            {"final_response": "done", "session_id": session_id, "messages": []},
+            {},
+        )
+
+    app = _create_session_app(adapter)
+    with patch.object(adapter, "_run_agent", side_effect=fake_run):
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                f"/api/sessions/{session_id}/chat/stream",
+                json={"message": "continue"},
+            )
+            assert resp.status == 200
+            body = await resp.text()
+
+    assert "event: lifecycle.status" in body
+    assert "event: context.compaction" not in body
 
 
 @pytest.mark.asyncio
