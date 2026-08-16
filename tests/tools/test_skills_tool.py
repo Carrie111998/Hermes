@@ -946,3 +946,314 @@ class TestSkillViewCollisionDetection:
         assert result["success"] is False
         assert "Ambiguous" in result["error"]
         assert len(result["matches"]) == 2
+
+
+class TestSkillViewRequires:
+    """skill_view exposes requires + missing_required_skills (P4).
+
+    ``requires`` is a hard skill-to-skill dependency: a missing / disabled /
+    platform-unsupported / setup_needed required skill flips ``setup_needed``
+    so cron preflight blocks the run without an LLM call, and the payload
+    carries the full dependency chain for the block reason.
+    """
+
+    def test_requires_exposed_in_payload_when_declared(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(tmp_path, "dep-b")
+            _make_skill(tmp_path, "dep-c")
+            _make_skill(
+                tmp_path,
+                "dep-a",
+                frontmatter_extra="requires:\n  - dep-b\n  - dep-c\n",
+            )
+            raw = skill_view("dep-a")
+        result = json.loads(raw)
+        assert result["success"] is True
+        assert result["requires"] == ["dep-b", "dep-c"]
+        assert result["missing_required_skills"] == []
+        assert result["setup_needed"] is False
+        assert result["readiness_status"] == "available"
+
+    def test_requires_empty_when_not_declared(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(tmp_path, "plain-skill")
+            raw = skill_view("plain-skill")
+        result = json.loads(raw)
+        assert result["success"] is True
+        assert result["requires"] == []
+        assert result["missing_required_skills"] == []
+        assert result["setup_needed"] is False
+
+    def test_missing_required_skill_blocks(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(
+                tmp_path,
+                "needs-missing",
+                frontmatter_extra="requires:\n  - no-such-skill\n",
+            )
+            raw = skill_view("needs-missing")
+        result = json.loads(raw)
+        assert result["success"] is True
+        assert result["setup_needed"] is True
+        assert result["readiness_status"] == "setup_needed"
+        assert result["missing_required_skills"] == [
+            {
+                "name": "no-such-skill",
+                "reason": "not found",
+                "chain": ["needs-missing", "no-such-skill"],
+            }
+        ]
+
+    def test_disabled_required_skill_reports_disabled(self, tmp_path, monkeypatch):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(
+                tmp_path,
+                "needs-disabled",
+                frontmatter_extra="requires:\n  - disabled-skill\n",
+            )
+            _make_skill(tmp_path, "disabled-skill")
+            monkeypatch.setattr(
+                skills_tool_module,
+                "_is_skill_disabled",
+                lambda name, platform=None: name == "disabled-skill",
+            )
+            raw = skill_view("needs-disabled")
+        result = json.loads(raw)
+        assert result["setup_needed"] is True
+        assert result["missing_required_skills"] == [
+            {
+                "name": "disabled-skill",
+                "reason": "disabled",
+                "chain": ["needs-disabled", "disabled-skill"],
+            }
+        ]
+
+    def test_platform_unsupported_required_skill_reports_unsupported(
+        self, tmp_path, monkeypatch
+    ):
+        real_platform = skills_tool_module.skill_matches_platform
+
+        def fake_platform(frontmatter):
+            if frontmatter.get("name") == "mac-only-skill":
+                return False
+            return real_platform(frontmatter)
+
+        monkeypatch.setattr(skills_tool_module, "skill_matches_platform", fake_platform)
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(
+                tmp_path,
+                "needs-unsupported",
+                frontmatter_extra="requires:\n  - mac-only-skill\n",
+            )
+            _make_skill(
+                tmp_path,
+                "mac-only-skill",
+                frontmatter_extra="platforms: [macos]\n",
+            )
+            raw = skill_view("needs-unsupported")
+        result = json.loads(raw)
+        assert result["setup_needed"] is True
+        assert result["missing_required_skills"][0]["name"] == "mac-only-skill"
+        assert result["missing_required_skills"][0]["reason"] == "unsupported platform"
+
+    def test_setup_needed_required_skill_blocks(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("TERMINAL_ENV", "local")
+        monkeypatch.delenv("DEP_API_KEY", raising=False)
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(
+                tmp_path,
+                "dep-needs-key",
+                frontmatter_extra="prerequisites:\n  env_vars: [DEP_API_KEY]\n",
+            )
+            _make_skill(
+                tmp_path,
+                "uses-dep",
+                frontmatter_extra="requires:\n  - dep-needs-key\n",
+            )
+            raw = skill_view("uses-dep")
+        result = json.loads(raw)
+        assert result["setup_needed"] is True
+        assert result["readiness_status"] == "setup_needed"
+        missing = result["missing_required_skills"]
+        assert len(missing) == 1
+        assert missing[0]["name"] == "dep-needs-key"
+        assert missing[0]["reason"].startswith("setup_needed")
+        assert "DEP_API_KEY" in missing[0]["reason"]
+        assert missing[0]["chain"] == ["uses-dep", "dep-needs-key"]
+
+    def test_requires_probe_skips_secret_capture(self, tmp_path, monkeypatch):
+        """A required skill with a missing env var must NOT trigger the
+        interactive secret-capture callback (capture=False probe)."""
+        monkeypatch.setenv("TERMINAL_ENV", "local")
+        monkeypatch.delenv("REQUIRED_DEP_KEY", raising=False)
+        calls = []
+
+        def fake_secret_callback(var_name, prompt, metadata=None):
+            calls.append(var_name)
+            return {
+                "success": False,
+                "stored_as": var_name,
+                "validated": False,
+                "skipped": True,
+            }
+
+        monkeypatch.setattr(
+            skills_tool_module,
+            "_secret_capture_callback",
+            fake_secret_callback,
+            raising=False,
+        )
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(
+                tmp_path,
+                "dep-needs-env",
+                frontmatter_extra="prerequisites:\n  env_vars: [REQUIRED_DEP_KEY]\n",
+            )
+            _make_skill(
+                tmp_path,
+                "main-skill",
+                frontmatter_extra="requires:\n  - dep-needs-env\n",
+            )
+            raw = skill_view("main-skill")
+        result = json.loads(raw)
+        assert calls == []  # requires probe never captures secrets
+        assert result["setup_needed"] is True
+        assert result["missing_required_skills"][0]["name"] == "dep-needs-env"
+        assert "REQUIRED_DEP_KEY" in result["missing_required_skills"][0]["reason"]
+
+    def test_transitive_closure_two_deep(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(
+                tmp_path,
+                "parent-skill",
+                frontmatter_extra="requires:\n  - mid-skill\n",
+            )
+            _make_skill(
+                tmp_path,
+                "mid-skill",
+                frontmatter_extra="requires:\n  - leaf-skill\n",
+            )
+            raw = skill_view("parent-skill")
+        result = json.loads(raw)
+        assert result["setup_needed"] is True
+        missing = result["missing_required_skills"]
+        assert len(missing) == 1
+        assert missing[0]["name"] == "leaf-skill"
+        assert missing[0]["reason"] == "not found"
+        assert missing[0]["chain"] == ["parent-skill", "mid-skill", "leaf-skill"]
+
+    def test_transitive_closure_three_deep(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(
+                tmp_path,
+                "root-skill",
+                frontmatter_extra="requires:\n  - level2-skill\n",
+            )
+            _make_skill(
+                tmp_path,
+                "level2-skill",
+                frontmatter_extra="requires:\n  - level3-skill\n",
+            )
+            _make_skill(
+                tmp_path,
+                "level3-skill",
+                frontmatter_extra="requires:\n  - ghost-skill\n",
+            )
+            raw = skill_view("root-skill")
+        result = json.loads(raw)
+        missing = result["missing_required_skills"]
+        assert len(missing) == 1
+        assert missing[0]["name"] == "ghost-skill"
+        assert missing[0]["chain"] == [
+            "root-skill",
+            "level2-skill",
+            "level3-skill",
+            "ghost-skill",
+        ]
+
+    def test_cycle_terminates_and_does_not_block(self, tmp_path):
+        """a -> b -> a: the traversal must terminate, and a cycle among
+        healthy (available) skills is NOT a runtime blocker — declaration
+        errors are the static scanner's job."""
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(
+                tmp_path,
+                "a-skill",
+                frontmatter_extra="requires:\n  - b-skill\n",
+            )
+            _make_skill(
+                tmp_path,
+                "b-skill",
+                frontmatter_extra="requires:\n  - a-skill\n",
+            )
+            raw = skill_view("a-skill")
+        result = json.loads(raw)
+        assert result["success"] is True
+        assert result["setup_needed"] is False
+        assert result["missing_required_skills"] == []
+
+    def test_self_reference_terminates(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(
+                tmp_path,
+                "self-skill",
+                frontmatter_extra="requires:\n  - self-skill\n",
+            )
+            raw = skill_view("self-skill")
+        result = json.loads(raw)
+        assert result["success"] is True
+        assert result["setup_needed"] is False
+        assert result["missing_required_skills"] == []
+
+    def test_non_string_requires_entries_ignored(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(tmp_path, "real-dep")
+            _make_skill(
+                tmp_path,
+                "mixed-requires",
+                frontmatter_extra=(
+                    "requires:\n"
+                    "  - real-dep\n"
+                    "  - 42\n"
+                    "  - null\n"
+                    "  - [nested]\n"
+                ),
+            )
+            raw = skill_view("mixed-requires")
+        result = json.loads(raw)
+        assert result["success"] is True
+        assert result["requires"] == ["real-dep"]
+        assert result["missing_required_skills"] == []
+
+    def test_plugin_skill_path_unaffected_by_requires(self, tmp_path):
+        """A plugin-provided skill is served by the plugin path and never
+        runs the local requires probe, so no requires payload appears."""
+        plugin_skill_dir = tmp_path / "plugin-root" / "myplugin" / "pskill"
+        plugin_skill_dir.mkdir(parents=True, exist_ok=True)
+        plugin_md = plugin_skill_dir / "SKILL.md"
+        plugin_md.write_text(
+            "---\n"
+            "name: myplugin:pskill\n"
+            "description: Plugin skill.\n"
+            "requires:\n"
+            "  - missing-dep\n"
+            "---\n\n"
+            "# Plugin\n",
+            encoding="utf-8",
+        )
+
+        class FakePM:
+            def discover_and_load(self, **kwargs):
+                pass
+
+            def find_plugin_skill(self, name):
+                return plugin_md
+
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path), patch(
+            "hermes_cli.plugins.get_plugin_manager", return_value=FakePM()
+        ):
+            raw = skill_view("myplugin:pskill")
+        result = json.loads(raw)
+        assert result["success"] is True
+        assert "requires" not in result
+        assert "missing_required_skills" not in result

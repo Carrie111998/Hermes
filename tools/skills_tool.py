@@ -525,6 +525,103 @@ def _remaining_required_environment_names(
     return remaining
 
 
+def _compute_readiness(
+    frontmatter: Dict[str, Any],
+    skill_name: str,
+    skill_dir: Optional[Path] = None,
+    *,
+    capture: bool = True,
+) -> Dict[str, Any]:
+    """Compute a skill's runtime readiness (required env vars + credential files).
+
+    Extracted from ``skill_view`` so the ``requires`` closure probe reuses
+    the exact same computation. ``capture=False`` skips the secret-capture
+    prompt — a requires probe must never trigger an interactive secret
+    prompt for a transitive dependency.
+    """
+    legacy_env_vars, _ = _collect_prerequisite_values(frontmatter)
+    required_env_vars = _get_required_environment_variables(
+        frontmatter, legacy_env_vars
+    )
+    backend = _get_terminal_backend_name()
+    env_snapshot = load_env()
+    missing_required_env_vars = [
+        e
+        for e in required_env_vars
+        if not e.get("optional")
+        and not _is_env_var_persisted(e["name"], env_snapshot)
+    ]
+    if capture:
+        capture_result = _capture_required_environment_variables(
+            skill_name,
+            missing_required_env_vars,
+        )
+        if missing_required_env_vars:
+            env_snapshot = load_env()
+    else:
+        capture_result = {
+            "missing_names": [e["name"] for e in missing_required_env_vars],
+            "setup_skipped": False,
+            "gateway_setup_hint": None,
+        }
+    remaining_missing_required_envs = _remaining_required_environment_names(
+        required_env_vars,
+        capture_result,
+        env_snapshot=env_snapshot,
+    )
+    setup_needed = bool(remaining_missing_required_envs)
+
+    # Register available skill env vars so they pass through to sandboxed
+    # execution environments (execute_code, terminal).  Only vars that are
+    # actually set get registered — missing ones are reported as setup_needed.
+    available_env_names = [
+        e["name"]
+        for e in required_env_vars
+        if e["name"] not in remaining_missing_required_envs
+    ]
+    if available_env_names:
+        try:
+            from tools.env_passthrough import register_env_passthrough
+
+            register_env_passthrough(available_env_names)
+        except Exception:
+            logger.debug(
+                "Could not register env passthrough for skill %s",
+                skill_name,
+                exc_info=True,
+            )
+
+    # Register credential files for mounting into remote sandboxes
+    # (Modal, Docker).  Files that exist on the host are registered;
+    # missing ones are added to the setup_needed indicators.
+    required_cred_files_raw = frontmatter.get("required_credential_files", [])
+    if not isinstance(required_cred_files_raw, list):
+        required_cred_files_raw = []
+    missing_cred_files: List[str] = []
+    if required_cred_files_raw:
+        try:
+            from tools.credential_files import register_credential_files
+
+            missing_cred_files = register_credential_files(required_cred_files_raw)
+            if missing_cred_files:
+                setup_needed = True
+        except Exception:
+            logger.debug(
+                "Could not register credential files for skill %s",
+                skill_name,
+                exc_info=True,
+            )
+
+    return {
+        "required_env_vars": required_env_vars,
+        "backend": backend,
+        "missing_required_envs": remaining_missing_required_envs,
+        "missing_cred_files": missing_cred_files,
+        "setup_needed": setup_needed,
+        "capture_result": capture_result,
+    }
+
+
 def _gateway_setup_hint() -> str:
     try:
         from gateway.platforms.base import GATEWAY_SECRET_CAPTURE_UNSUPPORTED_MESSAGE
@@ -1054,6 +1151,262 @@ def _plugin_skill_linked_files(skill_root: Path) -> Dict[str, List[str]] | None:
     return linked or None
 
 
+def _skill_search_dirs() -> List[Path]:
+    """All directories searched for skills (active profile dir + external)."""
+    from agent.skill_utils import get_external_skills_dirs
+
+    all_dirs = []
+    active_skills_dir = _skills_dir()
+    if active_skills_dir.exists():
+        all_dirs.append(active_skills_dir)
+    all_dirs.extend(get_external_skills_dirs())
+    return all_dirs
+
+
+def _resolve_skill_md(
+    name: str,
+    local_category_name: str | None = None,
+) -> Tuple[Optional[Path], Optional[Path], Optional[dict]]:
+    """Resolve a local skill name to (skill_dir, skill_md, error).
+
+    Mirrors the local-skill lookup inside ``skill_view`` (direct path,
+    categorized fall-through, recursive by directory name, frontmatter
+    ``name:``, legacy flat ``<name>.md``) so the ``requires`` closure probe
+    and ``skill_view`` share a single name→SKILL.md interpretation. Returns
+    an ``error`` dict — the exact JSON body ``skill_view`` would return —
+    when the skill cannot be resolved (no skills dir / not found /
+    ambiguous collision).
+    """
+    all_dirs = _skill_search_dirs()
+
+    if not all_dirs:
+        return None, None, {
+            "success": False,
+            "error": "Skills directory does not exist yet. It will be created on first install.",
+        }
+
+    skill_dir = None
+    skill_md = None
+
+    # Collision detection: collect ALL candidates across every dir using
+    # every lookup strategy (direct path, recursive by parent dir name,
+    # legacy flat <name>.md). If more than one matches, refuse and tell
+    # the caller — silent shadowing of a local skill by a same-named
+    # external skill is a real bug class (`/skills` shows one, agent
+    # loaded the other) so we surface it loudly instead of guessing.
+    from agent.skill_utils import iter_skill_index_files
+
+    candidates: List[Tuple[Optional[Path], Path]] = []  # (skill_dir, skill_md)
+    seen_md: set = set()
+
+    def _record(sd: Optional[Path], smd: Path) -> None:
+        try:
+            key = smd.resolve()
+        except Exception:
+            key = smd
+        if key in seen_md:
+            return
+        seen_md.add(key)
+        candidates.append((sd, smd))
+
+    for search_dir in all_dirs:
+        # Strategy 1: direct path (e.g., "mlops/axolotl" or bare "axolotl"
+        # at the top of the dir).
+        direct_path = search_dir / name
+        if (
+            not _is_skill_support_path(direct_path)
+            and direct_path.is_dir()
+            and (direct_path / "SKILL.md").exists()
+        ):
+            _record(direct_path, direct_path / "SKILL.md")
+        elif direct_path.with_suffix(".md").exists() and not _is_skill_support_path(
+            direct_path.with_suffix(".md")
+        ):
+            _record(None, direct_path.with_suffix(".md"))
+
+        # Strategy 1b: categorized form for plugin namespace fall-through
+        # (e.g., a "myplugin:explore" name with no plugin registered also
+        # tries the on-disk path "myplugin/explore").
+        if local_category_name:
+            categorized_path = search_dir / local_category_name
+            if (
+                not _is_skill_support_path(categorized_path)
+                and categorized_path.is_dir()
+                and (categorized_path / "SKILL.md").exists()
+            ):
+                _record(categorized_path, categorized_path / "SKILL.md")
+            elif categorized_path.with_suffix(
+                ".md"
+            ).exists() and not _is_skill_support_path(
+                categorized_path.with_suffix(".md")
+            ):
+                _record(None, categorized_path.with_suffix(".md"))
+
+        # Strategy 2: recursive by directory name (catches nested skills
+        # like "foundations/runtime/explore-codebase" called by bare name),
+        # plus frontmatter `name:` lookup. `skills_list()` exposes the
+        # frontmatter name, so `skill_view(name)` must accept it too even
+        # when the on-disk directory is a shorter category/alias.
+        for found_skill_md in iter_skill_index_files(search_dir, "SKILL.md"):
+            if found_skill_md.parent.name == name:
+                _record(found_skill_md.parent, found_skill_md)
+                continue
+            try:
+                fm_content = found_skill_md.read_text(encoding="utf-8-sig", errors="replace")
+                fm, _ = _parse_frontmatter(fm_content)
+            except Exception:
+                fm = {}
+            if fm.get("name") == name:
+                _record(found_skill_md.parent, found_skill_md)
+
+        # Strategy 3: legacy flat <name>.md files anywhere under the dir.
+        # Exclude skill support docs: references/templates/assets/scripts
+        # are loaded through skill_view(skill, file_path=...) and must not
+        # shadow or collide with real skills that share the same basename.
+        for found_md in search_dir.rglob(f"{name}.md"):
+            if found_md.name != "SKILL.md" and not _is_skill_support_path(
+                found_md
+            ):
+                _record(None, found_md)
+
+    if len(candidates) > 1:
+        paths = [str(smd) for _, smd in candidates]
+        logging.getLogger(__name__).warning(
+            "Skill name collision for '%s': %d candidates — %s",
+            name, len(candidates), "; ".join(paths),
+        )
+        return None, None, {
+            "success": False,
+            "error": (
+                f"Ambiguous skill name '{name}': {len(candidates)} skills "
+                "match across your local skills dir and external_dirs. "
+                "Refusing to guess — load one explicitly by its categorized path."
+            ),
+            "matches": paths,
+            "hint": (
+                "Pass the full relative path instead of the bare name "
+                "(e.g., 'category/skill-name'), or rename one of the "
+                "colliding skills so each name is unique."
+            ),
+        }
+
+    if candidates:
+        skill_dir, skill_md = candidates[0]
+
+    if not skill_md or not skill_md.exists():
+        available = [s["name"] for s in _sort_skills(_find_all_skills())[:20]]
+        return None, None, {
+            "success": False,
+            "error": f"Skill '{name}' not found.",
+            "available_skills": available,
+            "hint": "Use skills_list to see all available skills",
+        }
+
+    return skill_dir, skill_md, None
+
+
+def _parse_requires(frontmatter: Dict[str, Any]) -> List[str]:
+    """Normalize a skill's top-level ``requires`` declaration to names.
+
+    Only string entries are kept; non-list / non-string declarations are
+    ignored at runtime (declaration errors are reported by the static
+    scanner, keeping the runtime fail-open and the static layer strict).
+    """
+    raw = frontmatter.get("requires")
+    if not isinstance(raw, list):
+        return []
+    return [
+        str(item).strip()
+        for item in raw
+        if isinstance(item, str) and str(item).strip()
+    ]
+
+
+def _requires_readiness(
+    name: str,
+    _visited: Optional[Set[str]] = None,
+    _chain: Optional[List[str]] = None,
+) -> List[Dict[str, Any]]:
+    """DFS the ``requires`` transitive closure of a skill.
+
+    Returns one entry per failed required skill: ``{name, reason, chain}``
+    where ``chain`` is the full dependency path from the entry skill to the
+    failure. A required skill fails when it is missing, disabled,
+    platform-unsupported, or reports setup_needed — an enforced dependency
+    that cannot be satisfied at run time must block the caller. ``_visited``
+    guards cycles / self-references so the traversal always terminates;
+    ``_chain`` carries the dependency path for the preflight message.
+    """
+    if _visited is None:
+        _visited = set()
+    if _chain is None:
+        _chain = [name]
+    if name in _visited:
+        return []  # cycle / self-reference guard — already explored
+    _visited.add(name)
+
+    failures: List[Dict[str, Any]] = []
+    skill_dir, skill_md, resolve_error = _resolve_skill_md(name)
+    if resolve_error is not None or skill_md is None:
+        failures.append(
+            {"name": name, "reason": "not found", "chain": list(_chain)}
+        )
+        return failures
+
+    try:
+        content = skill_md.read_text(encoding="utf-8-sig", errors="replace")
+    except Exception as e:
+        failures.append(
+            {"name": name, "reason": f"unreadable: {e}", "chain": list(_chain)}
+        )
+        return failures
+    try:
+        frontmatter, _ = _parse_frontmatter(content)
+    except Exception:
+        frontmatter = {}
+
+    resolved_name = frontmatter.get(
+        "name", skill_md.stem if not skill_dir else skill_dir.name
+    )
+    if not skill_matches_platform(frontmatter):
+        failures.append(
+            {
+                "name": resolved_name,
+                "reason": "unsupported platform",
+                "chain": list(_chain),
+            }
+        )
+        return failures
+    if _is_skill_disabled(resolved_name):
+        failures.append(
+            {"name": resolved_name, "reason": "disabled", "chain": list(_chain)}
+        )
+        return failures
+
+    readiness = _compute_readiness(
+        frontmatter, resolved_name, skill_dir, capture=False
+    )
+    if readiness["setup_needed"]:
+        reasons = [
+            f"env ${env_name}" for env_name in readiness["missing_required_envs"]
+        ] + [
+            f"credential file {path}" for path in readiness["missing_cred_files"]
+        ]
+        failures.append(
+            {
+                "name": resolved_name,
+                "reason": "setup_needed"
+                + (f": {', '.join(reasons)}" if reasons else ""),
+                "chain": list(_chain),
+            }
+        )
+        return failures
+
+    for req in _parse_requires(frontmatter):
+        failures.extend(_requires_readiness(req, _visited, _chain + [req]))
+    return failures
+
+
 def skill_view(
     name: str,
     file_path: str = None,
@@ -1160,8 +1513,6 @@ def skill_view(
             if bare:
                 local_category_name = f"{namespace}/{bare}"
 
-        from agent.skill_utils import get_external_skills_dirs
-
         # The categorized fall-through form (namespace/bare) joins onto each
         # search dir too; re-validate it since `bare` is not namespace-checked.
         if local_category_name:
@@ -1176,144 +1527,18 @@ def skill_view(
                     ensure_ascii=False,
                 )
 
-        # Build list of all skill directories to search
-        all_dirs = []
+        # Resolve the skill on disk — the ``requires`` closure probe shares
+        # this same name→SKILL.md interpretation.
+        skill_dir, skill_md, resolve_error = _resolve_skill_md(
+            name, local_category_name
+        )
+        if resolve_error is not None:
+            return json.dumps(resolve_error, ensure_ascii=False)
+
+        # Re-derive the search context for the security/trusted-dir checks
+        # below (the resolution itself lives in _resolve_skill_md).
         active_skills_dir = _skills_dir()
-        if active_skills_dir.exists():
-            all_dirs.append(active_skills_dir)
-        all_dirs.extend(get_external_skills_dirs())
-
-        if not all_dirs:
-            return json.dumps(
-                {
-                    "success": False,
-                    "error": "Skills directory does not exist yet. It will be created on first install.",
-                },
-                ensure_ascii=False,
-            )
-
-        skill_dir = None
-        skill_md = None
-
-        # Collision detection: collect ALL candidates across every dir using
-        # every lookup strategy (direct path, recursive by parent dir name,
-        # legacy flat <name>.md). If more than one matches, refuse and tell
-        # the caller — silent shadowing of a local skill by a same-named
-        # external skill is a real bug class (`/skills` shows one, agent
-        # loaded the other) so we surface it loudly instead of guessing.
-        from agent.skill_utils import iter_skill_index_files
-
-        candidates: List[Tuple[Optional[Path], Path]] = []  # (skill_dir, skill_md)
-        seen_md: set = set()
-
-        def _record(sd: Optional[Path], smd: Path) -> None:
-            try:
-                key = smd.resolve()
-            except Exception:
-                key = smd
-            if key in seen_md:
-                return
-            seen_md.add(key)
-            candidates.append((sd, smd))
-
-        for search_dir in all_dirs:
-            # Strategy 1: direct path (e.g., "mlops/axolotl" or bare "axolotl"
-            # at the top of the dir).
-            direct_path = search_dir / name
-            if (
-                not _is_skill_support_path(direct_path)
-                and direct_path.is_dir()
-                and (direct_path / "SKILL.md").exists()
-            ):
-                _record(direct_path, direct_path / "SKILL.md")
-            elif direct_path.with_suffix(".md").exists() and not _is_skill_support_path(
-                direct_path.with_suffix(".md")
-            ):
-                _record(None, direct_path.with_suffix(".md"))
-
-            # Strategy 1b: categorized form for plugin namespace fall-through
-            # (e.g., a "myplugin:explore" name with no plugin registered also
-            # tries the on-disk path "myplugin/explore").
-            if local_category_name:
-                categorized_path = search_dir / local_category_name
-                if (
-                    not _is_skill_support_path(categorized_path)
-                    and categorized_path.is_dir()
-                    and (categorized_path / "SKILL.md").exists()
-                ):
-                    _record(categorized_path, categorized_path / "SKILL.md")
-                elif categorized_path.with_suffix(
-                    ".md"
-                ).exists() and not _is_skill_support_path(
-                    categorized_path.with_suffix(".md")
-                ):
-                    _record(None, categorized_path.with_suffix(".md"))
-
-            # Strategy 2: recursive by directory name (catches nested skills
-            # like "foundations/runtime/explore-codebase" called by bare name),
-            # plus frontmatter `name:` lookup. `skills_list()` exposes the
-            # frontmatter name, so `skill_view(name)` must accept it too even
-            # when the on-disk directory is a shorter category/alias.
-            for found_skill_md in iter_skill_index_files(search_dir, "SKILL.md"):
-                if found_skill_md.parent.name == name:
-                    _record(found_skill_md.parent, found_skill_md)
-                    continue
-                try:
-                    fm_content = found_skill_md.read_text(encoding="utf-8-sig", errors="replace")
-                    fm, _ = _parse_frontmatter(fm_content)
-                except Exception:
-                    fm = {}
-                if fm.get("name") == name:
-                    _record(found_skill_md.parent, found_skill_md)
-
-            # Strategy 3: legacy flat <name>.md files anywhere under the dir.
-            # Exclude skill support docs: references/templates/assets/scripts
-            # are loaded through skill_view(skill, file_path=...) and must not
-            # shadow or collide with real skills that share the same basename.
-            for found_md in search_dir.rglob(f"{name}.md"):
-                if found_md.name != "SKILL.md" and not _is_skill_support_path(
-                    found_md
-                ):
-                    _record(None, found_md)
-
-        if len(candidates) > 1:
-            paths = [str(smd) for _, smd in candidates]
-            logging.getLogger(__name__).warning(
-                "Skill name collision for '%s': %d candidates — %s",
-                name, len(candidates), "; ".join(paths),
-            )
-            return json.dumps(
-                {
-                    "success": False,
-                    "error": (
-                        f"Ambiguous skill name '{name}': {len(candidates)} skills "
-                        "match across your local skills dir and external_dirs. "
-                        "Refusing to guess — load one explicitly by its categorized path."
-                    ),
-                    "matches": paths,
-                    "hint": (
-                        "Pass the full relative path instead of the bare name "
-                        "(e.g., 'category/skill-name'), or rename one of the "
-                        "colliding skills so each name is unique."
-                    ),
-                },
-                ensure_ascii=False,
-            )
-
-        if candidates:
-            skill_dir, skill_md = candidates[0]
-
-        if not skill_md or not skill_md.exists():
-            available = [s["name"] for s in _sort_skills(_find_all_skills())[:20]]
-            return json.dumps(
-                {
-                    "success": False,
-                    "error": f"Skill '{name}' not found.",
-                    "available_skills": available,
-                    "hint": "Use skills_list to see all available skills",
-                },
-                ensure_ascii=False,
-            )
+        all_dirs = _skill_search_dirs()
 
         # Read the file once — reused for platform check and main content below
         try:
@@ -1580,71 +1805,22 @@ def skill_view(
         skill_name = frontmatter.get(
             "name", skill_md.stem if not skill_dir else skill_dir.name
         )
-        legacy_env_vars, _ = _collect_prerequisite_values(frontmatter)
-        required_env_vars = _get_required_environment_variables(
-            frontmatter, legacy_env_vars
-        )
-        backend = _get_terminal_backend_name()
-        env_snapshot = load_env()
-        missing_required_env_vars = [
-            e
-            for e in required_env_vars
-            if not e.get("optional")
-            and not _is_env_var_persisted(e["name"], env_snapshot)
-        ]
-        capture_result = _capture_required_environment_variables(
-            skill_name,
-            missing_required_env_vars,
-        )
-        if missing_required_env_vars:
-            env_snapshot = load_env()
-        remaining_missing_required_envs = _remaining_required_environment_names(
-            required_env_vars,
-            capture_result,
-            env_snapshot=env_snapshot,
-        )
-        setup_needed = bool(remaining_missing_required_envs)
+        readiness = _compute_readiness(frontmatter, skill_name, skill_dir)
+        required_env_vars = readiness["required_env_vars"]
+        backend = readiness["backend"]
+        remaining_missing_required_envs = readiness["missing_required_envs"]
+        missing_cred_files = readiness["missing_cred_files"]
+        setup_needed = readiness["setup_needed"]
+        capture_result = readiness["capture_result"]
 
-        # Register available skill env vars so they pass through to sandboxed
-        # execution environments (execute_code, terminal).  Only vars that are
-        # actually set get registered — missing ones are reported as setup_needed.
-        available_env_names = [
-            e["name"]
-            for e in required_env_vars
-            if e["name"] not in remaining_missing_required_envs
-        ]
-        if available_env_names:
-            try:
-                from tools.env_passthrough import register_env_passthrough
-
-                register_env_passthrough(available_env_names)
-            except Exception:
-                logger.debug(
-                    "Could not register env passthrough for skill %s",
-                    skill_name,
-                    exc_info=True,
-                )
-
-        # Register credential files for mounting into remote sandboxes
-        # (Modal, Docker).  Files that exist on the host are registered;
-        # missing ones are added to the setup_needed indicators.
-        required_cred_files_raw = frontmatter.get("required_credential_files", [])
-        if not isinstance(required_cred_files_raw, list):
-            required_cred_files_raw = []
-        missing_cred_files: list = []
-        if required_cred_files_raw:
-            try:
-                from tools.credential_files import register_credential_files
-
-                missing_cred_files = register_credential_files(required_cred_files_raw)
-                if missing_cred_files:
-                    setup_needed = True
-            except Exception:
-                logger.debug(
-                    "Could not register credential files for skill %s",
-                    skill_name,
-                    exc_info=True,
-                )
+        # ``requires`` transitive closure — a missing / disabled /
+        # unsupported / setup_needed required skill makes the whole skill
+        # unready. cron preflight consumes this via ``setup_needed`` and
+        # reports the exact failures from ``missing_required_skills``.
+        requires = _parse_requires(frontmatter)
+        missing_required = _requires_readiness(skill_name) if requires else []
+        if missing_required:
+            setup_needed = True
 
         rendered_content = content
         if preprocess:
@@ -1747,6 +1923,8 @@ def skill_view(
             "missing_required_environment_variables": remaining_missing_required_envs,
             "missing_credential_files": missing_cred_files,
             "missing_required_commands": [],
+            "requires": requires,
+            "missing_required_skills": missing_required,
             "setup_needed": setup_needed,
             "setup_skipped": capture_result["setup_skipped"],
             "readiness_status": SkillReadinessStatus.SETUP_NEEDED.value
@@ -1780,6 +1958,9 @@ def skill_view(
                 f"env ${env_name}" for env_name in remaining_missing_required_envs
             ] + [
                 f"file {path}" for path in missing_cred_files
+            ] + [
+                f"required skill '{r['name']}' ({r['reason']})"
+                for r in missing_required
             ]
             setup_note = _build_setup_note(
                 SkillReadinessStatus.SETUP_NEEDED,
