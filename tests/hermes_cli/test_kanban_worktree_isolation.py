@@ -260,6 +260,23 @@ def test_new_worktree_branch_rejects_origin_without_url(tmp_path):
     assert not target.exists()
 
 
+def test_new_worktree_branch_rejects_unresolved_remote_default(tmp_path):
+    repo = _make_repo(tmp_path)
+    remote = tmp_path / "origin.git"
+    subprocess.run(
+        ["git", "init", "--bare", str(remote)],
+        check=True, capture_output=True, text=True,
+    )
+    _git(repo, "remote", "add", "origin", str(remote))
+    _git(repo, "push", "origin", "HEAD:refs/heads/trunk")
+    target = repo / ".worktrees" / "new-task"
+
+    with pytest.raises(RuntimeError, match="could not resolve a fetched default branch"):
+        kb._ensure_git_worktree(repo, target, "project/new-task")
+
+    assert not target.exists()
+
+
 def test_decompose_worktree_children_get_own_workspace(kanban_home):
     with kb.connect() as conn:
         root = kb.create_task(conn, title="build the feature", triage=True)

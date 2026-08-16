@@ -7634,7 +7634,9 @@ def _worktree_base_ref(repo_root: Path) -> str:
     for candidate in candidates:
         if _is_commit(candidate):
             return candidate
-    return "HEAD"
+    raise RuntimeError(
+        "could not resolve a fetched default branch for new Kanban worktree"
+    )
 
 
 def _git_common_dir(path: Path) -> Optional[Path]:
