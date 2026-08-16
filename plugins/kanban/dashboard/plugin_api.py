@@ -2944,6 +2944,7 @@ def _strict_query_values(query_params, *, allowed: set[str], required: set[str])
 
 
 def _resolve_signal_board(raw: str | None) -> str:
+    """Require an existing board expressed as its exact canonical slug."""
     if not raw:
         raise ValueError("board is required")
     try:

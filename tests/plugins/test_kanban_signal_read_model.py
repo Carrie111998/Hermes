@@ -298,7 +298,10 @@ def test_event_generation_rotates_with_hard_delete(signal_home):
         conn.execute("DELETE FROM task_events WHERE task_id=?", (task_id,))
         before = kb.event_generation(conn)
         assert kb.delete_task(conn, task_id) is True
-        assert kb.event_generation(conn) != before
+        after = kb.event_generation(conn)
+        assert after != before
+        assert kb.delete_task(conn, task_id) is False
+        assert kb.event_generation(conn) == after
     finally:
         conn.close()
 

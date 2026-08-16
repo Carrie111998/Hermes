@@ -685,6 +685,8 @@ Every handler is a thin wrapper and adds no new task-domain logic. Mutation and 
 
 The projection exposes only bounded task identity/status/timing fields, parent-child links, and bounded run identity/status/timing fields. It never returns task titles, bodies, results, prompts, workspace or branch paths, claim locks, raw errors, summaries, metadata, or event payloads.
 
+When `truncated` is `true`, tasks are partial and links and runs cover only that visible task set. Clients must not infer board-wide completeness or compute integral board metrics from that response; they should render an explicit partial state or fail closed.
+
 Signal WebSocket frames carry `generation`, `cursor`, `reset`, and allowlisted event identity fields. Event-history deletion rotates the generation in the same SQLite transaction. Fresh streams may use `since=0` without `generation`; reconnects with `since>0` must send the generation received with their snapshot or prior frame. A mismatch returns an initial `reset: true`, and the client must fetch a fresh signal read model before applying more events. Omitting `view` preserves the legacy WebSocket protocol unchanged.
 
 ### Dashboard config
