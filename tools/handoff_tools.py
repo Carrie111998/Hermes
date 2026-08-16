@@ -2,15 +2,16 @@
 
 GXTD-390 introduces an explicit handoff contract so work routed from one
 profile to another always has a durable return path.  This module implements
-that contract's durable Kanban-backed mode first; the immediate profile-session
-mode is intentionally fail-closed until the runtime has a session-spawn API that
-can return a live target-session link.
+both durable Kanban-backed handoff tasks and immediate target-profile one-shot
+session handoffs that return final or blocked results to the origin.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import subprocess
+import time
 from typing import Any, Mapping, Optional
 
 from tools.registry import registry, tool_error
@@ -166,6 +167,132 @@ def _origin_session_id(args: Mapping[str, Any], kw: Mapping[str, Any]) -> Option
     return str(raw) if raw else None
 
 
+def _target_profile_state_db_path(target_profile: str):
+    from hermes_cli.profiles import get_profile_dir
+
+    return get_profile_dir(target_profile) / "state.db"
+
+
+def _latest_handoff_profile_session(
+    target_profile: str,
+    *,
+    started_after: float,
+) -> Optional[str]:
+    """Return newest target-profile session created by this handoff run."""
+    db_path = _target_profile_state_db_path(target_profile)
+    if not db_path.exists():
+        return None
+    try:
+        import sqlite3
+
+        conn = sqlite3.connect(str(db_path))
+        try:
+            row = conn.execute(
+                "SELECT id FROM sessions "
+                "WHERE source = 'handoff_profile' AND started_at >= ? "
+                "ORDER BY started_at DESC LIMIT 1",
+                (started_after - 2.0,),
+            ).fetchone()
+            return str(row[0]) if row else None
+        finally:
+            conn.close()
+    except Exception:
+        return None
+
+
+def _session_link(profile: str, session_id: Optional[str]) -> Optional[str]:
+    if not session_id:
+        return None
+    return f"@session:{profile}/{session_id}"
+
+
+def _run_target_profile_session(
+    *,
+    target_profile: str,
+    prompt: str,
+    origin_profile: str,
+    origin_session_id: Optional[str],
+    timeout_seconds: int,
+    model: Optional[str] = None,
+    provider: Optional[str] = None,
+    toolsets: Optional[str] = None,
+) -> dict[str, Any]:
+    """Spawn a one-shot target-profile Hermes session and capture its result."""
+    started_after = time.time()
+    cmd = [
+        "hermes",
+        "--profile",
+        target_profile,
+        "chat",
+        "--source",
+        "handoff_profile",
+        "--quiet",
+        "--query",
+        prompt,
+    ]
+    if model:
+        cmd.extend(["--model", str(model)])
+    if provider:
+        cmd.extend(["--provider", str(provider)])
+    if toolsets:
+        cmd.extend(["--toolsets", str(toolsets)])
+
+    env = os.environ.copy()
+    # The target profile session must be a normal profile-bound turn, not a
+    # continuation of the origin's Kanban/gateway process-local context.
+    for key in list(env):
+        if key.startswith("HERMES_KANBAN_") or key.startswith("HERMES_SESSION_"):
+            env.pop(key, None)
+    env["HERMES_HANDOFF_ORIGIN_PROFILE"] = origin_profile
+    if origin_session_id:
+        env["HERMES_HANDOFF_ORIGIN_SESSION_ID"] = origin_session_id
+
+    try:
+        completed = subprocess.run(
+            cmd,
+            env=env,
+            text=True,
+            capture_output=True,
+            timeout=max(1, int(timeout_seconds)),
+            cwd=os.getcwd(),
+        )
+    except subprocess.TimeoutExpired as exc:
+        session_id = _latest_handoff_profile_session(
+            target_profile,
+            started_after=started_after,
+        )
+        return {
+            "status": "blocked",
+            "session_id": session_id,
+            "session_link": _session_link(target_profile, session_id),
+            "blocked_reason": f"target profile session timed out after {timeout_seconds}s",
+            "final_result": (exc.stdout or "")[-4000:] if isinstance(exc.stdout, str) else "",
+        }
+
+    session_id = _latest_handoff_profile_session(
+        target_profile,
+        started_after=started_after,
+    )
+    stdout = (completed.stdout or "").strip()
+    stderr = (completed.stderr or "").strip()
+    if completed.returncode == 0:
+        return {
+            "status": "final",
+            "session_id": session_id,
+            "session_link": _session_link(target_profile, session_id),
+            "final_result": stdout[-12000:],
+            "returncode": completed.returncode,
+        }
+    return {
+        "status": "blocked",
+        "session_id": session_id,
+        "session_link": _session_link(target_profile, session_id),
+        "blocked_reason": stderr[-4000:] or stdout[-4000:] or f"target profile exited {completed.returncode}",
+        "final_result": stdout[-12000:],
+        "returncode": completed.returncode,
+    }
+
+
 def _format_handoff_body(
     *,
     prompt: str,
@@ -197,6 +324,41 @@ def _format_handoff_body(
     if body and str(body).strip():
         chunks.extend(["", "## Additional context", str(body).strip()])
     return "\n".join(chunks).strip() + "\n"
+
+
+def _format_handoff_profile_prompt(
+    *,
+    prompt: str,
+    body: Optional[str],
+    target_profile: str,
+    origin_profile: str,
+    origin_session_id: Optional[str],
+    source_context_policy: str,
+) -> str:
+    metadata = {
+        "mode": "handoff_profile",
+        "target_profile": target_profile,
+        "origin_profile": origin_profile,
+        "origin_session_id": origin_session_id,
+        "source_context_policy": source_context_policy,
+        "return_contract": "final_or_blocked_result_to_origin",
+    }
+    chunks = [
+        "# Hermes handoff_profile",
+        "",
+        "You are running inside the target Hermes profile for an immediate cross-profile handoff.",
+        "Complete the request if possible. If blocked, return a concise blocked result with the reason and needed next action.",
+        "",
+        "```json",
+        json.dumps(metadata, indent=2, sort_keys=True),
+        "```",
+        "",
+        "## Handoff prompt",
+        prompt.strip(),
+    ]
+    if body and str(body).strip():
+        chunks.extend(["", "## Additional context", str(body).strip()])
+    return "\n".join(chunks).strip()
 
 
 def _handle_handoff_task(args: dict, **kw: Any) -> str:
@@ -297,15 +459,45 @@ def _handle_handoff_task(args: dict, **kw: Any) -> str:
 
 
 def _handle_handoff_profile(args: dict, **kw: Any) -> str:
+    prompt = str(args.get("prompt") or "").strip()
+    if not prompt:
+        return _err("prompt is required")
     try:
         target_profile = _normalize_target_profile(args.get("target_profile"))
+        origin_profile = str(args.get("origin_profile") or _current_profile()).strip() or "default"
+        origin_session_id = _origin_session_id(args, kw)
     except ValueError as exc:
         return _err(str(exc))
-    return _err(
-        "handoff_profile is contract-defined but this runtime has no safe "
-        f"target-session spawn API wired yet for {target_profile!r}; use "
-        "mode='handoff_task' for durable execution, or implement the session "
-        "spawn/link slice before claiming immediate profile handoff support"
+
+    source_context_policy = str(args.get("source_context_policy") or "summary").strip() or "summary"
+    target_prompt = _format_handoff_profile_prompt(
+        prompt=prompt,
+        body=args.get("body"),
+        target_profile=target_profile,
+        origin_profile=origin_profile,
+        origin_session_id=origin_session_id,
+        source_context_policy=source_context_policy,
+    )
+    timeout_seconds = int(args.get("max_runtime_seconds") or 300)
+    try:
+        result = _run_target_profile_session(
+            target_profile=target_profile,
+            prompt=target_prompt,
+            origin_profile=origin_profile,
+            origin_session_id=origin_session_id,
+            timeout_seconds=timeout_seconds,
+            model=args.get("model"),
+            provider=args.get("provider"),
+            toolsets=args.get("toolsets"),
+        )
+    except Exception as exc:
+        return _err(f"handoff_profile: {exc}")
+    return _ok(
+        mode="handoff_profile",
+        target_profile=target_profile,
+        origin_profile=origin_profile,
+        origin_session_id=origin_session_id,
+        **result,
     )
 
 
@@ -324,9 +516,8 @@ HANDOFF_SCHEMA = {
         "Create a first-class Hermes cross-profile handoff. "
         "mode='handoff_task' creates a durable Kanban task assigned to the "
         "target profile and registers a mandatory origin callback for terminal "
-        "events. mode='handoff_profile' is reserved for immediate target-profile "
-        "sessions and currently fails closed until a safe session-spawn backend "
-        "is wired."
+        "events. mode='handoff_profile' starts an immediate target-profile "
+        "one-shot session and returns its session link plus final/blocked result."
     ),
     "parameters": {
         "type": "object",
@@ -387,6 +578,7 @@ HANDOFF_SCHEMA = {
             "goal_max_turns": {"type": "integer"},
             "model": {"type": "string"},
             "provider": {"type": "string"},
+            "toolsets": {"type": "string", "description": "Optional comma-separated toolsets for handoff_profile target session."},
             "initial_status": {"type": "string", "enum": ["running", "blocked"]},
             "board": {"type": "string"},
         },

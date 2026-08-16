@@ -77,8 +77,8 @@ _HERMES_CORE_TOOLS = [
     # Home Assistant smart home control (gated on HASS_TOKEN via check_fn)
     "ha_list_entities", "ha_get_state", "ha_list_services", "ha_call_service",
     # First-class cross-profile handoff. Durable handoffs write Kanban tasks
-    # with an explicit callback subscription; immediate profile handoff remains
-    # fail-closed until a safe target-session spawn backend is wired.
+    # with an explicit callback subscription; immediate profile handoffs start
+    # target-profile one-shot sessions and return final/blocked results.
     "handoff",
     # Kanban multi-agent coordination — only in schema when the agent is
     # spawned as a kanban worker (HERMES_KANBAN_TASK env set) or the current
