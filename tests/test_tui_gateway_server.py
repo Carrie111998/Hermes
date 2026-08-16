@@ -1800,7 +1800,13 @@ def test_wake_passive_start_reads_disabled_config_before_requirements(monkeypatc
 
     hermes_home = Path(os.environ["HERMES_HOME"])
     config_path = hermes_home / "config.yaml"
-    config_path.write_text("wake_word:\n  enabled: false\n", encoding="utf-8")
+    config_path.write_text(
+        "wake_word:\n  enabled: false\n  phrase: from-test-config\n",
+        encoding="utf-8",
+    )
+    loaded_config = wake_word.load_wake_word_config()
+    assert loaded_config["enabled"] is False
+    assert loaded_config["phrase"] == "from-test-config"
     resolve_capture = Mock(return_value="local")
     check_requirements = Mock(return_value={"available": True})
     monkeypatch.setattr(wake_word, "resolve_capture_mode", resolve_capture)
