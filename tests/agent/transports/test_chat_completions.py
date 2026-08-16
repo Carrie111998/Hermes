@@ -471,6 +471,71 @@ class TestChatCompletionsNormalize:
         assert nr.tool_calls[0].name == "terminal"
         assert nr.tool_calls[0].id == "call_123"
 
+    def test_tool_call_leaked_into_content_is_recovered(self, transport):
+        """Ollama's /v1 endpoint sometimes leaves tool_calls empty and puts
+        the call as raw JSON in content instead (hermes-agent#5867).
+        Reproduced live against qwen2.5-coder:7b on Ollama's OpenAI-compat
+        endpoint: content == '{"name": "...", "arguments": {...}}',
+        tool_calls == None, finish_reason == "stop"."""
+        r = SimpleNamespace(
+            choices=[SimpleNamespace(
+                message=SimpleNamespace(
+                    content='{\n  "name": "kanban_create_card",\n  "arguments": {\n    "title": "test delegation"\n  }\n}',
+                    tool_calls=None,
+                    reasoning_content=None,
+                ),
+                finish_reason="stop",
+            )],
+            usage=None,
+        )
+        nr = transport.normalize_response(r)
+        assert nr.tool_calls is not None
+        assert len(nr.tool_calls) == 1
+        assert nr.tool_calls[0].name == "kanban_create_card"
+        assert json.loads(nr.tool_calls[0].arguments) == {"title": "test delegation"}
+        assert nr.content is None
+        assert nr.finish_reason == "tool_calls"
+
+    def test_multiple_tool_calls_leaked_into_content_are_recovered(self, transport):
+        """Multi-tool dispatch: Ollama concatenates leaked calls as
+        whitespace-separated JSON objects with no enclosing array, and omits
+        ``arguments`` entirely for zero-arg calls. Reproduced live with a
+        two-tool chief-of-staff-shaped prompt."""
+        r = SimpleNamespace(
+            choices=[SimpleNamespace(
+                message=SimpleNamespace(
+                    content='{"name": "kanban_create_card", "arguments": {"title": "Weather Research Task", "assignee": "monitor"}}\n{"name": "todo_list"}',
+                    tool_calls=None,
+                    reasoning_content=None,
+                ),
+                finish_reason="stop",
+            )],
+            usage=None,
+        )
+        nr = transport.normalize_response(r)
+        assert nr.tool_calls is not None
+        assert len(nr.tool_calls) == 2
+        assert nr.tool_calls[0].name == "kanban_create_card"
+        assert nr.tool_calls[1].name == "todo_list"
+        assert json.loads(nr.tool_calls[1].arguments) == {}
+
+    def test_plain_text_content_is_not_mistaken_for_a_leaked_tool_call(self, transport):
+        """Guard against false positives: ordinary prose must never be
+        reinterpreted as a tool call, even if it happens to contain JSON."""
+        r = SimpleNamespace(
+            choices=[SimpleNamespace(
+                message=SimpleNamespace(
+                    content='Sure — here is the config you asked for: {"name": "example"}',
+                    tool_calls=None,
+                    reasoning_content=None,
+                ),
+                finish_reason="stop",
+            )],
+            usage=None,
+        )
+        nr = transport.normalize_response(r)
+        assert nr.tool_calls is None
+        assert nr.content == 'Sure — here is the config you asked for: {"name": "example"}'
 
 
     def test_empty_reasoning_content_preserved(self, transport):

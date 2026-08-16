@@ -19,6 +19,59 @@ from agent.transports.base import ProviderTransport
 from agent.transports.types import NormalizedResponse, ToolCall, Usage
 
 
+def _parse_leaked_tool_calls(content: Any) -> list["ToolCall"] | None:
+    """Recover tool call(s) a model emitted as raw JSON in ``content``
+    instead of the structured ``tool_calls`` field.
+
+    Ollama's OpenAI-compatible endpoint doesn't reliably populate
+    ``tool_calls`` for some local models (hermes-agent#5867): the model
+    still decides to call a tool and formats the call correctly, but the
+    endpoint returns it as plain text — one or more concatenated JSON
+    objects shaped ``{"name": ..., "arguments": {...}}``, whitespace
+    separated, with no enclosing array, ``arguments`` omitted for zero-arg
+    calls. Reproduced live against qwen2.5-coder:7b.
+
+    Deliberately strict: the *entire* stripped content must decode as a
+    sequence of such objects with nothing else around them, so this never
+    misfires on ordinary prose that happens to contain a JSON fragment.
+    """
+    if not isinstance(content, str):
+        return None
+    text = content.strip()
+    if not text:
+        return None
+
+    decoder = json.JSONDecoder()
+    calls: list[ToolCall] = []
+    idx = 0
+    length = len(text)
+    while idx < length:
+        while idx < length and text[idx].isspace():
+            idx += 1
+        if idx >= length:
+            break
+        try:
+            obj, end = decoder.raw_decode(text, idx)
+        except (json.JSONDecodeError, ValueError):
+            return None
+        if not isinstance(obj, dict) or not isinstance(obj.get("name"), str):
+            return None
+        arguments = obj.get("arguments", {})
+        if not isinstance(arguments, dict):
+            return None
+        if set(obj.keys()) - {"name", "arguments"}:
+            return None
+        calls.append(
+            ToolCall(
+                id=None,
+                name=obj["name"],
+                arguments=json.dumps(arguments, ensure_ascii=False),
+            )
+        )
+        idx = end
+    return calls or None
+
+
 def _static_prompt_instructions(messages: list[dict[str, Any]]) -> str:
     """Return the stable system/developer prefix used for cache routing.
 
@@ -894,6 +947,16 @@ class ChatCompletionsTransport(ProviderTransport):
                     )
                 )
 
+        # Ollama /v1 fallback: the endpoint sometimes leaves tool_calls
+        # empty and puts the call as raw JSON in content instead. See
+        # _parse_leaked_tool_calls for the observed shape (hermes-agent#5867).
+        content_had_leaked_tool_calls = False
+        if not tool_calls:
+            leaked = _parse_leaked_tool_calls(msg.content)
+            if leaked is not None:
+                tool_calls = leaked
+                content_had_leaked_tool_calls = True
+
         usage = None
         if hasattr(response, "usage") and response.usage:
             u = response.usage
@@ -933,6 +996,10 @@ class ChatCompletionsTransport(ProviderTransport):
         # loop's refusal handler surfaces it clearly and stops. ``refusal`` is
         # ``None`` for normal responses, so this is a no-op in the common case.
         content = msg.content
+        if content_had_leaked_tool_calls:
+            content = None
+            if finish_reason in (None, "stop"):
+                finish_reason = "tool_calls"
         refusal = getattr(msg, "refusal", None)
         if refusal is None and hasattr(msg, "model_extra"):
             _msg_extra = getattr(msg, "model_extra", None) or {}
