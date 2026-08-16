@@ -85,6 +85,7 @@ class TestBuildRelaunchArgv:
         script.write_text("#!/usr/bin/env python3\n")
         script.chmod(0o755)
         managed_python = "/venv/bin/python"
+        monkeypatch.setattr(relaunch_mod, "resolve_hermes_bin", lambda: str(script))
         monkeypatch.setattr(relaunch_mod.sys, "argv", [str(script)])
         monkeypatch.setattr(relaunch_mod.sys, "executable", managed_python)
 
