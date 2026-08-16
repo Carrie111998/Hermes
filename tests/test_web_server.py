@@ -134,6 +134,7 @@ def test_start_server_headless_prints_dashboard_hint(monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "hermes dashboard" in out
     assert "headless backend" in out
+    assert "JSON-RPC/WS API is still available" in out
 
 
 def test_start_server_enables_ws_ping_for_half_open_detection(monkeypatch):

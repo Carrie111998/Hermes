@@ -18162,6 +18162,7 @@ def start_server(
                 # (#84865). Say it up front instead of only on 404.
                 print("  This is a headless backend (no browser UI). Use "
                       "`hermes dashboard` to open the web dashboard.")
+                print("  The JSON-RPC/WS API is still available for scripted clients.")
             else:
                 print(f"  Hermes Web UI → http://{host}:{actual_port}")
             _maybe_open_browser(host, actual_port, open_browser, initial_profile)
