@@ -1,6 +1,6 @@
 ---
 title: "ARCH-003: runtime-state audit and replay verification"
-status: DESIGN_REVIEW_REVISE_V3_PENDING
+status: DESIGN_REVIEW_PASS
 date: 2026-08-16
 type: architecture
 ticket: ARCH-003
@@ -11,7 +11,7 @@ target_repo: hermes-agent
 
 ## Status
 
-DESIGN_REVIEW_REVISE_V3_PENDING
+DESIGN_REVIEW_PASS
 
 This ticket is a design gate only. No source implementation, runtime-state
 migration, DGX database inspection, deployment, or automatic repair is
@@ -243,6 +243,29 @@ These are the final design-only corrections currently identified by the same
 authenticated Claude family. No implementation, migration, live-state test,
 DGX mutation, deployment, or repair action is authorized.
 
+## Final design review consensus
+
+Status: DESIGN_REVIEW_PASS
+
+The final corrected revision 3 packet was reviewed by exactly one
+authenticated Claude Opus reviewer and one authenticated AGY reviewer using
+identical metadata-only content.
+
+- Packet SHA-256:
+  `d3789a8daefa1a3f903692b829a2aa4030a6469b6d5089cd5efc121329601657`
+- Claude Opus: `AUTHENTICATED_REVIEWER: yes`, `PASS`, blocking corrections
+  none.
+- AGY: `AUTHENTICATED_REVIEWER: yes`, `PASS`, correction set none.
+
+The design gate is closed. Claude noted three non-blocking implementation-gate
+items: document privileged compaction as the append-only exception, define
+digest-key custody/rotation durability, and add a profile-isolation read-path
+test. These do not authorize implementation and must be carried into the
+separate implementation review.
+
+Implementation, focused tests, CI, merge, deployment, runtime health,
+rollback, automatic repair, and full event-sourcing remain separate gates.
+
 ## Planned implementation evidence
 
 Not run. No source files, migrations, tests, DGX runtime, or deployment have
@@ -250,6 +273,6 @@ been changed by this ticket.
 
 ## Current next action
 
-Re-review the reconciled correction set with the same authenticated Claude
-family using the same bounded packet revision. Only a Claude PASS on the
-corrected design can close this design gate; implementation remains separate.
+Create a separate implementation plan that carries the three non-blocking
+implementation notes above. Do not edit source or mutate DGX until the
+implementation gate is separately authorized.
