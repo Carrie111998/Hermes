@@ -1119,7 +1119,7 @@ _api_agent_request_reservation: ContextVar[Optional[dict[str, bool]]] = ContextV
 )
 
 
-def _admit_api_agent_request(handler):
+def _admit_api_agent_request(handler=None, *, auth_checker: Optional[str] = None):
     """Reserve an authenticated API turn before its handler first awaits.
 
     Gateway shutdown and aiohttp requests share an event loop. Keeping the
@@ -1128,27 +1128,40 @@ def _admit_api_agent_request(handler):
     still parsing its body or resolving session state. The mutable reservation
     is intentionally shared with child tasks so agent/task bookkeeping releases
     this one slot exactly once.
-    """
-    @wraps(handler)
-    async def _wrapped(self, request, *args, **kwargs):
-        auth_err = self._check_auth(request)
-        if auth_err:
-            return auth_err
-        draining = self._draining_response()
-        if draining is not None:
-            return draining
-        reservation = {"active": True}
-        token = _api_agent_request_reservation.set(reservation)
-        self._pending_agent_requests += 1
-        try:
-            return await handler(self, request, *args, **kwargs)
-        finally:
-            if reservation["active"]:
-                reservation["active"] = False
-                self._pending_agent_requests = max(0, self._pending_agent_requests - 1)
-            _api_agent_request_reservation.reset(token)
 
-    return _wrapped
+    Usable both as ``@_admit_api_agent_request`` and as
+    ``@_admit_api_agent_request(auth_checker=...)``. ``auth_checker`` names the
+    instance method used to authenticate the request (default ``_check_auth``).
+    Remote-attach chat reuses this admission path but must accept a scoped
+    attach token, so it passes ``_check_remote_auth``.
+    """
+
+    def _decorate(fn):
+        @wraps(fn)
+        async def _wrapped(self, request, *args, **kwargs):
+            checker = getattr(self, auth_checker) if auth_checker else self._check_auth
+            auth_err = checker(request)
+            if auth_err:
+                return auth_err
+            draining = self._draining_response()
+            if draining is not None:
+                return draining
+            reservation = {"active": True}
+            token = _api_agent_request_reservation.set(reservation)
+            self._pending_agent_requests += 1
+            try:
+                return await fn(self, request, *args, **kwargs)
+            finally:
+                if reservation["active"]:
+                    reservation["active"] = False
+                    self._pending_agent_requests = max(0, self._pending_agent_requests - 1)
+                _api_agent_request_reservation.reset(token)
+
+        return _wrapped
+
+    if handler is None:
+        return _decorate
+    return _decorate(handler)
 
 
 def _release_pending_api_work(adapter, reservation: dict[str, bool]) -> None:
@@ -3598,19 +3611,23 @@ class APIServerAdapter(BasePlatformAdapter):
 
         return response
 
+    @_admit_api_agent_request(auth_checker="_check_remote_auth")
     async def _handle_remote_session_chat(
         self, request: "web.Request"
     ) -> "web.Response":
-        """POST /api/remote/sessions/{session_id}/chat — reuse session chat."""
-        auth_err = self._check_remote_auth(request)
-        if auth_err:
-            return auth_err
+        """POST /api/remote/sessions/{session_id}/chat — reuse session chat.
+
+        Uses the agent-request admission path (so the turn participates in
+        shutdown draining) but authenticates with the remote attach token via
+        ``_check_remote_auth`` — the plain ``_check_auth`` would reject a
+        scoped attach token before this handler ran.
+        """
         _, err = await self._get_open_remote_session_or_404(
             request.match_info["session_id"]
         )
         if err is not None:
             return err
-        return await self._handle_session_chat(request)
+        return await self._handle_session_chat_impl(request)
 
     # ------------------------------------------------------------------
     # /api/sessions — thin client/session resource API
@@ -4007,6 +4024,10 @@ class APIServerAdapter(BasePlatformAdapter):
     @_admit_api_agent_request
     async def _handle_session_chat(self, request: "web.Request") -> "web.Response":
         """POST /api/sessions/{session_id}/chat — one synchronous agent turn."""
+        return await self._handle_session_chat_impl(request)
+
+    async def _handle_session_chat_impl(self, request: "web.Request") -> "web.Response":
+        """Shared session-chat implementation (admission is applied by callers)."""
         gateway_session_key, key_err = self._parse_session_key_header(request)
         if key_err is not None:
             return key_err
