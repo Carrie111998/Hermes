@@ -1,4 +1,3 @@
-import os
 """Shared module-level constants for the SessionDB family of modules.
 
 Extracted verbatim from hermes_state.py so the SessionDB mixin modules
@@ -7,6 +6,7 @@ reference them without importing hermes_state (which would be a cycle).
 hermes_state re-imports every name here for backward compatibility.
 """
 
+import os
 from typing import Any
 
 from agent.skill_commands import (

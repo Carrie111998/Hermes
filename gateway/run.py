@@ -1949,7 +1949,9 @@ def _bridge_max_turns_from_config(home: "Path") -> None:
         if "cjk_fts" in sessions_cfg:
             os.environ["HERMES_CJK_FTS"] = str(sessions_cfg["cjk_fts"])
         if "fts5" in sessions_cfg:
-            os.environ["HERMES_FTS5"] = str(sessions_cfg["fts5"])
+            # An explicit HERMES_FTS5 in the environment wins over config.yaml
+            # so ops can force the flag per-process without editing config.
+            os.environ.setdefault("HERMES_FTS5", str(sessions_cfg["fts5"]))
         if "search_slow_ms" in sessions_cfg:
             os.environ["HERMES_SEARCH_SLOW_MS"] = str(sessions_cfg["search_slow_ms"])
 

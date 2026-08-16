@@ -109,8 +109,14 @@ class SessionSchemaMixin:
 
     def _sqlite_supports_fts5(self, cursor: sqlite3.Cursor) -> bool:
         # config.yaml sessions.fts5 opt-out (issue #69603): when disabled,
-        # report FTS5 unavailable so startup takes the no-FTS path.
+        # report FTS5 unavailable so startup takes the no-FTS path. Logged
+        # distinctly from a genuinely missing FTS5 extension so support can
+        # tell user opt-out apart from a build problem.
         if not _fts5_config_enabled():
+            logger.info(
+                "FTS5 disabled via sessions.fts5 config; taking no-FTS path "
+                "(transcript persistence unaffected, search falls back to LIKE)"
+            )
             return False
         try:
             cursor.execute("CREATE VIRTUAL TABLE temp._hermes_fts5_probe USING fts5(x)")
