@@ -1,6 +1,6 @@
 ---
 title: "ARCH-003 implementation plan: runtime-state audit and replay verification"
-status: IMPLEMENTATION_PLAN_REVISE_V13_PENDING
+status: IMPLEMENTATION_PLAN_REVISE_V14_PENDING
 date: 2026-08-16
 type: implementation-plan
 ticket: ARCH-003
@@ -294,6 +294,11 @@ this posture.
   current generation in the event.
 - Any mutation/genesis journal constraint or write failure aborts the complete
   enclosing materialized-state mutation; errors must not be swallowed.
+- If the digest key is unavailable while preparing a mutation/genesis, fail
+  closed before opening the SQLite transaction, leave materialized state
+  unchanged, emit no event, and surface the shared `KEY_UNAVAILABLE` reason.
+  This is distinct from `WRITE_ABORT`, which covers a transaction or
+  continuity refusal after the mutation path has entered its write contract.
 - The privileged baseline writer is the sole event-only exception and uses the
   exclusive lock ordering defined in Gate 1.
 - There is no sequence retry path under the write-lock-first discipline. An
@@ -326,13 +331,16 @@ Implement a bounded verifier that:
   duplicate or missing predecessors, digest-parameter identity, schemas, the
   shared and verifier-side closed reason-code subsets, and terminal state;
 - uses a code-level `REPLAY_EVENT_LIMIT = 10000` counted from the effective
-  replay start point: the latest valid baseline under the current digest
-  identifier if one exists, otherwise the latest valid marked genesis under the
-  current digest identifier; otherwise `UNKNOWN`. Baseline and genesis rows
-  carry the origin epoch marker and origin-genesis sequence, so current-origin
-  validity is checked from bounded row metadata without scanning an unbounded
-  pre-start prefix. Events preceding the selected start are ignored after that
-  O(1) metadata check;
+  replay start point. Compute the start candidates as the highest valid baseline
+  under the current digest identifier and the latest valid marked genesis under
+  the current digest identifier, when present; select the later candidate by
+  `entity_seq`. If neither candidate exists, return `UNKNOWN`. Baseline and
+  genesis rows carry the origin epoch marker and origin-genesis sequence, so
+  current-origin validity is checked from bounded row metadata without scanning
+  an unbounded pre-start prefix. Events preceding the selected start are
+  ignored after that O(1) metadata check, and counter continuity is enforced
+  only from the selected start forward. This permits a newer-writer-epoch
+  genesis after a baseline to re-originate the entity.
 - selects the valid baseline with the highest `sealed_through_seq`, ignores
   events before it, and returns `UNKNOWN` for same-sequence tuple conflicts,
   overlapping contradictory baselines, a baseline without a valid current
@@ -399,7 +407,9 @@ Add deterministic tests for:
 - bypass-path rejection for mutation/genesis while permitting the named baseline
   writer;
 - keyed digest/profile isolation, identifier/key-check mismatch, digest
-  rotation without bridging, and verify-time key unavailability;
+  rotation without bridging, verify-time key unavailability, and mutation-time
+  key unavailability returning shared `KEY_UNAVAILABLE` without changing
+  materialized state;
 - duplicate, missing, malformed, non-contiguous, and unsupported events;
 - empty history returning `UNKNOWN` with `EMPTY_HISTORY`;
 - the same fixture with a materialized-write counter gap returning `UNKNOWN`
@@ -416,6 +426,8 @@ Add deterministic tests for:
 - same-sequence conflicting baselines and contradictory overlapping baselines
   returning `UNKNOWN`, while strictly increasing successive baselines select
   the highest valid one;
+- a baseline followed by a newer-writer-epoch marked genesis selecting the
+  later genesis start and reaching `CONSISTENT`;
 - sealed baseline contents, baseline sequence consumption, and post-baseline
   continuity;
 - snapshot race using explicit `BEGIN DEFERRED` and the selected WAL
@@ -587,6 +599,23 @@ DGX changes, deployment, repair, or event-sourcing. The corrected plan must
 return to the same authenticated Claude reviewer family and then to AGY on the
 identical packet.
 
+## Implementation-plan review reconciliation v13
+
+The v13 authenticated Claude Opus review returned `REVISE` with three bounded
+plan-text corrections. The corrections are incorporated above:
+
+1. Replay start selects the later of the highest valid baseline and the latest
+   valid current-epoch genesis, with counter continuity enforced only from that
+   selected start.
+2. Mutation-time digest-key unavailability is a shared `KEY_UNAVAILABLE`
+   fail-closed outcome with no state or event mutation.
+3. Acceptance coverage now explicitly includes v12.
+
+These remain plan-only corrections and do not authorize source edits, tests,
+DGX changes, deployment, repair, or event-sourcing. The corrected plan must
+return to the same authenticated Claude reviewer family and then to AGY on the
+identical packet.
+
 ## Acceptance criteria
 
 ARCH-003 implementation is ready for its delivery gates only when:
@@ -615,7 +644,7 @@ ARCH-003 implementation is ready for its delivery gates only when:
   retention job; entities beyond the replay limit remain UNKNOWN in this ticket,
   and the 100,000-event/100 MiB per-profile threshold is a documented follow-up
   operational review, not an in-ticket operator gate;
-- reconciliation v1 and v5-v11 items are incorporated into the normative
+- reconciliation v1 and v5-v12 items are incorporated into the normative
   Gates 0-4 text (with v2-v4 explicitly folded into the v1/v4 text), and this
   merged plan revision receives the same-family re-review;
 - all focused and relevant tests pass;
@@ -648,6 +677,8 @@ ARCH-003 implementation is ready for its delivery gates only when:
   complete reconciliation coverage, and explicit reason-code test bindings.
 - v12: event-to-event counter continuity, permanent counter-gap UNKNOWN,
   explicit WRITE_ABORT recovery boundary, and deduplicated schema contract.
+- v13: later-start selection for baseline/genesis re-origination, shared
+  mutation-time KEY_UNAVAILABLE semantics, and complete acceptance coverage.
 
 
 ## Non-goals
