@@ -12,6 +12,7 @@ import {
   NO_PROJECT_ID,
   overlayLiveLanes,
   overlayLivePreviews,
+  seedEmptyLanesFromPreviews,
   sessionProjectColor,
   type SidebarProjectTree,
   type SidebarSessionGroup,
@@ -812,6 +813,87 @@ describe('overlayLiveLanes', () => {
     ])
   })
 
+  it('keeps recent sessions on the home lane when live branch is master but rows have no git_branch', () => {
+    // Repro: backend places empty-git_branch rows under `main`; the desktop folds
+    // main+master into one home lane labeled by the LIVE branch (`master`). Live
+    // overlay still computes `::branch::main` for empty git_branch and used to
+    // fork a phantom lane + evict those ids out of home — leaving home with only
+    // sessions absent from `$sessions` (stale history under the home glyph).
+    const recent = makeSession('/www/app', {
+      id: 'recent',
+      git_branch: null,
+      started_at: 100,
+      last_active: 200
+    })
+    const mid = makeSession('/www/app', {
+      id: 'mid',
+      git_branch: null,
+      started_at: 50,
+      last_active: 60
+    })
+    const staleOnlyOnBackend = makeSession('/www/app', {
+      id: 'stale',
+      git_branch: null,
+      started_at: 10,
+      last_active: 20
+    })
+    const masterOnly = makeSession('/www/app', {
+      id: 'master-row',
+      git_branch: 'master',
+      started_at: 5,
+      last_active: 15
+    })
+
+    const backend = projectNode({
+      id: 'p_app',
+      path: '/www/app',
+      repos: [
+        {
+          id: '/www/app',
+          label: 'app',
+          path: '/www/app',
+          sessionCount: 4,
+          groups: [
+            lane({
+              id: '/www/app::branch::main',
+              label: 'main',
+              isMain: true,
+              path: '/www/app',
+              sessions: [recent, mid, staleOnlyOnBackend]
+            }),
+            lane({
+              id: '/www/app::branch::master',
+              label: 'master',
+              isMain: true,
+              path: '/www/app',
+              sessions: [masterOnly]
+            })
+          ]
+        }
+      ]
+    })
+
+    const folded = {
+      ...backend,
+      repos: backend.repos.map(repo => ({
+        ...repo,
+        groups: mergeRepoWorktreeGroups(repo, [
+          { path: '/www/app', branch: 'master', isMain: true, detached: false } as HermesGitWorktree
+        ])
+      }))
+    }
+
+    // Live cache only has the two recent rows (paged window) — the failure mode
+    // that depleted home of everything also present in `$sessions`.
+    const overlaid = overlayLiveLanes(folded, [recent, mid])
+    const groups = overlaid.repos[0].groups
+    const home = groups.find(g => g.isHome)
+
+    expect(home?.label).toBe('master')
+    expect(groups.filter(g => g.isMain)).toHaveLength(1)
+    expect(home?.sessions.map(s => s.id)).toEqual(['recent', 'mid', 'stale', 'master-row'])
+  })
+
   it('adds a new session to an existing worktree lane keyed by a divergent id (matches by path)', () => {
     // Backend keyed the worktree lane off a branch-style id (no live git probe),
     // but the lane PATH is the worktree dir. A new session under that worktree
@@ -982,6 +1064,71 @@ describe('overlayLiveLanes', () => {
     // Session must appear only in the worktree lane
     expect(featureLane?.sessions.map(s => s.id)).toEqual(['moved'])
     expect(overlaid.sessionCount).toBe(1)
+  })
+})
+
+describe('seedEmptyLanesFromPreviews', () => {
+  it('seeds empty main lanes from overview previewSessions', () => {
+    const recent = makeSession('/www/app', { id: 'recent', last_active: 200, started_at: 200 })
+    const older = makeSession('/www/app', { id: 'older', last_active: 100, started_at: 100 })
+
+    const project = projectNode({
+      id: 'p_app',
+      path: '/www/app',
+      previewSessions: [older, recent],
+      sessionCount: 40,
+      repos: [
+        {
+          id: '/www/app',
+          label: 'app',
+          path: '/www/app',
+          sessionCount: 40,
+          groups: [
+            lane({
+              id: '/www/app::branch::main',
+              label: 'main',
+              isMain: true,
+              path: '/www/app',
+              sessions: []
+            })
+          ]
+        }
+      ]
+    })
+
+    const seeded = seedEmptyLanesFromPreviews(project)
+
+    expect(seeded.repos[0].groups[0].sessions.map(s => s.id)).toEqual(['recent', 'older'])
+    expect(seeded.sessionCount).toBe(2)
+  })
+
+  it('leaves already-hydrated lanes untouched', () => {
+    const existing = makeSession('/www/app', { id: 'backend-row', last_active: 50 })
+    const preview = makeSession('/www/app', { id: 'preview-only', last_active: 200 })
+
+    const project = projectNode({
+      id: 'p_app',
+      previewSessions: [preview],
+      repos: [
+        {
+          id: '/www/app',
+          label: 'app',
+          path: '/www/app',
+          sessionCount: 1,
+          groups: [
+            lane({
+              id: '/www/app::branch::main',
+              label: 'main',
+              isMain: true,
+              path: '/www/app',
+              sessions: [existing]
+            })
+          ]
+        }
+      ]
+    })
+
+    expect(seedEmptyLanesFromPreviews(project)).toBe(project)
   })
 })
 
