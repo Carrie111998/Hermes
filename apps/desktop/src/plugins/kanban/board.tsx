@@ -54,6 +54,7 @@ import {
   type CSSProperties,
   type DragEvent as ReactDragEvent,
   type ReactNode,
+  useCallback,
   useEffect,
   useMemo,
   useRef,
@@ -73,9 +74,11 @@ import {
   estimateNew,
   fetchBoard,
   fetchBoards,
-  fetchProfiles,
+  fetchOrchestration,
+  orchestrationKey,
   patchTask,
-  PROFILES_KEY
+  profileQueryOptions,
+  taskKey
 } from './api'
 import { BoardSwitcher } from './board-switcher'
 import { TaskDrawer } from './drawer'
@@ -96,7 +99,6 @@ import {
   lockedReason,
   RunClock,
   shortId,
-  useDefaultAssignee,
   useKanban,
   useOrchestration
 } from './ui'
@@ -144,12 +146,20 @@ function Meta({ children, icon }: { children: ReactNode; icon: string }) {
   )
 }
 
-function CardFooter({ arc, task }: { arc: ArcState | null; task: KanbanTask }) {
+function CardFooter({
+  arc,
+  fallback,
+  orchestrator,
+  task
+}: {
+  arc: ArcState | null
+  fallback: string
+  orchestrator: string
+  task: KanbanTask
+}) {
   const k = useKanban()
   const created = ago(task.created_at)
   const links = task.link_counts ? task.link_counts.parents + task.link_counts.children : 0
-  const fallback = useDefaultAssignee()
-  const orchestrator = useOrchestration()?.resolved_orchestrator_profile ?? ''
   // Ready + no assignee: with a configured default assignee the dispatcher
   // auto-assigns on its next tick (#27145) — say THAT, not "won't run". Only
   // a board with no fallback has the genuine silent failure.
@@ -237,7 +247,19 @@ function CardFooter({ arc, task }: { arc: ArcState | null; task: KanbanTask }) {
   )
 }
 
-function Card({
+function nestedInteractiveTarget(currentTarget: HTMLElement, target: EventTarget | null): boolean {
+  if (!(target instanceof Element)) {
+    return false
+  }
+
+  const interactive = target.closest(
+    'button, a, input, select, textarea, [role="button"], [role="menuitem"], [contenteditable="true"]'
+  )
+
+  return interactive !== null && interactive !== currentTarget
+}
+
+export function Card({
   columns,
   onDelete,
   onMove,
@@ -258,13 +280,16 @@ function Card({
   const [dragging, setDragging] = useState(false)
   const meta = columnMeta(task.status)
   const summary = task.latest_summary || task.body
-  const fallback = useDefaultAssignee()
+  const orchestration = useOrchestration()
+  const fallback = orchestration?.resolved_default_assignee?.trim() ?? ''
+  const orchestrator = orchestration?.resolved_orchestrator_profile ?? ''
   const arc = arcState(task, fallback)
 
   return (
     <ContextMenu>
       <ContextMenuTrigger asChild>
         <div
+          aria-label={task.title || task.id}
           className={cn(
             'group relative flex cursor-grab flex-col gap-2 rounded-md border border-(--ui-stroke-tertiary) border-l-2 bg-(--ui-bg-elevated) p-2.5',
             // Hover matches the provider-picker rows: a quiet primary fill;
@@ -274,7 +299,17 @@ function Card({
             dragging && 'opacity-40'
           )}
           draggable
-          onClick={event => (event.metaKey || event.ctrlKey ? onToggleSelect(task.id) : onOpen(task.id))}
+          onClick={event => {
+            if (nestedInteractiveTarget(event.currentTarget, event.target)) {
+              return
+            }
+
+            if (event.metaKey || event.ctrlKey) {
+              onToggleSelect(task.id)
+            } else {
+              onOpen(task.id)
+            }
+          }}
           onDragEnd={() => setDragging(false)}
           onDragStart={event => {
             event.dataTransfer.setData('text/plain', task.id)
@@ -284,7 +319,25 @@ function Card({
             event.dataTransfer.setDragImage(event.currentTarget, event.nativeEvent.offsetX, event.nativeEvent.offsetY)
             setDragging(true)
           }}
+          onKeyDown={event => {
+            if (
+              nestedInteractiveTarget(event.currentTarget, event.target) ||
+              (event.key !== 'Enter' && event.key !== ' ')
+            ) {
+              return
+            }
+
+            event.preventDefault()
+
+            if (event.metaKey || event.ctrlKey) {
+              onToggleSelect(task.id)
+            } else {
+              onOpen(task.id)
+            }
+          }}
+          role="button"
           style={{ '--kanban-tone': meta.tone, borderLeftColor: meta.tone } as CSSProperties}
+          tabIndex={0}
         >
           {/* Machine-activity arc: animates ONLY while an agent is actually on
               the card (claimed + working; amber when the heartbeat is gone).
@@ -300,7 +353,7 @@ function Card({
           {summary && (
             <span className="line-clamp-2 text-[0.6875rem] leading-snug text-(--ui-text-tertiary)">{summary}</span>
           )}
-          <CardFooter arc={arc} task={task} />
+          <CardFooter arc={arc} fallback={fallback} orchestrator={orchestrator} task={task} />
         </div>
       </ContextMenuTrigger>
       <ContextMenuContent>
@@ -467,7 +520,7 @@ function Column({
               <div className="flex flex-col gap-2" key={assignee}>
                 <div className="flex items-center gap-1.5 px-1 pt-1 text-[0.625rem] text-(--ui-text-quaternary)">
                   {assignee !== UNASSIGNED_LANE && <Avatar name={assignee} size="0.875rem" />}
-                  {assignee}
+                  {assignee === UNASSIGNED_LANE ? k.unassigned : assignee}
                   <span className="tabular-nums">{tasks.length}</span>
                 </div>
                 {tasks.map(task => (
@@ -525,6 +578,28 @@ const NO_PARENT = '__none__'
 const PARKED = '__parked__'
 const WORKSPACE_KINDS = ['scratch', 'worktree', 'dir'] as const
 
+interface NewTaskOperation {
+  board: string
+  generation: number
+  target: string
+}
+
+export function resolveNewTaskAssignee(
+  selection: string,
+  effectiveDefault: null | string | undefined,
+  effectiveProfiles: ReadonlySet<string>
+): string | undefined {
+  if (selection === PARKED) {
+    return undefined
+  }
+
+  if (selection && effectiveProfiles.has(selection)) {
+    return selection
+  }
+
+  return effectiveDefault && effectiveProfiles.has(effectiveDefault) ? effectiveDefault : undefined
+}
+
 function Field({ children, label }: { children: ReactNode; label: string }) {
   return (
     <label className="flex flex-col gap-1">
@@ -534,28 +609,86 @@ function Field({ children, label }: { children: ReactNode; label: string }) {
   )
 }
 
-function NewTaskDialog({
+export function NewTaskDialog({
   onClose,
   parents,
   target
 }: {
-  onClose: () => void
+  onClose: (board: string) => void
   parents: Array<{ id: string; title: string }>
   target: null | string
 }) {
   const k = useKanban()
   const qc = useQueryClient()
-  const { data: roster } = useQuery({ queryKey: PROFILES_KEY, queryFn: fetchProfiles, staleTime: 60_000 })
-  // Title-only creates must RUN: "auto" resolves to the orchestration default
-  // (ultimately the active profile), applied at create time. Never silently
-  // unassigned — parking a card is the explicit choice, not the default.
-  const resolvedDefault = useOrchestration()?.resolved_default_assignee || 'default'
+  const selectedSlug = useValue($boardSlug)
+  const dialogOpen = Boolean(target)
+  const lifecycle = useRef({ board: selectedSlug, generation: 0, open: dialogOpen, target })
+  const createOwner = useRef<null | number>(null)
+  const estimateOwner = useRef<null | number>(null)
+
+  if (
+    lifecycle.current.board !== selectedSlug ||
+    lifecycle.current.open !== dialogOpen ||
+    lifecycle.current.target !== target
+  ) {
+    lifecycle.current = {
+      board: selectedSlug,
+      generation: lifecycle.current.generation + 1,
+      open: dialogOpen,
+      target
+    }
+    createOwner.current = null
+    estimateOwner.current = null
+  }
+
+  const lifecycleGeneration = lifecycle.current.generation
+
+  const operation: NewTaskOperation | null = target
+    ? { board: selectedSlug, generation: lifecycleGeneration, target }
+    : null
+
+  const isCurrent = (candidate: NewTaskOperation) => {
+    const current = lifecycle.current
+
+    return (
+      current.open &&
+      current.board === candidate.board &&
+      current.generation === candidate.generation &&
+      current.target === candidate.target
+    )
+  }
+
+  const rosterQuery = useQuery(profileQueryOptions(selectedSlug))
+
+  const orchestrationQuery = useQuery({
+    queryFn: () => fetchOrchestration(selectedSlug),
+    queryKey: orchestrationKey(selectedSlug),
+    staleTime: 60_000
+  })
+
+  const roster = rosterQuery.data
+  const orchestration = orchestrationQuery.data
+  const policyError = rosterQuery.error ?? orchestrationQuery.error
+
+  const effectiveProfiles = new Set(
+    (roster?.profiles ?? [])
+      .filter(profile => profile.effective_allowed && orchestration?.effective_allowed_profiles.includes(profile.name))
+      .map(profile => profile.name)
+  )
+
+  // Title-only creates run under the effective orchestration default when one
+  // exists. A deny-all board has no default and therefore parks the task; never
+  // fabricate a profile that the board policy excludes.
+  const candidateDefault = orchestration?.resolved_default_assignee ?? ''
+  const resolvedDefault = effectiveProfiles.has(candidateDefault) ? candidateDefault : ''
+
+  const policyReady =
+    Boolean(roster && orchestration) && !policyError && !rosterQuery.isFetching && !orchestrationQuery.isFetching
 
   // Board-level workspace default: a task inherits the current board's
   // configured project dir (scratch when unset, worktree in a git repo, else
   // dir) unless the operator overrides it below. Set the board default in the
   // board switcher's "Board settings…".
-  const selectedSlug = useValue($boardSlug)
   const { data: boards } = useQuery({ queryKey: BOARDS_KEY, queryFn: fetchBoards, staleTime: 30_000 })
   const currentBoard = boards?.boards.find(b => b.slug === (selectedSlug || boards.current))
   const boardDefaultKind = currentBoard?.default_workspace_kind || 'scratch'
@@ -577,49 +710,119 @@ function NewTaskDialog({
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<null | string>(null)
   const [estimate, setEstimate] = useState<null | TaskEstimate>(null)
+  const [estimating, setEstimating] = useState(false)
+  const [workspaceTouched, setWorkspaceTouched] = useState(false)
+
+  // Reset per open/board only. Metadata can arrive after the dialog opens, but
+  // it must never erase title/body input the user already typed.
+  useEffect(() => {
+    const current = lifecycle.current
+
+    if (
+      !target ||
+      !current.open ||
+      current.board !== selectedSlug ||
+      current.generation !== lifecycleGeneration ||
+      current.target !== target
+    ) {
+      return
+    }
+
+    setTitle('')
+    setBodyText('')
+    setAssignee('')
+    setPriority('0')
+    setSkills('')
+    setWorkspaceTouched(false)
+    setWorkspaceKind('scratch')
+    setWorkspacePath('')
+    setParent('')
+    setModelOverride(EMPTY_OVERRIDE)
+    setGoalMode(false)
+    setError(null)
+    setBusy(false)
+    setEstimate(null)
+    setEstimating(false)
+  }, [lifecycleGeneration, selectedSlug, target])
+
+  // Adopt a late board workspace default only while that selector is pristine.
+  useEffect(() => {
+    const current = lifecycle.current
+
+    if (
+      target &&
+      !workspaceTouched &&
+      current.open &&
+      current.board === selectedSlug &&
+      current.generation === lifecycleGeneration &&
+      current.target === target
+    ) {
+      setWorkspaceKind(boardDefaultKind)
+    }
+  }, [boardDefaultKind, lifecycleGeneration, selectedSlug, target, workspaceTouched])
+
+  const closeDialog = (candidate: NewTaskOperation | null) => {
+    if (!candidate || !isCurrent(candidate)) {
+      return
+    }
+
+    const current = lifecycle.current
+    lifecycle.current = {
+      board: current.board,
+      generation: current.generation + 1,
+      open: false,
+      target: null
+    }
+    onClose(candidate.board)
+  }
 
   // Rough effort estimate from the typed title/body (before the task exists),
   // via the auto-routed auxiliary model. Makes a model call — explicit action.
-  const estMut = useMutation({
-    mutationFn: () => estimateNew(title.trim(), bodyText.trim()),
-    onError: err => host.notify({ kind: 'error', message: errText(err) }),
-    onSuccess: r => {
-      if (r.ok) {
-        setEstimate(r)
+  const runEstimate = async () => {
+    if (!operation || !title.trim() || estimateOwner.current === operation.generation) {
+      return
+    }
+
+    const candidate = operation
+    const estimateTitle = title.trim()
+    const estimateBody = bodyText.trim()
+    estimateOwner.current = candidate.generation
+    setEstimating(true)
+
+    try {
+      const result = await estimateNew(estimateTitle, estimateBody)
+
+      if (!isCurrent(candidate)) {
+        return
+      }
+
+      if (result.ok) {
+        setEstimate(result)
       } else {
-        host.notify({ kind: 'warning', message: r.reason || k.couldNotEstimate })
+        host.notify({ kind: 'warning', message: result.reason || k.couldNotEstimate })
+      }
+    } catch (err) {
+      if (isCurrent(candidate)) {
+        host.notify({ kind: 'error', message: errText(err) })
+      }
+    } finally {
+      if (isCurrent(candidate) && estimateOwner.current === candidate.generation) {
+        estimateOwner.current = null
+        setEstimating(false)
       }
     }
-  })
-
-  // Reset per open — the dialog is externally controlled (open = target set),
-  // so onOpenChange(true) never fires; key the reset off `target` (and the
-  // resolved board default, which may arrive after the first open).
-  useEffect(() => {
-    if (target) {
-      setTitle('')
-      setBodyText('')
-      setAssignee('')
-      setPriority('0')
-      setSkills('')
-      setWorkspaceKind(boardDefaultKind)
-      setWorkspacePath('')
-      setParent('')
-      setModelOverride(EMPTY_OVERRIDE)
-      setGoalMode(false)
-      setError(null)
-      setBusy(false)
-      setEstimate(null)
-    }
-  }, [target, boardDefaultKind])
+  }
 
   const submit = async () => {
     const trimmed = title.trim()
 
-    if (!trimmed || !target || busy) {
+    if (!trimmed || !operation || createOwner.current === operation.generation || !policyReady) {
       return
     }
 
+    const candidate = operation
+    const board = candidate.board
+    createOwner.current = candidate.generation
     setBusy(true)
     setError(null)
 
@@ -631,41 +834,54 @@ function NewTaskDialog({
 
       // create() derives status (triage flag → 'triage', else 'ready'); move to
       // the requested column when they differ, so a per-column add lands right.
-      const { task, warning } = await createTask({
-        assignee: assignee === PARKED ? undefined : assignee || resolvedDefault,
+      const { task, warning } = await createTask(board, {
+        assignee: resolveNewTaskAssignee(assignee, resolvedDefault, effectiveProfiles),
         body: bodyText.trim() || undefined,
         goal_mode: goalMode,
         parents: parent ? [parent] : undefined,
         priority: Number(priority) || 0,
         skills: skillList.length ? skillList : undefined,
         title: trimmed,
-        triage: isTriage,
+        triage: candidate.target === 'triage',
         workspace_kind: workspaceKind,
         ...overrideCreateFields(modelOverride),
         // Empty → backend inherits the board's default project dir.
         workspace_path: workspaceKind !== 'scratch' && workspacePath.trim() ? workspacePath.trim() : undefined
       })
 
-      if (task && task.status !== target) {
-        await patchTask(task.id, { status: target })
+      if (task && task.status !== candidate.target) {
+        await patchTask(board, task.id, { status: candidate.target })
       }
 
       // Dispatcher-presence warning ("this ready task will sit idle") — not an
       // error, but the user should know.
-      if (warning) {
+      if (warning && isCurrent(candidate)) {
         host.notify({ kind: 'warning', message: warning })
       }
 
-      await qc.invalidateQueries({ queryKey: ['kanban', 'board'] })
-      onClose()
+      await Promise.all([
+        qc.invalidateQueries({ queryKey: ['kanban', 'board', board] }),
+        qc.invalidateQueries({ queryKey: BOARDS_KEY }),
+        ...(task ? [qc.invalidateQueries({ queryKey: taskKey(board, task.id) })] : [])
+      ])
+
+      if (isCurrent(candidate)) {
+        closeDialog(candidate)
+      }
     } catch (err) {
-      setError(errText(err))
-      setBusy(false)
+      if (isCurrent(candidate)) {
+        setError(errText(err))
+      }
+    } finally {
+      if (isCurrent(candidate) && createOwner.current === candidate.generation) {
+        createOwner.current = null
+        setBusy(false)
+      }
     }
   }
 
   return (
-    <Dialog onOpenChange={open => !open && onClose()} open={Boolean(target)}>
+    <Dialog onOpenChange={open => !open && closeDialog(operation)} open={dialogOpen}>
       {/* `overflow-visible`: DialogContent publishes ITSELF as the portal
           container for popovers opened inside it (dialog-portal-context), and
           its default `overflow-y-auto` then crops them at the dialog's edge —
@@ -703,7 +919,13 @@ function NewTaskDialog({
               <Input onChange={event => setPriority(event.target.value)} type="number" value={priority} />
             </Field>
             <Field label={k.workspace}>
-              <Select onValueChange={setWorkspaceKind} value={workspaceKind}>
+              <Select
+                onValueChange={value => {
+                  setWorkspaceTouched(true)
+                  setWorkspaceKind(value)
+                }}
+                value={workspaceKind}
+              >
                 <SelectTrigger>
                   <SelectValue />
                 </SelectTrigger>
@@ -732,15 +954,36 @@ function NewTaskDialog({
             </Field>
           )}
 
+          {policyError && (
+            <ErrorState description={errText(policyError)} title={k.taskPolicyLoadError}>
+              <Button
+                disabled={rosterQuery.isFetching || orchestrationQuery.isFetching}
+                onClick={() => void Promise.all([rosterQuery.refetch(), orchestrationQuery.refetch()])}
+                size="sm"
+                variant="outline"
+              >
+                <Codicon name="refresh" size="0.8rem" />
+                {k.retry}
+              </Button>
+            </ErrorState>
+          )}
+
           <Field label={k.assignee}>
-            <Select onValueChange={v => setAssignee(v === NO_PARENT ? '' : v)} value={assignee || NO_PARENT}>
+            <Select
+              disabled={!policyReady}
+              onValueChange={v => setAssignee(v === NO_PARENT ? '' : v)}
+              value={
+                (assignee === PARKED || effectiveProfiles.has(assignee) ? assignee : '') ||
+                (resolvedDefault ? NO_PARENT : PARKED)
+              }
+            >
               <SelectTrigger>
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
-                <SelectItem value={NO_PARENT}>{k.defaultOption(resolvedDefault)}</SelectItem>
+                {resolvedDefault && <SelectItem value={NO_PARENT}>{k.defaultOption(resolvedDefault)}</SelectItem>}
                 {(roster?.profiles ?? [])
-                  .filter(profile => profile.name !== resolvedDefault)
+                  .filter(profile => profile.effective_allowed && profile.name !== resolvedDefault)
                   .map(profile => (
                     <SelectItem key={profile.name} value={profile.name}>
                       {profile.name}
@@ -798,37 +1041,33 @@ function NewTaskDialog({
                 <Tip label={k.reEstimate}>
                   <Button
                     aria-label={k.reEstimate}
-                    disabled={!title.trim() || estMut.isPending}
-                    onClick={() => estMut.mutate()}
+                    disabled={!title.trim() || estimating}
+                    onClick={() => void runEstimate()}
                     size="icon-xs"
                     variant="ghost"
                   >
-                    <Codicon name="refresh" size="0.7rem" spinning={estMut.isPending} />
+                    <Codicon name="refresh" size="0.7rem" spinning={estimating} />
                   </Button>
                 </Tip>
               </>
             ) : (
               <Tip label={k.estimateTip}>
                 <Button
-                  disabled={!title.trim() || estMut.isPending}
-                  onClick={() => estMut.mutate()}
+                  disabled={!title.trim() || estimating}
+                  onClick={() => void runEstimate()}
                   size="xs"
                   variant="ghost"
                 >
-                  <Codicon
-                    name={estMut.isPending ? 'loading' : 'dashboard'}
-                    size="0.75rem"
-                    spinning={estMut.isPending}
-                  />
-                  {estMut.isPending ? k.estimating : k.estimate}
+                  <Codicon name={estimating ? 'loading' : 'dashboard'} size="0.75rem" spinning={estimating} />
+                  {estimating ? k.estimating : k.estimate}
                 </Button>
               </Tip>
             )}
           </div>
-          <Button onClick={onClose} variant="text">
+          <Button onClick={() => closeDialog(operation)} variant="text">
             {k.cancel}
           </Button>
-          <Button disabled={!title.trim() || busy} onClick={() => void submit()}>
+          <Button disabled={!title.trim() || busy || !policyReady} onClick={() => void submit()}>
             {busy ? k.creating : k.createTask}
           </Button>
         </DialogFooter>
@@ -951,45 +1190,114 @@ function FilterMenu({
  * done, reassign after a profile change) via POST /tasks/bulk, which applies
  * per-id and reports partial failures — failed cards stay selected.
  */
-function SelectionBar({
+interface BulkOperation {
+  board: string
+  generation: number
+  ids: string[]
+  owner: symbol
+}
+
+export function SelectionBar({
   columns,
+  generation,
+  isCurrent,
   onClear,
   onDone,
   selected
 }: {
   columns: string[]
+  generation: number
+  isCurrent: (board: string, generation: number) => boolean
   onClear: () => void
-  onDone: (failed: string[]) => void
+  onDone: (board: string, generation: number, failed: string[]) => void
   selected: ReadonlySet<string>
 }) {
   const k = useKanban()
   const qc = useQueryClient()
-  const { data: roster } = useQuery({ queryKey: PROFILES_KEY, queryFn: fetchProfiles, staleTime: 60_000 })
+  const slug = useValue($boardSlug)
+  const { data: roster } = useQuery(profileQueryOptions(slug))
+  const pendingOwner = useRef<null | symbol>(null)
+  const [pending, setPending] = useState<null | { board: string; generation: number; owner: symbol }>(null)
 
-  const finish = (failed: Array<{ error?: string; id: string }>) => {
-    void qc.invalidateQueries({ queryKey: ['kanban', 'board'] })
+  const finish = (
+    operation: BulkOperation,
+    failed: Array<{ error?: string; id: string }>,
+    total: number,
+    countChanged: boolean
+  ) => {
+    const { board, generation: operationGeneration, ids } = operation
+    void qc.invalidateQueries({ queryKey: ['kanban', 'board', board] })
+
+    for (const id of ids) {
+      void qc.invalidateQueries({ queryKey: taskKey(board, id) })
+    }
+
+    if (countChanged) {
+      void qc.invalidateQueries({ queryKey: BOARDS_KEY })
+    }
+
+    if (!isCurrent(board, operationGeneration)) {
+      return
+    }
 
     if (failed.length > 0) {
       host.notify({
         kind: 'warning',
-        message: k.bulkFailed(failed.length, selected.size, failed[0].error ?? k.refused)
+        message: k.bulkFailed(failed.length, total, failed[0].error ?? k.refused)
       })
     }
 
-    onDone(failed.map(f => f.id))
+    onDone(
+      board,
+      operationGeneration,
+      failed.map(f => f.id)
+    )
   }
 
   const bulk = useMutation({
-    mutationFn: (patch: Record<string, unknown>) => bulkTasks([...selected], patch),
-    onError: err => host.notify({ kind: 'error', message: errText(err) }),
-    onSuccess: data => finish(data.results.filter(r => !r.ok))
+    mutationFn: ({ board, ids, patch }: BulkOperation & { patch: Record<string, unknown> }) =>
+      bulkTasks(board, ids, patch),
+    onError: (err, vars) => {
+      if (isCurrent(vars.board, vars.generation)) {
+        host.notify({ kind: 'error', message: errText(err) })
+      }
+    },
+    onSettled: (_data, _error, vars) => {
+      if (pendingOwner.current === vars.owner) {
+        pendingOwner.current = null
+
+        if (isCurrent(vars.board, vars.generation)) {
+          setPending(null)
+        }
+      }
+    },
+    onSuccess: (data, vars) =>
+      finish(
+        vars,
+        data.results.filter(r => !r.ok),
+        vars.ids.length,
+        Object.hasOwn(vars.patch, 'status') || vars.patch.archive === true
+      )
   })
+
+  const start = (run: (operation: BulkOperation) => void) => {
+    if (pending?.board === slug && pending.generation === generation) {
+      return
+    }
+
+    const owner = Symbol('kanban-bulk-write')
+    const operation = { board: slug, generation, ids: [...selected], owner }
+    pendingOwner.current = owner
+    setPending({ board: slug, generation, owner })
+    run(operation)
+  }
+
+  const runBulk = (patch: Record<string, unknown>) => start(operation => bulk.mutate({ ...operation, patch }))
 
   // No bulk-delete on the backend — fan out per id, same partial-failure story.
   const bulkDelete = useMutation({
-    mutationFn: async () => {
-      const ids = [...selected]
-      const settled = await Promise.allSettled(ids.map(id => deleteTask(id)))
+    mutationFn: async ({ board, ids }: BulkOperation) => {
+      const settled = await Promise.allSettled(ids.map(id => deleteTask(board, id)))
 
       return ids.flatMap((id, i) => {
         const result = settled[i]
@@ -997,10 +1305,24 @@ function SelectionBar({
         return result.status === 'rejected' ? [{ error: errText(result.reason), id }] : []
       })
     },
-    onSuccess: finish
+    onError: (err, vars) => {
+      if (isCurrent(vars.board, vars.generation)) {
+        host.notify({ kind: 'error', message: errText(err) })
+      }
+    },
+    onSettled: (_data, _error, vars) => {
+      if (pendingOwner.current === vars.owner) {
+        pendingOwner.current = null
+
+        if (isCurrent(vars.board, vars.generation)) {
+          setPending(null)
+        }
+      }
+    },
+    onSuccess: (failed, vars) => finish(vars, failed, vars.ids.length, true)
   })
 
-  const busy = bulk.isPending || bulkDelete.isPending
+  const busy = pending?.board === slug && pending.generation === generation
   // One menu at a time — controlled, so a click on the second trigger can
   // never race Radix's dismiss layer into two open menus.
   const [menu, setMenu] = useState<'assign' | 'move' | null>(null)
@@ -1022,7 +1344,7 @@ function SelectionBar({
             {columns
               .filter(name => !isLockedTarget(name))
               .map(name => (
-                <DropdownMenuItem key={name} onSelect={() => bulk.mutate({ status: name })}>
+                <DropdownMenuItem key={name} onSelect={() => runBulk({ status: name })}>
                   <span className="size-2 rounded-full" style={{ backgroundColor: columnMeta(name).tone }} />
                   {columnLabel(k, name)}
                 </DropdownMenuItem>
@@ -1038,29 +1360,31 @@ function SelectionBar({
             </Button>
           </DropdownMenuTrigger>
           <DropdownMenuContent align="center">
-            {(roster?.profiles ?? []).map(profile => (
-              <DropdownMenuItem
-                key={profile.name}
-                onSelect={() => bulk.mutate({ assignee: profile.name, reclaim_first: true })}
-              >
-                <Avatar name={profile.name} size="0.875rem" />
-                {profile.name}
-              </DropdownMenuItem>
-            ))}
+            {(roster?.profiles ?? [])
+              .filter(profile => profile.effective_allowed)
+              .map(profile => (
+                <DropdownMenuItem
+                  key={profile.name}
+                  onSelect={() => runBulk({ assignee: profile.name, reclaim_first: true })}
+                >
+                  <Avatar name={profile.name} size="0.875rem" />
+                  {profile.name}
+                </DropdownMenuItem>
+              ))}
             <DropdownMenuSeparator />
-            <DropdownMenuItem onSelect={() => bulk.mutate({ assignee: '', reclaim_first: true })}>
+            <DropdownMenuItem onSelect={() => runBulk({ assignee: '', reclaim_first: true })}>
               {k.unassignAction}
             </DropdownMenuItem>
           </DropdownMenuContent>
         </DropdownMenu>
 
-        <Button disabled={busy} onClick={() => bulk.mutate({ archive: true })} size="xs" variant="ghost">
+        <Button disabled={busy} onClick={() => runBulk({ archive: true })} size="xs" variant="ghost">
           {k.archive}
         </Button>
         <Button
           className="text-destructive"
           disabled={busy}
-          onClick={() => bulkDelete.mutate()}
+          onClick={() => start(operation => bulkDelete.mutate(operation))}
           size="xs"
           variant="ghost"
         >
@@ -1087,11 +1411,13 @@ export function KanbanBoardPage() {
 
   // Live updates ride the events socket (bindApi); this interval is only the
   // slow heartbeat for socketless paths (OAuth remotes, dropped connections).
-  const { data: board, error } = useQuery({
-    queryFn: () => fetchBoard(archived),
+  const boardQuery = useQuery({
+    queryFn: () => fetchBoard(slug, archived),
     queryKey: boardKey(slug, archived),
     refetchInterval: 60_000
   })
+
+  const { data: board, error } = boardQuery
 
   const [openId, setOpenId] = useState<null | string>(null)
   const [addStatus, setAddStatus] = useState<null | string>(null)
@@ -1100,6 +1426,43 @@ export function KanbanBoardPage() {
   const [tenant, setTenant] = useState('')
   const [assignee, setAssignee] = useState('')
   const [selected, setSelected] = useState<ReadonlySet<string>>(new Set())
+  const selectedRef = useRef(selected)
+  selectedRef.current = selected
+  const selectionGeneration = useRef(0)
+  const selectionBoard = useRef(slug)
+  const currentSlug = useRef(slug)
+  currentSlug.current = slug
+
+  const replaceSelection = useCallback((next: ReadonlySet<string>) => {
+    selectionGeneration.current += 1
+    selectedRef.current = next
+    setSelected(next)
+  }, [])
+
+  if (selectionBoard.current !== slug) {
+    selectionBoard.current = slug
+    selectionGeneration.current += 1
+  }
+
+  // Observe every board transition, not only the final render, so A→B→A can
+  // never make an old bulk completion look current by string equality alone.
+  useEffect(
+    () =>
+      $boardSlug.listen(next => {
+        if (selectionBoard.current !== next) {
+          selectionBoard.current = next
+          selectionGeneration.current += 1
+        }
+      }),
+    []
+  )
+
+  useEffect(() => {
+    setOpenId(null)
+    setAddStatus(null)
+    setSettingsOpen(false)
+    replaceSelection(new Set())
+  }, [replaceSelection, slug])
 
   // A new-task request raised from outside the page (⌘⌥N, the palette row).
   // The command navigates here and parks the lane; the page picks it up on
@@ -1117,15 +1480,13 @@ export function KanbanBoardPage() {
   }, [requestedLane])
 
   const toggleSelect = (id: string) => {
-    setSelected(prev => {
-      const next = new Set(prev)
+    const next = new Set(selectedRef.current)
 
-      if (!next.delete(id)) {
-        next.add(id)
-      }
+    if (!next.delete(id)) {
+      next.add(id)
+    }
 
-      return next
-    })
+    replaceSelection(next)
   }
 
   // Prune ids that left the board (completed elsewhere, deleted, filtered by
@@ -1137,12 +1498,13 @@ export function KanbanBoardPage() {
 
     const alive = new Set(board.columns.flatMap(col => col.tasks.map(task => task.id)))
 
-    setSelected(prev => {
-      const kept = [...prev].filter(id => alive.has(id))
+    const previous = selectedRef.current
+    const kept = [...previous].filter(id => alive.has(id))
 
-      return kept.length === prev.size ? prev : new Set(kept)
-    })
-  }, [board])
+    if (kept.length !== previous.size) {
+      replaceSelection(new Set(kept))
+    }
+  }, [board, replaceSelection])
 
   useEffect(() => {
     if (selected.size === 0) {
@@ -1151,14 +1513,14 @@ export function KanbanBoardPage() {
 
     const onKey = (event: KeyboardEvent) => {
       if (event.key === 'Escape') {
-        setSelected(new Set())
+        replaceSelection(new Set())
       }
     }
 
     window.addEventListener('keydown', onKey)
 
     return () => window.removeEventListener('keydown', onKey)
-  }, [selected.size])
+  }, [replaceSelection, selected.size])
 
   const columnNames = board?.columns.map(col => col.name) ?? []
 
@@ -1186,50 +1548,71 @@ export function KanbanBoardPage() {
   const total = filtered?.columns.reduce((sum, col) => sum + col.tasks.length, 0) ?? 0
 
   const moveMut = useMutation({
-    mutationFn: ({ id, status }: { id: string; status: string }) => patchTask(id, { status }),
-    onMutate: async ({ id, status }) => {
-      await qc.cancelQueries({ queryKey: boardKey(slug, archived) })
-      const previous = qc.getQueryData<KanbanBoard>(boardKey(slug, archived))
+    mutationFn: ({
+      board: targetBoard,
+      id,
+      status
+    }: {
+      archived: boolean
+      board: string
+      fromStatus: string
+      id: string
+      status: string
+    }) => patchTask(targetBoard, id, { status }),
+    onMutate: async ({ archived: targetArchived, board: targetBoard, id, status }) => {
+      const key = boardKey(targetBoard, targetArchived)
+      await qc.cancelQueries({ queryKey: key })
+      const previous = qc.getQueryData<KanbanBoard>(key)
 
       if (previous) {
-        qc.setQueryData(boardKey(slug, archived), moveCard(previous, id, status))
+        qc.setQueryData(key, moveCard(previous, id, status))
       }
 
-      return { previous }
+      return { key, previous }
     },
     onError: (err, _vars, context) => {
       if (context?.previous) {
-        qc.setQueryData(boardKey(slug, archived), context.previous)
+        qc.setQueryData(context.key, context.previous)
       }
 
       host.notify({ kind: 'error', message: errText(err) })
     },
     onSettled: (_data, _err, vars) => {
-      void qc.invalidateQueries({ queryKey: ['kanban', 'board'] })
-      void qc.invalidateQueries({ queryKey: ['kanban', 'task', slug, vars.id] })
+      void qc.invalidateQueries({ queryKey: ['kanban', 'board', vars.board] })
+      void qc.invalidateQueries({ queryKey: taskKey(vars.board, vars.id) })
+
+      if (vars.fromStatus === 'archived' || vars.status === 'archived') {
+        void qc.invalidateQueries({ queryKey: BOARDS_KEY })
+      }
     }
   })
 
   const deleteMut = useMutation({
-    mutationFn: (id: string) => deleteTask(id),
-    onMutate: async id => {
-      await qc.cancelQueries({ queryKey: boardKey(slug, archived) })
-      const previous = qc.getQueryData<KanbanBoard>(boardKey(slug, archived))
+    mutationFn: ({ board: targetBoard, id }: { archived: boolean; board: string; id: string }) =>
+      deleteTask(targetBoard, id),
+    onMutate: async ({ archived: targetArchived, board: targetBoard, id }) => {
+      const key = boardKey(targetBoard, targetArchived)
+      await qc.cancelQueries({ queryKey: key })
+      const previous = qc.getQueryData<KanbanBoard>(key)
 
       if (previous) {
-        qc.setQueryData(boardKey(slug, archived), removeCard(previous, id))
+        qc.setQueryData(key, removeCard(previous, id))
       }
 
-      return { previous }
+      return { key, previous }
     },
     onError: (err, _id, context) => {
       if (context?.previous) {
-        qc.setQueryData(boardKey(slug, archived), context.previous)
+        qc.setQueryData(context.key, context.previous)
       }
 
       host.notify({ kind: 'error', message: errText(err) })
     },
-    onSettled: () => void qc.invalidateQueries({ queryKey: ['kanban', 'board'] })
+    onSettled: (_data, _err, vars) => {
+      void qc.invalidateQueries({ queryKey: ['kanban', 'board', vars.board] })
+      void qc.invalidateQueries({ queryKey: taskKey(vars.board, vars.id) })
+      void qc.invalidateQueries({ queryKey: BOARDS_KEY })
+    }
   })
 
   const onMove = (id: string, status: string) => {
@@ -1245,7 +1628,7 @@ export function KanbanBoardPage() {
       return
     }
 
-    moveMut.mutate({ id, status })
+    moveMut.mutate({ archived, board: slug, fromStatus: task.status, id, status })
   }
 
   const errorMessage = error ? errText(error) : null
@@ -1369,7 +1752,12 @@ export function KanbanBoardPage() {
 
       {errorMessage && !board ? (
         <div className="grid flex-1 place-items-center">
-          <ErrorState title={errorMessage} />
+          <ErrorState description={errorMessage} title={k.boardLoadError}>
+            <Button onClick={() => void boardQuery.refetch()} size="sm" variant="outline">
+              <Codicon name="refresh" size="0.8rem" />
+              {k.retry}
+            </Button>
+          </ErrorState>
         </div>
       ) : !filtered ? (
         <div className="grid flex-1 place-items-center">
@@ -1402,7 +1790,7 @@ export function KanbanBoardPage() {
                 columns={columnNames}
                 key={col.name}
                 onAdd={setAddStatus}
-                onDelete={id => deleteMut.mutate(id)}
+                onDelete={id => deleteMut.mutate({ archived, board: slug, id })}
                 onDropTask={onMove}
                 onMove={onMove}
                 onOpen={setOpenId}
@@ -1418,13 +1806,31 @@ export function KanbanBoardPage() {
       {selected.size > 0 && (
         <SelectionBar
           columns={columnNames}
-          onClear={() => setSelected(new Set())}
-          onDone={failed => setSelected(new Set(failed))}
+          generation={selectionGeneration.current}
+          isCurrent={(board, generation) =>
+            $boardSlug.get() === board && currentSlug.current === board && selectionGeneration.current === generation
+          }
+          onClear={() => {
+            replaceSelection(new Set())
+          }}
+          onDone={(board, generation, failed) => {
+            if (
+              $boardSlug.get() === board &&
+              currentSlug.current === board &&
+              selectionGeneration.current === generation
+            ) {
+              replaceSelection(new Set(failed))
+            }
+          }}
           selected={selected}
         />
       )}
 
-      <NewTaskDialog onClose={() => setAddStatus(null)} parents={parentOptions} target={addStatus} />
+      <NewTaskDialog
+        onClose={board => board === currentSlug.current && setAddStatus(null)}
+        parents={parentOptions}
+        target={addStatus}
+      />
       <TaskDrawer columns={columnNames} id={openId} onClose={() => setOpenId(null)} onOpen={setOpenId} />
     </div>
   )

@@ -306,6 +306,11 @@ model:
 # Disable this only when every review is performed manually from the dashboard.
 kanban:
   review_dispatch: true
+  # Optional machine-wide assignment safety ceiling. Boards may narrow this
+  # list but cannot allow profiles outside it. Omit/null = unrestricted;
+  # an empty list denies all assignments.
+  # allowed_profiles:
+  #   - default
 
 # =============================================================================
 # Terminal Tool Configuration

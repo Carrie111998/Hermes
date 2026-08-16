@@ -173,11 +173,16 @@ export interface WorkerLog {
 
 /** GET /orchestration — dispatcher knobs from config.yaml + resolved values. */
 export interface OrchestrationSettings {
+  board: string
   orchestrator_profile: string
   default_assignee: string
   auto_decompose: boolean
-  resolved_orchestrator_profile: string
-  resolved_default_assignee: string
+  auto_promote_children: boolean
+  resolved_orchestrator_profile: null | string
+  resolved_default_assignee: null | string
+  active_profile: string
+  board_allowed_profiles: null | string[]
+  effective_allowed_profiles: string[]
 }
 
 /** GET /profiles — the roster the decomposer routes across. */
@@ -186,6 +191,9 @@ export interface KanbanProfile {
   is_default: boolean
   description: string
   description_auto: boolean
+  machine_allowed: boolean
+  board_selected: boolean
+  effective_allowed: boolean
 }
 
 /** Column presentation — codicon + tone only. Labels + help live in i18n

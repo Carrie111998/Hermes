@@ -177,65 +177,83 @@ def _load_config() -> dict:
         return {}
 
 
-def _resolve_orchestrator_profile(cfg: dict) -> str:
-    """Resolve which profile owns the root/orchestration task after fan-out.
-
-    Falls back to the active default profile when ``kanban.orchestrator_profile``
-    is unset, so a task is never stranded for lack of an orchestrator.
-    """
+def _resolve_profile_choice(
+    cfg: dict,
+    config_key: str,
+    *,
+    valid_names: set[str],
+) -> Optional[str]:
+    """Resolve a configured route within the installed effective roster."""
     kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
-    explicit = (kanban_cfg.get("orchestrator_profile") or "").strip()
-    if explicit:
-        try:
-            if profiles_mod.profile_exists(explicit):
-                return explicit
-        except Exception:
-            pass
-    # Fall back to the active default profile.
+    explicit = (kanban_cfg.get(config_key) or "").strip()
+    if explicit in valid_names:
+        return explicit
     try:
-        return profiles_mod.get_active_profile_name() or "default"
+        active = profiles_mod.get_active_profile_name() or "default"
     except Exception:
-        return "default"
+        active = "default"
+    if active in valid_names:
+        return active
+    return min(valid_names) if valid_names else None
 
 
-def _resolve_default_assignee(cfg: dict) -> str:
-    """Resolve which profile catches child tasks the orchestrator can't route."""
-    kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
-    explicit = (kanban_cfg.get("default_assignee") or "").strip()
-    if explicit:
-        try:
-            if profiles_mod.profile_exists(explicit):
-                return explicit
-        except Exception:
-            pass
-    try:
-        return profiles_mod.get_active_profile_name() or "default"
-    except Exception:
-        return "default"
+def _resolve_orchestrator_profile(
+    cfg: dict,
+    *,
+    valid_names: set[str],
+) -> Optional[str]:
+    """Resolve the root owner within the installed effective roster."""
+    return _resolve_profile_choice(
+        cfg,
+        "orchestrator_profile",
+        valid_names=valid_names,
+    )
 
 
-def _build_roster() -> tuple[list[dict], set[str]]:
-    """Return (roster_for_prompt, valid_assignee_names).
+def _resolve_default_assignee(
+    cfg: dict,
+    *,
+    valid_names: set[str],
+) -> Optional[str]:
+    """Resolve the child fallback within the installed effective roster."""
+    return _resolve_profile_choice(
+        cfg,
+        "default_assignee",
+        valid_names=valid_names,
+    )
+
+
+def _build_roster(
+    *,
+    board: Optional[str] = None,
+    conn=None,
+) -> tuple[list[dict], set[str]]:
+    """Return the prompt roster and installed names allowed by board policy.
 
     Each roster entry is ``{name, description, has_description}``. The
-    valid-set is used after the LLM responds to rewrite invalid
-    assignees to the default fallback.
+    valid-set is used after the LLM responds to rewrite invalid assignees to
+    an installed effective fallback.
     """
     roster: list[dict] = []
     valid: set[str] = set()
     try:
         all_profiles = profiles_mod.list_profiles()
+        allowed = kb.kanban_allowed_profiles(board=board, conn=conn)
     except Exception as exc:
-        logger.warning("decompose: failed to list profiles: %s", exc)
+        logger.warning("decompose: failed to build effective profile roster: %s", exc)
         return roster, valid
-    for p in all_profiles:
-        desc = (p.description or "").strip()
+    for profile in all_profiles:
+        if allowed is not None and profile.name not in allowed:
+            continue
+        desc = (profile.description or "").strip()
         roster.append({
-            "name": p.name,
-            "description": desc or f"(no description; profile named {p.name!r})",
+            "name": profile.name,
+            "description": (
+                desc or f"(no description; profile named {profile.name!r})"
+            ),
             "has_description": bool(desc),
         })
-        valid.add(p.name)
+        valid.add(profile.name)
     return roster, valid
 
 
@@ -273,6 +291,7 @@ def decompose_task(
     *,
     author: Optional[str] = None,
     timeout: Optional[int] = None,
+    board: Optional[str] = None,
 ) -> DecomposeOutcome:
     """Decompose a triage task into a graph of child tasks.
 
@@ -280,22 +299,50 @@ def decompose_task(
     expected failure modes (task not in triage, no aux client
     configured, API error, malformed response, decomposer returned
     fanout=true with empty task list) — those surface via ``ok=False``.
+
+    The board is resolved once at entry and then passed to every connection
+    and policy lookup so a concurrent current-board change cannot alter routing
+    or redirect the eventual mutation.
     """
-    with kb.connect_closing() as conn:
+    effective_board = board or kb.get_current_board()
+    with kb.connect_closing(board=effective_board) as conn:
         task = kb.get_task(conn, task_id)
-    if task is None:
-        return DecomposeOutcome(task_id, False, "unknown task id")
-    if task.status != "triage":
+        if task is None:
+            return DecomposeOutcome(task_id, False, "unknown task id")
+        if task.status != "triage":
+            return DecomposeOutcome(
+                task_id,
+                False,
+                f"task is not in triage (status={task.status!r})",
+            )
+        roster, valid_names = _build_roster(
+            board=effective_board,
+            conn=conn,
+        )
+    if not valid_names:
         return DecomposeOutcome(
-            task_id, False, f"task is not in triage (status={task.status!r})"
+            task_id,
+            False,
+            "no installed profiles are allowed by the effective board policy",
         )
 
     cfg = _load_config()
-    orchestrator = _resolve_orchestrator_profile(cfg)
-    default_assignee = _resolve_default_assignee(cfg)
+    orchestrator = _resolve_orchestrator_profile(
+        cfg,
+        valid_names=valid_names,
+    )
+    default_assignee = _resolve_default_assignee(
+        cfg,
+        valid_names=valid_names,
+    )
+    if orchestrator is None or default_assignee is None:
+        return DecomposeOutcome(
+            task_id,
+            False,
+            "no installed profiles are allowed by the effective board policy",
+        )
     kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
     auto_promote = bool(kanban_cfg.get("auto_promote_children", True))
-    roster, valid_names = _build_roster()
 
     try:
         from agent.auxiliary_client import call_llm  # type: ignore
@@ -361,15 +408,21 @@ def decompose_task(
             return DecomposeOutcome(
                 task_id, False, "decomposer returned fanout=false with no title/body",
             )
-        with kb.connect_closing() as conn:
-            ok = kb.specify_triage_task(
-                conn,
-                task_id,
-                title=title_val,
-                body=body_val,
-                assignee=assignee_val,
-                author=audit_author,
-            )
+        try:
+            with kb.connect_closing(board=effective_board) as conn:
+                ok = kb.specify_triage_task(
+                    conn,
+                    task_id,
+                    title=title_val,
+                    body=body_val,
+                    assignee=assignee_val,
+                    author=audit_author,
+                )
+        except ValueError as exc:
+            return DecomposeOutcome(task_id, False, f"DB rejected task: {exc}")
+        except Exception as exc:
+            logger.exception("decompose: DB error on task %s", task_id)
+            return DecomposeOutcome(task_id, False, f"DB error: {type(exc).__name__}")
         if not ok:
             return DecomposeOutcome(
                 task_id, False, "task moved out of triage before promotion",
@@ -430,7 +483,7 @@ def decompose_task(
         })
 
     try:
-        with kb.connect_closing() as conn:
+        with kb.connect_closing(board=effective_board) as conn:
             child_ids = kb.decompose_triage_task(
                 conn,
                 task_id,
@@ -456,9 +509,14 @@ def decompose_task(
     )
 
 
-def list_triage_ids(*, tenant: Optional[str] = None) -> list[str]:
+def list_triage_ids(
+    *,
+    tenant: Optional[str] = None,
+    board: Optional[str] = None,
+) -> list[str]:
     """Return task ids currently in the triage column."""
-    with kb.connect_closing() as conn:
+    effective_board = board or kb.get_current_board()
+    with kb.connect_closing(board=effective_board) as conn:
         rows = kb.list_tasks(
             conn,
             status="triage",

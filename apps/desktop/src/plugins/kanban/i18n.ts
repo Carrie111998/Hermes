@@ -185,6 +185,20 @@ type KanbanMessages = {
   profileDescriptionsHint: string
   profileGoodAt: string
   auto: string
+  profilesAllowedBoard: string
+  inheritMachinePolicy: string
+  blockedByMachinePolicy: string
+  noWorkersCanRun: string
+  orchestrationLoadError: string
+  retry: string
+  boardLoadError: string
+  taskLoadError: string
+  taskPolicyLoadError: string
+  autoDescribeFailed: string
+  configuredBlocked: (name: string) => string
+  defaultResolved: (name: string) => string
+  effectiveFallback: (name: string) => string
+  none: string
 }
 
 const en: KanbanMessages = {
@@ -376,7 +390,21 @@ const en: KanbanMessages = {
   profileDescriptionsHint:
     'Descriptions guide the decomposer’s routing. Auto-generate with the auxiliary model, or write your own.',
   profileGoodAt: 'What is this profile good at?',
-  auto: 'Auto'
+  auto: 'Auto',
+  profilesAllowedBoard: 'Profiles allowed on this board',
+  inheritMachinePolicy: 'Inherit machine policy',
+  blockedByMachinePolicy: 'blocked by machine policy',
+  noWorkersCanRun: 'No workers can run on this board.',
+  orchestrationLoadError: 'Couldn’t load orchestration settings',
+  retry: 'Retry',
+  boardLoadError: 'Couldn’t load this board',
+  taskLoadError: 'Couldn’t load this task',
+  taskPolicyLoadError: 'Couldn’t load assignment policy',
+  autoDescribeFailed: 'Couldn’t generate a profile description',
+  configuredBlocked: name => `${name} (configured, blocked)`,
+  defaultResolved: name => `Default (effective: ${name})`,
+  effectiveFallback: name => `Effective fallback: ${name}`,
+  none: 'None'
 }
 
 const ja: KanbanMessages = {
@@ -567,7 +595,21 @@ const ja: KanbanMessages = {
   profileDescriptionsHint:
     '説明はデコンポーザーのルーティングを導きます。補助モデルで自動生成するか、自分で書いてください。',
   profileGoodAt: 'このプロフィールの得意分野は？',
-  auto: '自動'
+  auto: '自動',
+  profilesAllowedBoard: 'このボードで許可するプロフィール',
+  inheritMachinePolicy: 'マシンポリシーを継承',
+  blockedByMachinePolicy: 'マシンポリシーでブロック',
+  noWorkersCanRun: 'このボードではワーカーを実行できません。',
+  orchestrationLoadError: 'オーケストレーション設定を読み込めませんでした',
+  retry: '再試行',
+  boardLoadError: 'このボードを読み込めませんでした',
+  taskLoadError: 'このタスクを読み込めませんでした',
+  taskPolicyLoadError: '割り当てポリシーを読み込めませんでした',
+  autoDescribeFailed: 'プロフィールの説明を生成できませんでした',
+  configuredBlocked: name => `${name}（設定済み・ブロック）`,
+  defaultResolved: name => `既定（有効: ${name}）`,
+  effectiveFallback: name => `実際のフォールバック: ${name}`,
+  none: 'なし'
 }
 
 const zh: KanbanMessages = {
@@ -755,7 +797,21 @@ const zh: KanbanMessages = {
   profileDescriptions: '配置档说明',
   profileDescriptionsHint: '说明用于引导分解器的路由。可用辅助模型自动生成，或自行填写。',
   profileGoodAt: '这个配置档擅长什么？',
-  auto: '自动'
+  auto: '自动',
+  profilesAllowedBoard: '此面板允许的配置档',
+  inheritMachinePolicy: '继承机器策略',
+  blockedByMachinePolicy: '受机器策略阻止',
+  noWorkersCanRun: '此面板没有可运行的工作单元。',
+  orchestrationLoadError: '无法加载编排设置',
+  retry: '重试',
+  boardLoadError: '无法加载此面板',
+  taskLoadError: '无法加载此任务',
+  taskPolicyLoadError: '无法加载分配策略',
+  autoDescribeFailed: '无法生成配置档说明',
+  configuredBlocked: name => `${name}（已配置，已阻止）`,
+  defaultResolved: name => `默认（实际生效：${name}）`,
+  effectiveFallback: name => `实际回退：${name}`,
+  none: '无'
 }
 
 const zhHant: KanbanMessages = {
@@ -943,7 +999,21 @@ const zhHant: KanbanMessages = {
   profileDescriptions: '設定檔說明',
   profileDescriptionsHint: '說明用於引導分解器的路由。可用輔助模型自動產生，或自行填寫。',
   profileGoodAt: '這個設定檔擅長什麼？',
-  auto: '自動'
+  auto: '自動',
+  profilesAllowedBoard: '此面板允許的設定檔',
+  inheritMachinePolicy: '繼承機器政策',
+  blockedByMachinePolicy: '受機器政策阻擋',
+  noWorkersCanRun: '此面板沒有可執行的工作單元。',
+  orchestrationLoadError: '無法載入編排設定',
+  retry: '重試',
+  boardLoadError: '無法載入此面板',
+  taskLoadError: '無法載入此任務',
+  taskPolicyLoadError: '無法載入指派政策',
+  autoDescribeFailed: '無法產生設定檔說明',
+  configuredBlocked: name => `${name}（已設定，已阻擋）`,
+  defaultResolved: name => `預設（實際生效：${name}）`,
+  effectiveFallback: name => `實際回退：${name}`,
+  none: '無'
 }
 
 /** Registered via `ctx.i18n.register` at plugin load (disposer tracked). */

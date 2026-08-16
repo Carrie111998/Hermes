@@ -2467,6 +2467,13 @@ DEFAULT_CONFIG = {
     # each claimable ready task. One dispatcher per profile is sufficient;
     # running more than one on the same kanban.db will race for claims.
     "kanban": {
+        # Machine safety ceiling for profiles that may own Kanban tasks;
+        # individual boards may narrow it but cannot widen it. ``None``
+        # preserves the historical unrestricted behavior; ``[]`` disables
+        # profile assignment entirely. The ceiling is read from the
+        # default/shared Hermes root so named-profile CLIs and secondary
+        # gateways cannot bypass it with profile-local config.
+        "allowed_profiles": None,
         # Auto-subscribe the originating gateway/TUI session to task
         # completion + block events when ``kanban_create`` is called from
         # inside a session that has a persistent delivery channel. The

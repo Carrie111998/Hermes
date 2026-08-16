@@ -36,9 +36,11 @@ the port.
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import logging
 import sqlite3
+import threading
 import time
 from dataclasses import asdict
 from pathlib import Path
@@ -54,6 +56,13 @@ from hermes_cli import kanban_diagnostics as kd
 log = logging.getLogger(__name__)
 
 router = APIRouter()
+
+# One process-wide owner for orchestration's cross-file mutation transaction.
+# Config persistence is atomic per save and board metadata persistence is
+# atomic per write, but a mixed request spans both files and may roll config
+# back. Without a lock around the full read/validate/write/rollback sequence,
+# that rollback can overwrite config committed by a newer request.
+_ORCHESTRATION_MUTATION_LOCK = threading.RLock()
 
 
 # ---------------------------------------------------------------------------
@@ -2561,15 +2570,19 @@ def rename_board(slug: str, payload: RenameBoardBody):
                 default_workdir = primary_path
         else:
             project_id = ""  # clear the scope
-    meta = kanban_db.write_board_metadata(
-        normed,
-        name=payload.name,
-        description=payload.description,
-        icon=payload.icon,
-        color=payload.color,
-        default_workdir=default_workdir,
-        project_id=project_id,
-    )
+    # This endpoint and PUT /orchestration both perform read-modify-write on
+    # board.json. Share orchestration's persistence lock so neither can commit
+    # metadata loaded before the other's write.
+    with _ORCHESTRATION_MUTATION_LOCK:
+        meta = kanban_db.write_board_metadata(
+            normed,
+            name=payload.name,
+            description=payload.description,
+            icon=payload.icon,
+            color=payload.color,
+            default_workdir=default_workdir,
+            project_id=project_id,
+        )
     meta["default_workspace_kind"] = _default_workspace_kind(meta)
     _, meta["project_name"], _ = _resolve_project(meta.get("project_id"))
     return {"board": meta}
@@ -2625,20 +2638,54 @@ class DescribeAutoBody(BaseModel):
     overwrite: bool = False
 
 
-@router.get("/profiles")
-def list_profile_roster():
-    """Return every installed profile with its description.
+def _open_policy_board(board: Optional[str]) -> tuple[str, sqlite3.Connection]:
+    """Open the requested/current board and return its canonical identity."""
+    resolved = _resolve_board(board)
+    conn = _conn(board=resolved)
+    try:
+        canonical = kanban_db._policy_board_slug(board=resolved, conn=conn)
+    except Exception:
+        canonical = None
+    if canonical is None:
+        canonical = resolved or kanban_db.get_current_board()
+    return canonical, conn
 
-    Consumed by the dashboard's settings panel (orchestrator picker)
-    and the profile-description editing UI. Profiles without a
-    description still appear here — they're routable on name alone,
-    just less precisely.
-    """
+
+def _installed_profile_names(profiles: list[Any], profiles_mod: Any) -> set[str]:
+    return {profiles_mod.normalize_profile_name(profile.name) for profile in profiles}
+
+
+def _config_shape_error(cfg: object) -> Optional[str]:
+    """Describe a config container that cannot be safely updated."""
+    if not isinstance(cfg, dict):
+        return "config root must be a mapping"
+    if "kanban" in cfg and not isinstance(cfg["kanban"], dict):
+        return "existing kanban section must be a mapping"
+    return None
+
+
+@router.get("/profiles")
+def list_profile_roster(
+    board: Optional[str] = Query(None, description="Kanban board slug (omit for current)"),
+):
+    """Return every installed profile with board-scoped policy flags."""
+    canonical_board, conn = _open_policy_board(board)
+    try:
+        machine_allowed = kanban_db.kanban_allowed_profiles()
+        effective_allowed = kanban_db.kanban_allowed_profiles(conn=conn)
+        board_selected = kanban_db._board_kanban_allowed_profiles(
+            board=canonical_board,
+            conn=conn,
+        )
+    finally:
+        conn.close()
+
     try:
         from hermes_cli import profiles as profiles_mod
         profiles = profiles_mod.list_profiles()
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"failed to list profiles: {exc}")
+
     return {
         "profiles": [
             {
@@ -2649,6 +2696,18 @@ def list_profile_roster():
                 "description": p.description or "",
                 "description_auto": bool(p.description_auto),
                 "skill_count": int(p.skill_count or 0),
+                "machine_allowed": (
+                    machine_allowed is None
+                    or profiles_mod.normalize_profile_name(p.name) in machine_allowed
+                ),
+                "board_selected": (
+                    board_selected is None
+                    or profiles_mod.normalize_profile_name(p.name) in board_selected
+                ),
+                "effective_allowed": (
+                    effective_allowed is None
+                    or profiles_mod.normalize_profile_name(p.name) in effective_allowed
+                ),
             }
             for p in profiles
         ],
@@ -2773,120 +2832,378 @@ class OrchestrationSettingsBody(BaseModel):
     default_assignee: Optional[str] = None
     auto_decompose: Optional[bool] = None
     auto_promote_children: Optional[bool] = None
+    allowed_profiles: Optional[list[Any]] = None
+
+
+def _display_selector(value: object) -> str:
+    """Return a stripped selector only when the config leaf is a string."""
+    return value.strip() if isinstance(value, str) else ""
+
+
+def _config_bool(value: object, *, default: bool) -> bool:
+    """Return a config boolean without coercing malformed leaf types."""
+    return value if isinstance(value, bool) else default
+
+
+def _resolve_roster_choice(
+    configured: str,
+    *,
+    installed_effective: list[str],
+    active_profile: str,
+    profiles_mod: Any,
+) -> Optional[str]:
+    """Resolve one global selector against a board's effective roster."""
+    installed_set = set(installed_effective)
+    if configured:
+        try:
+            canonical = profiles_mod.normalize_profile_name(configured)
+            profiles_mod.validate_profile_name(canonical)
+        except ValueError:
+            canonical = ""
+        if canonical in installed_set:
+            return canonical
+    try:
+        active = profiles_mod.normalize_profile_name(active_profile)
+    except ValueError:
+        active = ""
+    if active in installed_set:
+        return active
+    return installed_effective[0] if installed_effective else None
 
 
 @router.get("/orchestration")
-def get_orchestration_settings():
-    """Return the current kanban orchestration knobs from config.yaml
-    plus the resolved effective values (filling in fallbacks)."""
+def get_orchestration_settings(
+    board: Optional[str] = Query(None, description="Kanban board slug (omit for current)"),
+):
+    """Return global settings resolved against one board's effective roster."""
+    canonical_board, conn = _open_policy_board(board)
+    try:
+        effective_allowed = kanban_db.kanban_allowed_profiles(conn=conn)
+        board_allowed = kanban_db._board_kanban_allowed_profiles(
+            board=canonical_board,
+            conn=conn,
+        )
+    finally:
+        conn.close()
+
     try:
         from hermes_cli.config import load_config
         cfg = load_config() or {}
     except Exception:
         cfg = {}
-    kanban_cfg = (cfg.get("kanban") or {}) if isinstance(cfg, dict) else {}
-    explicit_orch = (kanban_cfg.get("orchestrator_profile") or "").strip()
-    explicit_default = (kanban_cfg.get("default_assignee") or "").strip()
-    auto_decompose = bool(kanban_cfg.get("auto_decompose", True))
-    auto_promote_children = bool(kanban_cfg.get("auto_promote_children", True))
+    kanban_cfg = cfg.get("kanban") if isinstance(cfg, dict) else None
+    if not isinstance(kanban_cfg, dict):
+        kanban_cfg = {}
+    explicit_orch = _display_selector(kanban_cfg.get("orchestrator_profile"))
+    explicit_default = _display_selector(kanban_cfg.get("default_assignee"))
+    auto_decompose = _config_bool(
+        kanban_cfg.get("auto_decompose"),
+        default=True,
+    )
+    auto_promote_children = _config_bool(
+        kanban_cfg.get("auto_promote_children"),
+        default=True,
+    )
 
-    # Resolve fallbacks the same way the decomposer does.
-    resolved_orch = explicit_orch
-    resolved_default = explicit_default
     try:
         from hermes_cli import profiles as profiles_mod
-        active_default = profiles_mod.get_active_profile_name() or "default"
-        if not resolved_orch or not profiles_mod.profile_exists(resolved_orch):
-            resolved_orch = active_default
-        if not resolved_default or not profiles_mod.profile_exists(resolved_default):
-            resolved_default = active_default
-    except Exception:
-        active_default = "default"
-        if not resolved_orch:
-            resolved_orch = active_default
-        if not resolved_default:
-            resolved_default = active_default
+        profiles = profiles_mod.list_profiles()
+        installed = _installed_profile_names(profiles, profiles_mod)
+        installed_effective = sorted(
+            installed
+            if effective_allowed is None
+            else installed & set(effective_allowed)
+        )
+        active_profile = profiles_mod.get_active_profile_name() or "default"
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"failed to resolve orchestration profiles: {exc}",
+        )
 
     return {
+        "board": canonical_board,
         "orchestrator_profile": explicit_orch,
         "default_assignee": explicit_default,
         "auto_decompose": auto_decompose,
         "auto_promote_children": auto_promote_children,
-        "resolved_orchestrator_profile": resolved_orch,
-        "resolved_default_assignee": resolved_default,
-        "active_profile": active_default,
+        "resolved_orchestrator_profile": _resolve_roster_choice(
+            explicit_orch,
+            installed_effective=installed_effective,
+            active_profile=active_profile,
+            profiles_mod=profiles_mod,
+        ),
+        "resolved_default_assignee": _resolve_roster_choice(
+            explicit_default,
+            installed_effective=installed_effective,
+            active_profile=active_profile,
+            profiles_mod=profiles_mod,
+        ),
+        "active_profile": active_profile,
+        "board_allowed_profiles": (
+            None if board_allowed is None else sorted(board_allowed)
+        ),
+        "effective_allowed_profiles": installed_effective,
     }
 
 
 @router.put("/orchestration")
-def set_orchestration_settings(payload: OrchestrationSettingsBody):
-    """Update the kanban orchestration knobs in ~/.hermes/config.yaml.
+def set_orchestration_settings(
+    payload: OrchestrationSettingsBody,
+    board: Optional[str] = Query(None, description="Kanban board slug (omit for current)"),
+):
+    """Update global selectors and/or one board's profile subset atomically."""
+    with _ORCHESTRATION_MUTATION_LOCK:
+        return _set_orchestration_settings_transaction(payload, board)
 
-    Each field is optional — only fields explicitly passed are
-    written. ``orchestrator_profile`` / ``default_assignee`` accept
-    empty strings to clear the override and fall back to the default
-    profile.
-    """
+
+def _set_orchestration_settings_transaction(
+    payload: OrchestrationSettingsBody,
+    board: Optional[str],
+):
+    """Run one serialized config + board metadata mutation transaction."""
+    fields_set = payload.model_fields_set
+    config_field_names = (
+        "orchestrator_profile",
+        "default_assignee",
+        "auto_decompose",
+        "auto_promote_children",
+    )
+    config_write_requested = any(
+        field_name in fields_set and getattr(payload, field_name) is not None
+        for field_name in config_field_names
+    )
+
+    canonical_board, conn = _open_policy_board(board)
     try:
-        from hermes_cli.config import load_config, save_config
-        cfg = load_config() or {}
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"failed to load config: {exc}")
+        machine_allowed = kanban_db.kanban_allowed_profiles()
+        existing_board_allowed = kanban_db._board_kanban_allowed_profiles(
+            board=canonical_board,
+            conn=conn,
+        )
+    finally:
+        conn.close()
 
-    kanban_section = cfg.setdefault("kanban", {})
-    if not isinstance(kanban_section, dict):
-        kanban_section = {}
-        cfg["kanban"] = kanban_section
-
-    # Validate any non-empty profile names exist before saving.
     try:
         from hermes_cli import profiles as profiles_mod
-    except Exception:
-        profiles_mod = None  # type: ignore
+        from hermes_cli import config as config_mod
 
-    if payload.orchestrator_profile is not None:
-        name = (payload.orchestrator_profile or "").strip()
-        if name and profiles_mod is not None:
-            try:
-                if not profiles_mod.profile_exists(name):
-                    raise HTTPException(
-                        status_code=400,
-                        detail=f"profile '{name}' does not exist",
-                    )
-            except HTTPException:
-                raise
-            except Exception:
-                pass  # fail open if the lookup itself errors
-        kanban_section["orchestrator_profile"] = name
-
-    if payload.default_assignee is not None:
-        name = (payload.default_assignee or "").strip()
-        if name and profiles_mod is not None:
-            try:
-                if not profiles_mod.profile_exists(name):
-                    raise HTTPException(
-                        status_code=400,
-                        detail=f"profile '{name}' does not exist",
-                    )
-            except HTTPException:
-                raise
-            except Exception:
-                pass
-        kanban_section["default_assignee"] = name
-
-    if payload.auto_decompose is not None:
-        kanban_section["auto_decompose"] = bool(payload.auto_decompose)
-
-    if payload.auto_promote_children is not None:
-        kanban_section["auto_promote_children"] = bool(payload.auto_promote_children)
-
-    try:
-        save_config(cfg)
+        profiles = profiles_mod.list_profiles()
+        installed = _installed_profile_names(profiles, profiles_mod)
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"failed to save config: {exc}")
+        raise HTTPException(status_code=500, detail=f"failed to load settings: {exc}")
 
-    # Echo back the resolved state (callers usually re-render from it).
-    return get_orchestration_settings()
+    original_cfg: Optional[dict[str, Any]] = None
+    if config_write_requested:
+        # load_config() can return a last-known-good value when config.yaml is
+        # currently malformed. Check the on-disk container as well so a write
+        # cannot replace a fail-closed machine policy with the cached value.
+        config_path = config_mod.get_config_path()
+        try:
+            raw_text = config_path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            raw_cfg: object = {}
+        except (OSError, UnicodeError) as exc:
+            raise HTTPException(
+                status_code=500,
+                detail=f"malformed config: config root cannot be read: {exc}",
+            ) from exc
+        else:
+            if not raw_text.strip():
+                raw_cfg = {}
+            else:
+                try:
+                    import yaml
+
+                    raw_cfg = yaml.safe_load(raw_text)
+                except Exception as exc:
+                    raise HTTPException(
+                        status_code=500,
+                        detail=f"malformed config: config root cannot be parsed: {exc}",
+                    ) from exc
+
+        shape_error = _config_shape_error(raw_cfg)
+        if shape_error is not None:
+            raise HTTPException(
+                status_code=500,
+                detail=f"malformed config: {shape_error}",
+            )
+
+        try:
+            loaded_cfg = config_mod.load_config()
+        except Exception as exc:
+            raise HTTPException(
+                status_code=500,
+                detail=f"malformed config: failed to load config: {exc}",
+            ) from exc
+        shape_error = _config_shape_error(loaded_cfg)
+        if shape_error is not None:
+            raise HTTPException(
+                status_code=500,
+                detail=f"malformed config: {shape_error}",
+            )
+        original_cfg = loaded_cfg
+
+    normalized_allowed: Optional[list[str]] = None
+
+    # Validate the prospective board policy without writing it. Installation
+    # is checked before the machine ceiling so an unknown name gets the most
+    # useful error even though it is necessarily absent from a finite ceiling.
+    if "allowed_profiles" in fields_set and payload.allowed_profiles is not None:
+        normalized_allowed = []
+        seen: set[str] = set()
+        for entry in payload.allowed_profiles:
+            if not isinstance(entry, str):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"invalid allowed_profiles entry {entry!r}: expected a profile name",
+                )
+            try:
+                name = profiles_mod.normalize_profile_name(entry)
+                profiles_mod.validate_profile_name(name)
+            except ValueError as exc:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"invalid allowed_profiles entry {entry!r}: {exc}",
+                ) from exc
+            if name not in installed:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"profile '{name}' does not exist",
+                )
+            if machine_allowed is not None and name not in machine_allowed:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"profile '{name}' is not permitted by the machine ceiling "
+                        "(kanban.allowed_profiles)"
+                    ),
+                )
+            if name not in seen:
+                normalized_allowed.append(name)
+                seen.add(name)
+
+    if "allowed_profiles" in fields_set:
+        prospective_board = (
+            None
+            if payload.allowed_profiles is None
+            else frozenset(normalized_allowed or [])
+        )
+    else:
+        prospective_board = existing_board_allowed
+
+    if machine_allowed is None:
+        prospective_effective = prospective_board
+    elif prospective_board is None:
+        prospective_effective = machine_allowed
+    else:
+        prospective_effective = machine_allowed & prospective_board
+    prospective_installed = (
+        installed
+        if prospective_effective is None
+        else installed & set(prospective_effective)
+    )
+
+    # Validate every requested global selector against the prospective roster,
+    # including a new allowed_profiles subset supplied in this same request.
+    selector_updates: dict[str, str] = {}
+    for field_name in ("orchestrator_profile", "default_assignee"):
+        value = getattr(payload, field_name)
+        if field_name not in fields_set or value is None:
+            continue
+        stripped = value.strip()
+        if not stripped:
+            selector_updates[field_name] = ""
+            continue
+        try:
+            name = profiles_mod.normalize_profile_name(stripped)
+            profiles_mod.validate_profile_name(name)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=400,
+                detail=f"invalid profile '{stripped}': {exc}",
+            ) from exc
+        if name not in installed:
+            raise HTTPException(
+                status_code=400,
+                detail=f"profile '{name}' does not exist",
+            )
+        if name not in prospective_installed:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"profile '{name}' is not permitted by the effective "
+                    f"policy for board '{canonical_board}'"
+                ),
+            )
+        selector_updates[field_name] = name
+
+    config_updates: dict[str, Any] = dict(selector_updates)
+    if "auto_decompose" in fields_set and payload.auto_decompose is not None:
+        config_updates["auto_decompose"] = bool(payload.auto_decompose)
+    if (
+        "auto_promote_children" in fields_set
+        and payload.auto_promote_children is not None
+    ):
+        config_updates["auto_promote_children"] = bool(payload.auto_promote_children)
+
+    # All validation is complete before either persistence surface is touched.
+    # For mixed requests the config write goes first, so a config failure can
+    # never leave a new board policy behind.
+    config_saved = False
+    if config_updates:
+        assert original_cfg is not None
+        updated_cfg = copy.deepcopy(original_cfg)
+        kanban_section = updated_cfg.setdefault("kanban", {})
+        kanban_section.update(config_updates)
+        try:
+            config_mod.save_config(updated_cfg)
+        except Exception as exc:
+            raise HTTPException(
+                status_code=500,
+                detail=f"failed to save config: {exc}",
+            ) from exc
+        config_saved = True
+
+    # A board-policy-only request must not rewrite machine config.yaml.
+    if "allowed_profiles" in fields_set:
+        try:
+            kanban_db.write_board_metadata(
+                canonical_board,
+                allowed_profiles=(
+                    None
+                    if payload.allowed_profiles is None
+                    else normalized_allowed
+                ),
+            )
+        except Exception as exc:
+            if config_saved:
+                assert original_cfg is not None
+                try:
+                    config_mod.save_config(original_cfg)
+                except Exception as rollback_exc:
+                    log.exception(
+                        "Failed to roll back config after board policy write failed"
+                    )
+                    raise HTTPException(
+                        status_code=500,
+                        detail=(
+                            f"failed to save board policy: {exc}; "
+                            f"config rollback failed: {rollback_exc}"
+                        ),
+                    ) from exc
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"failed to save board policy: {exc}; config restored",
+                ) from exc
+            if isinstance(exc, ValueError):
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            raise HTTPException(
+                status_code=500,
+                detail=f"failed to save board policy: {exc}",
+            ) from exc
+
+    return get_orchestration_settings(board=canonical_board)
 
 
 @router.websocket("/events")

@@ -43,6 +43,11 @@ export const $lanesByProfile = atom<boolean>(false)
  *  auto: empty lanes collapse to a rail, occupied lanes expand. Persisted. */
 export const $collapsedLanes = atom<Record<string, boolean>>({})
 
+/** Global profile-description writes are not board-scoped. Keep their owner
+ * outside any panel so a board switch/remount cannot start a second write while
+ * the first request is still in flight. */
+export const $profileDescriptionWriteOwner = atom<null | symbol>(null)
+
 const BOARD_SLUG_KEY = 'boardSlug'
 const INTRO_KEY = 'introDismissed'
 const LANES_KEY = 'lanesByProfile'
@@ -58,7 +63,7 @@ function onEventsFrame(slug: string, data: unknown): void {
     return
   }
 
-  void queryClient.invalidateQueries({ queryKey: ['kanban', 'board'] })
+  void queryClient.invalidateQueries({ queryKey: ['kanban', 'board', slug] })
   // Any event can change a board's card count — keep the switcher badge honest.
   void queryClient.invalidateQueries({ queryKey: BOARDS_KEY })
 
@@ -107,6 +112,8 @@ export function bindApi(r: Rest, storage: PluginStorage, socket: Socket): () => 
   return () => {
     unsubs.forEach(unsub => unsub())
     close?.()
+    nudgeTimers.forEach(timer => clearTimeout(timer))
+    nudgeTimers.clear()
     rest = null
   }
 }
@@ -115,10 +122,9 @@ function call<T>(path: string, opts?: PluginRestOptions): Promise<T> {
   return rest ? rest<T>(path, opts) : Promise.reject(new Error('kanban api not ready'))
 }
 
-/** Append the selected board (and other params) to a path. */
-function withBoard(path: string, params: Record<string, string> = {}): string {
+/** Append one explicitly captured board (and other params) to a path. */
+function withBoard(slug: string, path: string, params: Record<string, string> = {}): string {
   const search = new URLSearchParams(params)
-  const slug = $boardSlug.get()
 
   if (slug) {
     search.set('board', slug)
@@ -138,85 +144,151 @@ export const BOARDS_KEY = ['kanban', 'boards'] as const
 export const PROFILES_KEY = ['kanban', 'profiles'] as const
 export const PROJECTS_KEY = ['kanban', 'projects'] as const
 export const ORCHESTRATION_KEY = ['kanban', 'orchestration'] as const
+export const ORCHESTRATION_MUTATION_KEY = ['kanban', 'orchestration-write'] as const
+export const ORCHESTRATION_MUTATION_SCOPE = { id: 'kanban:orchestration-write' } as const
+export const PROFILE_DESCRIPTION_MUTATION_KEY = ['kanban', 'profile-description-write'] as const
+export const PROFILE_DESCRIPTION_MUTATION_SCOPE = { id: 'kanban:profile-description-write' } as const
+export const profilesKey = (slug: string) => [...PROFILES_KEY, slug] as const
+export const orchestrationKey = (slug: string) => [...ORCHESTRATION_KEY, slug] as const
 
 // ── reads ─────────────────────────────────────────────────────────────────────
 
-export const fetchBoard = (archived: boolean) =>
-  call<KanbanBoard>(withBoard('/board', archived ? { include_archived: 'true' } : {}))
+export const fetchBoard = (slug: string, archived = false): Promise<KanbanBoard> =>
+  call<KanbanBoard>(withBoard(slug, '/board', archived ? { include_archived: 'true' } : {}))
 
-export const fetchTask = (id: string) => call<KanbanTaskDetail>(withBoard(`/tasks/${id}`))
+export const fetchTask = (slug: string, id: string) => call<KanbanTaskDetail>(withBoard(slug, `/tasks/${id}`))
 
 /** Worker stdout/stderr tail (last 16 KiB — plenty for the drawer). */
-export const fetchLog = (id: string) => call<WorkerLog>(withBoard(`/tasks/${id}/log`, { tail: '16384' }))
+export const fetchLog = (slug: string, id: string) =>
+  call<WorkerLog>(withBoard(slug, `/tasks/${id}/log`, { tail: '16384' }))
 
 export const fetchBoards = () => call<BoardsResponse>('/boards')
 
-export const fetchProfiles = () => call<{ profiles: KanbanProfile[] }>('/profiles')
+export const fetchProfiles = (slug: string) => call<{ profiles: KanbanProfile[] }>(withBoard(slug, '/profiles'))
+
+/** Shared query contract for every board-scoped assignment roster surface. */
+export const profileQueryOptions = (slug: string) => ({
+  queryFn: () => fetchProfiles(slug),
+  queryKey: profilesKey(slug),
+  staleTime: 60_000
+})
 
 /** First-class Hermes projects, for scoping a board's default workspace. */
 export const fetchProjects = () => call<{ projects: KanbanProject[] }>('/projects')
 
-export const fetchOrchestration = () => call<OrchestrationSettings>('/orchestration')
+export const fetchOrchestration = (slug: string) => call<OrchestrationSettings>(withBoard(slug, '/orchestration'))
 
 // ── writes ────────────────────────────────────────────────────────────────────
+
+/** Claim the one global profile-description write slot synchronously, before a
+ * React Query mutation can be queued. The matching owner token prevents an old
+ * completion from releasing a newer claim. */
+export function claimProfileDescriptionWrite(): null | symbol {
+  if ($profileDescriptionWriteOwner.get()) {
+    return null
+  }
+
+  const owner = Symbol('kanban-profile-description-write')
+  $profileDescriptionWriteOwner.set(owner)
+
+  return owner
+}
+
+export function runProfileDescriptionWrite<T>(owner: symbol, write: () => Promise<T>): Promise<T> {
+  if ($profileDescriptionWriteOwner.get() !== owner) {
+    return Promise.reject(new Error('profile description write is already in progress'))
+  }
+
+  let request: Promise<T>
+
+  try {
+    request = write()
+  } catch (error) {
+    if ($profileDescriptionWriteOwner.get() === owner) {
+      $profileDescriptionWriteOwner.set(null)
+    }
+
+    return Promise.reject(error)
+  }
+
+  return request.finally(() => {
+    if ($profileDescriptionWriteOwner.get() === owner) {
+      $profileDescriptionWriteOwner.set(null)
+    }
+  })
+}
 
 // Every board edit nudges the dispatcher (debounced, fire-and-forget) so the
 // change takes effect NOW instead of on the next 60s tick — create a ready
 // task and the worker spawns immediately, no manual "nudge" ritual. The tick
 // is lock-guarded and ~1ms when there's nothing to do, so over-nudging is
 // free; failures are non-events (the periodic tick still exists).
-let nudgeTimer: null | ReturnType<typeof setTimeout> = null
+const nudgeTimers = new Map<string, ReturnType<typeof setTimeout>>()
 
-function autoNudge(): void {
-  if (nudgeTimer != null) {
-    clearTimeout(nudgeTimer)
+function autoNudge(slug: string): void {
+  const pending = nudgeTimers.get(slug)
+
+  if (pending != null) {
+    clearTimeout(pending)
   }
 
-  nudgeTimer = setTimeout(() => {
-    nudgeTimer = null
-    nudgeDispatcher().catch(() => undefined)
-  }, 400)
+  nudgeTimers.set(
+    slug,
+    setTimeout(() => {
+      nudgeTimers.delete(slug)
+      nudgeDispatcher(slug).catch(() => undefined)
+    }, 400)
+  )
 }
 
 /** Resolve the write, then kick the dispatcher. Rejections pass through. */
-function nudged<T>(write: Promise<T>): Promise<T> {
+function nudged<T>(slug: string, write: Promise<T>): Promise<T> {
   return write.then(value => {
-    autoNudge()
+    autoNudge(slug)
 
     return value
   })
 }
 
-export const patchTask = (id: string, patch: Record<string, unknown>) =>
-  nudged(call(withBoard(`/tasks/${id}`), { method: 'PATCH', body: patch }))
+export const patchTask = (slug: string, id: string, patch: Record<string, unknown>) =>
+  nudged(slug, call(withBoard(slug, `/tasks/${id}`), { method: 'PATCH', body: patch }))
 
-export const createTask = (body: Record<string, unknown>) =>
-  nudged(call<{ task: KanbanTask | null; warning?: string }>(withBoard('/tasks'), { method: 'POST', body }))
+export const createTask = (slug: string, body: Record<string, unknown>) =>
+  nudged(slug, call<{ task: KanbanTask | null; warning?: string }>(withBoard(slug, '/tasks'), { method: 'POST', body }))
 
 // Deleting can unblock dependants (a gone parent no longer gates), so it
 // nudges too.
-export const deleteTask = (id: string) => nudged(call(withBoard(`/tasks/${id}`), { method: 'DELETE' }))
+export const deleteTask = (slug: string, id: string) =>
+  nudged(slug, call(withBoard(slug, `/tasks/${id}`), { method: 'DELETE' }))
 
 /** One patch, many ids — independent per-id application; returns per-id
  *  outcomes so the UI can toast partial failures. */
-export const bulkTasks = (ids: string[], patch: Record<string, unknown>) =>
+export const bulkTasks = (slug: string, ids: string[], patch: Record<string, unknown>) =>
   nudged(
-    call<{ results: Array<{ id: string; ok: boolean; error?: string }> }>(withBoard('/tasks/bulk'), {
+    slug,
+    call<{ results: Array<{ id: string; ok: boolean; error?: string }> }>(withBoard(slug, '/tasks/bulk'), {
       method: 'POST',
       body: { ids, ...patch }
     })
   )
 
-export const addComment = (id: string, body: string) =>
-  call(withBoard(`/tasks/${id}/comments`), { method: 'POST', body: { author: 'desktop', body } })
+export const addComment = (slug: string, id: string, body: string) =>
+  call(withBoard(slug, `/tasks/${id}/comments`), { method: 'POST', body: { author: 'desktop', body } })
 
-export const reassignTask = (id: string, profile: string) =>
-  nudged(call(withBoard(`/tasks/${id}/reassign`), { method: 'POST', body: { profile, reclaim_first: true } }))
+export const assignTask = (slug: string, id: string, profile: null | string) =>
+  nudged(
+    slug,
+    call(withBoard(slug, `/tasks/${id}/reassign`), { method: 'POST', body: { profile, reclaim_first: true } })
+  )
 
-export const reclaimTask = (id: string) => nudged(call(withBoard(`/tasks/${id}/reclaim`), { method: 'POST', body: {} }))
+export const reclaimTask = (slug: string, id: string) =>
+  nudged(slug, call(withBoard(slug, `/tasks/${id}/reclaim`), { method: 'POST', body: {} }))
 
-export const uploadAttachment = (id: string, upload: { filename: string; contentType?: string; bytes: ArrayBuffer }) =>
-  call(withBoard(`/tasks/${id}/attachments`), { method: 'POST', upload })
+export const uploadAttachment = (
+  slug: string,
+  id: string,
+  upload: { filename: string; contentType?: string; bytes: ArrayBuffer }
+) => call(withBoard(slug, `/tasks/${id}/attachments`), { method: 'POST', upload })
 
 export const createBoard = (slug: string, name: string, projectId?: string) =>
   call<{ board: { slug: string } }>('/boards', {
@@ -226,8 +298,8 @@ export const createBoard = (slug: string, name: string, projectId?: string) =>
 
 /** Rough auxiliary-model estimate for a task (tokens + complexity). Makes a
  *  model call — gate behind an explicit user action + disclaimer. */
-export const estimateTask = (id: string) =>
-  call<TaskEstimate>(withBoard(`/tasks/${id}/estimate`), { method: 'POST', body: {} })
+export const estimateTask = (slug: string, id: string) =>
+  call<TaskEstimate>(withBoard(slug, `/tasks/${id}/estimate`), { method: 'POST', body: {} })
 
 /** Estimate from typed title/body before a task exists (create dialog). */
 export const estimateNew = (title: string, body: string) =>
@@ -238,10 +310,11 @@ export const estimateNew = (title: string, body: string) =>
 export const updateBoard = (slug: string, patch: Record<string, unknown>) =>
   call<{ board: BoardMeta }>(`/boards/${encodeURIComponent(slug)}`, { method: 'PATCH', body: patch })
 
-export const nudgeDispatcher = () => call<{ spawned?: unknown[] }>(withBoard('/dispatch'), { method: 'POST', body: {} })
+export const nudgeDispatcher = (slug: string) =>
+  call<{ spawned?: unknown[] }>(withBoard(slug, '/dispatch'), { method: 'POST', body: {} })
 
-export const saveOrchestration = (patch: Record<string, unknown>) =>
-  call<OrchestrationSettings>('/orchestration', { method: 'PUT', body: patch })
+export const saveOrchestration = (slug: string, patch: Record<string, unknown>) =>
+  call<OrchestrationSettings>(withBoard(slug, '/orchestration'), { method: 'PUT', body: patch })
 
 export const saveProfileDescription = (name: string, description: string) =>
   call(`/profiles/${encodeURIComponent(name)}`, { method: 'PATCH', body: { description } })

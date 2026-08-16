@@ -10,8 +10,10 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import shutil
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -770,19 +772,61 @@ def test_dashboard_done_actions_prompt_for_completion_summary():
     )
 
 
-def test_dashboard_cancel_keeps_task_in_old_status(client):
-    """Behavioral: the cancel branch of the dispatch path (no PATCH/DELETE
-    issued) must leave the task in its previous status. The cancel guard
-    lives in the bundle; this test pins the backend contract that the guard
-    relies on.
-    """
-    t = client.post("/api/plugins/kanban/tasks",
-                    json={"title": "x"}).json()["task"]
-    # Tasks land in ``ready`` by default. No PATCH issued — simulating the
-    # cancel branch in the bundle.
-    assert t["status"] == "ready"
-    r = client.get(f"/api/plugins/kanban/tasks/{t['id']}")
-    assert r.json()["task"]["status"] == "ready"
+def test_dashboard_cancel_keeps_task_dispatch_suppressed():
+    """Execute the production-used dialog-owner cancel path."""
+    js = _dashboard_bundle_source()
+    helper_source = js[
+        js.index("function settleDialogOwner"):
+        js.index("function useKanbanDialogs")
+    ]
+    hook = js[
+        js.index("function useKanbanDialogs"):
+        js.index("const API =", js.index("function useKanbanDialogs"))
+    ]
+    assert (
+        "return settleDialogOwner(resolverRef, setDialogState, confirmed, extras);"
+        in hook
+    )
+    assert (
+        "const onCancel = React.useCallback(function () { close(false, null); }"
+        in hook
+    )
+
+    probe = helper_source + """
+const resolverRef = {current: null};
+let dialogState = {kind: "confirm"};
+let requests = 0;
+const pending = new Promise(function (resolve) { resolverRef.current = resolve; });
+const settled = settleDialogOwner(
+  resolverRef,
+  function (next) { dialogState = next; },
+  false,
+  null
+);
+pending.then(function (result) {
+  if (result.confirmed) requests += 1;
+  console.log(JSON.stringify({
+    settled,
+    confirmed: result.confirmed,
+    ownerReleased: resolverRef.current === null,
+    dialogState,
+    requests
+  }));
+});
+"""
+    completed = subprocess.run(
+        ["node", "-e", probe],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert json.loads(completed.stdout) == {
+        "settled": True,
+        "confirmed": False,
+        "ownerReleased": True,
+        "dialogState": None,
+        "requests": 0,
+    }
 
 
 def test_dashboard_confirm_dispatches_expected_patch_body(client):
@@ -1225,8 +1269,1407 @@ def test_specify_happy_path(client, monkeypatch):
     assert "**Goal**" in (detail["body"] or "")
 
 
+def _dashboard_bundle_source():
+    repo_root = Path(__file__).resolve().parents[2]
+    return (
+        repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "index.js"
+    ).read_text(encoding="utf-8")
+
+
+def test_dashboard_orchestration_policy_lifecycle_in_shipped_bundle():
+    """Exercise the real registered bundle in headless Chromium."""
+    repo_root = Path(__file__).resolve().parents[2]
+    harness = (
+        repo_root
+        / "tests"
+        / "plugins"
+        / "kanban"
+        / "dashboard_orchestration_bundle_harness.mjs"
+    )
+    node = shutil.which("node")
+    assert node is not None, "declared Playwright runtime is absent: node not found"
+
+    completed = subprocess.run(
+        [node, str(harness)],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode == 0, (
+        f"bundle harness failed ({completed.returncode})\n"
+        f"stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}"
+    )
+    assert json.loads(completed.stdout) == {
+        "ok": True,
+        "board": "beta",
+        "put_url": "/api/plugins/kanban/orchestration?board=beta",
+        "put_body": {"allowed_profiles": []},
+        "checks": 6,
+    }
+
+
+def test_dashboard_task_deletes_pin_the_board_captured_before_confirmation():
+    js = _dashboard_bundle_source()
+    single_start = js.index("const deleteTask = useCallback")
+    bulk_start = js.index("const deleteSelected = useCallback", single_start)
+    render_start = js.index("// --- render", bulk_start)
+    single = js[single_start:bulk_start]
+    bulk = js[bulk_start:render_start]
+
+    assert single.index("const requestBoard = board;") < single.index(
+        "kanbanDialogs.request({"
+    )
+    assert single.index(
+        "const requestGeneration = boardActionGenerationRef.current;"
+    ) < single.index("kanbanDialogs.request({")
+    assert (
+        "SDK.fetchJSON(withBoard(`${API}/tasks/${encodeURIComponent(taskId)}`, "
+        "requestBoard), {"
+    ) in single
+    assert "method: \"DELETE\"" in single
+    assert single.count("isExactBoardRequestCurrent(") == 2
+
+    assert bulk.index("const requestBoard = board;") < bulk.index(
+        "kanbanDialogs.request({"
+    )
+    assert bulk.index(
+        "const requestGeneration = boardActionGenerationRef.current;"
+    ) < bulk.index("kanbanDialogs.request({")
+    assert bulk.index("const ids = Array.from(selectedIds);") < bulk.index(
+        "kanbanDialogs.request({"
+    )
+    assert (
+        "withBoard(`${API}/tasks/${encodeURIComponent(id)}`, requestBoard)"
+    ) in bulk
+    assert "SDK.fetchJSON(`${API}/tasks/" not in single + bulk
+    assert bulk.count("isExactBoardRequestCurrent(") == 3
+
+
+def test_dashboard_board_delete_completion_is_generation_local():
+    js = _dashboard_bundle_source()
+    start = js.index("const deleteBoard = useCallback")
+    end = js.index("const deleteTask = useCallback", start)
+    delete_board = js[start:end]
+
+    assert delete_board.index("const requestBoard = board;") < delete_board.index(
+        "SDK.fetchJSON("
+    )
+    assert delete_board.index(
+        "const requestGeneration = boardActionGenerationRef.current;"
+    ) < delete_board.index("SDK.fetchJSON(")
+    guard = delete_board.index("if (!isExactBoardRequestCurrent(")
+    assert guard < delete_board.index("loadBoardList();")
+    assert guard < delete_board.index('switchBoard("default");')
+    assert "if (requestBoard === slug)" in delete_board
+
+
+def test_dashboard_exact_board_request_helper_rejects_deferred_a_completion():
+    js = _dashboard_bundle_source()
+    helper_source = js[
+        js.index("const ASSIGNEE_UNASSIGNED"):
+        js.index("// The SDK's Select component")
+    ]
+    probe = helper_source + """
+const boardRef = {current: "board-a"};
+const generationRef = {current: 7};
+const requestBoard = boardRef.current;
+const requestGeneration = generationRef.current;
+const mutations = {success: 0, catch: 0, finally: 0, load: 0};
+function settle(kind) {
+  if (!isExactBoardRequestCurrent(
+    boardRef, generationRef, requestBoard, requestGeneration
+  )) return;
+  mutations[kind] += 1;
+  mutations.load += 1;
+}
+boardRef.current = "board-b";
+generationRef.current += 1;
+settle("success");
+settle("catch");
+settle("finally");
+const afterB = isExactBoardRequestCurrent(
+  boardRef, generationRef, requestBoard, requestGeneration
+);
+boardRef.current = "board-a";
+const afterReturnToA = isExactBoardRequestCurrent(
+  boardRef, generationRef, requestBoard, requestGeneration
+);
+console.log(JSON.stringify({afterB, afterReturnToA, mutations}));
+"""
+    completed = subprocess.run(
+        ["node", "-e", probe],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert json.loads(completed.stdout) == {
+        "afterB": False,
+        "afterReturnToA": False,
+        "mutations": {"success": 0, "catch": 0, "finally": 0, "load": 0},
+    }
+
+
+def test_dashboard_exact_drawer_load_helper_rejects_stale_task_and_board():
+    js = _dashboard_bundle_source()
+    helper_source = js[
+        js.index("const ASSIGNEE_UNASSIGNED"):
+        js.index("// The SDK's Select component")
+    ]
+    probe = helper_source + """
+const identityA = taskDrawerIdentity("board-a", "task-1");
+const identityB = taskDrawerIdentity("board-a", "task-2");
+const identityOtherBoard = taskDrawerIdentity("board-b", "task-2");
+const state = createTaskRequestState(identityA);
+const loadA = beginTaskLoad(state, identityA);
+let rendered = null;
+let staleWrites = 0;
+
+// Linked navigation can batch close/open. Starting B must invalidate A even
+// when the component has not unmounted yet.
+const loadB = beginTaskLoad(state, identityB);
+if (isTaskLoadCurrent(state, loadB)) rendered = "task-2";
+if (isTaskLoadCurrent(state, loadA)) {
+  rendered = "task-1";
+  staleWrites += 1;
+}
+const oldIdentityActive = isTaskIdentityActive(state, identityA);
+const currentIdentityActive = isTaskIdentityActive(state, identityB);
+deactivateTaskRequests(state);
+if (isTaskLoadCurrent(state, loadB)) staleWrites += 1;
+
+console.log(JSON.stringify({
+  identitiesDiffer: identityA !== identityB && identityB !== identityOtherBoard,
+  rendered,
+  staleWrites,
+  oldIdentityActive,
+  currentIdentityActive,
+  activeAfterUnmount: isTaskIdentityActive(state, identityB)
+}));
+"""
+    completed = subprocess.run(
+        ["node", "-e", probe],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert json.loads(completed.stdout) == {
+        "identitiesDiffer": True,
+        "rendered": "task-2",
+        "staleWrites": 0,
+        "oldIdentityActive": False,
+        "currentIdentityActive": True,
+        "activeAfterUnmount": False,
+    }
+
+
+def test_dashboard_owned_operation_helper_serializes_and_is_stale_safe():
+    js = _dashboard_bundle_source()
+    helper_source = js[
+        js.index("const ASSIGNEE_UNASSIGNED"):
+        js.index("// The SDK's Select component")
+    ]
+    probe = helper_source + """
+const owner = createOperationOwner();
+let profileRequests = 0;
+function beginProfileWrite(board, name, kind) {
+  const token = claimOwnedOperation(owner, {board, name, kind});
+  if (token === null) return null;
+  profileRequests += 1;
+  return token;
+}
+const saveA = beginProfileWrite("a", "alpha", "save");
+const busyOnA = operationOwnerIsBusy(owner);
+// A board transition does not touch the owner: profile endpoints are global.
+const autoBWhileABusy = beginProfileWrite("b", "beta", "auto");
+const requestsWhileABusy = profileRequests;
+const busyOnB = operationOwnerIsBusy(owner);
+const releaseA = releaseOwnedOperation(owner, saveA);
+const nextSaveB = beginProfileWrite("b", "beta", "save");
+const staleReleaseA = releaseOwnedOperation(owner, saveA);
+const bStillOwned = ownsOperation(owner, nextSaveB);
+const releaseB = releaseOwnedOperation(owner, nextSaveB);
+
+const createOwner = createOperationOwner();
+const form = {title: "retry me", workspace: "/repo", assignee: "builder"};
+const firstCreate = claimOwnedOperation(createOwner, {kind: "create-task"});
+const duplicateCreate = claimOwnedOperation(createOwner, {kind: "create-task"});
+const resetAfterReject = settleInlineCreateSubmission(createOwner, firstCreate, false);
+if (resetAfterReject) Object.keys(form).forEach((key) => { form[key] = ""; });
+const retryCreate = claimOwnedOperation(createOwner, {kind: "create-task"});
+const resetAfterSuccess = settleInlineCreateSubmission(createOwner, retryCreate, true);
+const preservedForRetry = Object.assign({}, form);
+if (resetAfterSuccess) Object.keys(form).forEach((key) => { form[key] = ""; });
+
+console.log(JSON.stringify({
+  saveClaimed: saveA !== null,
+  busyOnA,
+  secondBoardWriteBlocked: autoBWhileABusy === null,
+  requestsWhileABusy,
+  busyOnB,
+  releaseA,
+  nextBoardWriteAllowed: nextSaveB !== null,
+  profileRequests,
+  staleReleaseA,
+  bStillOwned,
+  releaseB,
+  busyAfterB: operationOwnerIsBusy(owner),
+  duplicateCreateBlocked: duplicateCreate === null,
+  resetAfterReject,
+  preservedForRetry,
+  retryClaimed: retryCreate !== null,
+  resetAfterSuccess,
+  formAfterSuccess: form
+}));
+"""
+    completed = subprocess.run(
+        ["node", "-e", probe],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert json.loads(completed.stdout) == {
+        "saveClaimed": True,
+        "busyOnA": True,
+        "secondBoardWriteBlocked": True,
+        "requestsWhileABusy": 1,
+        "busyOnB": True,
+        "releaseA": True,
+        "nextBoardWriteAllowed": True,
+        "profileRequests": 2,
+        "staleReleaseA": False,
+        "bStillOwned": True,
+        "releaseB": True,
+        "busyAfterB": False,
+        "duplicateCreateBlocked": True,
+        "resetAfterReject": False,
+        "preservedForRetry": {
+            "title": "retry me",
+            "workspace": "/repo",
+            "assignee": "builder",
+        },
+        "retryClaimed": True,
+        "resetAfterSuccess": True,
+        "formAfterSuccess": {"title": "", "workspace": "", "assignee": ""},
+    }
+
+
+def test_dashboard_drawer_identity_and_accessibility_wiring():
+    js = _dashboard_bundle_source()
+    page = js[
+        js.index("function KanbanPage()"):
+        js.index("function collectDiagTasks")
+    ]
+    drawer = js[js.index("function TaskDrawer"):js.index("function _fmtBytes")]
+
+    assert "key: taskDrawerIdentity(board, selectedTaskId)" in page
+    assert drawer.index("setData(null);") < drawer.index("SDK.fetchJSON(")
+    assert "const loadToken = beginTaskLoad(" in drawer
+    assert "taskDrawerIdentity(request.board, d.task.id) !== request.identity" in drawer
+    assert "const displayedData = dataIdentity === drawerIdentity ? data : null;" in drawer
+    assert "if (props.onOpenTask) props.onOpenTask(taskId);" in drawer
+    linked_open = drawer[drawer.index("onOpenTask: function (taskId)"):]
+    linked_open = linked_open[:linked_open.index("requestDialog:")]
+    assert "props.onClose()" not in linked_open
+
+    for contract in (
+        'role: "dialog"',
+        '"aria-modal": true',
+        '"aria-labelledby": drawerHeadingId',
+        'id: drawerHeadingId',
+        "ref: closeRef",
+        "closeRef.current.focus();",
+        'if (e.key === "Escape") closeDrawer();',
+        "previousFocus.focus();",
+    ):
+        assert contract in drawer
+
+
+def test_dashboard_count_changing_task_actions_refresh_board_counts():
+    js = _dashboard_bundle_source()
+    page = js[
+        js.index("function KanbanPage()"):
+        js.index("function collectDiagTasks")
+    ]
+    drawer = js[js.index("function TaskDrawer"):js.index("function _fmtBytes")]
+
+    create = page[page.index("const createTask"):page.index("const toggleSelected")]
+    assert create.index("if (!isExactBoardRequestCurrent(") < create.index(
+        "loadBoardList();"
+    )
+
+    move = page[page.index("const performMoveTask"):page.index(
+        "// Pre-dispatch dialog step"
+    )]
+    assert move.count('if (newStatus === "archived") loadBoardList();') == 2
+
+    bulk = page[page.index("const applyBulk"):page.index("// --- board switching")]
+    assert "finalPatch.archive === true || finalPatch.status === \"archived\"" in bulk
+    assert bulk.index("if (!actionIsCurrent()) return res;") < bulk.index(
+        "loadBoardList();"
+    )
+
+    single_delete = page[page.index("const deleteTask"):page.index(
+        "const deleteSelected"
+    )]
+    bulk_delete = page[page.index("const deleteSelected"):page.index("// --- render")]
+    for delete_path in (single_delete, bulk_delete):
+        assert delete_path.index("if (!isExactBoardRequestCurrent(") < (
+            delete_path.index("loadBoardList();")
+        )
+
+    assert "onCountsRefresh: loadBoardList" in page
+    assert 'finalPatch.status === "archived" && props.onCountsRefresh' in drawer
+    assert "if (props.onCountsRefresh) props.onCountsRefresh();" in drawer
+
+
+def test_dashboard_inline_create_waits_for_success_and_surfaces_rejection():
+    js = _dashboard_bundle_source()
+    column = js[js.index("function BoardColumn"):js.index("function TaskCard")]
+    inline = js[js.index("function InlineCreate"):js.index("function TaskDrawer")]
+
+    assert "return props.onCreate(body);" in column
+    assert "onSuccess: function () { setShowCreate(false); }" in column
+    assert "const operationToken = claimOwnedOperation(" in inline
+    assert "if (operationToken === null) return Promise.resolve(null);" in inline
+    assert inline.index("return props.onSubmit(body);") < inline.index(
+        "setTitle(\"\")"
+    )
+    assert "settleInlineCreateSubmission(" in inline
+    assert "setSubmitError(tx(t, \"taskCreateFailed\"" in inline
+    assert 'role: "alert"' in inline
+    assert "disabled: submitting || !title.trim()" in inline
+
+
+def test_dashboard_task_and_bulk_completions_use_exact_board_identity():
+    js = _dashboard_bundle_source()
+    page = js[
+        js.index("function KanbanPage()"):
+        js.index("function collectDiagTasks")
+    ]
+    move = page[
+        page.index("const performMoveTask"):
+        page.index("// Pre-dispatch dialog step")
+    ]
+    apply_bulk = page[
+        page.index("const applyBulk"):
+        page.index("// --- board switching")
+    ]
+
+    assert "withBoard(`${API}/tasks/bulk`, requestBoard)" in move
+    assert "`${API}/tasks/${encodeURIComponent(taskId)}`, requestBoard" in move
+    assert move.count("if (!actionIsCurrent())") >= 3
+    assert "if (!b || !actionIsCurrent()) return b;" in move
+
+    assert "const requestBoard = board;" in apply_bulk
+    assert "const requestGeneration = boardActionGenerationRef.current;" in apply_bulk
+    assert "withBoard(`${API}/tasks/bulk`, requestBoard)" in apply_bulk
+    assert apply_bulk.count("if (!actionIsCurrent())") == 2
+    assert "if (!b || !actionIsCurrent()) return b;" in apply_bulk
+
+
+def test_dashboard_create_and_nudge_callbacks_pin_exact_board_identity():
+    js = _dashboard_bundle_source()
+    page = js[
+        js.index("function KanbanPage()"):
+        js.index("function collectDiagTasks")
+    ]
+    create = page[
+        page.index("const createTask = useCallback"):
+        page.index("const toggleSelected", page.index("const createTask = useCallback"))
+    ]
+    toolbar = page[
+        page.index("onNudgeDispatch: function ()"):
+        page.index("onRefresh: loadBoard", page.index("onNudgeDispatch: function ()"))
+    ]
+
+    # Both requests capture identity before dispatch and pin the HTTP URL to it.
+    for callback in (create, toolbar):
+        assert callback.index("const requestBoard = board;") < callback.index(
+            "SDK.fetchJSON("
+        )
+        assert callback.index(
+            "const requestGeneration = boardActionGenerationRef.current;"
+        ) < callback.index("SDK.fetchJSON(")
+        assert (
+            "boardRef, boardActionGenerationRef, requestBoard, requestGeneration,"
+        ) in callback
+    assert "withBoard(`${API}/tasks`, requestBoard)" in create
+    assert "withBoard(`${API}/dispatch?max=8`, requestBoard)" in toolbar
+
+    # Create success cannot publish A's warning or reload callbacks onto B.
+    create_guard = create.index("if (!isExactBoardRequestCurrent(")
+    assert create_guard < create.index("setError(")
+    assert create_guard < create.index("loadBoard();")
+    assert create_guard < create.index("loadBoardList();")
+
+    # Nudge success and error each independently reject stale A completion.
+    assert toolbar.count("if (!isExactBoardRequestCurrent(") == 2
+    success_guard = toolbar.index("if (!isExactBoardRequestCurrent(")
+    error_guard = toolbar.index("if (!isExactBoardRequestCurrent(", success_guard + 1)
+    assert success_guard < toolbar.index("loadBoard()")
+    assert error_guard < toolbar.index("setError(")
+
+
+def test_dashboard_board_load_and_websocket_are_generation_local():
+    js = _dashboard_bundle_source()
+    page = js[
+        js.index("function KanbanPage()"):
+        js.index("function collectDiagTasks")
+    ]
+
+    # Full-board and page-level profile loads reject stale success/error/finally.
+    assert "const boardActionGenerationRef = useRef(0);" in page
+    assert "const boardLoadGenerationRef = useRef(0);" in page
+    assert "const profilesGenerationRef = useRef(0);" in page
+    assert page.count(
+        "boardRef, boardLoadGenerationRef, requestBoard, requestGeneration,"
+    ) == 3
+    assert "SDK.fetchJSON(withBoard(`${API}/profiles`, requestBoard))" in page
+    assert page.count(
+        "boardRef, profilesGenerationRef, requestBoard, requestGeneration,"
+    ) == 2
+
+    # Each WS effect owns its close flag, socket, timer, and backoff.
+    for contract in (
+        "let closed = false;",
+        "let socket = null;",
+        "let reconnectTimer = null;",
+        "let backoff = 1000;",
+        "if (closed || boardRef.current !== socketBoard) return;",
+        "if (reconnectTimer) clearTimeout(reconnectTimer);",
+        "try { ws.close(); } catch (_e) { /* noop */ }",
+    ):
+        assert contract in page
+    assert "wsClosedRef" not in page
+    assert "wsBackoffRef" not in page
+    assert "wsRef" not in page
+
+    # The visible error-only state retries through the production exact-board
+    # helper. A callback retained from A cannot start loading after B is active.
+    error_render = page[
+        page.index("if (error && !boardData)"):
+        page.index("if (!filteredBoard)")
+    ]
+    assert "h(Button, {" in error_render
+    assert "onClick: retryBoardLoad," in error_render
+    assert 'tx(t, "retry", "Retry")' in error_render
+    assert (
+        "return retryExactBoardLoad(boardRef, board, setLoading, loadBoard);"
+        in page
+    )
+
+    helper_source = js[
+        js.index("const ASSIGNEE_UNASSIGNED"):
+        js.index("// The SDK's Select component")
+    ]
+    probe = helper_source + """
+const retryBoardRef = {current: "board-a"};
+const loadingFor = [];
+const requests = [];
+function retry(capturedBoard) {
+  return retryExactBoardLoad(
+    retryBoardRef,
+    capturedBoard,
+    function () { loadingFor.push(capturedBoard); },
+    function () {
+      requests.push(capturedBoard);
+      return Promise.resolve({board: capturedBoard});
+    }
+  );
+}
+const staleRetryA = function () { return retry("board-a"); };
+retryBoardRef.current = "board-b";
+Promise.all([staleRetryA(), retry("board-b")]).then(function (results) {
+  console.log(JSON.stringify({loadingFor, requests, results}));
+});
+"""
+    completed = subprocess.run(
+        ["node", "-e", probe],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert json.loads(completed.stdout) == {
+        "loadingFor": ["board-b"],
+        "requests": ["board-b"],
+        "results": [None, {"board": "board-b"}],
+    }
+
+    # A switch invalidates work and clears every board-local interaction surface.
+    switch = page[page.index("const switchBoard"):page.index("const createNewBoard")]
+    for contract in (
+        "boardActionGenerationRef.current += 1;",
+        "boardLoadGenerationRef.current += 1;",
+        "profilesGenerationRef.current += 1;",
+        "setSelectedTaskId(null);",
+        "setShowNewBoard(false);",
+        "setShowBoardSettings(false);",
+        "setTaskEventTick({});",
+        "kanbanDialogs.cancel();",
+        "clearSelected();",
+    ):
+        assert contract in switch
+    assert "key: board" in page
+
+
+def test_dashboard_effective_roster_drives_every_assignment_surface():
+    js = _dashboard_bundle_source()
+
+    # Execute the production-used pure roster/sentinel helpers, rather than
+    # only proving their names are present in the bundle.
+    helper_source = js[
+        js.index("const ASSIGNEE_UNASSIGNED"):
+        js.index("// The SDK's Select component")
+    ]
+    probe = helper_source + """
+const names = effectiveProfileNames([
+  {name: "alpha", effective_allowed: true},
+  {name: "historical", effective_allowed: false}
+]);
+console.log(JSON.stringify({
+  names,
+  allowed: canSubmitAssignee("alpha", names, true),
+  historical: canSubmitAssignee("historical", names, true),
+  unassigned: canSubmitAssignee(ASSIGNEE_UNASSIGNED, names, true),
+  patchNone: assignmentPatchValue(ASSIGNEE_UNASSIGNED),
+  createAuto: assignmentCreateValue(ASSIGNEE_DISPATCHER),
+  normalizedAllowed: normalizeCreateAssignee("alpha", names),
+  normalizedStale: normalizeCreateAssignee("historical", names),
+  allowedPayload: {assignee: createTaskAssigneeValue("alpha", names)},
+  stalePayload: {assignee: createTaskAssigneeValue("historical", names)},
+  dispatcherPayload: {assignee: createTaskAssigneeValue(ASSIGNEE_DISPATCHER, names)},
+  sentinelsDiffer: ASSIGNEE_UNASSIGNED !== ASSIGNEE_DISPATCHER
+}));
+"""
+    completed = subprocess.run(
+        ["node", "-e", probe],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert json.loads(completed.stdout) == {
+        "names": ["alpha"],
+        "allowed": True,
+        "historical": False,
+        "unassigned": True,
+        "patchNone": "",
+        "createAuto": None,
+        "normalizedAllowed": "alpha",
+        "normalizedStale": "__kanban_dispatcher__",
+        "allowedPayload": {"assignee": "alpha"},
+        "stalePayload": {"assignee": None},
+        "dispatcherPayload": {"assignee": None},
+        "sentinelsDiffer": True,
+    }
+
+    # Page roster flows through bulk, drawer/diagnostics, and create columns.
+    assert "return profilesBoard === board ? effectiveProfileNames(profiles) : [];" in js
+    assert js.count("effectiveAssignees: effectiveAssignees") >= 3
+    assert "effectiveAssignees: props.effectiveAssignees" in js
+
+    inline = js[js.index("function InlineCreate"):js.index("function TaskDrawer")]
+    assert "useState(ASSIGNEE_DISPATCHER)" in inline
+    assert "const controlledAssignee = normalizeCreateAssignee(" in inline
+    assert "if (assignee !== controlledAssignee) setAssignee(controlledAssignee);" in inline
+    assert "value: controlledAssignee" in inline
+    assert "const payloadAssignee = createTaskAssigneeValue(" in inline
+    assert "assignee, props.effectiveAssignees || []," in inline
+    assert "assignee: payloadAssignee" in inline
+    assert "props.effectiveAssignees || []" in inline
+    assert "assignee.trim()" not in inline
+
+    diagnostic = js[js.index("function DiagnosticCard"):js.index("function DiagnosticsSection")]
+    assert "value: ASSIGNEE_UNASSIGNED" in diagnostic
+    assert "profile: nextProfile || null" in diagnostic
+    assert "canSubmitAssignee(reassignProfile, effectiveAssignees, true)" in diagnostic
+
+    drawer = js[js.index("function AssigneeEditor"):js.index("function PriorityEditor")]
+    assert "value: ASSIGNEE_UNASSIGNED" in drawer
+    assert "disabled: true" in drawer
+    assert "assignee: assignmentPatchValue(v)" in drawer
+    assert "h(Input" not in drawer
+
+
 # ---------------------------------------------------------------------------
-# Final result visibility for Done cards
+# Board-scoped profile policy and orchestration settings
 # ---------------------------------------------------------------------------
 
 
+@pytest.fixture
+def policy_boards(kanban_home):
+    profiles_root = kanban_home / "profiles"
+    for name in ("alpha", "beta", "blocked"):
+        (profiles_root / name).mkdir(parents=True)
+
+    kb.create_board("board-a", name="Board A")
+    kb.create_board("board-b", name="Board B")
+    kb.write_board_metadata("board-a", allowed_profiles=["alpha"])
+    kb.write_board_metadata("board-b", allowed_profiles=["beta"])
+
+    config_path = kanban_home / "config.yaml"
+    config_path.write_text(
+        json.dumps(
+            {
+                "kanban": {
+                    "allowed_profiles": ["default", "alpha", "beta"],
+                    "orchestrator_profile": "alpha",
+                    "default_assignee": "beta",
+                    "auto_decompose": True,
+                    "auto_promote_children": False,
+                },
+                "policy_test_sentinel": {"preserve": True},
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return {
+        "home": kanban_home,
+        "config_path": config_path,
+        "board_a_path": kb.board_metadata_path("board-a"),
+        "board_b_path": kb.board_metadata_path("board-b"),
+    }
+
+
+def _profile_policy_flags(response):
+    assert response.status_code == 200, response.text
+    return {
+        profile["name"]: {
+            "machine_allowed": profile["machine_allowed"],
+            "board_selected": profile["board_selected"],
+            "effective_allowed": profile["effective_allowed"],
+        }
+        for profile in response.json()["profiles"]
+    }
+
+
+def test_profiles_are_all_visible_with_board_scoped_policy_flags(
+    client, policy_boards,
+):
+    # A raw board subset can select a machine-blocked profile. It remains
+    # visible and selected, but can never become effectively assignable.
+    kb.write_board_metadata(
+        "board-a",
+        allowed_profiles=["alpha", "blocked"],
+    )
+
+    assert _profile_policy_flags(
+        client.get("/api/plugins/kanban/profiles?board=board-a")
+    ) == {
+        "default": {
+            "machine_allowed": True,
+            "board_selected": False,
+            "effective_allowed": False,
+        },
+        "alpha": {
+            "machine_allowed": True,
+            "board_selected": True,
+            "effective_allowed": True,
+        },
+        "beta": {
+            "machine_allowed": True,
+            "board_selected": False,
+            "effective_allowed": False,
+        },
+        "blocked": {
+            "machine_allowed": False,
+            "board_selected": True,
+            "effective_allowed": False,
+        },
+    }
+    assert _profile_policy_flags(
+        client.get("/api/plugins/kanban/profiles?board=board-b")
+    ) == {
+        "default": {
+            "machine_allowed": True,
+            "board_selected": False,
+            "effective_allowed": False,
+        },
+        "alpha": {
+            "machine_allowed": True,
+            "board_selected": False,
+            "effective_allowed": False,
+        },
+        "beta": {
+            "machine_allowed": True,
+            "board_selected": True,
+            "effective_allowed": True,
+        },
+        "blocked": {
+            "machine_allowed": False,
+            "board_selected": False,
+            "effective_allowed": False,
+        },
+    }
+
+    # Omitting board follows the current board selected by the connection.
+    kb.set_current_board("board-b")
+    assert _profile_policy_flags(
+        client.get("/api/plugins/kanban/profiles")
+    ) == _profile_policy_flags(
+        client.get("/api/plugins/kanban/profiles?board=board-b")
+    )
+
+
+def test_get_orchestration_reports_raw_effective_and_resolved_per_board(
+    client, policy_boards,
+):
+    board_a = client.get(
+        "/api/plugins/kanban/orchestration?board=board-a"
+    )
+    assert board_a.status_code == 200, board_a.text
+    assert board_a.json() == {
+        "board": "board-a",
+        "orchestrator_profile": "alpha",
+        "default_assignee": "beta",
+        "auto_decompose": True,
+        "auto_promote_children": False,
+        "resolved_orchestrator_profile": "alpha",
+        "resolved_default_assignee": "alpha",
+        "active_profile": "default",
+        "board_allowed_profiles": ["alpha"],
+        "effective_allowed_profiles": ["alpha"],
+    }
+
+    board_b = client.get(
+        "/api/plugins/kanban/orchestration?board=board-b"
+    )
+    assert board_b.status_code == 200, board_b.text
+    assert board_b.json()["board"] == "board-b"
+    assert board_b.json()["board_allowed_profiles"] == ["beta"]
+    assert board_b.json()["effective_allowed_profiles"] == ["beta"]
+    assert board_b.json()["resolved_orchestrator_profile"] == "beta"
+    assert board_b.json()["resolved_default_assignee"] == "beta"
+
+    kb.write_board_metadata("board-a", allowed_profiles=[])
+    empty = client.get(
+        "/api/plugins/kanban/orchestration?board=board-a"
+    )
+    assert empty.status_code == 200, empty.text
+    assert empty.json()["board_allowed_profiles"] == []
+    assert empty.json()["effective_allowed_profiles"] == []
+    assert empty.json()["resolved_orchestrator_profile"] is None
+    assert empty.json()["resolved_default_assignee"] is None
+
+    kb.set_current_board("board-b")
+    current = client.get("/api/plugins/kanban/orchestration")
+    assert current.status_code == 200, current.text
+    assert current.json()["board"] == "board-b"
+    assert current.json()["effective_allowed_profiles"] == ["beta"]
+
+
+def test_get_policy_endpoints_fail_closed_for_non_mapping_kanban_config(
+    client, policy_boards,
+):
+    config_path = policy_boards["config_path"]
+    board_path = policy_boards["board_a_path"]
+    config_path.write_text(
+        json.dumps(
+            {
+                "kanban": ["not", "a", "mapping"],
+                "policy_test_sentinel": {"preserve": True},
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    config_before = config_path.read_bytes()
+    board_before = board_path.read_bytes()
+
+    roster = client.get("/api/plugins/kanban/profiles?board=board-a")
+    assert roster.status_code == 200, roster.text
+    assert all(
+        not profile["machine_allowed"] and not profile["effective_allowed"]
+        for profile in roster.json()["profiles"]
+    )
+
+    settings = client.get(
+        "/api/plugins/kanban/orchestration?board=board-a"
+    )
+    assert settings.status_code == 200, settings.text
+    assert settings.json()["orchestrator_profile"] == ""
+    assert settings.json()["default_assignee"] == ""
+    assert settings.json()["auto_decompose"] is True
+    assert settings.json()["auto_promote_children"] is True
+    assert settings.json()["board_allowed_profiles"] == ["alpha"]
+    assert settings.json()["effective_allowed_profiles"] == []
+    assert settings.json()["resolved_orchestrator_profile"] is None
+    assert settings.json()["resolved_default_assignee"] is None
+    assert config_path.read_bytes() == config_before
+    assert board_path.read_bytes() == board_before
+
+
+def test_get_orchestration_uses_safe_defaults_for_malformed_config_leaves(
+    client, policy_boards,
+):
+    config_path = policy_boards["config_path"]
+    board_path = policy_boards["board_a_path"]
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    config["kanban"].update(
+        {
+            "orchestrator_profile": [],
+            "default_assignee": {"profile": "beta"},
+            "auto_decompose": "false",
+        }
+    )
+    config_path.write_text(
+        json.dumps(config, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    config_before = config_path.read_bytes()
+    board_before = board_path.read_bytes()
+    other_board_before = policy_boards["board_b_path"].read_bytes()
+
+    response = client.get(
+        "/api/plugins/kanban/orchestration?board=board-a"
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {
+        "board": "board-a",
+        "orchestrator_profile": "",
+        "default_assignee": "",
+        "auto_decompose": True,
+        "auto_promote_children": False,
+        "resolved_orchestrator_profile": "alpha",
+        "resolved_default_assignee": "alpha",
+        "active_profile": "default",
+        "board_allowed_profiles": ["alpha"],
+        "effective_allowed_profiles": ["alpha"],
+    }
+    assert config_path.read_bytes() == config_before
+    assert board_path.read_bytes() == board_before
+    assert policy_boards["board_b_path"].read_bytes() == other_board_before
+
+
+def test_put_preserves_unrelated_malformed_config_leaves(
+    client, policy_boards,
+):
+    from hermes_cli.config import read_raw_config
+
+    config_path = policy_boards["config_path"]
+    board_path = policy_boards["board_a_path"]
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    config["kanban"].update(
+        {
+            "orchestrator_profile": [],
+            "default_assignee": {"profile": "beta"},
+            "auto_decompose": "false",
+        }
+    )
+    config_path.write_text(
+        json.dumps(config, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    board_before = board_path.read_bytes()
+    other_board_before = policy_boards["board_b_path"].read_bytes()
+
+    response = client.put(
+        "/api/plugins/kanban/orchestration?board=board-a",
+        json={"auto_promote_children": True},
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["orchestrator_profile"] == ""
+    assert response.json()["default_assignee"] == ""
+    assert response.json()["auto_decompose"] is True
+    assert response.json()["auto_promote_children"] is True
+    assert response.json()["resolved_orchestrator_profile"] == "alpha"
+    assert response.json()["resolved_default_assignee"] == "alpha"
+    assert response.json()["effective_allowed_profiles"] == ["alpha"]
+
+    config["kanban"]["auto_promote_children"] = True
+    saved_config = read_raw_config()
+    assert isinstance(saved_config.pop("_config_version"), int)
+    assert saved_config == config
+    assert board_path.read_bytes() == board_before
+    assert policy_boards["board_b_path"].read_bytes() == other_board_before
+
+
+def test_put_allowed_profiles_tri_state_isolated_and_config_write_free(
+    client, policy_boards,
+):
+    config_path = policy_boards["config_path"]
+    board_b_path = policy_boards["board_b_path"]
+    original_config = config_path.read_bytes()
+    original_board_b = board_b_path.read_bytes()
+
+    selected = client.put(
+        "/api/plugins/kanban/orchestration?board=board-a",
+        json={"allowed_profiles": [" Alpha ", "alpha"]},
+    )
+    assert selected.status_code == 200, selected.text
+    assert selected.json()["board_allowed_profiles"] == ["alpha"]
+    assert kb.read_board_metadata("board-a")["allowed_profiles"] == ["alpha"]
+    assert config_path.read_bytes() == original_config
+    assert board_b_path.read_bytes() == original_board_b
+
+    inherited = client.put(
+        "/api/plugins/kanban/orchestration?board=board-a",
+        json={"allowed_profiles": None},
+    )
+    assert inherited.status_code == 200, inherited.text
+    assert inherited.json()["board_allowed_profiles"] is None
+    assert inherited.json()["effective_allowed_profiles"] == [
+        "alpha",
+        "beta",
+        "default",
+    ]
+    assert config_path.read_bytes() == original_config
+    assert board_b_path.read_bytes() == original_board_b
+
+    empty = client.put(
+        "/api/plugins/kanban/orchestration?board=board-a",
+        json={"allowed_profiles": []},
+    )
+    assert empty.status_code == 200, empty.text
+    assert empty.json()["board_allowed_profiles"] == []
+    assert config_path.read_bytes() == original_config
+    assert board_b_path.read_bytes() == original_board_b
+
+    # Omitting allowed_profiles preserves the explicit empty board policy.
+    global_update = client.put(
+        "/api/plugins/kanban/orchestration?board=board-a",
+        json={"auto_decompose": False},
+    )
+    assert global_update.status_code == 200, global_update.text
+    assert kb.read_board_metadata("board-a")["allowed_profiles"] == []
+    assert kb.read_board_metadata("board-b")["allowed_profiles"] == ["beta"]
+
+    # A no-board PUT follows the connection/current board instead of default.
+    config_after_global_update = config_path.read_bytes()
+    kb.set_current_board("board-b")
+    current_update = client.put(
+        "/api/plugins/kanban/orchestration",
+        json={"allowed_profiles": ["alpha"]},
+    )
+    assert current_update.status_code == 200, current_update.text
+    assert current_update.json()["board"] == "board-b"
+    assert kb.read_board_metadata("board-a")["allowed_profiles"] == []
+    assert kb.read_board_metadata("board-b")["allowed_profiles"] == ["alpha"]
+    assert config_path.read_bytes() == config_after_global_update
+
+
+def test_put_keeps_global_writes_and_scopes_new_policy_to_requested_board(
+    client, policy_boards,
+):
+    board_b_before = policy_boards["board_b_path"].read_bytes()
+
+    response = client.put(
+        "/api/plugins/kanban/orchestration?board=board-a",
+        json={
+            "allowed_profiles": [" Beta ", "beta"],
+            "orchestrator_profile": "BETA",
+            "default_assignee": "beta",
+            "auto_decompose": False,
+            "auto_promote_children": True,
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["board_allowed_profiles"] == ["beta"]
+    assert response.json()["resolved_orchestrator_profile"] == "beta"
+    assert response.json()["resolved_default_assignee"] == "beta"
+    assert response.json()["auto_decompose"] is False
+    assert response.json()["auto_promote_children"] is True
+    assert kb.read_board_metadata("board-a")["allowed_profiles"] == ["beta"]
+    assert policy_boards["board_b_path"].read_bytes() == board_b_before
+
+    from hermes_cli.config import load_config
+
+    kanban_config = load_config()["kanban"]
+    assert kanban_config["allowed_profiles"] == ["default", "alpha", "beta"]
+    assert kanban_config["orchestrator_profile"] == "beta"
+    assert kanban_config["default_assignee"] == "beta"
+    assert kanban_config["auto_decompose"] is False
+    assert kanban_config["auto_promote_children"] is True
+
+
+@pytest.mark.parametrize(
+    ("allowed_profiles", "detail_fragment"),
+    [
+        (["bad/name"], "invalid"),
+        ([123], "invalid"),
+        (["missing"], "does not exist"),
+        (["blocked"], "machine ceiling"),
+    ],
+)
+def test_put_rejects_invalid_uninstalled_or_machine_blocked_board_profiles(
+    client, policy_boards, allowed_profiles, detail_fragment,
+):
+    board_path = policy_boards["board_a_path"]
+    config_path = policy_boards["config_path"]
+    board_before = board_path.read_bytes()
+    config_before = config_path.read_bytes()
+
+    response = client.put(
+        "/api/plugins/kanban/orchestration?board=board-a",
+        json={"allowed_profiles": allowed_profiles},
+    )
+
+    assert response.status_code == 400, response.text
+    assert detail_fragment in response.json()["detail"].lower()
+    assert board_path.read_bytes() == board_before
+    assert config_path.read_bytes() == config_before
+
+
+@pytest.mark.parametrize("selector", ["orchestrator_profile", "default_assignee"])
+def test_put_rejects_selector_disallowed_by_prospective_board_policy_atomically(
+    client, policy_boards, selector,
+):
+    board_path = policy_boards["board_a_path"]
+    config_path = policy_boards["config_path"]
+    board_before = board_path.read_bytes()
+    config_before = config_path.read_bytes()
+
+    response = client.put(
+        "/api/plugins/kanban/orchestration?board=board-a",
+        json={"allowed_profiles": ["beta"], selector: "alpha"},
+    )
+
+    assert response.status_code == 400, response.text
+    assert "board" in response.json()["detail"].lower()
+    assert board_path.read_bytes() == board_before
+    assert config_path.read_bytes() == config_before
+
+
+def test_policy_endpoints_reject_unknown_board_without_mutation(
+    client, policy_boards,
+):
+    config_path = policy_boards["config_path"]
+    config_before = config_path.read_bytes()
+
+    for method, path, kwargs in (
+        ("get", "/api/plugins/kanban/profiles?board=unknown", {}),
+        ("get", "/api/plugins/kanban/orchestration?board=unknown", {}),
+        (
+            "put",
+            "/api/plugins/kanban/orchestration?board=unknown",
+            {"json": {"allowed_profiles": ["alpha"]}},
+        ),
+    ):
+        response = getattr(client, method)(path, **kwargs)
+        assert response.status_code == 404, response.text
+
+    assert not kb.board_exists("unknown")
+    assert config_path.read_bytes() == config_before
+
+
+@pytest.mark.parametrize(
+    ("malformed_config", "detail_fragment"),
+    [
+        (["not", "a", "mapping"], "root"),
+        ({"kanban": ["not", "a", "mapping"]}, "kanban"),
+    ],
+)
+def test_put_refuses_malformed_global_config_before_any_mixed_write(
+    client, policy_boards, malformed_config, detail_fragment,
+):
+    config_path = policy_boards["config_path"]
+    board_path = policy_boards["board_a_path"]
+    config_path.write_text(
+        json.dumps(malformed_config, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    config_before = config_path.read_bytes()
+    board_before = board_path.read_bytes()
+
+    response = client.put(
+        "/api/plugins/kanban/orchestration?board=board-a",
+        json={"allowed_profiles": [], "auto_decompose": False},
+    )
+
+    assert response.status_code == 500, response.text
+    detail = response.json()["detail"].lower()
+    assert "malformed config" in detail
+    assert detail_fragment in detail
+    assert config_path.read_bytes() == config_before
+    assert board_path.read_bytes() == board_before
+
+
+def test_policy_only_put_remains_config_write_free_with_malformed_global_config(
+    client, policy_boards,
+):
+    config_path = policy_boards["config_path"]
+    config_path.write_text('["malformed-root"]\n', encoding="utf-8")
+    config_before = config_path.read_bytes()
+
+    response = client.put(
+        "/api/plugins/kanban/orchestration?board=board-a",
+        json={"allowed_profiles": []},
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["board_allowed_profiles"] == []
+    assert config_path.read_bytes() == config_before
+    assert kb.read_board_metadata("board-a")["allowed_profiles"] == []
+
+
+def test_malformed_board_policy_is_reported_and_validated_fail_closed(
+    client, policy_boards,
+):
+    board_path = policy_boards["board_a_path"]
+    config_path = policy_boards["config_path"]
+    malformed_metadata = {
+        "slug": "board-a",
+        "name": "Board A",
+        "allowed_profiles": "alpha",
+        "policy_test_sentinel": {"preserve": True},
+    }
+    board_path.write_text(
+        json.dumps(malformed_metadata, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+    roster = client.get("/api/plugins/kanban/profiles?board=board-a")
+    assert roster.status_code == 200, roster.text
+    assert all(
+        not profile["board_selected"] and not profile["effective_allowed"]
+        for profile in roster.json()["profiles"]
+    )
+
+    settings = client.get(
+        "/api/plugins/kanban/orchestration?board=board-a"
+    )
+    assert settings.status_code == 200, settings.text
+    assert settings.json()["board_allowed_profiles"] == []
+    assert settings.json()["effective_allowed_profiles"] == []
+
+    board_before = board_path.read_bytes()
+    config_before = config_path.read_bytes()
+    rejected = client.put(
+        "/api/plugins/kanban/orchestration?board=board-a",
+        json={"orchestrator_profile": "alpha"},
+    )
+    assert rejected.status_code == 400, rejected.text
+    assert "effective policy" in rejected.json()["detail"].lower()
+    assert board_path.read_bytes() == board_before
+    assert config_path.read_bytes() == config_before
+
+    repaired = client.put(
+        "/api/plugins/kanban/orchestration?board=board-a",
+        json={"allowed_profiles": ["alpha"]},
+    )
+    assert repaired.status_code == 200, repaired.text
+    assert repaired.json()["board_allowed_profiles"] == ["alpha"]
+    assert kb.read_board_metadata("board-a")["policy_test_sentinel"] == {
+        "preserve": True,
+    }
+    assert config_path.read_bytes() == config_before
+
+
+def test_mixed_put_saves_config_before_board_and_leaves_board_on_config_failure(
+    client, policy_boards, monkeypatch,
+):
+    from hermes_cli import config as config_mod
+
+    config_path = policy_boards["config_path"]
+    board_path = policy_boards["board_a_path"]
+    config_before = config_path.read_bytes()
+    board_before = board_path.read_bytes()
+    calls = []
+
+    def fail_config_save(_cfg):
+        calls.append("config")
+        raise OSError("config save exploded")
+
+    def unexpected_board_write(*_args, **_kwargs):
+        calls.append("board")
+        raise AssertionError("board write ran before config save completed")
+
+    monkeypatch.setattr(config_mod, "save_config", fail_config_save)
+    monkeypatch.setattr(kb, "write_board_metadata", unexpected_board_write)
+
+    response = client.put(
+        "/api/plugins/kanban/orchestration?board=board-a",
+        json={
+            "allowed_profiles": ["beta"],
+            "orchestrator_profile": "beta",
+        },
+    )
+
+    assert response.status_code == 500, response.text
+    assert "failed to save config" in response.json()["detail"].lower()
+    assert calls == ["config"]
+    assert config_path.read_bytes() == config_before
+    assert board_path.read_bytes() == board_before
+
+
+def test_mixed_put_rolls_config_back_when_board_write_fails(
+    client, policy_boards, monkeypatch,
+):
+    from hermes_cli import config as config_mod
+
+    original_save_config = config_mod.save_config
+    original_config = config_mod.load_config()
+    board_path = policy_boards["board_a_path"]
+    board_before = board_path.read_bytes()
+    calls = []
+
+    def recording_save(cfg):
+        calls.append("config")
+        original_save_config(cfg)
+
+    def fail_board_write(*_args, **_kwargs):
+        calls.append("board")
+        assert config_mod.load_config()["kanban"]["orchestrator_profile"] == "beta"
+        raise OSError("board write exploded")
+
+    monkeypatch.setattr(config_mod, "save_config", recording_save)
+    monkeypatch.setattr(kb, "write_board_metadata", fail_board_write)
+
+    response = client.put(
+        "/api/plugins/kanban/orchestration?board=board-a",
+        json={
+            "allowed_profiles": ["beta"],
+            "orchestrator_profile": "beta",
+        },
+    )
+
+    assert response.status_code == 500, response.text
+    assert "config restored" in response.json()["detail"].lower()
+    assert calls == ["config", "board", "config"]
+    assert config_mod.load_config() == original_config
+    assert board_path.read_bytes() == board_before
+
+
+def test_mixed_put_reports_config_rollback_failure(
+    client, policy_boards, monkeypatch, caplog,
+):
+    from hermes_cli import config as config_mod
+
+    original_save_config = config_mod.save_config
+    board_path = policy_boards["board_a_path"]
+    board_before = board_path.read_bytes()
+    save_calls = 0
+
+    def fail_second_save(cfg):
+        nonlocal save_calls
+        save_calls += 1
+        if save_calls == 2:
+            raise OSError("rollback exploded")
+        original_save_config(cfg)
+
+    def fail_board_write(*_args, **_kwargs):
+        raise OSError("board write exploded")
+
+    monkeypatch.setattr(config_mod, "save_config", fail_second_save)
+    monkeypatch.setattr(kb, "write_board_metadata", fail_board_write)
+
+    with caplog.at_level("ERROR"):
+        response = client.put(
+            "/api/plugins/kanban/orchestration?board=board-a",
+            json={
+                "allowed_profiles": ["beta"],
+                "orchestrator_profile": "beta",
+            },
+        )
+
+    assert response.status_code == 500, response.text
+    detail = response.json()["detail"].lower()
+    assert "board write exploded" in detail
+    assert "rollback failed" in detail
+    assert "rollback exploded" in detail
+    assert "rollback exploded" in caplog.text
+    assert save_calls == 2
+    assert board_path.read_bytes() == board_before
+
+
+def test_mixed_put_transaction_serializes_rollback_before_later_success(
+    client, policy_boards, monkeypatch,
+):
+    """A failed mixed write cannot roll stale config over a later success."""
+    from hermes_cli import config as config_mod
+
+    original_save_config = config_mod.save_config
+    original_write_board_metadata = kb.write_board_metadata
+    first_save_entered = threading.Event()
+    release_first_save = threading.Event()
+    second_save_entered = threading.Event()
+    second_start = threading.Barrier(2)
+    responses = {}
+    save_calls = []
+    board_calls = []
+
+    def controlled_save(cfg):
+        kanban_cfg = cfg["kanban"]
+        profile = kanban_cfg["orchestrator_profile"]
+        auto_decompose = kanban_cfg["auto_decompose"]
+        save_calls.append((profile, auto_decompose))
+        if profile == "beta":
+            first_save_entered.set()
+            assert release_first_save.wait(5), "timed out releasing first config save"
+        elif profile == "alpha" and auto_decompose is False:
+            second_save_entered.set()
+        original_save_config(cfg)
+
+    def fail_first_board_write(*args, **kwargs):
+        allowed = kwargs.get("allowed_profiles")
+        board_calls.append(tuple(allowed) if allowed is not None else None)
+        if allowed == ["beta"]:
+            raise OSError("first board write exploded")
+        return original_write_board_metadata(*args, **kwargs)
+
+    def run_first_request():
+        responses["first"] = TestClient(client.app).put(
+            "/api/plugins/kanban/orchestration?board=board-a",
+            json={
+                "allowed_profiles": ["beta"],
+                "orchestrator_profile": "beta",
+            },
+        )
+
+    def run_second_request():
+        second_start.wait()
+        responses["second"] = TestClient(client.app).put(
+            "/api/plugins/kanban/orchestration?board=board-a",
+            json={
+                "allowed_profiles": ["alpha"],
+                "orchestrator_profile": "alpha",
+                "auto_decompose": False,
+            },
+        )
+
+    monkeypatch.setattr(config_mod, "save_config", controlled_save)
+    monkeypatch.setattr(kb, "write_board_metadata", fail_first_board_write)
+
+    first_thread = threading.Thread(target=run_first_request, name="first-mixed-put")
+    second_thread = threading.Thread(target=run_second_request, name="second-mixed-put")
+    first_thread.start()
+    try:
+        assert first_save_entered.wait(5), "first request never entered config save"
+        second_thread.start()
+        second_start.wait()
+        assert not second_save_entered.wait(0.5), (
+            "second request entered config save while the first mixed transaction "
+            "was blocked"
+        )
+    finally:
+        release_first_save.set()
+        first_thread.join(5)
+        if second_thread.ident is not None:
+            second_thread.join(5)
+
+    assert not first_thread.is_alive()
+    assert not second_thread.is_alive()
+    assert responses["first"].status_code == 500, responses["first"].text
+    assert "config restored" in responses["first"].json()["detail"].lower()
+    assert responses["second"].status_code == 200, responses["second"].text
+    assert save_calls == [
+        ("beta", True),
+        ("alpha", True),
+        ("alpha", False),
+    ]
+    assert board_calls == [("beta",), ("alpha",)]
+    assert config_mod.load_config()["kanban"]["orchestrator_profile"] == "alpha"
+    assert config_mod.load_config()["kanban"]["auto_decompose"] is False
+    assert kb.read_board_metadata("board-a")["allowed_profiles"] == ["alpha"]
+
+    plugin_module = sys.modules["hermes_dashboard_plugin_kanban_test"]
+    transaction_lock = plugin_module._ORCHESTRATION_MUTATION_LOCK
+    assert transaction_lock.acquire(blocking=False), (
+        "orchestration transaction lock remained held after the board-write exception"
+    )
+    transaction_lock.release()

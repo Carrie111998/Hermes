@@ -525,6 +525,7 @@ def _relative_age(ts: Optional[int], now: Optional[int] = None) -> str:
 # ---------------------------------------------------------------------------
 
 DEFAULT_BOARD = "default"
+_ALLOWED_PROFILES_UNSET = object()
 _CURRENT_BOARD_OVERRIDE: ContextVar[str | None] = ContextVar(
     "hermes_kanban_current_board_override",
     default=None,
@@ -812,8 +813,8 @@ def board_metadata_path(board: Optional[str] = None) -> Path:
     """Return the path to ``board.json`` for ``board``.
 
     Stores display metadata (display name, description, icon, color,
-    created_at). The on-disk slug is the canonical identity; this file
-    is purely for presentation in the CLI / dashboard.
+    created_at) and board policy such as ``allowed_profiles``. The on-disk
+    slug is the canonical identity.
     """
     slug = _normalize_board_slug(board) or DEFAULT_BOARD
     return board_dir(slug) / "board.json"
@@ -829,22 +830,16 @@ def _default_board_display_name(slug: str) -> str:
     return " ".join(part.capitalize() for part in slug.replace("_", "-").split("-") if part) or slug
 
 
-def read_board_metadata(board: Optional[str] = None) -> dict:
-    """Return ``board.json`` contents (or synthesized defaults).
-
-    Never raises — a missing / malformed ``board.json`` falls back to a
-    synthesised entry so the dashboard always has something to render.
-    Includes the canonical ``slug`` and ``db_path`` so the caller
-    doesn't need to reconstruct them.
-    """
-    slug = _normalize_board_slug(board) or DEFAULT_BOARD
-    meta: dict[str, Any] = {
+def _board_metadata_defaults(slug: str) -> dict[str, Any]:
+    """Return the synthesized metadata schema for one canonical board slug."""
+    return {
         "slug": slug,
         "name": _default_board_display_name(slug),
         "description": "",
         "icon": "",
         "color": "",
         "default_workdir": None,
+        "allowed_profiles": None,
         # Optional first-class Project this board is scoped to. When set, new
         # tasks inherit it (deterministic worktree + branch under the project's
         # primary repo) and ``default_workdir`` mirrors the project's primary
@@ -853,18 +848,80 @@ def read_board_metadata(board: Optional[str] = None) -> dict:
         "created_at": None,
         "archived": False,
     }
+
+
+def _normalize_allowed_profiles_api(value: object) -> Optional[list[str]]:
+    """Validate and canonicalize an API-supplied board profile subset."""
+    if value is None:
+        return None
+    if not isinstance(value, list):
+        raise ValueError("allowed_profiles must be a list of profile names or None")
+
+    from hermes_cli.profiles import normalize_profile_name, validate_profile_name
+
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for entry in value:
+        if not isinstance(entry, str):
+            raise ValueError("allowed_profiles entries must be profile names")
+        try:
+            profile = normalize_profile_name(entry)
+            validate_profile_name(profile)
+        except ValueError as exc:
+            raise ValueError(f"invalid allowed_profiles entry {entry!r}: {exc}") from exc
+        if profile not in seen:
+            normalized.append(profile)
+            seen.add(profile)
+    return normalized
+
+
+def read_board_metadata(board: Optional[str] = None) -> dict:
+    """Return board display/policy metadata (or synthesized defaults).
+
+    Never raises — a missing / malformed ``board.json`` falls back to a
+    synthesised entry so the dashboard always has something to render.
+    Includes the canonical ``slug`` and ``db_path`` so the caller
+    doesn't need to reconstruct them.
+    """
+    slug = _normalize_board_slug(board) or DEFAULT_BOARD
+    meta = _board_metadata_defaults(slug)
     try:
         p = board_metadata_path(slug)
         if p.exists():
             raw = json.loads(p.read_text(encoding="utf-8"))
-            if isinstance(raw, dict):
+            if isinstance(raw, Mapping):
+                meta.update(raw)
                 # Never let the metadata file claim a different slug than
                 # its directory — trust the filesystem.
-                raw["slug"] = slug
-                meta.update(raw)
-    except (OSError, json.JSONDecodeError):
+                meta["slug"] = slug
+    except (OSError, UnicodeError, json.JSONDecodeError):
         pass
     meta["db_path"] = str(kanban_db_path(slug))
+    return meta
+
+
+def _load_board_metadata_for_update(slug: str) -> dict[str, Any]:
+    """Strictly load existing metadata before a destructive rewrite."""
+    path = board_metadata_path(slug)
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return _board_metadata_defaults(slug)
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError(
+            f"refusing to update board metadata {path}: "
+            "existing board.json cannot be read or parsed"
+        ) from exc
+    if not isinstance(raw, Mapping):
+        raise ValueError(
+            f"refusing to update board metadata {path}: "
+            "existing board.json is not a mapping"
+        )
+
+    meta = _board_metadata_defaults(slug)
+    meta.update(raw)
+    # Never let the metadata file claim a different slug than its directory.
+    meta["slug"] = slug
     return meta
 
 
@@ -878,19 +935,22 @@ def write_board_metadata(
     archived: Optional[bool] = None,
     default_workdir: Optional[str] = None,
     project_id: Optional[str] = None,
+    allowed_profiles: object = _ALLOWED_PROFILES_UNSET,
 ) -> dict:
-    """Create / update ``board.json`` for ``board``.
+    """Create / update board display and policy metadata in ``board.json``.
 
     Preserves any existing fields not mentioned in the call. Sets
     ``created_at`` on first write. Returns the resulting metadata dict.
 
     ``project_id``: ``None`` leaves it unchanged; empty string clears the
     project scope; a value sets it (not validated here — the caller resolves
-    it against ``projects_db``).
+    it against ``projects_db``). ``allowed_profiles`` uses three-way semantics:
+    omitting it preserves the current policy, ``None`` clears it to inherit the
+    machine ceiling, and a list stores an explicit (possibly empty) subset.
     """
     _assert_not_delegated_child_mutation()
     slug = _normalize_board_slug(board) or DEFAULT_BOARD
-    meta = read_board_metadata(slug)
+    meta = _load_board_metadata_for_update(slug)
     # Preserve existing DB-derived fields — they get re-computed each
     # read but shouldn't be written into board.json.
     meta.pop("db_path", None)
@@ -908,13 +968,20 @@ def write_board_metadata(
         meta["default_workdir"] = str(default_workdir) if default_workdir else None
     if project_id is not None:
         meta["project_id"] = str(project_id) if project_id else None
+    if allowed_profiles is not _ALLOWED_PROFILES_UNSET:
+        meta["allowed_profiles"] = _normalize_allowed_profiles_api(
+            allowed_profiles
+        )
     if not meta.get("created_at"):
         meta["created_at"] = int(time.time())
     path = board_metadata_path(slug)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
+    from utils import atomic_write_text
+
+    atomic_write_text(
+        path,
         json.dumps(meta, indent=2, ensure_ascii=False) + "\n",
         encoding="utf-8",
+        preserve_mode=True,
     )
     meta["db_path"] = str(kanban_db_path(slug))
     return meta
@@ -929,6 +996,7 @@ def create_board(
     color: Optional[str] = None,
     default_workdir: Optional[str] = None,
     project_id: Optional[str] = None,
+    allowed_profiles: object = _ALLOWED_PROFILES_UNSET,
 ) -> dict:
     """Create a new board directory + DB + metadata. Idempotent.
 
@@ -947,6 +1015,7 @@ def create_board(
         color=color,
         default_workdir=default_workdir,
         project_id=project_id,
+        allowed_profiles=allowed_profiles,
     )
     # Touch the DB so list_boards() sees it immediately.
     init_db(board=normed)
@@ -2324,6 +2393,21 @@ def _schema_is_present(conn: sqlite3.Connection) -> bool:
     return row is not None
 
 
+def _set_connection_board_hint(
+    conn: sqlite3.Connection,
+    board: Optional[str],
+) -> None:
+    """Attach best-effort board context for non-standard DB path overrides."""
+    if board is None:
+        return
+    try:
+        setattr(conn, "_hermes_kanban_board_hint", board)
+    except (AttributeError, TypeError):
+        # Some lightweight connection test doubles do not allow attributes.
+        # Policy lookup still has the canonical PRAGMA path fallback.
+        pass
+
+
 def connect(
     db_path: Optional[Path] = None,
     *,
@@ -2347,6 +2431,10 @@ def connect(
       ``HERMES_KANBAN_DB`` env → ``HERMES_KANBAN_BOARD`` env →
       ``<root>/kanban/current`` → ``default``.
     """
+    board_hint = _normalize_board_slug(board)
+    if board_hint is None and db_path is None:
+        board_hint = get_current_board()
+
     if db_path is not None:
         path = db_path
     else:
@@ -2366,6 +2454,7 @@ def connect(
     resolved = str(path.resolve())
     if resolved in _INITIALIZED_PATHS:
         conn = _sqlite_connect(path)
+        _set_connection_board_hint(conn, board_hint)
         try:
             conn.row_factory = sqlite3.Row
             with _INIT_LOCK:
@@ -2419,6 +2508,7 @@ def connect(
         _guard_existing_db_is_healthy(path)
         resolved = str(path.resolve())
         conn = _sqlite_connect(path)
+        _set_connection_board_hint(conn, board_hint)
         try:
             conn.row_factory = sqlite3.Row
             with _INIT_LOCK:
@@ -3146,13 +3236,308 @@ def _claimer_id() -> str:
 # Task creation / mutation
 # ---------------------------------------------------------------------------
 
-def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
-    """Lowercase-assignee normalization for Kanban rows (dashboard/CLI parity)."""
-    if assignee is None:
+def _configured_profile_policy(
+    raw: object,
+    *,
+    source: str,
+) -> Optional[frozenset[str]]:
+    """Parse one configured policy layer, failing closed when malformed."""
+    if raw is None:
         return None
+    if not isinstance(raw, list):
+        _log.warning(
+            "kanban profile policy from %s must be a list or null; "
+            "rejecting all profile assignments",
+            source,
+        )
+        return frozenset()
+
+    from hermes_cli.profiles import normalize_profile_name, validate_profile_name
+
+    allowed: set[str] = set()
+    for entry in raw:
+        if not isinstance(entry, str):
+            _log.warning(
+                "kanban profile policy from %s contains non-string entry %r; "
+                "rejecting all profile assignments",
+                source,
+                entry,
+            )
+            return frozenset()
+        try:
+            profile = normalize_profile_name(entry)
+            validate_profile_name(profile)
+        except ValueError as exc:
+            _log.warning(
+                "kanban profile policy from %s contains invalid profile %r (%s); "
+                "rejecting all profile assignments",
+                source,
+                entry,
+                exc,
+            )
+            return frozenset()
+        allowed.add(profile)
+    return frozenset(allowed)
+
+
+def _machine_kanban_allowed_profiles() -> Optional[frozenset[str]]:
+    """Read the machine safety ceiling from the shared/default Hermes root."""
+    import yaml
+
+    from hermes_constants import get_default_hermes_root
+
+    config_path = get_default_hermes_root() / "config.yaml"
+    if not config_path.is_file():
+        return None
+    try:
+        payload = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        _log.warning(
+            "kanban machine profile policy from %s could not be read (%s); "
+            "rejecting all profile assignments",
+            config_path,
+            exc,
+        )
+        return frozenset()
+
+    if payload is None:
+        return None
+    if not isinstance(payload, Mapping):
+        _log.warning(
+            "kanban machine profile policy source %s is not a mapping; "
+            "rejecting all profile assignments",
+            config_path,
+        )
+        return frozenset()
+    if "kanban" not in payload:
+        return None
+    kanban_cfg = payload.get("kanban")
+    if not isinstance(kanban_cfg, Mapping):
+        _log.warning(
+            "kanban machine profile policy source %s has a malformed kanban "
+            "container; rejecting all profile assignments",
+            config_path,
+        )
+        return frozenset()
+    if "allowed_profiles" not in kanban_cfg:
+        return None
+    return _configured_profile_policy(
+        kanban_cfg.get("allowed_profiles"),
+        source=f"machine config {config_path} (kanban.allowed_profiles)",
+    )
+
+
+def _connection_main_db_path(conn: sqlite3.Connection) -> Optional[Path]:
+    """Return SQLite's canonical path for the connection's ``main`` DB."""
+    try:
+        cursor = conn.execute("PRAGMA database_list")
+        fetchall = getattr(cursor, "fetchall", None)
+        if callable(fetchall):
+            rows = fetchall()
+        else:
+            row = cursor.fetchone()
+            rows = [row] if row is not None else []
+    except Exception:
+        return None
+    for row in rows:
+        try:
+            name, raw_path = row[1], row[2]
+        except (IndexError, KeyError, TypeError):
+            continue
+        if name != "main" or not raw_path:
+            continue
+        try:
+            return Path(str(raw_path)).expanduser().resolve()
+        except OSError:
+            return Path(str(raw_path)).expanduser()
+    return None
+
+
+def _board_slug_from_connection(conn: sqlite3.Connection) -> Optional[str]:
+    """Identify a board from its canonical DB path, then its frozen open hint."""
+    db_path = _connection_main_db_path(conn)
+    if db_path is not None:
+        try:
+            home = kanban_home().expanduser().resolve()
+        except OSError:
+            home = kanban_home().expanduser()
+        if db_path == home / "kanban.db":
+            return DEFAULT_BOARD
+        try:
+            relative = db_path.relative_to(home / "kanban" / "boards")
+        except ValueError:
+            relative = None
+        if relative is not None and len(relative.parts) == 2:
+            slug, filename = relative.parts
+            if filename == "kanban.db":
+                try:
+                    return _normalize_board_slug(slug)
+                except ValueError:
+                    return None
+
+    hint = getattr(conn, "_hermes_kanban_board_hint", None)
+    if hint:
+        try:
+            return _normalize_board_slug(str(hint))
+        except ValueError:
+            return None
+    return None
+
+
+def _mutation_board_slug(
+    conn: sqlite3.Connection,
+    board: Optional[str],
+) -> Optional[str]:
+    """Bind a mutating call's explicit board to stable connection provenance.
+
+    Canonical board DB paths are authoritative. Non-standard paths opened by
+    :func:`connect` retain their frozen board hint. Connections and safe test
+    doubles with neither form of provenance remain compatible with an explicit
+    board context, but an identifiable connection can never be retagged by a
+    caller-selected board.
+    """
+    connection_board = _board_slug_from_connection(conn)
+    if board is None:
+        return connection_board
+    requested_board = _normalize_board_slug(board) or DEFAULT_BOARD
+    if connection_board is not None and requested_board != connection_board:
+        raise ValueError(
+            f"explicit board {requested_board!r} does not match connection board "
+            f"{connection_board!r}"
+        )
+    return requested_board
+
+
+def _policy_board_slug(
+    *,
+    board: Optional[str],
+    conn: Optional[sqlite3.Connection],
+) -> Optional[str]:
+    """Resolve explicit board context before connection-derived identity."""
+    if board is not None:
+        return _normalize_board_slug(board) or DEFAULT_BOARD
+    if conn is not None:
+        return _board_slug_from_connection(conn)
+    return None
+
+
+def _board_kanban_allowed_profiles(
+    *,
+    board: Optional[str] = None,
+    conn: Optional[sqlite3.Connection] = None,
+) -> Optional[frozenset[str]]:
+    """Read one board's optional profile subset from ``board.json``."""
+    slug = _policy_board_slug(board=board, conn=conn)
+    if slug is None:
+        return None
+    metadata_path = board_metadata_path(slug)
+    try:
+        if not metadata_path.is_file():
+            return None
+        payload = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        _log.warning(
+            "kanban board profile policy from %s could not be read (%s); "
+            "rejecting all profile assignments",
+            metadata_path,
+            exc,
+        )
+        return frozenset()
+    if not isinstance(payload, Mapping):
+        _log.warning(
+            "kanban board profile policy source %s is not a mapping; "
+            "rejecting all profile assignments",
+            metadata_path,
+        )
+        return frozenset()
+    if "allowed_profiles" not in payload:
+        return None
+    return _configured_profile_policy(
+        payload.get("allowed_profiles"),
+        source=f"board metadata {metadata_path} (allowed_profiles)",
+    )
+
+
+def _resolve_kanban_allowed_profiles(
+    machine_ceiling: Optional[frozenset[str]],
+    board_subset: Optional[frozenset[str]],
+) -> Optional[frozenset[str]]:
+    """Intersect the machine ceiling with an optional board subset."""
+    if machine_ceiling is None:
+        return board_subset
+    if board_subset is None:
+        return machine_ceiling
+    return machine_ceiling & board_subset
+
+
+def kanban_allowed_profiles(
+    *,
+    board: Optional[str] = None,
+    conn: Optional[sqlite3.Connection] = None,
+) -> Optional[frozenset[str]]:
+    """Return the effective Kanban assignment policy for explicit context.
+
+    With no ``board`` or ``conn``, this remains the legacy machine-ceiling
+    reader. Passing either context additionally applies that board's subset.
+    """
+    machine_ceiling = _machine_kanban_allowed_profiles()
+    if board is None and conn is None:
+        return machine_ceiling
+    board_subset = _board_kanban_allowed_profiles(board=board, conn=conn)
+    return _resolve_kanban_allowed_profiles(machine_ceiling, board_subset)
+
+
+def is_kanban_profile_allowed(
+    profile: str,
+    *,
+    board: Optional[str] = None,
+    conn: Optional[sqlite3.Connection] = None,
+) -> bool:
+    """Return whether *profile* is a member of the effective policy."""
+    from hermes_cli.profiles import normalize_profile_name, validate_profile_name
+
+    try:
+        canonical = normalize_profile_name(profile)
+        validate_profile_name(canonical)
+    except ValueError:
+        return False
+    allowed = kanban_allowed_profiles(board=board, conn=conn)
+    return allowed is None or canonical in allowed
+
+
+def _normalize_assignee_filter(assignee: str) -> str:
+    """Normalize a read-only assignee filter without applying current policy."""
     from hermes_cli.profiles import normalize_profile_name
 
     return normalize_profile_name(assignee)
+
+
+def _canonical_assignee(
+    assignee: Optional[str],
+    *,
+    board: Optional[str] = None,
+    conn: Optional[sqlite3.Connection] = None,
+) -> Optional[str]:
+    """Canonicalize an assignment and enforce its effective board policy."""
+    if assignee is None:
+        return None
+    from hermes_cli.profiles import normalize_profile_name, validate_profile_name
+
+    canonical = normalize_profile_name(assignee)
+    validate_profile_name(canonical)
+    allowed = kanban_allowed_profiles(board=board, conn=conn)
+    if allowed is not None and canonical not in allowed:
+        if allowed:
+            allowed_text = ", ".join(sorted(allowed))
+            raise ValueError(
+                f"profile {canonical!r} is not allowed for Kanban assignment; "
+                f"allowed profiles: {allowed_text}"
+            )
+        raise ValueError(
+            f"profile {canonical!r} is not allowed for Kanban assignment; "
+            "no profiles are currently allowed"
+        )
+    return canonical
 
 
 def create_task(
@@ -3223,12 +3608,13 @@ def create_task(
     board can supply the repo and branch convention. Its literal worktree is
     never reused; the new task still gets its own task-id-keyed path.
     """
+    board = _mutation_board_slug(conn, board)
     model_override = (model_override or "").strip() or None
     provider_override = (provider_override or "").strip() or None
     reasoning_effort = normalize_reasoning_effort(reasoning_effort)
     if provider_override and not model_override:
         raise ValueError("provider_override requires a model_override")
-    assignee = _canonical_assignee(assignee)
+    assignee = _canonical_assignee(assignee, board=board, conn=conn)
     if not title or not title.strip():
         raise ValueError("title is required")
     if initial_status not in VALID_INITIAL_STATUSES:
@@ -3664,7 +4050,7 @@ def list_tasks(
     params: list[Any] = []
     if assignee is not None:
         query += " AND assignee = ?"
-        params.append(_canonical_assignee(assignee))
+        params.append(_normalize_assignee_filter(assignee))
     if status is not None:
         if status not in VALID_STATUSES:
             raise ValueError(f"status must be one of {sorted(VALID_STATUSES)}")
@@ -3705,7 +4091,7 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
     Refuses to reassign a task that's currently running (claim_lock set).
     Reassign after the current run completes if needed.
     """
-    profile = _canonical_assignee(profile)
+    profile = _canonical_assignee(profile, conn=conn)
     with write_txn(conn):
         row = conn.execute(
             "SELECT status, claim_lock, assignee FROM tasks WHERE id = ?", (task_id,)
@@ -5201,6 +5587,10 @@ def reassign_task(
     Returns True if the reassign landed. ``profile`` may be ``None`` to
     unassign entirely.
     """
+    # Validate against this connection's effective policy before reclaim_task
+    # can terminate a worker, end its current run, or append reclaim events.
+    # assign_task deliberately validates again at the final write boundary.
+    profile = _canonical_assignee(profile, conn=conn)
     if reclaim_first:
         # Safe to call even if nothing to reclaim.
         reclaim_task(conn, task_id, reason=reason or "reassign")
@@ -6504,7 +6894,11 @@ def request_review(
                         "malformed); pass reviewer= explicitly",
                     )
                 reviewer = prior_reviewer
-        reviewer = _canonical_assignee(reviewer) if reviewer is not None else None
+        reviewer = (
+            _canonical_assignee(reviewer, conn=conn)
+            if reviewer is not None
+            else None
+        )
         assignee_sql = ", assignee = ?" if reviewer is not None else ""
         params: tuple[Any, ...]
         if expected_run_id is None:
@@ -6640,9 +7034,10 @@ def request_changes(
         implementer = requested_payload.get("implementer")
         if not isinstance(implementer, str) or not implementer.strip():
             return False, "review handoff has no valid implementer provenance"
+        implementer = _canonical_assignee(implementer, conn=conn)
         reviewer = task_row["assignee"]
         if isinstance(reviewer, str) and reviewer.strip():
-            reviewer = _canonical_assignee(reviewer)
+            reviewer = _normalize_assignee_filter(reviewer)
         else:
             reviewer = None
 
@@ -6905,6 +7300,8 @@ def reopen_review_task(conn: sqlite3.Connection, task_id: str) -> bool:
         implementer = handoff.get("implementer")
         if not isinstance(implementer, str) or not implementer.strip():
             implementer = None
+        else:
+            implementer = _canonical_assignee(implementer, conn=conn)
         assignee_sql = ", assignee = ?" if implementer else ""
         params: tuple[Any, ...] = (
             (new_status, implementer, task_id)
@@ -7132,7 +7529,7 @@ def specify_triage_task(
     """
     if title is not None and not title.strip():
         raise ValueError("title cannot be blank")
-    assignee = _canonical_assignee(assignee)
+    assignee = _canonical_assignee(assignee, conn=conn)
     with write_txn(conn):
         existing = conn.execute(
             "SELECT title, body, assignee FROM tasks WHERE id = ? AND status = 'triage'",
@@ -7234,7 +7631,7 @@ def decompose_triage_task(
     if not children:
         return None
     if root_assignee is not None:
-        root_assignee = _canonical_assignee(root_assignee)
+        root_assignee = _canonical_assignee(root_assignee, conn=conn)
 
     # Pre-validate the children list shape outside the txn. Cheap checks
     # that don't need DB access. Bad input aborts before we touch the DB.
@@ -7313,7 +7710,7 @@ def decompose_triage_task(
             new_id = _new_task_id()
             title = child["title"].strip()
             body = child.get("body")
-            assignee = _canonical_assignee(child.get("assignee"))
+            assignee = _canonical_assignee(child.get("assignee"), conn=conn)
             # Per-child override wins; otherwise inherit the root's
             # workspace. A child that sets workspace_kind without a path
             # falls back to the root path only when kinds match (so a
@@ -9446,7 +9843,11 @@ def check_respawn_guard(
     return None
 
 
-def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
+def has_spawnable_ready(
+    conn: sqlite3.Connection,
+    *,
+    board: Optional[str] = None,
+) -> bool:
     """Return True iff there is at least one ready+assigned+unclaimed task
     whose assignee maps to a real Hermes profile.
 
@@ -9470,15 +9871,22 @@ def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
     try:
         from hermes_cli.profiles import profile_exists  # local import: avoids cycle
     except Exception:
-        # Can't introspect — assume spawnable, preserve legacy behavior.
-        return True
+        profile_exists = None  # type: ignore[assignment]
     for row in rows:
-        if profile_exists(row["assignee"]):
+        if not is_kanban_profile_allowed(
+            row["assignee"], board=board, conn=conn
+        ):
+            continue
+        if profile_exists is None or profile_exists(row["assignee"]):
             return True
     return False
 
 
-def has_spawnable_review(conn: sqlite3.Connection) -> bool:
+def has_spawnable_review(
+    conn: sqlite3.Connection,
+    *,
+    board: Optional[str] = None,
+) -> bool:
     """Return True iff there is at least one review+assigned+unclaimed task
     whose assignee maps to a real Hermes profile.
 
@@ -9496,9 +9904,13 @@ def has_spawnable_review(conn: sqlite3.Connection) -> bool:
     try:
         from hermes_cli.profiles import profile_exists  # local import: avoids cycle
     except Exception:
-        return True
+        profile_exists = None  # type: ignore[assignment]
     for row in rows:
-        if profile_exists(row["assignee"]):
+        if not is_kanban_profile_allowed(
+            row["assignee"], board=board, conn=conn
+        ):
+            continue
+        if profile_exists is None or profile_exists(row["assignee"]):
             return True
     return False
 
@@ -9545,12 +9957,15 @@ def dispatch_once(
     ``DispatchResult`` with ``skipped_locked=True`` and does no DB writes;
     the holder is already making progress on the same board.
 
-    The lock is keyed off the board's resolved DB path, so unrelated
+    The lock is keyed off the connection's resolved DB path, so unrelated
     boards tick in parallel. See :func:`_dispatch_tick_lock` for the
     cross-process / cross-platform mechanics.
     """
+    board = _mutation_board_slug(conn, board)
     try:
-        db_path = kanban_db_path(board=board)
+        db_path = _connection_main_db_path(conn)
+        if db_path is None:
+            db_path = kanban_db_path(board=board)
     except Exception:
         # Path resolution should never fail, but if it somehow does we
         # must not lose the tick — fall through to an unguarded dispatch
@@ -9734,8 +10149,19 @@ def _dispatch_once_locked(
     _default_assignee_resolved = False
     if _default_assignee:
         try:
+            canonical_default = _canonical_assignee(
+                _default_assignee, board=board, conn=conn
+            )
+            assert canonical_default is not None
+            _default_assignee = canonical_default
             from hermes_cli.profiles import profile_exists as _pe
             _default_assignee_resolved = bool(_pe(_default_assignee))
+        except ValueError:
+            _log.warning(
+                "kanban dispatch: refusing disallowed default_assignee=%r",
+                _default_assignee,
+            )
+            _default_assignee = None
         except Exception:
             # Profiles module not importable (test stubs, exotic envs).
             # Trust the operator's config and try the assignment; the
@@ -9811,6 +10237,16 @@ def _dispatch_once_locked(
             # this distinction to suppress spurious "stuck" warnings on
             # multi-lane setups where the ready queue is steadily full
             # of human-pulled work.
+            result.skipped_nonspawnable.append(row["id"])
+            continue
+        if not is_kanban_profile_allowed(
+            row_assignee, board=board, conn=conn
+        ):
+            _log.warning(
+                "kanban dispatch: refusing task %s assigned to disallowed profile %r",
+                row["id"],
+                row_assignee,
+            )
             result.skipped_nonspawnable.append(row["id"])
             continue
         # Per-profile concurrency cap (#21582): even if there's global
@@ -9959,6 +10395,16 @@ def _dispatch_once_locked(
         except Exception:
             profile_exists = None  # type: ignore[assignment]
         if profile_exists is not None and not profile_exists(row["assignee"]):
+            result.skipped_nonspawnable.append(row["id"])
+            continue
+        if not is_kanban_profile_allowed(
+            row["assignee"], board=board, conn=conn
+        ):
+            _log.warning(
+                "kanban review dispatch: refusing task %s assigned to disallowed profile %r",
+                row["id"],
+                row["assignee"],
+            )
             result.skipped_nonspawnable.append(row["id"])
             continue
         if _per_profile_cap is not None:
@@ -11570,8 +12016,13 @@ def read_worker_log(
 # Assignee enumeration (known profiles + per-profile board stats)
 # ---------------------------------------------------------------------------
 
-def list_profiles_on_disk() -> list[str]:
-    """Return the set of assignee/profile names discovered on disk.
+def list_profiles_on_disk(
+    *,
+    conn: Optional[sqlite3.Connection] = None,
+    board: Optional[str] = None,
+    include_disallowed: bool = False,
+) -> list[str]:
+    """Return assignable profile names discovered on disk.
 
     Includes:
     - named profiles under ``<default-root>/profiles/<name>/config.yaml``
@@ -11579,7 +12030,10 @@ def list_profiles_on_disk() -> list[str]:
 
     Reads profile paths directly so this module has no import dependency on
     ``hermes_cli.profiles`` (which pulls in a large chunk of the CLI startup
-    path).
+    path). Explicit board/connection context applies the effective board
+    policy; no context preserves the legacy machine-ceiling view. Callers that
+    need inventory rather than an assignment roster may set
+    ``include_disallowed=True``.
     """
     try:
         from hermes_constants import get_default_hermes_root
@@ -11602,15 +12056,25 @@ def list_profiles_on_disk() -> list[str]:
         except OSError:
             pass
 
+    if not include_disallowed:
+        allowed = kanban_allowed_profiles(board=board, conn=conn)
+        if allowed is not None:
+            names.intersection_update(allowed)
     return sorted(names)
 
 
-def known_assignees(conn: sqlite3.Connection) -> list[dict]:
-    """Return every assignee name known to the board or on disk.
+def known_assignees(
+    conn: sqlite3.Connection,
+    *,
+    board: Optional[str] = None,
+) -> list[dict]:
+    """Return every effectively allowed assignee known to the board or on disk.
 
     Each entry is ``{"name": str, "on_disk": bool, "counts": {status: n}}``.
-    A name is included when it's a configured profile on disk OR when
-    any non-archived task has it as the assignee. Used by:
+    A name is included when it is allowed by the effective board policy and is
+    a configured profile on disk OR has a non-archived historical assignment.
+    Disallowed historical cards remain visible through :func:`list_tasks` but
+    are intentionally omitted from this assignment roster. Used by:
 
     - ``hermes kanban assignees`` for the terminal.
     - The dashboard assignee dropdown (so a fresh profile appears in
@@ -11618,7 +12082,7 @@ def known_assignees(conn: sqlite3.Connection) -> list[dict]:
     - Router-profile heuristics ("who's overloaded?") without scanning
       the whole board.
     """
-    on_disk = set(list_profiles_on_disk())
+    on_disk = set(list_profiles_on_disk(conn=conn, board=board))
 
     # Count tasks per (assignee, status), excluding archived.
     counts: dict[str, dict[str, int]] = {}
@@ -11629,7 +12093,11 @@ def known_assignees(conn: sqlite3.Connection) -> list[dict]:
     ):
         counts.setdefault(row["assignee"], {})[row["status"]] = int(row["n"])
 
-    names = sorted(on_disk | set(counts.keys()))
+    allowed = kanban_allowed_profiles(board=board, conn=conn)
+    if allowed is None:
+        names = sorted(on_disk | set(counts.keys()))
+    else:
+        names = sorted(on_disk | (set(counts.keys()) & set(allowed)))
     return [
         {
             "name": name,
