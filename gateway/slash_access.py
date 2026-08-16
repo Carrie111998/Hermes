@@ -238,7 +238,17 @@ def identity_candidates(source: Any) -> Tuple[str, ...]:
         if normalized and normalized not in candidates:
             candidates.append(normalized)
     except Exception:  # pragma: no cover - never let identity break the gate
-        logger.debug("slash_access: alias expansion failed for %r", raw, exc_info=True)
+        # The raw id alone is the fail-safe answer (a LID matches no
+        # phone-keyed admin list), but all the operator sees is their own
+        # admin being refused. Warn rather than debug so the cause is in the
+        # log; an unreadable mapping file is additionally reported once per
+        # file by whatsapp_identity, so what lands here is the unexpected.
+        logger.warning(
+            "slash_access: alias expansion failed for %r — authorization will "
+            "compare the raw transport id only",
+            raw,
+            exc_info=True,
+        )
 
     return tuple(candidates)
 

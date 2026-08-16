@@ -42,6 +42,12 @@ logger = logging.getLogger(__name__)
 # full-width digits / Unicode word chars can't sneak through.
 _SAFE_IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9@.+\-]+$")
 
+# Mapping files that have already been reported as unreadable. A corrupt or
+# unreadable file stays that way, and expansion now runs on the inbound path
+# for every routed message, so the warning fires once per file rather than per
+# lookup. Bounded because the key is a filesystem path we constructed.
+_WARNED_MAPPING_PATHS: Set[str] = set()
+
 from hermes_constants import get_hermes_dir, get_process_hermes_home
 
 
@@ -192,7 +198,23 @@ def expand_whatsapp_aliases(identifier: str) -> Set[str]:
                     json.loads(mapping_path.read_text(encoding="utf-8"))
                 )
             except (OSError, json.JSONDecodeError) as exc:
-                logger.debug("whatsapp_identity: failed to read %s: %s", mapping_path, exc)
+                # Degrading to the raw identifier is safe (a LID never matches
+                # a phone-keyed allow-list), but it is invisible: the operator
+                # sees "admin refused in their own group" or a DM landing on
+                # the default profile, with nothing in the log connecting that
+                # to an unreadable mapping file. Warn on the first failure per
+                # file so the cause is one grep away.
+                key = str(mapping_path)
+                if key not in _WARNED_MAPPING_PATHS:
+                    _WARNED_MAPPING_PATHS.add(key)
+                    logger.warning(
+                        "whatsapp_identity: cannot read alias mapping %s (%s) — "
+                        "this sender's phone/LID forms will not resolve to each "
+                        "other, so phone-keyed admin lists and profile routes "
+                        "may not match them",
+                        mapping_path,
+                        exc,
+                    )
                 continue
             if mapped and mapped not in resolved:
                 queue.append(mapped)
