@@ -42,6 +42,24 @@ def _strip_enclosing_markdown_fence(text: str) -> str:
     return body.strip()
 
 
+def _recover_calls_before_trailing_narrative(
+    calls: list["ToolCall"], text: str, ws_start: int, idx: int
+) -> list["ToolCall"] | None:
+    """Called when decoding stops before consuming all of ``text``.
+
+    If at least one valid call was already parsed and the unparsed
+    remainder is separated from it by a blank line, keep the calls parsed
+    so far and drop the remainder as hallucinated narrative. Otherwise
+    there's nothing safe to recover — bail out entirely, matching the
+    strict all-or-nothing behavior this replaces.
+    """
+    if not calls:
+        return None
+    if text[ws_start:idx].count("\n") < 2:
+        return None
+    return calls
+
+
 def _parse_leaked_tool_calls(content: Any) -> list["ToolCall"] | None:
     """Recover tool call(s) a model emitted as raw JSON in ``content``
     instead of the structured ``tool_calls`` field.
@@ -63,6 +81,17 @@ def _parse_leaked_tool_calls(content: Any) -> list["ToolCall"] | None:
     malformed case where the closing fence is missing entirely. Only a
     fence wrapping the *whole* content is stripped, so a code block that's
     part of a longer prose reply is left alone.
+
+    A third variant: one or more well-formed leaked calls followed by a
+    hallucinated narrative paragraph (e.g. a fake "task delegated"
+    confirmation, or — seen live — a fabricated ``[OUT-OF-BAND USER
+    MESSAGE]`` marker mimicking Hermes's own trusted channel). That
+    trailing text is discarded, never surfaced as real content. Only
+    recovered when it's separated from the last valid call by a blank
+    line (a real paragraph break): text that continues in the same
+    paragraph (no blank line) is left alone and treated as ordinary prose
+    that merely starts with JSON-like syntax, preserving the same
+    false-positive guarantee as the exact-match case above.
     """
     if not isinstance(content, str):
         return None
@@ -76,6 +105,7 @@ def _parse_leaked_tool_calls(content: Any) -> list["ToolCall"] | None:
     idx = 0
     length = len(text)
     while idx < length:
+        ws_start = idx
         while idx < length and text[idx].isspace():
             idx += 1
         if idx >= length:
@@ -83,14 +113,14 @@ def _parse_leaked_tool_calls(content: Any) -> list["ToolCall"] | None:
         try:
             obj, end = decoder.raw_decode(text, idx)
         except (json.JSONDecodeError, ValueError):
-            return None
+            return _recover_calls_before_trailing_narrative(calls, text, ws_start, idx)
         if not isinstance(obj, dict) or not isinstance(obj.get("name"), str):
-            return None
+            return _recover_calls_before_trailing_narrative(calls, text, ws_start, idx)
         arguments = obj.get("arguments", {})
         if not isinstance(arguments, dict):
-            return None
+            return _recover_calls_before_trailing_narrative(calls, text, ws_start, idx)
         if set(obj.keys()) - {"name", "arguments"}:
-            return None
+            return _recover_calls_before_trailing_narrative(calls, text, ws_start, idx)
         calls.append(
             ToolCall(
                 id=None,
