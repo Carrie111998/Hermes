@@ -20,6 +20,9 @@ logger = logging.getLogger(__name__)
 
 _YAML_MUTATION_LOCKS: dict[str, threading.RLock] = {}
 _YAML_MUTATION_LOCKS_GUARD = threading.Lock()
+_YAML11_AMBIGUOUS_WORDS = {
+    "y", "n", "yes", "no", "true", "false", "on", "off", "null", "~",
+}
 
 
 TRUTHY_STRINGS = frozenset({"1", "true", "yes", "on"})
@@ -626,8 +629,9 @@ def atomic_roundtrip_yaml_update(
 
 
 @contextlib.contextmanager
-def _yaml_mutation_lock(path: Path, timeout: float = 10.0):
+def _yaml_mutation_lock(path: Union[str, Path], timeout: float = 10.0):
     """Serialize a YAML read-modify-write section across threads and processes."""
+    path = Path(path)
     lock_key = str(path.resolve())
     with _YAML_MUTATION_LOCKS_GUARD:
         thread_lock = _YAML_MUTATION_LOCKS.setdefault(lock_key, threading.RLock())
@@ -684,11 +688,14 @@ def atomic_roundtrip_yaml_append(
     path: Union[str, Path],
     key_path: str,
     value: Any,
+    *,
+    initial_values: list[Any] | None = None,
 ) -> None:
     """Append to a dotted list path without losing YAML formatting or updates."""
     from ruamel.yaml import YAML
     from ruamel.yaml.comments import CommentedMap, CommentedSeq
     from ruamel.yaml.error import YAMLError
+    from ruamel.yaml.scalarstring import DoubleQuotedScalarString
 
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -698,6 +705,17 @@ def atomic_roundtrip_yaml_append(
     yaml_rt.allow_unicode = True
     yaml_rt.default_flow_style = False
     yaml_rt.indent(mapping=2, sequence=4, offset=2)
+
+    def _yaml11_safe_value(item: Any) -> Any:
+        if isinstance(item, str) and item.lower() in _YAML11_AMBIGUOUS_WORDS:
+            return DoubleQuotedScalarString(item)
+        if isinstance(item, dict):
+            return CommentedMap(
+                (key, _yaml11_safe_value(child)) for key, child in item.items()
+            )
+        if isinstance(item, list):
+            return CommentedSeq(_yaml11_safe_value(child) for child in item)
+        return item
 
     with _yaml_mutation_lock(path):
         if path.exists():
@@ -748,13 +766,15 @@ def atomic_roundtrip_yaml_append(
                 ) from exc
         else:
             if leaf not in current:
-                current[leaf] = CommentedSeq()
+                current[leaf] = CommentedSeq(
+                    _yaml11_safe_value(item) for item in (initial_values or [])
+                )
             target = current[leaf]
         if not isinstance(target, list):
             raise ValueError(
                 f"target contains {type(target).__name__}, not a list"
             )
-        target.append(value)
+        target.append(_yaml11_safe_value(value))
 
         original_mode = _preserve_file_mode(path)
         original_owner = _preserve_file_owner(path)
@@ -846,10 +866,6 @@ def atomic_roundtrip_yaml_save(
     # `approvals.mode: off` silently round-trips back as `False` under
     # yaml.safe_load. Force-quote any new string value that YAML 1.1 would
     # otherwise misparse as bool/null.
-    _YAML11_AMBIGUOUS_WORDS = {
-        "y", "n", "yes", "no", "true", "false", "on", "off", "null", "~",
-    }
-
     def _quote_if_yaml11_ambiguous(value):
         if isinstance(value, str) and value.lower() in _YAML11_AMBIGUOUS_WORDS:
             return DoubleQuotedScalarString(value)

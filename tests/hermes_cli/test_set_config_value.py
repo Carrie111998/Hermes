@@ -335,6 +335,28 @@ class TestListAppend:
             "/opt/hermes/second.py",
         ]
 
+    def test_append_preserves_json_string_types(self, _isolated_hermes_home):
+        from hermes_cli.config import append_config_value
+
+        append_config_value(
+            "hooks.pre_llm_call",
+            '{"name":"on","values":["off","null","ordinary"]}',
+        )
+
+        import yaml
+
+        saved = yaml.safe_load(_read_config(_isolated_hermes_home))
+        assert saved["hooks"]["pre_llm_call"] == [
+            {"name": "on", "values": ["off", "null", "ordinary"]}
+        ]
+
+    def test_append_seeds_nonempty_default_list(self, _isolated_hermes_home):
+        from hermes_cli.config import append_config_value, load_config
+
+        append_config_value("toolsets", '"web"')
+
+        assert load_config()["toolsets"] == ["hermes-cli", "web"]
+
     def test_append_rejects_invalid_json(self, capsys):
         from hermes_cli.config import append_config_value
 
@@ -376,11 +398,15 @@ class TestListAppend:
         from hermes_cli import managed_scope
         from hermes_cli.config import append_config_value
 
-        monkeypatch.setattr(managed_scope, "is_key_managed", lambda key: True)
+        monkeypatch.setattr(
+            managed_scope,
+            "managed_config_keys",
+            lambda: {"custom_providers"},
+        )
         monkeypatch.setattr(managed_scope, "get_managed_dir", lambda: Path("managed"))
 
         with pytest.raises(SystemExit) as exc:
-            append_config_value("hooks.pre_llm_call", '"check.py"')
+            append_config_value("custom_providers.0.models", '"check.py"')
 
         assert exc.value.code == 1
         assert "managed by your administrator" in capsys.readouterr().err
@@ -429,7 +455,6 @@ class TestListAppend:
 
         saved = yaml.safe_load(config_path.read_text(encoding="utf-8"))
         assert sorted(saved["hooks"]["pre_llm_call"]) == list(range(6))
-
 
 # ---------------------------------------------------------------------------
 # Cron drift guard warning — regression tests for #59031

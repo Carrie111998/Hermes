@@ -5435,7 +5435,16 @@ def append_config_value(key: str, value: str):
 
     from hermes_cli import managed_scope
 
-    if managed_scope.is_key_managed(key):
+    managed_keys = managed_scope.managed_config_keys()
+    managed_key = next(
+        (
+            candidate
+            for candidate in managed_keys
+            if key == candidate or key.startswith(f"{candidate}.")
+        ),
+        None,
+    )
+    if managed_key is not None:
         managed_dir = managed_scope.get_managed_dir()
         src = (managed_dir / "config.yaml") if managed_dir else "the managed scope"
         print(
@@ -5460,7 +5469,16 @@ def append_config_value(key: str, value: str):
     try:
         from utils import atomic_roundtrip_yaml_append
 
-        atomic_roundtrip_yaml_append(config_path, key, parsed_value)
+        default_value = _get_nested(DEFAULT_CONFIG, key)
+        initial_values = (
+            copy.deepcopy(default_value) if isinstance(default_value, list) else None
+        )
+        atomic_roundtrip_yaml_append(
+            config_path,
+            key,
+            parsed_value,
+            initial_values=initial_values,
+        )
     except (ValueError, TimeoutError) as exc:
         print(f"✗ Cannot append to '{key}': {exc}", file=sys.stderr)
         sys.exit(1)
