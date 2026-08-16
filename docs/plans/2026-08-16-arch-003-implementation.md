@@ -1,6 +1,6 @@
 ---
 title: "ARCH-003 implementation plan: runtime-state audit and replay verification"
-status: IMPLEMENTATION_PLAN_REVISE_V24_PENDING
+status: IMPLEMENTATION_PLAN_REVISE_V25_PENDING
 date: 2026-08-16
 type: implementation-plan
 ticket: ARCH-003
@@ -142,8 +142,14 @@ prompt construction, legacy `state.db`, or unrelated dirty worktree files.
   every member on the surface where it is legal. No implementation may add a
   code outside this partition without a plan revision.
 - Freeze the origin-marker enum before Gate 1 edits:
-  `POST_MIGRATION_GENESIS`, `POST_ROTATION_GENESIS`,
-  `GENERATION_REORIGIN_GENESIS`, and `MANUAL_REORIGIN_GENESIS`.
+  `POST_MIGRATION_GENESIS`, `NEW_ENTITY_GENESIS`,
+  `POST_ROTATION_GENESIS`, `GENERATION_REORIGIN_GENESIS`, and
+  `MANUAL_REORIGIN_GENESIS`. Assign markers by this deterministic
+  precedence: explicit `MANUAL_REORIGIN_GENESIS` first; then
+  `NEW_ENTITY_GENESIS) when the row is created by the mutation; then
+  `GENERATION_REORIGIN_GENESIS` for a pre-existing row after a newer writer
+  epoch; then `POST_ROTATION_GENESIS` for a pre-existing row after digest
+  rotation; then `POST_MIGRATION_GENESIS` for a legacy/pre-journal row.
   A baseline copies the origin marker of the epoch it seals; no other origin
   marker is valid.
 - Confirm that the prior release can start with the new journal table present
@@ -163,8 +169,8 @@ Add a versioned runtime-state-owned journal table with:
 - non-secret digest-parameter identifier;
 - non-secret key-check value bound to the digest-parameter identifier;
 - origin marker from the closed set `POST_MIGRATION_GENESIS`,
-  `POST_ROTATION_GENESIS`, `GENERATION_REORIGIN_GENESIS`, or
-  `MANUAL_REORIGIN_GENESIS`;
+  `NEW_ENTITY_GENESIS`, `POST_ROTATION_GENESIS`,
+  `GENERATION_REORIGIN_GENESIS`, or `MANUAL_REORIGIN_GENESIS`;
 - origin epoch marker and origin-genesis sequence, copied into genesis and
   baseline records so origin-epoch validity is checked from bounded row metadata;
 - per-profile/entity monotonic sequence with uniqueness;
@@ -201,8 +207,8 @@ or the startup write transaction reaches its fixed timeout, startup returns
 downgrade-unsafe/read-only, and serves no ordinary or event-only writes until a
 later successful startup transition; it must not serve mutations under an
 uncleared transition.
-restarting the same writer epoch never advances it. A startup observing a
-durable epoch newer than the running writer enters global downgrade-unsafe
+A same-epoch restart never advances `current_generation`. A startup observing
+a durable epoch newer than the running writer enters global downgrade-unsafe
 mode for the database: all ordinary runtime-state writes across all profiles
 and entities, including both event-only baseline and re-originating genesis
 writers, return mutation-side `WRITE_ABORT`; only read-only verification may
@@ -355,6 +361,10 @@ Migration compatibility tests must assert this posture.
   (including a post-migration entity) is `genesis`; the first such mutation
   after a current-generation advance is also `genesis`, while subsequent
   mutations use `mutation`.
+- Determine a no-op by comparing the requested before/after replay tuple
+  before issuing any replay-tuple UPDATE. A true no-op issues no replay-tuple
+  UPDATE, therefore does not fire the counter trigger and emits no event.
+  Do not implement a write-then-revert shape.
 - Emit no event for a true no-op that changes no replayed column.
 - Ordinary mutation/genesis paths acquire the shared side of the named
   cross-process maintenance RW lock before opening the SQLite WAL transaction;
@@ -433,7 +443,17 @@ Implement a bounded verifier that:
   duplicate or missing predecessors, digest-parameter identity, schemas, the
   shared and verifier-side closed reason-code subsets, and terminal state;
 - uses a code-level `REPLAY_EVENT_LIMIT = 10000` counted from the effective
-  replay start point. Compute the start candidates as the highest valid baseline
+  replay start point. Before status/reason selection, apply this total verifier
+  diagnostic precedence from highest to lowest: `SNAPSHOT_FAILURE`,
+  `UNSUPPORTED_VERSION`, `HISTORY_MALFORMED`, `EMPTY_HISTORY`,
+  `MATERIALIZED_STATE_ASYMMETRY`, `GENERATION_MISMATCH`,
+  `KEY_UNAVAILABLE`, `KEY_CHECK_MISMATCH`, `DIGEST_PARAMETER_MISMATCH`,
+  `LEGACY_ORIGIN_MISSING`, `SEQUENCE_INVALID`, `BASELINE_INVALID`,
+  `WRITE_COUNTER_GAP`, `REPLAY_EVENT_LIMIT_EXCEEDED`,
+  `POST_TERMINAL_EVENT`, `DRIFT_DETECTED`, `OK`. The first applicable
+  code wins; `EMPTY_HISTORY` therefore wins over row-marker mismatch when
+  the entity has zero journal rows, while `MATERIALIZED_STATE_ASYMMETRY`
+  applies when one side exists and the other does not. Compute the start candidates as the highest valid baseline
   under the current digest identifier and the latest valid marked genesis under
   the current digest identifier, when present; select the later candidate by
   `entity_seq`. If neither candidate exists, return `UNKNOWN` with
@@ -531,8 +551,6 @@ Add deterministic tests for:
   expected under write-lock-first discipline;
 - baseline generation-marker mismatch returning `UNKNOWN` with
   `GENERATION_MISMATCH`;
-- startup lock/busy timeout returning `LOCK_TIMEOUT` and refusing all
-  ordinary and event-only writes until a successful transition;
 - bypass-path rejection for mutation/genesis while permitting only the named
   baseline writer and the explicitly authorized re-originating genesis writer;
 - caller contract for `WRITE_ABORT`: no automatic retry, affected operation
@@ -542,7 +560,6 @@ Add deterministic tests for:
   key unavailability returning shared `KEY_UNAVAILABLE` without changing
   materialized state;
 - duplicate, missing, malformed, non-contiguous, and unsupported events;
-- empty history returning `UNKNOWN` with `EMPTY_HISTORY`;
 - the same fixture with a materialized-write counter gap in either direction
   (`>` or `<`) returning `UNKNOWN` with `WRITE_COUNTER_GAP`, a baseline
   attempt refused with `WRITE_ABORT`, and a subsequent ordinary mutation
@@ -570,8 +587,7 @@ Add deterministic tests for:
   false `DRIFT`;
 - replay bound counted from the effective replay start point, bounded
   origin-epoch metadata validation, current-epoch genesis selection, baseline
-  selection, generation mismatch, and every member of each surface's closed
-  reason-code subset;
+  selection, and every member of each surface's closed reason-code subset;
 - verifier-performs-no-writes using a direct database-change assertion;
 - materialized-row/history asymmetry returning `UNKNOWN`;
 - post-terminal events returning `UNKNOWN`;
@@ -931,6 +947,25 @@ DGX changes, deployment, repair, or event-sourcing. The corrected plan must
 return to the same authenticated Claude reviewer family and then to AGY on the
 identical packet.
 
+## Implementation-plan review reconciliation v24
+
+The v24 authenticated Claude Opus review returned `REVISE` with six bounded
+plan-text corrections. The corrections are incorporated above:
+
+1. Acceptance coverage now includes v23.
+2. The startup same-epoch non-advancement sentence is repaired.
+3. `NEW_ENTITY_GENESIS` and deterministic origin-marker precedence are
+   defined.
+4. Total verifier reason-code precedence is defined across all diagnostic
+   groups.
+5. Duplicate Gate 4 entries are removed.
+6. No-op determination occurs before any replay-tuple update.
+
+These remain plan-only corrections and do not authorize source edits, tests,
+DGX changes, deployment, repair, or event-sourcing. The corrected plan must
+return to the same authenticated Claude reviewer family and then to AGY on the
+identical packet.
+
 ## Acceptance criteria
 
 ARCH-003 implementation is ready for its delivery gates only when:
@@ -959,7 +994,7 @@ ARCH-003 implementation is ready for its delivery gates only when:
   retention job; entities beyond the replay limit remain UNKNOWN in this ticket,
   and the 100,000-event/100 MiB per-profile threshold is a documented follow-up
   operational review, not an in-ticket operator gate;
-- reconciliation v1 and v5-v22 items are incorporated into the normative
+- reconciliation v1 and v5-v23 items are incorporated into the normative
   Gates 0-4 text (with v2-v4 explicitly folded into the v1/v4 text), and this
   merged plan revision receives the same-family re-review;
 - all focused and relevant tests pass;
@@ -1014,6 +1049,9 @@ ARCH-003 implementation is ready for its delivery gates only when:
   EMPTY_HISTORY versus LEGACY_ORIGIN_MISSING precedence, and complete coverage.
 - v23: generation-mismatch reason precedence, startup timeout fail-closed
   posture, and complete coverage.
+- v24: startup sentence repair, NEW_ENTITY_GENESIS and marker precedence,
+  total verifier reason precedence, Gate 4 deduplication, and pre-update
+  no-op determination.
 
 
 ## Non-goals
