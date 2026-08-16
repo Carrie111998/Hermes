@@ -2235,28 +2235,37 @@ def run_doctor(args):
             _whatsapp_bridge_dir = resolve_whatsapp_bridge_dir()
         except Exception:
             _whatsapp_bridge_dir = PROJECT_ROOT / "scripts" / "whatsapp-bridge"
-        # npm 11.10-11.16 honor .npmrc's `min-release-age` but ignore
-        # `min-release-age-exclude`, so `npm audit fix` on that band ETARGETs
-        # on every package we deliberately exempted. Detect it once so the
-        # remediation hint below doesn't send the user into that failure.
-        _npm_release_age_unsafe = False
-        try:
-            from hermes_cli.npm_engine import npm_ignores_min_release_age_exclude
-
-            _npm_version_probe = subprocess.run(
-                [_npm_bin, "--version"],
-                capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=10,
-            )
-            _npm_version = _npm_version_probe.stdout.strip() if _npm_version_probe.returncode == 0 else None
-            _npm_release_age_unsafe = npm_ignores_min_release_age_exclude(_npm_version)
-        except Exception:
-            _npm_version = None
         npm_audit_targets = [
             (PROJECT_ROOT, "Browser tools (agent-browser)", ["--workspaces=false"]),
             (PROJECT_ROOT, "web workspace", ["--workspace", "web"]),
             (PROJECT_ROOT, "ui-tui workspace", ["--workspace", "ui-tui"]),
             (_whatsapp_bridge_dir, "WhatsApp bridge", []),
         ]
+        # npm 11.10-11.16 honor .npmrc's `min-release-age` but ignore
+        # `min-release-age-exclude`, so `npm audit fix` on that band ETARGETs
+        # on every package we deliberately exempted. Detect it once so the
+        # remediation hint below doesn't send the user into that failure —
+        # but only when some target actually has node_modules to audit, so a
+        # bare checkout (or a hung/aliased npm) doesn't pay this probe on
+        # every doctor run.
+        _npm_version = None
+        _npm_release_age_unsafe = False
+        _has_npm_audit_target = any(
+            ((PROJECT_ROOT if audit_extra else npm_dir) / "node_modules").exists()
+            for npm_dir, _label, audit_extra in npm_audit_targets
+        )
+        if _has_npm_audit_target:
+            try:
+                from hermes_cli.npm_engine import npm_ignores_min_release_age_exclude
+
+                _npm_version_probe = subprocess.run(
+                    [_npm_bin, "--version"],
+                    capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=5,
+                )
+                _npm_version = _npm_version_probe.stdout.strip() if _npm_version_probe.returncode == 0 else None
+                _npm_release_age_unsafe = npm_ignores_min_release_age_exclude(_npm_version)
+            except Exception:
+                _npm_version = None
         for npm_dir, label, audit_extra in npm_audit_targets:
             # For workspace-scoped audits run from PROJECT_ROOT the
             # node_modules check must use the workspace root; standalone dirs

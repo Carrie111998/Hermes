@@ -1419,12 +1419,15 @@ class TestDoctorNpmAuditMinReleaseAgeBand:
     brace-expansion) — see #83544. On that band, doctor must not hand out a
     command it knows will fail."""
 
-    def _run(self, monkeypatch, tmp_path, npm_version, inject_workspace_vulns=False):
+    def _run(self, monkeypatch, tmp_path, npm_version, inject_workspace_vulns=False,
+             create_node_modules=True, version_calls=None):
         home = tmp_path / ".hermes"
         home.mkdir(parents=True, exist_ok=True)
         (home / "config.yaml").write_text("memory: {}\n", encoding="utf-8")
         project = tmp_path / "project"
-        (project / "node_modules").mkdir(parents=True, exist_ok=True)
+        project.mkdir(parents=True, exist_ok=True)
+        if create_node_modules:
+            (project / "node_modules").mkdir(parents=True, exist_ok=True)
 
         monkeypatch.delenv("TERMUX_VERSION", raising=False)
         monkeypatch.delenv("PREFIX", raising=False)
@@ -1446,6 +1449,8 @@ class TestDoctorNpmAuditMinReleaseAgeBand:
 
         def fake_run(cmd, **kwargs):
             if cmd[:2] == [npm_bin, "--version"]:
+                if version_calls is not None:
+                    version_calls.append(cmd)
                 return _subprocess.CompletedProcess(cmd, 0, f"{npm_version}\n", "")
             if cmd[:3] == [npm_bin, "audit", "--json"]:
                 is_flagged_target = "--workspaces=false" in cmd or (
@@ -1502,3 +1507,12 @@ class TestDoctorNpmAuditMinReleaseAgeBand:
         # (--workspaces=false) target, which has no unrelated arborist issue.
         assert out.count("can't fix this here") == 1
         assert "npm install -g npm@latest" in out
+
+    def test_no_node_modules_skips_the_version_probe(self, monkeypatch, tmp_path):
+        """No audit target has node_modules, so no audit can run either way —
+        `npm --version` must not be probed just to compute an unused band
+        check (see #83602 review)."""
+        version_calls = []
+        self._run(monkeypatch, tmp_path, "11.12.1", create_node_modules=False,
+                   version_calls=version_calls)
+        assert version_calls == []
