@@ -1,6 +1,6 @@
 ---
 title: "ARCH-003 implementation plan: runtime-state audit and replay verification"
-status: IMPLEMENTATION_PLAN_REVISE_V4_PENDING
+status: IMPLEMENTATION_PLAN_REVISE_V5_PENDING
 date: 2026-08-16
 type: implementation-plan
 ticket: ARCH-003
@@ -36,7 +36,7 @@ boundary.
 The implementation must preserve:
 
 - the existing runtime-state CAS transition contract;
-- one mutation connection and transaction;
+- one mutation connection and transaction per committed mutation, under the writer model selected in Gate 0;
 - profile isolation;
 - prompt-cache stability;
 - the gateway and platform message loops;
@@ -86,10 +86,15 @@ prompt construction, legacy `state.db`, or unrelated dirty worktree files.
   Record the writer matrix before source edits.
 - Use SQLite WAL mode for both the single-writer and multi-writer branches.
   Record and test `PRAGMA journal_mode=WAL` and the selected busy-timeout.
-  The single-writer branch proves one mutation connection and defensive abort;
-  the multi-writer branch specifies bounded retry policy and ownership
-  boundaries. The benchmark also uses WAL deliberately so its isolation
-  measurement matches the shipped path.
+  The single-writer branch proves one mutation connection and defensive abort
+  for ordinary mutation/genesis operation; the multi-writer branch specifies
+  bounded retry policy and ownership boundaries.
+- Define one named runtime-state maintenance mutex shared by mutation/genesis
+  paths and the privileged baseline writer. The baseline writer must acquire
+  this mutex before its WAL transaction; the single-writer no-contention proof
+  excludes baseline operation and must be re-established by any future ticket
+  that wires compaction. If no existing local lock primitive can implement the
+  mutex safely, stop preflight and revise the plan.
 - Map every runtime-state lifecycle mutation and prove the chosen CAS
   chokepoint covers them.
 - Locate the existing local secret/key-storage mechanism without printing or
@@ -171,17 +176,18 @@ this posture.
   owner-version-only changes with unchanged lifecycle state.
 - Emit no event for a true no-op that changes no replayed column.
 - Use the caller's existing SQLite WAL connection and transaction for mutation
-  and genesis events.
+  and genesis events, while holding the named runtime-state maintenance mutex.
 - Any mutation/genesis journal constraint or write failure aborts the complete
   enclosing materialized-state mutation; errors must not be swallowed.
-- The privileged baseline writer is the sole exception: a baseline event may
-  commit without a materialized-state mutation, but only through the named
-  out-of-band writer after its sealed tuple validation and within its own
-  explicit WAL transaction.
+- The privileged baseline writer is the sole event-only exception: it acquires
+  the same maintenance mutex, validates its sealed tuple, and appends the
+  baseline event in its own explicit WAL transaction. It is not invoked by this
+  ticket.
 - In the multi-writer branch, use a code-level `SEQUENCE_RETRY_LIMIT = 3`;
   retry with a fresh in-transaction sequence and abort the enclosing mutation
   when the cap is exhausted. In the single-writer branch, prove contention
-  cannot occur and retain an explicit defensive abort path.
+  cannot occur for ordinary mutation/genesis and retain an explicit defensive
+  abort path.
 - Neither retry nor abort may create a committed mutation/genesis event without
   its state mutation or a replay-visible sequence gap. Baseline sequence
   continuity is governed by Gate 1.
@@ -193,8 +199,10 @@ this posture.
 
 Implement a bounded verifier that:
 
-- opens one SQLite WAL read-only transaction on one connection and reads both the
-  bounded event stream and materialized row within that same deferred snapshot;
+- opens a read-only SQLite WAL connection and explicitly executes
+  `BEGIN DEFERRED`; the first event-stream read establishes the snapshot,
+  and both the bounded event stream and materialized row are read after that
+  snapshot establishment and before the transaction ends;
 - returns per-entity `CONSISTENT`, `DRIFT`, or `UNKNOWN`;
 - treats `UNKNOWN` as absorbing;
 - requires complete verified history for `DRIFT`;
@@ -202,9 +210,12 @@ Implement a bounded verifier that:
   baseline-to-next-event sequence continuity, duplicate or missing
   predecessors, digest-parameter identity, schema versions, reason codes, and
   terminal state;
-- uses a code-level `REPLAY_EVENT_LIMIT = 10000` per entity; exceeding it
-  permanently returns `UNKNOWN` for that entity in this ticket, with no
-  in-scope compaction remedy;
+- uses a code-level `REPLAY_EVENT_LIMIT = 10000` counted from the effective
+  replay start point: the latest valid baseline if one exists, otherwise the
+  genesis event;
+- selects the valid baseline with the highest `sealed_through_seq`, ignores
+  events before that baseline, and returns `UNKNOWN` for conflicting or
+  overlapping baselines;
 - returns `UNKNOWN` on snapshot failure, unsupported/newer versions, malformed
   history, unknown digest regime, verify-time key unavailability, exceeded
   bound, missing legacy origin, or a materialized-row/history asymmetry;
@@ -235,6 +246,7 @@ Add deterministic tests for:
 - owner-version-only mutation;
 - mutation/genesis journal failure rolling back materialized state;
 - SQLite WAL and selected busy-timeout;
+- named maintenance-mutex exclusion between baseline and mutation paths;
 - writer-model branch:
   - multi-writer: sequence retry cap and concurrent contention;
   - single-writer: single-writer invariant and defensive abort path;
@@ -244,21 +256,29 @@ Add deterministic tests for:
   and verify-time key unavailability;
 - duplicate, missing, malformed, non-contiguous, and unsupported events;
 - truncated-head history without an origin marker returning `UNKNOWN`;
+- sealed-baseline tuple mismatch against the materialized row returning
+  `UNKNOWN`;
+- baseline with a non-current digest-parameter identifier returning
+  `UNKNOWN`;
 - sealed baseline contents, baseline sequence consumption, and post-baseline
   continuity;
-- snapshot race using the selected WAL read-transaction mechanism, returning
-  `CONSISTENT` or `UNKNOWN`, never false `DRIFT`;
-- replay bound and closed reason-code enforcement;
+- snapshot race using explicit `BEGIN DEFERRED` and the selected WAL
+  read-transaction mechanism, returning `CONSISTENT` or `UNKNOWN`, never
+  false `DRIFT`;
+- replay bound counted from the effective replay start point, baseline
+  selection, conflicting/overlapping baselines, and closed reason codes;
 - verifier-performs-no-writes using a direct database-change assertion;
 - materialized-row/history asymmetry returning `UNKNOWN`;
 - post-terminal events returning `UNKNOWN`;
 - prompt-cache/gateway no-change check: runtime-state modules must not import
   or invoke gateway conversation or prompt-construction modules;
-- mutation benchmark: 200 warmup mutations followed by 1000 measured
-  mutations against a temp SQLite WAL database, comparing the journal-enabled
-  CAS path with a test-local journal-disabled control at the same measurement
-  boundary; report p95 incremental overhead and block delivery if it exceeds
-  5 ms. The control is not shipped and has no user-facing disable switch;
+- mutation benchmark: 20 repetitions, each with 200 warmup mutations followed
+  by 1000 measured mutations, on the same Python/SQLite WAL test environment
+  and temp database shape. Compare journal-enabled CAS with a test-local
+  journal-disabled control at the same measurement boundary; report p95
+  incremental overhead. The 5 ms p95 threshold is a local-preflight blocker;
+  CI records the result but does not gate on host-noise variance. The control
+  is not shipped and has no user-facing disable switch;
 - `DRIFT` only for complete verified history;
 - non-replayed columns remain outside the verifier claim.
 
@@ -322,13 +342,14 @@ must be incorporated before implementation authorization:
 These are plan-only corrections. They do not authorize source edits, migration,
 tests, DGX changes, deployment, repair, or event-sourcing.
 
-## Implementation-plan review reconciliation v3
+## Implementation-plan review reconciliation v4
 
-The v3 review required the normative gates to resolve baseline-event exception
-semantics, unconditional WAL snapshot behavior, truncated-head coverage,
-genesis before/after semantics, terminal-event handling, and replay-limit and
-benchmark-control limitations. These are incorporated in Gates 0-4 above. This
-section is changelog only; Gates 0-4 are authoritative.
+The v4 review required unconditional WAL snapshot semantics, explicit
+maintenance-mutex exclusion for the privileged baseline writer, effective
+replay-start and baseline-selection rules, rejection tests for stale/mismatched
+baselines, a defined local benchmark protocol, and an explicit accepted
+limitation for replay-limit overflow and digest rotation. These are incorporated
+in Gates 0-4 above; this section is changelog only.
 
 ## Acceptance criteria
 
@@ -341,7 +362,7 @@ ARCH-003 implementation is ready for its delivery gates only when:
   explicit in the Gates 0-4 bodies;
 - profile/entity sequences are contiguous and race-safe;
 - legacy rows have explicit `UNKNOWN` behavior;
-- baselines and digest regimes are verifiable;
+- baselines are verifiable and any digest rotation explicitly renders all pre-rotation history `UNKNOWN` with no in-ticket recovery path;
 - verifier reads are snapshot-consistent and read-only;
 - `DRIFT` is never produced from incomplete or ambiguous history;
 - verifier mutation and prompt-cache/gateway isolation tests pass;
