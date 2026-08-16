@@ -5,8 +5,9 @@ conversation busy" is a cross-process question and the answer lives in
 ``state.db``. Admission polarity is set by who initiated the turn:
 
 * machine-initiated (the auto-continue of a crash-interrupted turn) is
-  fail-closed. It peeks at the conversation's turn lease, and it consumes the
-  ``interrupted_turns`` row with a compare-and-swap that exactly one process
+  fail-closed. It peeks at the conversation's turn lease before it does
+  anything at all to the ``interrupted_turns`` row -- continue it or retire it
+  -- and it consumes the row with a compare-and-swap that exactly one process
   can win. Anything unproven resolves to abstaining, which defers the recovery
   to the next resume rather than losing it: the record stays where it was.
 * user-initiated is fail-open. It waits a bounded time with a visible notice
@@ -170,6 +171,124 @@ def test_a_live_holder_defers_the_continuation(emits, schedule_env, turn_db):
     assert survivor is not None
     assert survivor["attempts"] == 0
     assert survivor["owner"] == _FOREIGN_OWNER
+
+
+def test_a_live_holder_defers_a_stale_record_too(
+    emits, schedule_env, turn_db, monkeypatch
+):
+    """The lease vetoes the policy retirements, not only the claim.
+
+    Freshness is a number in this process's config file, and the record it
+    would be applied to here belongs to a turn that is provably still running.
+    A process configured with a shorter window than the one running the turn
+    would otherwise force-delete a live turn's record -- the same deletion the
+    owner check exists to prevent, reached by a different route. The record is
+    left where it is; when the lease lapses the next resume applies the window
+    to it.
+    """
+    _record(turn_db, "session-key", "the turn that is actually running")
+    assert turn_db.try_acquire_session_turn_lease(
+        "session-key", _LIVE_HOLDER, ttl_seconds=300
+    )
+    # Server-side clock only: the lease row's expiry is read through
+    # hermes_state's own time, so the record goes stale while the lease stays
+    # live, which is the whole point of the case.
+    monkeypatch.setattr(
+        server, "time", types.SimpleNamespace(time=lambda: time.time() + 3600)
+    )
+
+    result = server._maybe_schedule_auto_continue("sid", _session(), "session-key")
+
+    assert result is None
+    assert not schedule_env
+    survivor = _read(turn_db, "session-key")
+    assert survivor is not None
+    assert survivor["attempts"] == 0
+    assert survivor["owner"] == _FOREIGN_OWNER
+
+
+def test_a_live_holder_defers_a_disabled_process_too(
+    emits, schedule_env, turn_db, monkeypatch
+):
+    """Turning auto-continue off does not license deleting a running turn's row.
+
+    The record here is this process's OWN, which is what makes the case
+    discriminating: the disabled arm's clear is owner-checked, so it would
+    land. It does not, because a lease is live on the conversation and a turn
+    that is running now needs its record whatever this process's config says
+    about continuing turns later.
+    """
+    session = _session()
+    server._record_interrupted_turn(session, "session-key", "own turn, still running")
+    assert _read(turn_db, "session-key") is not None
+    assert turn_db.try_acquire_session_turn_lease(
+        "session-key", _LIVE_HOLDER, ttl_seconds=300
+    )
+    monkeypatch.setattr(
+        server,
+        "_load_cfg",
+        lambda: {"desktop": {"auto_continue": {"enabled": False}}},
+    )
+
+    result = server._maybe_schedule_auto_continue("sid", session, "session-key")
+
+    assert result is None
+    assert not schedule_env
+    survivor = _read(turn_db, "session-key")
+    assert survivor is not None
+    assert survivor["prompt"] == "own turn, still running"
+
+
+def test_a_live_holder_defers_an_exhausted_record_too(
+    emits, schedule_env, turn_db
+):
+    """The third retirement arm, and the one that reads most like a fact.
+
+    An attempt count at the ceiling looks like a property of the record rather
+    than of the reader, but the ceiling it is compared against is this
+    process's config, and the count is only evidence that earlier continuations
+    were started. Neither says the turn running right now has stopped. The row
+    a live lease covers is that turn's own record, so deleting it here does not
+    stop a loop, it removes the trace the turn would crash into: if the turn
+    then dies, no record remains and nothing recovers it at all. Deferring
+    keeps the ceiling intact for the resume that follows the lease.
+    """
+    _record(turn_db, "session-key", "the turn that is actually running", attempts=2)
+    assert turn_db.try_acquire_session_turn_lease(
+        "session-key", _LIVE_HOLDER, ttl_seconds=300
+    )
+
+    result = server._maybe_schedule_auto_continue("sid", _session(), "session-key")
+
+    assert result is None
+    assert not schedule_env
+    survivor = _read(turn_db, "session-key")
+    assert survivor is not None
+    assert survivor["attempts"] == 2
+    assert survivor["owner"] == _FOREIGN_OWNER
+
+
+def test_no_holder_leaves_the_policy_retirements_intact(
+    schedule_env, turn_db, monkeypatch
+):
+    """The lease is a veto, not an exemption.
+
+    The companion to the two above, stated here rather than left implicit in
+    the freshness tests next door: with nothing holding the conversation, a
+    stale record is still collected. Otherwise the peek would have turned the
+    windows off.
+    """
+    _record(turn_db, "session-key", "old prompt")
+    assert turn_db.get_session_turn_lease_holder("session-key") is None
+    monkeypatch.setattr(
+        server, "time", types.SimpleNamespace(time=lambda: time.time() + 3600)
+    )
+
+    result = server._maybe_schedule_auto_continue("sid", _session(), "session-key")
+
+    assert result is None
+    assert not schedule_env
+    assert _read(turn_db, "session-key") is None
 
 
 def test_a_dead_holders_lease_does_not_block_the_continuation(

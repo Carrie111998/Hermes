@@ -7939,6 +7939,23 @@ def _maybe_schedule_auto_continue(sid: str, session: dict, session_key: str) -> 
     marker = _read_interrupted_turn(session, session_key)
     if marker is None:
         return None
+    # The lease is read before any policy is applied to the record, because a
+    # live lease answers a question none of the policies can: the record is
+    # evidence a turn started, not that it stopped, and a live lease says it is
+    # still running in some process. That makes the record that process's
+    # business until its lease lapses, and it outranks every reason this
+    # process has for retiring it. The freshness window and the attempt ceiling
+    # are read from this process's config, so two processes sharing a
+    # HERMES_HOME can disagree about them — and a turn that is provably alive
+    # is not stale to the process running it, whatever this one's numbers say.
+    # Nothing is cleared here: when the lease lapses, the next resume reads the
+    # record again and applies policy to it then.
+    if _turn_is_held_elsewhere(session, session_key):
+        logger.debug(
+            "auto-continue stood down for %s: the conversation's turn lease is held",
+            session_key,
+        )
+        return None
     enabled, freshness_secs, max_attempts = _auto_continue_config()
     age = time.time() - marker["started_at"]
     if age > freshness_secs or marker["attempts"] >= max_attempts:
@@ -7959,27 +7976,20 @@ def _maybe_schedule_auto_continue(sid: str, session: dict, session_key: str) -> 
     # Admission. Nobody typed this turn, so it is fail-closed: it runs only on
     # positive proof that this process may run it, and every unproven case
     # stands down silently. Two hermes serve processes can share one
-    # HERMES_HOME, so both halves are cross-process questions.
+    # HERMES_HOME, so this is a cross-process question, as the lease peek above
+    # already was.
     #
-    # First the lease, which answers "is the turn still running": the record
-    # is evidence a turn started, not that it stopped. Then the claim, which
-    # is the guarantee — a compare-and-swap on the whole record exactly one
-    # process can win, so two resumes racing the same orphan produce one
-    # continuation. The engine's own acquire still serializes underneath, but
-    # serializing a duplicate turn only makes it run second; this stops it
-    # being queued.
+    # The peek answered "is the turn still running". The claim is the
+    # guarantee — a compare-and-swap on the whole record exactly one process
+    # can win, so two resumes racing the same orphan produce one continuation.
+    # The engine's own acquire still serializes underneath, but serializing a
+    # duplicate turn only makes it run second; this stops it being queued.
     #
     # The token is `marker`, the record read at the top of this function, and
     # it is handed back whole. The counter alone would not do: every
     # user-initiated turn re-records with attempts=0 from a prologue that runs
     # long before the engine takes the lease, so a counter value read off an
     # orphan recurs under a live turn that the peek cannot yet see.
-    if _turn_is_held_elsewhere(session, session_key):
-        logger.debug(
-            "auto-continue stood down for %s: the conversation's turn lease is held",
-            session_key,
-        )
-        return None
     claimed = _claim_interrupted_turn(session, session_key, expected=marker)
     if claimed is None:
         logger.debug("auto-continue stood down for %s: record not claimed", session_key)
