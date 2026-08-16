@@ -53,7 +53,7 @@
 | HERMES-AUTH-002 | MERGED_DEPLOYED | Separate target-config ticket; do not conflate it with the Telegram lane. |
 | HERMES-CALENDAR-GUARD-001 | MERGED_DEPLOYED | Actual `hermes-mcp-health-guard.timer` remains active/waiting; the historical calendar-guard unit name is not installed. |
 | HERMES-MONITORING-001 | BLOCKED | No merge or deployment inference from current gateway evidence. |
-| ARCH-002 | IMPLEMENTED_UNMERGED_REVIEW_BLOCKED | Isolated branch `ticket/arch-002-runtime-state-contract`; CAS lifecycle transitions, terminal immutability, and idempotent same-state retry implemented; focused tests `24 passed`; commit/push next, merge/deploy separate. |
+| ARCH-002 | IMPLEMENTED_UNMERGED_REVIEW_BLOCKED | Isolated branch `ticket/arch-002-runtime-state-contract`; CAS lifecycle transitions, terminal immutability, and idempotent same-state retry implemented; focused tests `24 passed`; CI run `31932199413` PASS; AGY advisory PASS but Claude verdict unavailable; merge/deploy separate. |
 
 ## Current next lane
 
