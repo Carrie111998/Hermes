@@ -226,6 +226,11 @@ class HonchoMemoryProvider(MemoryProvider):
         self._injection_log_path: Optional[str] = None
         self._injection_log_lock = threading.Lock()
 
+        # Pinned `injection.sessionStart` component list, or None when the
+        # caller pinned none. None means "render whatever the backend returned",
+        # which is the historical behaviour — see _format_first_turn_context.
+        self._session_start_components: Optional[frozenset] = None
+
         # B5: Cost-awareness turn counting and cadence
         self._turn_count = 0
         self._injection_frequency = "every-turn"  # or "first-turn"
@@ -343,6 +348,7 @@ class HonchoMemoryProvider(MemoryProvider):
                 if cfg.reasoning_level_cap in self._LEVEL_ORDER:
                     self._reasoning_level_cap = cfg.reasoning_level_cap
                 self._injection_log_path = self._resolve_injection_log_path(raw)
+                self._session_start_components = self._resolve_session_start(raw)
             except Exception as e:
                 logger.debug("Honcho cost-awareness config parse error: %s", e)
 
@@ -566,30 +572,50 @@ class HonchoMemoryProvider(MemoryProvider):
             return True
         return not (self._init_thread and self._init_thread.is_alive())
 
+    #: ``injection.sessionStart`` component name -> (context key, heading).
+    #: Order is the render order, and is deliberately independent of the order
+    #: components are listed in config: a caller reordering its list should not
+    #: silently reorder the agent's context.
+    _SESSION_START_COMPONENTS = (
+        ("summary", "summary", "## Session Summary"),
+        ("peerRepresentation", "representation", "## User Representation"),
+        ("peerCard", "card", "## User Peer Card"),
+        ("aiRepresentation", "ai_representation", "## AI Self-Representation"),
+        ("aiCard", "ai_card", "## AI Identity Card"),
+    )
+
     def _format_first_turn_context(self, ctx: dict) -> str:
-        """Format the prefetch context dict into a readable system prompt block."""
+        """Render the prefetch context, honouring ``injection.sessionStart``.
+
+        Unconfigured callers are unaffected: ``None`` means no list was pinned, and
+        everything renders. An explicitly empty list means "inject nothing" and is
+        honoured as such rather than being treated as unset — the two are different
+        instructions.
+        """
+        allowed = self._session_start_components
         parts = []
+        suppressed = []
 
-        # Session summary — session-scoped context, placed first for relevance
-        summary = ctx.get("summary", "")
-        if summary:
-            parts.append(f"## Session Summary\n{summary}")
+        for name, key, heading in self._SESSION_START_COMPONENTS:
+            value = ctx.get(key, "")
+            if not value:
+                continue
+            if allowed is not None and name not in allowed:
+                # Recorded, not dropped silently: a component the backend
+                # returned and this filter withheld is a decision worth being
+                # able to see in a log, not an absence to be inferred later.
+                suppressed.append(f"{name} ({len(value)}B)")
+                continue
+            parts.append(f"{heading}\n{value}")
 
-        rep = ctx.get("representation", "")
-        if rep:
-            parts.append(f"## User Representation\n{rep}")
-
-        card = ctx.get("card", "")
-        if card:
-            parts.append(f"## User Peer Card\n{card}")
-
-        ai_rep = ctx.get("ai_representation", "")
-        if ai_rep:
-            parts.append(f"## AI Self-Representation\n{ai_rep}")
-
-        ai_card = ctx.get("ai_card", "")
-        if ai_card:
-            parts.append(f"## AI Identity Card\n{ai_card}")
+        if suppressed:
+            logger.debug(
+                "Honcho session-start injection filtered by config: kept %s, "
+                "suppressed %s",
+                [n for n, k, _ in self._SESSION_START_COMPONENTS
+                 if ctx.get(k) and (allowed is None or n in allowed)],
+                suppressed,
+            )
 
         if not parts:
             return ""
@@ -638,6 +664,23 @@ class HonchoMemoryProvider(MemoryProvider):
             )
 
         return header
+
+    @staticmethod
+    def _resolve_session_start(raw: dict) -> Optional[frozenset]:
+        """The pinned ``injection.sessionStart`` list, or None if unpinned.
+
+        Returns a set rather than the list because order is fixed by the render
+        table, and ``None`` rather than an empty set for "unpinned" so that a
+        caller asking for *nothing* stays distinguishable from a caller who
+        never asked. Unknown names are kept.
+        """
+        injection = raw.get("injection")
+        if not isinstance(injection, dict):
+            return None
+        listed = injection.get("sessionStart")
+        if not isinstance(listed, (list, tuple)):
+            return None
+        return frozenset(str(x) for x in listed)
 
     @staticmethod
     def _resolve_injection_log_path(raw: dict) -> Optional[str]:
