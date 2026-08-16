@@ -1759,13 +1759,11 @@ class TestRequestChangesFlow:
     def test_changes_string_alias_in_cli_choice_map(self):
         """The CLI prompt accepts ``c``/``changes``/``change``/etc. as
         the choice token (we don't expect users to type the full word).
-        This is checked indirectly by parsing the prompt loop source so
-        the test catches accidental token removals during refactors."""
-        src = Path(approval_module.__file__).read_text(encoding="utf-8")
-        # Spot-check: at minimum the short form 'c' must be present in
-        # the choice loop. The exact alias set is allowed to grow over
-        # time but never shrink without an explicit decision.
-        assert "'c'" in src or '"c"' in src or "'c', 'changes'" in src
+        Assert the exported alias constant rather than reading source text."""
+        aliases = approval_module.CLI_CHANGES_CHOICE_ALIASES
+        # Minimum stable set — may grow, must not lose the short form.
+        for required in ("c", "changes", "change", "request", "feedback"):
+            assert required in aliases, f"missing CLI changes alias: {required}"
         # And the i18n keys referenced by the loop must exist in the
         # English catalog so users actually see the prompt.
         import yaml as _yaml

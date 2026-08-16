@@ -2323,6 +2323,11 @@ def detect_dangerous_command(command: str) -> tuple:
 _lock = threading.Lock()
 
 
+# Accepted CLI tokens for the Request Changes path (issue #25693).
+# Exposed as a module constant so tests can assert the alias set without
+# reading source text.
+CLI_CHANGES_CHOICE_ALIASES = frozenset({'c', 'changes', 'change', 'request', 'feedback'})
+
 def _changes_message(feedback: str) -> str:
     """Format the BLOCKED-with-feedback message returned to the agent.
 
@@ -3064,7 +3069,7 @@ def _prompt_dangerous_approval_inner(command: str, description: str,
                     return "session"
                 print(t("approval.allowed_always"))
                 return "always"
-            elif choice in {'c', 'changes', 'change', 'request', 'feedback'}:
+            elif choice in CLI_CHANGES_CHOICE_ALIASES:
                 # Capture free-text feedback so the agent can revise the
                 # command instead of just being denied. An empty response
                 # falls through to deny so we never re-prompt the agent

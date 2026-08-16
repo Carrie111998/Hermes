@@ -883,7 +883,7 @@ class TelegramAdapter(BasePlatformAdapter):
         self._model_picker_state: Dict[str, dict] = {}
         self._choice_picker_state: Dict[str, dict] = {}
         # Approval button state: message_id → session_key
-        self._approval_state: Dict[int, str] = {}
+        self._approval_state: Dict[int, Any] = {}
         # Slash-confirm button state: confirm_id → session_key (for /reload-mcp
         # and any other slash-confirm prompts; see GatewayRunner._request_slash_confirm).
         self._slash_confirm_state: Dict[str, str] = {}
@@ -6135,34 +6135,48 @@ class TelegramAdapter(BasePlatformAdapter):
             # Issue #25693: "Request Changes" sits between Always and Deny as
             # the collaboration option. Order matters -- the destructive
             # choice (Deny) stays last so it never gets clicked by reflex.
+            try:
+                from agent.i18n import t as _t_btn
+                _btn_once = _t_btn("approval.button_once")
+                _btn_session = _t_btn("approval.button_session")
+                _btn_always = _t_btn("approval.button_always")
+                _btn_changes = _t_btn("approval.button_changes")
+                _btn_deny = _t_btn("approval.button_deny")
+            except Exception:
+                _btn_once = "✅ Allow Once"
+                _btn_session = "✅ Session"
+                _btn_always = "✅ Always"
+                _btn_changes = "📝 Request Changes"
+                _btn_deny = "❌ Deny"
+
             if smart_denied:
                 keyboard = InlineKeyboardMarkup([
                     [
-                        InlineKeyboardButton("✅ Allow Once", callback_data=f"ea:once:{approval_id}"),
-                        InlineKeyboardButton("❌ Deny", callback_data=f"ea:deny:{approval_id}"),
+                        InlineKeyboardButton(_btn_once, callback_data=f"ea:once:{approval_id}"),
+                        InlineKeyboardButton(_btn_deny, callback_data=f"ea:deny:{approval_id}"),
                     ],
                 ])
             else:
                 row1 = [
-                    InlineKeyboardButton("✅ Allow Once", callback_data=f"ea:once:{approval_id}"),
+                    InlineKeyboardButton(_btn_once, callback_data=f"ea:once:{approval_id}"),
                 ]
                 if allow_session:
                     row1.append(
-                        InlineKeyboardButton("✅ Session", callback_data=f"ea:session:{approval_id}")
+                        InlineKeyboardButton(_btn_session, callback_data=f"ea:session:{approval_id}")
                     )
                 row2 = []
                 if allow_permanent:
                     row2.append(
-                        InlineKeyboardButton("✅ Always", callback_data=f"ea:always:{approval_id}")
+                        InlineKeyboardButton(_btn_always, callback_data=f"ea:always:{approval_id}")
                     )
                 row2.append(
-                    InlineKeyboardButton("📝 Request Changes", callback_data=f"ea:changes:{approval_id}")
+                    InlineKeyboardButton(_btn_changes, callback_data=f"ea:changes:{approval_id}")
                 )
                 keyboard = InlineKeyboardMarkup([
                     row1,
                     row2,
                     [
-                        InlineKeyboardButton("❌ Deny", callback_data=f"ea:deny:{approval_id}"),
+                        InlineKeyboardButton(_btn_deny, callback_data=f"ea:deny:{approval_id}"),
                     ],
                 ])
 
@@ -6188,7 +6202,10 @@ class TelegramAdapter(BasePlatformAdapter):
             msg = await self._send_message_with_thread_fallback(**kwargs)
 
             # Store session_key keyed by approval_id for the callback handler
-            self._approval_state[approval_id] = session_key
+            self._approval_state[approval_id] = {
+                "session_key": session_key,
+                "status": "pending",
+            }
 
             return SendResult(success=True, message_id=str(msg.message_id))
         except Exception as e:
@@ -7009,10 +7026,11 @@ class TelegramAdapter(BasePlatformAdapter):
              feedback=...)`` -- this unblocks the agent thread waiting in
              ``check_dangerous_command`` and carries the feedback inline.
 
-        The approval entry stays in ``_approval_state`` for the whole
-        capture window so a duplicate click on the original message can be
-        rejected cleanly. We pop it only after the bridge resolves (or on
-        timeout / cancel).
+        The approval entry stays in ``_approval_state`` with
+        ``status="capturing"`` for the whole capture window so a duplicate
+        click on the original message is rejected up front (before a second
+        clarify bridge can race). We pop it only after the bridge resolves
+        (or on timeout / cancel / setup failure).
         """
         # Build clarify entry. ID format mirrors the existing convention
         # used by send_clarify so logs are easy to grep across both paths.
@@ -7245,10 +7263,27 @@ class TelegramAdapter(BasePlatformAdapter):
                 # those terminate the approval immediately.
                 user_display = getattr(query.from_user, "first_name", "User")
                 if choice == "changes":
-                    session_key = self._approval_state.get(approval_id)
+                    state = self._approval_state.get(approval_id)
+                    if not state:
+                        await query.answer(text="This approval has already been resolved.")
+                        return
+                    # Normalize legacy str entries and reject duplicate capture clicks.
+                    if isinstance(state, str):
+                        state = {"session_key": state, "status": "pending"}
+                        self._approval_state[approval_id] = state
+                    if not isinstance(state, dict):
+                        await query.answer(text="This approval has already been resolved.")
+                        return
+                    if state.get("status") == "capturing":
+                        await query.answer(text="Already collecting feedback for this approval.")
+                        return
+                    session_key = state.get("session_key")
                     if not session_key:
                         await query.answer(text="This approval has already been resolved.")
                         return
+                    # Mark capturing BEFORE starting the bridge so a second
+                    # click cannot spawn a parallel capture on the same id.
+                    state["status"] = "capturing"
                     await self._begin_approval_changes_capture(
                         query=query,
                         approval_id=approval_id,
@@ -7257,7 +7292,19 @@ class TelegramAdapter(BasePlatformAdapter):
                     )
                     return
 
-                session_key = self._approval_state.pop(approval_id, None)
+                state = self._approval_state.pop(approval_id, None)
+                if not state:
+                    await query.answer(text="This approval has already been resolved.")
+                    return
+                if isinstance(state, dict):
+                    if state.get("status") == "capturing":
+                        # Feedback capture in flight — ignore competing choices.
+                        self._approval_state[approval_id] = state
+                        await query.answer(text="Already collecting feedback for this approval.")
+                        return
+                    session_key = state.get("session_key")
+                else:
+                    session_key = state
                 if not session_key:
                     await query.answer(text="This approval has already been resolved.")
                     return
