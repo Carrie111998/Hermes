@@ -1,6 +1,6 @@
 ---
 title: "ARCH-003 implementation plan: runtime-state audit and replay verification"
-status: IMPLEMENTATION_PLAN_REVISE_V9_PENDING
+status: IMPLEMENTATION_PLAN_REVISE_V10_PENDING
 date: 2026-08-16
 type: implementation-plan
 ticket: ARCH-003
@@ -99,9 +99,11 @@ prompt construction, legacy `state.db`, or unrelated dirty worktree files.
   SQLite transaction and release it after commit or rollback. The privileged
   baseline writer acquires its exclusive/write side before opening its WAL
   transaction and releases it after commit or rollback.
-- Set `LOCK_ACQUIRE_TIMEOUT = 5s` for both lock sides. Acquisition failure
-  returns a closed `LOCK_TIMEOUT` reason, aborts before opening SQLite, and
-  never blocks ordinary mutations indefinitely. The cross-process primitive
+- Set `LOCK_ACQUIRE_TIMEOUT = 5s` for both lock sides and
+  `SQLITE_BUSY_TIMEOUT = 5s` for SQLite busy handling. Record and test both
+  fixed values; the Gate 4 benchmark is evaluated with these values. Acquisition
+  failure returns a closed `LOCK_TIMEOUT` reason, aborts before opening SQLite,
+  and never blocks ordinary mutations indefinitely. The cross-process primitive
   must release ownership automatically when its holder dies; if safe
   stale-holder recovery cannot be proven, stop preflight. Exclusive baseline
   acquisition may fail and be retried only by its out-of-band caller.
@@ -118,6 +120,17 @@ prompt construction, legacy `state.db`, or unrelated dirty worktree files.
 - Define the journal migration version, event kinds, replay tuple, baseline
   fields, genesis semantics, generation record, key-check value, and rollback
   posture before edits.
+- Freeze the closed diagnostic reason-code enum before Gate 3 edits. Statuses
+  remain `CONSISTENT`, `DRIFT`, and `UNKNOWN`; the only permitted diagnostic
+  reason codes are: `OK`, `DRIFT_DETECTED`, `LOCK_TIMEOUT`,
+  `EMPTY_HISTORY`, `LEGACY_ORIGIN_MISSING`, `KEY_UNAVAILABLE`,
+  `KEY_CHECK_MISMATCH`, `DIGEST_PARAMETER_MISMATCH`,
+  `GENERATION_MISMATCH`, `MATERIALIZED_STATE_ASYMMETRY`,
+  `SEQUENCE_INVALID`, `BASELINE_INVALID`, `HISTORY_MALFORMED`,
+  `UNSUPPORTED_VERSION`, `REPLAY_LIMIT_EXCEEDED`,
+  `SNAPSHOT_FAILURE`, `POST_TERMINAL_EVENT`, and `WRITE_ABORT`.
+  No implementation may add a reason code outside this set without a plan
+  revision.
 - Confirm that the prior release can start with the new journal table present
   and that rollback does not require deleting the table or losing materialized
   state.
@@ -156,8 +169,8 @@ updates the row marker and records the current generation in its event. A row
 whose marker is older than the current generation, or whose materialized state
 advanced without a corresponding current-generation event, is `UNKNOWN`, never
 `DRIFT`. A rollback-then-roll-forward cycle therefore keeps affected entities
-`UNKNOWN` until a subsequent journaled genesis/mutation re-establishes
-current-generation origin.
+`UNKNOWN` until the first subsequent journaled genesis re-establishes
+current-generation origin; a plain mutation cannot re-establish that origin.
 
 The replay tuple is explicitly `lifecycle_state`, `owner_version`, and
 `state_schema_version`; terminality is derived from lifecycle state. The
@@ -199,12 +212,16 @@ arbitrary user data.
 
 Legacy entities use the no-backfill policy: pre-journal rows remain `UNKNOWN`
 until a successful post-migration mutation emits a marked post-migration
-genesis event. That single genesis event both establishes the trusted origin
-and records the committed mutation: its before-state tuple is the
-then-observed origin tuple, its after-state tuple is the committed post-mutation
-tuple, and no separate genesis-plus-mutation pair is emitted. `CONSISTENT`
-for that entity covers only history from that genesis event onward. A truncated
-head without the required origin marker returns `UNKNOWN`.
+genesis event. Any entity with no prior current-epoch journal history, including
+an entity first created after migration, likewise emits a marked genesis for its
+first journaled replay-tuple mutation. After a current-generation advance, the
+first journaled replay-tuple mutation also emits a marked genesis; a plain
+mutation never establishes a new origin epoch. That single genesis event both
+establishes the trusted origin and records the committed mutation: its before-state
+tuple is the then-observed origin tuple, its after-state tuple is the committed
+post-mutation tuple, and no separate genesis-plus-mutation pair is emitted.
+`CONSISTENT` for that entity covers only history from that genesis event onward. A
+truncated head without the required origin marker returns `UNKNOWN`.
 
 Digest parameter identifiers are persisted metadata; key material is never
 journaled. Use HMAC-SHA-256 for the entity digest and for the key-check over a
@@ -227,7 +244,11 @@ this posture.
 
 - Emit exactly one `mutation` or `genesis` event for every committed
   mutation that changes any member of the replay tuple, including
-  owner-version-only changes with unchanged lifecycle state.
+  owner-version-only changes with unchanged lifecycle state. The first
+  journaled replay-tuple mutation for an entity with no current-epoch history
+  (including a post-migration entity) is `genesis`; the first such mutation
+  after a current-generation advance is also `genesis`, while subsequent
+  mutations use `mutation`.
 - Emit no event for a true no-op that changes no replayed column.
 - Ordinary mutation/genesis paths acquire the shared side of the named
   cross-process maintenance RW lock before opening the SQLite WAL transaction;
@@ -267,8 +288,8 @@ Implement a bounded verifier that:
 - requires complete verified history for `DRIFT`;
 - validates event kind, origin/genesis markers, journal generation/epoch
   continuity, baseline contents and baseline-to-next-event sequence continuity,
-  duplicate or missing predecessors, digest-parameter identity, schemas,
-  reason codes, and terminal state;
+  duplicate or missing predecessors, digest-parameter identity, schemas, the
+  closed Gate 0 reason-code enum, and terminal state;
 - uses a code-level `REPLAY_EVENT_LIMIT = 10000` counted from the effective
   replay start point: the latest valid baseline under the current digest
   identifier if one exists, otherwise the latest valid marked genesis under the
@@ -313,15 +334,19 @@ Add deterministic tests for:
 - prior-version startup with the journal table present and rollback posture;
 - current-generation record advancement and concurrent generation advance during
   verify returning `CONSISTENT` or `UNKNOWN`, never false `DRIFT`;
+- a newly created post-migration entity whose first journaled mutation is a
+  marked genesis and reaches `CONSISTENT` after a valid follow-up mutation;
+- first post-generation-advance mutation emitting a marked genesis, with a
+  plain mutation alone unable to re-establish the epoch;
 - one event per committed replay-tuple mutation;
 - true no-op without an event;
 - owner-version-only mutation;
 - mutation/genesis journal failure rolling back materialized state;
-- SQLite WAL, selected busy-timeout, `BEGIN IMMEDIATE`, and read-only WAL
-  preconditions;
-- `LOCK_ACQUIRE_TIMEOUT = 5s`, `LOCK_TIMEOUT` reason, stale-holder
-  recovery, and shared/exclusive cross-process RW-lock exclusion/release
-  ordering;
+- SQLite WAL, fixed `SQLITE_BUSY_TIMEOUT = 5s`, `BEGIN IMMEDIATE`, and
+  read-only WAL preconditions;
+- `LOCK_ACQUIRE_TIMEOUT = 5s`, `SQLITE_BUSY_TIMEOUT = 5s`,
+  `LOCK_TIMEOUT` reason, stale-holder recovery, and shared/exclusive
+  cross-process RW-lock exclusion/release ordering;
 - single-writer invariant and defensive abort; no sequence-collision retry is
   expected under write-lock-first discipline;
 - baseline generation-marker mismatch returning `UNKNOWN`;
@@ -345,8 +370,8 @@ Add deterministic tests for:
   read-transaction mechanism, returning `CONSISTENT` or `UNKNOWN`, never
   false `DRIFT`;
 - replay bound counted from the effective replay start point, current-epoch
-  genesis selection, baseline selection, generation mismatch, and closed
-  reason codes;
+  genesis selection, baseline selection, generation mismatch, and every member
+  of the closed reason-code enum;
 - verifier-performs-no-writes using a direct database-change assertion;
 - materialized-row/history asymmetry returning `UNKNOWN`;
 - post-terminal events returning `UNKNOWN`;
@@ -431,31 +456,54 @@ no-retry discipline, baseline generation checks, HMAC-SHA-256 key-check
 parameters, and one authoritative benchmark gate. These are incorporated in
 Gates 0-4 above. This section is changelog only.
 
+## Implementation-plan review reconciliation v9
+
+The v9 authenticated Claude Opus review returned `REVISE` with seven bounded
+plan-text corrections. The corrections are incorporated above:
+
+1. Any entity without current-epoch history, including post-migration-created
+   entities, begins with a marked genesis; generation recovery is genesis-only.
+2. The acceptance criteria use the write-lock-first/no-retry defensive-abort
+   discipline rather than a nonexistent sequence retry cap.
+3. Local preflight is the authoritative 5 ms p95 benchmark gate; CI is
+   record-only for host-noise variance.
+4. Gate 0 freezes the closed diagnostic reason-code enum.
+5. Growth accounting includes out-of-band baseline rows.
+6. `SQLITE_BUSY_TIMEOUT = 5s` is fixed and included in the benchmark contract.
+
+These remain plan-only corrections and do not authorize source edits, tests,
+DGX changes, deployment, repair, or event-sourcing. The corrected plan must
+return to the same authenticated Claude reviewer family and then to AGY on the
+identical packet.
+
 ## Acceptance criteria
 
 ARCH-003 implementation is ready for its delivery gates only when:
 
 - every committed replay-tuple mutation emits exactly one metadata-only event;
 - journal failure cannot commit a materialized mutation;
-- the writer model, snapshot mechanism, sequence retry cap, baseline/genesis
-  schema, digest rotation behavior, rollback posture, and key handling are
-  explicit in the Gates 0-4 bodies;
+- the writer model, snapshot mechanism, write-lock-first/no-retry defensive
+  abort discipline, baseline/genesis schema, digest rotation behavior, rollback
+  posture, and key handling are explicit in the Gates 0-4 bodies;
 - profile/entity sequences are contiguous and race-safe;
 - legacy rows have explicit `UNKNOWN` behavior;
 - baselines are verifiable; digest rotation starts a marked post-rotation
   genesis epoch, while all pre-rotation history remains `UNKNOWN` with no
   in-ticket bridge or recovery path; rollback downgrade windows are detected
-  by the generation marker and remain `UNKNOWN` until re-originated;
+  by the generation marker and remain `UNKNOWN` until the first subsequent
+  marked genesis re-originates the entity; a plain mutation cannot recover it;
 - verifier reads are snapshot-consistent and read-only;
 - `DRIFT` is never produced from incomplete or ambiguous history;
 - verifier mutation and prompt-cache/gateway isolation tests pass;
 - incremental mutation-path overhead target is at most 5 ms p95 in the focused
-  benchmark; exceeding it blocks delivery and requires plan revision;
+  benchmark; the authoritative enforcement point is the local-preflight
+  benchmark arm, where exceeding 5 ms p95 blocks delivery and requires plan
+  revision; CI records the result but does not gate on host-noise variance;
 - journal growth is one bounded metadata row per committed replay-tuple
-  mutation, with no automatic retention job; entities beyond the replay limit
-  remain UNKNOWN in this ticket, and the 100,000-event/100 MiB per-profile
-  threshold is a documented follow-up operational review, not an in-ticket
-  operator gate;
+  mutation, plus one row per out-of-band baseline event, with no automatic
+  retention job; entities beyond the replay limit remain UNKNOWN in this ticket,
+  and the 100,000-event/100 MiB per-profile threshold is a documented follow-up
+  operational review, not an in-ticket operator gate;
 - reconciliation v1 items are incorporated into the normative Gates 0-4 text and
   this merged plan revision receives the same-family re-review;
 - all focused and relevant tests pass;
@@ -475,6 +523,12 @@ ARCH-003 implementation is ready for its delivery gates only when:
 - v7: generation continuity for downgrade windows, current-epoch replay start,
   key-check binding, lock timeout/stale-holder behavior, retry removal, and
   distributed benchmark shape.
+- v8: durable current-generation record, explicit no-delete policy, baseline
+  generation checks, HMAC key-check parameters, and authoritative benchmark
+  wording.
+- v9: post-migration creation genesis, genesis-only generation recovery,
+  closed reason-code enumeration, fixed SQLite busy timeout, no-retry acceptance
+  wording, benchmark enforcement point, and baseline-inclusive growth accounting.
 
 
 ## Non-goals
