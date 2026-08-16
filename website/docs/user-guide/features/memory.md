@@ -452,10 +452,16 @@ def _is_duplicate(blocks, recent_blocks):
     return any(_normalize(b) and _normalize(b) in recent_norm for b in blocks)
 
 
+# Dedup state. The `pre_llm_call` hook does not receive `recent_blocks` from
+# Hermes, so the plugin tracks the last injected block set itself.
+_LAST_BLOCKS: list[dict] = []
+
+
 def register(ctx):
     read_fn = _load_adapter()
 
     def on_pre_llm_call(*args, **kwargs):
+        global _LAST_BLOCKS
         read_fn = kwargs.get("read_fn") if isinstance(kwargs, dict) else None
         read_fn = read_fn or _load_adapter()
         if read_fn is None:
@@ -467,9 +473,9 @@ def register(ctx):
             return None
         if not blocks:
             return None
-        recent_blocks = kwargs.get("recent_blocks", []) if isinstance(kwargs, dict) else []
-        if _is_duplicate(blocks, recent_blocks):
+        if _is_duplicate(blocks, _LAST_BLOCKS):
             return None
+        _LAST_BLOCKS = blocks
         block = _build_context_block(blocks)
         return {"context": block}
 
@@ -491,25 +497,80 @@ from pathlib import Path
 from typing import Any
 
 
-HERMES_CONFIG_CANDIDATES = [
-    Path(os.environ.get("HERMES_CONFIG", "")) if os.environ.get("HERMES_CONFIG") else None,
-    Path.home() / "AppData" / "Local" / "hermes" / "config.yaml",
-    Path.home() / ".hermes" / "config.yaml",
-]
+def _config_candidates():
+    hermes_home = os.environ.get("HERMES_HOME")
+    if hermes_home:
+        yield Path(hermes_home) / "config.yaml"
+    if os.environ.get("HERMES_CONFIG"):
+        yield Path(os.environ["HERMES_CONFIG"])
+    # Platform-aware fallbacks. Prefer HERMES_HOME / HERMES_CONFIG when set;
+    # these are here so the recipe works on a default install without them.
+    if os.name == "nt":
+        yield Path.home() / "AppData" / "Local" / "hermes" / "config.yaml"
+    else:
+        yield Path.home() / ".hermes" / "config.yaml"
 
 
 def _read_hermes_memory_provider():
-    for candidate in HERMES_CONFIG_CANDIDATES:
-        if candidate and candidate.exists():
-            try:
-                text = candidate.read_text(encoding="utf-8")
-                for line in text.splitlines():
-                    line = line.strip()
-                    if line.startswith("provider:"):
-                        return line.split(":", 1)[1].strip()
-            except Exception:
-                return None
+    for candidate in _config_candidates():
+        if not candidate.exists():
+            continue
+        try:
+            text = candidate.read_text(encoding="utf-8")
+            # Scan only inside the top-level `memory:` block so a `provider:`
+            # key elsewhere in the YAML can't be matched.
+            in_memory = False
+            for line in text.splitlines():
+                stripped = line.strip()
+                if not stripped or stripped.startswith("#"):
+                    continue
+                if stripped == "memory:":
+                    in_memory = True
+                    continue
+                if in_memory and stripped and not stripped[0].isspace():
+                    in_memory = False  # left the memory: block
+                if in_memory and stripped.startswith("provider:"):
+                    return stripped.split(":", 1)[1].strip()
+        except Exception:
+            return None
     return None
+
+
+def _read_hindsight_config():
+    """Return dict of hindsight llm settings from config, with fallbacks."""
+    from_path = None
+    for candidate in _config_candidates():
+        if candidate.exists():
+            from_path = candidate
+            break
+    if from_path is None:
+        return {}
+    try:
+        import yaml
+        data = yaml.safe_load(from_path.read_text(encoding="utf-8")) or {}
+    except Exception:
+        return {}
+    # Preferred shape: memory.hindsight.llm.* ; legacy shape: hindsight.*
+    h = (data.get("memory") or {}).get("hindsight") or {}
+    if isinstance(h, dict):
+        llm = h.get("llm") or {}
+        bank_id = h.get("bank_id")
+        if isinstance(llm, dict) and (llm.get("provider") or llm.get("model")):
+            return {
+                "provider": llm.get("provider"),
+                "model": llm.get("model"),
+                "base_url": llm.get("base_url"),
+                "bank_id": bank_id,
+            }
+    legacy = data.get("hindsight") or {}
+    if isinstance(legacy, dict):
+        return {
+            "provider": legacy.get("llm_provider"),
+            "model": legacy.get("llm_model"),
+            "base_url": legacy.get("llm_base_url"),
+            "bank_id": legacy.get("bank_id"),
+        }
+    return {}
 
 
 def _load_hindsight():
@@ -542,16 +603,20 @@ def _read_hindsight(limit: int = 20) -> list[dict[str, Any]]:
     if HindsightEmbedded is None:
         return []
     try:
+        cfg = _read_hindsight_config()
+        # Config values win; hardcoded values are only fallbacks so the recipe
+        # still runs on a stock install.
         client = HindsightEmbedded(
             profile="hermes",
-            llm_provider="ollama",
-            llm_model="qwen3.5:9b",
-            llm_base_url="http://localhost:11434/v1",
+            llm_provider=cfg.get("provider") or "ollama",
+            llm_model=cfg.get("model") or "qwen3.5:9b",
+            llm_base_url=cfg.get("base_url") or "http://localhost:11434/v1",
+            bank_id=cfg.get("bank_id") or "hermes",
             idle_timeout=0,
             log_level="error",
         )
         recall = client.recall(
-            bank_id="hermes",
+            bank_id=cfg.get("bank_id") or "hermes",
             query="recent memories",
             max_tokens=4096,
             budget="mid",
@@ -632,8 +697,11 @@ hindsight:
 
 - `pre_llm_call` context text is injected into the model prompt every turn, so
   keep it compact and bounded.
-- Use `recent_blocks` to dedupe identical injected facts across consecutive
-  turns; Hermes passes this through to the hook.
+- The `pre_llm_call` hook does not receive `recent_blocks` from Hermes (it gets
+  `session_id`, `task_id`, `turn_id`, `user_message`, `conversation_history`,
+  `is_first_turn`, `model`, `platform`, `parent_session_id`, `sender_id`). The
+  sample dedupes with module-level state instead; you can also dedupe against
+  `conversation_history` if you need cross-process safety.
 - This does not replace MEMORY.md/USER.md session-start injection. It is
   additive.
 - Recalled memory is **trusted background data**, not authoritative. It must
