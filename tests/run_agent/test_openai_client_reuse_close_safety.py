@@ -138,30 +138,52 @@ class TestEnsurePrimaryClientExhaustive:
                 agent, "_force_close_tcp_sockets", lambda client: 0
             )
 
-            # Simulate another thread still "borrowing" the old client
-            # (e.g. unwinding a stream) concurrently with recovery — the
-            # scenario #70773 describes. It never touches close() itself;
-            # it just proves recovery doesn't need to wait for or race
-            # against borrowers because it no longer hard-closes at all.
+            # Hold a real borrower reference across retirement. The start and
+            # release barriers guarantee that recovery overlaps the borrower;
+            # merely starting a thread here would allow it to finish before
+            # _ensure_primary_openai_client runs and would not test the race.
+            borrower_started = threading.Event()
+            borrower_release = threading.Event()
             borrower_done = threading.Event()
 
             def _borrower(client=old_client):
-                for _ in range(50):
-                    _ = client.is_closed
+                borrower_started.set()
+                borrower_release.wait(timeout=5)
+                _ = client.is_closed
                 borrower_done.set()
 
             t = threading.Thread(target=_borrower, daemon=True)
             t.start()
 
-            result = agent._ensure_primary_openai_client(
-                reason=f"exhaustive-{i}"
-            )
+            if not borrower_started.wait(timeout=5):
+                failures.append((i, "borrower thread never started"))
+                borrower_release.set()
+                t.join(timeout=5)
+                continue
+
+            shutdown_calls = []
+
+            def _shutdown_only(client):
+                shutdown_calls.append(client)
+                return 0
+
+            monkeypatch.setattr(agent, "_force_close_tcp_sockets", _shutdown_only)
+            try:
+                result = agent._ensure_primary_openai_client(
+                    reason=f"exhaustive-{i}"
+                )
+            finally:
+                borrower_release.set()
 
             t.join(timeout=5)
             if not borrower_done.is_set():
                 failures.append((i, "borrower thread never finished"))
             elif result is not new_client:
                 failures.append((i, "did not return the new client"))
+            elif shutdown_calls != [old_client]:
+                failures.append(
+                    (i, f"unexpected shutdown calls: {shutdown_calls!r}")
+                )
             elif old_client.close_calls != 0:
                 failures.append(
                     (i, f"hard close() called {old_client.close_calls}x")
