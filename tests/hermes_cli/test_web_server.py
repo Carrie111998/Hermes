@@ -3903,6 +3903,7 @@ class TestValidateProviderCredential:
         [
             (302, "Endpoint returned HTTP 302."),
             (401, "The endpoint rejected the API key."),
+            (403, "The endpoint rejected the API key."),
             (500, "Endpoint returned HTTP 500."),
         ],
     )

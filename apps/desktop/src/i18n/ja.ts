@@ -2164,6 +2164,8 @@ export const ja = defineLocale({
     getKey: 'キーを取得',
     replaceCurrent: '現在の値を置き換え',
     pasteApiKey: 'API キーを貼り付け',
+    localEndpointTrust:
+      'エンドポイント検証ではプライベートまたはローカルネットワークのアドレスにアクセスできます。信頼できるエンドポイントのみ入力してください。',
     couldNotSave: '認証情報を保存できませんでした。',
     connecting: '接続中',
     update: '更新',

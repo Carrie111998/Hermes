@@ -40,10 +40,12 @@ describe('desktop i18n runtime translator', () => {
     setRuntimeI18nLocale('ja')
     expect(translateNow('settings.appearance.title')).toBe('外観')
     expect(translateNow('settings.nav.providers')).toBe('プロバイダー')
+    expect(translateNow('onboarding.localEndpointTrust')).toContain('信頼できるエンドポイント')
 
     setRuntimeI18nLocale('zh-hant')
     expect(translateNow('settings.appearance.title')).toBe('外觀')
     expect(translateNow('settings.nav.providerApiKeys')).toBe('API 金鑰')
+    expect(translateNow('onboarding.localEndpointTrust')).toContain('您信任的端點')
   })
 
   it('keeps translated settings field copy addressable from schema keys', () => {

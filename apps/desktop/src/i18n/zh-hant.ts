@@ -2089,6 +2089,7 @@ export const zhHant = defineLocale({
     getKey: '取得金鑰',
     replaceCurrent: '取代目前值',
     pasteApiKey: '貼上 API 金鑰',
+    localEndpointTrust: '端點驗證可以存取私人或本機網路位址。請只輸入您信任的端點。',
     couldNotSave: '無法儲存憑證。',
     connecting: '連線中',
     update: '更新',

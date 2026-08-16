@@ -10,6 +10,7 @@ import {
   saveCustomEndpoint,
   validateCustomEndpoint
 } from '@/hermes'
+import { useI18n } from '@/i18n'
 import { triggerHaptic } from '@/lib/haptics'
 import { Check, Globe, Loader2, Plus, Save, Trash2, Zap } from '@/lib/icons'
 import { cn } from '@/lib/utils'
@@ -75,6 +76,7 @@ function toPayload(form: EndpointForm, models?: string[]): CustomEndpointUpdate 
 }
 
 export function CustomEndpointsSettings({ onConfigSaved, onMainModelChanged }: CustomEndpointsSettingsProps) {
+  const { t } = useI18n()
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
   const [testing, setTesting] = useState(false)
@@ -319,9 +321,7 @@ export function CustomEndpointsSettings({ onConfigSaved, onMainModelChanged }: C
                 placeholder="http://127.0.0.1:8081/v1"
                 value={form.baseUrl}
               />
-              <span>
-                Endpoint validation can reach private or local network addresses. Only enter an endpoint you trust.
-              </span>
+              <span>{t.onboarding.localEndpointTrust}</span>
             </label>
             <div className="grid gap-3 sm:grid-cols-[minmax(0,1fr)_12rem]">
               <label className="grid gap-1.5 text-xs text-muted-foreground">
