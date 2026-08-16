@@ -342,6 +342,9 @@ export type {
  *  `ctx.register` stays the door for permanent contributions. Namespace the
  *  id with your plugin slug (`kanban:board-switcher`). */
 export { Contribute, type ContributeProps } from '@/contrib/react/contribute'
+/** Subscribe to every contribution in an area. Surface hosts use this to
+ * consume declarative actions supplied by external plugins. */
+export { useContributions } from '@/contrib/react/use-contributions'
 export type { Contribution } from '@/contrib/types'
 /** The live gateway instance type — for typing the `gateway` prop `McpTab`
  *  takes; obtain the instance from `host.getGateway()`. */
@@ -380,6 +383,32 @@ export { profileColor, profileColorSoft } from '@/lib/profile-color'
 export { queryClient } from '@/lib/query-client'
 
 export const PANES_AREA = 'panes'
+/** Kanban card/drawer actions contributed by desktop plugins. The Kanban host
+ * owns rendering; plugins provide a declarative label/icon plus a callback. */
+export const KANBAN_TASK_ACTIONS_AREA = 'kanban.task.actions'
+export type KanbanTaskActionLocation = 'card' | 'context-menu' | 'drawer-menu'
+export interface KanbanTaskActionContext {
+  /** Concrete board slug, never the empty "current board" sentinel. */
+  board: string
+  location: KanbanTaskActionLocation
+  task: {
+    assignee?: null | string
+    body?: null | string
+    id: string
+    priority?: number
+    status: string
+    tenant?: null | string
+    title: string
+  }
+}
+export interface KanbanTaskActionContribution {
+  /** VS Code codicon id rendered by the Kanban host. */
+  codicon?: string
+  label: string
+  /** Omit for all supported locations. */
+  locations?: readonly KanbanTaskActionLocation[]
+  run: (context: KanbanTaskActionContext) => Promise<void> | void
+}
 /** Hermes' reasoning levels + their compact labels, so a plugin surfacing a
  *  thinking depth uses the same scale and spelling as the rest of the app. */
 export {

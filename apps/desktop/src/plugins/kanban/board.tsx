@@ -81,6 +81,7 @@ import { BoardSwitcher } from './board-switcher'
 import { TaskDrawer } from './drawer'
 import { EMPTY_OVERRIDE, ModelOverrideField, overrideCreateFields, type TaskModelOverride } from './model-override'
 import { OrchestrationPanel } from './orchestration'
+import { runKanbanTaskAction, taskActionContext, useKanbanTaskActions } from './task-actions'
 import { columnMeta, type KanbanBoard, type KanbanTask, type TaskEstimate } from './types'
 import {
   $newTaskLane,
@@ -238,6 +239,7 @@ function CardFooter({ arc, task }: { arc: ArcState | null; task: KanbanTask }) {
 }
 
 function Card({
+  board,
   columns,
   onDelete,
   onMove,
@@ -246,6 +248,7 @@ function Card({
   selected,
   task
 }: {
+  board: string
   columns: string[]
   onDelete: (id: string) => void
   onMove: (id: string, status: string) => void
@@ -260,6 +263,8 @@ function Card({
   const summary = task.latest_summary || task.body
   const fallback = useDefaultAssignee()
   const arc = arcState(task, fallback)
+  const cardActions = useKanbanTaskActions('card')
+  const menuActions = useKanbanTaskActions('context-menu')
 
   return (
     <ContextMenu>
@@ -294,7 +299,35 @@ function Card({
           {(arc === 'running' || arc === 'stale') && !dragging && !selected && (
             <span aria-hidden className={cn('kanban-arc', arc === 'stale' && 'kanban-arc--stale')} />
           )}
-          <span className="line-clamp-2 text-[0.8125rem] font-medium leading-snug text-foreground">
+          {cardActions.length > 0 && (
+            <div
+              className="absolute top-1.5 right-1.5 z-10 flex gap-0.5 opacity-0 transition-opacity group-hover:opacity-100 focus-within:opacity-100"
+              onMouseDown={event => event.stopPropagation()}
+            >
+              {cardActions.map(action => (
+                <button
+                  aria-label={action.label}
+                  className="grid size-6 place-items-center rounded text-(--ui-text-tertiary) hover:bg-(--chrome-action-hover) hover:text-foreground"
+                  draggable={false}
+                  key={action.id}
+                  onClick={event => {
+                    event.stopPropagation()
+                    void runKanbanTaskAction(action, taskActionContext(board, 'card', task))
+                  }}
+                  title={action.label}
+                  type="button"
+                >
+                  <Codicon name={action.codicon || 'comment-discussion'} size="0.85rem" />
+                </button>
+              ))}
+            </div>
+          )}
+          <span
+            className={cn(
+              'line-clamp-2 text-[0.8125rem] font-medium leading-snug text-foreground',
+              cardActions.length > 0 && 'pr-6'
+            )}
+          >
             {task.title || task.id}
           </span>
           {summary && (
@@ -312,6 +345,15 @@ function Card({
           <Codicon name={selected ? 'close' : 'check-all'} size="0.85rem" />
           {selected ? k.deselect : k.select(formatModifierToken('mod'))}
         </ContextMenuItem>
+        {menuActions.map(action => (
+          <ContextMenuItem
+            key={action.id}
+            onSelect={() => void runKanbanTaskAction(action, taskActionContext(board, 'context-menu', task))}
+          >
+            <Codicon name={action.codicon || 'comment-discussion'} size="0.85rem" />
+            {action.label}
+          </ContextMenuItem>
+        ))}
         <ContextMenuSeparator />
         {columns
           .filter(name => name !== task.status && !isLockedTarget(name))
@@ -334,6 +376,7 @@ function Card({
 // ── column ───────────────────────────────────────────────────────────────────
 
 function Column({
+  board,
   collapsed,
   column,
   columns,
@@ -346,6 +389,7 @@ function Column({
   onToggleSelect,
   selected
 }: {
+  board: string
   collapsed: boolean
   column: { name: string; tasks: KanbanTask[] }
   columns: string[]
@@ -472,6 +516,7 @@ function Column({
                 </div>
                 {tasks.map(task => (
                   <Card
+                    board={board}
                     columns={columns}
                     key={task.id}
                     onDelete={onDelete}
@@ -486,6 +531,7 @@ function Column({
             ))
           : column.tasks.map(task => (
               <Card
+                board={board}
                 columns={columns}
                 key={task.id}
                 onDelete={onDelete}
@@ -1084,6 +1130,8 @@ export function KanbanBoardPage() {
   const qc = useQueryClient()
   const slug = useValue($boardSlug)
   const [archived, setArchived] = useState(false)
+  const { data: boards } = useQuery({ queryFn: fetchBoards, queryKey: BOARDS_KEY, staleTime: 30_000 })
+  const resolvedSlug = slug || boards?.current || 'default'
 
   // Live updates ride the events socket (bindApi); this interval is only the
   // slow heartbeat for socketless paths (OAuth remotes, dropped connections).
@@ -1397,6 +1445,7 @@ export function KanbanBoardPage() {
 
             return (
               <Column
+                board={resolvedSlug}
                 collapsed={laneOverrides[col.name] ?? auto}
                 column={col}
                 columns={columnNames}
@@ -1425,7 +1474,7 @@ export function KanbanBoardPage() {
       )}
 
       <NewTaskDialog onClose={() => setAddStatus(null)} parents={parentOptions} target={addStatus} />
-      <TaskDrawer columns={columnNames} id={openId} onClose={() => setOpenId(null)} onOpen={setOpenId} />
+      <TaskDrawer board={resolvedSlug} columns={columnNames} id={openId} onClose={() => setOpenId(null)} onOpen={setOpenId} />
     </div>
   )
 }

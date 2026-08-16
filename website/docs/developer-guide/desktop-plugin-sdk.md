@@ -211,6 +211,34 @@ Import the area constants from the SDK; each area has its own `data` payload.
 | Keybind | `KEYBINDS_AREA` | `data: KeybindContribution` |
 | Theme | `THEMES_AREA` | `data` as a `DesktopTheme` |
 | Composer | `COMPOSER_AREAS.*` | render slots, or middleware / attachment providers |
+| Kanban task action | `KANBAN_TASK_ACTIONS_AREA` | `data: KanbanTaskActionContribution` |
+
+### Kanban task actions
+
+Kanban task actions are declarative: the host renders the native card button,
+card context-menu item, and task-drawer menu item. Plugins supply labels,
+codicons, placement, and a callback rather than arbitrary card JSX.
+
+```javascript
+import { KANBAN_TASK_ACTIONS_AREA } from '@hermes/plugin-sdk'
+
+ctx.register({
+  id: 'discuss-task',
+  area: KANBAN_TASK_ACTIONS_AREA,
+  data: {
+    label: 'Discuss task',
+    codicon: 'comment-discussion',
+    locations: ['card', 'context-menu', 'drawer-menu'],
+    run: ({ board, task, location }) => {
+      // `board` is the concrete board slug; `task.id` is the selected task.
+      // Action failures are isolated and surfaced by the Kanban host.
+    }
+  }
+})
+```
+
+Omit `locations` to show the action in every supported location. Card actions
+render as compact icon buttons; both menus use the same label and callback.
 
 ### Panes
 
