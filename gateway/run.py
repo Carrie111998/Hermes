@@ -5925,16 +5925,21 @@ class TurnRunner:
         # Register the release hook on the adapter so base.py's finally
         # block can fire it after delivering the main response.
         if ctx._status_adapter and ctx.session_key:
+            _post_delivery_key = self._runner._adapter_key_for_source(
+                ctx._status_adapter,
+                ctx.source,
+                fallback=ctx.session_key,
+            )
             if getattr(type(ctx._status_adapter), "register_post_delivery_callback", None) is not None:
                 ctx._status_adapter.register_post_delivery_callback(
-                    ctx.session_key,
+                    _post_delivery_key,
                     _release_bg_review_messages,
                     generation=ctx.run_generation,
                 )
             else:
                 _pdc = getattr(ctx._status_adapter, "_post_delivery_callbacks", None)
                 if _pdc is not None:
-                    _pdc[ctx.session_key] = _release_bg_review_messages
+                    _pdc[_post_delivery_key] = _release_bg_review_messages
         # Memory update notifications in chat.  Config: display.memory_notifications
         #   off     — no chat notification (still logged to stdout)
         #   on      — generic "💾 Memory updated" (default)
@@ -20324,13 +20329,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     run_generation,
                 )
                 _stale_adapter = self._adapter_for_source(source)
+                _stale_adapter_key = self._adapter_key_for_source(
+                    _stale_adapter,
+                    source,
+                    fallback=_quick_key,
+                )
                 if getattr(type(_stale_adapter), "pop_post_delivery_callback", None) is not None:
                     _stale_adapter.pop_post_delivery_callback(
-                        _quick_key,
+                        _stale_adapter_key,
                         generation=run_generation,
                     )
                 elif _stale_adapter and hasattr(_stale_adapter, "_post_delivery_callbacks"):
-                    _stale_adapter._post_delivery_callbacks.pop(_quick_key, None)
+                    _stale_adapter._post_delivery_callbacks.pop(
+                        _stale_adapter_key,
+                        None,
+                    )
                 return None
 
             response = agent_result.get("final_response") or ""
@@ -29709,7 +29722,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # base.py's finally block) and call it.
                     if getattr(type(adapter), "pop_post_delivery_callback", None) is not None:
                         _bg_cb = adapter.pop_post_delivery_callback(
-                            session_key,
+                            adapter_key,
                             generation=run_generation,
                         )
                         if callable(_bg_cb):
@@ -29720,7 +29733,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             except Exception:
                                 pass
                     elif adapter and hasattr(adapter, "_post_delivery_callbacks"):
-                        _bg_cb = adapter._post_delivery_callbacks.pop(session_key, None)
+                        _bg_cb = adapter._post_delivery_callbacks.pop(
+                            adapter_key,
+                            None,
+                        )
                         if callable(_bg_cb):
                             try:
                                 _bg_result = _bg_cb()
@@ -30096,8 +30112,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     pass
 
             try:
+                _cleanup_adapter_key = self._adapter_key_for_source(
+                    _cleanup_adapter,
+                    source,
+                    fallback=session_key,
+                )
                 _cleanup_adapter.register_post_delivery_callback(
-                    session_key,
+                    _cleanup_adapter_key,
                     _cleanup_temp_bubbles,
                     generation=run_generation,
                 )
