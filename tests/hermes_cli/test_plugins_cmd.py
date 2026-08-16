@@ -933,3 +933,121 @@ class TestModelProviderInstallPath:
         console = Console()
         result = pc._require_installed_plugin("test-provider", plugins_dir, console)
         assert result == mp_dir.resolve()
+
+    def test_require_installed_plugin_rejects_absolute_path(self, tmp_path):
+        """Absolute paths like /etc must not bypass containment via the
+        model-providers fallback (#76387 review)."""
+        from hermes_cli import plugins_cmd as pc
+        from rich.console import Console
+
+        plugins_dir = tmp_path / "plugins"
+        plugins_dir.mkdir()
+        # Create a real dir at /tmp-equivalent to prove the fallback would
+        # find it if _sanitize_plugin_name were NOT applied.
+        # (We can't create /etc, but _sanitize_plugin_name rejects absolute
+        #  paths regardless of existence.)
+
+        console = Console()
+        # Should exit (SystemExit), NOT return a path outside plugins_dir.
+        with pytest.raises(SystemExit):
+            pc._require_installed_plugin("/etc", plugins_dir, console)
+
+    def test_legacy_flat_model_provider_migrated_on_reinstall(self, tmp_path, monkeypatch):
+        """A legacy flat model-provider install is moved into model-providers/
+        when the plugin is reinstalled with --force (#76387 review)."""
+        if shutil.which("git") is None:
+            pytest.skip("git not available")
+
+        from hermes_cli import plugins_cmd as pc
+
+        repo_root = tmp_path / "repo"
+        self._make_model_provider_repo(repo_root)
+
+        plugins_dir = tmp_path / "plugins"
+        plugins_dir.mkdir()
+        monkeypatch.setattr(pc, "_plugins_dir", lambda: plugins_dir)
+
+        # Simulate a legacy flat install: plugin sits at top level.
+        legacy = plugins_dir / "test-provider"
+        legacy.mkdir(parents=True)
+        (legacy / "plugin.yaml").write_text("name: test-provider\nkind: model-provider\n")
+        (legacy / "__init__.py").write_text("# old\n")
+
+        # Reinstall with force — migration should move legacy into model-providers/.
+        target, manifest, name = pc._install_plugin_core(
+            f"file://{repo_root}", force=True
+        )
+
+        assert target == (plugins_dir / "model-providers" / "test-provider").resolve()
+        assert (target / "plugin.yaml").exists()
+        # Legacy flat path is gone.
+        assert not legacy.exists()
+
+    def test_legacy_flat_model_provider_migrated_on_update(self, tmp_path, monkeypatch):
+        """cmd_update relocates a legacy flat model-provider install into
+        model-providers/ so the registry can discover it (#76387 review)."""
+        if shutil.which("git") is None:
+            pytest.skip("git not available")
+
+        import subprocess as sp
+        from hermes_cli import plugins_cmd as pc
+
+        # Build an origin repo with a model-provider plugin.
+        origin = tmp_path / "origin"
+        self._make_model_provider_repo(origin)
+
+        plugins_dir = tmp_path / "plugins"
+        plugins_dir.mkdir()
+        monkeypatch.setattr(pc, "_plugins_dir", lambda: plugins_dir)
+
+        # Clone flat (legacy layout) — simulate pre-fix install.
+        legacy = plugins_dir / "test-provider"
+        sp.run(["git", "clone", "-q", str(origin), str(legacy)], check=True)
+        # Simulate install metadata so cmd_update doesn't choke on missing record.
+        meta_path = plugins_dir / ".install-metadata.json"
+        meta_path.write_text('{}')
+
+        # Patch _read_install_metadata to find our plugin.
+        monkeypatch.setattr(pc, "_read_install_metadata", lambda: {})
+
+        console = None  # cmd_update creates its own console
+        # cmd_update should relocate the flat install.
+        pc.cmd_update("test-provider")
+
+        # Plugin is now under model-providers/.
+        new_path = plugins_dir / "model-providers" / "test-provider"
+        assert new_path.is_dir()
+        assert (new_path / "plugin.yaml").exists()
+        assert not legacy.exists()
+
+    def test_migrated_provider_discoverable_by_registry(self, tmp_path, monkeypatch):
+        """After migration, the provider is discoverable via the Provider
+        Registry's get_provider_profile() — the behavior contract (#76387 review)."""
+        if shutil.which("git") is None:
+            pytest.skip("git not available")
+
+        from hermes_cli import plugins_cmd as pc
+
+        repo_root = tmp_path / "repo"
+        self._make_model_provider_repo(repo_root)
+
+        hermes_home = tmp_path / "hermes-home"
+        plugins_dir = hermes_home / "plugins"
+        plugins_dir.mkdir(parents=True)
+        monkeypatch.setattr(pc, "_plugins_dir", lambda: plugins_dir)
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        # Install — should land under model-providers/.
+        target, manifest, name = pc._install_plugin_core(
+            f"file://{repo_root}", force=False
+        )
+        assert target == (plugins_dir / "model-providers" / "test-provider").resolve()
+
+        # The Provider Registry should discover it.
+        import providers
+
+        providers._discovered = False
+        providers._REGISTRY.clear()
+        profile = providers.get_provider_profile("test-provider")
+        assert profile is not None
+        assert profile.name == "test-provider"
