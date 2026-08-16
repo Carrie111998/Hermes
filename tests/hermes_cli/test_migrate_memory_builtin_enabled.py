@@ -104,5 +104,16 @@ class TestBuiltinMemoryEnabledHelper:
     def test_user_profile_alone_enables_store(self):
         assert self._effective({"user_profile_enabled": True}) is True
 
+    def test_user_profile_false_alone_keeps_store_on(self):
+        """user_profile_enabled-only config must NOT silently disable the
+        built-in store: pre-v38 the merged memory_enabled: true default kept it
+        on, and an absent builtin/legacy key still defaults to True."""
+        assert self._effective({"user_profile_enabled": False}) is True
+
+    def test_user_profile_true_keeps_store_on_despite_builtin_false(self):
+        """builtin_enabled: false + user_profile_enabled: true still creates
+        the store (user profile), so the tool stays advertised."""
+        assert self._effective({"builtin_enabled": False, "user_profile_enabled": True}) is True
+
     def test_default_when_unset(self):
         assert self._effective(None) is True

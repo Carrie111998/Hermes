@@ -1171,11 +1171,13 @@ def builtin_memory_enabled() -> bool:
     that creates ``agent._memory_store`` (agent/agent_init.py). Reads the *raw*
     user config so an explicit legacy ``memory.memory_enabled: false`` is never
     masked by the new ``builtin_enabled`` default (True) before the v38
-    migration rewrites the key. Explicit user settings win; a user with no
-    memory section gets the default (built-in enabled). Fail-open True on
-    config read errors — never hide memory on an unrelated failure (note: a
-    provider serving memory may then diverge briefly from the tool's advertised
-    availability until the config error clears).
+    migration rewrites the key. An absent builtin/legacy key defaults to True,
+    so a config that sets only ``user_profile_enabled`` keeps the pre-v38
+    behavior (built-in store on) rather than silently disabling it. Explicit
+    user settings win; a user with no memory section gets the default (built-in
+    enabled). Fail-open True on config read errors — never hide memory on an
+    unrelated failure (note: a provider serving memory may then diverge briefly
+    from the tool's advertised availability until the config error clears).
     """
     try:
         from hermes_cli.config import read_raw_config_readonly
@@ -1186,8 +1188,12 @@ def builtin_memory_enabled() -> bool:
     if any(
         k in mem for k in ("builtin_enabled", "memory_enabled", "user_profile_enabled")
     ):
+        # Only an EXPLICIT builtin/legacy key can turn the store off; an absent
+        # builtin key defaults to True so a config that sets only
+        # user_profile_enabled keeps the pre-v38 default (built-in store on),
+        # matching the old merged memory_enabled: true default.
         return bool(
-            mem.get("builtin_enabled", mem.get("memory_enabled", False))
+            mem.get("builtin_enabled", mem.get("memory_enabled", True))
             or mem.get("user_profile_enabled", False)
         )
     return True
