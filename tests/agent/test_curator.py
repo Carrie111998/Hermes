@@ -28,7 +28,11 @@ def curator_env(tmp_path, monkeypatch):
     importlib.reload(curator)
 
     # Neutralize the real LLM pass by default — tests opt in per-case.
-    monkeypatch.setattr(curator, "_run_llm_review", lambda prompt: "llm-stub")
+    # dry_run kwarg matches _run_llm_review's signature (#87793 gate).
+    monkeypatch.setattr(
+        curator, "_run_llm_review",
+        lambda prompt, dry_run=False: "llm-stub",
+    )
 
     # Default: no config file → curator defaults. Tests can override.
     monkeypatch.setattr(curator, "_load_config", lambda: {})
@@ -412,7 +416,7 @@ def test_dry_run_injects_report_only_banner(curator_env, monkeypatch):
     u.mark_agent_created("a")
 
     captured = {}
-    def _stub(prompt):
+    def _stub(prompt, dry_run=False):
         captured["prompt"] = prompt
         return {"final": "", "summary": "s", "model": "", "provider": "",
                 "tool_calls": [], "error": None}
@@ -433,7 +437,7 @@ def test_run_review_synchronous_invokes_llm_stub(curator_env, monkeypatch):
     u.mark_agent_created("a")
 
     calls = []
-    def _stub(prompt):
+    def _stub(prompt, dry_run=False):
         calls.append(prompt)
         return {
             "final": "stubbed-summary",
