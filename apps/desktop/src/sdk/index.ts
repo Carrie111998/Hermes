@@ -382,8 +382,8 @@ export const host = {
             content: body,
             observed: true
           })
-          .then((res: { ok?: boolean } | null) => {
-            if (res && res.ok === false) {
+          .then((res: unknown) => {
+            if (typeof res === 'object' && res !== null && 'ok' in res && res.ok === false) {
               console.warn('session.append_message failed', res)
               return
             }
