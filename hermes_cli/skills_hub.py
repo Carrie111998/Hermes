@@ -155,6 +155,10 @@ def _resolve_bare_github_repo_skill(identifier: str, sources):
     if not _GITHUB_REPO_IDENTIFIER_RE.match(identifier):
         return None, None, None
 
+    prefix = identifier.split("/", 1)[0]
+    if any(src.source_id() == prefix for src in sources):
+        return None, None, None
+
     github = next((src for src in sources if src.source_id() == "github"), None)
     if github is None or not hasattr(github, "_get_repo_tree"):
         return None, None, None

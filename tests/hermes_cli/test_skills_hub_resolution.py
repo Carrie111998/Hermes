@@ -7,6 +7,7 @@ from tools.skills_hub import SkillBundle, SkillMeta
 class _FakeGitHubSource:
     def __init__(self, tree_paths):
         self.tree_paths = tree_paths
+        self.repo_tree_requests = []
         self.fetched = []
         self.inspected = []
 
@@ -14,6 +15,7 @@ class _FakeGitHubSource:
         return "github"
 
     def _get_repo_tree(self, repo):
+        self.repo_tree_requests.append(repo)
         return (
             "main",
             [{"type": "blob", "path": path} for path in self.tree_paths],
@@ -73,6 +75,33 @@ class _FakeClawHubSource:
         return None
 
 
+class _FakeOfficialSource:
+    def source_id(self):
+        return "official"
+
+    def fetch(self, identifier):
+        if identifier == "official/last30days":
+            return SkillBundle(
+                name="last30days",
+                files={"SKILL.md": "official skill"},
+                source="official",
+                identifier=identifier,
+                trust_level="builtin",
+            )
+        return None
+
+    def inspect(self, identifier):
+        if identifier == "official/last30days":
+            return SkillMeta(
+                name="last30days",
+                description="Official skill",
+                source="official",
+                identifier=identifier,
+                trust_level="builtin",
+            )
+        return None
+
+
 def test_bare_github_repo_prefers_current_repo_skill_over_registry_alias():
     github = _FakeGitHubSource(["skills/last30days/SKILL.md"])
     clawhub = _FakeClawHubSource()
@@ -109,3 +138,20 @@ def test_bare_github_repo_falls_back_to_sources_when_repo_skill_is_ambiguous():
     assert bundle.source == "clawhub"
     assert meta is not None
     assert meta.source == "clawhub"
+
+
+def test_registered_source_identifier_bypasses_bare_github_preflight():
+    github = _FakeGitHubSource(["skills/last30days/SKILL.md"])
+    official = _FakeOfficialSource()
+
+    meta, bundle, matched = _resolve_source_meta_and_bundle(
+        "official/last30days",
+        [github, official],
+    )
+
+    assert github.repo_tree_requests == []
+    assert matched is official
+    assert bundle is not None
+    assert bundle.source == "official"
+    assert meta is not None
+    assert meta.source == "official"
