@@ -745,13 +745,22 @@ def check_command_security(command: str) -> dict:
     if not cfg["tirith_enabled"]:
         return {"action": "allow", "findings": [], "summary": ""}
 
-    # Circuit breaker: if tirith has crashed _CRASH_LIMIT times in a row,
-    # stop trying for the rest of the process.  Without this, a corrupted
-    # or missing binary causes every tool call to hit the same spawn failure
-    # → fail-open → agent retry loop, hanging the user for 20+ minutes
-    # (issue #41400).
+    # Circuit breaker: stop invoking a repeatedly failing scanner, but preserve
+    # the configured availability policy. In fail-closed mode an open breaker
+    # must remain a block; otherwise repeated scanner failures silently turn a
+    # strict policy back into fail-open for the rest of the process.
     if _circuit_open:
-        return {"action": "allow", "findings": [], "summary": "tirith disabled (circuit breaker)"}
+        if cfg["tirith_fail_open"]:
+            return {
+                "action": "allow",
+                "findings": [],
+                "summary": "tirith disabled (circuit breaker, fail-open)",
+            }
+        return {
+            "action": "block",
+            "findings": [],
+            "summary": "tirith disabled (circuit breaker, fail-closed)",
+        }
 
     # Unsupported platform (Windows etc.) — tirith has no binary here and
     # never will. Skip the resolver entirely so we don't even try to spawn.

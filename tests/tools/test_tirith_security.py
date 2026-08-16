@@ -629,6 +629,38 @@ class TestSpawnWarningDedup:
 
 
 # ---------------------------------------------------------------------------
+# Circuit-breaker policy must preserve fail-closed semantics
+# ---------------------------------------------------------------------------
+
+class TestCircuitBreakerFailPolicy:
+    @patch("tools.tirith_security._load_security_config")
+    def test_open_circuit_blocks_when_fail_closed(self, mock_cfg):
+        mock_cfg.return_value = {
+            "tirith_enabled": True, "tirith_path": "tirith",
+            "tirith_timeout": 5, "tirith_fail_open": False,
+        }
+        _tirith_mod._circuit_open = True
+
+        result = check_command_security("echo hi")
+
+        assert result["action"] == "block"
+        assert "fail-closed" in result["summary"]
+
+    @patch("tools.tirith_security._load_security_config")
+    def test_open_circuit_still_allows_when_fail_open(self, mock_cfg):
+        mock_cfg.return_value = {
+            "tirith_enabled": True, "tirith_path": "tirith",
+            "tirith_timeout": 5, "tirith_fail_open": True,
+        }
+        _tirith_mod._circuit_open = True
+
+        result = check_command_security("echo hi")
+
+        assert result["action"] == "allow"
+        assert "circuit breaker" in result["summary"]
+
+
+# ---------------------------------------------------------------------------
 # .app TLD suppression (issue #24461)
 # ---------------------------------------------------------------------------
 
