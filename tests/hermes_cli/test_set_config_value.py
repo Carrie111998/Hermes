@@ -410,6 +410,25 @@ class TestListAppend:
         assert exc.value.code == 1
         assert "Cannot parse" in capsys.readouterr().err
 
+    @pytest.mark.parametrize("document", ["false\n", "0\n", "[]\n"])
+    def test_append_rejects_falsy_non_mapping_root(
+        self,
+        _isolated_hermes_home,
+        capsys,
+        document,
+    ):
+        from hermes_cli.config import append_config_value
+
+        config_path = _isolated_hermes_home / "config.yaml"
+        config_path.write_text(document, encoding="utf-8")
+
+        with pytest.raises(SystemExit) as exc:
+            append_config_value("hooks.pre_llm_call", '"check.py"')
+
+        assert exc.value.code == 1
+        assert "root is not a mapping" in capsys.readouterr().err
+        assert config_path.read_text(encoding="utf-8") == document
+
     def test_append_rejects_managed_list(self, monkeypatch, capsys):
         from hermes_cli import managed_scope
         from hermes_cli.config import append_config_value

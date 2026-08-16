@@ -722,7 +722,8 @@ def atomic_roundtrip_yaml_append(
         if path.exists():
             try:
                 with path.open("r", encoding="utf-8") as f:
-                    config = yaml_rt.load(f) or CommentedMap()
+                    loaded = yaml_rt.load(f)
+                    config = CommentedMap() if loaded is None else loaded
             except (YAMLError, UnicodeError) as exc:
                 raise ValueError(f"Cannot parse {path}: {exc}") from exc
         else:
