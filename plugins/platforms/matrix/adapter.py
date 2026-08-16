@@ -135,6 +135,7 @@ from gateway.platforms.base import (
     SendResult,
     resolve_proxy_url,
     proxy_kwargs_for_aiohttp,
+    safe_url_for_log,
     _ssrf_redirect_guard,
 )
 from gateway.platforms.helpers import ThreadParticipationTracker
@@ -776,7 +777,7 @@ def _create_matrix_session(proxy_url: str | None):
             logger.warning(
                 "aiohttp_socks not installed — SOCKS proxy %s ignored. "
                 "Run: pip install aiohttp-socks",
-                proxy_url,
+                safe_url_for_log(proxy_url),
             )
             return aiohttp.ClientSession(trust_env=True)
 
