@@ -16650,7 +16650,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     exec_cmd = qcmd.get("command", "")
                     if exec_cmd:
                         if "{args}" in exec_cmd:
-                            # Let a quick command take arguments: `/note 26056 ...`
+                            # Let a quick command take arguments: `/note some text ...`
                             # substitutes into `{args}`. The command is handed to a
                             # shell, so the user-supplied text must be quoted — an
                             # unquoted substitution would make every quick command

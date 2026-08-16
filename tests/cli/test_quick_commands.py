@@ -186,9 +186,9 @@ class TestGatewayQuickCommands:
         runner._pending_messages = {}
         runner._is_user_authorized = MagicMock(return_value=True)
 
-        event = self._make_event("note", "26056 Sodra skolan")
+        event = self._make_event("note", "42 Example Project")
         result = await runner._handle_message(event)
-        assert result == "26056 Sodra skolan"
+        assert result == "42 Example Project"
 
     @pytest.mark.asyncio
     async def test_exec_command_args_are_shell_quoted(self):
