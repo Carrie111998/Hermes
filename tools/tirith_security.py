@@ -34,6 +34,7 @@ import tempfile
 import threading
 import time
 import urllib.request
+from urllib.parse import urlsplit
 
 from hermes_constants import get_hermes_home
 
@@ -830,12 +831,13 @@ def check_command_security(command: str) -> dict:
     _crash_count = 0
 
     # Parse JSON for enrichment (never overrides the exit code verdict)
-    findings = []
+    raw_findings = []
     summary = ""
     try:
         data = json.loads(result.stdout) if result.stdout.strip() else {}
-        raw_findings = data.get("findings", [])
-        findings = raw_findings[:_MAX_FINDINGS]
+        parsed_findings = data.get("findings", [])
+        if isinstance(parsed_findings, list):
+            raw_findings = parsed_findings
         summary = (data.get("summary", "") or "")[:_MAX_SUMMARY_LEN]
     except (json.JSONDecodeError, AttributeError):
         # JSON parse failure degrades findings/summary, not the verdict
@@ -850,39 +852,141 @@ def check_command_security(command: str) -> dict:
     # and the "can be confused with file extensions" heuristic generates false
     # positives for normal API calls.  Any other finding (including other
     # lookalike_tld entries for non-.app TLDs) preserves the warn action.
-    if action == "warn" and findings:
-        non_suppressible = [f for f in findings if not _is_app_tld_finding(f)]
-        if not non_suppressible:
+    if action == "warn" and raw_findings:
+        if all(_is_app_tld_finding(f) for f in raw_findings):
             action = "allow"
-            findings = []
+            raw_findings = []
             summary = ""
 
+    # Cap returned details only after the complete finding set has determined
+    # the verdict. Otherwise suppressible findings can fill the cap and hide a
+    # later non-.app threat, incorrectly downgrading warn to allow.
+    findings = raw_findings[:_MAX_FINDINGS]
     return {"action": action, "findings": findings, "summary": summary}
 
 
-# ``.app`` at a hostname boundary: a literal ``.app`` NOT followed by another
-# hostname char (``[a-z0-9-]``). Matches ``example.app`` / a bare ``.app`` /
-# ``'.app'`` in prose, but not ``.appspot`` / ``.apple`` / ``paypal.app-secure.com``.
-_APP_TLD_RE = re.compile(r"\.app(?![a-z0-9-])")
+_APP_TLD_RE = re.compile(r"\.app", re.IGNORECASE)
+_HOSTNAME_CHARS = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-."
+)
+_HOSTNAME_START_DELIMITERS = frozenset(" \t\r\n'\"`([{</:@=")
+_HOSTNAME_END_DELIMITERS = frozenset(" \t\r\n'\"`/\\:?#,;!)]}>")
+
+
+def _structured_value_has_app_tld(value: object, *, tld_only: bool = False) -> bool:
+    """Return whether a structured TLD/hostname value ends in ``.app``."""
+    text = str(value).strip().strip("'\"")
+    if not text:
+        return False
+
+    normalized_tld = text.removeprefix(".").casefold()
+    if tld_only:
+        return normalized_tld == "app"
+    if text.casefold() == ".app":
+        return True
+    if any(char.isspace() for char in text):
+        return False
+
+    try:
+        parsed = urlsplit(text if "://" in text else f"//{text}")
+        hostname = parsed.hostname
+    except ValueError:
+        return False
+    if not hostname:
+        return False
+
+    # A final DNS root dot is harmless in a structured hostname. Normalize
+    # internationalized labels to ASCII, then reject empty/malformed labels so
+    # ambiguous strings cannot masquerade as a hostname ending in ``app``.
+    try:
+        normalized_hostname = hostname.rstrip(".").encode("idna").decode("ascii").casefold()
+    except UnicodeError:
+        return False
+    labels = normalized_hostname.split(".")
+    labels_are_valid = all(
+        label
+        and len(label) <= 63
+        and label[0].isalnum()
+        and label[-1].isalnum()
+        and all(char.isalnum() or char == "-" for char in label)
+        for label in labels
+    )
+    return len(labels) >= 2 and labels_are_valid and labels[-1] == "app"
+
+
+def _free_text_has_only_terminal_app_mentions(value: object) -> bool | None:
+    """Classify ``.app`` mentions in prose conservatively.
+
+    True means every mention is a terminal hostname label, False means at
+    least one is continued or ambiguously delimited, and None means the field
+    does not mention ``.app`` at all.
+    """
+    text = str(value)
+    matches = list(_APP_TLD_RE.finditer(text))
+    if not matches:
+        return None
+
+    for match in matches:
+        # Walk back over an optional ASCII hostname and require a boundary.
+        start = match.start()
+        while start > 0 and text[start - 1] in _HOSTNAME_CHARS:
+            start -= 1
+        if start > 0 and text[start - 1] not in _HOSTNAME_START_DELIMITERS:
+            return False
+        if not _structured_value_has_app_tld(text[start:match.end()]):
+            return False
+
+        # A dot means another hostname label (or ambiguous trailing prose), and
+        # non-ASCII punctuation is deliberately not accepted as a delimiter.
+        end = match.end()
+        if end < len(text) and text[end] not in _HOSTNAME_END_DELIMITERS:
+            return False
+
+    return True
 
 
 def _is_app_tld_finding(finding: dict) -> bool:
     """Return True if this finding is a lookalike_tld warning for the .app TLD only.
 
-    Checks the rule_id and inspects common value/detail field names that
-    Tirith may use to carry the TLD string.
+    Prefer Tirith's structured URL evidence, whose normalized hostname must
+    end in the exact ``app`` label. Legacy structured fields follow the same
+    rule. Free-text fields are accepted only when every ``.app`` mention has
+    unambiguous hostname boundaries. A contradiction in any field is unsafe.
     """
     if not isinstance(finding, dict):
         return False
     if finding.get("rule_id") != "lookalike_tld":
         return False
-    for field in ("value", "tld", "detail", "description", "message"):
-        val = finding.get(field)
-        # Match the ``.app`` gTLD at a hostname boundary, not as a bare
-        # substring: ``.app`` followed by ``[a-z0-9-]`` is a different label
-        # or TLD (``.appspot``, ``.apple``, ``paypal.app-secure.com``) and must
-        # NOT be treated as the benign ``.app`` case, or a real lookalike_tld
-        # warning gets silently swallowed and the command allowed.
-        if val is not None and _APP_TLD_RE.search(str(val).lower()):
-            return True
-    return False
+
+    structured_checks = []
+    evidence = finding.get("evidence")
+    if isinstance(evidence, list):
+        for item in evidence:
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") == "url" and item.get("raw") is not None:
+                structured_checks.append(_structured_value_has_app_tld(item["raw"]))
+            elif item.get("type") == "host_comparison" and item.get("raw_host") is not None:
+                structured_checks.append(_structured_value_has_app_tld(item["raw_host"]))
+
+    for field in ("host", "hostname", "domain", "value"):
+        if finding.get(field) is not None:
+            structured_checks.append(_structured_value_has_app_tld(finding[field]))
+    if finding.get("tld") is not None:
+        structured_checks.append(
+            _structured_value_has_app_tld(finding["tld"], tld_only=True)
+        )
+    if structured_checks and not all(structured_checks):
+        return False
+
+    free_text_checks = []
+    for field in ("detail", "description", "message"):
+        if finding.get(field) is None:
+            continue
+        check = _free_text_has_only_terminal_app_mentions(finding[field])
+        if check is not None:
+            free_text_checks.append(check)
+    if free_text_checks and not all(free_text_checks):
+        return False
+
+    return bool(structured_checks or free_text_checks)
