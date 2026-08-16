@@ -719,10 +719,22 @@ class CheckpointManager:
         if not self._git_available:
             return False
 
-        abs_dir = str(_normalize_path(working_dir))
+        abs_path = _normalize_path(working_dir)
+        abs_dir = str(abs_path)
 
-        # Skip root, home, and other overly broad directories
-        if abs_dir in {"/", str(Path.home())}:
+        # Skip root, home, and other overly broad directories.  Compare a
+        # RESOLVED path against a resolved home, and detect a filesystem root
+        # structurally (a root is its own parent) rather than by matching the
+        # literal "/".  On Windows ``Path("/").resolve()`` is the *current
+        # drive's* root — "C:\\" — which never equals "/", so a bare "/" used
+        # to sail past this guard into _take(), whose first act is
+        # ``_dir_file_count()``: an rglob over the entire drive that only
+        # stops after _MAX_FILES (50,000) entries.  That runs on the agent's
+        # pre-mutation hot path (agent/tool_executor.py) for any edit whose
+        # project root resolves to a drive root, and it made
+        # test_skip_root_dir the slowest test in this module (8.4s warm, and
+        # unbounded on a cold or contended host).
+        if abs_path == abs_path.parent or abs_path == _normalize_path(str(Path.home())):
             logger.debug("Checkpoint skipped: directory too broad (%s)", abs_dir)
             return False
 

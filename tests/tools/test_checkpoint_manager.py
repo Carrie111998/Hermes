@@ -19,6 +19,7 @@ from tools.checkpoint_manager import (
     _git_env,
     _normalize_path,
     _dir_file_count,
+    _MAX_FILES,
     _project_hash,
     _store_path,
     _ref_name,
@@ -230,6 +231,41 @@ class TestTakeCheckpoint:
     def test_skip_home_dir(self, mgr):
         assert mgr.ensure_checkpoint(str(Path.home()), "home") is False
 
+    @pytest.mark.parametrize("broad", ["/", "HOME"])
+    def test_broad_dir_guard_fires_before_any_filesystem_walk(
+        self, mgr, monkeypatch, broad,
+    ):
+        """The too-broad guard must short-circuit BEFORE ``_take`` walks anything.
+
+        Asserting only ``is False`` (the two tests above) cannot tell a guard
+        hit from a guard MISS that happened to bail later: ``_take`` also
+        returns False once ``_dir_file_count`` exceeds _MAX_FILES.  On Windows
+        that was the live path — ``Path("/").resolve()`` is the current drive's
+        root ("C:\\"), never the literal "/" the guard compared against — so
+        "/" fell through and rglob'd 50,000 entries of the whole C: drive
+        before returning the expected False.  The test passed and took 8.4s.
+
+        Spying on ``_dir_file_count`` turns that silent fallthrough into a
+        failure.  Note the spy RECORDS rather than raises: ``ensure_checkpoint``
+        wraps ``_take`` in a bare ``except Exception`` and returns False, so a
+        raising spy is swallowed and the test passes against the very bug it
+        is meant to pin.
+        """
+        walked = []
+
+        def _spy_dir_file_count(path):
+            walked.append(path)
+            return _MAX_FILES + 1  # bail out of _take immediately
+
+        monkeypatch.setattr(
+            "tools.checkpoint_manager._dir_file_count", _spy_dir_file_count,
+        )
+        target = str(Path.home()) if broad == "HOME" else broad
+        assert mgr.ensure_checkpoint(target, "broad") is False
+        assert walked == [], (
+            f"too-broad guard missed {target!r}: _dir_file_count walked {walked}"
+        )
+
     def test_multiple_projects_share_store(self, mgr, tmp_path):
         """Two projects commit to the SAME shared store (dedup wins)."""
         a = tmp_path / "proj-a"
@@ -315,6 +351,69 @@ class TestListCheckpoints:
 # Pruning: max_snapshots actually enforced (v2 fix)
 # =========================================================================
 
+# Measured git spawns for test_max_snapshots_trims_history's shape
+# (max_snapshots=2, 4 snapshots).  Counted 2026-08-15 by wrapping
+# tools.checkpoint_manager.subprocess.run; the old max_snapshots=3 / 6
+# snapshots shape cost 75.
+_TRIM_HISTORY_SPAWNS = 50
+
+# Same, for test_steady_state_prune_snapshot_spawn_budget's shape: 2 seed
+# snapshots to reach capacity + 1 at-capacity snapshot, max_snapshots=2.
+_SPAWN_BUDGET_SPAWNS = 38
+
+# A real git command in this file costs ~1.24x a bare ``git --version``
+# (derived from the 2026-08-11 loaded-host pair: 2.75s probe, 3.4s/spawn
+# across 75 spawns).  Used to price a test before running it.
+_SPAWN_COST_VS_PROBE = 1.24
+
+# Skip rather than run when the projection eats more than half the class's
+# 600s timeout.  Half, not all: --timeout-method=thread ``os._exit``es the
+# WHOLE pytest process, so overshooting the budget destroys the sweep's
+# results instead of failing one test.  A skip is loud, cheap and honest;
+# a session kill silently truncates the run (2026-08-11 aborted tests/tools
+# at 12% while still printing a clean-looking result).
+_SPAWN_BUDGET_SECONDS = 300.0
+
+# Memoised result of _probe_git_spawn_cost().
+_GIT_SPAWN_COST = None
+
+
+def _probe_git_spawn_cost() -> float:
+    """Wall-clock seconds for one bare ``git --version``.
+
+    The module docstring's own calibration handle: sub-0.5s on a quiet host,
+    2.746s on the 2026-08-11 contended one.  Cached per session — the probe
+    is itself a spawn, and on the host it is meant to detect it is expensive.
+    """
+    global _GIT_SPAWN_COST
+    if _GIT_SPAWN_COST is None:
+        start = time.monotonic()
+        subprocess.run(
+            ["git", "--version"], capture_output=True, text=True, timeout=120,
+        )
+        _GIT_SPAWN_COST = time.monotonic() - start
+    return _GIT_SPAWN_COST
+
+
+def _require_affordable_spawns(spawn_count: int) -> None:
+    """Skip if this host is too contended to afford ``spawn_count`` git spawns.
+
+    These tests are spawn-bound, and process-spawn cost on Windows is not a
+    property of the code under test — it swings ~14x with host contention
+    (0.26s/spawn quiet, 3.6s/spawn under 8 concurrent sweeps).  No timeout
+    value fixes that; see the TestRealPruning docstring.
+    """
+    probe = _probe_git_spawn_cost()
+    projected = spawn_count * probe * _SPAWN_COST_VS_PROBE
+    if projected > _SPAWN_BUDGET_SECONDS:
+        pytest.skip(
+            f"host too contended for a {spawn_count}-git-spawn test: a bare "
+            f"`git --version` took {probe:.2f}s, projecting ~{projected:.0f}s "
+            f"(budget {_SPAWN_BUDGET_SECONDS:.0f}s). Skipping beats letting "
+            f"--timeout-method=thread os._exit the whole sweep."
+        )
+
+
 @pytest.mark.timeout(600)
 class TestRealPruning:
     """Real snapshot+prune cycles — dozens of git spawns per test.
@@ -348,34 +447,63 @@ class TestRealPruning:
     timeout(600) clears the measured loaded-host cost with ~2.3x margin while
     staying bounded.  Individual git calls are independently capped by
     checkpoint_manager._GIT_TIMEOUT (30s), so a real hang still terminates —
-    but only since 2026-08-15.  Before then that cap was nominal for exactly
-    the calls this class exercises: ``_run_git`` used ``subprocess.run(
+    but only since 2026-08-16.  Before then that cap was nominal wherever a
+    git subcommand left a grandchild alive: ``_run_git`` used ``subprocess.run(
     capture_output=True, timeout=N)``, whose Windows timeout path kills the
-    direct child and then drains the capture pipe with NO timeout, blocking
-    until a surviving grandchild releases the inherited handle.  ``git gc
-    --prune=now`` — which prune_checkpoints and _enforce_size_cap both run —
-    is the one probed git subcommand that spawns such a grandchild, so a slow
-    gc could wedge here indefinitely.  ``_run_git`` now spawns via
-    ``run_text_capture`` (file-backed capture + tree-kill); see
-    TestGitTimeoutIsBounded, which guards the routing.
+    direct child and then re-enters ``communicate()`` with NO timeout, blocking
+    until every handle on the capture pipe closes — impossible while a
+    surviving grandchild holds the inherited one (measured: a ``timeout=2``
+    call returned after 24.3s).  ``git gc --prune=now`` — which
+    prune_checkpoints and _enforce_size_cap both run — is the one probed git
+    subcommand that spawns such a grandchild, so a slow gc could wedge there
+    indefinitely.  ``_run_git`` now spawns via ``run_text_capture``
+    (file-backed capture + tree-kill); see TestGitTimeoutIsBounded, which
+    guards the routing.
+
+    THAT HAZARD IS NOT WHY THESE TESTS WERE SLOW — do not conflate the two.
+    The snapshot commands this class drives (add, write-tree, commit-tree,
+    update-ref, log) are leaf processes: probed 2026-08-15, none of them spawns
+    a descendant, so their 30s cap held even before the capture-pipe fix and
+    the fix did not speed them up.  Their cost is N spawns times a per-spawn
+    price set by host contention, and no timeout value rescues that — raising
+    the clock only buys a slower failure.  test_max_snapshots_trims_history
+    hung >900s and damaged two sweeps for this reason alone.
+
+    So the lever is the SPAWN COUNT, not the clock.  Measured on this host:
+
+        max_snapshots=3, 6 snapshots -> 75 spawns, 10.14s quiet
+        max_snapshots=2, 4 snapshots -> 50 spawns,  5.67s quiet   <- now
+
+    A 2026-08-15 ``pytest tests/tools -n auto`` sweep (8,572 tests) ranked the
+    old 75-spawn shape the SLOWEST TEST IN THE DIRECTORY at 29.81s, against
+    6.93s for the same test in a single-file run — 4.3x from spawn contention
+    alone.  4 snapshots against a cap of 2 still exercises the whole contract
+    (trimming happens, two commits are dropped, newest-first order survives
+    the chain rebuild) for a third fewer processes.
+
+    ``_require_affordable_spawns`` above then converts the residual risk from
+    "session-killing hang" into "visible skip": it prices one real git spawn
+    and skips when the projected cost would eat the budget, rather than
+    letting --timeout-method=thread take the whole sweep down with it.
     """
 
     def test_max_snapshots_trims_history(self, work_dir, checkpoint_base, monkeypatch):
+        _require_affordable_spawns(_TRIM_HISTORY_SPAWNS)
         monkeypatch.setattr("tools.checkpoint_manager.CHECKPOINT_BASE", checkpoint_base)
         # Tiny cap to test enforcement.
-        m = CheckpointManager(enabled=True, max_snapshots=3)
+        m = CheckpointManager(enabled=True, max_snapshots=2)
 
-        for i in range(6):
+        for i in range(4):
             (work_dir / "main.py").write_text(f"v{i}\n")
             m.new_turn()
             m.ensure_checkpoint(str(work_dir), f"step-{i}")
 
         cps = m.list_checkpoints(str(work_dir))
-        assert len(cps) == 3
+        assert len(cps) == 2          # step-0 and step-1 trimmed away
         reasons = [c["reason"] for c in cps]
-        # Newest first — step-5, step-4, step-3
-        assert reasons[0] == "step-5"
-        assert reasons[-1] == "step-3"
+        # Newest first — step-3, step-2
+        assert reasons[0] == "step-3"
+        assert reasons[-1] == "step-2"
 
     def test_max_file_size_mb_skips_large_files(
         self, tmp_path, checkpoint_base, monkeypatch,
@@ -413,7 +541,18 @@ class TestRealPruning:
         snapshot.  Object reclamation belongs to the maintenance paths
         (``prune_checkpoints`` daily sweep, ``_enforce_size_cap``), not the
         snapshot hot path.
+
+        The ``<= 13`` assertion below is the one load-INDEPENDENT protection in
+        this class, so skipping it on a contended host has a real cost: the gc
+        tripwire goes dark for that run (this file has already lost the no-gc
+        contract once to a merge — see the 0.17.0 casualty fixed by 4761bc486).
+        Guarded anyway, because the alternative is worse: reaching this test's
+        38 spawns on a host that cannot afford them lets --timeout-method=thread
+        ``os._exit`` the whole process, which discards the results of every
+        other test in the sweep, tripwire included.  One dark tripwire beats a
+        truncated sweep that still prints a clean-looking summary.
         """
+        _require_affordable_spawns(_SPAWN_BUDGET_SPAWNS)
         import tools.checkpoint_manager as cm
 
         monkeypatch.setattr("tools.checkpoint_manager.CHECKPOINT_BASE", checkpoint_base)
