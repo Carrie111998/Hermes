@@ -139,6 +139,27 @@ class TestLoadConfigDefaults:
             "api": "https://pass.wafer.ai/v1",
         }
 
+    @pytest.mark.parametrize("operation", ["set", "get", "unset"])
+    def test_config_commands_reject_unclosed_quoted_key_without_traceback(
+        self, tmp_path, capsys, operation: str
+    ):
+        key = 'providers."qwen3.5'
+
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+            with pytest.raises(SystemExit) as exc:
+                if operation == "set":
+                    set_config_value(key, "required")
+                elif operation == "get":
+                    get_config_value(key)
+                else:
+                    unset_config_value(key)
+
+        assert exc.value.code == 1
+        captured = capsys.readouterr()
+        assert "Invalid config key" in captured.err
+        assert "unclosed quoted segment" in captured.err
+        assert "Traceback" not in captured.err
+
     def test_config_set_json_object_for_provider_extra_headers_is_mapping(
         self, tmp_path
     ):

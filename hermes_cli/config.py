@@ -1027,6 +1027,19 @@ def _split_config_key(dotted_key: str) -> list[str]:
     return parts
 
 
+def _validate_config_key_syntax_or_exit(key: str) -> None:
+    """Validate CLI config-key quoting and print a friendly error on failure."""
+    try:
+        _split_config_key(key)
+    except ValueError as exc:
+        print(f"✗ Invalid config key {key!r}: {exc}", file=sys.stderr)
+        print(
+            '  Close quoted literal-dot segments, e.g. providers."qwen3.5".api',
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+
 def _resolve_existing_dict_segment(
     current: dict,
     parts: list[str],
@@ -5010,6 +5023,7 @@ def set_config_value(key: str, value: str, force: bool = False):
     if is_managed():
         managed_error("set configuration values")
         return
+    _validate_config_key_syntax_or_exit(key)
     # Managed scope guard (D2): a key pinned by the managed layer cannot be set by
     # the user — the next load would override it anyway. Hard-reject and name the
     # source. Distinct from is_managed() above (the package-manager write-lock).
@@ -5219,6 +5233,7 @@ def set_config_value(key: str, value: str, force: bool = False):
 
 def get_config_value(key: str, *, as_json: bool = False):
     """Print a resolved configuration value."""
+    _validate_config_key_syntax_or_exit(key)
     if _is_env_config_key(key):
         env_value = get_env_value(key.upper())
         value = _MISSING if env_value is None else env_value
@@ -5237,6 +5252,7 @@ def unset_config_value(key: str):
     if is_managed():
         managed_error("unset configuration values")
         return
+    _validate_config_key_syntax_or_exit(key)
     # Managed scope guard: a key pinned by the managed layer cannot be unset by
     # the user — the next load would reinstate it anyway (mirrors set_config_value).
     from hermes_cli import managed_scope
