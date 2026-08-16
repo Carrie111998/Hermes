@@ -61,8 +61,14 @@ def _(rid, params: dict) -> dict:
 @method("process.kill")
 def _(rid, params: dict) -> dict:
     """Kill ONE background process — scoped to the caller's session so one
-    window can't reap another session's work (unlike process.stop's kill_all)."""
-    session, err = _sess(params, rid)
+    window can't reap another session's work (unlike process.stop's kill_all).
+
+    Resolves via ``_sess_building``: the ownership check reads ``session_key``
+    only. Unlike ``process.list`` this handler is NOT in ``_LONG_HANDLERS``, so
+    the old wait ran inline on the socket reader thread and stalled every RPC
+    queued behind a Stop the user had already pressed.
+    """
+    session, err = _sess_building(params, rid)
     if err:
         return err
     proc_id = str(params.get("process_id") or "")
