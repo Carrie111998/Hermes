@@ -1163,10 +1163,22 @@ _patch_failure_lock = threading.Lock()
 _patch_failure_tracker: dict = {}  # {task_id: {resolved_path: count}}
 
 
+# The per-task interior caps below don't stop the top-level task_id key
+# set itself from growing monotonically in a long-lived gateway process.
+# FIFO-evict the oldest task entry on overflow.
+_TRACKED_TASKS_CAP = 1024
+
+
+def _cap_task_tracker(tracker: dict) -> None:
+    while len(tracker) > _TRACKED_TASKS_CAP:
+        tracker.pop(next(iter(tracker)), None)
+
+
 def _record_patch_failure(task_id: str, resolved_path: str) -> int:
     """Increment and return the consecutive-failure count for this path."""
     with _patch_failure_lock:
         task_failures = _patch_failure_tracker.setdefault(task_id, {})
+        _cap_task_tracker(_patch_failure_tracker)
         # Cap dict size per task to avoid unbounded growth in long sessions
         # where the agent fails on many distinct files.  64 distinct
         # failing files per task is generous; older entries get evicted.
@@ -1330,6 +1342,7 @@ def _record_not_found(op: str, resolved_str: str, task_id: str, error_json: str)
             "read_history": set(), "dedup": {},
             "dedup_hits": {}, "read_timestamps": {},
         })
+        _cap_task_tracker(_read_tracker)
         nf = task_data.setdefault("not_found", {})
         nf[(op, resolved_str)] = (time.monotonic(), error_json)
         _cap_read_tracker_data(task_data)
@@ -1811,6 +1824,7 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 2000, task_id: str =
                 "read_history": set(), "dedup": {},
                 "dedup_hits": {}, "read_timestamps": {},
             })
+            _cap_task_tracker(_read_tracker)
             # Backward-compat for pre-existing tracker entries that predate
             # dedup_hits/read_timestamps (long-lived task or crossed an
             # upgrade boundary).
@@ -2582,6 +2596,7 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
             task_data = _read_tracker.setdefault(task_id, {
                 "last_key": None, "consecutive": 0, "read_history": set(),
             })
+            _cap_task_tracker(_read_tracker)
             if task_data["last_key"] == search_key:
                 task_data["consecutive"] += 1
             else:
