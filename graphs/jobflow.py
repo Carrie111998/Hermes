@@ -29,6 +29,7 @@ Langfuse as a parent trace with child spans per node.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import time
 import uuid
@@ -76,6 +77,7 @@ def _emit_event(event_type_str: str, source: str, payload: dict, priority: Optio
         return None
 
 _TRACER = get_tracer("hermes.jobflow")
+logger = logging.getLogger(__name__)
 
 # Diego mandate 2026-04-24: ONLY gpt-5.5 via OAuth across the whole platform.
 # obs.oauth_llm.get_codex_chat_model() bridges langchain to chatgpt.com/backend-api/codex

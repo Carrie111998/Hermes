@@ -567,10 +567,14 @@ def test_toolset_has_keys_for_vision_accepts_codex_auth(tmp_path, monkeypatch):
     assert _toolset_has_keys("vision") is True
 
 
-def test_save_platform_tools_preserves_mcp_server_names():
+def test_save_platform_tools_preserves_passthrough_and_applies_selection():
     """Ensure MCP server names are preserved when saving platform tools.
 
     Regression test for https://github.com/NousResearch/hermes-agent/issues/1247
+
+    Broader than ``test_save_platform_tools_preserves_mcp_server_names``
+    below: it also asserts the new selection is actually applied — added
+    entries appear and deselected ones are dropped.
     """
     config = {
         "platform_toolsets": {

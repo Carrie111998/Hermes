@@ -98,7 +98,13 @@ def codex_auth_dir(tmp_path, monkeypatch):
     return codex_dir
 
 
-class TestAuxiliaryMaxTokensParam:
+class TestAuxiliaryMaxTokensParamCopilot:
+    """GitHub Copilot custom base URLs must emit ``max_completion_tokens``.
+    Patches ``_resolve_custom_runtime`` (which ``_current_custom_base_url``
+    delegates to), so it covers the copilot host detection that the
+    URL/model matrix in ``TestAuxiliaryMaxTokensParam`` does not.
+    """
+
     def test_uses_max_completion_tokens_for_github_copilot_custom_base(self):
         with patch("agent.auxiliary_client._resolve_custom_runtime", return_value=("https://api.githubcopilot.com", "key", None)), \
              patch("agent.auxiliary_client._read_nous_auth", return_value=None):

@@ -1320,7 +1320,9 @@ class TestGetDueJobs:
         assert get_job("recurring")["run_claim"]["at"] == original_at
 
 
-    def test_broken_cron_without_next_run_is_recovered(self, tmp_cron_dir, monkeypatch):
+    def test_broken_cron_without_next_run_is_recovered_midday_schedule(self, tmp_cron_dir, monkeypatch):
+        """Same recovery path as the 07:00 variant below, but for a job whose
+        next fire time is later the same day (12:00 vs a 10:00 "now")."""
         now = datetime(2026, 3, 18, 10, 0, 0, tzinfo=timezone.utc)
         monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
 

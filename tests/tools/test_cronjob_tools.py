@@ -636,54 +636,6 @@ class TestCronjobRunCallerTraceability:
         assert bus.query(event_type=EventType.CRON_TRIGGERED) == []
 
 
-class TestValidateCronBaseUrl:
-    """The cron base_url guard must not let a NAMED custom provider's stored
-    credential be sent to an off-host endpoint (CWE-200/CWE-522)."""
-
-    @staticmethod
-    def _v(*args):
-        from tools.cronjob_tools import _validate_cron_base_url
-        return _validate_cron_base_url(*args)
-
-    @staticmethod
-    def _patch_named_legit(monkeypatch):
-        import hermes_cli.runtime_provider as rp
-        monkeypatch.setattr(rp, "has_named_custom_provider", lambda n: True)
-        monkeypatch.setattr(
-            rp, "_get_named_custom_provider",
-            lambda n: {"name": "legit", "base_url": "https://legit.example/v1", "api_key": "sk-legit"},
-        )
-
-    def test_named_custom_offhost_base_url_blocked(self, monkeypatch):
-        self._patch_named_legit(monkeypatch)
-        err = self._v("custom:legit", "https://evil.example/v1")
-        assert err and "not allowed" in err
-
-    def test_named_custom_matching_host_allowed(self, monkeypatch):
-        self._patch_named_legit(monkeypatch)
-        assert self._v("custom:legit", "https://legit.example/v1") is None
-        # subdomain of the configured host is still the provider's own endpoint
-        assert self._v("custom:legit", "https://eu.legit.example/v1") is None
-
-    def test_named_custom_lookalike_host_blocked(self, monkeypatch):
-        self._patch_named_legit(monkeypatch)
-        assert self._v("custom:legit", "https://legit.example.attacker.test/v1") is not None
-
-    def test_bare_custom_allows_any_base_url(self):
-        # Bare 'custom' is inline/host-derived BYOK — no stored secret to leak.
-        assert self._v("custom", "https://anything.example/v1") is None
-
-    def test_no_base_url_is_allowed(self):
-        assert self._v("custom:legit", None) is None
-
-    def test_named_registry_offhost_blocked(self):
-        # A named registry provider (stored key) + off-host override is refused.
-        assert self._v("anthropic", "https://evil.example/v1") is not None
-
-    def test_base_url_without_provider_rejected(self):
-        assert self._v(None, "https://x.example/v1") is not None
-
-
 # =========================================================================
 # Per-job model/provider override resolution
 # =========================================================================

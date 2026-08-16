@@ -153,12 +153,22 @@ class TestDingTalkAdapterInit:
 # ---------------------------------------------------------------------------
 
 
-class TestExtractText:
+class TestExtractTextBasic:
+    """Legacy-shape ``_extract_text`` cases: whitespace stripping, a bare
+    ``str`` payload, and the image-entry skip in the legacy ``rich_text``
+    list.  ``TestExtractText`` further down covers the SDK >= 0.20 shapes;
+    these assertions are not duplicated there.
+
+    Every case sets ``rich_text_content`` explicitly: ``_extract_text`` reads
+    it before the legacy ``rich_text`` list, and an unset ``MagicMock``
+    attribute is truthy, which would otherwise swallow the fallback path.
+    """
 
     def test_extracts_dict_text(self):
         from plugins.platforms.dingtalk.adapter import DingTalkAdapter
         msg = MagicMock()
         msg.text = {"content": "  hello world  "}
+        msg.rich_text_content = None
         msg.rich_text = None
         assert DingTalkAdapter._extract_text(msg) == "hello world"
 
@@ -166,6 +176,7 @@ class TestExtractText:
         from plugins.platforms.dingtalk.adapter import DingTalkAdapter
         msg = MagicMock()
         msg.text = "plain text"
+        msg.rich_text_content = None
         msg.rich_text = None
         assert DingTalkAdapter._extract_text(msg) == "plain text"
 
@@ -173,6 +184,7 @@ class TestExtractText:
         from plugins.platforms.dingtalk.adapter import DingTalkAdapter
         msg = MagicMock()
         msg.text = ""
+        msg.rich_text_content = None
         msg.rich_text = [{"text": "part1"}, {"text": "part2"}, {"image": "url"}]
         assert DingTalkAdapter._extract_text(msg) == "part1 part2"
 
@@ -180,6 +192,7 @@ class TestExtractText:
         from plugins.platforms.dingtalk.adapter import DingTalkAdapter
         msg = MagicMock()
         msg.text = ""
+        msg.rich_text_content = None
         msg.rich_text = None
         assert DingTalkAdapter._extract_text(msg) == ""
 
