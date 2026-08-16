@@ -454,3 +454,75 @@ def test_cli_complete_uses_persisted_recovery_route(
     with kb.connect() as conn:
         task = kb.get_task(conn, task_id)
         assert task is not None and task.status == "review"
+
+
+def test_release_notes_child_is_not_a_review_lane(kanban_home: Path) -> None:
+    with kb.connect() as conn:
+        parent_id, _run_id = _blocked_task(conn, evidence())
+        child_id = kb.create_task(
+            conn,
+            title="Prepare the cumulative MVP release-candidate PR",
+            assignee="hermes-coding",
+        )
+        kb.link_tasks(conn, parent_id, child_id)
+        assert kb._review_child_ids(conn, parent_id) == []
+        recovered, lane = kb.recover_blocked_completion(
+            conn,
+            parent_id,
+            provider=lambda _candidate: provider_state(),
+        )
+        assert (recovered, lane) == (True, "same_card")
+        parent = kb.get_task(conn, parent_id)
+        child = kb.get_task(conn, child_id)
+        assert parent is not None and parent.status == "review"
+        assert child is not None and child.status != "ready"
+
+
+def test_title_review_fallback_still_selects_downstream_child(
+    kanban_home: Path,
+) -> None:
+    with kb.connect() as conn:
+        parent_id, _run_id = _blocked_task(conn, evidence())
+        child_id = kb.create_task(
+            conn,
+            title="Independent review of the published candidate",
+            assignee="hermes-coding",
+        )
+        kb.link_tasks(conn, parent_id, child_id)
+        assert kb._review_child_ids(conn, parent_id) == [child_id]
+
+
+def test_sdlc_review_skill_marks_review_child(kanban_home: Path) -> None:
+    with kb.connect() as conn:
+        parent_id, _run_id = _blocked_task(conn, evidence())
+        child_id = kb.create_task(
+            conn,
+            title="Validate the implementation",
+            assignee="hermes-coding",
+            skills=["sdlc-review"],
+        )
+        kb.link_tasks(conn, parent_id, child_id)
+        assert kb._review_child_ids(conn, parent_id) == [child_id]
+
+
+def test_stale_pr_comment_outside_window_is_not_scanned(
+    kanban_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = 5_000_000
+    monkeypatch.setattr(kb.time, "time", lambda: now)
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="old pr comment", assignee="hermes-coding")
+        kb.add_comment(
+            conn,
+            task_id,
+            author="hermes-coding",
+            body="Opened https://github.com/example/repo/pull/6",
+        )
+        conn.execute(
+            "UPDATE task_comments SET created_at = ? WHERE task_id = ?",
+            (now - kb._RESPAWN_GUARD_PR_WINDOW - 10, task_id),
+        )
+        conn.commit()
+        assert kb.check_respawn_guard(conn, task_id) is None
+
