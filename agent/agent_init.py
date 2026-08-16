@@ -875,6 +875,10 @@ def init_agent(
     # the end of the prior turn had finished).
     agent._background_review_agent = None
     agent._background_review_lock = threading.Lock()
+    agent._background_review_done = threading.Event()
+    agent._background_review_done.set()
+    agent._background_review_registered = threading.Event()
+    agent._background_review_registered.set()
 
     # Store OpenRouter provider preferences
     agent.providers_allowed = providers_allowed

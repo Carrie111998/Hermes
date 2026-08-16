@@ -170,6 +170,11 @@ _HANDOFF_SKIP_FINAL_RESPONSE = (
 # to treat it as cancellation metadata rather than assistant prose.
 INTERRUPT_WAITING_FOR_MODEL_PREFIX = "Operation interrupted: waiting for model response ("
 
+# A cancelled review normally unwinds as soon as its request-local socket is
+# aborted (well under a second). Keep the barrier bounded so a broken review
+# cannot replace the old 30-minute live-turn stall with an unbounded prologue.
+_BACKGROUND_REVIEW_CANCEL_WAIT_SECONDS = 10.0
+
 
 def _should_rearm_compression_budget(
     compression_attempts: int,
@@ -1672,28 +1677,102 @@ def run_conversation(
 
     # If a background memory/skill review spawned at the end of a PRIOR turn
     # (agent/background_review.py) is still running its own run_conversation()
-    # when THIS turn starts, cancel it now rather than letting both make
-    # outbound API calls concurrently against the same session_id/credentials.
-    # That concurrency can produce doubled prompt-token accounting on this
-    # turn's own calls and, because the review fork is a fully separate
-    # AIAgent with no route back to THIS agent's interrupt() by default, a
-    # lockup that survives a normal /stop and needs a hard Ctrl+C.
-    # ``review_agent.interrupt()`` is fire-and-forget here — it just flags
-    # cancellation and aborts the review's in-flight socket; it does not
-    # block waiting for the review's daemon thread to exit, so it can't add
-    # latency to this turn. Only ever set on the real owning agent (the
-    # review fork's own copy of this attribute stays None — reviews don't
-    # spawn nested reviews), so this is a no-op on every other run_conversation
-    # caller (subagents, the review fork itself, etc).
-    _pending_review = getattr(agent, "_background_review_agent", None)
-    if _pending_review is not None:
-        try:
-            _pending_review.interrupt("superseded by a new live turn")
-        except Exception:
-            logger.debug(
-                "Failed to cancel in-flight background review for a new turn",
-                exc_info=True,
+    # when THIS turn starts, cancel it and wait for its turn to unwind before
+    # entering live-turn setup. ``interrupt()`` is only a cancellation request:
+    # proceeding immediately used to leave a race window where the review and
+    # live turn shared one session/Relay runtime. In production that repeatedly
+    # froze the live turn after its tool batch until the 30-minute gateway idle
+    # timeout. The review unregisters itself as soon as run_conversation exits;
+    # _background_review_done is the barrier for that exact boundary.
+    _review_lock = getattr(agent, "_background_review_lock", None)
+    if _review_lock is not None:
+        with _review_lock:
+            _pending_review = getattr(agent, "_background_review_agent", None)
+            _review_done = getattr(agent, "_background_review_done", None)
+            _review_registered = getattr(
+                agent, "_background_review_registered", None
             )
+    else:
+        _pending_review = getattr(agent, "_background_review_agent", None)
+        _review_done = getattr(agent, "_background_review_done", None)
+        _review_registered = getattr(agent, "_background_review_registered", None)
+
+    _review_in_flight = _pending_review is not None or (
+        _review_done is not None and not _review_done.is_set()
+    )
+    if _review_in_flight:
+        _review_deadline = (
+            time.monotonic() + _BACKGROUND_REVIEW_CANCEL_WAIT_SECONDS
+        )
+
+        # The thread clears the lifecycle event before start, then registers
+        # its concrete AIAgent after setup. Wait for either registration or
+        # completion so the setup window cannot escape cancellation.
+        if _pending_review is None and _review_registered is not None:
+            _review_registered.wait(
+                timeout=max(0.0, _review_deadline - time.monotonic())
+            )
+            if _review_lock is not None:
+                with _review_lock:
+                    _pending_review = getattr(
+                        agent, "_background_review_agent", None
+                    )
+            else:
+                _pending_review = getattr(agent, "_background_review_agent", None)
+
+        if _pending_review is not None:
+            try:
+                _pending_review.interrupt("superseded by a new live turn")
+            except Exception:
+                logger.debug(
+                    "Failed to cancel in-flight background review for a new turn",
+                    exc_info=True,
+                )
+
+        if _review_done is not None:
+            _review_stopped = _review_done.wait(
+                timeout=max(0.0, _review_deadline - time.monotonic())
+            )
+        else:
+            # Compatibility for lightweight/test agents created without
+            # agent_init: observe the existing identity-guarded pointer.
+            while time.monotonic() < _review_deadline:
+                if _review_lock is not None:
+                    with _review_lock:
+                        _review_stopped = (
+                            getattr(agent, "_background_review_agent", None)
+                            is not _pending_review
+                        )
+                else:
+                    _review_stopped = (
+                        getattr(agent, "_background_review_agent", None)
+                        is not _pending_review
+                    )
+                if _review_stopped:
+                    break
+                time.sleep(0.01)
+            else:
+                _review_stopped = False
+
+        if not _review_stopped:
+            _review_error = (
+                "The previous background review did not stop within "
+                f"{_BACKGROUND_REVIEW_CANCEL_WAIT_SECONDS:g} seconds; "
+                "refusing to start a concurrent live turn against the same session."
+            )
+            logger.error(_review_error)
+            return {
+                "final_response": (
+                    "⚠️ A background self-improvement review did not stop promptly, "
+                    "so I cancelled this attempt instead of risking another long "
+                    "stall. Please resend your message."
+                ),
+                "messages": list(conversation_history or []),
+                "api_calls": 0,
+                "completed": False,
+                "failed": True,
+                "error": _review_error,
+            }
 
     # Adopt any ~/.hermes/.env credential/base-url edits made since the last
     # turn — a Settings save updates .env but not this worker's client, which

@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+import threading
+import time
+
+import pytest
+
 import run_agent as run_agent_module
 from run_agent import AIAgent
 
@@ -32,6 +37,10 @@ def _bare_agent() -> AIAgent:
     import threading as _threading
     agent._background_review_agent = None
     agent._background_review_lock = _threading.Lock()
+    agent._background_review_done = _threading.Event()
+    agent._background_review_done.set()
+    agent._background_review_registered = _threading.Event()
+    agent._background_review_registered.set()
     agent._active_children = []
     agent._active_children_lock = _threading.Lock()
     return agent
@@ -296,6 +305,12 @@ def test_background_review_registers_on_active_children_for_interrupt(monkeypatc
             # the parent must already point at this fork.
             seen["active_children_during_run"] = list(agent._active_children)
             seen["background_review_agent_during_run"] = agent._background_review_agent
+            seen["background_review_done_during_run"] = (
+                agent._background_review_done.is_set()
+            )
+            seen["background_review_registered_during_run"] = (
+                agent._background_review_registered.is_set()
+            )
 
         def shutdown_memory_provider(self):
             pass
@@ -317,11 +332,15 @@ def test_background_review_registers_on_active_children_for_interrupt(monkeypatc
     fork = seen["background_review_agent_during_run"]
     assert fork is not None
     assert seen["active_children_during_run"] == [fork]
+    assert seen["background_review_done_during_run"] is False
+    assert seen["background_review_registered_during_run"] is True
 
     # After the review completes, both tracking slots must be cleared —
     # otherwise a later interrupt() would try to cancel an already-closed
     # agent, or the next turn would wait on a review that no longer exists.
     assert agent._background_review_agent is None
+    assert agent._background_review_done.is_set()
+    assert agent._background_review_registered.is_set()
     assert agent._active_children == []
 
 
@@ -353,6 +372,128 @@ def test_new_live_turn_cancels_still_running_background_review(monkeypatch):
     _pending_review.interrupt("superseded by a new live turn")
 
     assert calls == ["superseded by a new live turn"]
+
+
+def test_new_live_turn_waits_until_background_review_has_exited(monkeypatch):
+    """The live turn must not enter setup while the cancelled review is alive.
+
+    ``interrupt()`` only requests cancellation; the review worker unregisters
+    itself asynchronously after ``run_conversation()`` unwinds.  Entering the
+    next turn between those two events recreates the same-session overlap that
+    the cancellation guard exists to prevent.
+    """
+    import agent.conversation_loop as conversation_loop_module
+
+    review_exited = threading.Event()
+    agent = _bare_agent()
+
+    class FakeReviewAgent:
+        def interrupt(self, message=None):
+            assert message == "superseded by a new live turn"
+
+            def finish_exit():
+                time.sleep(0.15)
+                with agent._background_review_lock:
+                    agent._background_review_agent = None
+                    agent._background_review_done.set()
+                review_exited.set()
+
+            threading.Thread(target=finish_exit, daemon=True).start()
+
+    agent._background_review_done.clear()
+    agent._background_review_agent = FakeReviewAgent()
+
+    class StopAfterPrologue(Exception):
+        pass
+
+    def fake_build_turn_context(*args, **kwargs):
+        assert review_exited.is_set(), (
+            "live turn entered setup before the interrupted background review exited"
+        )
+        raise StopAfterPrologue
+
+    monkeypatch.setattr(
+        conversation_loop_module,
+        "build_turn_context",
+        fake_build_turn_context,
+    )
+
+    with pytest.raises(StopAfterPrologue):
+        conversation_loop_module.run_conversation(agent, "next live message")
+
+
+def test_new_live_turn_fails_closed_when_background_review_will_not_exit(
+    monkeypatch,
+):
+    """A wedged review must not be allowed to overlap the live turn."""
+    import agent.conversation_loop as conversation_loop_module
+
+    class WedgedReviewAgent:
+        def interrupt(self, message=None):
+            assert message == "superseded by a new live turn"
+
+    agent = _bare_agent()
+    agent._background_review_done.clear()
+    agent._background_review_agent = WedgedReviewAgent()
+    monkeypatch.setattr(
+        conversation_loop_module,
+        "_BACKGROUND_REVIEW_CANCEL_WAIT_SECONDS",
+        0.01,
+    )
+    build_calls = []
+    monkeypatch.setattr(
+        conversation_loop_module,
+        "build_turn_context",
+        lambda *args, **kwargs: build_calls.append(True),
+    )
+
+    result = conversation_loop_module.run_conversation(agent, "next live message")
+
+    assert result["failed"] is True
+    assert "refusing to start a concurrent live turn" in result["error"]
+    assert build_calls == []
+
+
+def test_new_live_turn_catches_background_review_setup_window(monkeypatch):
+    """A review is in flight before its forked AIAgent pointer is published."""
+    import agent.conversation_loop as conversation_loop_module
+
+    agent = _bare_agent()
+    agent._background_review_done.clear()
+    agent._background_review_registered.clear()
+    review_exited = threading.Event()
+
+    class RegisteringReviewAgent:
+        def interrupt(self, message=None):
+            assert message == "superseded by a new live turn"
+            with agent._background_review_lock:
+                agent._background_review_agent = None
+                agent._background_review_done.set()
+            review_exited.set()
+
+    def finish_setup():
+        time.sleep(0.05)
+        with agent._background_review_lock:
+            agent._background_review_agent = RegisteringReviewAgent()
+            agent._background_review_registered.set()
+
+    threading.Thread(target=finish_setup, daemon=True).start()
+
+    class StopAfterPrologue(Exception):
+        pass
+
+    def fake_build_turn_context(*args, **kwargs):
+        assert review_exited.is_set()
+        raise StopAfterPrologue
+
+    monkeypatch.setattr(
+        conversation_loop_module,
+        "build_turn_context",
+        fake_build_turn_context,
+    )
+
+    with pytest.raises(StopAfterPrologue):
+        conversation_loop_module.run_conversation(agent, "next live message")
 
 
 

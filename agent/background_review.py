@@ -889,6 +889,13 @@ def _run_review_in_thread(
     except Exception:
         pass
 
+    # Capture this fork's generation-specific lifecycle events. A later live
+    # turn can finish and spawn a new review before this daemon completes its
+    # teardown; setting the parent's then-current events would incorrectly mark
+    # that newer review as done.
+    _review_done = getattr(agent, "_background_review_done", None)
+    _review_registered = getattr(agent, "_background_review_registered", None)
+
     review_agent = None
     review_messages: List[Dict] = []
     review_usage: Dict[str, Any] = {}
@@ -905,8 +912,16 @@ def _run_review_in_thread(
                 with _br_lock:
                     if agent._background_review_agent is agent_ref:
                         agent._background_review_agent = None
+                        if _review_done is not None:
+                            _review_done.set()
+                        if _review_registered is not None:
+                            _review_registered.set()
             elif agent._background_review_agent is agent_ref:
                 agent._background_review_agent = None
+                if _review_done is not None:
+                    _review_done.set()
+                if _review_registered is not None:
+                    _review_registered.set()
         if hasattr(agent, "_active_children"):
             try:
                 _ac_lock = getattr(agent, "_active_children_lock", None)
@@ -1128,8 +1143,12 @@ def _run_review_in_thread(
                 if _br_lock is not None:
                     with _br_lock:
                         agent._background_review_agent = review_agent
+                        if _review_registered is not None:
+                            _review_registered.set()
                 else:
                     agent._background_review_agent = review_agent
+                    if _review_registered is not None:
+                        _review_registered.set()
             if hasattr(agent, "_active_children"):
                 _ac_lock = getattr(agent, "_active_children_lock", None)
                 if _ac_lock is not None:

@@ -1850,12 +1850,48 @@ class AIAgent:
             focus=focus,
             task_cfg=task_cfg,
         )
+        # Publish the review lifecycle before the daemon starts. The fork does
+        # non-trivial setup before it can register its AIAgent pointer; without
+        # these events, a new live turn can slip through that setup window and
+        # race the review before there is anything available to interrupt.
+        _review_done = threading.Event()
+        _review_registered = threading.Event()
+        _review_lock = getattr(self, "_background_review_lock", None)
+        if _review_lock is not None:
+            with _review_lock:
+                self._background_review_done = _review_done
+                self._background_review_registered = _review_registered
+        else:
+            self._background_review_done = _review_done
+            self._background_review_registered = _review_registered
+
+        def _review_target() -> None:
+            try:
+                target()
+            finally:
+                # Setup failures can happen before the fork registers itself.
+                # Wake both wait sites so a live turn never blocks on a review
+                # thread that has already exited.
+                if _review_registered is not None:
+                    _review_registered.set()
+                if _review_done is not None:
+                    _review_done.set()
+
         # Carry the active profile into the review thread so MEMORY.md / skill
         # review writes land in the right profile (#54937).
         t = threading.Thread(
-            target=propagate_context_to_thread(target), daemon=True, name="bg-review"
+            target=propagate_context_to_thread(_review_target),
+            daemon=True,
+            name="bg-review",
         )
-        t.start()
+        try:
+            t.start()
+        except Exception:
+            if _review_registered is not None:
+                _review_registered.set()
+            if _review_done is not None:
+                _review_done.set()
+            raise
 
     def _build_memory_write_metadata(
         self,
