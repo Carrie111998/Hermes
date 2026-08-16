@@ -589,10 +589,17 @@ def _request_approval(action: str, args: Dict[str, Any],
             if current_key and is_approval_bypass_active_for_session(current_key):
                 return None
         except Exception:
-            # Approval state must fail closed if it cannot be resolved.
-            pass
+            # Approval state must fail closed if it cannot be resolved, but a
+            # broken bypass check (e.g. a renamed function) should not fail
+            # silently — log it so the underlying error is diagnosable.
+            logger.warning(
+                "computer_use approval-bypass check failed for action %r; "
+                "failing closed",
+                action, exc_info=True,
+            )
         return json.dumps({
             "error": "approval required but no approval mechanism is available",
+            "code": "approval_unavailable",
             "hint": "computer_use needs interactive CLI approval or an explicit "
                     "unattended-mode opt-in (/yolo, or the configured bypass) "
                     "before destructive actions can run in this context.",

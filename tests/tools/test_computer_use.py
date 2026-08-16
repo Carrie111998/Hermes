@@ -192,9 +192,26 @@ class TestHeadlessApprovalFailClosed:
 
         parsed = json.loads(out)
         assert parsed.get("error"), out
+        assert parsed.get("code") == "approval_unavailable", out
         assert not noop_backend.calls, (
             "backend must not be invoked when approval cannot be resolved"
         )
+
+    def test_bypass_check_failure_fails_closed_and_logs(self, noop_backend, caplog):
+        """A broken bypass check (e.g. a renamed function) must still deny —
+        and log, so the failure is diagnosable instead of a silent deny."""
+        import logging
+        from tools.computer_use.tool import handle_computer_use
+
+        with patch("tools.approval.is_approval_bypass_active_for_session",
+                    side_effect=RuntimeError("boom")), \
+             caplog.at_level(logging.WARNING, logger="tools.computer_use.tool"):
+            out = handle_computer_use({"action": "click", "element": 3})
+
+        parsed = json.loads(out)
+        assert parsed.get("error"), out
+        assert not noop_backend.calls
+        assert any("approval-bypass check failed" in r.message for r in caplog.records)
 
     def test_destructive_action_allowed_when_bypass_active(self, noop_backend):
         """Explicit unattended opt-in (/yolo, approvals.mode: off) must still
