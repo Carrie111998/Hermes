@@ -71,7 +71,14 @@ def test_transitive_security_floors_are_bounded_core_requirements(
     first_fixed: str,
     next_major: str,
 ):
-    """Known-vulnerable transitives must be bounded core requirements."""
+    """Known-vulnerable transitives must be bounded core requirements.
+
+    Membership checks alone cannot distinguish `>2.14.1` from `>=2.14.2` or
+    `<3` from `<3.0.1`, so beyond the vulnerable/fixed/next-major probes the
+    requirement must also structurally encode an explicit lower bound at or
+    above the first fixed release and an explicit upper bound below the next
+    major release.
+    """
     data = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
     requirements = {
         Requirement(spec).name.lower(): Requirement(spec)
@@ -86,6 +93,27 @@ def test_transitive_security_floors_are_bounded_core_requirements(
     assert Version(last_vulnerable) not in specifier
     assert Version(first_fixed) in specifier
     assert Version(next_major) not in specifier
+
+    # Bound shape: an explicit lower bound at or above the first fixed
+    # release, and an explicit upper bound below the next major release.
+    lower_bounds = [
+        Version(spec.version)
+        for spec in specifier
+        if spec.operator in (">=", "~=", "==")
+    ]
+    assert any(bound >= Version(first_fixed) for bound in lower_bounds), (
+        f"{package} requirement must encode a lower bound at or above the "
+        f"first fixed release {first_fixed} (got {requirements[package]!s})"
+    )
+    upper_bounds = [
+        Version(spec.version)
+        for spec in specifier
+        if spec.operator in ("<", "<=")
+    ]
+    assert any(bound <= Version(next_major) for bound in upper_bounds), (
+        f"{package} requirement must encode an upper bound below the next "
+        f"major release {next_major} (got {requirements[package]!s})"
+    )
 
 
 # Minimum non-vulnerable Starlette: CVE-2026-48710 ("BadHost") was fixed in
