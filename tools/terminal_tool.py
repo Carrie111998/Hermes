@@ -2850,9 +2850,15 @@ def terminal_tool(
                 # redirect keeps leading-dash paths out of argv (same form as
                 # tools/image_source.py).
                 try:
+                    remote_script_path = script_path
+                    if os.name == "nt" and env_type != "local":
+                        # ``lifecycle_guard`` renders candidates using the
+                        # host Path flavor. Restore POSIX remote spelling on
+                        # Windows before passing the path to a remote shell.
+                        remote_script_path = script_path.replace("\\", "/")
                     result = env.execute(
                         f"head -c {_MAX_REFERENCED_SCRIPT_BYTES + 1} "
-                        f"< {shlex.quote(script_path)}"
+                        f"< {shlex.quote(remote_script_path)}"
                     )
                     if result.get("returncode", -1) == 0:
                         output = result.get("output", "")

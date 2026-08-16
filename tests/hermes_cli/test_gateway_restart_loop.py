@@ -305,7 +305,7 @@ class TestTerminalToolGatewayLifecycleGuard:
         script.write_text("#!/bin/bash\nsleep 45\nhermes gateway restart\n", encoding="utf-8")
         self._patch_env(monkeypatch, self._make_fake_env(), inside_gateway=True)
 
-        result = json.loads(tt.terminal_tool(command=f"/bin/bash {script}"))
+        result = json.loads(tt.terminal_tool(command=f"/bin/bash {script.as_posix()}"))
 
         assert result["exit_code"] == 1
         assert "referenced script" in result["error"]
@@ -383,7 +383,7 @@ class TestTerminalToolGatewayLifecycleGuard:
         )
         self._patch_env(monkeypatch, self._make_fake_env(), inside_gateway=True)
 
-        result = json.loads(tt.terminal_tool(command=f"/bin/bash {script}"))
+        result = json.loads(tt.terminal_tool(command=f"/bin/bash {script.as_posix()}"))
 
         assert result["exit_code"] == 1
         assert "referenced script" in result["error"]
@@ -415,7 +415,7 @@ class TestTerminalToolGatewayLifecycleGuard:
         script.chmod(0o700)
         self._patch_env(monkeypatch, self._make_fake_env(), inside_gateway=True)
 
-        result = json.loads(tt.terminal_tool(command=str(script)))
+        result = json.loads(tt.terminal_tool(command=script.as_posix()))
 
         assert result["exit_code"] == 1
 
@@ -438,7 +438,7 @@ class TestTerminalToolGatewayLifecycleGuard:
         self._patch_env(monkeypatch, self._make_fake_env(), inside_gateway=True)
 
         result = json.loads(tt.terminal_tool(
-            command=f"/bin/bash -O extglob {script}"
+            command=f"/bin/bash -O extglob {script.as_posix()}"
         ))
 
         assert result["exit_code"] == 1
@@ -479,13 +479,15 @@ class TestTerminalToolGatewayLifecycleGuard:
 
         self._patch_env(monkeypatch, _FakeEnv(), inside_gateway=True)
 
-        result = json.loads(tt.terminal_tool(command=f"/bin/bash {outer}"))
+        result = json.loads(tt.terminal_tool(command=f"/bin/bash {outer.as_posix()}"))
 
         assert result["exit_code"] == 1
 
     def test_non_regular_referenced_script_fails_closed(self, monkeypatch, tmp_path):
         import tools.terminal_tool as tt
 
+        if not hasattr(os, "mkfifo"):
+            pytest.skip("FIFO creation is unavailable on this platform")
         fifo = tmp_path / "script.fifo"
         os.mkfifo(fifo)
         self._patch_env(monkeypatch, self._make_fake_env(), inside_gateway=True)
@@ -533,7 +535,7 @@ class TestTerminalToolGatewayLifecycleGuard:
         monkeypatch.setattr(
             tt, "_check_all_guards", lambda cmd, env, **kwargs: {"approved": True}
         )
-        command = f"/bin/bash {script}"
+        command = f"/bin/bash {script.as_posix()}"
 
         result = json.loads(tt.terminal_tool(command=command))
 
@@ -1033,7 +1035,7 @@ class TestTerminalToolGatewayLifecycleGuardRemote:
         monkeypatch.setattr(tt, "_active_environments", {eid: fake_env})
         monkeypatch.setattr(tt, "_last_activity", {eid: 0.0})
         monkeypatch.setattr(tt, "_task_env_overrides", {})
-        monkeypatch.setattr(tt, "_get_env_config", lambda: {"env_type": "local", "cwd": "/tmp", "timeout": 60, "lifetime_seconds": 3600})
+        monkeypatch.setattr(tt, "_get_env_config", lambda: {"env_type": "ssh", "cwd": "/tmp", "timeout": 60, "lifetime_seconds": 3600})
         if inside_gateway:
             monkeypatch.setenv("_HERMES_GATEWAY", "1")
         else:
@@ -1053,7 +1055,7 @@ class TestTerminalToolGatewayLifecycleGuardRemote:
             def execute(self, command, **kwargs):
                 calls.append(command)
                 if "head -c" in command and "/remote/workspace/remote.sh" in command:
-                    return {"output": "#!/bin/bash\\nhermes gateway restart\\n", "returncode": 0}
+                    return {"output": "#!/bin/bash\nhermes gateway restart\n", "returncode": 0}
                 return {"output": "", "returncode": 0}
 
         fake_env = _RemoteEnv()
@@ -1207,8 +1209,9 @@ class TestLifecycleGuardNeverRaises:
     def test_directory_and_dev_null_fail_closed_not_crash(self, tmp_path):
         # Non-regular files are suspicious (fail closed = blocked), but the
         # important contract is: verdict, not exception.
-        assert self._scan(f"bash {tmp_path}") is True
-        assert self._scan("bash /dev/null") is True
+        assert self._scan(f"bash {tmp_path.as_posix()}") is True
+        if os.name != "nt":
+            assert self._scan("bash /dev/null") is True
 
     def test_magic_prefix_binaries_skipped_without_full_read(self, tmp_path):
         """Executable magic (ELF/PE/Mach-O) short-circuits the read: the
@@ -1238,6 +1241,9 @@ class TestLifecycleGuardNeverRaises:
         binary.write_bytes(b"\x7fELF" + bytes(128))
         for value in ("nul\x00byte.sh", str(binary), "/nonexistent/x.sh"):
             check_gateway_lifecycle("clean prompt", value)  # must not raise
-        for value in ("/dev/null", str(tmp_path)):
+        non_regular_values = [str(tmp_path)]
+        if os.name != "nt":
+            non_regular_values.append("/dev/null")
+        for value in non_regular_values:
             with pytest.raises(GatewayLifecycleBlocked):
                 check_gateway_lifecycle("clean prompt", value)
