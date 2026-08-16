@@ -1,6 +1,6 @@
 ---
 title: "ARCH-003 implementation plan: runtime-state audit and replay verification"
-status: IMPLEMENTATION_PLAN_REVISE_V6_PENDING
+status: IMPLEMENTATION_PLAN_REVISE_V7_PENDING
 date: 2026-08-16
 type: implementation-plan
 ticket: ARCH-003
@@ -86,17 +86,21 @@ prompt construction, legacy `state.db`, or unrelated dirty worktree files.
   Record the writer matrix before source edits.
 - Use SQLite WAL mode for both the single-writer and multi-writer branches.
   Record and test `PRAGMA journal_mode=WAL`, the selected busy-timeout, and
-  read-only WAL preconditions: `-wal` and `-shm` accessibility and the
-  immutable-open behavior used by the verifier.
-- Define one named runtime-state maintenance mutex shared by mutation/genesis
-  paths and the privileged baseline writer. Acquire it before opening the
-  SQLite transaction and release it only after commit or rollback on both
-  paths. The single-writer branch proves one mutation connection and
-  defensive abort for ordinary mutation/genesis operation; the multi-writer
-  branch requires a cross-process mutex and specifies bounded retry policy.
-  If no safe cross-process primitive exists for a multi-process writer matrix,
-  stop preflight.
-- Mutation/genesis transactions use `BEGIN IMMEDIATE` or an equivalent
+  read-only WAL preconditions: `-wal` and `-shm` accessibility. The verifier
+  uses a normal read-only WAL connection with `BEGIN DEFERRED`; immutable-open
+  is prohibited because it cannot provide the required concurrent WAL snapshot.
+- Define one named cross-process runtime-state maintenance RW lock. Ordinary
+  mutation/genesis paths acquire its shared/read side before opening the
+  SQLite transaction and release it after commit or rollback. The privileged
+  baseline writer acquires its exclusive/write side before opening its WAL
+  transaction and releases it after commit or rollback. This permits
+  multi-writer sequence contention while excluding baseline operations from
+  concurrent mutations.
+- The single-writer branch proves one ordinary mutation connection and
+  defensive abort; the multi-writer branch requires the cross-process RW lock
+  plus bounded retry policy. If no safe cross-process RW lock exists, stop
+  preflight.
+- Mutation/genesis transactions use `BEGIN IMMEDIATE` or equivalent
   write-lock-first discipline before sequence allocation. Constraint-collision
   retries and busy-timeout/snapshot-invalidation aborts are separate outcomes.
 - Map every runtime-state lifecycle mutation and prove the chosen CAS
@@ -146,12 +150,21 @@ without an accompanying materialized-state mutation.
 
 The privileged baseline writer is an internal runtime-state maintenance
 operation with explicit operator authorization, outside the gateway, scheduler,
-and verifier surfaces. It acquires the named maintenance mutex before opening
-its SQLite WAL transaction, validates the sealed tuple against the current
-materialized row and current maximum sequence, appends the baseline event on
-the same connection, and releases the mutex after commit or rollback. Production
-gateway, scheduler, and automatic-repair paths never invoke it in this ticket;
-hermetic tests may invoke it directly.
+and verifier surfaces. It acquires the exclusive side of the named
+cross-process maintenance RW lock before opening its SQLite WAL transaction,
+validates the sealed tuple against the current materialized row and current
+maximum sequence, appends the baseline event on the same connection, and
+releases the lock after commit or rollback. Production gateway, scheduler, and
+automatic-repair paths never invoke it in this ticket; hermetic tests may invoke
+it directly.
+
+A valid baseline must be in or after a valid origin epoch under the current
+digest-parameter identifier. A legacy/pre-journal or pre-rotation entity with
+no valid current-epoch genesis cannot be made `CONSISTENT` by a baseline.
+Successive baselines with strictly increasing `sealed_through_seq` are the
+expected compaction case. Same-sequence baselines with different tuples, or a
+later baseline whose sealed tuple contradicts a surviving baseline in its
+sealed range, are conflicting and verify as `UNKNOWN`.
 
 The migration must not record raw business keys, owner tokens, prompts,
 messages, tool arguments, credentials, filesystem paths, provider payloads, or
@@ -185,15 +198,16 @@ this posture.
   mutation that changes any member of the replay tuple, including
   owner-version-only changes with unchanged lifecycle state.
 - Emit no event for a true no-op that changes no replayed column.
-- Acquire the named maintenance mutex before opening the caller's SQLite WAL
-  transaction; use `BEGIN IMMEDIATE` or equivalent before sequence allocation;
-  release the mutex only after commit or rollback.
+- Ordinary mutation/genesis paths acquire the shared side of the named
+  cross-process maintenance RW lock before opening the SQLite WAL transaction;
+  use `BEGIN IMMEDIATE` or equivalent before sequence allocation; release the
+  shared lock only after commit or rollback.
 - Use the caller's existing SQLite WAL connection and transaction for mutation
   and genesis events.
 - Any mutation/genesis journal constraint or write failure aborts the complete
   enclosing materialized-state mutation; errors must not be swallowed.
-- The privileged baseline writer is the sole event-only exception and follows
-  the same mutex-before-transaction and release-after-commit/rollback ordering.
+- The privileged baseline writer is the sole event-only exception and uses the
+  exclusive lock ordering defined in Gate 1.
 - In the multi-writer branch, use a code-level `SEQUENCE_RETRY_LIMIT = 3`
   only for statement-level sequence uniqueness collisions. A busy-timeout
   exhaustion or snapshot-invalidation error aborts the whole transaction and
@@ -214,20 +228,22 @@ Implement a bounded verifier that:
 - opens a read-only SQLite WAL connection and explicitly executes
   `BEGIN DEFERRED`; the first event-stream read establishes the snapshot,
   and both the bounded event stream and materialized row are read after that
-  snapshot establishment and before the transaction ends;
+  snapshot establishment and before the transaction ends. Immutable-open is
+  prohibited for this verifier.
 - returns per-entity `CONSISTENT`, `DRIFT`, or `UNKNOWN`;
 - treats `UNKNOWN` as absorbing;
 - requires complete verified history for `DRIFT`;
 - validates event kind, origin/genesis markers, baseline contents and
   baseline-to-next-event sequence continuity, duplicate or missing
-  predecessors, digest-parameter identity, schema versions, reason codes, and
-  terminal state;
+  predecessors, digest-parameter identity, schemas, reason codes, and terminal
+  state;
 - uses a code-level `REPLAY_EVENT_LIMIT = 10000` counted from the effective
   replay start point: the latest valid baseline if one exists, otherwise the
   genesis event;
 - selects the valid baseline with the highest `sealed_through_seq`, ignores
-  events before that baseline, and returns `UNKNOWN` for conflicting or
-  overlapping baselines;
+  events before it, and returns `UNKNOWN` for same-sequence tuple conflicts,
+  overlapping contradictory baselines, or a baseline without a valid current
+  origin epoch;
 - returns `UNKNOWN` on snapshot failure, unsupported/newer versions, malformed
   history, unknown digest regime, verify-time key unavailability, exceeded
   bound, missing legacy origin, or a materialized-row/history asymmetry;
@@ -261,7 +277,8 @@ Add deterministic tests for:
 - mutation/genesis journal failure rolling back materialized state;
 - SQLite WAL, selected busy-timeout, `BEGIN IMMEDIATE`, and read-only WAL
   preconditions;
-- named maintenance-mutex exclusion between baseline and mutation paths;
+- shared/exclusive cross-process maintenance-RW-lock exclusion and release
+  ordering between baseline and mutation paths;
 - writer-model branch:
   - multi-writer: sequence uniqueness retry, busy-timeout/snapshot-invalidation
     whole-transaction abort, and concurrent contention;
@@ -275,7 +292,11 @@ Add deterministic tests for:
 - sealed-baseline tuple mismatch against the materialized row returning
   `UNKNOWN`;
 - baseline behind the current maximum sequence returning `UNKNOWN`;
+- baseline with no valid current origin returning `UNKNOWN`;
 - baseline with a non-current digest-parameter identifier returning `UNKNOWN`;
+- same-sequence conflicting baselines and contradictory overlapping baselines
+  returning `UNKNOWN`, while strictly increasing successive baselines select
+  the highest valid one;
 - sealed baseline contents, baseline sequence consumption, and post-baseline
   continuity;
 - snapshot race using explicit `BEGIN DEFERRED` and the selected WAL
@@ -358,14 +379,14 @@ must be incorporated before implementation authorization:
 These are plan-only corrections. They do not authorize source edits, migration,
 tests, DGX changes, deployment, repair, or event-sourcing.
 
-## Implementation-plan review reconciliation v5
+## Implementation-plan review reconciliation v6
 
-The v5 review required explicit post-rotation genesis semantics, current-maximum
-baseline validation, write-lock-first mutation transactions, fixed
-mutex/transaction ordering with cross-process scope, direct baseline test
-invocation rules, a precise pooled-latency benchmark, and read-only WAL
-preconditions. These are incorporated in Gates 0-4 above. This section is
-changelog only.
+The v6 review required explicit cross-process maintenance-RW-lock granularity,
+removal of immutable-open from the WAL snapshot discipline, current-origin
+requirements for baselines, successive-baseline/conflict semantics, and a
+continuous reconciliation audit trail. These are incorporated in Gates 0-4
+above. Earlier v2-v5 corrections are folded into this normative text; this
+section is changelog only.
 
 ## Acceptance criteria
 
