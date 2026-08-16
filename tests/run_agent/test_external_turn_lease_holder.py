@@ -9,9 +9,12 @@ the contract: with the parameter absent, the internal lease path is unchanged.
 
 from __future__ import annotations
 
+import logging
 import os
 import threading
 import time
+
+import pytest
 
 from hermes_state import SessionDB
 from run_agent import AIAgent
@@ -322,10 +325,16 @@ def test_external_holder_starts_no_refresher(monkeypatch):
     assert [event[0] for event in control_db.events] == ["acquire", "release"]
 
 
-def test_external_holder_ignored_without_session_id(monkeypatch):
-    """Without a session id there is no conversation to fence, so nothing arms."""
+def test_external_holder_ignored_without_session_id(caplog, monkeypatch):
+    """Without a session id there is no conversation to fence, so nothing arms.
+
+    Dropping the holder is the contract, but dropping it silently is not: a
+    caller that believes the lease it acquired covers this turn is running
+    unfenced, and only the log can tell it so.
+    """
     db = _DB()
     agent = _agent_with_db(db, session_id="")
+    holder = _external_holder()
     observed = {}
 
     def fake_run(_agent, _message, _system, history, *_args, **_kwargs):
@@ -338,17 +347,104 @@ def test_external_holder_ignored_without_session_id(monkeypatch):
         return {"final_response": "ok", "messages": history, "failed": False}
 
     monkeypatch.setattr("agent.conversation_loop.run_conversation", fake_run)
-    result = AIAgent.run_conversation(
-        agent,
-        "new message",
-        conversation_history=[{"role": "user", "content": "seed"}],
-        session_turn_lease_holder=_external_holder(),
-    )
+    with caplog.at_level(logging.WARNING, logger="run_agent"):
+        result = AIAgent.run_conversation(
+            agent,
+            "new message",
+            conversation_history=[{"role": "user", "content": "seed"}],
+            session_turn_lease_holder=holder,
+        )
 
     assert result["final_response"] == "ok"
     assert observed["holder"] is None
     assert _REFRESHER_THREAD_NAME not in observed["threads"]
     assert db.events == []
+    # Named, not just counted: the operator has to know which holder was
+    # dropped to find the caller that supplied it.
+    assert any(
+        "session turn lease holder supplied without a session id"
+        in record.getMessage()
+        and holder in record.getMessage()
+        for record in caplog.records
+    )
+
+
+def test_external_holder_cleared_on_interrupted_exit(monkeypatch):
+    """The fence input is cleared on the exits that skip a normal completion.
+
+    The clear lives in the outermost ``finally`` chain rather than beside the
+    return, so it has to survive both an exception leaving the turn through
+    ``except BaseException`` and an early return reporting an interrupt. Only
+    the completed-turn exit was pinned before. An agent that kept the holder
+    after either of these would fence its next turn with a lease the caller
+    has since released, and the fence would then admit writes the next
+    conversation's real owner should have refused.
+    """
+    holder = _external_holder()
+    observed = {}
+
+    def _record_armed(_agent):
+        observed.setdefault("armed", []).append(
+            getattr(_agent, "_active_session_turn_lease_holder", None)
+        )
+
+    # Arm 1: the turn leaves by raising. KeyboardInterrupt and not a plain
+    # Exception, because the real interrupt is a BaseException and the clear
+    # must not be sitting behind a handler that never sees one.
+    def raising_run(_agent, _message, _system, _history, *_args, **_kwargs):
+        _record_armed(_agent)
+        raise KeyboardInterrupt("stopped mid-turn")
+
+    monkeypatch.setattr("agent.conversation_loop.run_conversation", raising_run)
+    raised_db = _DB()
+    raised_agent = _agent_with_db(raised_db)
+    with pytest.raises(KeyboardInterrupt):
+        AIAgent.run_conversation(
+            raised_agent,
+            "new message",
+            conversation_history=[{"role": "user", "content": "seed"}],
+            session_turn_lease_holder=holder,
+            session_turn_lease_ttl_seconds=45.0,
+        )
+
+    # Armed while the turn was running, so the clear below is not vacuous.
+    assert observed["armed"] == [holder]
+    assert getattr(raised_agent, "_active_session_turn_lease_holder", None) is None
+    assert (
+        getattr(raised_agent, "_active_session_turn_lease_ttl_seconds", None) is None
+    )
+    # Clearing is not releasing: the row stays the caller's on this exit too.
+    assert raised_db.events == []
+
+    # Arm 2: the turn returns early reporting an interrupt instead of raising,
+    # which is the shape the interrupt and redirect paths actually take.
+    def interrupted_run(_agent, _message, _system, history, *_args, **_kwargs):
+        _record_armed(_agent)
+        return {
+            "final_response": "",
+            "messages": history,
+            "failed": False,
+            "interrupted": True,
+        }
+
+    monkeypatch.setattr("agent.conversation_loop.run_conversation", interrupted_run)
+    returned_db = _DB()
+    returned_agent = _agent_with_db(returned_db)
+    result = AIAgent.run_conversation(
+        returned_agent,
+        "new message",
+        conversation_history=[{"role": "user", "content": "seed"}],
+        session_turn_lease_holder=holder,
+        session_turn_lease_ttl_seconds=45.0,
+    )
+
+    assert result["interrupted"] is True
+    assert observed["armed"] == [holder, holder]
+    assert getattr(returned_agent, "_active_session_turn_lease_holder", None) is None
+    assert (
+        getattr(returned_agent, "_active_session_turn_lease_ttl_seconds", None) is None
+    )
+    assert returned_db.events == []
 
 
 def test_absent_param_is_behavior_neutral(monkeypatch):
