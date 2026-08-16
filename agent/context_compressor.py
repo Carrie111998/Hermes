@@ -2480,7 +2480,10 @@ class ContextCompressor(ContextEngine):
         correction now covers the soft-replay family).
         """
         cached = getattr(self, "_replay_all_cache", None)
-        key = (self.provider, self.model, self.base_url)
+        try:
+            key = (self.provider, self.model, self.base_url)
+        except AttributeError:
+            key = None
         if cached is not None and cached[0] == key:
             return cached[1]
         result = False

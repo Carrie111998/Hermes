@@ -410,3 +410,45 @@ class TestReapplyReasoningEchoSoft:
         msgs = copy.deepcopy(self.MSGS)
         reapply_reasoning_echo(msgs, False, soft_replay=True)
         assert reapply_reasoning_echo(msgs, False, soft_replay=True) == 0
+
+
+class TestSoftToStrictFallbackNoLeak:
+    """The local→strict provider fallback boundary (PR #87123 discussion):
+    history persisted under a soft-replay loopback primary carries
+    reasoning_content on every assistant turn.  When the request falls
+    back to a strict provider (Mistral/Cerebras/Groq reject the field
+    with 400/422), reapply_reasoning_echo must strip every trace —
+    genuine preserved reasoning included — so nothing leaks to the wire."""
+
+    # A soft-replay session's history: genuine CoT preserved verbatim.
+    SOFT_MSGS = [
+        {"role": "assistant", "content": "a1",
+         "reasoning_content": "genuine chain of thought"},
+        {"role": "assistant", "content": "a2", "reasoning_content": " "},
+        {"role": "assistant", "content": "a3"},  # bare turn, nothing to strip
+        {"role": "user", "content": "u"},
+    ]
+
+    def test_fallback_strips_genuine_reasoning_too(self):
+        import copy
+        msgs = copy.deepcopy(self.SOFT_MSGS)
+        changed = reapply_reasoning_echo(msgs, needs_thinking_pad=False)
+        assert changed == 2
+        assert all("reasoning_content" not in m for m in msgs)
+
+    def test_fallback_idempotent(self):
+        import copy
+        msgs = copy.deepcopy(self.SOFT_MSGS)
+        reapply_reasoning_echo(msgs, False)
+        assert reapply_reasoning_echo(msgs, False) == 0
+
+    def test_apply_policy_strict_strips_soft_shaped_history(self):
+        # The rebuild path (apply_reasoning_content_policy) on a message
+        # shaped by a soft primary: strict target must not carry the field.
+        api = {"role": "assistant", "content": "x",
+               "reasoning_content": "genuine CoT"}
+        apply_reasoning_content_policy(
+            {"role": "assistant", "content": "x",
+             "reasoning_content": "genuine CoT"},
+            api, needs_thinking_pad=False, soft_replay=False)
+        assert "reasoning_content" not in api
