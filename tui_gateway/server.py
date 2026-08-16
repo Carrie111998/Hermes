@@ -39,9 +39,9 @@ from agent.skill_commands import describe_skill_invocation
 from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX
 from tui_gateway import git_probe
 from tui_gateway.turn_marker import (
-    clear_turn_marker,
-    read_turn_marker,
-    record_turn_start,
+    read_turn_markers,
+    retire_sidecar,
+    sidecar_exists,
 )
 from tui_gateway.transport import (
     StdioTransport,
@@ -7658,20 +7658,304 @@ def _session_home(session: dict) -> Path:
     return Path(profile_home) if profile_home else Path(_hermes_home)
 
 
+# Cross-process turn lease, for the user-initiated path below. The TTL matches
+# the engine's (run_agent.py), because the lease this process takes is the one
+# the engine then runs the turn under. The wait is deliberately far shorter
+# than the engine's 1800s: a user is watching this one, and a wait that long
+# is indistinguishable from a hang. Fixed for now rather than configurable —
+# the path they govern is dormant (see _preacquire_turn_lease), so there is
+# nothing yet for an operator to tune. Config keys belong with the change that
+# turns the path on.
+_TURN_LEASE_TTL_SECONDS = 300.0
+_TURN_LEASE_WAIT_SECONDS = 120.0
+_TURN_LEASE_WAIT_NOTICE_SECONDS = 15.0
+_TURN_LEASE_BUSY_MESSAGE = (
+    "Another Hermes process is running this session. Your message was not "
+    "sent - wait for that turn to finish, then send it again."
+)
+
+
+def _turn_record_owner() -> str:
+    """This process's stamp on interrupted-turn records.
+
+    Same shape as the durable turn lease's holder (``run_agent.py`` mints
+    ``pid=<pid>:turn=<id>:platform=<platform>``) without the per-turn nonce: a
+    record outlives the turn that wrote it, and every turn in this process is
+    equally entitled to retire it. Computed per call rather than cached so a
+    forked child stamps its own pid.
+    """
+    return f"pid={os.getpid()}:platform=tui"
+
+
+def _record_interrupted_turn(
+    session: dict, key: str, prompt: str, *, attempts: int = 0
+) -> None:
+    """Record a turn that is about to run, stamped with this process."""
+    if not key or not isinstance(prompt, str) or not prompt.strip():
+        return
+    try:
+        with _session_db(session) as db:
+            if db is None:
+                return
+            db.record_interrupted_turn(
+                key, prompt, attempts=attempts, owner=_turn_record_owner()
+            )
+    except Exception:
+        logger.debug("failed to record interrupted turn for %s", key, exc_info=True)
+
+
+def _read_interrupted_turn(session: dict, key: str) -> dict | None:
+    """The record left by a turn on ``key`` that never concluded, or None."""
+    if not key:
+        return None
+    try:
+        with _session_db(session) as db:
+            if db is None:
+                return None
+            return db.read_interrupted_turn(key)
+    except Exception:
+        logger.debug("failed to read interrupted turn for %s", key, exc_info=True)
+        return None
+
+
+def _claim_interrupted_turn(session: dict, key: str, *, expected: dict) -> dict | None:
+    """Take the record for re-running, or None when this process must stand down.
+
+    The claim is the admission decision for a machine-initiated turn, and it
+    is fail-closed: anything that is not a won compare-and-swap on the record
+    this process just read — a competing claimant, a record some process
+    rewrote between the read and the claim, a record already retired, a
+    storage failure — resolves to None. Standing down leaves the record for
+    the next resume, so nothing is lost by being wrong in this direction.
+
+    ``expected`` is the record :func:`_read_interrupted_turn` returned, handed
+    back whole: it is the version token, and every field of it has to still be
+    on the row for the claim to land.
+    """
+    if not key or not isinstance(expected, dict):
+        return None
+    try:
+        with _session_db(session) as db:
+            if db is None:
+                return None
+            return db.claim_interrupted_turn(key, expected=expected)
+    except Exception:
+        logger.debug("failed to claim interrupted turn for %s", key, exc_info=True)
+        return None
+
+
+def _turn_is_held_elsewhere(session: dict, key: str) -> bool:
+    """True when a live turn lease covers this conversation, or we cannot tell.
+
+    The interrupted-turn record proves a turn started, not that it stopped. A
+    live lease says the turn is still running in some process, which makes the
+    record that process's business until its lease lapses.
+
+    Every way of not getting an answer resolves to True. False is the licence
+    to act on the record, and no unreadable database is evidence that a turn
+    stopped.
+    """
+    if not key:
+        return False
+    try:
+        with _session_db(session) as db:
+            if db is None:
+                # No database to ask. Unreachable on the shared-DB path (the
+                # record read above came from one), but a profile handle can
+                # fail to open on its own, and defer is the safe answer.
+                return True
+            return bool(db.get_session_turn_lease_holder(key))
+    except Exception:
+        # Cannot read the lease means cannot rule out a running turn.
+        logger.debug("turn lease peek failed for %s", key, exc_info=True)
+        return True
+
+
+def _engine_takes_lease_holder(agent) -> bool:
+    """True when this engine can run a turn under a lease its caller took.
+
+    The same additive-parameter probe the turn-start display typing uses. An
+    engine without the parameter acquires its own lease under its own holder
+    string, so pre-acquiring here would leave it blocking on this process's
+    own row until it could reclaim it at TTL. The gate is what keeps that
+    from happening while the engine side of this is still on its way.
+    """
+    run_conversation = getattr(agent, "run_conversation", None)
+    if run_conversation is None:
+        return False
+    try:
+        return "session_turn_lease_holder" in inspect.signature(
+            run_conversation
+        ).parameters
+    except (TypeError, ValueError):
+        return False
+
+
+def _preacquire_turn_lease(sid: str, session: dict, key: str) -> tuple[bool, str | None]:
+    """Admission for a user-initiated turn: (admitted, holder to hand the engine).
+
+    Fail-open, because a person is waiting on this one: wait a bounded time
+    for whatever is running, say so while waiting, and refuse in the open if
+    the wait runs out. ``(True, None)`` means there was nothing to do — no
+    conversation key, no database, or an engine that cannot take a holder —
+    and the turn proceeds exactly as it does today.
+
+    A refusal is ``(False, None)``: the caller emits the terminal frame and
+    starts nothing. It leaves the interrupted-turn record alone, because that
+    record belongs to whichever process is running the turn.
+    """
+    if not key:
+        return True, None
+    agent = session.get("agent")
+    if agent is None or not _engine_takes_lease_holder(agent):
+        return True, None
+    holder = f"pid={os.getpid()}:turn={uuid.uuid4().hex[:12]}:platform=tui"
+
+    def _on_wait(elapsed: float) -> None:
+        text = (
+            "Another Hermes process is using this session; waiting for it to "
+            "finish before starting your turn…"
+            if elapsed < 1.0
+            else f"Still waiting for the other Hermes process on this session ({int(elapsed)}s)…"
+        )
+        _emit("status.update", sid, {"kind": "process", "text": text})
+
+    # Tracked separately from `admitted` because the acquire can succeed and
+    # the block can still raise on the way out (closing a profile handle, say).
+    # An acquired lease that nobody returns holds the conversation for the full
+    # TTL, and the caller is about to refuse the turn rather than run it.
+    acquired = False
+    try:
+        with _session_db(session) as db:
+            if db is None:
+                return True, None
+            admitted = db.acquire_session_turn_lease(
+                key,
+                holder,
+                ttl_seconds=_TURN_LEASE_TTL_SECONDS,
+                wait_seconds=_TURN_LEASE_WAIT_SECONDS,
+                on_wait=_on_wait,
+                wait_notice_interval_seconds=_TURN_LEASE_WAIT_NOTICE_SECONDS,
+                should_abort=lambda: bool(session.get("_turn_cancel_requested")),
+            )
+            acquired = bool(admitted)
+    except Exception:
+        # Storage is the only thing that can answer this, and a turn that
+        # cannot be serialized against another process is a turn that should
+        # not start. Refusing says so; it does not hang.
+        logger.warning("turn lease acquisition failed for %s", key, exc_info=True)
+        if acquired:
+            _release_turn_lease(session, key, holder)
+        return False, None
+    if not admitted:
+        return False, None
+    return True, holder
+
+
+def _release_turn_lease(session: dict, key: str, holder: str | None) -> None:
+    """Release a lease this process took; owner-scoped and idempotent."""
+    if not key or not holder:
+        return
+    try:
+        with _session_db(session) as db:
+            if db is None:
+                return
+            db.release_session_turn_lease(key, holder)
+    except Exception:
+        # The lease expires on its own; a failed release costs the next turn
+        # a wait, never correctness.
+        logger.debug("failed to release turn lease for %s", key, exc_info=True)
+
+
+def _clear_interrupted_turn(session: dict, *keys: str, force: bool = False) -> None:
+    """Retire records this process owns; ``force`` retires regardless of owner."""
+    wanted = list(dict.fromkeys(key for key in keys if key))
+    if not wanted:
+        return
+    owner = _turn_record_owner()
+    try:
+        with _session_db(session) as db:
+            if db is None:
+                return
+            for key in wanted:
+                db.clear_interrupted_turn(key, owner=owner, force=force)
+    except Exception:
+        logger.debug("failed to clear interrupted turn", exc_info=True)
+
+
+_TURN_MARKER_MIGRATION_LOCK = threading.Lock()
+_TURN_MARKER_MIGRATION_WARNED: set[str] = set()
+
+
+def _migrate_turn_markers(session: dict) -> None:
+    """Import this home's legacy interrupted-turn sidecar, once, then rename it.
+
+    Lazy and per-HERMES_HOME rather than per-process: ``_session_home`` is
+    profile-aware, so one gateway can be serving two homes with a sidecar
+    each. The rename is the one-shot flag — a failure leaves the file in place
+    and the next resume retries; only the warning is deduplicated. Once a home
+    has no sidecar this costs one stat and takes no lock.
+
+    Legacy entries carry no owner, so they import as ``owner IS NULL`` and any
+    process may retire them, which is the same freedom the file gave.
+    """
+    home = _session_home(session)
+    if not sidecar_exists(home):
+        return
+    with _TURN_MARKER_MIGRATION_LOCK:
+        # Re-check: a concurrent resume on this home may have just finished.
+        if not sidecar_exists(home):
+            return
+        home_key = os.path.normcase(os.path.abspath(str(home)))
+        entries = read_turn_markers(home)
+        try:
+            with _session_db(session) as db:
+                if db is None:
+                    return
+                # Newest first: two sidecar keys can be segments of one
+                # compression lineage and therefore resolve to a single row,
+                # and the newest record is the one a resume should see.
+                imported = db.import_interrupted_turns(
+                    sorted(
+                        entries.items(),
+                        key=lambda item: item[1]["started_at"],
+                        reverse=True,
+                    )
+                )
+            retire_sidecar(home)
+        except Exception:
+            if home_key not in _TURN_MARKER_MIGRATION_WARNED:
+                _TURN_MARKER_MIGRATION_WARNED.add(home_key)
+                logger.warning(
+                    "could not import the legacy interrupted-turn sidecar; "
+                    "leaving it in place to retry on the next resume",
+                    exc_info=True,
+                )
+            return
+        _TURN_MARKER_MIGRATION_WARNED.discard(home_key)
+        if imported:
+            logger.info(
+                "imported %d legacy interrupted-turn record(s) into state.db",
+                imported,
+            )
+
+
 def _retire_turn_marker(session: dict, *keys: str) -> None:
-    """Drop the crash marker for a turn whose outcome is about to reach the client.
+    """Drop the crash record for a turn whose outcome is about to reach the client.
 
     Called immediately before the terminal frame rather than at the end of the
     turn thread: post-turn work (titles, memory sync, goal hooks) runs for a
     second or more after the client has its answer, and quitting inside that
-    window would leave a marker that looks like a crash — re-running a finished
+    window would leave a record that looks like a crash — re-running a finished
     turn on the next launch. Extra ``keys`` cover a session_key that
     compression rotated mid-turn.
+
+    Owner-checked: this retires the records this process wrote (and legacy
+    records that carry no owner). A turn running in another process keeps its
+    record even when this one decides the turn is over, because only the
+    process that ran the turn can know that it ended.
     """
-    home = _session_home(session)
-    for key in dict.fromkeys((*keys, str(session.get("session_key") or ""))):
-        if key:
-            clear_turn_marker(home, key)
+    _clear_interrupted_turn(session, *keys, str(session.get("session_key") or ""))
 
 
 def _auto_continue_note(prompt: str) -> str:
@@ -7679,11 +7963,20 @@ def _auto_continue_note(prompt: str) -> str:
     # tooling recognizes both. The original prompt is embedded because a hard
     # crash persists nothing of the interrupted turn to the session DB — this
     # note is the only copy the model will see.
+    #
+    # The note asserts only what the claim proved, which is narrower than it
+    # sounds: this process took the record of the previous turn, and at the
+    # moment it admitted itself no live turn-lease claim stood on the
+    # conversation. It does NOT prove the process that started the turn is
+    # gone — that process may be alive and merely past its lease — which is
+    # why the old wording ("the app or its backend process stopped") had to
+    # go. Anything stronger here is a guess the model would act on.
     return (
-        f"{_AUTO_CONTINUE_NOTE_PREFIX} — the app or its backend process "
-        "stopped before the turn could finish. Some of the work may already "
-        "be complete; check the current state before redoing anything, then "
-        "finish the task. The interrupted request was:]\n\n"
+        f"{_AUTO_CONTINUE_NOTE_PREFIX} — no completion was ever recorded for "
+        "it, and this process claimed that turn's record with no live turn "
+        "held on the conversation. Some of the work may already be complete; "
+        "check the current state before redoing anything, then finish the "
+        "task. The interrupted request was:]\n\n"
         f"{prompt}"
     )
 
@@ -7698,21 +7991,71 @@ def _maybe_schedule_auto_continue(sid: str, session: dict, session_key: str) -> 
     same _run_prompt_submit machinery as every other synthesized turn — so
     the client that just resumed streams it live.
     """
-    home = _session_home(session)
-    marker = read_turn_marker(home, session_key)
+    _migrate_turn_markers(session)
+    marker = _read_interrupted_turn(session, session_key)
     if marker is None:
+        return None
+    # The lease is read before any policy is applied to the record, because a
+    # live lease answers a question none of the policies can: the record is
+    # evidence a turn started, not that it stopped, and a live lease says it is
+    # still running in some process. That makes the record that process's
+    # business until its lease lapses, and it outranks every reason this
+    # process has for retiring it. The freshness window and the attempt ceiling
+    # are read from this process's config, so two processes sharing a
+    # HERMES_HOME can disagree about them — and a turn that is provably alive
+    # is not stale to the process running it, whatever this one's numbers say.
+    # Nothing is cleared here: when the lease lapses, the next resume reads the
+    # record again and applies policy to it then.
+    if _turn_is_held_elsewhere(session, session_key):
+        logger.debug(
+            "auto-continue stood down for %s: the conversation's turn lease is held",
+            session_key,
+        )
         return None
     enabled, freshness_secs, max_attempts = _auto_continue_config()
     age = time.time() - marker["started_at"]
-    if not enabled or age > freshness_secs or marker["attempts"] >= max_attempts:
-        # Stale, disabled, or crash-looping: stop trying. The journal/partial
-        # transcript still shows what happened; a manual message continues it.
-        clear_turn_marker(home, session_key)
+    if age > freshness_secs or marker["attempts"] >= max_attempts:
+        # Stale or crash-looping: a policy retirement, so it is taken
+        # regardless of owner. The journal/partial transcript still shows what
+        # happened; a manual message continues it.
+        _clear_interrupted_turn(session, session_key, force=True)
+        return None
+    if not enabled:
+        # Disabled is a local policy state, not a fact about the record:
+        # another process may run with auto-continue on, and this one may be
+        # re-enabled later. Retire only what this process owns (plus ownerless
+        # legacy imports) and leave a foreign owner's live record alone.
+        _clear_interrupted_turn(session, session_key)
         return None
     if session.get("_auto_continue_scheduled"):
         return None
+    # Admission. Nobody typed this turn, so it is fail-closed: it runs only on
+    # positive proof that this process may run it, and every unproven case
+    # stands down silently. Two hermes serve processes can share one
+    # HERMES_HOME, so this is a cross-process question, as the lease peek above
+    # already was.
+    #
+    # The peek answered "is the turn still running". The claim is the
+    # guarantee — a compare-and-swap on the whole record exactly one process
+    # can win, so two resumes racing the same orphan produce one continuation.
+    # The engine's own acquire still serializes underneath, but serializing a
+    # duplicate turn only makes it run second; this stops it being queued.
+    #
+    # The token is `marker`, the record read at the top of this function, and
+    # it is handed back whole. The counter alone would not do: every
+    # user-initiated turn re-records with attempts=0 from a prologue that runs
+    # long before the engine takes the lease, so a counter value read off an
+    # orphan recurs under a live turn that the peek cannot yet see.
+    claimed = _claim_interrupted_turn(session, session_key, expected=marker)
+    if claimed is None:
+        logger.debug("auto-continue stood down for %s: record not claimed", session_key)
+        return None
     session["_auto_continue_scheduled"] = True
-    attempt = marker["attempts"] + 1
+    # The bumped counter is the one thing the claim changed. Everything else
+    # comes from `marker`, which the compare-and-swap has just proved is still
+    # what is on the row — so the age this function logged above and the
+    # timestamp it reports below are one read, not two.
+    attempt = claimed["attempts"]
     text = _auto_continue_note(marker["prompt"])
 
     def kickoff() -> None:
@@ -8171,7 +8514,9 @@ def _inflight_snapshot(session: dict) -> dict | None:
     return snapshot
 
 
-def _emit_terminal_turn_error(sid: str, session: dict, error: Any) -> None:
+def _emit_terminal_turn_error(
+    sid: str, session: dict, error: Any, *, retire_marker: bool = True
+) -> None:
     """Close a failed turn with a terminal ``message.complete`` frame.
 
     Emits the same ``status: "error"`` frame shape the returned-error path in
@@ -8179,6 +8524,11 @@ def _emit_terminal_turn_error(sid: str, session: dict, error: Any) -> None:
     uniform), and retains the failed turn via ``_fail_inflight_turn`` so a
     client that missed this frame (disconnect window) can recover it from
     ``session.resume``'s ``inflight`` payload.
+
+    ``retire_marker=False`` is for a turn that was refused before it ran: no
+    turn concluded here, so there is no crash record of ours to retire, and
+    the record that may be sitting there belongs to the turn running in the
+    other process.
     """
     with session["history_lock"]:
         _fail_inflight_turn(session, error)
@@ -8203,7 +8553,8 @@ def _emit_terminal_turn_error(sid: str, session: dict, error: Any) -> None:
         rendered = ""
     if rendered:
         payload["rendered"] = rendered
-    _retire_turn_marker(session)
+    if retire_marker:
+        _retire_turn_marker(session)
     _emit("message.complete", sid, payload)
 
 
@@ -10299,7 +10650,25 @@ def _run_prompt_submit(
     display_metadata: dict | None = None,
     image_paths: list[str] | None = None,
     queued_prompt_generation: int | None = None,
+    user_initiated: bool = False,
 ) -> None:
+    """Run one turn on this session's agent.
+
+    ``user_initiated`` is the caller class, and it is what the cross-process
+    admission below keys on: True means a person typed this and is watching
+    the screen, so the turn may wait and may refuse out loud. It is set at the
+    ``prompt.submit`` handler and nowhere else.
+
+    The default is False on purpose. This function is also the dispatch point
+    for every machine-synthesized turn in the gateway — auto-continue, goal
+    continuations, the loop wakeup tick, kanban and async-delegation
+    notification batches — and none of those has anyone to show a busy notice
+    to, so a new one added later must not inherit a bounded wait and a "send
+    it again" refusal by forgetting to opt out. ``display_kind`` cannot carry
+    this: it describes how the transcript renders a turn, several
+    machine-synthesized callers pass none at all, and the ones that do pass
+    values of their own.
+    """
     with session["history_lock"]:
         if (
             queued_prompt_generation is not None
@@ -10363,18 +10732,81 @@ def _run_prompt_submit(
         # True once a failed turn's snapshot was retained for resume replay —
         # tells the finally below to skip the normal inflight clear.
         turn_error_retained = False
-        # Durable crash marker: written before the turn runs, retired the
+        # Durable crash record: written before the turn runs, retired the
         # moment its outcome reaches the client (see _retire_turn_marker).
         # Any concluded turn — success, handled error, interrupt — retires
-        # it, so a marker that survives means the process died mid-turn;
+        # it, so a record that survives means the process died mid-turn;
         # session.resume auto-continues from it. Compression can rotate
         # session_key mid-turn, so remember the key we wrote under.
-        marker_home = _session_home(session)
         marker_key = str(session.get("session_key") or "")
+        # Admission for a turn a person is waiting on, against the same
+        # cross-process lease the engine uses. Only a user-initiated turn takes
+        # this arm; a machine-synthesized one has nobody to show a busy notice
+        # to, and the auto-continue among them already made its decision by
+        # claiming or standing down at schedule time. Nothing happens on either
+        # path until the engine can be handed the holder this takes (see
+        # _preacquire_turn_lease).
+        lease_holder = None
+        if user_initiated:
+            admitted, lease_holder = _preacquire_turn_lease(sid, session, marker_key)
+            if not admitted:
+                # Refused before anything ran: no record written, no record
+                # retired, no engine started. The turn the user is waiting
+                # behind still owns the conversation and its own crash record.
+                #
+                # Everything the prologue above consumed has to go back,
+                # because this turn is not happening and the user is being
+                # told to send the message again. The `finally` below is the
+                # only other place these are unwound and this return never
+                # reaches it.
+                if one_turn_restore:
+                    # A `/model --once` override would otherwise become
+                    # permanent: the turn it was scoped to never ran.
+                    try:
+                        _restore_agent_model_runtime(agent, one_turn_restore)
+                        _restart_slash_worker(sid, session)
+                        _persist_live_session_runtime(session)
+                        _persist_live_session_system_prompt(session)
+                    except Exception:
+                        logger.debug(
+                            "TUI one-turn model restore failed", exc_info=True
+                        )
+                _emit_terminal_turn_error(
+                    sid, session, _TURN_LEASE_BUSY_MESSAGE, retire_marker=False
+                )
+                with session["history_lock"]:
+                    session["running"] = False
+                    session["last_active"] = time.time()
+                    if image_paths is None and images:
+                        # This call drained them off the session; a refusal
+                        # that kept them would lose the user's attachments
+                        # while telling them to resend. Same restore idiom as
+                        # the busy-submit path: ours first, then anything
+                        # attached while we were waiting.
+                        session["attached_images"] = images + list(
+                            session.get("attached_images", [])
+                        )
+                # Latching this would suppress every later auto-continue on
+                # this in-memory session; the finally below pops it for a turn
+                # that ran, so a refusal has to pop it too.
+                session.pop("_auto_continue_scheduled", None)
+                _emit_settled_session_info(sid, session, agent)
+                # A prompt sent while this one was waiting was queued against
+                # this turn, and this turn is over. Same hand-off the normal
+                # path makes below. That drained turn is dispatched internally
+                # rather than by the RPC handler, so it does not take this arm
+                # — it runs as it does today and the engine's own acquire
+                # serializes it, which is the fail-safe direction.
+                _drain_queued_prompt(rid, sid, session)
+                _current_runtime_session_record.reset(runtime_session_token)
+                reset_transport(transport_token)
+                return
         marker_attempt = int(session.pop("_auto_continue_attempt", 0) or 0)
         marker_text = session.pop("_auto_continue_prompt", None) or text
         if isinstance(marker_text, str) and marker_text.strip():
-            record_turn_start(marker_home, marker_key, marker_text, attempts=marker_attempt)
+            _record_interrupted_turn(
+                session, marker_key, marker_text, attempts=marker_attempt
+            )
         try:
             from tools.approval import (
                 reset_current_session_key,
@@ -10619,6 +11051,16 @@ def _run_prompt_submit(
             if display_kind and "persist_user_display_kind" in _run_params:
                 run_kwargs["persist_user_display_kind"] = display_kind
                 run_kwargs["persist_user_display_metadata"] = display_metadata
+            if lease_holder and "session_turn_lease_holder" in _run_params:
+                # This process already holds the conversation and made the
+                # admission call. Hand the holder over so the engine arms its
+                # write fence with it instead of acquiring a second time under
+                # a different string, which would block on our own row.
+                run_kwargs["session_turn_lease_holder"] = lease_holder
+                if "session_turn_lease_ttl_seconds" in _run_params:
+                    run_kwargs["session_turn_lease_ttl_seconds"] = (
+                        _TURN_LEASE_TTL_SECONDS
+                    )
             # Auto-titling now fires inside the turn prologue (shared by every
             # surface). Hand the agent this session's live-rename hook so the
             # sidebar repaints the moment a title lands, rather than waiting
@@ -11133,6 +11575,9 @@ def _run_prompt_submit(
             # Backstop for turns that never reached a terminal frame (the
             # frame paths retire the marker as they emit).
             _retire_turn_marker(session, marker_key)
+            # Hand the conversation back. The engine does not release a lease
+            # it did not take, so this is the only release on that path.
+            _release_turn_lease(session, marker_key, lease_holder)
             session.pop("_auto_continue_scheduled", None)
             _emit_settled_session_info(sid, session, agent)
 
