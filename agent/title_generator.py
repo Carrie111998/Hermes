@@ -149,25 +149,45 @@ _MACHINE_PREFIXES = (
 # which can be a misclassification (an IME candidate popup described as a
 # browser search bar) or text copied from the screenshot (a previous
 # session's title). Titling from them names the session after the vision
-# model's guess, not after what the user actually asked. Two call sites
-# produce slightly different wording, so the matcher keys on the shared
-# ``[The user attached an image`` prefix and consumes the bracketed block
-# plus any trailing ``[hint]`` line, rather than hardcoding one phrase:
-#   tui_gateway/server.py:  "[The user attached an image:\n<desc>]\n[hint]"
-#   cli.py:                 "[The user attached an image. Here's what it
-#                            contains:\n<desc>]\n[hint]"
-# Failure variants ("...but analysis failed.") are matched by the same rule.
-# The description body may itself contain brackets (the vision model echoes
-# code like ``array[0] = 1``), so the body is matched as a mix of non-bracket
-# chars and ``[xxx]`` atomic blocks — the closing ``]`` terminates the
-# envelope, not the first ``]`` inside the description (2026-08-10 #82339
-# follow-up from triage review).
+# model's guess, not after what the user actually asked.
+#
+# Matching strategy — structural, not verbatim:
+#   - Look for a leading ``[`` block whose first line signals an image
+#     attachment (``attached an image``). We key on the semantic marker
+#     rather than hardcoding one phrase, because two call sites already
+#     use slightly different wording and a third variant would silently
+#     reintroduce the bug (#82339 review follow-up):
+#       tui_gateway/server.py:  "[The user attached an image:\n<desc>]\n[hint]"
+#       cli.py:                 "[The user attached an image. Here's what it
+#                                contains:\n<desc>]\n[hint]"
+#   - Failure variants ("...but analysis failed.") are matched by the same
+#     rule — they still start with the image-attachment signal.
+#   - The description body may itself contain brackets (the vision model
+#     echoes code like ``array[0] = 1``), so the body is matched as a mix
+#     of non-bracket chars and ``[xxx]`` atomic blocks — the closing ``]``
+#     terminates the envelope, not the first ``]`` inside the description
+#     (2026-08-10 #82339 follow-up from triage review).
+#   - An optional trailing ``[hint]`` line (vision_analyze pointer) is
+#     consumed along with each envelope block.
 _IMAGE_ENVELOPE_RE = re.compile(
-    r"\[\s*The user attached an image"
+    r"\[\s*[^\n]*attached an image[^\n]*\n?"
     r"(?:[^\[\]]|\[[^\]\n]*\])*\]"
     r"(?:\s*\[[^\]\n]*\])?",
-    re.DOTALL,
+    re.IGNORECASE | re.DOTALL,
 )
+
+# After stripping envelopes, if nothing remains, the input was probably
+# not a real enrichment envelope — it was a user quoting or pasting an
+# envelope-shaped string as their entire message. We return the original
+# so titling doesn't end up with zero input. Real enrichment messages
+# always have the user's actual request below the envelope, so stripping
+# leaves non-empty content and this guard never fires.
+#
+# We deliberately do NOT use a minimum-length threshold: short requests
+# like "Fix it" or "hi" after an envelope are real user messages, and
+# the cost of under-stripping (title slightly poisoned) is lower than
+# the cost of inventing a heuristic that misclassifies edge cases.
+
 
 def _strip_image_envelope(text: str) -> str:
     """Remove leading image-attachment envelopes prepended by enrichment.
@@ -176,13 +196,22 @@ def _strip_image_envelope(text: str) -> str:
     ``_enrich_with_attached_images`` and the CLI enrichment put them), so a
     user who literally types ``[The user attached an image ...]`` mid-sentence
     keeps their text. Repeated blocks (multiple images) are all removed.
+
+    If stripping would remove everything (no user content remains below
+    the envelope), the original text is returned unchanged — the message
+    was probably not an enrichment envelope, just a user quoting one.
     """
-    stripped = (text or "").lstrip()
+    original = text or ""
+    stripped = original.lstrip()
     while True:
         m = _IMAGE_ENVELOPE_RE.match(stripped)
         if not m:
             break
         stripped = stripped[m.end():].lstrip()
+    # Guard: if we ate everything, we probably ate the user's message,
+    # not an enrichment envelope.
+    if not stripped.strip():
+        return original
     return stripped
 
 
