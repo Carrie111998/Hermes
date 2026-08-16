@@ -8169,29 +8169,25 @@ def enforce_max_runtime(
                 event_id = _append_event(
                     conn, tid, "timed_out", payload, run_id=run_id,
                 )
-                timed_out.append(tid)
-        # Increment the unified failure counter. Outside the write_txn
-        # above because ``_record_task_failure`` opens its own. If the
-        # breaker trips, this flips the retried task to ``blocked`` and
-        # emits a ``gave_up`` event on top of the ``timed_out`` we
-        # already emitted.
-        if cur.rowcount == 1:
-            tripped = _record_task_failure(
-                conn, tid,
-                error=f"elapsed {int(elapsed)}s > limit {int(row['max_runtime_seconds'])}s",
-                outcome="timed_out",
-                release_claim=False,
-                end_run=False,
-                event_payload_extra={
-                    "pid": pid,
-                    "sigkill": killed,
-                    "retry_status": retry_status,
-                },
-            )
-            payload["will_retry"] = not tripped
-            with write_txn(conn):
+                tripped = _record_task_failure_in_txn(
+                    conn, tid,
+                    error=(
+                        f"elapsed {int(elapsed)}s > "
+                        f"limit {int(row['max_runtime_seconds'])}s"
+                    ),
+                    outcome="timed_out",
+                    release_claim=False,
+                    end_run=False,
+                    event_payload_extra={
+                        "pid": pid,
+                        "sigkill": killed,
+                        "retry_status": retry_status,
+                    },
+                )
+                payload["will_retry"] = not tripped
                 _update_event_payload(conn, event_id, payload)
                 _update_run_metadata(conn, run_id, payload)
+                timed_out.append(tid)
     return timed_out
 
 
@@ -8839,124 +8835,147 @@ def _record_task_failure(
     ``max_retries`` override against the violation streak itself. The
     failure is still counted into ``consecutive_failures``.
     """
+    with write_txn(conn):
+        return _record_task_failure_in_txn(
+            conn,
+            task_id,
+            error,
+            outcome=outcome,
+            failure_limit=failure_limit,
+            force_trip=force_trip,
+            release_claim=release_claim,
+            end_run=end_run,
+            event_payload_extra=event_payload_extra,
+        )
+
+
+def _record_task_failure_in_txn(
+    conn: sqlite3.Connection,
+    task_id: str,
+    error: str,
+    *,
+    outcome: str,
+    failure_limit: int = None,
+    force_trip: bool = False,
+    release_claim: bool = False,
+    end_run: bool = False,
+    event_payload_extra: Optional[dict] = None,
+) -> bool:
+    """Inner implementation of _record_task_failure for existing write_txn scopes."""
     if failure_limit is None:
         failure_limit = DEFAULT_FAILURE_LIMIT
     blocked = False
-    with write_txn(conn):
-        row = conn.execute(
-            "SELECT consecutive_failures, status, max_retries, current_run_id "
-            "FROM tasks WHERE id = ?", (task_id,),
-        ).fetchone()
-        if row is None:
-            return False
-        retry_status = (
-            _retry_status_for_run(conn, task_id, row["current_run_id"])
-            if release_claim
-            else ("review" if row["status"] == "review" else "ready")
-        )
-        failures = int(row["consecutive_failures"]) + 1
+    row = conn.execute(
+        "SELECT consecutive_failures, status, max_retries, current_run_id "
+        "FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    if row is None:
+        return False
+    retry_status = (
+        _retry_status_for_run(conn, task_id, row["current_run_id"])
+        if release_claim
+        else ("review" if row["status"] == "review" else "ready")
+    )
+    failures = int(row["consecutive_failures"]) + 1
 
-        # Per-task override wins over both caller-supplied and default
-        # thresholds. None (the common case) falls through.
-        task_override = (
-            row["max_retries"] if "max_retries" in row.keys() else None
-        )
-        if task_override is not None:
-            effective_limit = int(task_override)
-            limit_source = "task"
-        else:
-            effective_limit = int(failure_limit)
-            limit_source = "dispatcher"
+    # Per-task override wins over both caller-supplied and default
+    # thresholds. None (the common case) falls through.
+    task_override = (
+        row["max_retries"] if "max_retries" in row.keys() else None
+    )
+    if task_override is not None:
+        effective_limit = int(task_override)
+        limit_source = "task"
+    else:
+        effective_limit = int(failure_limit)
+        limit_source = "dispatcher"
 
-        if force_trip or failures >= effective_limit:
-            # Trip the breaker.
-            if release_claim:
-                # Spawn path: still running, also clear claim state.
-                conn.execute(
-                    "UPDATE tasks SET status = 'blocked', claim_lock = NULL, "
-                    "claim_expires = NULL, worker_pid = NULL, "
-                    "consecutive_failures = ?, last_failure_error = ? "
-                    "WHERE id = ? AND status IN ('running', 'ready', 'review')",
-                    (failures, error[:500], task_id),
-                )
-            else:
-                # Timeout/crash path: source phase already restored with claim
-                # cleared; just flip to blocked + update
-                # counter fields.
-                conn.execute(
-                    "UPDATE tasks SET status = 'blocked', "
-                    "consecutive_failures = ?, last_failure_error = ? "
-                    "WHERE id = ? AND status IN ('ready', 'review', 'running')",
-                    (failures, error[:500], task_id),
-                )
-            run_id = None
-            if end_run:
-                # Only the spawn path has an open run to close.
-                run_id = _end_run(
-                    conn, task_id,
-                    outcome="gave_up", status="gave_up",
-                    error=error[:500],
-                    metadata={
-                        "failures": failures,
-                        "trigger_outcome": outcome,
-                        "effective_limit": effective_limit,
-                        "limit_source": limit_source,
-                        "retry_status": retry_status,
-                    },
-                )
-            payload = {
-                "failures": failures,
-                "effective_limit": effective_limit,
-                "limit_source": limit_source,
-                "error": error[:500],
-                "trigger_outcome": outcome,
-                "retry_status": retry_status,
-            }
-            if event_payload_extra:
-                payload.update(event_payload_extra)
-            _append_event(
-                conn, task_id, "gave_up", payload, run_id=run_id,
+    if force_trip or failures >= effective_limit:
+        # Trip the breaker.
+        if release_claim:
+            # Spawn path: still running, also clear claim state.
+            conn.execute(
+                "UPDATE tasks SET status = 'blocked', claim_lock = NULL, "
+                "claim_expires = NULL, worker_pid = NULL, "
+                "consecutive_failures = ?, last_failure_error = ? "
+                "WHERE id = ? AND status IN ('running', 'ready', 'review')",
+                (failures, error[:500], task_id),
             )
-            blocked = True
         else:
-            # Below threshold.
-            if release_claim:
-                # Spawn path: restore the claimed source phase + clear claim.
-                conn.execute(
-                    "UPDATE tasks SET status = ?, claim_lock = NULL, "
-                    "claim_expires = NULL, worker_pid = NULL, "
-                    "consecutive_failures = ?, last_failure_error = ? "
-                    "WHERE id = ? AND status = 'running'",
-                    (retry_status, failures, error[:500], task_id),
-                )
-            else:
-                # Timeout/crash path: caller already restored the source phase.
-                conn.execute(
-                    "UPDATE tasks SET consecutive_failures = ?, "
-                    "last_failure_error = ? WHERE id = ?",
-                    (failures, error[:500], task_id),
-                )
-            if end_run:
-                # Spawn path: close the open run with outcome.
-                run_id = _end_run(
-                    conn, task_id,
-                    outcome=outcome, status=outcome,
-                    error=error[:500],
-                    metadata={
-                        "failures": failures,
-                        "retry_status": retry_status,
-                    },
-                )
-                _append_event(
-                    conn, task_id, outcome,
-                    {
-                        "error": error[:500],
-                        "failures": failures,
-                        "retry_status": retry_status,
-                    },
-                    run_id=run_id,
-                )
-            # Timeout/crash path's caller already emitted its own event.
+            # Timeout/crash path: source phase already restored with claim
+            # cleared; just flip to blocked + update counter fields.
+            conn.execute(
+                "UPDATE tasks SET status = 'blocked', "
+                "consecutive_failures = ?, last_failure_error = ? "
+                "WHERE id = ? AND status IN ('ready', 'review', 'running')",
+                (failures, error[:500], task_id),
+            )
+        run_id = None
+        if end_run:
+            # Only the spawn path has an open run to close.
+            run_id = _end_run(
+                conn, task_id,
+                outcome="gave_up", status="gave_up",
+                error=error[:500],
+                metadata={
+                    "failures": failures,
+                    "trigger_outcome": outcome,
+                    "effective_limit": effective_limit,
+                    "limit_source": limit_source,
+                    "retry_status": retry_status,
+                },
+            )
+        payload = {
+            "failures": failures,
+            "effective_limit": effective_limit,
+            "limit_source": limit_source,
+            "error": error[:500],
+            "trigger_outcome": outcome,
+            "retry_status": retry_status,
+        }
+        if event_payload_extra:
+            payload.update(event_payload_extra)
+        _append_event(conn, task_id, "gave_up", payload, run_id=run_id)
+        blocked = True
+    else:
+        # Below threshold.
+        if release_claim:
+            # Spawn path: restore the claimed source phase + clear claim.
+            conn.execute(
+                "UPDATE tasks SET status = ?, claim_lock = NULL, "
+                "claim_expires = NULL, worker_pid = NULL, "
+                "consecutive_failures = ?, last_failure_error = ? "
+                "WHERE id = ? AND status = 'running'",
+                (retry_status, failures, error[:500], task_id),
+            )
+        else:
+            # Timeout/crash path: caller already restored the source phase.
+            conn.execute(
+                "UPDATE tasks SET consecutive_failures = ?, "
+                "last_failure_error = ? WHERE id = ?",
+                (failures, error[:500], task_id),
+            )
+        if end_run:
+            # Spawn path: close the open run with outcome.
+            run_id = _end_run(
+                conn, task_id,
+                outcome=outcome, status=outcome,
+                error=error[:500],
+                metadata={
+                    "failures": failures,
+                    "retry_status": retry_status,
+                },
+            )
+            _append_event(
+                conn, task_id, outcome,
+                {
+                    "error": error[:500],
+                    "failures": failures,
+                    "retry_status": retry_status,
+                },
+                run_id=run_id,
+            )
+        # Timeout/crash path's caller already emitted its own event.
     return blocked
 
 
