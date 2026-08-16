@@ -2382,6 +2382,10 @@ def _launch_tui(
     if accept_hooks:
         env["HERMES_ACCEPT_HOOKS"] = "1"
     if no_skills_index:
+        # Internal Node→Python bridge variable (TUI subprocess only). Not a
+        # user-facing config knob: the public surface is the --no-skills-index
+        # flag and skills.inject_index. Keep HERMES_TUI_* reserved for
+        # gateway-internal plumbing so it is not promoted as a user setting.
         env["HERMES_TUI_NO_SKILLS_INDEX"] = "1"
     # Guarantee a generous V8 heap for the TUI. Default node cap is ~1.5–4GB
     # depending on version and can fatal-OOM on long sessions with large

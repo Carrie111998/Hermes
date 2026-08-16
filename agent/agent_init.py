@@ -78,6 +78,9 @@ def _resolve_skills_index_injection(
     if override is not None:
         return override
     if not isinstance(skills_config, dict):
+        logger.warning(
+            "skills config must be a mapping; defaulting inject_index to true"
+        )
         return True
     configured = skills_config.get("inject_index", True)
     if not isinstance(configured, bool):
@@ -1814,19 +1817,23 @@ def init_agent(
     # Skills config: prompt-index injection and skill-creation reminders.
     # ``inject_index`` is session-static because the rendered system prompt is
     # cached for the conversation lifetime.
-    agent._inject_skills_index = True
-    agent._skill_nudge_interval = 10
+    agent._inject_skills_index = _resolve_skills_index_injection(
+        _agent_cfg.get("skills", {}),
+        inject_skills_index,
+    )
+    # Narrow the guard to the cast itself: a non-numeric value is a local
+    # config error we can diagnose, while config-read failures should surface
+    # instead of being swallowed by a broad except (Copilot review #83314).
     try:
-        skills_config = _agent_cfg.get("skills", {})
-        if not isinstance(skills_config, dict):
-            skills_config = {}
-        agent._inject_skills_index = _resolve_skills_index_injection(
-            skills_config,
-            inject_skills_index,
+        agent._skill_nudge_interval = int(
+            _agent_cfg.get("skills", {}).get("creation_nudge_interval", 10)
         )
-        agent._skill_nudge_interval = int(skills_config.get("creation_nudge_interval", 10))
-    except Exception:
-        pass
+    except (TypeError, ValueError) as _nudge_err:
+        logger.warning(
+            "skills.creation_nudge_interval must be an integer; "
+            "defaulting to 10 (%s)",
+            _nudge_err,
+        )
 
     # Tool-use enforcement config: "auto" (default — matches hardcoded
     # model list), true (always), false (never), or list of substrings.
