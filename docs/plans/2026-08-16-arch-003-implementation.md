@@ -1,6 +1,6 @@
 ---
 title: "ARCH-003 implementation plan: runtime-state audit and replay verification"
-status: IMPLEMENTATION_PLAN_REVISE_V18_PENDING
+status: IMPLEMENTATION_PLAN_REVISE_V19_PENDING
 date: 2026-08-16
 type: implementation-plan
 ticket: ARCH-003
@@ -57,8 +57,14 @@ The implementation must preserve:
 3. **Compaction:** Implement the sealed baseline representation and verifier
    rules. Compaction is a privileged, out-of-band operation and is not wired
    into the gateway, scheduler, or automatic repair path in this ticket.
-4. **Verifier surface:** Keep the verifier library-local plus hermetic tests.
-   Any operator CLI, scheduler, or dashboard surface is a separate follow-up.
+4. **Verifier and maintenance surface:** Keep the verifier library-local plus
+   hermetic tests. The authorized re-originating genesis is an internal,
+   code-level maintenance invocation requiring explicit operator authorization;
+   it is not exposed as a user-facing CLI, scheduler, dashboard, gateway, or
+   automatic-repair path in this ticket. If that maintenance invocation is not
+   available in a deployment, affected entities remain write-blocked with
+   bounded `WRITE_ABORT` while unaffected conversations and platform loops
+   continue; delivery must record this operational consequence.
 
 ## Expected code surfaces
 
@@ -166,6 +172,14 @@ Add a versioned runtime-state-owned journal table with:
 - baseline sealed lifecycle state, owner-version, state schema version, and
   sealed-through sequence when event kind is `baseline`;
 - sealed materialized-write counter when event kind is `baseline`.
+
+Within the same migration transaction, add the non-null
+`materialized_write_counter` column to every runtime-state materialized row
+with deterministic default `0`, backfill all pre-existing rows to `0`, and
+install the database-level replay-tuple trigger/write-guard before the
+migration commits. No row may be observable with a missing counter or without
+the guard. Migration compatibility tests must verify the column, default,
+backfill, and guard survive prior-version startup and rollback.
 
 Add a durable database-level current-generation record:
 `runtime_state_journal_meta.current_generation`, owned by the runtime-state
@@ -341,6 +355,13 @@ Migration compatibility tests must assert this posture.
   current generation in the event.
 - Any mutation/genesis journal constraint or write failure aborts the complete
   enclosing materialized-state mutation; errors must not be swallowed.
+- The CAS caller receives a typed bounded `WRITE_ABORT` refusal for
+  continuity, downgrade-unsafe, or journal-transaction failure; it performs no
+  automatic retry, does not drop or corrupt the session loop, and leaves
+  unaffected conversations/platform loops running. The gateway-facing error
+  boundary returns the existing safe operation-failure response without
+  entering prompt construction; Gate 4 exercises this caller contract with a
+  real CAS caller adapter.
 - If the digest key is unavailable while preparing a mutation/genesis, fail
   closed before opening the SQLite transaction, leave materialized state
   unchanged, emit no event, and surface the shared `KEY_UNAVAILABLE` reason.
@@ -462,6 +483,8 @@ Add deterministic tests for:
 - baseline generation-marker mismatch returning `UNKNOWN`;
 - bypass-path rejection for mutation/genesis while permitting only the named
   baseline writer and the explicitly authorized re-originating genesis writer;
+- caller contract for `WRITE_ABORT`: no automatic retry, affected operation
+  receives a bounded failure, and unaffected loops continue;
 - keyed digest/profile isolation, identifier/key-check mismatch, digest
   rotation without bridging, verify-time key unavailability, and mutation-time
   key unavailability returning shared `KEY_UNAVAILABLE` without changing
@@ -749,6 +772,26 @@ DGX changes, deployment, repair, or event-sourcing. The corrected plan must
 return to the same authenticated Claude reviewer family and then to AGY on the
 identical packet.
 
+## Implementation-plan review reconciliation v18
+
+The v18 authenticated Claude Opus review returned `REVISE` with four bounded
+plan-text corrections. The corrections are incorporated above:
+
+1. The authorized re-originating genesis remains an internal code-level
+   maintenance invocation; unavailable invocation leaves affected entities
+   write-blocked, while unaffected loops continue and the consequence is
+   recorded.
+2. `WRITE_ABORT` has a bounded caller contract with no automatic retry and no
+   session-loop corruption.
+3. Acceptance coverage now includes v17.
+4. Migration initializes the non-null counter to zero and installs the
+   replay-tuple trigger/write-guard in the same migration transaction.
+
+These remain plan-only corrections and do not authorize source edits, tests,
+DGX changes, deployment, repair, or event-sourcing. The corrected plan must
+return to the same authenticated Claude reviewer family and then to AGY on the
+identical packet.
+
 ## Acceptance criteria
 
 ARCH-003 implementation is ready for its delivery gates only when:
@@ -777,7 +820,7 @@ ARCH-003 implementation is ready for its delivery gates only when:
   retention job; entities beyond the replay limit remain UNKNOWN in this ticket,
   and the 100,000-event/100 MiB per-profile threshold is a documented follow-up
   operational review, not an in-ticket operator gate;
-- reconciliation v1 and v5-v16 items are incorporated into the normative
+- reconciliation v1 and v5-v17 items are incorporated into the normative
   Gates 0-4 text (with v2-v4 explicitly folded into the v1/v4 text), and this
   merged plan revision receives the same-family re-review;
 - all focused and relevant tests pass;
@@ -820,6 +863,8 @@ ARCH-003 implementation is ready for its delivery gates only when:
   and singular counter increment mechanism.
 - v17: complete re-originating genesis event-only contract, exclusive-lock
   bypass allowance, and mandatory database-level counter guard.
+- v18: bounded WRITE_ABORT caller behavior, explicit no-CLI operational
+  consequence, and atomic counter migration initialization.
 
 
 ## Non-goals
