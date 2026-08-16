@@ -1,3 +1,4 @@
+import json
 import sqlite3
 from pathlib import Path
 
@@ -762,6 +763,192 @@ def test_legacy_database_rebuilds_characterization_events_for_launch_abort(
         )
     finally:
         reopened.close()
+
+
+def test_current_database_quarantines_orphan_characterization_events(tmp_path):
+    """A v28 audit orphan must not prevent every bridge service restart."""
+
+    db_path = tmp_path / "v28-characterization-event-orphan.db"
+    current = hermes_state.SessionDB(db_path)
+    try:
+        current._conn.execute(
+            "INSERT INTO sessions (id, source, started_at) VALUES (?, ?, ?)",
+            ("preserve-source", "cli", 90.0),
+        )
+        current._conn.execute(
+            "INSERT INTO messages (session_id, role, content, timestamp) "
+            "VALUES (?, ?, ?, ?)",
+            ("preserve-source", "user", "preserve this session", 91.0),
+        )
+        current._conn.execute(
+            """INSERT INTO session_claude_visibility_jobs (
+                   id, source_session_id, bridge_id, idempotency_key,
+                   reserved_claude_uuid, native_name, source_provider,
+                   source_cwd, signed_marker, state, attempts,
+                   next_attempt_at, eligible_at, created_at, updated_at
+               ) VALUES (
+                   'orphaned-characterization-job',
+                   'codex:orphaned-characterization', 'orphaned-bridge',
+                   'orphaned-idempotency',
+                   '99999999-9999-4999-8999-999999999999',
+                   '[Codex] orphaned characterization', 'codex', 'C:/orphaned',
+                   'orphaned-signed-marker', 'claude_retry', 1,
+                   100, 100, 100, 100
+               )"""
+        )
+        current._conn.execute(
+            """INSERT INTO session_claude_visibility_characterization_events (
+                   job_id, event_kind, operation_id, source_session_id,
+                   bridge_id, idempotency_key, reserved_claude_uuid,
+                   evidence_digest, created_at
+               ) VALUES (
+                   'orphaned-characterization-job', 'registered',
+                   '88888888-8888-4888-8888-888888888888',
+                   'codex:orphaned-characterization', 'orphaned-bridge',
+                   'orphaned-idempotency',
+                   '99999999-9999-4999-8999-999999999999', ?, 100.125
+               )""",
+            ("e" * 64,),
+        )
+        current._conn.commit()
+    finally:
+        current.close()
+
+    # Simulate the historical defect: an older writer deleted a parent with
+    # foreign-key enforcement disabled, leaving only a non-operational audit row.
+    damaged = sqlite3.connect(db_path)
+    try:
+        damaged.execute("PRAGMA foreign_keys=OFF")
+        damaged.execute(
+            "DELETE FROM session_claude_visibility_jobs "
+            "WHERE id = 'orphaned-characterization-job'"
+        )
+        damaged.execute(
+            """DELETE FROM session_bridge_migrations
+               WHERE migration_name =
+                   'claude_characterization_event_orphan_quarantine_v29'"""
+        )
+        damaged.commit()
+    finally:
+        damaged.close()
+
+    repaired = hermes_state.SessionDB(db_path)
+    try:
+        assert _characterization_event_rows(repaired._conn) == []
+        assert [
+            tuple(row)
+            for row in repaired._conn.execute(
+                """SELECT job_id, event_kind, operation_id, source_session_id,
+                          bridge_id, idempotency_key, reserved_claude_uuid,
+                          evidence_digest, created_at, reason
+                     FROM session_claude_visibility_characterization_event_quarantine"""
+            ).fetchall()
+        ] == [
+            (
+                "orphaned-characterization-job",
+                "registered",
+                "88888888-8888-4888-8888-888888888888",
+                "codex:orphaned-characterization",
+                "orphaned-bridge",
+                "orphaned-idempotency",
+                "99999999-9999-4999-8999-999999999999",
+                "e" * 64,
+                100.125,
+                "missing_parent_job",
+            )
+        ]
+        assert [
+            tuple(row)
+            for row in repaired._conn.execute(
+                "SELECT content FROM messages WHERE session_id = 'preserve-source'"
+            ).fetchall()
+        ] == [("preserve this session",)]
+        assert repaired._conn.execute(
+            """PRAGMA foreign_key_check(
+                   'session_claude_visibility_characterization_events'
+               )"""
+        ).fetchall() == []
+        assert repaired._conn.execute(
+            """SELECT COUNT(*) FROM session_bridge_migrations
+               WHERE migration_name =
+                   'claude_characterization_event_orphan_quarantine_v29'"""
+        ).fetchone()[0] == 1
+    finally:
+        repaired.close()
+
+
+def test_current_database_quarantines_orphan_sidebar_resolution(tmp_path):
+    """Legacy resolution evidence without a job must not block every delivery."""
+
+    db_path = tmp_path / "sidebar-resolution-orphan.db"
+    current = hermes_state.SessionDB(db_path)
+    current.close()
+
+    damaged = sqlite3.connect(db_path)
+    try:
+        damaged.execute("PRAGMA foreign_keys=OFF")
+        damaged.execute(
+            """INSERT INTO session_sidebar_terminal_resolutions (
+                   job_id, idempotency_key, source_session_id, bridge_id,
+                   codex_thread_id, failure_state, failure_code,
+                   failure_attempts, failure_next_attempt_at,
+                   failure_updated_at, resolution_code, evidence_kind,
+                   evidence_version, evidence_digest, resolved_at
+               ) VALUES (
+                   'orphaned-sidebar-job', 'orphaned-sidebar-idempotency',
+                   'claude:orphaned-sidebar-source', 'orphaned-sidebar-bridge',
+                   'orphaned-codex-thread', 'sidebar_failed',
+                   'native_create_ambiguous', 1, 100, 100,
+                   'native_thread_unrecoverable',
+                   'codex_app_server_read_not_loaded_resume_no_rollout',
+                   1, ?, 100
+               )""",
+            ("f" * 64,),
+        )
+        damaged.execute(
+            """DELETE FROM session_bridge_migrations
+               WHERE migration_name =
+                   'sidebar_resolution_orphan_quarantine_v30'"""
+        )
+        damaged.commit()
+    finally:
+        damaged.close()
+
+    repaired = hermes_state.SessionDB(db_path)
+    try:
+        assert repaired._conn.execute(
+            "SELECT COUNT(*) FROM session_sidebar_terminal_resolutions"
+        ).fetchone()[0] == 0
+        quarantined = repaired._conn.execute(
+            """SELECT resolution_table, job_id, source_session_id, reason,
+                      payload_json
+                 FROM session_sidebar_orphan_resolution_quarantine"""
+        ).fetchone()
+        assert quarantined is not None
+        assert tuple(quarantined[:4]) == (
+            "session_sidebar_terminal_resolutions",
+            "orphaned-sidebar-job",
+            "claude:orphaned-sidebar-source",
+            "missing_parent_job",
+        )
+        payload = json.loads(quarantined[4])
+        assert payload["idempotency_key"] == "orphaned-sidebar-idempotency"
+        assert payload["evidence_digest"] == "f" * 64
+        for table_name in (
+            "session_sidebar_terminal_resolutions",
+            "session_sidebar_precreate_resolutions",
+            "session_sidebar_unbound_resolutions",
+        ):
+            assert repaired._conn.execute(
+                f"PRAGMA foreign_key_check({table_name})"
+            ).fetchall() == []
+        assert repaired._conn.execute(
+            """SELECT COUNT(*) FROM session_bridge_migrations
+               WHERE migration_name =
+                   'sidebar_resolution_orphan_quarantine_v30'"""
+        ).fetchone()[0] == 1
+    finally:
+        repaired.close()
 
 
 def test_v28_characterization_event_rebuild_rolls_back_and_reopens(
