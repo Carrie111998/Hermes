@@ -6346,7 +6346,22 @@ def tick(
             fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         elif msvcrt:
             msvcrt.locking(lock_fd.fileno(), msvcrt.LK_NBLCK, 1)
-    except (OSError, IOError):
+    except (OSError, IOError) as _lock_err:
+        # FD exhaustion is NOT lock contention. The ticker retries every
+        # interval, so this self-heals once descriptors free up — but it must
+        # be VISIBLE: the old code logged at debug level and returned 0, which
+        # the provider loop read as a clean tick (ok=True), clearing the error
+        # marker and leaving the scheduler silently stalled while the gateway
+        # heartbeat kept beating (#87644).
+        import errno as _errno
+
+        if getattr(_lock_err, "errno", None) in (_errno.EMFILE, _errno.ENFILE):
+            logger.warning(
+                "Cron tick skipped: file descriptor exhaustion (errno %s) — "
+                "possible fd leak; will retry next tick",
+                getattr(_lock_err, "errno", None),
+            )
+            raise
         logger.debug("Tick skipped — another instance holds the lock")
         if lock_fd is not None:
             lock_fd.close()
