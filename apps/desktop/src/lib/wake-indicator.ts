@@ -1,4 +1,4 @@
-export type WakeIndicatorState = 'capturing' | 'detected' | 'hidden'
+export type WakeIndicatorState = 'armed' | 'capturing' | 'detected' | 'hidden'
 
 export type WakeIndicatorVoiceStatus = 'idle' | 'listening' | 'speaking' | 'thinking' | 'transcribing'
 
@@ -11,8 +11,15 @@ function pushState(state: WakeIndicatorState): void {
     return
   }
 
+  console.log('[wake-indicator] pushState:', lastState, '->', state)
   lastState = state
   window.hermesDesktop?.wakeIndicator?.setState(state)
+}
+
+export function setWakeArmedState(enabled: boolean): void {
+  const state = enabled ? 'armed' : 'hidden'
+  console.log('[wake-indicator] setWakeArmedState:', state)
+  pushState(state)
 }
 
 export function activateWakeIndicator(): void {

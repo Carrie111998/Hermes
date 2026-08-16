@@ -26,6 +26,16 @@
   width: 120px;
 }
 
+/* Armed: subtle small dot — "listening for Hey Hermes" (#84393) */
+.wake-indicator-surface[data-state='armed'] .wake-indicator-light {
+  animation: wake-indicator-armed-breathe 4s ease-in-out infinite;
+  background: rgba(124, 58, 237, 0.7);
+  border: 1px solid rgba(216, 180, 254, 0.45);
+  box-shadow: 0 0 12px rgba(124, 58, 237, 0.8);
+  height: 24px;
+  width: 80px;
+}
+
 .wake-indicator-surface[data-state='detected'] .wake-indicator-light {
   animation: wake-indicator-breathe 2.5s ease-in-out infinite;
 }
@@ -48,6 +58,20 @@
   }
 }
 
+/* Armed breathe: slower, gentler (#84393) */
+@keyframes wake-indicator-armed-breathe {
+  0%,
+  100% {
+    opacity: 0.3;
+    transform: scale(0.9);
+  }
+
+  50% {
+    opacity: 0.6;
+    transform: scale(1);
+  }
+}
+
 @media (prefers-reduced-motion: reduce) {
   .wake-indicator-light {
     transition: opacity 200ms ease-out;
@@ -56,6 +80,12 @@
   .wake-indicator-surface[data-state='detected'] .wake-indicator-light {
     animation: none;
     opacity: 0.72;
+    transform: scale(1);
+  }
+
+  .wake-indicator-surface[data-state='armed'] .wake-indicator-light {
+    animation: none;
+    opacity: 0.45;
     transform: scale(1);
   }
 }

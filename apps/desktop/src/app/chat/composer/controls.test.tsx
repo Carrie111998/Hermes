@@ -84,41 +84,21 @@ describe('wake-word ear visibility', () => {
     resetWakeWordState()
   })
 
-  it('stays mounted during a busy agent turn', () => {
+  it('wake-word button is NOT in composer (moved to Settings #84391)', () => {
     applyWakeStatus({ available: true, enabled: true, listening: true, phrase: 'hey hermes' })
     renderControls({ busy: true, busyAction: 'stop' })
 
-    expect(screen.getByLabelText('Wake word: "hey hermes" — listening')).toBeTruthy()
+    expect(screen.queryByLabelText(/Wake word/)).toBeNull()
   })
 
-  it('stays mounted (enabled in config) even when a start was refused', () => {
-    applyWakeStatus({ available: true, enabled: true, listening: false, phrase: 'hey hermes' })
-    // Transient refusal marks available false but enabled keeps it mounted.
-    applyWakeStartResult({ hint: 'mic busy', reason: 'unavailable', started: false })
-    renderControls()
-
-    expect(screen.getByLabelText('Wake word: "hey hermes" — off')).toBeTruthy()
-  })
-
-  it('stays visible (never hides) even when unavailable and not enabled', () => {
+  it('wake-word button not shown even when unavailable', () => {
     applyWakeStatus({ available: false, enabled: false, listening: false, phrase: 'hey hermes' })
     renderControls()
 
-    // The ear ALWAYS shows so the user can click to enable; a failed start
-    // surfaces its reason in the tooltip rather than hiding the control.
-    expect(screen.getByLabelText('Wake word: "hey hermes" — off')).toBeTruthy()
+    expect(screen.queryByLabelText(/Wake word/)).toBeNull()
   })
 
-  it('surfaces the backend refusal reason in the tooltip, still visible', () => {
-    applyWakeStatus({ available: false, enabled: false, listening: false, phrase: 'hey hermes' })
-    applyWakeStartResult({ hint: 'run `hermes tools` (Voice section)', reason: 'unavailable', started: false })
-    renderControls()
-
-    const ear = screen.getByLabelText('Wake word: "hey hermes" — off')
-    expect(ear).toBeTruthy()
-  })
-
-  it('shows a disabled paused ear inside the voice-conversation pill', () => {
+  it('wake-word button not shown in voice-conversation pill either', () => {
     applyWakeStatus({ available: true, enabled: true, listening: true, phrase: 'hey hermes' })
     renderControls({
       conversation: {
@@ -133,7 +113,6 @@ describe('wake-word ear visibility', () => {
       }
     })
 
-    const ear = screen.getByLabelText('Wake word: "hey hermes" — paused during voice chat')
-    expect((ear as HTMLButtonElement).disabled).toBe(true)
+    expect(screen.queryByLabelText(/Wake word/)).toBeNull()
   })
 })

@@ -1,6 +1,7 @@
 import { atom } from 'nanostores'
 
 import { type ClientWakeCaptureHandle, startClientWakeCapture } from '@/lib/wake-client-capture'
+import { setWakeArmedState } from '@/lib/wake-indicator'
 import { $gateway } from '@/store/gateway'
 
 // "Hey Hermes" wake-word listener state for the composer toggle. The gateway is
@@ -21,6 +22,7 @@ export interface WakeWordState {
   pending: boolean
   /** Human-facing wake phrase, e.g. "hey hermes". */
   phrase: string
+  /** Latest wake-word model score for diagnostics. */
 }
 
 const INITIAL_WAKE_WORD_STATE: WakeWordState = {
@@ -187,8 +189,12 @@ export function applyWakeStatus(status: WakeStatusResponse | null | undefined): 
     enabled: Boolean(status?.enabled),
     listening,
     notice: listening && !silent ? '' : noticeFrom(status),
-    phrase: status?.phrase?.trim() || current.phrase
+    phrase: status?.phrase?.trim() || current.phrase,
   })
+
+  // Sync indicator: armed when listening, hidden otherwise (#84393)
+  console.log('[wake-word] applyWakeStatus -> setWakeArmedState:', listening)
+  setWakeArmedState(listening)
 }
 
 /** Sync the atom from a `wake.start` response. A `{started:false, reason}`
@@ -207,6 +213,10 @@ export function applyWakeStartResult(result: WakeStartResponse | null | undefine
       phrase: result.phrase?.trim() || current.phrase
     })
     void maybeStartClientCapture(result)
+
+    // Sync indicator: armed on successful start (#84393)
+    console.log('[wake-word] applyWakeStartResult -> setWakeArmedState: true')
+    setWakeArmedState(true)
 
     return
   }
@@ -239,6 +249,10 @@ export function applyWakeStopResult(result: WakeStopResponse | null | undefined)
     notice: result?.stopped ? '' : noticeFrom(result),
     pending: false
   })
+
+  // Sync indicator: hidden on stop (#84393)
+  console.log('[wake-word] applyWakeStopResult -> setWakeArmedState: false')
+  setWakeArmedState(false)
 }
 
 /**

@@ -6,9 +6,11 @@ import { hudTargetSessionId } from '@/app/hud/handoff'
 import { toggleLayoutEditMode } from '@/components/pane-shell/edit-mode'
 import { resetLayoutTree } from '@/components/pane-shell/tree/store'
 import { Button } from '@/components/ui/button'
+import { Codicon } from '@/components/ui/codicon'
 import { Tip, TipKeybindLabel } from '@/components/ui/tooltip'
 import { useI18n } from '@/i18n'
 import { triggerHaptic } from '@/lib/haptics'
+import { Ear, EarOff, Volume2, VolumeX } from '@/lib/icons'
 import { cn } from '@/lib/utils'
 import { $hapticsMuted, toggleHapticsMuted } from '@/store/haptics'
 import { toggleHud } from '@/store/hud'
@@ -19,16 +21,12 @@ import {
   togglePanesFlipped,
   toggleSidebarOpen
 } from '@/store/layout'
+import { $autoSpeakReplies, setAutoSpeakReplies } from '@/store/voice-prefs'
+import { $wakeWord, toggleWakeWord } from '@/store/wake-word'
 
 import { appViewForPath, isOverlayView } from '../routes'
 
-import {
-  TITLEBAR_ICON_BADGE_SCALE,
-  titlebarButtonClass,
-  titlebarIconSizeCss,
-  titlebarToolClusterClass
-} from './titlebar'
-import { TitlebarIcon } from './titlebar-icon'
+import { titlebarButtonClass } from './titlebar'
 
 export interface TitlebarTool {
   id: string
@@ -66,12 +64,12 @@ function LayoutGlyph({ modHeld }: { modHeld: boolean }) {
   return (
     <>
       <span className={cn('inline-flex', modHeld && 'group-hover/tool:hidden')}>
-        <TitlebarIcon name="layout" />
+        <Codicon name="layout" />
       </span>
       <span className={cn('relative hidden', modHeld && 'group-hover/tool:inline-flex')}>
-        <TitlebarIcon name="layout" />
+        <Codicon name="layout" />
         <span className="absolute -bottom-1 -right-1.5 grid place-items-center rounded-full bg-(--ui-bg-chrome) p-px">
-          <TitlebarIcon className="-scale-x-100" name="refresh" size={titlebarIconSizeCss(TITLEBAR_ICON_BADGE_SCALE)} />
+          <Codicon className="-scale-x-100" name="refresh" size="0.5625rem" />
         </span>
       </span>
     </>
@@ -109,6 +107,8 @@ export function TitlebarControls({ leftTools = [], tools = [], onOpenSettings }:
   const hapticsMuted = useStore($hapticsMuted)
   const fileBrowserOpen = useStore($fileBrowserOpen)
   const sidebarOpen = useStore($sidebarOpen)
+  const wake = useStore($wakeWord)
+  const autoSpeak = useStore($autoSpeakReplies)
 
   const toggleHaptics = () => {
     if (!hapticsMuted) {
@@ -133,7 +133,7 @@ export function TitlebarControls({ leftTools = [], tools = [], onOpenSettings }:
   const leftToolbarTools: TitlebarTool[] = [
     {
       actionId: 'view.toggleSidebar',
-      icon: <TitlebarIcon name="layout-sidebar-left" />,
+      icon: <Codicon name="layout-sidebar-left" />,
       id: 'sidebar',
       label: leftEdge.open ? t.titlebar.hideSidebar : t.titlebar.showSidebar,
       onSelect: () => {
@@ -143,7 +143,7 @@ export function TitlebarControls({ leftTools = [], tools = [], onOpenSettings }:
     },
     {
       actionId: 'view.flipPanes',
-      icon: <TitlebarIcon name="arrow-swap" />,
+      icon: <Codicon name="arrow-swap" />,
       id: 'flip-panes',
       label: t.titlebar.swapSidebarSides,
       onSelect: () => {
@@ -156,7 +156,7 @@ export function TitlebarControls({ leftTools = [], tools = [], onOpenSettings }:
 
   const rightSidebarTool: TitlebarTool = {
     actionId: 'view.toggleRightSidebar',
-    icon: <TitlebarIcon name="layout-sidebar-right" />,
+    icon: <Codicon name="layout-sidebar-right" />,
     id: 'right-sidebar',
     label: rightEdge.open ? t.titlebar.hideRightSidebar : t.titlebar.showRightSidebar,
     onSelect: () => {
@@ -193,7 +193,7 @@ export function TitlebarControls({ leftTools = [], tools = [], onOpenSettings }:
       // crowds the ⌘⇧H hint off the tooltip. Label only — the hint is appended
       // from the action registry, same as every other tool here.
       actionId: 'view.toggleHud',
-      icon: <TitlebarIcon name="comment-discussion" />,
+      icon: <Codicon name="comment-discussion" />,
       id: 'hud',
       label: t.titlebar.enterHud,
       onSelect: () => {
@@ -203,14 +203,46 @@ export function TitlebarControls({ leftTools = [], tools = [], onOpenSettings }:
     },
     {
       active: hapticsMuted,
-      icon: <TitlebarIcon name={hapticsMuted ? 'mute' : 'unmute'} />,
+      icon: <Codicon name={hapticsMuted ? 'mute' : 'unmute'} />,
       id: 'haptics',
       label: hapticsMuted ? t.titlebar.unmuteHaptics : t.titlebar.muteHaptics,
       onSelect: toggleHaptics
     },
     {
+      active: wake.listening,
+      icon: (
+        <span style={wake.listening ? {  } : undefined}>
+          {wake.listening ? <Ear size="1rem" /> : <EarOff size="1rem" />}
+        </span>
+      ),
+      id: 'wake-word',
+      label: (() => {
+        const scoreInfo = wake.lastScore ? ` [score: ${wake.lastScore.score.toFixed(4)} / ${wake.lastScore.threshold}]` : ''
+        return wake.listening
+          ? `Hey Hermes: listening${wake.phrase ? ` "${wake.phrase}"` : ''}${scoreInfo}`
+          : wake.notice
+            ? `Hey Hermes: ${wake.notice}${scoreInfo}`
+            : `Hey Hermes: off${scoreInfo}`
+      })(),
+      onSelect: () => {
+        console.warn('[wake] ear clicked, current state:', JSON.stringify($wakeWord.get()))
+        triggerHaptic('tap')
+        void toggleWakeWord()
+      }
+    },
+    {
+      active: autoSpeak,
+      icon: autoSpeak ? <Volume2 size="1rem" /> : <VolumeX size="1rem" />,
+      id: 'auto-tts',
+      label: autoSpeak ? 'Read aloud: on' : 'Read aloud: off',
+      onSelect: () => {
+        triggerHaptic('tap')
+        void setAutoSpeakReplies(!autoSpeak)
+      }
+    },
+    {
       actionId: 'nav.settings',
-      icon: <TitlebarIcon name="settings-gear" />,
+      icon: <Codicon name="settings-gear" />,
       id: 'settings',
       label: t.titlebar.openSettings,
       onSelect: () => {
@@ -235,10 +267,7 @@ export function TitlebarControls({ leftTools = [], tools = [], onOpenSettings }:
     <>
       <div
         aria-label={t.shell.windowControls}
-        className={cn(
-          titlebarToolClusterClass,
-          'left-(--titlebar-controls-left) top-(--titlebar-controls-top) translate-y-(--titlebar-controls-y-nudge)'
-        )}
+        className="fixed left-(--titlebar-controls-left) top-(--titlebar-controls-top) z-70 flex translate-y-0.5 flex-row items-center gap-x-1 pointer-events-auto select-none [-webkit-app-region:no-drag]"
       >
         {leftToolbarTools
           .filter(tool => !tool.hidden)
@@ -258,10 +287,7 @@ export function TitlebarControls({ leftTools = [], tools = [], onOpenSettings }:
       {visiblePaneTools.length > 0 && (
         <div
           aria-label={t.shell.paneControls}
-          className={cn(
-            titlebarToolClusterClass,
-            'top-[calc(var(--titlebar-controls-top)+var(--right-rail-top-inset,0px))] right-[calc(var(--titlebar-tools-right)+var(--shell-preview-toolbar-gap,0))]'
-          )}
+          className="fixed top-[calc(var(--titlebar-controls-top)+var(--right-rail-top-inset,0px))] right-[calc(var(--titlebar-tools-right)+var(--shell-preview-toolbar-gap,0))] z-70 flex flex-row items-center gap-x-1 pointer-events-auto select-none [-webkit-app-region:no-drag]"
         >
           {visiblePaneTools.map(tool => (
             <TitlebarToolButton key={tool.id} navigate={navigate} tool={tool} />
@@ -271,7 +297,7 @@ export function TitlebarControls({ leftTools = [], tools = [], onOpenSettings }:
 
       <div
         aria-label={t.shell.appControls}
-        className={cn(titlebarToolClusterClass, 'right-(--titlebar-tools-right) top-(--titlebar-controls-top)')}
+        className="fixed right-(--titlebar-tools-right) top-(--titlebar-controls-top) z-70 flex flex-row items-center justify-end gap-x-1 pointer-events-auto select-none [-webkit-app-region:no-drag]"
       >
         {visibleSystemTools.map(tool => (
           <TitlebarToolButton key={tool.id} navigate={navigate} tool={tool} />
