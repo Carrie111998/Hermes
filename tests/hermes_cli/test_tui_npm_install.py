@@ -17,13 +17,13 @@ def main_mod():
 def _touch_ink(root: Path) -> None:
     ink = root / "node_modules" / "@hermes" / "ink" / "package.json"
     ink.parent.mkdir(parents=True, exist_ok=True)
-    ink.write_text("{}")
+    ink.write_text("{}", encoding="utf-8")
 
 
 def _touch_tui_entry(root: Path) -> None:
     entry = root / "dist" / "entry.js"
     entry.parent.mkdir(parents=True, exist_ok=True)
-    entry.write_text("console.log('tui')")
+    entry.write_text("console.log('tui')", encoding="utf-8")
 
 
 def _assert_utf8_replace_capture(kwargs: dict) -> None:
@@ -62,7 +62,7 @@ def test_make_tui_argv_uses_bundled_tui_when_workspace_missing(
 
     bundled_entry = tmp_path / "bundled" / "entry.js"
     bundled_entry.parent.mkdir(parents=True)
-    bundled_entry.write_text("// bundled TUI")
+    bundled_entry.write_text("// bundled TUI", encoding="utf-8")
     monkeypatch.setattr(main_mod, "_find_bundled_tui", lambda: bundled_entry)
 
     def which(name: str) -> str | None:
@@ -148,11 +148,11 @@ def test_make_tui_argv_omits_workspace_when_tui_has_own_lockfile(
     """
     tui_dir = tmp_path / "ui-tui"
     tui_dir.mkdir()
-    (tui_dir / "package.json").write_text("{}")
+    (tui_dir / "package.json").write_text("{}", encoding="utf-8")
     # Simulate curl-install layout: tui_dir has its own lockfile
-    (tui_dir / "package-lock.json").write_text("{}")
+    (tui_dir / "package-lock.json").write_text("{}", encoding="utf-8")
     # Parent also has lockfile (but _workspace_root prefers tui_dir's own)
-    (tmp_path / "package-lock.json").write_text("{}")
+    (tmp_path / "package-lock.json").write_text("{}", encoding="utf-8")
 
     monkeypatch.delenv("TERMUX_VERSION", raising=False)
     monkeypatch.setenv("PREFIX", "/usr")
@@ -176,3 +176,33 @@ def test_make_tui_argv_omits_workspace_when_tui_has_own_lockfile(
     assert install_cmd[:2] == ["/bin/npm", "install"]
     # cwd must be tui_dir (standalone), not parent
     assert calls[0][1]["cwd"] == str(tui_dir)
+
+
+def test_make_tui_argv_installs_nested_ink_workspace(
+    tmp_path: Path, main_mod, monkeypatch
+) -> None:
+    """A root-workspace install must include @hermes/ink's dependencies."""
+    tui_dir = tmp_path / "ui-tui"
+    tui_dir.mkdir()
+    (tui_dir / "package.json").write_text("{}", encoding="utf-8")
+    (tmp_path / "package-lock.json").write_text("{}", encoding="utf-8")
+
+    monkeypatch.delenv("TERMUX_VERSION", raising=False)
+    monkeypatch.setenv("PREFIX", "/usr")
+    monkeypatch.setattr(main_mod, "_tui_need_npm_install", lambda _root: True)
+    monkeypatch.setattr(main_mod.shutil, "which", lambda name: f"/bin/{name}")
+    calls = []
+
+    def fake_run(*args, **kwargs):
+        calls.append((args, kwargs))
+        return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(main_mod.subprocess, "run", fake_run)
+
+    main_mod._make_tui_argv(tui_dir, tui_dev=False)
+
+    install_cmd = calls[0][0][0]
+    assert install_cmd.count("--workspace") == 2
+    assert "ui-tui" in install_cmd
+    assert "ui-tui/packages/hermes-ink" in install_cmd
+    assert "apps/desktop" not in install_cmd
