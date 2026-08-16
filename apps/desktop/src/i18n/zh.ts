@@ -3240,6 +3240,7 @@ export const zh: Translations = {
     wakeWordListening: phrase => `唤醒词:"${phrase}" — 正在监听`,
     wakeWordOff: phrase => `唤醒词:"${phrase}" — 已关闭`,
     wakeWordPausedVoice: phrase => `唤醒词:"${phrase}" — 语音对话期间暂停`,
+    wakeWordClickToEnable: '点击启用',
     lookupLoading: '查找中…',
     lookupNoMatches: '没有匹配项。',
     lookupTry: '试试',

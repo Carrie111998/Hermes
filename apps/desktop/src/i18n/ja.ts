@@ -2770,6 +2770,7 @@ export const ja = defineLocale({
     wakeWordListening: phrase => `ウェイクワード:「${phrase}」— 待機中`,
     wakeWordOff: phrase => `ウェイクワード:「${phrase}」— オフ`,
     wakeWordPausedVoice: phrase => `ウェイクワード:「${phrase}」— 音声チャット中は一時停止`,
+    wakeWordClickToEnable: 'クリックして有効化',
     lookupLoading: '検索中…',
     lookupNoMatches: '一致なし。',
     lookupTry: '試す',

@@ -1920,6 +1920,7 @@ export const ar = defineLocale({
     stopDictation: 'إيقاف الإملاء',
     transcribingDictation: 'جار تفريغ الإملاء',
     voiceDictation: 'إملاء صوتي',
+    wakeWordClickToEnable: 'انقر للتمكين',
     lookupLoading: 'جار البحث...',
     lookupNoMatches: 'لا توجد نتائج',
     lookupTry: 'جرب',

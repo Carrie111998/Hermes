@@ -2591,6 +2591,7 @@ export const zhHant = defineLocale({
     wakeWordListening: phrase => `喚醒詞:「${phrase}」— 正在聆聽`,
     wakeWordOff: phrase => `喚醒詞:「${phrase}」— 已關閉`,
     wakeWordPausedVoice: phrase => `喚醒詞:「${phrase}」— 語音對話期間暫停`,
+    wakeWordClickToEnable: '點擊啟用',
     lookupLoading: '查詢中…',
     lookupNoMatches: '沒有相符項目。',
     lookupTry: '試試',
