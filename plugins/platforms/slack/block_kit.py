@@ -56,7 +56,12 @@ _TODO_TERMINAL = frozenset({"completed", "cancelled"})
 _TODO_INLINE_CODE_RE = re.compile(r"`[^`\n]+`")
 _TODO_FENCED_CODE_RE = re.compile(r"```.*?```|~~~.*?~~~", re.DOTALL)
 _TODO_LOCAL_PATH_RE = re.compile(
-    r"(?:(?:/Users|/home|/private/var|/tmp)/[^\s,;:]+|~/[^\s,;:]+)"
+    r"(?:"
+    r"(?:/Users|/home|/private/var|/tmp)/[^\s,;:]+"
+    r"|~/[^\s,;:]+"
+    r"|[A-Za-z]:\\[^\s,;]+"
+    r"|\\\\[^\s,;]+"
+    r")"
 )
 _TODO_SECRET_RE = re.compile(
     r"(?i)\b(api[_-]?key|token|secret|password)\s*[:=]\s*[^\s,;]+"

@@ -2776,6 +2776,8 @@ class SlackAdapter(BasePlatformAdapter):
             self._todo_progress_lock = asyncio.Lock()
         if not hasattr(self, "_TODO_PROGRESS_MAX"):
             self._TODO_PROGRESS_MAX = 2000
+        if not hasattr(self, "_todo_progress_by_run"):
+            self._todo_progress_by_run = {}
 
     def _trim_todo_progress_states(self) -> None:
         if len(self._todo_progress_states) <= self._TODO_PROGRESS_MAX:
@@ -2786,6 +2788,7 @@ class SlackAdapter(BasePlatformAdapter):
         for key, state in stale:
             self._todo_progress_states.pop(key, None)
             self._todo_progress_tokens.pop(state.token, None)
+            self._todo_progress_by_run.pop((state.session_key, state.generation), None)
 
     async def project_todo_progress(
         self,
@@ -2825,12 +2828,22 @@ class SlackAdapter(BasePlatformAdapter):
                     return False
                 if generation > state.generation:
                     self._todo_progress_tokens.pop(state.token, None)
+                    self._todo_progress_by_run.pop(
+                        (state.session_key, state.generation), None
+                    )
                     state.generation = generation
                     state.user_id = str(user_id or "")
                     state.token = secrets.token_urlsafe(18)
                     state.action_consumed = False
                     state.closed = False
                     self._todo_progress_tokens[state.token] = route
+                    self._todo_progress_by_run[
+                        (state.session_key, state.generation)
+                    ] = route
+                else:
+                    self._todo_progress_by_run[
+                        (state.session_key, state.generation)
+                    ] = route
                 state.snapshot = snapshot
                 state.revision += 1
                 state.updated_at = time.monotonic()
@@ -2907,6 +2920,7 @@ class SlackAdapter(BasePlatformAdapter):
             )
             self._todo_progress_states[route] = state
             self._todo_progress_tokens[token] = route
+            self._todo_progress_by_run[(state.session_key, state.generation)] = route
             self._trim_todo_progress_states()
             return True
 
@@ -2925,19 +2939,15 @@ class SlackAdapter(BasePlatformAdapter):
         except (TypeError, ValueError):
             return False
         async with self._todo_progress_lock:
-            match = next(
-                (
-                    (route, state)
-                    for route, state in self._todo_progress_states.items()
-                    if state.session_key == str(session_key)
-                    and state.generation == generation
-                    and (overwrite_closed or not state.closed)
-                ),
-                None,
-            )
-            if match is None:
+            route = self._todo_progress_by_run.get((str(session_key), generation))
+            state = self._todo_progress_states.get(route) if route is not None else None
+            if (
+                state is None
+                or state.session_key != str(session_key)
+                or state.generation != generation
+                or (state.closed and not overwrite_closed)
+            ):
                 return False
-            _route, state = match
             state.closed = True
             state.action_consumed = True
             state.revision += 1

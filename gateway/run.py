@@ -9229,10 +9229,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         busy_text_mode = self._effective_busy_text_mode(event.source)
         effective_mode = self._busy_input_mode
-        # EZ-525: an authorized plain-text reply in an active Slack thread is
-        # steering input, regardless of the workspace-wide busy mode. Media,
-        # internal completions, approvals, and commands retain their existing
-        # queue/interrupt paths. A failed steer still falls back to FIFO below.
+        busy_text_mode = getattr(self, "_busy_text_mode", "interrupt")
+        # EZ-525: authorized plain-text replies in an active Slack thread steer
+        # when the workspace is not explicitly in queue mode. Queue stays
+        # queue — do not silently override busy_input_mode / busy_text_mode.
+        # Media, internal completions, approvals, and commands keep their
+        # existing paths. A failed steer still falls back to FIFO below.
         _slack_plain_text_reply = bool(
             event.source.platform == Platform.SLACK
             and event.source.thread_id
@@ -9240,7 +9242,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             and not event.media_urls
             and not event.media_types
         )
-        if _slack_plain_text_reply:
+        _queue_configured = (
+            self._busy_input_mode == "queue" or busy_text_mode == "queue"
+        )
+        if _slack_plain_text_reply and not _queue_configured:
             effective_mode = "steer"
         if (
             event.message_type == MessageType.TEXT
@@ -14792,7 +14797,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Do not truncate/rewrite its transcript until the interrupted adapter
         # task has fully unwound and flushed. The retry re-enters through the
         # canonical /retry command under the adapter's normal session guard.
-        expected_invalidation_generation = generation + 1
+        # Read the generation stop actually produced — do not assume +1.
+        post_stop = self._peek_session_state(session_key)
+        expected_invalidation_generation = (
+            int(post_stop.persistent.run_generation)
+            if post_stop is not None
+            else None
+        )
+        if expected_invalidation_generation is None:
+            return False
         handle_message = getattr(adapter, "handle_message", None) if adapter is not None else None
         if active_task is None or not callable(handle_message):
             return False

@@ -59,7 +59,9 @@ def _event(text="change direction", user_id="U1"):
 
 def test_todo_renderer_is_private_bounded_and_interactive():
     snapshot = _snapshot()
-    snapshot["todos"][0]["content"] += " bearer sk-live-example123456"
+    snapshot["todos"][0]["content"] += (
+        " bearer sk-live-example123456 C:\\Users\\aditya\\.env \\\\server\\share\\secret"
+    )
 
     assert todo_progress_eligible(snapshot)
     rendered = render_todo_progress(
@@ -77,6 +79,8 @@ def test_todo_renderer_is_private_bounded_and_interactive():
     assert "hermes_todo_stop" in blob
     assert "hermes_todo_restart" in blob
     assert "/Users/" not in blob
+    assert "C:\\\\Users" not in blob
+    assert "\\\\server" not in blob
     assert "secret" not in blob
     assert "sk-live" not in blob
 
@@ -247,6 +251,7 @@ def _steering_runner(agent):
     runner.adapters = {Platform.SLACK: adapter}
     runner._busy_input_mode = "interrupt"
     runner._busy_text_mode = "interrupt"
+    runner._draining = False
     runner._is_user_authorized = lambda source: True
     state = SimpleNamespace(turn=SimpleNamespace(agent=agent), busy_ack_ts=0.0)
     runner._peek_session_state = MagicMock(return_value=state)
@@ -289,6 +294,23 @@ async def test_failed_slack_steer_queues_fifo_without_ack():
     adapter._send_with_retry.assert_not_awaited()
 
 
+@pytest.mark.asyncio
+async def test_queued_workspace_does_not_force_slack_thread_steer():
+    agent = MagicMock()
+    agent.steer.return_value = True
+    agent.active_children = set()
+    runner, adapter = _steering_runner(agent)
+    runner._busy_input_mode = "queue"
+    runner._busy_text_mode = "queue"
+    event = _event()
+    session_key = "slack:T1:C1:111.1"
+
+    assert await runner._handle_active_session_busy_message(event, session_key) is False
+
+    agent.steer.assert_not_called()
+    adapter._send_with_retry.assert_not_awaited()
+
+
 def _control_runner(active_generation=5):
     runner = object.__new__(GatewayRunner)
     session_key = "slack:T1:C1:111.1"
@@ -304,6 +326,11 @@ def _control_runner(active_generation=5):
     runner._session_key_for_source = lambda source: session_key
     runner._adapter_for_source = lambda source: adapter
     runner._busy_stop_command = AsyncMock()
+    runner._peek_session_state = MagicMock(
+        return_value=SimpleNamespace(
+            persistent=SimpleNamespace(run_generation=active_generation + 1)
+        )
+    )
     runner._is_session_run_current = MagicMock(return_value=True)
     async_store = MagicMock()
     async_store.get_or_create_session = AsyncMock(
