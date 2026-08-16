@@ -1,6 +1,6 @@
 ---
 title: "ARCH-003 implementation plan: runtime-state audit and replay verification"
-status: IMPLEMENTATION_PLAN_REVISE_V7_PENDING
+status: IMPLEMENTATION_PLAN_REVISE_V8_PENDING
 date: 2026-08-16
 type: implementation-plan
 ticket: ARCH-003
@@ -93,22 +93,26 @@ prompt construction, legacy `state.db`, or unrelated dirty worktree files.
   mutation/genesis paths acquire its shared/read side before opening the
   SQLite transaction and release it after commit or rollback. The privileged
   baseline writer acquires its exclusive/write side before opening its WAL
-  transaction and releases it after commit or rollback. This permits
-  multi-writer sequence contention while excluding baseline operations from
-  concurrent mutations.
+  transaction and releases it after commit or rollback.
+- Set `LOCK_ACQUIRE_TIMEOUT = 5s` for both lock sides. Acquisition failure
+  returns a closed `LOCK_TIMEOUT` reason, aborts before opening SQLite, and
+  never blocks ordinary mutations indefinitely. The cross-process primitive
+  must release ownership automatically when its holder dies; if safe
+  stale-holder recovery cannot be proven, stop preflight. Exclusive baseline
+  acquisition may fail and be retried only by its out-of-band caller.
 - The single-writer branch proves one ordinary mutation connection and
-  defensive abort; the multi-writer branch requires the cross-process RW lock
-  plus bounded retry policy. If no safe cross-process RW lock exists, stop
-  preflight.
-- Mutation/genesis transactions use `BEGIN IMMEDIATE` or equivalent
-  write-lock-first discipline before sequence allocation. Constraint-collision
-  retries and busy-timeout/snapshot-invalidation aborts are separate outcomes.
+  defensive abort; the multi-writer branch requires the cross-process RW lock.
+  Mutation/genesis transactions use `BEGIN IMMEDIATE` or equivalent
+  write-lock-first discipline before sequence allocation. Since the write lock
+  is held through commit, sequence collisions are not a retry path; any
+  unexpected uniqueness collision aborts defensively.
 - Map every runtime-state lifecycle mutation and prove the chosen CAS
   chokepoint covers them.
 - Locate the existing local secret/key-storage mechanism without printing or
   copying secrets. If durable custody is unavailable, stop.
 - Define the journal migration version, event kinds, replay tuple, baseline
-  fields, genesis semantics, and rollback posture before edits.
+  fields, genesis semantics, generation marker, key-check value, and rollback
+  posture before edits.
 - Confirm that the prior release can start with the new journal table present
   and that rollback does not require deleting the table or losing materialized
   state.
@@ -124,20 +128,32 @@ Add a versioned runtime-state-owned journal table with:
 - profile/entity category;
 - profile-scoped keyed entity digest;
 - non-secret digest-parameter identifier;
+- non-secret key-check value bound to the digest-parameter identifier;
 - origin marker for migration-origin or post-migration genesis;
 - per-profile/entity monotonic sequence with uniqueness;
 - operation category;
 - lifecycle state before/after;
 - owner-version before/after;
 - state schema version and journal event version;
-- bounded closed reason code;
+- journal-writer generation/epoch continuity marker;
 - diagnostic timestamp;
 - baseline sealed lifecycle state, owner-version, state schema version, and
   sealed-through sequence when event kind is `baseline`.
 
+Add a materialized-row journal-writer generation marker. The upgraded runtime
+advances the database generation atomically on startup under the new schema
+version; every mutation/genesis updates the row marker and records the current
+generation in its event. A row whose marker is older than the current
+generation, or whose materialized state advanced without a corresponding
+current-generation event, is `UNKNOWN`, never `DRIFT`. A rollback-then-
+roll-forward cycle therefore keeps affected entities `UNKNOWN` until a
+subsequent journaled genesis/mutation re-establishes current-generation origin.
+
 The replay tuple is explicitly `lifecycle_state`, `owner_version`, and
-`state_schema_version`; terminality is derived from lifecycle state. Columns
-outside this tuple are outside the verifier's `CONSISTENT` claim.
+`state_schema_version`; terminality is derived from lifecycle state. The
+generation marker is a provenance continuity check, not a user-visible
+replayed state. Columns outside the replay tuple are outside the verifier's
+`CONSISTENT` claim.
 
 Baseline events consume the same per-profile/entity sequence space. A baseline
 row has `entity_seq = sealed_through_seq + 1`; inside its transaction the
@@ -180,12 +196,15 @@ for that entity covers only history from that genesis event onward. A truncated
 head without the required origin marker returns `UNKNOWN`.
 
 Digest parameter identifiers are persisted metadata; key material is never
-journaled. A digest-parameter rotation starts a new epoch: the first committed
+journaled. Persist the key-check as a truncated digest of a fixed known
+constant under the digest key. The verifier recomputes it before replay and
+returns `UNKNOWN` if the key-check does not match the identifier or if the key
+is unavailable.
+
+A digest-parameter rotation starts a new epoch: the first committed
 post-rotation replay-tuple mutation emits a marked genesis event under the new
 identifier, with `CONSISTENT` covering only post-rotation history. All
 pre-rotation history remains `UNKNOWN` and is not bridged by this ticket.
-
-Verify-time key unavailability is `UNKNOWN`.
 
 Migration rollback is forward-compatible: prior code must tolerate the journal
 table's presence and continue serving materialized rows; rollback must not
@@ -203,20 +222,19 @@ this posture.
   use `BEGIN IMMEDIATE` or equivalent before sequence allocation; release the
   shared lock only after commit or rollback.
 - Use the caller's existing SQLite WAL connection and transaction for mutation
-  and genesis events.
+  and genesis events, update the materialized generation marker, and record the
+  current generation in the event.
 - Any mutation/genesis journal constraint or write failure aborts the complete
   enclosing materialized-state mutation; errors must not be swallowed.
 - The privileged baseline writer is the sole event-only exception and uses the
   exclusive lock ordering defined in Gate 1.
-- In the multi-writer branch, use a code-level `SEQUENCE_RETRY_LIMIT = 3`
-  only for statement-level sequence uniqueness collisions. A busy-timeout
-  exhaustion or snapshot-invalidation error aborts the whole transaction and
-  surfaces a bounded failure; it is not retried inside the invalid transaction.
-  In the single-writer branch, prove ordinary contention cannot occur and retain
-  an explicit defensive abort path.
-- Neither retry nor abort may create a committed mutation/genesis event without
-  its state mutation or a replay-visible sequence gap. Baseline sequence
-  continuity is governed by Gate 1.
+- There is no sequence retry path under the write-lock-first discipline. An
+  unexpected uniqueness collision or busy-timeout exhaustion aborts the whole
+  transaction and surfaces a bounded failure; it is not retried inside the
+  invalid transaction.
+- Neither abort may create a committed mutation/genesis event without its state
+  mutation or a replay-visible sequence gap. Baseline sequence continuity is
+  governed by Gate 1.
 - Add a negative test proving lifecycle writes cannot bypass the mutation/genesis
   emission chokepoint; the test must not reject the explicitly named baseline
   writer.
@@ -229,24 +247,30 @@ Implement a bounded verifier that:
   `BEGIN DEFERRED`; the first event-stream read establishes the snapshot,
   and both the bounded event stream and materialized row are read after that
   snapshot establishment and before the transaction ends. Immutable-open is
-  prohibited for this verifier.
+  prohibited for this verifier;
+- validates the key-check value before replay and returns `UNKNOWN` on
+  identifier/key mismatch or key unavailability;
 - returns per-entity `CONSISTENT`, `DRIFT`, or `UNKNOWN`;
 - treats `UNKNOWN` as absorbing;
 - requires complete verified history for `DRIFT`;
-- validates event kind, origin/genesis markers, baseline contents and
-  baseline-to-next-event sequence continuity, duplicate or missing
-  predecessors, digest-parameter identity, schemas, reason codes, and terminal
-  state;
+- validates event kind, origin/genesis markers, journal generation/epoch
+  continuity, baseline contents and baseline-to-next-event sequence continuity,
+  duplicate or missing predecessors, digest-parameter identity, schemas,
+  reason codes, and terminal state;
 - uses a code-level `REPLAY_EVENT_LIMIT = 10000` counted from the effective
-  replay start point: the latest valid baseline if one exists, otherwise the
-  genesis event;
+  replay start point: the latest valid baseline under the current digest
+  identifier if one exists, otherwise the latest valid marked genesis under the
+  current digest identifier; otherwise `UNKNOWN`. Events preceding that start
+  are ignored;
 - selects the valid baseline with the highest `sealed_through_seq`, ignores
   events before it, and returns `UNKNOWN` for same-sequence tuple conflicts,
-  overlapping contradictory baselines, or a baseline without a valid current
-  origin epoch;
+  overlapping contradictory baselines, a baseline without a valid current
+  origin epoch, a stale generation marker, or a materialized state advanced
+  during a generation with no current-generation event;
 - returns `UNKNOWN` on snapshot failure, unsupported/newer versions, malformed
-  history, unknown digest regime, verify-time key unavailability, exceeded
-  bound, missing legacy origin, or a materialized-row/history asymmetry;
+  history, unknown digest regime, key-check mismatch, verify-time key
+  unavailability, exceeded bound, missing legacy origin, or a
+  materialized-row/history asymmetry;
 - treats a materialized row missing while history exists, or history existing
   without a materialized row, as `UNKNOWN`, never `DRIFT`;
 - treats any event observed after a terminal lifecycle state as malformed
@@ -270,6 +294,9 @@ Add deterministic tests for:
   limiting `CONSISTENT` to post-genesis history;
 - post-rotation genesis under a new digest identifier, with pre-rotation
   history remaining `UNKNOWN`;
+- downgrade-window simulation: mutate materialized state with journaling
+  disabled, roll forward, and assert verifier returns `UNKNOWN`, never
+  `DRIFT`;
 - prior-version startup with the journal table present and rollback posture;
 - one event per committed replay-tuple mutation;
 - true no-op without an event;
@@ -277,16 +304,14 @@ Add deterministic tests for:
 - mutation/genesis journal failure rolling back materialized state;
 - SQLite WAL, selected busy-timeout, `BEGIN IMMEDIATE`, and read-only WAL
   preconditions;
-- shared/exclusive cross-process maintenance-RW-lock exclusion and release
-  ordering between baseline and mutation paths;
-- writer-model branch:
-  - multi-writer: sequence uniqueness retry, busy-timeout/snapshot-invalidation
-    whole-transaction abort, and concurrent contention;
-  - single-writer: single-writer invariant and defensive abort path;
+- `LOCK_ACQUIRE_TIMEOUT = 5s`, lock-timeout reason, stale-holder recovery,
+  and shared/exclusive cross-process RW-lock exclusion/release ordering;
+- single-writer invariant and defensive abort; no sequence-collision retry is
+  expected under write-lock-first discipline;
 - bypass-path rejection for mutation/genesis while permitting the named baseline
   writer;
-- keyed digest/profile isolation, digest-parameter rotation without bridging,
-  and verify-time key unavailability;
+- keyed digest/profile isolation, identifier/key-check mismatch, digest
+  rotation without bridging, and verify-time key unavailability;
 - duplicate, missing, malformed, non-contiguous, and unsupported events;
 - truncated-head history without an origin marker returning `UNKNOWN`;
 - sealed-baseline tuple mismatch against the materialized row returning
@@ -302,20 +327,22 @@ Add deterministic tests for:
 - snapshot race using explicit `BEGIN DEFERRED` and the selected WAL
   read-transaction mechanism, returning `CONSISTENT` or `UNKNOWN`, never
   false `DRIFT`;
-- replay bound counted from the effective replay start point, baseline
-  selection, conflicting/overlapping baselines, and closed reason codes;
+- replay bound counted from the effective replay start point, current-epoch
+  genesis selection, baseline selection, conflicting/overlapping baselines,
+  generation mismatch, and closed reason codes;
 - verifier-performs-no-writes using a direct database-change assertion;
 - materialized-row/history asymmetry returning `UNKNOWN`;
 - post-terminal events returning `UNKNOWN`;
 - prompt-cache/gateway no-change check: runtime-state modules must not import
   or invoke gateway conversation or prompt-construction modules;
 - mutation benchmark: 20 repetitions, each with 200 warmup mutations followed
-  by 1000 measured mutations, on the same Python/SQLite WAL test environment
-  and temp database shape. Pool all measured per-mutation latencies across the
-  20 repetitions and compute one p95 per arm; report the journal-enabled minus
-  journal-disabled p95. The 5 ms p95 threshold is a local-preflight blocker;
-  CI records the result but does not gate on host-noise variance. The control
-  is test-local and has no user-facing disable switch;
+  by 1000 measured mutations distributed round-robin across 100 entities, on
+  the same Python/SQLite WAL test environment and temp database shape. Pool all
+  measured per-mutation latencies across the 20 repetitions and compute one
+  p95 per arm; report the journal-enabled minus journal-disabled p95. The
+  5 ms p95 threshold is a local-preflight blocker; CI records the result but
+  does not gate on host-noise variance. The control is test-local and has no
+  user-facing disable switch;
 - `DRIFT` only for complete verified history;
 - non-replayed columns remain outside the verifier claim.
 
@@ -379,14 +406,14 @@ must be incorporated before implementation authorization:
 These are plan-only corrections. They do not authorize source edits, migration,
 tests, DGX changes, deployment, repair, or event-sourcing.
 
-## Implementation-plan review reconciliation v6
+## Implementation-plan review reconciliation v7
 
-The v6 review required explicit cross-process maintenance-RW-lock granularity,
-removal of immutable-open from the WAL snapshot discipline, current-origin
-requirements for baselines, successive-baseline/conflict semantics, and a
-continuous reconciliation audit trail. These are incorporated in Gates 0-4
-above. Earlier v2-v5 corrections are folded into this normative text; this
-section is changelog only.
+The v7 review required downgrade-window detection, current-epoch genesis
+selection, key-check binding, bounded lock acquisition and stale-holder
+recovery, removal of unreachable sequence retry, distributed benchmark shape,
+aligned benchmark gating, and a continuous reconciliation index. These are
+incorporated in Gates 0-4 above. Earlier v1-v6 correction summaries are
+retained in the reconciliation index below.
 
 ## Acceptance criteria
 
@@ -401,7 +428,8 @@ ARCH-003 implementation is ready for its delivery gates only when:
 - legacy rows have explicit `UNKNOWN` behavior;
 - baselines are verifiable; digest rotation starts a marked post-rotation
   genesis epoch, while all pre-rotation history remains `UNKNOWN` with no
-  in-ticket bridge or recovery path;
+  in-ticket bridge or recovery path; rollback downgrade windows are detected
+  by the generation marker and remain `UNKNOWN` until re-originated;
 - verifier reads are snapshot-consistent and read-only;
 - `DRIFT` is never produced from incomplete or ambiguous history;
 - verifier mutation and prompt-cache/gateway isolation tests pass;
@@ -417,6 +445,21 @@ ARCH-003 implementation is ready for its delivery gates only when:
 - all focused and relevant tests pass;
 - authenticated Claude + AGY implementation review reaches consensus;
 - no unrelated dirty worktree or DGX runtime state was changed.
+
+## Reconciliation changelog index
+
+- v1: writer model, snapshot mechanism, baseline/genesis fields, rotation and
+  rollback semantics, overhead/growth expectations, and direct safety tests.
+- v2-v4: folded into v1 and v4 normative Gate 0-4 text; revision commits are
+  retained in GitHub history.
+- v5: post-rotation genesis, current-sequence baseline checks, write-lock-first
+  discipline, fixed lock ordering, benchmark protocol, and WAL preconditions.
+- v6: cross-process maintenance-RW-lock granularity, immutable-open removal,
+  current-origin baseline requirement, successive-baseline conflict semantics.
+- v7: generation continuity for downgrade windows, current-epoch replay start,
+  key-check binding, lock timeout/stale-holder behavior, retry removal, and
+  distributed benchmark shape.
+
 
 ## Non-goals
 
