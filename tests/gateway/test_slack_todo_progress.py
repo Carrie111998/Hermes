@@ -447,3 +447,60 @@ async def test_gateway_rejects_stale_control_generation():
 
     runner._busy_stop_command.assert_not_awaited()
     adapter.handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_gateway_rejects_non_integer_control_generation():
+    runner, adapter, session_key, _active_task = _control_runner()
+    payload = _control_payload(session_key)
+    payload["generation"] = "not-a-generation"
+
+    assert not await runner.handle_slack_todo_action("stop", payload)
+
+    runner._busy_stop_command.assert_not_awaited()
+    adapter.handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_late_complete_does_not_overwrite_stopped_card():
+    adapter, client, _runner, state, body = await _project_action_card()
+    await adapter._handle_todo_action(
+        AsyncMock(),
+        body,
+        {"action_id": "hermes_todo_stop", "value": state.token},
+    )
+    client.chat_update.reset_mock()
+
+    newer = asyncio.Event()
+    setattr(newer, "_hermes_run_generation", 13)
+    adapter._active_sessions[state.session_key] = newer
+    await adapter.on_processing_complete(_event(), ProcessingOutcome.SUCCESS)
+
+    client.chat_update.assert_not_awaited()
+    assert state.closed is True
+    assert next(iter(adapter._todo_progress_states.values())).generation == 7
+
+
+@pytest.mark.asyncio
+async def test_complete_without_active_session_still_closes_card():
+    adapter, client = _slack_adapter()
+    session_key = "slack:T1:C1:111.1"
+    assert await adapter.project_todo_progress(
+        "C1",
+        _snapshot(),
+        metadata={"team_id": "T1", "thread_id": "111.1"},
+        session_key=session_key,
+        generation=4,
+        user_id="U1",
+    )
+    runner = MagicMock()
+    runner._session_key_for_source = MagicMock(return_value=session_key)
+    setattr(adapter, "gateway_runner", runner)
+
+    await adapter.on_processing_complete(_event(), ProcessingOutcome.SUCCESS)
+
+    assert next(iter(adapter._todo_progress_states.values())).closed is True
+    assert all(
+        block["type"] != "actions"
+        for block in client.chat_update.await_args.kwargs["blocks"]
+    )

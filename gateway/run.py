@@ -9228,13 +9228,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         running_agent = _busy_state.turn.agent if _busy_state else None
 
         busy_text_mode = self._effective_busy_text_mode(event.source)
-        effective_mode = self._busy_input_mode
-        busy_text_mode = getattr(self, "_busy_text_mode", "interrupt")
-        # EZ-525: authorized plain-text replies in an active Slack thread steer
-        # when the workspace is not explicitly in queue mode. Queue stays
-        # queue — do not silently override busy_input_mode / busy_text_mode.
-        # Media, internal completions, approvals, and commands keep their
-        # existing paths. A failed steer still falls back to FIFO below.
+        # Keep the profile-routed mode from above. Overwriting with the
+        # workspace-wide default would break multiplex steer/queue (#83648).
+        # EZ-525: authorized Slack thread replies steer unless the routed
+        # mode is already queue. Media, internal completions, approvals,
+        # and commands keep their existing paths.
         _slack_plain_text_reply = bool(
             event.source.platform == Platform.SLACK
             and event.source.thread_id
@@ -9243,7 +9241,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             and not event.media_types
         )
         _queue_configured = (
-            self._busy_input_mode == "queue" or busy_text_mode == "queue"
+            effective_mode == "queue" or busy_text_mode == "queue"
         )
         if _slack_plain_text_reply and not _queue_configured:
             effective_mode = "steer"
@@ -14739,7 +14737,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         thread_ts = str(payload.get("thread_ts") or "")
         user_id = str(payload.get("user_id") or "")
         session_key = str(payload.get("session_key") or "")
-        generation = int(payload.get("generation") or 0)
+        try:
+            generation = int(payload.get("generation") or 0)
+        except (TypeError, ValueError):
+            return False
         if not channel_id or not user_id or not session_key or not generation:
             return False
 

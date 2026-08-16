@@ -2790,6 +2790,16 @@ class SlackAdapter(BasePlatformAdapter):
             self._todo_progress_tokens.pop(state.token, None)
             self._todo_progress_by_run.pop((state.session_key, state.generation), None)
 
+    def _open_todo_generation(self, session_key: str) -> int:
+        """Return the newest still-open card generation for a session, if any."""
+        self._ensure_todo_progress_state()
+        open_generations = [
+            state.generation
+            for state in self._todo_progress_states.values()
+            if state.session_key == str(session_key) and not state.closed
+        ]
+        return max(open_generations) if open_generations else 0
+
     async def project_todo_progress(
         self,
         chat_id: str,
@@ -4134,8 +4144,9 @@ class SlackAdapter(BasePlatformAdapter):
         self, event: MessageEvent, outcome: ProcessingOutcome
     ) -> None:
         """Resolve todo UI, then swap the optional outcome reaction."""
-        # Finalize only the generation that actually completed. A late callback
-        # from an interrupted run cannot close a newer retry's card.
+        # Finalize only a card owned by this completing generation. A late
+        # callback must not close a newer retry's card: finalize matches
+        # session+generation and ignores already-closed states.
         try:
             runner = getattr(self, "gateway_runner", None)
             if runner is None:
@@ -4144,11 +4155,13 @@ class SlackAdapter(BasePlatformAdapter):
             if callable(session_key_fn):
                 session_key = str(session_key_fn(event.source))
                 active = self._active_sessions.get(session_key)
-                generation = getattr(active, "_hermes_run_generation", 0) or 0
+                generation = getattr(active, "_hermes_run_generation", None)
+                if not generation:
+                    generation = self._open_todo_generation(session_key)
                 if generation:
                     await self.finalize_todo_progress(
                         session_key,
-                        generation,
+                        int(generation),
                         terminal_status=outcome.value,
                     )
         except Exception:
@@ -7054,7 +7067,9 @@ class SlackAdapter(BasePlatformAdapter):
         if not normalized_user_id:
             return False
 
-        runner = getattr(getattr(self, "_message_handler", None), "__self__", None)
+        runner = getattr(self, "gateway_runner", None)
+        if runner is None:
+            runner = getattr(getattr(self, "_message_handler", None), "__self__", None)
         auth_fn = getattr(runner, "_is_user_authorized", None)
         if callable(auth_fn):
             try:
