@@ -2322,6 +2322,8 @@ export const en: Translations = {
     replaceCurrent: 'Replace current value',
     pasteApiKey: 'Paste API key',
     localApiKeyPlaceholder: 'API key (optional — only if your endpoint requires one)',
+    localEndpointTrust:
+      'Endpoint validation can reach private or local network addresses. Only enter an endpoint you trust.',
     couldNotSave: 'Could not save credential.',
     connecting: 'Connecting',
     update: 'Update',

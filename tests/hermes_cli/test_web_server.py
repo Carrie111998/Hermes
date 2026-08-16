@@ -3819,6 +3819,9 @@ class TestValidateProviderCredential:
         enumerate models: the optional api_key is sent as a Bearer header so the
         probe doesn't come back empty (the desktop loop's root cause)."""
         captured = {}
+        monkeypatch.setattr(
+            "tools.url_safety.is_always_blocked_url", lambda url: False
+        )
 
         class _Resp:
             status_code = 200
@@ -3894,6 +3897,34 @@ class TestValidateProviderCredential:
             json={"key": "OPENAI_BASE_URL", "value": "http://127.0.0.1:8000/v1"},
         )
         assert captured["headers"] is None
+
+    @pytest.mark.parametrize(
+        ("status", "message"),
+        [
+            (302, "Endpoint returned HTTP 302."),
+            (401, "The endpoint rejected the API key."),
+            (500, "Endpoint returned HTTP 500."),
+        ],
+    )
+    def test_local_endpoint_surfaces_http_errors(self, monkeypatch, status, message):
+        monkeypatch.setattr(
+            "tools.url_safety.is_always_blocked_url", lambda url: False
+        )
+        monkeypatch.setattr(
+            "tools.url_safety.create_ssrf_safe_async_client",
+            lambda **kwargs: _fake_httpx_async_client(status=status)(**kwargs),
+        )
+
+        data = self._post(
+            "OPENAI_BASE_URL", "https://text.example.com/v1"
+        ).json()
+
+        assert data == {
+            "ok": False,
+            "reachable": True,
+            "message": message,
+            "models": [],
+        }
 
     def test_named_custom_endpoint_probe_is_async(self, monkeypatch):
         """Custom endpoint validation must not block the dashboard event loop."""
@@ -4175,6 +4206,9 @@ class TestValidateCustomEndpointSsrf:
 
     def test_allows_public_https_endpoint(self, monkeypatch):
         client_kwargs = {}
+        monkeypatch.setattr(
+            "tools.url_safety.is_always_blocked_url", lambda url: False
+        )
 
         class _Resp:
             status_code = 200

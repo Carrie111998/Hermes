@@ -1931,6 +1931,7 @@ export interface Translations {
     replaceCurrent: string
     pasteApiKey: string
     localApiKeyPlaceholder: string
+    localEndpointTrust: string
     couldNotSave: string
     connecting: string
     update: string

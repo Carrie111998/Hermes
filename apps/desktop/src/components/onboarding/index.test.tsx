@@ -4,7 +4,7 @@ import { afterEach, describe, expect, it } from 'vitest'
 import { $desktopOnboarding, type DesktopOnboardingState, type OnboardingContext } from '@/store/onboarding'
 import type { OAuthProvider } from '@/types/hermes'
 
-import { Picker } from '.'
+import { ApiKeyForm, Picker } from '.'
 
 function provider(id: string, name = id): OAuthProvider {
   return {
@@ -123,5 +123,21 @@ describe('onboarding Picker', () => {
     render(<Picker ctx={ctx} />)
 
     expect(screen.queryByRole('button', { name: "I'll choose a provider later" })).toBeNull()
+  })
+})
+
+describe('ApiKeyForm', () => {
+  it('explains the private-network trust boundary for custom endpoints', () => {
+    render(
+      <ApiKeyForm
+        canGoBack={false}
+        initialEnvKey="OPENAI_BASE_URL"
+        onBack={() => undefined}
+        onSave={async () => ({ ok: true })}
+      />
+    )
+
+    expect(screen.getByText(/private or local network addresses/i)).toBeTruthy()
+    expect(screen.getByText(/only enter an endpoint you trust/i)).toBeTruthy()
   })
 })

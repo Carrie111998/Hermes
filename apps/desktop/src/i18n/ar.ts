@@ -1957,6 +1957,8 @@ export const ar = defineLocale({
     replaceCurrent: 'استبدال القيمة الحالية',
     pasteApiKey: 'ألصق مفتاح API',
     localApiKeyPlaceholder: 'مفتاح API (اختياري — فقط إذا كانت نقطة النهاية تتطلبه)',
+    localEndpointTrust:
+      'يمكن للتحقق من نقطة النهاية الوصول إلى عناوين الشبكة الخاصة أو المحلية. أدخل فقط نقطة نهاية تثق بها.',
     couldNotSave: 'تعذر حفظ بيانات الاعتماد.',
     connecting: 'جار الاتصال',
     update: 'تحديث',

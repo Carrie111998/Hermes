@@ -7568,6 +7568,20 @@ async def validate_provider_credential(body: EnvVarUpdate, request: Request):
         try:
             async with _endpoint_probe_client(timeout=httpx.Timeout(8.0)) as client:
                 resp = await client.get(url, headers=headers)
+            if resp.status_code in (401, 403):
+                return {
+                    "ok": False,
+                    "reachable": True,
+                    "message": "The endpoint rejected the API key.",
+                    "models": [],
+                }
+            if not resp.is_success:
+                return {
+                    "ok": False,
+                    "reachable": True,
+                    "message": f"Endpoint returned HTTP {resp.status_code}.",
+                    "models": [],
+                }
             return {"ok": True, "reachable": True, "message": "", "models": _parse_model_ids(resp)}
         except SSRFConnectionBlocked:
             return {

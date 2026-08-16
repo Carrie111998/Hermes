@@ -668,15 +668,18 @@ export function ApiKeyForm({
           value={value}
         />
         {isLocal ? (
-          <Input
-            autoComplete="off"
-            className="font-mono"
-            onChange={e => setLocalKey(e.target.value)}
-            onKeyDown={e => e.key === 'Enter' && void submit()}
-            placeholder={t.onboarding.localApiKeyPlaceholder}
-            type="password"
-            value={localKey}
-          />
+          <>
+            <Input
+              autoComplete="off"
+              className="font-mono"
+              onChange={e => setLocalKey(e.target.value)}
+              onKeyDown={e => e.key === 'Enter' && void submit()}
+              placeholder={t.onboarding.localApiKeyPlaceholder}
+              type="password"
+              value={localKey}
+            />
+            <p className="text-xs text-muted-foreground">{t.onboarding.localEndpointTrust}</p>
+          </>
         ) : null}
         {error ? <p className="text-xs text-destructive">{error}</p> : null}
       </div>

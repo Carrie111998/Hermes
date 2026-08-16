@@ -319,6 +319,9 @@ export function CustomEndpointsSettings({ onConfigSaved, onMainModelChanged }: C
                 placeholder="http://127.0.0.1:8081/v1"
                 value={form.baseUrl}
               />
+              <span>
+                Endpoint validation can reach private or local network addresses. Only enter an endpoint you trust.
+              </span>
             </label>
             <div className="grid gap-3 sm:grid-cols-[minmax(0,1fr)_12rem]">
               <label className="grid gap-1.5 text-xs text-muted-foreground">

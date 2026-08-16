@@ -2505,6 +2505,7 @@ export const zh: Translations = {
     replaceCurrent: '替换当前值',
     pasteApiKey: '粘贴 API 密钥',
     localApiKeyPlaceholder: 'API 密钥（可选 — 仅当端点需要时填写）',
+    localEndpointTrust: '端点验证可以访问专用或本地网络地址。请仅输入你信任的端点。',
     couldNotSave: '无法保存凭据。',
     connecting: '连接中',
     update: '更新',
