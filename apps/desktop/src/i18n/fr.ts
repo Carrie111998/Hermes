@@ -3005,6 +3005,23 @@ export const fr = defineLocale({
     }
   },
 
+  uninstall: {
+    dangerZone: 'Zone de danger',
+    checking: 'Vérification de l\'installation…',
+    confirmTitle: 'Désinstaller Hermes',
+    confirmBody: consequence => `Cela va supprimer ${consequence}. Tu pourras le réinstaller plus tard.`,
+    uninstalling: 'Désinstallation…',
+    yesUninstall: 'Oui, désinstaller',
+    cancel: 'Annuler',
+    uninstallHermes: 'Désinstaller Hermes',
+    uninstallDescription: 'Supprimer Hermes de cet ordinateur.',
+    options: {
+      gui: { title: 'GUI seulement', description: 'Supprime uniquement l\'application de bureau.', consequence: 'l\'application de bureau' },
+      lite: { title: 'Version lite (garder mes données)', description: 'Supprime l\'application mais garde vos données.', consequence: 'l\'application (données conservées)' },
+      full: { title: 'Désinstallation complète', description: 'Supprime tout, y compris toutes les données.', consequence: 'Hermes et toutes les données associées' }
+    }
+  },
+
   errors: {
     genericFailure: 'Quelque chose s\'est mal passé',
     boundaryTitle: 'Un problème est survenu dans l\'interface',
