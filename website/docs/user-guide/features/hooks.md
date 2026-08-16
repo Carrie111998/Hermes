@@ -740,7 +740,7 @@ def my_callback(session_id: str, user_message: str, assistant_response: str,
 | `model` | `str` | The model identifier |
 | `platform` | `str` | Where the session is running |
 | `sender_id` | `str` | Platform user identifier for gateway sessions, or an empty string when unavailable |
-| `usage` | `dict` | Session-cumulative input, output, cache, reasoning, prompt, completion, and total token counters at finalization |
+| `usage` | `dict` | Session-cumulative input, output, cache, reasoning, prompt, completion, and total token counters at finalization; subtract the previous observed totals when a plugin needs per-turn deltas |
 
 **Fires:** In `run_agent.py`, inside `run_conversation()`, after the tool loop exits with a final response. Guarded by `if final_response and not interrupted` — so it does **not** fire when the user interrupts mid-turn or the agent hits the iteration limit without producing a response.
 
