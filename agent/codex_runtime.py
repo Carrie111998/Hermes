@@ -26,6 +26,7 @@ from agent.stream_single_writer import claim_stream_writer, stream_writer_is_cur
 from agent.terminal_continuation import (
     BUDGET_EXHAUSTED_NOTICE,
     CONTINUATION_NUDGE,
+    MAX_TERMINAL_CONTINUATIONS,
     ContinuationReason,
 )
 
@@ -736,8 +737,31 @@ def run_codex_app_server_turn(
             )
         ]
 
+    def _apply_recovery_failure_notice(completed_turn) -> None:
+        original_text = completed_turn.final_text
+        checkpoint = fallback_candidate_text or original_text
+        detail = str(completed_turn.error or "interrupted")
+        completed_turn.final_text = (
+            f"{checkpoint.rstrip()}\n\n"
+            f"PAUSED — Codex app-server continuation failed: {detail}. "
+            "Fall back to the default runtime with `/codex-runtime auto`."
+        )
+        for projected in reversed(completed_turn.projected_messages):
+            if (
+                isinstance(projected, dict)
+                and projected.get("role") == "assistant"
+                and not projected.get("tool_calls")
+                and projected.get("content") == original_text
+            ):
+                projected["content"] = completed_turn.final_text
+                break
+        else:
+            completed_turn.projected_messages.append(
+                {"role": "assistant", "content": completed_turn.final_text}
+            )
+
     try:
-        for continuation_attempt in range(3):
+        for continuation_attempt in range(MAX_TERMINAL_CONTINUATIONS + 1):
             native_turn_attempts += 1
             current_turn = agent._codex_session.run_turn(user_input=next_input)
             codex_turns.append(current_turn)
@@ -759,6 +783,15 @@ def run_codex_app_server_turn(
                 or getattr(current_turn, "should_retire", False)
                 or not current_turn.final_text
             ):
+                if (
+                    current_turn.error is not None
+                    or getattr(current_turn, "should_retire", False)
+                    or (
+                        current_turn.interrupted
+                        and not getattr(agent, "_interrupt_requested", False)
+                    )
+                ):
+                    _apply_recovery_failure_notice(current_turn)
                 if fallback_candidate_text and not current_turn.final_text:
                     current_turn.final_text = fallback_candidate_text
                     current_turn.projected_messages.append(

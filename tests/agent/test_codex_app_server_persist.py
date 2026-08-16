@@ -239,7 +239,8 @@ def test_codex_recovery_error_stops_and_preserves_real_tool_events():
     durable_text = "\n".join(
         str(message.get("content") or "") for message in result["messages"]
     )
-    assert result["final_response"] == first.final_text
+    assert first.final_text in result["final_response"]
+    assert "PAUSED" in result["final_response"]
     assert "Running tests." in durable_text
     assert "25 failed" in durable_text
     assert "I'm now implementing the remaining" in durable_text
@@ -345,7 +346,8 @@ def test_codex_recovery_interruption_stops_without_third_turn():
     durable_text = "\n".join(
         str(message.get("content") or "") for message in result["messages"]
     )
-    assert result["final_response"] == first.final_text
+    assert first.final_text in result["final_response"]
+    assert "PAUSED" in result["final_response"]
     assert "25 failed" in durable_text
     assert "I'm now implementing the remaining" in durable_text
     assert "still incomplete" not in durable_text
@@ -553,6 +555,71 @@ def test_codex_false_stop_budget_exhaustion_is_visible():
     assert agent._codex_session.run_turn.call_count == 3
     assert "PAUSED" in result["final_response"]
     assert "budget exhausted" in result["final_response"]
+
+
+def test_codex_false_stop_loop_uses_shared_continuation_cap(monkeypatch):
+    from agent import codex_runtime
+
+    agent = _make_agent(session_db=None)
+    agent.api_mode = "codex_app_server"
+    agent.model = "gpt-5.6-terra"
+    agent._intent_ack_continuation = "auto"
+    agent.valid_tool_names = {"terminal"}
+    agent._strip_think_blocks.side_effect = lambda content: content
+    monkeypatch.setattr(codex_runtime, "MAX_TERMINAL_CONTINUATIONS", 1, raising=False)
+    session = agent._codex_session
+    session.run_turn.side_effect = [
+        _false_stop_turn("turn-1"),
+        _false_stop_turn("turn-2"),
+    ]
+    request = "Continue implementing the fix in /app until tests pass."
+
+    result = run_codex_app_server_turn(
+        agent,
+        user_message=request,
+        original_user_message=request,
+        messages=[{"role": "user", "content": request}],
+        effective_task_id="task-shared-cap",
+    )
+
+    assert session.run_turn.call_count == 2
+
+
+def test_codex_partial_retry_error_returns_checkpoint_with_pause_notice():
+    agent = _make_agent(session_db=None)
+    agent.api_mode = "codex_app_server"
+    agent.model = "gpt-5.6-terra"
+    agent._intent_ack_continuation = "auto"
+    agent.valid_tool_names = {"terminal"}
+    agent._strip_think_blocks.side_effect = lambda content: content
+    first = _false_stop_turn("turn-1")
+    failed = SimpleNamespace(
+        interrupted=False,
+        native_completed=False,
+        error="transport failed",
+        thread_id="thread-1",
+        turn_id="turn-2",
+        projected_messages=[{"role": "assistant", "content": "partial retry output"}],
+        tool_iterations=0,
+        final_text="partial retry output",
+        should_retire=True,
+        compacted=False,
+    )
+    agent._codex_session.run_turn.side_effect = [first, failed]
+    request = "Continue implementing the fix in /app until tests pass."
+
+    result = run_codex_app_server_turn(
+        agent,
+        user_message=request,
+        original_user_message=request,
+        messages=[{"role": "user", "content": request}],
+        effective_task_id="task-partial-retry-error",
+    )
+
+    assert result["error"] == "transport failed"
+    assert first.final_text in result["final_response"]
+    assert "PAUSED" in result["final_response"]
+    assert "partial retry output" not in result["final_response"]
 
 
 def test_codex_user_interrupt_is_reported_and_cleared():

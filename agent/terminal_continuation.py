@@ -113,6 +113,8 @@ _ALLOWED_FINISH_REASONS = {None, "", "stop", "completed"}
 
 
 class ContinuationReason(str, Enum):
+    # Enum members are singletons in Python; callers intentionally use ``is``
+    # so only this policy's canonical sentinel is treated as no-continuation.
     NONE = "none"
     INITIAL_INTENT_ACK = "initial_intent_ack"
     POST_TOOL_IMMEDIATE_ACTION = "post_tool_immediate_action"
