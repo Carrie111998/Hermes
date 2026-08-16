@@ -1281,6 +1281,18 @@ class SessionSearchMixin:
 
     _BROADEN_MAX_TERMS = 12
 
+    # Question/function words dropped from broadened queries before the term
+    # cap. Natural queries lead with these ("what error did the …"), and under
+    # a capped OR-join every stopword kept is a distinctive term crowded out.
+    # Lowercase only — uppercase AND/OR/NOT never reach here (explicit-syntax
+    # queries are not broadened).
+    _BROADEN_STOPWORDS = frozenset(
+        "a an and are as at be but by did do does for from had has have how in "
+        "into is it its no not of on or our say said that the their then there "
+        "these this to was we were what when where which who why will with you "
+        "your".split()
+    )
+
     @classmethod
     def _broaden_fts5_query(cls, query: str) -> Optional[str]:
         """OR-join a plain multi-word query for the zero-result recall fallback.
@@ -1294,13 +1306,17 @@ class SessionSearchMixin:
         Returns the broadened query, or None when broadening does not apply:
         single-term queries (nothing to broaden), queries already using
         explicit FTS5 syntax (quotes, ``*``, uppercase booleans), or queries
-        with no extractable terms. Terms shorter than 2 chars are dropped and
-        the term list is capped at ``_BROADEN_MAX_TERMS`` — BM25 ranking keeps
-        rare, specific terms on top regardless of how common the rest are.
+        with no extractable terms. Terms shorter than 2 chars and stopwords
+        are dropped (unless that would empty the query) and the term list is
+        capped at ``_BROADEN_MAX_TERMS``, so the cap spends its slots on the
+        distinctive terms BM25 can actually rank on.
         """
         if not query or cls._EXPLICIT_FTS_SYNTAX.search(query):
             return None
         terms = [t for t in cls._BROADEN_TERM.findall(query) if len(t) >= 2]
+        content_terms = [t for t in terms if t.lower() not in cls._BROADEN_STOPWORDS]
+        if len(content_terms) >= 2:
+            terms = content_terms
         # Dedupe preserving order; a repeated term adds nothing under OR.
         terms = list(dict.fromkeys(terms))[: cls._BROADEN_MAX_TERMS]
         if len(terms) < 2:

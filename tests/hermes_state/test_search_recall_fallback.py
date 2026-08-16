@@ -122,6 +122,16 @@ class TestBroadenHelper:
         assert terms.count("alpha") == 1
         assert len(terms) == SessionDB._BROADEN_MAX_TERMS
 
+    def test_stopwords_dropped_when_content_terms_remain(self):
+        q = SessionDB._broaden_fts5_query("what did the compiler report for main.rs")
+        terms = q.split(" OR ")
+        assert "what" not in terms and "the" not in terms
+        assert "compiler" in terms and '"main.rs"' in terms
+
+    def test_all_stopword_query_still_broadens(self):
+        # Dropping stopwords must never empty the query into a None.
+        assert SessionDB._broaden_fts5_query("what was that about") is not None
+
     def test_lowercase_or_is_a_plain_word(self):
         # FTS5 booleans are uppercase-only; "cats or dogs" is a plain query
         # and should broaden.
