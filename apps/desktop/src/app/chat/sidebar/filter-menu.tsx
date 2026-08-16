@@ -284,7 +284,7 @@ export function SidebarFilterMenu({ className }: { className?: string }) {
                 <DropdownMenuSubTrigger hideChevron>
                   {copy.savedViews}
                   <span className="ml-auto flex max-w-28 items-center gap-1 pl-4 text-(--ui-text-tertiary)">
-                    <span className="truncate">{activeSavedView?.name}</span>
+                    <span className="truncate">{activeSavedView?.name ?? '—'}</span>
                     <Codicon name="chevron-right" size="1rem" />
                   </span>
                 </DropdownMenuSubTrigger>

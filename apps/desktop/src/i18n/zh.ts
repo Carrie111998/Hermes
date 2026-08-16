@@ -2184,24 +2184,24 @@ export const zh: Translations = {
       rename: '重命名…',
       delete: '删除',
       saveTitle: '保存侧边栏视图',
-      saveDescription: '保存当前分组、排序、筛选、配置档范围、元数据和显示模式。',
+      saveDescription: '保存当前分组、排序、筛选、配置档案范围、元数据和显示模式。',
       renameTitle: '重命名侧边栏视图',
       renameDescription: '为此已保存视图设置新名称。',
-      applyTitle: '切换个人资料并使用视图？',
-      applyDescription: (name, profile) => `“${name}”会切换到“${profile}”个人资料并开始新聊天，然后应用该视图。`,
+      applyTitle: '切换配置档案并使用视图？',
+      applyDescription: (name, profile) => `“${name}”会切换到“${profile}”配置档案并开始新聊天，然后应用该视图。`,
       updateTitle: '更新已保存视图？',
       updateDescription: name => `要用当前侧边栏设置替换“${name}”吗？`,
       deleteTitle: '删除侧边栏视图？',
       deleteDescription: name => `删除“${name}”？这不会更改当前侧边栏。`,
       nameLabel: '名称',
-      namePlaceholder: '例如 待审核',
+      namePlaceholder: '例如：待审核',
       grouping: '分组',
       ordering: '排序',
       show: '显示',
       inboxStyle: '收件箱样式',
       status: '状态',
       pullRequest: '拉取请求',
-      profile: '配置档',
+      profile: '配置档案',
       project: '项目',
       archived: '已归档',
       resetToDefaults: '恢复默认设置',
@@ -2213,7 +2213,7 @@ export const zh: Translations = {
         none: '无',
         project: '项目',
         status: '状态',
-        profile: '配置档'
+        profile: '配置档案'
       },
       orderings: {
         updated: '更新时间',
@@ -2229,7 +2229,7 @@ export const zh: Translations = {
         tokens: '令牌',
         cost: '费用',
         pr: 'PR',
-        profile: '配置档'
+        profile: '配置档案'
       },
       statusFilters: {
         'needs-input': '需要输入',
