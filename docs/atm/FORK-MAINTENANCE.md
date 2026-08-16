@@ -1,0 +1,55 @@
+# Fork Maintenance — how randlee/hermes-agent tracks the upstream firehose
+
+Upstream (`NousResearch/hermes-agent`) lands 200–700 commits/day. This fork exists to
+carry ONE thing on top of it: the ATM injection patch stack (see
+`PATCH-REQUIREMENTS.md` in this directory — read it first; it is the contract).
+
+## Repo roles
+
+| Thing | Role |
+|---|---|
+| `main` | upstream/main + the ATM patch stack, advanced only by reviewed PR |
+| `atm/stack` branch | the patch stack (3 code commits + this docs commit), rebased onto upstream daily; force-push allowed HERE, never on main |
+| `sync/candidate-YYYYMMDD` branches | daily PR candidates produced by the cron |
+| `runtime-*` tags | sources of built runtimes (see `~/.hermes/RUNTIME-PLAN.md` on the gateway host) |
+| `~/Documents/forks/hermes-agent` (host) | integration WORKSPACE only — nothing executes from it (enforced by runtime-audit) |
+| `~/.hermes/runtime/<tag>/` (host) | immutable runtime installs; gateways run `runtime/current` |
+
+## Daily pipeline (2-level cron)
+
+**Level 1 — mechanical (no agent judgment):** `fork-sync-v2.sh` in a scratch clone:
+1. fetch upstream; branch `sync/candidate-YYYYMMDD` from `upstream/main`
+2. rebase `atm/stack` onto it (`git rebase`); a clean rebase proceeds, ANY conflict
+   → level 2
+3. fresh venv: `uv sync --frozen --no-dev --extra messaging`; run the seam contract
+   tests (`tests/gateway/test_inject_internal_message.py`, 26 expected) + hooks tests
+4. green → push candidate branch, `git format-patch upstream/main..` attached as PR
+   artifact, open PR to `main`
+5. review chain: **contessa** (local-llm) reviews the diff-vs-upstream and test
+   output — the diff must be exactly the known patch stack, nothing more; then the
+   **qwen reviewer** profile reviews contessa's review + the PR and approves/merges
+   (branch protection requires 1 approval). Disagreement or anything unexpected →
+   level 2.
+
+**Level 2 — escalation (agent judgment):** triggered by rebase conflict, test
+failure, or reviewer rejection. The escalation agent receives `PATCH-REQUIREMENTS.md`
+and follows its "How to update the patch" procedure. Its output is an updated
+`atm/stack` + a PR — never a direct push to main, never a force-push of main, never
+a branch-protection change. If the contract can't be met, it stops and reports to
+Rand with analysis.
+
+## Promotion (deliberate, not automatic)
+
+Merged main ≠ deployed. To deploy: tag, then on the gateway host
+`make-runtime.sh --repo <fork> --ref <tag> --name <runtime-N> --hermes-atm <ver>
+--atm-graft <ver>`, canary one profile, flip `runtime/current`, rolling restart.
+Rollback = flip the symlink back. Full procedure: `~/.hermes/RUNTIME-PLAN.md`.
+
+## History / lessons already learned
+
+- Merge-based daily syncs (the pre-2026-08-16 pipeline) accumulated conflict debt
+  and once ended with an agent force-pushing main and loosening branch protection.
+  Rebase-the-stack + PR + protected main is the replacement. Do not regress to it.
+- The patch's only recurring conflict is the `gateway/run.py` import block (trivial).
+- Goal state is patch size ZERO: if upstream ever ships a public injection API,
+  adapt hermes-atm to it and retire this stack.
