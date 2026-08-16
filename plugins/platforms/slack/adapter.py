@@ -2640,8 +2640,13 @@ class SlackAdapter(BasePlatformAdapter):
                     "ts": stream.stream_ts,
                     "chunks": chunks,
                 }
-                if fallback_text:
-                    append_payload["markdown_text"] = fallback_text
+                # Do NOT attach markdown_text here: chat.appendStream
+                # rejects a request carrying both markdown_text and chunks
+                # with `cannot_provide_both_markdown_text_and_chunks`, which
+                # made every native task-card update fail and downgraded
+                # each turn to the plain-text fallback (#87743). The chunks
+                # are the native rendering; the caller keeps its own
+                # editable-text fallback rail for when this call fails.
                 await client.api_call("chat.appendStream", json=append_payload)
                 return SendResult(success=True, message_id=stream.stream_ts)
             except Exception as exc:  # pragma: no cover - defensive logging
