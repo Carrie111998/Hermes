@@ -1,6 +1,6 @@
 ---
 title: "ARCH-003 implementation plan: runtime-state audit and replay verification"
-status: IMPLEMENTATION_PLAN_REVISE_V8_PENDING
+status: IMPLEMENTATION_PLAN_REVISE_V9_PENDING
 date: 2026-08-16
 type: implementation-plan
 ticket: ARCH-003
@@ -82,8 +82,13 @@ prompt construction, legacy `state.db`, or unrelated dirty worktree files.
 - Verify repository identity, design commit, branch, worktree, and merged
   runtime-state implementation.
 - Enumerate every process, thread, connection, scheduler path, maintenance
-  path, and privileged baseline/compaction path that can write runtime state.
-  Record the writer matrix before source edits.
+  path, materialized-row deletion/purge path, and privileged baseline/compaction
+  path that can write runtime state. Record the writer matrix before source
+  edits.
+- This ticket has no hard-delete or profile-purge event contract. If preflight
+  finds a delete path reaching runtime-state rows, stop implementation and
+  revise the plan before source edits; otherwise record an explicit no-delete
+  assertion and test it.
 - Use SQLite WAL mode for both the single-writer and multi-writer branches.
   Record and test `PRAGMA journal_mode=WAL`, the selected busy-timeout, and
   read-only WAL preconditions: `-wal` and `-shm` accessibility. The verifier
@@ -111,7 +116,7 @@ prompt construction, legacy `state.db`, or unrelated dirty worktree files.
 - Locate the existing local secret/key-storage mechanism without printing or
   copying secrets. If durable custody is unavailable, stop.
 - Define the journal migration version, event kinds, replay tuple, baseline
-  fields, genesis semantics, generation marker, key-check value, and rollback
+  fields, genesis semantics, generation record, key-check value, and rollback
   posture before edits.
 - Confirm that the prior release can start with the new journal table present
   and that rollback does not require deleting the table or losing materialized
@@ -140,14 +145,19 @@ Add a versioned runtime-state-owned journal table with:
 - baseline sealed lifecycle state, owner-version, state schema version, and
   sealed-through sequence when event kind is `baseline`.
 
-Add a materialized-row journal-writer generation marker. The upgraded runtime
-advances the database generation atomically on startup under the new schema
-version; every mutation/genesis updates the row marker and records the current
-generation in its event. A row whose marker is older than the current
-generation, or whose materialized state advanced without a corresponding
-current-generation event, is `UNKNOWN`, never `DRIFT`. A rollback-then-
-roll-forward cycle therefore keeps affected entities `UNKNOWN` until a
-subsequent journaled genesis/mutation re-establishes current-generation origin.
+Add a durable database-level current-generation record:
+`runtime_state_journal_meta.current_generation`, owned by the runtime-state
+migration/startup module. Only the upgraded startup path advances it. Gate 3
+reads it inside the same `BEGIN DEFERRED` snapshot as the event stream and
+materialized row.
+
+Add a materialized-row journal-writer generation marker. Every mutation/genesis
+updates the row marker and records the current generation in its event. A row
+whose marker is older than the current generation, or whose materialized state
+advanced without a corresponding current-generation event, is `UNKNOWN`, never
+`DRIFT`. A rollback-then-roll-forward cycle therefore keeps affected entities
+`UNKNOWN` until a subsequent journaled genesis/mutation re-establishes
+current-generation origin.
 
 The replay tuple is explicitly `lifecycle_state`, `owner_version`, and
 `state_schema_version`; terminality is derived from lifecycle state. The
@@ -168,11 +178,12 @@ The privileged baseline writer is an internal runtime-state maintenance
 operation with explicit operator authorization, outside the gateway, scheduler,
 and verifier surfaces. It acquires the exclusive side of the named
 cross-process maintenance RW lock before opening its SQLite WAL transaction,
-validates the sealed tuple against the current materialized row and current
-maximum sequence, appends the baseline event on the same connection, and
-releases the lock after commit or rollback. Production gateway, scheduler, and
-automatic-repair paths never invoke it in this ticket; hermetic tests may invoke
-it directly.
+verifies the target row's generation marker equals the current-generation
+record, validates the sealed tuple against the current materialized row and
+current maximum sequence, appends the baseline event on the same connection,
+and releases the lock after commit or rollback. Production gateway, scheduler,
+and automatic-repair paths never invoke it in this ticket; hermetic tests may
+invoke it directly.
 
 A valid baseline must be in or after a valid origin epoch under the current
 digest-parameter identifier. A legacy/pre-journal or pre-rotation entity with
@@ -196,10 +207,11 @@ for that entity covers only history from that genesis event onward. A truncated
 head without the required origin marker returns `UNKNOWN`.
 
 Digest parameter identifiers are persisted metadata; key material is never
-journaled. Persist the key-check as a truncated digest of a fixed known
-constant under the digest key. The verifier recomputes it before replay and
-returns `UNKNOWN` if the key-check does not match the identifier or if the key
-is unavailable.
+journaled. Use HMAC-SHA-256 for the entity digest and for the key-check over a
+fixed known constant; retain at least 128 bits of key-check output. Record the
+algorithm, truncation length, and key generation under the non-secret
+digest-parameter identifier. The verifier recomputes and compares the key-check
+before replay and returns `UNKNOWN` on mismatch or key unavailability.
 
 A digest-parameter rotation starts a new epoch: the first committed
 post-rotation replay-tuple mutation emits a marked genesis event under the new
@@ -245,11 +257,11 @@ Implement a bounded verifier that:
 
 - opens a read-only SQLite WAL connection and explicitly executes
   `BEGIN DEFERRED`; the first event-stream read establishes the snapshot,
-  and both the bounded event stream and materialized row are read after that
-  snapshot establishment and before the transaction ends. Immutable-open is
-  prohibited for this verifier;
-- validates the key-check value before replay and returns `UNKNOWN` on
-  identifier/key mismatch or key unavailability;
+  and the current-generation record, bounded event stream, and materialized row
+  are all read after that snapshot establishment and before the transaction
+  ends. Immutable-open is prohibited for this verifier;
+- validates the HMAC-SHA-256 key-check, algorithm/truncation parameters, and
+  digest identifier before replay;
 - returns per-entity `CONSISTENT`, `DRIFT`, or `UNKNOWN`;
 - treats `UNKNOWN` as absorbing;
 - requires complete verified history for `DRIFT`;
@@ -289,6 +301,7 @@ outside the `CONSISTENT` claim.
 Add deterministic tests for:
 
 - empty database and journal migration;
+- explicit no-delete assertion: no delete/purge path reaches runtime-state rows;
 - legacy populated rows returning `UNKNOWN`;
 - marked post-migration genesis adopting the before-state origin tuple and
   limiting `CONSISTENT` to post-genesis history;
@@ -298,16 +311,20 @@ Add deterministic tests for:
   disabled, roll forward, and assert verifier returns `UNKNOWN`, never
   `DRIFT`;
 - prior-version startup with the journal table present and rollback posture;
+- current-generation record advancement and concurrent generation advance during
+  verify returning `CONSISTENT` or `UNKNOWN`, never false `DRIFT`;
 - one event per committed replay-tuple mutation;
 - true no-op without an event;
 - owner-version-only mutation;
 - mutation/genesis journal failure rolling back materialized state;
 - SQLite WAL, selected busy-timeout, `BEGIN IMMEDIATE`, and read-only WAL
   preconditions;
-- `LOCK_ACQUIRE_TIMEOUT = 5s`, lock-timeout reason, stale-holder recovery,
-  and shared/exclusive cross-process RW-lock exclusion/release ordering;
+- `LOCK_ACQUIRE_TIMEOUT = 5s`, `LOCK_TIMEOUT` reason, stale-holder
+  recovery, and shared/exclusive cross-process RW-lock exclusion/release
+  ordering;
 - single-writer invariant and defensive abort; no sequence-collision retry is
   expected under write-lock-first discipline;
+- baseline generation-marker mismatch returning `UNKNOWN`;
 - bypass-path rejection for mutation/genesis while permitting the named baseline
   writer;
 - keyed digest/profile isolation, identifier/key-check mismatch, digest
@@ -328,8 +345,8 @@ Add deterministic tests for:
   read-transaction mechanism, returning `CONSISTENT` or `UNKNOWN`, never
   false `DRIFT`;
 - replay bound counted from the effective replay start point, current-epoch
-  genesis selection, baseline selection, conflicting/overlapping baselines,
-  generation mismatch, and closed reason codes;
+  genesis selection, baseline selection, generation mismatch, and closed
+  reason codes;
 - verifier-performs-no-writes using a direct database-change assertion;
 - materialized-row/history asymmetry returning `UNKNOWN`;
 - post-terminal events returning `UNKNOWN`;
@@ -406,14 +423,13 @@ must be incorporated before implementation authorization:
 These are plan-only corrections. They do not authorize source edits, migration,
 tests, DGX changes, deployment, repair, or event-sourcing.
 
-## Implementation-plan review reconciliation v7
+## Implementation-plan review reconciliation v8
 
-The v7 review required downgrade-window detection, current-epoch genesis
-selection, key-check binding, bounded lock acquisition and stale-holder
-recovery, removal of unreachable sequence retry, distributed benchmark shape,
-aligned benchmark gating, and a continuous reconciliation index. These are
-incorporated in Gates 0-4 above. Earlier v1-v6 correction summaries are
-retained in the reconciliation index below.
+The v8 review required a durable current-generation record in the verifier
+snapshot, explicit no-delete policy, acceptance wording aligned with the
+no-retry discipline, baseline generation checks, HMAC-SHA-256 key-check
+parameters, and one authoritative benchmark gate. These are incorporated in
+Gates 0-4 above. This section is changelog only.
 
 ## Acceptance criteria
 
