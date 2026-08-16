@@ -27,6 +27,7 @@ from tools.delegate_tool import (
     _build_child_agent,
     _build_child_progress_callback,
     _build_child_system_prompt,
+    _normalize_child_result,
     _strip_blocked_tools,
     _resolve_child_credential_pool,
     _resolve_delegation_credentials,
@@ -41,6 +42,8 @@ def _make_mock_parent(depth=0):
     parent.api_key="***"
     parent.provider = "openrouter"
     parent.api_mode = "chat_completions"
+    parent.acp_command = None
+    parent.acp_args = []
     parent.model = "anthropic/claude-sonnet-4"
     parent.platform = "cli"
     parent.providers_allowed = None
@@ -65,6 +68,8 @@ class TestDelegateRequirements(unittest.TestCase):
         self.assertIn("goal", props)
         self.assertIn("tasks", props)
         self.assertIn("context", props)
+        self.assertIn("read_only", props)
+        self.assertIn("read_only", props["tasks"]["items"]["properties"])
         # toolsets is intentionally NOT exposed to the model — subagents always
         # inherit the parent's toolsets. Letting the model name toolsets was a
         # capability-selection surface the model should not control.
@@ -140,9 +145,74 @@ class TestChildSystemPrompt(unittest.TestCase):
         self.assertNotIn("CONTEXT", prompt)
 
 class TestStripBlockedTools(unittest.TestCase):
+    def test_read_only_rejects_acp_transport(self):
+        parent = _make_mock_parent()
+        parent.acp_command = "copilot"
+        parent.acp_args = ["--stdio"]
+
+        with self.assertRaisesRegex(ValueError, "read_only delegation.*ACP"):
+            _build_child_agent(
+                task_index=0,
+                goal="Audit safely",
+                context=None,
+                toolsets=None,
+                model=None,
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+                role="leaf",
+                read_only=True,
+            )
+
+    def test_read_only_child_gets_exact_tool_allowlist_and_forces_leaf(self):
+        parent = _make_mock_parent()
+        parent.enabled_toolsets = ["hermes-cli"]
+
+        with (
+            patch("run_agent.AIAgent") as MockAgent,
+            patch("tools.delegate_tool._get_orchestrator_enabled", return_value=True),
+            patch("tools.delegate_tool._get_max_spawn_depth", return_value=2),
+        ):
+            child = MagicMock()
+            MockAgent.return_value = child
+            _build_child_agent(
+                task_index=0,
+                goal="Audit safely",
+                context=None,
+                toolsets=None,
+                model=None,
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+                role="orchestrator",
+                read_only=True,
+            )
+
+        _, kwargs = MockAgent.call_args
+        allowed = set(kwargs["allowed_tool_names"])
+        self.assertIn("read_file", allowed)
+        self.assertIn("search_files", allowed)
+        self.assertIn("web_search", allowed)
+        self.assertNotIn("terminal", allowed)
+        self.assertNotIn("execute_code", allowed)
+        self.assertNotIn("write_file", allowed)
+        self.assertNotIn("patch", allowed)
+        self.assertNotIn("tool_call", allowed)
+        self.assertNotIn("browser_click", allowed)
+        self.assertEqual(child._delegate_role, "leaf")
+        self.assertTrue(child._delegate_read_only)
     def test_removes_blocked_toolsets(self):
         result = _strip_blocked_tools(["terminal", "file", "delegation", "clarify", "memory", "code_execution"])
         self.assertEqual(sorted(result), ["code_execution", "file", "terminal"])
+
+    def test_result_envelope_is_present_on_failure_paths(self):
+        child = MagicMock()
+        child._delegate_read_only = True
+        for status in ("error", "timeout", "interrupted", "failed"):
+            entry = _normalize_child_result({"status": status}, child)
+            self.assertEqual(entry["semantic_status"], "not_applicable")
+            self.assertTrue(entry["read_only"])
+            self.assertEqual(entry["exit_reason"], status)
 
     def test_strips_cronjob_toolset(self):
         """Regression for issue #43466: child subagents must not inherit
@@ -1304,7 +1374,6 @@ class TestDelegateHeartbeat(unittest.TestCase):
             f"Heartbeat stopped too early while child was waiting on the model; "
             f"got {len(touch_calls)} touches",
         )
-
 
 class TestDelegationReasoningEffort(unittest.TestCase):
     """Tests for delegation.reasoning_effort config override."""
