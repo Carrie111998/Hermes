@@ -6071,6 +6071,15 @@ def _get_pre_tool_call_directive_details(
         # Snapshot the accumulated modify state as it stood when this approve
         # was seen: deferring the return must not retroactively pull in modify
         # directives that follow it.
+        #
+        # The copy is shallow, matching the ``dict(args)`` the accumulator
+        # itself is built from, and that is sufficient here: a later ``modify``
+        # reaches the accumulator only through ``modified_args.update(partial)``,
+        # which rebinds top-level keys rather than mutating the values behind
+        # them, so it cannot reach through this snapshot's shared references.
+        # Deep-copying would instead diverge from the documented shallow-merge
+        # contract for ``modify`` and silently break hooks that pass unpicklable
+        # or identity-significant objects through the args.
         first_approve = _PreToolCallDirective(
             action="approve", message=message, rule_key=rule_key,
             modified_args=dict(modified_args) if modified_args is not None else None,
