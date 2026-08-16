@@ -799,6 +799,7 @@ class TestDiscordVoiceChannelMethods:
         adapter._ready_event = MagicMock()
         adapter._post_connect_task = None
         adapter._missed_message_backfill_task = None
+        adapter._missed_message_backfill_periodic_task = None
 
         await adapter.disconnect()
 

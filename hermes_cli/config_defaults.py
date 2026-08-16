@@ -2070,6 +2070,7 @@ DEFAULT_CONFIG = {
         "missed_message_backfill": {
             "enabled": False,             # Replay missed Discord messages after reconnect/startup
             "channels": "",               # Comma-separated channel IDs; empty uses free_response_channels
+            "interval_seconds": 60,        # Periodic reconciliation cadence; 0 keeps only the ready-time scan
             "window_seconds": 21600,      # Only inspect messages from the last 6 hours
             "limit": 100,                 # Global cap on messages scanned per reconnect
             "max_dispatches": 10,         # Cap on recovered messages dispatched per reconnect
