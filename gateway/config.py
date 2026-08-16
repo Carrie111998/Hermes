@@ -2043,6 +2043,16 @@ def _warn_explicit_disable_beats_env(platform: Platform) -> None:
     )
 
 
+def is_email_send_only(extra: dict | None) -> bool:
+    """Return whether Email config explicitly selects outbound-only mode."""
+    extra = extra or {}
+    mode = str(extra.get("mode") or extra.get("delivery_mode") or "").strip().lower()
+    return mode in {
+        "send_only", "send-only", "smtp_only", "smtp-only",
+        "outbound_only", "outbound-only",
+    } or bool(extra.get("send_only", False))
+
+
 def _apply_env_overrides(config: GatewayConfig) -> None:
     """Apply environment variable overrides to config."""
     getenv = _getenv_str
@@ -2335,13 +2345,7 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
     email_send_only = False
     if email_config:
         email_extra = email_config.extra or {}
-        email_mode = str(
-            email_extra.get("mode") or email_extra.get("delivery_mode") or ""
-        ).strip().lower()
-        email_send_only = email_mode in {
-            "send_only", "send-only", "smtp_only", "smtp-only",
-            "outbound_only", "outbound-only",
-        } or bool(email_extra.get("send_only", False))
+        email_send_only = is_email_send_only(email_extra)
 
     if email_has_full_inbound or (email_has_smtp and email_send_only):
         # Honors an explicit ``platforms.email.enabled: false`` (#48820).
