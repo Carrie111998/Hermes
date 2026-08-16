@@ -1770,7 +1770,11 @@ export const en: Translations = {
         `${count} scheduled ${count === 1 ? 'job' : 'jobs'} will be skipped until you review their model settings.`,
       detailMore: (names, remaining) => `${names} and ${remaining} more`,
       review: 'Review scheduled jobs',
-      saveFailed: 'Hermes did not save that model change.'
+      saveFailed: 'Hermes did not save that model change.',
+      confirmTitle: 'Model Selection Warning',
+      confirmDetail: 'Confirm only if you accept this trade-off.',
+      confirmAction: 'Confirm',
+      declined: 'Model change cancelled — you declined the data-training tier warning.'
     },
     search: 'Search cron jobs...',
     loading: 'Loading cron jobs...',
@@ -3154,6 +3158,9 @@ export const en: Translations = {
     cwdStagedTitle: 'Working directory staged',
     cwdStagedMessage: 'Restart the desktop backend to apply cwd changes to this active session.',
     modelSwitchFailed: 'Model switch failed',
+    modelSwitchDeclined: 'Model switch cancelled — you declined the data-training tier warning.',
+    modelSwitchConfirmTitle: 'Model Selection Warning',
+    modelSwitchConfirmAction: 'Confirm',
     sessionExported: 'Session exported',
     sessionExportFailed: 'Could not export session',
     imageSaved: 'Image saved',
