@@ -395,7 +395,9 @@ def test_ensure_tui_cached_bundle_uses_root_lockfile_and_workspace_install(
     cache_dir = tmp_path / "home" / "cache" / "tui-bundle"
     build_dir = tmp_path / "home" / "cache" / "tui-bundle-build"
     monkeypatch.setattr(main_mod, "_tui_cached_bundle_dir", lambda: cache_dir)
-    monkeypatch.setattr(main_mod, "_tui_cached_build_dir", lambda: build_dir)
+    monkeypatch.setattr(
+        main_mod, "_tui_cached_build_dir", lambda _cache_root=None: build_dir
+    )
     monkeypatch.setattr(
         "hermes_constants.with_hermes_node_path",
         lambda env=None: {"PATH": "/managed-node/bin"},
@@ -474,7 +476,9 @@ def test_tui_cached_bundle_stamps_the_staged_copy(main_mod, tmp_path, monkeypatc
     cache_root = tmp_path / "home" / "cache" / "tui-bundle"
     build_dir = tmp_path / "home" / "cache" / "tui-bundle-build"
     monkeypatch.setattr(main_mod, "_tui_cached_bundle_dir", lambda: cache_root)
-    monkeypatch.setattr(main_mod, "_tui_cached_build_dir", lambda: build_dir)
+    monkeypatch.setattr(
+        main_mod, "_tui_cached_build_dir", lambda _cache_root=None: build_dir
+    )
     monkeypatch.setattr(main_mod, "_tui_workspace_writable", lambda _path: False)
     monkeypatch.setattr(main_mod, "_resolve_node_runtime_npm", lambda: "/usr/bin/npm")
 
@@ -648,7 +652,9 @@ def test_tui_cache_refresh_keeps_previous_returned_generation_launchable(
     cache_dir = tmp_path / "home" / "cache" / "tui-bundle"
     build_dir = tmp_path / "home" / "cache" / "tui-bundle-build"
     monkeypatch.setattr(main_mod, "_tui_cached_bundle_dir", lambda: cache_dir)
-    monkeypatch.setattr(main_mod, "_tui_cached_build_dir", lambda: build_dir)
+    monkeypatch.setattr(
+        main_mod, "_tui_cached_build_dir", lambda _cache_root=None: build_dir
+    )
     monkeypatch.setenv("HERMES_QUIET", "1")
 
     build_number = 0
@@ -850,6 +856,32 @@ def test_tui_redirect_detection_supports_python311_reparse_attributes(main_mod):
 
 
 @pytest.mark.skipif(os.name == "nt", reason="dir_fd hardening is POSIX-only")
+def test_tui_cache_paths_resolve_legitimate_symlinked_hermes_home(
+    monkeypatch, main_mod, tmp_path
+):
+    real_home = tmp_path / "real-home"
+    real_home.mkdir(mode=0o700)
+    linked_home = tmp_path / "linked-home"
+    linked_home.symlink_to(real_home, target_is_directory=True)
+    monkeypatch.setenv("HERMES_HOME", str(linked_home))
+
+    cache_root = main_mod._tui_cached_bundle_dir()
+    replacement_home = tmp_path / "replacement-home"
+    replacement_home.mkdir(mode=0o700)
+    linked_home.unlink()
+    linked_home.symlink_to(replacement_home, target_is_directory=True)
+    build_root = main_mod._tui_cached_build_dir(cache_root)
+
+    assert cache_root == real_home / "cache" / "tui-bundle"
+    assert build_root == real_home / "cache" / "tui-bundle-build"
+
+    main_mod._prepare_tui_cache_root(cache_root)
+
+    assert cache_root.is_dir()
+    assert not (replacement_home / "cache").exists()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="dir_fd hardening is POSIX-only")
 def test_tui_cache_root_creation_resists_parent_swap(
     monkeypatch, main_mod, tmp_path
 ):
@@ -884,8 +916,8 @@ def test_tui_cache_root_creation_resists_parent_swap(
 @pytest.mark.skipif(os.name == "nt", reason="POSIX ownership/mode gate")
 def test_tui_cache_root_rejects_group_writable_home(main_mod, tmp_path):
     home = tmp_path / "home"
-    home.mkdir(mode=0o770)
-    home.chmod(0o770)
+    home.mkdir(mode=0o2770)
+    home.chmod(0o2770)
     cache_root = home / "cache" / "tui-bundle"
 
     with pytest.raises(RuntimeError, match="private|unsafe"):

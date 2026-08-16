@@ -2205,16 +2205,22 @@ def _tui_workspace_writable(tui_dir: Path) -> bool:
         return False
 
 
+def _tui_cache_home() -> Path:
+    from hermes_constants import get_hermes_home
+
+    try:
+        return get_hermes_home().resolve(strict=False)
+    except (OSError, RuntimeError) as exc:
+        raise RuntimeError("unable to resolve TUI cache home") from exc
+
+
 def _tui_cached_bundle_dir() -> Path:
-    from hermes_constants import get_hermes_home
-
-    return get_hermes_home() / "cache" / "tui-bundle"
+    return _tui_cache_home() / "cache" / "tui-bundle"
 
 
-def _tui_cached_build_dir() -> Path:
-    from hermes_constants import get_hermes_home
-
-    return get_hermes_home() / "cache" / "tui-bundle-build"
+def _tui_cached_build_dir(cache_root: Optional[Path] = None) -> Path:
+    cache_root = cache_root or _tui_cached_bundle_dir()
+    return cache_root.with_name("tui-bundle-build")
 
 
 def _tui_path_is_redirect(path: Path) -> bool:
@@ -2625,7 +2631,7 @@ def _ensure_tui_cached_bundle(
             return cache_dir
 
         source_root = _workspace_root(tui_dir)
-        build_dir = _tui_cached_build_dir()
+        build_dir = _tui_cached_build_dir(cache_root)
         if _tui_path_has_redirect(build_dir, anchor=cache_home):
             raise RuntimeError("refusing unsafe TUI cache build path")
         generations = _tui_cached_generations_dir(cache_root, create=True)
