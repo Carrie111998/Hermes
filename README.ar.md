@@ -18,6 +18,7 @@
   <a href="README.zh-CN.md"><img src="https://img.shields.io/badge/Lang-中文-red?style=for-the-badge" alt="中文"></a>
   <a href="README.ur-pk.md"><img src="https://img.shields.io/badge/Lang-اردو-green?style=for-the-badge" alt="اردو"></a>
   <a href="README.es.md"><img src="https://img.shields.io/badge/Lang-Español-orange?style=for-the-badge" alt="Español"></a>
+  <a href="README.ar.md"><img src="https://img.shields.io/badge/Lang-العربية-teal?style=for-the-badge" alt="العربية"></a>
 </p>
 
 **وكيل الذكاء الاصطناعي الذي يطوّر نفسه بنفسه، من بناء [Nous Research](https://nousresearch.com).** إنه الوكيل الوحيد المزوّد بحلقة تعلّم مدمجة (learning loop) — يبتكر مهارات من تجاربه، ويحسّنها أثناء الاستخدام، ويذكّر نفسه بحفظ ما تعلّمه، ويبحث في محادثاته السابقة، ويكوّن عنك، جلسة بعد جلسة، فهمًا أعمق. شغّله على خادم VPS بخمسة دولارات، أو على عنقود GPU‏ (cluster)، أو على بنية بلا خوادم (serverless) لا تكلّف شيئًا يُذكر وهي خاملة. وهو غير مقيّد بجهازك — كلّمه من تيليجرام بينما يعمل على جهاز افتراضي (VM) في السحابة.
