@@ -16,6 +16,14 @@ transport:
 auth:
   type: oauth
 
+# Composer-suggestion triggers (desktop brand pills).
+suggest:
+  keywords:
+    - flax
+    - flaxsites
+  hosts:
+    - flaxsites.com
+
 # Leave the tool selection unset so the install-time checklist can show the
 # current Flax tool surface. New hosted tools are discovered on reconnect; a
 # user with a fixed allowlist can revisit it with `hermes mcp configure flax`.
