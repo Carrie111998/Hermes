@@ -9631,6 +9631,25 @@ def _collect_kanban_notifications(session: dict) -> list:
         from hermes_cli import kanban_db as _kb
     except Exception:
         return []
+    try:
+        session_db = _get_db()
+    except Exception:
+        return []
+    if session_db is None:
+        return []
+
+    def _subscription_belongs_here(sub: dict) -> bool:
+        owner_key = str(sub.get("chat_id") or "")
+        if not owner_key:
+            return False
+        try:
+            resolved_key = session_db.resolve_notification_owner_session_id(
+                owner_key
+            )
+        except Exception:
+            return False
+        return bool(resolved_key) and str(resolved_key) == session_key
+
     texts: list = []
     try:
         boards = _kb.list_boards(include_archived=False)
@@ -9656,15 +9675,19 @@ def _collect_kanban_notifications(session: dict) -> list:
         if resolved in seen_db_paths:
             continue
         seen_db_paths.add(resolved)
-        # A poller runs per live TUI/Desktop session. Avoid opening this board
-        # writable unless it has a subscription owned by this exact session;
-        # subscriptions for gateways or other sessions are not actionable here.
+        # A poller runs per live TUI/Desktop session. Inspect subscriptions
+        # read-only and resolve their durable owner through compression lineage
+        # before opening the board writable. Resolving even an exact raw-key
+        # match prevents a stale parent runtime from claiming its live tip's
+        # event. Missing or ambiguous lineage fails closed without moving the
+        # subscription cursor.
         try:
-            if _kb.count_notify_subs(
-                board=slug,
-                platform="tui",
-                chat_id=session_key,
-            ) == 0:
+            probe_subs = _kb.list_notify_subs_readonly(board=slug)
+            if not any(
+                (sub.get("platform") or "").lower() == "tui"
+                and _subscription_belongs_here(sub)
+                for sub in probe_subs
+            ):
                 continue
         except Exception:
             # Preserve delivery if the read-only probe cannot inspect a
@@ -9682,16 +9705,21 @@ def _collect_kanban_notifications(session: dict) -> list:
             for sub in subs:
                 if (sub.get("platform") or "").lower() != "tui":
                     continue
-                if sub.get("chat_id") != session_key:
-                    continue
-                _old, _new, events = _kb.claim_unseen_events_for_sub(
-                    conn,
-                    task_id=sub["task_id"],
-                    platform=sub["platform"],
-                    chat_id=sub["chat_id"],
-                    thread_id=sub.get("thread_id") or "",
-                    kinds=_KANBAN_NOTIFY_KINDS,
+                claimed = session_db.claim_if_notification_owner(
+                    str(sub.get("chat_id") or ""),
+                    session_key,
+                    lambda: _kb.claim_unseen_events_for_sub(
+                        conn,
+                        task_id=sub["task_id"],
+                        platform=sub["platform"],
+                        chat_id=sub["chat_id"],
+                        thread_id=sub.get("thread_id") or "",
+                        kinds=_KANBAN_NOTIFY_KINDS,
+                    ),
                 )
+                if claimed is None:
+                    continue
+                _old, _new, events = claimed
                 if not events:
                     continue
                 task = _kb.get_task(conn, sub["task_id"])

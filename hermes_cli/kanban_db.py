@@ -11201,6 +11201,28 @@ def list_notify_subs(
     return out
 
 
+def list_notify_subs_readonly(
+    db_path: Optional[Path] = None,
+    *,
+    board: Optional[str] = None,
+) -> list[dict]:
+    """List notification subscriptions without opening the board writable."""
+    path = db_path if db_path is not None else kanban_db_path(board=board)
+    if not path.exists():
+        return []
+    conn = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
+    conn.row_factory = sqlite3.Row
+    try:
+        try:
+            return list_notify_subs(conn)
+        except sqlite3.OperationalError as exc:
+            if "no such table" in str(exc).lower():
+                return []
+            raise
+    finally:
+        conn.close()
+
+
 def count_notify_subs(
     db_path: Optional[Path] = None,
     *,
