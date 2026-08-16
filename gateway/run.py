@@ -8381,6 +8381,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         `/reasoning <level>` is session-scoped by default. `--global` may be
         supplied in any position to persist the change to config.yaml.
+        `--session` is accepted as an explicit no-op for parity with the CLI
+        handlers (which strip it too) — it must not survive into the value
+        token, or `/temperature 0.8 --session` would fail the float() parse.
         """
         import shlex
 
@@ -8397,6 +8400,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         for token in tokens:
             if token == "--global":
                 persist_global = True
+            elif token == "--session":
+                # Explicit no-op: session scope is the default. Strip it so
+                # value parsers (e.g. float() in /temperature) never see it.
+                continue
             else:
                 value_tokens.append(token)
         return " ".join(value_tokens).strip().lower(), persist_global
@@ -20343,7 +20350,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             self._reasoning_config = reasoning_config
             self._service_tier = self._resolve_session_service_tier(source=source)
-            turn_route = self._resolve_turn_agent_config(prompt, model, runtime_kwargs)
+            # Resolve the session key so a session-scoped /temperature
+            # override applies to background sub-agent turns too (same
+            # behavior as the main-turn call site).
+            try:
+                _bg_session_key = self._session_key_for_source(source)
+            except Exception:
+                _bg_session_key = None
+            turn_route = self._resolve_turn_agent_config(
+                prompt, model, runtime_kwargs, session_key=_bg_session_key
+            )
 
             # Enrich the prompt with image descriptions so the background
             # agent can see user-attached images (same as the main flow).

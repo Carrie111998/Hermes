@@ -2942,10 +2942,24 @@ class APIServerAdapter(BasePlatformAdapter):
         if request_service_tier is not _REQUEST_OPTION_MISSING:
             agent_kwargs["service_tier"] = request_service_tier
         if request_generation_params:
-            agent_kwargs["request_overrides"] = {
-                **dict(agent_kwargs.get("request_overrides") or {}),
-                **request_generation_params,
-            }
+            # max_tokens must NOT ride through request_overrides: the
+            # transports merge request_overrides into the final API kwargs
+            # AFTER max_tokens resolution, so a raw "max_tokens" key would
+            # clobber the provider-correct key (max_tokens vs
+            # max_completion_tokens) chosen by max_tokens_param_fn — and the
+            # codex transport applies overrides before its max_tokens
+            # handling, silently dropping it there. Route it through the
+            # dedicated AIAgent(max_tokens=...) kwarg instead, which flows
+            # through the provider-aware path on every transport.
+            _gen_overrides = dict(request_generation_params)
+            _gen_max_tokens = _gen_overrides.pop("max_tokens", None)
+            if _gen_max_tokens is not None:
+                agent_kwargs["max_tokens"] = _gen_max_tokens
+            if _gen_overrides:
+                agent_kwargs["request_overrides"] = {
+                    **dict(agent_kwargs.get("request_overrides") or {}),
+                    **_gen_overrides,
+                }
 
         agent = AIAgent(**agent_kwargs)
         agent._hermes_api_runtime = {

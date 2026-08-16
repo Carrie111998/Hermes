@@ -3408,6 +3408,11 @@ class CLICommandsMixin:
         self.agent = None  # Force agent re-init with new temperature
 
         if explicit_global and save_config_value("model.temperature", new_temp):
+            # Global write supersedes any session override — clear it so a
+            # stale override can't shadow a later config edit (parity with
+            # the gateway /temperature handler).
+            self.temperature_override = None
+            self.agent = None  # Force agent re-init with the config default
             _cprint(f"  {_ACCENT}✓ Generation temperature set to {new_temp} (saved to config){_RST}")
         elif explicit_global:
             _cprint(f"  {_ACCENT}✓ Generation temperature set to {new_temp} (session only; config save failed){_RST}")
