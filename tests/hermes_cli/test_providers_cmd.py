@@ -409,3 +409,143 @@ class TestRouteCommand:
         pc._cmd_route(route_args(require_parameters=True, data_collection="deny"))
         assert store["provider_routing"]["require_parameters"] is True
         assert store["provider_routing"]["data_collection"] == "deny"
+
+
+# ---------------------------------------------------------------------------
+# /provider slash command — parse + apply
+# ---------------------------------------------------------------------------
+
+
+class TestParseProviderSlashArgs:
+    def test_bare(self):
+        assert pc.parse_provider_slash_args("") == {"global": False}
+
+    def test_bare_global_flag_only(self):
+        assert pc.parse_provider_slash_args("--global") == {"global": True}
+
+    def test_single_provider_forces_order(self):
+        assert pc.parse_provider_slash_args("DeepInfra") == {
+            "order": ["DeepInfra"],
+            "global": False,
+        }
+
+    def test_csv_providers(self):
+        assert pc.parse_provider_slash_args("DeepInfra, Decart") == {
+            "order": ["DeepInfra", "Decart"],
+            "global": False,
+        }
+
+    def test_sort(self):
+        assert pc.parse_provider_slash_args("sort price") == {"sort": "price", "global": False}
+        assert pc.parse_provider_slash_args("sort latency") == {"sort": "latency", "global": False}
+
+    def test_sort_invalid_raises(self):
+        with pytest.raises(ValueError):
+            pc.parse_provider_slash_args("sort cheapest")
+
+    def test_only_and_ignore(self):
+        assert pc.parse_provider_slash_args("only Anthropic, Google") == {
+            "only": ["Anthropic", "Google"],
+            "global": False,
+        }
+        assert pc.parse_provider_slash_args("ignore DeepInfra") == {
+            "ignore": ["DeepInfra"],
+            "global": False,
+        }
+
+    def test_require_parameters(self):
+        assert pc.parse_provider_slash_args("require-parameters") == {
+            "require_parameters": True,
+            "global": False,
+        }
+
+    def test_data_collection(self):
+        assert pc.parse_provider_slash_args("data-collection deny") == {
+            "data_collection": "deny",
+            "global": False,
+        }
+
+    def test_data_collection_invalid_raises(self):
+        with pytest.raises(ValueError):
+            pc.parse_provider_slash_args("data-collection maybe")
+
+    def test_clear_variants(self):
+        for value in ("clear", "reset", "off"):
+            assert pc.parse_provider_slash_args(value) == {"clear": True, "global": False}
+
+    def test_global_flag(self):
+        assert pc.parse_provider_slash_args("DeepInfra --global") == {
+            "order": ["DeepInfra"],
+            "global": True,
+        }
+        assert pc.parse_provider_slash_args("--global DeepInfra") == {
+            "order": ["DeepInfra"],
+            "global": True,
+        }
+        assert pc.parse_provider_slash_args("clear --global") == {"clear": True, "global": True}
+
+
+class TestApplySessionProviderRouting:
+    def _session(self):
+        return SimpleNamespace(
+            _providers_order=None,
+            _provider_sort=None,
+            _providers_only=None,
+            _providers_ignore=None,
+            _provider_require_params=False,
+            _provider_data_collection=None,
+        )
+
+    def _agent(self):
+        return SimpleNamespace(
+            providers_order=None,
+            provider_sort=None,
+            providers_allowed=None,
+            providers_ignored=None,
+            provider_require_parameters=False,
+            provider_data_collection=None,
+        )
+
+    def test_order_applied_to_session_and_agent(self):
+        session, agent = self._session(), self._agent()
+        changes = pc.apply_session_provider_routing(session, agent, {"order": ["DeepInfra"]})
+        assert session._providers_order == ["DeepInfra"]
+        assert agent.providers_order == ["DeepInfra"]
+        assert changes == ["order=['DeepInfra']"]
+
+    def test_sort_and_ignore(self):
+        session, agent = self._session(), self._agent()
+        pc.apply_session_provider_routing(session, agent, {"sort": "price", "ignore": ["X"]})
+        assert session._provider_sort == "price"
+        assert session._providers_ignore == ["X"]
+        assert agent.provider_sort == "price"
+        assert agent.providers_ignored == ["X"]
+
+    def test_agent_none_still_mutates_session(self):
+        session = self._session()
+        pc.apply_session_provider_routing(session, None, {"sort": "price"})
+        assert session._provider_sort == "price"
+
+    def test_clear_resets_session_and_agent(self):
+        session, agent = self._session(), self._agent()
+        session._providers_order = ["DeepInfra"]
+        agent.providers_order = ["DeepInfra"]
+        changes = pc.apply_session_provider_routing(session, agent, {"clear": True})
+        assert session._providers_order is None
+        assert agent.providers_order is None
+        assert session._provider_require_params is False
+        assert "cleared" in changes[0]
+
+    def test_empty_parsed_no_changes(self):
+        session, agent = self._session(), self._agent()
+        assert pc.apply_session_provider_routing(session, agent, {}) == []
+
+
+class TestSlashRegistry:
+    def test_provider_in_command_registry(self):
+        from hermes_cli.commands import resolve_command
+
+        cmd = resolve_command("provider")
+        assert cmd is not None
+        assert cmd.name == "provider"
+        assert cmd.cli_only is True

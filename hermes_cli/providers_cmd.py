@@ -316,12 +316,6 @@ def _parse_csv(raw: str) -> list:
     return [p.strip() for p in (raw or "").split(",") if p.strip()]
 
 
-def _set_routing_value(pr: dict, key: str, value) -> None:
-    if value is None:
-        return
-    pr[key] = list(value) if isinstance(value, (list, tuple)) else value
-
-
 def _cmd_route(args) -> None:
     """Show or update the ``provider_routing`` config section."""
     from hermes_cli.config import load_config, save_config
@@ -390,6 +384,107 @@ def _cmd_route(args) -> None:
     print("  Takes effect on the next session (restart the CLI or gateway).")
     print("  Only applies to OpenRouter / Nous Portal routes.")
     print()
+
+
+# ---------------------------------------------------------------------------
+# /provider slash command — session-scoped routing (parse + apply are pure)
+# ---------------------------------------------------------------------------
+
+_SORT_VALUES = {"price", "throughput", "latency"}
+
+
+def parse_provider_slash_args(arg_str: str) -> dict:
+    """Parse ``/provider`` arguments into a routing delta dict.
+
+    Forms (anything else is treated as a provider name to force):
+      ``''``                      -> ``{}`` (show current) + maybe global
+      ``DeepInfra``               -> ``{'order': ['DeepInfra']}``
+      ``DeepInfra, Decart``       -> ``{'order': ['DeepInfra', 'Decart']}``
+      ``sort price``              -> ``{'sort': 'price'}``
+      ``only A,B`` / ``ignore A,B`` -> ``{'only': [...]}`` / ``{'ignore': [...]}``
+      ``require-parameters``      -> ``{'require_parameters': True}``
+      ``data-collection deny``    -> ``{'data_collection': 'deny'}``
+      ``clear``/``reset``/``off`` -> ``{'clear': True}``
+      appended ``--global``       -> ``{'global': True}`` (persist to config)
+
+    Raises ValueError for invalid sort/data-collection values.
+    """
+    tokens = (arg_str or "").split()
+    persist = "--global" in tokens
+    tokens = [t for t in tokens if t != "--global"]
+    raw = " ".join(tokens).strip()
+    if not raw:
+        return {"global": persist}
+    if raw in {"clear", "reset", "off"}:
+        return {"clear": True, "global": persist}
+    first = tokens[0]
+    rest = " ".join(tokens[1:]).strip()
+    if first == "sort":
+        if rest not in _SORT_VALUES:
+            raise ValueError("sort must be one of: price, throughput, latency")
+        return {"sort": rest, "global": persist}
+    if first in {"only", "ignore", "data-collection", "require-parameters"}:
+        if first == "require-parameters":
+            return {"require_parameters": True, "global": persist}
+        if first == "data-collection":
+            if rest not in {"allow", "deny"}:
+                raise ValueError("data-collection must be 'allow' or 'deny'")
+            return {"data_collection": rest, "global": persist}
+        return {first: _parse_csv(rest), "global": persist}
+    # Bare provider name(s) — force the order.
+    return {"order": _parse_csv(raw), "global": persist}
+
+
+def apply_session_provider_routing(session, agent, parsed: dict) -> list:
+    """Apply a parsed ``/provider`` delta to session + live agent attrs.
+
+    ``session`` carries the startup-read routing attributes (HermesCLI:
+    ``_providers_order``, ``_provider_sort``, ``_providers_only``,
+    ``_providers_ignore``, ``_provider_require_params``,
+    ``_provider_data_collection``). ``agent`` is the optional live AIAgent
+    whose per-request attributes (``providers_order``, ``provider_sort``,
+    ``providers_allowed``, ``providers_ignored``,
+    ``provider_require_parameters``, ``provider_data_collection``) are
+    mutated so the NEXT API call honors the change immediately (the routing
+    preferences are read per request build in
+    ``agent.chat_completion_helpers._provider_preferences_for_agent``).
+
+    Returns human-readable change lines (empty = no change requested).
+    """
+    def _set(session_attr: str, agent_attr: str, value) -> None:
+        setattr(session, session_attr, value)
+        if agent is not None:
+            setattr(agent, agent_attr, value)
+
+    changes: list = []
+    if parsed.get("clear"):
+        _set("_providers_order", "providers_order", None)
+        _set("_provider_sort", "provider_sort", None)
+        _set("_providers_only", "providers_allowed", None)
+        _set("_providers_ignore", "providers_ignored", None)
+        _set("_provider_require_params", "provider_require_parameters", False)
+        _set("_provider_data_collection", "provider_data_collection", None)
+        return ["routing cleared (OpenRouter default)"]
+
+    if "order" in parsed:
+        _set("_providers_order", "providers_order", parsed["order"])
+        changes.append(f"order={parsed['order']}")
+    if "sort" in parsed:
+        _set("_provider_sort", "provider_sort", parsed["sort"])
+        changes.append(f"sort={parsed['sort']}")
+    if "only" in parsed:
+        _set("_providers_only", "providers_allowed", parsed["only"])
+        changes.append(f"only={parsed['only']}")
+    if "ignore" in parsed:
+        _set("_providers_ignore", "providers_ignored", parsed["ignore"])
+        changes.append(f"ignore={parsed['ignore']}")
+    if parsed.get("require_parameters"):
+        _set("_provider_require_params", "provider_require_parameters", True)
+        changes.append("require_parameters=true")
+    if "data_collection" in parsed:
+        _set("_provider_data_collection", "provider_data_collection", parsed["data_collection"])
+        changes.append(f"data_collection={parsed['data_collection']}")
+    return changes
 
 
 # ---------------------------------------------------------------------------
