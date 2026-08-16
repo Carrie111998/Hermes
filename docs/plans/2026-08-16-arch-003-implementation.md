@@ -1,6 +1,6 @@
 ---
 title: "ARCH-003 implementation plan: runtime-state audit and replay verification"
-status: IMPLEMENTATION_PLAN_REVISE_V16_PENDING
+status: IMPLEMENTATION_PLAN_REVISE_V17_PENDING
 date: 2026-08-16
 type: implementation-plan
 ticket: ARCH-003
@@ -192,8 +192,10 @@ journal emission succeeds. Non-replay-tuple-only updates do not increment it
 and remain outside the verifier's `CONSISTENT` claim. A database-level
 trigger restricted to the replay-tuple columns, with a value-change predicate,
 or an equivalent write guard must preserve this increment for any prior writer
-that can mutate those columns. The mutation/genesis transaction records the
-counter before/after values in its event and updates the row marker. A row whose marker is older
+that can mutate those columns. Choose exactly one increment mechanism; the
+new writer must not increment the counter both in application code and in the
+trigger/write-guard. The mutation/genesis transaction records the counter
+before/after values in its event and updates the row marker. A row whose marker is older
 than the current generation, or whose materialized counter is greater than the
 latest journaled counter for that entity, is `UNKNOWN`, never `DRIFT`. Every event's before-counter must equal the immediately preceding event's
 after-counter, or the baseline's sealed counter. A marked genesis for an
@@ -207,10 +209,13 @@ result may be `DRIFT` with `DRIFT_DETECTED`. This is the concrete
 discriminator between an unjournaled state advance and genuine drift. A rollback-then-roll-forward cycle therefore keeps affected entities
 `UNKNOWN`. A strictly newer writer epoch can re-originate on its first
 journaled mutation as defined above; a same-epoch counter-gap entity has no
-automatic or plain-mutation recovery path in this ticket. Its next ordinary
-mutation is rejected with `WRITE_ABORT` until a separately authorized
-re-originating operation exists. A same-epoch process restart does not advance
-`current_generation`; an unjournaled write is detected by the counter gap.
+automatic or plain-mutation recovery path. Its next ordinary mutation is
+rejected with `WRITE_ABORT`. The only in-ticket exit is a separately
+authorized, out-of-band re-originating genesis operation, which records a new
+origin marker using the observed materialized counter as its before-counter;
+it is not callable by the gateway, scheduler, verifier, or automatic-repair
+path. A same-epoch process restart does not advance `current_generation`;
+an unjournaled write is detected by the counter gap.
 
 The replay tuple is explicitly `lifecycle_state`, `owner_version`, and
 `state_schema_version`; terminality is derived from lifecycle state. The
@@ -233,8 +238,13 @@ and verifier surfaces. It acquires the exclusive side of the named
 cross-process maintenance RW lock before opening its SQLite WAL transaction,
 verifies the target row's generation marker equals the current-generation
 record, validates the sealed tuple against the current materialized row and
-current maximum sequence, appends the baseline event on the same connection,
-and releases the lock after commit or rollback. Production gateway, scheduler,
+current maximum sequence, and also requires the materialized counter to equal
+the latest journaled after-counter (or prior baseline sealed counter). A
+counter-gap entity cannot be sealed across by this baseline writer: it refuses
+with mutation-side `WRITE_ABORT`, appends no baseline, and leaves the entity
+for the separately authorized re-originating genesis operation. Otherwise it
+appends the baseline event on the same connection and releases the lock after
+commit or rollback. Production gateway, scheduler,
 and automatic-repair paths never invoke it in this ticket; hermetic tests may
 invoke it directly.
 
@@ -307,6 +317,8 @@ Migration compatibility tests must assert this posture.
   and starts a new counter-continuity epoch. A strictly newer writer-epoch
   re-originating genesis is the other explicit exception; it starts a new
   selected replay epoch and supersedes the prior gap as defined by Gate 3.
+  The separately authorized same-epoch re-originating genesis is the third
+  explicit exception and uses the same observed-counter starting rule.
 - Use the caller's existing SQLite WAL connection and transaction for mutation
   and genesis events, update the materialized generation marker, and record the
   current generation in the event.
@@ -402,8 +414,11 @@ Add deterministic tests for:
 - current-generation record advancement only on a strictly newer writer epoch,
   same-epoch restart without advancement, same-epoch rollback/roll-forward
   detected by the materialized-write counter gap, downgrade-unsafe startup
-  returning mutation-side `WRITE_ABORT`, and concurrent generation advance
-  during verify returning `CONSISTENT` or `UNKNOWN`, never false `DRIFT`;
+  returning mutation-side `WRITE_ABORT`, baseline refusal across a counter
+  gap returning `WRITE_ABORT`, separately authorized same-epoch
+  re-originating genesis restoring mutation ability, and concurrent generation
+  advance during verify returning `CONSISTENT` or `UNKNOWN`, never false
+  `DRIFT`;
 - a newly created post-migration entity whose first journaled mutation is a
   marked genesis and reaches `CONSISTENT` after a valid follow-up mutation;
 - first post-generation-advance mutation emitting a marked genesis, with a
@@ -415,8 +430,9 @@ Add deterministic tests for:
   mutation-side `WRITE_ABORT`;
 - any same-epoch ordinary mutation attempted in downgrade-unsafe mode or
   against a persisted counter-gap entity returns mutation-side `WRITE_ABORT`;
-  a strictly newer writer-epoch re-originating genesis is exempt and
-  supersedes the gap at the later replay start;
+  a strictly newer writer-epoch or separately authorized same-epoch
+  re-originating genesis is exempt and supersedes the gap at the later replay
+  start;
 - SQLite WAL, fixed `SQLITE_BUSY_TIMEOUT = 5s`, `BEGIN IMMEDIATE`, and
   read-only WAL preconditions;
 - `LOCK_ACQUIRE_TIMEOUT = 5s`, `SQLITE_BUSY_TIMEOUT = 5s`,
@@ -434,8 +450,11 @@ Add deterministic tests for:
 - duplicate, missing, malformed, non-contiguous, and unsupported events;
 - empty history returning `UNKNOWN` with `EMPTY_HISTORY`;
 - the same fixture with a materialized-write counter gap returning `UNKNOWN`
-  with `WRITE_COUNTER_GAP`, and a subsequent ordinary mutation rejected with
-  `WRITE_ABORT`;
+  with `WRITE_COUNTER_GAP`, a baseline attempt refused with `WRITE_ABORT`,
+  and a subsequent ordinary mutation rejected with `WRITE_ABORT`;
+- the same fixture with an explicitly authorized out-of-band same-epoch
+  re-originating genesis adopting the observed counter, followed by a valid
+  mutation reaching `CONSISTENT`;
 - the same fixture with equal counters but a tuple mismatch returning
   `DRIFT` with `DRIFT_DETECTED`;
 - truncated-head history without an origin marker returning `UNKNOWN`;
@@ -676,6 +695,24 @@ DGX changes, deployment, repair, or event-sourcing. The corrected plan must
 return to the same authenticated Claude reviewer family and then to AGY on the
 identical packet.
 
+## Implementation-plan review reconciliation v16
+
+The v16 authenticated Claude Opus review returned `REVISE` with three bounded
+plan-text corrections. The corrections are incorporated above:
+
+1. Counter-gap entities have a bounded, explicitly authorized out-of-band
+   same-epoch re-originating genesis remediation; ordinary mutation remains
+   fail-closed.
+2. The privileged baseline writer refuses to seal across a counter gap with
+   `WRITE_ABORT`; it does not clear the gap.
+3. Acceptance coverage now includes v15, and the counter increment mechanism is
+   singular to prevent double increments.
+
+These remain plan-only corrections and do not authorize source edits, tests,
+DGX changes, deployment, repair, or event-sourcing. The corrected plan must
+return to the same authenticated Claude reviewer family and then to AGY on the
+identical packet.
+
 ## Acceptance criteria
 
 ARCH-003 implementation is ready for its delivery gates only when:
@@ -704,7 +741,7 @@ ARCH-003 implementation is ready for its delivery gates only when:
   retention job; entities beyond the replay limit remain UNKNOWN in this ticket,
   and the 100,000-event/100 MiB per-profile threshold is a documented follow-up
   operational review, not an in-ticket operator gate;
-- reconciliation v1 and v5-v14 items are incorporated into the normative
+- reconciliation v1 and v5-v15 items are incorporated into the normative
   Gates 0-4 text (with v2-v4 explicitly folded into the v1/v4 text), and this
   merged plan revision receives the same-family re-review;
 - all focused and relevant tests pass;
@@ -743,6 +780,8 @@ ARCH-003 implementation is ready for its delivery gates only when:
   newer-epoch genesis exception, and merged replay-start validation.
 - v15: genesis continuity starting counters, rollback-preserved counter
   mechanism, LEGACY_ORIGIN_MISSING binding, and corrected coverage.
+- v16: authorized same-epoch re-origin remediation, baseline gap refusal,
+  and singular counter increment mechanism.
 
 
 ## Non-goals
