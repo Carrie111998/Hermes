@@ -1,7 +1,7 @@
 # Project Handover - hermes-agent
 
 **Plan key:** hermes-agent  
-**Last verified:** 2026-08-16 09:16 CST  
+**Last verified:** 2026-08-16 09:36 CST  
 **Handover owner/session:** Codex  
 **Authoritative project log:** `docs/ROADMAP-HERMES-DGX.md`
 
@@ -44,12 +44,13 @@ The local audit checkout observed during this refresh is `D:/PROJECT/Hermes`, br
 
 ## 4. Ticket and gate state
 
-### Current lane: HERMES-TELEGRAM-TRANSPORT-001 diagnosis
+### Current lane: HERMES-TELEGRAM-INBOUND-001
 
-- **Plan:** `docs/plans/2026-08-15-hermes-telegram-transport-001.md`.
-- **Status:** `MERGED_DEPLOYED_RUNTIME_DEGRADED`.
-- **Next action:** map the current DGX primary/fallback Telegram network path and polling-progress ownership, then prepare a narrow correction only if the root cause is confirmed.
-- **Do not:** claim inbound readiness, fold ARCH-002 or monitoring work into this lane, or change credentials/allowlists/webhook state.
+- **Plan:** `docs/plans/2026-08-16-hermes-telegram-inbound-001.md`.
+- **Status:** `PLAN_ONLY / READY_FOR_REVIEW`.
+- **Parent lane:** HERMES-TELEGRAM-TRANSPORT-001 is `MERGED_DEPLOYED_RUNTIME_DEGRADED`; its service and outbound gates passed, but inbound readiness remains unproven.
+- **Next action:** perform bounded read-only DGX diagnosis, line-map the missing `getUpdates` progress signal, and route the plan to exactly one authenticated Claude and one authenticated AGY reviewer on the same packet.
+- **Do not:** implement, restart, deploy, change credentials/allowlists/webhook state, or claim inbound readiness before the ticket review and direct polling evidence gates pass.
 
 ### Other ticket state
 
