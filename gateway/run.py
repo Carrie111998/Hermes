@@ -2858,6 +2858,32 @@ def _event_media_is_audio(event, index: int) -> bool:
     return getattr(event, "message_type", None) in {MessageType.VOICE, MessageType.AUDIO}
 
 
+def _is_bare_media_filename(text: str) -> bool:
+    """Return True when message text is only a transport filename.
+
+    Matrix ``m.audio``/``m.file`` events populate ``content.body`` with the
+    uploaded filename when the sender adds no caption, and the adapter only
+    blanks that for ``m.image``. The filename then survives into ``event.text``
+    and is appended after the transcript, where the model reads it as the
+    user's message rather than as transport noise.
+
+    Deliberately conservative -- a single token, no whitespace, no path
+    separators, and a known media suffix -- so a genuine caption is never
+    discarded.
+    """
+    candidate = str(text or "").strip()
+    if not candidate or any(ch.isspace() for ch in candidate):
+        return False
+    if os.path.basename(candidate) != candidate:
+        return False
+    suffix = os.path.splitext(candidate)[1].lower()
+    return suffix in {
+        ".ogg", ".oga", ".opus", ".m4a", ".mp3", ".wav", ".flac", ".aac", ".amr",
+        ".mp4", ".webm", ".mov", ".mkv",
+        ".jpg", ".jpeg", ".png", ".gif", ".webp", ".heic",
+    }
+
+
 def _event_media_is_stt_input(event, index: int) -> bool:
     """True when an audio attachment should enter the automatic STT pipeline."""
     message_type = getattr(event, "message_type", None)
@@ -24074,6 +24100,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _placeholder = "(The user sent a message with no text content)"
             if user_text and user_text.strip() == _placeholder:
                 return prefix, []
+            if user_text and _is_bare_media_filename(user_text):
+                return prefix, []
             if user_text:
                 return f"{prefix}\n\n{user_text}", []
             return prefix, []
@@ -24088,6 +24116,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             unavailable_note = "[voice message could not be transcribed]"
             _placeholder = "(The user sent a message with no text content)"
             if user_text and user_text.strip() == _placeholder:
+                return unavailable_note, []
+            if user_text and _is_bare_media_filename(user_text):
                 return unavailable_note, []
             if user_text:
                 return f"{unavailable_note}\n\n{user_text}", []
@@ -24169,6 +24199,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # when we successfully transcribed the audio — it's redundant.
             _placeholder = "(The user sent a message with no text content)"
             if user_text and user_text.strip() == _placeholder:
+                return prefix, successful_transcripts
+            if user_text and _is_bare_media_filename(user_text):
                 return prefix, successful_transcripts
             if user_text:
                 return f"{prefix}\n\n{user_text}", successful_transcripts
