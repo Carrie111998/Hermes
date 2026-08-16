@@ -32,7 +32,9 @@ carry ONE thing on top of it: the ATM injection patch stack (see
    level 2.
 
 **Level 2 — escalation (agent judgment):** triggered by rebase conflict, test
-failure, or reviewer rejection. The escalation agent receives `PATCH-REQUIREMENTS.md`
+failure, or reviewer rejection. The escalation agent is **loki** (hermes-agent-atm
+maintainer, frontier model; workspace `hendrix/loki/`, reachable via
+`atm send loki`). Loki receives `PATCH-REQUIREMENTS.md`
 and follows its "How to update the patch" procedure. Its output is an updated
 `atm/stack` + a PR — never a direct push to main, never a force-push of main, never
 a branch-protection change. If the contract can't be met, it stops and reports to
