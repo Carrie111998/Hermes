@@ -274,16 +274,14 @@ def _resolve_pid_exists():
     """Lazy import of the authoritative cross-platform PID-existence check.
 
     active_sessions no longer does ``from gateway.status import _pid_exists``
-    per-call.  A per-call import inside ``_pid_alive``'s inner try/except meant
-    any import failure in ``gateway.status`` (circular import, syntax error,
-    missing transitive dep, scaffold race) was silently caught and returned
-    False for every PID — wiping the entire active-session registry through
-    ``_prune_dead`` exactly when it matters most (startup).
+    per-call.  The binding is resolved once at first use and reused, so the
+    import machinery (and its failure modes: circular import, syntax error,
+    missing transitive dep, scaffold race) is exercised at most once per
+    process instead of on every ``_pid_alive`` call.
 
-    Importing once at first call and reusing the reference keeps the blast
-    radius bounded: if the import itself fails, ``_PID_EXISTS`` is never bound
-    and every ``_pid_alive`` call raises — surfacing the real problem instead
-    of silently making every PID look dead.
+    If the import fails, ``_PID_EXISTS`` is never bound and ``_pid_alive``
+    treats the PID as *unknown* — it fails closed (reports alive) so
+    ``_prune_dead`` spares every entry rather than wiping the registry.
     """
     global _PID_EXISTS
     from gateway.status import _pid_exists as _PID_EXISTS  # noqa: WPS436
@@ -298,6 +296,12 @@ def _pid_alive(pid: Any, process_start_time: Any = None) -> bool:
         return False
     try:
         _resolve_pid_exists()
+    except Exception:
+        # Checker unavailable: we cannot prove the PID dead. Report alive
+        # so _prune_dead spares entries instead of wiping the registry on
+        # an import failure in gateway.status.
+        return True
+    try:
         exists = bool(_PID_EXISTS(pid_int))
     except Exception:
         return False

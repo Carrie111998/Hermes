@@ -280,3 +280,45 @@ def test_pid_fallback_surface_detection_warns(caplog):
                 surface = aS._get_terminal_surface_id()
     assert surface.startswith("win32-pid:")
     assert any("duplicate-session guard is ineffective" in r.message for r in caplog.records)
+
+
+# --- _pid_alive fail-closed on checker unavailability (#87278 review) ----------
+
+
+def test_pid_alive_spare_entries_when_checker_import_fails(monkeypatch):
+    """A gateway.status import failure must NOT make every PID look dead.
+
+    _prune_dead drops entries where _pid_alive is False; treating an import
+    failure as dead wipes the whole registry exactly when startup needs it.
+    The fail-closed contract: unknown liveness reports alive (spare).
+    """
+    from hermes_cli import active_sessions as aS
+
+    def _boom():
+        raise ImportError("gateway.status unavailable (test)")
+
+    monkeypatch.setattr(aS, "_resolve_pid_exists", _boom)
+    # Ensure no stale binding from another test leaks into this one.
+    monkeypatch.delattr(aS, "_PID_EXISTS", raising=False)
+
+    assert aS._pid_alive(12345) is True  # unknown -> spare
+    assert aS._pid_alive(99999) is True
+
+
+def test_pid_alive_uses_bound_checker_when_resolve_succeeds(monkeypatch):
+    from hermes_cli import active_sessions as aS
+
+    monkeypatch.setattr(aS, "_PID_EXISTS", lambda pid: pid == 42, raising=False)
+    monkeypatch.setattr(aS, "_resolve_pid_exists", lambda: None)
+
+    assert aS._pid_alive(42) is True
+    assert aS._pid_alive(43) is False
+
+
+def test_pid_alive_invalid_inputs_stay_dead():
+    from hermes_cli.active_sessions import _pid_alive
+
+    assert _pid_alive(None) is False
+    assert _pid_alive("junk") is False
+    assert _pid_alive(0) is False
+    assert _pid_alive(-5) is False

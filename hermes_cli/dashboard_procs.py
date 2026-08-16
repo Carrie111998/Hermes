@@ -820,6 +820,17 @@ def _is_alive_parent(ppid: int, child_create_time: float | None = None) -> bool:
         return True
 
 
+def _current_process_identity(pid: int) -> tuple[float, str] | None:
+    """Live ``(create_time, exe)`` identity of *pid*, or None if gone/unreadable."""
+    try:
+        import psutil  # type: ignore
+
+        proc = psutil.Process(pid)
+        return (proc.create_time(), (proc.exe() or "").lower())
+    except Exception:
+        return None
+
+
 def _tui_node_exclude_pids() -> set[int]:
     """PIDs that must never be reaped by the TUI node reaper.
 
@@ -1106,16 +1117,6 @@ def _reap_orphaned_tui_nodes(
     killed: list[int] = []
     failed: list[int] = []
 
-    def _current_identity(pid: int) -> tuple[float, str] | None:
-        """Live identity of *pid* now, or None if gone/unidentifiable."""
-        try:
-            import psutil  # type: ignore
-
-            proc = psutil.Process(pid)
-            return (proc.create_time(), (proc.exe() or "").lower())
-        except Exception:
-            return None
-
     if sys.platform == "win32":
         from hermes_cli._subprocess_compat import windows_hide_flags
 
@@ -1123,7 +1124,7 @@ def _reap_orphaned_tui_nodes(
             # Require a non-None identity that still matches the scanned process
             # immediately before the forced tree-kill. A None, or a changed
             # identity (PID reused by an unrelated process), means skip.
-            current = _current_identity(pid)
+            current = _current_process_identity(pid)
             if current is None or current != baseline:
                 continue
             try:
@@ -1149,7 +1150,7 @@ def _reap_orphaned_tui_nodes(
         for pid, _cmd, baseline in targets:
             # Re-validate right before SIGTERM: skip if the PID is now gone or
             # belongs to a different (reused) process.
-            current = _current_identity(pid)
+            current = _current_process_identity(pid)
             if current is None or current != baseline:
                 continue
             try:
@@ -1168,7 +1169,7 @@ def _reap_orphaned_tui_nodes(
             # Re-validate before escalating to SIGKILL: only the SAME process
             # instance we SIGTERM'd may be killed. A None or changed identity
             # (PID reused) means skip — never kill an unrelated replacement.
-            current = _current_identity(pid)
+            current = _current_process_identity(pid)
             if current is None or current != baseline:
                 continue
             try:
@@ -1487,13 +1488,17 @@ def _reap_orphaned_desktop_local_serves(
 def _scan_windows_gateway_processes(
     *,
     exclude_pids: set[int] | None = None,
-) -> list[tuple[int, str]]:
-    """Return orphaned ``python.exe`` gateway processes on Windows.
+) -> list[tuple[int, str, tuple[float, str] | None]]:
+    """Return candidate ``python.exe`` gateway processes on Windows.
 
     Scans for ``python.exe`` processes whose command line contains
-    ``hermes_cli.main gateway run --replace`` and whose parent process is
-    dead. Returns ``(pid, cmdline)`` tuples. Excludes any PIDs in
-    ``exclude_pids``. Returns an empty list on any scan error.
+    ``hermes_cli.main gateway run --replace``. Returns
+    ``(pid, cmdline, identity)`` triples where ``identity`` is a scan-time
+    ``(create_time, exe)`` snapshot bound to the exact process_iter
+    observation (None if unavailable — the reaper skips those). Orphan
+    verification (dead parent, PID-reuse-aware) is done by the caller via
+    :func:`_is_alive_parent` with the scanned child's create time. Excludes
+    any PIDs in ``exclude_pids``. Returns an empty list on any scan error.
     """
     if sys.platform != "win32":
         return []
@@ -1501,8 +1506,10 @@ def _scan_windows_gateway_processes(
     try:
         import psutil  # type: ignore
 
-        matches: list[tuple[int, str]] = []
-        for proc in psutil.process_iter(["pid", "name", "cmdline", "ppid"]):
+        matches: list[tuple[int, str, tuple[float, str] | None]] = []
+        for proc in psutil.process_iter(
+            ["pid", "name", "cmdline", "create_time", "exe"]
+        ):
             try:
                 info = proc.info
                 pid = info.get("pid")
@@ -1514,12 +1521,14 @@ def _scan_windows_gateway_processes(
                 cmdline = " ".join(info.get("cmdline") or [])
                 if "hermes_cli.main gateway run --replace" not in cmdline:
                     continue
-                ppid = info.get("ppid")
-                if ppid is None or ppid <= 1:
-                    continue
-                if _is_alive_parent(ppid):
-                    continue
-                matches.append((int(pid), cmdline))
+                try:
+                    identity = (
+                        float(info["create_time"]),
+                        (info.get("exe") or "").lower(),
+                    )
+                except (TypeError, ValueError):
+                    identity = None
+                matches.append((int(pid), cmdline, identity))
             except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
                 continue
             except Exception:
@@ -1546,7 +1555,11 @@ def _reap_orphaned_windows_gateway_processes(
     Safety:
     - only processes whose cmdline matches ``hermes_cli.main gateway run --replace``
     - only processes whose current ppid is dead (not merely reparented to
-      a live supervisor)
+      a live supervisor), checked PID-reuse-aware against the scanned
+      child's create time (a reused parent PID cannot shield an orphan)
+    - only processes with a scan-time ``(create_time, exe)`` identity that
+      still matches immediately before the tree-kill (a PID reused between
+      scan and kill can never be killed)
     - never self / never ``HERMES_DESKTOP_CHILD_PID`` entries
     - never a PID a valid ``backend.lock.json`` claims as its owner
     - uses ``taskkill /T /F /PID`` tree-kill, same as the rest of the
@@ -1572,31 +1585,42 @@ def _reap_orphaned_windows_gateway_processes(
     except Exception:
         return {"matched": [], "killed": [], "failed": []}
 
-    targets: list[tuple[int, str]] = []
+    targets: list[tuple[int, str, tuple[float, str]]] = []
     try:
         owned_now = set(_lock_owned_serve_pids())
     except Exception:
         owned_now = set()
-    for pid, cmd in scanned:
+    for pid, cmd, scan_identity in scanned:
         if pid in owned_now:
+            continue
+        # Skip unidentifiable processes — same fail-closed rule as the TUI
+        # node reaper: never kill a PID we cannot bind to the scanned process.
+        if not scan_identity:
             continue
         ppid = _process_ppid(pid)
         if ppid is None:
             continue
-        if _is_alive_parent(ppid):
+        # Pass the child's scan-time create time so _is_alive_parent can
+        # detect a reused parent PID (a real parent is always older).
+        if _is_alive_parent(ppid, scan_identity[0]):
             continue
-        targets.append((pid, cmd))
+        targets.append((pid, cmd, scan_identity))
 
     if not targets:
         return {"matched": [], "killed": [], "failed": []}
 
-    matched = [pid for pid, _ in targets]
+    matched = [pid for pid, _, _ in targets]
     killed: list[int] = []
     failed: list[int] = []
 
     from hermes_cli._subprocess_compat import windows_hide_flags
 
-    for pid, _cmd in targets:
+    for pid, _cmd, baseline in targets:
+        # Identity must still match the scanned process right before the
+        # forced tree-kill; a gone or replaced (PID-reused) process is skipped.
+        current = _current_process_identity(pid)
+        if current is None or current != baseline:
+            continue
         try:
             result = subprocess.run(
                 ["taskkill", "/T", "/F", "/PID", str(pid)],

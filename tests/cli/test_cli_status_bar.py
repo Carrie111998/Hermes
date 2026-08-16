@@ -219,23 +219,35 @@ class TestCLIStatusBar:
         assert cli_obj._spinner_widget_height(width=40) == 0
 
     def test_classic_cli_application_pins_refresh_interval_zero(self):
-        # #70031 review feedback on #73241: a regression of the
-        # Application(refresh_interval=0.0) pin must be caught. The classic
-        # CLI Application is constructed deep inside the interactive run
-        # loop (not unit-instantiable without a real TTY), so pin the
-        # construction site in source alongside the behavioral cadence
-        # split covered by test_spinner_loop_branch_* above.
-        import inspect
+        # #70031 review feedback on #73241 and #87278: a regression of the
+        # Application(refresh_interval=0.0) pin must be caught. The
+        # construction site is extracted into _build_classic_cli_application
+        # (a pure factory), so the pins are asserted on a real Application
+        # instance — no source inspection, no TTY.
+        from prompt_toolkit.application import Application
+        from prompt_toolkit.key_binding import KeyBindings
+        from prompt_toolkit.layout import Layout
+        from prompt_toolkit.layout.containers import Window
+        from prompt_toolkit.output import DummyOutput
 
-        source = inspect.getsource(cli_mod)
-        assert "refresh_interval=0.0" in source, (
+        app = cli_mod._build_classic_cli_application(
+            layout=Layout(Window()),
+            key_bindings=KeyBindings(),
+            style=None,
+            output=DummyOutput(),
+        )
+
+        assert isinstance(app, Application)
+        assert app.refresh_interval == 0.0, (
             "classic-CLI Application must pin refresh_interval=0.0 (#70031): "
             "prompt_toolkit's timer fires regardless of agent state and "
             "stacks chrome mid-turn"
         )
-        # The configured cadence must be read via resolve_idle_refresh_interval
-        # (idle-only), never handed straight back to the Application.
-        assert "refresh_interval=float(CLI_CONFIG" not in source
+        assert app.erase_when_done is True, (
+            "classic-CLI Application must erase chrome on exit (#38252): "
+            "a frozen final copy stacks with the next session's UI on resume"
+        )
+        assert app.full_screen is False
 
     def test_spinner_loop_branch_never_repaints_while_agent_runs(self):
         # #70031 invariant: while the agent runs (no child command) the

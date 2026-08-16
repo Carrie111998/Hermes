@@ -853,6 +853,50 @@ def spinner_loop_branch(command_running: bool, agent_running: bool, idle_refresh
     return "idle_stable"
 
 
+def _build_classic_cli_application(
+    *,
+    layout,
+    key_bindings,
+    style,
+    output=None,
+    cursor=None,
+):
+    """Build the classic-CLI prompt_toolkit ``Application`` (#70031 pins).
+
+    Pure factory (no ``self``, no TTY touch) so tests can construct the
+    Application and assert its pins directly — the interactive run loop is
+    not unit-instantiable without a real terminal.
+
+    Two pins are load-bearing for the stacked-frames fix:
+
+    - ``refresh_interval=0.0`` — prompt_toolkit's own repaint timer is
+      disabled. The timer fires regardless of agent state, so while a turn
+      runs it repaints the bottom chrome every N seconds; in non-fullscreen
+      mode each redraw can scroll the previous chrome copy into scrollback,
+      stacking repeated spinner/status frames (#70031). The configured
+      ``display.cli_refresh_interval`` cadence is applied IDLE-only by the
+      background ``spinner_loop`` (see ``spinner_loop_branch``), never here.
+    - ``erase_when_done=True`` — teardown erases the live bottom chrome
+      instead of freezing a final copy into scrollback, where it would stack
+      with the next session's UI on resume (#38252).
+    """
+    kwargs = {}
+    if output is not None:
+        kwargs["output"] = output
+    if cursor is not None:
+        kwargs["cursor"] = cursor
+    return Application(
+        layout=layout,
+        key_bindings=key_bindings,
+        style=style,
+        full_screen=False,
+        mouse_support=False,
+        refresh_interval=0.0,
+        erase_when_done=True,
+        **kwargs,
+    )
+
+
 # Initialize centralized logging early — agent.log + errors.log in ~/.hermes/logs/.
 # This ensures CLI sessions produce a log trail even before AIAgent is instantiated.
 try:
@@ -18765,43 +18809,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         _cpr_disabled_output = _select_classic_cli_pt_output(sys.stdout)
 
         # Create the application
-        app = Application(
+        app = _build_classic_cli_application(
             layout=layout,
             key_bindings=kb,
             style=style,
-            full_screen=False,
-            mouse_support=False,
-            **({"output": _cpr_disabled_output} if _cpr_disabled_output is not None else {}),
-            # Read from display.cli_refresh_interval (default 0 = disabled).
-            # When non-zero, the background spinner_loop (below) triggers an
-            # invalidate on this cadence while the agent is IDLE, keeping
-            # wall-clock status-bar read-outs ticking.  We deliberately do
-            # NOT hand this to prompt_toolkit's own Application.refresh_interval
-            # here: that timer fires regardless of agent state, so while a turn
-            # is running it repaints the bottom chrome (spinner + status bar)
-            # every N seconds.  In non-fullscreen mode each such redraw can
-            # scroll the previous chrome copy up into scrollback — stacking
-            # repeated kawaii spinner frames / status columns instead of
-            # overwriting them in place.  This is the root cause of the
-            # "status lines repeat mid-turn" artifact (#70031), reproduced on
-            # Windows with display.cli_refresh_interval set.  Mid-turn chrome
-            # still updates live because every agent event (_on_thinking,
-            # tool start/complete, notices) explicitly calls _invalidate — we
-            # only suppress the *periodic* redraw while busy.  See #48309 /
-            # #70031.
-            refresh_interval=0.0,
-            # Erase the live bottom chrome (status bar, input box, separator
-            # rules) on exit instead of freezing a final copy into scrollback.
-            # Without this, prompt_toolkit's render_as_done teardown repaints
-            # the chrome one last time and leaves it stranded above the exit
-            # summary — so a dead status bar + empty prompt sit between the
-            # conversation transcript and the "Resume this session" block, and
-            # stack with the next session's UI on resume (#38252). The actual
-            # conversation transcript is printed through patch_stdout into
-            # normal scrollback and is unaffected; only the managed chrome is
-            # erased. Applies to every exit path (/exit, /quit, EOF, Ctrl+C).
-            erase_when_done=True,
-            **({'cursor': _STEADY_CURSOR} if _STEADY_CURSOR is not None else {}),
+            output=_cpr_disabled_output,
+            cursor=_STEADY_CURSOR,
         )
         _disable_prompt_toolkit_cpr_warning(app)
         self._app = app  # Store reference for clarify_callback
