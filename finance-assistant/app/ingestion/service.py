@@ -37,9 +37,17 @@ class IngestionService:
         self, path: str | Path, *, source: IngestionSource = IngestionSource.MANUAL,
         source_external_id: str | None = None,
     ) -> ProcessingResult:
-        pdf_path = Path(path).expanduser().resolve()
+        pdf_path = Path(path).expanduser()
         digest = ""
         try:
+            if pdf_path.is_symlink():
+                return ProcessingResult(
+                    source=source, file_name=pdf_path.name, sha256=digest,
+                    source_external_id=source_external_id,
+                    status=IngestionStatus.FAILED,
+                    errors=["Symbolic-link input is not allowed"],
+                )
+            pdf_path = pdf_path.resolve()
             if not pdf_path.is_file():
                 raise FileNotFoundError(str(pdf_path))
             if pdf_path.suffix.casefold() != ".pdf":
@@ -110,7 +118,16 @@ class IngestionService:
                 if result.warnings or skipped
                 else IngestionStatus.SUCCESS
             )
-            result.archive_path = self._move_to_archive(pdf_path, parser.bank_id, metadata.statement_date or metadata.period_end)
+            try:
+                result.archive_path = self._move_to_archive(
+                    pdf_path, parser.bank_id, metadata.statement_date or metadata.period_end,
+                )
+            except Exception as exc:
+                # The database transaction and its audit event are already
+                # committed. Do not turn a successful import into FAILED and
+                # invite a retry that can create confusing duplicate state.
+                result.warnings.append(f"Archive move failed: {exc}")
+                result.status = IngestionStatus.SUCCESS_WITH_WARNINGS
             self._record_log(result, already_recorded=True)
             return result
         except ParserFormatError as exc:
@@ -126,7 +143,7 @@ class IngestionService:
         return [
             self.process_file(path, source=IngestionSource.DIRECTORY)
             for path in sorted(inbox.iterdir())
-            if path.is_file() and path.suffix.casefold() == ".pdf"
+            if not path.is_symlink() and path.is_file() and path.suffix.casefold() == ".pdf"
         ]
 
     def get_statement_status(self, year: int, month: int) -> dict[str, str]:

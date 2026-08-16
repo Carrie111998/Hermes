@@ -214,6 +214,37 @@ def test_batch_ingest_assigns_directory_source(tmp_path):
     assert {result.status for result in results} == {IngestionStatus.SUCCESS, IngestionStatus.UNSUPPORTED}
 
 
+def test_symlink_input_is_rejected_without_following_or_moving_target(tmp_path):
+    service = make_service(tmp_path)
+    target = create_pdf(tmp_path / "outside.pdf", "DUMMY")
+    link = tmp_path / "inbox-link.pdf"
+    link.symlink_to(target)
+
+    result = service.process_file(link)
+
+    assert result.status is IngestionStatus.FAILED
+    assert result.failed_path is None
+    assert target.exists()
+    assert link.is_symlink()
+
+
+def test_archive_failure_does_not_report_committed_import_as_failed(tmp_path, monkeypatch):
+    service = make_service(tmp_path)
+    pdf = create_pdf(tmp_path / "archive-failure.pdf", "DUMMY TWO")
+
+    def fail_archive(*args, **kwargs):
+        raise OSError("archive unavailable")
+
+    monkeypatch.setattr(service, "_move_to_archive", fail_archive)
+    result = service.process_file(pdf)
+
+    assert result.status is IngestionStatus.SUCCESS_WITH_WARNINGS
+    assert result.archive_path is None
+    assert any("Archive move failed" in warning for warning in result.warnings)
+    assert service.database_count("statements") == 1
+    assert service.database_count("transactions") == 2
+
+
 def test_database_failure_rolls_back_statement_and_transactions(tmp_path):
     class FailingService(IngestionService):
         def _insert_database(self, *args, **kwargs):

@@ -341,8 +341,14 @@ class AnalysisService:
                 result.append({"transaction_date": item["transaction_date"], "amount": item["amount"], "bank": item["bank"]})
         return result
 
+
+class MerchantRuleService:
+    """Writable persistence boundary for explicit merchant overrides."""
+
+    def __init__(self, database: Database):
+        self.database = database
+
     def set_merchant_rule(self, merchant: str, category: str, subcategory: str | None = None) -> None:
-        """Persist an explicit merchant override; analysis itself remains read-only."""
         normalized = normalize_merchant(merchant)
         self.database.connection.execute(
             """INSERT INTO merchant_rules (merchant_normalized, category, subcategory, source, created_at)

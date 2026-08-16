@@ -4,7 +4,7 @@ from decimal import Decimal
 import duckdb
 import pytest
 
-from app.analysis.service import AnalysisService
+from app.analysis.service import AnalysisService, MerchantRuleService
 from app.database.schema import initialize_database
 from app.models import Statement, Transaction, TransactionType
 
@@ -82,7 +82,7 @@ def test_calendar_month_boundaries_and_comparison_zero(tmp_path):
 
 def test_manual_merchant_rule_precedes_deterministic_rule(tmp_path):
     service = make_service(tmp_path)
-    service.set_merchant_rule("UNKNOWN SHOP", "Market", "Supermarket")
+    MerchantRuleService(service.database).set_merchant_rule("UNKNOWN SHOP", "Market", "Supermarket")
     result = service.analyze("2026-08")
     assert result.uncategorized_count == 0
     assert result.by_subcategory["Supermarket"] == Decimal("50.00")
