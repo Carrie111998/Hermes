@@ -6311,10 +6311,20 @@ class AIAgent:
                 from hermes_cli.config import (
                     apply_custom_provider_extra_headers_to_client_kwargs,
                 )
-
-                apply_custom_provider_extra_headers_to_client_kwargs(
-                    self._client_kwargs, base_url,
+                from hermes_cli.runtime_provider import (
+                    _is_named_loopback_ollama_route,
                 )
+
+                # The named loopback Ollama resolver deliberately drops stale
+                # provider auth headers. Do not reconstruct them here from
+                # config after that credential boundary has been applied.
+                route_provider = (
+                    getattr(self, "requested_provider", "") or self.provider
+                )
+                if not _is_named_loopback_ollama_route(route_provider, base_url):
+                    apply_custom_provider_extra_headers_to_client_kwargs(
+                        self._client_kwargs, base_url,
+                    )
             except Exception:
                 logger.debug("custom-provider extra_headers skipped", exc_info=True)
 

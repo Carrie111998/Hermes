@@ -46,6 +46,36 @@ class TestNormalizeCustomProviderEntry:
         assert get_custom_provider_endpoint(entry) == expected
 
 
+    def test_endpoint_helper_skips_invalid_canonical_value_like_normalizer(self):
+        """Invalid canonical aliases must fall through consistently everywhere."""
+        entry = {
+            "base_url": "not a URL",
+            "url": "https://valid-url.example/v1",
+            "api": "https://valid-api.example/v1",
+        }
+
+        normalized = _normalize_custom_provider_entry(entry, provider_key="test")
+
+        assert normalized is not None
+        assert get_custom_provider_endpoint(entry) == normalized["base_url"]
+        assert normalized["base_url"] == "https://valid-url.example/v1"
+
+
+    def test_endpoint_helper_accepts_normalizer_camelcase_base_url_alias(self):
+        """Raw consumers must accept the normalizer's baseUrl compatibility alias."""
+        entry = {
+            "baseUrl": "https://camel-base.example/v1",
+            "url": "https://legacy-url.example/v1",
+            "api": "https://legacy-api.example/v1",
+        }
+
+        normalized = _normalize_custom_provider_entry(entry, provider_key="test")
+
+        assert normalized is not None
+        assert get_custom_provider_endpoint(entry) == normalized["base_url"]
+        assert normalized["base_url"] == "https://camel-base.example/v1"
+
+
 
 
 

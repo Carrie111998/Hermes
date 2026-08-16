@@ -9,6 +9,52 @@ from unittest.mock import MagicMock, patch
 from run_agent import AIAgent
 
 
+def test_named_loopback_ollama_does_not_apply_configured_provider_headers():
+    """Local named Ollama must not reattach headers dropped by its resolver."""
+    agent = AIAgent.__new__(AIAgent)
+    agent._client_kwargs = {}
+    agent.provider = "custom"
+    agent.requested_provider = "ollama"
+    agent.api_mode = "chat_completions"
+    agent._apply_user_default_headers = lambda: None
+
+    with patch("hermes_cli.config.load_config", return_value={
+        "providers": {
+            "ollama": {
+                "base_url": "http://127.0.0.1:11434/v1",
+                "extra_headers": {"Authorization": "header-credential-sentinel"},
+            }
+        }
+    }):
+        agent._apply_client_headers_for_base_url("http://127.0.0.1:11434/v1")
+
+    assert "default_headers" not in agent._client_kwargs
+
+
+def test_named_remote_ollama_keeps_configured_provider_headers():
+    """The named local boundary does not suppress remote Ollama headers."""
+    agent = AIAgent.__new__(AIAgent)
+    agent._client_kwargs = {}
+    agent.provider = "custom"
+    agent.requested_provider = "ollama"
+    agent.api_mode = "chat_completions"
+    agent._apply_user_default_headers = lambda: None
+
+    with patch("hermes_cli.config.load_config", return_value={
+        "providers": {
+            "ollama": {
+                "base_url": "https://ollama.remote.example/v1",
+                "extra_headers": {"Authorization": "remote-header-sentinel"},
+            }
+        }
+    }):
+        agent._apply_client_headers_for_base_url("https://ollama.remote.example/v1")
+
+    assert agent._client_kwargs["default_headers"] == {
+        "Authorization": "remote-header-sentinel"
+    }
+
+
 @patch("run_agent.OpenAI")
 def test_openrouter_base_url_applies_or_headers(mock_openai):
     mock_openai.return_value = MagicMock()
@@ -279,5 +325,3 @@ def test_openrouter_headers_no_cache_when_disabled(mock_openai):
     assert headers["HTTP-Referer"] == "https://hermes-agent.nousresearch.com"
     assert "X-OpenRouter-Cache" not in headers
     assert "X-OpenRouter-Cache-TTL" not in headers
-
-

@@ -49,6 +49,115 @@ def test_noauth_lmstudio_still_resolves(monkeypatch):
     assert resolved["api_key"]
 
 
+def test_named_loopback_ollama_drops_configured_credentials_and_headers(tmp_path, monkeypatch):
+    """The named local Ollama route cannot inherit stale remote credentials."""
+    (tmp_path / "config.yaml").write_text(
+        """\
+providers:
+  ollama:
+    base_url: http://127.0.0.1:11434/v1
+    api_key: inline-credential-sentinel
+    key_env: LOCAL_OLLAMA_TEST_KEY
+    extra_headers:
+      Authorization: header-credential-sentinel
+    extra_body:
+      gateway_token: body-credential-sentinel
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("LOCAL_OLLAMA_TEST_KEY", "env-credential-sentinel")
+    monkeypatch.setattr(rp, "_try_resolve_from_custom_pool", lambda *_a, **_kw: None)
+
+    resolved = rp.resolve_runtime_provider(
+        requested="ollama", explicit_api_key="explicit-credential-sentinel"
+    )
+
+    assert resolved["provider"] == "custom"
+    assert resolved["base_url"] == "http://127.0.0.1:11434/v1"
+    assert resolved["api_key"] == "no-key-required"
+    assert "extra_headers" not in resolved
+    assert "request_overrides" not in resolved
+
+
+def test_named_loopback_ollama_bypasses_pool_credentials(tmp_path, monkeypatch):
+    """Pooled credentials must not follow the exact named local Ollama route."""
+    (tmp_path / "config.yaml").write_text(
+        """\
+providers:
+  ollama:
+    base_url: http://localhost:11434/v1
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    pool_calls = []
+
+    def pool_with_credential(*_args, **_kwargs):
+        pool_calls.append(True)
+        return {
+            "provider": "custom",
+            "base_url": "http://localhost:11434/v1",
+            "api_key": "pool-credential-sentinel",
+            "extra_headers": {"Authorization": "pool-header-sentinel"},
+        }
+
+    monkeypatch.setattr(rp, "_try_resolve_from_custom_pool", pool_with_credential)
+
+    resolved = rp.resolve_runtime_provider(requested="ollama")
+
+    assert resolved["api_key"] == "no-key-required"
+    assert "extra_headers" not in resolved
+    assert pool_calls == []
+
+
+def test_named_loopback_ollama_explicit_endpoint_bypasses_pool_credentials(monkeypatch):
+    """An explicit local endpoint keeps the exact named Ollama no-key boundary."""
+    pool_calls = []
+
+    def pool_with_credential(*_args, **_kwargs):
+        pool_calls.append(True)
+        return {
+            "provider": "custom",
+            "base_url": "http://127.0.0.1:11434/v1",
+            "api_key": "pool-credential-sentinel",
+        }
+
+    monkeypatch.setattr(rp, "_try_resolve_from_custom_pool", pool_with_credential)
+
+    resolved = rp.resolve_runtime_provider(
+        requested="ollama",
+        explicit_api_key="explicit-credential-sentinel",
+        explicit_base_url="http://127.0.0.1:11434/v1",
+    )
+
+    assert resolved["api_key"] == "no-key-required"
+    assert resolved["requested_provider"] == "ollama"
+    assert pool_calls == []
+
+
+def test_named_remote_ollama_preserves_configured_credentials_and_headers(tmp_path, monkeypatch):
+    """The local credential boundary does not change remote Ollama routes."""
+    (tmp_path / "config.yaml").write_text(
+        """\
+providers:
+  ollama:
+    base_url: https://ollama.remote.example/v1
+    api_key: remote-credential-sentinel
+    extra_headers:
+      Authorization: remote-header-sentinel
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(rp, "_try_resolve_from_custom_pool", lambda *_a, **_kw: None)
+
+    resolved = rp.resolve_runtime_provider(requested="ollama")
+
+    assert resolved["api_key"] == "remote-credential-sentinel"
+    assert resolved["extra_headers"] == {"Authorization": "remote-header-sentinel"}
+
+
 def _fake_invoke_jwt(ttl_seconds=3600):
     header = base64.urlsafe_b64encode(b'{"alg":"none","typ":"JWT"}').decode().rstrip("=")
     payload = base64.urlsafe_b64encode(

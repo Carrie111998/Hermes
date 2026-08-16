@@ -2954,7 +2954,10 @@ def list_authenticated_providers(
         # the wire protocol differs.
         from collections import OrderedDict as _OD3
 
-        from hermes_cli.config import is_provider_enabled
+        from hermes_cli.config import (
+            get_custom_provider_endpoint,
+            is_provider_enabled,
+        )
 
         ep_groups: "_OD3[tuple, dict]" = _OD3()
         for ep_name, ep_cfg in user_providers.items():
@@ -2967,12 +2970,7 @@ def list_authenticated_providers(
             if ep_name.lower() in seen_slugs:
                 continue
             display_name = ep_cfg.get("name", "") or ep_name
-            api_url = (
-                ep_cfg.get("base_url", "")
-                or ep_cfg.get("api", "")
-                or ep_cfg.get("url", "")
-                or ""
-            )
+            api_url = get_custom_provider_endpoint(ep_cfg)
             key_env = str(ep_cfg.get("key_env", "") or "").strip()
             inline_api_key = str(ep_cfg.get("api_key", "") or "").strip()
             api_mode = str(

@@ -30,7 +30,7 @@ import time
 import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Any, Optional, List, Tuple, Set
+from typing import Callable, Dict, Any, Optional, List, Tuple, Set
 
 from hermes_cli.route_identity import normalize_route_base_url
 from hermes_cli.secret_prompt import masked_secret_prompt
@@ -1327,20 +1327,39 @@ def _canonical_api_mode(api_mode: str) -> str:
     return _API_MODE_ALIASES.get(cleaned.lower(), cleaned)
 
 
-def get_custom_provider_endpoint(entry: Any) -> str:
+def get_custom_provider_endpoint(
+    entry: Any,
+    *,
+    on_invalid_endpoint: Optional[Callable[[str, str], None]] = None,
+) -> str:
     """Return a custom provider's canonical endpoint field.
 
     ``base_url`` is the current schema; ``url`` and ``api`` are compatibility
     aliases retained in existing configs.  Keeping the precedence here makes
     runtime, picker, and dashboard consumers agree when an older entry has
-    both a legacy field and a later canonical override.
+    both a legacy field and a later canonical override. Invalid higher-priority
+    values fall through just like ``_normalize_custom_provider_entry``.
     """
     if not isinstance(entry, dict):
         return ""
     for key in ("base_url", "url", "api"):
         value = entry.get(key)
+        if key == "base_url" and key not in entry:
+            value = entry.get("baseUrl")
         if isinstance(value, str) and value.strip():
-            return value.strip()
+            candidate = value.strip()
+            # Endpoints can include unresolved environment references or
+            # templated regions. They are expanded at runtime, so retain them
+            # without URL parsing as the normalizer has always done.
+            if re.search(r"\{[^}]+\}", candidate):
+                return candidate
+            from urllib.parse import urlparse
+
+            parsed = urlparse(candidate)
+            if parsed.scheme and parsed.netloc:
+                return candidate
+            if on_invalid_endpoint:
+                on_invalid_endpoint(key, candidate)
     return ""
 
 
@@ -1409,31 +1428,16 @@ def _normalize_custom_provider_entry(
             provider_key or "?", ", ".join(sorted(unknown)),
         )
 
-    from urllib.parse import urlparse
+    def _warn_invalid_endpoint(url_key: str, candidate: str) -> None:
+        logger.warning(
+            "providers.%s: '%s' value '%s' is not a valid URL "
+            "(no scheme or host) — skipped",
+            provider_key or "?", url_key, candidate,
+        )
 
-    base_url = ""
-    for url_key in ("base_url", "url", "api"):
-        raw_url = entry.get(url_key)
-        if isinstance(raw_url, str) and raw_url.strip():
-            candidate = raw_url.strip()
-            # Accept URLs containing unresolved placeholder tokens — both
-            # ``${ENV_VAR}`` env-refs and bare ``{region}``-style templates —
-            # without URL validation. They are expanded at runtime, so a
-            # caller reaching this normalizer with raw (un-expanded) config
-            # would otherwise see the provider silently dropped (#14457).
-            if re.search(r"\{[^}]+\}", candidate):
-                base_url = candidate
-                break
-            parsed = urlparse(candidate)
-            if parsed.scheme and parsed.netloc:
-                base_url = candidate
-                break
-            else:
-                logger.warning(
-                    "providers.%s: '%s' value '%s' is not a valid URL "
-                    "(no scheme or host) — skipped",
-                    provider_key or "?", url_key, candidate,
-                )
+    base_url = get_custom_provider_endpoint(
+        entry, on_invalid_endpoint=_warn_invalid_endpoint
+    )
     if not base_url:
         return None
 

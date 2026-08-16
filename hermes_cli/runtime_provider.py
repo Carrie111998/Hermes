@@ -74,6 +74,14 @@ def _loopback_hostname(host: str) -> bool:
     return h in {"localhost", "127.0.0.1", "::1", "0.0.0.0"}
 
 
+def _is_named_loopback_ollama_route(requested_provider: str, base_url: str) -> bool:
+    """Whether the exact named Ollama route resolves to a local endpoint."""
+    return (
+        (requested_provider or "").strip().lower() == "ollama"
+        and _loopback_hostname(base_url_hostname(base_url))
+    )
+
+
 def _config_base_url_trustworthy_for_bare_custom(cfg_base_url: str, cfg_provider: str) -> bool:
     """Decide whether ``model.base_url`` may back bare ``custom`` runtime resolution.
 
@@ -1103,6 +1111,18 @@ def _resolve_named_custom_runtime(
     # `provider: ollama` with a LAN/WireGuard `base_url` doesn't silently
     # fall through to OpenRouter.
     requested_norm = (requested_provider or "").strip().lower()
+    if explicit_base_url and _is_named_loopback_ollama_route(
+        requested_provider, explicit_base_url
+    ):
+        base_url = explicit_base_url.strip().rstrip("/")
+        return {
+            "provider": "custom",
+            "api_mode": _detect_api_mode_for_url(base_url) or "chat_completions",
+            "base_url": base_url,
+            "api_key": "no-key-required",
+            "source": "direct-alias",
+            "requested_provider": requested_provider,
+        }
     if requested_norm and requested_norm != "custom":
         try:
             from hermes_cli.auth import resolve_provider as _resolve_provider
@@ -1155,6 +1175,28 @@ def _resolve_named_custom_runtime(
     ).rstrip("/")
     if not base_url:
         return None
+
+    # A literal ``provider: ollama`` targeting loopback is Hermes's local
+    # no-auth route. Old provider entries can retain remote credentials and
+    # auth headers after an endpoint is changed locally; none may cross this
+    # boundary. Keep model and output-token overrides, which are nonsecret.
+    # Do not apply this to custom:ollama or remote/LAN Ollama endpoints.
+    if _is_named_loopback_ollama_route(requested_provider, base_url):
+        result = {
+            "provider": "custom",
+            "api_mode": custom_provider.get("api_mode")
+            or _detect_api_mode_for_url(base_url)
+            or "chat_completions",
+            "base_url": base_url,
+            "api_key": "no-key-required",
+            "source": f"custom_provider:{custom_provider.get('name', requested_provider)}",
+            "requested_provider": requested_provider,
+        }
+        if custom_provider.get("model"):
+            result["model"] = custom_provider["model"]
+        if isinstance(custom_provider.get("max_output_tokens"), int):
+            result["max_output_tokens"] = custom_provider["max_output_tokens"]
+        return result
 
     # Check if a credential pool exists for this custom endpoint
     pool_result = _try_resolve_from_custom_pool(base_url, "custom", custom_provider.get("api_mode"), provider_name=custom_provider.get("name"))

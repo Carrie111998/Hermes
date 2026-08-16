@@ -86,6 +86,59 @@ def test_resolve_user_provider_prefers_canonical_base_url_over_legacy_api():
     assert provider.base_url == "http://127.0.0.1:11434/v1"
 
 
+@pytest.mark.parametrize(
+    ("entry", "expected"),
+    [
+        (
+            {
+                "api": "https://picker-api.example/v1",
+                "url": "https://picker-url.example/v1",
+            },
+            "https://picker-url.example/v1",
+        ),
+        (
+            {
+                "api": "https://picker-api.example/v1",
+                "url": "https://picker-url.example/v1",
+                "base_url": "https://picker-base.example/v1",
+            },
+            "https://picker-base.example/v1",
+        ),
+        (
+            {
+                "api": "https://picker-api.example/v1",
+                "url": "https://picker-url.example/v1",
+                "baseUrl": "https://picker-camel-base.example/v1",
+            },
+            "https://picker-camel-base.example/v1",
+        ),
+    ],
+)
+def test_list_authenticated_providers_uses_canonical_endpoint_precedence(
+    monkeypatch, entry, expected
+):
+    """The real picker must agree with canonical provider endpoint resolution."""
+    monkeypatch.setattr("agent.models_dev.fetch_models_dev", lambda: {})
+    monkeypatch.setattr("hermes_cli.providers.HERMES_OVERLAYS", {})
+    monkeypatch.setattr("hermes_cli.models.get_curated_nous_model_ids", lambda: [])
+
+    providers = list_authenticated_providers(
+        current_provider="other",
+        user_providers={
+            "picker-provider": {
+                "name": "Picker Provider",
+                "model": "picker-model",
+                **entry,
+            }
+        },
+        custom_providers=[],
+        max_models=50,
+    )
+
+    provider = next(p for p in providers if p["slug"] == "picker-provider")
+    assert provider["api_url"] == expected
+
+
 def test_list_authenticated_providers_enumerates_dict_format_models(monkeypatch):
     """providers: dict entries with ``models:`` as a dict keyed by model id
     (canonical Hermes write format) should surface every key in the picker.
